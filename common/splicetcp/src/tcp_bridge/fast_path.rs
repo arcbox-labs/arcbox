@@ -2,6 +2,72 @@ use super::{FastPathConn, GSO_SEGMENT_MSS, SynFlowKey, TCP_MIN_MSS, TcpBridge};
 use crate::ethernet::ETH_HEADER_LEN;
 use std::net::Ipv4Addr;
 
+/// Frame-construction context shared by the first-transmission and
+/// retransmission paths of `poll_fast_path`.
+struct FrameCtx {
+    large_frames: bool,
+    guest_mss: usize,
+    gw_mac: [u8; 6],
+    guest_mac: [u8; 6],
+}
+
+/// Builds guest-bound TCP data frames for `data` starting at `seq_start`:
+/// one GSO-style frame when enabled and the peer accepts 1460-byte
+/// segments, MSS-clamped segmentation otherwise (each emitted IP packet
+/// must fit every link on the path — e.g. a 1500-MTU docker bridge behind
+/// a 4000-MTU eth0). Does NOT advance `conn.our_seq` — retransmissions
+/// re-emit already-consumed sequence space.
+fn emit_data_frames(
+    ctx: &FrameCtx,
+    conn: &FastPathConn,
+    seq_start: u32,
+    data: &[u8],
+    frames: &mut Vec<Vec<u8>>,
+) {
+    if ctx.large_frames && conn.peer_mss >= GSO_SEGMENT_MSS {
+        let large = ETH_HEADER_LEN + 40 + data.len() > 1500;
+        let params = crate::ethernet::TcpFrameParams {
+            src_ip: conn.remote_ip,
+            dst_ip: conn.guest_ip,
+            src_port: conn.remote_port,
+            dst_port: conn.guest_port,
+            seq: seq_start,
+            ack: conn.last_ack,
+            window: 65535,
+            src_mac: ctx.gw_mac,
+            dst_mac: ctx.guest_mac,
+        };
+        frames.push(if large {
+            crate::ethernet::build_tcp_data_frame_partial_csum(&params, data)
+        } else {
+            crate::ethernet::build_tcp_data_frame(&params, data)
+        });
+        return;
+    }
+    let seg = ctx
+        .guest_mss
+        .min(usize::from(conn.peer_mss.max(TCP_MIN_MSS)));
+    let mut offset = 0;
+    while offset < data.len() {
+        let chunk_end = (offset + seg).min(data.len());
+        frames.push(crate::ethernet::build_tcp_data_frame(
+            &crate::ethernet::TcpFrameParams {
+                src_ip: conn.remote_ip,
+                dst_ip: conn.guest_ip,
+                src_port: conn.remote_port,
+                dst_port: conn.guest_port,
+                seq: seq_start.wrapping_add(offset as u32),
+                ack: conn.last_ack,
+                window: 65535,
+                src_mac: ctx.gw_mac,
+                dst_mac: ctx.guest_mac,
+            },
+            &data[offset..chunk_end],
+        ));
+        offset = chunk_end;
+    }
+}
+
 impl TcpBridge {
     /// Checks if a TCP frame matches a fast-path connection.
     ///
@@ -65,32 +131,6 @@ impl TcpBridge {
             return Some(Vec::new()); // Intercepted, no reply frame.
         }
 
-        // Download flow control: every guest frame carrying ACK updates our
-        // view of how much of OUR stream it received and how much receive
-        // window it advertises. Monotonic on the ack (a reordered frame
-        // must not regress it); the window rides along with the newest ack,
-        // and an equal ack still applies it (pure window updates).
-        if flags & 0x10 != 0 {
-            let guest_ack = u32::from_be_bytes([
-                frame[l4_start + 8],
-                frame[l4_start + 9],
-                frame[l4_start + 10],
-                frame[l4_start + 11],
-            ]);
-            let current = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
-            if guest_ack.wrapping_sub(current) < 0x8000_0000 {
-                let raw_win = u32::from(u16::from_be_bytes([
-                    frame[l4_start + 14],
-                    frame[l4_start + 15],
-                ]));
-                conn.guest_acked
-                    .store(guest_ack, std::sync::atomic::Ordering::Relaxed);
-                conn.guest_window.store(
-                    raw_win << conn.guest_wscale,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-        }
         // Extract payload using IPv4 total_length to exclude Ethernet padding.
         // NOTE: FIN check is deferred until after payload write — RFC 793
         // allows FIN segments to carry data.
@@ -100,6 +140,54 @@ impl TcpBridge {
         let payload_start = l4_start + tcp_data_offset;
         let payload_end = ip_end.min(frame.len());
         let payload_len = payload_end.saturating_sub(payload_start);
+
+        // Download flow control: every guest frame carrying ACK updates our
+        // view of how much of OUR stream it received and how much receive
+        // window it advertises. Monotonic on the ack (a reordered frame
+        // must not regress it); the window rides along with the newest ack,
+        // and an equal ack still applies it (pure window updates). A pure
+        // ACK repeating the same ack AND window while our data is in flight
+        // is a duplicate ACK — three of them mean the guest is missing a
+        // frame and triggers fast retransmit in `poll_fast_path`.
+        if flags & 0x10 != 0 {
+            let guest_ack = u32::from_be_bytes([
+                frame[l4_start + 8],
+                frame[l4_start + 9],
+                frame[l4_start + 10],
+                frame[l4_start + 11],
+            ]);
+            let current = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
+            let advance = guest_ack.wrapping_sub(current);
+            if advance < 0x8000_0000 {
+                let scaled_win = u32::from(u16::from_be_bytes([
+                    frame[l4_start + 14],
+                    frame[l4_start + 15],
+                ])) << conn.guest_wscale;
+                // FIN|SYN|RST all clear — `trailing_zeros` (clippy's
+                // suggestion) would obscure that this is a flag test.
+                let plain_ack = flags & (0x01 | 0x02 | 0x04) == 0;
+                if advance == 0
+                    && payload_len == 0
+                    && plain_ack
+                    && scaled_win == conn.guest_window.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
+                    let in_flight = sent.wrapping_sub(guest_ack);
+                    if in_flight > 0 && in_flight < 0x8000_0000 {
+                        conn.dup_acks = conn.dup_acks.saturating_add(1);
+                        if conn.dup_acks >= 3 {
+                            conn.fast_retransmit = true;
+                        }
+                    }
+                } else if advance > 0 {
+                    conn.dup_acks = 0;
+                }
+                conn.guest_acked
+                    .store(guest_ack, std::sync::atomic::Ordering::Relaxed);
+                conn.guest_window
+                    .store(scaled_win, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         // Write payload to host stream (if any). The invariant that keeps
         // uploads lossless with no shim-side buffering: `last_ack` advances
@@ -253,6 +341,13 @@ impl TcpBridge {
         let mut to_remove = Vec::new();
         let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
         let gw_mac = self.fast_path_gateway_mac;
+        let ctx = FrameCtx {
+            large_frames: self.large_frames_enabled,
+            guest_mss: self.fast_path_guest_mss,
+            gw_mac,
+            guest_mac,
+        };
+        let now = std::time::Instant::now();
 
         for (key, conn) in &mut self.fast_path_conns {
             if conn.inline_owned {
@@ -273,23 +368,117 @@ impl TcpBridge {
                 }
                 continue;
             }
+            // ---- Sender-side loss recovery (runs for host_eof flows too:
+            // in-flight data and the FIN itself still need repair) ----
+            let acked = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
+            let drained = acked.wrapping_sub(conn.retransmit_seq);
+            if drained > 0 && drained < 0x8000_0000 {
+                // The guest ACKed more of our stream — release the buffered
+                // prefix and reset the loss-recovery clocks.
+                let n = (drained as usize).min(conn.retransmit_buf.len());
+                conn.retransmit_buf.drain(..n);
+                conn.retransmit_seq = acked;
+                conn.last_progress = now;
+                conn.rto = super::INITIAL_RTO;
+                conn.dup_acks = 0;
+            }
+            let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
+            let in_flight = sent.wrapping_sub(acked);
+            if in_flight > 0 && in_flight < 0x8000_0000 {
+                let timed_out = now.duration_since(conn.last_progress) >= conn.rto;
+                if conn.fast_retransmit || timed_out {
+                    // Resend everything from the guest's ack point: buffered
+                    // data first, then the FIN if it is still unACKed. The
+                    // path beyond guest eth0 (bridge → veth → container
+                    // backlog) drops under burst; without this a single
+                    // dropped frame wedges the flow forever.
+                    let offset = acked.wrapping_sub(conn.retransmit_seq) as usize;
+                    if offset < conn.retransmit_buf.len() {
+                        let data: Vec<u8> =
+                            conn.retransmit_buf.iter().skip(offset).copied().collect();
+                        emit_data_frames(&ctx, conn, acked, &data, &mut frames);
+                    }
+                    if let Some(fin_seq) = conn.fin_seq
+                        && sent.wrapping_sub(fin_seq) < 0x8000_0000
+                        && fin_seq.wrapping_sub(acked) < 0x8000_0000
+                    {
+                        frames.push(crate::ethernet::build_tcp_fin_frame(
+                            &crate::ethernet::TcpFrameParams {
+                                src_ip: conn.remote_ip,
+                                dst_ip: conn.guest_ip,
+                                src_port: conn.remote_port,
+                                dst_port: conn.guest_port,
+                                seq: fin_seq,
+                                ack: conn.last_ack,
+                                window: 65535,
+                                src_mac: gw_mac,
+                                dst_mac: guest_mac,
+                            },
+                        ));
+                    }
+                    tracing::debug!(
+                        "Fast path retransmit {}:{} → {}:{} ({} bytes from seq={acked}, cause={}, rto={:?})",
+                        conn.remote_ip,
+                        conn.remote_port,
+                        conn.guest_ip,
+                        conn.guest_port,
+                        in_flight,
+                        if conn.fast_retransmit {
+                            "dup-acks"
+                        } else {
+                            "rto"
+                        },
+                        conn.rto,
+                    );
+                    conn.fast_retransmit = false;
+                    conn.dup_acks = 0;
+                    conn.retransmits += 1;
+                    conn.last_progress = now;
+                    conn.rto = (conn.rto * 2).min(super::MAX_RTO);
+                }
+            } else {
+                // Nothing in flight — keep the RTO clock parked so the next
+                // send starts a fresh timeout window.
+                conn.last_progress = now;
+                conn.fast_retransmit = false;
+            }
+
             if conn.host_eof {
                 continue;
             }
 
             // Never read (hence send) beyond the guest's advertised receive
-            // window: within the budget the guest kernel guarantees
-            // buffering, and the local link is lossless, so no gap can form
-            // that this retransmission-free path could never repair. Unread
-            // bytes stay in the host socket buffer — kernel-level
-            // backpressure toward the upstream.
-            let budget = super::send_budget(
-                conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
-                conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed),
-                conn.guest_window.load(std::sync::atomic::Ordering::Relaxed),
-            ) as usize;
+            // window (capped: the cap bounds both the retransmission buffer
+            // and the burst a flow can throw at the guest's bridge/veth
+            // backlog). Unread bytes stay in the host socket buffer —
+            // kernel-level backpressure toward the upstream.
+            let window = conn
+                .guest_window
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(super::HONORED_WINDOW_CAP);
+            let budget = super::send_budget(sent, acked, window) as usize;
             if budget == 0 {
+                if !conn.window_stalled {
+                    conn.window_stalled = true;
+                    tracing::debug!(
+                        "Fast path window stall {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
+                        conn.remote_ip,
+                        conn.remote_port,
+                        conn.guest_ip,
+                        conn.guest_port,
+                    );
+                }
                 continue;
+            }
+            if conn.window_stalled {
+                conn.window_stalled = false;
+                tracing::debug!(
+                    "Fast path window reopened {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
+                    conn.remote_ip,
+                    conn.remote_port,
+                    conn.guest_ip,
+                    conn.guest_port,
+                );
             }
             let cap = budget.min(conn.read_buf.len());
 
@@ -311,7 +500,9 @@ impl TcpBridge {
                             src_mac: gw_mac,
                             dst_mac: guest_mac,
                         });
-                    // FIN consumes 1 SEQ.
+                    // FIN consumes 1 SEQ; remember its position so a lost
+                    // FIN is retransmitted like any other in-flight byte.
+                    conn.fin_seq = Some(seq_now);
                     conn.our_seq
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     frames.push(fin);
@@ -321,72 +512,11 @@ impl TcpBridge {
                 }
                 Ok(n) => {
                     conn.down_bytes += n as u64;
-                    // Channel/inject path: send the entire read as one large
-                    // frame (the inject thread's GSO hint lets the guest
-                    // re-segment at MSS). Gated on the peer accepting the fixed
-                    // 1460-byte GSO segments; a smaller-MSS peer falls through to
-                    // the clamped segmentation below.
-                    let data = &conn.read_buf[..n];
-                    if self.large_frames_enabled && conn.peer_mss >= GSO_SEGMENT_MSS {
-                        let large = ETH_HEADER_LEN + 40 + data.len() > 1500;
-                        let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
-                        let params = crate::ethernet::TcpFrameParams {
-                            src_ip: conn.remote_ip,
-                            dst_ip: conn.guest_ip,
-                            src_port: conn.remote_port,
-                            dst_port: conn.guest_port,
-                            seq: seq_now,
-                            ack: conn.last_ack,
-                            window: 65535,
-                            src_mac: gw_mac,
-                            dst_mac: guest_mac,
-                        };
-                        let data_frame = if large {
-                            crate::ethernet::build_tcp_data_frame_partial_csum(&params, data)
-                        } else {
-                            crate::ethernet::build_tcp_data_frame(&params, data)
-                        };
-                        conn.our_seq
-                            .fetch_add(data.len() as u32, std::sync::atomic::Ordering::Relaxed);
-                        frames.push(data_frame);
-                    } else {
-                        // Non-GSO path: segment at the smaller of the configured
-                        // guest MSS and the MSS the peer advertised, so each
-                        // emitted IP packet fits every link on the path to the
-                        // guest endpoint — including a 1500-MTU docker bridge
-                        // behind a 4000-MTU eth0. Without the peer_mss bound a
-                        // container silently drops these oversized frames and
-                        // Host→VM stalls.
-                        let seg = self
-                            .fast_path_guest_mss
-                            .min(conn.peer_mss.max(TCP_MIN_MSS) as usize);
-                        let mut offset = 0;
-                        while offset < data.len() {
-                            let chunk_end = (offset + seg).min(data.len());
-                            let chunk = &data[offset..chunk_end];
-                            let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
-                            let data_frame = crate::ethernet::build_tcp_data_frame(
-                                &crate::ethernet::TcpFrameParams {
-                                    src_ip: conn.remote_ip,
-                                    dst_ip: conn.guest_ip,
-                                    src_port: conn.remote_port,
-                                    dst_port: conn.guest_port,
-                                    seq: seq_now,
-                                    ack: conn.last_ack,
-                                    window: 65535,
-                                    src_mac: gw_mac,
-                                    dst_mac: guest_mac,
-                                },
-                                chunk,
-                            );
-                            conn.our_seq.fetch_add(
-                                chunk.len() as u32,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            frames.push(data_frame);
-                            offset = chunk_end;
-                        }
-                    }
+                    let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
+                    conn.retransmit_buf.extend(&conn.read_buf[..n]);
+                    emit_data_frames(&ctx, conn, seq_now, &conn.read_buf[..n], &mut frames);
+                    conn.our_seq
+                        .fetch_add(n as u32, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No data available — expected for non-blocking.
@@ -434,9 +564,10 @@ impl TcpBridge {
         let Some(conn) = self.fast_path_conns.remove(key) else {
             return;
         };
-        if conn.up_would_block + conn.up_short_writes + conn.up_out_of_order > 0 {
+        if conn.up_would_block + conn.up_short_writes + conn.up_out_of_order + conn.retransmits > 0
+        {
             tracing::debug!(
-                "Fast path close {}:{} → {}:{}: upload recovered via guest retransmit (would_block={}, short_writes={}, out_of_order={})",
+                "Fast path close {}:{} → {}:{}: loss recovery (up: would_block={}, short_writes={}, out_of_order={}; down: retransmits={})",
                 key.src_ip,
                 key.src_port,
                 key.dst_ip,
@@ -444,6 +575,7 @@ impl TcpBridge {
                 conn.up_would_block,
                 conn.up_short_writes,
                 conn.up_out_of_order,
+                conn.retransmits,
             );
         }
         if let Some(ref obs) = self.observer {
@@ -581,6 +713,15 @@ impl TcpBridge {
                 up_would_block: 0,
                 up_short_writes: 0,
                 up_out_of_order: 0,
+                window_stalled: false,
+                retransmit_buf: std::collections::VecDeque::new(),
+                retransmit_seq: our_seq,
+                last_progress: std::time::Instant::now(),
+                rto: super::INITIAL_RTO,
+                dup_acks: 0,
+                fast_retransmit: false,
+                fin_seq: None,
+                retransmits: 0,
                 read_buf: if inline_owned {
                     Vec::new()
                 } else {
