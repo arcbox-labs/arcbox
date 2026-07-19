@@ -65,6 +65,12 @@ pub struct InlineConn {
 // SAFETY: TcpStream is Send, all other fields are Send+Sync.
 unsafe impl Send for InlineConn {}
 
+/// Cap on the guest window this thread honors — bounds the burst a flow
+/// can throw at the guest-internal bridge/veth backlog. Keep in sync with
+/// `splicetcp::tcp_bridge::HONORED_WINDOW_CAP` (this crate must not
+/// depend on splicetcp).
+const HONORED_WINDOW_CAP: u32 = 256 * 1024;
+
 impl InlineConn {
     /// Bytes this thread may still send without exceeding the guest's
     /// advertised receive window: `window − (sent − acked)`, wrap-safe.
@@ -75,7 +81,10 @@ impl InlineConn {
     pub fn send_budget(&self) -> u32 {
         let sent = self.our_seq.load(Ordering::Relaxed);
         let acked = self.guest_acked.load(Ordering::Relaxed);
-        let window = self.guest_window.load(Ordering::Relaxed);
+        let window = self
+            .guest_window
+            .load(Ordering::Relaxed)
+            .min(HONORED_WINDOW_CAP);
         let in_flight = sent.wrapping_sub(acked);
         if in_flight >= 0x8000_0000 {
             // Transiently stale snapshot from racing atomics.
