@@ -1,16 +1,23 @@
 name: "CodeQL"
 
-# Advanced setup, migrated from default setup so the Swift language can use
-# build-mode: none. Default setup ran Swift under autobuild, which invoked a
-# bare `swift build` on the arcbox-vz shim; that build cannot resolve the
-# Virtualization.framework Mac-guest APIs (VZMacPlatformConfiguration et al.)
-# without the project's real SDK context, so every PR got a spurious red
-# "Analyze (swift)" even though the shim builds fine in the release pipeline.
+# Advanced setup, migrated from default setup. Default setup ran Swift under
+# autobuild, which invoked a bare `swift build` on the arcbox-vz shim; that
+# build cannot resolve the Virtualization.framework Mac-guest APIs
+# (VZMacPlatformConfiguration et al.) without the project's real SDK context,
+# so every PR got a spurious red "Analyze (swift)" even though the shim builds
+# fine in the release pipeline.
 #
-# All three languages extract without a build (buildless is GA for actions,
-# rust, and swift), so no compilation — and no false build failure — occurs.
-# When editing, keep the job name "Analyze (<language>)" so it keeps matching
-# any required-status-check rules carried over from default setup.
+# Swift is dropped rather than analyzed here: the CodeQL Swift extractor does
+# not support build-mode: none, and its only other modes (autobuild, manual)
+# both require the same shim build that CI cannot satisfy. actions and rust
+# extract without a build (buildless), so no compilation — and no false build
+# failure — occurs. When editing, keep the job name "Analyze (<language>)" so
+# it keeps matching any required-status-check rules carried over from default
+# setup.
+#
+# NOTE: default setup must be disabled (code-scanning default-setup ->
+# not-configured) before this workflow's results can be processed; while it
+# stays enabled, advanced-configuration SARIF uploads are rejected.
 
 on:
   push:
@@ -43,10 +50,6 @@ jobs:
             runner: ubuntu-latest
           - language: rust
             runner: ubuntu-latest
-          # Swift extraction ships in the macOS CodeQL bundle; keep it on a
-          # macOS runner even buildless.
-          - language: swift
-            runner: macos-latest
 
     steps:
       - name: Checkout
