@@ -19,6 +19,9 @@ use super::cmdline::docker_data_device;
 /// `0x10040` (superblock starts at `0x10000`, magic at internal offset `0x40`).
 const BTRFS_MAGIC: [u8; 8] = [0x5f, 0x42, 0x48, 0x52, 0x66, 0x53, 0x5f, 0x4d];
 const BTRFS_MAGIC_OFFSET: u64 = 0x10040;
+/// Offset of the `total_bytes` field in the Btrfs superblock (superblock at
+/// 64 KiB + 0x70 within it).
+const BTRFS_TOTAL_BYTES_OFFSET: u64 = 0x10070;
 
 /// Temporary mount point for the raw Btrfs device before subvolume bind mounts.
 ///
@@ -39,6 +42,45 @@ fn has_btrfs_superblock(device: &str) -> bool {
         return false;
     }
     magic == BTRFS_MAGIC
+}
+
+/// Reads the Btrfs superblock's `total_bytes` (the device size the filesystem
+/// was last resized to). `None` if the field can't be read.
+fn btrfs_total_bytes(device: &str) -> Option<u64> {
+    let mut file = std::fs::File::open(device).ok()?;
+    file.seek(SeekFrom::Start(BTRFS_TOTAL_BYTES_OFFSET)).ok()?;
+    let mut buf = [0_u8; 8];
+    file.read_exact(&mut buf).ok()?;
+    Some(u64::from_le_bytes(buf))
+}
+
+/// Reads a block device's size in bytes by seeking to its end.
+fn block_device_size(device: &str) -> Option<u64> {
+    let mut file = std::fs::File::open(device).ok()?;
+    file.seek(SeekFrom::End(0)).ok()
+}
+
+/// Fails loudly when the block device is smaller than the Btrfs filesystem it
+/// carries. Btrfs refuses to mount (`open_ctree failed`) in that case, so a
+/// bare mount error would otherwise repeat every retry with no explanation.
+///
+/// The mismatch happens when the VM engine is switched to a backend that
+/// exposes a smaller disk than the one the filesystem was grown against (the
+/// VZ→HV capacity bug). The data is intact; switching the engine back recovers.
+fn check_device_fits_filesystem(device: &str) -> Result<(), String> {
+    let (Some(fs_bytes), Some(dev_bytes)) = (btrfs_total_bytes(device), block_device_size(device))
+    else {
+        return Ok(());
+    };
+    if dev_bytes < fs_bytes {
+        return Err(format!(
+            "data disk is {dev_bytes} bytes but its Btrfs filesystem was grown to \
+             {fs_bytes} bytes; the block device shrank (VM engine switched to a \
+             backend exposing a smaller disk). Switch the engine back to VZ to \
+             recover — the data is intact."
+        ));
+    }
+    Ok(())
 }
 
 /// Formats the device as Btrfs if it does not already have a Btrfs superblock.
@@ -117,6 +159,10 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
         Ok(note) => tracing::info!("{}", note),
         Err(e) => return Err(e),
     }
+
+    // Step 1.5: Fail loudly if the device is smaller than its filesystem — Btrfs
+    // would otherwise reject the mount below with an opaque error on every retry.
+    check_device_fits_filesystem(&device)?;
 
     // Step 2: Mount raw Btrfs to temporary writable mount point.
     if !crate::mount::is_mounted(BTRFS_TEMP_MOUNT) {

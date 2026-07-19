@@ -24,6 +24,10 @@ pub const ARCBOX_HVC_BLK_WRITE: u64 = 0xC200_0002;
 /// Returns X0 = 0 on success or negative errno.
 pub const ARCBOX_HVC_BLK_FLUSH: u64 = 0xC200_0003;
 
+/// HVC block capacity query. X1=dev_idx.
+/// Returns X0 = device capacity in 512-byte sectors, or negative errno.
+pub const ARCBOX_HVC_BLK_CAPACITY: u64 = 0xC200_0004;
+
 /// HVC block read or write.
 /// X1=device_idx, X2=sector, X3=buffer_gpa, X4=byte_length.
 /// `is_write`: false=pread, true=pwrite.
@@ -102,6 +106,22 @@ pub fn handle_hvc_blk_io(
         return (-libc::EIO as i64) as u64;
     }
     byte_len as u64
+}
+
+/// HVC block capacity query. X1=device_idx.
+///
+/// Returns the device's real capacity in 512-byte sectors so the guest driver
+/// can size the disk correctly instead of assuming a fixed placeholder. A wrong
+/// (too-small) size silently corrupts a Btrfs data disk whose metadata records
+/// the true size — see the VZ↔HV capacity mismatch this closes.
+pub fn handle_hvc_blk_capacity(vcpu: &arcbox_hv::HvVcpu, hvc_blk_fds: &[(i32, u32, u64)]) -> u64 {
+    let Ok(device_idx) = vcpu.get_reg(X1) else {
+        return (-libc::EINVAL as i64) as u64;
+    };
+    let Some(&(_, _, capacity_sectors)) = hvc_blk_fds.get(device_idx as usize) else {
+        return (-libc::ENODEV as i64) as u64;
+    };
+    capacity_sectors
 }
 
 /// HVC block flush (fsync). X1=device_idx.
