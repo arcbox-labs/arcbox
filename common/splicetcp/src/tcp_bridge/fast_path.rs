@@ -158,7 +158,15 @@ impl TcpBridge {
             ]);
             let current = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
             let advance = guest_ack.wrapping_sub(current);
-            if advance < 0x8000_0000 {
+            // Reject an ACK beyond what we actually sent (RFC 793: an ACK
+            // must not cover data past SND.NXT). Accepting one would let
+            // poll_fast_path drain retransmit_buf past real in-flight bytes
+            // and move retransmit_seq beyond our_seq, so those bytes could
+            // never be retransmitted — the flow would truncate or wedge.
+            let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
+            let beyond_sent =
+                guest_ack.wrapping_sub(sent) != 0 && guest_ack.wrapping_sub(sent) < 0x8000_0000;
+            if advance < 0x8000_0000 && !beyond_sent {
                 let scaled_win = u32::from(u16::from_be_bytes([
                     frame[l4_start + 14],
                     frame[l4_start + 15],
@@ -171,7 +179,6 @@ impl TcpBridge {
                     && plain_ack
                     && scaled_win == conn.guest_window.load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
                     let in_flight = sent.wrapping_sub(guest_ack);
                     if in_flight > 0 && in_flight < 0x8000_0000 {
                         conn.dup_acks = conn.dup_acks.saturating_add(1);
