@@ -58,7 +58,9 @@ service MachineService {
 
     // Subscribes to machine lifecycle events. The stream stays open until the
     // client disconnects. Emitted actions:
-    //   "created" | "started" | "idle" | "stopped"
+    //   "created" | "started" | "idle" | "stopped" | "removed"
+    // plus "resync" (empty name) when the server dropped events under load and
+    // the client should re-list. Events for the default System VM are included.
     rpc Events(MachineEventsRequest) returns (stream MachineEvent);
 }
 
@@ -353,13 +355,15 @@ message MachineEventsRequest {
 
 // A machine lifecycle event.
 message MachineEvent {
-    // Machine name.
+    // Machine name (empty for "resync").
     string name = 1;
     // Action:
     //   "created" — machine record created
     //   "started" — VM reached the running state
     //   "idle"    — running VM entered the idle (reduced-resource) state
     //   "stopped" — VM shut down
+    //   "removed" — machine deleted
+    //   "resync"  — events were dropped under load; re-list to recover
     string action = 2;
     // Unix nanoseconds.
     int64 timestamp = 3;

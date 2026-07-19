@@ -1514,7 +1514,7 @@ pub struct MachineEventsRequest {
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineEvent {
-    /// Machine name.
+    /// Machine name (empty for "resync").
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     /// Action:
@@ -1522,6 +1522,8 @@ pub struct MachineEvent {
     ///    "started" — VM reached the running state
     ///    "idle"    — running VM entered the idle (reduced-resource) state
     ///    "stopped" — VM shut down
+    ///    "removed" — machine deleted
+    ///    "resync"  — events were dropped under load; re-list to recover
     #[prost(string, tag = "2")]
     pub action: ::prost::alloc::string::String,
     /// Unix nanoseconds.

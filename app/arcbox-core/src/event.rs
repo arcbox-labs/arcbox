@@ -17,6 +17,8 @@ pub enum Event {
     MachineIdle { name: String },
     /// Machine stopped.
     MachineStopped { name: String },
+    /// Machine removed (record and disks deleted).
+    MachineRemoved { name: String },
     /// Container subnet route installed on the host for a machine's bridge NIC.
     ContainerRouteInstalled { name: String },
 }

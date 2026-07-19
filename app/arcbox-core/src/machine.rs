@@ -269,6 +269,10 @@ pub struct MachineManager {
     machines_dir: PathBuf,
     /// Shared DNS hosts table from NetworkManager, passed to VMM on start.
     shared_dns_hosts: Option<std::sync::Arc<arcbox_dns::LocalHostsTable>>,
+    /// System-wide event bus. User-machine lifecycle events are published here
+    /// so watchers (`MachineService.Events`) see them; the default System VM's
+    /// events are published by its own lifecycle actor instead.
+    event_bus: crate::event::EventBus,
 }
 
 impl MachineManager {
@@ -278,6 +282,7 @@ impl MachineManager {
         vm_manager: Arc<VmManager>,
         data_dir: PathBuf,
         shared_dns_hosts: Option<std::sync::Arc<arcbox_dns::LocalHostsTable>>,
+        event_bus: crate::event::EventBus,
     ) -> Self {
         let machines_dir = data_dir.join("machines");
         let persistence = MachinePersistence::new(&machines_dir);
@@ -376,6 +381,16 @@ impl MachineManager {
             data_dir,
             machines_dir,
             shared_dns_hosts,
+            event_bus,
+        }
+    }
+
+    /// Publish a lifecycle event for user machine `name`. The default System VM
+    /// is skipped: its lifecycle actor publishes the same events, so emitting
+    /// here too would double them.
+    fn publish_event(&self, name: &str, event: crate::event::Event) {
+        if name != crate::vm_lifecycle::DEFAULT_MACHINE_NAME {
+            self.event_bus.publish(event);
         }
     }
 
@@ -542,6 +557,12 @@ impl MachineManager {
 
         machines.insert(config.name.clone(), info);
 
+        self.publish_event(
+            &config.name,
+            crate::event::Event::MachineCreated {
+                name: config.name.clone(),
+            },
+        );
         Ok(config.name)
     }
 
@@ -602,6 +623,12 @@ impl MachineManager {
             })?;
         }
 
+        self.publish_event(
+            name,
+            crate::event::Event::MachineStarted {
+                name: name.to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -971,6 +998,12 @@ impl MachineManager {
             );
         }
 
+        self.publish_event(
+            name,
+            crate::event::Event::MachineStopped {
+                name: name.to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -1097,6 +1130,13 @@ impl MachineManager {
                         e
                     );
                 }
+                drop(machines);
+                self.publish_event(
+                    name,
+                    crate::event::Event::MachineStopped {
+                        name: name.to_string(),
+                    },
+                );
                 Ok(true)
             }
             Ok(false) => {
@@ -1192,6 +1232,13 @@ impl MachineManager {
         // restart even though VM and in-memory state are already gone.
         self.persistence.remove(name)?;
 
+        drop(machines);
+        self.publish_event(
+            name,
+            crate::event::Event::MachineRemoved {
+                name: name.to_string(),
+            },
+        );
         tracing::info!("Removed machine '{}'", name);
         Ok(())
     }
