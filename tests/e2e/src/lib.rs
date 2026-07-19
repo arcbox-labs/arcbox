@@ -4,7 +4,9 @@ pub mod boot_assets;
 pub mod daemon;
 pub mod docker;
 pub mod metrics;
+pub mod net_fixtures;
 pub mod sandbox;
+pub mod scenario;
 pub mod signing;
 
 pub fn repo_root() -> PathBuf {

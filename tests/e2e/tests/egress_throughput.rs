@@ -23,19 +23,15 @@
 //! via the gateway-IP→loopback translation, which also regression-tests
 //! `host.docker.internal` staying direct under a configured system proxy.
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::Path;
-use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
-use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle};
+use arcbox_e2e::daemon::DaemonHandle;
 use arcbox_e2e::docker::{docker_output, ensure_image};
 use arcbox_e2e::metrics::RunMetrics;
-
-static TRACING: Once = Once::new();
+use arcbox_e2e::net_fixtures::{GUEST_GATEWAY_IP, spawn_blob_server};
+use arcbox_e2e::scenario::run_vz_scenario;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Blob size per download. Large enough to sustain a multi-second transfer
@@ -47,123 +43,11 @@ const DOWNLOADS: usize = 6;
 /// Ceiling for one in-container download (loopback moves 64 MB in seconds;
 /// generous slack for slow CI hosts).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-/// Gateway IP the guest sees on its primary (userspace-netstack) NIC.
-/// TcpBridge translates connections targeting it to host `127.0.0.1`
-/// (the `host.docker.internal` mechanism), which is exactly the datapath
-/// under test.
-const GUEST_GATEWAY_IP: &str = "10.0.2.1";
-
-fn init_tracing() {
-    TRACING.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .try_init();
-    });
-}
-
-/// Serves `BLOB_BYTES` of zeroes for any HTTP request, one thread per
-/// connection, until the process exits. Returns the bound port.
-fn spawn_blob_server() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("binding blob server")?;
-    let port = listener.local_addr()?.port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            std::thread::spawn(move || {
-                // Read the request until the header terminator (or EOF).
-                let mut buf = [0u8; 4096];
-                let mut request = Vec::new();
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) => return,
-                        Ok(n) => {
-                            request.extend_from_slice(&buf[..n]);
-                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Err(_) => return,
-                    }
-                }
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {BLOB_BYTES}\r\nConnection: close\r\n\r\n"
-                );
-                if stream.write_all(header.as_bytes()).is_err() {
-                    return;
-                }
-                let chunk = vec![0u8; 64 * 1024];
-                let mut remaining = BLOB_BYTES;
-                while remaining > 0 {
-                    let n = remaining.min(chunk.len());
-                    if stream.write_all(&chunk[..n]).is_err() {
-                        return;
-                    }
-                    remaining -= n;
-                }
-            });
-        }
-    });
-    Ok(port)
-}
 
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon and drives sustained egress downloads"]
 fn sustained_egress_downloads_do_not_stall() -> Result<()> {
-    init_tracing();
-
-    let root = arcbox_e2e::repo_root();
-    if !arcbox_e2e::env_flag("SKIP_BUILD") {
-        let shell = xshell::Shell::new()?;
-        shell.change_dir(&root);
-        xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
-    }
-
-    let version = resolve_boot_version(&root)?;
-    let data_dir = tempfile::Builder::new()
-        .prefix("arcbox-egress-throughput-")
-        .tempdir()?;
-    stage_dev_boot_assets(&root, data_dir.path(), &version)?;
-
-    // Probe a free port for the daemon's host DNS service so this test can
-    // run alongside a developer's live daemon (fixed 5553) and parallel
-    // test runs. The bind is dropped before the daemon starts — a benign
-    // TOCTOU for a test harness.
-    let dns_port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .context("probing a free DNS port")?
-        .port();
-
-    let mut daemon = DaemonHandle::spawn(DaemonConfig {
-        binary: root.join("target/release/arcbox-daemon"),
-        data_dir: data_dir.path().to_owned(),
-        args: vec![],
-        env: vec![
-            ("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version),
-            ("ARCBOX_VM_BACKEND".to_owned(), "vz".to_owned()),
-            ("ARCBOX_DNS_PORT".to_owned(), dns_port.to_string()),
-            // Per-SYN datapath tracing: stall forensics need the gated-SYN,
-            // handshake-retransmit, and RST decisions, which log at debug.
-            (
-                "RUST_LOG".to_owned(),
-                "info,arcbox_net=debug,splicetcp=debug".to_owned(),
-            ),
-        ],
-    })?;
-
-    let mut metrics = RunMetrics::new("egress_throughput", Some("vz"));
-    let result = scenario(&mut daemon, data_dir.path(), &mut metrics);
-    metrics.passed = result.is_ok();
-    if let Err(error) = metrics.write(Some(data_dir.path())) {
-        tracing::warn!("writing run metrics failed: {error:#}");
-    }
-    if result.is_err() {
-        let kept = data_dir.keep();
-        tracing::warn!(path = %kept.display(), "preserving test directory");
-    }
-    result
+    run_vz_scenario("egress_throughput", scenario)
 }
 
 fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics) -> Result<()> {
@@ -172,8 +56,8 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
     metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
 
-    let port = spawn_blob_server()?;
-    let url = format!("http://{GUEST_GATEWAY_IP}:{port}/blob");
+    let server = spawn_blob_server(BLOB_BYTES)?;
+    let url = format!("http://{GUEST_GATEWAY_IP}:{}/blob", server.port());
     tracing::info!(%url, blob_mb = BLOB_BYTES / (1024 * 1024), "blob server up");
 
     // ABX-423 experiment (ARCBOX_E2E_GUEST_SAMPLER): a persistent in-guest
