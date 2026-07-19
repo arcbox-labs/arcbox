@@ -264,7 +264,9 @@ async fn read_promoted_conn(
         let budget = crate::tcp_bridge::send_budget(
             conn.our_seq.load(Ordering::Relaxed),
             conn.guest_acked.load(Ordering::Relaxed),
-            conn.guest_window.load(Ordering::Relaxed),
+            conn.guest_window
+                .load(Ordering::Relaxed)
+                .min(crate::tcp_bridge::HONORED_WINDOW_CAP),
         ) as usize;
         if budget == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
