@@ -1,0 +1,64 @@
+name: "CodeQL"
+
+# Advanced setup, migrated from default setup so the Swift language can use
+# build-mode: none. Default setup ran Swift under autobuild, which invoked a
+# bare `swift build` on the arcbox-vz shim; that build cannot resolve the
+# Virtualization.framework Mac-guest APIs (VZMacPlatformConfiguration et al.)
+# without the project's real SDK context, so every PR got a spurious red
+# "Analyze (swift)" even though the shim builds fine in the release pipeline.
+#
+# All three languages extract without a build (buildless is GA for actions,
+# rust, and swift), so no compilation — and no false build failure — occurs.
+# When editing, keep the job name "Analyze (<language>)" so it keeps matching
+# any required-status-check rules carried over from default setup.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly, matching the cadence default setup used.
+    - cron: "31 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            runner: ubuntu-latest
+          - language: rust
+            runner: ubuntu-latest
+          # Swift extraction ships in the macOS CodeQL bundle; keep it on a
+          # macOS runner even buildless.
+          - language: swift
+            runner: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
