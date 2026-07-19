@@ -30,22 +30,33 @@ faults; `egress_throughput` only measures the happy path.
 Fixture: `ChaosOrigin` — a localhost TCP/HTTP server the container fetches
 from through the proxy, with per-connection fault controls:
 
+Only faults the in-process origin can produce **at the application layer**
+belong here; anything that needs the packet path interrupted (dropped SYNs, a
+peer that stops ACKing) is Tier 3, because the host kernel keeps ACKing for a
+merely-idle in-process peer and a closed local port answers with RST rather
+than dropping the SYN.
+
 | Fault | Mechanism | Assertion (guest side) |
 |---|---|---|
-| `rst_mid_transfer` | `SO_LINGER=0` + close at byte N | read fails ≤ 2s; no zombie flow |
+| `rst_mid_transfer` | `SO_LINGER=0` + close at byte N | read fails ≤ deadline; no zombie flow *(Phase 1, implemented)* |
 | `fin_half_close` | `shutdown(WR)` mid-body | EOF surfaces, connection drains |
-| `silent_death` | `SIGSTOP` the origin (peer stops ACKing) | guest read errors ≤ proxy idle/keepalive deadline (**currently unbounded — this is the incident; test is `#[should_panic]`-documented until the proxy fix lands**) |
 | `stall_then_resume` | pause N s < deadline, resume | transfer completes; no spurious reset |
-| `connect_blackhole` | drop SYNs (listener closed, port firewalled in-process) | connect error ≤ deadline, not a hang |
 | `slow_loris` | 1 byte/s body | backpressure holds; no daemon memory growth (ties into splicetcp egress-backpressure work) |
 
 Flow shapes to cross with each fault: short request, multi-GB download,
 idle-keepalive connection, 100 concurrent flows, inbound port-forward (host →
-container), DNS-over-intercept lookups.
+container).
 
 Zombie detection helper: `docker exec <c> netstat -tn` via the daemon's Docker
-API; assert no `ESTABLISHED` flow to `198.18.0.0/15` whose counters are frozen
-across two samples after the origin is gone.
+API; assert no `ESTABLISHED` flow **to the chaos-origin destination the guest
+actually dialed** (`10.0.2.1:<port>` for the gateway→loopback path, the same
+destination `egress_throughput` uses) whose counters are frozen across two
+samples after the origin is gone. Note `198.18.0.0/15` is *not* an ArcBox
+address — it is the Surge/Clash Fake-IP convention (`common/AGENTS.md`); a flow
+lands there only when the developer's host runs such a proxy, so keying the
+detector on it would silently pass on a clean runner. (The 2026-07-19 field
+capture showed a `198.18.x` zombie precisely because that host proxies through
+Fake-IP; the ArcBox-owned leg is the `10.0.2.1` one.)
 
 ## Tier 2 — daemon/VM lifecycle faults (default suite, serialized)
 
@@ -71,15 +82,31 @@ runner-wide lock; locally behind `ARCBOX_E2E_HOST_CHAOS=1`):
   en0+en10 with the same gateway) → in-flight proxied flows must error ≤
   deadline, new flows must work immediately;
 - **sleep/wake** (manual trigger): flows across a host sleep either resume or
-  error — never zombie.
+  error — never zombie;
+- **silent upstream death** (the field incident, faithfully): with a flow in
+  flight, interrupt its packet path — drop the upstream leg's packets via a
+  scoped `pf`/route change so the peer stops being reachable without a
+  FIN/RST. This is the real reproduction of the incident (the daemon's socket
+  errors, e.g. `EHOSTUNREACH`/`ETIMEDOUT`); the guest leg must error ≤
+  deadline, not zombie. Cannot be done in-process (Tier 1), which is why it
+  lives here;
+- **connect blackhole**: drop SYNs to a target so `connect(2)` never completes
+  → connect error ≤ the proxy's connect deadline, not a hang. Also needs the
+  firewall (a closed local port answers with RST, which is fast rejection, not
+  a blackhole), so it is host-global, not Tier 1.
 
 ## Observability assertions (cross-cutting)
 
-Each fault test also asserts the daemon *logged* a proxy-layer event for the
-fault (target `arcbox_net`/proxy, level ≥ WARN). Today this fails for
-`silent_death` — the incident produced zero proxy-layer lines — so the
-logging gap is captured as a failing-by-design expectation alongside the
-behavior gap.
+Tests for **abnormal** terminations assert the daemon *logged* a proxy-layer
+event (target `arcbox_net`/proxy, level ≥ WARN): a peer RST, a silent upstream
+death, a connect blackhole. This deliberately excludes normal traffic that
+merely resembles a fault — a clean FIN half-close, a stall that resumes and
+completes, a slow-but-successful transfer — because those are not proxy faults
+and a WARN on them would be production log noise (and would make correct tests
+fail). The silent-upstream-death case (Tier 3) is where this currently fails —
+the field incident produced zero proxy-layer lines — so the logging gap is
+captured as a failing-by-design expectation alongside the behavior gap, and
+both flip green with the same proxy fix.
 
 ## Where it runs
 
@@ -92,10 +119,12 @@ behavior gap.
 
 ## Phasing
 
-1. `ChaosOrigin` fixture + `rst_mid_transfer` + `silent_death` (the incident
-   regression, expected-fail) + zombie detector. Smallest PR that would have
-   caught the field bug.
-2. Remaining Tier 1 faults × flow shapes; Tier 2.
-3. Proxy fix (upstream keepalive/idle deadline → guest-leg RST + WARN log) —
-   flips the expected-fail tests green; ships with them in one PR.
-4. Tier 3 after the self-hosted runner exists.
+1. **(implemented)** `ChaosOrigin` fixture + `rst_mid_transfer` bounded-failure
+   test — the smallest real e2e that exercises upstream-death propagation on
+   ArcBox's own datapath. The faithful silent-death regression is Tier 3
+   (needs packet-path interruption), not here.
+2. Remaining Tier 1 faults × flow shapes; the zombie-detection helper; Tier 2.
+3. Tier 3, including the silent-upstream-death incident regression
+   (expected-fail) — after the self-hosted runner exists.
+4. Proxy fix (detect upstream-leg death/error → guest-leg RST + WARN log) —
+   flips the Tier 3 expected-fail tests green; ships with them in one PR.
