@@ -1172,3 +1172,72 @@ async fn triple_dup_ack_triggers_fast_retransmit() {
     ]);
     assert_eq!(first_seq, 1, "fast retransmit restarts at the ack cursor");
 }
+
+/// An ACK beyond what the shim actually sent (SND.NXT) must be ignored:
+/// accepting it would drain the retransmission buffer past real in-flight
+/// bytes and strand them (unretransmittable → truncation/wedge).
+#[tokio::test]
+async fn download_ack_beyond_sent_is_ignored() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 102);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40027,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1460, None);
+
+    // Send 2920 bytes downstream (our_seq goes 1 → 2921).
+    accepted.write_all(&[0xF0; 2920]).await.unwrap();
+    let mut sent = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while sent < 2920 && std::time::Instant::now() < deadline {
+        sent += bridge
+            .poll_fast_path()
+            .iter()
+            .map(|f| f.len().saturating_sub(ETH_HEADER_LEN + 40))
+            .sum::<usize>();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(sent, 2920);
+
+    // Impossible ACK: acks seq 9999, far beyond our_seq (2921). Must be
+    // ignored — a later RTO must still retransmit from the real cursor (1),
+    // not from the bogus 9999.
+    let bogus = make_guest_segment((40027, dst_ip, 443), 1, 9999, 65535, 0x10, &[]);
+    bridge.try_fast_path_intercept(&bogus).expect("intercepted");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut retransmitted = Vec::new();
+    while retransmitted.is_empty() && std::time::Instant::now() < deadline {
+        retransmitted = bridge.poll_fast_path();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !retransmitted.is_empty(),
+        "the impossible ACK must not have drained the retransmit buffer"
+    );
+    let tcp = ETH_HEADER_LEN + 20;
+    let first_seq = u32::from_be_bytes([
+        retransmitted[0][tcp + 4],
+        retransmitted[0][tcp + 5],
+        retransmitted[0][tcp + 6],
+        retransmitted[0][tcp + 7],
+    ]);
+    assert_eq!(
+        first_seq, 1,
+        "retransmit from the real cursor, not the bogus ACK"
+    );
+}
