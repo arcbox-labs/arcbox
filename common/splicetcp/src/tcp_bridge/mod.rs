@@ -10,7 +10,21 @@
 //! No congestion control, retransmission, reordering, or TIME_WAIT state
 //! is implemented here — both endpoints (guest Linux kernel, host macOS
 //! kernel) own their own TCP stacks end-to-end; any state machine work in
-//! the middle would be duplication.
+//! the middle would be duplication. Two sender-side disciplines make that
+//! stance sound (2026-07-19, found by the network-workload e2e):
+//!
+//! - **Upload (guest→host)**: a segment is ACKed only for the bytes
+//!   actually written, in order, to the host socket. Anything the socket
+//!   didn't take (`WouldBlock`, short write) or that arrived beyond the
+//!   contiguous cursor stays un-ACKed and the guest sees dup-ACKs — its
+//!   own fast-retransmit/RTO machinery repairs the stream. ACKing past
+//!   unwritten bytes is how uploads silently lost data.
+//! - **Download (host→guest)**: sends never exceed the receive window the
+//!   guest advertises (tracked from its ACKs, scaled by its SYN wscale).
+//!   Within that window the guest kernel guarantees buffering, and the
+//!   local L2 link is lossless by contract — so no gap can form that the
+//!   (retransmission-free) shim could never repair. Overrunning the window
+//!   is how concurrent downloads wedged permanently.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -232,6 +246,24 @@ pub(super) struct FastPathConn {
     /// path the guest can forward them over (e.g. a 1500-MTU docker bridge
     /// behind a 4000-MTU `eth0`). See `poll_fast_path`.
     peer_mss: u16,
+    /// Window-scale shift the guest advertised in its SYN / SYN-ACK
+    /// (0 when it offered none — scaling is then off per RFC 7323).
+    guest_wscale: u8,
+    /// Highest ACK the guest has sent for OUR stream. Shared with the
+    /// inline inject thread — the "sent and acknowledged" cursor of
+    /// download flow control.
+    guest_acked: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Receive window from the guest's most recent ACK, already scaled by
+    /// `guest_wscale`. Together with `guest_acked` it bounds host→guest
+    /// in-flight bytes (see [`send_budget`]).
+    guest_window: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Upload-path recovery counters (reported at flow close): segments
+    /// the host socket wouldn't take, segments it took partially, and
+    /// segments that arrived beyond the contiguous cursor. All three
+    /// recover via guest retransmission; they quantify backpressure, not loss.
+    up_would_block: u64,
+    up_short_writes: u64,
+    up_out_of_order: u64,
     /// Read buffer for host → guest data (reused across polls).
     read_buf: Vec<u8>,
     /// True if host stream has reached EOF.
@@ -263,6 +295,22 @@ impl FastPathConn {
             shared.store(ack, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// Bytes the shim may still send host→guest without exceeding the guest's
+/// advertised receive window: `window − (sent − acked)`, wrap-safe.
+///
+/// The guest kernel guarantees buffering only inside this budget; staying
+/// inside it (on a lossless local link) is what lets the shim carry no
+/// retransmission machinery at all.
+pub(crate) fn send_budget(our_seq: u32, guest_acked: u32, guest_window: u32) -> u32 {
+    let in_flight = our_seq.wrapping_sub(guest_acked);
+    if in_flight >= 0x8000_0000 {
+        // Transiently stale snapshot ("acked ahead of sent") from racing
+        // atomics — treat as nothing in flight rather than stalling.
+        return guest_window;
+    }
+    guest_window.saturating_sub(in_flight)
 }
 
 impl TcpBridge {

@@ -20,6 +20,8 @@ impl arcbox_net::direct_rx::ConnSink for InlineConnSinkAdapter {
             guest_port: conn.guest_port,
             our_seq: conn.our_seq,
             last_ack: conn.last_ack,
+            guest_acked: conn.guest_acked,
+            guest_window: conn.guest_window,
             gw_mac: conn.gw_mac,
             guest_mac: conn.guest_mac,
             host_eof: false,

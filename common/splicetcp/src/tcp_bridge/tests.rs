@@ -345,7 +345,7 @@ async fn poll_fast_path_segments_frames_for_unix_dgram_limit() {
         dst_port: 443,
     };
     // Jumbo peer MSS so the dgram limit — not the peer bound — drives sizing.
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 9000);
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 9000, None);
 
     let payload = vec![0xAB; FAST_PATH_GUEST_MSS * 2 + 128];
     accepted.write_all(&payload).await.unwrap();
@@ -409,7 +409,7 @@ async fn poll_fast_path_segments_frames_for_configured_mtu() {
         dst_port: 443,
     };
     // Jumbo peer MSS so the configured MTU — not the peer bound — drives sizing.
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 9000);
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 9000, None);
 
     let payload = vec![0xAB; 5000];
     accepted.write_all(&payload).await.unwrap();
@@ -468,7 +468,7 @@ async fn poll_fast_path_clamps_segments_to_peer_mss() {
         dst_port: 443,
     };
     // …but the peer (a 1500-MTU bridged container) advertised MSS 1460.
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1460);
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1460, None);
 
     let payload = vec![0xAB; 5000];
     accepted.write_all(&payload).await.unwrap();
@@ -534,7 +534,7 @@ async fn large_frames_below_gso_mss_falls_back_to_clamped_segmentation() {
         dst_port: 443,
     };
     // …but the peer advertised MSS 1400, below the 1460 GSO segment size.
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1400);
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1400, None);
 
     let payload = vec![0xAB; 5000];
     accepted.write_all(&payload).await.unwrap();
@@ -593,7 +593,7 @@ async fn poll_fast_path_read_error_emits_rst_and_removes_flow() {
         dst_ip: Ipv4Addr::new(198, 18, 30, 95),
         dst_port: 443,
     };
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460);
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460, None);
     assert_eq!(bridge.fast_path_count(), 1);
 
     // Abortive close: SO_LINGER(0) turns the peer's close into a RST, so
@@ -655,7 +655,7 @@ async fn inline_dead_flag_reaps_bridge_entry() {
         dst_port: 443,
     };
     // peer_mss ≥ GSO_SEGMENT_MSS → inline-eligible, handed to the sink.
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 9000);
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 9000, None);
     assert_eq!(bridge.fast_path_count(), 1);
     let promoted = sink
         .0
@@ -720,4 +720,333 @@ async fn handshake_ttl_abort_emits_rst() {
         rst[ETH_HEADER_LEN + 20 + 11],
     ]);
     assert_eq!(ack, 7778);
+}
+
+// -------- Upload in-order ACK discipline / download window tests --------
+// Regression net for the 2026-07-19 findings: uploads ACKed across
+// WouldBlock holes and short writes (silent data loss), downloads overran
+// the guest's receive window with no retransmission to repair the gap.
+
+/// Builds a guest TCP segment with explicit flags, window, and payload.
+/// `flow` is the guest-side (src_port, dst_ip, dst_port) tuple.
+fn make_guest_segment(
+    flow: (u16, Ipv4Addr, u16),
+    seq: u32,
+    ack: u32,
+    window: u16,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let (src_port, dst_ip, dst_port) = flow;
+    let ip_total = 40 + payload.len();
+    let mut frame = vec![0u8; ETH_HEADER_LEN + ip_total];
+    frame[0..6].copy_from_slice(&GW_MAC);
+    frame[6..12].copy_from_slice(&GUEST_MAC);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    let ip = 14;
+    frame[ip] = 0x45;
+    frame[ip + 2..ip + 4].copy_from_slice(&(ip_total as u16).to_be_bytes());
+    frame[ip + 8] = 64;
+    frame[ip + 9] = 6;
+    frame[ip + 12..ip + 16].copy_from_slice(&GUEST_IP.octets());
+    frame[ip + 16..ip + 20].copy_from_slice(&dst_ip.octets());
+    let tcp = 34;
+    frame[tcp..tcp + 2].copy_from_slice(&src_port.to_be_bytes());
+    frame[tcp + 2..tcp + 4].copy_from_slice(&dst_port.to_be_bytes());
+    frame[tcp + 4..tcp + 8].copy_from_slice(&seq.to_be_bytes());
+    frame[tcp + 8..tcp + 12].copy_from_slice(&ack.to_be_bytes());
+    frame[tcp + 12] = 0x50;
+    frame[tcp + 13] = flags;
+    frame[tcp + 14..tcp + 16].copy_from_slice(&window.to_be_bytes());
+    frame[tcp + 20..].copy_from_slice(payload);
+    frame
+}
+
+fn tcp_flags_of(frame: &[u8]) -> u8 {
+    frame[ETH_HEADER_LEN + 20 + 13]
+}
+
+fn tcp_ack_of(frame: &[u8]) -> u32 {
+    let tcp = ETH_HEADER_LEN + 20;
+    u32::from_be_bytes([
+        frame[tcp + 8],
+        frame[tcp + 9],
+        frame[tcp + 10],
+        frame[tcp + 11],
+    ])
+}
+
+/// A segment arriving beyond the contiguous cursor (a hole precedes it)
+/// must not be written to the host socket and must not advance the ACK —
+/// the reply is a dup-ACK at the cursor. Filling the hole in order then
+/// delivers everything, bytes in the right order.
+#[tokio::test]
+async fn upload_hole_is_never_acked_or_written() {
+    use std::io::Read;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 96);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40021,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460, None);
+
+    // Out-of-order segment: 2000..2100 is missing.
+    let ooo = make_guest_segment((40021, dst_ip, 443), 2100, 1000, 65535, 0x18, &[0xBB; 50]);
+    let reply = bridge.try_fast_path_intercept(&ooo).expect("intercepted");
+    assert_eq!(
+        tcp_ack_of(&reply),
+        2000,
+        "hole ahead of the segment: reply must be a dup-ACK at the cursor"
+    );
+
+    // Fill the hole in order, then retransmit the tail.
+    let fill = make_guest_segment((40021, dst_ip, 443), 2000, 1000, 65535, 0x18, &[0xAA; 100]);
+    let reply = bridge.try_fast_path_intercept(&fill).expect("intercepted");
+    assert_eq!(tcp_ack_of(&reply), 2100);
+    let tail = make_guest_segment((40021, dst_ip, 443), 2100, 1000, 65535, 0x18, &[0xBB; 50]);
+    let reply = bridge.try_fast_path_intercept(&tail).expect("intercepted");
+    assert_eq!(tcp_ack_of(&reply), 2150);
+
+    // The host socket saw the contiguous stream in order — no 0xBB bytes
+    // written ahead of the hole.
+    let mut server = accepted.into_std().unwrap();
+    server.set_nonblocking(false).unwrap();
+    server
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut got = [0u8; 150];
+    server.read_exact(&mut got).unwrap();
+    assert!(got[..100].iter().all(|&b| b == 0xAA));
+    assert!(got[100..].iter().all(|&b| b == 0xBB));
+}
+
+/// A FIN whose sequence position lies beyond the cursor (its stream still
+/// has a gap) must not tear the flow down — teardown would cut off the
+/// retransmissions that repair the gap (the silent-truncation bug). Once
+/// the gap is filled, the retransmitted FIN completes the close.
+#[tokio::test]
+async fn upload_fin_with_gap_defers_teardown() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (_accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 97);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40022,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460, None);
+
+    // FIN at 2100 while the cursor is still 2000: 100 bytes are missing.
+    let early_fin = make_guest_segment((40022, dst_ip, 443), 2100, 1000, 65535, 0x11, &[]);
+    let reply = bridge
+        .try_fast_path_intercept(&early_fin)
+        .expect("intercepted");
+    assert_eq!(
+        tcp_flags_of(&reply) & 0x01,
+        0,
+        "deferred FIN must be answered with a plain dup-ACK, not FIN-ACK"
+    );
+    assert_eq!(tcp_ack_of(&reply), 2000);
+    assert_eq!(
+        bridge.fast_path_count(),
+        1,
+        "flow must survive a FIN that precedes its missing data"
+    );
+
+    // Gap filled, FIN retransmitted → normal close.
+    let fill = make_guest_segment((40022, dst_ip, 443), 2000, 1000, 65535, 0x18, &[0xAA; 100]);
+    let reply = bridge.try_fast_path_intercept(&fill).expect("intercepted");
+    assert_eq!(tcp_ack_of(&reply), 2100);
+    let fin = make_guest_segment((40022, dst_ip, 443), 2100, 1000, 65535, 0x11, &[]);
+    let reply = bridge.try_fast_path_intercept(&fin).expect("intercepted");
+    assert_ne!(tcp_flags_of(&reply) & 0x01, 0, "in-order FIN gets FIN-ACK");
+    assert_eq!(tcp_ack_of(&reply), 2101, "FIN consumes one sequence number");
+    assert_eq!(bridge.fast_path_count(), 0);
+}
+
+/// Property: the ACK returned for a data segment never covers bytes the
+/// host socket did not take. Driven by writing far more than a shrunken
+/// send buffer accepts, then retransmitting from the ACK cursor until the
+/// whole payload lands — every byte must reach the server exactly once.
+#[tokio::test]
+async fn upload_ack_never_exceeds_host_writable() {
+    use std::io::Read;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let std_client = client.unwrap().into_std().unwrap();
+    // Shrink both socket buffers so segments outrun what the kernel will
+    // take and the write path must report partial/zero takes.
+    socket2::SockRef::from(&std_client)
+        .set_send_buffer_size(4096)
+        .unwrap();
+    let (accepted, _) = accepted.unwrap();
+    socket2::SockRef::from(&accepted)
+        .set_recv_buffer_size(4096)
+        .unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 98);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40023,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, std_client, 1000, 2000, 1460, None);
+
+    let mut server = accepted.into_std().unwrap();
+    server.set_nonblocking(false).unwrap();
+    server
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .unwrap();
+
+    // Segments stay MTU-plausible (an IP packet's total length is u16);
+    // the volume, not the segment size, is what outruns the buffers.
+    const SEGMENT: usize = 8 * 1024;
+    let payload = vec![0xCC; 256 * 1024];
+    let base: u32 = 2000;
+    let mut cursor: u32 = base;
+    let mut server_received = 0usize;
+    let mut short_takes = 0usize;
+    let mut read_buf = vec![0u8; 64 * 1024];
+
+    for _ in 0..2000 {
+        let offset = cursor.wrapping_sub(base) as usize;
+        if offset >= payload.len() {
+            break;
+        }
+        let chunk = &payload[offset..(offset + SEGMENT).min(payload.len())];
+        let segment = make_guest_segment((40023, dst_ip, 443), cursor, 1000, 65535, 0x18, chunk);
+        let reply = bridge
+            .try_fast_path_intercept(&segment)
+            .expect("intercepted");
+        let acked = tcp_ack_of(&reply);
+        let advance = acked.wrapping_sub(cursor) as usize;
+        assert!(advance <= chunk.len(), "ACK beyond the offered bytes");
+        if advance < chunk.len() {
+            short_takes += 1;
+        }
+        cursor = acked;
+
+        // Drain whatever reached the server; every ACKed byte must
+        // eventually be readable.
+        while server_received < cursor.wrapping_sub(base) as usize {
+            match server.read(&mut read_buf) {
+                Ok(0) => panic!("server EOF mid-transfer"),
+                Ok(n) => {
+                    assert!(read_buf[..n].iter().all(|&b| b == 0xCC));
+                    server_received += n;
+                }
+                Err(e) => panic!("ACKed bytes never reached the server: {e}"),
+            }
+        }
+    }
+
+    assert_eq!(
+        cursor.wrapping_sub(base) as usize,
+        payload.len(),
+        "retransmit-from-cursor must eventually deliver the whole payload"
+    );
+    assert_eq!(server_received, payload.len());
+    assert!(
+        short_takes > 0,
+        "test must actually exercise the partial-take path (send buffer 4 KiB, payload 64 KiB)"
+    );
+}
+
+/// The download side must never send beyond the guest's advertised receive
+/// window: with no ACKs after promotion at most one unscaled window goes
+/// out; a window-opening ACK releases the next tranche.
+#[tokio::test]
+async fn poll_fast_path_respects_guest_window() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 99);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40024,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1460, None);
+
+    accepted.write_all(&vec![0xDD; 100_000]).await.unwrap();
+
+    async fn drain(bridge: &mut TcpBridge) -> usize {
+        let mut sent = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut idle = 0;
+        while std::time::Instant::now() < deadline && idle < 10 {
+            let batch = bridge.poll_fast_path();
+            if batch.is_empty() {
+                idle += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            } else {
+                idle = 0;
+                sent += batch
+                    .iter()
+                    .map(|f| f.len().saturating_sub(ETH_HEADER_LEN + 40))
+                    .sum::<usize>();
+            }
+        }
+        sent
+    }
+
+    let first = drain(&mut bridge).await;
+    assert!(
+        first <= 65535,
+        "no guest ACK yet: at most one unscaled window may be sent, got {first}"
+    );
+    assert!(
+        first >= 65535 - 1460,
+        "the initial window should be filled, got {first}"
+    );
+
+    // Guest ACKs everything and re-opens a 65535 window.
+    let ack = make_guest_segment((40024, dst_ip, 443), 1, 1 + first as u32, 65535, 0x10, &[]);
+    bridge.try_fast_path_intercept(&ack).expect("intercepted");
+
+    let second = drain(&mut bridge).await;
+    assert!(second > 0, "an opening ACK must release more data");
+    assert!(
+        second <= 65535,
+        "second tranche must respect the re-advertised window, got {second}"
+    );
 }
