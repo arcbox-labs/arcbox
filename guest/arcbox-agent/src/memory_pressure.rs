@@ -11,8 +11,11 @@
 //! balloon leaves `MemAvailable` at roughly the configured headroom under
 //! both virtio-balloon accounting modes (with and without
 //! `DEFLATE_ON_OOM`), and `workingset_refault` counts thrashing directly.
-//! The guest kernel ships without `CONFIG_PSI`; if that changes the sampler
-//! can switch to PSI triggers without touching this contract.
+//! This sampling path is the portable fallback: once the detector arms, the
+//! Linux agent upgrades to a kernel PSI trigger on `/proc/pressure/memory`
+//! (the guest kernel now ships `CONFIG_PSI`) and pauses sampling, dropping
+//! back here only when the trigger is unavailable. This module's contract is
+//! unchanged either way.
 
 /// Refault-rate samples that must consecutively exceed the threshold before
 /// tripping. Damps one-off bursts (e.g. a cold-started binary faulting its
