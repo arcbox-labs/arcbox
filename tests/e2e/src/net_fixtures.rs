@@ -335,37 +335,75 @@ pub fn assert_no_established_flows(
 pub struct DaemonLogCursor {
     path: PathBuf,
     offset: u64,
+    /// Inode of the file the cursor was taken in — rotation renames the
+    /// file, so a changed inode (not a shorter length: the new file can
+    /// grow past the old offset) is the rotation signal.
+    ino: Option<u64>,
 }
 
 pub fn daemon_log_cursor(data_dir: &Path) -> DaemonLogCursor {
     let path = data_dir.join("log/daemon.log");
-    let offset = std::fs::metadata(&path).map_or(0, |m| m.len());
-    DaemonLogCursor { path, offset }
+    let meta = std::fs::metadata(&path).ok();
+    DaemonLogCursor {
+        offset: meta.as_ref().map_or(0, std::fs::Metadata::len),
+        ino: meta.map(|m| std::os::unix::fs::MetadataExt::ino(&m)),
+        path,
+    }
 }
 
 impl DaemonLogCursor {
     /// Proxy-layer (`arcbox_net`/`splicetcp`/`arcbox_proxy` and their
     /// submodules — the needles are prefixes) ERROR lines appended since
-    /// the cursor was taken. If the log rotated underneath the cursor, the
-    /// rotated generations (`daemon.log.N`, oldest first) are stitched
-    /// back in front of the current file so the cursor offset still lands
-    /// on the right byte and no window of the run escapes the scan.
+    /// the cursor was taken.
+    ///
+    /// Rotation is detected by inode identity, not length — after a
+    /// rotation the new `daemon.log` can grow past the old offset. When
+    /// the cursor's file has been renamed away, every generation from the
+    /// cursor's inode (`daemon.log.N`, oldest first) through the current
+    /// file is stitched into one stream so the offset still lands on the
+    /// cursor byte; if the cursor's generation already aged out of
+    /// retention, everything is scanned (over-matching boot-phase lines
+    /// beats silently dropping workload-phase ones).
     pub fn proxy_errors(&self) -> Result<Vec<String>> {
-        let mut contents = std::fs::read(&self.path)
+        let current = std::fs::read(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
-        if (contents.len() as u64) < self.offset {
-            let mut stitched = Vec::new();
+        let current_ino = std::fs::metadata(&self.path)
+            .ok()
+            .map(|m| std::os::unix::fs::MetadataExt::ino(&m));
+
+        let (contents, offset) = if self.ino.is_none() || current_ino == self.ino {
+            (current, self.offset)
+        } else {
+            // Oldest → newest: daemon.log.9 .. daemon.log.1, then current.
+            let mut generations: Vec<(Option<u64>, Vec<u8>)> = Vec::new();
             for n in (1..=9).rev() {
                 let rotated = self.path.with_extension(format!("log.{n}"));
                 if let Ok(bytes) = std::fs::read(&rotated) {
-                    stitched.extend_from_slice(&bytes);
+                    let ino = std::fs::metadata(&rotated)
+                        .ok()
+                        .map(|m| std::os::unix::fs::MetadataExt::ino(&m));
+                    generations.push((ino, bytes));
                 }
             }
-            stitched.append(&mut contents);
-            contents = stitched;
-        }
-        let tail = if contents.len() as u64 >= self.offset {
-            &contents[self.offset as usize..]
+            generations.push((current_ino, current));
+            let start = generations
+                .iter()
+                .position(|(ino, _)| *ino == self.ino)
+                .unwrap_or(0);
+            let offset = if generations[start].0 == self.ino {
+                self.offset
+            } else {
+                0
+            };
+            let stitched = generations
+                .drain(start..)
+                .flat_map(|(_, bytes)| bytes)
+                .collect();
+            (stitched, offset)
+        };
+
+        let tail = if contents.len() as u64 >= offset {
+            &contents[offset as usize..]
         } else {
             contents.as_slice()
         };
@@ -383,5 +421,63 @@ impl DaemonLogCursor {
             })
             .map(str::to_owned)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ERR: &str = r#"{"level":"ERROR","fields":{"message":"x"},"target":"arcbox_net::darwin::datapath_loop::guest_tx"}"#;
+
+    fn write_log(dir: &Path, name: &str, lines: &[&str]) {
+        std::fs::write(dir.join("log").join(name), lines.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn proxy_errors_sees_across_rotation_even_when_new_file_outgrows_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("log")).unwrap();
+        // Pre-cursor content, including an ERROR that must NOT be reported.
+        write_log(dir.path(), "daemon.log", &[ERR, "boot line"]);
+        let cursor = daemon_log_cursor(dir.path());
+
+        // Post-cursor ERROR lands in the same file, then the log rotates and
+        // the NEW current file grows well past the old cursor offset.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("log/daemon.log"))
+            .unwrap();
+        std::io::Write::write_all(&mut f, format!("{ERR}\n").as_bytes()).unwrap();
+        drop(f);
+        std::fs::rename(
+            dir.path().join("log/daemon.log"),
+            dir.path().join("log/daemon.log.1"),
+        )
+        .unwrap();
+        let filler = vec!["info line"; 64].join("\n");
+        write_log(dir.path(), "daemon.log", &[&filler, ERR]);
+
+        let errors = cursor.proxy_errors().unwrap();
+        assert_eq!(
+            errors.len(),
+            2,
+            "one rotated-away post-cursor ERROR + one in the new file; \
+             the pre-cursor ERROR stays excluded: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_errors_matches_module_qualified_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("log")).unwrap();
+        write_log(dir.path(), "daemon.log", &[]);
+        let cursor = daemon_log_cursor(dir.path());
+        write_log(dir.path(), "daemon.log", &[ERR]);
+        // Same inode (rewritten in place on most filesystems is not
+        // guaranteed, so re-take metadata semantics: the assertion is on
+        // needle matching, which is inode-independent).
+        let errors = cursor.proxy_errors().unwrap();
+        assert_eq!(errors.len(), 1, "submodule target must match: {errors:?}");
     }
 }
