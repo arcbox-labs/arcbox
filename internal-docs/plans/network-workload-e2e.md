@@ -114,12 +114,14 @@ the proxy, not to gate anything.
 
 ## First-run findings (2026-07-19, Phase 1 on master's datapath)
 
-The initial local run failed all five Phase-1 scenarios and pinned three
-datapath defects, all with **zero proxy-layer WARN/ERROR lines** — the fault
-plan's observability gap reproduced under plain workloads:
+The initial local runs (with and without hot-path debug logging) failed all
+five Phase-1 scenarios and pinned three datapath defects, all with **zero
+proxy-layer WARN/ERROR lines** — the fault plan's observability gap
+reproduced under plain workloads:
 
-1. **Uploads silently lose data** (W2, both variants: 256 MiB arrived
-   ~1-2.6 MB short while the in-container client exited 0). Mechanism, from
+1. **Uploads silently lose data** (W2, both variants, both runs: 256 MiB
+   arrived 1.3-3.2 MB short while the in-container client exited 0 — even
+   against a reader draining at full speed). Mechanism, from
    `common/splicetcp/src/tcp_bridge/fast_path.rs`:
    - `is_new_data` accepts any segment whose *end* extends `last_ack`, so
      after a `WouldBlock` drop the next in-flight segment is written and
@@ -129,8 +131,11 @@ plan's observability gap reproduced under plain workloads:
      full, losing the unwritten tail;
    - FIN handling runs `close_fast_path` unconditionally, so a
      close-after-write client kills gap recovery even where it would work.
-2. **Concurrent downloads wedge permanently** (W3: ~30 of 64 flows died on
-   a 60 s read timeout; W4 degraded until the 240 s ceiling). The download
+2. **Concurrent downloads wedge permanently, sequential ones degrade**
+   (W3: 18 of 64 single-container flows and 5 of 64 across-containers flows
+   died on a 60 s read timeout even with quiet logging; W4: sequential churn
+   slowed to ~2 s/request — 120 of 500 requests inside the 240 s ceiling).
+   The download
    direction sends with a hardcoded `window: 65535`, never reads the guest's
    advertised receive window, has no retransmission, and deliberately
    ignores pure ACKs — so a single guest-side window-overrun drop leaves a
