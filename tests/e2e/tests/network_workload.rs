@@ -109,8 +109,16 @@ fn net_workload_egress_suite() -> Result<()> {
                 ("burst_multi_container", burst_multi_container),
                 ("churn_sequential", churn_sequential),
             ];
+            // Diagnostic filter: run only the named scenario, e.g.
+            // ARCBOX_E2E_WORKLOAD_ONLY=burst_single_container.
+            let only = std::env::var("ARCBOX_E2E_WORKLOAD_ONLY").ok();
             let mut failures = Vec::new();
             for (name, scenario) in scenarios {
+                if let Some(ref only) = only
+                    && only != name
+                {
+                    continue;
+                }
                 tracing::info!(scenario = name, "starting");
                 match scenario(data_dir, metrics, &image) {
                     Ok(()) => tracing::info!(scenario = name, "passed"),

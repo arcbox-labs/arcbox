@@ -19,12 +19,16 @@
 //!   contiguous cursor stays un-ACKed and the guest sees dup-ACKs — its
 //!   own fast-retransmit/RTO machinery repairs the stream. ACKing past
 //!   unwritten bytes is how uploads silently lost data.
-//! - **Download (host→guest)**: sends never exceed the receive window the
-//!   guest advertises (tracked from its ACKs, scaled by its SYN wscale).
-//!   Within that window the guest kernel guarantees buffering, and the
-//!   local L2 link is lossless by contract — so no gap can form that the
-//!   (retransmission-free) shim could never repair. Overrunning the window
-//!   is how concurrent downloads wedged permanently.
+//! - **Download (host→guest)**: the shim is the *sender-side* TCP for this
+//!   direction, and the path beyond guest `eth0` (bridge → veth → container
+//!   netns backlog) drops frames under burst like any real network — so it
+//!   keeps the two sender duties a real stack cannot delegate: it never
+//!   sends beyond the guest's advertised receive window (tracked from its
+//!   ACKs, scaled by its SYN wscale, capped at [`HONORED_WINDOW_CAP`]),
+//!   and it buffers in-flight bytes for retransmission (triple-dup-ACK
+//!   fast retransmit, RTO backoff otherwise). Without these, one dropped
+//!   frame wedged a flow forever and window overrun made that routine
+//!   under concurrency.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -88,6 +92,18 @@ const SHIM_MSS: u16 = 1460;
 /// IPv4 minimum (576-byte MTU − 40), so it is always safe to send; it also
 /// guards against a missing or malformed MSS option collapsing segments to 0.
 pub(crate) const TCP_MIN_MSS: u16 = 536;
+
+/// Cap on the guest receive window the download path honors. Bounds both
+/// the per-flow retransmission buffer and the burst a single flow can
+/// inject toward the guest's bridge/veth backlog. 256 KiB sustains
+/// multi-GB/s at sub-millisecond local RTTs.
+pub(crate) const HONORED_WINDOW_CAP: u32 = 256 * 1024;
+
+/// Initial retransmission timeout for unACKed download bytes; doubles per
+/// retransmission up to [`MAX_RTO`]. Local RTTs are sub-millisecond, so
+/// 200 ms only ever fires on actual loss, not reordering.
+pub(crate) const INITIAL_RTO: std::time::Duration = std::time::Duration::from_millis(200);
+pub(crate) const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Fixed segment size the GSO/inline injection paths let the guest re-segment
 /// at (the `gso_size` stamped by `arcbox-net-inject`'s `write_inline_headers`
@@ -215,6 +231,11 @@ pub struct TcpBridge {
     /// TCP handshakes being synthesized. Each entry is promoted to
     /// `fast_path_conns` once the 3-way completes.
     handshake_conns: HashMap<SynFlowKey, HandshakeConn>,
+    /// Notified when a pending handshake's async host connect resolves, so
+    /// the datapath loop can emit the SYN-ACK immediately instead of
+    /// waiting for the next guest frame or timer tick (an idle loop
+    /// otherwise adds up to a full tick of connect latency).
+    handshake_waker: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// A TCP connection promoted to the fast path — bypasses any TCP state
@@ -264,6 +285,31 @@ pub(super) struct FastPathConn {
     up_would_block: u64,
     up_short_writes: u64,
     up_out_of_order: u64,
+    /// True while the flow sits at a zero send budget — transition
+    /// logging only, so a stuck window is visible in the daemon log
+    /// without per-poll noise.
+    window_stalled: bool,
+    /// Sender-side retransmission buffer: every download byte from
+    /// `retransmit_seq` (== the last drained `guest_acked`) up to `our_seq`,
+    /// bounded by [`HONORED_WINDOW_CAP`]. Non-inline flows only.
+    retransmit_buf: std::collections::VecDeque<u8>,
+    /// Sequence number of `retransmit_buf[0]`.
+    retransmit_seq: u32,
+    /// Last time `guest_acked` advanced (RTO clock, armed while in flight).
+    last_progress: StdInstant,
+    /// Current retransmission timeout (backs off per retransmission).
+    rto: std::time::Duration,
+    /// Consecutive duplicate ACKs at the same `guest_acked` while data is
+    /// in flight — three trigger fast retransmit.
+    dup_acks: u8,
+    /// Set by the intercept when the dup-ACK threshold fires; consumed by
+    /// the next poll pass.
+    fast_retransmit: bool,
+    /// Sequence number of our FIN when `host_eof` (the FIN needs
+    /// retransmission too — a lost FIN wedges the close the same way).
+    fin_seq: Option<u32>,
+    /// Download retransmissions performed (diagnostics, logged at close).
+    retransmits: u64,
     /// Read buffer for host → guest data (reused across polls).
     read_buf: Vec<u8>,
     /// True if host stream has reached EOF.
@@ -332,7 +378,15 @@ impl TcpBridge {
             conn_sink: None,
             observer: None,
             handshake_conns: HashMap::new(),
+            handshake_waker: None,
         }
+    }
+
+    /// Installs a waker notified whenever an async host connect for a
+    /// pending handshake resolves. Must be set from within a Tokio runtime
+    /// context (`handle_outbound_syn` spawns the forwarding task).
+    pub fn set_handshake_waker(&mut self, waker: std::sync::Arc<tokio::sync::Notify>) {
+        self.handshake_waker = Some(waker);
     }
 
     /// Enables large frame mode (no MSS segmentation).

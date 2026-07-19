@@ -47,6 +47,9 @@ pub fn run_vz_scenario_with_log(
     scenario: impl FnOnce(&mut DaemonHandle, &Path, &mut RunMetrics) -> Result<()>,
 ) -> Result<()> {
     init_tracing();
+    // Diagnostic override for the daemon under test, e.g.
+    // ARCBOX_E2E_DAEMON_LOG="info,splicetcp::tcp_bridge=debug".
+    let rust_log = std::env::var("ARCBOX_E2E_DAEMON_LOG").unwrap_or_else(|_| rust_log.to_owned());
 
     let root = crate::repo_root();
     if !crate::env_flag("SKIP_BUILD") {
@@ -78,7 +81,7 @@ pub fn run_vz_scenario_with_log(
             ("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version),
             ("ARCBOX_VM_BACKEND".to_owned(), "vz".to_owned()),
             ("ARCBOX_DNS_PORT".to_owned(), dns_port.to_string()),
-            ("RUST_LOG".to_owned(), rust_log.to_owned()),
+            ("RUST_LOG".to_owned(), rust_log),
         ],
     })?;
 

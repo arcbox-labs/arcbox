@@ -1050,3 +1050,125 @@ async fn poll_fast_path_respects_guest_window() {
         "second tranche must respect the re-advertised window, got {second}"
     );
 }
+
+/// In-flight download bytes that never get ACKed must be retransmitted
+/// after the RTO — the path beyond guest eth0 drops under burst, and
+/// without sender-side retransmission one dropped frame wedges the flow.
+#[tokio::test]
+async fn poll_retransmits_unacked_data_after_rto() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 100);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40025,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1460, None);
+
+    accepted.write_all(&[0xEE; 4096]).await.unwrap();
+
+    // First transmission (pretend every frame is lost — we just drop them).
+    let mut sent = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while sent < 4096 && std::time::Instant::now() < deadline {
+        sent += bridge
+            .poll_fast_path()
+            .iter()
+            .map(|f| f.len().saturating_sub(ETH_HEADER_LEN + 40))
+            .sum::<usize>();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(sent, 4096, "initial transmission");
+
+    // No guest ACK ever arrives. After the RTO the same sequence space
+    // must be re-emitted, starting at the un-ACKed cursor (seq=1).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut retransmitted = Vec::new();
+    while retransmitted.is_empty() && std::time::Instant::now() < deadline {
+        retransmitted = bridge.poll_fast_path();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !retransmitted.is_empty(),
+        "RTO must re-emit un-ACKed data with no guest ACKs at all"
+    );
+    let tcp = ETH_HEADER_LEN + 20;
+    let first_seq = u32::from_be_bytes([
+        retransmitted[0][tcp + 4],
+        retransmitted[0][tcp + 5],
+        retransmitted[0][tcp + 6],
+        retransmitted[0][tcp + 7],
+    ]);
+    assert_eq!(first_seq, 1, "retransmission restarts at the ack cursor");
+}
+
+/// Three duplicate ACKs (same ack, same window, no payload, data in
+/// flight) must trigger an immediate fast retransmit from the ack point.
+#[tokio::test]
+async fn triple_dup_ack_triggers_fast_retransmit() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 101);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40026,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1460, None);
+
+    accepted.write_all(&[0xEF; 2920]).await.unwrap();
+    let mut sent = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while sent < 2920 && std::time::Instant::now() < deadline {
+        sent += bridge
+            .poll_fast_path()
+            .iter()
+            .map(|f| f.len().saturating_sub(ETH_HEADER_LEN + 40))
+            .sum::<usize>();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(sent, 2920, "initial transmission");
+
+    // Guest signals a gap: three dup-ACKs at the initial cursor with the
+    // (unchanged) initial window.
+    for _ in 0..3 {
+        let dup = make_guest_segment((40026, dst_ip, 443), 1, 1, 65535, 0x10, &[]);
+        bridge.try_fast_path_intercept(&dup).expect("intercepted");
+    }
+    let retransmitted = bridge.poll_fast_path();
+    assert!(
+        !retransmitted.is_empty(),
+        "three dup-ACKs must fast-retransmit without waiting for the RTO"
+    );
+    let tcp = ETH_HEADER_LEN + 20;
+    let first_seq = u32::from_be_bytes([
+        retransmitted[0][tcp + 4],
+        retransmitted[0][tcp + 5],
+        retransmitted[0][tcp + 6],
+        retransmitted[0][tcp + 7],
+    ]);
+    assert_eq!(first_seq, 1, "fast retransmit restarts at the ack cursor");
+}

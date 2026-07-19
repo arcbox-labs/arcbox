@@ -244,6 +244,22 @@ impl NetworkDatapath {
         let mut maintenance = tokio::time::interval(Duration::from_secs(30));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Wakes the loop when a pending handshake's host connect resolves,
+        // so the SYN-ACK goes out immediately (an idle loop otherwise sits
+        // in select! until the next guest frame or the 1 s tick — that tick
+        // dominated fresh-connection latency at ~2 s per sequential fetch).
+        let handshake_waker = std::sync::Arc::new(tokio::sync::Notify::new());
+        tcp_bridge.set_handshake_waker(handshake_waker.clone());
+
+        // Fast poll cadence while fast-path connections exist: their host
+        // sockets have no readiness registration (they are polled), so
+        // without this an idle connection's first response bytes wait for
+        // the next guest frame or the 1 s tick. 20 ms bounds first-byte
+        // latency at negligible idle cost (50 polls/s only while flows
+        // are open); sustained transfers self-sustain via guest ACK frames.
+        let mut fastpath_tick = tokio::time::interval(Duration::from_millis(20));
+        fastpath_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         tracing::info!("Network datapath started (TCP shim + socket proxy mode)");
 
         loop {
@@ -417,6 +433,15 @@ impl NetworkDatapath {
                     egress.maintenance();
                     guest_tx.log_stats(rx_frames);
                 }
+
+                // A pending handshake's host connect resolved — fall through
+                // so poll_handshakes() in the common tail emits the SYN-ACK
+                // right away.
+                () = handshake_waker.notified() => {}
+
+                // Bounded first-byte latency for polled fast-path sockets;
+                // the common tail's poll_fast_path() does the actual work.
+                _ = fastpath_tick.tick(), if tcp_bridge.fast_path_count() > 0 => {}
             }
 
             // ── Common tail: run on every iteration regardless of which
@@ -447,9 +472,9 @@ impl NetworkDatapath {
             //    backlog is pending. Skipping the poll leaves host-socket
             //    data in the host kernel's receive buffer, closing the
             //    host-side TCP window so the remote sender throttles instead
-            //    of the datapath dropping frames (lossless backpressure; the
-            //    shim has no retransmission, so a dropped data frame would
-            //    stall the connection permanently).
+            //    of the datapath dropping frames (lossless backpressure —
+            //    preferable even though the bridge can retransmit, since
+            //    retransmission costs a round trip per loss).
             if guest_tx.has_backlog() {
                 guest_tx.stats.gated_polls += 1;
             } else {

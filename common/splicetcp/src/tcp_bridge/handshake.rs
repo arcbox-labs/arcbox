@@ -109,6 +109,22 @@ impl TcpBridge {
             dst_port,
             domain,
         });
+        // Wake the datapath loop the moment the connect resolves: on an
+        // idle loop nothing else fires until the next guest frame or the
+        // 1 s timer tick, and that tick otherwise dominates every fresh
+        // connection's latency (sequential fetches ran at ~2 s/request).
+        let result_rx = if let Some(waker) = &self.handshake_waker {
+            let waker = std::sync::Arc::clone(waker);
+            let (tx, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let value = result_rx.await.unwrap_or(None);
+                let _ = tx.send(value);
+                waker.notify_one();
+            });
+            rx
+        } else {
+            result_rx
+        };
 
         let our_isn = next_isn();
         self.handshake_conns.insert(
