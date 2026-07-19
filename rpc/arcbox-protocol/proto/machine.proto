@@ -55,6 +55,11 @@ service MachineService {
 
     // Gets the SSH connection info.
     rpc SSHInfo(SSHInfoRequest) returns (SSHInfoResponse);
+
+    // Subscribes to machine lifecycle events. The stream stays open until the
+    // client disconnects. Emitted actions:
+    //   "created" | "started" | "idle" | "stopped"
+    rpc Events(MachineEventsRequest) returns (stream MachineEvent);
 }
 
 // Request to create a machine.
@@ -336,4 +341,28 @@ message SSHInfoResponse {
     string identity_file = 4;
     // SSH command string.
     string command = 5;
+}
+
+// Request to subscribe to machine lifecycle events.
+message MachineEventsRequest {
+    // Filter by machine ID/name (empty = all machines).
+    string id = 1;
+    // Filter by event action (empty = all actions).
+    string action = 2;
+}
+
+// A machine lifecycle event.
+message MachineEvent {
+    // Machine name.
+    string name = 1;
+    // Action:
+    //   "created" — machine record created
+    //   "started" — VM reached the running state
+    //   "idle"    — running VM entered the idle (reduced-resource) state
+    //   "stopped" — VM shut down
+    string action = 2;
+    // Unix nanoseconds.
+    int64 timestamp = 3;
+    // Additional context (reserved; e.g. error detail on future actions).
+    map<string, string> attributes = 4;
 }

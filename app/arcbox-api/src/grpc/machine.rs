@@ -7,10 +7,10 @@ use arcbox_core::machine_image;
 use arcbox_grpc::v1::machine_service_server;
 use arcbox_protocol::v1::{
     CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
-    ListMachinesResponse, MachineAgentRequest, MachineExecInput, MachineExecOutput,
-    MachineExecRequest, MachineInfo, MachineNetwork, MachinePingResponse, MachineSummary,
-    MachineSystemInfo, RemoveMachineRequest, StartMachineRequest, StopMachineRequest,
-    machine_exec_input,
+    ListMachinesResponse, MachineAgentRequest, MachineEvent, MachineEventsRequest,
+    MachineExecInput, MachineExecOutput, MachineExecRequest, MachineInfo, MachineNetwork,
+    MachinePingResponse, MachineSummary, MachineSystemInfo, RemoveMachineRequest,
+    StartMachineRequest, StopMachineRequest, machine_exec_input,
 };
 use tokio_stream::Stream;
 use tokio_stream::StreamExt as _;
@@ -546,5 +546,92 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             }
         };
         Ok(Response::new(Box::pin(out_stream)))
+    }
+
+    type EventsStream = Pin<Box<dyn Stream<Item = Result<MachineEvent, Status>> + Send + 'static>>;
+
+    async fn events(
+        &self,
+        request: Request<MachineEventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let req = request.into_inner();
+        let mut rx = self.runtime.ready()?.event_bus().subscribe();
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let Some(machine_event) = to_machine_event(&event) else {
+                            continue;
+                        };
+                        if !req.id.is_empty() && machine_event.name != req.id {
+                            continue;
+                        }
+                        if !req.action.is_empty() && machine_event.action != req.action {
+                            continue;
+                        }
+                        yield Ok(machine_event);
+                    }
+                    // Dropped events under load: the client re-lists on the next
+                    // event it sees, so a gap only delays convergence.
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// Maps a system event to its machine-lifecycle wire form, or `None` for
+/// events that are not machine lifecycle transitions.
+fn to_machine_event(event: &arcbox_core::event::Event) -> Option<MachineEvent> {
+    use arcbox_core::event::Event;
+
+    let (name, action) = match event {
+        Event::MachineCreated { name } => (name, "created"),
+        Event::MachineStarted { name } => (name, "started"),
+        Event::MachineIdle { name } => (name, "idle"),
+        Event::MachineStopped { name } => (name, "stopped"),
+        _ => return None,
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    Some(MachineEvent {
+        name: name.clone(),
+        action: action.to_owned(),
+        timestamp,
+        attributes: std::collections::HashMap::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_machine_event;
+    use arcbox_core::event::Event;
+
+    #[test]
+    fn maps_each_machine_lifecycle_event() {
+        let cases = [
+            (Event::MachineCreated { name: "m".into() }, "created"),
+            (Event::MachineStarted { name: "m".into() }, "started"),
+            (Event::MachineIdle { name: "m".into() }, "idle"),
+            (Event::MachineStopped { name: "m".into() }, "stopped"),
+        ];
+        for (event, action) in cases {
+            let mapped = to_machine_event(&event).expect("machine event maps");
+            assert_eq!(mapped.name, "m");
+            assert_eq!(mapped.action, action);
+        }
+    }
+
+    #[test]
+    fn ignores_non_machine_events() {
+        assert!(to_machine_event(&Event::VmStarted { id: "vm".into() }).is_none());
+        assert!(to_machine_event(&Event::ContainerRouteInstalled { name: "m".into() }).is_none());
     }
 }
