@@ -91,7 +91,25 @@ jobs:
         # member, resolves inter-deps via a local temp registry, then uploads in
         # dependency order, waiting for the index between uploads. --no-verify:
         # see the note above (crates that embed out-of-tree workspace files).
-        run: cargo publish --workspace --exclude arcbox-hv --no-verify --locked
+        #
+        # crates.io rate-limits bulk updates to existing crates (HTTP 429 after
+        # a burst), and the workspace has ~50 members — a single pass never gets
+        # through. Retry with backoff: cargo skips crates already published at
+        # this version, so each pass uploads whatever the refill allows until
+        # the whole workspace is up. Only a persistent non-rate-limit failure
+        # exhausts the attempts and fails the job.
+        run: |
+          attempts=20
+          for i in $(seq 1 "$attempts"); do
+            if cargo publish --workspace --exclude arcbox-hv --no-verify --locked; then
+              echo "crates.io publish complete after $i attempt(s)"
+              exit 0
+            fi
+            echo "::notice::crates.io publish attempt $i/$attempts incomplete (likely rate-limited); backing off 60s"
+            sleep 60
+          done
+          echo "::error::crates.io publish did not complete after $attempts attempts"
+          exit 1
 
   # ==========================================================================
   # Build + sign macOS ARM64 host binaries
