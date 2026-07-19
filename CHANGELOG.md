@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.24](https://github.com/arcboxlabs/arcbox/compare/v0.4.23...v0.4.24) (2026-07-19)
+
+
+### Features
+
+* **api:** MachineService.Events lifecycle stream ([76b8b51](https://github.com/arcboxlabs/arcbox/commit/76b8b51b1961b88b0a89568b342216d0f109ff40))
+
+
+### Bug Fixes
+
+* **api,core:** publish user-machine lifecycle events + address review ([b15c78e](https://github.com/arcboxlabs/arcbox/commit/b15c78e86b111ac3550b7f8b79841d77ff5ef0cf))
+* **vmm,agent,daemon:** honor real HVC block capacity; fail loud on shrink ([#453](https://github.com/arcboxlabs/arcbox/issues/453)) ([8de541d](https://github.com/arcboxlabs/arcbox/commit/8de541dcc4ee0140cb9f88992fa77d721d4f452e))
+
+
+### Tests
+
+* **e2e:** address review — drop non-faithful silent-stall, fix plan ([4283606](https://github.com/arcboxlabs/arcbox/commit/4283606cff09438e972884cfdd5658a7e306c6b9))
+* **e2e:** detect log rotation by inode, not length ([f2c6d30](https://github.com/arcboxlabs/arcbox/commit/f2c6d30907ad83e9288b0ad0f490bf9a60cea547))
+* **e2e:** lift shared net fixtures and scenario harness ([c72500c](https://github.com/arcboxlabs/arcbox/commit/c72500c03156830e72089df35d60ceb70ff9164d))
+* **e2e:** network-fault Phase 1 — bounded-failure regression ([cb4ebf9](https://github.com/arcboxlabs/arcbox/commit/cb4ebf9fcc4e0a6daa5b95ec6b85b6ac55b7dafb))
+* **e2e:** network-workload Phase 1 — upload, burst, churn ([170838c](https://github.com/arcboxlabs/arcbox/commit/170838ce04ef64dcdf53ab86cc5f38da1f2e8ec3))
+* **e2e:** quiet workload logging, richer diagnostics, record findings ([144bd46](https://github.com/arcboxlabs/arcbox/commit/144bd46dbeb7ddf967fef4b16e4a4f58f3372fba))
+* **e2e:** wait for fixture recordings, scan rotated logs ([b95f35b](https://github.com/arcboxlabs/arcbox/commit/b95f35bcce9d3b2c0e6aec8c0902bf1efc9ef655))
+
+
+### Documentation
+
+* **agent:** refresh memory-pressure PSI comment ([c226e2b](https://github.com/arcboxlabs/arcbox/commit/c226e2b22c9b1e20be355ba2cf467b73a1e75f29))
+* **e2e:** network-fault E2E suite plan ([b0fc759](https://github.com/arcboxlabs/arcbox/commit/b0fc759f21cb223c4d1da33dac483bde62613c0d))
+* **e2e:** network-workload E2E suite plan ([2c502ff](https://github.com/arcboxlabs/arcbox/commit/2c502ffb3eb90bcf084641efd50e4bbc23feb614))
+* **e2e:** record clean-run numbers in the findings section ([242a72a](https://github.com/arcboxlabs/arcbox/commit/242a72aa67a9f2549482e03083e9126734391cc0))
+
+
+### Continuous Integration
+
+* **codeql:** migrate to advanced setup, Swift buildless ([#449](https://github.com/arcboxlabs/arcbox/issues/449)) ([82f9a97](https://github.com/arcboxlabs/arcbox/commit/82f9a97c58fcd0a998f6cf7336157683ee46c803))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.6.7 (kernel 6.18.38) ([7b1fd59](https://github.com/arcboxlabs/arcbox/commit/7b1fd59faab8d352ba52da9352e4b3ac6deb9ee4))
+* **assets:** bump boot assets to 0.6.8 (mkfs.erofs + rootfs razor) ([#448](https://github.com/arcboxlabs/arcbox/issues/448)) ([175ed58](https://github.com/arcboxlabs/arcbox/commit/175ed58b8dcbf067d4e77899f7acc47ffb41d602))
+* **assets:** bump boot assets to 0.6.9 ([4304ed4](https://github.com/arcboxlabs/arcbox/commit/4304ed47c739cd00a5cab85bcdfc1b70be0b8c88))
+* **assets:** bump boot assets to 0.6.9 (kernel v0.0.20) ([#454](https://github.com/arcboxlabs/arcbox/issues/454)) ([4304ed4](https://github.com/arcboxlabs/arcbox/commit/4304ed47c739cd00a5cab85bcdfc1b70be0b8c88))
+
 ## [0.4.23](https://github.com/arcboxlabs/arcbox/compare/v0.4.22...v0.4.23) (2026-07-18)
 
 
