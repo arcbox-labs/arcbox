@@ -257,9 +257,11 @@ async fn read_promoted_conn(
     let mut buf = vec![0u8; 32 * 1024];
     loop {
         // Never read (hence send) beyond the guest's advertised receive
-        // window — see `tcp_bridge::send_budget`. When window-limited, the
-        // guest's next ACK reopens the budget; 1 ms polling caps the wait
-        // while still sustaining multi-GB/s at an 8 MiB window. Unread
+        // window (capped at `HONORED_WINDOW_CAP`, 256 KiB) — see
+        // `tcp_bridge::send_budget`. When window-limited, the guest's next
+        // ACK reopens the budget; 1 ms polling bounds the wait, a
+        // ~256 MiB/s per-flow ceiling in that regime — ACK-driven wakeups
+        // take over long before it binds. Unread
         // bytes stay in the host socket buffer (kernel backpressure).
         let budget = crate::tcp_bridge::send_budget(
             conn.our_seq.load(Ordering::Relaxed),
