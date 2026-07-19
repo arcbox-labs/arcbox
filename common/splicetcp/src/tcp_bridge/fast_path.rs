@@ -64,6 +64,33 @@ impl TcpBridge {
             self.close_fast_path(&key);
             return Some(Vec::new()); // Intercepted, no reply frame.
         }
+
+        // Download flow control: every guest frame carrying ACK updates our
+        // view of how much of OUR stream it received and how much receive
+        // window it advertises. Monotonic on the ack (a reordered frame
+        // must not regress it); the window rides along with the newest ack,
+        // and an equal ack still applies it (pure window updates).
+        if flags & 0x10 != 0 {
+            let guest_ack = u32::from_be_bytes([
+                frame[l4_start + 8],
+                frame[l4_start + 9],
+                frame[l4_start + 10],
+                frame[l4_start + 11],
+            ]);
+            let current = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
+            if guest_ack.wrapping_sub(current) < 0x8000_0000 {
+                let raw_win = u32::from(u16::from_be_bytes([
+                    frame[l4_start + 14],
+                    frame[l4_start + 15],
+                ]));
+                conn.guest_acked
+                    .store(guest_ack, std::sync::atomic::Ordering::Relaxed);
+                conn.guest_window.store(
+                    raw_win << conn.guest_wscale,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
         // Extract payload using IPv4 total_length to exclude Ethernet padding.
         // NOTE: FIN check is deferred until after payload write — RFC 793
         // allows FIN segments to carry data.
@@ -74,99 +101,130 @@ impl TcpBridge {
         let payload_end = ip_end.min(frame.len());
         let payload_len = payload_end.saturating_sub(payload_start);
 
-        // Write payload to host stream (if any). Handle retransmits by
-        // only advancing `last_ack` when the segment extends previously
-        // acknowledged data; re-writing already-ACKed bytes to the host
-        // would corrupt the TLS stream on the peer side.
+        // Write payload to host stream (if any). The invariant that keeps
+        // uploads lossless with no shim-side buffering: `last_ack` advances
+        // ONLY over bytes actually written, in order, to the host socket.
+        // Everything else (out-of-order arrival, WouldBlock, the unwritten
+        // tail of a short write) stays un-ACKed, so the guest's own
+        // fast-retransmit/RTO machinery repairs the stream — dup-ACKs from
+        // the fall-through below are the recovery signal. ACKing past
+        // unwritten bytes is how uploads silently lost data (2026-07-19).
         if payload_len > 0 {
             use std::io::Write;
             let seq_end = guest_seq.wrapping_add(payload_len as u32);
-            // seq_end > conn.last_ack (wrap-safe) means "segment carries
-            // at least one new byte". Otherwise the entire segment is a
-            // retransmit of data we already ACKed.
-            let is_new_data = seq_end.wrapping_sub(conn.last_ack) > 0
-                && seq_end.wrapping_sub(conn.last_ack) < 0x8000_0000;
-            if is_new_data {
-                let payload = &frame[payload_start..payload_start + payload_len];
-                match conn.stream.write(payload) {
-                    Ok(_n) => {
-                        conn.up_bytes += payload_len as u64;
-                        conn.set_last_ack(seq_end);
-                        tracing::trace!(
-                            "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} wrote {payload_len} bytes"
-                        );
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        tracing::trace!(
-                            "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} WouldBlock"
-                        );
-                        return Some(Vec::new());
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                        // Peer closed; inject already relayed FIN. ACK at
-                        // TCP layer so the guest stops retransmitting.
-                        conn.set_last_ack(seq_end);
-                        tracing::debug!(
-                            "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} Broken pipe, draining {payload_len} bytes"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Fast path TX write error, RST to guest: {e}");
-                        // Mirror the RX-error path: the host stream is dead,
-                        // so tear the guest side down with RST instead of
-                        // leaving it ESTABLISHED forever (ABX-431).
-                        let rst = crate::ethernet::build_tcp_rst_frame(
-                            &crate::ethernet::TcpFrameParams {
-                                src_ip: conn.remote_ip,
-                                dst_ip: conn.guest_ip,
-                                src_port: conn.remote_port,
-                                dst_port: conn.guest_port,
-                                seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
-                                ack: conn.last_ack,
-                                window: 0,
-                                src_mac: self.fast_path_gateway_mac,
-                                dst_mac: self.fast_path_guest_mac.unwrap_or([0xFF; 6]),
-                            },
-                        );
-                        self.close_fast_path(&key);
-                        return Some(rst);
-                    }
-                }
-            } else {
-                // Duplicate/already-ACKed segment — skip write, re-ACK.
+            // Bytes this segment extends past our contiguous cursor.
+            let extends = seq_end.wrapping_sub(conn.last_ack);
+            if extends == 0 || extends >= 0x8000_0000 {
+                // Entirely at or behind the cursor — a retransmit of data
+                // we already ACKed. Skip the write, fall through to re-ACK.
                 tracing::trace!(
                     "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} retransmit (guest_seq={guest_seq}, last_ack={}, payload={payload_len})",
                     conn.last_ack
                 );
+            } else {
+                // Leading bytes already ACKed (partial retransmit overlap).
+                let overlap = conn.last_ack.wrapping_sub(guest_seq);
+                if overlap >= 0x8000_0000 {
+                    // guest_seq is ahead of the cursor: a hole precedes this
+                    // segment. Writing it would corrupt the byte stream and
+                    // ACKing it would bury the hole forever. Leave last_ack
+                    // alone — the ACK below is a dup-ACK, which is exactly
+                    // what makes the guest fast-retransmit the gap.
+                    conn.up_out_of_order += 1;
+                } else {
+                    let fresh = &frame[payload_start + overlap as usize..payload_end];
+                    match conn.stream.write(fresh) {
+                        Ok(n) => {
+                            conn.up_bytes += n as u64;
+                            conn.set_last_ack(conn.last_ack.wrapping_add(n as u32));
+                            if n < fresh.len() {
+                                // Host socket buffer filled mid-segment: ACK
+                                // covers only what was written; the guest
+                                // retransmits the tail.
+                                conn.up_short_writes += 1;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // Nothing written, nothing ACKed. Fall through to
+                            // the dup-ACK so the guest fast-retransmits once
+                            // the socket drains, instead of waiting out RTO.
+                            conn.up_would_block += 1;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            // Peer closed; inject already relayed FIN. ACK at
+                            // TCP layer so the guest stops retransmitting.
+                            conn.set_last_ack(seq_end);
+                            tracing::debug!(
+                                "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} Broken pipe, draining {payload_len} bytes"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Fast path TX write error, RST to guest: {e}");
+                            // Mirror the RX-error path: the host stream is dead,
+                            // so tear the guest side down with RST instead of
+                            // leaving it ESTABLISHED forever (ABX-431).
+                            let rst = crate::ethernet::build_tcp_rst_frame(
+                                &crate::ethernet::TcpFrameParams {
+                                    src_ip: conn.remote_ip,
+                                    dst_ip: conn.guest_ip,
+                                    src_port: conn.remote_port,
+                                    dst_port: conn.guest_port,
+                                    seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                                    ack: conn.last_ack,
+                                    window: 0,
+                                    src_mac: self.fast_path_gateway_mac,
+                                    dst_mac: self.fast_path_guest_mac.unwrap_or([0xFF; 6]),
+                                },
+                            );
+                            self.close_fast_path(&key);
+                            return Some(rst);
+                        }
+                    }
+                }
             }
         }
 
-        // FIN handling — after payload has been forwarded to host.
+        // FIN handling — only once every byte before it has been written and
+        // ACKed. A FIN whose sequence position is beyond `last_ack` (data
+        // still missing, or its own payload only partially written) must not
+        // tear anything down: closing here would cut off the retransmissions
+        // that repair the gap, truncating the upload. The guest re-sends the
+        // gap and the FIN; until then it gets the dup-ACK below.
         if flags & 0x01 != 0 {
-            tracing::debug!("Fast path: FIN from guest {src_ip}:{src_port}→{dst_ip}:{dst_port}");
-            // FIN consumes 1 sequence number (in addition to any data bytes
-            // already accounted for above).
-            conn.set_last_ack(conn.last_ack.wrapping_add(1));
-            let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
-            let fin_ack = crate::ethernet::build_tcp_fin_frame(&crate::ethernet::TcpFrameParams {
-                src_ip: conn.remote_ip,
-                dst_ip: conn.guest_ip,
-                src_port: conn.remote_port,
-                dst_port: conn.guest_port,
-                seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
-                ack: conn.last_ack,
-                window: 65535,
-                src_mac: self.fast_path_gateway_mac,
-                dst_mac: guest_mac,
-            });
-            self.close_fast_path(&key);
-            return Some(fin_ack);
+            let fin_seq = guest_seq.wrapping_add(payload_len as u32);
+            if fin_seq == conn.last_ack {
+                tracing::debug!(
+                    "Fast path: FIN from guest {src_ip}:{src_port}→{dst_ip}:{dst_port}"
+                );
+                // FIN consumes 1 sequence number (in addition to any data
+                // bytes already accounted for above).
+                conn.set_last_ack(conn.last_ack.wrapping_add(1));
+                let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
+                let fin_ack =
+                    crate::ethernet::build_tcp_fin_frame(&crate::ethernet::TcpFrameParams {
+                        src_ip: conn.remote_ip,
+                        dst_ip: conn.guest_ip,
+                        src_port: conn.remote_port,
+                        dst_port: conn.guest_port,
+                        seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                        ack: conn.last_ack,
+                        window: 65535,
+                        src_mac: self.fast_path_gateway_mac,
+                        dst_mac: guest_mac,
+                    });
+                self.close_fast_path(&key);
+                return Some(fin_ack);
+            }
+            tracing::debug!(
+                "Fast path: FIN from guest {src_ip}:{src_port}→{dst_ip}:{dst_port} deferred (fin_seq={fin_seq}, last_ack={})",
+                conn.last_ack
+            );
         }
 
-        // Only ACK if the guest sent data — replying to a pure ACK
-        // would create a dup-ACK loop that triggers fast retransmits on
-        // the peer and tanks host→VM throughput.
-        if payload_len == 0 {
+        // Only ACK frames that carried payload or a deferred FIN — replying
+        // to a pure ACK would create a dup-ACK loop that triggers fast
+        // retransmits on the peer and tanks host→VM throughput.
+        if payload_len == 0 && flags & 0x01 == 0 {
             return Some(Vec::new());
         }
 
@@ -219,8 +277,24 @@ impl TcpBridge {
                 continue;
             }
 
+            // Never read (hence send) beyond the guest's advertised receive
+            // window: within the budget the guest kernel guarantees
+            // buffering, and the local link is lossless, so no gap can form
+            // that this retransmission-free path could never repair. Unread
+            // bytes stay in the host socket buffer — kernel-level
+            // backpressure toward the upstream.
+            let budget = super::send_budget(
+                conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed),
+                conn.guest_window.load(std::sync::atomic::Ordering::Relaxed),
+            ) as usize;
+            if budget == 0 {
+                continue;
+            }
+            let cap = budget.min(conn.read_buf.len());
+
             use std::io::Read;
-            match conn.stream.read(&mut conn.read_buf) {
+            match conn.stream.read(&mut conn.read_buf[..cap]) {
                 Ok(0) => {
                     // Host EOF — send FIN to guest.
                     conn.host_eof = true;
@@ -360,6 +434,18 @@ impl TcpBridge {
         let Some(conn) = self.fast_path_conns.remove(key) else {
             return;
         };
+        if conn.up_would_block + conn.up_short_writes + conn.up_out_of_order > 0 {
+            tracing::debug!(
+                "Fast path close {}:{} → {}:{}: upload recovered via guest retransmit (would_block={}, short_writes={}, out_of_order={})",
+                key.src_ip,
+                key.src_port,
+                key.dst_ip,
+                key.dst_port,
+                conn.up_would_block,
+                conn.up_short_writes,
+                conn.up_out_of_order,
+            );
+        }
         if let Some(ref obs) = self.observer {
             let down = conn.down_bytes
                 + conn
@@ -391,6 +477,7 @@ impl TcpBridge {
         our_seq: u32,
         last_ack: u32,
         peer_mss: u16,
+        peer_wscale: Option<u8>,
     ) {
         // Set non-blocking for polling in the event loop.
         stream.set_nonblocking(true).ok();
@@ -398,6 +485,12 @@ impl TcpBridge {
 
         let last_ack_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(last_ack));
         let our_seq_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(our_seq));
+        // Download flow-control state: nothing of ours is unACKed yet, and
+        // until the guest's first post-handshake ACK arrives we assume one
+        // unscaled window (SYN windows are unscaled per RFC 7323) — the
+        // first real ACK replaces it within a round trip.
+        let guest_acked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(our_seq));
+        let guest_window = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(65535));
         // Shared host→guest byte counter — allocated ONLY when a flow observer is
         // installed, so an un-observed consumer (e.g. the VMM datapath) pays no
         // per-connection allocation or atomic. The inline inject thread increments
@@ -433,6 +526,8 @@ impl TcpBridge {
                         peer_mss,
                         our_seq: std::sync::Arc::clone(&our_seq_atomic),
                         last_ack: std::sync::Arc::clone(&last_ack_atomic),
+                        guest_acked: std::sync::Arc::clone(&guest_acked),
+                        guest_window: std::sync::Arc::clone(&guest_window),
                         down_bytes: down_shared.clone(),
                         gw_mac,
                         guest_mac,
@@ -480,6 +575,12 @@ impl TcpBridge {
                 remote_port: key.dst_port,
                 guest_port: key.src_port,
                 peer_mss,
+                guest_wscale: peer_wscale.unwrap_or(0),
+                guest_acked,
+                guest_window,
+                up_would_block: 0,
+                up_short_writes: 0,
+                up_out_of_order: 0,
                 read_buf: if inline_owned {
                     Vec::new()
                 } else {

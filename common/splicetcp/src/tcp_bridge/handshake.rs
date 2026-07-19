@@ -415,10 +415,11 @@ impl TcpBridge {
                 let our_seq = conn.our_isn.wrapping_add(1);
                 let last_ack = conn.peer_isn.wrapping_add(1);
                 let peer_mss = conn.peer_mss;
+                let peer_wscale = conn.peer_wscale;
                 let Some(stream) = conn.host_stream else {
                     return Some(Vec::new());
                 };
-                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss);
+                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss, peer_wscale);
                 Some(Vec::new())
             }
             HandshakeRole::ActiveOpen => {
@@ -471,10 +472,11 @@ impl TcpBridge {
                     });
 
                 let peer_mss = conn.peer_mss;
+                let peer_wscale = conn.peer_wscale;
                 let Some(stream) = conn.host_stream else {
                     return Some(vec![ack_frame]);
                 };
-                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss);
+                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss, peer_wscale);
                 Some(vec![ack_frame])
             }
         }
