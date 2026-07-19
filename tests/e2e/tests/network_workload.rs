@@ -266,7 +266,12 @@ fn burst_single_container(data_dir: &Path, metrics: &mut RunMetrics, _image: &st
     if elapsed >= BURST_DEADLINE {
         bail!("burst_single: took {elapsed:?} (>= {BURST_DEADLINE:?})");
     }
-    check_stragglers(&server.timings(), BURST_FLOWS, "burst_single", metrics)?;
+    check_stragglers(
+        &server.wait_for_timings(BURST_FLOWS, SWEEP_GRACE),
+        BURST_FLOWS,
+        "burst_single",
+        metrics,
+    )?;
     assert_no_established_flows(data_dir, BENCH, server.port(), SWEEP_GRACE)
 }
 
@@ -320,7 +325,12 @@ fn burst_multi_container(data_dir: &Path, metrics: &mut RunMetrics, image: &str)
     }
     // No netns sweep: the burst containers are gone, and with them their
     // guest-side flows; the quiet-log check still covers the daemon side.
-    check_stragglers(&server.timings(), BURST_FLOWS, "burst_multi", metrics)
+    check_stragglers(
+        &server.wait_for_timings(BURST_FLOWS, SWEEP_GRACE),
+        BURST_FLOWS,
+        "burst_multi",
+        metrics,
+    )
 }
 
 /// W4: 500 sequential fresh-connection requests. Flatness bound: the mean of
@@ -356,7 +366,7 @@ done"#
         bail!("churn: took {elapsed:?} (>= {CHURN_DEADLINE:?})");
     }
 
-    let timings = server.timings();
+    let timings = server.wait_for_timings(CHURN_REQUESTS, SWEEP_GRACE);
     if timings.len() != CHURN_REQUESTS {
         bail!(
             "churn: expected {CHURN_REQUESTS} completed requests, server saw {}",

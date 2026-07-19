@@ -62,6 +62,23 @@ impl BlobServer {
         self.timings.lock().expect("timings poisoned").clone()
     }
 
+    /// [`timings`](Self::timings), but waits up to `grace` for `expected`
+    /// recordings to land first. A recording is pushed only once the
+    /// fixture thread sees the client's TCP close, which races the
+    /// client command's own (vsock-delivered) completion — without the
+    /// wait, an exact-count check can miss the last flows despite every
+    /// client having succeeded.
+    pub fn wait_for_timings(&self, expected: usize, grace: Duration) -> Vec<Duration> {
+        let deadline = Instant::now() + grace;
+        loop {
+            let snapshot = self.timings();
+            if snapshot.len() >= expected || Instant::now() >= deadline {
+                return snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     pub fn reset_timings(&self) {
         self.timings.lock().expect("timings poisoned").clear();
     }
@@ -327,12 +344,26 @@ pub fn daemon_log_cursor(data_dir: &Path) -> DaemonLogCursor {
 }
 
 impl DaemonLogCursor {
-    /// Proxy-layer (`arcbox_net`/`splicetcp`/`arcbox_proxy`) ERROR lines
-    /// appended since the cursor was taken. Reads from the start if the log
-    /// rotated underneath the cursor.
+    /// Proxy-layer (`arcbox_net`/`splicetcp`/`arcbox_proxy` and their
+    /// submodules — the needles are prefixes) ERROR lines appended since
+    /// the cursor was taken. If the log rotated underneath the cursor, the
+    /// rotated generations (`daemon.log.N`, oldest first) are stitched
+    /// back in front of the current file so the cursor offset still lands
+    /// on the right byte and no window of the run escapes the scan.
     pub fn proxy_errors(&self) -> Result<Vec<String>> {
-        let contents = std::fs::read(&self.path)
+        let mut contents = std::fs::read(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
+        if (contents.len() as u64) < self.offset {
+            let mut stitched = Vec::new();
+            for n in (1..=9).rev() {
+                let rotated = self.path.with_extension(format!("log.{n}"));
+                if let Ok(bytes) = std::fs::read(&rotated) {
+                    stitched.extend_from_slice(&bytes);
+                }
+            }
+            stitched.append(&mut contents);
+            contents = stitched;
+        }
         let tail = if contents.len() as u64 >= self.offset {
             &contents[self.offset as usize..]
         } else {
