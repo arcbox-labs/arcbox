@@ -31,6 +31,21 @@ pub fn run_vz_scenario(
     name: &str,
     scenario: impl FnOnce(&mut DaemonHandle, &Path, &mut RunMetrics) -> Result<()>,
 ) -> Result<()> {
+    // Per-SYN datapath tracing: stall forensics need the gated-SYN,
+    // handshake-retransmit, and RST decisions, which log at debug.
+    run_vz_scenario_with_log(name, "info,arcbox_net=debug,splicetcp=debug", scenario)
+}
+
+/// [`run_vz_scenario`] with an explicit daemon `RUST_LOG`.
+///
+/// Workload tests pass a quieter filter: `splicetcp=debug` logs every
+/// classified frame, and at dup-ACK-storm rates the logging itself distorts
+/// the datapath under measurement (~6k lines/s observed).
+pub fn run_vz_scenario_with_log(
+    name: &str,
+    rust_log: &str,
+    scenario: impl FnOnce(&mut DaemonHandle, &Path, &mut RunMetrics) -> Result<()>,
+) -> Result<()> {
     init_tracing();
 
     let root = crate::repo_root();
@@ -63,12 +78,7 @@ pub fn run_vz_scenario(
             ("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version),
             ("ARCBOX_VM_BACKEND".to_owned(), "vz".to_owned()),
             ("ARCBOX_DNS_PORT".to_owned(), dns_port.to_string()),
-            // Per-SYN datapath tracing: stall forensics need the gated-SYN,
-            // handshake-retransmit, and RST decisions, which log at debug.
-            (
-                "RUST_LOG".to_owned(),
-                "info,arcbox_net=debug,splicetcp=debug".to_owned(),
-            ),
+            ("RUST_LOG".to_owned(), rust_log.to_owned()),
         ],
     })?;
 

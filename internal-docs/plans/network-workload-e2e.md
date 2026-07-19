@@ -112,6 +112,44 @@ Each with a hard deadline and the zombie sweep. Results are
 environment-dependent by nature; these exist to be run manually when touching
 the proxy, not to gate anything.
 
+## First-run findings (2026-07-19, Phase 1 on master's datapath)
+
+The initial local run failed all five Phase-1 scenarios and pinned three
+datapath defects, all with **zero proxy-layer WARN/ERROR lines** — the fault
+plan's observability gap reproduced under plain workloads:
+
+1. **Uploads silently lose data** (W2, both variants: 256 MiB arrived
+   ~1-2.6 MB short while the in-container client exited 0). Mechanism, from
+   `common/splicetcp/src/tcp_bridge/fast_path.rs`:
+   - `is_new_data` accepts any segment whose *end* extends `last_ack`, so
+     after a `WouldBlock` drop the next in-flight segment is written and
+     `set_last_ack(seq_end)` **ACKs across the hole** — the guest never
+     retransmits the dropped bytes (permanent gap, silently acknowledged);
+   - `Ok(_n)` ignores short writes: partially written segments are ACKed in
+     full, losing the unwritten tail;
+   - FIN handling runs `close_fast_path` unconditionally, so a
+     close-after-write client kills gap recovery even where it would work.
+2. **Concurrent downloads wedge permanently** (W3: ~30 of 64 flows died on
+   a 60 s read timeout; W4 degraded until the 240 s ceiling). The download
+   direction sends with a hardcoded `window: 65535`, never reads the guest's
+   advertised receive window, has no retransmission, and deliberately
+   ignores pure ACKs — so a single guest-side window-overrun drop leaves a
+   sequence gap no mechanism can fill; the guest dup-ACK storms (hundreds
+   to ~1.1k per flow in the daemon log) until the client times out. The
+   `guest-tx delivery counters` prove L2 delivery stayed lossless
+   (`lossy_dropped=0`, `enobufs` events blocked-not-dropped), placing the
+   loss at guest TCP window overrun.
+3. **Hot-path debug logging is an observer effect**: `splicetcp=debug` logs
+   every classified frame (~6k lines/s during a dup-ACK storm), distorting
+   the datapath under measurement. The workload suite therefore runs the
+   daemon at `info,arcbox_net=debug`.
+
+Status: W2–W4 are **red by design** until the TcpBridge fixes land (only
+ACK bytes actually written in-order; honor the guest's receive window or
+retransmit; make both loss paths log at WARN). Same convention as the fault
+plan's Tier 3: the suite is the regression net that flips green with the
+fix, and the strict assertions stay.
+
 ## Runtime budget
 
 Default suite ≈ 4 test binaries (`network_workload` W2–W5, `network_inbound`

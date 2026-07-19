@@ -38,7 +38,7 @@ use arcbox_e2e::net_fixtures::{
     GUEST_GATEWAY_IP, SinkPause, assert_no_established_flows, daemon_log_cursor, spawn_blob_server,
     spawn_slow_sink,
 };
-use arcbox_e2e::scenario::run_vz_scenario;
+use arcbox_e2e::scenario::run_vz_scenario_with_log;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Long-lived workbench container: scenarios `docker exec` into it (vsock,
@@ -80,63 +80,70 @@ const SWEEP_GRACE: Duration = Duration::from_secs(10);
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon; run on the e2e runner"]
 fn net_workload_egress_suite() -> Result<()> {
-    run_vz_scenario("network_workload", |daemon, data_dir, metrics| {
-        metrics.time("daemon_ready", || daemon.wait_ready_blocking(READY_TIMEOUT))?;
-        let image =
-            std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
-        metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
-        docker_output(
-            data_dir,
-            &["run", "-d", "--name", BENCH, &image, "sleep", "2147483647"],
-            Duration::from_secs(60),
-        )
-        .context("starting workbench container")?;
+    // No splicetcp=debug: it logs every classified frame, and a dup-ACK
+    // storm turns that into ~6k lines/s of hot-path logging that distorts
+    // the very throughput under test.
+    run_vz_scenario_with_log(
+        "network_workload",
+        "info,arcbox_net=debug",
+        |daemon, data_dir, metrics| {
+            metrics.time("daemon_ready", || daemon.wait_ready_blocking(READY_TIMEOUT))?;
+            let image =
+                std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
+            metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
+            docker_output(
+                data_dir,
+                &["run", "-d", "--name", BENCH, &image, "sleep", "2147483647"],
+                Duration::from_secs(60),
+            )
+            .context("starting workbench container")?;
 
-        // Taken after setup so image-pull noise is out of scope; covers
-        // every workload below.
-        let log = daemon_log_cursor(data_dir);
+            // Taken after setup so image-pull noise is out of scope; covers
+            // every workload below.
+            let log = daemon_log_cursor(data_dir);
 
-        let scenarios: [(&str, ScenarioFn); 5] = [
-            ("upload_steady", upload_steady),
-            ("upload_paused_reader", upload_paused_reader),
-            ("burst_single_container", burst_single_container),
-            ("burst_multi_container", burst_multi_container),
-            ("churn_sequential", churn_sequential),
-        ];
-        let mut failures = Vec::new();
-        for (name, scenario) in scenarios {
-            tracing::info!(scenario = name, "starting");
-            match scenario(data_dir, metrics, &image) {
-                Ok(()) => tracing::info!(scenario = name, "passed"),
-                Err(error) => {
-                    tracing::warn!(scenario = name, "failed: {error:#}");
-                    failures.push(format!("{name}: {error:#}"));
+            let scenarios: [(&str, ScenarioFn); 5] = [
+                ("upload_steady", upload_steady),
+                ("upload_paused_reader", upload_paused_reader),
+                ("burst_single_container", burst_single_container),
+                ("burst_multi_container", burst_multi_container),
+                ("churn_sequential", churn_sequential),
+            ];
+            let mut failures = Vec::new();
+            for (name, scenario) in scenarios {
+                tracing::info!(scenario = name, "starting");
+                match scenario(data_dir, metrics, &image) {
+                    Ok(()) => tracing::info!(scenario = name, "passed"),
+                    Err(error) => {
+                        tracing::warn!(scenario = name, "failed: {error:#}");
+                        failures.push(format!("{name}: {error:#}"));
+                    }
                 }
             }
-        }
 
-        match log.proxy_errors() {
-            Ok(errors) if !errors.is_empty() => failures.push(format!(
-                "quiet-log: {} proxy-layer ERROR line(s) during workloads:\n{}",
-                errors.len(),
-                errors.join("\n")
-            )),
-            Ok(_) => {}
-            Err(error) => failures.push(format!("quiet-log: unreadable: {error:#}")),
-        }
+            match log.proxy_errors() {
+                Ok(errors) if !errors.is_empty() => failures.push(format!(
+                    "quiet-log: {} proxy-layer ERROR line(s) during workloads:\n{}",
+                    errors.len(),
+                    errors.join("\n")
+                )),
+                Ok(_) => {}
+                Err(error) => failures.push(format!("quiet-log: unreadable: {error:#}")),
+            }
 
-        docker_ignore(data_dir, &["rm".into(), "-f".into(), BENCH.into()]);
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            bail!(
-                "{} of {} workload checks failed:\n{}",
-                failures.len(),
-                scenarios.len() + 1,
-                failures.join("\n---\n")
-            )
-        }
-    })
+            docker_ignore(data_dir, &["rm".into(), "-f".into(), BENCH.into()]);
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                bail!(
+                    "{} of {} workload checks failed:\n{}",
+                    failures.len(),
+                    scenarios.len() + 1,
+                    failures.join("\n---\n")
+                )
+            }
+        },
+    )
 }
 
 type ScenarioFn = fn(&Path, &mut RunMetrics, &str) -> Result<()>;
@@ -243,12 +250,17 @@ fn burst_single_container(data_dir: &Path, metrics: &mut RunMetrics, _image: &st
     let script = burst_script(&url, BURST_FLOWS);
 
     let started = Instant::now();
-    docker_output(
+    if let Err(error) = docker_output(
         data_dir,
         &["exec", BENCH, "sh", "-c", &script],
         BURST_DEADLINE + Duration::from_secs(60),
-    )
-    .context("burst_single: in-container burst")?;
+    ) {
+        bail!(
+            "burst_single: in-container burst failed ({} of {BURST_FLOWS} flows completed \
+             server-side): {error:#}",
+            server.timings().len()
+        );
+    }
     let elapsed = started.elapsed();
     metrics.record("burst_single_wall", elapsed.as_secs_f64());
     if elapsed >= BURST_DEADLINE {
@@ -295,7 +307,12 @@ fn burst_multi_container(data_dir: &Path, metrics: &mut RunMetrics, image: &str)
     for name in &names {
         docker_ignore(data_dir, &["rm".into(), "-f".into(), name.clone()]);
     }
-    result?;
+    if let Err(error) = result {
+        bail!(
+            "burst_multi failed ({} of {BURST_FLOWS} flows completed server-side): {error:#}",
+            server.timings().len()
+        );
+    }
     let elapsed = started.elapsed();
     metrics.record("burst_multi_wall", elapsed.as_secs_f64());
     if elapsed >= BURST_DEADLINE {
@@ -322,12 +339,17 @@ done"#
     );
 
     let started = Instant::now();
-    docker_output(
+    if let Err(error) = docker_output(
         data_dir,
         &["exec", BENCH, "sh", "-c", &script],
         CHURN_DEADLINE + Duration::from_secs(60),
-    )
-    .context("churn: in-container request loop")?;
+    ) {
+        bail!(
+            "churn: request loop failed ({} of {CHURN_REQUESTS} requests completed \
+             server-side): {error:#}",
+            server.timings().len()
+        );
+    }
     let elapsed = started.elapsed();
     metrics.record("churn_wall", elapsed.as_secs_f64());
     if elapsed >= CHURN_DEADLINE {
