@@ -16,6 +16,12 @@
 //! - **W4 churn** (apk/git-HTTP shape): 500 sequential fresh-connection
 //!   requests with a latency-flatness bound — per-flow state leaks show up
 //!   as monotonic slowdown.
+//! - **W13 parallel large downloads** (multi-image-pull shape): 8 × 64 MiB
+//!   concurrently — sustained windowing and retransmission under volume
+//!   rather than connection count.
+//! - **W14 docker build**: context upload over vsock, RUN-step networking
+//!   through the datapath, layer commits; byte-exactness asserted inside
+//!   the build via `RUN test $(wc -c ...)` steps.
 //!
 //! All scenarios share one booted daemon (boot dominates the runtime) and
 //! run inside a long-lived workbench container whose netns the zombie sweep
@@ -73,6 +79,27 @@ const CHURN_REQUESTS: usize = 500;
 const CHURN_BLOB_BYTES: usize = 64 * 1024;
 const CHURN_DEADLINE: Duration = Duration::from_secs(180);
 
+/// W13: concurrent LARGE downloads (multi-image-pull shape) — few flows,
+/// each moving real volume. Where the burst stresses flow setup and
+/// per-flow fairness, this stresses sustained windowing, the retransmit
+/// buffers, and the delivery queue at full throughput.
+const PARALLEL_LARGE_FLOWS: usize = 8;
+const PARALLEL_LARGE_BLOB_BYTES: usize = 64 * 1024 * 1024;
+const PARALLEL_LARGE_DEADLINE: Duration = Duration::from_secs(240);
+/// Straggler floor for large flows. Observed medians are a few seconds
+/// (2.4 s at ~131 MiB/s aggregate), so this floor — not 4×median — is
+/// usually the operative bound: it tolerates CI slowness on multi-second
+/// transfers while still failing a flow that wedges outright (a wedged
+/// flow costs its client timeout, far beyond 10 s).
+const PARALLEL_LARGE_FLOOR: Duration = Duration::from_secs(10);
+
+/// W14: docker build — context upload (vsock), RUN-step networking
+/// through the datapath, and layer commits, in one compound daily flow.
+const BUILD_CONTEXT_PAYLOAD: usize = 8 * 1024 * 1024;
+const BUILD_FETCH_BYTES: usize = 4 * 1024 * 1024;
+const BUILD_DEADLINE: Duration = Duration::from_secs(240);
+const BUILD_TAG: &str = "net-workload-build:latest";
+
 /// Teardown grace for the zombie sweep: in-flight FIN handling passes, a
 /// frozen flow (the 2026-07-19 incident shape) fails.
 const SWEEP_GRACE: Duration = Duration::from_secs(10);
@@ -102,12 +129,14 @@ fn net_workload_egress_suite() -> Result<()> {
             // every workload below.
             let log = daemon_log_cursor(data_dir);
 
-            let scenarios: [(&str, ScenarioFn); 5] = [
+            let scenarios: [(&str, ScenarioFn); 7] = [
                 ("upload_steady", upload_steady),
                 ("upload_paused_reader", upload_paused_reader),
                 ("burst_single_container", burst_single_container),
                 ("burst_multi_container", burst_multi_container),
                 ("churn_sequential", churn_sequential),
+                ("parallel_large_downloads", parallel_large_downloads),
+                ("docker_build_network", docker_build_network),
             ];
             // Diagnostic filter: run only the named scenario, e.g.
             // ARCBOX_E2E_WORKLOAD_ONLY=burst_single_container.
@@ -278,6 +307,7 @@ fn burst_single_container(data_dir: &Path, metrics: &mut RunMetrics, _image: &st
         &server.wait_for_timings(BURST_FLOWS, SWEEP_GRACE),
         BURST_FLOWS,
         "burst_single",
+        Duration::from_secs(2),
         metrics,
     )?;
     assert_no_established_flows(data_dir, BENCH, server.port(), SWEEP_GRACE)
@@ -337,6 +367,7 @@ fn burst_multi_container(data_dir: &Path, metrics: &mut RunMetrics, image: &str)
         &server.wait_for_timings(BURST_FLOWS, SWEEP_GRACE),
         BURST_FLOWS,
         "burst_multi",
+        Duration::from_secs(2),
         metrics,
     )
 }
@@ -399,12 +430,13 @@ done"#
     assert_no_established_flows(data_dir, BENCH, server.port(), SWEEP_GRACE)
 }
 
-/// Straggler bound: slowest flow ≤ max(4× median, 2 s). The absolute floor
-/// keeps sub-second medians from turning scheduler noise into a failure.
+/// Straggler bound: slowest flow ≤ max(4× median, `floor`). The absolute
+/// floor keeps small medians from turning scheduler noise into a failure.
 fn check_stragglers(
     timings: &[Duration],
     expected: usize,
     label: &str,
+    floor: Duration,
     metrics: &mut RunMetrics,
 ) -> Result<()> {
     if timings.len() != expected {
@@ -420,7 +452,7 @@ fn check_stragglers(
     metrics.record(&format!("{label}_flow_median"), median.as_secs_f64());
     metrics.record(&format!("{label}_flow_slowest"), slowest.as_secs_f64());
     tracing::info!(?median, ?slowest, "{label} flow timings");
-    let bound = (median * 4).max(Duration::from_secs(2));
+    let bound = (median * 4).max(floor);
     if slowest > bound {
         bail!(
             "{label}: slowest flow {slowest:?} exceeds straggler bound {bound:?} \
@@ -428,4 +460,116 @@ fn check_stragglers(
         );
     }
     Ok(())
+}
+
+/// W13: eight concurrent 64 MiB downloads — the multi-image-pull shape.
+/// Sustained full-throughput windowing across parallel flows; the straggler
+/// bound catches a flow whose retransmission or window accounting wedges
+/// under volume rather than under connection count.
+fn parallel_large_downloads(data_dir: &Path, metrics: &mut RunMetrics, _image: &str) -> Result<()> {
+    let server = spawn_blob_server(PARALLEL_LARGE_BLOB_BYTES)?;
+    let url = format!("http://{GUEST_GATEWAY_IP}:{}/blob", server.port());
+    let script = burst_script(&url, PARALLEL_LARGE_FLOWS);
+
+    let started = Instant::now();
+    if let Err(error) = docker_output(
+        data_dir,
+        &["exec", BENCH, "sh", "-c", &script],
+        PARALLEL_LARGE_DEADLINE + Duration::from_secs(60),
+    ) {
+        bail!(
+            "parallel_large: downloads failed ({} of {PARALLEL_LARGE_FLOWS} flows completed \
+             server-side): {error:#}",
+            server.timings().len()
+        );
+    }
+    let elapsed = started.elapsed();
+    metrics.record("parallel_large_wall", elapsed.as_secs_f64());
+    let total_mib = (PARALLEL_LARGE_FLOWS * PARALLEL_LARGE_BLOB_BYTES) / (1024 * 1024);
+    metrics.record(
+        "parallel_large_mib_per_s",
+        total_mib as f64 / elapsed.as_secs_f64(),
+    );
+    tracing::info!(?elapsed, total_mib, "parallel large downloads done");
+    if elapsed >= PARALLEL_LARGE_DEADLINE {
+        bail!("parallel_large: took {elapsed:?} (>= {PARALLEL_LARGE_DEADLINE:?})");
+    }
+    check_stragglers(
+        &server.wait_for_timings(PARALLEL_LARGE_FLOWS, SWEEP_GRACE),
+        PARALLEL_LARGE_FLOWS,
+        "parallel_large",
+        PARALLEL_LARGE_FLOOR,
+        metrics,
+    )?;
+    assert_no_established_flows(data_dir, BENCH, server.port(), SWEEP_GRACE)
+}
+
+/// W14: docker build — the compound daily flow. Exercises the build-context
+/// upload (Docker API over vsock), RUN-step networking through the full
+/// datapath, and layer commits. Byte-exactness is asserted *inside* the
+/// build: `RUN test $(wc -c ...)` steps fail the build on any truncation,
+/// of the COPY'd context payload or of the in-RUN download.
+fn docker_build_network(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let server = spawn_blob_server(BUILD_FETCH_BYTES)?;
+    let url = format!("http://{GUEST_GATEWAY_IP}:{}/blob", server.port());
+
+    // Build context: a Dockerfile plus an incompressible payload so the
+    // context transfer moves real bytes.
+    let ctx = data_dir.join("build-ctx");
+    std::fs::create_dir_all(&ctx).context("creating build context dir")?;
+    let mut payload = vec![0u8; BUILD_CONTEXT_PAYLOAD];
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for chunk in payload.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+    }
+    std::fs::write(ctx.join("payload.bin"), &payload).context("writing context payload")?;
+    // Content hashes, not just lengths: a corrupted-but-length-preserving
+    // transfer (the pre-fix upload path could reorder/hole-fill) must fail
+    // the build, for both the vsock context upload and the RUN download.
+    use sha2::Digest;
+    let payload_sha = format!("{:x}", sha2::Sha256::digest(&payload));
+    let blob_sha = format!("{:x}", sha2::Sha256::digest(vec![0u8; BUILD_FETCH_BYTES]));
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            "FROM {image}\n\
+             COPY payload.bin /payload.bin\n\
+             RUN echo \"{payload_sha}  /payload.bin\" | sha256sum -c -\n\
+             RUN wget -q -O /blob {url} && echo \"{blob_sha}  /blob\" | sha256sum -c -\n\
+             RUN echo built-ok > /marker\n"
+        ),
+    )
+    .context("writing Dockerfile")?;
+
+    let started = Instant::now();
+    let ctx_arg = ctx.display().to_string();
+    let build = docker_output(
+        data_dir,
+        &["build", "-t", BUILD_TAG, &ctx_arg],
+        BUILD_DEADLINE + Duration::from_secs(60),
+    );
+    let elapsed = started.elapsed();
+    metrics.record("docker_build_wall", elapsed.as_secs_f64());
+    let result = (|| {
+        build.context("docker build")?;
+        if elapsed >= BUILD_DEADLINE {
+            bail!("docker_build: took {elapsed:?} (>= {BUILD_DEADLINE:?})");
+        }
+        // The image must actually run and carry the final layer.
+        let marker = docker_output(
+            data_dir,
+            &["run", "--rm", BUILD_TAG, "cat", "/marker"],
+            Duration::from_secs(60),
+        )
+        .context("running built image")?;
+        if !marker.contains("built-ok") {
+            bail!("docker_build: marker layer missing from built image: {marker:?}");
+        }
+        Ok(())
+    })();
+    docker_ignore(data_dir, &["rmi".into(), "-f".into(), BUILD_TAG.into()]);
+    result
 }
