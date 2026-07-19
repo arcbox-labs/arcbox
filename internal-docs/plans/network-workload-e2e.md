@@ -97,6 +97,8 @@ boot time dominates.
 | W10 | container↔container (compose shape) | user-defined network, `busybox httpd` server + client by service name and by IP | resolution + transfer work; regression net for guest bridge/iptables-legacy config (6.18) |
 | W11 | registry round-trip (push+pull compound) | `registry:2` in-guest publishing ephemeral port; host CLI pushes alpine to `host.docker.internal:<port>`, pulls back | full-loop egress+inbound with real dockerd traffic. **Blocked**: guest dockerd needs `insecure-registries` for plain-HTTP non-loopback — requires an agent-side knob first; Phase 3 |
 | W12 | long-lived idle flow across idle-shrink | keepalive flow held open past `ARCBOX_IDLE_TIMEOUT_SECS=20`, then reused | works or errors — never zombies (overlaps fault plan Tier 2; implement once, there) |
+| W13 | parallel large downloads (multi-image-pull shape) | 8 × 64 MiB concurrent in the workbench | all complete ≤ deadline; straggler ≤ max(4×median, 10 s); throughput recorded; zombie sweep *(implemented)* |
+| W14 | docker build (compound daily flow) | context with 8 MiB incompressible payload + RUN wget from the blob server; byte-exactness via in-build `RUN test $(wc -c)` | build succeeds ≤ deadline; built image runs; context and download byte-exact *(implemented)* |
 
 ## External phase (env-gated, never default, still local)
 
