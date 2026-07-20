@@ -2,7 +2,24 @@
 
 mod common;
 
+use std::process::Command;
+
 use arcbox_helper::client::{Client, ClientError};
+
+#[test]
+fn version_flag_reports_the_helper_version_on_stdout() {
+    let output = Command::new(env!("CARGO_BIN_EXE_arcbox-helper"))
+        .arg("--version")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("arcbox-helper {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
+}
 
 #[tokio::test]
 async fn version_returns_helper_crate_version() {
