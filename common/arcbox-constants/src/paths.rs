@@ -172,10 +172,10 @@ pub const DOCKER_CLI_PLUGINS: &[&str] = &["docker-buildx", "docker-compose"];
 /// Used by multiple subsystems (privileged helper, brew hooks, setup install)
 /// to decide whether an existing `/usr/local/bin/` symlink can be safely replaced.
 ///
-/// Rules mirror the helper's `CliTarget` parser (absolute, under
-/// `/Applications/` or `/Users/`, contains `.app/Contents/MacOS/xbin/`, no
-/// `..`). Kept as a pure path check so callers do not need to depend on the
-/// helper crate.
+/// Single source of truth for the path shape also enforced by the helper's
+/// `CliTarget` parser: absolute, under `/Applications/` or `/Users/`, contains
+/// `.app/Contents/MacOS/xbin/`, no `..`. Kept in this crate so callers do not
+/// need to depend on the helper.
 ///
 /// Gated on the `std` feature: it takes a `std::path::Path`, so it is
 /// unavailable (and unusable) in `no_std` builds.
@@ -183,24 +183,31 @@ pub const DOCKER_CLI_PLUGINS: &[&str] = &["docker-buildx", "docker-compose"];
 pub fn is_arcbox_owned(target: &std::path::Path) -> bool {
     use std::path::Component;
 
-    if !target.is_absolute() {
-        return false;
-    }
-    if target
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
+    if !target.is_absolute()
+        || target
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
     {
         return false;
     }
 
-    let s = target.to_string_lossy();
-    if !s.starts_with("/Applications/") && !s.starts_with("/Users/") {
+    let bytes = target.as_os_str().as_encoded_bytes();
+    let under_apps_or_users = bytes.starts_with(b"/Applications/") || bytes.starts_with(b"/Users/");
+    if !under_apps_or_users {
         return false;
     }
 
+    has_app_xbin_structure(target)
+}
+
+/// `true` when some component window is `.app/Contents/MacOS/xbin`.
+#[cfg(feature = "std")]
+fn has_app_xbin_structure(target: &std::path::Path) -> bool {
+    use std::path::Component;
+
     let components: Vec<_> = target.components().collect();
     components.windows(4).any(|w| {
-        matches!(&w[0], Component::Normal(name) if name.to_string_lossy().ends_with(".app"))
+        matches!(&w[0], Component::Normal(name) if name.as_encoded_bytes().ends_with(b".app"))
             && w[1] == Component::Normal("Contents".as_ref())
             && w[2] == Component::Normal("MacOS".as_ref())
             && w[3] == Component::Normal("xbin".as_ref())

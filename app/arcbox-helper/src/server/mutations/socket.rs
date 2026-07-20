@@ -11,6 +11,7 @@ use std::path::Path;
 use arcbox_helper::validate::SocketTarget;
 
 use crate::server::fs_root;
+use crate::server::mutations::cli::{prepare_symlink_slot, remove_owned_symlink};
 
 /// Standard Docker socket path.
 const DOCKER_SOCK: &str = arcbox_constants::paths::privileged::DOCKER_SOCKET;
@@ -34,67 +35,37 @@ pub fn unlink() -> Result<(), String> {
 }
 
 fn link_at(link_path: &Path, target: &SocketTarget) -> Result<(), String> {
-    let target_path = Path::new(target.as_str());
-    let display = link_path.display();
+    use crate::server::mutations::cli::Slot;
 
-    match fs::symlink_metadata(link_path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let existing = fs::read_link(link_path)
-                .map_err(|e| format!("failed to read symlink {display}: {e}"))?;
-            if existing == target_path {
-                return Ok(());
+    let target_path = Path::new(target.as_str());
+    let slot =
+        prepare_symlink_slot(link_path, target_path, is_arcbox_socket_target).map_err(|e| {
+            // Keep the Docker Desktop hint on the non-symlink case.
+            if e.contains("not a symlink") {
+                format!("{e} (is Docker Desktop running? stop it first)")
+            } else {
+                e
             }
-            if !is_arcbox_socket_target(&existing) {
-                return Err(format!(
-                    "{display} is a symlink to {} (not ArcBox-owned, not replacing)",
-                    existing.display()
-                ));
-            }
-            fs::remove_file(link_path)
-                .map_err(|e| format!("failed to remove existing {display}: {e}"))?;
-        }
-        Ok(_) => {
-            return Err(format!(
-                "{display} exists but is not a symlink \
-                 (is Docker Desktop running? stop it first)"
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(format!("failed to stat {display}: {e}"));
-        }
+        })?;
+    if slot == Slot::AlreadyCorrect {
+        return Ok(());
     }
 
-    // Ensure parent exists (production: /var/run always does; tests may use tmp).
     if let Some(parent) = link_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
 
-    unix_fs::symlink(target_path, link_path)
-        .map_err(|e| format!("failed to create symlink {display} -> {target}: {e}"))
+    unix_fs::symlink(target_path, link_path).map_err(|e| {
+        format!(
+            "failed to create symlink {} -> {target}: {e}",
+            link_path.display()
+        )
+    })
 }
 
 fn unlink_at(link_path: &Path) -> Result<(), String> {
-    let display = link_path.display();
-
-    match fs::symlink_metadata(link_path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let target = fs::read_link(link_path)
-                .map_err(|e| format!("failed to read symlink {display}: {e}"))?;
-            if !is_arcbox_socket_target(&target) {
-                // Not ours — leave it. Matches cli_unlink ownership policy.
-                return Ok(());
-            }
-            fs::remove_file(link_path).map_err(|e| format!("failed to remove {display}: {e}"))
-        }
-        Ok(_) => {
-            // Real socket / file owned by another daemon — do not touch.
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to stat {display}: {e}")),
-    }
+    remove_owned_symlink(link_path, is_arcbox_socket_target)
 }
 
 /// `true` when `target` parses as a valid ArcBox socket path
@@ -140,7 +111,6 @@ mod tests {
             .parse::<SocketTarget>()
             .unwrap();
 
-        // Foreign existing symlink — refuse.
         symlink("/var/run/other.sock", &link).unwrap();
         let err = link_at(&link, &target).unwrap_err();
         assert!(err.contains("not ArcBox-owned"), "{err}");
@@ -149,13 +119,11 @@ mod tests {
             PathBuf::from("/var/run/other.sock")
         );
 
-        // ArcBox-owned existing — replace.
         fs::remove_file(&link).unwrap();
         symlink("/Users/alice/.arcbox/run/old.sock", &link).unwrap();
         link_at(&link, &target).unwrap();
         assert_eq!(fs::read_link(&link).unwrap(), Path::new(target.as_str()));
 
-        // Idempotent.
         link_at(&link, &target).unwrap();
     }
 
@@ -168,18 +136,15 @@ mod tests {
         unlink_at(&link).unwrap();
         assert!(!link.exists());
 
-        // Foreign — leave alone.
         symlink("/var/run/other.sock", &link).unwrap();
         unlink_at(&link).unwrap();
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
 
-        // Real file — leave alone.
         fs::remove_file(&link).unwrap();
         fs::write(&link, b"not a socket").unwrap();
         unlink_at(&link).unwrap();
         assert!(link.is_file());
 
-        // Missing — ok.
         fs::remove_file(&link).unwrap();
         unlink_at(&link).unwrap();
     }

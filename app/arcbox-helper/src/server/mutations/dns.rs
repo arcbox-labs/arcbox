@@ -54,7 +54,11 @@ fn install_at(resolver_dir: &Path, domain: &Domain, port: DnsPort) -> Result<(),
                 path.display()
             ));
         }
-        Ok(_) | Err(_) => {}
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("failed to read {}: {e}", path.display()));
+        }
     }
 
     let content =

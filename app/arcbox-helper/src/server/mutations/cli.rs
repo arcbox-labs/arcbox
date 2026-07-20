@@ -35,40 +35,13 @@ pub fn unlink(name: &CliName) -> Result<(), String> {
     unlink_at(&fs_root::resolve(CLI_BIN_DIR), name)
 }
 
-/// Testable implementation: operate under `bin_dir` instead of `/usr/local/bin`.
 fn link_at(bin_dir: &Path, name: &CliName, target: &CliTarget) -> Result<(), String> {
     let link_path = bin_dir.join(name.as_str());
     let target_path = Path::new(target.as_str());
 
     ensure_safe_cli_target(target_path, target)?;
-
-    match fs::symlink_metadata(&link_path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let existing = fs::read_link(&link_path)
-                .map_err(|e| format!("failed to read symlink {}: {e}", link_path.display()))?;
-            if existing == target_path {
-                return Ok(());
-            }
-            if !is_arcbox_owned(&existing) {
-                return Err(format!(
-                    "{} is a symlink to {} (not ArcBox-owned, not replacing)",
-                    link_path.display(),
-                    existing.display()
-                ));
-            }
-            fs::remove_file(&link_path)
-                .map_err(|e| format!("failed to remove {}: {e}", link_path.display()))?;
-        }
-        Ok(_) => {
-            return Err(format!(
-                "{} exists and is not a symlink (not replacing)",
-                link_path.display()
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(format!("failed to stat {}: {e}", link_path.display()));
-        }
+    if prepare_symlink_slot(&link_path, target_path, is_arcbox_owned)? == Slot::AlreadyCorrect {
+        return Ok(());
     }
 
     fs::create_dir_all(bin_dir)
@@ -83,22 +56,7 @@ fn link_at(bin_dir: &Path, name: &CliName, target: &CliTarget) -> Result<(), Str
 }
 
 fn unlink_at(bin_dir: &Path, name: &CliName) -> Result<(), String> {
-    let link_path = bin_dir.join(name.as_str());
-
-    match fs::symlink_metadata(&link_path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let target = fs::read_link(&link_path)
-                .map_err(|e| format!("failed to read symlink {}: {e}", link_path.display()))?;
-            if is_arcbox_owned(&target) {
-                fs::remove_file(&link_path)
-                    .map_err(|e| format!("failed to remove {}: {e}", link_path.display()))?;
-            }
-            Ok(())
-        }
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to stat {}: {e}", link_path.display())),
-    }
+    remove_owned_symlink(&bin_dir.join(name.as_str()), is_arcbox_owned)
 }
 
 /// Ensures `target_path` exists, is a regular file (not a symlink/dir), and —
@@ -121,10 +79,8 @@ fn ensure_safe_cli_target(target_path: &Path, display: &CliTarget) -> Result<(),
         return Err(format!("CLI target '{display}' is not a regular file"));
     }
 
-    // Re-check ownership on the canonical path so a cleverly named intermediate
-    // component cannot slip past the string-level CliTarget / is_arcbox_owned
-    // checks after resolution (e.g. bind mounts). Canonicalize requires the
-    // final component to exist — we already verified that above.
+    // Re-check ownership on the canonical path so resolution (bind mounts,
+    // etc.) cannot slip past the string-level CliTarget check.
     let canonical = fs::canonicalize(target_path)
         .map_err(|e| format!("failed to canonicalize CLI target {display}: {e}"))?;
     if !is_arcbox_owned(&canonical) {
@@ -137,37 +93,84 @@ fn ensure_safe_cli_target(target_path: &Path, display: &CliTarget) -> Result<(),
     Ok(())
 }
 
+/// Outcome of inspecting a destination path before creating a managed symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Slot {
+    /// Nothing at the path (or we cleared our stale link) — caller should create.
+    Ready,
+    /// Already points at the desired target — no-op.
+    AlreadyCorrect,
+}
+
+/// Shared "inspect destination before creating a managed symlink" step.
+///
+/// - missing → [`Slot::Ready`]
+/// - already points at `want` → [`Slot::AlreadyCorrect`]
+/// - symlink owned by us (`is_ours`) → remove, then [`Slot::Ready`]
+/// - foreign symlink / regular file → error
+pub(super) fn prepare_symlink_slot(
+    link_path: &Path,
+    want: &Path,
+    is_ours: impl Fn(&Path) -> bool,
+) -> Result<Slot, String> {
+    let display = link_path.display();
+    match fs::symlink_metadata(link_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let existing = fs::read_link(link_path)
+                .map_err(|e| format!("failed to read symlink {display}: {e}"))?;
+            if existing == want {
+                return Ok(Slot::AlreadyCorrect);
+            }
+            if !is_ours(&existing) {
+                return Err(format!(
+                    "{display} is a symlink to {} (not ArcBox-owned, not replacing)",
+                    existing.display()
+                ));
+            }
+            fs::remove_file(link_path).map_err(|e| format!("failed to remove {display}: {e}"))?;
+            Ok(Slot::Ready)
+        }
+        Ok(_) => Err(format!(
+            "{display} exists and is not a symlink (not replacing)"
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Slot::Ready),
+        Err(e) => Err(format!("failed to stat {display}: {e}")),
+    }
+}
+
+/// Removes `link_path` only when it is a symlink whose target passes `is_ours`.
+pub(super) fn remove_owned_symlink(
+    link_path: &Path,
+    is_ours: impl Fn(&Path) -> bool,
+) -> Result<(), String> {
+    let display = link_path.display();
+    match fs::symlink_metadata(link_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let target = fs::read_link(link_path)
+                .map_err(|e| format!("failed to read symlink {display}: {e}"))?;
+            if is_ours(&target) {
+                fs::remove_file(link_path)
+                    .map_err(|e| format!("failed to remove {display}: {e}"))?;
+            }
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to stat {display}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ensure_safe_cli_target, link_at, unlink_at};
-    use arcbox_helper::validate::{CliName, CliTarget};
+    use super::{Slot, ensure_safe_cli_target, prepare_symlink_slot, remove_owned_symlink};
+    use arcbox_constants::paths::is_arcbox_owned;
+    use arcbox_helper::validate::CliTarget;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
 
-    fn home_xbin_root(label: &str) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        let root = PathBuf::from(home).join(format!(".arcbox-helper-test-{label}"));
-        let _ = fs::remove_dir_all(&root);
-        Some(root)
-    }
-
-    fn write_xbin_docker(root: &Path) -> CliTarget {
-        let xbin = root.join("Apps/ArcBox.app/Contents/MacOS/xbin");
-        fs::create_dir_all(&xbin).unwrap();
-        let file = xbin.join("docker");
-        fs::write(&file, b"#!/bin/sh\n").unwrap();
-        format!(
-            "{}/Apps/ArcBox.app/Contents/MacOS/xbin/docker",
-            root.display()
-        )
-        .parse()
-        .unwrap()
-    }
-
     #[test]
     fn rejects_missing_target() {
-        // Use a path that cannot exist on this machine (unique UUID segment).
         let display =
             "/Users/nobody/.arcbox-helper-missing-9f3c2a1b/Apps/ArcBox.app/Contents/MacOS/xbin/docker"
                 .parse::<CliTarget>()
@@ -194,83 +197,47 @@ mod tests {
     }
 
     #[test]
-    fn accepts_regular_file_under_arcbox_xbin_shape() {
-        let Some(root) = home_xbin_root("cli-accept") else {
-            return;
-        };
-        let target = write_xbin_docker(&root);
-        ensure_safe_cli_target(Path::new(target.as_str()), &target).unwrap();
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn link_replaces_only_arcbox_owned_symlink() {
-        let Some(root) = home_xbin_root("cli-link") else {
-            return;
-        };
-        let target = write_xbin_docker(&root);
-        let name = "docker".parse::<CliName>().unwrap();
-
+    fn prepare_slot_preserves_foreign_and_replaces_ours() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        fs::create_dir_all(&bin).unwrap();
+        let link = dir.path().join("docker");
+        let want = Path::new("/Applications/ArcBox.app/Contents/MacOS/xbin/docker");
 
-        // Existing foreign symlink — must not be replaced.
-        symlink("/usr/local/bin/real-docker", bin.join("docker")).unwrap();
-        let err = link_at(&bin, &name, &target).unwrap_err();
+        symlink("/usr/local/bin/real-docker", &link).unwrap();
+        let err = prepare_symlink_slot(&link, want, is_arcbox_owned).unwrap_err();
         assert!(err.contains("not ArcBox-owned"), "{err}");
         assert_eq!(
-            fs::read_link(bin.join("docker")).unwrap(),
+            fs::read_link(&link).unwrap(),
             PathBuf::from("/usr/local/bin/real-docker")
         );
 
-        // Replace ArcBox-owned existing link.
-        fs::remove_file(bin.join("docker")).unwrap();
-        symlink(
-            "/Applications/Old.app/Contents/MacOS/xbin/docker",
-            bin.join("docker"),
-        )
-        .unwrap();
-        link_at(&bin, &name, &target).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink("/Applications/Old.app/Contents/MacOS/xbin/docker", &link).unwrap();
         assert_eq!(
-            fs::read_link(bin.join("docker")).unwrap(),
-            Path::new(target.as_str())
+            prepare_symlink_slot(&link, want, is_arcbox_owned).unwrap(),
+            Slot::Ready
         );
+        assert!(!link.exists(), "owned stale link should be cleared");
 
-        // unlink removes ArcBox-owned only.
-        unlink_at(&bin, &name).unwrap();
-        assert!(!bin.join("docker").exists());
-
-        // Foreign unlink is a no-op.
-        symlink("/usr/local/bin/real-docker", bin.join("docker")).unwrap();
-        unlink_at(&bin, &name).unwrap();
-        assert!(
-            bin.join("docker")
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink()
+        // Idempotent: already correct.
+        symlink(want, &link).unwrap();
+        assert_eq!(
+            prepare_symlink_slot(&link, want, is_arcbox_owned).unwrap(),
+            Slot::AlreadyCorrect
         );
-
-        let _ = fs::remove_dir_all(&root);
+        assert_eq!(fs::read_link(&link).unwrap(), want);
     }
 
     #[test]
-    fn link_refuses_regular_file_at_destination() {
-        let Some(root) = home_xbin_root("cli-reg") else {
-            return;
-        };
-        let target = write_xbin_docker(&root);
-        let name = "docker".parse::<CliName>().unwrap();
-
+    fn remove_owned_only() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("docker"), b"not a link").unwrap();
+        let link = dir.path().join("docker");
 
-        let err = link_at(&bin, &name, &target).unwrap_err();
-        assert!(err.contains("not a symlink"), "{err}");
+        symlink("/Applications/ArcBox.app/Contents/MacOS/xbin/docker", &link).unwrap();
+        remove_owned_symlink(&link, is_arcbox_owned).unwrap();
+        assert!(!link.exists());
 
-        let _ = fs::remove_dir_all(&root);
+        symlink("/usr/local/bin/real-docker", &link).unwrap();
+        remove_owned_symlink(&link, is_arcbox_owned).unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
     }
 }

@@ -52,18 +52,14 @@ const LOCAL_PEERTOKEN: libc::c_int = 0x006;
 ///
 /// Debug builds always return `true`. Release builds require a matching
 /// code signature; failures are logged and the connection is dropped.
-pub fn verify(stream: &tokio::net::UnixStream) -> bool {
-    if cfg!(debug_assertions) {
-        return true;
-    }
-
-    verify_release(stream)
+#[cfg(debug_assertions)]
+pub fn verify(_stream: &tokio::net::UnixStream) -> bool {
+    true
 }
 
+/// Release: prefer audit-token binding; fall back to PID if the sockopt fails.
 #[cfg(not(debug_assertions))]
-fn verify_release(stream: &tokio::net::UnixStream) -> bool {
-    // Prefer audit-token binding; fall back to PID if the sockopt fails
-    // (older kernels / unusual transports).
+pub fn verify(stream: &tokio::net::UnixStream) -> bool {
     if let Some(token) = peer_audit_token(stream) {
         for identifier in ALLOWED_IDENTIFIERS {
             if security::check_code_signature_audit(&token, identifier, TEAM_ID) {
@@ -102,11 +98,6 @@ fn verify_release(stream: &tokio::net::UnixStream) -> bool {
         "peer auth: rejected (no matching code signature)"
     );
     false
-}
-
-#[cfg(debug_assertions)]
-fn verify_release(_stream: &tokio::net::UnixStream) -> bool {
-    true
 }
 
 /// Peer PID via `LOCAL_PEERPID`.
