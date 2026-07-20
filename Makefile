@@ -141,18 +141,22 @@ HELPER_SOCKET ?= /tmp/arcbox-helper.sock
 run-helper: build-helper
 	sudo ARCBOX_HELPER_SOCKET=$(HELPER_SOCKET) $(TARGET_DIR)/arcbox-helper
 
-# Install the helper into launchd (production-like). Requires sudo.
-install-helper: build-helper
-	sudo install -o root -g wheel -m 755 $(TARGET_DIR)/arcbox-helper /usr/local/libexec/arcbox-helper
+# Install the authenticated release helper into the world-connectable launchd
+# socket. Debug helpers skip peer authentication and must only use run-helper's
+# user-controlled development socket.
+install-helper:
+	$(MAKE) build-helper PROFILE=release
+	sudo install -o root -g wheel -m 755 target/release/arcbox-helper /usr/local/libexec/arcbox-helper
 	sudo cp bundle/com.arcboxlabs.desktop.helper.plist /Library/LaunchDaemons/
 	-sudo launchctl bootout system/com.arcboxlabs.desktop.helper 2>/dev/null
 	sudo launchctl bootstrap system /Library/LaunchDaemons/com.arcboxlabs.desktop.helper.plist
 	@echo "✓ arcbox-helper installed and registered with launchd"
 
-# Rebuild and hot-reload the helper in launchd (bootout → copy → bootstrap).
-reload-helper: build-helper
+# Rebuild and hot-reload the authenticated release helper.
+reload-helper:
+	$(MAKE) build-helper PROFILE=release
 	-sudo launchctl bootout system/com.arcboxlabs.desktop.helper 2>/dev/null
-	sudo cp $(TARGET_DIR)/arcbox-helper /usr/local/libexec/arcbox-helper
+	sudo cp target/release/arcbox-helper /usr/local/libexec/arcbox-helper
 	sudo launchctl bootstrap system /Library/LaunchDaemons/com.arcboxlabs.desktop.helper.plist
 	@echo "✓ arcbox-helper reloaded"
 
