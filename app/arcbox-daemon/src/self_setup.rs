@@ -50,14 +50,38 @@ pub async fn run(tasks: &[&dyn SetupTask]) {
         }
     };
 
-    let expected_version = env!("CARGO_PKG_VERSION");
     match client.version().await {
-        Ok(version) if version == expected_version => {}
-        Ok(version) => tracing::warn!(
-            helper_version = %version,
-            daemon_version = expected_version,
-            "arcbox-helper version differs from daemon; run 'sudo abctl _install --no-daemon --no-shell'"
-        ),
+        Ok(version) => {
+            let min = arcbox_constants::helper::MIN_HELPER_VERSION;
+            match arcbox_constants::helper::parse_helper_version(&version) {
+                Some(installed) => {
+                    let Some(minimum) = arcbox_constants::helper::parse_semver_triple(min) else {
+                        tracing::warn!(
+                            min_helper_version = min,
+                            "invalid MIN_HELPER_VERSION constant"
+                        );
+                        return;
+                    };
+                    if arcbox_constants::helper::helper_version_satisfies(installed, minimum) {
+                        tracing::debug!(
+                            helper_version = %version,
+                            min_helper_version = min,
+                            "arcbox-helper version ok"
+                        );
+                    } else {
+                        tracing::warn!(
+                            helper_version = %version,
+                            min_helper_version = min,
+                            "arcbox-helper too old; run 'sudo abctl _install --no-daemon --no-shell'"
+                        );
+                    }
+                }
+                None => tracing::warn!(
+                    helper_version = %version,
+                    "unrecognized arcbox-helper version; run 'sudo abctl _install --no-daemon --no-shell'"
+                ),
+            }
+        }
         Err(e) => tracing::warn!(
             error = %e,
             "failed to check arcbox-helper version"

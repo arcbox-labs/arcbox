@@ -3,6 +3,8 @@
 pub mod cmdline;
 pub mod devices;
 pub mod env;
+#[cfg(feature = "std")]
+pub mod helper;
 pub mod paths;
 pub mod ports;
 pub mod status;
