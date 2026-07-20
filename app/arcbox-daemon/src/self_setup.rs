@@ -45,10 +45,28 @@ pub trait SetupTask: Send + Sync {
 pub async fn run(tasks: &[&dyn SetupTask]) {
     let client = match Client::connect().await {
         Ok(c) => c,
+        Err(ClientError::UnrecognizedVersion(version)) => {
+            tracing::warn!(
+                version = %version,
+                "arcbox-helper returned an unrecognized version; run 'sudo abctl _install --no-daemon --no-shell' to replace it"
+            );
+            return;
+        }
+        Err(ClientError::IncompatibleVersion {
+            installed,
+            required,
+        }) => {
+            tracing::warn!(
+                installed = %installed,
+                required,
+                "arcbox-helper is incompatible; run 'sudo abctl _install --no-daemon --no-shell' to replace it"
+            );
+            return;
+        }
         Err(e) => {
             tracing::debug!(
                 error = %e,
-                "arcbox-helper unavailable or incompatible, skipping self-setup"
+                "arcbox-helper unavailable, skipping self-setup"
             );
             return;
         }

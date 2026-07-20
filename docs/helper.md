@@ -86,11 +86,18 @@ Rejected peers are dropped before any tarpc dispatch; logs include
 anything outside `/Applications/` or `/Users/` without a
 `.app/Contents/MacOS/xbin/` segment.
 
-### Daemon compatibility gate
+### Client-wide compatibility gate
 
-If the helper is unreachable, unparseable, or older than
-`MIN_HELPER_VERSION`, daemon `self_setup` **skips all privileged tasks** so it
-never drives new tarpc ordinals into a legacy binary.
+Every mutation-capable `Client::connect` / `Client::connect_to` call checks the
+helper's `version` RPC before returning a client. If the helper is unreachable,
+unparseable, outside the supported wire major, or older than
+`MIN_HELPER_VERSION`, no mutation client is returned. This protects every
+consumer—including daemon `self_setup`, route reconciliation, and CLI helper
+operations—from driving new tarpc ordinals into a legacy binary.
+
+Diagnostics use the non-mutating `Client::probe_version` path so `abctl doctor`
+can still report the version of an incompatible helper without exposing a
+client capable of sending privileged mutations.
 
 ## Local E2E (no root)
 
