@@ -26,9 +26,9 @@ fn link_at(link_path: &Path, target: &SocketTarget) -> Result<(), HelperError> {
     let target_path = Path::new(target.as_str());
     let slot = prepare_symlink_slot(link_path, target_path, is_arcbox_socket_target).map_err(
         |e| match e {
-            HelperError::NotASymlink { path } => HelperError::NotASymlink {
-                path: format!("{path} (is Docker Desktop running? stop it first)"),
-            },
+            // Map generic "not a symlink" to the docker-specific variant so
+            // `path` stays clean and Display carries the Desktop hint.
+            HelperError::NotASymlink { path } => HelperError::DockerSocketOccupied { path },
             other => other,
         },
     )?;
@@ -124,6 +124,15 @@ mod tests {
             .parse::<SocketTarget>()
             .unwrap();
         let err = link_at(&link, &target).unwrap_err();
-        assert!(matches!(err, HelperError::NotASymlink { .. }), "{err}");
+        assert!(
+            matches!(err, HelperError::DockerSocketOccupied { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Docker Desktop"), "{err}");
+        // path field must stay a pure path (no hint stuffed into it).
+        if let HelperError::DockerSocketOccupied { path } = &err {
+            assert!(!path.contains("Docker Desktop"), "{path}");
+            assert!(path.ends_with("docker.sock"), "{path}");
+        }
     }
 }
