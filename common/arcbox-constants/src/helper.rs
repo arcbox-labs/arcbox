@@ -124,4 +124,13 @@ mod tests {
         assert!(!helper_needs_reinstall(Some((1, 0, 0)), Some((1, 0, 0))));
         assert!(!helper_needs_reinstall(Some((1, 1, 0)), Some((1, 0, 0))));
     }
+
+    /// `MIN_HELPER_VERSION` must parse and stay a proper semver triple.
+    #[test]
+    fn min_helper_version_is_valid_semver() {
+        assert!(
+            parse_semver_triple(MIN_HELPER_VERSION).is_some(),
+            "MIN_HELPER_VERSION={MIN_HELPER_VERSION:?} must parse"
+        );
+    }
 }

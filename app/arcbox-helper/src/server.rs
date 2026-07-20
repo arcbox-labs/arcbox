@@ -137,11 +137,11 @@ pub async fn run(idle_exit: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Fallback: bind our own socket (development / manual start).
         //
-        // Socket is 0o666 intentionally for development convenience. In
-        // production, launchd owns the socket (SockPathMode in the plist)
-        // and peer_auth enforces code-signature verification in release
-        // builds. Manual mode is only used on dev machines where the
-        // threat model doesn't include local privilege escalation.
+        // Mode 0o666 matches the production launchd plist (`SockPathMode`
+        // 438). Auth is **not** the filesystem mode — release builds always
+        // run `peer_auth::verify` (code signature + Team ID allow-list) before
+        // any RPC is dispatched. Manual mode is for dev machines; do not
+        // disable peer auth in release to "make local testing easier".
         let path = arcbox_helper::socket_path();
         let _ = std::fs::remove_file(&path);
 
