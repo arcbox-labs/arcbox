@@ -172,13 +172,39 @@ pub const DOCKER_CLI_PLUGINS: &[&str] = &["docker-buildx", "docker-compose"];
 /// Used by multiple subsystems (privileged helper, brew hooks, setup install)
 /// to decide whether an existing `/usr/local/bin/` symlink can be safely replaced.
 ///
+/// Rules mirror the helper's `CliTarget` parser (absolute, under
+/// `/Applications/` or `/Users/`, contains `.app/Contents/MacOS/xbin/`, no
+/// `..`). Kept as a pure path check so callers do not need to depend on the
+/// helper crate.
+///
 /// Gated on the `std` feature: it takes a `std::path::Path`, so it is
 /// unavailable (and unusable) in `no_std` builds.
 #[cfg(feature = "std")]
 pub fn is_arcbox_owned(target: &std::path::Path) -> bool {
-    target
-        .to_string_lossy()
-        .contains(".app/Contents/MacOS/xbin/")
+    use std::path::Component;
+
+    if !target.is_absolute() {
+        return false;
+    }
+    if target
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return false;
+    }
+
+    let s = target.to_string_lossy();
+    if !s.starts_with("/Applications/") && !s.starts_with("/Users/") {
+        return false;
+    }
+
+    let components: Vec<_> = target.components().collect();
+    components.windows(4).any(|w| {
+        matches!(&w[0], Component::Normal(name) if name.to_string_lossy().ends_with(".app"))
+            && w[1] == Component::Normal("Contents".as_ref())
+            && w[2] == Component::Normal("MacOS".as_ref())
+            && w[3] == Component::Normal("xbin".as_ref())
+    })
 }
 
 /// Host-side subdirectory names within the profile data directory.
@@ -356,6 +382,33 @@ mod tests {
             layout.daemon_log,
             PathBuf::from("/tmp/arcbox/log/daemon.log")
         );
+    }
+
+    #[test]
+    fn is_arcbox_owned_matches_cli_target_rules() {
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Applications/ArcBox.app/Contents/MacOS/xbin/docker"
+        )));
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Users/alice/Apps/ArcBox.app/Contents/MacOS/xbin/docker-compose"
+        )));
+        // Relative / traversal / wrong prefix — must not count as ours.
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "Contents/MacOS/xbin/docker"
+        )));
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "/Applications/ArcBox.app/Contents/MacOS/xbin/../../evil"
+        )));
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "/tmp/evil.app/Contents/MacOS/xbin/docker"
+        )));
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "/usr/local/bin/docker"
+        )));
+        // Nested .app/xbin (same rule as CliTarget) is still owned.
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Users/evil/not-really.app/Contents/MacOS/xbin/nested.app/Contents/MacOS/xbin/docker"
+        )));
     }
 
     #[test]

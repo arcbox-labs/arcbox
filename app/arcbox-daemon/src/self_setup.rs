@@ -37,7 +37,10 @@ pub trait SetupTask: Send + Sync {
 ///
 /// Connects once and runs tasks sequentially — this keeps the helper alive
 /// for the duration (launchd socket activation starts it on first connect).
-/// If the helper is unreachable, all tasks are skipped.
+/// If the helper is unreachable **or older than
+/// [`arcbox_constants::helper::MIN_HELPER_VERSION`]**, all tasks are skipped so
+/// we never drive new RPCs (e.g. `hosts_alias_*`) into a legacy binary that
+/// misdecodes tarpc ordinals.
 pub async fn run(tasks: &[&dyn SetupTask]) {
     let client = match Client::connect().await {
         Ok(c) => c,
@@ -50,42 +53,8 @@ pub async fn run(tasks: &[&dyn SetupTask]) {
         }
     };
 
-    match client.version().await {
-        Ok(version) => {
-            let min = arcbox_constants::helper::MIN_HELPER_VERSION;
-            match arcbox_constants::helper::parse_helper_version(&version) {
-                Some(installed) => {
-                    let Some(minimum) = arcbox_constants::helper::parse_semver_triple(min) else {
-                        tracing::warn!(
-                            min_helper_version = min,
-                            "invalid MIN_HELPER_VERSION constant"
-                        );
-                        return;
-                    };
-                    if arcbox_constants::helper::helper_version_satisfies(installed, minimum) {
-                        tracing::debug!(
-                            helper_version = %version,
-                            min_helper_version = min,
-                            "arcbox-helper version ok"
-                        );
-                    } else {
-                        tracing::warn!(
-                            helper_version = %version,
-                            min_helper_version = min,
-                            "arcbox-helper too old; run 'sudo abctl _install --no-daemon --no-shell'"
-                        );
-                    }
-                }
-                None => tracing::warn!(
-                    helper_version = %version,
-                    "unrecognized arcbox-helper version; run 'sudo abctl _install --no-daemon --no-shell'"
-                ),
-            }
-        }
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to check arcbox-helper version"
-        ),
+    if !helper_version_ok(&client).await {
+        return;
     }
 
     for task in tasks {
@@ -101,8 +70,53 @@ pub async fn run(tasks: &[&dyn SetupTask]) {
             Err(e) => tracing::warn!(
                 task = name,
                 error = %e,
-                "failed (run 'sudo arcbox install' to fix)"
+                "failed (run 'sudo abctl _install --no-daemon --no-shell' to fix)"
             ),
         }
+    }
+}
+
+/// Returns `true` when the connected helper meets
+/// [`arcbox_constants::helper::MIN_HELPER_VERSION`].
+///
+/// On failure logs a warning and returns `false` so callers skip privileged
+/// tasks rather than hammering an incompatible helper.
+async fn helper_version_ok(client: &Client) -> bool {
+    let min = arcbox_constants::helper::MIN_HELPER_VERSION;
+    let Ok(version) = client.version().await else {
+        tracing::warn!("failed to check arcbox-helper version; skipping self-setup");
+        return false;
+    };
+
+    let Some(installed) = arcbox_constants::helper::parse_helper_version(&version) else {
+        tracing::warn!(
+            helper_version = %version,
+            "unrecognized arcbox-helper version; run 'sudo abctl _install --no-daemon --no-shell'"
+        );
+        return false;
+    };
+
+    let Some(minimum) = arcbox_constants::helper::parse_semver_triple(min) else {
+        tracing::warn!(
+            min_helper_version = min,
+            "invalid MIN_HELPER_VERSION constant"
+        );
+        return false;
+    };
+
+    if arcbox_constants::helper::helper_version_satisfies(installed, minimum) {
+        tracing::debug!(
+            helper_version = %version,
+            min_helper_version = min,
+            "arcbox-helper version ok"
+        );
+        true
+    } else {
+        tracing::warn!(
+            helper_version = %version,
+            min_helper_version = min,
+            "arcbox-helper too old; skipping self-setup — run 'sudo abctl _install --no-daemon --no-shell'"
+        );
+        false
     }
 }

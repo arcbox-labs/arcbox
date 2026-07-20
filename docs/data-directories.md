@@ -129,6 +129,7 @@ Defined in `app/arcbox-core/src/config.rs` (`user_config_path`,
 ## 3. Privileged Paths (Require Root)
 
 Defined in `common/arcbox-constants/src/paths.rs`, `privileged` module.
+See also [helper.md](helper.md) for versioning, threat model, and ownership rules.
 
 | Path | Purpose | Creator |
 |------|---------|---------|
