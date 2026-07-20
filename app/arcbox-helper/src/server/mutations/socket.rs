@@ -10,6 +10,8 @@ use std::path::Path;
 
 use arcbox_helper::validate::SocketTarget;
 
+use crate::server::fs_root;
+
 /// Standard Docker socket path.
 const DOCKER_SOCK: &str = arcbox_constants::paths::privileged::DOCKER_SOCKET;
 
@@ -20,7 +22,7 @@ const DOCKER_SOCK: &str = arcbox_constants::paths::privileged::DOCKER_SOCKET;
 /// (`~/.arcbox/` or `~/.arcbox-dev/`), it is replaced. Foreign symlinks and
 /// real socket files are refused.
 pub fn link(target: &SocketTarget) -> Result<(), String> {
-    link_at(Path::new(DOCKER_SOCK), target)
+    link_at(&fs_root::resolve(DOCKER_SOCK), target)
 }
 
 /// Removes the `/var/run/docker.sock` symlink **only** when it points into an
@@ -28,7 +30,7 @@ pub fn link(target: &SocketTarget) -> Result<(), String> {
 ///
 /// Idempotent: returns Ok if already absent or not ArcBox-owned.
 pub fn unlink() -> Result<(), String> {
-    unlink_at(Path::new(DOCKER_SOCK))
+    unlink_at(&fs_root::resolve(DOCKER_SOCK))
 }
 
 fn link_at(link_path: &Path, target: &SocketTarget) -> Result<(), String> {

@@ -8,6 +8,8 @@ use std::path::Path;
 
 use arcbox_helper::validate::{DnsPort, Domain};
 
+use crate::server::fs_root;
+
 /// Directory where macOS looks for per-domain resolver files.
 const RESOLVER_DIR: &str = "/etc/resolver";
 
@@ -21,7 +23,7 @@ const MARKER: &str = "# managed by arcbox-helper";
 /// missing. Foreign resolver files (no marker) are refused so we never clobber
 /// admin-managed DNS.
 pub fn install(domain: &Domain, port: DnsPort) -> Result<(), String> {
-    install_at(Path::new(RESOLVER_DIR), domain, port)
+    install_at(&fs_root::resolve(RESOLVER_DIR), domain, port)
 }
 
 /// Removes the resolver file for `domain` **only** when it carries the
@@ -29,7 +31,7 @@ pub fn install(domain: &Domain, port: DnsPort) -> Result<(), String> {
 ///
 /// Idempotent: returns Ok if the file does not exist or is not ours.
 pub fn uninstall(domain: &Domain) -> Result<(), String> {
-    uninstall_at(Path::new(RESOLVER_DIR), domain)
+    uninstall_at(&fs_root::resolve(RESOLVER_DIR), domain)
 }
 
 /// Checks if an ArcBox-managed resolver file is installed for `domain`.
@@ -37,7 +39,7 @@ pub fn uninstall(domain: &Domain) -> Result<(), String> {
 /// Requires the management marker so a hand-written resolver file is not
 /// reported as "ours".
 pub fn status(domain: &Domain) -> Result<bool, String> {
-    status_at(Path::new(RESOLVER_DIR), domain)
+    status_at(&fs_root::resolve(RESOLVER_DIR), domain)
 }
 
 fn install_at(resolver_dir: &Path, domain: &Domain, port: DnsPort) -> Result<(), String> {

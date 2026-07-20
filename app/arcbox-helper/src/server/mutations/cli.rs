@@ -10,6 +10,8 @@ use std::path::Path;
 use arcbox_constants::paths::is_arcbox_owned;
 use arcbox_helper::validate::{CliName, CliTarget};
 
+use crate::server::fs_root;
+
 /// Default install prefix for system-wide CLI symlinks.
 const CLI_BIN_DIR: &str = "/usr/local/bin";
 
@@ -23,14 +25,14 @@ const CLI_BIN_DIR: &str = "/usr/local/bin";
 /// user-writable symlink under `…/xbin/` would let `/usr/local/bin/docker`
 /// resolve to an arbitrary path.
 pub fn link(name: &CliName, target: &CliTarget) -> Result<(), String> {
-    link_at(Path::new(CLI_BIN_DIR), name, target)
+    link_at(&fs_root::resolve(CLI_BIN_DIR), name, target)
 }
 
 /// Removes `/usr/local/bin/{name}` if it is a symlink pointing inside an ArcBox bundle.
 ///
 /// Idempotent: returns Ok if already absent or not an ArcBox-owned symlink.
 pub fn unlink(name: &CliName) -> Result<(), String> {
-    unlink_at(Path::new(CLI_BIN_DIR), name)
+    unlink_at(&fs_root::resolve(CLI_BIN_DIR), name)
 }
 
 /// Testable implementation: operate under `bin_dir` instead of `/usr/local/bin`.
@@ -166,9 +168,10 @@ mod tests {
     #[test]
     fn rejects_missing_target() {
         // Use a path that cannot exist on this machine (unique UUID segment).
-        let display = "/Users/nobody/.arcbox-helper-missing-9f3c2a1b/Apps/ArcBox.app/Contents/MacOS/xbin/docker"
-            .parse::<CliTarget>()
-            .unwrap();
+        let display =
+            "/Users/nobody/.arcbox-helper-missing-9f3c2a1b/Apps/ArcBox.app/Contents/MacOS/xbin/docker"
+                .parse::<CliTarget>()
+                .unwrap();
         let err = ensure_safe_cli_target(Path::new(display.as_str()), &display).unwrap_err();
         assert!(err.contains("does not exist"), "{err}");
     }

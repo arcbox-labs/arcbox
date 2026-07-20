@@ -1,5 +1,6 @@
 //! tarpc server: accept loop, launchd integration, idle shutdown.
 
+pub mod fs_root;
 mod handler;
 mod launchd;
 mod mutations;

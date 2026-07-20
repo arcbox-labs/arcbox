@@ -8,14 +8,25 @@
 //! offers no way to install caller-controlled hosts entries.
 
 use std::fs;
+use std::path::PathBuf;
 
 use arcbox_helper::{HOSTS_ALIAS_LINE as MANAGED_LINE, hosts_alias_installed};
+
+use crate::server::fs_root;
 
 const HOSTS_PATH: &str = "/etc/hosts";
 /// Temp sibling for the atomic rewrite; same filesystem as `/etc/hosts`.
 const HOSTS_TMP_PATH: &str = "/etc/hosts.arcbox.tmp";
 /// Uninstall matcher: any line tagged with this comment is ours.
 const MARKER: &str = "# managed by arcbox-helper";
+
+fn hosts_path() -> PathBuf {
+    fs_root::resolve(HOSTS_PATH)
+}
+
+fn hosts_tmp_path() -> PathBuf {
+    fs_root::resolve(HOSTS_TMP_PATH)
+}
 
 /// Appends the ArcBox alias line to `/etc/hosts`.
 ///
@@ -80,7 +91,16 @@ fn is_managed(line: &str) -> bool {
 }
 
 fn read_hosts() -> Result<String, String> {
-    fs::read_to_string(HOSTS_PATH).map_err(|e| format!("failed to read {HOSTS_PATH}: {e}"))
+    let path = hosts_path();
+    // Under TEST_ROOT the hosts file may not exist yet — treat as empty so
+    // install can create it. Production always has /etc/hosts.
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && fs_root::test_root().is_some() => {
+            Ok(String::new())
+        }
+        Err(e) => Err(format!("failed to read {}: {e}", path.display())),
+    }
 }
 
 /// Replaces `/etc/hosts` atomically: write a temp sibling, fix its mode
@@ -89,13 +109,20 @@ fn read_hosts() -> Result<String, String> {
 fn write_hosts(content: &str) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::write(HOSTS_TMP_PATH, content)
-        .map_err(|e| format!("failed to write {HOSTS_TMP_PATH}: {e}"))?;
-    fs::set_permissions(HOSTS_TMP_PATH, fs::Permissions::from_mode(0o644))
-        .map_err(|e| format!("failed to chmod {HOSTS_TMP_PATH}: {e}"))?;
-    fs::rename(HOSTS_TMP_PATH, HOSTS_PATH).map_err(|e| {
-        let _ = fs::remove_file(HOSTS_TMP_PATH);
-        format!("failed to replace {HOSTS_PATH}: {e}")
+    let hosts = hosts_path();
+    let tmp = hosts_tmp_path();
+
+    if let Some(parent) = hosts.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+
+    fs::write(&tmp, content).map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("failed to chmod {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &hosts).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to replace {}: {e}", hosts.display())
     })
 }
 

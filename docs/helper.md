@@ -91,6 +91,21 @@ If the helper is unreachable, unparseable, or older than
 `MIN_HELPER_VERSION`, daemon `self_setup` **skips all privileged tasks** so it
 never drives new tarpc ordinals into a legacy binary.
 
+## Local E2E (no root)
+
+Debug builds honour `ARCBOX_HELPER_TEST_ROOT`. When set, privileged paths are
+rewritten under that directory so the real helper binary can be exercised
+without touching the live system:
+
+```bash
+cargo test -p arcbox-helper --test e2e_fs_test
+```
+
+Release builds **ignore** the env var (production must never be redirected).
+
+Also covered by unit tests in the helper binary (`--bins`) and mock tarpc
+integration tests (`--tests` excluding `e2e_fs_test`).
+
 ## Non-goals (not 1.0.0 blockers)
 
 - Batch `cli_link` RPC — call sites link a fixed small set of tools.
