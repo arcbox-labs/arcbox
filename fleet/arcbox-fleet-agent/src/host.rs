@@ -69,9 +69,7 @@ pub fn host_info_json() -> String {
         })
         .collect::<Vec<_>>();
 
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok());
+    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
 
     let info = serde_json::json!({
         "os": sysinfo::System::name(),
