@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-helper"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arcbox-constants",
  "arcbox-logging",
