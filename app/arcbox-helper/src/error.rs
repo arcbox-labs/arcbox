@@ -57,6 +57,14 @@ pub enum HelperError {
     /// Prefer a dedicated variant when a call site needs structured matching.
     #[error("{0}")]
     Other(String),
+
+    /// `/var/run/docker.sock` (or sandboxed equivalent) is a real file/socket,
+    /// typically held by Docker Desktop — not a replaceable symlink.
+    ///
+    /// Kept separate from [`Self::NotASymlink`] so `path` stays a pure path and
+    /// UX copy is not stuffed into structured fields.
+    #[error("{path} exists but is not a symlink (is Docker Desktop running? stop it first)")]
+    DockerSocketOccupied { path: String },
 }
 
 impl HelperError {
@@ -100,6 +108,13 @@ impl HelperError {
             path: path.as_ref().display().to_string(),
         }
     }
+
+    #[must_use]
+    pub fn docker_socket_occupied(path: impl AsRef<Path>) -> Self {
+        Self::DockerSocketOccupied {
+            path: path.as_ref().display().to_string(),
+        }
+    }
 }
 
 /// Stable machine-readable code for metrics / Desktop branching.
@@ -117,6 +132,7 @@ impl HelperError {
             Self::ForeignManagedFile { .. } => "foreign_managed_file",
             Self::Io { .. } => "io",
             Self::Other(_) => "other",
+            Self::DockerSocketOccupied { .. } => "docker_socket_occupied",
         }
     }
 }
