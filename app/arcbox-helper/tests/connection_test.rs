@@ -35,6 +35,29 @@ async fn version_returns_helper_crate_version() {
     );
 }
 
+#[tokio::test]
+async fn mutation_client_rejects_an_old_wire_version() {
+    let (client, _dir) = common::setup_with_version("arcbox-helper 0.4.24").await;
+
+    assert!(matches!(
+        client,
+        Err(ClientError::IncompatibleVersion {
+            installed,
+            required: "1.0.0"
+        }) if installed == "arcbox-helper 0.4.24"
+    ));
+}
+
+#[tokio::test]
+async fn mutation_client_rejects_an_unrecognized_version() {
+    let (client, _dir) = common::setup_with_version("arcbox-helper broken").await;
+
+    assert!(matches!(
+        client,
+        Err(ClientError::UnrecognizedVersion(version)) if version == "arcbox-helper broken"
+    ));
+}
+
 /// Package version, workspace path-dep pin, and MIN_HELPER_VERSION must move
 /// together. Catches "bumped Cargo.toml but forgot MIN" before release.
 #[test]

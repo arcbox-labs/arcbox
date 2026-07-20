@@ -215,30 +215,27 @@ fn check_container_route() -> CheckResult {
 #[cfg(target_os = "macos")]
 async fn check_helper() -> CheckResult {
     let min = arcbox_constants::helper::MIN_HELPER_VERSION;
-    match arcbox_helper::client::Client::connect().await {
-        Ok(client) => match client.version().await {
-            Ok(version) => match arcbox_constants::helper::parse_helper_version(&version) {
-                Some(installed) => {
-                    let Some(minimum) = arcbox_constants::helper::parse_semver_triple(min) else {
-                        return CheckResult::Fail(format!(
-                            "invalid MIN_HELPER_VERSION constant {min:?}"
-                        ));
-                    };
-                    if arcbox_constants::helper::helper_version_satisfies(installed, minimum) {
-                        CheckResult::Pass(format!("reachable ({version})"))
-                    } else {
-                        CheckResult::Fail(format!(
-                            "{version} is older than required {min}; run 'sudo abctl _install --no-daemon --no-shell'"
-                        ))
-                    }
+    match arcbox_helper::client::Client::probe_version().await {
+        Ok(version) => match arcbox_constants::helper::parse_helper_version(&version) {
+            Some(installed) => {
+                let Some(minimum) = arcbox_constants::helper::parse_semver_triple(min) else {
+                    return CheckResult::Fail(format!(
+                        "invalid MIN_HELPER_VERSION constant {min:?}"
+                    ));
+                };
+                if arcbox_constants::helper::helper_version_satisfies(installed, minimum) {
+                    CheckResult::Pass(format!("reachable ({version})"))
+                } else {
+                    CheckResult::Fail(format!(
+                        "{version} is older than required {min}; run 'sudo abctl _install --no-daemon --no-shell'"
+                    ))
                 }
-                None => CheckResult::Fail(format!(
-                    "unrecognized version {version:?}; run 'sudo abctl _install --no-daemon --no-shell'"
-                )),
-            },
-            Err(e) => CheckResult::Fail(format!("version check failed: {e}")),
+            }
+            None => CheckResult::Fail(format!(
+                "unrecognized version {version:?}; run 'sudo abctl _install --no-daemon --no-shell'"
+            )),
         },
-        Err(e) => CheckResult::Fail(format!("not reachable via launchd socket: {e}")),
+        Err(e) => CheckResult::Fail(format!("version check failed: {e}")),
     }
 }
 
