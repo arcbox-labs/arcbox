@@ -43,9 +43,10 @@ pub enum RouteError {
 impl From<ClientError> for RouteError {
     fn from(e: ClientError) -> Self {
         match e {
-            ClientError::Connection(_) | ClientError::Rpc(_) => {
-                Self::HelperUnavailable(e.to_string())
-            }
+            ClientError::Connection(_)
+            | ClientError::Rpc(_)
+            | ClientError::UnrecognizedVersion(_)
+            | ClientError::IncompatibleVersion { .. } => Self::HelperUnavailable(e.to_string()),
             ClientError::Helper(err) => Self::RouteFailed(err.to_string()),
         }
     }

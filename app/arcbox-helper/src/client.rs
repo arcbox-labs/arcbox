@@ -16,6 +16,17 @@ pub enum ClientError {
     /// tarpc transport or RPC-level failure.
     #[error("helper rpc failed: {0}")]
     Rpc(#[from] tarpc::client::RpcError),
+    /// The helper returned a version string that cannot be interpreted safely.
+    #[error("unrecognized helper version {0:?}")]
+    UnrecognizedVersion(String),
+    /// The helper's RPC wire major or minimum version is incompatible.
+    #[error("helper {installed} is incompatible; required {required}")]
+    IncompatibleVersion {
+        /// Version line returned by the helper.
+        installed: String,
+        /// Minimum compatible helper version.
+        required: &'static str,
+    },
     /// The helper executed the operation but it returned a structured error.
     #[error(transparent)]
     Helper(#[from] HelperError),
@@ -30,16 +41,21 @@ impl Client {
     /// Connects to the helper daemon via Unix socket.
     ///
     /// Uses launchd-managed socket by default (`/var/run/arcbox-helper.sock`),
-    /// overridable via `ARCBOX_HELPER_SOCKET` env var.
+    /// overridable via `ARCBOX_HELPER_SOCKET` env var. The connection is
+    /// rejected before any mutation when the helper wire version is
+    /// incompatible with this client.
     pub async fn connect() -> Result<Self, ClientError> {
         let inner = crate::connect().await?;
-        Ok(Self { inner })
+        let client = Self { inner };
+        client.ensure_compatible().await?;
+        Ok(client)
     }
 
     /// Connects to the helper daemon at an explicit socket path.
     ///
     /// Unlike [`connect()`](Self::connect), this does not read the
-    /// `ARCBOX_HELPER_SOCKET` env var, making it safe for parallel tests.
+    /// `ARCBOX_HELPER_SOCKET` env var, making it safe for parallel tests. It
+    /// enforces the same wire-version check as [`connect()`](Self::connect).
     pub async fn connect_to(path: &str) -> Result<Self, ClientError> {
         let transport = tarpc::serde_transport::unix::connect(
             path,
@@ -48,7 +64,19 @@ impl Client {
         .await?;
         let inner =
             crate::HelperServiceClient::new(tarpc::client::Config::default(), transport).spawn();
-        Ok(Self { inner })
+        let client = Self { inner };
+        client.ensure_compatible().await?;
+        Ok(client)
+    }
+
+    /// Connects only long enough to report the installed helper version.
+    ///
+    /// This intentionally skips compatibility enforcement so diagnostics can
+    /// explain why an old helper must be replaced. It never exposes a client
+    /// capable of sending mutation RPCs.
+    pub async fn probe_version() -> Result<String, ClientError> {
+        let inner = crate::connect().await?;
+        Self { inner }.version().await
     }
 
     /// Adds a host route for `subnet` via `iface`.
@@ -150,5 +178,23 @@ impl Client {
     /// Returns the helper daemon version.
     pub async fn version(&self) -> Result<String, ClientError> {
         Ok(self.inner.version(tarpc::context::current()).await?)
+    }
+
+    async fn ensure_compatible(&self) -> Result<(), ClientError> {
+        let version = self.version().await?;
+        let installed = arcbox_constants::helper::parse_helper_version(&version)
+            .ok_or_else(|| ClientError::UnrecognizedVersion(version.clone()))?;
+        let required = arcbox_constants::helper::MIN_HELPER_VERSION;
+        let minimum = arcbox_constants::helper::parse_semver_triple(required)
+            .expect("MIN_HELPER_VERSION is covered by a unit test");
+
+        if arcbox_constants::helper::helper_version_satisfies(installed, minimum) {
+            Ok(())
+        } else {
+            Err(ClientError::IncompatibleVersion {
+                installed: version,
+                required,
+            })
+        }
     }
 }

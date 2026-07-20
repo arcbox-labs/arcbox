@@ -13,7 +13,9 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 
 #[derive(Clone)]
-pub struct MockHelperServer;
+pub struct MockHelperServer {
+    version: String,
+}
 
 impl HelperService for MockHelperServer {
     async fn route_add(
@@ -107,18 +109,33 @@ impl HelperService for MockHelperServer {
     }
 
     async fn version(self, _: tarpc::context::Context) -> String {
-        format!("arcbox-helper {}", env!("CARGO_PKG_VERSION"))
+        self.version
     }
 }
 
 /// Starts a mock server on a temp socket and returns a connected `Client`.
 pub async fn setup() -> (Client, tempfile::TempDir) {
+    let version = format!("arcbox-helper {}", env!("CARGO_PKG_VERSION"));
+    let (client, dir) = setup_with_version(&version).await;
+    (client.unwrap(), dir)
+}
+
+/// Starts a mock server with a caller-selected version response.
+pub async fn setup_with_version(
+    version: &str,
+) -> (
+    Result<Client, arcbox_helper::client::ClientError>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("helper.sock");
     let sock_str = sock_path.to_str().unwrap().to_string();
 
     let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
     let codec = tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec::builder();
+    let server = MockHelperServer {
+        version: version.to_owned(),
+    };
 
     tokio::spawn(async move {
         loop {
@@ -128,7 +145,7 @@ pub async fn setup() -> (Client, tempfile::TempDir) {
             let transport = tarpc::serde_transport::new(codec.new_framed(conn), Bincode::default());
             tokio::spawn(
                 BaseChannel::with_defaults(transport)
-                    .execute(MockHelperServer.serve())
+                    .execute(server.clone().serve())
                     .for_each(|resp| async {
                         tokio::spawn(resp);
                     }),
@@ -136,6 +153,6 @@ pub async fn setup() -> (Client, tempfile::TempDir) {
         }
     });
 
-    let client = Client::connect_to(&sock_str).await.unwrap();
+    let client = Client::connect_to(&sock_str).await;
     (client, dir)
 }
