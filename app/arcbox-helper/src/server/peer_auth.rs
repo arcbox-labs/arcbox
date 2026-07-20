@@ -19,14 +19,8 @@
 //! - Debug: skip (dev ergonomics only — never ship a release helper without
 //!   this gate).
 //!
-//! Authentication flow (release):
-//! 1. Prefer `LOCAL_PEERTOKEN` when the kernel provides it.
-//! 2. Fall back to `LOCAL_PEERPID`.
-//! 3. `SecCodeCopyGuestWithAttributes` → `SecCodeCheckValidity` against
-//!    `identifier "…" and anchor apple generic and certificate leaf[subject.OU] = "TEAM"`.
-
-#[cfg(not(debug_assertions))]
-use std::os::unix::io::AsRawFd;
+//! Implementation uses the `security-framework` crate's code-signing bindings
+//! (`GuestAttributes`, `SecCode`, `SecRequirement`).
 
 /// ArcBox Team ID (Apple Developer Portal).
 #[cfg(any(test, not(debug_assertions)))]
@@ -62,7 +56,7 @@ pub fn verify(_stream: &tokio::net::UnixStream) -> bool {
 pub fn verify(stream: &tokio::net::UnixStream) -> bool {
     if let Some(token) = peer_audit_token(stream) {
         for identifier in ALLOWED_IDENTIFIERS {
-            if security::check_code_signature_audit(&token, identifier, TEAM_ID) {
+            if check_code_signature_audit(&token, identifier, TEAM_ID) {
                 tracing::debug!(identifier, source = "audit_token", "peer auth: accepted");
                 return true;
             }
@@ -85,7 +79,7 @@ pub fn verify(stream: &tokio::net::UnixStream) -> bool {
     };
 
     for identifier in ALLOWED_IDENTIFIERS {
-        if security::check_code_signature_pid(pid, identifier, TEAM_ID) {
+        if check_code_signature_pid(pid, identifier, TEAM_ID) {
             tracing::debug!(pid, identifier, source = "pid", "peer auth: accepted");
             return true;
         }
@@ -103,6 +97,8 @@ pub fn verify(stream: &tokio::net::UnixStream) -> bool {
 /// Peer PID via `LOCAL_PEERPID`.
 #[cfg(not(debug_assertions))]
 fn peer_pid(stream: &tokio::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+
     let fd = stream.as_raw_fd();
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
@@ -121,11 +117,38 @@ fn peer_pid(stream: &tokio::net::UnixStream) -> Option<i32> {
     if ret == 0 { Some(pid) } else { None }
 }
 
+/// macOS `audit_token_t` — 8 × u32.
+#[cfg(not(debug_assertions))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AuditToken {
+    vals: [u32; 8],
+}
+
+#[cfg(not(debug_assertions))]
+impl AuditToken {
+    fn zeroed() -> Self {
+        Self { vals: [0; 8] }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: plain POD, no padding concerns for [u32; 8].
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
 /// Peer audit token via `LOCAL_PEERTOKEN` (macOS).
 #[cfg(not(debug_assertions))]
-fn peer_audit_token(stream: &tokio::net::UnixStream) -> Option<security::AuditToken> {
+fn peer_audit_token(stream: &tokio::net::UnixStream) -> Option<AuditToken> {
+    use std::os::unix::io::AsRawFd;
+
     let fd = stream.as_raw_fd();
-    let mut token = security::AuditToken::zeroed();
+    let mut token = AuditToken::zeroed();
     let mut len = std::mem::size_of_val(&token) as libc::socklen_t;
 
     // SAFETY: getsockopt with a valid fd and correctly sized audit_token_t.
@@ -143,245 +166,59 @@ fn peer_audit_token(stream: &tokio::net::UnixStream) -> Option<security::AuditTo
 }
 
 #[cfg(not(debug_assertions))]
-mod security {
-    use std::ffi::c_void;
-    use std::ptr;
+fn requirement_string(identifier: &str, team_id: &str) -> String {
+    format!(
+        "identifier \"{identifier}\" and \
+         anchor apple generic and \
+         certificate leaf[subject.OU] = \"{team_id}\""
+    )
+}
 
-    // Opaque types from Security.framework.
-    type SecCodeRef = *const c_void;
-    type SecRequirementRef = *const c_void;
+/// `kSecCSCheckNestedCode | kSecCSStrictValidate`.
+#[cfg(not(debug_assertions))]
+fn check_flags() -> security_framework::os::macos::code_signing::Flags {
+    use security_framework::os::macos::code_signing::Flags;
+    Flags::CHECK_NESTED_CODE | Flags::STRICT_VALIDATE
+}
 
-    // CoreFoundation types.
-    type CFDictionaryRef = *const c_void;
-    type CFStringRef = *const c_void;
-    type CFNumberRef = *const c_void;
-    type CFAllocatorRef = *const c_void;
-    type CFDataRef = *const c_void;
+#[cfg(not(debug_assertions))]
+fn check_code_signature_pid(pid: i32, identifier: &str, team_id: &str) -> bool {
+    use security_framework::os::macos::code_signing::{GuestAttributes, SecCode, SecRequirement};
 
-    const K_CF_ALLOCATOR_DEFAULT: CFAllocatorRef = ptr::null();
-    /// `kCFNumberIntType` (CFNumber.h).
-    const K_CF_NUMBER_INT_TYPE: isize = 9;
+    let mut attrs = GuestAttributes::new();
+    attrs.set_pid(pid);
+    let Ok(code) = SecCode::copy_guest_with_attribues(None, &attrs, Default::default()) else {
+        return false;
+    };
+    let Ok(req) = requirement_string(identifier, team_id).parse::<SecRequirement>() else {
+        return false;
+    };
+    code.check_validity(check_flags(), &req).is_ok()
+}
 
-    /// `kSecCSDefaultFlags | kSecCSCheckNestedCode | kSecCSStrictValidate`
-    /// from SecStaticCode.h / CSCommon.h:
-    /// - `kSecCSDefaultFlags = 0`
-    /// - `kSecCSCheckNestedCode = 1 << 3`
-    /// - `kSecCSStrictValidate = 1 << 4`
-    // kSecCSDefaultFlags (= 0) is intentionally omitted: ORing identity zero
-    // trips clippy::identity_op. Nested + strict is the full check set.
-    pub(super) const SEC_CS_CHECK_FLAGS: u32 = (1 << 3) | (1 << 4);
+#[cfg(not(debug_assertions))]
+fn check_code_signature_audit(token: &AuditToken, identifier: &str, team_id: &str) -> bool {
+    use core_foundation::base::TCFType;
+    use core_foundation::data::CFData;
+    use security_framework::os::macos::code_signing::{GuestAttributes, SecCode, SecRequirement};
 
-    /// macOS `audit_token_t` — 8 × u32.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct AuditToken {
-        vals: [u32; 8],
-    }
+    let token_data = CFData::from_buffer(token.as_bytes());
+    let mut attrs = GuestAttributes::new();
+    attrs.set_audit_token(token_data.as_concrete_TypeRef());
 
-    impl AuditToken {
-        pub fn zeroed() -> Self {
-            Self { vals: [0; 8] }
-        }
-    }
-
-    #[link(name = "Security", kind = "framework")]
-    unsafe extern "C" {
-        fn SecCodeCopyGuestWithAttributes(
-            host: SecCodeRef,
-            attrs: CFDictionaryRef,
-            flags: u32,
-            guest: *mut SecCodeRef,
-        ) -> i32;
-
-        fn SecCodeCheckValidity(
-            code: SecCodeRef,
-            flags: u32,
-            requirement: SecRequirementRef,
-        ) -> i32;
-
-        fn SecRequirementCreateWithString(
-            text: CFStringRef,
-            flags: u32,
-            requirement: *mut SecRequirementRef,
-        ) -> i32;
-
-        static kSecGuestAttributePid: CFStringRef;
-        static kSecGuestAttributeAudit: CFStringRef;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFDictionaryCreate(
-            allocator: CFAllocatorRef,
-            keys: *const *const c_void,
-            values: *const *const c_void,
-            num_values: isize,
-            key_callbacks: *const c_void,
-            value_callbacks: *const c_void,
-        ) -> CFDictionaryRef;
-
-        fn CFNumberCreate(
-            allocator: CFAllocatorRef,
-            the_type: isize,
-            value_ptr: *const c_void,
-        ) -> CFNumberRef;
-
-        fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: isize) -> CFDataRef;
-
-        fn CFRelease(cf: *const c_void);
-
-        static kCFTypeDictionaryKeyCallBacks: c_void;
-        static kCFTypeDictionaryValueCallBacks: c_void;
-    }
-
-    /// Creates a CFString from a Rust &str. Caller must CFRelease.
-    unsafe fn cf_string(s: &str) -> CFStringRef {
-        #[link(name = "CoreFoundation", kind = "framework")]
-        unsafe extern "C" {
-            fn CFStringCreateWithBytes(
-                alloc: CFAllocatorRef,
-                bytes: *const u8,
-                num_bytes: isize,
-                encoding: u32,
-                is_external: u8,
-            ) -> CFStringRef;
-        }
-
-        const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
-
-        let Ok(num_bytes) = isize::try_from(s.len()) else {
-            return std::ptr::null();
-        };
-
-        unsafe {
-            CFStringCreateWithBytes(
-                K_CF_ALLOCATOR_DEFAULT,
-                s.as_ptr(),
-                num_bytes,
-                K_CF_STRING_ENCODING_UTF8,
-                0,
-            )
-        }
-    }
-
-    fn requirement_string(identifier: &str, team_id: &str) -> String {
-        // Apple generic anchor + leaf OU (Team ID). Matches Developer ID and
-        // Apple Development leaves under the same team — both are used for
-        // local daemon builds that still need helper access.
-        format!(
-            "identifier \"{identifier}\" and \
-             anchor apple generic and \
-             certificate leaf[subject.OU] = \"{team_id}\""
-        )
-    }
-
-    /// Takes ownership of `attrs` (always CFRelease'd).
-    unsafe fn check_with_attrs(attrs: CFDictionaryRef, identifier: &str, team_id: &str) -> bool {
-        if attrs.is_null() {
-            return false;
-        }
-
-        let mut code: SecCodeRef = ptr::null();
-        let status =
-            unsafe { SecCodeCopyGuestWithAttributes(ptr::null(), attrs, 0, &raw mut code) };
-        unsafe { CFRelease(attrs) };
-
-        if status != 0 || code.is_null() {
-            return false;
-        }
-
-        let req_str = requirement_string(identifier, team_id);
-        let cf_req_str = unsafe { cf_string(&req_str) };
-        if cf_req_str.is_null() {
-            unsafe { CFRelease(code) };
-            return false;
-        }
-
-        let mut requirement: SecRequirementRef = ptr::null();
-        let status = unsafe { SecRequirementCreateWithString(cf_req_str, 0, &raw mut requirement) };
-        unsafe { CFRelease(cf_req_str) };
-
-        if status != 0 || requirement.is_null() {
-            unsafe { CFRelease(code) };
-            return false;
-        }
-
-        let status = unsafe { SecCodeCheckValidity(code, SEC_CS_CHECK_FLAGS, requirement) };
-        unsafe {
-            CFRelease(requirement);
-            CFRelease(code);
-        }
-
-        status == 0
-    }
-
-    /// Verifies that `pid` is signed with `identifier` by `team_id`.
-    pub fn check_code_signature_pid(pid: i32, identifier: &str, team_id: &str) -> bool {
-        unsafe {
-            let pid_number = CFNumberCreate(
-                K_CF_ALLOCATOR_DEFAULT,
-                K_CF_NUMBER_INT_TYPE,
-                (&raw const pid).cast::<c_void>(),
-            );
-            if pid_number.is_null() {
-                return false;
-            }
-
-            let keys = [kSecGuestAttributePid];
-            let values = [pid_number];
-            let attrs = CFDictionaryCreate(
-                K_CF_ALLOCATOR_DEFAULT,
-                keys.as_ptr().cast(),
-                values.as_ptr().cast(),
-                1,
-                &raw const kCFTypeDictionaryKeyCallBacks,
-                &raw const kCFTypeDictionaryValueCallBacks,
-            );
-            // Dictionary retains values; release our local ref.
-            CFRelease(pid_number);
-
-            check_with_attrs(attrs, identifier, team_id)
-        }
-    }
-
-    /// Verifies the process identified by `token` is signed with `identifier`
-    /// by `team_id`. Prefer this over PID when `LOCAL_PEERTOKEN` is available.
-    pub fn check_code_signature_audit(token: &AuditToken, identifier: &str, team_id: &str) -> bool {
-        unsafe {
-            let token_bytes = std::slice::from_raw_parts(
-                std::ptr::from_ref(token).cast::<u8>(),
-                std::mem::size_of::<AuditToken>(),
-            );
-            let Ok(len) = isize::try_from(token_bytes.len()) else {
-                return false;
-            };
-            let token_data = CFDataCreate(K_CF_ALLOCATOR_DEFAULT, token_bytes.as_ptr(), len);
-            if token_data.is_null() {
-                return false;
-            }
-
-            let keys = [kSecGuestAttributeAudit];
-            let values = [token_data];
-            let attrs = CFDictionaryCreate(
-                K_CF_ALLOCATOR_DEFAULT,
-                keys.as_ptr().cast(),
-                values.as_ptr().cast(),
-                1,
-                &raw const kCFTypeDictionaryKeyCallBacks,
-                &raw const kCFTypeDictionaryValueCallBacks,
-            );
-            CFRelease(token_data);
-
-            check_with_attrs(attrs, identifier, team_id)
-        }
-    }
+    let Ok(code) = SecCode::copy_guest_with_attribues(None, &attrs, Default::default()) else {
+        return false;
+    };
+    let Ok(req) = requirement_string(identifier, team_id).parse::<SecRequirement>() else {
+        return false;
+    };
+    code.check_validity(check_flags(), &req).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn allowed_identifiers_are_nonempty_and_arcbox() {
-        // Compile-time sanity: every allowed id is under our reverse-DNS.
         for id in super::ALLOWED_IDENTIFIERS {
             assert!(
                 id.starts_with("com.arcboxlabs."),
@@ -394,8 +231,10 @@ mod tests {
 
     #[test]
     #[cfg(not(debug_assertions))]
-    fn sec_cs_check_flags_match_apple_headers() {
-        // kSecCSCheckNestedCode = 1<<3, kSecCSStrictValidate = 1<<4
-        assert_eq!(super::security::SEC_CS_CHECK_FLAGS, (1 << 3) | (1 << 4));
+    fn check_flags_include_nested_and_strict() {
+        use security_framework::os::macos::code_signing::Flags;
+        let f = super::check_flags();
+        assert!(f.contains(Flags::CHECK_NESTED_CODE));
+        assert!(f.contains(Flags::STRICT_VALIDATE));
     }
 }

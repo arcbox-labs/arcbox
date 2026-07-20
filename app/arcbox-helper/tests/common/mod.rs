@@ -4,6 +4,7 @@
 //! operations, plus a `setup()` helper that spins up the mock on a temp
 //! Unix socket and returns a connected `Client`.
 
+use arcbox_helper::HelperError;
 use arcbox_helper::HelperService;
 use arcbox_helper::client::Client;
 use arcbox_helper::validate;
@@ -20,14 +21,18 @@ impl HelperService for MockHelperServer {
         _: tarpc::context::Context,
         subnet: String,
         iface: String,
-    ) -> Result<(), String> {
-        validate::validate_subnet(&subnet)?;
-        validate::validate_iface(&iface)?;
+    ) -> Result<(), HelperError> {
+        validate::validate_subnet(&subnet).map_err(HelperError::validation)?;
+        validate::validate_iface(&iface).map_err(HelperError::validation)?;
         Ok(())
     }
 
-    async fn route_remove(self, _: tarpc::context::Context, subnet: String) -> Result<(), String> {
-        validate::validate_subnet(&subnet)?;
+    async fn route_remove(
+        self,
+        _: tarpc::context::Context,
+        subnet: String,
+    ) -> Result<(), HelperError> {
+        validate::validate_subnet(&subnet).map_err(HelperError::validation)?;
         Ok(())
     }
 
@@ -36,40 +41,52 @@ impl HelperService for MockHelperServer {
         _: tarpc::context::Context,
         domain: String,
         port: u16,
-    ) -> Result<(), String> {
-        validate::validate_domain(&domain)?;
-        validate::validate_port(port)?;
+    ) -> Result<(), HelperError> {
+        validate::validate_domain(&domain).map_err(HelperError::validation)?;
+        validate::validate_port(port).map_err(HelperError::validation)?;
         Ok(())
     }
 
-    async fn dns_uninstall(self, _: tarpc::context::Context, domain: String) -> Result<(), String> {
-        validate::validate_domain(&domain)?;
+    async fn dns_uninstall(
+        self,
+        _: tarpc::context::Context,
+        domain: String,
+    ) -> Result<(), HelperError> {
+        validate::validate_domain(&domain).map_err(HelperError::validation)?;
         Ok(())
     }
 
-    async fn dns_status(self, _: tarpc::context::Context, domain: String) -> Result<bool, String> {
-        validate::validate_domain(&domain)?;
+    async fn dns_status(
+        self,
+        _: tarpc::context::Context,
+        domain: String,
+    ) -> Result<bool, HelperError> {
+        validate::validate_domain(&domain).map_err(HelperError::validation)?;
         Ok(false)
     }
 
-    async fn hosts_alias_install(self, _: tarpc::context::Context) -> Result<(), String> {
+    async fn hosts_alias_install(self, _: tarpc::context::Context) -> Result<(), HelperError> {
         Ok(())
     }
 
-    async fn hosts_alias_uninstall(self, _: tarpc::context::Context) -> Result<(), String> {
+    async fn hosts_alias_uninstall(self, _: tarpc::context::Context) -> Result<(), HelperError> {
         Ok(())
     }
 
-    async fn hosts_alias_status(self, _: tarpc::context::Context) -> Result<bool, String> {
+    async fn hosts_alias_status(self, _: tarpc::context::Context) -> Result<bool, HelperError> {
         Ok(false)
     }
 
-    async fn socket_link(self, _: tarpc::context::Context, target: String) -> Result<(), String> {
-        validate::validate_socket_target(&target)?;
+    async fn socket_link(
+        self,
+        _: tarpc::context::Context,
+        target: String,
+    ) -> Result<(), HelperError> {
+        validate::validate_socket_target(&target).map_err(HelperError::validation)?;
         Ok(())
     }
 
-    async fn socket_unlink(self, _: tarpc::context::Context) -> Result<(), String> {
+    async fn socket_unlink(self, _: tarpc::context::Context) -> Result<(), HelperError> {
         Ok(())
     }
 
@@ -78,14 +95,14 @@ impl HelperService for MockHelperServer {
         _: tarpc::context::Context,
         name: String,
         target: String,
-    ) -> Result<(), String> {
-        validate::validate_cli_name(&name)?;
-        validate::validate_cli_target(&target)?;
+    ) -> Result<(), HelperError> {
+        validate::validate_cli_name(&name).map_err(HelperError::validation)?;
+        validate::validate_cli_target(&target).map_err(HelperError::validation)?;
         Ok(())
     }
 
-    async fn cli_unlink(self, _: tarpc::context::Context, name: String) -> Result<(), String> {
-        validate::validate_cli_name(&name)?;
+    async fn cli_unlink(self, _: tarpc::context::Context, name: String) -> Result<(), HelperError> {
+        validate::validate_cli_name(&name).map_err(HelperError::validation)?;
         Ok(())
     }
 
@@ -95,9 +112,6 @@ impl HelperService for MockHelperServer {
 }
 
 /// Starts a mock server on a temp socket and returns a connected `Client`.
-///
-/// The returned `TempDir` must be kept alive for the duration of the test
-/// so the socket file is not cleaned up prematurely.
 pub async fn setup() -> (Client, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("helper.sock");

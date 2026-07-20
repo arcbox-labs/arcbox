@@ -5,6 +5,7 @@
 //! instead of managing tarpc connections directly.
 
 use crate::HelperServiceClient;
+use crate::error::HelperError;
 
 /// Errors from helper client operations.
 #[derive(Debug, thiserror::Error)]
@@ -15,9 +16,9 @@ pub enum ClientError {
     /// tarpc transport or RPC-level failure.
     #[error("helper rpc failed: {0}")]
     Rpc(#[from] tarpc::client::RpcError),
-    /// The helper executed the operation but it returned an error.
-    #[error("helper error: {0}")]
-    Helper(String),
+    /// The helper executed the operation but it returned a structured error.
+    #[error(transparent)]
+    Helper(#[from] HelperError),
 }
 
 /// Client for the arcbox-helper privileged daemon.
@@ -52,98 +53,98 @@ impl Client {
 
     /// Adds a host route for `subnet` via `iface`.
     pub async fn route_add(&self, subnet: &str, iface: &str) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .route_add(tarpc::context::current(), subnet.into(), iface.into())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Removes the host route for `subnet`.
     pub async fn route_remove(&self, subnet: &str) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .route_remove(tarpc::context::current(), subnet.into())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Installs a DNS resolver file for `domain` on port `port`.
     pub async fn dns_install(&self, domain: &str, port: u16) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .dns_install(tarpc::context::current(), domain.into(), port)
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Removes the DNS resolver file for `domain`.
     pub async fn dns_uninstall(&self, domain: &str) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .dns_uninstall(tarpc::context::current(), domain.into())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Checks if a DNS resolver file is installed for `domain`.
     pub async fn dns_status(&self, domain: &str) -> Result<bool, ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .dns_status(tarpc::context::current(), domain.into())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Appends the fixed `127.0.0.1 ArcBox` alias to `/etc/hosts`.
     pub async fn hosts_alias_install(&self) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .hosts_alias_install(tarpc::context::current())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Removes the ArcBox alias line from `/etc/hosts`.
     pub async fn hosts_alias_uninstall(&self) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .hosts_alias_uninstall(tarpc::context::current())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Checks whether the ArcBox `/etc/hosts` alias is installed.
     pub async fn hosts_alias_status(&self) -> Result<bool, ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .hosts_alias_status(tarpc::context::current())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Creates the `/var/run/docker.sock` → `target` symlink.
     pub async fn socket_link(&self, target: &str) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .socket_link(tarpc::context::current(), target.into())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Removes the `/var/run/docker.sock` symlink.
     pub async fn socket_unlink(&self) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .socket_unlink(tarpc::context::current())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Creates `/usr/local/bin/{name}` → `target` symlink.
     pub async fn cli_link(&self, name: &str, target: &str) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .cli_link(tarpc::context::current(), name.into(), target.into())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Removes `/usr/local/bin/{name}` symlink if ArcBox-owned.
     pub async fn cli_unlink(&self, name: &str) -> Result<(), ClientError> {
-        self.inner
+        Ok(self
+            .inner
             .cli_unlink(tarpc::context::current(), name.into())
-            .await?
-            .map_err(ClientError::Helper)
+            .await??)
     }
 
     /// Returns the helper daemon version.

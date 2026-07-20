@@ -106,13 +106,24 @@ Release builds **ignore** the env var (production must never be redirected).
 Also covered by unit tests in the helper binary (`--bins`) and mock tarpc
 integration tests (`--tests` excluding `e2e_fs_test`).
 
+## Wire errors
+
+RPC failures use structured [`HelperError`](../app/arcbox-helper/src/error.rs)
+(`Result<(), HelperError>` over bincode). Variants are **append-only** (index
+encoded). Clients match on `HelperError::code()` / enum arms; `Display` remains
+human-readable for logs.
+
+## Peer auth implementation
+
+Release builds use the `security-framework` crate
+(`GuestAttributes` + `SecCode` + `SecRequirement`) rather than hand-rolled
+Security.framework FFI. Debug builds skip signature checks.
+
 ## Non-goals (not 1.0.0 blockers)
 
 - Batch `cli_link` RPC — call sites link a fixed small set of tools.
 - Helper `health` RPC — `version` + connect success is enough for doctor.
 - Doctor codesign detail dump — useful later; not required for correctness.
-- Structured tarpc error enums — wire remains `Result<(), String>`; internal
-  mutations keep ownership/safety checks regardless of error type.
 
 ## Related paths
 

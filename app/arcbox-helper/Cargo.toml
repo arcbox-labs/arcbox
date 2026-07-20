@@ -34,6 +34,10 @@ arcbox-route = { workspace = true }
 tracing = { workspace = true }
 tokio-util = "0.7"
 ipnetwork = "0.21.1"
+# Code-signing peer auth (release). default-features off: we only need
+# os::macos::code_signing, not Secure Transport / ALPN.
+security-framework = { version = "3.7", default-features = false }
+core-foundation = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

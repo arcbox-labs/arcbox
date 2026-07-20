@@ -46,7 +46,7 @@ impl From<ClientError> for RouteError {
             ClientError::Connection(_) | ClientError::Rpc(_) => {
                 Self::HelperUnavailable(e.to_string())
             }
-            ClientError::Helper(msg) => Self::RouteFailed(msg),
+            ClientError::Helper(err) => Self::RouteFailed(err.to_string()),
         }
     }
 }
@@ -158,7 +158,7 @@ pub async fn remove_route() {
         Ok(()) => {
             tracing::info!(subnet = CONTAINER_SUBNET, "route removed");
         }
-        Err(ClientError::Helper(msg)) if msg.contains("not in table") => {
+        Err(ClientError::Helper(err)) if err.to_string().contains("not in table") => {
             tracing::debug!(subnet = CONTAINER_SUBNET, "route already absent");
         }
         Err(e) => {

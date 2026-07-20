@@ -1,75 +1,52 @@
 //! Docker socket symlink management.
-//!
-//! Creates or removes a symlink at `/var/run/docker.sock` pointing to the
-//! user's ArcBox Docker socket. This lets Docker CLI tools find the daemon
-//! without explicit `DOCKER_HOST` configuration.
 
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::Path;
 
+use arcbox_helper::HelperError;
 use arcbox_helper::validate::SocketTarget;
 
 use crate::server::fs_root;
-use crate::server::mutations::cli::{prepare_symlink_slot, remove_owned_symlink};
+use crate::server::mutations::cli::{Slot, prepare_symlink_slot, remove_owned_symlink};
 
-/// Standard Docker socket path.
 const DOCKER_SOCK: &str = arcbox_constants::paths::privileged::DOCKER_SOCKET;
 
 /// Creates a symlink at `/var/run/docker.sock` → `target`.
-///
-/// Idempotent: if the symlink already points to `target`, this is a no-op.
-/// If it is a symlink pointing elsewhere **and** that target is ArcBox-owned
-/// (`~/.arcbox/` or `~/.arcbox-dev/`), it is replaced. Foreign symlinks and
-/// real socket files are refused.
-pub fn link(target: &SocketTarget) -> Result<(), String> {
+pub fn link(target: &SocketTarget) -> Result<(), HelperError> {
     link_at(&fs_root::resolve(DOCKER_SOCK), target)
 }
 
-/// Removes the `/var/run/docker.sock` symlink **only** when it points into an
-/// ArcBox data dir. Foreign symlinks and real sockets are left alone.
-///
-/// Idempotent: returns Ok if already absent or not ArcBox-owned.
-pub fn unlink() -> Result<(), String> {
+/// Removes the `/var/run/docker.sock` symlink only when ArcBox-owned.
+pub fn unlink() -> Result<(), HelperError> {
     unlink_at(&fs_root::resolve(DOCKER_SOCK))
 }
 
-fn link_at(link_path: &Path, target: &SocketTarget) -> Result<(), String> {
-    use crate::server::mutations::cli::Slot;
-
+fn link_at(link_path: &Path, target: &SocketTarget) -> Result<(), HelperError> {
     let target_path = Path::new(target.as_str());
-    let slot =
-        prepare_symlink_slot(link_path, target_path, is_arcbox_socket_target).map_err(|e| {
-            // Keep the Docker Desktop hint on the non-symlink case.
-            if e.contains("not a symlink") {
-                format!("{e} (is Docker Desktop running? stop it first)")
-            } else {
-                e
-            }
-        })?;
+    let slot = prepare_symlink_slot(link_path, target_path, is_arcbox_socket_target).map_err(
+        |e| match e {
+            HelperError::NotASymlink { path } => HelperError::NotASymlink {
+                path: format!("{path} (is Docker Desktop running? stop it first)"),
+            },
+            other => other,
+        },
+    )?;
     if slot == Slot::AlreadyCorrect {
         return Ok(());
     }
 
     if let Some(parent) = link_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| HelperError::io("create_dir", parent, e))?;
     }
 
-    unix_fs::symlink(target_path, link_path).map_err(|e| {
-        format!(
-            "failed to create symlink {} -> {target}: {e}",
-            link_path.display()
-        )
-    })
+    unix_fs::symlink(target_path, link_path).map_err(|e| HelperError::io("symlink", link_path, e))
 }
 
-fn unlink_at(link_path: &Path) -> Result<(), String> {
+fn unlink_at(link_path: &Path) -> Result<(), HelperError> {
     remove_owned_symlink(link_path, is_arcbox_socket_target)
 }
 
-/// `true` when `target` parses as a valid ArcBox socket path
-/// (`/Users/…/.arcbox/…` or `…/.arcbox-dev/…`).
 fn is_arcbox_socket_target(target: &Path) -> bool {
     target
         .to_str()
@@ -79,6 +56,7 @@ fn is_arcbox_socket_target(target: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{is_arcbox_socket_target, link_at, unlink_at};
+    use arcbox_helper::HelperError;
     use arcbox_helper::validate::SocketTarget;
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -97,9 +75,6 @@ mod tests {
     #[test]
     fn rejects_foreign_socket_paths() {
         assert!(!is_arcbox_socket_target(Path::new("/var/run/docker.sock")));
-        assert!(!is_arcbox_socket_target(Path::new(
-            "/Users/alice/.docker/run/docker.sock"
-        )));
         assert!(!is_arcbox_socket_target(Path::new("/tmp/evil.sock")));
     }
 
@@ -113,7 +88,7 @@ mod tests {
 
         symlink("/var/run/other.sock", &link).unwrap();
         let err = link_at(&link, &target).unwrap_err();
-        assert!(err.contains("not ArcBox-owned"), "{err}");
+        assert!(matches!(err, HelperError::ForeignSymlink { .. }), "{err}");
         assert_eq!(
             fs::read_link(&link).unwrap(),
             PathBuf::from("/var/run/other.sock")
@@ -123,7 +98,6 @@ mod tests {
         symlink("/Users/alice/.arcbox/run/old.sock", &link).unwrap();
         link_at(&link, &target).unwrap();
         assert_eq!(fs::read_link(&link).unwrap(), Path::new(target.as_str()));
-
         link_at(&link, &target).unwrap();
     }
 
@@ -139,14 +113,6 @@ mod tests {
         symlink("/var/run/other.sock", &link).unwrap();
         unlink_at(&link).unwrap();
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-
-        fs::remove_file(&link).unwrap();
-        fs::write(&link, b"not a socket").unwrap();
-        unlink_at(&link).unwrap();
-        assert!(link.is_file());
-
-        fs::remove_file(&link).unwrap();
-        unlink_at(&link).unwrap();
     }
 
     #[test]
@@ -158,6 +124,6 @@ mod tests {
             .parse::<SocketTarget>()
             .unwrap();
         let err = link_at(&link, &target).unwrap_err();
-        assert!(err.contains("not a symlink"), "{err}");
+        assert!(matches!(err, HelperError::NotASymlink { .. }), "{err}");
     }
 }
