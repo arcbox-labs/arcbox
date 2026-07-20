@@ -64,7 +64,7 @@ signature verification on every accept (`peer_auth::verify`):
 1. Prefer `LOCAL_PEERTOKEN` (audit token) — binds to the live connecting process.
 2. Fall back to `LOCAL_PEERPID`.
 3. `SecCodeCopyGuestWithAttributes` → `SecCodeCheckValidity` with
-   default dynamic-validation flags and
+   strict dynamic-validation (without the static-only nested-code flag) and
    `identifier "…" and anchor apple generic and certificate leaf[subject.OU] = "TEAM"`.
 4. Allow-list: `com.arcboxlabs.desktop{,.dev}{,.daemon,.cli}`.
 
