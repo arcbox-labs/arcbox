@@ -43,8 +43,9 @@ async fn mutation_client_rejects_an_old_wire_version() {
         client,
         Err(ClientError::IncompatibleVersion {
             installed,
-            required: "1.0.0"
+            required,
         }) if installed == "arcbox-helper 0.4.24"
+            && required == arcbox_constants::helper::MIN_HELPER_VERSION
     ));
 }
 
@@ -79,8 +80,8 @@ fn helper_version_pins_are_aligned() {
         "root Cargo.toml must pin arcbox-helper = {{ version = \"{pkg}\", ... }}"
     );
 
-    // Independent of workspace package version (0.4.x).
-    assert_eq!(pkg, "1.0.0");
+    // Independent of the workspace package version.
+    assert_eq!(pkg, "1.0.1");
 }
 
 #[tokio::test]
