@@ -1665,7 +1665,7 @@ pub struct MacosMachineInfo {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosImagePullRequest {
     /// Image reference: a stream name with an optional pinned version,
-    /// e.g. "tahoe-base" or "tahoe-base@2026.07.02".
+    /// e.g. "tahoe-base" or "tahoe-base@2026.07.03".
     #[prost(string, tag = "1")]
     pub reference: ::prost::alloc::string::String,
     /// Manifest override (URL or daemon-local path); bypasses the published
@@ -1753,7 +1753,7 @@ pub struct MacosImageSummary {
     /// Source (manifest location), if known.
     #[prost(string, tag = "6")]
     pub source: ::prost::alloc::string::String,
-    /// Published version label (e.g. "2026.07.02"), if pulled.
+    /// Published version label (e.g. "2026.07.03"), if pulled.
     #[prost(string, tag = "7")]
     pub version: ::prost::alloc::string::String,
     /// Guest macOS product version (e.g. "26.5"), if known.

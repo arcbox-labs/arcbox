@@ -2,7 +2,7 @@
 //!
 //! Disposable, single-purpose macOS VMs: pull a pre-baked base image once,
 //! then copy-on-write clone it to boot clean, throwaway guests. This is a
-//! distinct noun from `arcbox machine` (Linux) and talks to its own
+//! distinct noun from `abctl machine` (Linux) and talks to its own
 //! `MacosService`.
 
 use anyhow::{Context, Result};
@@ -104,7 +104,7 @@ pub struct RemoveArgs {
 /// macOS base image commands.
 #[derive(Subcommand)]
 pub enum ImageCommands {
-    /// Pull a published base image (e.g. tahoe-base or tahoe-base@2026.07.02)
+    /// Pull a published base image (e.g. tahoe-base or tahoe-base@2026.07.03)
     Pull(SourceArgs),
     /// Resolve a reference against the published index without downloading:
     /// what version a pull would land, and what is installed locally
@@ -122,7 +122,7 @@ pub enum ImageCommands {
 #[derive(Args)]
 pub struct SourceArgs {
     /// Image reference: stream name with optional pinned version
-    /// (e.g. "tahoe-base" or "tahoe-base@2026.07.02").
+    /// (e.g. "tahoe-base" or "tahoe-base@2026.07.03").
     #[arg(required_unless_present = "manifest", conflicts_with = "manifest")]
     pub reference: Option<String>,
     /// Use a manifest directly (URL or daemon-local path), bypassing the
@@ -197,7 +197,7 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
     println!("  Memory: {} MiB", args.memory);
     println!();
     println!("To start it, run:");
-    println!("  arcbox macos start {}", args.name);
+    println!("  abctl macos start {}", args.name);
     Ok(())
 }
 
@@ -253,7 +253,7 @@ async fn execute_list() -> Result<()> {
         println!("No macOS guests found.");
         println!();
         println!("To create one, run:");
-        println!("  arcbox macos create <name> --image <base>");
+        println!("  abctl macos create <name> --image <base>");
         return Ok(());
     }
 
@@ -359,7 +359,7 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
                 println!("No macOS images found.");
                 println!();
                 println!("To pull one, run:");
-                println!("  arcbox macos image pull tahoe-base");
+                println!("  abctl macos image pull tahoe-base");
                 return Ok(());
             }
 

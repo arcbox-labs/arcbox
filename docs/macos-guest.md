@@ -26,15 +26,15 @@ and they are a **Machine-tier** capability (no Container or Sandbox tier).
 
 ## Startup Path Shape
 
-macOS guests are a separate noun end to end: the `arcbox macos` CLI talks to a dedicated
-`MacosService`, distinct from the Linux `arcbox machine` / `MachineService`. The two share
+macOS guests are a separate noun end to end: the `abctl macos` CLI talks to a dedicated
+`MacosService`, distinct from the Linux `abctl machine` / `MachineService`. The two share
 no request types and no routing — only the daemon process, the gRPC socket, and the reused
 `arcbox-vz` device configuration. The macOS lower half is an independent chain through
 `arcbox-vz` into Apple's framework, and never touches `arcbox-vmm` / HV / the vsock
 guest agent.
 
 ```text
-arcbox machine ...               arcbox macos ...            (CLI, separate nouns)
+abctl machine ...                abctl macos ...             (CLI, separate nouns)
         │  gRPC                          │  gRPC
         ▼                               ▼
 MachineService (machine.rs)      MacosService (macos.rs, macOS-only)
@@ -58,7 +58,7 @@ VmManager::start                 macos::MacVm
    `macos-runner-image-builder` repo for the format spec):
 
    ```text
-   arcbox macos image pull tahoe-base[@version]   (or --manifest <url|path>)
+   abctl macos image pull tahoe-base[@version]    (or --manifest <url|path>)
      → resolve via index.json → fetch manifest
      → validate hardware model support BEFORE the multi-GB download
      → stream disk.img.zst: socket → zstd decode → zero-skipping sparse writes
@@ -75,7 +75,7 @@ VmManager::start                 macos::MacVm
 2. **Per-VM create (fast, CoW).**
 
    ```text
-   arcbox macos create <n> --image <base> [--cpus N --memory MiB]
+   abctl macos create <n> --image <base> [--cpus N --memory MiB]
      → reject if --cpus / --memory are below the image's published minimums
      → assemble in a staging dir, then rename it into place atomically
        (concurrent creates of the same name cannot corrupt each other)
@@ -88,7 +88,7 @@ VmManager::start                 macos::MacVm
 3. **Per-VM start (hot path).**
 
    ```text
-   arcbox macos start <n>
+   abctl macos start <n>
      → MacVm.build → arcbox-vz VirtualMachineConfiguration
           boot_loader = MacOSBootLoader
           platform    = MacPlatform{ hardware_model, machine_id, aux_storage }
@@ -106,7 +106,7 @@ VmManager::start                 macos::MacVm
    persisted in its record, and pinned to the NAT interface at boot. vmnet's
    DHCP server (`bootpd`) writes leases to `/var/db/dhcpd_leases`; the daemon
    resolves the machine's lease by that MAC (`app/arcbox-core/src/macos/lease.rs`)
-   and reports the address via `Inspect`. `arcbox macos ip <n> [--wait <secs>]`
+   and reports the address via `Inspect`. `abctl macos ip <n> [--wait <secs>]`
    prints it — the handle callers (e.g. a CI driver) use to `ssh` into the
    guest and run work directly, with no in-guest agent or provisioning channel.
 
@@ -152,10 +152,10 @@ Teardown for the disposable loop: `request_stop` (graceful) -> delete the per-VM
 | guest IP from DHCP lease | `app/arcbox-core/src/macos/lease.rs` |
 | daemon wiring | `app/arcbox-core/src/runtime.rs` (`mac_machine_manager()`) |
 | daemon gRPC (macOS-only) | `app/arcbox-api/src/grpc/macos.rs` (`MacosServiceImpl`) |
-| CLI | `app/arcbox-cli/src/commands/macos.rs` (`arcbox macos`) |
+| CLI | `app/arcbox-cli/src/commands/macos.rs` (`abctl macos`) |
 
 `MacosService` is a wholly separate gRPC service from the Linux `MachineService`: its own
-request types (macOS-shaped, in MiB/GiB, no Linux fields), its own `arcbox macos` CLI noun,
+request types (macOS-shaped, in MiB/GiB, no Linux fields), its own `abctl macos` CLI noun,
 and it delegates straight to `mac_machine_manager()` — no `guest_os` discriminator and no
 ownership-probe routing. The service is registered and the CLI noun exists only on Apple
 Silicon hosts. macOS VM operations are `!Send` (ObjC handles + the VM dispatch queue across
@@ -166,21 +166,21 @@ current-thread runtime inside `spawn_blocking` (`grpc::run_macos_blocking`).
 
 ```sh
 # 1. Pull a published base image (multi-GB download; progress streams to the CLI):
-arcbox macos image pull tahoe-base            # latest per the published index
-arcbox macos image pull tahoe-base@2026.07.02 # pinned version
-arcbox macos image pull --manifest <url|path> # dev: bypass the index
-arcbox macos image resolve tahoe-base        # what a pull would land, without downloading
-arcbox macos image ls
+abctl macos image pull tahoe-base             # latest per the published index
+abctl macos image pull tahoe-base@2026.07.03  # pinned version
+abctl macos image pull --manifest <url|path>  # dev: bypass the index
+abctl macos image resolve tahoe-base          # what a pull would land, without downloading
+abctl macos image ls
 
 # 2. Create a disposable guest by copy-on-write cloning the base (instant):
-arcbox macos create ci-1 --image tahoe-base --cpus 4 --memory 8192
+abctl macos create ci-1 --image tahoe-base --cpus 4 --memory 8192
 
 # 3. Start / list / stop / remove:
-arcbox macos start ci-1
-arcbox macos ls
-arcbox macos stop ci-1
-arcbox macos rm ci-1
-arcbox macos image rm tahoe-base
+abctl macos start ci-1
+abctl macos ls
+abctl macos stop ci-1
+abctl macos rm ci-1
+abctl macos image rm tahoe-base
 ```
 
 ## Verification status
@@ -205,8 +205,8 @@ arcbox macos image rm tahoe-base
 - The CLI → daemon → manager surface is implemented and clippy-clean, but the daemon
   binary does not link under the devenv/nix toolchain (its SDK lacks the macOS 15+
   `hv_gic_*` Hypervisor.framework symbols `arcbox-hv`'s GIC backend needs — a
-  pre-existing limitation unrelated to this feature). A real `arcbox macos image pull`
-  → `arcbox macos create` → `arcbox macos start` run uses the project's
+  pre-existing limitation unrelated to this feature). A real `abctl macos image pull`
+  → `abctl macos create` → `abctl macos start` run uses the project's
   normal (system-SDK) build path, with the daemon Developer-ID-signed.
 
 ## Security model (zero-trust): what's achievable

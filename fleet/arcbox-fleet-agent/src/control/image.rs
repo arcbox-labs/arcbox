@@ -285,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_without_vm_backend_promotes_macos_target() {
         let state = AgentState::new(&seed());
-        state.set_macos_runner_image_target("tahoe-base@2026.07.02");
+        state.set_macos_runner_image_target("tahoe-base@2026.07.03");
         let service = ImageService::new(state.clone(), None, None);
 
         let mut stream = service
