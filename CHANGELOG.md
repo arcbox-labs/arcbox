@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/arcboxlabs/arcbox/compare/v0.4.24...v0.5.0) (2026-07-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **helper:** security-framework peer auth + structured HelperError wire
+
+### Features
+
+* **helper:** give arcbox-helper an independent crate version ([172ae31](https://github.com/arcboxlabs/arcbox/commit/172ae31d926254b969cfb7a7001c93d304149561))
+* **helper:** security-framework peer auth + structured HelperError wire ([8061ba5](https://github.com/arcboxlabs/arcbox/commit/8061ba5dd1c5ad0cd4d8f157608a175e59b7250c))
+
+
+### Bug Fixes
+
+* **helper:** clarify compatibility diagnostics ([a9affdd](https://github.com/arcboxlabs/arcbox/commit/a9affddb21519ac7862886c80ea60b8650f0e750))
+* **helper:** dedicated DockerSocketOccupied error variant ([d0d16e5](https://github.com/arcboxlabs/arcbox/commit/d0d16e56189459fd8a3da2c913452927812d795e))
+* **helper:** enforce wire compatibility in client ([351d14d](https://github.com/arcboxlabs/arcbox/commit/351d14d90cac5ec504295d6b634e7b3127345751))
+* **helper:** harden peer auth and mutation ownership before 1.0.0 ([4baf753](https://github.com/arcboxlabs/arcbox/commit/4baf75378cc053cfe5e658f28f5185a4a64ddad6))
+* **helper:** only register authenticated builds ([8a70611](https://github.com/arcboxlabs/arcbox/commit/8a706118932fff1e77ff364bd26f216651e2bbe3))
+* **helper:** reject incompatible major helper versions ([32639f5](https://github.com/arcboxlabs/arcbox/commit/32639f5ab2a70c72aa6a729c757b96cd3729acc2))
+* **helper:** report version on stdout ([29cd3ea](https://github.com/arcboxlabs/arcbox/commit/29cd3ea8b7239d42154dcb817c2e9d42f8ed9dfb))
+* **net:** cap the honored guest window on the inline paths too ([6640822](https://github.com/arcboxlabs/arcbox/commit/6640822ecfeb716f55533cc762ad99f2e4745b46))
+* **net:** make TcpBridge uploads lossless and honor the guest window ([d9821ce](https://github.com/arcboxlabs/arcbox/commit/d9821ceedabc6365655c0c5a586a2d6b7c3153b8))
+* **net:** reject a guest ACK beyond what the shim sent ([59331fb](https://github.com/arcboxlabs/arcbox/commit/59331fba8f6fbff79751c9856aa9d97ebd8c9707))
+* **net:** retransmit lost download frames, wake the idle datapath ([af65e5f](https://github.com/arcboxlabs/arcbox/commit/af65e5ffbe03a65197c731aa81fcb394253b3e2f))
+
+
+### Code Refactoring
+
+* **helper:** dedupe path ownership and symlink slot logic ([3781642](https://github.com/arcboxlabs/arcbox/commit/37816422bd5d31c2ad0f0880a50aa1492c11da4c))
+
+
+### Tests
+
+* **e2e:** W13 parallel large downloads + W14 docker build ([c5c0dee](https://github.com/arcboxlabs/arcbox/commit/c5c0deeda644e3ba83f2c752d02a336a819abc2b))
+* **helper:** real-binary E2E suite under ARCBOX_HELPER_TEST_ROOT ([b91d413](https://github.com/arcboxlabs/arcbox/commit/b91d4132842a833ec84ac77fb8879e8ac65989ab))
+
+
+### Documentation
+
+* **e2e:** record the workload-suite findings as resolved ([4961c41](https://github.com/arcboxlabs/arcbox/commit/4961c41ea9e716fa7507eb057f0da108ae88aba2))
+* **macos:** refresh stale CLI name and image-version examples ([#459](https://github.com/arcboxlabs/arcbox/issues/459)) ([d6a646a](https://github.com/arcboxlabs/arcbox/commit/d6a646a5cae0c83c79012648264059ab80b81490))
+* **net:** align the direct_rx window comment with the 256 KiB cap ([f0a2edc](https://github.com/arcboxlabs/arcbox/commit/f0a2edc51fa1fc4f3fb39b1c3cbc03861776c399))
+
+
+### Continuous Integration
+
+* **release:** retry crates.io publish through the rate limit ([#455](https://github.com/arcboxlabs/arcbox/issues/455)) ([9b663cc](https://github.com/arcboxlabs/arcbox/commit/9b663ccebea63e185b581901ca7b4f690ab2c000))
+
 ## [0.4.24](https://github.com/arcboxlabs/arcbox/compare/v0.4.23...v0.4.24) (2026-07-19)
 
 
