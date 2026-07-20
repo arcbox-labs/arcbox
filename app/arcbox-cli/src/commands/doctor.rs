@@ -235,7 +235,10 @@ async fn check_helper() -> CheckResult {
                 "unrecognized version {version:?}; run 'sudo abctl _install --no-daemon --no-shell'"
             )),
         },
-        Err(e) => CheckResult::Fail(format!("version check failed: {e}")),
+        Err(arcbox_helper::client::ClientError::Connection(e)) => {
+            CheckResult::Fail(format!("not reachable via launchd socket: {e}"))
+        }
+        Err(e) => CheckResult::Fail(format!("version RPC failed: {e}")),
     }
 }
 
