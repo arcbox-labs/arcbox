@@ -90,6 +90,8 @@ impl HelperService for HelperServer {
     }
 
     async fn version(self, _: tarpc::context::Context) -> String {
-        env!("CARGO_PKG_VERSION").to_string()
+        // Same shape as `arcbox-helper --version` so Desktop/doctor can parse
+        // one format from either path.
+        format!("arcbox-helper {}", env!("CARGO_PKG_VERSION"))
     }
 }

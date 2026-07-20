@@ -90,7 +90,7 @@ impl HelperService for MockHelperServer {
     }
 
     async fn version(self, _: tarpc::context::Context) -> String {
-        env!("CARGO_PKG_VERSION").to_string()
+        format!("arcbox-helper {}", env!("CARGO_PKG_VERSION"))
     }
 }
 

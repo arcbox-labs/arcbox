@@ -75,7 +75,11 @@ pub trait HelperService {
     /// Removes `/usr/local/bin/{name}` symlink if it points inside an ArcBox bundle.
     async fn cli_unlink(name: String) -> Result<(), String>;
 
-    /// Returns the helper version string.
+    /// Returns the helper crate version string (`arcbox-helper <semver>`).
+    ///
+    /// This is the **independent** helper package version, not the arcbox
+    /// workspace version. Callers should parse it with
+    /// [`arcbox_constants::helper::parse_helper_version`].
     async fn version() -> String;
 
     // New methods append ONLY: the bincode transport encodes the request
