@@ -218,6 +218,7 @@ fc-sdk = "0.2.3"
 
 # Internal crates
 arcbox-constants = { version = "0.5.0", path = "common/arcbox-constants", features = ["std"] } # x-release-please-version
+arcbox-pty = { version = "0.5.0", path = "common/arcbox-pty" } # x-release-please-version
 arcbox-dns = { version = "0.5.0", path = "common/arcbox-dns" } # x-release-please-version
 arcbox-error = { version = "0.5.0", path = "common/arcbox-error" } # x-release-please-version
 arcbox-route = { version = "0.5.0", path = "common/arcbox-route" } # x-release-please-version

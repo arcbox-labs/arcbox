@@ -11,7 +11,7 @@ description = "Cargo xtask build-automation tasks for the ArcBox workspace"
 
 [dependencies]
 anyhow.workspace = true
-arcbox-constants = { version = "0.4.16", path = "../common/arcbox-constants", features = ["std"] }
+arcbox-constants.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 dirs.workspace = true
 flate2 = "1.1.9"
