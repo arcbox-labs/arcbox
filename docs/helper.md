@@ -23,7 +23,8 @@ arcbox-helper 1.0.0
 ```
 
 Desktop and daemon parse that line with
-`arcbox_constants::helper::parse_helper_version` and compare by semver triple.
+`arcbox_constants::helper::parse_helper_version` and compare by semver triple
+**within the same major** (a higher major is a wire break, not “newer is fine”).
 
 ### When to bump
 
