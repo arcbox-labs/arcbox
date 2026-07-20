@@ -71,6 +71,22 @@ pub fn host_info_json() -> String {
 
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
 
+    let lan_ips = sysinfo::Networks::new_with_refreshed_list()
+        .iter()
+        .flat_map(|(iface, data)| {
+            data.ip_networks()
+                .iter()
+                .filter(|net| !net.addr.is_loopback() && !net.addr.is_unspecified())
+                .map(move |net| {
+                    serde_json::json!({
+                        "interface": iface,
+                        "ip": net.addr.to_string(),
+                        "prefix": net.prefix,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+
     let info = serde_json::json!({
         "os": sysinfo::System::name(),
         "os_version": sysinfo::System::long_os_version(),
@@ -81,6 +97,7 @@ pub fn host_info_json() -> String {
         "boot_time_unix": sysinfo::System::boot_time(),
         "agent_pid": std::process::id(),
         "disks": disks,
+        "lan_ips": lan_ips,
     });
     info.to_string()
 }
