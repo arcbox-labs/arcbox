@@ -33,9 +33,10 @@ pub fn normalize_helper_version_line(version_output: &str) -> &str {
 
 /// Parses a dotted numeric version into `(major, minor, patch)` components.
 ///
-/// Accepts optional pre-release / build suffixes by ignoring everything after
-/// `-` or `+` on the last numeric component segment that is still pure digits.
-/// Returns `None` when fewer than one numeric component is present.
+/// Strips any pre-release / build suffix (everything from the first `-` or
+/// `+`), then reads up to three dot-separated numeric fields (missing minor
+/// / patch default to `0`). Returns `None` when no leading numeric component
+/// is present.
 #[must_use]
 pub fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
     let core = version
@@ -62,17 +63,31 @@ pub fn parse_helper_version(version_output: &str) -> Option<(u64, u64, u64)> {
     parse_semver_triple(normalize_helper_version_line(version_output))
 }
 
-/// `true` when `installed >= minimum` by major.minor.patch ordering.
+/// `true` when the installed helper is safe for a daemon that requires
+/// `minimum`.
+///
+/// Rules:
+/// - **Same major** as `minimum` (wire major; a future `2.x` helper is not
+///   accepted by a `1.x` daemon even if `2.x > 1.x` numerically).
+/// - `installed >= minimum` within that major (minor/patch floor).
+///
+/// A higher major must force reinstall / doctor fail so tarpc ordinal and
+/// `HelperError` layout breaks cannot be silently driven into the wrong binary.
 #[must_use]
 pub fn helper_version_satisfies(installed: (u64, u64, u64), minimum: (u64, u64, u64)) -> bool {
-    installed >= minimum
+    installed.0 == minimum.0 && installed >= minimum
 }
 
 /// Whether the on-disk helper should be replaced by the bundled binary.
 ///
-/// Reinstall when installed is missing or **strictly older** than bundled.
-/// Equal or newer (app downgrade) keeps the existing binary so admin prompts
-/// are not thrashed.
+/// Reinstall when:
+/// - installed or bundled version is missing / unparseable
+/// - **major differs** either way (wire break; including app downgrade that
+///   left a newer-major helper on disk)
+/// - installed is **strictly older** than bundled within the same major
+///
+/// Equal or newer minor/patch on the **same major** keeps the existing binary
+/// so ordinary app downgrades do not thrash the admin-password prompt.
 #[must_use]
 pub fn helper_needs_reinstall(
     installed: Option<(u64, u64, u64)>,
@@ -81,7 +96,7 @@ pub fn helper_needs_reinstall(
     match (installed, bundled) {
         (_, None) => true,
         (None, Some(_)) => true,
-        (Some(have), Some(want)) => have < want,
+        (Some(have), Some(want)) => have.0 != want.0 || have < want,
     }
 }
 
@@ -118,11 +133,18 @@ mod tests {
         assert!(helper_version_satisfies((1, 0, 0), (1, 0, 0)));
         assert!(helper_version_satisfies((1, 0, 1), (1, 0, 0)));
         assert!(!helper_version_satisfies((0, 4, 24), (1, 0, 0)));
+        // Higher major is a wire break — not "newer is fine".
+        assert!(!helper_version_satisfies((2, 0, 0), (1, 0, 0)));
+        assert!(!helper_version_satisfies((1, 0, 0), (2, 0, 0)));
 
         assert!(helper_needs_reinstall(None, Some((1, 0, 0))));
         assert!(helper_needs_reinstall(Some((0, 4, 12)), Some((1, 0, 0))));
         assert!(!helper_needs_reinstall(Some((1, 0, 0)), Some((1, 0, 0))));
+        // Same major, newer patch/minor — keep (no password thrash on app downgrade).
         assert!(!helper_needs_reinstall(Some((1, 1, 0)), Some((1, 0, 0))));
+        // Major mismatch either direction — replace.
+        assert!(helper_needs_reinstall(Some((2, 0, 0)), Some((1, 0, 0))));
+        assert!(helper_needs_reinstall(Some((1, 0, 0)), Some((2, 0, 0))));
     }
 
     /// `MIN_HELPER_VERSION` must parse and stay a proper semver triple.
