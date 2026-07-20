@@ -47,7 +47,7 @@ arcbox-logging.workspace = true
 
 # vsock and arcbox-vm are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
-arcbox-pty = { version = "0.4.20", path = "../../common/arcbox-pty" } # x-release-please-version
+arcbox-pty.workspace = true
 tokio-vsock = "0.5"
 arcbox-vm = { workspace = true }
 tonic.workspace = true
