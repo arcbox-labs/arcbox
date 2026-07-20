@@ -176,12 +176,13 @@ fn requirement_string(identifier: &str, team_id: &str) -> String {
 
 /// Flags accepted by `SecCodeCheckValidity` for a live process.
 ///
-/// Nested and strict validation flags are for static bundle validation and
-/// make the dynamic API fail with `errSecCSInvalidFlags`.
+/// Strict validation retains additional bundle-structure checks. Nested-code
+/// recursion is static-only and makes the dynamic API fail with
+/// `errSecCSInvalidFlags`.
 #[cfg(all(target_os = "macos", any(test, not(debug_assertions))))]
 fn dynamic_validation_flags() -> security_framework::os::macos::code_signing::Flags {
     use security_framework::os::macos::code_signing::Flags;
-    Flags::NONE
+    Flags::STRICT_VALIDATE
 }
 
 #[cfg(not(debug_assertions))]
