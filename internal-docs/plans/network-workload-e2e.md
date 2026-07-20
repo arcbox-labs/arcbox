@@ -99,6 +99,8 @@ boot time dominates.
 | W12 | long-lived idle flow across idle-shrink | keepalive flow held open past `ARCBOX_IDLE_TIMEOUT_SECS=20`, then reused | works or errors — never zombies (overlaps fault plan Tier 2; implement once, there) |
 | W13 | parallel large downloads (multi-image-pull shape) | 8 × 64 MiB concurrent in the workbench | all complete ≤ deadline; straggler ≤ max(4×median, 10 s); throughput recorded; zombie sweep *(implemented)* |
 | W14 | docker build (compound daily flow) | context with 8 MiB incompressible payload + RUN wget from the blob server; byte-exactness via in-build `RUN test $(wc -c)` | build succeeds ≤ deadline; built image runs; context and download byte-exact *(implemented)* |
+| W15 | download integrity | known-pattern (`fill_pattern`) download piped through in-guest `sha256sum` | hash matches the server's hash of the exact bytes served — content, not just length *(implemented)* |
+| W16 | upload integrity | container hashes a urandom payload it sends; host `spawn_hashing_sink` hashes what it receives | the two SHA-256s match — guards the direction the silent-data-loss bug hit *(implemented)* |
 
 ## External phase (env-gated, never default, still local)
 

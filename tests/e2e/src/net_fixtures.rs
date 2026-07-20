@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 use crate::docker::docker_output;
 
@@ -22,6 +23,42 @@ use crate::docker::docker_output;
 /// connections to it into host `127.0.0.1` — the `host.docker.internal`
 /// mechanism, and the datapath every fixture here sits behind.
 pub const GUEST_GATEWAY_IP: &str = "10.0.2.1";
+
+/// Fills `buf` with a deterministic, position-dependent pattern.
+///
+/// A seeded xorshift64* stream. Unlike a run of zeroes, this makes any
+/// truncation, reordering, or duplication in transit change the SHA-256 —
+/// the integrity check that byte-count-only assertions miss (the datapath's
+/// silent-upload-loss bug advanced the ACK past unwritten bytes, so a
+/// length check alone could pass on corrupt data). Distinct seeds give
+/// distinct streams (only the degenerate all-zero state is remapped).
+pub fn fill_pattern(buf: &mut [u8], seed: u64) {
+    // xorshift sticks at zero; remap only that one state so every other
+    // seed stays distinct (`seed | 1` would collide 42 and 43).
+    let mut state = if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
+    };
+    for chunk in buf.chunks_mut(8) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let bytes = state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+}
+
+/// Lowercase-hex SHA-256 of `data`.
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
 
 /// Reads request headers until the `\r\n\r\n` terminator. Returns false on
 /// EOF or error before the terminator.
@@ -127,6 +164,66 @@ pub fn spawn_blob_server(blob_bytes: usize) -> Result<BlobServer> {
     Ok(BlobServer { port, timings })
 }
 
+/// HTTP origin serving a fixed deterministic-pattern body of known SHA-256.
+///
+/// For download **integrity** (not just completion) checks: the body is
+/// generated once and served verbatim, so the guest can pipe the download
+/// through `sha256sum` and compare to [`sha256`](Self::sha256).
+pub struct PatternServer {
+    port: u16,
+    sha256: String,
+    len: usize,
+}
+
+impl PatternServer {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Lowercase-hex SHA-256 of the exact bytes this origin serves.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+pub fn spawn_pattern_server(len: usize, seed: u64) -> Result<PatternServer> {
+    let mut body = vec![0u8; len];
+    fill_pattern(&mut body, seed);
+    let sha256 = sha256_hex(&body);
+    let body = std::sync::Arc::new(body);
+
+    let listener = TcpListener::bind("127.0.0.1:0").context("binding pattern server")?;
+    let port = listener.local_addr()?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let body = std::sync::Arc::clone(&body);
+            std::thread::spawn(move || {
+                if !drain_request_headers(&mut stream) {
+                    return;
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(header.as_bytes()).is_err() {
+                    return;
+                }
+                let _ = stream.write_all(&body);
+            });
+        }
+    });
+    Ok(PatternServer { port, sha256, len })
+}
+
 /// HTTP origin that serves `partial_body` bytes of an `advertised_len`
 /// body, then turns its close into a RST (`SO_LINGER` zero).
 ///
@@ -202,6 +299,10 @@ pub struct SlowSink {
     received: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
     transfer: Arc<Mutex<Option<Duration>>>,
+    /// SHA-256 of the received byte stream, present only when the sink was
+    /// spawned with hashing enabled (upload integrity). Hashing every byte
+    /// costs CPU, so throughput-only sinks leave it `None`.
+    hasher: Option<Arc<Mutex<Sha256>>>,
 }
 
 pub struct SinkReport {
@@ -209,6 +310,9 @@ pub struct SinkReport {
     /// Accept → the sink's read loop ending (byte count reached or client
     /// hangup), measured sink-side. Includes any configured pause.
     pub transfer: Duration,
+    /// Lowercase-hex SHA-256 of the received bytes, when hashing was
+    /// enabled; empty otherwise.
+    pub sha256: String,
 }
 
 impl SlowSink {
@@ -223,6 +327,15 @@ impl SlowSink {
         let started = Instant::now();
         while started.elapsed() < timeout {
             if self.done.load(Ordering::Acquire) {
+                let sha256 = self.hasher.as_ref().map_or_else(String::new, |h| {
+                    let digest = h.lock().expect("hasher poisoned").clone().finalize();
+                    let mut hex = String::with_capacity(64);
+                    for byte in digest {
+                        use std::fmt::Write;
+                        let _ = write!(hex, "{byte:02x}");
+                    }
+                    hex
+                });
                 return Ok(SinkReport {
                     received: self.received.load(Ordering::Acquire),
                     transfer: self
@@ -230,6 +343,7 @@ impl SlowSink {
                         .lock()
                         .expect("transfer poisoned")
                         .unwrap_or_default(),
+                    sha256,
                 });
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -242,14 +356,30 @@ impl SlowSink {
 }
 
 pub fn spawn_slow_sink(expected: usize, pause: Option<SinkPause>) -> Result<SlowSink> {
+    spawn_slow_sink_inner(expected, pause, false)
+}
+
+/// [`spawn_slow_sink`] that also SHA-256s the received stream, for upload
+/// integrity (compare [`SinkReport::sha256`] against what the client sent).
+pub fn spawn_hashing_sink(expected: usize) -> Result<SlowSink> {
+    spawn_slow_sink_inner(expected, None, true)
+}
+
+fn spawn_slow_sink_inner(
+    expected: usize,
+    pause: Option<SinkPause>,
+    hash: bool,
+) -> Result<SlowSink> {
     let listener = TcpListener::bind("127.0.0.1:0").context("binding slow sink")?;
     let port = listener.local_addr()?.port();
     let received = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
     let transfer: Arc<Mutex<Option<Duration>>> = Arc::default();
+    let hasher = hash.then(|| Arc::new(Mutex::new(Sha256::new())));
     let sink_received = Arc::clone(&received);
     let sink_done = Arc::clone(&done);
     let sink_transfer = Arc::clone(&transfer);
+    let sink_hasher = hasher.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -271,6 +401,9 @@ pub fn spawn_slow_sink(expected: usize, pause: Option<SinkPause>) -> Result<Slow
                 match stream.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if let Some(h) = &sink_hasher {
+                            h.lock().expect("hasher poisoned").update(&buf[..n]);
+                        }
                         sink_received.fetch_add(n, Ordering::AcqRel);
                     }
                 }
@@ -285,6 +418,7 @@ pub fn spawn_slow_sink(expected: usize, pause: Option<SinkPause>) -> Result<Slow
         received,
         done,
         transfer,
+        hasher,
     })
 }
 
@@ -429,6 +563,48 @@ mod tests {
     use super::*;
 
     const ERR: &str = r#"{"level":"ERROR","fields":{"message":"x"},"target":"arcbox_net::darwin::datapath_loop::guest_tx"}"#;
+
+    #[test]
+    fn pattern_is_deterministic_and_seed_sensitive() {
+        let mut a = vec![0u8; 4096];
+        let mut b = vec![0u8; 4096];
+        fill_pattern(&mut a, 42);
+        fill_pattern(&mut b, 42);
+        assert_eq!(a, b, "same seed ⇒ same bytes");
+        assert_eq!(sha256_hex(&a), sha256_hex(&b));
+
+        let mut c = vec![0u8; 4096];
+        fill_pattern(&mut c, 43);
+        assert_ne!(a, c, "different seed ⇒ different bytes");
+
+        // Not a trivial constant run — this is what makes reordering /
+        // truncation detectable where a zero blob would not be.
+        assert!(a.windows(64).any(|w| w.iter().any(|&x| x != a[0])));
+    }
+
+    #[test]
+    fn pattern_length_changes_the_hash() {
+        let mut short = vec![0u8; 1000];
+        let mut long = vec![0u8; 1001];
+        fill_pattern(&mut short, 7);
+        fill_pattern(&mut long, 7);
+        // A prefix relationship (truncation) must not collide on the hash.
+        assert_ne!(sha256_hex(&short), sha256_hex(&long));
+    }
+
+    #[test]
+    fn sha256_hex_is_lowercase_64_hex() {
+        let h = sha256_hex(b"");
+        assert_eq!(
+            h,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(h.len(), 64);
+        assert!(
+            h.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+    }
 
     fn write_log(dir: &Path, name: &str, lines: &[&str]) {
         std::fs::write(dir.join("log").join(name), lines.join("\n") + "\n").unwrap();
