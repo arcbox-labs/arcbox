@@ -273,10 +273,10 @@ mod tests {
         assert_eq!(r.stream, "tahoe-base");
         assert_eq!(r.version, None);
 
-        let r: ImageReference = "tahoe-base@2026.07.02".parse().unwrap();
+        let r: ImageReference = "tahoe-base@2026.07.03".parse().unwrap();
         assert_eq!(r.stream, "tahoe-base");
-        assert_eq!(r.version.as_deref(), Some("2026.07.02"));
-        assert_eq!(r.to_string(), "tahoe-base@2026.07.02");
+        assert_eq!(r.version.as_deref(), Some("2026.07.03"));
+        assert_eq!(r.to_string(), "tahoe-base@2026.07.03");
     }
 
     #[test]
@@ -294,9 +294,9 @@ mod tests {
                 "schema_version": 1,
                 "images": {
                     "tahoe-base": {
-                        "latest": "2026.07.02",
+                        "latest": "2026.07.03",
                         "versions": {
-                            "2026.07.02": { "manifest": "tahoe-base/2026.07.02/manifest.json" },
+                            "2026.07.03": { "manifest": "tahoe-base/2026.07.03/manifest.json" },
                             "2026.06.01": { "manifest": "tahoe-base/2026.06.01/manifest.json" }
                         }
                     }
@@ -306,8 +306,8 @@ mod tests {
         .unwrap();
 
         let latest = index.resolve(&"tahoe-base".parse().unwrap()).unwrap();
-        assert_eq!(latest.0, "2026.07.02");
-        assert_eq!(latest.1, "tahoe-base/2026.07.02/manifest.json");
+        assert_eq!(latest.0, "2026.07.03");
+        assert_eq!(latest.1, "tahoe-base/2026.07.03/manifest.json");
 
         let pinned = index
             .resolve(&"tahoe-base@2026.06.01".parse().unwrap())
@@ -330,12 +330,12 @@ mod tests {
 
         let manifest = base
             .as_dir()
-            .join("tahoe-base/2026.07.02/manifest.json")
+            .join("tahoe-base/2026.07.03/manifest.json")
             .unwrap();
         let disk = manifest.join("disk.img.zst").unwrap();
         assert_eq!(
             disk.to_string(),
-            "https://images.arcbox.dev/tahoe-base/2026.07.02/disk.img.zst"
+            "https://images.arcbox.dev/tahoe-base/2026.07.03/disk.img.zst"
         );
 
         let manifest = RemoteLocation::parse("/tmp/out/manifest.json");
@@ -347,7 +347,7 @@ mod tests {
     fn validate_name_accepts_plain_and_dotted_components() {
         for ok in [
             "tahoe-base",
-            "tahoe-base@2026.07.02",
+            "tahoe-base@2026.07.03",
             "ubuntu-noble-arm64",
             ".pull-x",
             ".create-ci-1",

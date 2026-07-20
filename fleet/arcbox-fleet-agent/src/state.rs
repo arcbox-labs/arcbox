@@ -743,11 +743,11 @@ mod tests {
     #[test]
     fn macos_runner_image_current_and_target_are_independent() {
         let state = AgentState::new(&seed());
-        state.set_macos_runner_image_target("tahoe-base@2026.07.02");
+        state.set_macos_runner_image_target("tahoe-base@2026.07.03");
         assert_eq!(state.macos_runner_image_current(), "tahoe-base");
-        assert_eq!(state.macos_runner_image_target(), "tahoe-base@2026.07.02");
+        assert_eq!(state.macos_runner_image_target(), "tahoe-base@2026.07.03");
 
-        state.set_macos_runner_image_current("tahoe-base@2026.07.02");
+        state.set_macos_runner_image_current("tahoe-base@2026.07.03");
         assert_eq!(
             state.macos_runner_image_current(),
             state.macos_runner_image_target()

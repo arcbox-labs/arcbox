@@ -199,7 +199,7 @@ enum SettingsCommand {
         #[arg(long)]
         participate: Option<bool>,
         /// macOS base-image stream darwin VM jobs boot from (e.g.
-        /// "tahoe-base" or "tahoe-base@2026.07.02").
+        /// "tahoe-base" or "tahoe-base@2026.07.03").
         #[arg(long)]
         macos_runner_image: Option<String>,
         /// "auto" | "enabled" | "disabled".

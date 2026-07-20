@@ -49,7 +49,7 @@ pub enum RemoteSource {
 pub struct ResolvedImage {
     /// Stream name (`tahoe-base`).
     pub name: String,
-    /// Concrete version a pull would land (`2026.07.02`), even when the
+    /// Concrete version a pull would land (`2026.07.03`), even when the
     /// source reference floats.
     pub version: String,
     /// Guest macOS product version (e.g. `26.5`).
@@ -398,7 +398,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema_version": 2,
             "name": "tahoe-base",
-            "version": "2026.07.02",
+            "version": "2026.07.03",
             "variant": "base",
             "built_at": "2026-07-02T00:00:00Z",
             "source_image": "ghcr.io/cirruslabs/macos-tahoe-base@sha256:abc",
@@ -425,7 +425,7 @@ mod tests {
         let image = mgr.pull_remote(source.clone(), |_, _| {}).await.unwrap();
 
         assert_eq!(image.meta.name, "tahoe-base");
-        assert_eq!(image.meta.version.as_deref(), Some("2026.07.02"));
+        assert_eq!(image.meta.version.as_deref(), Some("2026.07.03"));
         assert_eq!(image.meta.os_version.as_deref(), Some("26.5"));
         assert_eq!(std::fs::read(image.disk_path()).unwrap(), disk);
         assert_eq!(std::fs::read(image.aux_path()).unwrap(), aux);
@@ -448,7 +448,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema_version": 2,
             "name": "../evil",
-            "version": "2026.07.02",
+            "version": "2026.07.03",
             "os": { "product_version": "26.5" },
             "hardware_model": REAL_HARDWARE_MODEL_B64,
             "machine_id": REAL_MACHINE_ID_B64,
@@ -484,7 +484,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema_version": 2,
             "name": "tahoe-base",
-            "version": "2026.07.02",
+            "version": "2026.07.03",
             "os": { "product_version": "26.5" },
             "hardware_model": REAL_HARDWARE_MODEL_B64,
             "machine_id": REAL_MACHINE_ID_B64,
@@ -528,7 +528,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema_version": 2,
             "name": "tahoe-base",
-            "version": "2026.07.02",
+            "version": "2026.07.03",
             "os": { "product_version": "26.5", "build": "25F71" },
             "runner_version": "2.334.0",
             "hardware_model": REAL_HARDWARE_MODEL_B64,
@@ -551,7 +551,7 @@ mod tests {
 
         let resolved = mgr.resolve_remote(&source).await.unwrap();
         assert_eq!(resolved.name, "tahoe-base");
-        assert_eq!(resolved.version, "2026.07.02");
+        assert_eq!(resolved.version, "2026.07.03");
         assert_eq!(resolved.os_version, "26.5");
         assert_eq!(resolved.os_build.as_deref(), Some("25F71"));
         assert_eq!(resolved.runner_version.as_deref(), Some("2.334.0"));
@@ -563,7 +563,7 @@ mod tests {
 
         mgr.pull_remote(source.clone(), |_, _| {}).await.unwrap();
         let resolved = mgr.resolve_remote(&source).await.unwrap();
-        assert_eq!(resolved.installed_version.as_deref(), Some("2026.07.02"));
+        assert_eq!(resolved.installed_version.as_deref(), Some("2026.07.03"));
     }
 
     #[tokio::test]
@@ -583,7 +583,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema_version": 2,
             "name": "tahoe-base",
-            "version": "2026.07.02",
+            "version": "2026.07.03",
             "os": { "product_version": "26.5" },
             "hardware_model": REAL_HARDWARE_MODEL_B64,
             "machine_id": REAL_MACHINE_ID_B64,

@@ -69,7 +69,7 @@ pub struct RunSpec<'a> {
     pub runner_image: &'a str,
 }
 
-/// The stream part of an image reference: `"tahoe-base@2026.07.02"` →
+/// The stream part of an image reference: `"tahoe-base@2026.07.03"` →
 /// `"tahoe-base"`. Installed images are registered under their stream name.
 fn stream_name(reference: &str) -> &str {
     reference.split_once('@').map_or(reference, |(s, _)| s)
@@ -105,7 +105,7 @@ impl VmRunner {
         if !images.iter().any(|i| i.name == stream_name(default_image)) {
             bail!(
                 "macOS runner image '{default_image}' is not installed in the daemon — \
-                 run `arcbox-fleet-agent prepare macos-runner-image` (or `arcbox macos \
+                 run `arcbox-fleet-agent prepare macos-runner-image` (or `abctl macos \
                  image pull {default_image}`) first"
             );
         }
@@ -476,12 +476,12 @@ mod tests {
     #[test]
     fn stream_name_strips_pinned_version() {
         assert_eq!(stream_name("tahoe-base"), "tahoe-base");
-        assert_eq!(stream_name("tahoe-base@2026.07.02"), "tahoe-base");
+        assert_eq!(stream_name("tahoe-base@2026.07.03"), "tahoe-base");
     }
 
     /// Full provision→ssh→exec→destroy cycle against a live daemon.
     /// Requires `arcbox-daemon` running with the default image pulled
-    /// (`arcbox macos image pull tahoe-base`); run manually:
+    /// (`abctl macos image pull tahoe-base`); run manually:
     /// `cargo test -p arcbox-fleet-agent vm_round_trip -- --ignored`.
     #[tokio::test]
     #[ignore = "needs a live arcbox-daemon with the tahoe-base image installed"]
