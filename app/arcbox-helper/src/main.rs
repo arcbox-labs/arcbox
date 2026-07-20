@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             "--version" | "-V" => {
-                eprintln!("arcbox-helper {}", env!("CARGO_PKG_VERSION"));
+                println!("arcbox-helper {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--idle-exit" => idle_exit = true,
