@@ -176,7 +176,9 @@ mod security {
     /// - `kSecCSDefaultFlags = 0`
     /// - `kSecCSCheckNestedCode = 1 << 3`
     /// - `kSecCSStrictValidate = 1 << 4`
-    pub(super) const SEC_CS_CHECK_FLAGS: u32 = 0 | (1 << 3) | (1 << 4);
+    // kSecCSDefaultFlags (= 0) is intentionally omitted: ORing identity zero
+    // trips clippy::identity_op. Nested + strict is the full check set.
+    pub(super) const SEC_CS_CHECK_FLAGS: u32 = (1 << 3) | (1 << 4);
 
     /// macOS `audit_token_t` — 8 × u32.
     #[repr(C)]
@@ -356,7 +358,7 @@ mod security {
     pub fn check_code_signature_audit(token: &AuditToken, identifier: &str, team_id: &str) -> bool {
         unsafe {
             let token_bytes = std::slice::from_raw_parts(
-                (token as *const AuditToken).cast::<u8>(),
+                std::ptr::from_ref(token).cast::<u8>(),
                 std::mem::size_of::<AuditToken>(),
             );
             let Ok(len) = isize::try_from(token_bytes.len()) else {

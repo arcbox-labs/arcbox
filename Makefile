@@ -29,7 +29,7 @@ endif
         build-fleet-agent fleet-proto-sync \
         test check fmt clean \
         setup-boot-assets sign sign-daemon sign-all verify run-daemon \
-        run-helper install-helper reload-helper
+        run-helper install-helper reload-helper test-helper
 
 ## ── Build ──────────────────────────────────────────────
 
@@ -155,6 +155,16 @@ reload-helper: build-helper
 	sudo cp $(TARGET_DIR)/arcbox-helper /usr/local/libexec/arcbox-helper
 	sudo launchctl bootstrap system /Library/LaunchDaemons/com.arcboxlabs.desktop.helper.plist
 	@echo "✓ arcbox-helper reloaded"
+
+# Full helper regression suite (no root): unit + mock tarpc + real-binary E2E.
+# E2E uses ARCBOX_HELPER_TEST_ROOT sandbox (debug builds only).
+test-helper:
+	cargo test -p arcbox-constants --features std --lib helper::
+	cargo test -p arcbox-constants --features std --lib is_arcbox_owned
+	cargo test -p arcbox-helper --lib
+	cargo test -p arcbox-helper --bins
+	cargo test -p arcbox-helper --tests
+	cargo clippy -p arcbox-helper -- -D warnings
 
 ## ── Cleanup ───────────────────────────────────────────
 

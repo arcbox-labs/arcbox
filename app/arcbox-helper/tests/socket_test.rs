@@ -25,3 +25,34 @@ async fn socket_unlink_valid() {
     let (client, _dir) = common::setup().await;
     client.socket_unlink().await.unwrap();
 }
+
+// cli_* live next to socket in the wire API; keep validation coverage here
+// until a dedicated cli_test.rs is warranted.
+
+#[tokio::test]
+async fn cli_link_valid() {
+    let (client, _dir) = common::setup().await;
+    client
+        .cli_link(
+            "docker",
+            "/Applications/ArcBox.app/Contents/MacOS/xbin/docker",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cli_link_rejects_bad_name() {
+    let (client, _dir) = common::setup().await;
+    let err = client
+        .cli_link("rm", "/Applications/ArcBox.app/Contents/MacOS/xbin/rm")
+        .await;
+    assert!(matches!(err, Err(ClientError::Helper(_))));
+}
+
+#[tokio::test]
+async fn cli_link_rejects_bad_target() {
+    let (client, _dir) = common::setup().await;
+    let err = client.cli_link("docker", "/tmp/docker").await;
+    assert!(matches!(err, Err(ClientError::Helper(_))));
+}
