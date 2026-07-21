@@ -150,6 +150,20 @@ impl FragmentReassembler {
             entry.header = Some(frame[..ip_start + ihl].to_vec());
         }
 
+        // Reject a fragment that overlaps already-received bytes without being
+        // fully contained in them — the teardrop / IDS-evasion class where a
+        // later fragment overwrites earlier data (RFC 8200 §4.5 / Linux parity).
+        // A fully-contained fragment is an idempotent retransmit and is allowed.
+        let conflicting_overlap = entry
+            .ranges
+            .iter()
+            .any(|&(s, e)| offset < e && s < end && !(s <= offset && end <= e));
+        if conflicting_overlap {
+            tracing::debug!("overlapping IP fragment; datagram dropped");
+            self.entries.remove(&key);
+            return None;
+        }
+
         if entry.payload.len() < end {
             entry.payload.resize(end, 0);
         }
