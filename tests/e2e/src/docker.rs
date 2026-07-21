@@ -111,13 +111,20 @@ pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
         image.replace(['/', ':'], "_").replace('.', "-")
     ));
     if tar.exists() {
-        docker_output(
+        // A corrupt cache must not poison every subsequent run (an HV
+        // `docker save` can truncate the streamed response — issue #256):
+        // discard it and fall through to a fresh pull.
+        match docker_output(
             data_dir,
             &["load", "-i", &tar.display().to_string()],
             Duration::from_secs(60),
-        )
-        .context("docker load from cache")?;
-        return Ok(());
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!("cached image load failed ({e:#}); discarding cache, re-pulling");
+                let _ = std::fs::remove_file(&tar);
+            }
+        }
     }
 
     let mut last_err = None;
@@ -131,6 +138,16 @@ pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
                     Duration::from_secs(60),
                 )
                 .context("docker save to cache")?;
+                // Validate before trusting: a truncated save (#256) only
+                // surfaces as "invalid byte in chunk length" on the NEXT
+                // run's load — catch it now instead.
+                let listing = std::process::Command::new("tar")
+                    .args(["-tf", &tar.display().to_string()])
+                    .output();
+                if !listing.map(|o| o.status.success()).unwrap_or(false) {
+                    tracing::warn!("saved image cache fails tar validation; discarding");
+                    let _ = std::fs::remove_file(&tar);
+                }
                 return Ok(());
             }
             Err(e) => {
