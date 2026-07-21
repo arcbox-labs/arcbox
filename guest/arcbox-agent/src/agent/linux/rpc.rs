@@ -222,7 +222,10 @@ where
             }
         };
 
-        if response.ready || status.docker_ready {
+        // EnsureRuntime settles only after Docker and its post-start routing
+        // setup are ready; RuntimeStatus independently confirms Docker is
+        // still reachable at the point we publish the terminal event.
+        if response.ready && status.docker_ready {
             return write_readiness_event(
                 stream,
                 trace_id,
