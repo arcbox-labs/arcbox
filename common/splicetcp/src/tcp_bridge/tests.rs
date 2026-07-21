@@ -1911,3 +1911,84 @@ async fn malformed_data_offset_is_not_spliced_to_host() {
         "a rejected segment must not splice bytes to the host socket"
     );
 }
+
+/// A retransmitted SYN-ACK on an established flow (the guest never saw our
+/// completing ACK) must be re-ACKed, not swallowed, or the guest keeps
+/// retransmitting until it times out.
+#[tokio::test]
+async fn retransmitted_syn_ack_gets_reack() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let (_accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 110);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40040,
+        dst_ip,
+        dst_port: 443,
+    };
+    // last_ack = 2000 ⇒ the guest's ISN was 1999 (SYN consumed one seq).
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        1460,
+        None,
+    );
+
+    // Retransmitted SYN-ACK at the ISN, no payload.
+    let syn_ack = make_guest_segment((40040, dst_ip, 443), 1999, 1000, 65535, 0x12, &[]);
+    let reply = bridge
+        .try_fast_path_intercept(&syn_ack)
+        .expect("intercepted");
+    assert!(
+        !reply.is_empty(),
+        "a retransmitted SYN-ACK must be re-ACKed"
+    );
+    assert_eq!(tcp_flags_of(&reply) & 0x10, 0x10, "reply carries ACK");
+    assert_eq!(tcp_ack_of(&reply), 2000, "re-ACK acknowledges the SYN");
+}
+
+/// A plain pure ACK (no SYN, no payload, no FIN) must still return nothing —
+/// re-ACKing it would start a dup-ACK loop. Guards the SYN carve-out above
+/// from swallowing the ordinary pure-ACK suppression.
+#[tokio::test]
+async fn pure_ack_returns_no_frame() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let (_accepted, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 111);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40041,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        1460,
+        None,
+    );
+
+    let pure_ack = make_guest_segment((40041, dst_ip, 443), 2000, 1000, 65535, 0x10, &[]);
+    let reply = bridge
+        .try_fast_path_intercept(&pure_ack)
+        .expect("intercepted");
+    assert!(reply.is_empty(), "a pure ACK must not be answered");
+}
