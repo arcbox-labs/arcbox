@@ -215,12 +215,13 @@ impl RxInjectThread {
             return;
         }
 
-        // Prune closed connections from previous iteration. `dead` is NOT
-        // set here: after a clean EOF the bridge entry must survive so the
-        // guest's ACK/FIN and half-close writes still hit
-        // try_fast_path_intercept (parity with the non-inline path); only
-        // the error path marks `dead` (ABX-431).
-        inline_conns.retain(|c| !c.host_eof);
+        // Prune connections closed on the previous iteration (clean host EOF)
+        // and any the bridge cancelled by setting `dead` — a guest FIN/RST tears
+        // the bridge entry down and signals here so this reader drops the conn
+        // (and its cloned fd) instead of holding it once its window freezes.
+        // A clean EOF does NOT set `dead`: the bridge entry must survive for the
+        // guest's close handshake (parity with the non-inline path).
+        inline_conns.retain(|c| !c.host_eof && !c.dead.load(std::sync::atomic::Ordering::Relaxed));
 
         // Fair-share pass: each conn gets at most PER_CONN_READS `readv`
         // calls per outer iteration. Each call can span up to MAX_MERGE

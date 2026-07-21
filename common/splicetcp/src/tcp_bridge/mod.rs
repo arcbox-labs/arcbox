@@ -349,6 +349,11 @@ pub(super) struct FastPathConn {
     read_buf: Vec<u8>,
     /// True if host stream has reached EOF.
     host_eof: bool,
+    /// True once the guest half-closed (sent an in-order FIN) while the host
+    /// side was still open: the poll path shuts the upstream's write side,
+    /// keeps relaying host→guest until the host EOFs, then reaps once its own
+    /// FIN is ACKed. Only set on the non-inline path (inline flows full-close).
+    guest_fin_seen: bool,
     /// True if the socket has been cloned to the inline inject thread.
     /// poll_fast_path() skips connections with this flag — the inject
     /// thread reads directly from the cloned socket.
