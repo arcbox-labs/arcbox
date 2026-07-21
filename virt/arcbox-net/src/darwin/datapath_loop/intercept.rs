@@ -283,18 +283,20 @@ async fn forward_dns_async(data: &[u8], upstream: &[SocketAddr]) -> Result<Vec<u
     }
     let query_id = [data[0], data[1]];
 
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| format!("bind failed: {e}"))?;
-
     for addr in upstream {
-        if socket.send_to(data, addr).await.is_err() {
+        // A connected socket makes the kernel drop datagrams from anyone but
+        // this upstream — a 16-bit txid alone is guessable by an off-path
+        // attacker flooding the ephemeral port, so the source filter matters.
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("bind failed: {e}"))?;
+        if socket.connect(addr).await.is_err() || socket.send(data).await.is_err() {
             continue;
         }
 
         let mut buf = [0u8; 4096];
-        match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _))) if len >= 2 && buf[0] == query_id[0] && buf[1] == query_id[1] => {
+        match tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf)).await {
+            Ok(Ok(len)) if len >= 2 && buf[0] == query_id[0] && buf[1] == query_id[1] => {
                 return Ok(buf[..len].to_vec());
             }
             _ => {}

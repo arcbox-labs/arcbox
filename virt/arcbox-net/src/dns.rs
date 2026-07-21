@@ -438,6 +438,22 @@ impl DnsForwarder {
         // Set response flags
         response[2] = 0x81; // QR=1, Opcode=0, AA=0, TC=0, RD=1
         response[3] = 0x80; // RA=1, Z=0, RCODE=0
+
+        // Only answer with the address record the client actually asked for.
+        // A mismatched qtype — a different family (A vs AAAA), or MX/TXT/SRV/…
+        // — is NODATA (the name exists but has no record of that type), never
+        // an A/AAAA record mislabeled as the answer to the asked-for type.
+        let qtype_matches = matches!(
+            (query.qtype, ip),
+            (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::Aaaa, IpAddr::V6(_))
+        );
+        if !qtype_matches {
+            response[6] = 0x00; // ANCOUNT high
+            response[7] = 0x00; // ANCOUNT low — NODATA
+            response.extend_from_slice(&query.raw_question);
+            return Ok(response);
+        }
+
         response[6] = 0x00; // ANCOUNT high
         response[7] = 0x01; // ANCOUNT low
 
@@ -780,6 +796,39 @@ mod tests {
         assert!(
             result.is_err(),
             "a reply with the wrong transaction id must be rejected"
+        );
+    }
+
+    /// A local-hostname reply must honor the query's QTYPE: an A query gets the
+    /// address record, but a mismatched type (e.g. MX) is NODATA, not an A
+    /// record mislabeled as an MX answer.
+    #[test]
+    fn local_response_honors_qtype() {
+        let forwarder = DnsForwarder::new(DnsConfig::default());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let a = build_test_query("myvm.arcbox.local");
+        let a_resp = forwarder
+            .build_local_response(&DnsQuery::parse(&a).unwrap(), ip)
+            .unwrap();
+        assert_eq!(
+            [a_resp[6], a_resp[7]],
+            [0x00, 0x01],
+            "an A query returns the address record"
+        );
+
+        // Same name, QTYPE = MX (15). QTYPE is the 4th/3rd-to-last byte.
+        let mut mx = build_test_query("myvm.arcbox.local");
+        let n = mx.len();
+        mx[n - 4] = 0x00;
+        mx[n - 3] = 0x0f;
+        let mx_resp = forwarder
+            .build_local_response(&DnsQuery::parse(&mx).unwrap(), ip)
+            .unwrap();
+        assert_eq!(
+            [mx_resp[6], mx_resp[7]],
+            [0x00, 0x00],
+            "an MX query on an A-only host is NODATA, not a mislabeled A record"
         );
     }
 
