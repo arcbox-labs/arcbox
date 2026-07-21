@@ -90,18 +90,33 @@ impl VmnetRelay {
                     }
                     Ok(n) => {
                         let fd = reader_fd.as_raw_fd();
-                        // SAFETY: write to a valid socketpair fd with valid buffer.
-                        let written =
-                            unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), n) };
-                        if written < 0 {
+                        // Retry EINTR (a signal interrupted the write before any
+                        // bytes were sent); surface any other error to classify.
+                        let write_err = loop {
+                            // SAFETY: write to a valid socketpair fd with valid buffer.
+                            let written =
+                                unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), n) };
+                            if written >= 0 {
+                                break None;
+                            }
                             let err = std::io::Error::last_os_error();
-                            match err.kind() {
-                                std::io::ErrorKind::BrokenPipe => break,
-                                // Non-blocking fd: backpressure from guest.
-                                // Drop the packet and continue — the guest
-                                // will retransmit at the transport layer.
-                                std::io::ErrorKind::WouldBlock => {}
-                                _ => tracing::debug!("vmnet→guest write error: {err}"),
+                            if err.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            break Some(err);
+                        };
+                        if let Some(err) = write_err {
+                            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                                break;
+                            }
+                            // WouldBlock (EAGAIN) or ENOBUFS: the guest RX ring
+                            // is momentarily full — drop this frame; the
+                            // transport layer retransmits. Anything else is
+                            // unexpected but non-fatal.
+                            if err.kind() != std::io::ErrorKind::WouldBlock
+                                && err.raw_os_error() != Some(libc::ENOBUFS)
+                            {
+                                tracing::debug!("vmnet→guest write error: {err}");
                             }
                         }
                     }
@@ -153,11 +168,17 @@ impl VmnetRelay {
                             std::cmp::Ordering::Equal => break, // Peer closed
                             std::cmp::Ordering::Less => {
                                 let err = std::io::Error::last_os_error();
-                                if err.kind() == std::io::ErrorKind::WouldBlock {
-                                    guard.clear_ready();
-                                } else {
-                                    tracing::debug!("guest→vmnet read error: {err}");
-                                    break;
+                                match err.kind() {
+                                    std::io::ErrorKind::WouldBlock => guard.clear_ready(),
+                                    // A signal interrupted the read before a
+                                    // frame arrived (EINTR): retry on the next
+                                    // iteration instead of tearing down the
+                                    // whole bridge-NIC relay.
+                                    std::io::ErrorKind::Interrupted => {}
+                                    _ => {
+                                        tracing::debug!("guest→vmnet read error: {err}");
+                                        break;
+                                    }
                                 }
                             }
                         }

@@ -12,13 +12,22 @@ impl AsRawFd for FdWrapper {
 
 /// Writes data to a raw file descriptor, returning bytes written or an error.
 pub(super) fn fd_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
-    // SAFETY: writing from our buffer to a valid socketpair fd.
-    let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
+    loop {
+        // SAFETY: writing from our buffer to a valid socketpair fd.
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            // A signal interrupted the write before any bytes were sent
+            // (EINTR). Retry so a Reliable TCP-shim frame is never dropped —
+            // the same permanent-stall failure the ENOBUFS/EAGAIN requeue
+            // path was built to avoid.
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
         #[allow(clippy::cast_sign_loss)]
-        Ok(n as usize)
+        return Ok(n as usize);
     }
 }
 
