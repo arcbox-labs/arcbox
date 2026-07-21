@@ -6,7 +6,10 @@
 //! (`app/arcbox-docker/src/host_reconciler.rs`) is the only path that can
 //! reclaim the host port-forward listener and DNS/alias registrations — this
 //! test proves its real guest query and cadence against a booted VZ System
-//! VM, which the unit tests (decision logic only) cannot.
+//! VM, which the unit tests (decision logic only) cannot. Both directions are
+//! pinned: the listener must STAY up for as long as docker reports the
+//! container present (the reconciler's fail-safe — it must never strip a live
+//! container), and must vanish within one sweep of the observed removal.
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -51,7 +54,9 @@ fn reconciler_tears_down_self_exited_container() -> Result<()> {
 
             // A published port on a container that ends on its own. --rm makes
             // guest dockerd auto-remove it on exit — the exact path that
-            // bypasses every host-side teardown handler.
+            // bypasses every host-side teardown handler. 30 s of lifetime
+            // keeps the setup steps (docker port, listener wait) safely clear
+            // of the exit on a loaded guest.
             docker_output(
                 data_dir,
                 &[
@@ -64,7 +69,7 @@ fn reconciler_tears_down_self_exited_container() -> Result<()> {
                     "127.0.0.1::80",
                     &image,
                     "sleep",
-                    "8",
+                    "30",
                 ],
                 Duration::from_secs(60),
             )
@@ -77,20 +82,54 @@ fn reconciler_tears_down_self_exited_container() -> Result<()> {
 
             // While the container lives, the host listener must accept (the
             // inbound relay answers the SYN regardless of what's inside).
-            let alive_deadline = Instant::now() + Duration::from_secs(6);
+            let alive_deadline = Instant::now() + Duration::from_secs(10);
             while !connects(port) {
                 if Instant::now() >= alive_deadline {
                     bail!("host listener for 127.0.0.1:{port} never came up");
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            tracing::info!(
-                port,
-                "published port live; waiting for self-exit + reconciler sweep"
-            );
+            tracing::info!(port, "published port live; waiting for the self-exit");
 
-            // The container exits at t≈8 s and dockerd removes it guest-side.
-            // The listener must disappear within one reconciler sweep.
+            // Wait for the container to exit AND be auto-removed guest-side —
+            // observed via docker, not assumed from the sleep duration. Until
+            // then the listener must STAY up: a reconciler that tears down a
+            // live container's networking (e.g. a broken guest query returning
+            // an empty running set) must fail this test, not pass it.
+            let removal_deadline = Instant::now() + Duration::from_secs(90);
+            loop {
+                let present = docker_output(
+                    data_dir,
+                    &[
+                        "ps",
+                        "-a",
+                        "--filter",
+                        &format!("name={NAME}"),
+                        "--format",
+                        "{{.Names}}",
+                    ],
+                    Duration::from_secs(20),
+                )
+                .context("docker ps")?;
+                if present.trim().is_empty() {
+                    break;
+                }
+                if !connects(port) {
+                    bail!(
+                        "host listener for 127.0.0.1:{port} disappeared while the \
+                         container still exists — networking torn down for a live container"
+                    );
+                }
+                if Instant::now() >= removal_deadline {
+                    bail!("container {NAME} never self-exited/auto-removed");
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            tracing::info!("container self-exited and was auto-removed; waiting for the sweep");
+
+            // Removal observed — now the listener must disappear within one
+            // reconciler sweep. The clock starts here, so teardown_seconds
+            // measures reconciler latency from the observed removal.
             let start = Instant::now();
             let deadline = start + TEARDOWN_DEADLINE;
             while connects(port) {
