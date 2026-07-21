@@ -305,20 +305,44 @@ impl TcpBridge {
                     }
                 }
                 HandshakeRole::ActiveOpen => {
-                    // Stop driving the guest-side handshake if the host client
-                    // that opened this inbound connection already disconnected
-                    // (peek on the non-blocking stream: EOF or a hard error) —
-                    // otherwise we retransmit the SYN toward the guest for the
-                    // full TTL for a connection the peer has abandoned.
-                    let host_dead = conn.host_stream.as_ref().is_some_and(|s| {
+                    // Stop driving the guest-side handshake only if the host
+                    // client that opened this inbound connection reset it — a
+                    // hard socket error on the non-blocking peek. A clean EOF
+                    // (peek Ok(0)) is NOT abandonment: the client half-closed
+                    // its write side but can still receive our response, so we
+                    // let the handshake complete and the established fast path
+                    // propagate the EOF as a FIN, exactly as it does after
+                    // promotion. Treating EOF as dead here broke protocols that
+                    // write-half-close to signal end-of-input.
+                    let host_reset = conn.host_stream.as_ref().is_some_and(|s| {
                         let mut probe = [0u8; 1];
                         match s.peek(&mut probe) {
-                            Ok(0) => true, // clean EOF from the host peer
-                            Ok(_) => false,
+                            Ok(_) => false, // data or a clean EOF — peer is not gone
                             Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
                         }
                     });
-                    if host_dead {
+                    if host_reset {
+                        // If we already sent our SYN the guest may sit in
+                        // SYN-RECEIVED; clear it with an RST at seq = our_isn+1
+                        // (its RCV.NXT), which a RFC 5961 guest accepts —
+                        // `handshake_abort_rst`'s seq=0 is for the passive-open
+                        // (SYN-SENT) guest and would be dropped as out-of-window
+                        // here. With no SYN sent the guest has no state to clear.
+                        if conn.saved_frame.is_some() {
+                            out.push(crate::ethernet::build_tcp_rst_frame(
+                                &crate::ethernet::TcpFrameParams {
+                                    src_ip: key.dst_ip,
+                                    dst_ip: key.src_ip,
+                                    src_port: key.dst_port,
+                                    dst_port: key.src_port,
+                                    seq: conn.our_isn.wrapping_add(1),
+                                    ack: 0,
+                                    window: 0,
+                                    src_mac: conn.gw_mac,
+                                    dst_mac: conn.guest_mac,
+                                },
+                            ));
+                        }
                         to_abort.push(*key);
                         continue;
                     }
