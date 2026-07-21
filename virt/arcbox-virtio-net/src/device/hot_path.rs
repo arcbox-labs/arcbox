@@ -146,8 +146,12 @@ impl VirtioNet {
 
     /// Polls the bound host fd for inbound Ethernet frames and injects up
     /// to 64 of them into the RX virtqueue described by `rx_qcfg`. Prepends
-    /// a zeroed 12-byte virtio-net header to each frame. Returns `true` if
-    /// any frame was injected, so the caller can fire the used-ring IRQ.
+    /// a 12-byte virtio-net header to each frame (`num_buffers` = 1 as
+    /// VERSION_1 requires without MRG_RXBUF; every other field zero — no
+    /// offloads on this path). Frames are delivered whole or not at all: a
+    /// chain that can't hold header + frame completes at zero length and
+    /// the frame is dropped. Returns `true` if the used ring advanced, so
+    /// the caller can fire the used-ring IRQ.
     ///
     /// The caller is responsible for building `rx_qcfg` from the device's
     /// MMIO state and gating on DRIVER_OK.
@@ -213,6 +217,7 @@ impl VirtioNet {
                 break;
             };
             let mut written = 0usize;
+            let mut refused = false;
             for desc in &chain.descriptors {
                 if !desc.is_write() {
                     continue;
@@ -235,22 +240,31 @@ impl VirtioNet {
                         };
                     }
                     written += to_write;
+                } else {
+                    // Descriptor outside guest RAM. Skipping it and filling
+                    // later descriptors could still reach `total` while the
+                    // frame's middle is a hole — poison the chain instead.
+                    refused = true;
+                    break;
                 }
             }
 
             // Deliver whole frames only. A partial fit — an undersized chain,
-            // or a descriptor pointing outside guest RAM (`slice_mut` refused
-            // it) — completes at zero length: the guest reclaims the popped
-            // chain (leaving it off the used ring would drain the RX ring
-            // dry) and the frame is dropped whole; TCP retransmits. Truncated
-            // delivery would hand the guest a corrupt frame it parses as
-            // complete. This device never offers MRG_RXBUF (it serves the
-            // vmnet bridge NIC), so spanning chains is never a legal
-            // alternative and a conformant guest posts full-frame buffers —
-            // the drop fires only for undersized or hostile rings. The used
-            // ring advances either way, so the guest still needs the
-            // interrupt below.
-            let used_len = if written == total { written as u32 } else { 0 };
+            // or a descriptor pointing outside guest RAM (`refused`) —
+            // completes at zero length: the guest reclaims the popped chain
+            // (leaving it off the used ring would drain the RX ring dry) and
+            // the frame is dropped whole; TCP retransmits. Truncated delivery
+            // would hand the guest a corrupt frame it parses as complete.
+            // This device never offers MRG_RXBUF (it serves the vmnet bridge
+            // NIC), so spanning chains is never a legal alternative and a
+            // conformant guest posts full-frame buffers — the drop fires only
+            // for undersized or hostile rings. The used ring advances either
+            // way, so the guest still needs the interrupt below.
+            let used_len = if !refused && written == total {
+                written as u32
+            } else {
+                0
+            };
             queue.push_used(chain.head_idx, used_len);
             published = true;
         }
