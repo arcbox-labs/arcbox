@@ -133,27 +133,6 @@ impl TcpBridge {
             return Some(Vec::new()); // Intercepted, no reply frame.
         }
 
-        // A SYN on an already-promoted flow means the guest retransmitted its
-        // SYN / SYN-ACK because it never saw our completing ACK (common on the
-        // inbound ActiveOpen path). Re-send the ACK rather than swallowing it
-        // (the pure-ACK fall-through below returns nothing for such a frame),
-        // which would leave the guest retransmitting until it times out.
-        if flags & 0x02 != 0 {
-            let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
-            let ack = crate::ethernet::build_tcp_ack_frame(&crate::ethernet::TcpFrameParams {
-                src_ip: conn.remote_ip,
-                dst_ip: conn.guest_ip,
-                src_port: conn.remote_port,
-                dst_port: conn.guest_port,
-                seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
-                ack: conn.last_ack,
-                window: 65535,
-                src_mac: self.fast_path_gateway_mac,
-                dst_mac: guest_mac,
-            });
-            return Some(ack);
-        }
-
         // Extract payload using IPv4 total_length to exclude Ethernet padding.
         // NOTE: FIN check is deferred until after payload write — RFC 793
         // allows FIN segments to carry data.
@@ -405,10 +384,15 @@ impl TcpBridge {
             );
         }
 
-        // Only ACK frames that carried payload or a deferred FIN — replying
-        // to a pure ACK would create a dup-ACK loop that triggers fast
-        // retransmits on the peer and tanks host→VM throughput.
-        if payload_len == 0 && flags & 0x01 == 0 {
+        // Only ACK frames that carried payload, a deferred FIN, or a SYN.
+        // Replying to a pure ACK would create a dup-ACK loop that triggers
+        // fast retransmits on the peer and tanks host→VM throughput. A
+        // retransmitted SYN-ACK (the guest never saw our completing ACK, common
+        // on the inbound ActiveOpen path) is the one no-payload-no-FIN frame we
+        // must still ACK, or the guest retransmits until it times out — any
+        // data or FIN it carried was already handled by the paths above, so it
+        // is never dropped.
+        if payload_len == 0 && flags & (0x01 | 0x02) == 0 {
             return Some(Vec::new());
         }
 
