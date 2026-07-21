@@ -244,6 +244,108 @@ async fn handshake_active_open_emits_syn_and_completes() {
     assert_eq!(bridge.fast_path_count(), 1);
 }
 
+/// A host client that half-closes (graceful FIN → peek EOF) before the guest
+/// SYN-ACK must NOT abort the handshake: the client can still receive our
+/// response, and the EOF should propagate as a FIN after promotion. Aborting
+/// here broke write-half-close request/response protocols.
+#[tokio::test]
+async fn active_open_host_eof_does_not_abort() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let host_stream = client.into_std().unwrap();
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    let flow_key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 8080,
+        dst_ip: GW_IP,
+        dst_port: 61501,
+    };
+    bridge.initiate_active_handshake(flow_key, host_stream, GW_MAC, GUEST_MAC);
+    let syn = bridge.poll_handshakes();
+    assert_eq!(syn[0][34 + 13], 0x02, "SYN emitted");
+
+    // Graceful close from the host peer: sends a FIN, so the shim's peek sees
+    // EOF (Ok(0)) — which must be treated as alive-but-half-closed, not dead.
+    drop(server);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let out = bridge.poll_handshakes();
+    assert_eq!(
+        bridge.handshake_count(),
+        1,
+        "a clean EOF must not evict the handshake"
+    );
+    assert!(
+        out.iter().all(|f| f[34 + 13] & 0x04 == 0),
+        "no RST on a graceful half-close"
+    );
+}
+
+/// A host client that RESETS (hard socket error on peek) before the guest
+/// SYN-ACK aborts the handshake AND sends the guest an RST at seq=our_isn+1
+/// so a SYN-RECEIVED guest (which received our SYN) clears its half-open
+/// state immediately instead of lingering to its own timeout.
+#[tokio::test]
+async fn active_open_host_reset_aborts_with_guest_rst() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let host_stream = client.into_std().unwrap();
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    let flow_key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 8080,
+        dst_ip: GW_IP,
+        dst_port: 61502,
+    };
+    bridge.initiate_active_handshake(flow_key, host_stream, GW_MAC, GUEST_MAC);
+    let syn = bridge.poll_handshakes();
+    let tcp = 34;
+    assert_eq!(syn[0][tcp + 13], 0x02, "SYN emitted");
+    let our_isn = u32::from_be_bytes([
+        syn[0][tcp + 4],
+        syn[0][tcp + 5],
+        syn[0][tcp + 6],
+        syn[0][tcp + 7],
+    ]);
+
+    // Force a RST from the host peer: SO_LINGER=0 makes close send RST.
+    socket2::SockRef::from(&server)
+        .set_linger(Some(std::time::Duration::ZERO))
+        .unwrap();
+    drop(server);
+
+    // The RST may take a moment to land; poll until the handshake is evicted.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut frames = Vec::new();
+    while bridge.handshake_count() > 0 && std::time::Instant::now() < deadline {
+        frames.extend(bridge.poll_handshakes());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        bridge.handshake_count(),
+        0,
+        "host reset must evict the handshake"
+    );
+    let rst = frames
+        .iter()
+        .find(|f| f[tcp + 13] & 0x04 != 0)
+        .expect("an RST must be sent to the guest");
+    let rst_seq = u32::from_be_bytes([rst[tcp + 4], rst[tcp + 5], rst[tcp + 6], rst[tcp + 7]]);
+    assert_eq!(
+        rst_seq,
+        our_isn.wrapping_add(1),
+        "RST seq must be our_isn+1 so a SYN-RECEIVED guest accepts it"
+    );
+}
+
 #[tokio::test]
 async fn handshake_rejects_mismatched_ack() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
