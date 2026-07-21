@@ -439,6 +439,14 @@ impl DnsForwarder {
         response[2] = 0x81; // QR=1, Opcode=0, AA=0, TC=0, RD=1
         response[3] = 0x80; // RA=1, Z=0, RCODE=0
 
+        // This builder emits only answer records — never authority or
+        // additional. Zero NSCOUNT and ARCOUNT (copied verbatim from the
+        // query header) so an EDNS query, which sets ARCOUNT=1 for its OPT
+        // pseudo-record, doesn't leave the response advertising a record we
+        // dropped — strict resolvers reject that as malformed. ANCOUNT is
+        // set per branch below. Mirrors `build_nxdomain_response`.
+        response[8..12].fill(0);
+
         // Only answer with the address record the client actually asked for.
         // A mismatched qtype — a different family (A vs AAAA), or MX/TXT/SRV/…
         // — is NODATA (the name exists but has no record of that type), never
@@ -830,6 +838,43 @@ mod tests {
             [0x00, 0x00],
             "an MX query on an A-only host is NODATA, not a mislabeled A record"
         );
+    }
+
+    /// A local-hostname reply to an EDNS(0) query must not advertise section
+    /// records it doesn't carry: the query's ARCOUNT=1 (OPT pseudo-record) is
+    /// copied into the response header, but the builder emits no OPT record,
+    /// so NSCOUNT and ARCOUNT must be zeroed on both the answer and NODATA
+    /// paths or strict resolvers reject the reply as malformed.
+    #[test]
+    fn local_response_zeroes_section_counts_for_edns() {
+        let forwarder = DnsForwarder::new(DnsConfig::default());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Turn an A query into an EDNS query: ARCOUNT=1 + an OPT record.
+        let make_edns = |name: &str, qtype: u8| {
+            let mut q = build_test_query(name);
+            let n = q.len();
+            q[n - 4] = 0x00;
+            q[n - 3] = qtype; // QTYPE
+            q[11] = 0x01; // ARCOUNT = 1
+            // Minimal OPT pseudo-record: root name, TYPE=41, CLASS=4096, TTL=0, RDLEN=0.
+            q.extend_from_slice(&[
+                0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]);
+            q
+        };
+
+        for (label, qtype) in [("answer (A match)", 0x01u8), ("NODATA (MX)", 0x0f)] {
+            let q = make_edns("myvm.arcbox.local", qtype);
+            let resp = forwarder
+                .build_local_response(&DnsQuery::parse(&q).unwrap(), ip)
+                .unwrap();
+            assert_eq!(
+                &resp[8..12],
+                &[0x00, 0x00, 0x00, 0x00],
+                "{label}: NSCOUNT and ARCOUNT must be zero (no authority/additional records emitted)"
+            );
+        }
     }
 
     fn build_test_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
