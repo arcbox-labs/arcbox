@@ -495,7 +495,11 @@ impl VirtioVsock {
         }
 
         if written == 0 {
-            return 0; // Nothing written — leave the avail entry unconsumed.
+            // The chain had no writable capacity, but it was already popped off
+            // the avail ring — return it to the used ring so the guest reclaims
+            // the descriptor instead of leaking it (which drains the RX ring).
+            queue.push_used(chain.head_idx, 0);
+            return 0;
         }
 
         queue.push_used(chain.head_idx, written as u32);
