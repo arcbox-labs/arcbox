@@ -305,6 +305,23 @@ impl TcpBridge {
                     }
                 }
                 HandshakeRole::ActiveOpen => {
+                    // Stop driving the guest-side handshake if the host client
+                    // that opened this inbound connection already disconnected
+                    // (peek on the non-blocking stream: EOF or a hard error) —
+                    // otherwise we retransmit the SYN toward the guest for the
+                    // full TTL for a connection the peer has abandoned.
+                    let host_dead = conn.host_stream.as_ref().is_some_and(|s| {
+                        let mut probe = [0u8; 1];
+                        match s.peek(&mut probe) {
+                            Ok(0) => true, // clean EOF from the host peer
+                            Ok(_) => false,
+                            Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+                        }
+                    });
+                    if host_dead {
+                        to_abort.push(*key);
+                        continue;
+                    }
                     if conn.saved_frame.is_none() {
                         let frame =
                             crate::ethernet::build_tcp_syn_frame(&crate::ethernet::SynParams {
