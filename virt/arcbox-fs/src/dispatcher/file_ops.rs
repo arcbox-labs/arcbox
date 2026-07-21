@@ -61,7 +61,16 @@ impl FuseDispatcher {
 
         // SAFETY: FuseWriteIn may sit at an unaligned offset in the VirtIO buffer.
         let write_in = unsafe { std::ptr::read_unaligned(body.as_ptr() as *const FuseWriteIn) };
-        let data = &body[size_of::<FuseWriteIn>()..];
+        // Honor the request's declared length rather than writing whatever
+        // bytes trail the header: a padded/oversized descriptor chain must not
+        // expand the write beyond `write_in.size`.
+        let Some(data) = body
+            .get(size_of::<FuseWriteIn>()..)
+            .and_then(|d| d.get(..write_in.size as usize))
+        else {
+            response.write_error(ctx.unique, libc::EINVAL);
+            return;
+        };
 
         match self
             .fs

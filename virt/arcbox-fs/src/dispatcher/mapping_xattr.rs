@@ -160,9 +160,15 @@ impl FuseDispatcher {
             unsafe { std::ptr::read_unaligned(body.as_ptr() as *const FuseGetxattrIn) };
         let name = self.parse_name(&body[size_of::<FuseGetxattrIn>()..]);
 
-        match self.fs.getxattr(ctx.nodeid, name, getxattr_in.size) {
+        // Bound the guest-controlled `size`: no xattr exceeds XATTR_SIZE_MAX
+        // (64 KiB), so a larger value can only be an attempt to force a huge
+        // per-request allocation. Clamping keeps the get correct (a real value
+        // fits; an over-large request that wouldn't fit still gets ERANGE).
+        const MAX_XATTR_SIZE: u32 = 64 * 1024;
+        let size = getxattr_in.size.min(MAX_XATTR_SIZE);
+        match self.fs.getxattr(ctx.nodeid, name, size) {
             Ok(value) => {
-                if getxattr_in.size == 0 {
+                if size == 0 {
                     // Return size only
                     let out = FuseGetxattrOut {
                         size: value.len() as u32,
@@ -196,7 +202,16 @@ impl FuseDispatcher {
         // Parse name\0value
         if let Some(null_pos) = rest.iter().position(|&b| b == 0) {
             let name = OsStr::from_bytes(&rest[..null_pos]);
-            let value = &rest[null_pos + 1..][..setxattr_in.size as usize];
+            // The declared value length must fit the bytes actually present
+            // after `name\0`; an oversized `size` used to index-panic here, and
+            // with panic=abort that killed the whole host process.
+            let Some(value) = rest
+                .get(null_pos + 1..)
+                .and_then(|v| v.get(..setxattr_in.size as usize))
+            else {
+                response.write_error(ctx.unique, libc::EINVAL);
+                return;
+            };
 
             match self.fs.setxattr(ctx.nodeid, name, value, setxattr_in.flags) {
                 Ok(()) => response.write_empty(ctx.unique),

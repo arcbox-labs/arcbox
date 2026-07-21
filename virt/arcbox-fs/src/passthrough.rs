@@ -185,6 +185,20 @@ impl PassthroughFs {
     /// Constructs the full host path for a given parent inode and name.
     #[allow(clippy::significant_drop_tightening)]
     fn get_path(&self, parent: u64, name: &OsStr) -> Result<PathBuf> {
+        // A FUSE name must be a single safe path component. The guest must
+        // never escape the shared root via `/`, `..`, `.`, an empty name, or an
+        // absolute path — `Path::join` replaces the base on an absolute arg and
+        // never lexically resolves `..`, so an unchecked name is a full
+        // host-filesystem escape (reachable read/write, incl. via DAX
+        // SETUPMAPPING). This is the single choke point for every name-taking
+        // opcode (lookup/create/mkdir/mknod/link/symlink/unlink/rmdir/rename).
+        let bytes = name.as_encoded_bytes();
+        if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+            return Err(FsError::InvalidPath(format!(
+                "unsafe FUSE name: {}",
+                name.display()
+            )));
+        }
         if parent == Self::ROOT_INODE {
             return Ok(self.root.join(name));
         }
