@@ -721,21 +721,26 @@ mod tests {
         packet
     }
 
-    /// A one-shot fake upstream that answers a single query with a 12-byte
-    /// response header, echoing the query's transaction id or corrupting it.
+    /// A one-shot fake upstream that answers a single query with a valid
+    /// response header (QDCOUNT=1) followed by the echoed question, so the
+    /// reply is protocol-valid rather than a bare truncated header. Echoes
+    /// the query's transaction id or corrupts it per `echo_txid`.
     fn spawn_fake_upstream(echo_txid: bool) -> (SocketAddr, std::thread::JoinHandle<()>) {
         use std::net::UdpSocket;
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            let (_, peer) = sock.recv_from(&mut buf).unwrap();
+            let (len, peer) = sock.recv_from(&mut buf).unwrap();
             let mut reply = if echo_txid {
                 vec![buf[0], buf[1]]
             } else {
                 vec![buf[0] ^ 0xFF, buf[1] ^ 0xFF]
             };
             reply.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
+            // Echo the question section so QDCOUNT=1 is honest and the reply
+            // is a protocol-valid message, not a truncated header.
+            reply.extend_from_slice(&buf[12..len]);
             sock.send_to(&reply, peer).unwrap();
         });
         (addr, handle)
