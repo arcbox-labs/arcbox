@@ -52,6 +52,9 @@ const MIN_SANE_EPOCH: u64 = 1_577_836_800;
 /// All Docker bridge subnets routed from macOS through the bridge NIC.
 const CONTAINER_SUBNET: &str = "172.16.0.0/12";
 
+/// Polling fallback for firewall managers that recreate `DOCKER-USER`.
+const DIRECT_ROUTING_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Idempotent, non-blocking EnsureRuntime handler.
 ///
 /// The first driver spawns [`do_ensure_runtime_start`] as a background
@@ -152,6 +155,7 @@ pub(super) async fn handle_runtime_status(_req: RuntimeStatusRequest) -> RpcResp
 /// daemon option `allow-direct-routing` removes Docker's earlier raw-table
 /// per-container drops; this rule then bypasses its unpublished-port drop.
 async fn ensure_direct_container_routing() -> Result<()> {
+    let _guard = direct_routing_lock().lock().await;
     let Some(bridge_iface) = crate::init::detect_bridge_interface() else {
         tracing::debug!("no bridge NIC found; skipping direct container routing rule");
         return Ok(());
@@ -175,6 +179,12 @@ async fn ensure_direct_container_routing() -> Result<()> {
     if check.status.success() {
         return Ok(());
     }
+    if check.status.code() != Some(1) {
+        bail!(
+            "iptables check failed: {}",
+            String::from_utf8_lossy(&check.stderr).trim()
+        );
+    }
 
     let install = Command::new("/sbin/iptables")
         .args(["-w", "2", "-I"])
@@ -195,6 +205,30 @@ async fn ensure_direct_container_routing() -> Result<()> {
         "direct container routing rule installed"
     );
     Ok(())
+}
+
+fn direct_routing_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Restores the direct-routing firewall rule if Docker recreates its chains.
+pub(super) async fn direct_container_routing_loop() {
+    let mut ticker = tokio::time::interval(DIRECT_ROUTING_RECONCILE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Initial runtime setup owns the readiness gate and first installation.
+    // Delay this fallback's first check to avoid duplicating startup probes.
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        if !probe_docker_api_ready(DOCKER_API_UNIX_SOCKET).await {
+            continue;
+        }
+        if let Err(error) = ensure_direct_container_routing().await {
+            tracing::warn!(%error, "failed to reconcile direct container routing rule");
+        }
+    }
 }
 
 pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
