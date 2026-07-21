@@ -14,6 +14,7 @@
 //!   matching, since the kernel fills interface/flags info in the reply.
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -172,6 +173,10 @@ pub struct GetReply {
     pub ifindex: u16,
     /// The flags from the reply (`rtm_flags`).
     pub flags: i32,
+    /// Destination network address selected by the kernel.
+    pub destination: Ipv4Addr,
+    /// Netmask of the route selected by the kernel.
+    pub netmask: Ipv4Addr,
 }
 
 /// Opens a PF_ROUTE socket, writes an RTM_GET message, and reads back the
@@ -223,9 +228,12 @@ pub fn route_query(msg: &[u8]) -> io::Result<GetReply> {
             if reply_hdr.rtm_errno != 0 {
                 return Err(io::Error::from_raw_os_error(reply_hdr.rtm_errno));
             }
+            let (destination, netmask) = parse_ipv4_route(&buf[..n as usize], &reply_hdr)?;
             return Ok(GetReply {
                 ifindex: reply_hdr.rtm_index,
                 flags: reply_hdr.rtm_flags,
+                destination,
+                netmask,
             });
         }
     }
@@ -236,8 +244,93 @@ pub fn route_query(msg: &[u8]) -> io::Result<GetReply> {
     ))
 }
 
+pub(crate) fn parse_ipv4_route(
+    message: &[u8],
+    header: &libc::rt_msghdr,
+) -> io::Result<(Ipv4Addr, Ipv4Addr)> {
+    let message_len = usize::from(header.rtm_msglen).min(message.len());
+    let mut offset = std::mem::size_of::<libc::rt_msghdr>();
+    let mut destination = None;
+    let mut netmask = None;
+
+    for index in 0..libc::RTAX_MAX {
+        if header.rtm_addrs & (1 << index) == 0 {
+            continue;
+        }
+        if offset + 2 > message_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing message sockaddr header is truncated",
+            ));
+        }
+
+        let sockaddr_len = usize::from(message[offset]);
+        let padded_len = sa_rlen(sockaddr_len);
+        if offset + padded_len > message_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing message sockaddr is truncated",
+            ));
+        }
+
+        if index == libc::RTAX_DST {
+            destination = Some(parse_sockaddr_ipv4(
+                &message[offset..offset + sockaddr_len],
+            )?);
+        } else if index == libc::RTAX_NETMASK {
+            netmask = Some(parse_sockaddr_netmask(
+                &message[offset..offset + sockaddr_len],
+            ));
+        }
+        offset += padded_len;
+    }
+
+    match destination {
+        Some(destination) => Ok((destination, netmask.unwrap_or(Ipv4Addr::BROADCAST))),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "routing reply omitted destination",
+        )),
+    }
+}
+
+fn parse_sockaddr_ipv4(sockaddr: &[u8]) -> io::Result<Ipv4Addr> {
+    if sockaddr.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPv4 sockaddr is too short",
+        ));
+    }
+    let family = i32::from(sockaddr[1]);
+    if family != libc::AF_INET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "routing message sockaddr is not IPv4",
+        ));
+    }
+    let mut octets = [0u8; 4];
+    let available = sockaddr.len().saturating_sub(4).min(octets.len());
+    octets[..available].copy_from_slice(&sockaddr[4..4 + available]);
+    Ok(Ipv4Addr::from(octets))
+}
+
+/// Parses XNU's radix-tree netmask representation.
+///
+/// Kernel replies do not contain a regular `sockaddr_in`: the family byte can
+/// hold mask data, trailing zero octets are omitted, and the default route is
+/// represented by `sa_len == 0`. IPv4 mask bytes still begin at the
+/// `sockaddr_in.sin_addr` offset.
+fn parse_sockaddr_netmask(sockaddr: &[u8]) -> Ipv4Addr {
+    let mut octets = [0u8; 4];
+    let available = sockaddr.len().saturating_sub(4).min(octets.len());
+    if available > 0 {
+        octets[..available].copy_from_slice(&sockaddr[4..4 + available]);
+    }
+    Ipv4Addr::from(octets)
+}
+
 /// Opens a fresh `PF_ROUTE` socket.
-fn open_route_socket() -> io::Result<OwnedFd> {
+pub(crate) fn open_route_socket() -> io::Result<OwnedFd> {
     // Safety: socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC) is always safe.
     let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0) };
     if fd < 0 {
@@ -269,6 +362,17 @@ mod tests {
         assert!(buf.len() >= std::mem::size_of::<libc::rt_msghdr>());
         // Safety: buf is large enough; read_unaligned handles alignment.
         unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<libc::rt_msghdr>()) }
+    }
+
+    fn write_hdr(buf: &mut [u8], header: libc::rt_msghdr) {
+        assert!(buf.len() >= std::mem::size_of::<libc::rt_msghdr>());
+        // Safety: buf is large enough; write_unaligned handles alignment.
+        unsafe { std::ptr::write_unaligned(buf.as_mut_ptr().cast(), header) };
+    }
+
+    fn netmask_offset(message: &[u8]) -> usize {
+        let destination_offset = std::mem::size_of::<libc::rt_msghdr>();
+        destination_offset + sa_rlen(usize::from(message[destination_offset]))
     }
 
     #[test]
@@ -343,5 +447,91 @@ mod tests {
         let hdr2 = read_hdr(&buf2);
 
         assert_ne!(hdr1.rtm_seq, hdr2.rtm_seq);
+    }
+
+    #[test]
+    fn parses_compact_ipv4_netmask_from_route_reply() {
+        let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
+        let dst = sockaddr::make_dst(net);
+        let mask = sockaddr::make_netmask(net);
+        let message = build_msg(MsgType::Get, &dst, None, &mask).unwrap();
+        let header = read_hdr(&message);
+
+        let (destination, netmask) = parse_ipv4_route(&message, &header).unwrap();
+
+        assert_eq!(destination, Ipv4Addr::new(172, 16, 0, 0));
+        assert_eq!(netmask, Ipv4Addr::new(255, 240, 0, 0));
+    }
+
+    #[test]
+    fn parses_kernel_shaped_trimmed_netmask() {
+        let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
+        let dst = sockaddr::make_dst(net);
+        let mask = sockaddr::make_netmask(net);
+        let mut message = build_msg(MsgType::Get, &dst, None, &mask).unwrap();
+        let offset = netmask_offset(&message);
+        message[offset..offset + 6].copy_from_slice(&[6, 0xff, 0xff, 0xff, 0xff, 0xf0]);
+        let header = read_hdr(&message);
+
+        let (_, netmask) = parse_ipv4_route(&message, &header).unwrap();
+
+        assert_eq!(netmask, Ipv4Addr::new(255, 240, 0, 0));
+    }
+
+    #[test]
+    fn zero_length_netmask_represents_default_route() {
+        let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
+        let dst = sockaddr::make_dst(net);
+        let mask = sockaddr::make_netmask(net);
+        let mut message = build_msg(MsgType::Get, &dst, None, &mask).unwrap();
+        let offset = netmask_offset(&message);
+        message[offset] = 0;
+        let header = read_hdr(&message);
+
+        let (_, netmask) = parse_ipv4_route(&message, &header).unwrap();
+
+        assert_eq!(netmask, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn omitted_netmask_represents_host_route() {
+        let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
+        let dst = sockaddr::make_dst(net);
+        let mask = sockaddr::make_netmask(net);
+        let mut message = build_msg(MsgType::Get, &dst, None, &mask).unwrap();
+        let mut header = read_hdr(&message);
+        header.rtm_addrs &= !libc::RTA_NETMASK;
+        write_hdr(&mut message, header);
+
+        let (_, netmask) = parse_ipv4_route(&message, &header).unwrap();
+
+        assert_eq!(netmask, Ipv4Addr::BROADCAST);
+    }
+
+    #[test]
+    fn rejects_truncated_route_sockaddr() {
+        let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
+        let dst = sockaddr::make_dst(net);
+        let mask = sockaddr::make_netmask(net);
+        let message = build_msg(MsgType::Get, &dst, None, &mask).unwrap();
+        let header = read_hdr(&message);
+
+        let error = parse_ipv4_route(&message[..message.len() - 1], &header).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_non_ipv4_route_destination() {
+        let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
+        let dst = sockaddr::make_dst(net);
+        let mask = sockaddr::make_netmask(net);
+        let mut message = build_msg(MsgType::Get, &dst, None, &mask).unwrap();
+        let header = read_hdr(&message);
+        message[std::mem::size_of::<libc::rt_msghdr>() + 1] = libc::AF_INET6 as u8;
+
+        let error = parse_ipv4_route(&message, &header).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

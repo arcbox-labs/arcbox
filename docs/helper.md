@@ -7,19 +7,19 @@ perform: `/usr/local/bin` CLI symlinks, `/var/run/docker.sock`, `/etc/resolver`,
 ## Independent version
 
 `arcbox-helper` owns its **own** Cargo package version
-(`app/arcbox-helper/Cargo.toml`), currently `1.0.1`. It is **not** tied to
+(`app/arcbox-helper/Cargo.toml`), currently `1.0.2`. It is **not** tied to
 `workspace.package.version`.
 
 | Pin | Location |
 |-----|----------|
-| Helper package version | `app/arcbox-helper/Cargo.toml` → `version = "1.0.1"` |
-| Workspace path-dep | root `Cargo.toml` → `arcbox-helper = { version = "1.0.1", path = ... }` (**no** `x-release-please-version`) |
+| Helper package version | `app/arcbox-helper/Cargo.toml` → `version = "1.0.2"` |
+| Workspace path-dep | root `Cargo.toml` → `arcbox-helper = { version = "1.0.2", path = ... }` (**no** `x-release-please-version`) |
 | Daemon/CLI floor | `arcbox_constants::helper::MIN_HELPER_VERSION` |
 
 `arcbox-helper --version` and the tarpc `version` RPC both print:
 
 ```text
-arcbox-helper 1.0.1
+arcbox-helper 1.0.2
 ```
 
 Desktop and daemon parse that line with

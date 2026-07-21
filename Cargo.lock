@@ -365,6 +365,7 @@ dependencies = [
  "arcbox-migration",
  "arcbox-net",
  "arcbox-protocol",
+ "arcbox-route",
  "arcbox-transport",
  "arcbox-virtio",
  "arcbox-vmm",
@@ -409,6 +410,7 @@ dependencies = [
  "arcbox-helper",
  "arcbox-logging",
  "arcbox-net",
+ "arcbox-route",
  "arcbox-transport",
  "async-trait",
  "axum",
@@ -646,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-helper"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arcbox-constants",
  "arcbox-logging",

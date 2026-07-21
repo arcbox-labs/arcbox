@@ -27,6 +27,11 @@ use tracing::{info, warn};
 use crate::context::{DaemonContext, ServiceHandles};
 use crate::dns_service::DnsService;
 
+#[cfg(target_os = "macos")]
+const ROUTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const ROUTE_EVENT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Starts the gRPC server with all services.
 ///
 /// Called before `init_runtime()` — Machine/Sandbox/Snapshot services will
@@ -188,11 +193,24 @@ pub async fn start_services(
         route_status_loop(route_events, route_state, route_shutdown).await;
     }));
 
+    #[cfg(target_os = "macos")]
+    let route_guard = linux_vm.then(|| {
+        let runtime = Arc::clone(runtime);
+        let setup_state = Arc::clone(&ctx.setup_state);
+        let shutdown = ctx.shutdown.clone();
+        tokio::spawn(async move {
+            container_route_guard(runtime, setup_state, shutdown).await;
+        })
+    });
+    #[cfg(not(target_os = "macos"))]
+    let route_guard = None;
+
     Ok(ServiceHandles {
         dns,
         docker,
         grpc,
         kubernetes_proxy,
+        route_guard,
     })
 }
 
@@ -230,6 +248,205 @@ async fn route_status_loop(
             },
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn container_route_guard(
+    runtime: Arc<Runtime>,
+    setup_state: Arc<arcbox_api::SetupState>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use arcbox_core::route_reconciler::RouteMode;
+
+    let mut ticker = tokio::time::interval(ROUTE_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut watcher = open_route_watcher();
+    let mut active: Option<(String, RouteMode)> = None;
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        let route_event = tokio::select! {
+            () = shutdown.cancelled() => break,
+            _ = ticker.tick() => false,
+            event = next_managed_route_event(watcher.as_ref()) => {
+                match event {
+                    Ok(()) => true,
+                    Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {
+                        tracing::debug!(
+                            "route event queue overflowed; reconciling current state"
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "route event watcher failed; polling remains active");
+                        watcher = None;
+                        false
+                    }
+                }
+            }
+        };
+
+        if route_event {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(ROUTE_EVENT_DEBOUNCE) => {}
+            }
+            if let Some(watcher) = watcher.as_ref() {
+                drain_route_events(watcher);
+            }
+        } else if watcher.is_none() {
+            watcher = open_route_watcher();
+        }
+
+        let runtime_for_bridge = Arc::clone(&runtime);
+        let bridge = match tokio::task::spawn_blocking(move || {
+            resolve_container_bridge(&runtime_for_bridge)
+        })
+        .await
+        {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                tracing::warn!(%error, "container bridge resolution task failed");
+                None
+            }
+        };
+        let Some(bridge) = bridge else {
+            active = None;
+            setup_state.set_route_installed(false);
+            consecutive_failures = 0;
+            continue;
+        };
+
+        let current_mode = active
+            .as_ref()
+            .filter(|(active_bridge, _)| active_bridge == &bridge)
+            .map(|(_, mode)| *mode);
+        let result = match current_mode {
+            Some(mode) => {
+                arcbox_core::route_reconciler::reconcile_route_for_bridge(&bridge, mode).await
+            }
+            None => arcbox_core::route_reconciler::initialize_route_for_bridge(&bridge).await,
+        };
+
+        match result {
+            Ok(mode) => {
+                let was_installed = setup_state.current().route_installed;
+                active = Some((bridge, mode));
+                setup_state.set_route_installed(true);
+                consecutive_failures = 0;
+                if !was_installed {
+                    runtime.event_bus().publish(
+                        arcbox_core::event::Event::ContainerRouteInstalled {
+                            name: arcbox_core::DEFAULT_MACHINE_NAME.to_string(),
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                setup_state.set_route_installed(false);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if should_log_route_failure(consecutive_failures) {
+                    tracing::warn!(
+                        %error,
+                        %bridge,
+                        consecutive_failures,
+                        "container route reconciliation failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_route_watcher() -> Option<tokio::io::unix::AsyncFd<arcbox_route::RouteWatcher>> {
+    match arcbox_route::RouteWatcher::open().and_then(tokio::io::unix::AsyncFd::new) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            tracing::warn!(%error, "route event watcher unavailable; using polling");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn next_managed_route_event(
+    watcher: Option<&tokio::io::unix::AsyncFd<arcbox_route::RouteWatcher>>,
+) -> std::io::Result<()> {
+    let Some(watcher) = watcher else {
+        return std::future::pending().await;
+    };
+
+    loop {
+        let mut ready = watcher.readable().await?;
+        match ready.try_io(|inner| inner.get_ref().read_event()) {
+            Ok(Ok(Some(event))) if event.network.is_some_and(is_managed_route) => return Ok(()),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::debug!(%error, "ignored malformed route event");
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_would_block) => {}
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn drain_route_events(watcher: &tokio::io::unix::AsyncFd<arcbox_route::RouteWatcher>) {
+    for _ in 0..256 {
+        match watcher.get_ref().read_event() {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_managed_route(network: arcbox_route::Ipv4Net) -> bool {
+    let network = network.to_string();
+    network == arcbox_core::route_reconciler::CONTAINER_SUBNET
+        || arcbox_core::route_reconciler::CONTAINER_SPLIT_SUBNETS
+            .iter()
+            .any(|candidate| network == *candidate)
+}
+
+#[cfg(all(target_os = "macos", feature = "vmnet"))]
+fn resolve_container_bridge(runtime: &Runtime) -> Option<String> {
+    let machine = runtime
+        .machine_manager()
+        .get(arcbox_core::DEFAULT_MACHINE_NAME)?;
+    if !matches!(
+        machine.state,
+        arcbox_core::machine::MachineState::Starting | arcbox_core::machine::MachineState::Running
+    ) {
+        return None;
+    }
+    runtime
+        .machine_manager()
+        .vmnet_bridge_name(arcbox_core::DEFAULT_MACHINE_NAME)
+}
+
+#[cfg(all(target_os = "macos", not(feature = "vmnet")))]
+fn resolve_container_bridge(runtime: &Runtime) -> Option<String> {
+    let machine = runtime
+        .machine_manager()
+        .get(arcbox_core::DEFAULT_MACHINE_NAME)?;
+    if !matches!(
+        machine.state,
+        arcbox_core::machine::MachineState::Starting | arcbox_core::machine::MachineState::Running
+    ) {
+        return None;
+    }
+    let mac = runtime
+        .machine_manager()
+        .bridge_mac(arcbox_core::DEFAULT_MACHINE_NAME)?;
+    arcbox_core::bridge_discovery::resolve_bridge_by_mac(&mac).map(|bridge| bridge.name)
+}
+
+#[cfg(target_os = "macos")]
+fn should_log_route_failure(consecutive_failures: u32) -> bool {
+    consecutive_failures == 1 || consecutive_failures.is_multiple_of(30)
 }
 
 fn register_host_dns(runtime: &Arc<Runtime>) {

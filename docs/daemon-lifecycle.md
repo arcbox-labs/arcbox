@@ -102,10 +102,9 @@ write current PID
 signal received
   ├─ cancel CancellationToken         → all services begin draining
   ├─ drain(DNS, Docker, gRPC)         → 5 s timeout, then abort
-  ├─ remove_route()                   → clean up container subnet route (macOS)
   ├─ runtime.shutdown()
   │   ├─ stop port forwarders
-  │   ├─ vm_lifecycle.shutdown()       → graceful VM stop, flush disk
+  │   ├─ vm_lifecycle.shutdown()       → graceful VM stop; bridge routes expire
   │   ├─ stop remaining machines
   │   └─ network_manager.stop()
   ├─ DockerContextManager.disable()   → remove Docker CLI integration

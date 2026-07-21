@@ -43,6 +43,7 @@ tonic-reflection = "0.14"
 arcbox-transport.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+arcbox-route.workspace = true
 macos-resolver = { workspace = true }
 libproc = { workspace = true }
 
