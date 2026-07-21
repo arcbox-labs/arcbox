@@ -22,7 +22,6 @@ use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_server::FleetLifecyc
 use arcbox_fleet_control_proto::v1::fleet_settings_service_server::FleetSettingsServiceServer;
 use arcbox_fleet_control_proto::v1::fleet_state_service_server::FleetStateServiceServer;
 use arcbox_fleet_control_proto::v1::{ConnectionState, Enrollment};
-use arcbox_fleet_proto::v1::Capability;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -31,9 +30,9 @@ use tonic::Status;
 use tonic::transport::Server;
 use tracing::{info, warn};
 
+use crate::backends::Backends;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
-use crate::docker::DockerRunner;
 use crate::runner::RunnerSupervisor;
 use crate::settings::SettingsStore;
 use crate::state::AgentState;
@@ -90,8 +89,8 @@ pub async fn serve(
 
     info!(socket = %socket_path.display(), "control-plane server listening");
 
-    let docker = supervisor.docker();
-    let vm = supervisor.vm();
+    let backends = supervisor.backends();
+    let daemon_socket = supervisor.config.vm.daemon_socket.clone();
     Server::builder()
         .add_service(FleetLifecycleServiceServer::new(LifecycleService::new(
             supervisor,
@@ -104,7 +103,9 @@ pub async fn serve(
             settings_store,
         )))
         .add_service(FleetImageServiceServer::new(ImageService::new(
-            state, docker, vm,
+            state,
+            backends,
+            daemon_socket,
         )))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await
@@ -228,10 +229,9 @@ enum State {
 /// subcommand works entirely offline, before this process even starts.
 pub struct AgentSupervisor {
     config: AgentConfig,
-    docker: Option<DockerRunner>,
-    vm: Option<crate::vm::VmRunner>,
-    interop: Option<crate::interop::InteropRunner>,
-    capabilities: Vec<Capability>,
+    /// The live backend registry: runtimes and the capability set they
+    /// serve, shared with every attachment and with `FleetImageService`.
+    backends: Arc<Backends>,
     /// Cancelled on process shutdown (SIGTERM/Ctrl-C); every attachment's
     /// `shutdown` is a child of this token.
     process_shutdown: CancellationToken,
@@ -248,28 +248,16 @@ pub struct AgentSupervisor {
 impl AgentSupervisor {
     /// Build the supervisor, immediately attaching if a credential is
     /// already persisted — the existing headless/farm behavior.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "construction genuinely needs the config, all three optional job backends \
-                  (docker/vm/interop), the advertised capabilities, and the three process-wide \
-                  handles; same shape as attach::run"
-    )]
     pub async fn new(
         config: AgentConfig,
-        docker: Option<DockerRunner>,
-        vm: Option<crate::vm::VmRunner>,
-        interop: Option<crate::interop::InteropRunner>,
-        capabilities: Vec<Capability>,
+        backends: Arc<Backends>,
         process_shutdown: CancellationToken,
         agent_state: AgentState,
         settings_store: SettingsStore,
     ) -> Result<Self> {
         let this = Self {
             config,
-            docker,
-            vm,
-            interop,
-            capabilities,
+            backends,
             process_shutdown,
             state: Mutex::new(State::Unenrolled),
             agent_state,
@@ -296,36 +284,27 @@ impl AgentSupervisor {
         Ok(this)
     }
 
-    /// A handle to the process-lifetime Docker runtime, if configured — read
-    /// by [`serve`] and passed to `FleetImageService` to prepare a candidate
-    /// `linux_runner_image` (see `control::image`). Fixed at construction
-    /// and unaffected by the attach/detach cycle: `docker_mode` changes are
-    /// restart-scoped, so this is never stale.
-    fn docker(&self) -> Option<DockerRunner> {
-        self.docker.clone()
+    /// The live backend registry — read by [`serve`] and shared with
+    /// `FleetImageService`, which prepares candidate runner images through
+    /// the runtimes it holds. The registry is live (the VM slot can
+    /// activate after startup); `docker_mode`/`vm_mode` *policy* changes
+    /// remain restart-scoped.
+    fn backends(&self) -> Arc<Backends> {
+        Arc::clone(&self.backends)
     }
 
     /// Whether the macOS VM backend is active — the daemon probe succeeded
-    /// at startup. Reported as a `GetAgentInfo` feature so clients can
-    /// discover it. Fixed at construction like [`Self::docker`]:
-    /// `vm_mode` changes are restart-scoped.
+    /// (at startup or on a later re-probe). Reported as a `GetAgentInfo`
+    /// feature so clients can discover it.
     pub fn vm_active(&self) -> bool {
-        self.vm.is_some()
-    }
-
-    /// A handle to the macOS VM backend, if active — read by [`serve`] and
-    /// passed to `FleetImageService` to prepare a candidate
-    /// `macos_runner_image` through the daemon. Fixed at construction, same
-    /// rationale as [`Self::docker`].
-    fn vm(&self) -> Option<crate::vm::VmRunner> {
-        self.vm.clone()
+        self.backends.vm_active()
     }
 
     /// Whether the WSL interop backend for windows jobs is active — the
     /// startup probe passed. Reported as a `GetAgentInfo` feature, same
-    /// rationale as [`Self::vm_active`]; restart-scoped like every backend.
+    /// rationale as [`Self::vm_active`].
     pub fn interop_active(&self) -> bool {
-        self.interop.is_some()
+        self.backends.interop_active()
     }
 
     /// Spawn the attach task for `credential` and build its [`Attachment`].
@@ -341,21 +320,15 @@ impl AgentSupervisor {
         // process-lifetime state, so clear any stale draining flag rather than
         // letting a re-enroll inherit it.
         self.agent_state.set_draining(false);
-        let (supervisor, egress_rx) = attach::spawn_supervisor(
-            &self.config,
-            self.docker.clone(),
-            self.vm.clone(),
-            self.interop.clone(),
-            self.capabilities.clone(),
-            self.agent_state.clone(),
-        );
+        let (supervisor, egress_rx) =
+            attach::spawn_supervisor(&self.config, self.backends(), self.agent_state.clone());
         let shutdown = self.process_shutdown.child_token();
         let task = tokio::spawn(attach::run(
             self.config.clone(),
             credential.clone(),
             supervisor.clone(),
             egress_rx,
-            self.capabilities.clone(),
+            self.backends(),
             shutdown.clone(),
             self.agent_state.clone(),
         ));
@@ -424,9 +397,10 @@ impl AgentSupervisor {
             control_plane.map_or_else(|| self.agent_state.gateway_target(), str::to_owned);
 
         // The gateway round-trip must not hold `state` locked.
-        let credential = enroll::enroll(&self.config, token, self.capabilities.clone(), &gateway)
-            .await
-            .map_err(Internal)?;
+        let credential =
+            enroll::enroll(&self.config, token, self.backends.capabilities(), &gateway)
+                .await
+                .map_err(Internal)?;
 
         let mut state = self.state.lock().await;
         // `check_enrollable` refuses `Enrolling`, so nothing else can
@@ -782,10 +756,7 @@ mod tests {
         Arc::new(
             AgentSupervisor::new(
                 test_config(dir.to_path_buf()),
-                None,
-                None,
-                None,
-                Vec::new(),
+                Backends::new(false, None, None, None, agent_state.clone()),
                 CancellationToken::new(),
                 agent_state,
                 SettingsStore::new(dir.join("settings.json")),
@@ -858,10 +829,7 @@ mod tests {
         let runner = crate::runner::RunnerSupervisor::new(
             events,
             None,
-            None,
-            None,
-            None,
-            Vec::new(),
+            Backends::new(false, None, None, None, agent_state.clone()),
             agent_state.clone(),
         );
         *supervisor.state.lock().await = State::Attached(Attachment {
@@ -953,10 +921,7 @@ mod tests {
         });
         let supervisor = AgentSupervisor::new(
             config,
-            None,
-            None,
-            None,
-            Vec::new(),
+            Backends::new(false, None, None, None, agent_state.clone()),
             CancellationToken::new(),
             agent_state.clone(),
             SettingsStore::new(dir.join("settings.json")),
@@ -988,10 +953,7 @@ mod tests {
         let supervisor = Arc::new(
             AgentSupervisor::new(
                 test_config(dir.clone()),
-                None,
-                None,
-                None,
-                Vec::new(),
+                Backends::new(false, None, None, None, agent_state.clone()),
                 CancellationToken::new(),
                 agent_state.clone(),
                 SettingsStore::new(dir.join("settings.json")),
@@ -1013,10 +975,7 @@ mod tests {
         let runner = crate::runner::RunnerSupervisor::new(
             events,
             None,
-            None,
-            None,
-            None,
-            Vec::new(),
+            Backends::new(false, None, None, None, agent_state.clone()),
             agent_state,
         );
         // A persisted credential, so the completed unenroll can prove the

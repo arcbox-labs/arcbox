@@ -13,15 +13,14 @@
 //! Capacity is never a number — admission gates on live load and free memory,
 //! so a busy host simply rejects and the platform re-offers elsewhere.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::{
-    AttachRequest, Backend, Capability, HostTelemetry, ProvisionRunner, RunnerAccepted,
-    RunnerRejected, attach_request,
+    AttachRequest, Backend, HostTelemetry, ProvisionRunner, RunnerAccepted, RunnerRejected,
+    attach_request,
 };
 use command_group::AsyncCommandGroup;
 use dashmap::DashMap;
@@ -29,34 +28,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::docker::{DockerRunner, RunSpec};
+use crate::backends::Backends;
+use crate::docker::RunSpec;
 use crate::host;
-use crate::interop::InteropRunner;
 use crate::state::AgentState;
-use crate::vm::VmRunner;
 
 /// Watchdog on a VM job's runtime: GitHub concludes jobs at 6 h, so a
 /// session still open past that (plus slack) means the guest wedged — treat
 /// it as a cancellation and destroy the guest.
 const MAX_VM_JOB_RUNTIME: Duration = Duration::from_secs(6 * 3600 + 1800);
-
-/// Convert a gateway-advertised capability into its control-plane
-/// counterpart. A plain function, not `From`: both `Capability` types are
-/// generated in other crates, so Rust's orphan rule blocks implementing a
-/// foreign trait (`From`) for two foreign types here.
-fn capability_to_control(c: &Capability) -> control_proto::Capability {
-    let backed_by = match Backend::try_from(c.backed_by) {
-        Ok(Backend::HostRunner) => control_proto::Backend::HostRunner,
-        Ok(Backend::Docker) => control_proto::Backend::Docker,
-        Ok(Backend::Vm) => control_proto::Backend::Vm,
-        Ok(Backend::Unspecified) | Err(_) => control_proto::Backend::Unspecified,
-    };
-    control_proto::Capability {
-        os: c.os.clone(),
-        arch: c.arch.clone(),
-        backed_by: backed_by as i32,
-    }
-}
 
 /// Outcome of the admission decision for an incoming offer.
 #[derive(Debug, PartialEq, Eq)]
@@ -99,14 +79,10 @@ struct Inner {
     /// Path to the installed runner's entry point (`run.sh`). `None` when
     /// only Docker-based execution is configured.
     runner_script: Option<PathBuf>,
-    /// Docker runtime for Linux jobs, if available.
-    docker: Option<DockerRunner>,
-    /// macOS VM backend for darwin jobs, if the local daemon serves it.
-    vm: Option<VmRunner>,
-    /// WSL interop backend for windows jobs, if the startup probe passed.
-    interop: Option<InteropRunner>,
-    /// The backend serving each advertised `(os, arch)` — the routing table.
-    backends: HashMap<(String, String), Backend>,
+    /// The live backend registry: the runtimes behind each advertised
+    /// capability and the `(os, arch)` → backend routing, read per offer so
+    /// routing always agrees with what is currently advertised.
+    backends: Arc<Backends>,
     /// Set once `Drain` is received; no new jobs are accepted.
     draining: std::sync::atomic::AtomicBool,
     /// Set while a self-update is pending; no new jobs are accepted. Kept
@@ -138,40 +114,24 @@ impl Drop for ReleaseGuard {
 }
 
 impl RunnerSupervisor {
-    /// Create a supervisor that emits verdicts on `events`. `capabilities` is the
-    /// same set advertised to the gateway, so routing and advertisement agree.
+    /// Create a supervisor that emits verdicts on `events`. Routing comes
+    /// live from `backends` — the same registry the advertised capability
+    /// set derives from, so routing and advertisement agree by construction.
     /// `load_ceiling`/`mem_floor_mib` are not parameters: `admit()` reads
     /// them live from `state`, which is the single source of truth settings
     /// write through.
     pub fn new(
         events: mpsc::Sender<AttachRequest>,
         runner_script: Option<PathBuf>,
-        docker: Option<DockerRunner>,
-        vm: Option<VmRunner>,
-        interop: Option<InteropRunner>,
-        capabilities: Vec<Capability>,
+        backends: Arc<Backends>,
         state: AgentState,
     ) -> Self {
-        // Static for the attachment's lifetime, so this is set once rather
-        // than tracked incrementally alongside `backends` below.
-        state.set_capabilities(capabilities.iter().map(capability_to_control).collect());
-        let backends = capabilities
-            .into_iter()
-            .filter_map(|c| {
-                Backend::try_from(c.backed_by)
-                    .ok()
-                    .map(|b| ((c.os, c.arch), b))
-            })
-            .collect();
         Self {
             inner: Arc::new(Inner {
                 events,
                 outstanding: DashMap::new(),
                 in_flight: DashMap::new(),
                 runner_script,
-                docker,
-                vm,
-                interop,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 draining_for_update: std::sync::atomic::AtomicBool::new(false),
@@ -255,7 +215,7 @@ impl RunnerSupervisor {
         {
             return Admission::Reject("host is draining".to_owned());
         }
-        let Some(&backend) = self.inner.backends.get(&(os.to_owned(), arch.to_owned())) else {
+        let Some(backend) = self.inner.backends.backend_for(os, arch) else {
             return Admission::Reject(format!("no capability for {os}/{arch}"));
         };
         let load_per_core = if telemetry.cpu_count > 0 {
@@ -464,13 +424,13 @@ impl RunnerSupervisor {
         token: &str,
         cancel: CancellationToken,
     ) {
-        // Invariant: the vm capability is only advertised when the daemon
-        // probe succeeded, so admit() routes here only with `vm` set.
-        let vm = self
-            .inner
-            .vm
-            .as_ref()
-            .expect("vm backend implies a vm runner");
+        // A vm capability is only advertised while the registry's VM slot
+        // is filled, and activation is one-way, so this cannot be empty;
+        // reject defensively rather than panic if that ever breaks.
+        let Some(vm) = self.inner.backends.vm() else {
+            self.reject(job_id, token, "macOS VM backend is not available");
+            return;
+        };
 
         // Startup (clone, boot, DHCP wait, ssh) takes minutes and must not
         // make the agent deaf to CancelRunner.
@@ -553,7 +513,7 @@ impl RunnerSupervisor {
         // Invariant: a windows capability is only advertised when the
         // interop probe passed, so admit() routes here only with `interop`
         // set; reject defensively rather than panic if that ever breaks.
-        let Some(interop) = &self.inner.interop else {
+        let Some(interop) = self.inner.backends.interop() else {
             self.reject(job_id, token, "windows jobs are not served by this agent");
             return;
         };
@@ -675,13 +635,13 @@ impl RunnerSupervisor {
         token: &str,
         cancel: CancellationToken,
     ) {
-        // Invariant: a Docker-backed capability is only advertised when Docker
-        // is present, so admit() routes here only with `docker` set.
-        let docker = self
-            .inner
-            .docker
-            .as_ref()
-            .expect("docker backend implies a docker runtime");
+        // A Docker-backed capability is only advertised while the registry's
+        // Docker slot is filled, so this cannot be empty; reject defensively
+        // rather than panic if that ever breaks.
+        let Some(docker) = self.inner.backends.docker() else {
+            self.reject(job_id, token, "docker runtime is not available");
+            return;
+        };
 
         // Startup is cancellation-aware: a slow image pull must not make the
         // agent deaf to CancelRunner and then accept a job the platform has
@@ -820,7 +780,10 @@ fn runner_command(script: &Path, encoded_jit_config: &str) -> tokio::process::Co
 
 #[cfg(test)]
 mod tests {
+    use arcbox_fleet_proto::v1::Capability;
+
     use super::*;
+    use crate::interop::InteropRunner;
 
     fn capability(os: &str, arch: &str, backend: Backend) -> Capability {
         Capability {
@@ -858,30 +821,18 @@ mod tests {
 
     fn supervisor(capabilities: Vec<Capability>) -> RunnerSupervisor {
         let (events, _rx) = mpsc::channel(1);
+        let state = AgentState::new(&seed());
         RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
-            None,
-            None,
-            None,
-            capabilities,
-            AgentState::new(&seed()),
+            Backends::fixed(capabilities, state.clone()),
+            state,
         )
     }
 
     // Idle host: plenty of headroom.
     fn idle() -> HostTelemetry {
         telemetry(0.5, 8192)
-    }
-
-    #[test]
-    fn constructor_mirrors_capabilities_into_state() {
-        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
-        let caps = sup.inner.state.current().capabilities;
-        assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].os, "darwin");
-        assert_eq!(caps[0].arch, "arm64");
-        assert_eq!(caps[0].backed_by, control_proto::Backend::HostRunner as i32);
     }
 
     #[test]
@@ -909,19 +860,17 @@ mod tests {
         interop: Option<InteropRunner>,
     ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(8);
-        let sup = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            interop,
+        let state = AgentState::new(&crate::settings::PersistedSettings {
+            load_ceiling: f64::MAX,
+            mem_floor_mib: 0,
+            ..seed()
+        });
+        let backends = Backends::fixed_with_interop(
             vec![capability("windows", "amd64", Backend::HostRunner)],
-            AgentState::new(&crate::settings::PersistedSettings {
-                load_ceiling: f64::MAX,
-                mem_floor_mib: 0,
-                ..seed()
-            }),
+            interop,
+            state.clone(),
         );
+        let sup = RunnerSupervisor::new(events, None, backends, state);
         (sup, rx)
     }
 
@@ -1134,14 +1083,15 @@ mod tests {
 
     fn supervisor_with_rx(capacity: usize) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(capacity);
+        let state = AgentState::new(&seed());
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
-            None,
-            None,
-            None,
-            vec![capability("darwin", "arm64", Backend::HostRunner)],
-            AgentState::new(&seed()),
+            Backends::fixed(
+                vec![capability("darwin", "arm64", Backend::HostRunner)],
+                state.clone(),
+            ),
+            state,
         );
         (sup, rx)
     }
@@ -1154,18 +1104,19 @@ mod tests {
         capacity: usize,
     ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(capacity);
+        let state = AgentState::new(&crate::settings::PersistedSettings {
+            load_ceiling: f64::MAX,
+            mem_floor_mib: 0,
+            ..seed()
+        });
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
-            None,
-            None,
-            None,
-            vec![capability("darwin", "arm64", Backend::HostRunner)],
-            AgentState::new(&crate::settings::PersistedSettings {
-                load_ceiling: f64::MAX,
-                mem_floor_mib: 0,
-                ..seed()
-            }),
+            Backends::fixed(
+                vec![capability("darwin", "arm64", Backend::HostRunner)],
+                state.clone(),
+            ),
+            state,
         );
         (sup, rx)
     }
@@ -1378,8 +1329,13 @@ mod tests {
     async fn shutdown_does_not_flip_observable_draining_but_drain_does() {
         let drained = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, None, None, Vec::new(), drained.clone())
-            .handle_drain();
+        RunnerSupervisor::new(
+            events,
+            None,
+            Backends::fixed(Vec::new(), drained.clone()),
+            drained.clone(),
+        )
+        .handle_drain();
         assert!(
             drained.current().draining,
             "Drain flips the observable flag"
@@ -1390,10 +1346,7 @@ mod tests {
         RunnerSupervisor::new(
             events,
             None,
-            None,
-            None,
-            None,
-            Vec::new(),
+            Backends::fixed(Vec::new(), torn_down.clone()),
             torn_down.clone(),
         )
         .shutdown(Duration::from_secs(1))

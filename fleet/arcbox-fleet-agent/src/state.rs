@@ -262,8 +262,9 @@ impl AgentState {
         self.tx.send_modify(|s| s.draining = draining);
     }
 
-    /// Advertised capabilities are static for an attachment's lifetime, so
-    /// this is set once rather than tracked incrementally.
+    /// Mirror the advertised capability set. Written only by the backend
+    /// registry (`crate::backends`): once at construction and again on
+    /// every backend activation.
     pub fn set_capabilities(&self, capabilities: Vec<Capability>) {
         self.tx.send_modify(|s| s.capabilities = capabilities);
     }
@@ -338,6 +339,20 @@ impl AgentState {
             .expect(SETTINGS_INVARIANT)
             .current
             .clone()
+    }
+
+    /// The `vm_mode` this process runs with (`current` is restart-scoped —
+    /// seeded at startup, never moved by `UpdateSettings`). Gates whether
+    /// `FleetImageService.Prepare` may dial the daemon for an inactive VM
+    /// backend.
+    pub fn vm_mode_current(&self) -> VmMode {
+        vm_mode_from_wire(
+            settings_of(&self.tx.borrow())
+                .vm_mode
+                .as_ref()
+                .expect(SETTINGS_INVARIANT)
+                .current,
+        )
     }
 
     /// The desired macOS image — what `FleetImageService.Prepare` pulls

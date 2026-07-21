@@ -27,6 +27,7 @@
 compile_error!("arcbox-fleet-agent supports macOS and Linux only");
 
 mod attach;
+mod backends;
 mod config;
 mod control;
 mod credentials;
@@ -35,6 +36,8 @@ mod enroll;
 mod fsutil;
 mod host;
 mod interop;
+#[cfg(test)]
+mod mock_daemon;
 mod runner;
 #[cfg(target_os = "macos")]
 mod service;
@@ -51,12 +54,12 @@ use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_control_proto::v1::fleet_image_service_client::FleetImageServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
-use arcbox_fleet_proto::v1::Capability;
 use arcbox_logging::LogConfig;
 use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::backends::Backends;
 use crate::config::{AgentConfig, DockerMode, VmMode};
 use crate::docker::DockerRunner;
 use crate::interop::InteropRunner;
@@ -257,9 +260,9 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // Enrollment is pure credential exchange — it never needs Docker or
             // the daemon, so an operator can enroll before either runtime is up.
             // The capabilities sent here are an initial hint, replaced wholesale
-            // by the first heartbeat once the agent attaches, so we advertise
-            // what we know without probing the runtimes.
-            let capabilities = capabilities(seed.runner_script.is_some(), None, None, None);
+            // by the first Attach handshake once the agent attaches, so we
+            // advertise what we know without probing the runtimes.
+            let capabilities = host::capabilities(seed.runner_script.is_some(), &[], false, false);
             let credential = match enroll::enroll(&config, token, capabilities, &seed.gateway).await
             {
                 Ok(credential) => credential,
@@ -288,20 +291,11 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
         Command::Quick(QuickCommand::Run) => {
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
-            let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
-            let vm = init_vm(
-                seed.vm_mode,
-                &seed.macos_runner_image,
-                &config.vm.daemon_socket,
-            )
-            .await?;
-            let interop = init_interop(seed.windows_runner_script.as_deref()).await;
-            let capabilities = capabilities(
-                seed.runner_script.is_some(),
-                docker.as_ref(),
-                vm.as_ref(),
-                interop.as_ref(),
-            );
+            // `quick run` opens no control socket, so nothing ever subscribes to
+            // this over `Watch` — but `RunnerSupervisor` still reads
+            // admission thresholds live from it, so it's load-bearing.
+            let agent_state = AgentState::new(&seed);
+            let backends = init_backends(&config, &seed, agent_state.clone()).await?;
             let credential = config.credential_store_for(&seed.gateway).load()?.context(
                 "no credential found — run `arcbox-fleet-agent quick enroll --token-file …` first",
             )?;
@@ -310,25 +304,22 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // `attach::run` stops accepting work and tears down in-flight
             // runners once this fires.
             let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
-
-            // `quick run` opens no control socket, so nothing ever subscribes to
-            // this over `Watch` — but `RunnerSupervisor` still reads
-            // admission thresholds live from it, so it's load-bearing.
-            let agent_state = AgentState::new(&seed);
-            let (supervisor, egress_rx) = attach::spawn_supervisor(
-                &config,
-                docker,
-                vm,
-                interop,
-                capabilities.clone(),
+            backends::spawn_vm_reprobe(
+                &backends,
                 agent_state.clone(),
+                seed.vm_mode,
+                config.vm.daemon_socket.clone(),
+                shutdown.clone(),
             );
+
+            let (supervisor, egress_rx) =
+                attach::spawn_supervisor(&config, Arc::clone(&backends), agent_state.clone());
             attach::run(
                 config,
                 credential,
                 supervisor,
                 egress_rx,
-                capabilities,
+                backends,
                 shutdown,
                 agent_state,
             )
@@ -348,35 +339,26 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
         Command::Serve => {
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
-            let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
-            let vm = init_vm(
-                seed.vm_mode,
-                &seed.macos_runner_image,
-                &config.vm.daemon_socket,
-            )
-            .await?;
-            let interop = init_interop(seed.windows_runner_script.as_deref()).await;
-            let capabilities = capabilities(
-                seed.runner_script.is_some(),
-                docker.as_ref(),
-                vm.as_ref(),
-                interop.as_ref(),
-            );
+            let agent_state = AgentState::new(&seed);
+            let backends = init_backends(&config, &seed, agent_state.clone()).await?;
             let socket_path = config.control_socket_path();
 
             // Cascades to every attach task's child token, so runners still
             // drain on SIGTERM even though `Unenroll` can also cancel one
             // independently.
             let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
+            backends::spawn_vm_reprobe(
+                &backends,
+                agent_state.clone(),
+                seed.vm_mode,
+                config.vm.daemon_socket.clone(),
+                shutdown.clone(),
+            );
 
-            let agent_state = AgentState::new(&seed);
             let supervisor = Arc::new(
                 control::AgentSupervisor::new(
                     config,
-                    docker,
-                    vm,
-                    interop,
-                    capabilities,
+                    backends,
                     shutdown.clone(),
                     agent_state.clone(),
                     settings_store.clone(),
@@ -667,24 +649,31 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
     Ok(token)
 }
 
-/// Build the capabilities this agent advertises: any Docker-served Linux
-/// capabilities, windows via WSL interop when that probe passed, plus the
-/// native pair — VM-served when the daemon backend is active, else the host
-/// runner (if a runner script is configured). Capacity is decided per offer
-/// from live telemetry, not here.
-fn capabilities(
-    runner_script_present: bool,
-    docker: Option<&DockerRunner>,
-    vm: Option<&VmRunner>,
-    interop: Option<&InteropRunner>,
-) -> Vec<Capability> {
-    let docker_arches = docker.map(DockerRunner::linux_arches).unwrap_or_default();
-    host::capabilities(
-        runner_script_present,
-        &docker_arches,
-        vm.is_some(),
-        interop.is_some(),
+/// Run the startup probes and assemble the backend registry: any
+/// Docker-served Linux capabilities, windows via WSL interop when that
+/// probe passed, plus the native pair — VM-served when the daemon backend
+/// is active, else the host runner (if a runner script is configured).
+/// Capacity is decided per offer from live telemetry, not here.
+async fn init_backends(
+    config: &AgentConfig,
+    seed: &PersistedSettings,
+    agent_state: AgentState,
+) -> Result<Arc<Backends>> {
+    let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
+    let vm = init_vm(
+        seed.vm_mode,
+        &seed.macos_runner_image,
+        &config.vm.daemon_socket,
     )
+    .await?;
+    let interop = init_interop(seed.windows_runner_script.as_deref()).await;
+    Ok(Backends::new(
+        seed.runner_script.is_some(),
+        docker,
+        vm,
+        interop,
+        agent_state,
+    ))
 }
 
 /// Probe Docker availability according to `mode`.
