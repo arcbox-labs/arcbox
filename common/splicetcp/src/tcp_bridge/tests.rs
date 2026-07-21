@@ -982,6 +982,109 @@ async fn upload_ooo_beyond_cap_is_dropped() {
     assert_eq!(conn.up_ooo_dropped, 1);
 }
 
+/// Overlapping parked segments (different start seqs, e.g. from guest
+/// re-segmentation) must not double-write their overlap into the host
+/// stream: the drain's `overlap` offset skips bytes the advancing cursor
+/// already covered. `[2100,2200)` + `[2150,2250)` ⇒ 2000..2250 exactly once.
+#[tokio::test]
+async fn upload_ooo_overlapping_segments_write_each_byte_once() {
+    use std::io::Read;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 104);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40036,
+        dst_ip,
+        dst_port: 443,
+    };
+    let mut server = fast_path_pair(&mut bridge, key, 2000).await;
+
+    // Two overlapping segments park behind the 2000..2100 hole. Their
+    // payloads agree on the overlap (2150..2200 = 0xBB), as a real TCP
+    // retransmit would.
+    let s_a = make_guest_segment((40036, dst_ip, 443), 2100, 1000, 65535, 0x18, &[0xBB; 100]);
+    assert_eq!(
+        tcp_ack_of(&bridge.try_fast_path_intercept(&s_a).unwrap()),
+        2000
+    );
+    let s_b = make_guest_segment((40036, dst_ip, 443), 2150, 1000, 65535, 0x18, &[0xBB; 100]);
+    assert_eq!(
+        tcp_ack_of(&bridge.try_fast_path_intercept(&s_b).unwrap()),
+        2000
+    );
+
+    // Fill the hole → both drain, overlap written once, ACK at 2250.
+    let fill = make_guest_segment((40036, dst_ip, 443), 2000, 1000, 65535, 0x18, &[0xAA; 100]);
+    let reply = bridge.try_fast_path_intercept(&fill).expect("intercepted");
+    assert_eq!(
+        tcp_ack_of(&reply),
+        2250,
+        "ACK must cover the union of overlapping segments, not their summed lengths"
+    );
+
+    let mut got = [0u8; 250];
+    server.read_exact(&mut got).unwrap();
+    assert!(got[..100].iter().all(|&b| b == 0xAA));
+    assert!(
+        got[100..].iter().all(|&b| b == 0xBB),
+        "overlap region intact, no shift"
+    );
+    // Exactly 250 bytes reached the server — no duplicated overlap tail.
+    server
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    let mut extra = [0u8; 1];
+    assert!(
+        matches!(server.read(&mut extra), Err(_) | Ok(0)),
+        "no bytes beyond the 250-byte union — overlap was not written twice"
+    );
+}
+
+/// A guest flooding tiny distinct out-of-order segments cannot exhaust the
+/// daemon: the parked-segment count is capped independently of the byte
+/// cap, and excess segments fall back to drop-and-dup-ACK.
+#[tokio::test]
+async fn upload_ooo_segment_count_is_bounded() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 105);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40037,
+        dst_ip,
+        dst_port: 443,
+    };
+    let _server = fast_path_pair(&mut bridge, key, 2000).await;
+
+    // 1-byte segments at 2002, 2004, … each sit past the 2000..2001 hole and
+    // never fill it, so every one parks. Total bytes stay far under the byte
+    // cap, so only the count cap can bound them.
+    let overshoot = 500u32;
+    for i in 0..(OOO_MAX_SEGMENTS as u32 + overshoot) {
+        let seq = 2002u32.wrapping_add(i * 2);
+        let seg = make_guest_segment((40037, dst_ip, 443), seq, 1000, 65535, 0x18, &[0x5A]);
+        assert_eq!(
+            tcp_ack_of(&bridge.try_fast_path_intercept(&seg).unwrap()),
+            2000
+        );
+    }
+
+    let conn = bridge.fast_path_conns.get(&key).unwrap();
+    assert_eq!(
+        conn.ooo_segs.len(),
+        OOO_MAX_SEGMENTS,
+        "parked segment count must be capped"
+    );
+    assert!(
+        conn.up_ooo_dropped >= overshoot as u64,
+        "segments past the cap must be dropped (got {})",
+        conn.up_ooo_dropped
+    );
+    assert!(conn.ooo_bytes <= OOO_REASSEMBLY_CAP);
+}
+
 /// Parking and draining must survive a sequence-number wraparound mid-gap.
 #[tokio::test]
 async fn upload_ooo_reassembly_across_seq_wraparound() {

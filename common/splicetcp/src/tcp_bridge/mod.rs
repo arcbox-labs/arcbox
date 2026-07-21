@@ -91,6 +91,17 @@ const SHIM_WSCALE: u8 = 7;
 /// drop-and-dup-ACK, which the guest repairs by retransmitting.
 const OOO_REASSEMBLY_CAP: usize = 4 * 1024 * 1024;
 
+/// Upper bound on the *number* of parked out-of-order segments per flow.
+/// [`OOO_REASSEMBLY_CAP`] alone bounds only payload bytes, so a guest could
+/// otherwise park millions of 1-byte segments — exhausting memory in
+/// per-segment `Vec`/allocator overhead and driving quadratic insert/scan
+/// work on the datapath thread. A real out-of-order burst is at most one
+/// window's worth of MSS-sized segments accumulated over a sub-millisecond
+/// local RTT (a few hundred); 4096 clears that by a wide margin while
+/// capping the adversarial case. Segments past this fall back to
+/// drop-and-dup-ACK like the byte cap.
+const OOO_MAX_SEGMENTS: usize = 4096;
+
 /// MSS we advertise in handshake frames to the guest. 1460 is the standard
 /// Ethernet MSS (1500 MTU − 40 bytes IP+TCP). Host→guest large frames with
 /// GSO are unaffected — MSS only bounds the *guest's* segment size.
@@ -294,12 +305,15 @@ pub(super) struct FastPathConn {
     up_short_writes: u64,
     up_out_of_order: u64,
     /// Upload segments that arrived beyond the contiguous cursor, parked
-    /// until the hole before them fills: `(guest_seq, payload)`, sorted by
+    /// until the hole before them fills: `(guest_seq, payload)`, ordered by
     /// wrapping distance from `last_ack`. Parking turns one lost frame into
     /// one guest retransmission; dropping (the pre-2026-07 behavior) made
     /// recovery go-back-N across the whole 8 MiB advertised window, which
-    /// collapsed docker-bridge uploads to tens of Mbit/s.
-    ooo_segs: Vec<(u32, Vec<u8>)>,
+    /// collapsed docker-bridge uploads to tens of Mbit/s. A deque so the
+    /// drain pops contiguous segments off the front in O(1); a real burst
+    /// arrives in ascending order (append to back), so keeping it ordered is
+    /// cheap. Bounded by [`OOO_REASSEMBLY_CAP`] and [`OOO_MAX_SEGMENTS`].
+    ooo_segs: std::collections::VecDeque<(u32, Vec<u8>)>,
     /// Total payload bytes parked in `ooo_segs`; bounded by
     /// [`OOO_REASSEMBLY_CAP`].
     ooo_bytes: usize,
@@ -373,23 +387,28 @@ impl FastPathConn {
     pub(super) fn buffer_ooo_segment(&mut self, seq: u32, payload: &[u8]) {
         let base = self.last_ack;
         let rel = seq.wrapping_sub(base) as usize;
+        let idx = self
+            .ooo_segs
+            .partition_point(|(s, _)| (s.wrapping_sub(base) as usize) < rel);
+        let replaces_existing = matches!(self.ooo_segs.get(idx), Some((s, _)) if *s == seq);
         if rel.saturating_add(payload.len()) > OOO_REASSEMBLY_CAP
             || self.ooo_bytes.saturating_add(payload.len()) > OOO_REASSEMBLY_CAP
+            // A new distinct segment past the count cap is dropped; an
+            // in-place replacement of a parked seq does not grow the count.
+            || (!replaces_existing && self.ooo_segs.len() >= OOO_MAX_SEGMENTS)
         {
             self.up_ooo_dropped += 1;
             return;
         }
-        let idx = self
-            .ooo_segs
-            .partition_point(|(s, _)| (s.wrapping_sub(base) as usize) < rel);
-        if let Some((s, existing)) = self.ooo_segs.get(idx)
-            && *s == seq
-        {
-            if existing.len() >= payload.len() {
-                return; // duplicate of an already-parked segment
+        if replaces_existing {
+            // Same start seq already parked: keep whichever is longer (a
+            // retransmit may carry more data), never write the shorter twice.
+            if self.ooo_segs[idx].1.len() >= payload.len() {
+                return;
             }
-            let (_, old) = self.ooo_segs.remove(idx);
-            self.ooo_bytes -= old.len();
+            if let Some((_, old)) = self.ooo_segs.remove(idx) {
+                self.ooo_bytes -= old.len();
+            }
         }
         self.ooo_bytes += payload.len();
         self.ooo_segs.insert(idx, (seq, payload.to_vec()));
@@ -404,15 +423,16 @@ impl FastPathConn {
     /// drain). A hard write error propagates for the caller's RST teardown.
     pub(super) fn drain_parked_segments(&mut self) -> std::io::Result<()> {
         use std::io::Write;
-        while let Some(&(seq, ref data)) = self.ooo_segs.first() {
+        while let Some(&(seq, ref data)) = self.ooo_segs.front() {
             let len = data.len();
             let seg_end = seq.wrapping_add(len as u32);
             let extends = seg_end.wrapping_sub(self.last_ack);
             if extends == 0 || extends >= 0x8000_0000 {
                 // Fully at/behind the cursor: a retransmit landed in-order
                 // first and already covered these bytes.
-                let (_, old) = self.ooo_segs.remove(0);
-                self.ooo_bytes -= old.len();
+                if let Some((_, old)) = self.ooo_segs.pop_front() {
+                    self.ooo_bytes -= old.len();
+                }
                 continue;
             }
             let overlap = self.last_ack.wrapping_sub(seq);
@@ -430,8 +450,9 @@ impl FastPathConn {
                     // Peer closed — drain at the TCP layer like the in-order
                     // path so the guest stops retransmitting.
                     self.set_last_ack(seg_end);
-                    let (_, old) = self.ooo_segs.remove(0);
-                    self.ooo_bytes -= old.len();
+                    if let Some((_, old)) = self.ooo_segs.pop_front() {
+                        self.ooo_bytes -= old.len();
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -443,8 +464,9 @@ impl FastPathConn {
                 self.up_short_writes += 1;
                 break; // remainder stays parked; overlap math resumes here
             }
-            let (_, old) = self.ooo_segs.remove(0);
-            self.ooo_bytes -= old.len();
+            if let Some((_, old)) = self.ooo_segs.pop_front() {
+                self.ooo_bytes -= old.len();
+            }
         }
         Ok(())
     }
