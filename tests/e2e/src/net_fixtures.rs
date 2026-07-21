@@ -49,15 +49,19 @@ pub fn fill_pattern(buf: &mut [u8], seed: u64) {
     }
 }
 
-/// Lowercase-hex SHA-256 of `data`.
-pub fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
+/// Lowercase-hex encoding of a byte stream.
+fn hex_encode(bytes: impl IntoIterator<Item = u8>) -> String {
+    use std::fmt::Write;
+    let mut hex = String::new();
+    for byte in bytes {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+/// Lowercase-hex SHA-256 of `data`.
+pub fn sha256_hex(data: &[u8]) -> String {
+    hex_encode(Sha256::digest(data))
 }
 
 /// Reads request headers until the `\r\n\r\n` terminator. Returns false on
@@ -328,13 +332,7 @@ impl SlowSink {
         while started.elapsed() < timeout {
             if self.done.load(Ordering::Acquire) {
                 let sha256 = self.hasher.as_ref().map_or_else(String::new, |h| {
-                    let digest = h.lock().expect("hasher poisoned").clone().finalize();
-                    let mut hex = String::with_capacity(64);
-                    for byte in digest {
-                        use std::fmt::Write;
-                        let _ = write!(hex, "{byte:02x}");
-                    }
-                    hex
+                    hex_encode(h.lock().expect("hasher poisoned").clone().finalize())
                 });
                 return Ok(SinkReport {
                     received: self.received.load(Ordering::Acquire),
