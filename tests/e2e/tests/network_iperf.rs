@@ -64,11 +64,21 @@ fn cell_timeout() -> Duration {
 /// variable (an idle-VM freeze drops a 5 Gbps path to 0.4 Gbps with no code
 /// change). Set `ARCBOX_E2E_IPERF_MIN_GBPS` on a quiet machine to turn this
 /// into a real per-host throughput regression gate.
-fn min_gbps() -> f64 {
-    std::env::var("ARCBOX_E2E_IPERF_MIN_GBPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0)
+fn min_gbps() -> Result<f64> {
+    match std::env::var("ARCBOX_E2E_IPERF_MIN_GBPS") {
+        Err(_) => Ok(0.0),
+        // A present-but-bad value must NOT silently disable the gate — a
+        // run set up to enforce a floor would then pass everything.
+        Ok(v) => {
+            let f: f64 = v
+                .parse()
+                .with_context(|| format!("ARCBOX_E2E_IPERF_MIN_GBPS={v:?} is not a number"))?;
+            if !f.is_finite() || f < 0.0 {
+                bail!("ARCBOX_E2E_IPERF_MIN_GBPS={v:?} must be a non-negative number");
+            }
+            Ok(f)
+        }
+    }
 }
 
 /// A host-side `iperf3 -s` bound to `127.0.0.1:port`, killed on drop. The
@@ -113,7 +123,18 @@ impl Drop for HostIperfServer {
 /// `end.sum_received.bits_per_second` — the receiver's view, correct for
 /// both forward (server receives) and `-R` (client receives).
 fn parse_bps(json: &str) -> Result<f64> {
-    let v: serde_json::Value = serde_json::from_str(json).context("parsing iperf3 JSON")?;
+    // `docker_output` returns stdout+stderr merged, so docker's own lines
+    // (e.g. "WARNING: The requested image's platform ... does not match")
+    // can bracket iperf3's `-J` object. iperf3 emits exactly one top-level
+    // JSON object, so slice from the first '{' to the last '}' rather than
+    // parsing the whole string (which serde rejects on any surrounding
+    // non-whitespace) — otherwise a benign docker warning fails the cell.
+    let start = json.find('{').context("no JSON object in iperf3 output")?;
+    let end = json
+        .rfind('}')
+        .context("no JSON object end in iperf3 output")?;
+    let v: serde_json::Value =
+        serde_json::from_str(&json[start..=end]).context("parsing iperf3 JSON")?;
     if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
         bail!("iperf3 reported: {err}");
     }
@@ -221,7 +242,7 @@ fn net_iperf_throughput_matrix() -> Result<()> {
             metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
 
             let server = HostIperfServer::spawn()?;
-            let floor = min_gbps();
+            let floor = min_gbps()?;
             let mut failures = Vec::new();
 
             // Egress matrix: {bridge, host-net} × {upload, download} × {single, P4}.

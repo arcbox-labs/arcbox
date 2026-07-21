@@ -133,5 +133,12 @@ Environment variables read by the tests:
 - `ARCBOX_E2E_METRICS_DIR` / `ARCBOX_E2E_RUN_LABEL` — archive per-run phase
   timings as `<label>.metrics.json` in the given directory (set automatically
   by `cargo xtask e2e`). Runs also write `metrics.json` into their data dir.
+- `ARCBOX_E2E_IPERF_IMAGE=<ref>` — guest iperf3 image for the
+  `network_iperf` throughput matrix (default `networkstatic/iperf3:latest`).
+- `ARCBOX_E2E_IPERF_MIN_GBPS=<f64>` — `network_iperf` gate floor. Unset (or
+  0) gates on liveness only (VZ throughput is too run-to-run variable for an
+  automated target); set it on a quiet machine to enforce a real per-host
+  throughput floor. A present-but-invalid value fails the test rather than
+  silently disabling the gate.
 
 Tracing is controlled with `RUST_LOG`; it defaults to `info` when unset.
