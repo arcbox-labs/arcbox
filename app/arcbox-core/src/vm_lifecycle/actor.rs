@@ -197,6 +197,13 @@ impl BalloonDeps for RealBalloonDeps {
             .set_balloon_target(&info.vm_id, bytes)
     }
 
+    /// HV advertises virtio-balloon free page reporting + deflate-on-oom
+    /// (`virt/arcbox-virtio-balloon`), so its guest self-reclaims; VZ's
+    /// traditional balloon does not.
+    fn guest_self_reclaims(&self) -> bool {
+        matches!(self.shared.backend(), arcbox_vmm::VmBackend::Hv)
+    }
+
     /// Any failure (connect, RPC, timeout) folds to `None`: the policy treats
     /// "unknown" as its own signal — never shrink on it, and fail open while
     /// shrunk, since a reclaim-thrashing guest is exactly one that cannot

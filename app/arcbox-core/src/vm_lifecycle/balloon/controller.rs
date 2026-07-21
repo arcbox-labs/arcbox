@@ -37,6 +37,13 @@
 //! ([`fail_open_backoff`]): after each failed descent the next idle entry is
 //! suppressed for a growing window, and a shrink that actually holds clears
 //! the streak so idle reclaim self-heals once the host recovers.
+//!
+//! This whole host-driven descent runs only on the VZ backend, whose
+//! traditional balloon exposes nothing but a target. The HV backend's
+//! virtio-balloon advertises free page reporting and deflate-on-oom, so its
+//! guest kernel drains idle memory to the host on its own and recovers under
+//! OOM without any target policy — there the controller stays out of the way
+//! (see [`BalloonDeps::guest_self_reclaims`]).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -91,6 +98,13 @@ pub(in crate::vm_lifecycle) trait BalloonDeps:
 
     /// Applies a balloon target on the hypervisor device.
     fn set_balloon_target(&self, bytes: u64) -> Result<()>;
+
+    /// Whether the guest reclaims idle memory on its own. The HV backend
+    /// advertises virtio-balloon free page reporting + deflate-on-oom, so its
+    /// guest kernel drains free pages to the host continuously and recovers
+    /// under OOM without a host-driven target; the idle-shrink descent is then
+    /// skipped. VZ's traditional balloon has no such mechanism and needs it.
+    fn guest_self_reclaims(&self) -> bool;
 
     /// Guest memory + load snapshot within `budget`; `None` = unreachable.
     fn guest_stats(&self, budget: Duration) -> impl Future<Output = Option<GuestStats>> + Send;
@@ -363,6 +377,16 @@ impl<D: BalloonDeps> BalloonController<D> {
         let Some(full) = self.deps.full_memory_bytes() else {
             return Mode::IdleUnshrunk;
         };
+        // On a backend whose guest self-reclaims (HV free page reporting), the
+        // host-driven descent is unnecessary and is the sole source of the
+        // inflate-stall pathology; stay out of the way and let the guest drain
+        // idle memory itself.
+        if self.deps.guest_self_reclaims() {
+            tracing::debug!(
+                "idle balloon shrink skipped; guest self-reclaims via free page reporting"
+            );
+            return Mode::Active;
+        }
         // Back off after repeated fail-opens. A shrink that fails the same way
         // every cycle — typically inflation stalling on a host that is itself
         // out of memory — must not restage its reclaim storm on the 5-minute
@@ -544,6 +568,8 @@ mod tests {
         /// When set, `set_balloon_target` fails (attempts still counted).
         fail_set_target: std::sync::atomic::AtomicBool,
         set_attempts: Arc<AtomicUsize>,
+        /// Emulates a self-reclaiming backend (HV free page reporting).
+        self_reclaims: bool,
         watch_supported: bool,
         watch_frames: Mutex<Vec<mpsc::UnboundedReceiver<WatchFrame>>>,
         watch_senders: Mutex<Vec<mpsc::UnboundedSender<WatchFrame>>>,
@@ -559,6 +585,7 @@ mod tests {
                 targets: Arc::new(Mutex::new(Vec::new())),
                 fail_set_target: std::sync::atomic::AtomicBool::new(false),
                 set_attempts: Arc::new(AtomicUsize::new(0)),
+                self_reclaims: false,
                 watch_supported: true,
                 watch_frames: Mutex::new(Vec::new()),
                 watch_senders: Mutex::new(Vec::new()),
@@ -595,6 +622,10 @@ mod tests {
             }
             self.targets.lock().unwrap().push(bytes);
             Ok(())
+        }
+
+        fn guest_self_reclaims(&self) -> bool {
+            self.self_reclaims
         }
 
         async fn guest_stats(&self, _budget: Duration) -> Option<GuestStats> {
@@ -1043,6 +1074,31 @@ mod tests {
 
         assert!(h.targets().is_empty());
         assert_eq!(h.activity_count(), 0);
+    }
+
+    /// The HV backend advertises free page reporting + deflate-on-oom, so the
+    /// guest self-reclaims: the host-driven idle-shrink must never fire — no
+    /// target, no watch, no forced idle exit.
+    #[tokio::test(start_paused = true)]
+    async fn self_reclaiming_backend_skips_idle_shrink() {
+        let mut deps = FakeDeps::new(Some(FULL));
+        deps.self_reclaims = true;
+        deps.push_stats(Some(idle_stats()));
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+
+        assert!(
+            h.targets().is_empty(),
+            "self-reclaiming guest must not be shrunk"
+        );
+        assert_eq!(
+            h.deps.watches_opened.load(Ordering::SeqCst),
+            0,
+            "no pressure watch on a self-reclaiming backend"
+        );
+        assert_eq!(h.activity_count(), 0, "declining to shrink is not activity");
     }
 
     #[test]
