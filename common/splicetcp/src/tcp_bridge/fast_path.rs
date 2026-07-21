@@ -197,13 +197,17 @@ impl TcpBridge {
         }
 
         // Write payload to host stream (if any). The invariant that keeps
-        // uploads lossless with no shim-side buffering: `last_ack` advances
-        // ONLY over bytes actually written, in order, to the host socket.
-        // Everything else (out-of-order arrival, WouldBlock, the unwritten
-        // tail of a short write) stays un-ACKed, so the guest's own
-        // fast-retransmit/RTO machinery repairs the stream — dup-ACKs from
-        // the fall-through below are the recovery signal. ACKing past
-        // unwritten bytes is how uploads silently lost data (2026-07-19).
+        // uploads lossless: `last_ack` advances ONLY over bytes actually
+        // written, in order, to the host socket. Everything else
+        // (WouldBlock, the unwritten tail of a short write) stays un-ACKed,
+        // so the guest's own fast-retransmit/RTO machinery repairs the
+        // stream — dup-ACKs from the fall-through below are the recovery
+        // signal. ACKing past unwritten bytes is how uploads silently lost
+        // data (2026-07-19). Out-of-order segments are parked un-ACKed in
+        // `ooo_segs` and written once the hole before them fills — parking
+        // (vs the old drop) is what keeps one lost frame from forcing the
+        // guest to retransmit the entire in-flight window.
+        let mut in_order_advanced = false;
         if payload_len > 0 {
             use std::io::Write;
             let seq_end = guest_seq.wrapping_add(payload_len as u32);
@@ -221,17 +225,20 @@ impl TcpBridge {
                 let overlap = conn.last_ack.wrapping_sub(guest_seq);
                 if overlap >= 0x8000_0000 {
                     // guest_seq is ahead of the cursor: a hole precedes this
-                    // segment. Writing it would corrupt the byte stream and
-                    // ACKing it would bury the hole forever. Leave last_ack
-                    // alone — the ACK below is a dup-ACK, which is exactly
-                    // what makes the guest fast-retransmit the gap.
+                    // segment. Writing it now would corrupt the byte stream
+                    // and ACKing it would bury the hole forever. Park it
+                    // (bounded) for delivery once the hole fills; leave
+                    // last_ack alone — the ACK below is a dup-ACK, which is
+                    // exactly what makes the guest fast-retransmit the gap.
                     conn.up_out_of_order += 1;
+                    conn.buffer_ooo_segment(guest_seq, &frame[payload_start..payload_end]);
                 } else {
                     let fresh = &frame[payload_start + overlap as usize..payload_end];
                     match conn.stream.write(fresh) {
                         Ok(n) => {
                             conn.up_bytes += n as u64;
                             conn.set_last_ack(conn.last_ack.wrapping_add(n as u32));
+                            in_order_advanced = true;
                             if n < fresh.len() {
                                 // Host socket buffer filled mid-segment: ACK
                                 // covers only what was written; the guest
@@ -249,6 +256,7 @@ impl TcpBridge {
                             // Peer closed; inject already relayed FIN. ACK at
                             // TCP layer so the guest stops retransmitting.
                             conn.set_last_ack(seq_end);
+                            in_order_advanced = true;
                             tracing::debug!(
                                 "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} Broken pipe, draining {payload_len} bytes"
                             );
@@ -277,6 +285,30 @@ impl TcpBridge {
                     }
                 }
             }
+        }
+
+        // A cursor advance may have landed right behind parked out-of-order
+        // segments — flush them now so the ACK below leaps over everything
+        // contiguous instead of forcing the guest to retransmit data that
+        // already arrived.
+        if in_order_advanced
+            && !conn.ooo_segs.is_empty()
+            && let Err(e) = conn.drain_parked_segments()
+        {
+            tracing::warn!("Fast path TX drain error, RST to guest: {e}");
+            let rst = crate::ethernet::build_tcp_rst_frame(&crate::ethernet::TcpFrameParams {
+                src_ip: conn.remote_ip,
+                dst_ip: conn.guest_ip,
+                src_port: conn.remote_port,
+                dst_port: conn.guest_port,
+                seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                ack: conn.last_ack,
+                window: 0,
+                src_mac: self.fast_path_gateway_mac,
+                dst_mac: self.fast_path_guest_mac.unwrap_or([0xFF; 6]),
+            });
+            self.close_fast_path(&key);
+            return Some(rst);
         }
 
         // FIN handling — only once every byte before it has been written and
@@ -574,7 +606,7 @@ impl TcpBridge {
         if conn.up_would_block + conn.up_short_writes + conn.up_out_of_order + conn.retransmits > 0
         {
             tracing::debug!(
-                "Fast path close {}:{} → {}:{}: loss recovery (up: would_block={}, short_writes={}, out_of_order={}; down: retransmits={})",
+                "Fast path close {}:{} → {}:{}: loss recovery (up: would_block={}, short_writes={}, out_of_order={}, ooo_dropped={}; down: retransmits={})",
                 key.src_ip,
                 key.src_port,
                 key.dst_ip,
@@ -582,6 +614,7 @@ impl TcpBridge {
                 conn.up_would_block,
                 conn.up_short_writes,
                 conn.up_out_of_order,
+                conn.up_ooo_dropped,
                 conn.retransmits,
             );
         }
@@ -720,6 +753,9 @@ impl TcpBridge {
                 up_would_block: 0,
                 up_short_writes: 0,
                 up_out_of_order: 0,
+                ooo_segs: Vec::new(),
+                ooo_bytes: 0,
+                up_ooo_dropped: 0,
                 window_stalled: false,
                 retransmit_buf: std::collections::VecDeque::new(),
                 retransmit_seq: our_seq,
