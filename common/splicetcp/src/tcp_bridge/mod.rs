@@ -91,11 +91,15 @@ const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// actively soliciting a response — retransmitting unACKed data or a FIN, or
 /// persist-probing a closed receive window. A live guest answers every
 /// solicit (a retransmit elicits at least a dup-ACK; a persist probe elicits
-/// a window-bearing ACK per RFC 793 §3.9), so five minutes of silence means
-/// the guest endpoint is gone (container netns torn down, VM wedged) and the
-/// entry would otherwise retransmit forever and leak its host fd plus up to
-/// [`HONORED_WINDOW_CAP`] of retransmission buffer. Deliberately generous so
-/// a paused-then-resumed VM (see `arcbox-vz` pause / sandbox checkpoint)
+/// a window-bearing ACK per RFC 793 §3.9), so five minutes of unanswered
+/// soliciting means the guest endpoint is gone (container netns torn down,
+/// VM wedged) and the entry would otherwise retransmit forever and leak its
+/// host fd plus up to [`HONORED_WINDOW_CAP`] of retransmission buffer. Both
+/// clocks must be stale: five minutes of *continuous soliciting* AND five
+/// minutes since the last guest frame — a long-idle flow whose upstream
+/// wakes up starts the soliciting clock fresh at the wake-up, so its guest
+/// gets the full deadline to answer. Deliberately generous so a
+/// paused-then-resumed VM (see `arcbox-vz` pause / sandbox checkpoint)
 /// keeps its in-flight flows across any reasonable pause. Purely idle flows
 /// (nothing in flight, window open) are never reaped — matching real TCP,
 /// which keeps quiescent connections indefinitely.
@@ -431,6 +435,11 @@ pub(super) struct FastPathConn {
     /// guest endpoint is gone and the flow is RST-reaped instead of
     /// retransmitting forever.
     last_guest_activity: StdInstant,
+    /// When the current uninterrupted stretch of soliciting began; `None`
+    /// while quiescent. The reap deadline runs against this too, so a
+    /// long-idle flow whose upstream wakes up is measured from the wake-up —
+    /// not from its (legitimately ancient) last guest frame.
+    soliciting_since: Option<StdInstant>,
 }
 
 impl FastPathConn {
