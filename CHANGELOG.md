@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2](https://github.com/arcboxlabs/arcbox/compare/v0.5.1...v0.5.2) (2026-07-21)
+
+
+### Bug Fixes
+
+* **agent:** gate readiness on routing setup ([4edbdc8](https://github.com/arcboxlabs/arcbox/commit/4edbdc8d4d5a99c197ca3fda24004d8e92544343))
+* **agent:** reconcile direct routing firewall rule ([564d73a](https://github.com/arcboxlabs/arcbox/commit/564d73ab815e436c6a745863b778a0f5e8c77b7f))
+* **dns:** don't hold the forwarder write lock across blocking upstream I/O ([75310eb](https://github.com/arcboxlabs/arcbox/commit/75310eb0bf0d292b351f47c357a6018f084be530))
+* **dns:** source-check forwarded replies and honor the query QTYPE ([4318422](https://github.com/arcboxlabs/arcbox/commit/4318422780a681c24a7777dc188ecf1edfdcffab))
+* **dns:** validate upstream replies to close cache-poisoning window ([e5e8e18](https://github.com/arcboxlabs/arcbox/commit/e5e8e18cb460958a9ac7d08bac6d4b90d730a48a))
+* **dns:** zero NSCOUNT and ARCOUNT in local-hostname responses ([6050d9d](https://github.com/arcboxlabs/arcbox/commit/6050d9d30d98558d35f2d82735199fa85af8065c))
+* **doctor:** query container route as network ([d4274d4](https://github.com/arcboxlabs/arcbox/commit/d4274d47c7d7f466a69658428a2d9390bae217f6))
+* **fs:** harden the passthrough FUSE server against hostile guests ([7aec6fd](https://github.com/arcboxlabs/arcbox/commit/7aec6fdc1ee0e87e9c71e1872c2ca04bb5de3f42))
+* **net:** abort an inbound ActiveOpen handshake when the host peer disconnects ([7c683ee](https://github.com/arcboxlabs/arcbox/commit/7c683ee55fbc009c9261f1092f1bf55cbb76ff1a))
+* **net:** add a zero-window persist probe to the download fast path ([b46b0dc](https://github.com/arcboxlabs/arcbox/commit/b46b0dcce16e2e9e0907bb3a45518dd0073f9537))
+* **net:** bound half-closed flows with a FIN_WAIT2 idle timeout ([ff4c330](https://github.com/arcboxlabs/arcbox/commit/ff4c3300d254025078407f6cf2c21647277c6097))
+* **net:** bound parked out-of-order segment count and drain in O(1) ([2111a5b](https://github.com/arcboxlabs/arcbox/commit/2111a5b94adcbf20c73a78dfab6bd5fef13923df))
+* **net:** extend the zero-window persist probe to inline-owned flows ([22c29ca](https://github.com/arcboxlabs/arcbox/commit/22c29cad0bd7cc84e0f1d6ef0646ec95018f3b8d))
+* **net:** half-close guest FIN instead of tearing the whole flow down ([d64aaec](https://github.com/arcboxlabs/arcbox/commit/d64aaec4459192a9875cf317157d5bc5c14959f7))
+* **net:** let a retransmitted SYN-ACK's payload/FIN flow through ([3702fe9](https://github.com/arcboxlabs/arcbox/commit/3702fe94a54eab5cfa1b4698e211504a383b6337))
+* **net:** park out-of-order upload segments instead of dropping them ([dc5edcc](https://github.com/arcboxlabs/arcbox/commit/dc5edcc9a0b286e4174c7339d1cf6bfa6bc3dcb9))
+* **net:** re-ACK a retransmitted guest SYN on an established fast-path flow ([27e90f3](https://github.com/arcboxlabs/arcbox/commit/27e90f3f85ee005d52cd1c9913c10e162a6f0ee5))
+* **net:** reject contained IP fragments that conflict byte-for-byte ([b69c776](https://github.com/arcboxlabs/arcbox/commit/b69c776ea97179eb1720bfa0ce7784c65133144c))
+* **net:** reject overlapping IP fragments instead of last-write-wins ([05f248b](https://github.com/arcboxlabs/arcbox/commit/05f248b72db3eb73ccf7cf31af261c16c2ebb480))
+* **net:** retry EINTR on the NIC datapaths instead of dropping / killing them ([610ada1](https://github.com/arcboxlabs/arcbox/commit/610ada1ef905cb590c10341d5fc26f06f089a458))
+* **net:** treat ActiveOpen host EOF as half-close, RST the guest on reset ([90c8bcc](https://github.com/arcboxlabs/arcbox/commit/90c8bcc8a0b1431dcf0b885147897a5fba389774))
+* **net:** validate IPv4 IHL and TCP data offset before parsing headers ([1d4d6c9](https://github.com/arcboxlabs/arcbox/commit/1d4d6c91ca4d475a0f9ac480da33d8b82f7e6216))
+* **network:** allow direct container traffic ([d4fb502](https://github.com/arcboxlabs/arcbox/commit/d4fb5027c66c37b3ac21280f4cff951ea2a85c01))
+* **route:** fall back to split container routes ([d027055](https://github.com/arcboxlabs/arcbox/commit/d0270553d858977b5935dcff06f1aa55af5dc2ba))
+* **route:** replace conflicting gateway routes ([20714c9](https://github.com/arcboxlabs/arcbox/commit/20714c96c1800aaf55ae97d920dedc09367dda8e))
+* **virtio:** interrupt the guest after a zero-length RX completion ([80f7639](https://github.com/arcboxlabs/arcbox/commit/80f763995966cdb4da38a2091eecdf9b910d59cf))
+* **virtio:** return zero-capacity RX chains to the used ring instead of leaking ([2ee2645](https://github.com/arcboxlabs/arcbox/commit/2ee264500d93a0cc61fbf9fdd32c5e2bed1b7d60))
+
+
+### Tests
+
+* **dns:** echo the question in the fake upstream reply ([ffda1be](https://github.com/arcboxlabs/arcbox/commit/ffda1be157608508b11359445d2b08c7b450e5ca))
+* **helper:** use a monotonic counter for unique fixture roots ([f74f1ab](https://github.com/arcboxlabs/arcbox/commit/f74f1ab034d9f01c2f64a008aa2222877586788f))
+* lookup_rejects_path_traversal_names. 64 arcbox-fs tests pass; clippy+fmt clean. ([7aec6fd](https://github.com/arcboxlabs/arcbox/commit/7aec6fdc1ee0e87e9c71e1872c2ca04bb5de3f42))
+
+
+### Miscellaneous Chores
+
+* **master:** release fleet-agent 0.1.3 ([#406](https://github.com/arcboxlabs/arcbox/issues/406)) ([701eff6](https://github.com/arcboxlabs/arcbox/commit/701eff6d0beb78ab6308f8474c1d9451c60b5207))
+
 ## [0.5.1](https://github.com/arcboxlabs/arcbox/compare/v0.5.0...v0.5.1) (2026-07-21)
 
 
