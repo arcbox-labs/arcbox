@@ -28,6 +28,14 @@ const ENV_MACOS_RUNNER_IMAGE: &str = "ARCBOX_FLEET_MACOS_RUNNER_IMAGE";
 const ENV_DAEMON_SOCKET: &str = "ARCBOX_FLEET_DAEMON_SOCKET";
 const ENV_CREDENTIAL_STORE: &str = "ARCBOX_FLEET_CREDENTIAL_STORE";
 
+/// h2 keepalive cadence on the gateway connection. Pings ride the transport
+/// independently of application traffic, so a dead network path (host sleep/
+/// resume, NAT rebind, silent middlebox drop) surfaces as a transport error
+/// within interval + timeout instead of whenever something upstream resets
+/// the TCP session; the attach loop's reconnect handles the error.
+const KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Reject an offer when 1-minute load average per core exceeds this.
 const DEFAULT_LOAD_CEILING: f64 = 0.9;
 /// Reject an offer when available memory is below this many MiB.
@@ -237,7 +245,12 @@ impl AgentConfig {
     /// default (see [`crate::state::AgentState::gateway_target`]).
     pub fn endpoint_for(&self, gateway: &str) -> Result<Endpoint> {
         let endpoint = Endpoint::from_shared(gateway.to_owned())
-            .with_context(|| format!("invalid gateway URI: {gateway}"))?;
+            .with_context(|| format!("invalid gateway URI: {gateway}"))?
+            .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+            // The attach stream can be legitimately quiet between heartbeats;
+            // keep pinging so liveness never depends on application traffic.
+            .keep_alive_while_idle(true);
 
         if gateway.starts_with("https://") {
             // Bundled webpki roots keep trust uniform across macOS/Linux.
