@@ -78,6 +78,15 @@ const HANDSHAKE_MAX_RETRANSMITS: u8 = 3;
 /// connects while they were still legitimately pending (ABX-431).
 const HANDSHAKE_TOTAL_TTL: std::time::Duration = std::time::Duration::from_secs(7);
 
+/// Idle deadline for a half-closed flow (guest sent FIN, host write side shut
+/// but not yet EOF'd). The clock is refreshed on every host→guest byte, so an
+/// actively streaming half-open never trips it; it only fires when the upstream
+/// keeps its write side open with nothing to send — the FIN_WAIT2-leak the
+/// non-inline half-close would otherwise hold forever. 120 s (2× Linux's
+/// default `tcp_fin_timeout`) is generous enough not to truncate a slow but
+/// live response while still bounding a hostile guest's accumulated entries.
+const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Window scale we advertise to the guest. Shift by 7 = 128× scaling,
 /// giving an effective receive window of 65535 × 128 = 8 MiB. Sufficient
 /// for any VM→Host BDP on a local loopback link.
@@ -349,11 +358,15 @@ pub(super) struct FastPathConn {
     read_buf: Vec<u8>,
     /// True if host stream has reached EOF.
     host_eof: bool,
-    /// True once the guest half-closed (sent an in-order FIN) while the host
-    /// side was still open: the poll path shuts the upstream's write side,
+    /// `Some(t)` once the guest half-closed (sent an in-order FIN) while the
+    /// host side was still open: the poll path shuts the upstream's write side,
     /// keeps relaying host→guest until the host EOFs, then reaps once its own
     /// FIN is ACKed. Only set on the non-inline path (inline flows full-close).
-    guest_fin_seen: bool,
+    /// `t` is the FIN_WAIT2 clock — set at the FIN and refreshed on every
+    /// host→guest byte; if it goes idle for [`HALF_CLOSE_TIMEOUT`] the entry is
+    /// reaped so a peer that keeps its write side open forever (or a guest that
+    /// silently drops FIN_WAIT2) can't leak the bridge entry and host fd.
+    guest_fin_at: Option<StdInstant>,
     /// True if the socket has been cloned to the inline inject thread.
     /// poll_fast_path() skips connections with this flag — the inject
     /// thread reads directly from the cloned socket.
