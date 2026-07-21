@@ -44,13 +44,14 @@ impl CacheEntry {
 
 impl DnsForwarder {
     /// Checks the cache for a query.
-    pub(super) fn check_cache(&mut self, query: &DnsQuery) -> Option<Vec<u8>> {
+    pub(super) fn check_cache(&self, query: &DnsQuery) -> Option<Vec<u8>> {
         let key = DnsCacheKey::new(&query.name, query.qtype, query.qclass);
 
+        let mut cache = self.cache.lock().expect("dns cache lock poisoned");
         // Clean up expired entries.
-        self.cache.retain(|_, v| !v.is_expired());
+        cache.retain(|_, v| !v.is_expired());
 
-        self.cache.get(&key).and_then(|entry| {
+        cache.get(&key).and_then(|entry| {
             let mut response = entry.response.clone();
             response[0..2].copy_from_slice(&query.raw_header[0..2]);
             rewrite_question(&mut response, &query.raw_question)?;
@@ -72,7 +73,7 @@ impl DnsForwarder {
     /// authority/additional sections, EDNS, DNSSEC, and record-type-specific
     /// RDATA without maintaining a fragile local packet re-builder. Hickory
     /// parses the response only to validate it and derive a safe expiry TTL.
-    pub(super) fn cache_response(&mut self, query: &DnsQuery, response: &[u8]) {
+    pub(super) fn cache_response(&self, query: &DnsQuery, response: &[u8]) {
         let Some(ttl) = self.cache_ttl_for_response(response) else {
             return;
         };
@@ -83,7 +84,10 @@ impl DnsForwarder {
             cached_at: Instant::now(),
             ttl,
         };
-        self.cache.insert(key, entry);
+        self.cache
+            .lock()
+            .expect("dns cache lock poisoned")
+            .insert(key, entry);
     }
 
     fn cache_ttl_for_response(&self, response: &[u8]) -> Option<Duration> {

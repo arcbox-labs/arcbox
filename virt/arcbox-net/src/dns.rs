@@ -255,8 +255,11 @@ pub struct DnsForwarder {
     config: DnsConfig,
     /// Shared local hostname mappings (hostname -> IP).
     local_hosts: Arc<LocalHostsTable>,
-    /// DNS cache (query -> response).
-    cache: HashMap<cache::DnsCacheKey, cache::CacheEntry>,
+    /// Response cache. Behind a `Mutex` (interior mutability) so `handle_query`
+    /// takes only `&self`; callers then hold a *read* lock on the surrounding
+    /// `RwLock<DnsForwarder>`, so a slow upstream forward never blocks the fast
+    /// local-resolution / cache-hit path.
+    cache: std::sync::Mutex<HashMap<cache::DnsCacheKey, cache::CacheEntry>>,
 }
 
 impl DnsForwarder {
@@ -266,7 +269,7 @@ impl DnsForwarder {
         Self {
             config,
             local_hosts: Arc::new(LocalHostsTable::new(HashMap::new())),
-            cache: HashMap::new(),
+            cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -280,7 +283,7 @@ impl DnsForwarder {
         Self {
             config,
             local_hosts,
-            cache: HashMap::new(),
+            cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -405,7 +408,7 @@ impl DnsForwarder {
     /// # Errors
     ///
     /// Returns an error if the query cannot be processed.
-    pub fn handle_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn handle_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         // Parse the query
         let query = DnsQuery::parse(data)?;
 
@@ -481,7 +484,7 @@ impl DnsForwarder {
     /// datagram not from that upstream, and the reply's transaction ID must
     /// echo the query's — together closing the off-path cache-poisoning window
     /// an unconnected `recv_from` (which accepted any sender's bytes) left open.
-    fn forward_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    fn forward_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         use std::net::UdpSocket;
 
         // The query's transaction ID; a valid reply must echo it.
@@ -520,8 +523,8 @@ impl DnsForwarder {
     }
 
     /// Clears the DNS cache.
-    pub fn clear_cache(&mut self) {
-        self.cache.clear();
+    pub fn clear_cache(&self) {
+        self.cache.lock().expect("dns cache lock poisoned").clear();
     }
 }
 
@@ -871,11 +874,11 @@ mod tests {
 
         let key =
             cache::DnsCacheKey::new(&parsed_query.name, parsed_query.qtype, parsed_query.qclass);
-        let entry = forwarder
-            .cache
-            .get_mut(&key)
-            .expect("response should be cached");
-        entry.cached_at -= Duration::from_secs(10);
+        {
+            let mut cache = forwarder.cache.lock().unwrap();
+            let entry = cache.get_mut(&key).expect("response should be cached");
+            entry.cached_at -= Duration::from_secs(10);
+        }
 
         let cached = forwarder
             .check_cache(&parsed_query)
@@ -902,10 +905,8 @@ mod tests {
 
         let key =
             cache::DnsCacheKey::new(&parsed_query.name, parsed_query.qtype, parsed_query.qclass);
-        let entry = forwarder
-            .cache
-            .get(&key)
-            .expect("response should be cached");
+        let cache = forwarder.cache.lock().unwrap();
+        let entry = cache.get(&key).expect("response should be cached");
         assert_eq!(entry.ttl, Duration::from_secs(30));
     }
 
