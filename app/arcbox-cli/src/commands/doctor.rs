@@ -183,7 +183,7 @@ fn check_bridge_nic() -> CheckResult {
 #[cfg(target_os = "macos")]
 fn check_container_route() -> CheckResult {
     let Ok(output) = Command::new("route")
-        .args(["-n", "get", "172.16.0.0"])
+        .args(["-n", "get", "-net", "172.16.0.0/12"])
         .output()
     else {
         return CheckResult::Fail("route command failed".into());
