@@ -445,6 +445,55 @@ impl TcpBridge {
                     .is_some_and(|d| d.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     to_remove.push(*key);
+                    continue;
+                }
+
+                // Zero-window persist for the inline path. The inject thread /
+                // direct_rx reader stops reading at a zero send budget and can't
+                // probe on its own, so a lost guest window-update ACK would
+                // deadlock the download forever. Emit a keepalive-style probe —
+                // one byte at `our_seq - 1`, an old duplicate — which a
+                // zero-window guest must answer with a window-bearing ACK
+                // (RFC 793 §3.9). It consumes no sequence space and touches no
+                // shared state, so a lost probe is harmlessly re-sent next
+                // interval with no stream gap (the inline path has no
+                // retransmit). Gated on nothing-in-flight: the guest has ACKed
+                // up to `our_seq`, so `our_seq - 1` is always an old byte, and
+                // any in-flight data would elicit its own window-bearing ACKs.
+                let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
+                let acked = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
+                let window = conn
+                    .guest_window
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .min(super::HONORED_WINDOW_CAP);
+                let in_flight = sent.wrapping_sub(acked);
+                let nothing_in_flight = in_flight == 0 || in_flight >= 0x8000_0000;
+                if super::send_budget(sent, acked, window) == 0 && nothing_in_flight {
+                    match conn.window_stalled_at {
+                        None => conn.window_stalled_at = Some(now),
+                        Some(at)
+                            if now.duration_since(at) >= super::ZERO_WINDOW_PERSIST_INTERVAL =>
+                        {
+                            conn.window_stalled_at = Some(now);
+                            frames.push(crate::ethernet::build_tcp_data_frame(
+                                &crate::ethernet::TcpFrameParams {
+                                    src_ip: conn.remote_ip,
+                                    dst_ip: conn.guest_ip,
+                                    src_port: conn.remote_port,
+                                    dst_port: conn.guest_port,
+                                    seq: sent.wrapping_sub(1),
+                                    ack: conn.last_ack,
+                                    window: 65535,
+                                    src_mac: gw_mac,
+                                    dst_mac: guest_mac,
+                                },
+                                &[0u8],
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                } else {
+                    conn.window_stalled_at = None;
                 }
                 continue;
             }

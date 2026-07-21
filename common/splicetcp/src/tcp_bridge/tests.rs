@@ -782,6 +782,102 @@ async fn inline_dead_flag_reaps_bridge_entry() {
     );
 }
 
+/// An inline-owned flow whose guest window closes with nothing in flight must
+/// still be probed: the inject/direct_rx reader can't probe on its own, so a
+/// lost window-update ACK would deadlock it. poll_fast_path emits a
+/// keepalive-style probe (1 byte at our_seq-1) on the persist timer, and stops
+/// once the window reopens.
+#[tokio::test]
+async fn inline_zero_window_persist_probes() {
+    struct CaptureSink(std::sync::Mutex<Option<crate::direct_rx::PromotedConn>>);
+    impl crate::direct_rx::ConnSink for CaptureSink {
+        fn send_conn(&self, conn: crate::direct_rx::PromotedConn) -> bool {
+            *self.0.lock().unwrap() = Some(conn);
+            true
+        }
+    }
+
+    let sink = std::sync::Arc::new(CaptureSink(std::sync::Mutex::new(None)));
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    bridge.set_conn_sink(std::sync::Arc::clone(&sink) as _);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let _accepted = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 130);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40070,
+        dst_ip,
+        dst_port: 443,
+    };
+    // peer_mss ≥ GSO_SEGMENT_MSS → inline-owned.
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        9000,
+        None,
+    );
+    let promoted = sink.0.lock().unwrap().take().expect("inline conn");
+
+    // Zero window, nothing in flight (guest has ACKed up to our_seq).
+    promoted
+        .our_seq
+        .store(5000, std::sync::atomic::Ordering::Relaxed);
+    promoted
+        .guest_acked
+        .store(5000, std::sync::atomic::Ordering::Relaxed);
+    promoted
+        .guest_window
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // First poll arms the persist clock but emits nothing yet.
+    assert!(
+        bridge.poll_fast_path().is_empty(),
+        "no probe before the persist interval"
+    );
+
+    // Backdate the persist clock past the interval.
+    let past = std::time::Instant::now()
+        .checked_sub(super::ZERO_WINDOW_PERSIST_INTERVAL + std::time::Duration::from_millis(10))
+        .expect("test clock underflow");
+    bridge
+        .fast_path_conns
+        .get_mut(&key)
+        .unwrap()
+        .window_stalled_at = Some(past);
+
+    // Next poll emits one keepalive-style probe at our_seq-1.
+    let frames = bridge.poll_fast_path();
+    assert_eq!(frames.len(), 1, "one persist probe emitted");
+    let tcp = ETH_HEADER_LEN + 20;
+    let probe_seq = u32::from_be_bytes([
+        frames[0][tcp + 4],
+        frames[0][tcp + 5],
+        frames[0][tcp + 6],
+        frames[0][tcp + 7],
+    ]);
+    assert_eq!(
+        probe_seq, 4999,
+        "probe sits at our_seq-1 (an old duplicate)"
+    );
+
+    // Reopening the window stops the probing.
+    promoted
+        .guest_window
+        .store(65535, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        bridge.poll_fast_path().is_empty(),
+        "no probe once the window reopens"
+    );
+}
+
 /// A handshake abort (TTL expiry) must RST the guest so its socket dies
 /// immediately instead of retrying SYNs against a flow the bridge already
 /// gave up on (ABX-431).
