@@ -2094,3 +2094,62 @@ async fn pure_ack_returns_no_frame() {
         .expect("intercepted");
     assert!(reply.is_empty(), "a pure ACK must not be answered");
 }
+
+/// Zero-window persist: when the guest closes its receive window with nothing
+/// in flight and its window-reopening ACK is lost, the shim must probe with a
+/// single byte to force the guest to re-advertise — otherwise the flow
+/// deadlocks with unread host data forever.
+#[tokio::test]
+async fn zero_window_stall_is_broken_by_a_persist_probe() {
+    use std::io::Write;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (server, _) = accepted.unwrap();
+    let mut server = server.into_std().unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 100);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40088,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460, None);
+
+    // Guest advertises a closed window (0), and the upstream has data to send.
+    let zero_win = make_guest_segment((40088, dst_ip, 443), 2000, 1000, 0, 0x10, &[]);
+    bridge.try_fast_path_intercept(&zero_win);
+    server.write_all(b"payload-bytes").unwrap();
+
+    // Arm the stall timer; nothing is sent while the window is shut.
+    assert!(
+        bridge.poll_fast_path().is_empty(),
+        "a closed window must not send before the persist timer fires"
+    );
+
+    // After the persist interval, a single-byte probe is emitted.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let frames = bridge.poll_fast_path();
+    assert_eq!(
+        frames.len(),
+        1,
+        "a persist probe must be emitted after the stall"
+    );
+    let payload_len = frames[0].len() - (ETH_HEADER_LEN + 20 + 20);
+    assert_eq!(payload_len, 1, "the persist probe carries exactly one byte");
+
+    // The guest re-advertises a large window (ACKing the probe): sending resumes.
+    let reopen = make_guest_segment((40088, dst_ip, 443), 2000, 1001, 65535, 0x10, &[]);
+    bridge.try_fast_path_intercept(&reopen);
+    assert!(
+        !bridge.poll_fast_path().is_empty(),
+        "sending must resume once the window reopens"
+    );
+}

@@ -569,9 +569,10 @@ impl TcpBridge {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .min(super::HONORED_WINDOW_CAP);
             let budget = super::send_budget(sent, acked, window) as usize;
-            if budget == 0 {
+            let cap = if budget == 0 {
                 if !conn.window_stalled {
                     conn.window_stalled = true;
+                    conn.window_stalled_at = Some(now);
                     tracing::debug!(
                         "Fast path window stall {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
                         conn.remote_ip,
@@ -580,19 +581,37 @@ impl TcpBridge {
                         conn.guest_port,
                     );
                 }
-                continue;
-            }
-            if conn.window_stalled {
-                conn.window_stalled = false;
-                tracing::debug!(
-                    "Fast path window reopened {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
-                    conn.remote_ip,
-                    conn.remote_port,
-                    conn.guest_ip,
-                    conn.guest_port,
-                );
-            }
-            let cap = budget.min(conn.read_buf.len());
+                // Zero-window persist: a window closed with nothing in flight is
+                // reopened only by a guest window-update ACK; if that ACK is
+                // lost the flow deadlocks. Probe with a single byte past the
+                // window on a timer to force the guest to re-advertise it. Once
+                // the probe byte is in flight, the RTO retransmit path above
+                // keeps probing on its own, so this only kicks the first byte.
+                let in_flight = sent.wrapping_sub(acked);
+                let nothing_in_flight = in_flight == 0 || in_flight >= 0x8000_0000;
+                let probe_due = conn.window_stalled_at.is_some_and(|at| {
+                    now.duration_since(at) >= super::ZERO_WINDOW_PERSIST_INTERVAL
+                });
+                if nothing_in_flight && probe_due {
+                    conn.window_stalled_at = Some(now);
+                    1 // one byte beyond the closed window
+                } else {
+                    continue;
+                }
+            } else {
+                if conn.window_stalled {
+                    conn.window_stalled = false;
+                    conn.window_stalled_at = None;
+                    tracing::debug!(
+                        "Fast path window reopened {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
+                        conn.remote_ip,
+                        conn.remote_port,
+                        conn.guest_ip,
+                        conn.guest_port,
+                    );
+                }
+                budget.min(conn.read_buf.len())
+            };
 
             use std::io::Read;
             match conn.stream.read(&mut conn.read_buf[..cap]) {
@@ -847,6 +866,7 @@ impl TcpBridge {
                 ooo_bytes: 0,
                 up_ooo_dropped: 0,
                 window_stalled: false,
+                window_stalled_at: None,
                 retransmit_buf: std::collections::VecDeque::new(),
                 retransmit_seq: our_seq,
                 last_progress: std::time::Instant::now(),

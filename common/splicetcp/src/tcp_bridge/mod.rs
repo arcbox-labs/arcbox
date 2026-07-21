@@ -133,6 +133,12 @@ pub(crate) const HONORED_WINDOW_CAP: u32 = 256 * 1024;
 pub(crate) const INITIAL_RTO: std::time::Duration = std::time::Duration::from_millis(200);
 pub(crate) const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Delay before the first zero-window persist probe once the guest closes its
+/// receive window with nothing in flight. After one probe byte is in flight the
+/// RTO retransmit path (INITIAL_RTO→MAX_RTO backoff) keeps probing on its own.
+pub(crate) const ZERO_WINDOW_PERSIST_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
 /// Fixed segment size the GSO/inline injection paths let the guest re-segment
 /// at (the `gso_size` stamped by `arcbox-net-inject`'s `write_inline_headers`
 /// and `inject_one_frame` — keep in sync). A flow whose peer advertised a
@@ -333,6 +339,10 @@ pub(super) struct FastPathConn {
     /// logging only, so a stuck window is visible in the daemon log
     /// without per-poll noise.
     window_stalled: bool,
+    /// When the window first closed with nothing in flight, for the
+    /// zero-window persist timer. `None` while the window is open. (The RTO
+    /// `last_progress` clock can't be reused: it is reset every idle poll.)
+    window_stalled_at: Option<StdInstant>,
     /// Sender-side retransmission buffer: every download byte from
     /// `retransmit_seq` (== the last drained `guest_acked`) up to `our_seq`,
     /// bounded by [`HONORED_WINDOW_CAP`]. Non-inline flows only.
