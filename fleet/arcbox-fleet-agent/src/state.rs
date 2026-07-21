@@ -341,6 +341,20 @@ impl AgentState {
             .clone()
     }
 
+    /// The `vm_mode` this process runs with (`current` is restart-scoped —
+    /// seeded at startup, never moved by `UpdateSettings`). Gates whether
+    /// `FleetImageService.Prepare` may dial the daemon for an inactive VM
+    /// backend.
+    pub fn vm_mode_current(&self) -> VmMode {
+        vm_mode_from_wire(
+            settings_of(&self.tx.borrow())
+                .vm_mode
+                .as_ref()
+                .expect(SETTINGS_INVARIANT)
+                .current,
+        )
+    }
+
     /// The desired macOS image — what `FleetImageService.Prepare` pulls
     /// through the daemon and then promotes to `current`.
     pub fn macos_runner_image_target(&self) -> String {

@@ -5,6 +5,7 @@
 //! Split from `FleetSettingsService` so quick state reads/writes never
 //! share a service with RPCs that stream a multi-gigabyte transfer.
 
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -12,9 +13,12 @@ use arcbox_fleet_control_proto::v1::fleet_image_service_server::FleetImageServic
 use arcbox_fleet_control_proto::v1::{ImageKind, PrepareRequest, PrepareResponse};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
+use tracing::{debug, warn};
 
 use crate::backends::Backends;
+use crate::config::VmMode;
 use crate::state::AgentState;
+use crate::vm::VmRunner;
 
 pub struct ImageService {
     state: AgentState,
@@ -23,6 +27,9 @@ pub struct ImageService {
     /// — read per request, so a backend that activated after startup is
     /// visible to the next Prepare.
     backends: Arc<Backends>,
+    /// The arcbox-daemon socket, for pulling `macos_runner_image` through
+    /// a daemon whose backend is not active yet (see [`macos_pull_handle`]).
+    daemon_socket: PathBuf,
     /// Serializes preparations. Two racing Prepares would pull concurrently
     /// and promote in arbitrary order, so the loser gets `ABORTED` instead
     /// of queueing behind a transfer of unknown length.
@@ -30,11 +37,41 @@ pub struct ImageService {
 }
 
 impl ImageService {
-    pub fn new(state: AgentState, backends: Arc<Backends>) -> Self {
+    pub fn new(state: AgentState, backends: Arc<Backends>, daemon_socket: PathBuf) -> Self {
         Self {
             state,
             backends,
+            daemon_socket,
             busy: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+/// The handle to pull `macos_runner_image` through: the active backend
+/// when there is one, else a direct dial of the daemon (`vm_mode`
+/// permitting). The dial deliberately skips the installed-image readiness
+/// check — the image being missing is exactly what the pull is about to
+/// fix, and requiring the full probe first was circular: an inactive
+/// backend skipped the very pull its activation was waiting on.
+async fn macos_pull_handle(
+    backends: &Backends,
+    vm_mode: VmMode,
+    daemon_socket: &Path,
+) -> Option<VmRunner> {
+    if let Some(vm) = backends.vm() {
+        return Some(vm);
+    }
+    if vm_mode == VmMode::Disabled {
+        return None;
+    }
+    match VmRunner::connect(daemon_socket).await {
+        Ok(vm) => Some(vm),
+        Err(e) => {
+            debug!(
+                error = format!("{e:#}"),
+                "daemon not reachable; macos_runner_image prepare will skip"
+            );
+            None
         }
     }
 }
@@ -97,6 +134,7 @@ impl FleetImageServiceTrait for ImageService {
             .map_err(|_| Status::aborted("another prepare is already in progress"))?;
         let state = self.state.clone();
         let backends = Arc::clone(&self.backends);
+        let daemon_socket = self.daemon_socket.clone();
 
         // The work runs inside the stream itself, not a detached task, so a
         // client disconnect drops it mid-pull: no promotion happens, and a
@@ -138,7 +176,8 @@ impl FleetImageServiceTrait for ImageService {
                     }
                     ImageKind::MacosRunnerImage => {
                         let target = state.macos_runner_image_target();
-                        match &backends.vm() {
+                        let vm_mode = state.vm_mode_current();
+                        match macos_pull_handle(&backends, vm_mode, &daemon_socket).await {
                             Some(vm) => {
                                 // The daemon streams pull progress (its terminal
                                 // stage is "done"); relay each event. Any failure
@@ -159,11 +198,28 @@ impl FleetImageServiceTrait for ImageService {
                                     let Some(progress) = progress else { break };
                                     yield event(kind, &progress.stage, "pulling", progress.fraction);
                                 }
+                                // A pull through a direct dial leaves a daemon that
+                                // can now pass the full readiness probe: activate the
+                                // backend so darwin VM jobs start dispatching without
+                                // an agent restart (the registry re-attaches for us).
+                                if !backends.vm_active() {
+                                    match VmRunner::new(&daemon_socket, &target).await {
+                                        Ok(runner) => {
+                                            backends.activate_vm(runner);
+                                            yield event(kind, "macOS VM backend activated", "activated", 1.0);
+                                        }
+                                        Err(e) => warn!(
+                                            error = format!("{e:#}"),
+                                            "macos_runner_image pulled, but the backend activation probe failed"
+                                        ),
+                                    }
+                                }
                             }
                             // Same rationale as the Docker-absent branch: with the
-                            // VM backend inactive no darwin VM job can dispatch, so
-                            // there is nothing to verify against — promote rather
-                            // than leave the setting pending forever.
+                            // VM backend inactive and the daemon unreachable no
+                            // darwin VM job can dispatch, so there is nothing to
+                            // verify against — promote rather than leave the
+                            // setting pending forever.
                             None => yield event(kind, "vm backend not active", "skipped", 1.0),
                         }
                         state.set_macos_runner_image_current(&target);
@@ -251,7 +307,11 @@ mod tests {
         let state = AgentState::new(&seed());
         state.set_linux_runner_image_target("ghcr.io/acme/runner:v2");
         let backends = Backends::new(false, None, None, None, state.clone());
-        let service = ImageService::new(state.clone(), backends);
+        let service = ImageService::new(
+            state.clone(),
+            backends,
+            PathBuf::from("/nonexistent/arcbox.sock"),
+        );
 
         let mut stream = service
             .prepare(Request::new(PrepareRequest {
@@ -283,7 +343,11 @@ mod tests {
         let state = AgentState::new(&seed());
         state.set_macos_runner_image_target("tahoe-base@2026.07.03");
         let backends = Backends::new(false, None, None, None, state.clone());
-        let service = ImageService::new(state.clone(), backends);
+        let service = ImageService::new(
+            state.clone(),
+            backends,
+            PathBuf::from("/nonexistent/arcbox.sock"),
+        );
 
         let mut stream = service
             .prepare(Request::new(PrepareRequest {
@@ -304,13 +368,51 @@ mod tests {
         );
     }
 
+    /// Prepare with an inactive VM backend but a reachable daemon must
+    /// pull through a direct dial and then activate the backend — breaking
+    /// the old circularity where an inactive backend skipped exactly the
+    /// pull its own activation probe was waiting on. macOS-only for the
+    /// same reason as the test above.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn prepare_activates_the_vm_backend_through_a_reachable_daemon() {
+        let daemon = crate::mock_daemon::MockDaemon::spawn(&[]).await;
+        let state = AgentState::new(&seed());
+        state.set_macos_runner_image_target("tahoe-base@2026.07.03");
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let service =
+            ImageService::new(state.clone(), Arc::clone(&backends), daemon.socket.clone());
+
+        let mut stream = service
+            .prepare(Request::new(PrepareRequest {
+                kinds: vec![ImageKind::MacosRunnerImage as i32],
+            }))
+            .await
+            .expect("Prepare")
+            .into_inner();
+        let mut stages = Vec::new();
+        while let Some(item) = stream.next().await {
+            stages.push(item.expect("event").stage);
+        }
+
+        assert_eq!(stages, ["pulling", "activated", "promoted"]);
+        assert!(backends.vm_active(), "prepare must activate the backend");
+        assert_eq!(
+            state.macos_runner_image_current(),
+            state.macos_runner_image_target()
+        );
+    }
+
     /// A second Prepare while one is live must be refused, not queued — and
     /// dropping the live stream (client disconnect) must release the slot.
     #[tokio::test]
     async fn concurrent_prepare_is_refused_until_the_first_stream_drops() {
         let state = AgentState::new(&seed());
-        let service =
-            ImageService::new(state.clone(), Backends::new(false, None, None, None, state));
+        let service = ImageService::new(
+            state.clone(),
+            Backends::new(false, None, None, None, state),
+            PathBuf::from("/nonexistent/arcbox.sock"),
+        );
 
         let held = service
             .prepare(Request::new(PrepareRequest { kinds: Vec::new() }))

@@ -90,30 +90,37 @@ impl VmRunner {
     /// whatever `macos_runner_image` is current at dispatch time
     /// ([`RunSpec::runner_image`]).
     pub async fn new(daemon_socket: &Path, default_image: &str) -> Result<Self> {
-        let channel = crate::control::client::connect(daemon_socket).await?;
-        let mut client = MacosServiceClient::new(channel);
-
-        // One call proves the daemon is up *and* speaks MacosService (an
-        // older daemon without it answers Unimplemented), and provides the
-        // installed-image check.
-        let images = client
-            .image_list(Empty {})
+        let runner = Self::connect(daemon_socket).await?;
+        runner
+            .installed_image(default_image)
             .await
-            .context("daemon does not serve macOS guests (MacosService.ImageList failed)")?
-            .into_inner()
-            .images;
-        if !images.iter().any(|i| i.name == stream_name(default_image)) {
-            bail!(
-                "macOS runner image '{default_image}' is not installed in the daemon — \
-                 run `arcbox-fleet-agent prepare macos-runner-image` (or `abctl macos \
-                 image pull {default_image}`) first"
-            );
-        }
-
-        let runner = Self { client };
+            .with_context(|| {
+                format!(
+                    "macOS runner image '{default_image}' is not available — run \
+                     `arcbox-fleet-agent prepare macos-runner-image` (or `abctl macos \
+                     image pull {default_image}`) first"
+                )
+            })?;
         runner.sweep_leftovers().await;
         info!(image = default_image, "macOS VM backend available");
         Ok(runner)
+    }
+
+    /// Connect to the daemon socket and prove it speaks `MacosService` (an
+    /// older daemon without it answers Unimplemented) — the first half of
+    /// [`Self::new`], with no installed-image requirement.
+    /// `FleetImageService.Prepare` uses this to pull an image through a
+    /// daemon whose backend is not yet active: the missing image is exactly
+    /// what that pull is about to fix, so demanding the full readiness
+    /// probe first would be circular.
+    pub async fn connect(daemon_socket: &Path) -> Result<Self> {
+        let channel = crate::control::client::connect(daemon_socket).await?;
+        let mut client = MacosServiceClient::new(channel);
+        client
+            .image_list(Empty {})
+            .await
+            .context("daemon does not serve macOS guests (MacosService.ImageList failed)")?;
+        Ok(Self { client })
     }
 
     /// Force-remove every `fleet-*` guest. Only this agent creates such

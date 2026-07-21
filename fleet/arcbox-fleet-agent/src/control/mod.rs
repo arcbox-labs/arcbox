@@ -90,6 +90,7 @@ pub async fn serve(
     info!(socket = %socket_path.display(), "control-plane server listening");
 
     let backends = supervisor.backends();
+    let daemon_socket = supervisor.config.vm.daemon_socket.clone();
     Server::builder()
         .add_service(FleetLifecycleServiceServer::new(LifecycleService::new(
             supervisor,
@@ -102,7 +103,9 @@ pub async fn serve(
             settings_store,
         )))
         .add_service(FleetImageServiceServer::new(ImageService::new(
-            state, backends,
+            state,
+            backends,
+            daemon_socket,
         )))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await
