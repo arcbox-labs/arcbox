@@ -129,6 +129,15 @@ workload suite. Cross-runtime comparison (OrbStack / Docker Desktop) is a
 manual `xtask` run of the same fixtures against another engine's
 `DOCKER_HOST`, not an automated gate.
 
+## Status
+
+D1–D3 are implemented (`tests/e2e/tests/docker_build.rs`) and currently
+**red for a real product reason**: every buildx-driven build hangs because
+guest FEX spins forever on BuildKit's amd64 arch-probe ELF, permanently
+wedging the BuildKit Control API (ABX-494 — first caught by this suite's
+first run; `network_workload` W14 reproduces it too). Do not weaken the
+suite; it goes green when ABX-494 is fixed.
+
 ## Phasing
 
 1. D1–D3 (context, stages, cache) — pure fixture work, no new capability
