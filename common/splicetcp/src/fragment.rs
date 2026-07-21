@@ -150,29 +150,45 @@ impl FragmentReassembler {
             entry.header = Some(frame[..ip_start + ihl].to_vec());
         }
 
-        // Reject a fragment that overlaps already-received bytes without being
-        // fully contained in them — the teardrop / IDS-evasion class where a
-        // later fragment overwrites earlier data (RFC 8200 §4.5 / Linux parity).
-        // A fully-contained fragment is an idempotent retransmit and is allowed.
-        let conflicting_overlap = entry
-            .ranges
-            .iter()
-            .any(|&(s, e)| offset < e && s < end && !(s <= offset && end <= e));
-        if conflicting_overlap {
-            tracing::debug!("overlapping IP fragment; datagram dropped");
+        // Classify this fragment against already-received byte ranges. A
+        // partial or extending overlap is the teardrop / IDS-evasion class
+        // where a later fragment overwrites earlier data (RFC 8200 §4.5 /
+        // Linux parity) — drop the datagram. A fully-contained fragment is an
+        // idempotent retransmit and is allowed, but ONLY if its bytes match
+        // what we already stored: a contained fragment carrying *different*
+        // data is the same last-write-wins evasion and is rejected too.
+        let mut fully_contained = false;
+        let mut partial_conflict = false;
+        for &(s, e) in &entry.ranges {
+            if offset < e && s < end {
+                if s <= offset && end <= e {
+                    fully_contained = true;
+                } else {
+                    partial_conflict = true;
+                    break;
+                }
+            }
+        }
+        let contained_mismatch = fully_contained && &entry.payload[offset..end] != fragment;
+        if partial_conflict || contained_mismatch {
+            tracing::debug!("overlapping/conflicting IP fragment; datagram dropped");
             self.entries.remove(&key);
             return None;
         }
 
-        if entry.payload.len() < end {
-            entry.payload.resize(end, 0);
-        }
-        entry.payload[offset..end].copy_from_slice(fragment);
-        merge_range(&mut entry.ranges, offset, end);
-        if entry.ranges.len() > MAX_RANGES {
-            tracing::debug!("fragment pattern exceeds the range cap; entry dropped");
-            self.entries.remove(&key);
-            return None;
+        // A contained, byte-identical retransmit is already stored — nothing
+        // to write, and the coverage ranges are unchanged.
+        if !fully_contained {
+            if entry.payload.len() < end {
+                entry.payload.resize(end, 0);
+            }
+            entry.payload[offset..end].copy_from_slice(fragment);
+            merge_range(&mut entry.ranges, offset, end);
+            if entry.ranges.len() > MAX_RANGES {
+                tracing::debug!("fragment pattern exceeds the range cap; entry dropped");
+                self.entries.remove(&key);
+                return None;
+            }
         }
 
         if entry.is_complete() {
@@ -442,6 +458,53 @@ mod tests {
         assert!(
             r.entries.is_empty(),
             "entry must drop once the range cap is crossed"
+        );
+    }
+
+    /// Build an MF fragment at frag-offset 0 with `len` payload bytes all set
+    /// to `fill`, from the first-fragment template.
+    fn frag_at_zero(template: &[u8], len: u16, fill: u8) -> Vec<u8> {
+        let ip = ETH_HEADER_LEN;
+        let mut f = template[..ip + 20 + len as usize].to_vec();
+        f[ip + 2..ip + 4].copy_from_slice(&(20 + len).to_be_bytes());
+        f[ip + 6..ip + 8].copy_from_slice(&0x2000u16.to_be_bytes()); // MF=1, offset 0
+        f[ip + 20..].fill(fill);
+        f
+    }
+
+    #[test]
+    fn contained_conflicting_fragment_drops_entry() {
+        let mut r = FragmentReassembler::new();
+        let now = Instant::now();
+        let template = fragments(3000)[0].clone();
+
+        // A 16-byte fragment fixes bytes [0,16); a later 8-byte fragment
+        // fully contained in it but carrying *different* data is the
+        // last-write-wins / IDS-evasion class and must drop the datagram,
+        // not silently overwrite the earlier bytes.
+        assert!(r.push(&frag_at_zero(&template, 16, 0xAA), now).is_none());
+        assert_eq!(r.entries.len(), 1);
+        assert!(r.push(&frag_at_zero(&template, 8, 0xBB), now).is_none());
+        assert!(
+            r.entries.is_empty(),
+            "a contained fragment with conflicting bytes must drop the datagram"
+        );
+    }
+
+    #[test]
+    fn contained_identical_fragment_is_harmless() {
+        let mut r = FragmentReassembler::new();
+        let now = Instant::now();
+        let template = fragments(3000)[0].clone();
+
+        // A byte-identical contained retransmit is idempotent — the entry
+        // survives and keeps its coverage.
+        assert!(r.push(&frag_at_zero(&template, 16, 0xAA), now).is_none());
+        assert!(r.push(&frag_at_zero(&template, 8, 0xAA), now).is_none());
+        assert_eq!(
+            r.entries.len(),
+            1,
+            "an identical contained retransmit must not drop the entry"
         );
     }
 }
