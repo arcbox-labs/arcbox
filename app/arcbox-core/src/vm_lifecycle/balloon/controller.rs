@@ -28,8 +28,15 @@
 //! Exits always ride the lifecycle state machine: pressure and fail-open
 //! paths restore full memory immediately, then note activity, which exits
 //! `Idle` and resets the 5-minute idle clock — so a re-shrink requires a
-//! fresh quiet period plus a fresh entry probe. Oscillation is structurally
-//! impossible.
+//! fresh quiet period plus a fresh entry probe. That rules out *tight*
+//! oscillation, but not a shrink that fails the same way every idle cycle:
+//! when the host itself is out of memory, inflation stalls and every descent
+//! fail-opens, so the 5-minute clock alone would restage the reclaim storm
+//! indefinitely (macOS reports "normal" memory pressure throughout — there is
+//! no host signal to gate on). Consecutive fail-opens therefore back off
+//! ([`fail_open_backoff`]): after each failed descent the next idle entry is
+//! suppressed for a growing window, and a shrink that actually holds clears
+//! the streak so idle reclaim self-heals once the host recovers.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -141,6 +148,23 @@ pub(in crate::vm_lifecycle) const WATCH_KEEPALIVE: Duration = Duration::from_sec
 /// Budget for the entry-time guest stats probe.
 const GUEST_STATS_TIMEOUT: Duration = Duration::from_secs(super::GUEST_STATS_TIMEOUT_SECS);
 
+/// Suppression window after the first fail-open, doubling with each further
+/// consecutive fail-open up to [`FAIL_OPEN_BACKOFF_MAX`]. Sized above the
+/// 5-minute idle timeout so a single failure already skips the next idle
+/// entry instead of restaging the reclaim storm.
+const FAIL_OPEN_BACKOFF_BASE: Duration = Duration::from_secs(600);
+
+/// Cap on the fail-open backoff window. A guest whose shrink never succeeds
+/// still re-probes this often, so idle reclaim self-heals once the host
+/// recovers.
+const FAIL_OPEN_BACKOFF_MAX: Duration = Duration::from_secs(3600);
+
+/// Backoff window for the current consecutive-fail-open streak (`>= 1`).
+fn fail_open_backoff(consecutive: u32) -> Duration {
+    let shift = consecutive.saturating_sub(1).min(3);
+    (FAIL_OPEN_BACKOFF_BASE * (1u32 << shift)).min(FAIL_OPEN_BACKOFF_MAX)
+}
+
 /// The controller task. Owns all balloon state; communicates with the world
 /// only through [`BalloonDeps`] (in) and the activity callback (out).
 pub(in crate::vm_lifecycle) struct BalloonController<D: BalloonDeps> {
@@ -154,6 +178,12 @@ pub(in crate::vm_lifecycle) struct BalloonController<D: BalloonDeps> {
     final_target: Option<u64>,
     /// When the current step was applied (dwell pacing).
     step_applied_at: Option<tokio::time::Instant>,
+    /// Consecutive fail-opens since the last shrink that held. Drives the
+    /// idle-shrink backoff so a reliably-failing shrink stops restaging its
+    /// reclaim storm every idle cycle.
+    consecutive_fail_opens: u32,
+    /// When the last fail-open happened, measured against the backoff window.
+    last_fail_open_at: Option<tokio::time::Instant>,
 }
 
 /// Controller mode; holds the open watch so drops cancel it naturally.
@@ -190,6 +220,8 @@ impl<D: BalloonDeps> BalloonController<D> {
             applied: None,
             final_target: None,
             step_applied_at: None,
+            consecutive_fail_opens: 0,
+            last_fail_open_at: None,
         }
     }
 
@@ -218,6 +250,7 @@ impl<D: BalloonDeps> BalloonController<D> {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
                             Some(BalloonCommand::ExitIdle) => {
+                                self.note_shrink_held();
                                 self.restore("idle exit");
                                 Mode::Active
                             }
@@ -228,7 +261,9 @@ impl<D: BalloonDeps> BalloonController<D> {
                             Ok(WatchFrame::Keepalive) => Mode::Watching(watch),
                             Ok(WatchFrame::Settled) => {
                                 if self.next_pending_step().is_none() {
-                                    // Final target reached; keep watching.
+                                    // Final target reached and the guest armed:
+                                    // the shrink held, so clear the streak.
+                                    self.note_shrink_held();
                                     Mode::Watching(watch)
                                 } else {
                                     // The guest settled at this memory level,
@@ -256,6 +291,7 @@ impl<D: BalloonDeps> BalloonController<D> {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
                             Some(BalloonCommand::ExitIdle) => {
+                                self.note_shrink_held();
                                 self.restore("idle exit");
                                 Mode::Active
                             }
@@ -287,6 +323,7 @@ impl<D: BalloonDeps> BalloonController<D> {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
                             Some(BalloonCommand::ExitIdle) => {
+                                self.note_shrink_held();
                                 self.restore("idle exit");
                                 Mode::Active
                             }
@@ -306,7 +343,12 @@ impl<D: BalloonDeps> BalloonController<D> {
                                         self.apply_step(next);
                                         Mode::Polling
                                     }
-                                    None => Mode::Polling,
+                                    // At the final target and still healthy:
+                                    // the shrink held, so clear the streak.
+                                    None => {
+                                        self.note_shrink_held();
+                                        Mode::Polling
+                                    }
                                 },
                             }
                         }
@@ -321,6 +363,17 @@ impl<D: BalloonDeps> BalloonController<D> {
         let Some(full) = self.deps.full_memory_bytes() else {
             return Mode::IdleUnshrunk;
         };
+        // Back off after repeated fail-opens. A shrink that fails the same way
+        // every cycle — typically inflation stalling on a host that is itself
+        // out of memory — must not restage its reclaim storm on the 5-minute
+        // idle clock. Suppress the entry (without even probing) until the
+        // streak's backoff window elapses; the next entry after it re-probes,
+        // so reclaim resumes once the host recovers.
+        if let Some(failed_at) = self.last_fail_open_at
+            && failed_at.elapsed() < fail_open_backoff(self.consecutive_fail_opens)
+        {
+            return Mode::IdleUnshrunk;
+        }
         let stats = self.deps.guest_stats(GUEST_STATS_TIMEOUT).await;
         // Commands that arrived while the probe was in flight outrank its
         // result: a Docker request during the (up to 3s) stats query must
@@ -402,8 +455,18 @@ impl<D: BalloonDeps> BalloonController<D> {
     fn fail_open(&mut self, reason: &str) -> Mode<D::Watch> {
         tracing::info!(reason, "restoring full memory");
         self.restore(reason);
+        self.consecutive_fail_opens = self.consecutive_fail_opens.saturating_add(1);
+        self.last_fail_open_at = Some(tokio::time::Instant::now());
         (self.activity)();
         Mode::Active
+    }
+
+    /// A shrink that held — settled at the final target, or was still healthy
+    /// when activity arrived — clears the fail-open streak so the next idle
+    /// entry is not needlessly suppressed.
+    fn note_shrink_held(&mut self) {
+        self.consecutive_fail_opens = 0;
+        self.last_fail_open_at = None;
     }
 
     /// Restores the balloon to the machine's full configured memory.
@@ -980,5 +1043,103 @@ mod tests {
 
         assert!(h.targets().is_empty());
         assert_eq!(h.activity_count(), 0);
+    }
+
+    #[test]
+    fn fail_open_backoff_grows_and_caps() {
+        // A streak of 1 waits the base window; each further failure doubles
+        // it, capped at the maximum.
+        assert_eq!(fail_open_backoff(1), FAIL_OPEN_BACKOFF_BASE);
+        assert_eq!(fail_open_backoff(2), FAIL_OPEN_BACKOFF_BASE * 2);
+        assert_eq!(fail_open_backoff(3), FAIL_OPEN_BACKOFF_BASE * 4);
+        assert_eq!(fail_open_backoff(4), FAIL_OPEN_BACKOFF_MAX);
+        assert_eq!(fail_open_backoff(99), FAIL_OPEN_BACKOFF_MAX);
+    }
+
+    /// The core anti-oscillation guard: a shrink that fail-opens must not
+    /// restage every idle cycle. Idle entries inside the backoff window are
+    /// suppressed without even probing; the first entry past it re-shrinks.
+    #[tokio::test(start_paused = true)]
+    async fn fail_open_backs_off_then_reprobes() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats())); // entry 1
+        let watch = deps.push_watch();
+        deps.push_stats(Some(idle_stats())); // re-probe past the backoff
+        let _watch2 = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
+
+        // Pressure → fail-open (streak = 1, backoff armed).
+        watch.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL]);
+
+        // A fresh idle entry inside the window is suppressed without probing.
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL],
+            "an idle entry within the backoff window must not re-shrink"
+        );
+
+        // Past the window the IdleUnshrunk retry re-probes and shrinks again.
+        tokio::time::advance(FAIL_OPEN_BACKOFF_BASE).await;
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL, FIRST_STEP]);
+    }
+
+    /// A shrink that holds clears the streak: the fail-open that follows a
+    /// held shrink waits the base window again, not a doubled one.
+    #[tokio::test(start_paused = true)]
+    async fn held_shrink_resets_backoff_streak() {
+        // Sized so used + headroom == FULL - SHRINK_STEP: the descent reaches
+        // its final target in one step, so a single Settled is settle-at-final.
+        let one_step_stats = GuestStats {
+            total: FULL,
+            available: 2 * GIB + super::super::IDLE_BALLOON_HEADROOM,
+            loadavg1: 0.1,
+        };
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats())); // cycle 1 → fail-open
+        let w1 = deps.push_watch();
+        deps.push_stats(Some(one_step_stats)); // cycle 2 → settles at final
+        let w2 = deps.push_watch();
+        deps.push_stats(Some(idle_stats())); // cycle 3 → shrinks after reset
+        let _w3 = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        w1.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL]); // streak = 1
+
+        // Wait out the base window, re-shrink, and settle at the final target.
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        tokio::time::advance(FAIL_OPEN_BACKOFF_BASE).await;
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL, FIRST_STEP]);
+        w2.send(WatchFrame::Settled).unwrap(); // final reached → streak reset
+        h.settle().await;
+
+        // A new fail-open now starts a fresh streak. If the streak had not
+        // reset it would be 2 (double window) and the base-length wait below
+        // would not re-probe.
+        w2.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        tokio::time::advance(FAIL_OPEN_BACKOFF_BASE).await;
+        h.settle().await;
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL, FIRST_STEP, FULL, FIRST_STEP],
+            "a held shrink must reset the streak to a base-length backoff"
+        );
     }
 }
