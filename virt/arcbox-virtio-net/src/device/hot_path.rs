@@ -178,6 +178,11 @@ impl VirtioNet {
         // chain we consumed but couldn't fill, stalling RX.
         let mut published = false;
         let hdr_len = VirtioNetHeader::SIZE;
+        // Injected header: num_buffers = 1 (VERSION_1 headers carry the field
+        // even without MRG_RXBUF, and the spec pins it to 1 then); every other
+        // field zero — this path performs no offloads.
+        let mut hdr = [0u8; VirtioNetHeader::SIZE];
+        hdr[10..12].copy_from_slice(&1u16.to_le_bytes());
         for _ in 0..64 {
             // Stop when the guest has no RX buffer posted.
             if !queue.has_avail() {
@@ -200,8 +205,8 @@ impl VirtioNet {
                 break;
             }
             let frame = &buf[..n as usize];
-            // The injected buffer is a zeroed virtio-net header followed by the
-            // frame, scattered across the chain's write-only descriptors.
+            // The injected buffer is the header followed by the frame,
+            // scattered across the chain's write-only descriptors.
             let total = hdr_len + frame.len();
 
             let Some(chain) = queue.pop_avail() else {
@@ -223,9 +228,8 @@ impl VirtioNet {
                 if let Some(out) = unsafe { queue.mem().slice_mut(desc.addr as usize, to_write) } {
                     for (k, slot) in out.iter_mut().enumerate() {
                         let pos = written + k;
-                        // virtio-net header is all zeros; frame follows it.
                         *slot = if pos < hdr_len {
-                            0
+                            hdr[pos]
                         } else {
                             frame[pos - hdr_len]
                         };
@@ -234,19 +238,20 @@ impl VirtioNet {
                 }
             }
 
-            if written == 0 {
-                // A chain with no writable capacity can't carry the frame, but
-                // it was already popped off the avail ring — return it to the
-                // used ring (zero length) so the guest reclaims the descriptor
-                // instead of leaking it forever (which drains the RX ring dry).
-                // This advances the used ring, so the guest still needs the
-                // interrupt below. The frame is dropped; TCP retransmits.
-                queue.push_used(chain.head_idx, 0);
-                published = true;
-                continue;
-            }
-
-            queue.push_used(chain.head_idx, written as u32);
+            // Deliver whole frames only. A partial fit — an undersized chain,
+            // or a descriptor pointing outside guest RAM (`slice_mut` refused
+            // it) — completes at zero length: the guest reclaims the popped
+            // chain (leaving it off the used ring would drain the RX ring
+            // dry) and the frame is dropped whole; TCP retransmits. Truncated
+            // delivery would hand the guest a corrupt frame it parses as
+            // complete. This device never offers MRG_RXBUF (it serves the
+            // vmnet bridge NIC), so spanning chains is never a legal
+            // alternative and a conformant guest posts full-frame buffers —
+            // the drop fires only for undersized or hostile rings. The used
+            // ring advances either way, so the guest still needs the
+            // interrupt below.
+            let used_len = if written == total { written as u32 } else { 0 };
+            queue.push_used(chain.head_idx, used_len);
             published = true;
         }
 
