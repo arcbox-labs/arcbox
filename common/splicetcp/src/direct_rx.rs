@@ -333,12 +333,6 @@ async fn read_promoted_conn(
                     c.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 let data = &buf[..n];
-                // Tee the sent bytes into the shared ring BEFORE the frames
-                // go out: the bridge drains it as the guest ACKs and
-                // re-emits from it on dup-ACK/RTO — the path beyond guest
-                // eth0 drops under burst, and without this a single lost
-                // frame wedges the flow forever.
-                conn.retx.lock().unwrap().1.extend(data);
                 let mut offset = 0;
                 while offset < data.len() {
                     let chunk_end = (offset + conn.guest_mss).min(data.len());
@@ -360,6 +354,14 @@ async fn read_promoted_conn(
                     );
                     conn.our_seq
                         .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                    // Tee each chunk as its sequence space is committed —
+                    // never the whole read up front: `frames.send` can park
+                    // this task on backpressure, and a ring running ahead
+                    // of SND.NXT would let the bridge retransmit bytes the
+                    // guest was never sent (whose ACKs the intercept then
+                    // rejects as beyond `our_seq`). The bridge drains the
+                    // ring as the guest ACKs and re-emits on dup-ACK/RTO.
+                    conn.retx.lock().unwrap().1.extend(chunk);
                     if frames.send(frame).await.is_err() {
                         return;
                     }

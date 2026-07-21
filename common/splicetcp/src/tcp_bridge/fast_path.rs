@@ -548,7 +548,18 @@ impl TcpBridge {
                         if conn.fast_retransmit || timed_out {
                             let offset = acked.wrapping_sub(*base) as usize;
                             if offset < ring_buf.len() {
-                                let data: Vec<u8> = ring_buf.iter().skip(offset).copied().collect();
+                                // Clamp to in-flight bytes: the owner tees
+                                // after advancing SND.NXT, but never emit
+                                // past `sent` even if a racing tee briefly
+                                // runs ahead — the guest would ACK bytes
+                                // the intercept then rejects as beyond
+                                // `our_seq`.
+                                let data: Vec<u8> = ring_buf
+                                    .iter()
+                                    .skip(offset)
+                                    .take(in_flight as usize)
+                                    .copied()
+                                    .collect();
                                 emit_data_frames(&ctx, conn, acked, &data, &mut frames);
                             }
                             if let Some(fin_seq) = fin_seq

@@ -2827,3 +2827,28 @@ async fn inline_lost_fin_is_retransmitted() {
         "an ACKed FIN must not be retransmitted"
     );
 }
+
+/// A ring that momentarily runs ahead of SND.NXT (the owner tees while a
+/// racing bridge poll fires) must never cause bytes beyond `sent` to be
+/// retransmitted — the guest would ACK them and the intercept would reject
+/// that ACK as beyond `our_seq`.
+#[tokio::test]
+async fn inline_retransmit_never_exceeds_sent() {
+    let (mut bridge, promoted, key) = inline_fixture(40114, Ipv4Addr::new(198, 18, 30, 154)).await;
+
+    // Simulate the transient: 100 bytes teed, only 40 of sequence space
+    // committed so far.
+    promoted.retx.lock().unwrap().1.extend([0xAA; 100]);
+    promoted
+        .our_seq
+        .fetch_add(40, std::sync::atomic::Ordering::Relaxed);
+
+    backdate_rto_clock(&mut bridge, &key);
+    let frames = bridge.poll_fast_path();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        tcp_payload_len(&frames[0]),
+        40,
+        "retransmission is clamped to the committed sequence space"
+    );
+}
