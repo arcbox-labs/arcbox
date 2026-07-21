@@ -1865,3 +1865,49 @@ async fn half_closed_flow_reaped_after_idle_timeout() {
         "idle half-open reaped after HALF_CLOSE_TIMEOUT"
     );
 }
+
+/// A segment matching an active flow but with a malformed TCP data offset
+/// (< 20) must be rejected outright and never written to the host socket —
+/// otherwise raw TCP header bytes get spliced into the upstream byte stream.
+#[tokio::test]
+async fn malformed_data_offset_is_not_spliced_to_host() {
+    use tokio::io::AsyncReadExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut server, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 99);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40077,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460, None);
+
+    // A PSH|ACK segment carrying 8 payload bytes, but with the TCP data-offset
+    // nibble cleared (data offset = 0, < the 20-byte minimum).
+    let mut bad = make_guest_segment((40077, dst_ip, 443), 2000, 1000, 65535, 0x18, &[0xAA; 8]);
+    let data_offset_byte = ETH_HEADER_LEN + 20 + 12; // IP header is 20 bytes (IHL=5)
+    bad[data_offset_byte] &= 0x0F; // clear the high (data-offset) nibble → 0
+
+    assert!(
+        bridge.try_fast_path_intercept(&bad).is_none(),
+        "a TCP data offset < 20 must be rejected"
+    );
+
+    let mut buf = [0u8; 8];
+    let got =
+        tokio::time::timeout(std::time::Duration::from_millis(100), server.read(&mut buf)).await;
+    assert!(
+        got.is_err(),
+        "a rejected segment must not splice bytes to the host socket"
+    );
+}

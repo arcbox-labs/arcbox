@@ -33,7 +33,7 @@ impl TcpBridge {
         }
         let ihl = ((syn_frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
-        if l4_start + 20 > syn_frame.len() {
+        if ihl < 20 || l4_start + 20 > syn_frame.len() {
             return None;
         }
 
@@ -362,7 +362,7 @@ impl TcpBridge {
         }
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
-        if l4_start + 20 > frame.len() {
+        if ihl < 20 || l4_start + 20 > frame.len() {
             return None;
         }
 
