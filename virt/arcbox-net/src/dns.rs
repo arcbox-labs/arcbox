@@ -476,28 +476,38 @@ impl DnsForwarder {
     }
 
     /// Forwards a query to upstream servers.
+    ///
+    /// Each upstream gets a freshly `connect`ed socket so the kernel drops any
+    /// datagram not from that upstream, and the reply's transaction ID must
+    /// echo the query's — together closing the off-path cache-poisoning window
+    /// an unconnected `recv_from` (which accepted any sender's bytes) left open.
     fn forward_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         use std::net::UdpSocket;
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| NetError::Dns(format!("failed to bind socket: {}", e)))?;
-
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| NetError::Dns(format!("failed to set timeout: {}", e)))?;
+        // The query's transaction ID; a valid reply must echo it.
+        let query_id = data.get(0..2);
 
         for upstream in &self.config.upstream {
-            // Send query
-            if socket.send_to(data, upstream).is_err() {
+            let socket = UdpSocket::bind("0.0.0.0:0")
+                .map_err(|e| NetError::Dns(format!("failed to bind socket: {}", e)))?;
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|e| NetError::Dns(format!("failed to set timeout: {}", e)))?;
+
+            // connect() filters incoming datagrams to this upstream only.
+            if socket.connect(upstream).is_err() || socket.send(data).is_err() {
                 continue;
             }
 
-            // Receive response
-            let mut buf = [0u8; 512];
-            if let Ok((len, _)) = socket.recv_from(&mut buf) {
+            // Sized for EDNS0 replies (a 512-byte buffer silently truncated
+            // them). Reject anything without a full header echoing our txid.
+            let mut buf = vec![0u8; 65535];
+            if let Ok(len) = socket.recv(&mut buf) {
+                if len < 12 || Some(&buf[0..2]) != query_id {
+                    continue;
+                }
                 let response = buf[..len].to_vec();
 
-                // Cache the response (simplified)
                 if let Ok(query) = DnsQuery::parse(data) {
                     self.cache_response(&query, &response);
                 }
@@ -706,6 +716,63 @@ mod tests {
         packet.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
         packet.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
         packet
+    }
+
+    /// A one-shot fake upstream that answers a single query with a 12-byte
+    /// response header, echoing the query's transaction id or corrupting it.
+    fn spawn_fake_upstream(echo_txid: bool) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        use std::net::UdpSocket;
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (_, peer) = sock.recv_from(&mut buf).unwrap();
+            let mut reply = if echo_txid {
+                vec![buf[0], buf[1]]
+            } else {
+                vec![buf[0] ^ 0xFF, buf[1] ^ 0xFF]
+            };
+            reply.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
+            sock.send_to(&reply, peer).unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn forward_query_accepts_matching_transaction_id() {
+        let (upstream, handle) = spawn_fake_upstream(true);
+        let config = DnsConfig {
+            upstream: vec![upstream],
+            ..DnsConfig::default()
+        };
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("example.com");
+        let reply = forwarder
+            .forward_query(&query)
+            .expect("a reply echoing the txid must be accepted");
+        handle.join().unwrap();
+        assert_eq!(&reply[0..2], &query[0..2], "reply carries the query's txid");
+    }
+
+    /// Regression (cache-poisoning): a reply whose transaction id does not
+    /// match the query must be rejected, never returned or cached.
+    #[test]
+    fn forward_query_rejects_mismatched_transaction_id() {
+        let (upstream, handle) = spawn_fake_upstream(false);
+        let config = DnsConfig {
+            upstream: vec![upstream],
+            ..DnsConfig::default()
+        };
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("example.com");
+        let result = forwarder.forward_query(&query);
+        handle.join().unwrap();
+        assert!(
+            result.is_err(),
+            "a reply with the wrong transaction id must be rejected"
+        );
     }
 
     fn build_test_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
