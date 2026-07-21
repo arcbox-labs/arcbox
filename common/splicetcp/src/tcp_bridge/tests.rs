@@ -2255,16 +2255,16 @@ async fn zero_window_stall_is_broken_by_a_persist_probe() {
 // left the guest leg ESTABLISHED forever (apk hung 23+ minutes), and a
 // vanished guest endpoint would leave the shim soliciting forever.
 
-/// Backdates a flow's sign-of-life clock so the dead-flow deadline is already
-/// past, without sleeping in the test.
-fn backdate_guest_activity(bridge: &mut TcpBridge, key: &SynFlowKey, by: std::time::Duration) {
-    bridge
-        .fast_path_conns
-        .get_mut(key)
-        .unwrap()
-        .last_guest_activity = std::time::Instant::now()
+/// Backdates a flow's sign-of-life AND soliciting clocks so the dead-flow
+/// deadline (which requires both to be stale) is already past, without
+/// sleeping in the test.
+fn backdate_dead_flow_clocks(bridge: &mut TcpBridge, key: &SynFlowKey, by: std::time::Duration) {
+    let past = std::time::Instant::now()
         .checked_sub(by)
         .expect("test clock underflow");
+    let conn = bridge.fast_path_conns.get_mut(key).unwrap();
+    conn.last_guest_activity = past;
+    conn.soliciting_since = Some(past);
 }
 
 /// Promotion must arm TCP keepalive on the upstream socket: a silently dead
@@ -2346,7 +2346,7 @@ async fn silent_guest_with_data_in_flight_is_rst_reaped() {
     assert!(in_flight, "data must go into flight toward the guest");
 
     bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
-    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+    backdate_dead_flow_clocks(&mut bridge, &key, std::time::Duration::from_millis(200));
 
     let frames = bridge.poll_fast_path();
     assert!(
@@ -2398,7 +2398,7 @@ async fn silent_guest_at_zero_window_is_rst_reaped() {
     );
 
     bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
-    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+    backdate_dead_flow_clocks(&mut bridge, &key, std::time::Duration::from_millis(200));
 
     let frames = bridge.poll_fast_path();
     assert!(
@@ -2450,7 +2450,7 @@ async fn guest_ack_refreshes_dead_flow_clock() {
     assert!(in_flight, "data must go into flight toward the guest");
 
     bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
-    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+    backdate_dead_flow_clocks(&mut bridge, &key, std::time::Duration::from_millis(200));
 
     // The guest answers (dup-ACK at the promoted seq) before the next poll.
     let dup_ack = make_guest_segment((40103, dst_ip, 443), 2000, 1000, 65535, 0x10, &[]);
@@ -2523,7 +2523,7 @@ async fn inline_silent_guest_with_data_in_flight_is_rst_reaped() {
         .store(65535, std::sync::atomic::Ordering::Relaxed);
 
     bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
-    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+    backdate_dead_flow_clocks(&mut bridge, &key, std::time::Duration::from_millis(200));
 
     let frames = bridge.poll_fast_path();
     assert!(
@@ -2538,5 +2538,78 @@ async fn inline_silent_guest_with_data_in_flight_is_rst_reaped() {
     assert!(
         promoted.dead.load(std::sync::atomic::Ordering::Relaxed),
         "the owner cancel flag must fire so the inline reader exits"
+    );
+}
+
+/// A long-idle flow whose upstream wakes up must NOT be insta-reaped: the
+/// last guest frame is legitimately ancient (the flow was quiescent), so the
+/// deadline must run from the moment soliciting began — the wake-up — giving
+/// the guest the full window to answer.
+#[tokio::test]
+async fn long_idle_flow_survives_upstream_wakeup() {
+    use std::io::Write;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let (server, _) = accepted.unwrap();
+    let mut server = server.into_std().unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 145);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40105,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        1460,
+        None,
+    );
+
+    // The flow has been quiescent far beyond the deadline: the guest's last
+    // frame is ancient, but nothing was being solicited.
+    bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
+    bridge
+        .fast_path_conns
+        .get_mut(&key)
+        .unwrap()
+        .last_guest_activity = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(30))
+        .expect("test clock underflow");
+
+    // Upstream wakes up: data goes into flight, soliciting starts NOW.
+    server.write_all(b"wakeup-data").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut woke = Vec::new();
+    while woke.is_empty() && std::time::Instant::now() < deadline {
+        woke = bridge.poll_fast_path();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!woke.is_empty(), "wakeup data must go into flight");
+    assert!(
+        woke.iter().all(|f| tcp_flags_of(f) & 0x04 == 0),
+        "the wakeup must not be answered with a RST"
+    );
+
+    // Immediately after the wakeup the guest has not answered yet — the flow
+    // must survive: the soliciting clock just started.
+    let frames = bridge.poll_fast_path();
+    assert!(
+        frames.iter().all(|f| tcp_flags_of(f) & 0x04 == 0),
+        "a freshly woken flow must not be RST"
+    );
+    assert_eq!(
+        bridge.fast_path_count(),
+        1,
+        "a freshly woken flow must survive until the guest had its full deadline"
     );
 }

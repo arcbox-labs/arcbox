@@ -478,8 +478,19 @@ impl TcpBridge {
                 // (the persist probe below never fires while bytes are
                 // outstanding). Soliciting = unACKed data outstanding or a
                 // closed window under persist; either demands a guest reply,
-                // so prolonged silence means the endpoint is gone.
-                if (!nothing_in_flight || conn.window_stalled_at.is_some())
+                // so prolonged unanswered soliciting means the endpoint is
+                // gone. Both clocks must be stale — the soliciting clock
+                // starts fresh when a long-idle flow's owner resumes sending,
+                // so its guest gets the full deadline to answer.
+                let soliciting = !nothing_in_flight || conn.window_stalled_at.is_some();
+                if !soliciting {
+                    conn.soliciting_since = None;
+                } else if conn.soliciting_since.is_none() {
+                    conn.soliciting_since = Some(now);
+                }
+                if conn
+                    .soliciting_since
+                    .is_some_and(|since| now.duration_since(since) >= dead_flow_timeout)
                     && now.duration_since(conn.last_guest_activity) >= dead_flow_timeout
                 {
                     tracing::warn!(
@@ -586,12 +597,24 @@ impl TcpBridge {
             // Dead-flow give-up: while soliciting (unACKed data or FIN being
             // RTO-retransmitted, or a closed window under persist probes) a
             // live guest always answers — with at least a dup-ACK or a
-            // window-bearing ACK. Prolonged total silence means the guest
-            // endpoint is gone; without this the RTO path retransmits forever
-            // and the entry leaks its fd and retransmission buffer.
+            // window-bearing ACK. Prolonged unanswered soliciting means the
+            // guest endpoint is gone; without this the RTO path retransmits
+            // forever and the entry leaks its fd and retransmission buffer.
+            // Both clocks must be stale: a long-idle flow whose upstream just
+            // woke up starts the soliciting clock here and now, so its guest
+            // gets the full deadline to answer despite an ancient last frame.
             let soliciting =
                 (in_flight > 0 && in_flight < 0x8000_0000) || conn.window_stalled_at.is_some();
-            if soliciting && now.duration_since(conn.last_guest_activity) >= dead_flow_timeout {
+            if !soliciting {
+                conn.soliciting_since = None;
+            } else if conn.soliciting_since.is_none() {
+                conn.soliciting_since = Some(now);
+            }
+            if conn
+                .soliciting_since
+                .is_some_and(|since| now.duration_since(since) >= dead_flow_timeout)
+                && now.duration_since(conn.last_guest_activity) >= dead_flow_timeout
+            {
                 tracing::warn!(
                     "Fast path: guest silent {:?} on soliciting flow {}:{} → {}:{}, RST + reap",
                     dead_flow_timeout,
@@ -1019,6 +1042,7 @@ impl TcpBridge {
                 down_shared: if inline_owned { down_shared } else { None },
                 dead,
                 last_guest_activity: std::time::Instant::now(),
+                soliciting_since: None,
             },
         );
     }
