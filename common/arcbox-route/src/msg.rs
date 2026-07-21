@@ -1,11 +1,11 @@
 //! Routing socket message construction and I/O.
 //!
 //! Builds `rt_msghdr` + variable-length sockaddr payloads for PF_ROUTE
-//! operations (RTM_ADD, RTM_DELETE, RTM_CHANGE, RTM_GET).
+//! operations (RTM_ADD, RTM_DELETE, RTM_GET).
 //!
 //! # I/O model
 //!
-//! - **Mutations** (add/delete/change): `write()` only. Success/failure is
+//! - **Mutations** (add/delete): `write()` only. Success/failure is
 //!   determined entirely by the `write()` return value and `errno`. No reply
 //!   is read — this avoids alignment UB on reply buffers, seq/pid matching
 //!   complexity, and `SO_USELOOPBACK` contradictions.
@@ -39,7 +39,6 @@ const MAX_READ_ATTEMPTS: usize = 50;
 pub enum MsgType {
     Add,
     Delete,
-    Change,
     Get,
 }
 
@@ -48,7 +47,6 @@ impl MsgType {
         match self {
             Self::Add => libc::RTM_ADD,
             Self::Delete => libc::RTM_DELETE,
-            Self::Change => libc::RTM_CHANGE,
             Self::Get => libc::RTM_GET,
         }
     }
@@ -311,19 +309,6 @@ mod tests {
             + sa_rlen(std::mem::size_of::<libc::sockaddr_in>())
             + sa_rlen(std::mem::size_of::<libc::sockaddr_in>());
         assert_eq!(buf.len(), expected);
-    }
-
-    #[test]
-    fn build_msg_change_type() {
-        let net: Ipv4Net = "10.0.0.0/8".parse().unwrap();
-        let dst = sockaddr::make_dst(net);
-        let gw = sockaddr::make_gateway_dl_with_index("bridge100", 1);
-        let mask = sockaddr::make_netmask(net);
-
-        let buf = build_msg(MsgType::Change, &dst, Some(&gw), &mask).unwrap();
-        let hdr = read_hdr(&buf);
-
-        assert_eq!(hdr.rtm_type, libc::RTM_CHANGE as u8);
     }
 
     #[test]

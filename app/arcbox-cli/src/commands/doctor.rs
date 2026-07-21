@@ -192,16 +192,22 @@ fn check_container_route() -> CheckResult {
 
     let mut iface = None;
     let mut gateway = None;
+    let mut is_gateway_route = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(val) = trimmed.strip_prefix("interface:") {
             iface = Some(val.trim().to_string());
         } else if let Some(val) = trimmed.strip_prefix("gateway:") {
             gateway = Some(val.trim().to_string());
+        } else if let Some(val) = trimmed.strip_prefix("flags:") {
+            is_gateway_route = val.split([',', '<', '>']).any(|flag| flag == "GATEWAY");
         }
     }
 
     match iface.as_deref() {
+        Some(i) if is_gateway_route => CheckResult::Fail(format!(
+            "172.16.0.0/12 → {i} is a gateway route; container traffic will fail"
+        )),
         Some(i) if i.starts_with("bridge") => CheckResult::Pass(format!("172.16.0.0/12 → {i}")),
         Some(i) => CheckResult::Fail(format!(
             "172.16.0.0/12 → {i} (expected bridge*, got wrong interface; gateway={:?})",

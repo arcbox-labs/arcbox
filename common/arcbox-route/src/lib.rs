@@ -13,8 +13,8 @@
 //!
 //! # Operations
 //!
-//! - [`add`] — Add a subnet route via an interface. Falls back to
-//!   `RTM_CHANGE` if the route already exists (atomic replace).
+//! - [`add`] — Add a subnet route via an interface. Replaces an existing
+//!   route when necessary.
 //! - [`remove`] — Delete a subnet route. Idempotent (missing route = Ok).
 //! - [`get`] — Query the current route for a subnet.
 //!
@@ -182,9 +182,9 @@ pub struct RouteInfo {
 ///
 /// Equivalent to: `route -n add -net <net> -interface <iface>`
 ///
-/// If the route already exists (`EEXIST`), atomically replaces it via
-/// `RTM_CHANGE`. This fixes the bug where a pre-existing route pointing
-/// to a different gateway/interface was silently left in place.
+/// If the route already exists (`EEXIST`), deletes it before adding the
+/// interface route. XNU's `RTM_CHANGE` cannot clear `RTF_GATEWAY`, so it
+/// cannot safely convert a conflicting VPN gateway route.
 ///
 /// # Errors
 ///
@@ -204,8 +204,12 @@ pub fn add(net: Ipv4Net, iface: &str) -> Result<(), String> {
             Ok(())
         }
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-            tracing::debug!(iface, net = %net, "route exists, replacing via RTM_CHANGE");
-            send_change(net, iface, &dst, &gw, &mask)
+            tracing::debug!(iface, net = %net, "route exists, replacing via delete and add");
+            remove(net)?;
+            msg::route_write(&add_msg)
+                .map_err(|e| format!("RTM_ADD {net} via {iface} after delete: {e}"))?;
+            tracing::debug!(iface, net = %net, "route replaced");
+            Ok(())
         }
         Err(e) => Err(format!("RTM_ADD {net} via {iface}: {e}")),
     }
@@ -268,28 +272,19 @@ pub fn get(net: Ipv4Net) -> Result<Option<RouteInfo>, String> {
     }
 }
 
-// ── Internal helpers ───────────────────────────────────────────────────
-
-/// Sends an RTM_CHANGE message — extracted to eliminate duplication in [`add`].
-fn send_change(
-    net: Ipv4Net,
-    iface: &str,
-    dst: &libc::sockaddr_in,
-    gw: &libc::sockaddr_dl,
-    mask: &libc::sockaddr_in,
-) -> Result<(), String> {
-    let change_msg = msg::build_msg(msg::MsgType::Change, dst, Some(gw), mask)
-        .map_err(|e| format!("RTM_CHANGE {net} via {iface}: failed to build message: {e}"))?;
-    msg::route_write(&change_msg).map_err(|e| format!("RTM_CHANGE {net} via {iface}: {e}"))?;
-    tracing::debug!(net = %net, "route replaced");
-    Ok(())
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RouteCleanup(Ipv4Net);
+
+    impl Drop for RouteCleanup {
+        fn drop(&mut self) {
+            let _ = remove(self.0);
+        }
+    }
 
     #[test]
     fn ipv4net_valid() {
@@ -365,5 +360,35 @@ mod tests {
             "0.0.0.0/0".parse::<Ipv4Net>().unwrap().mask(),
             Ipv4Addr::UNSPECIFIED
         );
+    }
+
+    #[test]
+    #[ignore = "requires root to mutate the macOS routing table"]
+    fn gateway_route_is_replaced_with_interface_route() {
+        use std::process::Command;
+
+        let net: Ipv4Net = "198.51.100.0/24".parse().unwrap();
+        remove(net).unwrap();
+        let _cleanup = RouteCleanup(net);
+
+        let output = Command::new("/sbin/route")
+            .args(["-n", "add", "-net", &net.to_string(), "127.0.0.1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to install gateway-route fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        add(net, "lo0").unwrap();
+        let route = get(net).unwrap().expect("replacement route should exist");
+
+        assert_eq!(route.flags & libc::RTF_GATEWAY, 0);
+        let lo0 = std::ffi::CString::new("lo0").unwrap();
+        // Safety: `lo0` is a valid NUL-terminated interface name.
+        let lo0_index = unsafe { libc::if_nametoindex(lo0.as_ptr()) };
+        assert_ne!(lo0_index, 0);
+        assert_eq!(u32::from(route.ifindex), lo0_index);
     }
 }
