@@ -753,7 +753,7 @@ impl TcpBridge {
                 up_would_block: 0,
                 up_short_writes: 0,
                 up_out_of_order: 0,
-                ooo_segs: Vec::new(),
+                ooo_segs: std::collections::VecDeque::new(),
                 ooo_bytes: 0,
                 up_ooo_dropped: 0,
                 window_stalled: false,
