@@ -1806,3 +1806,62 @@ async fn download_ack_beyond_sent_is_ignored() {
         "retransmit from the real cursor, not the bogus ACK"
     );
 }
+
+/// A half-closed flow (guest sent FIN, host keeps its write side open with
+/// nothing to send) must not leak forever: the FIN_WAIT2 idle clock reaps it
+/// once it exceeds HALF_CLOSE_TIMEOUT with no host→guest progress.
+#[tokio::test]
+async fn half_closed_flow_reaped_after_idle_timeout() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    // Keep the server end alive and silent: the host never EOFs and has
+    // nothing to send, so poll_fast_path reads WouldBlock forever.
+    let (_server, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 120);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40060,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        1460,
+        None,
+    );
+
+    // Guest half-closes with an in-order FIN → the flow is retained.
+    let fin = make_guest_segment((40060, dst_ip, 443), 2000, 1000, 65535, 0x11, &[]);
+    let reply = bridge.try_fast_path_intercept(&fin).expect("intercepted");
+    assert_ne!(tcp_flags_of(&reply) & 0x10, 0, "half-close FIN is ACKed");
+    assert_eq!(bridge.fast_path_count(), 1, "half-closed flow retained");
+
+    // Within the idle window it must survive a poll.
+    bridge.poll_fast_path();
+    assert_eq!(
+        bridge.fast_path_count(),
+        1,
+        "not reaped while inside the idle window"
+    );
+
+    // Backdate the FIN_WAIT2 clock past the timeout; the next poll reaps it.
+    let past = std::time::Instant::now()
+        .checked_sub(super::HALF_CLOSE_TIMEOUT + std::time::Duration::from_secs(1))
+        .expect("test clock underflow");
+    bridge.fast_path_conns.get_mut(&key).unwrap().guest_fin_at = Some(past);
+    bridge.poll_fast_path();
+    assert_eq!(
+        bridge.fast_path_count(),
+        0,
+        "idle half-open reaped after HALF_CLOSE_TIMEOUT"
+    );
+}

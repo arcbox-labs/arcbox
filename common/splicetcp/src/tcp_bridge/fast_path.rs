@@ -338,7 +338,7 @@ impl TcpBridge {
                         "Fast path: guest half-close {src_ip}:{src_port}→{dst_ip}:{dst_port}"
                     );
                     let _ = conn.stream.shutdown(std::net::Shutdown::Write);
-                    conn.guest_fin_seen = true;
+                    conn.guest_fin_at = Some(std::time::Instant::now());
                     let ack =
                         crate::ethernet::build_tcp_ack_frame(&crate::ethernet::TcpFrameParams {
                             src_ip: conn.remote_ip,
@@ -438,16 +438,34 @@ impl TcpBridge {
             }
             // A half-closed non-inline flow is fully done once the host has
             // also EOF'd (our FIN was sent) and the guest ACKed that FIN.
-            if conn.guest_fin_seen && conn.host_eof {
-                if let Some(fin_seq) = conn.fin_seq {
-                    let acked_past_fin = conn
-                        .guest_acked
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .wrapping_sub(fin_seq);
-                    if (1..0x8000_0000).contains(&acked_past_fin) {
-                        to_remove.push(*key);
-                        continue;
+            if let Some(fin_at) = conn.guest_fin_at {
+                if conn.host_eof {
+                    if let Some(fin_seq) = conn.fin_seq {
+                        let acked_past_fin = conn
+                            .guest_acked
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .wrapping_sub(fin_seq);
+                        if (1..0x8000_0000).contains(&acked_past_fin) {
+                            to_remove.push(*key);
+                            continue;
+                        }
                     }
+                }
+                // FIN_WAIT2 leak guard: the guest finished sending but the
+                // upstream keeps its write side open (or the guest silently
+                // dropped its FIN_WAIT2 state). The clock is refreshed on every
+                // host→guest byte below, so this only fires on a truly idle
+                // half-open — reap it instead of holding the entry + fd forever.
+                if now.duration_since(fin_at) >= super::HALF_CLOSE_TIMEOUT {
+                    tracing::debug!(
+                        "Fast path: half-close idle timeout, reaping {}:{} → {}:{}",
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
+                    );
+                    to_remove.push(*key);
+                    continue;
                 }
             }
             // ---- Sender-side loss recovery (runs for host_eof flows too:
@@ -594,6 +612,11 @@ impl TcpBridge {
                 }
                 Ok(n) => {
                     conn.down_bytes += n as u64;
+                    // Host→guest progress refreshes the half-close idle clock so
+                    // a slow but live streamed response is never reaped.
+                    if conn.guest_fin_at.is_some() {
+                        conn.guest_fin_at = Some(now);
+                    }
                     let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
                     conn.retransmit_buf.extend(&conn.read_buf[..n]);
                     emit_data_frames(&ctx, conn, seq_now, &conn.read_buf[..n], &mut frames);
@@ -826,7 +849,7 @@ impl TcpBridge {
                     vec![0u8; 32768]
                 },
                 host_eof: false,
-                guest_fin_seen: false,
+                guest_fin_at: None,
                 inline_owned,
                 up_bytes: 0,
                 down_bytes: 0,
