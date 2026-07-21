@@ -65,6 +65,10 @@ pub enum HelperError {
     /// UX copy is not stuffed into structured fields.
     #[error("{path} exists but is not a symlink (is Docker Desktop running? stop it first)")]
     DockerSocketOccupied { path: String },
+
+    /// An exact route already exists and was left untouched.
+    #[error("route conflict for {subnet}")]
+    RouteConflict { subnet: String },
 }
 
 impl HelperError {
@@ -133,6 +137,7 @@ impl HelperError {
             Self::Io { .. } => "io",
             Self::Other(_) => "other",
             Self::DockerSocketOccupied { .. } => "docker_socket_occupied",
+            Self::RouteConflict { .. } => "route_conflict",
         }
     }
 }

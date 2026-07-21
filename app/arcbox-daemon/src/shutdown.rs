@@ -117,11 +117,6 @@ async fn stop_runtime(runtime: Arc<Runtime>, grace: Option<Duration>) -> bool {
 }
 
 async fn cleanup(ctx: &DaemonContext) {
-    #[cfg(target_os = "macos")]
-    {
-        arcbox_core::route_reconciler::remove_route().await;
-    }
-
     if ctx.docker_integration {
         if let Ok(ctx_manager) = DockerContextManager::new(ctx.layout.docker_socket.clone()) {
             let _ = ctx_manager.disable();
@@ -223,6 +218,9 @@ async fn drain(handles: &mut ServiceHandles) {
         if let Some(h) = handles.kubernetes_proxy.as_mut() {
             let _ = h.await;
         }
+        if let Some(h) = handles.route_guard.as_mut() {
+            let _ = h.await;
+        }
     })
     .await
     .is_err()
@@ -237,6 +235,9 @@ async fn drain(handles: &mut ServiceHandles) {
             h.abort();
         }
         if let Some(h) = handles.kubernetes_proxy.as_mut() {
+            h.abort();
+        }
+        if let Some(h) = handles.route_guard.as_mut() {
             h.abort();
         }
     }

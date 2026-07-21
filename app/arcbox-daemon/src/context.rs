@@ -129,4 +129,6 @@ pub struct ServiceHandles {
     pub docker: Option<tokio::task::JoinHandle<()>>,
     pub grpc: tokio::task::JoinHandle<()>,
     pub kubernetes_proxy: Option<tokio::task::JoinHandle<()>>,
+    /// Host container-route guard; present only on macOS with the Linux VM enabled.
+    pub route_guard: Option<tokio::task::JoinHandle<()>>,
 }

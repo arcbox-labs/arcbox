@@ -81,7 +81,7 @@ fn helper_version_pins_are_aligned() {
     );
 
     // Independent of the workspace package version.
-    assert_eq!(pkg, "1.0.1");
+    assert_eq!(pkg, "1.0.2");
 }
 
 #[tokio::test]
