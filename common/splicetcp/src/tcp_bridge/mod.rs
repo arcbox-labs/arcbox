@@ -87,6 +87,33 @@ const HANDSHAKE_TOTAL_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// live response while still bounding a hostile guest's accumulated entries.
 const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Give-up deadline for a flow whose guest has gone silent while the shim is
+/// actively soliciting a response — retransmitting unACKed data or a FIN, or
+/// persist-probing a closed receive window. A live guest answers every
+/// solicit (a retransmit elicits at least a dup-ACK; a persist probe elicits
+/// a window-bearing ACK per RFC 793 §3.9), so five minutes of silence means
+/// the guest endpoint is gone (container netns torn down, VM wedged) and the
+/// entry would otherwise retransmit forever and leak its host fd plus up to
+/// [`HONORED_WINDOW_CAP`] of retransmission buffer. Deliberately generous so
+/// a paused-then-resumed VM (see `arcbox-vz` pause / sandbox checkpoint)
+/// keeps its in-flight flows across any reasonable pause. Purely idle flows
+/// (nothing in flight, window open) are never reaped — matching real TCP,
+/// which keeps quiescent connections indefinitely.
+const DEAD_FLOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// TCP keepalive for the host-side (upstream) leg of every fast-path flow.
+/// Without it a silently dead upstream — a default-route flap, a crashed
+/// system proxy, a NAT timeout — never surfaces on the socket: reads stay
+/// `WouldBlock` forever and the guest leg sits ESTABLISHED with empty queues
+/// until the guest app gives up (observed in prod: `apk` hung 23+ minutes).
+/// With keepalive the kernel probes an idle upstream and turns its death
+/// into a read error, which `poll_fast_path` / the inline owners already
+/// propagate as a guest RST. Idle 60 s + 4 probes × 15 s ⇒ a dead upstream
+/// is detected within ~2 minutes of its last byte.
+const UPSTREAM_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+const UPSTREAM_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const UPSTREAM_KEEPALIVE_RETRIES: u32 = 4;
+
 /// Window scale we advertise to the guest. Shift by 7 = 128× scaling,
 /// giving an effective receive window of 65535 × 128 = 8 MiB. Sufficient
 /// for any VM→Host BDP on a local loopback link.
@@ -270,6 +297,9 @@ pub struct TcpBridge {
     /// waiting for the next guest frame or timer tick (an idle loop
     /// otherwise adds up to a full tick of connect latency).
     handshake_waker: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Silence deadline before a soliciting flow is declared dead
+    /// ([`DEAD_FLOW_TIMEOUT`]; overridable in tests).
+    dead_flow_timeout: std::time::Duration,
 }
 
 /// A TCP connection promoted to the fast path — bypasses any TCP state
@@ -394,6 +424,13 @@ pub(super) struct FastPathConn {
     /// unset so the entry survives for the guest's close handshake. `Some`
     /// only when `inline_owned` (ABX-431).
     dead: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Last time any guest frame for this flow reached
+    /// `try_fast_path_intercept` — the flow's sign of life. While the shim is
+    /// soliciting a response (data/FIN in flight, or a closed window being
+    /// persist-probed) and this goes stale past [`DEAD_FLOW_TIMEOUT`], the
+    /// guest endpoint is gone and the flow is RST-reaped instead of
+    /// retransmitting forever.
+    last_guest_activity: StdInstant,
 }
 
 impl FastPathConn {
@@ -536,7 +573,13 @@ impl TcpBridge {
             observer: None,
             handshake_conns: HashMap::new(),
             handshake_waker: None,
+            dead_flow_timeout: DEAD_FLOW_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_dead_flow_timeout(&mut self, timeout: std::time::Duration) {
+        self.dead_flow_timeout = timeout;
     }
 
     /// Installs a waker notified whenever an async host connect for a

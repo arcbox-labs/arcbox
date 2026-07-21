@@ -117,6 +117,9 @@ impl TcpBridge {
         };
 
         let conn = self.fast_path_conns.get_mut(&key)?;
+        // Any guest frame for the flow — data, ACK, dup-ACK, even a bare
+        // window probe — is its sign of life for the dead-flow reaper.
+        conn.last_guest_activity = std::time::Instant::now();
 
         let guest_seq = u32::from_be_bytes([
             frame[l4_start + 4],
@@ -428,6 +431,7 @@ impl TcpBridge {
             guest_mac,
         };
         let now = std::time::Instant::now();
+        let dead_flow_timeout = self.dead_flow_timeout;
 
         for (key, conn) in &mut self.fast_path_conns {
             if conn.inline_owned {
@@ -468,6 +472,40 @@ impl TcpBridge {
                     .min(super::HONORED_WINDOW_CAP);
                 let in_flight = sent.wrapping_sub(acked);
                 let nothing_in_flight = in_flight == 0 || in_flight >= 0x8000_0000;
+                // Dead-flow give-up: the inline path has no RTO, so a guest
+                // that vanished with data in flight freezes the send budget
+                // and would hold the entry, host fd, and owner task forever
+                // (the persist probe below never fires while bytes are
+                // outstanding). Soliciting = unACKed data outstanding or a
+                // closed window under persist; either demands a guest reply,
+                // so prolonged silence means the endpoint is gone.
+                if (!nothing_in_flight || conn.window_stalled_at.is_some())
+                    && now.duration_since(conn.last_guest_activity) >= dead_flow_timeout
+                {
+                    tracing::warn!(
+                        "Fast path: guest silent {:?} on soliciting inline flow {}:{} → {}:{}, RST + reap",
+                        dead_flow_timeout,
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
+                    );
+                    frames.push(crate::ethernet::build_tcp_rst_frame(
+                        &crate::ethernet::TcpFrameParams {
+                            src_ip: conn.remote_ip,
+                            dst_ip: conn.guest_ip,
+                            src_port: conn.remote_port,
+                            dst_port: conn.guest_port,
+                            seq: sent,
+                            ack: conn.last_ack,
+                            window: 0,
+                            src_mac: gw_mac,
+                            dst_mac: guest_mac,
+                        },
+                    ));
+                    to_remove.push(*key);
+                    continue;
+                }
                 if super::send_budget(sent, acked, window) == 0 && nothing_in_flight {
                     match conn.window_stalled_at {
                         None => conn.window_stalled_at = Some(now),
@@ -545,6 +583,39 @@ impl TcpBridge {
             }
             let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
             let in_flight = sent.wrapping_sub(acked);
+            // Dead-flow give-up: while soliciting (unACKed data or FIN being
+            // RTO-retransmitted, or a closed window under persist probes) a
+            // live guest always answers — with at least a dup-ACK or a
+            // window-bearing ACK. Prolonged total silence means the guest
+            // endpoint is gone; without this the RTO path retransmits forever
+            // and the entry leaks its fd and retransmission buffer.
+            let soliciting =
+                (in_flight > 0 && in_flight < 0x8000_0000) || conn.window_stalled_at.is_some();
+            if soliciting && now.duration_since(conn.last_guest_activity) >= dead_flow_timeout {
+                tracing::warn!(
+                    "Fast path: guest silent {:?} on soliciting flow {}:{} → {}:{}, RST + reap",
+                    dead_flow_timeout,
+                    key.src_ip,
+                    key.src_port,
+                    key.dst_ip,
+                    key.dst_port,
+                );
+                frames.push(crate::ethernet::build_tcp_rst_frame(
+                    &crate::ethernet::TcpFrameParams {
+                        src_ip: conn.remote_ip,
+                        dst_ip: conn.guest_ip,
+                        src_port: conn.remote_port,
+                        dst_port: conn.guest_port,
+                        seq: sent,
+                        ack: conn.last_ack,
+                        window: 0,
+                        src_mac: gw_mac,
+                        dst_mac: guest_mac,
+                    },
+                ));
+                to_remove.push(*key);
+                continue;
+            }
             if in_flight > 0 && in_flight < 0x8000_0000 {
                 let timed_out = now.duration_since(conn.last_progress) >= conn.rto;
                 if conn.fast_retransmit || timed_out {
@@ -812,6 +883,17 @@ impl TcpBridge {
         // Set non-blocking for polling in the event loop.
         stream.set_nonblocking(true).ok();
         stream.set_nodelay(true).ok();
+        // Keepalive on the upstream leg: a silently dead upstream (route
+        // flap, crashed proxy) otherwise never errors, leaving the guest leg
+        // ESTABLISHED forever. Applies to the underlying socket, so inline
+        // owners reading a cloned fd inherit it. See UPSTREAM_KEEPALIVE_*.
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(super::UPSTREAM_KEEPALIVE_IDLE)
+            .with_interval(super::UPSTREAM_KEEPALIVE_INTERVAL)
+            .with_retries(super::UPSTREAM_KEEPALIVE_RETRIES);
+        if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+            tracing::warn!("Fast path: keepalive setup failed for {key:?}: {e}");
+        }
 
         let last_ack_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(last_ack));
         let our_seq_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(our_seq));
@@ -936,6 +1018,7 @@ impl TcpBridge {
                 down_bytes: 0,
                 down_shared: if inline_owned { down_shared } else { None },
                 dead,
+                last_guest_activity: std::time::Instant::now(),
             },
         );
     }
