@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -47,6 +48,9 @@ const REQUIRED_RUNTIME_BINARIES: &[&str] = &[
 /// enough that TLS certificates issued after 2020 pass validation.
 /// 2020-01-01T00:00:00Z
 const MIN_SANE_EPOCH: u64 = 1_577_836_800;
+
+/// All Docker bridge subnets routed from macOS through the bridge NIC.
+const CONTAINER_SUBNET: &str = "172.16.0.0/12";
 
 /// Idempotent, non-blocking EnsureRuntime handler.
 ///
@@ -90,19 +94,30 @@ async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
         status = collect_runtime_status().await;
     }
 
-    let mut message = status.detail.clone();
-    if !notes.is_empty() {
-        message = format!("{}; {}", notes.join("; "), status.detail);
+    let routing_error = if status.docker_ready {
+        ensure_direct_container_routing().await.err()
+    } else {
+        None
+    };
+
+    let mut message = if notes.is_empty() {
+        status.detail.clone()
+    } else {
+        format!("{}; {}", notes.join("; "), status.detail)
+    };
+    if let Some(error) = &routing_error {
+        message = format!("{message}; direct container routing setup failed: {error:#}");
     }
 
-    let result_status = if status.docker_ready {
+    let ready = status.docker_ready && routing_error.is_none();
+    let result_status = if ready {
         ensure_runtime::STATUS_STARTED.to_string()
     } else {
         ensure_runtime::STATUS_FAILED.to_string()
     };
 
     RuntimeEnsureResponse {
-        ready: status.docker_ready,
+        ready,
         endpoint: status.endpoint,
         message,
         status: result_status,
@@ -126,6 +141,60 @@ async fn do_ensure_runtime_probe() -> RuntimeEnsureResponse {
 
 pub(super) async fn handle_runtime_status(_req: RuntimeStatusRequest) -> RpcResponse {
     RpcResponse::RuntimeStatus(collect_runtime_status().await)
+}
+
+/// Allows traffic arriving on the vmnet bridge NIC to reach Docker bridge
+/// subnets routed from macOS.
+///
+/// Docker creates `DOCKER-USER` only after it starts. Installing this rule
+/// before dockerd is ineffective, and inserting directly into `FORWARD` is
+/// unstable because Docker prepends its own chains on startup. The matching
+/// daemon option `allow-direct-routing` removes Docker's earlier raw-table
+/// per-container drops; this rule then bypasses its unpublished-port drop.
+async fn ensure_direct_container_routing() -> Result<()> {
+    let Some(bridge_iface) = crate::init::detect_bridge_interface() else {
+        tracing::debug!("no bridge NIC found; skipping direct container routing rule");
+        return Ok(());
+    };
+
+    let rule = [
+        "DOCKER-USER",
+        "-i",
+        bridge_iface.as_str(),
+        "-d",
+        CONTAINER_SUBNET,
+        "-j",
+        "ACCEPT",
+    ];
+    let check = Command::new("/sbin/iptables")
+        .args(["-w", "2", "-C"])
+        .args(rule)
+        .output()
+        .await
+        .context("checking DOCKER-USER rule")?;
+    if check.status.success() {
+        return Ok(());
+    }
+
+    let install = Command::new("/sbin/iptables")
+        .args(["-w", "2", "-I"])
+        .args(rule)
+        .output()
+        .await
+        .context("installing DOCKER-USER rule")?;
+    if !install.status.success() {
+        bail!(
+            "iptables failed: {}",
+            String::from_utf8_lossy(&install.stderr).trim()
+        );
+    }
+
+    tracing::info!(
+        interface = bridge_iface,
+        subnet = CONTAINER_SUBNET,
+        "direct container routing rule installed"
+    );
+    Ok(())
 }
 
 pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
