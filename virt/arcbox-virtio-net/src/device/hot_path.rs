@@ -230,8 +230,12 @@ impl VirtioNet {
             }
 
             if written == 0 {
-                // No writable space in this chain; drop the frame and leave the
-                // avail entry unconsumed (matches the legacy behavior).
+                // A chain with no writable capacity can't carry the frame, but
+                // it was already popped off the avail ring — return it to the
+                // used ring (zero length) so the guest reclaims the descriptor
+                // instead of leaking it forever (which drains the RX ring dry).
+                // The frame is dropped; TCP retransmits.
+                queue.push_used(chain.head_idx, 0);
                 continue;
             }
 
