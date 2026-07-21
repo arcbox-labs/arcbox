@@ -5,9 +5,9 @@
 //! - Two virtqueues: `inflateq` (0) and `deflateq` (1).
 //! - Feature bit `VIRTIO_BALLOON_F_DEFLATE_ON_OOM` (bit 2) — the guest may
 //!   reclaim balloon pages on OOM without host permission. Safe for us
-//!   because we use `madvise(MADV_DONTNEED)` which does not unmap the
-//!   guest-visible region; reclaimed pages simply re-fault zero-filled,
-//!   matching the balloon contract.
+//!   because we `madvise` (see [`RELEASE_ADVICE`]) rather than unmap the
+//!   guest-visible region, so a reclaimed page still faults in normally on
+//!   the next guest access, matching the balloon contract.
 //! - Two config-space fields: `num_pages` (host → guest target, read-only
 //!   from the guest) and `actual` (guest → host current, written by the
 //!   guest as pages are inflated/deflated).
@@ -16,7 +16,7 @@
 //!   kernel periodically hands batches of currently-free pages to the host
 //!   on `reporting_vq` (transport index computed from the negotiated
 //!   feature set — see [`reporting_queue_index`]); the host
-//!   `madvise(MADV_DONTNEED)`s the ranges and completes the buffers.
+//!   `madvise`s the ranges (see [`RELEASE_ADVICE`]) and completes the buffers.
 //!   Combined with
 //!   `DEFLATE_ON_OOM` this lets the guest kernel self-manage: idle memory
 //!   drains back to the host with no balloon-target policy at all.
@@ -31,19 +31,18 @@
 //!
 //! When the guest inflates the balloon, it writes a descriptor chain
 //! containing `u32` PFNs (4 KiB granularity) into the inflate queue.
-//! For each PFN, the host calls `madvise(MADV_DONTNEED)` on the
-//! corresponding page of the guest RAM mapping. The physical page is
-//! released back to the kernel's free pool. A subsequent access from
-//! the guest will re-fault a zero page — acceptable per §5.5.1: the
-//! guest has promised not to use the page until it tells the host via
-//! the deflate queue.
+//! For each PFN, the host calls `madvise` ([`RELEASE_ADVICE`]) on the
+//! corresponding page of the guest RAM mapping, releasing the physical
+//! backing to the host while leaving the mapping intact. The guest has
+//! promised (per §5.5.1) not to touch the page until it deflates it, so
+//! its contents are irrelevant until then.
 //!
 //! ## Deflate semantics
 //!
-//! Deflate requests are no-ops on our side: because we used
-//! `MADV_DONTNEED` (not `munmap`), the pages remain mapped and re-fault
-//! automatically on guest access. We still consume the descriptors and
-//! write the used ring so the guest's queue does not stall.
+//! Deflate requests are no-ops on our side: because we `madvise` (not
+//! `munmap`), the pages remain mapped and fault back in automatically on
+//! guest access. We still consume the descriptors and write the used ring
+//! so the guest's queue does not stall.
 
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
@@ -92,6 +91,21 @@ const QUEUE_SLOTS: usize = 5;
 const BALLOON_PFN_SHIFT: u32 = 12;
 const BALLOON_PAGE_SIZE: u64 = 1 << BALLOON_PFN_SHIFT;
 
+/// `madvise` advice used to hand inflated / reported pages back to the host.
+///
+/// On macOS `MADV_DONTNEED` does NOT release physical backing — XNU maps
+/// `VM_BEHAVIOR_DONTNEED` to a deactivation hint that only moves pages to the
+/// inactive queue, so the VM process's footprint never shrinks. `MADV_FREE` is
+/// the advice that actually lets the host reclaim the pages under pressure
+/// (matching libkrun's macOS balloon path). The guest has promised not to
+/// touch these pages until it re-allocates them, so the fact that `MADV_FREE`
+/// leaves stale content until reclaim (rather than zero-faulting) is within the
+/// balloon / free-page-reporting contract.
+#[cfg(target_os = "macos")]
+const RELEASE_ADVICE: libc::c_int = libc::MADV_FREE;
+#[cfg(not(target_os = "macos"))]
+const RELEASE_ADVICE: libc::c_int = libc::MADV_DONTNEED;
+
 /// Traditional VirtIO memory balloon device.
 ///
 /// Host-side knobs live in atomics so callers outside the vCPU thread
@@ -114,7 +128,7 @@ pub struct VirtioBalloon {
     /// Guest-reported current inflated count in 4 KiB pages. Written by
     /// the guest via config-space writes at offset 4..8.
     actual: AtomicU32,
-    /// Advisory counter of total pages reclaimed via `MADV_DONTNEED`
+    /// Advisory counter of total pages released via `madvise`
     /// since the device was created. Purely observational.
     inflated_total: AtomicU32,
     /// Lightweight bump counter to flag config-space updates to the
@@ -338,15 +352,13 @@ fn handle_pfn_list(buf: &[u8], ram_base: *mut u8, ram_len: usize, gpa_base: usiz
         // SAFETY: ram_base points to a live host mapping of the guest
         // RAM region, valid for ram_len bytes. offset..offset+page_size
         // was bounds-checked above. madvise on a host mapping with
-        // MADV_DONTNEED is documented to release physical backing
-        // without invalidating the virtual mapping; subsequent access
-        // re-faults zero-filled pages — which is exactly the balloon
-        // contract (§5.5.1).
-        let ret =
-            unsafe { libc::madvise(ram_base.add(offset).cast(), page_size, libc::MADV_DONTNEED) };
+        // RELEASE_ADVICE releases the physical backing without
+        // invalidating the virtual mapping; the guest keeps the page
+        // off-limits until it deflates, per the balloon contract (§5.5.1).
+        let ret = unsafe { libc::madvise(ram_base.add(offset).cast(), page_size, RELEASE_ADVICE) };
         if ret != 0 {
             tracing::warn!(
-                "virtio-balloon: madvise(MADV_DONTNEED) at offset {:#x} failed: {}",
+                "virtio-balloon: madvise at offset {:#x} failed: {}",
                 offset,
                 std::io::Error::last_os_error()
             );
@@ -357,7 +369,7 @@ fn handle_pfn_list(buf: &[u8], ram_base: *mut u8, ram_len: usize, gpa_base: usiz
     handled
 }
 
-/// Releases one guest-reported free range via `madvise(MADV_DONTNEED)`,
+/// Releases one guest-reported free range via `madvise` ([`RELEASE_ADVICE`]),
 /// returning the number of 4 KiB pages released. The range is
 /// guest-controlled: it must be page-aligned, non-empty, and fully inside
 /// the guest RAM mapping, or it is logged and skipped.
@@ -390,14 +402,14 @@ fn handle_reported_range(
     }
     // SAFETY: ram_base points to a live host mapping of the guest RAM
     // region, valid for ram_len bytes; offset..end was bounds-checked
-    // above. MADV_DONTNEED releases the physical backing without
-    // invalidating the mapping; the guest re-faults zero pages, which is
-    // the free-page-reporting contract (the pages are free right now and
-    // the guest keeps them off-limits until the buffer completes).
-    let ret = unsafe { libc::madvise(ram_base.add(offset).cast(), len, libc::MADV_DONTNEED) };
+    // above. RELEASE_ADVICE releases the physical backing without
+    // invalidating the mapping; the pages are free right now and the guest
+    // keeps them off-limits until the buffer completes, per the
+    // free-page-reporting contract.
+    let ret = unsafe { libc::madvise(ram_base.add(offset).cast(), len, RELEASE_ADVICE) };
     if ret != 0 {
         tracing::warn!(
-            "virtio-balloon: madvise(MADV_DONTNEED) on reported range {:#x}+{:#x} failed: {}",
+            "virtio-balloon: madvise on reported range {:#x}+{:#x} failed: {}",
             offset,
             len,
             std::io::Error::last_os_error()

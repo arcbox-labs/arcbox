@@ -82,10 +82,14 @@ pub(super) enum EntryDecision {
 /// Computes the idle balloon target for the observed guest usage:
 /// used memory plus [`IDLE_BALLOON_HEADROOM`], clamped to
 /// [`IDLE_BALLOON_FLOOR`] and the full configured size.
+///
+/// The floor is itself capped at `full`: a machine configured below the
+/// floor (a tiny user VM) has nothing to reclaim, and an un-capped
+/// `clamp(FLOOR, full)` with `full < FLOOR` would panic (`min > max`).
 pub(super) fn idle_target(stats: GuestStats, full: u64) -> u64 {
     let used = stats.total.saturating_sub(stats.available);
     used.saturating_add(IDLE_BALLOON_HEADROOM)
-        .clamp(IDLE_BALLOON_FLOOR, full)
+        .clamp(IDLE_BALLOON_FLOOR.min(full), full)
 }
 
 /// Decides the balloon move when the VM enters idle.
@@ -147,6 +151,19 @@ mod tests {
         // Guest uses almost everything: no shrink beyond full.
         let t = idle_target(stats(FULL, 128 * MIB), FULL);
         assert_eq!(t, FULL);
+    }
+
+    /// Regression: a machine configured below the 384 MiB floor must not
+    /// panic `idle_target` (clamp with `min > max`). There is nothing to
+    /// reclaim, so the target is the full size and entry decides `Keep`.
+    #[test]
+    fn idle_target_below_floor_machine_does_not_panic() {
+        let tiny = 256 * MIB; // below IDLE_BALLOON_FLOOR (384 MiB)
+        assert_eq!(idle_target(stats(tiny, 200 * MIB), tiny), tiny);
+        assert_eq!(
+            entry_decision(Some(stats(tiny, 200 * MIB)), tiny),
+            EntryDecision::Keep
+        );
     }
 
     #[test]
