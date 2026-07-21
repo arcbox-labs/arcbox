@@ -440,6 +440,12 @@ pub(super) struct FastPathConn {
     /// long-idle flow whose upstream wakes up is measured from the wake-up —
     /// not from its (legitimately ancient) last guest frame.
     soliciting_since: Option<StdInstant>,
+    /// Retransmission ring shared with the inline owner (`Some` iff
+    /// `inline_owned`): the owner tees every sent payload and the FIN
+    /// position into it; `poll_fast_path` drains the ACKed prefix and
+    /// re-emits on dup-ACK/RTO — the inline counterpart of
+    /// `retransmit_buf`. See [`crate::direct_rx::RetxRing`].
+    retx: Option<crate::direct_rx::RetxRing>,
 }
 
 impl FastPathConn {

@@ -460,10 +460,10 @@ impl TcpBridge {
                 // zero-window guest must answer with a window-bearing ACK
                 // (RFC 793 §3.9). It consumes no sequence space and touches no
                 // shared state, so a lost probe is harmlessly re-sent next
-                // interval with no stream gap (the inline path has no
-                // retransmit). Gated on nothing-in-flight: the guest has ACKed
-                // up to `our_seq`, so `our_seq - 1` is always an old byte, and
-                // any in-flight data would elicit its own window-bearing ACKs.
+                // interval with no stream gap. Gated on nothing-in-flight: the
+                // guest has ACKed up to `our_seq`, so `our_seq - 1` is always
+                // an old byte, and any in-flight data would elicit its own
+                // window-bearing ACKs.
                 let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
                 let acked = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
                 let window = conn
@@ -516,6 +516,85 @@ impl TcpBridge {
                     ));
                     to_remove.push(*key);
                     continue;
+                }
+                // Sender-side loss recovery for inline flows, from the shared
+                // ring the owner tees every sent payload into (the inline
+                // counterpart of `retransmit_buf`): drain the ACKed prefix,
+                // then re-emit everything past the guest's ack point on
+                // triple-dup-ACK (counted by the intercept, same as
+                // non-inline) or RTO. The path beyond guest eth0 (bridge →
+                // veth → container netns backlog) drops under burst, so
+                // window gating alone cannot prevent a wedge — without this
+                // a single lost frame stalled the flow forever.
+                // Retransmissions travel the ordinary polled frame path
+                // (guest_tx), not the zero-copy inject path — correct and
+                // rare, so the cost is irrelevant.
+                if let Some(retx) = conn.retx.as_ref().map(std::sync::Arc::clone) {
+                    let mut ring = retx.lock().unwrap();
+                    let (ref mut base, ref mut ring_buf, fin_seq) = *ring;
+                    let drained = acked.wrapping_sub(*base);
+                    if drained > 0 && drained < 0x8000_0000 {
+                        // The guest ACKed more of our stream — release the
+                        // buffered prefix and reset the loss-recovery clocks.
+                        let n = (drained as usize).min(ring_buf.len());
+                        ring_buf.drain(..n);
+                        *base = acked;
+                        conn.last_progress = now;
+                        conn.rto = super::INITIAL_RTO;
+                        conn.dup_acks = 0;
+                    }
+                    if !nothing_in_flight {
+                        let timed_out = now.duration_since(conn.last_progress) >= conn.rto;
+                        if conn.fast_retransmit || timed_out {
+                            let offset = acked.wrapping_sub(*base) as usize;
+                            if offset < ring_buf.len() {
+                                let data: Vec<u8> = ring_buf.iter().skip(offset).copied().collect();
+                                emit_data_frames(&ctx, conn, acked, &data, &mut frames);
+                            }
+                            if let Some(fin_seq) = fin_seq
+                                && sent.wrapping_sub(fin_seq) < 0x8000_0000
+                                && fin_seq.wrapping_sub(acked) < 0x8000_0000
+                            {
+                                frames.push(crate::ethernet::build_tcp_fin_frame(
+                                    &crate::ethernet::TcpFrameParams {
+                                        src_ip: conn.remote_ip,
+                                        dst_ip: conn.guest_ip,
+                                        src_port: conn.remote_port,
+                                        dst_port: conn.guest_port,
+                                        seq: fin_seq,
+                                        ack: conn.last_ack,
+                                        window: 65535,
+                                        src_mac: gw_mac,
+                                        dst_mac: guest_mac,
+                                    },
+                                ));
+                            }
+                            tracing::debug!(
+                                "Fast path inline retransmit {}:{} → {}:{} ({} bytes from seq={acked}, cause={}, rto={:?})",
+                                conn.remote_ip,
+                                conn.remote_port,
+                                conn.guest_ip,
+                                conn.guest_port,
+                                in_flight,
+                                if conn.fast_retransmit {
+                                    "dup-acks"
+                                } else {
+                                    "rto"
+                                },
+                                conn.rto,
+                            );
+                            conn.fast_retransmit = false;
+                            conn.dup_acks = 0;
+                            conn.retransmits += 1;
+                            conn.last_progress = now;
+                            conn.rto = (conn.rto * 2).min(super::MAX_RTO);
+                        }
+                    } else {
+                        // Nothing in flight — keep the RTO clock parked so
+                        // the next send starts a fresh timeout window.
+                        conn.last_progress = now;
+                        conn.fast_retransmit = false;
+                    }
                 }
                 if super::send_budget(sent, acked, window) == 0 && nothing_in_flight {
                     match conn.window_stalled_at {
@@ -946,12 +1025,19 @@ impl TcpBridge {
         // polling path below, where each segment matches its advertised MSS.
         let inline_eligible = peer_mss >= GSO_SEGMENT_MSS;
         let mut dead: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+        let mut retx: Option<crate::direct_rx::RetxRing> = None;
         if let Some(sink) = self.conn_sink.as_ref().filter(|_| inline_eligible) {
             match stream.try_clone() {
                 Ok(cloned) => {
                     let gw_mac = self.fast_path_gateway_mac;
                     let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
                     let dead_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    // Retransmission ring: base seq starts at our current
+                    // send cursor; the owner tees sent bytes, the bridge
+                    // drains and re-emits (see RetxRing).
+                    let retx_ring: crate::direct_rx::RetxRing = std::sync::Arc::new(
+                        std::sync::Mutex::new((our_seq, std::collections::VecDeque::new(), None)),
+                    );
                     let promoted = crate::direct_rx::PromotedConn {
                         stream: cloned,
                         remote_ip: key.dst_ip,
@@ -967,10 +1053,12 @@ impl TcpBridge {
                         gw_mac,
                         guest_mac,
                         dead: std::sync::Arc::clone(&dead_flag),
+                        retx: std::sync::Arc::clone(&retx_ring),
                     };
                     if sink.send_conn(promoted) {
                         inline_owned = true;
                         dead = Some(dead_flag);
+                        retx = Some(retx_ring);
                         tracing::info!(
                             "Fast path: promoted INLINE {}:{} → {}:{} (seq={our_seq}, ack={last_ack})",
                             key.src_ip,
@@ -1043,6 +1131,7 @@ impl TcpBridge {
                 dead,
                 last_guest_activity: std::time::Instant::now(),
                 soliciting_since: None,
+                retx,
             },
         );
     }

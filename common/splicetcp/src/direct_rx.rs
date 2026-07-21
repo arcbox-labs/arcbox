@@ -52,6 +52,25 @@ impl FrameSink for ChannelFrameSink {
     }
 }
 
+/// Shared retransmission ring between the bridge's `FastPathConn` and the
+/// inline owner that sends on its behalf: `(seq of buf[0], unACKed sent
+/// bytes, FIN seq once sent)`.
+///
+/// The owner tees every payload it sends into `buf` (and records the FIN
+/// position); `TcpBridge::poll_fast_path` drains the ACKed prefix as
+/// `guest_acked` advances and re-emits from the ring on dup-ACK/RTO —
+/// giving inline flows the same sender-side loss recovery as the polled
+/// path (the link beyond guest eth0 drops under burst, so window gating
+/// alone cannot prevent a wedge; see `tcp_bridge`'s module docs).
+///
+/// Deliberately a tuple of std types only, so `arcbox-net-inject` can hold
+/// the same ring without a splicetcp dependency (the same pattern as the
+/// shared seq atomics). Bounded in practice by `HONORED_WINDOW_CAP`: the
+/// owner never sends beyond that budget, and the ring holds only unACKed
+/// bytes plus at most one poll tick of drain lag.
+pub type RetxRing =
+    std::sync::Arc<std::sync::Mutex<(u32, std::collections::VecDeque<u8>, Option<u32>)>>;
+
 /// A TCP connection promoted to the inline inject path.
 ///
 /// Carries everything the inject thread needs to construct
@@ -106,6 +125,10 @@ pub struct PromotedConn {
     /// writes still reach `try_fast_path_intercept` (parity with the
     /// non-inline path).
     pub dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Retransmission ring shared with the bridge — the owner tees every
+    /// sent payload (and the FIN position) into it; `poll_fast_path`
+    /// drains and re-emits. See [`RetxRing`].
+    pub retx: RetxRing,
 }
 
 /// Accepts promoted fast-path connections and delivers them to the RX
@@ -195,6 +218,7 @@ impl ConnSink for TokioFrameConnSink {
             gw_mac,
             guest_mac,
             dead,
+            retx,
         } = conn;
         // A `false` return means "not accepted": the flow stays on the
         // bridge's slow path, so `dead` must NOT be set here.
@@ -212,6 +236,7 @@ impl ConnSink for TokioFrameConnSink {
             guest_window,
             down_bytes,
             dead,
+            retx,
             gw_mac,
             guest_mac,
             // Bound this sink's own MTU-derived segmentation by the peer's MSS so
@@ -237,6 +262,7 @@ struct AsyncPromotedConn {
     guest_window: Arc<std::sync::atomic::AtomicU32>,
     down_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
     dead: Arc<std::sync::atomic::AtomicBool>,
+    retx: RetxRing,
     gw_mac: [u8; 6],
     guest_mac: [u8; 6],
     guest_mss: usize,
@@ -295,6 +321,9 @@ async fn read_promoted_conn(
                     src_mac: conn.gw_mac,
                     dst_mac: conn.guest_mac,
                 });
+                // Record the FIN position so the bridge retransmits a lost
+                // FIN like any other in-flight byte.
+                conn.retx.lock().unwrap().2 = Some(seq_now);
                 conn.our_seq.fetch_add(1, Ordering::Relaxed);
                 let _ = frames.send(fin).await;
                 return;
@@ -304,6 +333,12 @@ async fn read_promoted_conn(
                     c.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 let data = &buf[..n];
+                // Tee the sent bytes into the shared ring BEFORE the frames
+                // go out: the bridge drains it as the guest ACKs and
+                // re-emits from it on dup-ACK/RTO — the path beyond guest
+                // eth0 drops under burst, and without this a single lost
+                // frame wedges the flow forever.
+                conn.retx.lock().unwrap().1.extend(data);
                 let mut offset = 0;
                 while offset < data.len() {
                     let chunk_end = (offset + conn.guest_mss).min(data.len());
@@ -391,6 +426,11 @@ mod tests {
         let our_seq = Arc::new(AtomicU32::new(1000));
         let last_ack = Arc::new(AtomicU32::new(2000));
         let down = Arc::new(AtomicU64::new(0));
+        let retx: RetxRing = Arc::new(std::sync::Mutex::new((
+            1000,
+            std::collections::VecDeque::new(),
+            None,
+        )));
         let std_stream = accepted.into_std().unwrap();
         let accepted_conn = PromotedConn {
             stream: std_stream,
@@ -407,6 +447,7 @@ mod tests {
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retx: Arc::clone(&retx),
         };
         assert!(sink.send_conn(accepted_conn));
 
@@ -429,6 +470,13 @@ mod tests {
         assert_eq!(u16::from_be_bytes([frame[tcp], frame[tcp + 1]]), 443);
         assert_eq!(u16::from_be_bytes([frame[tcp + 2], frame[tcp + 3]]), 50000);
         assert_eq!(&frame[tcp + 20..tcp + 24], b"pong");
+        // The sent bytes are teed into the shared retransmission ring so
+        // the bridge can re-emit them on dup-ACK/RTO.
+        assert_eq!(
+            retx.lock().unwrap().1.iter().copied().collect::<Vec<u8>>(),
+            b"pong",
+            "sent payload teed into the ring"
+        );
     }
 
     #[tokio::test]
@@ -457,6 +505,11 @@ mod tests {
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retx: Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+                None,
+            ))),
         };
         assert!(sink.send_conn(accepted_conn));
 
@@ -509,6 +562,11 @@ mod tests {
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retx: Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+                None,
+            ))),
         };
         assert!(sink.send_conn(accepted_conn));
 
@@ -555,6 +613,11 @@ mod tests {
 
         let (sink, mut rx) = TokioFrameConnSink::channel(4);
         let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retx: RetxRing = Arc::new(std::sync::Mutex::new((
+            1000,
+            std::collections::VecDeque::new(),
+            None,
+        )));
         let conn = PromotedConn {
             stream: accepted.into_std().unwrap(),
             remote_ip: std::net::Ipv4Addr::new(203, 0, 113, 10),
@@ -570,6 +633,7 @@ mod tests {
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             dead: Arc::clone(&dead),
+            retx: Arc::clone(&retx),
         };
         assert!(sink.send_conn(conn));
 
@@ -582,6 +646,11 @@ mod tests {
         let flags = frame[ETH_HEADER_LEN + 20 + 13];
         assert_ne!(flags & 0x01, 0, "must be a FIN (flags {flags:#04x})");
         assert_eq!(flags & 0x04, 0, "must not be a RST (flags {flags:#04x})");
+        assert_eq!(
+            retx.lock().unwrap().2,
+            Some(1000),
+            "the FIN position is recorded for bridge retransmission"
+        );
 
         // Give the read task time to exit, then confirm it left `dead` unset.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -618,6 +687,11 @@ mod tests {
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             dead: Arc::clone(&dead),
+            retx: Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+                None,
+            ))),
         };
         assert!(sink.send_conn(conn));
 

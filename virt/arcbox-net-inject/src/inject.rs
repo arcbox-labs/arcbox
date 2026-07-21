@@ -400,6 +400,9 @@ impl RxInjectThread {
                         let first_buf =
                             unsafe { std::slice::from_raw_parts_mut(desc_ptrs[0], desc_lens[0]) };
                         inline_conn::write_fin_headers(first_buf, conn);
+                        // Record the FIN position so the bridge retransmits
+                        // a lost FIN like any other in-flight byte.
+                        conn.retx.lock().unwrap().2 = Some(conn.our_seq.load(Ordering::Relaxed));
                         conn.our_seq.fetch_add(1, Ordering::Relaxed);
 
                         *fire |=
@@ -430,6 +433,35 @@ impl RxInjectThread {
                         let first_buf =
                             unsafe { std::slice::from_raw_parts_mut(desc_ptrs[0], desc_lens[0]) };
                         inline_conn::write_inline_headers(first_buf, conn, n, num_used as u16);
+
+                        // Tee the sent bytes into the shared retransmission
+                        // ring: the bridge drains it as the guest ACKs and
+                        // re-emits from it on dup-ACK/RTO — the path beyond
+                        // guest eth0 drops under burst, and without this a
+                        // single lost frame wedged the flow forever.
+                        {
+                            let mut ring = conn.retx.lock().unwrap();
+                            let mut copied = 0usize;
+                            for i in 0..num_used {
+                                let start = if i == 0 {
+                                    inline_conn::TOTAL_HDR_LEN
+                                } else {
+                                    0
+                                };
+                                let take = per_desc_len[i].min(n - copied);
+                                if take == 0 {
+                                    break;
+                                }
+                                // SAFETY: same device-owned descriptor
+                                // buffers readv just filled; still exclusive
+                                // to us until the used publish below.
+                                let payload = unsafe {
+                                    std::slice::from_raw_parts(desc_ptrs[i].add(start), take)
+                                };
+                                ring.1.extend(payload);
+                                copied += take;
+                            }
+                        }
 
                         // Advance the shared atomic so ACK frames emitted by
                         // the datapath carry the correct seq value.
@@ -631,6 +663,11 @@ mod tests {
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             host_eof: false,
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retx: Arc::new(std::sync::Mutex::new((
+                1000,
+                std::collections::VecDeque::new(),
+                None,
+            ))),
         }
     }
 
@@ -723,6 +760,20 @@ mod tests {
             1000 + payload.len() as u32
         );
 
+        // Every sent byte is teed into the shared retransmission ring, in
+        // order across the descriptor spans, so the bridge can re-emit on
+        // dup-ACK/RTO.
+        {
+            let ring = conns[0].retx.lock().unwrap();
+            assert_eq!(ring.0, 1000, "ring base is the promoted seq");
+            assert_eq!(
+                ring.1.iter().copied().collect::<Vec<u8>>(),
+                payload,
+                "teed bytes match the sent payload"
+            );
+            assert_eq!(ring.2, None, "no FIN yet");
+        }
+
         // Nothing more buffered: a second poll consumes nothing.
         let (mut batch2, mut fire2) = (0u16, false);
         thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
@@ -781,6 +832,9 @@ mod tests {
         // TCP flags byte in the injected frame: FIN | ACK.
         let first = ram.buffer(0, inline_conn::TOTAL_HDR_LEN);
         assert_eq!(first[12 + 14 + 20 + 13], 0x11);
+        // The FIN position is recorded in the shared ring so the bridge can
+        // retransmit a lost FIN.
+        assert_eq!(conns[0].retx.lock().unwrap().2, Some(1000));
 
         // Clean EOF must NOT mark the flow dead: the bridge entry stays
         // alive so the guest's ACK/FIN and half-close writes still reach

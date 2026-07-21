@@ -26,6 +26,7 @@ impl arcbox_net::direct_rx::ConnSink for InlineConnSinkAdapter {
             guest_mac: conn.guest_mac,
             host_eof: false,
             dead: conn.dead,
+            retx: conn.retx,
         };
         self.tx.try_send(inline).is_ok()
     }
