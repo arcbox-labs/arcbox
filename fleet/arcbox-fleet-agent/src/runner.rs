@@ -1,8 +1,10 @@
 //! Runner supervision: the agent is the admission authority. On each offer it
 //! decides — against live host state — whether to run the job, starts the
 //! runner, and answers the gateway with **accept** (the runner started) or
-//! **reject** (try another host). It reports no terminal event; the GitHub
-//! webhook is the authoritative outcome.
+//! **reject** (try another host). It reports no authoritative outcome — the
+//! GitHub webhook concludes the job — but a started runner's exit does emit
+//! a `RunnerExited` liveness hint so the platform can fail fast when no
+//! webhook is ever coming (the runner died before completing anything).
 //!
 //! Backend is chosen from the agent's own advertised capabilities: Linux jobs a
 //! Docker capability serves run in a container (isolation); darwin jobs a `vm`
@@ -19,8 +21,8 @@ use std::time::Duration;
 
 use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::{
-    AttachRequest, Backend, HostTelemetry, ProvisionRunner, RunnerAccepted, RunnerRejected,
-    attach_request,
+    AttachRequest, Backend, HostTelemetry, ProvisionRunner, RunnerAccepted, RunnerExited,
+    RunnerRejected, attach_request,
 };
 use command_group::AsyncCommandGroup;
 use dashmap::DashMap;
@@ -521,25 +523,38 @@ impl RunnerSupervisor {
         self.accept_started(job_id, token);
         info!(job_id, "runner started (vm)");
 
+        // The watchdog is distinct from a cancel: the runner is gone without
+        // the platform having concluded the job, so it still gets the
+        // runner-exited hint below — a cancel does not.
+        enum VmExit {
+            Exited(Option<u32>),
+            Canceled,
+            Watchdog,
+        }
         let exited = {
             let wait = std::pin::pin!(running.wait());
             tokio::select! {
-                exit = wait => Some(exit),
-                () = cancel.cancelled() => None,
+                exit = wait => VmExit::Exited(exit),
+                () = cancel.cancelled() => VmExit::Canceled,
                 () = tokio::time::sleep(MAX_VM_JOB_RUNTIME) => {
                     warn!(job_id, "vm job exceeded the runtime watchdog; destroying guest");
-                    None
+                    VmExit::Watchdog
                 }
             }
         };
         match exited {
-            Some(exit_status) => {
+            VmExit::Exited(exit_status) => {
                 info!(job_id, ?exit_status, "runner exited");
                 running.destroy().await;
+                self.notify_runner_exited(job_id);
             }
-            // CancelRunner or the watchdog: destroy the guest, awaited, so
-            // the in-flight slot outlives the guest — never the reverse.
-            None => {
+            VmExit::Watchdog => {
+                running.destroy().await;
+                self.notify_runner_exited(job_id);
+            }
+            // CancelRunner: destroy the guest, awaited, so the in-flight
+            // slot outlives the guest — never the reverse.
+            VmExit::Canceled => {
                 running.destroy().await;
                 info!(job_id, "runner canceled");
             }
@@ -614,9 +629,12 @@ impl RunnerSupervisor {
         );
 
         tokio::select! {
-            result = job.wait() => match result {
-                Ok(status) => info!(job_id, success = status.success(), "runner exited"),
-                Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+            result = job.wait() => {
+                match result {
+                    Ok(status) => info!(job_id, success = status.success(), "runner exited"),
+                    Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+                }
+                self.notify_runner_exited(job_id);
             },
             // CancelRunner: taskkill the Windows tree and reap the relay,
             // awaited, so the slot outlives the teardown.
@@ -656,9 +674,12 @@ impl RunnerSupervisor {
         info!(job_id, "runner started (host)");
 
         tokio::select! {
-            result = child.wait() => match result {
-                Ok(status) => info!(job_id, success = status.success(), "runner exited"),
-                Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+            result = child.wait() => {
+                match result {
+                    Ok(status) => info!(job_id, success = status.success(), "runner exited"),
+                    Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+                }
+                self.notify_runner_exited(job_id);
             },
             // CancelRunner: SIGKILL the whole process group and reap it. The
             // token is level-triggered, so a cancel that fired while the runner
@@ -740,10 +761,12 @@ impl RunnerSupervisor {
             Some(Ok(exit_code)) => {
                 info!(job_id, exit_code, "runner exited");
                 running.remove().await;
+                self.notify_runner_exited(job_id);
             }
             Some(Err(e)) => {
                 warn!(job_id, error = %e, "waiting on container failed");
                 running.remove().await;
+                self.notify_runner_exited(job_id);
             }
             // CancelRunner: kill and remove the container, awaited, so the
             // in-flight slot outlives the container — never the reverse.
@@ -790,6 +813,25 @@ impl RunnerSupervisor {
         for parked_token in &parked {
             self.reject(job_id, parked_token, reason);
         }
+    }
+
+    /// Report that a started runner exited. A liveness hint for the platform
+    /// — the GitHub webhook stays the authoritative outcome, and successful
+    /// jobs emit this too, right before their webhook — letting it fail fast
+    /// a job whose completion webhook never comes (the runner died before
+    /// completing anything). Tracked and resent until acked, like a verdict;
+    /// the deterministic token collapses resends and replays onto one
+    /// outstanding entry. Never called for canceled jobs: the platform
+    /// already concluded those and owes them nothing.
+    fn notify_runner_exited(&self, job_id: &str) {
+        let token = format!("exit:{job_id}");
+        self.send_verdict(
+            &token,
+            attach_request::Msg::RunnerExited(RunnerExited {
+                job_id: job_id.to_owned(),
+                ack_token: token.clone(),
+            }),
+        );
     }
 
     /// Accept an offer (the runner has started).
@@ -1020,6 +1062,16 @@ mod tests {
         })
         .await
         .expect("slot released once the runner exited");
+
+        // The started runner's exit emits the tracked runner-exited hint.
+        let exited = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("runner-exited event after the runner finished")
+            .expect("egress channel open");
+        match exited.msg {
+            Some(attach_request::Msg::RunnerExited(e)) => assert_eq!(e.job_id, "rjob_win"),
+            other => panic!("expected RunnerExited, got {other:?}"),
+        }
     }
 
     /// A cancel that arrives while the interop spawn is still in the WINPID
@@ -1402,6 +1454,26 @@ mod tests {
             Some(attach_request::Msg::RunnerAccepted(a)) => assert_eq!(a.offer_token, "tok_late"),
             other => panic!("expected RunnerAccepted, got {other:?}"),
         }
+    }
+
+    /// The runner-exited event is tracked like a verdict: emitted with a
+    /// deterministic per-job token, resent until the gateway acks it.
+    #[tokio::test]
+    async fn runner_exited_is_tracked_until_acked() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+
+        sup.notify_runner_exited("rjob_a");
+        match rx.try_recv().expect("event emitted").msg {
+            Some(attach_request::Msg::RunnerExited(e)) => {
+                assert_eq!(e.job_id, "rjob_a");
+                assert_eq!(e.ack_token, "exit:rjob_a");
+            }
+            other => panic!("expected RunnerExited, got {other:?}"),
+        }
+        assert!(sup.inner.outstanding.contains_key("exit:rjob_a"));
+
+        sup.handle_ack("exit:rjob_a");
+        assert!(!sup.inner.outstanding.contains_key("exit:rjob_a"));
     }
 
     /// A start failure rejects the parked redeliveries too — every offer of
