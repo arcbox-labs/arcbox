@@ -2249,3 +2249,294 @@ async fn zero_window_stall_is_broken_by_a_persist_probe() {
         "sending must resume once the window reopens"
     );
 }
+
+// -------- Zombie-flow guards: upstream keepalive + dead-guest give-up --------
+// Regression net for the 2026-07-19 prod zombie: a silently dead upstream leg
+// left the guest leg ESTABLISHED forever (apk hung 23+ minutes), and a
+// vanished guest endpoint would leave the shim soliciting forever.
+
+/// Backdates a flow's sign-of-life clock so the dead-flow deadline is already
+/// past, without sleeping in the test.
+fn backdate_guest_activity(bridge: &mut TcpBridge, key: &SynFlowKey, by: std::time::Duration) {
+    bridge
+        .fast_path_conns
+        .get_mut(key)
+        .unwrap()
+        .last_guest_activity = std::time::Instant::now()
+        .checked_sub(by)
+        .expect("test clock underflow");
+}
+
+/// Promotion must arm TCP keepalive on the upstream socket: a silently dead
+/// upstream (route flap, crashed proxy) otherwise never errors, and the guest
+/// leg stays ESTABLISHED with empty queues forever.
+#[tokio::test]
+async fn promotion_arms_upstream_keepalive() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, _accepted) = tokio::join!(connect, listener.accept());
+    let std_client = client.unwrap().into_std().unwrap();
+    // A cloned fd shares the underlying socket, so it observes the option.
+    let probe = std_client.try_clone().unwrap();
+    assert!(
+        !socket2::SockRef::from(&probe).keepalive().unwrap(),
+        "precondition: keepalive off before promotion"
+    );
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 140);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40100,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, std_client, 1000, 2000, 1460, None);
+
+    assert!(
+        socket2::SockRef::from(&probe).keepalive().unwrap(),
+        "promotion must enable keepalive on the upstream leg"
+    );
+}
+
+/// A guest that vanishes with unACKed data in flight must be RST-reaped after
+/// the dead-flow deadline instead of being retransmitted to forever (leaking
+/// the entry, host fd, and retransmission buffer).
+#[tokio::test]
+async fn silent_guest_with_data_in_flight_is_rst_reaped() {
+    use std::io::Write;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let (server, _) = accepted.unwrap();
+    let mut server = server.into_std().unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 141);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40101,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        1460,
+        None,
+    );
+
+    // Upstream data goes into flight; the guest never ACKs a byte of it.
+    server.write_all(b"unacked-data").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut in_flight = false;
+    while !in_flight && std::time::Instant::now() < deadline {
+        in_flight = !bridge.poll_fast_path().is_empty();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(in_flight, "data must go into flight toward the guest");
+
+    bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
+    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+
+    let frames = bridge.poll_fast_path();
+    assert!(
+        frames.iter().any(|f| tcp_flags_of(f) & 0x04 != 0),
+        "a dead soliciting flow must be RST-terminated"
+    );
+    assert_eq!(bridge.fast_path_count(), 0, "the dead flow must be reaped");
+}
+
+/// A guest that closed its receive window and then vanished (persist probes
+/// go unanswered) must be reaped too — the zero-window arm of the give-up.
+#[tokio::test]
+async fn silent_guest_at_zero_window_is_rst_reaped() {
+    use std::io::Write;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let (server, _) = accepted.unwrap();
+    let mut server = server.into_std().unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 142);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40102,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        1460,
+        None,
+    );
+
+    // Guest shuts its window with upstream data pending, then goes silent.
+    let zero_win = make_guest_segment((40102, dst_ip, 443), 2000, 1000, 0, 0x10, &[]);
+    bridge.try_fast_path_intercept(&zero_win);
+    server.write_all(b"pending").unwrap();
+    assert!(
+        bridge.poll_fast_path().is_empty(),
+        "a closed window sends nothing (persist clock armed)"
+    );
+
+    bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
+    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+
+    let frames = bridge.poll_fast_path();
+    assert!(
+        frames.iter().any(|f| tcp_flags_of(f) & 0x04 != 0),
+        "a dead zero-window flow must be RST-terminated"
+    );
+    assert_eq!(bridge.fast_path_count(), 0, "the dead flow must be reaped");
+}
+
+/// Any guest frame — here a dup-ACK — is a sign of life that must reset the
+/// dead-flow clock: a slow guest is not a dead guest.
+#[tokio::test]
+async fn guest_ack_refreshes_dead_flow_clock() {
+    use std::io::Write;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let (server, _) = accepted.unwrap();
+    let mut server = server.into_std().unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 143);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40103,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        1460,
+        None,
+    );
+
+    server.write_all(b"unacked-data").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut in_flight = false;
+    while !in_flight && std::time::Instant::now() < deadline {
+        in_flight = !bridge.poll_fast_path().is_empty();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(in_flight, "data must go into flight toward the guest");
+
+    bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
+    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+
+    // The guest answers (dup-ACK at the promoted seq) before the next poll.
+    let dup_ack = make_guest_segment((40103, dst_ip, 443), 2000, 1000, 65535, 0x10, &[]);
+    bridge.try_fast_path_intercept(&dup_ack);
+
+    let frames = bridge.poll_fast_path();
+    assert!(
+        frames.iter().all(|f| tcp_flags_of(f) & 0x04 == 0),
+        "a responding guest must not be RST"
+    );
+    assert_eq!(
+        bridge.fast_path_count(),
+        1,
+        "a responding guest keeps its flow"
+    );
+}
+
+/// The inline path has no RTO, so a vanished guest freezes the send budget
+/// with data in flight and nothing would ever tear the flow down: the give-up
+/// must reap it and fire the owner's cancel flag so the reader task exits.
+#[tokio::test]
+async fn inline_silent_guest_with_data_in_flight_is_rst_reaped() {
+    struct CaptureSink(std::sync::Mutex<Option<crate::direct_rx::PromotedConn>>);
+    impl crate::direct_rx::ConnSink for CaptureSink {
+        fn send_conn(&self, conn: crate::direct_rx::PromotedConn) -> bool {
+            *self.0.lock().unwrap() = Some(conn);
+            true
+        }
+    }
+
+    let sink = std::sync::Arc::new(CaptureSink(std::sync::Mutex::new(None)));
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    bridge.set_conn_sink(std::sync::Arc::clone(&sink) as _);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let _accepted = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 144);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40104,
+        dst_ip,
+        dst_port: 443,
+    };
+    // peer_mss ≥ GSO_SEGMENT_MSS → inline-owned.
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        9000,
+        None,
+    );
+    let promoted = sink.0.lock().unwrap().take().expect("inline conn");
+
+    // 1000 bytes in flight, window open — the state a vanished guest leaves
+    // behind (no persist probe fires while bytes are outstanding).
+    promoted
+        .our_seq
+        .store(5000, std::sync::atomic::Ordering::Relaxed);
+    promoted
+        .guest_acked
+        .store(4000, std::sync::atomic::Ordering::Relaxed);
+    promoted
+        .guest_window
+        .store(65535, std::sync::atomic::Ordering::Relaxed);
+
+    bridge.set_dead_flow_timeout(std::time::Duration::from_millis(100));
+    backdate_guest_activity(&mut bridge, &key, std::time::Duration::from_millis(200));
+
+    let frames = bridge.poll_fast_path();
+    assert!(
+        frames.iter().any(|f| tcp_flags_of(f) & 0x04 != 0),
+        "a dead inline flow must be RST-terminated"
+    );
+    assert_eq!(
+        bridge.fast_path_count(),
+        0,
+        "the dead inline flow must be reaped"
+    );
+    assert!(
+        promoted.dead.load(std::sync::atomic::Ordering::Relaxed),
+        "the owner cancel flag must fire so the inline reader exits"
+    );
+}
