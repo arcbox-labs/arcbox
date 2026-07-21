@@ -5,6 +5,11 @@
 //! this suite tests the build surface itself, with scenarios modeled on the
 //! real-world Dockerfile corpus in the plan:
 //!
+//! - **D1 large context** (immich / node_modules shape): 512 MiB
+//!   incompressible payload + 100k small files through the context upload,
+//!   with `.dockerignore` exclusion. Byte-exactness asserted *inside* the
+//!   build (payload sha + whole-tree sha), so truncation or corruption
+//!   anywhere in the transfer fails the build.
 //! - **D2 stage graph** (grafana / buildkit shape): a 12-stage diamond —
 //!   `FROM scratch AS scripts` carrier (airflow pattern), four independent
 //!   branches, `COPY --from` joins, a heredoc RUN, `COPY --link`, and a
@@ -30,12 +35,20 @@ use arcbox_e2e::docker::{docker_ignore, docker_output, ensure_image};
 use arcbox_e2e::metrics::RunMetrics;
 use arcbox_e2e::net_fixtures::daemon_log_cursor;
 use arcbox_e2e::scenario::run_vz_scenario_with_log;
+use sha2::Digest;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// External dockerfile frontend used by D2's `# syntax=` directive,
 /// pre-loaded so the build does not depend on registry reachability.
 const FRONTEND_IMAGE: &str = "docker/dockerfile:1";
+
+/// D1: payload size and small-file tree shape (100 dirs × 1000 files).
+const LARGE_CTX_PAYLOAD: usize = 512 * 1024 * 1024;
+const LARGE_CTX_TREE_DIRS: usize = 100;
+const LARGE_CTX_FILES_PER_DIR: usize = 1000;
+const LARGE_CTX_DEADLINE: Duration = Duration::from_secs(300);
+const LARGE_CTX_TAG: &str = "arcbox-e2e-build:large-ctx";
 
 /// D2: stage-graph build deadline.
 const STAGE_GRAPH_DEADLINE: Duration = Duration::from_secs(120);
@@ -64,9 +77,10 @@ fn docker_build_suite() -> Result<()> {
         // every build below.
         let log = daemon_log_cursor(data_dir);
 
-        let scenarios: [(&str, ScenarioFn); 2] = [
+        let scenarios: [(&str, ScenarioFn); 3] = [
             ("stage_graph", stage_graph),
             ("cache_semantics", cache_semantics),
+            ("large_context", large_context),
         ];
         // Diagnostic filter: run only the named scenario, e.g.
         // ARCBOX_E2E_BUILD_ONLY=cache_semantics.
@@ -149,6 +163,33 @@ fn image_file(data_dir: &Path, tag: &str, path: &str) -> Result<String> {
     )
     .map(|out| out.trim().to_owned())
     .with_context(|| format!("reading {path} from {tag}"))
+}
+
+/// Extracts BuildKit's own context-transfer timing from `--progress=plain`
+/// output (`#N transferring context: <bytes> <secs>s done`). Best-effort:
+/// the line format is BuildKit's, not ours, so a miss records nothing.
+fn context_transfer_seconds(output: &str) -> Option<f64> {
+    output
+        .lines()
+        .rfind(|line| line.contains("transferring context:") && line.trim_end().ends_with("done"))
+        .and_then(|line| {
+            line.split_whitespace()
+                .rev()
+                .filter(|token| token.len() > 1 && token.ends_with('s'))
+                .find_map(|token| token.trim_end_matches('s').parse::<f64>().ok())
+        })
+}
+
+/// Fills `buf` with xorshift output — incompressible, so context transfer
+/// and layer commits move real bytes.
+fn fill_incompressible(buf: &mut [u8]) {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for chunk in buf.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+    }
 }
 
 /// D2: 12-stage diamond under the external `docker/dockerfile:1` frontend.
@@ -442,5 +483,83 @@ RUN sleep {sleep} && {stamp} > /stamp-leaf
     for tag in &tags {
         docker_ignore(data_dir, &["rmi".into(), "-f".into(), tag.clone()]);
     }
+    result
+}
+
+/// D1: 512 MiB incompressible payload plus a 100k-file tree through the
+/// context upload, `.dockerignore` honored. All integrity assertions run
+/// *inside* the build: the payload sha, the file count, and a whole-tree
+/// sha computed in deterministic path order, so a single lost, truncated,
+/// or corrupted entry anywhere in the transfer fails the build.
+fn large_context(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let ctx = data_dir.join("d1-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d1 context dir")?;
+
+    let generated = Instant::now();
+    let mut payload = vec![0u8; LARGE_CTX_PAYLOAD];
+    fill_incompressible(&mut payload);
+    std::fs::write(ctx.join("payload.bin"), &payload).context("writing payload")?;
+    let payload_sha = format!("{:x}", sha2::Sha256::digest(&payload));
+    drop(payload);
+
+    // Zero-padded names make guest-side `find . | sort` order equal this
+    // generation order, so one incremental host hash matches the in-build
+    // whole-tree hash.
+    let mut tree_hasher = sha2::Sha256::new();
+    for dir in 0..LARGE_CTX_TREE_DIRS {
+        let dir_name = format!("d{dir:03}");
+        let dir_path = ctx.join("tree").join(&dir_name);
+        std::fs::create_dir_all(&dir_path)?;
+        for file in 0..LARGE_CTX_FILES_PER_DIR {
+            let content = format!("{dir_name}/f{file:03}\n");
+            std::fs::write(dir_path.join(format!("f{file:03}")), &content)?;
+            tree_hasher.update(content.as_bytes());
+        }
+    }
+    let tree_sha = format!("{:x}", tree_hasher.finalize());
+    let file_count = LARGE_CTX_TREE_DIRS * LARGE_CTX_FILES_PER_DIR;
+
+    std::fs::write(ctx.join(".dockerignore"), "excluded/\n")?;
+    std::fs::create_dir_all(ctx.join("excluded"))?;
+    std::fs::write(ctx.join("excluded/marker.txt"), "must-not-transfer\n")?;
+    tracing::info!(
+        elapsed = ?generated.elapsed(),
+        payload_mib = LARGE_CTX_PAYLOAD / (1024 * 1024),
+        file_count,
+        "large_context: context generated"
+    );
+
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r#"FROM {image}
+COPY . /ctx
+RUN echo "{payload_sha}  /ctx/payload.bin" | sha256sum -c -
+RUN test "$(find /ctx/tree -type f | wc -l)" -eq {file_count}
+RUN cd /ctx/tree && test "$(find . -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)" = "{tree_sha}"
+RUN test ! -e /ctx/excluded
+"#
+        ),
+    )
+    .context("writing d1 Dockerfile")?;
+
+    let result = (|| {
+        let (output, elapsed) = timed_build(
+            data_dir,
+            metrics,
+            "large_context_build_wall",
+            &ctx,
+            LARGE_CTX_TAG,
+            LARGE_CTX_DEADLINE,
+        )?;
+        match context_transfer_seconds(&output) {
+            Some(seconds) => metrics.record("large_context_transfer", seconds),
+            None => tracing::info!("large_context: no transfer timing in build output"),
+        }
+        tracing::info!(?elapsed, "large_context: build done");
+        Ok(())
+    })();
+
+    docker_ignore(data_dir, &["rmi".into(), "-f".into(), LARGE_CTX_TAG.into()]);
     result
 }

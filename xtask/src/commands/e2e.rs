@@ -153,8 +153,9 @@ fn prebuild(root: &std::path::Path, test: &str) -> Result<bool> {
             .run()?;
             Ok(true)
         }
-        // Must match tests/e2e/tests/egress_throughput.rs's own build.
-        "egress_throughput" => {
+        // Must match tests/e2e/src/scenario.rs's self-build (the shared
+        // daemon-boot scaffolding both of these targets run through).
+        "egress_throughput" | "docker_build" => {
             xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
             Ok(true)
         }
