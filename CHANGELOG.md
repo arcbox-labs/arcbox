@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1](https://github.com/arcboxlabs/arcbox/compare/v0.5.0...v0.5.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* **helper:** retain strict dynamic validation ([3de5f4e](https://github.com/arcboxlabs/arcbox/commit/3de5f4e4978f4322c4820db4df2dd9679e70655c))
+* **helper:** use valid dynamic code-signing flags ([9263b88](https://github.com/arcboxlabs/arcbox/commit/9263b88db27e0792be15bb652c6dfffd13e7b2b5))
+
 ## [0.5.0](https://github.com/arcboxlabs/arcbox/compare/v0.4.24...v0.5.0) (2026-07-20)
 
 
