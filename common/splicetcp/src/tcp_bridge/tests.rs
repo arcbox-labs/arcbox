@@ -1299,9 +1299,156 @@ async fn upload_fin_with_gap_defers_teardown() {
     assert_eq!(tcp_ack_of(&reply), 2100);
     let fin = make_guest_segment((40022, dst_ip, 443), 2100, 1000, 65535, 0x11, &[]);
     let reply = bridge.try_fast_path_intercept(&fin).expect("intercepted");
-    assert_ne!(tcp_flags_of(&reply) & 0x01, 0, "in-order FIN gets FIN-ACK");
+    // In-order guest FIN on a flow whose host side is still open is a
+    // *half-close*: acknowledge it with a plain ACK and keep relaying — our own
+    // FIN follows only when the host itself reaches EOF (see poll_fast_path).
+    assert_eq!(
+        tcp_flags_of(&reply) & 0x01,
+        0,
+        "in-order guest FIN is a half-close: plain ACK, not FIN-ACK"
+    );
     assert_eq!(tcp_ack_of(&reply), 2101, "FIN consumes one sequence number");
-    assert_eq!(bridge.fast_path_count(), 0);
+    assert_eq!(
+        bridge.fast_path_count(),
+        1,
+        "half-close keeps the flow until the host side also closes"
+    );
+}
+
+fn tcp_seq_of(frame: &[u8]) -> u32 {
+    let tcp = ETH_HEADER_LEN + 20;
+    u32::from_be_bytes([
+        frame[tcp + 4],
+        frame[tcp + 5],
+        frame[tcp + 6],
+        frame[tcp + 7],
+    ])
+}
+
+/// Polls the bridge until it emits a frame (or a bounded budget elapses),
+/// giving a just-closed host socket time to deliver its FIN.
+async fn poll_until_frame(bridge: &mut TcpBridge) -> Vec<u8> {
+    for _ in 0..200 {
+        if let Some(frame) = bridge.poll_fast_path().into_iter().next() {
+            return frame;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("bridge emitted no frame within budget");
+}
+
+/// A guest half-close (in-order FIN while the host side is still open) must
+/// propagate to the upstream as a write-shutdown — its read side sees EOF —
+/// rather than a full teardown that truncates the still-in-flight response.
+#[tokio::test]
+async fn guest_half_close_shuts_host_write_side() {
+    use tokio::io::AsyncReadExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut server, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 97);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40044,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460, None);
+
+    // In-order guest FIN (no gap, no sink → non-inline).
+    let fin = make_guest_segment((40044, dst_ip, 443), 2000, 1000, 65535, 0x11, &[]);
+    let reply = bridge.try_fast_path_intercept(&fin).expect("intercepted");
+    assert_eq!(
+        tcp_flags_of(&reply) & 0x01,
+        0,
+        "half-close ACKs, does not FIN"
+    );
+    assert_eq!(
+        bridge.fast_path_count(),
+        1,
+        "flow kept for the host→guest direction"
+    );
+
+    // The upstream's read side must observe EOF (our shutdown(Write)).
+    let mut buf = [0u8; 4];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), server.read(&mut buf))
+        .await
+        .expect("upstream read did not block forever")
+        .expect("upstream read ok");
+    assert_eq!(
+        n, 0,
+        "guest half-close reaches the upstream as EOF, not a reset"
+    );
+}
+
+/// Full half-close lifecycle: after the guest half-closes and the host then
+/// reaches its own EOF, the shim emits its FIN and reaps the flow once the
+/// guest ACKs it — no leaked entry.
+#[tokio::test]
+async fn half_closed_flow_reaps_after_host_eof() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (server, _) = accepted.unwrap();
+
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 98);
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 40055,
+        dst_ip,
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460, None);
+
+    // Guest half-closes.
+    let fin = make_guest_segment((40055, dst_ip, 443), 2000, 1000, 65535, 0x11, &[]);
+    bridge.try_fast_path_intercept(&fin).expect("intercepted");
+    assert_eq!(bridge.fast_path_count(), 1);
+
+    // Host closes → poll observes EOF and emits our FIN (flow still kept).
+    drop(server);
+    let our_fin = poll_until_frame(&mut bridge).await;
+    assert_ne!(
+        tcp_flags_of(&our_fin) & 0x01,
+        0,
+        "shim FINs the guest on host EOF"
+    );
+    assert_eq!(
+        bridge.fast_path_count(),
+        1,
+        "kept until the guest ACKs our FIN"
+    );
+
+    // Guest ACKs our FIN → the next poll reaps the flow.
+    let our_fin_seq = tcp_seq_of(&our_fin);
+    let ack = make_guest_segment(
+        (40055, dst_ip, 443),
+        2001,
+        our_fin_seq.wrapping_add(1),
+        65535,
+        0x10,
+        &[],
+    );
+    bridge.try_fast_path_intercept(&ack);
+    bridge.poll_fast_path();
+    assert_eq!(
+        bridge.fast_path_count(),
+        0,
+        "flow reaped once both sides closed"
+    );
 }
 
 /// Property: the ACK returned for a data segment never covers bytes the

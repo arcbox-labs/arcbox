@@ -320,13 +320,42 @@ impl TcpBridge {
         if flags & 0x01 != 0 {
             let fin_seq = guest_seq.wrapping_add(payload_len as u32);
             if fin_seq == conn.last_ack {
-                tracing::debug!(
-                    "Fast path: FIN from guest {src_ip}:{src_port}→{dst_ip}:{dst_port}"
-                );
                 // FIN consumes 1 sequence number (in addition to any data
                 // bytes already accounted for above).
                 conn.set_last_ack(conn.last_ack.wrapping_add(1));
                 let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
+                // Non-inline flow whose host side is still open: a genuine
+                // half-close. Shut only the upstream's receive side (the guest
+                // will send no more), keep relaying host→guest until the host
+                // EOFs on its own (poll then emits OUR FIN), and just ACK the
+                // FIN here — reaping happens in poll once both sides are closed.
+                // A full close here would truncate the still-in-flight response
+                // and, with unread bytes buffered, RST the real upstream.
+                // Inline flows (whose reader owns host→guest) and flows where
+                // the host already closed fall through to the full teardown.
+                if !conn.host_eof && !conn.inline_owned {
+                    tracing::debug!(
+                        "Fast path: guest half-close {src_ip}:{src_port}→{dst_ip}:{dst_port}"
+                    );
+                    let _ = conn.stream.shutdown(std::net::Shutdown::Write);
+                    conn.guest_fin_seen = true;
+                    let ack =
+                        crate::ethernet::build_tcp_ack_frame(&crate::ethernet::TcpFrameParams {
+                            src_ip: conn.remote_ip,
+                            dst_ip: conn.guest_ip,
+                            src_port: conn.remote_port,
+                            dst_port: conn.guest_port,
+                            seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                            ack: conn.last_ack,
+                            window: 65535,
+                            src_mac: self.fast_path_gateway_mac,
+                            dst_mac: guest_mac,
+                        });
+                    return Some(ack);
+                }
+                tracing::debug!(
+                    "Fast path: FIN from guest {src_ip}:{src_port}→{dst_ip}:{dst_port}"
+                );
                 let fin_ack =
                     crate::ethernet::build_tcp_fin_frame(&crate::ethernet::TcpFrameParams {
                         src_ip: conn.remote_ip,
@@ -406,6 +435,20 @@ impl TcpBridge {
                     to_remove.push(*key);
                 }
                 continue;
+            }
+            // A half-closed non-inline flow is fully done once the host has
+            // also EOF'd (our FIN was sent) and the guest ACKed that FIN.
+            if conn.guest_fin_seen && conn.host_eof {
+                if let Some(fin_seq) = conn.fin_seq {
+                    let acked_past_fin = conn
+                        .guest_acked
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .wrapping_sub(fin_seq);
+                    if (1..0x8000_0000).contains(&acked_past_fin) {
+                        to_remove.push(*key);
+                        continue;
+                    }
+                }
             }
             // ---- Sender-side loss recovery (runs for host_eof flows too:
             // in-flight data and the FIN itself still need repair) ----
@@ -603,6 +646,18 @@ impl TcpBridge {
         let Some(conn) = self.fast_path_conns.remove(key) else {
             return;
         };
+        // An inline flow shares its host socket with an independent reader (the
+        // inject thread / direct_rx task) holding a cloned fd. Dropping only our
+        // clone leaves that reader running on the sibling fd — spinning forever
+        // once its send window freezes. Signal its cancel flag and shut the
+        // socket so it exits and releases the fd (guest-initiated FIN/RST, and
+        // the host-error paths, all funnel through here).
+        if conn.inline_owned {
+            if let Some(dead) = &conn.dead {
+                dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+        }
         if conn.up_would_block + conn.up_short_writes + conn.up_out_of_order + conn.retransmits > 0
         {
             tracing::debug!(
@@ -771,6 +826,7 @@ impl TcpBridge {
                     vec![0u8; 32768]
                 },
                 host_eof: false,
+                guest_fin_seen: false,
                 inline_owned,
                 up_bytes: 0,
                 down_bytes: 0,
