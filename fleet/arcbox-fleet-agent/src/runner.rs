@@ -43,10 +43,42 @@ const MAX_VM_JOB_RUNTIME: Duration = Duration::from_secs(6 * 3600 + 1800);
 enum Admission {
     /// Run the job via this backend.
     Accept(Backend),
-    /// The job is already running here; re-accept idempotently, don't restart.
+    /// The job is already in flight here; never start a second runner. The
+    /// redelivered offer is re-accepted once the runner has started, or
+    /// parked on the job's slot until the start settles.
     Duplicate,
     /// Decline the offer; `reason` is echoed back for debuggability.
     Reject(String),
+}
+
+/// Supervision state of one in-flight job.
+///
+/// `started`/`parked_offers` implement the redelivery contract: an accept
+/// tells the platform "the runner is running", and during startup that is
+/// neither true yet nor guaranteed to become true — so an offer redelivered
+/// while the runner is still starting parks here and is answered with the
+/// start outcome (accept or reject) instead of being resolved early. A
+/// cancellation mid-startup drops the slot with its parked tokens: the
+/// platform concluded the job, so no verdict is owed on any of its offers.
+struct JobSlot {
+    /// Level-triggered cancel signal delivered to the job's `run_job` task;
+    /// see [`RunnerSupervisor::handle_cancel`].
+    cancel: CancellationToken,
+    /// Set once the start settled with an accept — the runner actually ran.
+    /// From then on redelivered offers are re-accepted instantly.
+    started: bool,
+    /// Offer tokens redelivered while the runner was starting.
+    parked_offers: Vec<String>,
+}
+
+impl JobSlot {
+    fn new(cancel: CancellationToken) -> Self {
+        Self {
+            cancel,
+            started: false,
+            parked_offers: Vec::new(),
+        }
+    }
 }
 
 /// Spawns and tracks runner processes, answering each offer with accept/reject.
@@ -67,15 +99,16 @@ struct Inner {
     /// through that is exactly the recovery we want. Growth is bounded because
     /// offers originate from the same parked workflows the acks come from.
     outstanding: DashMap<String, attach_request::Msg>,
-    /// Jobs currently running here, each with its cancellation token — one map
-    /// for duplicate detection, cancel delivery, and release. Cancelling a token
-    /// makes the job's `run_job` tear down the runner — the whole process group
+    /// Jobs currently running here, each with its supervision state
+    /// ([`JobSlot`]) — one map for duplicate detection, redelivered-offer
+    /// parking, cancel delivery, and release. Cancelling a slot's token makes
+    /// the job's `run_job` tear down the runner — the whole process group
     /// (host), the container (Docker), the guest (VM), or the Windows process
     /// tree (interop) — awaited, before the entry is released.
     /// The token is level-triggered, so a cancel that lands while the runner is
     /// still starting is observed at the next cancellation point rather than
     /// lost; see [`RunnerSupervisor::handle_cancel`].
-    in_flight: DashMap<String, CancellationToken>,
+    in_flight: DashMap<String, JobSlot>,
     /// Path to the installed runner's entry point (`run.sh`). `None` when
     /// only Docker-based execution is configured.
     runner_script: Option<PathBuf>,
@@ -159,7 +192,20 @@ impl RunnerSupervisor {
                 // At-least-once delivery: a re-offer of a job started here must
                 // never start a second runner, but must still resolve this
                 // offer — with the new token, since each offer has its own
-                // awakeable and the old one is dead.
+                // awakeable and the old one is dead. While the runner is still
+                // starting the verdict is not yet known, so the token parks on
+                // the slot and the start outcome answers it (an early accept
+                // would claim "running" for a runner that may still fail to
+                // start).
+                if let Some(mut slot) = self.inner.in_flight.get_mut(&job_id) {
+                    if !slot.started {
+                        if !slot.parked_offers.contains(&token) {
+                            slot.parked_offers.push(token);
+                        }
+                        info!(job_id, "duplicate offer while starting; verdict deferred");
+                        return;
+                    }
+                }
                 info!(job_id, "duplicate offer; re-accepting");
                 self.accept(&job_id, &token);
             }
@@ -171,7 +217,9 @@ impl RunnerSupervisor {
                 // down the runner — process group (host) or container (Docker),
                 // awaited — so `CancelRunner` never orphans the runner's work.
                 let cancel = CancellationToken::new();
-                self.inner.in_flight.insert(job_id.clone(), cancel.clone());
+                self.inner
+                    .in_flight
+                    .insert(job_id.clone(), JobSlot::new(cancel.clone()));
                 self.inner.state.add_in_flight(control_proto::InFlightJob {
                     job_id,
                     os: order.os.clone(),
@@ -255,7 +303,7 @@ impl RunnerSupervisor {
     /// not an event that can race past it.
     pub fn handle_cancel(&self, job_id: &str) {
         if let Some(entry) = self.inner.in_flight.get(job_id) {
-            entry.value().cancel();
+            entry.value().cancel.cancel();
             warn!(job_id, "runner cancel requested");
         }
     }
@@ -360,7 +408,7 @@ impl RunnerSupervisor {
         // Cancelling is idempotent, so jobs already mid-cancel just keep
         // tearing down and are covered by the wait below.
         for entry in &self.inner.in_flight {
-            entry.value().cancel();
+            entry.value().cancel.cancel();
         }
         if self.inner.in_flight.is_empty() {
             return;
@@ -406,7 +454,7 @@ impl RunnerSupervisor {
             // Never advertised, so admit() never routes here; reject
             // defensively rather than panic if it ever slips through.
             Backend::Unspecified => {
-                self.reject(&job_id, &token, "backend not supported by this agent");
+                self.reject_start(&job_id, &token, "backend not supported by this agent");
             }
         }
     }
@@ -428,7 +476,7 @@ impl RunnerSupervisor {
         // is filled, and activation is one-way, so this cannot be empty;
         // reject defensively rather than panic if that ever breaks.
         let Some(vm) = self.inner.backends.vm() else {
-            self.reject(job_id, token, "macOS VM backend is not available");
+            self.reject_start(job_id, token, "macOS VM backend is not available");
             return;
         };
 
@@ -451,7 +499,7 @@ impl RunnerSupervisor {
             Some(Err(e)) => {
                 // Includes the daemon's two-guest license-cap refusal: reject
                 // and the platform re-offers elsewhere.
-                self.reject(
+                self.reject_start(
                     job_id,
                     token,
                     &format!("failed to start macOS guest: {e:#}"),
@@ -470,7 +518,7 @@ impl RunnerSupervisor {
         };
 
         // The runner command has been issued in the guest: accept the offer.
-        self.accept(job_id, token);
+        self.accept_started(job_id, token);
         info!(job_id, "runner started (vm)");
 
         let exited = {
@@ -514,7 +562,7 @@ impl RunnerSupervisor {
         // interop probe passed, so admit() routes here only with `interop`
         // set; reject defensively rather than panic if that ever breaks.
         let Some(interop) = self.inner.backends.interop() else {
-            self.reject(job_id, token, "windows jobs are not served by this agent");
+            self.reject_start(job_id, token, "windows jobs are not served by this agent");
             return;
         };
 
@@ -531,7 +579,7 @@ impl RunnerSupervisor {
         let mut job = match spawned {
             Some(Ok(job)) => job,
             Some(Err(e)) => {
-                self.reject(
+                self.reject_start(
                     job_id,
                     token,
                     &format!("failed to spawn windows runner: {e:#}"),
@@ -558,7 +606,7 @@ impl RunnerSupervisor {
             return;
         }
 
-        self.accept(job_id, token);
+        self.accept_started(job_id, token);
         info!(
             job_id,
             windows_pid = job.windows_pid(),
@@ -590,7 +638,7 @@ impl RunnerSupervisor {
         cancel: CancellationToken,
     ) {
         let Some(runner_script) = &self.inner.runner_script else {
-            self.reject(job_id, token, "no host runner script configured");
+            self.reject_start(job_id, token, "no host runner script configured");
             return;
         };
 
@@ -598,13 +646,13 @@ impl RunnerSupervisor {
         let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(e) => {
-                self.reject(job_id, token, &format!("failed to spawn runner: {e}"));
+                self.reject_start(job_id, token, &format!("failed to spawn runner: {e}"));
                 return;
             }
         };
 
         // The runner is running: accept the offer.
-        self.accept(job_id, token);
+        self.accept_started(job_id, token);
         info!(job_id, "runner started (host)");
 
         tokio::select! {
@@ -639,7 +687,7 @@ impl RunnerSupervisor {
         // Docker slot is filled, so this cannot be empty; reject defensively
         // rather than panic if that ever breaks.
         let Some(docker) = self.inner.backends.docker() else {
-            self.reject(job_id, token, "docker runtime is not available");
+            self.reject_start(job_id, token, "docker runtime is not available");
             return;
         };
 
@@ -662,7 +710,7 @@ impl RunnerSupervisor {
         let running = match started {
             Some(Ok(running)) => running,
             Some(Err(e)) => {
-                self.reject(job_id, token, &format!("failed to start container: {e}"));
+                self.reject_start(job_id, token, &format!("failed to start container: {e}"));
                 return;
             }
             None => {
@@ -678,7 +726,7 @@ impl RunnerSupervisor {
         };
 
         // The container is running: accept the offer.
-        self.accept(job_id, token);
+        self.accept_started(job_id, token);
         info!(job_id, arch = %order.arch, "runner started (docker)");
 
         let exited = {
@@ -703,6 +751,44 @@ impl RunnerSupervisor {
                 running.cancel().await;
                 info!(job_id, "runner canceled");
             }
+        }
+    }
+
+    /// Accept an offer whose runner just started, plus every offer for the
+    /// same job parked while the start was in flight — each has its own
+    /// awakeable, so each gets its own verdict. The slot is marked `started`
+    /// under the entry lock first, so a redelivery racing this call either
+    /// lands in `parked_offers` before the drain (answered here) or observes
+    /// `started` and is re-accepted instantly.
+    fn accept_started(&self, job_id: &str, token: &str) {
+        let parked = self
+            .inner
+            .in_flight
+            .get_mut(job_id)
+            .map(|mut slot| {
+                slot.started = true;
+                std::mem::take(&mut slot.parked_offers)
+            })
+            .unwrap_or_default();
+        self.accept(job_id, token);
+        for parked_token in &parked {
+            self.accept(job_id, parked_token);
+        }
+    }
+
+    /// Reject an offer whose runner failed to start, plus every offer parked
+    /// while the start was in flight — they were all promised the start
+    /// outcome.
+    fn reject_start(&self, job_id: &str, token: &str, reason: &str) {
+        let parked = self
+            .inner
+            .in_flight
+            .get_mut(job_id)
+            .map(|mut slot| std::mem::take(&mut slot.parked_offers))
+            .unwrap_or_default();
+        self.reject(job_id, token, reason);
+        for parked_token in &parked {
+            self.reject(job_id, parked_token, reason);
         }
     }
 
@@ -1026,7 +1112,7 @@ mod tests {
         let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
         sup.inner
             .in_flight
-            .insert("rjob_a".to_owned(), CancellationToken::new());
+            .insert("rjob_a".to_owned(), JobSlot::new(CancellationToken::new()));
         sup.inner
             .draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1263,13 +1349,84 @@ mod tests {
     }
 
     /// Register an in-flight job with its cancel token, mirroring what
-    /// `handle_provision` sets up before spawning `run_job`.
+    /// `handle_provision` sets up before spawning `run_job` (start not yet
+    /// settled).
     fn register_in_flight(sup: &RunnerSupervisor, job_id: &str) -> CancellationToken {
         let cancel = CancellationToken::new();
         sup.inner
             .in_flight
-            .insert(job_id.to_owned(), cancel.clone());
+            .insert(job_id.to_owned(), JobSlot::new(cancel.clone()));
         cancel
+    }
+
+    fn provision(job_id: &str, offer_token: &str) -> ProvisionRunner {
+        ProvisionRunner {
+            job_id: job_id.to_owned(),
+            os: "darwin".to_owned(),
+            arch: "arm64".to_owned(),
+            encoded_jit_config: String::new(),
+            offer_token: offer_token.to_owned(),
+        }
+    }
+
+    /// An offer redelivered while the runner is still starting must not be
+    /// answered early — accept claims "the runner is running", which is not
+    /// yet true. The token parks on the slot (deduplicated) and the start
+    /// outcome resolves it alongside the original offer; redeliveries after
+    /// the start re-accept instantly.
+    #[tokio::test]
+    async fn offer_redelivered_while_starting_is_answered_by_the_start_outcome() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        register_in_flight(&sup, "rjob_a");
+
+        sup.handle_provision(provision("rjob_a", "tok_redelivered"));
+        sup.handle_provision(provision("rjob_a", "tok_redelivered"));
+        assert!(
+            rx.try_recv().is_err(),
+            "no verdict may resolve an offer whose runner is still starting"
+        );
+
+        sup.accept_started("rjob_a", "tok_orig");
+        let mut accepted = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg.msg {
+                Some(attach_request::Msg::RunnerAccepted(a)) => accepted.push(a.offer_token),
+                other => panic!("expected RunnerAccepted, got {other:?}"),
+            }
+        }
+        assert_eq!(accepted, vec!["tok_orig", "tok_redelivered"]);
+
+        // Started: a further redelivery is re-accepted instantly.
+        sup.handle_provision(provision("rjob_a", "tok_late"));
+        match rx.try_recv().expect("instant re-accept once started").msg {
+            Some(attach_request::Msg::RunnerAccepted(a)) => assert_eq!(a.offer_token, "tok_late"),
+            other => panic!("expected RunnerAccepted, got {other:?}"),
+        }
+    }
+
+    /// A start failure rejects the parked redeliveries too — every offer of
+    /// the job was promised the start outcome, and an unanswered token would
+    /// strand its awakeable until the platform-side offer deadline.
+    #[tokio::test]
+    async fn start_failure_rejects_parked_offers_too() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        register_in_flight(&sup, "rjob_a");
+
+        sup.handle_provision(provision("rjob_a", "tok_redelivered"));
+        assert!(rx.try_recv().is_err());
+
+        sup.reject_start("rjob_a", "tok_orig", "boot failed");
+        let mut rejected = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg.msg {
+                Some(attach_request::Msg::RunnerRejected(r)) => {
+                    assert_eq!(r.reason, "boot failed");
+                    rejected.push(r.offer_token);
+                }
+                other => panic!("expected RunnerRejected, got {other:?}"),
+            }
+        }
+        assert_eq!(rejected, vec!["tok_orig", "tok_redelivered"]);
     }
 
     #[tokio::test]
