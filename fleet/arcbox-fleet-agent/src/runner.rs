@@ -49,37 +49,97 @@ enum Admission {
     /// redelivered offer is re-accepted once the runner has started, or
     /// parked on the job's slot until the start settles.
     Duplicate,
+    /// The runner has exited and its accepted verdict is still awaiting an
+    /// ack. Re-accept without starting the single-use JIT config again.
+    ReplayAccepted,
     /// Decline the offer; `reason` is echoed back for debuggability.
     Reject(String),
 }
 
 /// Supervision state of one in-flight job.
 ///
-/// `started`/`parked_offers` implement the redelivery contract: an accept
-/// tells the platform "the runner is running", and during startup that is
-/// neither true yet nor guaranteed to become true — so an offer redelivered
-/// while the runner is still starting parks here and is answered with the
-/// start outcome (accept or reject) instead of being resolved early. A
-/// cancellation mid-startup drops the slot with its parked tokens: the
-/// platform concluded the job, so no verdict is owed on any of its offers.
+/// The state transition is the linearization point between runner startup and
+/// cancellation. A redelivery racing that transition either parks while the
+/// outcome is unknown or observes the settled outcome; no token can arrive
+/// after a one-shot drain and be lost.
 struct JobSlot {
     /// Level-triggered cancel signal delivered to the job's `run_job` task;
     /// see [`RunnerSupervisor::handle_cancel`].
     cancel: CancellationToken,
-    /// Set once the start settled with an accept — the runner actually ran.
-    /// From then on redelivered offers are re-accepted instantly.
-    started: bool,
-    /// Offer tokens redelivered while the runner was starting.
-    parked_offers: Vec<String>,
+    state: JobState,
+}
+
+enum JobState {
+    /// The runner has not settled startup. Each redelivery has its own
+    /// awakeable and waits here for the same accept/reject outcome.
+    Starting { parked_offers: Vec<String> },
+    /// The runner started, so redeliveries are re-accepted immediately.
+    Started,
+    /// Startup failed, so redeliveries receive the same rejection while the
+    /// slot remains present.
+    Rejected { reason: String },
+    /// The platform concluded the job. No verdict is owed for any offer.
+    Cancelled,
+}
+
+enum DuplicateVerdict {
+    Deferred,
+    Accept,
+    Reject(String),
+    Ignore,
 }
 
 impl JobSlot {
     fn new(cancel: CancellationToken) -> Self {
         Self {
             cancel,
-            started: false,
-            parked_offers: Vec::new(),
+            state: JobState::Starting {
+                parked_offers: Vec::new(),
+            },
         }
+    }
+
+    fn duplicate_verdict(&mut self, token: &str) -> DuplicateVerdict {
+        match &mut self.state {
+            JobState::Starting { parked_offers } => {
+                if !parked_offers.iter().any(|parked| parked == token) {
+                    parked_offers.push(token.to_owned());
+                }
+                DuplicateVerdict::Deferred
+            }
+            JobState::Started => DuplicateVerdict::Accept,
+            JobState::Rejected { reason } => DuplicateVerdict::Reject(reason.clone()),
+            JobState::Cancelled => DuplicateVerdict::Ignore,
+        }
+    }
+
+    fn accept_start(&mut self) -> Option<Vec<String>> {
+        let parked = match &mut self.state {
+            JobState::Starting { parked_offers } => std::mem::take(parked_offers),
+            JobState::Cancelled => return None,
+            JobState::Started => panic!("runner start accepted twice"),
+            JobState::Rejected { .. } => panic!("runner start accepted after rejection"),
+        };
+        self.state = JobState::Started;
+        Some(parked)
+    }
+
+    fn reject_start(&mut self, reason: &str) -> Option<Vec<String>> {
+        let parked = match &mut self.state {
+            JobState::Starting { parked_offers } => std::mem::take(parked_offers),
+            JobState::Cancelled => return None,
+            JobState::Started => panic!("runner start rejected after acceptance"),
+            JobState::Rejected { .. } => panic!("runner start rejected twice"),
+        };
+        self.state = JobState::Rejected {
+            reason: reason.to_owned(),
+        };
+        Some(parked)
+    }
+
+    fn cancel(&mut self) {
+        self.state = JobState::Cancelled;
+        self.cancel.cancel();
     }
 }
 
@@ -189,54 +249,68 @@ impl RunnerSupervisor {
             info!(job_id, "offer replayed; verdict already pending");
             return;
         }
-        match self.admit(&job_id, &order.os, &order.arch, &host::telemetry()) {
-            Admission::Duplicate => {
-                // At-least-once delivery: a re-offer of a job started here must
-                // never start a second runner, but must still resolve this
-                // offer — with the new token, since each offer has its own
-                // awakeable and the old one is dead. While the runner is still
-                // starting the verdict is not yet known, so the token parks on
-                // the slot and the start outcome answers it (an early accept
-                // would claim "running" for a runner that may still fail to
-                // start).
-                if let Some(mut slot) = self.inner.in_flight.get_mut(&job_id) {
-                    if !slot.started {
-                        if !slot.parked_offers.contains(&token) {
-                            slot.parked_offers.push(token);
-                        }
-                        info!(job_id, "duplicate offer while starting; verdict deferred");
-                        return;
-                    }
-                }
-                info!(job_id, "duplicate offer; re-accepting");
-                self.accept(&job_id, &token);
-            }
-            Admission::Reject(reason) => self.reject(&job_id, &token, &reason),
-            Admission::Accept(backend) => {
-                // Reserve synchronously so a follow-up offer sees the job in
-                // flight before the spawned task starts the runner. The token
-                // travels with the entry: cancelling it makes `run_job` tear
-                // down the runner — process group (host) or container (Docker),
-                // awaited — so `CancelRunner` never orphans the runner's work.
-                let cancel = CancellationToken::new();
-                self.inner
-                    .in_flight
-                    .insert(job_id.clone(), JobSlot::new(cancel.clone()));
-                self.inner.state.add_in_flight(control_proto::InFlightJob {
-                    job_id,
-                    os: order.os.clone(),
-                    arch: order.arch.clone(),
-                });
-                let sup = self.clone();
-                tokio::spawn(async move {
-                    // The guard releases the job on any task exit, including a
-                    // panic, so the ID never leaks in `in_flight`.
-                    let _release = ReleaseGuard {
-                        inner: sup.inner.clone(),
-                        job_id: order.job_id.clone(),
+        loop {
+            match self.admit(&job_id, &order.os, &order.arch, &host::telemetry()) {
+                Admission::Duplicate => {
+                    // The slot may disappear after admit() observes it. Retry
+                    // admission instead of assuming that a missing slot means
+                    // the runner started: a failed start removes the slot too.
+                    let Some(mut slot) = self.inner.in_flight.get_mut(&job_id) else {
+                        continue;
                     };
-                    sup.run_job(order, backend, token, cancel).await;
-                });
+                    match slot.duplicate_verdict(&token) {
+                        DuplicateVerdict::Deferred => {
+                            info!(job_id, "duplicate offer while starting; verdict deferred");
+                        }
+                        DuplicateVerdict::Accept => {
+                            info!(job_id, "duplicate offer; re-accepting");
+                            self.accept(&job_id, &token);
+                        }
+                        DuplicateVerdict::Reject(reason) => {
+                            self.reject(&job_id, &token, &reason);
+                        }
+                        DuplicateVerdict::Ignore => {
+                            info!(job_id, "duplicate offer for canceled job; no verdict owed");
+                        }
+                    }
+                    return;
+                }
+                Admission::ReplayAccepted => {
+                    info!(
+                        job_id,
+                        "completed runner's accept still pending; re-accepting"
+                    );
+                    self.accept(&job_id, &token);
+                    return;
+                }
+                Admission::Reject(reason) => {
+                    self.reject(&job_id, &token, &reason);
+                    return;
+                }
+                Admission::Accept(backend) => {
+                    // Reserve synchronously so a follow-up offer sees the job
+                    // in flight before the spawned task starts the runner.
+                    let cancel = CancellationToken::new();
+                    self.inner
+                        .in_flight
+                        .insert(job_id.clone(), JobSlot::new(cancel.clone()));
+                    self.inner.state.add_in_flight(control_proto::InFlightJob {
+                        job_id,
+                        os: order.os.clone(),
+                        arch: order.arch.clone(),
+                    });
+                    let sup = self.clone();
+                    tokio::spawn(async move {
+                        // The guard releases the job on any task exit,
+                        // including a panic, so the ID never leaks.
+                        let _release = ReleaseGuard {
+                            inner: sup.inner.clone(),
+                            job_id: order.job_id.clone(),
+                        };
+                        sup.run_job(order, backend, token, cancel).await;
+                    });
+                    return;
+                }
             }
         }
     }
@@ -251,8 +325,11 @@ impl RunnerSupervisor {
         // can finish (releasing `in_flight`) while its accept is still unacked,
         // and a re-offer of that job must replay "started here" — not admit a
         // fresh runner for a job whose single-use JIT config is already spent.
-        if self.inner.in_flight.contains_key(job_id) || self.has_unacked_accept(job_id) {
+        if self.inner.in_flight.contains_key(job_id) {
             return Admission::Duplicate;
+        }
+        if self.has_unacked_accept(job_id) {
+            return Admission::ReplayAccepted;
         }
         if self
             .inner
@@ -304,8 +381,8 @@ impl RunnerSupervisor {
     /// entry stays until that release: cancellation is a state the job observes,
     /// not an event that can race past it.
     pub fn handle_cancel(&self, job_id: &str) {
-        if let Some(entry) = self.inner.in_flight.get(job_id) {
-            entry.value().cancel.cancel();
+        if let Some(mut slot) = self.inner.in_flight.get_mut(job_id) {
+            slot.cancel();
             warn!(job_id, "runner cancel requested");
         }
     }
@@ -409,8 +486,8 @@ impl RunnerSupervisor {
         self.stop_accepting();
         // Cancelling is idempotent, so jobs already mid-cancel just keep
         // tearing down and are covered by the wait below.
-        for entry in &self.inner.in_flight {
-            entry.value().cancel.cancel();
+        for mut slot in self.inner.in_flight.iter_mut() {
+            slot.cancel();
         }
         if self.inner.in_flight.is_empty() {
             return;
@@ -519,8 +596,13 @@ impl RunnerSupervisor {
             }
         };
 
-        // The runner command has been issued in the guest: accept the offer.
-        self.accept_started(job_id, token);
+        // The runner command has been issued in the guest. Cancellation and
+        // acceptance arbitrate through the slot before any verdict is sent.
+        if !self.accept_started(job_id, token) {
+            running.destroy().await;
+            info!(job_id, "runner canceled during startup");
+            return;
+        }
         info!(job_id, "runner started (vm)");
 
         // The watchdog is distinct from a cancel: the runner is gone without
@@ -612,16 +694,14 @@ impl RunnerSupervisor {
             }
         };
 
-        // A cancel that landed while the spawn was completing: the platform
-        // already concluded the job, so don't resolve the offer — tear the
-        // job down instead of accepting it just to kill it.
-        if cancel.is_cancelled() {
+        // A cancel that landed while the spawn was completing wins the slot
+        // transition, so no verdict is sent for the runner we tear down.
+        if !self.accept_started(job_id, token) {
             job.kill().await;
             info!(job_id, "runner canceled during interop spawn");
             return;
         }
 
-        self.accept_started(job_id, token);
         info!(
             job_id,
             windows_pid = job.windows_pid(),
@@ -669,8 +749,15 @@ impl RunnerSupervisor {
             }
         };
 
-        // The runner is running: accept the offer.
-        self.accept_started(job_id, token);
+        // group_spawn is synchronous, but cancellation is handled on another
+        // runtime thread. Arbitrate through the slot before accepting.
+        if !self.accept_started(job_id, token) {
+            if let Err(e) = child.kill().await {
+                warn!(job_id, error = %e, "killing runner process group failed");
+            }
+            info!(job_id, "runner canceled during host spawn");
+            return;
+        }
         info!(job_id, "runner started (host)");
 
         tokio::select! {
@@ -746,8 +833,13 @@ impl RunnerSupervisor {
             }
         };
 
-        // The container is running: accept the offer.
-        self.accept_started(job_id, token);
+        // The container is running. Cancellation and acceptance arbitrate
+        // through the slot before any verdict is sent.
+        if !self.accept_started(job_id, token) {
+            running.cancel().await;
+            info!(job_id, "runner canceled during startup");
+            return;
+        }
         info!(job_id, arch = %order.arch, "runner started (docker)");
 
         let exited = {
@@ -777,38 +869,39 @@ impl RunnerSupervisor {
         }
     }
 
-    /// Accept an offer whose runner just started, plus every offer for the
-    /// same job parked while the start was in flight — each has its own
-    /// awakeable, so each gets its own verdict. The slot is marked `started`
-    /// under the entry lock first, so a redelivery racing this call either
-    /// lands in `parked_offers` before the drain (answered here) or observes
-    /// `started` and is re-accepted instantly.
-    fn accept_started(&self, job_id: &str, token: &str) {
-        let parked = self
+    /// Settle startup as accepted and answer every parked redelivery. Returns
+    /// false when cancellation won the state transition, in which case the
+    /// caller must tear down the runner without sending a verdict.
+    fn accept_started(&self, job_id: &str, token: &str) -> bool {
+        let mut slot = self
             .inner
             .in_flight
             .get_mut(job_id)
-            .map(|mut slot| {
-                slot.started = true;
-                std::mem::take(&mut slot.parked_offers)
-            })
-            .unwrap_or_default();
+            .unwrap_or_else(|| panic!("in-flight slot disappeared while starting {job_id}"));
+        let parked = slot.accept_start();
+        let Some(parked) = parked else {
+            return false;
+        };
         self.accept(job_id, token);
         for parked_token in &parked {
             self.accept(job_id, parked_token);
         }
+        true
     }
 
-    /// Reject an offer whose runner failed to start, plus every offer parked
-    /// while the start was in flight — they were all promised the start
-    /// outcome.
+    /// Settle startup as rejected and answer every parked redelivery. A
+    /// redelivery arriving after the drain observes the stored rejection and
+    /// receives the same verdict. Cancellation suppresses every verdict.
     fn reject_start(&self, job_id: &str, token: &str, reason: &str) {
-        let parked = self
+        let mut slot = self
             .inner
             .in_flight
             .get_mut(job_id)
-            .map(|mut slot| std::mem::take(&mut slot.parked_offers))
-            .unwrap_or_default();
+            .unwrap_or_else(|| panic!("in-flight slot disappeared while starting {job_id}"));
+        let parked = slot.reject_start(reason);
+        let Some(parked) = parked else {
+            return;
+        };
         self.reject(job_id, token, reason);
         for parked_token in &parked {
             self.reject(job_id, parked_token, reason);
@@ -1373,7 +1466,7 @@ mod tests {
         sup.accept("rjob_a", "tok1");
         assert_eq!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
-            Admission::Duplicate
+            Admission::ReplayAccepted
         );
 
         // Once the gateway settles the accept, the job is genuinely done here.
@@ -1438,7 +1531,7 @@ mod tests {
             "no verdict may resolve an offer whose runner is still starting"
         );
 
-        sup.accept_started("rjob_a", "tok_orig");
+        assert!(sup.accept_started("rjob_a", "tok_orig"));
         let mut accepted = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             match msg.msg {
@@ -1499,6 +1592,48 @@ mod tests {
             }
         }
         assert_eq!(rejected, vec!["tok_orig", "tok_redelivered"]);
+    }
+
+    /// Once startup rejects, a redelivery racing slot release observes the
+    /// stored outcome instead of parking after the one-shot drain.
+    #[tokio::test]
+    async fn redelivery_after_start_rejection_is_rejected_immediately() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        register_in_flight(&sup, "rjob_a");
+
+        sup.reject_start("rjob_a", "tok_orig", "boot failed");
+        rx.try_recv().expect("original rejection");
+
+        sup.handle_provision(provision("rjob_a", "tok_late"));
+        match rx.try_recv().expect("late redelivery rejected").msg {
+            Some(attach_request::Msg::RunnerRejected(rejected)) => {
+                assert_eq!(rejected.offer_token, "tok_late");
+                assert_eq!(rejected.reason, "boot failed");
+            }
+            other => panic!("expected RunnerRejected, got {other:?}"),
+        }
+    }
+
+    /// Cancellation is a terminal startup outcome: a backend completing after
+    /// the cancel must tear down without resolving the original or parked
+    /// offers as accepted or rejected.
+    #[tokio::test]
+    async fn cancellation_wins_late_start_settlement() {
+        let (accepted, mut accepted_rx) = supervisor_with_rx(8);
+        register_in_flight(&accepted, "rjob_accept");
+        accepted.handle_provision(provision("rjob_accept", "tok_parked"));
+        accepted.handle_cancel("rjob_accept");
+
+        assert!(!accepted.accept_started("rjob_accept", "tok_orig"));
+        assert!(accepted_rx.try_recv().is_err());
+
+        let (rejected, mut rejected_rx) = supervisor_with_rx(8);
+        register_in_flight(&rejected, "rjob_reject");
+        rejected.handle_provision(provision("rjob_reject", "tok_parked"));
+        rejected.handle_cancel("rjob_reject");
+
+        rejected.reject_start("rjob_reject", "tok_orig", "boot failed");
+        assert!(rejected_rx.try_recv().is_err());
     }
 
     #[tokio::test]
