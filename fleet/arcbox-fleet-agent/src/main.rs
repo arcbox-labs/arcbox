@@ -36,6 +36,8 @@ mod enroll;
 mod fsutil;
 mod host;
 mod interop;
+#[cfg(test)]
+mod mock_daemon;
 mod runner;
 #[cfg(target_os = "macos")]
 mod service;
@@ -302,6 +304,13 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // `attach::run` stops accepting work and tears down in-flight
             // runners once this fires.
             let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
+            backends::spawn_vm_reprobe(
+                &backends,
+                agent_state.clone(),
+                seed.vm_mode,
+                config.vm.daemon_socket.clone(),
+                shutdown.clone(),
+            );
 
             let (supervisor, egress_rx) =
                 attach::spawn_supervisor(&config, Arc::clone(&backends), agent_state.clone());
@@ -310,7 +319,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 credential,
                 supervisor,
                 egress_rx,
-                backends.capabilities(),
+                backends,
                 shutdown,
                 agent_state,
             )
@@ -338,6 +347,13 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // drain on SIGTERM even though `Unenroll` can also cancel one
             // independently.
             let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
+            backends::spawn_vm_reprobe(
+                &backends,
+                agent_state.clone(),
+                seed.vm_mode,
+                config.vm.daemon_socket.clone(),
+                shutdown.clone(),
+            );
 
             let supervisor = Arc::new(
                 control::AgentSupervisor::new(

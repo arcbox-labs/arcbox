@@ -262,8 +262,9 @@ impl AgentState {
         self.tx.send_modify(|s| s.draining = draining);
     }
 
-    /// Advertised capabilities are static for an attachment's lifetime, so
-    /// this is set once rather than tracked incrementally.
+    /// Mirror the advertised capability set. Written only by the backend
+    /// registry (`crate::backends`): once at construction and again on
+    /// every backend activation.
     pub fn set_capabilities(&self, capabilities: Vec<Capability>) {
         self.tx.send_modify(|s| s.capabilities = capabilities);
     }

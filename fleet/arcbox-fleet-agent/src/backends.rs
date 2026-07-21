@@ -20,16 +20,27 @@
 //! lifetime. A backend that dies later surfaces as per-job failures
 //! (reject + platform re-offer), never as a capability retraction.
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::{Backend, Capability};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
+use crate::config::VmMode;
 use crate::docker::DockerRunner;
 use crate::host;
 use crate::interop::InteropRunner;
 use crate::state::AgentState;
 use crate::vm::VmRunner;
+
+/// How often to re-run the VM backend probe while it is inactive. The
+/// probe is one unix-socket connect plus one `ImageList` RPC against the
+/// local daemon — cheap enough to poll; the loop exits on activation.
+const VM_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Convert a gateway-advertised capability into its control-plane
 /// counterpart. A plain function, not `From`: both `Capability` types are
@@ -70,6 +81,9 @@ pub struct Backends {
     /// Observable-state handle the advertised capability set is mirrored
     /// into on every change.
     state: AgentState,
+    /// Nudged on every activation. Attach loops subscribe and treat a
+    /// change as "the advertised capability set is stale — re-attach".
+    changed: watch::Sender<()>,
     /// Test override for [`Self::capabilities`], so routing/advertisement
     /// logic can be exercised with synthetic sets independent of the host
     /// this test runs on.
@@ -93,11 +107,35 @@ impl Backends {
             vm: RwLock::new(vm),
             interop,
             state,
+            changed: watch::channel(()).0,
             #[cfg(test)]
             fixed_capabilities: None,
         });
         this.mirror_capabilities();
         this
+    }
+
+    /// Activate the macOS VM backend. One-way: the first activation wins
+    /// and later calls are ignored (the existing handle keeps serving).
+    /// Mirrors the grown capability set into the observable state and
+    /// nudges [`Self::subscribe`]rs so attach loops re-attach and the
+    /// gateway learns the new set.
+    pub fn activate_vm(&self, runner: VmRunner) {
+        {
+            let mut slot = self.vm.write().expect(LOCK_INVARIANT);
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(runner);
+        }
+        self.mirror_capabilities();
+        self.changed.send_replace(());
+    }
+
+    /// Subscribe to activations. Receivers only learn "something changed"
+    /// and re-derive the capability set from the registry.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
     /// The capability set this agent serves right now — what the `Attach`
@@ -168,6 +206,70 @@ impl Backends {
 /// while holding one, so poisoning is unreachable.
 const LOCK_INVARIANT: &str = "backend slot lock poisoned";
 
+/// Spawn the VM backend re-probe when this host could ever activate it:
+/// macOS, `vm_mode` Auto, and the startup probe having failed. `Enabled`
+/// needs no re-probe (startup fails while the daemon is down, and launchd
+/// respawns the agent until it comes up); `Disabled` means never. This
+/// closes the login race where the LaunchAgent starts before arcbox-daemon
+/// has bound its socket — without it the failed startup probe silently
+/// benched darwin VM jobs for the whole process lifetime.
+///
+/// The task is detached: it exits on activation or when `shutdown` fires.
+pub fn spawn_vm_reprobe(
+    backends: &Arc<Backends>,
+    state: AgentState,
+    mode: VmMode,
+    daemon_socket: PathBuf,
+    shutdown: CancellationToken,
+) {
+    if std::env::consts::OS != "macos" || mode != VmMode::Auto || backends.vm_active() {
+        return;
+    }
+    info!("macOS VM backend unavailable at startup; re-probing in the background");
+    tokio::spawn(vm_reprobe_loop(
+        Arc::clone(backends),
+        state,
+        daemon_socket,
+        VM_REPROBE_INTERVAL,
+        shutdown,
+    ));
+}
+
+/// Re-run the startup probe every `interval` until it succeeds, then
+/// activate the backend and exit. Probes against the *current*
+/// `macos_runner_image` — the same image dispatch would boot — so a probe
+/// can also start succeeding once the image gets installed (e.g. by
+/// `abctl macos image pull`), not only once the daemon comes up.
+async fn vm_reprobe_loop(
+    backends: Arc<Backends>,
+    state: AgentState,
+    daemon_socket: PathBuf,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(interval) => {}
+        }
+        let image = state.macos_runner_image_current();
+        match VmRunner::new(&daemon_socket, &image).await {
+            Ok(runner) => {
+                info!("macOS VM backend became available; activating");
+                backends.activate_vm(runner);
+                return;
+            }
+            // The startup probe already warned once; steady-state misses
+            // stay at debug so an offline daemon doesn't spam the log.
+            Err(e) => debug!(
+                error = format!("{e:#}"),
+                "macOS VM backend still unavailable"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Backends {
     /// Registry whose [`Self::capabilities`] returns a fixed synthetic set,
@@ -191,6 +293,7 @@ impl Backends {
             vm: RwLock::new(None),
             interop,
             state,
+            changed: watch::channel(()).0,
             fixed_capabilities: Some(capabilities),
         });
         this.mirror_capabilities();
@@ -268,5 +371,65 @@ mod tests {
         assert!(backends.docker().is_none());
         assert!(backends.vm().is_none());
         assert!(backends.capabilities().is_empty());
+    }
+
+    /// Activation must grow the derived capability set (native platform,
+    /// VM-backed), refresh the observable-state mirror, and nudge
+    /// subscribers — the re-attach trigger.
+    #[tokio::test]
+    async fn activate_vm_grows_capabilities_and_notifies() {
+        let daemon = crate::mock_daemon::MockDaemon::spawn(&["tahoe-base"]).await;
+        let runner = VmRunner::new(&daemon.socket, "tahoe-base")
+            .await
+            .expect("probe against the mock daemon");
+
+        let state = AgentState::new(&seed());
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let mut rx = backends.subscribe();
+        rx.mark_unchanged();
+
+        backends.activate_vm(runner);
+
+        assert!(backends.vm_active());
+        assert!(backends.vm().is_some());
+        assert!(rx.has_changed().expect("registry alive"));
+        let capabilities = backends.capabilities();
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].os, host::host_os());
+        assert_eq!(capabilities[0].backed_by, Backend::Vm as i32);
+        assert_eq!(
+            backends.backend_for(&host::host_os(), &host::host_arch()),
+            Some(Backend::Vm)
+        );
+        assert_eq!(state.current().capabilities.len(), 1);
+    }
+
+    /// While the probe keeps failing (daemon up, image missing) the loop
+    /// stays inactive; once the probe starts succeeding it activates and
+    /// exits. This is the image-appears flavor of the login race — the
+    /// daemon-appears flavor differs only in which probe step fails.
+    #[tokio::test]
+    async fn vm_reprobe_loop_activates_when_the_probe_starts_succeeding() {
+        let daemon = crate::mock_daemon::MockDaemon::spawn(&[]).await;
+        let state = AgentState::new(&seed());
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let loop_task = tokio::spawn(vm_reprobe_loop(
+            Arc::clone(&backends),
+            state,
+            daemon.socket.clone(),
+            Duration::from_millis(10),
+            CancellationToken::new(),
+        ));
+
+        // Give a few ticks their chance to mis-activate on the missing image.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!backends.vm_active());
+
+        daemon.install("tahoe-base");
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("loop must exit once the probe succeeds")
+            .expect("reprobe loop must not panic");
+        assert!(backends.vm_active());
     }
 }

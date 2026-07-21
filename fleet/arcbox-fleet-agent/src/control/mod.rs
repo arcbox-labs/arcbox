@@ -325,7 +325,7 @@ impl AgentSupervisor {
             credential.clone(),
             supervisor.clone(),
             egress_rx,
-            self.backends.capabilities(),
+            self.backends(),
             shutdown.clone(),
             self.agent_state.clone(),
         ));
