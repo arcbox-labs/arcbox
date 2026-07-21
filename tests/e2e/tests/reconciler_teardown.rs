@@ -70,8 +70,9 @@ fn reconciler_tears_down_self_exited_container() -> Result<()> {
             )
             .context("starting self-exiting published container")?;
 
-            let mapped = docker_output(data_dir, &["port", NAME, "80/tcp"], Duration::from_secs(20))
-                .context("docker port")?;
+            let mapped =
+                docker_output(data_dir, &["port", NAME, "80/tcp"], Duration::from_secs(20))
+                    .context("docker port")?;
             let port = host_port_of(&mapped)?;
 
             // While the container lives, the host listener must accept (the
@@ -83,7 +84,10 @@ fn reconciler_tears_down_self_exited_container() -> Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            tracing::info!(port, "published port live; waiting for self-exit + reconciler sweep");
+            tracing::info!(
+                port,
+                "published port live; waiting for self-exit + reconciler sweep"
+            );
 
             // The container exits at t≈8 s and dockerd removes it guest-side.
             // The listener must disappear within one reconciler sweep.
