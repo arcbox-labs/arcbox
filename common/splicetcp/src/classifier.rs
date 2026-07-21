@@ -315,6 +315,13 @@ impl FrameClassifier {
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
 
+        // Reject a malformed IPv4 header: version must be 4 and IHL ≥ 20. A
+        // smaller IHL collapses l4_start into the IP header, so the 'TCP'
+        // fields below would be read from attacker-controlled header bytes.
+        if ihl < 20 || (frame[ip_start] >> 4) != 4 {
+            return;
+        }
+
         // A fragment (MF set or nonzero offset) carries at most a partial L4
         // datagram, and downstream consumers parse one datagram per frame —
         // reassemble first (ABX-429). A completed datagram re-enters here

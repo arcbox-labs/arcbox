@@ -87,7 +87,9 @@ impl TcpBridge {
 
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
-        if frame.len() < l4_start + 20 {
+        // IHL < 20 would collapse l4_start into the IP header, so every TCP
+        // field below (ports, seq/ack, flags) would be read from IP bytes.
+        if ihl < 20 || frame.len() < l4_start + 20 {
             return None;
         }
 
@@ -137,6 +139,11 @@ impl TcpBridge {
         let ip_total_len = u16::from_be_bytes([frame[ip_start + 2], frame[ip_start + 3]]) as usize;
         let ip_end = ip_start + ip_total_len;
         let tcp_data_offset = ((frame[l4_start + 12] >> 4) as usize) * 4;
+        // The data offset must cover the 20-byte TCP header; a smaller value
+        // would splice TCP header bytes into the payload written to the host.
+        if tcp_data_offset < 20 || l4_start + tcp_data_offset > frame.len() {
+            return None;
+        }
         let payload_start = l4_start + tcp_data_offset;
         let payload_end = ip_end.min(frame.len());
         let payload_len = payload_end.saturating_sub(payload_start);

@@ -594,7 +594,7 @@ pub(super) fn build_rst_from_syn(syn_frame: &[u8], gateway_mac: [u8; 6]) -> Opti
 
     let ihl = ((syn_frame[ip_start] & 0x0F) as usize) * 4;
     let l4_start = ip_start + ihl;
-    if l4_start + 20 > syn_frame.len() {
+    if ihl < 20 || l4_start + 20 > syn_frame.len() {
         return None;
     }
 
