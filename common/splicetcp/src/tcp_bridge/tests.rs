@@ -1810,8 +1810,12 @@ async fn poll_fast_path_respects_guest_window() {
 
     accepted.write_all(&vec![0xDD; 100_000]).await.unwrap();
 
-    async fn drain(bridge: &mut TcpBridge) -> usize {
-        let mut sent = 0usize;
+    /// Highest sequence-space coverage the bridge has emitted past `base`.
+    /// Coverage, not a byte total: on a slow machine the 200 ms RTO can fire
+    /// mid-drain and retransmit in-window bytes — which does not violate the
+    /// window and must not fail the assertion.
+    async fn drain(bridge: &mut TcpBridge, base: u32) -> usize {
+        let mut covered = 0usize;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut idle = 0;
         while std::time::Instant::now() < deadline && idle < 10 {
@@ -1821,16 +1825,19 @@ async fn poll_fast_path_respects_guest_window() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             } else {
                 idle = 0;
-                sent += batch
-                    .iter()
-                    .map(|f| f.len().saturating_sub(ETH_HEADER_LEN + 40))
-                    .sum::<usize>();
+                for f in &batch {
+                    let payload = f.len().saturating_sub(ETH_HEADER_LEN + 40);
+                    let end = tcp_seq_of(f)
+                        .wrapping_add(payload as u32)
+                        .wrapping_sub(base);
+                    covered = covered.max(end as usize);
+                }
             }
         }
-        sent
+        covered
     }
 
-    let first = drain(&mut bridge).await;
+    let first = drain(&mut bridge, 1).await;
     assert!(
         first <= 65535,
         "no guest ACK yet: at most one unscaled window may be sent, got {first}"
@@ -1844,7 +1851,7 @@ async fn poll_fast_path_respects_guest_window() {
     let ack = make_guest_segment((40024, dst_ip, 443), 1, 1 + first as u32, 65535, 0x10, &[]);
     bridge.try_fast_path_intercept(&ack).expect("intercepted");
 
-    let second = drain(&mut bridge).await;
+    let second = drain(&mut bridge, 1 + first as u32).await;
     assert!(second > 0, "an opening ACK must release more data");
     assert!(
         second <= 65535,
