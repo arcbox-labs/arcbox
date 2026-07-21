@@ -12,6 +12,12 @@
 //!   (the external frontend 12 of 25 corpus files declare). Asserts the
 //!   final image carries exactly the export-stage artifact and none of the
 //!   builder-stage residue.
+//! - **D3 cache semantics** (mastodon / next.js shape): a
+//!   `RUN --mount=type=cache,sharing=locked` step plus a leaf step, then
+//!   three rebuilds — unchanged (full cache hit: identical image ID, warm
+//!   wall bounded), leaf-only change (upstream stamp stable, downstream
+//!   re-runs), base change (both re-run, and the cache mount's content
+//!   demonstrably survives across builds).
 //!
 //! All scenarios share one booted daemon; failures aggregate. The workload
 //! suite's quiet-log rule applies: builds must leave no proxy-layer ERROR.
@@ -36,6 +42,14 @@ const STAGE_GRAPH_DEADLINE: Duration = Duration::from_secs(120);
 const STAGE_GRAPH_TAG: &str = "arcbox-e2e-build:stage-graph";
 const STAGE_GRAPH_PROBE: &str = "arcbox-e2e-build-d2-probe";
 
+/// D3: per-build deadline, the sleep that gives the cold build measurable
+/// duration (two sleeping steps ⇒ cold ≥ 2× this), and the warm bound —
+/// `max(cold / 10, WARM_FLOOR)`, the suite's usual CI-slack floor so a
+/// fast cold build isn't judged on noise.
+const CACHE_BUILD_DEADLINE: Duration = Duration::from_secs(120);
+const CACHE_STEP_SLEEP_SECS: u64 = 4;
+const CACHE_WARM_FLOOR: Duration = Duration::from_secs(3);
+
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon; run on the e2e runner"]
 fn docker_build_suite() -> Result<()> {
@@ -50,9 +64,12 @@ fn docker_build_suite() -> Result<()> {
         // every build below.
         let log = daemon_log_cursor(data_dir);
 
-        let scenarios: [(&str, ScenarioFn); 1] = [("stage_graph", stage_graph)];
+        let scenarios: [(&str, ScenarioFn); 2] = [
+            ("stage_graph", stage_graph),
+            ("cache_semantics", cache_semantics),
+        ];
         // Diagnostic filter: run only the named scenario, e.g.
-        // ARCBOX_E2E_BUILD_ONLY=stage_graph.
+        // ARCBOX_E2E_BUILD_ONLY=cache_semantics.
         let only = std::env::var("ARCBOX_E2E_BUILD_ONLY").ok();
         let mut failures = Vec::new();
         for (name, scenario) in scenarios {
@@ -121,6 +138,17 @@ fn timed_build(
         bail!("{key}: build took {elapsed:?} (>= {deadline:?})");
     }
     Ok((output, elapsed))
+}
+
+/// `cat`s one file out of a built image via a throwaway container.
+fn image_file(data_dir: &Path, tag: &str, path: &str) -> Result<String> {
+    docker_output(
+        data_dir,
+        &["run", "--rm", tag, "cat", path],
+        Duration::from_secs(60),
+    )
+    .map(|out| out.trim().to_owned())
+    .with_context(|| format!("reading {path} from {tag}"))
 }
 
 /// D2: 12-stage diamond under the external `docker/dockerfile:1` frontend.
@@ -277,5 +305,142 @@ COPY --link --from=join /artifact.txt /artifact.txt
         data_dir,
         &["rmi".into(), "-f".into(), STAGE_GRAPH_TAG.into()],
     );
+    result
+}
+
+/// D3: cache semantics across four builds of one Dockerfile. Each RUN step
+/// writes a per-execution random stamp, so "was this step re-executed?" is
+/// read from the image itself rather than parsed out of progress output.
+/// The cached step's `--mount=type=cache` also round-trips a token, proving
+/// the cache mount's content survives across builds.
+fn cache_semantics(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let ctx = data_dir.join("d3-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d3 context dir")?;
+    std::fs::write(ctx.join("base.txt"), "base-v1\n")?;
+    std::fs::write(ctx.join("leaf.txt"), "leaf-v1\n")?;
+    let sleep = CACHE_STEP_SLEEP_SECS;
+    let stamp = "head -c 16 /dev/urandom | sha256sum | cut -d' ' -f1";
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r"FROM {image}
+COPY base.txt /base.txt
+RUN --mount=type=cache,target=/build-cache,sharing=locked (cp /build-cache/token /cache-prev 2>/dev/null || : > /cache-prev) && cp /base.txt /build-cache/token && sleep {sleep} && {stamp} > /stamp-base
+COPY leaf.txt /leaf.txt
+RUN sleep {sleep} && {stamp} > /stamp-leaf
+"
+        ),
+    )
+    .context("writing d3 Dockerfile")?;
+
+    let tags = ["cold", "warm", "leaf", "base"].map(|t| format!("arcbox-e2e-build:cache-{t}"));
+    let [cold_tag, warm_tag, leaf_tag, base_tag] = &tags;
+
+    let result = (|| {
+        // Build 1 — cold: everything executes, the cache mount is seeded.
+        let (_, cold_wall) = timed_build(
+            data_dir,
+            metrics,
+            "cache_cold_wall",
+            &ctx,
+            cold_tag,
+            CACHE_BUILD_DEADLINE,
+        )?;
+        let cold_stamp_base = image_file(data_dir, cold_tag, "/stamp-base")?;
+        let cold_stamp_leaf = image_file(data_dir, cold_tag, "/stamp-leaf")?;
+        let cold_cache_prev = image_file(data_dir, cold_tag, "/cache-prev")?;
+        if cold_stamp_base.is_empty() || cold_stamp_leaf.is_empty() {
+            bail!("cache: cold build produced empty stamps");
+        }
+        if !cold_cache_prev.is_empty() {
+            bail!(
+                "cache: cold build saw a pre-existing cache token {cold_cache_prev:?} — \
+                 the fresh daemon's build cache was not empty"
+            );
+        }
+
+        // Build 2 — unchanged: a full cache hit, so the same image ID and a
+        // wall bounded far below cold (with the usual CI-slack floor).
+        let (_, warm_wall) = timed_build(
+            data_dir,
+            metrics,
+            "cache_warm_wall",
+            &ctx,
+            warm_tag,
+            CACHE_BUILD_DEADLINE,
+        )?;
+        let id = |tag: &str| {
+            docker_output(
+                data_dir,
+                &["image", "inspect", "-f", "{{.Id}}", tag],
+                Duration::from_secs(30),
+            )
+            .map(|out| out.trim().to_owned())
+        };
+        let (cold_id, warm_id) = (id(cold_tag)?, id(warm_tag)?);
+        if warm_id != cold_id {
+            bail!("cache: unchanged rebuild produced a different image ({cold_id} vs {warm_id})");
+        }
+        let warm_bound = cold_wall.div_f64(10.0).max(CACHE_WARM_FLOOR);
+        if warm_wall > warm_bound {
+            bail!(
+                "cache: unchanged rebuild took {warm_wall:?} (bound {warm_bound:?}, \
+                 cold {cold_wall:?}) — cache hit not engaging"
+            );
+        }
+
+        // Build 3 — leaf change: the step above the change stays cached,
+        // the steps at and below it re-execute.
+        std::fs::write(ctx.join("leaf.txt"), "leaf-v2\n")?;
+        timed_build(
+            data_dir,
+            metrics,
+            "cache_leaf_wall",
+            &ctx,
+            leaf_tag,
+            CACHE_BUILD_DEADLINE,
+        )?;
+        let leaf_stamp_base = image_file(data_dir, leaf_tag, "/stamp-base")?;
+        let leaf_stamp_leaf = image_file(data_dir, leaf_tag, "/stamp-leaf")?;
+        if leaf_stamp_base != cold_stamp_base {
+            bail!("cache: leaf-only change re-executed the upstream cached step");
+        }
+        if leaf_stamp_leaf == cold_stamp_leaf {
+            bail!("cache: leaf change did not re-execute the downstream step");
+        }
+
+        // Build 4 — base change: both steps re-execute, and the re-run
+        // cached step reads back the token build 1 wrote — the cache mount
+        // persisted across builds.
+        std::fs::write(ctx.join("base.txt"), "base-v2\n")?;
+        timed_build(
+            data_dir,
+            metrics,
+            "cache_base_wall",
+            &ctx,
+            base_tag,
+            CACHE_BUILD_DEADLINE,
+        )?;
+        let base_stamp_base = image_file(data_dir, base_tag, "/stamp-base")?;
+        let base_stamp_leaf = image_file(data_dir, base_tag, "/stamp-leaf")?;
+        let base_cache_prev = image_file(data_dir, base_tag, "/cache-prev")?;
+        if base_stamp_base == cold_stamp_base {
+            bail!("cache: base change did not re-execute the cached step");
+        }
+        if base_stamp_leaf == leaf_stamp_leaf {
+            bail!("cache: base change did not invalidate the downstream step");
+        }
+        if base_cache_prev != "base-v1" {
+            bail!(
+                "cache: cache-mount token did not survive across builds \
+                 (read {base_cache_prev:?}, expected \"base-v1\")"
+            );
+        }
+        Ok(())
+    })();
+
+    for tag in &tags {
+        docker_ignore(data_dir, &["rmi".into(), "-f".into(), tag.clone()]);
+    }
     result
 }
