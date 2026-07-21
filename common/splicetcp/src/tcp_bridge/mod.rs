@@ -83,6 +83,14 @@ const HANDSHAKE_TOTAL_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// for any VM→Host BDP on a local loopback link.
 const SHIM_WSCALE: u8 = 7;
 
+/// Upper bound on parked out-of-order upload bytes per flow, and on how far
+/// past `last_ack` a parked segment may start. The [`SHIM_WSCALE`] window
+/// invites the guest to keep up to 8 MiB in flight, so a single lost frame
+/// can put megabytes of valid data behind a hole; parking is capped below
+/// the full window to bound memory. Segments past either cap fall back to
+/// drop-and-dup-ACK, which the guest repairs by retransmitting.
+const OOO_REASSEMBLY_CAP: usize = 4 * 1024 * 1024;
+
 /// MSS we advertise in handshake frames to the guest. 1460 is the standard
 /// Ethernet MSS (1500 MTU − 40 bytes IP+TCP). Host→guest large frames with
 /// GSO are unaffected — MSS only bounds the *guest's* segment size.
@@ -285,6 +293,19 @@ pub(super) struct FastPathConn {
     up_would_block: u64,
     up_short_writes: u64,
     up_out_of_order: u64,
+    /// Upload segments that arrived beyond the contiguous cursor, parked
+    /// until the hole before them fills: `(guest_seq, payload)`, sorted by
+    /// wrapping distance from `last_ack`. Parking turns one lost frame into
+    /// one guest retransmission; dropping (the pre-2026-07 behavior) made
+    /// recovery go-back-N across the whole 8 MiB advertised window, which
+    /// collapsed docker-bridge uploads to tens of Mbit/s.
+    ooo_segs: Vec<(u32, Vec<u8>)>,
+    /// Total payload bytes parked in `ooo_segs`; bounded by
+    /// [`OOO_REASSEMBLY_CAP`].
+    ooo_bytes: usize,
+    /// OOO segments discarded because a reassembly cap was exceeded
+    /// (recovered by guest retransmission, exactly as before parking existed).
+    up_ooo_dropped: u64,
     /// True while the flow sits at a zero send budget — transition
     /// logging only, so a stuck window is visible in the daemon log
     /// without per-poll noise.
@@ -340,6 +361,92 @@ impl FastPathConn {
         if let Some(ref shared) = self.last_ack_shared {
             shared.store(ack, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Parks an upload segment that arrived beyond the contiguous cursor
+    /// (caller guarantees `seq` is strictly ahead of `last_ack`).
+    /// Deduplicates same-seq arrivals and enforces [`OOO_REASSEMBLY_CAP`]
+    /// on both total parked bytes and how far past the cursor a segment
+    /// may start. Parking never ACKs: `last_ack` still advances only over
+    /// bytes actually written to the host socket, in
+    /// [`Self::drain_parked_segments`].
+    pub(super) fn buffer_ooo_segment(&mut self, seq: u32, payload: &[u8]) {
+        let base = self.last_ack;
+        let rel = seq.wrapping_sub(base) as usize;
+        if rel.saturating_add(payload.len()) > OOO_REASSEMBLY_CAP
+            || self.ooo_bytes.saturating_add(payload.len()) > OOO_REASSEMBLY_CAP
+        {
+            self.up_ooo_dropped += 1;
+            return;
+        }
+        let idx = self
+            .ooo_segs
+            .partition_point(|(s, _)| (s.wrapping_sub(base) as usize) < rel);
+        if let Some((s, existing)) = self.ooo_segs.get(idx)
+            && *s == seq
+        {
+            if existing.len() >= payload.len() {
+                return; // duplicate of an already-parked segment
+            }
+            let (_, old) = self.ooo_segs.remove(idx);
+            self.ooo_bytes -= old.len();
+        }
+        self.ooo_bytes += payload.len();
+        self.ooo_segs.insert(idx, (seq, payload.to_vec()));
+    }
+
+    /// Writes parked out-of-order segments that the advanced `last_ack` now
+    /// reaches, in sequence order, with the same partial-take semantics as
+    /// the in-order path: the cursor advances only over bytes the host
+    /// socket accepted. Stops at the first remaining hole, `WouldBlock`, or
+    /// short take — whatever stays parked is re-driven by the guest's
+    /// retransmission machinery (an arriving retransmit re-enters this
+    /// drain). A hard write error propagates for the caller's RST teardown.
+    pub(super) fn drain_parked_segments(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        while let Some(&(seq, ref data)) = self.ooo_segs.first() {
+            let len = data.len();
+            let seg_end = seq.wrapping_add(len as u32);
+            let extends = seg_end.wrapping_sub(self.last_ack);
+            if extends == 0 || extends >= 0x8000_0000 {
+                // Fully at/behind the cursor: a retransmit landed in-order
+                // first and already covered these bytes.
+                let (_, old) = self.ooo_segs.remove(0);
+                self.ooo_bytes -= old.len();
+                continue;
+            }
+            let overlap = self.last_ack.wrapping_sub(seq);
+            if overlap >= 0x8000_0000 {
+                break; // a hole still precedes the first parked segment
+            }
+            let start = overlap as usize;
+            let take = match self.stream.write(&self.ooo_segs[0].1[start..]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.up_would_block += 1;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    // Peer closed — drain at the TCP layer like the in-order
+                    // path so the guest stops retransmitting.
+                    self.set_last_ack(seg_end);
+                    let (_, old) = self.ooo_segs.remove(0);
+                    self.ooo_bytes -= old.len();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            self.up_bytes += take as u64;
+            let new_ack = self.last_ack.wrapping_add(take as u32);
+            self.set_last_ack(new_ack);
+            if take < len - start {
+                self.up_short_writes += 1;
+                break; // remainder stays parked; overlap math resumes here
+            }
+            let (_, old) = self.ooo_segs.remove(0);
+            self.ooo_bytes -= old.len();
+        }
+        Ok(())
     }
 }
 
