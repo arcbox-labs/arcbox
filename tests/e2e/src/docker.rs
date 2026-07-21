@@ -144,7 +144,7 @@ pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
                 let listing = std::process::Command::new("tar")
                     .args(["-tf", &tar.display().to_string()])
                     .output();
-                if !listing.map(|o| o.status.success()).unwrap_or(false) {
+                if !listing.is_ok_and(|o| o.status.success()) {
                     tracing::warn!("saved image cache fails tar validation; discarding");
                     let _ = std::fs::remove_file(&tar);
                 }
