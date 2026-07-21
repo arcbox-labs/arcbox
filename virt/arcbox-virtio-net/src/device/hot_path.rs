@@ -171,7 +171,12 @@ impl VirtioNet {
         let used0 = queue.mem().read_u16(rx_qcfg.used_addr as usize + 2);
         queue.set_last_avail_idx(used0);
 
-        let mut injected = false;
+        // "Published" = we advanced the used ring and the guest must be
+        // interrupted so it reclaims the descriptors — true both for a real
+        // frame injection and for a zero-length completion of an unusable
+        // chain. Returning only on injection would leak the interrupt for a
+        // chain we consumed but couldn't fill, stalling RX.
+        let mut published = false;
         let hdr_len = VirtioNetHeader::SIZE;
         for _ in 0..64 {
             // Stop when the guest has no RX buffer posted.
@@ -234,25 +239,27 @@ impl VirtioNet {
                 // it was already popped off the avail ring — return it to the
                 // used ring (zero length) so the guest reclaims the descriptor
                 // instead of leaking it forever (which drains the RX ring dry).
-                // The frame is dropped; TCP retransmits.
+                // This advances the used ring, so the guest still needs the
+                // interrupt below. The frame is dropped; TCP retransmits.
                 queue.push_used(chain.head_idx, 0);
+                published = true;
                 continue;
             }
 
             queue.push_used(chain.head_idx, written as u32);
-            injected = true;
+            published = true;
         }
 
         // Publish avail_event for an EVENT_IDX guest (gated: the field sits past
         // the used ring when EVENT_IDX is not negotiated). RX publishes the
         // current avail.idx (not the consumed cursor): the host polls for frames
         // so it only wants a kick for RX buffers posted beyond what it has seen.
-        if injected && event_idx {
+        if published && event_idx {
             let avail_idx_now = queue.mem().read_u16(rx_qcfg.avail_addr as usize + 2);
             let avail_event_off = rx_qcfg.used_addr as usize + 4 + rx_qcfg.size as usize * 8;
             queue.mem().write_u16(avail_event_off, avail_idx_now);
         }
 
-        injected
+        published
     }
 }

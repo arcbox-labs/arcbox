@@ -358,15 +358,22 @@ impl VirtioVsock {
                 &packet,
             );
 
-            if written > 0 {
+            if let Some(n) = written {
+                // Consuming a chain advances the used ring — even a zero-length
+                // completion of an unusable chain — so the guest must be
+                // interrupted to reclaim the descriptor.
                 injected = true;
 
-                // Fire injected_notify for REQUEST ops — unblocks any
-                // daemon-side connect waiting in `connect_vsock_hv`.
-                if let Ok(mut mgr) = conns.lock() {
-                    if let Some(conn) = mgr.get_mut(&conn_id) {
-                        if let Some(tx) = conn.injected_notify.take() {
-                            let _ = tx.send(());
+                // Fire injected_notify only when the packet actually landed:
+                // a REQUEST op unblocks a daemon-side connect waiting in
+                // `connect_vsock_hv`. A zero-length completion delivered
+                // nothing, so it must not signal delivery.
+                if n > 0 {
+                    if let Ok(mut mgr) = conns.lock() {
+                        if let Some(conn) = mgr.get_mut(&conn_id) {
+                            if let Some(tx) = conn.injected_notify.take() {
+                                let _ = tx.send(());
+                            }
                         }
                     }
                 }
@@ -430,9 +437,11 @@ impl VirtioVsock {
     /// Writes `packet` into the next available RX descriptor chain.
     ///
     /// `desc_addr`, `avail_addr`, `used_addr` are slice offsets (already
-    /// translated from GPA by subtracting `gpa_base`). Returns the number
-    /// of bytes written, or 0 if no RX descriptor was available or the
-    /// descriptor chain ran out of writable buffer space.
+    /// translated from GPA by subtracting `gpa_base`). Returns `None` when no
+    /// RX descriptor was available (nothing consumed), `Some(0)` when a chain
+    /// was consumed but had no writable capacity (a zero-length used completion
+    /// — the guest still needs an interrupt to reclaim it), or `Some(n)` for
+    /// the number of bytes written.
     #[allow(clippy::too_many_arguments)]
     fn write_to_rx_descriptor(
         guest_mem: &mut [u8],
@@ -442,7 +451,7 @@ impl VirtioVsock {
         q_size: usize,
         gpa_base: usize,
         packet: &[u8],
-    ) -> usize {
+    ) -> Option<usize> {
         // Reconstruct a GPA-based QueueConfig from the offset arguments so the
         // queue resolves every address through GuestMemWriter exactly once.
         let cfg = QueueConfig {
@@ -470,7 +479,7 @@ impl VirtioVsock {
         queue.set_last_avail_idx(used0);
 
         let Some(chain) = queue.pop_avail() else {
-            return 0; // No available descriptors.
+            return None; // No available descriptors — nothing consumed.
         };
 
         // Walk the chain, scattering the packet into the write-only buffers.
@@ -498,11 +507,13 @@ impl VirtioVsock {
             // The chain had no writable capacity, but it was already popped off
             // the avail ring — return it to the used ring so the guest reclaims
             // the descriptor instead of leaking it (which drains the RX ring).
+            // Some(0), not None: the used ring advanced, so the caller must
+            // still interrupt the guest.
             queue.push_used(chain.head_idx, 0);
-            return 0;
+            return Some(0);
         }
 
         queue.push_used(chain.head_idx, written as u32);
-        written
+        Some(written)
     }
 }
