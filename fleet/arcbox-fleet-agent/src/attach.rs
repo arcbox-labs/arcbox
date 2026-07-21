@@ -6,6 +6,7 @@
 //! reconnect keeps running, and its terminal event is forwarded to whichever
 //! stream is live instead of being lost into the dropped connection's channel.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,9 +23,9 @@ use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tracing::{info, warn};
 
+use crate::backends::Backends;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
-use crate::docker;
 use crate::host;
 use crate::runner::RunnerSupervisor;
 use crate::state::AgentState;
@@ -122,22 +123,12 @@ fn telemetry_to_control(t: &HostTelemetry) -> control_proto::HostTelemetry {
 /// its own task.
 pub fn spawn_supervisor(
     config: &AgentConfig,
-    docker: Option<docker::DockerRunner>,
-    vm: Option<crate::vm::VmRunner>,
-    interop: Option<crate::interop::InteropRunner>,
-    capabilities: Vec<Capability>,
+    backends: Arc<Backends>,
     state: AgentState,
 ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
     let (egress_tx, egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
-    let supervisor = RunnerSupervisor::new(
-        egress_tx,
-        config.runner_script.clone(),
-        docker,
-        vm,
-        interop,
-        capabilities,
-        state,
-    );
+    let supervisor =
+        RunnerSupervisor::new(egress_tx, config.runner_script.clone(), backends, state);
     (supervisor, egress_rx)
 }
 
@@ -688,8 +679,11 @@ mod tests {
             machine_id: "fltm_parked".to_owned(),
             machine_token: "flt_revoked".to_owned(),
         };
-        let (supervisor, egress_rx) =
-            spawn_supervisor(&config, None, None, None, Vec::new(), state.clone());
+        let (supervisor, egress_rx) = spawn_supervisor(
+            &config,
+            Backends::fixed(Vec::new(), state.clone()),
+            state.clone(),
+        );
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(run(
             config,
@@ -813,16 +807,7 @@ mod tests {
             gateway: gateway.clone(),
             ..seed()
         });
-        let (events, _rx) = mpsc::channel(1);
-        let supervisor = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            AgentState::new(&seed()),
-        );
+        let supervisor = supervisor();
         let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
         let mut pending = None;
         let mut backoff = INITIAL_BACKOFF;
@@ -869,18 +854,8 @@ mod tests {
     /// handle) for the life of the process.
     #[tokio::test]
     async fn verdict_resend_task_exits_when_shutdown_fires() {
-        let (events, _rx) = mpsc::channel(1);
-        let supervisor = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            AgentState::new(&seed()),
-        );
         let shutdown = CancellationToken::new();
-        let handle = spawn_verdict_resend(supervisor, shutdown.clone());
+        let handle = spawn_verdict_resend(supervisor(), shutdown.clone());
 
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(1), handle)
@@ -917,6 +892,20 @@ mod tests {
         }
     }
 
+    /// A minimal supervisor over an empty fixed-capability registry, with
+    /// its own observable state — for tests that only need the handle and
+    /// never route a verdict through it (the egress receiver is dropped).
+    fn supervisor() -> RunnerSupervisor {
+        let (events, _rx) = mpsc::channel(1);
+        let state = AgentState::new(&seed());
+        RunnerSupervisor::new(
+            events,
+            None,
+            Backends::fixed(Vec::new(), state.clone()),
+            state,
+        )
+    }
+
     /// The connect + Attach-RPC handshake has no cancellation awareness of
     /// its own (see this fn's own doc in the non-test code above) — without
     /// racing it against `shutdown`, a reconnect attempt could complete the
@@ -926,16 +915,7 @@ mod tests {
     #[tokio::test]
     async fn connect_and_serve_bails_out_immediately_when_already_cancelled() {
         let state = AgentState::new(&seed());
-        let (events, _rx) = mpsc::channel(1);
-        let supervisor = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            AgentState::new(&seed()),
-        );
+        let supervisor = supervisor();
         let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
         let mut pending = None;
         let mut backoff = INITIAL_BACKOFF;

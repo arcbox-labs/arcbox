@@ -13,19 +13,16 @@ use arcbox_fleet_control_proto::v1::{ImageKind, PrepareRequest, PrepareResponse}
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use crate::docker::DockerRunner;
+use crate::backends::Backends;
 use crate::state::AgentState;
-use crate::vm::VmRunner;
 
 pub struct ImageService {
     state: AgentState,
-    /// The process-lifetime Docker handle, if configured. Never stale:
-    /// `docker_mode` changes are restart-scoped (see
-    /// `AgentSupervisor::docker`'s doc).
-    docker: Option<DockerRunner>,
-    /// The process-lifetime macOS VM backend handle, if active. Never
-    /// stale for the same reason (`vm_mode` is restart-scoped).
-    vm: Option<VmRunner>,
+    /// The live backend registry: the Docker handle for
+    /// `linux_runner_image`, the macOS VM backend for `macos_runner_image`
+    /// — read per request, so a backend that activated after startup is
+    /// visible to the next Prepare.
+    backends: Arc<Backends>,
     /// Serializes preparations. Two racing Prepares would pull concurrently
     /// and promote in arbitrary order, so the loser gets `ABORTED` instead
     /// of queueing behind a transfer of unknown length.
@@ -33,11 +30,10 @@ pub struct ImageService {
 }
 
 impl ImageService {
-    pub fn new(state: AgentState, docker: Option<DockerRunner>, vm: Option<VmRunner>) -> Self {
+    pub fn new(state: AgentState, backends: Arc<Backends>) -> Self {
         Self {
             state,
-            docker,
-            vm,
+            backends,
             busy: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -100,8 +96,7 @@ impl FleetImageServiceTrait for ImageService {
             .try_lock_owned()
             .map_err(|_| Status::aborted("another prepare is already in progress"))?;
         let state = self.state.clone();
-        let docker = self.docker.clone();
-        let vm = self.vm.clone();
+        let backends = Arc::clone(&self.backends);
 
         // The work runs inside the stream itself, not a detached task, so a
         // client disconnect drops it mid-pull: no promotion happens, and a
@@ -112,7 +107,7 @@ impl FleetImageServiceTrait for ImageService {
                 match kind {
                     ImageKind::LinuxRunnerImage => {
                         let target = state.linux_runner_image_target();
-                        match &docker {
+                        match &backends.docker() {
                             Some(docker) => {
                                 // All-or-nothing: every advertised arch must pull
                                 // before promotion, so a partial-arch image can
@@ -143,7 +138,7 @@ impl FleetImageServiceTrait for ImageService {
                     }
                     ImageKind::MacosRunnerImage => {
                         let target = state.macos_runner_image_target();
-                        match &vm {
+                        match &backends.vm() {
                             Some(vm) => {
                                 // The daemon streams pull progress (its terminal
                                 // stage is "done"); relay each event. Any failure
@@ -255,7 +250,8 @@ mod tests {
     async fn prepare_without_docker_promotes_target() {
         let state = AgentState::new(&seed());
         state.set_linux_runner_image_target("ghcr.io/acme/runner:v2");
-        let service = ImageService::new(state.clone(), None, None);
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let service = ImageService::new(state.clone(), backends);
 
         let mut stream = service
             .prepare(Request::new(PrepareRequest {
@@ -286,7 +282,8 @@ mod tests {
     async fn prepare_without_vm_backend_promotes_macos_target() {
         let state = AgentState::new(&seed());
         state.set_macos_runner_image_target("tahoe-base@2026.07.03");
-        let service = ImageService::new(state.clone(), None, None);
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let service = ImageService::new(state.clone(), backends);
 
         let mut stream = service
             .prepare(Request::new(PrepareRequest {
@@ -311,7 +308,9 @@ mod tests {
     /// dropping the live stream (client disconnect) must release the slot.
     #[tokio::test]
     async fn concurrent_prepare_is_refused_until_the_first_stream_drops() {
-        let service = ImageService::new(AgentState::new(&seed()), None, None);
+        let state = AgentState::new(&seed());
+        let service =
+            ImageService::new(state.clone(), Backends::new(false, None, None, None, state));
 
         let held = service
             .prepare(Request::new(PrepareRequest { kinds: Vec::new() }))
