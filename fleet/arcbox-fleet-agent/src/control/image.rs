@@ -177,7 +177,7 @@ impl FleetImageServiceTrait for ImageService {
                     ImageKind::MacosRunnerImage => {
                         let target = state.macos_runner_image_target();
                         let vm_mode = state.vm_mode_current();
-                        match macos_pull_handle(&backends, vm_mode, &daemon_socket).await {
+                        let activation = match macos_pull_handle(&backends, vm_mode, &daemon_socket).await {
                             Some(vm) => {
                                 // The daemon streams pull progress (its terminal
                                 // stage is "done"); relay each event. Any failure
@@ -204,15 +204,17 @@ impl FleetImageServiceTrait for ImageService {
                                 // an agent restart (the registry re-attaches for us).
                                 if !backends.vm_active() {
                                     match VmRunner::new(&daemon_socket, &target).await {
-                                        Ok(runner) => {
-                                            backends.activate_vm(runner);
-                                            yield event(kind, "macOS VM backend activated", "activated", 1.0);
+                                        Ok(runner) => Some(runner),
+                                        Err(e) => {
+                                            warn!(
+                                                error = format!("{e:#}"),
+                                                "macos_runner_image pulled, but the backend activation probe failed"
+                                            );
+                                            None
                                         }
-                                        Err(e) => warn!(
-                                            error = format!("{e:#}"),
-                                            "macos_runner_image pulled, but the backend activation probe failed"
-                                        ),
                                     }
+                                } else {
+                                    None
                                 }
                             }
                             // Same rationale as the Docker-absent branch: with the
@@ -220,9 +222,16 @@ impl FleetImageServiceTrait for ImageService {
                             // darwin VM job can dispatch, so there is nothing to
                             // verify against — promote rather than leave the
                             // setting pending forever.
-                            None => yield event(kind, "vm backend not active", "skipped", 1.0),
-                        }
+                            None => {
+                                yield event(kind, "vm backend not active", "skipped", 1.0);
+                                None
+                            }
+                        };
                         state.set_macos_runner_image_current(&target);
+                        if let Some(runner) = activation {
+                            backends.activate_vm(runner);
+                            yield event(kind, "macOS VM backend activated", "activated", 1.0);
+                        }
                     }
                     // `resolve_kinds` admits no other variant.
                     ImageKind::Unspecified => unreachable!("resolve_kinds admits no other variant"),
@@ -392,7 +401,16 @@ mod tests {
             .into_inner();
         let mut stages = Vec::new();
         while let Some(item) = stream.next().await {
-            stages.push(item.expect("event").stage);
+            let stage = item.expect("event").stage;
+            if stage == "activated" {
+                assert_eq!(
+                    state.macos_runner_image_current(),
+                    state.macos_runner_image_target(),
+                    "the promoted image must be visible before VM capability activation"
+                );
+                assert!(backends.vm_active(), "the VM backend must be active");
+            }
+            stages.push(stage);
         }
 
         assert_eq!(stages, ["pulling", "activated", "promoted"]);
