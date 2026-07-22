@@ -84,10 +84,14 @@ const SSH_TAG: &str = "arcbox-e2e-build:ssh";
 const BIND_DEADLINE: Duration = Duration::from_secs(120);
 const BIND_TAG: &str = "arcbox-e2e-build:bind";
 
-/// D9: chatty-RUN line count (~1 MiB of step output — deliberately below
-/// BuildKit's default per-step log clip, so "no clip marker" is a fair
-/// streaming-integrity assertion rather than a tunable).
-const STREAM_LINES: usize = 150_000;
+/// D9: chatty-RUN shape. BuildKit rate-limits step logs (the embedded
+/// builder clips at 200 KiB/s — measured, the marker names the limit), so
+/// the emitter is PACED: `STREAM_CHUNKS` bursts of `STREAM_CHUNK_LINES`
+/// lines with a 1 s sleep between (~68 KiB/s). Under the limit, "no clip
+/// marker + tail lines present" is a fair streaming-integrity assertion;
+/// a bulk `seq` would be clipped by design and prove nothing.
+const STREAM_CHUNKS: usize = 5;
+const STREAM_CHUNK_LINES: usize = 10_000;
 const STREAM_DEADLINE: Duration = Duration::from_secs(120);
 const STREAM_TAG: &str = "arcbox-e2e-build:stream";
 const QUIET_TAG: &str = "arcbox-e2e-build:quiet";
@@ -685,6 +689,9 @@ fn assert_absent_from_saved_image(
     )
     .context("docker save for secret sweep")?;
 
+    // No `X && echo LEAK` shorthand under `set -e`: a non-matching grep
+    // returns 1, fails the AND-list, and aborts the sweep before
+    // SWEEP-DONE — every clean image would read as an incomplete sweep.
     let script = format!(
         r#"set -e
 d=$(mktemp -d)
@@ -692,9 +699,9 @@ trap 'rm -rf "$d"' EXIT
 tar -xf "{tar_arg}" -C "$d"
 find "$d" -type f | while read -r f; do
   if [ "$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')" = "1f8b" ]; then
-    gunzip -c "$f" 2>/dev/null | grep -aq -- "{needle}" && echo "LEAK:$f"
-  else
-    grep -aq -- "{needle}" "$f" && echo "LEAK:$f"
+    if gunzip -c "$f" 2>/dev/null | grep -aq -- "{needle}"; then echo "LEAK:$f"; fi
+  elif grep -aq -- "{needle}" "$f"; then
+    echo "LEAK:$f"
   fi
 done
 echo SWEEP-DONE"#
@@ -725,11 +732,15 @@ fn session_secret_ssh(data_dir: &Path, metrics: &mut RunMetrics, image: &str) ->
     let ctx = data_dir.join("d4-secret-ctx");
     std::fs::create_dir_all(&ctx).context("creating d4 secret context dir")?;
     std::fs::write(ctx.join("token.txt"), SECRET_VALUE)?;
+    // The Dockerfile must carry only the HASH of the secret: RUN command
+    // lines persist verbatim into the image config's history, so inlining
+    // the value would plant exactly the leak the sweep below hunts for.
+    let secret_sha = format!("{:x}", sha2::Sha256::digest(SECRET_VALUE.as_bytes()));
     std::fs::write(
         ctx.join("Dockerfile"),
         format!(
             r#"FROM {image}
-RUN --mount=type=secret,id=build_token test "$(cat /run/secrets/build_token)" = "{SECRET_VALUE}" && echo secret-visible > /probe
+RUN --mount=type=secret,id=build_token echo "{secret_sha}  /run/secrets/build_token" | sha256sum -c - && echo secret-visible > /probe
 RUN test ! -e /run/secrets/build_token
 "#
         ),
@@ -828,18 +839,23 @@ RUN test ! -e /lockfile.txt
     result
 }
 
-/// D9: build-output streaming. A RUN step emitting ~1 MiB of ordered lines
-/// must arrive un-clipped through the proxy (a wedge shows up as the
-/// deadline, truncation as the clip marker or a missing tail), and `-q`
-/// mode must reduce to exactly one image-ID line.
+/// D9: build-output streaming. A RUN step emitting ordered lines, paced
+/// under BuildKit's step-log rate clip, must arrive complete through the
+/// proxy (a wedge shows up as the deadline, truncation as the clip marker
+/// or a missing tail), and `-q` mode must reduce to one image-ID line.
 fn output_streaming(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
     let ctx = data_dir.join("d9-ctx");
     std::fs::create_dir_all(&ctx).context("creating d9 context dir")?;
+    let total_lines = STREAM_CHUNKS * STREAM_CHUNK_LINES;
+    let chunk_indices = (1..=STREAM_CHUNKS)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
     std::fs::write(
         ctx.join("Dockerfile"),
         format!(
             r"FROM {image}
-RUN seq 1 {STREAM_LINES}
+RUN for i in {chunk_indices}; do seq $(( (i-1)*{STREAM_CHUNK_LINES} + 1 )) $(( i*{STREAM_CHUNK_LINES} )); sleep 1; done
 RUN echo streamed > /marker
 "
         ),
@@ -859,8 +875,8 @@ RUN echo streamed > /marker
         if output.contains("output clipped") {
             bail!("streaming: BuildKit clipped the step log (proxy delivered a truncated stream)");
         }
-        let tail_marker = STREAM_LINES.to_string();
-        let near_tail_marker = (STREAM_LINES - 1).to_string();
+        let tail_marker = total_lines.to_string();
+        let near_tail_marker = (total_lines - 1).to_string();
         if !output.contains(&tail_marker) || !output.contains(&near_tail_marker) {
             bail!("streaming: tail of the step log missing ({near_tail_marker}/{tail_marker})");
         }

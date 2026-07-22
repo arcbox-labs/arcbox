@@ -100,7 +100,7 @@ assertions are deadlines and behavior, never absolute throughput.
 | D6 | cross-platform args + FEX (vaultwarden/moby; ABX-375) | (a) `--platform=$BUILDPLATFORM` FROM + `TARGETARCH` expansion, native; (b) `--platform linux/amd64` with a `RUN uname -m` step | (a) correct arch strings baked; (b) FEX provisioned ⇒ `x86_64` output, else **fail-closed** with the actionable error (both directions asserted) |
 | D7 | concurrent builds (CI shape) | 4 parallel distinct builds + 2 same-context duplicates | all complete ≤ deadline; no cross-talk (unique markers per image); zombie sweep clean |
 | D8 | cancellation (production reality) | kill client mid-context-upload and mid-RUN; rebuild after | daemon log free of proxy ERROR; follow-up build succeeds; no leaked build processes guest-side |
-| D9 | output streaming | `--progress=plain` with a RUN emitting ~1 MiB of ordered lines (below BuildKit's per-step clip, so "no clip marker" is a fair assertion); `docker build -q` | tail lines present, no clip marker, deadline catches a wedge; quiet mode prints exactly one image ID *(implemented)* |
+| D9 | output streaming | `--progress=plain` with a RUN emitting 50k ordered lines PACED under BuildKit's 200 KiB/s step-log rate clip (bulk output is clipped by design and proves nothing); `docker build -q` | tail lines present, no clip marker, deadline catches a wedge; quiet mode prints exactly one image ID *(implemented)* |
 | D10 | exporters | `docker build -o type=local,dest=…` and `-o type=tar` | exported artifact byte-exact vs in-image content — exercises reverse session streaming *(implemented)* |
 
 External syntax frontends (`# syntax=docker/dockerfile:1`) are exercised in
