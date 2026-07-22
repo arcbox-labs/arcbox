@@ -4,6 +4,9 @@ pub const GUEST_DOCKER_VSOCK_PORT_KEY: &str = "arcbox.guest_docker_vsock_port=";
 /// Kernel cmdline key for guest Docker data block-device path.
 pub const DOCKER_DATA_DEVICE_KEY: &str = "arcbox.docker_data_device=";
 
+/// Kernel cmdline key for guest Docker metadata block-device path.
+pub const DOCKER_METADATA_DEVICE_KEY: &str = "arcbox.docker_metadata_device=";
+
 /// Kernel cmdline key carrying the host path of the interactive debug-console
 /// Unix socket (custom-HV backend).
 ///

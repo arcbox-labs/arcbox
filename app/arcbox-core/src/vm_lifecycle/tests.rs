@@ -1,5 +1,5 @@
 use super::boot::{agent_timeout_error, ensure_earlycon, ensure_sparse_block_image};
-use super::types::{DesiredBoot, machine_drift_reason};
+use super::types::{DesiredBoot, machine_drift_reason, metadata_image_filename};
 use super::*;
 use crate::machine::MachineState;
 use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
@@ -152,7 +152,20 @@ fn sample_machine(cpus: u32, memory_mb: u64, kernel: &str, cmdline: &str) -> Mac
         disk_gb: 50,
         kernel: Some(kernel.to_string()),
         cmdline: Some(cmdline.to_string()),
-        block_devices: Vec::new(),
+        block_devices: vec![
+            crate::vm::BlockDeviceConfig {
+                path: "/rootfs.erofs".to_string(),
+                read_only: true,
+            },
+            crate::vm::BlockDeviceConfig {
+                path: "/data/docker.img".to_string(),
+                read_only: false,
+            },
+            crate::vm::BlockDeviceConfig {
+                path: "/data/docker-meta.img".to_string(),
+                read_only: false,
+            },
+        ],
         distro: None,
         distro_version: None,
         disk_path: None,
@@ -197,7 +210,25 @@ fn machine_drift_detects_each_overridable_field() {
 
     // The cmdline gap that previously slipped through (e.g. arm64.nosve
     // added/removed without bumping the boot-asset version).
-    let mut m = current;
+    let mut m = current.clone();
     m.cmdline = Some("console=hvc0 earlycon arm64.nosve".to_string());
     assert_eq!(machine_drift_reason(&m, &want, &boot), Some("cmdline"));
+
+    // A machine persisted before the ext4 metadata volume (two disks) must
+    // be recreated so the guest receives vdc.
+    let mut m = current;
+    m.block_devices.pop();
+    assert_eq!(
+        machine_drift_reason(&m, &want, &boot),
+        Some("block_devices")
+    );
+}
+
+#[test]
+fn metadata_image_filename_pairs_with_data_image() {
+    assert_eq!(metadata_image_filename("docker.img"), "docker-meta.img");
+    assert_eq!(
+        metadata_image_filename("docker-rosetta.img"),
+        "docker-rosetta-meta.img"
+    );
 }

@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 
 use arcbox_core::persistence::MachinePersistence;
 
-const DISK_IMAGE_NAMES: [&str; 2] = ["docker.img", "docker-rosetta.img"];
+const DISK_IMAGE_NAMES: [&str; 4] = [
+    "docker.img",
+    "docker-meta.img",
+    "docker-rosetta.img",
+    "docker-rosetta-meta.img",
+];
 
 /// Why startup must scan for stale disk-image holders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

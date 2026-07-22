@@ -774,6 +774,15 @@ async fn try_start_bundled_runtime() -> String {
         Err(e) => return format!("data volume setup failed: {}", e),
     }
 
+    // Bind the fsync-hot metadata dirs onto the ext4 volume before the
+    // daemons open their boltdb files. A hard error means the volume exists
+    // but is unusable — starting dockerd against the stale shadowed btrfs
+    // state would fork it, so abort instead.
+    match super::metadata_volume::ensure_metadata_mount() {
+        Ok(note) => notes.push(note),
+        Err(e) => return format!("metadata volume setup failed: {}", e),
+    }
+
     // The docker data mount now exists; export it read-only over NFS.
     setup_nfs_export(&mut notes);
 

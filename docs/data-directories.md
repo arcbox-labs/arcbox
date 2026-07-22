@@ -57,6 +57,7 @@ Defined in `app/arcbox-core/src/config.rs`.
 | `data/machines/` | Virtual machine data | daemon |
 | `data/volumes/` | Named volumes | daemon |
 | `data/docker.img` | Docker persistent disk image (Btrfs) | daemon |
+| `data/docker-meta.img` | Docker metadata disk image (ext4, fsync-hot boltdb state); paired with `docker.img` — back up or move the two together | daemon |
 
 ### 1.4 `boot/` — Boot Asset Cache
 
