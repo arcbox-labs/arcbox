@@ -131,12 +131,17 @@ manual `xtask` run of the same fixtures against another engine's
 
 ## Status
 
-D1–D3 are implemented (`tests/e2e/tests/docker_build.rs`) and currently
-**red for a real product reason**: every buildx-driven build hangs because
-guest FEX spins forever on BuildKit's amd64 arch-probe ELF, permanently
-wedging the BuildKit Control API (ABX-494 — first caught by this suite's
-first run; `network_workload` W14 reproduces it too). Do not weaken the
-suite; it goes green when ABX-494 is fixed.
+D1–D5 and D9–D10 are implemented (`tests/e2e/tests/docker_build.rs`) and
+**fully green** against boot bundle ≥ 0.6.10. The suite's first-ever run
+caught ABX-494 (guest FEX spun forever on BuildKit's amd64 arch-probe,
+wedging the whole BuildKit Control API; fixed by boot-assets#44), and its
+first green-guest run caught a latent harness bug (`run_with_timeout`
+didn't drain pipes, turning any >64 KiB-output command into a bogus
+timeout). On bundles < 0.6.10 the suite is red by design — do not weaken
+it. Two BuildKit realities encoded in the assertions: image IDs are not
+comparable across builds (`created` is re-stamped even on full cache
+hits), and step logs are rate-clipped at 200 KiB/s (chatty RUNs must be
+paced).
 
 ## Phasing
 
