@@ -180,7 +180,7 @@ fn checksum_add_fast(data: &[u8]) -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is mandatory on AArch64.
-        return unsafe { checksum_add_neon(data) };
+        unsafe { checksum_add_neon(data) }
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -288,7 +288,10 @@ pub fn checksum_simd(data: &[u8]) -> u16 {
 }
 
 /// Deprecated name kept for external callers that linked the old NEON entry.
+///
+/// Prefer [`checksum`] or [`checksum_simd`].
 #[cfg(target_arch = "aarch64")]
+#[deprecated(note = "use checksum() or checksum_simd() instead")]
 #[target_feature(enable = "neon")]
 #[inline]
 pub unsafe fn checksum_simd_neon(data: &[u8]) -> u16 {
