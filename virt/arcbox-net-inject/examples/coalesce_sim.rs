@@ -110,6 +110,9 @@ fn main() {
     println!(
         "duration={duration_s}s BATCH={BATCH_SIZE} default={WINDOW_DEFAULT_US}µs max={WINDOW_MAX_US}µs expand_min_fps={EXPAND_MIN_FPS} quiet_max_batch={QUIET_MAX_BATCH}"
     );
+    println!(
+        "Note: 'irqs' here = non-empty flushes with EVENT_IDX off; production can suppress further."
+    );
     println!();
     println!(
         "{:<32} {:<12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8}",
