@@ -16,8 +16,10 @@ use crate::error::{CoreError, Result};
 use crate::event::Event;
 use crate::machine::MachineConfig;
 use arcbox_constants::cmdline::{
-    DEBUG_CONSOLE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE,
+    DEBUG_CONSOLE_KEY, DOCKER_METADATA_DEVICE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
+    HV_EARLYCON_DIRECTIVE,
 };
+use arcbox_constants::devices::DOCKER_METADATA_BLOCK_DEVICE;
 use arcbox_error::CommonError;
 
 use super::actor::{Completion, InternalEvent, LifecycleShared};
@@ -457,6 +459,20 @@ impl LifecycleShared {
                 cmdline.push_str(GUEST_DOCKER_VSOCK_PORT_KEY);
                 cmdline.push_str(&port.to_string());
             }
+        }
+
+        // Declare the ext4 metadata device this machine attaches as vdc.
+        // Unlike the data device (auto-detected for its HVC fast path), the
+        // declaration is authoritative: key present → the agent waits for
+        // the node and hard-fails if it never appears; key absent (older
+        // daemon) → the agent skips the metadata volume without probing.
+        if !cmdline
+            .split_whitespace()
+            .any(|token| token.starts_with(DOCKER_METADATA_DEVICE_KEY))
+        {
+            cmdline.push(' ');
+            cmdline.push_str(DOCKER_METADATA_DEVICE_KEY);
+            cmdline.push_str(DOCKER_METADATA_BLOCK_DEVICE);
         }
 
         // Always attach an interactive debug console on the custom-HV backend.

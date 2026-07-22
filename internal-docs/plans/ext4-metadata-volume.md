@@ -36,7 +36,7 @@ current btrfs locations. Everything else stays on btrfs unchanged.
 | Storage for ext4 | Second virtio-blk disk image | Loop file on btrfs rejected: loop FLUSH re-enters the btrfs commit path, keeping the 9.5 ms cost. GPT-partitioning docker.img rejected: destructive migration of existing whole-disk btrfs images. |
 | Image name | `<data-stem>-meta.img` derived from the data image (`docker.img` → `docker-meta.img`, `docker-rosetta.img` → `docker-rosetta-meta.img`) | Follows the existing per-VM data-image parameterization (`vm_lifecycle/mod.rs::for_machine`). |
 | Virtual size | 2 GiB, sparse (`ensure_sparse_block_image`), no resize path | Holds only bolt DBs + small configs; 2 GiB is ~100× headroom. No resize2fs in guest; fixed size avoids that dependency. |
-| Guest device | `/dev/vdc` (third `BlockDeviceConfig` in the Vec; both backends attach in Vec order) + cmdline override key `arcbox.docker_metadata_device=` mirroring the existing data-device pattern | HV additionally exposes serial `arcbox-blk-docker-meta.img` via GET_ID, but ordering is already the load-bearing contract for vdb. No HVC fast-path analogue — metadata I/O is tiny. |
+| Guest device | `/dev/vdc` (third `BlockDeviceConfig` in the Vec; both backends attach in Vec order), **declared** by the host via `arcbox.docker_metadata_device=` on the cmdline when it attaches the disk | Declaration is authoritative: key present → the agent waits for the node and hard-fails if it never appears; key absent (older daemon) → zero-delay skip (an already-present default node is still honored for bespoke e2e configs). Unlike the data device there is no HVC fast path to auto-detect, so no probe-timeout heuristics. HV additionally exposes serial `arcbox-blk-docker-meta.img` via GET_ID. |
 | Formatter | `mkfs.ext4` (static e2fsprogs) added to the guest rootfs via boot-assets, invoked guest-side like `mkfs.btrfs` | `arcbox-ext4` crate rejected: its formatter sets no `HAS_JOURNAL` (registry source, `formatter.rs:1107-1111`), and journal-less ext4 has no crash replay — VM force-stop is a routine event and these DBs are the system of record. Host-side formatting impossible (no mke2fs on macOS). |
 | mkfs options | `mkfs.ext4 -F -O fast_commit -E lazy_itable_init=0,lazy_journal_init=0 -L arcbox-meta` | fast_commit reduces exactly our fsync pattern (small metadata commits); kernel is 6.x with `CONFIG_EXT4_FS=y` on both arches. Lazy init off: one-time cost at first format, no background trickle. |
 | Mount options | `noatime` (defaults otherwise: `data=ordered`, barriers on) | `discard` skipped — bolt files are stable in size, few deletes. |
@@ -91,8 +91,10 @@ New module `agent/linux/metadata_volume.rs`, called from
 `ensure_data_mount()` — i.e. after btrfs targets exist, before the NFS export
 and before containerd/dockerd start (bolt files guaranteed closed):
 
-1. Resolve device: cmdline override → `/dev/vdc`; wait up to 5 s for the node
-   (same loop as `btrfs.rs`).
+1. Resolve device from the host's cmdline declaration; wait up to 5 s for
+   the declared node (same loop as `btrfs.rs`) and hard-fail if it never
+   appears. No declaration → skip immediately (older daemon), unless the
+   default node already exists (bespoke e2e configs).
 2. Probe ext4 superblock magic (0xEF53 at offset 0x438). If absent →
    `mkfs.ext4` with the locked options.
 3. Mount at `/run/arcbox/metadata` (`noatime`). On failure: `e2fsck -y`,
@@ -119,7 +121,8 @@ Failure policy (version-skew safe):
 
 | Condition | Behavior |
 |---|---|
-| Device node absent (older daemon without the third disk) | warn + continue on btrfs — perf-only degradation |
+| No cmdline declaration and no default node (older daemon without the third disk) | warn + continue on btrfs, zero probe delay — perf-only degradation |
+| Device declared but the node never appears | **hard fail** — the host promised the disk; a silent skip could boot dockerd against stale shadowed state |
 | mkfs binary absent AND device blank (older rootfs) | warn + continue — nothing was ever migrated, no split-brain possible |
 | Device present with ext4 but mount/fsck fails | **hard fail** runtime start — booting dockerd against the stale shadowed btrfs DBs would fork state |
 

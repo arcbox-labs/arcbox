@@ -13,7 +13,9 @@ use std::path::Path;
 
 use arcbox_constants::paths::{CONTAINERD_DATA_MOUNT_POINT, DOCKER_DATA_MOUNT_POINT};
 
-use super::cmdline::docker_metadata_device;
+use arcbox_constants::devices::DOCKER_METADATA_BLOCK_DEVICE;
+
+use super::cmdline::declared_docker_metadata_device;
 use crate::metadata_migrate::{EntryKind, Prepared, prepare_entry};
 
 /// Mount point of the raw ext4 volume (`/run` is tmpfs, writable).
@@ -79,21 +81,36 @@ fn mappings() -> Vec<Mapping> {
 /// files must be closed while entries migrate).
 ///
 /// Failure policy (version-skew safe, see the plan doc):
-/// - device absent (daemon without the third disk) → `Ok`, btrfs-only boot;
+/// - no cmdline declaration and no default node (older daemon without the
+///   third disk) → `Ok`, btrfs-only boot, zero probe delay;
 /// - mkfs binary absent AND device blank (older rootfs) → `Ok`, skip;
-/// - device present with ext4 but mount/prepare/bind fails → `Err` — booting
-///   dockerd against the stale shadowed btrfs state would fork it.
+/// - device declared but never appears, or present but unusable after an
+///   `e2fsck -y` retry → `Err` — booting dockerd against the stale shadowed
+///   btrfs state would fork it.
 pub(super) fn ensure_metadata_mount() -> Result<String, String> {
     let maps = mappings();
     if maps.iter().all(|m| crate::mount::is_mounted(&m.target)) {
         return Ok("metadata binds already mounted".to_string());
     }
 
-    let device = docker_metadata_device();
-    if !wait_for_device(&device) {
-        tracing::warn!(device, "metadata device absent; running btrfs-only layout");
-        return Ok(format!("metadata device {device} absent; skipped"));
-    }
+    let device = match declared_docker_metadata_device() {
+        Some(device) => {
+            if !wait_for_device(&device) {
+                return Err(format!("declared metadata device {device} never appeared"));
+            }
+            device
+        }
+        // No declaration (older daemon). An already-present default node is
+        // still honored so bespoke configs (e2e probes) can attach the disk
+        // without a cmdline; otherwise run the btrfs-only layout.
+        None if Path::new(DOCKER_METADATA_BLOCK_DEVICE).exists() => {
+            DOCKER_METADATA_BLOCK_DEVICE.to_string()
+        }
+        None => {
+            tracing::warn!("no metadata device declared or present; btrfs-only layout");
+            return Ok("metadata volume skipped (no device)".to_string());
+        }
+    };
 
     let mut notes = Vec::new();
 
