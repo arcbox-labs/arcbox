@@ -3,9 +3,13 @@
 use std::path::Path;
 
 use arcbox_constants::cmdline::{
-    DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
+    DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY,
+    DOCKER_METADATA_DEVICE_KEY as DOCKER_METADATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
 };
-use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
+use arcbox_constants::devices::{
+    DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT,
+    DOCKER_METADATA_BLOCK_DEVICE as DOCKER_METADATA_DEVICE_DEFAULT,
+};
 use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
 use arcbox_constants::ports::{DOCKER_API_VSOCK_PORT, KUBERNETES_API_VSOCK_PORT};
 
@@ -57,6 +61,17 @@ pub(super) fn docker_data_device() -> String {
         return HVC_DATA_DEVICE.to_string();
     }
     DOCKER_DATA_DEVICE_DEFAULT.to_string()
+}
+
+pub(super) fn docker_metadata_device() -> String {
+    // Prefer explicit kernel cmdline override; no HVC fast-path analogue —
+    // metadata I/O is tiny, plain virtio-blk is plenty.
+    if let Some(v) = cmdline_value(DOCKER_METADATA_DEVICE_CMDLINE_KEY) {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    DOCKER_METADATA_DEVICE_DEFAULT.to_string()
 }
 
 pub(super) fn kubernetes_api_vsock_port() -> u32 {

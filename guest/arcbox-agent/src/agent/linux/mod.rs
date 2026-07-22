@@ -10,6 +10,7 @@ mod disk;
 mod kubernetes;
 mod machine_exec;
 mod memory_pressure;
+mod metadata_volume;
 mod port_forward;
 mod probe;
 mod proxy;
