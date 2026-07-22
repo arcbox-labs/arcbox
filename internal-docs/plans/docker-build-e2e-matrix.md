@@ -128,21 +128,33 @@ outside the timed region; real-project contexts fetched at the Tier X
 pins, with X2's pnpm accommodation). Single-shot numbers — trend anchors,
 not gates.
 
-| shape | wall |
-|---|---|
-| simple 3-RUN alpine build, cold (includes first-build builder bootstrap + arch probes) | 8.1 s |
-| same build, full cache hit | 1.8 s |
-| 512 MiB + 100k-file context, cold | 26.4 s |
-| 12-stage diamond, cold | 12.7 s |
-| `--platform linux/amd64` (FEX): probe + 300k-iteration shell loop | 6.4 s |
-| postgres `17/bookworm` (real apt + gpg + wget) | 75.6 s |
-| next.js `with-docker` (pnpm frozen install + `next build`) | 37.8 s |
-| caddy `2.11/builder` (apk + xcaddy fetch) | 25.2 s |
+Comparison engine: Colima 0.10.3 on the same host, matched shape (18
+vCPU / 16 GiB, VZ, virtiofs, `--vz-rosetta`; its dockerd 29.5.2 — one
+minor behind ArcBox's 29.6.1, same BuildKit generation).
 
-Cross-engine comparison was not possible on the baseline host — OrbStack
-is uninstalled there (dangling `~/.orbstack`); the harness takes any
-engine via `DOCKER_HOST` when one is available. Pre-ABX-494 every row
-below the cache-hit line was ∞ (all buildx builds hung).
+| shape | ArcBox | Colima | ratio |
+|---|---|---|---|
+| simple 3-RUN alpine build, cold | 8.1 s | 0.60 s | **13.5×** |
+| same build, full cache hit | 1.8 s | 0.16 s | **11×** |
+| 512 MiB + 100k-file context, cold | 26.4 s | 20.3 s | 1.3× |
+| 12-stage diamond, cold | 12.7 s | 1.5 s | **8.4×** |
+| `--platform linux/amd64` (FEX vs Rosetta): probe + 300k-iter shell loop | 6.4 s | 0.87 s | 7.3× |
+| postgres `17/bookworm` (real apt + gpg + wget) | 75.6 s | 40.7 s | 1.9× |
+| next.js `with-docker` (pnpm frozen install + `next build`) | 37.8 s | 27.1 s | 1.4× |
+| caddy `2.11/builder` (apk + xcaddy fetch) | 25.2 s | 16.0 s | 1.6× |
+
+Reading: throughput-bound shapes (large context, real network builds)
+sit at 1.3–1.9× — the datapath holds up. The 8–13× rows are all
+**per-build / per-step overhead**: ~1 s per stage on ArcBox vs ~0.1 s on
+Colima (multistage), and a 1.8 s floor for a fully-cached build vs
+0.16 s. The bottleneck is round-trip/latency-shaped, not
+bandwidth-shaped — suspects are the per-request vsock connect in the
+docker proxy, session/gRPC round trips through the two-hop relay, and
+per-layer snapshot-commit cost on the guest disk; profiling needed
+(tracked in Linear). The amd64 row is dominated by the same overhead,
+so it does NOT cleanly measure FEX-vs-Rosetta CPU speed. Pre-ABX-494
+every ArcBox row below the cache-hit line was ∞ (all buildx builds
+hung).
 
 ## Bench methodology
 
