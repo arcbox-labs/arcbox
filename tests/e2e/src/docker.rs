@@ -5,6 +5,7 @@
 //! via `DOCKER_HOST`, so the developer's Docker context and any host
 //! daemon stay untouched (see tests/e2e/README.md on isolation).
 
+use std::io::Read as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -141,22 +142,104 @@ pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
 }
 
 /// Runs a command, killing it once `timeout` passes.
+///
+/// Both pipes are drained on background threads for the whole run: an
+/// undrained pipe fills at ~64 KiB and blocks the child, which turns any
+/// chatty command (a `--progress=plain` build, a large pull) into a bogus
+/// timeout. On a real timeout the error carries the output tail, so a
+/// killed command still leaves forensics.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout_thread = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr_thread = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if child.try_wait()?.is_some() {
-            return child
-                .wait_with_output()
-                .context("collecting command output");
+        if let Some(status) = child.try_wait()? {
+            let stdout = stdout_thread.join().unwrap_or_default();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         thread::sleep(Duration::from_millis(100));
     }
 
     let _ = child.kill();
     let _ = child.wait();
-    Err(anyhow!("command timed out after {}s", timeout.as_secs()))
+    // Killing the child EOFs the pipes, so the drain threads finish.
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    let mut tail_start = combined.len().saturating_sub(2000);
+    while !combined.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    Err(anyhow!(
+        "command timed out after {}s; output tail:\n{}",
+        timeout.as_secs(),
+        &combined[tail_start..]
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command whose output exceeds the OS pipe buffer must complete: an
+    /// undrained pipe blocks the child at ~64 KiB and the old implementation
+    /// turned every chatty command into a bogus timeout (caught by the
+    /// docker_build D9 streaming scenario).
+    #[test]
+    fn chatty_command_is_drained_not_deadlocked() {
+        let output = run_with_timeout(
+            Command::new("sh").args([
+                "-c",
+                "dd if=/dev/zero bs=1024 count=256 2>/dev/null | base64",
+            ]),
+            Duration::from_secs(20),
+        )
+        .expect("chatty command must not time out");
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 64 * 1024);
+    }
+
+    /// A genuine timeout must surface the output tail for forensics.
+    #[test]
+    fn timeout_error_carries_output_tail() {
+        let error = run_with_timeout(
+            Command::new("sh").args(["-c", "echo tail-marker; sleep 30"]),
+            Duration::from_secs(1),
+        )
+        .expect_err("command must time out");
+        assert!(error.to_string().contains("tail-marker"));
+    }
 }
