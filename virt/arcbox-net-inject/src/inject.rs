@@ -228,11 +228,8 @@ impl RxInjectThread {
             fire = false;
         }
 
-        // Final flush on shutdown if a partial batch was left mid-iteration
-        // (running flag cleared between pushes).
-        if fire {
-            self.flush_interrupt(&queue, fire);
-        }
+        // Every loop iteration ends in finish_batch (which flushes when
+        // batch > 0), so no trailing flush is needed on exit.
 
         tracing::info!(
             frames = stats.frames_injected(),

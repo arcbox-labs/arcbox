@@ -87,7 +87,7 @@ impl InjectStats {
 
     /// Log at most once per second at debug level (interval deltas + current window).
     ///
-    /// No-ops immediately when DEBUG is disabled so the inject hot path does
+    /// Returns immediately when DEBUG is disabled so the inject hot path does
     /// not pay for `Instant::now()` under normal logging.
     pub fn maybe_log(&mut self) {
         if !tracing::enabled!(Level::DEBUG) {
