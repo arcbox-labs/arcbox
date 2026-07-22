@@ -28,6 +28,18 @@ use crate::stats::InjectStats;
 /// Backoff duration when RX descriptors are exhausted.
 const DESCRIPTOR_BACKOFF: Duration = Duration::from_micros(100);
 
+/// Arguments for [`RxInjectThread::finish_batch`].
+struct FinishBatch<'a> {
+    queue: &'a SplitQueue,
+    batch: u16,
+    fire: bool,
+    window_budget_us: u32,
+    filled_early: bool,
+    allow_adapt: bool,
+    policy: &'a mut CoalescePolicy,
+    stats: &'a mut InjectStats,
+}
+
 /// Context for the RX injection thread.
 pub struct RxInjectThread {
     /// Channel receiving raw Ethernet frames from the producer.
@@ -82,27 +94,6 @@ impl RxInjectThread {
         let mut policy = CoalescePolicy::new();
         let mut stats = InjectStats::default();
 
-        // Flush + stats + policy in one place (normal, exhaustion, disconnect, idle).
-        let finish_batch = |queue: &SplitQueue,
-                            batch: u16,
-                            fire: bool,
-                            window_budget_us: u32,
-                            filled_early: bool,
-                            allow_adapt: bool,
-                            policy: &mut CoalescePolicy,
-                            stats: &mut InjectStats,
-                            thread: &Self| {
-            if batch > 0 {
-                thread.flush_interrupt(queue, fire);
-                stats.on_flush(batch, fire, window_budget_us);
-            }
-            // Always observe (incl. batch == 0 idle) so the window can decay.
-            policy.observe(batch, filled_early, allow_adapt);
-            stats.sync_policy_events(policy.expand_events(), policy.shrink_events());
-            stats.window_us = window_budget_us;
-            stats.maybe_log();
-        };
-
         loop {
             if !self.running.load(Ordering::Relaxed) {
                 break;
@@ -155,22 +146,21 @@ impl RxInjectThread {
                     Err(RecvTimeoutError::Disconnected) => {
                         tracing::info!("rx-inject: channel disconnected, shutting down");
                         let filled_early = (batch as usize) >= BATCH_SIZE;
-                        finish_batch(
-                            &queue,
+                        self.finish_batch(FinishBatch {
+                            queue: &queue,
                             batch,
                             fire,
                             window_budget_us,
                             filled_early,
-                            true,
-                            &mut policy,
-                            &mut stats,
-                            &self,
-                        );
+                            allow_adapt: true,
+                            policy: &mut policy,
+                            stats: &mut stats,
+                        });
                         tracing::info!(
-                            frames = stats.frames_injected,
-                            flushes = stats.flushes,
-                            irqs_fired = stats.irqs_fired,
-                            window_us_max = stats.window_us_max,
+                            frames = stats.frames_injected(),
+                            flushes = stats.flushes(),
+                            irqs_fired = stats.irqs_fired(),
+                            window_us_max = stats.window_us_max(),
                             "rx-inject thread stopped (channel disconnected, {} inline conns)",
                             inline_conns.len(),
                         );
@@ -186,17 +176,16 @@ impl RxInjectThread {
                     // backoff. Do not adapt the window (storms neither expand
                     // nor shrink latency budget).
                     if batch > 0 {
-                        finish_batch(
-                            &queue,
+                        self.finish_batch(FinishBatch {
+                            queue: &queue,
                             batch,
                             fire,
                             window_budget_us,
-                            false,
-                            false,
-                            &mut policy,
-                            &mut stats,
-                            &self,
-                        );
+                            filled_early: false,
+                            allow_adapt: false,
+                            policy: &mut policy,
+                            stats: &mut stats,
+                        });
                         fire = false;
                         batch = 0;
                     }
@@ -214,17 +203,16 @@ impl RxInjectThread {
             // Normal end of gather: timeout or BATCH full. Empty idle still
             // observes so the window can decay after load.
             let filled_early = (batch as usize) >= BATCH_SIZE;
-            finish_batch(
-                &queue,
+            self.finish_batch(FinishBatch {
+                queue: &queue,
                 batch,
                 fire,
                 window_budget_us,
                 filled_early,
-                true,
-                &mut policy,
-                &mut stats,
-                &self,
-            );
+                allow_adapt: true,
+                policy: &mut policy,
+                stats: &mut stats,
+            });
             fire = false;
         }
 
@@ -235,13 +223,28 @@ impl RxInjectThread {
         }
 
         tracing::info!(
-            frames = stats.frames_injected,
-            flushes = stats.flushes,
-            irqs_fired = stats.irqs_fired,
-            window_us_max = stats.window_us_max,
+            frames = stats.frames_injected(),
+            flushes = stats.flushes(),
+            irqs_fired = stats.irqs_fired(),
+            window_us_max = stats.window_us_max(),
             "rx-inject thread stopped ({} inline conns remaining)",
             inline_conns.len(),
         );
+    }
+
+    /// Flush (if any work), update coalesce policy, and emit interval stats.
+    ///
+    /// Used for normal timeout/BATCH completion, descriptor exhaustion,
+    /// channel disconnect, and empty idle ticks (`batch == 0`).
+    fn finish_batch(&self, f: FinishBatch<'_>) {
+        if f.batch > 0 {
+            self.flush_interrupt(f.queue, f.fire);
+            f.stats.on_flush(f.batch, f.fire, f.window_budget_us);
+        }
+        // Always observe (incl. batch == 0 idle) so the window can decay.
+        f.policy.observe(f.batch, f.filled_early, f.allow_adapt);
+        f.stats.sync_from_policy(f.policy, f.window_budget_us);
+        f.stats.maybe_log();
     }
 
     /// Polls all active inline connections, reading from host sockets

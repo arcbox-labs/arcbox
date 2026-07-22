@@ -5,18 +5,20 @@
 
 use std::time::{Duration, Instant};
 
+use crate::coalesce::CoalescePolicy;
+
 /// Per-thread inject path counters.
 #[derive(Debug, Default)]
 pub struct InjectStats {
-    pub frames_injected: u64,
-    pub flushes: u64,
-    pub irqs_fired: u64,
-    pub irqs_suppressed: u64,
-    pub batch_sum: u64,
-    pub window_us: u32,
-    pub window_us_max: u32,
-    pub expand_events: u64,
-    pub shrink_events: u64,
+    frames_injected: u64,
+    flushes: u64,
+    irqs_fired: u64,
+    irqs_suppressed: u64,
+    batch_sum: u64,
+    window_us: u32,
+    window_us_max: u32,
+    expand_events: u64,
+    shrink_events: u64,
     last_log: Option<Instant>,
     /// Snapshot of counters at the last log (for interval rates).
     prev_frames: u64,
@@ -29,6 +31,30 @@ pub struct InjectStats {
 }
 
 impl InjectStats {
+    /// Lifetime frames published to the used ring.
+    #[must_use]
+    pub const fn frames_injected(&self) -> u64 {
+        self.frames_injected
+    }
+
+    /// Lifetime non-empty flushes.
+    #[must_use]
+    pub const fn flushes(&self) -> u64 {
+        self.flushes
+    }
+
+    /// Lifetime IRQs that actually fired.
+    #[must_use]
+    pub const fn irqs_fired(&self) -> u64 {
+        self.irqs_fired
+    }
+
+    /// Peak gather window observed (microseconds).
+    #[must_use]
+    pub const fn window_us_max(&self) -> u32 {
+        self.window_us_max
+    }
+
     /// Record one flush of `batch` frames with notify decision `fired`.
     ///
     /// `window_us` is the gather budget that applied to this batch (not the
@@ -46,13 +72,16 @@ impl InjectStats {
         self.window_us_max = self.window_us_max.max(window_us);
     }
 
-    /// Copy expand/shrink tallies from the policy.
-    pub fn sync_policy_events(&mut self, expand: u64, shrink: u64) {
-        self.expand_events = expand;
-        self.shrink_events = shrink;
+    /// Refresh expand/shrink tallies from the policy and note the budget in effect.
+    pub fn sync_from_policy(&mut self, policy: &CoalescePolicy, window_budget_us: u32) {
+        self.expand_events = policy.expand_events();
+        self.shrink_events = policy.shrink_events();
+        self.window_us = window_budget_us;
     }
 
     /// Log at most once per second at debug level (interval deltas + current window).
+    ///
+    /// Runs at 1 Hz only; allocating short display strings for rates is fine.
     pub fn maybe_log(&mut self) {
         let now = Instant::now();
         let due = self
@@ -89,8 +118,8 @@ impl InjectStats {
             flushes = d_flushes,
             irqs_fired = d_irqs,
             irqs_suppressed = d_suppressed,
-            frames_per_irq = format!("{fpi:.1}"),
-            avg_batch = format!("{avg_batch:.1}"),
+            frames_per_irq = fpi,
+            avg_batch = avg_batch,
             window_us = self.window_us,
             window_us_max = self.window_us_max,
             expand = d_expand,
