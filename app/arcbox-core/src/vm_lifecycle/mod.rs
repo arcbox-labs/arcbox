@@ -84,6 +84,12 @@ const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
 /// only consumes actual disk space for written blocks. 8 TiB matches OrbStack
 /// and prevents users from hitting artificial limits.
 const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+/// Persistent guest metadata image size (2 GiB sparse file).
+///
+/// The ext4 volume holds only the fsync-hot boltdb metadata directories —
+/// bulk data stays on the btrfs data image — so 2 GiB is ~100x headroom.
+/// See internal-docs/plans/ext4-metadata-volume.md.
+const DOCKER_METADATA_IMAGE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub(crate) use boot::ensure_sparse_block_image;
 pub use health::HealthMonitor;

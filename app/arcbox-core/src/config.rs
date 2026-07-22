@@ -179,6 +179,15 @@ impl Config {
     pub fn docker_img_path(&self) -> PathBuf {
         self.data_subdir().join("docker.img")
     }
+
+    /// Returns the path to the Docker metadata image (`data/docker-meta.img`).
+    ///
+    /// Paired with [`Self::docker_img_path`]: the ext4 volume carrying the
+    /// fsync-hot boltdb metadata (see internal-docs/plans/ext4-metadata-volume.md).
+    #[must_use]
+    pub fn docker_meta_img_path(&self) -> PathBuf {
+        self.data_subdir().join("docker-meta.img")
+    }
 }
 
 /// Default VM configuration.

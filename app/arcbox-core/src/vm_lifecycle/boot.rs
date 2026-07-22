@@ -21,8 +21,8 @@ use arcbox_constants::cmdline::{
 use arcbox_error::CommonError;
 
 use super::actor::{Completion, InternalEvent, LifecycleShared};
-use super::types::{DesiredBoot, machine_drift_reason};
-use super::{DOCKER_DATA_IMAGE_SIZE_BYTES, RecoveryAction};
+use super::types::{DesiredBoot, machine_drift_reason, metadata_image_filename};
+use super::{DOCKER_DATA_IMAGE_SIZE_BYTES, DOCKER_METADATA_IMAGE_SIZE_BYTES, RecoveryAction};
 
 impl LifecycleShared {
     /// Boots the VM end-to-end (create if needed, start with retries, wait for
@@ -342,7 +342,8 @@ impl LifecycleShared {
     ///
     /// Block devices:
     /// - vda: rootfs.erofs (read-only)
-    /// - vdb: docker-data.img (read-write)
+    /// - vdb: docker-data.img (read-write, btrfs bulk data)
+    /// - vdc: docker-meta.img (read-write, ext4 metadata volume)
     async fn create_default_machine(&self) -> Result<()> {
         let boot = self.resolve_desired_boot().await?;
         let rootfs_path = boot.rootfs_image.to_string_lossy().to_string();
@@ -365,6 +366,20 @@ impl LifecycleShared {
         // available, falling back to /dev/vdb (VirtIO block).
         block_devices.push(crate::vm::BlockDeviceConfig {
             path: docker_data_image.to_string_lossy().to_string(),
+            read_only: false,
+        });
+
+        // Attach the ext4 metadata volume (vdc): the fsync-hot boltdb
+        // metadata lives there while bulk data stays on the btrfs data disk.
+        // The two images are a paired set — see
+        // internal-docs/plans/ext4-metadata-volume.md.
+        let metadata_image = self
+            .data_dir
+            .join(arcbox_constants::paths::host::DATA)
+            .join(metadata_image_filename(&self.data_image_filename));
+        ensure_sparse_block_image(&metadata_image, DOCKER_METADATA_IMAGE_SIZE_BYTES)?;
+        block_devices.push(crate::vm::BlockDeviceConfig {
+            path: metadata_image.to_string_lossy().to_string(),
             read_only: false,
         });
 

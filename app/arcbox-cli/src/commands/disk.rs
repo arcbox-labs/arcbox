@@ -103,6 +103,22 @@ async fn execute_usage() -> Result<()> {
     );
     println!("  Reclaimable: {:.1} GiB", usage.reclaimable_gib());
 
+    // The metadata image is small but part of the data set; report it so
+    // "what is on disk" is complete.
+    let meta_path = config.docker_meta_img_path();
+    if meta_path.exists() {
+        let meta = read_disk_usage(&meta_path)?;
+        println!();
+        println!("Docker metadata disk:");
+        println!("  Path:        {}", meta_path.display());
+        println!("  Logical:     {:.1} GiB", meta.logical_gib());
+        println!(
+            "  Physical:    {:.1} GiB   ({:.1}%)",
+            meta.physical_gib(),
+            meta.usage_pct()
+        );
+    }
+
     Ok(())
 }
 

@@ -188,7 +188,26 @@ pub(super) fn machine_drift_reason(
         Some("kernel")
     } else if persisted.cmdline.as_deref() != Some(boot.cmdline.as_str()) {
         Some("cmdline")
+    } else if persisted.block_devices.len() != DEFAULT_MACHINE_DISK_COUNT {
+        // A machine persisted before the ext4 metadata volume carries only
+        // two disks; recreating rewrites the machine record (image files are
+        // untouched) so the guest receives vdc and can migrate.
+        Some("block_devices")
     } else {
         None
     }
+}
+
+/// Number of block devices `create_default_machine` attaches: EROFS rootfs
+/// (vda), btrfs data image (vdb), ext4 metadata image (vdc).
+pub(super) const DEFAULT_MACHINE_DISK_COUNT: usize = 3;
+
+/// Derives the metadata-volume image filename paired with a data image:
+/// `docker.img` → `docker-meta.img`, `docker-rosetta.img` →
+/// `docker-rosetta-meta.img`.
+pub(super) fn metadata_image_filename(data_image_filename: &str) -> String {
+    let stem = data_image_filename
+        .strip_suffix(".img")
+        .unwrap_or(data_image_filename);
+    format!("{stem}-meta.img")
 }
