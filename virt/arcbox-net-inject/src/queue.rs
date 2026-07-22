@@ -1,6 +1,6 @@
 //! Single-frame RX injection through the unified [`SplitQueue`].
 
-use arcbox_virtio::SplitQueue;
+use arcbox_virtio_core::SplitQueue;
 
 /// Virtio-net header size (all zeros for RX passthrough).
 pub const VIRTIO_NET_HDR_SIZE: usize = 12;
@@ -121,7 +121,7 @@ pub fn inject_one_frame(queue: &mut SplitQueue, frame: &[u8]) -> Option<bool> {
 mod tests {
     use std::sync::Arc;
 
-    use arcbox_virtio::{GuestMemWriter, QueueConfig, SplitQueue};
+    use arcbox_virtio_core::{GuestMemWriter, QueueConfig, SplitQueue};
 
     use super::*;
 

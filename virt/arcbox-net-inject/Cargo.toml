@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-arcbox-virtio = { workspace = true }
+arcbox-virtio-core = { workspace = true }
 crossbeam-channel = "0.5"
 tracing = "0.1"
 

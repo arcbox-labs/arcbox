@@ -16,29 +16,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arcbox_virtio::{GuestMemWriter, QueueConfig, SplitQueue};
+use arcbox_virtio_core::{GuestMemWriter, QueueConfig, SplitQueue};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
+use crate::coalesce::{BATCH_SIZE, CoalescePolicy};
 use crate::inline_conn::{self, InlineConn};
 use crate::irq::IrqHandle;
 use crate::queue;
-
-/// Maximum frames to inject per batch before checking interrupt thresholds.
-///
-/// At line-rate (~9 Gbps, 500k fps), a batch of 64 frames means the inject
-/// thread fires IRQ ~8000 times/second. Each IRQ entails an MMIO trap and
-/// guest-side RX soft-irq processing. Raising to 256 cuts IRQ rate to
-/// ~2000/s while the 50 µs `COALESCE_TIMEOUT` still bounds latency.
-const BATCH_SIZE: usize = 256;
-
-/// Interrupt coalescing timeout.
-///
-/// With GSO on the RX path the average frame size is ~30 KiB, so at
-/// 10 Gbps we're at ~37 kfps — a 50 µs timeout only batches ~2 frames
-/// before firing an IRQ, so the `BATCH_SIZE` ceiling is never reached.
-/// 200 µs raises the effective batch to ~7 frames without noticeably
-/// hurting ACK latency (Linux NAPI poll is typically 200 µs anyway).
-const COALESCE_TIMEOUT: Duration = Duration::from_micros(200);
+use crate::stats::InjectStats;
 
 /// Backoff duration when RX descriptors are exhausted.
 const DESCRIPTOR_BACKOFF: Duration = Duration::from_micros(100);
@@ -94,6 +79,29 @@ impl RxInjectThread {
         let mut inline_conns: Vec<InlineConn> = Vec::new();
         // Whether any push since the last flush requested an interrupt.
         let mut fire = false;
+        let mut policy = CoalescePolicy::new();
+        let mut stats = InjectStats::default();
+
+        // Flush + stats + policy in one place (normal, exhaustion, disconnect, idle).
+        let finish_batch = |queue: &SplitQueue,
+                            batch: u16,
+                            fire: bool,
+                            window_budget_us: u32,
+                            filled_early: bool,
+                            allow_adapt: bool,
+                            policy: &mut CoalescePolicy,
+                            stats: &mut InjectStats,
+                            thread: &Self| {
+            if batch > 0 {
+                thread.flush_interrupt(queue, fire);
+                stats.on_flush(batch, fire, window_budget_us);
+            }
+            // Always observe (incl. batch == 0 idle) so the window can decay.
+            policy.observe(batch, filled_early, allow_adapt);
+            stats.sync_policy_events(policy.expand_events(), policy.shrink_events());
+            stats.window_us = window_budget_us;
+            stats.maybe_log();
+        };
 
         loop {
             if !self.running.load(Ordering::Relaxed) {
@@ -114,6 +122,8 @@ impl RxInjectThread {
 
             let mut batch = 0u16;
             let loop_start = Instant::now();
+            let window_budget_us = policy.window_us();
+            let window = Duration::from_micros(u64::from(window_budget_us));
 
             // Phase 2: Poll inline connections (direct socket -> guest buffer).
             if !inline_conns.is_empty() {
@@ -121,17 +131,17 @@ impl RxInjectThread {
             }
 
             // Phase 3: Drain channel frames (classifier / DHCP / DNS / ARP).
-            // Use the remaining coalescing timeout after inline polling.
+            // Use the remaining adaptive window after inline polling.
             let elapsed = loop_start.elapsed();
-            let remaining = COALESCE_TIMEOUT.saturating_sub(elapsed);
+            let remaining = window.saturating_sub(elapsed);
 
             while (batch as usize) < BATCH_SIZE {
                 // Use the remaining timeout for the first recv, then zero
                 // for subsequent ones to drain without blocking.
                 let timeout = if batch == 0 && inline_conns.is_empty() {
                     // No inline conns and nothing batched yet — block for
-                    // the full coalescing timeout.
-                    COALESCE_TIMEOUT
+                    // the full coalescing window.
+                    window
                 } else if remaining.is_zero() {
                     // Timeout already consumed by inline polling — try_recv only.
                     Duration::ZERO
@@ -144,9 +154,26 @@ impl RxInjectThread {
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => {
                         tracing::info!("rx-inject: channel disconnected, shutting down");
-                        if batch > 0 {
-                            self.flush_interrupt(&queue, fire);
-                        }
+                        let filled_early = (batch as usize) >= BATCH_SIZE;
+                        finish_batch(
+                            &queue,
+                            batch,
+                            fire,
+                            window_budget_us,
+                            filled_early,
+                            true,
+                            &mut policy,
+                            &mut stats,
+                            &self,
+                        );
+                        tracing::info!(
+                            frames = stats.frames_injected,
+                            flushes = stats.flushes,
+                            irqs_fired = stats.irqs_fired,
+                            window_us_max = stats.window_us_max,
+                            "rx-inject thread stopped (channel disconnected, {} inline conns)",
+                            inline_conns.len(),
+                        );
                         return;
                     }
                 };
@@ -155,10 +182,21 @@ impl RxInjectThread {
                     fire |= notify;
                     batch += 1;
                 } else {
-                    // Descriptor exhaustion: flush interrupt so guest can
-                    // process and repost, then backoff.
+                    // Descriptor exhaustion: flush so guest can repost, then
+                    // backoff. Do not adapt the window (storms neither expand
+                    // nor shrink latency budget).
                     if batch > 0 {
-                        self.flush_interrupt(&queue, fire);
+                        finish_batch(
+                            &queue,
+                            batch,
+                            fire,
+                            window_budget_us,
+                            false,
+                            false,
+                            &mut policy,
+                            &mut stats,
+                            &self,
+                        );
                         fire = false;
                         batch = 0;
                     }
@@ -173,18 +211,34 @@ impl RxInjectThread {
                 }
             }
 
-            if batch > 0 {
-                self.flush_interrupt(&queue, fire);
-                fire = false;
-            }
+            // Normal end of gather: timeout or BATCH full. Empty idle still
+            // observes so the window can decay after load.
+            let filled_early = (batch as usize) >= BATCH_SIZE;
+            finish_batch(
+                &queue,
+                batch,
+                fire,
+                window_budget_us,
+                filled_early,
+                true,
+                &mut policy,
+                &mut stats,
+                &self,
+            );
+            fire = false;
         }
 
-        // Final flush on shutdown.
+        // Final flush on shutdown if a partial batch was left mid-iteration
+        // (running flag cleared between pushes).
         if fire {
             self.flush_interrupt(&queue, fire);
         }
 
         tracing::info!(
+            frames = stats.frames_injected,
+            flushes = stats.flushes,
+            irqs_fired = stats.irqs_fired,
+            window_us_max = stats.window_us_max,
             "rx-inject thread stopped ({} inline conns remaining)",
             inline_conns.len(),
         );

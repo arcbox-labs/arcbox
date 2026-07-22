@@ -960,7 +960,7 @@ dependencies = [
 name = "arcbox-net-inject"
 version = "0.6.9"
 dependencies = [
- "arcbox-virtio",
+ "arcbox-virtio-core",
  "crossbeam-channel",
  "socket2 0.6.4",
  "tracing",
