@@ -84,6 +84,18 @@ const SSH_TAG: &str = "arcbox-e2e-build:ssh";
 const BIND_DEADLINE: Duration = Duration::from_secs(120);
 const BIND_TAG: &str = "arcbox-e2e-build:bind";
 
+/// D9: chatty-RUN line count (~1 MiB of step output — deliberately below
+/// BuildKit's default per-step log clip, so "no clip marker" is a fair
+/// streaming-integrity assertion rather than a tunable).
+const STREAM_LINES: usize = 150_000;
+const STREAM_DEADLINE: Duration = Duration::from_secs(120);
+const STREAM_TAG: &str = "arcbox-e2e-build:stream";
+const QUIET_TAG: &str = "arcbox-e2e-build:quiet";
+
+/// D10: exporter scenario — artifacts stream host-ward through the session.
+const EXPORT_DEADLINE: Duration = Duration::from_secs(120);
+const EXPORT_PAYLOAD: &str = "exporter-proof-payload\n";
+
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon; run on the e2e runner"]
 fn docker_build_suite() -> Result<()> {
@@ -98,11 +110,13 @@ fn docker_build_suite() -> Result<()> {
         // every build below.
         let log = daemon_log_cursor(data_dir);
 
-        let scenarios: [(&str, ScenarioFn); 5] = [
+        let scenarios: [(&str, ScenarioFn); 7] = [
             ("stage_graph", stage_graph),
             ("cache_semantics", cache_semantics),
             ("session_secret_ssh", session_secret_ssh),
             ("bind_mounts", bind_mounts),
+            ("output_streaming", output_streaming),
+            ("exporters", exporters),
             ("large_context", large_context),
         ];
         // Diagnostic filter: run only the named scenario, e.g.
@@ -812,4 +826,130 @@ RUN test ! -e /lockfile.txt
     })();
     docker_ignore(data_dir, &["rmi".into(), "-f".into(), BIND_TAG.into()]);
     result
+}
+
+/// D9: build-output streaming. A RUN step emitting ~1 MiB of ordered lines
+/// must arrive un-clipped through the proxy (a wedge shows up as the
+/// deadline, truncation as the clip marker or a missing tail), and `-q`
+/// mode must reduce to exactly one image-ID line.
+fn output_streaming(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let ctx = data_dir.join("d9-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d9 context dir")?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r"FROM {image}
+RUN seq 1 {STREAM_LINES}
+RUN echo streamed > /marker
+"
+        ),
+    )
+    .context("writing d9 Dockerfile")?;
+
+    let result = (|| {
+        let (output, _) = timed_build(
+            data_dir,
+            metrics,
+            "streaming_build_wall",
+            &ctx,
+            STREAM_TAG,
+            &["--no-cache"],
+            STREAM_DEADLINE,
+        )?;
+        if output.contains("output clipped") {
+            bail!("streaming: BuildKit clipped the step log (proxy delivered a truncated stream)");
+        }
+        let tail_marker = STREAM_LINES.to_string();
+        let near_tail_marker = (STREAM_LINES - 1).to_string();
+        if !output.contains(&tail_marker) || !output.contains(&near_tail_marker) {
+            bail!("streaming: tail of the step log missing ({near_tail_marker}/{tail_marker})");
+        }
+
+        // Quiet mode: exactly one image-ID line on stdout.
+        let ctx_arg = ctx.display().to_string();
+        let quiet = docker_output(
+            data_dir,
+            &["build", "-q", "-t", QUIET_TAG, &ctx_arg],
+            STREAM_DEADLINE,
+        )
+        .context("quiet build")?;
+        let quiet = quiet.trim();
+        if !quiet.starts_with("sha256:") || quiet.lines().count() != 1 {
+            bail!("streaming: -q output is not a single image ID: {quiet:?}");
+        }
+        Ok(())
+    })();
+    docker_ignore(data_dir, &["rmi".into(), "-f".into(), STREAM_TAG.into()]);
+    docker_ignore(data_dir, &["rmi".into(), "-f".into(), QUIET_TAG.into()]);
+    result
+}
+
+/// D10: exporters — `--output type=local` and `type=tar` stream the build
+/// artifact back to the client through the session, the reverse of the
+/// context-upload direction. Content must arrive byte-exact.
+fn exporters(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let ctx = data_dir.join("d10-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d10 context dir")?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r"FROM {image} AS build
+RUN mkdir /out && printf '{}' > /out/artifact.txt
+FROM scratch AS export
+COPY --from=build /out/ /
+",
+            EXPORT_PAYLOAD.trim_end_matches('\n'),
+        ),
+    )
+    .context("writing d10 Dockerfile")?;
+    // printf without a trailing newline directive: the payload constant's
+    // newline is added back by comparing against the trimmed form.
+    let expected = EXPORT_PAYLOAD.trim_end_matches('\n');
+    let ctx_arg = ctx.display().to_string();
+
+    let local_dest = data_dir.join("d10-local-out");
+    let local_arg = format!("type=local,dest={}", local_dest.display());
+    let started = Instant::now();
+    let local = docker_output(
+        data_dir,
+        &["build", "--progress=plain", "-o", &local_arg, &ctx_arg],
+        EXPORT_DEADLINE,
+    );
+    metrics.record("exporter_local_wall", started.elapsed().as_secs_f64());
+    local.context("local exporter build")?;
+    let exported = std::fs::read_to_string(local_dest.join("artifact.txt"))
+        .context("reading locally-exported artifact")?;
+    if exported != expected {
+        bail!("exporters: local export mismatch: {exported:?} != {expected:?}");
+    }
+
+    let tar_dest = data_dir.join("d10-export.tar");
+    let tar_arg = format!("type=tar,dest={}", tar_dest.display());
+    let started = Instant::now();
+    let tar_build = docker_output(
+        data_dir,
+        &["build", "--progress=plain", "-o", &tar_arg, &ctx_arg],
+        EXPORT_DEADLINE,
+    );
+    metrics.record("exporter_tar_wall", started.elapsed().as_secs_f64());
+    tar_build.context("tar exporter build")?;
+    let extract_dir = data_dir.join("d10-tar-out");
+    std::fs::create_dir_all(&extract_dir)?;
+    let extract = std::process::Command::new("tar")
+        .args(["-xf", &tar_dest.display().to_string(), "-C"])
+        .arg(&extract_dir)
+        .output()
+        .context("extracting tar export")?;
+    if !extract.status.success() {
+        bail!(
+            "exporters: tar extract failed: {}",
+            String::from_utf8_lossy(&extract.stderr)
+        );
+    }
+    let exported = std::fs::read_to_string(extract_dir.join("artifact.txt"))
+        .context("reading tar-exported artifact")?;
+    if exported != expected {
+        bail!("exporters: tar export mismatch: {exported:?} != {expected:?}");
+    }
+    Ok(())
 }
