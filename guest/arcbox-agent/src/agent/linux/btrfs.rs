@@ -2,8 +2,9 @@
 //!
 //! On first boot the data device is formatted as Btrfs with five subvolumes
 //! (`@docker`, `@containerd`, `@k3s`, `@kubelet`, `@cni`), each bind-mounted
-//! to its canonical path. Metadata-heavy directories get `NOCOW` to avoid
-//! Btrfs + APFS double write amplification.
+//! to its canonical path. The fsync-hot boltdb metadata is NOT kept here —
+//! it lives on the ext4 metadata volume (`metadata_volume.rs`); btrfs holds
+//! the bulk, compression-friendly data.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;
@@ -247,11 +248,6 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
             .status()
         {
             Ok(s) if s.success() => {
-                // Disable Btrfs COW on metadata-heavy subdirectories.
-                // BoltDB (containerd/dockerd) does frequent fdatasync on
-                // small pages. Without NOCOW, each write triggers Btrfs
-                // copy-on-write + APFS COW on the host = double amplification.
-                disable_cow_on_metadata_dirs(target);
                 notes.push(format!("mounted {} -> {}", subvol, target));
             }
             Ok(s) => {
@@ -270,65 +266,6 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
         Ok("data subvolumes already mounted".to_string())
     } else {
         Ok(notes.join("; "))
-    }
-}
-
-/// Disables Btrfs COW (sets NOCOW attribute) on metadata-heavy subdirectories.
-///
-/// BoltDB and other metadata stores do frequent fdatasync on small pages.
-/// Btrfs COW amplifies each write (copy 16KB metadata page + update B-tree),
-/// and the host's APFS does another COW on top — double write amplification.
-/// NOCOW converts these to in-place overwrites at the Btrfs layer.
-fn disable_cow_on_metadata_dirs(mount_point: &str) {
-    // FS_IOC_SETFLAGS = _IOW('f', 2, long)
-    // FS_NOCOW_FL = 0x00800000
-    const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
-
-    // Subdirectories that contain BoltDB or other fsync-heavy metadata.
-    // The NOCOW attribute is inherited by new files created in these dirs.
-    let metadata_subdirs = [
-        "io.containerd.metadata.v1.bolt",
-        "io.containerd.snapshotter.v1.overlayfs",
-        "containerd",
-        "network",
-        "builder",
-        "buildkit",
-        "image",
-        "trust",
-    ];
-
-    for subdir in &metadata_subdirs {
-        let path = format!("{}/{}", mount_point, subdir);
-        let _ = std::fs::create_dir_all(&path);
-
-        let Ok(cpath) = std::ffi::CString::new(path.as_str()) else {
-            continue;
-        };
-        // SAFETY: valid path, O_RDONLY | O_DIRECTORY.
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-        if fd < 0 {
-            continue;
-        }
-
-        let mut flags: libc::c_long = 0;
-        // Get current flags, then set NOCOW.
-        // SAFETY: FS_IOC_GETFLAGS/SETFLAGS on a valid directory fd.
-        // NOTE: `libc::Ioctl` differs per target — `c_ulong` on
-        // Linux GNU, `c_int` on Linux musl. Using the typedef keeps
-        // the cast right for whichever target we cross-compile to.
-        unsafe {
-            #[allow(clippy::cast_possible_wrap)]
-            let get_flags = 0x8008_6601u32 as libc::Ioctl; // FS_IOC_GETFLAGS
-            #[allow(clippy::cast_possible_wrap)]
-            let set_flags = 0x4008_6602u32 as libc::Ioctl; // FS_IOC_SETFLAGS
-            if libc::ioctl(fd, get_flags, &mut flags) == 0 {
-                flags |= FS_NOCOW_FL;
-                if libc::ioctl(fd, set_flags, &flags) == 0 {
-                    tracing::debug!("set NOCOW on {}", path);
-                }
-            }
-            libc::close(fd);
-        }
     }
 }
 
