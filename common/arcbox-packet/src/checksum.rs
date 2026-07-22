@@ -13,22 +13,37 @@ pub fn checksum_fold(mut sum: u32) -> u16 {
     !sum as u16
 }
 
+/// Length at which SIMD `checksum_add` is used. Short headers stay scalar
+/// so setup cost does not dominate.
+const SIMD_THRESHOLD: usize = 64;
+
 /// Calculates the ones' complement sum of 16-bit words.
 ///
-/// This is the core operation for IP/TCP/UDP checksums.
+/// This is the core operation for IP/TCP/UDP checksums. Buffers of
+/// [`SIMD_THRESHOLD`] bytes or more use the architecture SIMD path when
+/// available (NEON / SSSE3); shorter buffers stay on the scalar loop.
 #[inline]
 pub fn checksum_add(data: &[u8]) -> u32 {
+    if data.len() >= SIMD_THRESHOLD {
+        checksum_add_fast(data)
+    } else {
+        checksum_add_scalar(data)
+    }
+}
+
+/// Scalar ones' complement sum (always available; used for short buffers
+/// and as the SIMD fallback).
+#[inline]
+pub fn checksum_add_scalar(data: &[u8]) -> u32 {
     let mut sum: u32 = 0;
     let mut i = 0;
 
-    // Process 16-bit words
     while i + 1 < data.len() {
         let word = u16::from_be_bytes([data[i], data[i + 1]]);
         sum = sum.wrapping_add(word as u32);
         i += 2;
     }
 
-    // Handle odd byte
     if i < data.len() {
         sum = sum.wrapping_add((data[i] as u32) << 8);
     }
@@ -159,190 +174,126 @@ pub fn udp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], udp_datagram: &[u8]) -> u1
     if result == 0 { 0xFFFF } else { result }
 }
 
-/// SIMD-optimized checksum for ARM64 NEON.
-///
-/// Uses NEON intrinsics to process 16 bytes at a time, with correct handling
-/// of network byte order (big-endian 16-bit words).
+/// Ones' complement sum via the fastest available path for this host.
+#[inline]
+fn checksum_add_fast(data: &[u8]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on AArch64.
+        return unsafe { checksum_add_neon(data) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 just verified.
+            unsafe { checksum_add_ssse3(data) }
+        } else {
+            checksum_add_scalar(data)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        checksum_add_scalar(data)
+    }
+}
+
+/// SIMD ones' complement sum for ARM64 NEON (16 bytes/iter, BE halfwords).
 ///
 /// # Safety
-///
-/// This function uses `#[target_feature(enable = "neon")]` and requires NEON support.
-/// On AArch64, NEON is always available as part of the architecture specification.
+/// Requires NEON (`#[target_feature(enable = "neon")]`). Always true on AArch64.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub unsafe fn checksum_simd_neon(data: &[u8]) -> u16 {
+unsafe fn checksum_add_neon(data: &[u8]) -> u32 {
     use std::arch::aarch64::*;
 
-    // SAFETY: All NEON intrinsics below are safe to call because:
-    // 1. We have #[target_feature(enable = "neon")] ensuring NEON is available
-    // 2. Pointer passed to vld1q_u8 is valid (from slice with length >= 16)
+    // SAFETY: NEON available; loads stay within `data`.
     unsafe {
         let mut sum = vdupq_n_u32(0);
-        let chunks = data.chunks_exact(16);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<16>();
 
         for chunk in chunks {
-            // Load 16 bytes from memory
             let bytes = vld1q_u8(chunk.as_ptr());
-
-            // Network byte order is big-endian. On little-endian ARM64, we need to
-            // swap bytes within each 16-bit word to get the correct checksum value.
-            // vrev16q_u8 swaps adjacent bytes: [0,1,2,3,...] -> [1,0,3,2,...]
+            // Network order is BE; swap adjacent bytes on LE host.
             let swapped = vrev16q_u8(bytes);
-
-            // Now interpret as 16-bit words (already in correct order for summation)
             let words = vreinterpretq_u16_u8(swapped);
-
-            // Pairwise add and accumulate to 32-bit to avoid overflow
-            // vpadalq_u16 adds adjacent pairs of u16 into u32 accumulators
             sum = vpadalq_u16(sum, words);
         }
 
-        // Horizontal sum of the four 32-bit lanes
-        let sum32 = vaddvq_u32(sum);
-
-        // Process remainder bytes using scalar code
-        let mut scalar_sum = sum32;
+        let mut scalar_sum = vaddvq_u32(sum);
         let mut i = 0;
         while i + 1 < remainder.len() {
-            // Read big-endian 16-bit word
             let word = u16::from_be_bytes([remainder[i], remainder[i + 1]]);
             scalar_sum = scalar_sum.wrapping_add(word as u32);
             i += 2;
         }
-
-        // Handle odd byte (padded with zero on the right in network order)
         if i < remainder.len() {
             scalar_sum = scalar_sum.wrapping_add((remainder[i] as u32) << 8);
         }
-
-        // Fold 32-bit sum into 16-bit checksum
-        while scalar_sum > 0xFFFF {
-            scalar_sum = (scalar_sum & 0xFFFF) + (scalar_sum >> 16);
-        }
-
-        !scalar_sum as u16
+        scalar_sum
     }
 }
 
-/// SIMD-optimized checksum for ARM64 NEON (safe wrapper).
-///
-/// This is the public safe interface that calls the unsafe NEON implementation.
-/// NEON is always available on AArch64 processors.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-pub fn checksum_simd(data: &[u8]) -> u16 {
-    // SAFETY: NEON is mandatory on AArch64 architecture
-    unsafe { checksum_simd_neon(data) }
-}
-
-/// SIMD-optimized checksum for x86_64 using SSSE3.
-///
-/// Uses SSSE3 intrinsics to process 16 bytes at a time, with correct handling
-/// of network byte order (big-endian 16-bit words).
-///
-/// SSSE3 is required for the `pshufb` instruction used for byte swapping.
-/// SSSE3 is available on all x86_64 CPUs since Intel Core 2 (2006) and
-/// AMD Barcelona (2007), covering essentially all modern x86_64 systems.
+/// SIMD ones' complement sum for x86_64 SSSE3.
 ///
 /// # Safety
-///
-/// This function uses `#[target_feature(enable = "ssse3")]` and requires SSSE3 support.
+/// Requires SSSE3 (`pshufb`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn checksum_simd_ssse3(data: &[u8]) -> u16 {
+unsafe fn checksum_add_ssse3(data: &[u8]) -> u32 {
     use std::arch::x86_64::*;
 
-    // SAFETY: All SSE/SSSE3 intrinsics below are safe to call because:
-    // 1. We have #[target_feature(enable = "ssse3")] ensuring SSSE3 is available
-    // 2. Pointers passed to _mm_loadu_si128 are valid (from slice with length >= 16)
+    // SAFETY: SSSE3 available; unaligned loads within `data`.
     unsafe {
-        // Accumulator: two 64-bit sums (we'll combine them at the end).
         let mut sum_lo = _mm_setzero_si128();
         let mut sum_hi = _mm_setzero_si128();
-
-        // Shuffle mask to swap bytes within 16-bit words for big-endian interpretation.
-        // Network byte order is big-endian, x86 is little-endian.
-        // This mask converts [0,1,2,3,4,5,...] to [1,0,3,2,5,4,...] (swap adjacent bytes).
         let swap_mask = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
 
-        let chunks = data.chunks_exact(16);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<16>();
 
         for chunk in chunks {
-            // Load 16 bytes from memory (unaligned load).
             let bytes = _mm_loadu_si128(chunk.as_ptr().cast());
-
-            // Swap bytes within each 16-bit word for big-endian interpretation.
             let swapped = _mm_shuffle_epi8(bytes, swap_mask);
-
-            // Unpack low and high halves to 32-bit words and add to accumulators.
-            // _mm_unpacklo_epi16 with zero unpacks low 4 u16s to low 4 u32s.
-            // _mm_unpackhi_epi16 with zero unpacks high 4 u16s to high 4 u32s.
             let zero = _mm_setzero_si128();
-            let words_lo = _mm_unpacklo_epi16(swapped, zero); // 4 x u32 (words 0-3)
-            let words_hi = _mm_unpackhi_epi16(swapped, zero); // 4 x u32 (words 4-7)
-
-            // Add to accumulators.
+            let words_lo = _mm_unpacklo_epi16(swapped, zero);
+            let words_hi = _mm_unpackhi_epi16(swapped, zero);
             sum_lo = _mm_add_epi32(sum_lo, words_lo);
             sum_hi = _mm_add_epi32(sum_hi, words_hi);
         }
 
-        // Combine lo and hi accumulators.
         let sum = _mm_add_epi32(sum_lo, sum_hi);
-
-        // Horizontal sum of the four 32-bit lanes.
-        // _mm_hadd_epi32: [a,b,c,d] + [a,b,c,d] => [a+b,c+d,a+b,c+d]
         let hadd1 = _mm_hadd_epi32(sum, sum);
         let hadd2 = _mm_hadd_epi32(hadd1, hadd1);
-        let sum32 = _mm_cvtsi128_si32(hadd2) as u32;
+        let mut scalar_sum = _mm_cvtsi128_si32(hadd2) as u32;
 
-        // Process remainder bytes using scalar code.
-        let mut scalar_sum = sum32;
         let mut i = 0;
         while i + 1 < remainder.len() {
-            // Read big-endian 16-bit word.
             let word = u16::from_be_bytes([remainder[i], remainder[i + 1]]);
             scalar_sum = scalar_sum.wrapping_add(word as u32);
             i += 2;
         }
-
-        // Handle odd byte (padded with zero on the right in network order).
         if i < remainder.len() {
             scalar_sum = scalar_sum.wrapping_add((remainder[i] as u32) << 8);
         }
-
-        // Fold 32-bit sum into 16-bit checksum.
-        while scalar_sum > 0xFFFF {
-            scalar_sum = (scalar_sum & 0xFFFF) + (scalar_sum >> 16);
-        }
-
-        !scalar_sum as u16
+        scalar_sum
     }
 }
 
-/// SIMD-optimized checksum for x86_64 (safe wrapper).
+/// Full Internet checksum using the SIMD path when available.
 ///
-/// This function detects SSSE3 support at runtime and uses the optimized
-/// SIMD implementation if available, otherwise falls back to scalar.
-#[cfg(target_arch = "x86_64")]
+/// Prefer [`checksum`] for call sites: it already selects SIMD for long
+/// buffers. This entry point forces the fast path for benches and tests.
 #[inline]
 pub fn checksum_simd(data: &[u8]) -> u16 {
-    // Check for SSSE3 support at runtime.
-    // On modern x86_64 CPUs, SSSE3 is virtually always available.
-    if is_x86_feature_detected!("ssse3") {
-        // SAFETY: We just verified SSSE3 is available.
-        unsafe { checksum_simd_ssse3(data) }
-    } else {
-        // Fallback to scalar implementation for ancient CPUs.
-        checksum(data)
-    }
+    checksum_fold(checksum_add_fast(data))
 }
 
-/// Fallback for non-SIMD architectures.
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub fn checksum_simd(data: &[u8]) -> u16 {
-    checksum(data)
+/// Deprecated name kept for external callers that linked the old NEON entry.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+pub unsafe fn checksum_simd_neon(data: &[u8]) -> u16 {
+    // SAFETY: NEON mandatory on AArch64.
+    checksum_fold(unsafe { checksum_add_neon(data) })
 }
 
 #[cfg(test)]
@@ -444,8 +395,43 @@ mod tests {
     #[test]
     fn test_checksum_simd() {
         let data: Vec<u8> = (0..100).collect();
-        let scalar = checksum(&data);
+        let scalar = checksum_fold(checksum_add_scalar(&data));
         let simd = checksum_simd(&data);
         assert_eq!(scalar, simd);
+    }
+
+    #[test]
+    fn test_checksum_add_fast_matches_scalar_long() {
+        let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        assert_eq!(checksum_add_scalar(&data), checksum_add_fast(&data));
+        assert_eq!(
+            checksum_fold(checksum_add_scalar(&data)),
+            checksum(&data),
+            "checksum() must match pure scalar on long buffers"
+        );
+    }
+
+    #[test]
+    fn test_tcp_checksum_long_payload_matches_scalar() {
+        let mut segment = vec![0u8; 20 + 1500];
+        segment[12] = 0x50; // data offset 5
+        for (i, b) in segment[20..].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        // Force scalar path for expected: zero checksum field then compute via scalar add.
+        segment[16] = 0;
+        segment[17] = 0;
+        let src = [10, 0, 0, 1];
+        let dst = [10, 0, 0, 2];
+        let mut sum = 0u32;
+        sum = sum.wrapping_add(u16::from_be_bytes([src[0], src[1]]) as u32);
+        sum = sum.wrapping_add(u16::from_be_bytes([src[2], src[3]]) as u32);
+        sum = sum.wrapping_add(u16::from_be_bytes([dst[0], dst[1]]) as u32);
+        sum = sum.wrapping_add(u16::from_be_bytes([dst[2], dst[3]]) as u32);
+        sum = sum.wrapping_add(6);
+        sum = sum.wrapping_add(segment.len() as u32);
+        sum = sum.wrapping_add(checksum_add_scalar(&segment));
+        let expected = checksum_fold(sum);
+        assert_eq!(tcp_checksum(src, dst, &segment), expected);
     }
 }
