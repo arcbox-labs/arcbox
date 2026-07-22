@@ -623,6 +623,20 @@ pub(super) fn ensure_runtime_prerequisites() -> Vec<String> {
         notes.push("enabled ip_forward".to_string());
     }
 
+    // Expedite RCU grace periods. Every container start's `runc create`
+    // (and network-namespace teardown) calls synchronize_rcu; on the
+    // non-expedited guest kernel each grace period parks runc ~70 ms in
+    // uninterruptible sleep (`__wait_rcu_gp`), which is the dominant
+    // runc-create cost — profiled at ~88 ms → ~10 ms with this set, an 8x
+    // cut (ABX-496). Expedited grace periods use IPIs (µs, not ms); the
+    // trade is more IPIs under RCU load, the right call for a
+    // container/build runtime with heavy netns churn.
+    if let Err(e) = std::fs::write("/sys/kernel/rcu_expedited", b"1\n") {
+        notes.push(format!("rcu_expedited failed({e})"));
+    } else {
+        notes.push("enabled rcu_expedited".to_string());
+    }
+
     // Load overlay module (needed for Docker's overlay2 storage driver).
     if !Path::new("/sys/module/overlay").exists() {
         let rc = std::process::Command::new("/sbin/modprobe")
