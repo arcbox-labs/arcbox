@@ -119,6 +119,31 @@ upstream commits:
 | X3 | caddyserver/caddy-docker `2.11/builder` | apk + checksum-verified xcaddy release fetch (the builder image installs the toolchain; the full compile happens when it is used) *(implemented)* |
 | X4 | mastodon or immich at a pinned tag | hour-scale polyglot heavyweight; manual smoke when touching the proxy or datapath, never CI |
 
+## Baseline (2026-07-22, M-series host, VZ guest, boot 0.6.10, dockerd 29.6.1 / BuildKit v0.31.1)
+
+Measured with an engine-agnostic harness (plain `docker build` timed
+host-side via `DOCKER_HOST`; cold-ness via a per-build nonce file in the
+context so no engine-global cache prune is needed; base images pre-pulled
+outside the timed region; real-project contexts fetched at the Tier X
+pins, with X2's pnpm accommodation). Single-shot numbers — trend anchors,
+not gates.
+
+| shape | wall |
+|---|---|
+| simple 3-RUN alpine build, cold (includes first-build builder bootstrap + arch probes) | 8.1 s |
+| same build, full cache hit | 1.8 s |
+| 512 MiB + 100k-file context, cold | 26.4 s |
+| 12-stage diamond, cold | 12.7 s |
+| `--platform linux/amd64` (FEX): probe + 300k-iteration shell loop | 6.4 s |
+| postgres `17/bookworm` (real apt + gpg + wget) | 75.6 s |
+| next.js `with-docker` (pnpm frozen install + `next build`) | 37.8 s |
+| caddy `2.11/builder` (apk + xcaddy fetch) | 25.2 s |
+
+Cross-engine comparison was not possible on the baseline host — OrbStack
+is uninstalled there (dangling `~/.orbstack`); the harness takes any
+engine via `DOCKER_HOST` when one is available. Pre-ABX-494 every row
+below the cache-hit line was ∞ (all buildx builds hung).
+
 ## Bench methodology
 
 No criterion micro-bench: build performance is dominated by the guest and
