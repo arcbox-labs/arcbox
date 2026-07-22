@@ -73,11 +73,12 @@ pub fn prepare_entry(
         if has_content(target, kind) {
             copy_entry(target, &partial, kind)?;
             fs::rename(&partial, &final_path)?;
-            // Persist the rename itself; best-effort (a lost rename is
-            // redone on the next boot).
-            if let Ok(dir) = fs::File::open(volume_root) {
-                let _ = dir.sync_all();
-            }
+            // The publish rename MUST be durable before the retire below:
+            // the two renames live on different filesystems (volume vs
+            // btrfs source), so without this barrier a crash could persist
+            // the retire while losing the publish — next boot would then
+            // see neither and start empty.
+            fs::File::open(volume_root)?.sync_all()?;
             Prepared::Migrated
         } else {
             create_entry(&final_path, kind)?;
@@ -159,7 +160,10 @@ fn copy_dir_synced(src: &Path, dst: &Path) -> io::Result<()> {
             copy_file_synced(&entry.path(), &to)?;
         }
     }
-    Ok(())
+    // Per-file fsync does not contractually persist this directory's
+    // entries; sync the dir itself so the published tree can never be
+    // durable-but-hollow (replay trusts the final path's existence).
+    fs::File::open(dst)?.sync_all()
 }
 
 /// `fs::copy` + fsync: the copy must be durable before the rename that

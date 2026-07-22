@@ -16,7 +16,7 @@ acquire_daemon_lease     flock(daemon.lock), terminate stale     ~instant or ≤
 start_control_plane      Bind arcbox.sock, SystemService up      ~instant
     │                    Desktop can connect from this point on.
     │
-release_stale_resources  Wait for docker.img holders to release  0–10 s
+release_stale_resources  Wait for disk-image holders to release  0–10 s
     │                    Reported as CLEANING_UP via gRPC.
     │
 prepare_assets           Seed/download boot assets               variable
@@ -120,7 +120,7 @@ signal received
 | `daemon.lock` | exists, old PID, **lock released** | `try_flock` succeeds instantly |
 | `docker.sock` | deleted | — |
 | `arcbox.sock` | deleted | — |
-| `docker.img` | exists, no holders | — |
+| disk images (`docker.img` + `docker-meta.img`, Rosetta counterparts) | exist, no holders | — |
 | VM | gracefully stopped | — |
 
 No manual intervention needed.
@@ -141,7 +141,7 @@ signal received during startup
   │                          graceful Stop behind itself, so an unbounded
   │                          wait could last the whole boot timeout
   └─ on timeout / second signal → runtime.shutdown_force()  → VM killed,
-                                  no orphaned XPC helpers holding docker.img
+                                  no orphaned XPC helpers holding disk images
 ```
 
 `early_runtime` is filled right after `Runtime` construction, before the
@@ -161,7 +161,7 @@ When the daemon is killed without graceful shutdown:
 - Socket files are **not** cleaned up.
 - VM is **not** gracefully stopped.
 - Container subnet route is **not** removed.
-- `docker.img` may still be held by Virtualization.framework XPC helpers.
+- The disk images (`docker.img`, `docker-meta.img`, Rosetta counterparts) may still be held by Virtualization.framework XPC helpers.
 
 ### Residual state after crash
 
@@ -170,7 +170,7 @@ When the daemon is killed without graceful shutdown:
 | `daemon.lock` | exists, old PID, **lock released** | `try_flock` succeeds instantly |
 | `docker.sock` | **stale** | `DockerApiServer::run` removes before bind |
 | `arcbox.sock` | **stale** | `start_grpc` removes before bind |
-| `docker.img` | **possibly held by XPC helpers** | `wait_for_resources` waits up to 10 s |
+| disk images | **possibly held by XPC helpers** | `wait_for_resources` waits up to 10 s |
 | VM | non-graceful termination | Virtualization.framework cleans up |
 | Route | **stale** | `recovery::run()` rebuilds |
 
@@ -189,10 +189,10 @@ When a new daemon starts while an old one is still running:
 6. Falls back to SIGKILL if unresponsive.
 7. Acquires the lock once released.
 8. `start_grpc` removes any stale sockets before binding.
-9. `wait_for_resources` waits for `docker.img` holders to release.
+9. `wait_for_resources` waits for disk-image holders to release.
 
 The old daemon's graceful shutdown runs its full sequence (drain, VM stop,
-socket cleanup). The new daemon only needs to handle the `docker.img`
+socket cleanup). The new daemon only needs to handle the disk-image
 holdover case.
 
 ## Socket Lifecycle
@@ -210,10 +210,10 @@ socket that another component has already bound.
 
 ## Edge Cases
 
-### docker.img held by orphaned XPC helpers
+### Disk images held by orphaned XPC helpers
 
 Virtualization.framework spawns XPC helper processes that may outlive the
-daemon. These processes hold `docker.img` open. The daemon waits up to
+daemon. These processes hold the disk images (`docker.img`, `docker-meta.img`, Rosetta counterparts) open. The daemon waits up to
 10 s for them to exit (`wait_for_resources`), then proceeds. If they
 persist, `init_runtime` may fail because the disk image is locked.
 
