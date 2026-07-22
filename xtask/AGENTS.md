@@ -36,6 +36,7 @@ Current recipe ↔ self-build mapping (keep both columns identical):
 | `sandbox`        | release cli+daemon + musl `arcbox-agent`/`arcbox-vm` bins | `sandbox.rs::build_binaries` (same)   |
 | `egress_throughput` | `cargo build --release -p arcbox-daemon`       | `scenario.rs::run_vz_scenario_with_log` (same) |
 | `docker_build`   | same as above                                     | `scenario.rs::run_vz_scenario_with_log` (same) |
+| `docker_build_external` | same as above                              | `scenario.rs::run_vz_scenario_with_log` (same) |
 | `virtio_debug`   | none (self-builds)                                | `cargo build --release -p arcbox-daemon` (RELEASE only) |
 | `daemon_failure` | none (self-builds)                                | `cargo build -p arcbox-daemon` (**DEBUG**)   |
 | anything else    | none — fallback notice, no `SKIP_BUILD`           | its own build                                |

@@ -97,9 +97,9 @@ assertions are deadlines and behavior, never absolute throughput.
 | D3 | cache semantics (mastodon/next.js) | `RUN --mount=type=cache,sharing=locked`; then 3 rebuilds: unchanged, one-file leaf change, base-layer change | per-execution stamps baked into the image prove the unchanged rebuild re-runs nothing (image IDs are NOT comparable — BuildKit re-stamps `created` per build), leaf change re-runs only downstream steps, base change re-runs both; warm wall ≤ max(cold/10, 3 s floor); cache-mount token survives across builds *(implemented)* |
 | D4 | BuildKit session (authentik secrets; ssh has no OSS exemplar but same channel) | `--secret id=x,src=file` consumed by `RUN --mount=type=secret`; `--ssh default=<sock>` against a throwaway host `ssh-agent` (one loaded key) | secret readable in RUN, gone next layer, **absent from every byte of `docker save`** (gzip-aware sweep); forwarded ssh sock present in RUN; quiet-log covers the `/session` upgrades *(implemented)* |
 | D5 | bind-mount lockfiles (authentik/immich) | `RUN --mount=type=bind,source=...` consuming context files without COPY layers | in-build read + derived hash lands in image; mount leaves no trace in the final fs *(implemented)* |
-| D6 | cross-platform args + FEX (vaultwarden/moby; ABX-375) | (a) `--platform=$BUILDPLATFORM` FROM + `TARGETARCH` expansion, native; (b) `--platform linux/amd64` with a `RUN uname -m` step | (a) correct arch strings baked; (b) FEX provisioned ⇒ `x86_64` output, else **fail-closed** with the actionable error (both directions asserted) |
-| D7 | concurrent builds (CI shape) | 4 parallel distinct builds + 2 same-context duplicates | all complete ≤ deadline; no cross-talk (unique markers per image); zombie sweep clean |
-| D8 | cancellation (production reality) | kill client mid-context-upload and mid-RUN; rebuild after | daemon log free of proxy ERROR; follow-up build succeeds; no leaked build processes guest-side |
+| D6 | cross-platform args + FEX (vaultwarden/moby; ABX-375) | (a) `--platform=$BUILDPLATFORM` FROM + `TARGETARCH` expansion, native; (b) `--platform linux/amd64` with a `RUN uname -m` step | (a) `linux/arm64:arm64` baked; (b) `x86_64` asserted in-build + image records `amd64` — the surface ABX-494 wedged. Fail-closed unprovisioned direction still awaits an e2e knob (FEX ships in every bundle ≥ 0.6.6) *(implemented, positive paths)* |
+| D7 | concurrent builds (CI shape) | 4 parallel distinct builds + 2 same-context duplicates, all in flight at once | all complete ≤ deadline; no cross-talk (unique markers per image); suite quiet-log covers the daemon side *(implemented)* |
+| D8 | cancellation (production reality) | SIGKILL the client mid-RUN and mid-context-upload (256 MiB); rebuild after | guest reaps the cancelled RUN's process (polled via `--pid=host`); follow-up build succeeds promptly; suite quiet-log asserts the daemon rode both kills without proxy ERRORs *(implemented)* |
 | D9 | output streaming | `--progress=plain` with a RUN emitting 50k ordered lines PACED under BuildKit's 200 KiB/s step-log rate clip (bulk output is clipped by design and proves nothing); `docker build -q` | tail lines present, no clip marker, deadline catches a wedge; quiet mode prints exactly one image ID *(implemented)* |
 | D10 | exporters | `docker build -o type=local,dest=…` and `-o type=tar` | exported artifact byte-exact vs in-image content — exercises reverse session streaming *(implemented)* |
 
@@ -114,9 +114,9 @@ upstream commits:
 
 | ID | Build | Why this one |
 |---|---|---|
-| X1 | docker-library/postgres `17/bookworm`, redis `7.4/debian`, nginx `mainline/debian` | tiny contexts, real apt + wget + **gpg keyserver** traffic — the classic official-image shape, near-zero context cost |
-| X2 | vercel/next.js `examples/with-docker` | real `npm ci` through the datapath; the single most common user Dockerfile shape |
-| X3 | caddyserver/caddy-docker builder | Go toolchain + module downloads inside the build |
+| X1 | docker-library/postgres `17/bookworm` | tiny context, real apt + wget + **gpg keyserver** traffic — the classic official-image shape; smoke: `postgres --version` *(implemented; redis/nginx are the same shape and stay out to keep the run bounded)* |
+| X2 | vercel/next.js `examples/with-docker` | real `pnpm install --frozen-lockfile` + `next build` through the datapath; the single most common user Dockerfile shape *(implemented)* |
+| X3 | caddyserver/caddy-docker `2.11/builder` | apk + checksum-verified xcaddy release fetch (the builder image installs the toolchain; the full compile happens when it is used) *(implemented)* |
 | X4 | mastodon or immich at a pinned tag | hour-scale polyglot heavyweight; manual smoke when touching the proxy or datapath, never CI |
 
 ## Bench methodology
@@ -131,8 +131,12 @@ manual `xtask` run of the same fixtures against another engine's
 
 ## Status
 
-D1–D5 and D9–D10 are implemented (`tests/e2e/tests/docker_build.rs`) and
-**fully green** against boot bundle ≥ 0.6.10. The suite's first-ever run
+The full Tier-D matrix D1–D10 is implemented
+(`tests/e2e/tests/docker_build.rs`), plus Tier X X1–X3
+(`tests/e2e/tests/docker_build_external.rs`, gated on
+`ARCBOX_E2E_EXTERNAL=1`, pinned upstream commits), and Tier D is
+**fully green** against boot bundle ≥ 0.6.10. The one deliberate gap:
+D6's fail-closed unprovisioned-FEX direction awaits an e2e knob. The suite's first-ever run
 caught ABX-494 (guest FEX spun forever on BuildKit's amd64 arch-probe,
 wedging the whole BuildKit Control API; fixed by boot-assets#44), and its
 first green-guest run caught a latent harness bug (`run_with_timeout`
