@@ -156,6 +156,35 @@ so it does NOT cleanly measure FEX-vs-Rosetta CPU speed. Pre-ABX-494
 every ArcBox row below the cache-hit line was ∞ (all buildx builds
 hung).
 
+### 2026-07-23 re-run — after the ABX-496 fixes
+
+Same script, same fixtures, same host, both engines cold and measured in
+the same session. ArcBox = master `e4aca033` (rcu_expedited + ext4
+metadata volume + VZ `.fsync`, boot bundle 0.6.11). Absolute numbers for
+the network rows are not comparable across days (registry weather);
+ratios within a session are.
+
+| shape | ArcBox | Colima | ratio (was) |
+|---|---|---|---|
+| simple 3-RUN alpine build, cold | 3.0 s | 0.95 s | 3.2× (13.5×) |
+| same build, full cache hit | 0.52 s | 0.30 s | 1.7× (11×) |
+| 512 MiB + 100k-file context, cold | 23.8–31.6 s | 32.9 s | **≤1× (1.3×)** |
+| 12-stage diamond, cold | 5.0 s | 1.6 s | 3.0× (8.4×) |
+| `--platform linux/amd64` (FEX vs Rosetta) | 2.13 s | 2.14 s | **1.0× (7.3×)** |
+| postgres `17/bookworm` | 83.7 s | 67.5 s | 1.24× (1.9×) |
+| next.js `with-docker` | 54.3 s | 50.3 s | 1.08× (1.4×) |
+| caddy `2.11/builder` | 23.7 s | 23.8 s | **1.0× (1.6×)** |
+
+Reading: real-project builds, the amd64 row, and large-context are at
+parity (1.0–1.24×). The residual gap is confined to the pure-overhead
+shapes (3.0–3.2×, ~2 s absolute) and matches the still-open `docker
+start` network-endpoint/iptables segment (~330 ms per container-backed
+step, measured 416 ms vs Colima 82 ms) — the next lever, tracked
+separately from ABX-496. Bench-hygiene note: Colima retains BuildKit
+cache across sessions and the real-project contexts carry no nonce, so
+re-runs must `docker builder prune -af` on Colima first or its
+real-project rows are cache hits.
+
 ## Bench methodology
 
 No criterion micro-bench: build performance is dominated by the guest and
