@@ -93,6 +93,9 @@ impl RxInjectThread {
         let mut fire = false;
         let mut policy = CoalescePolicy::new();
         let mut stats = InjectStats::default();
+        // After descriptor exhaustion, skip adapt on the next empty gather so
+        // a storm does not immediately shrink the window (more IRQs).
+        let mut skip_idle_adapt = false;
 
         loop {
             if !self.running.load(Ordering::Relaxed) {
@@ -122,17 +125,15 @@ impl RxInjectThread {
             }
 
             // Phase 3: Drain channel frames (classifier / DHCP / DNS / ARP).
-            // Use the remaining adaptive window after inline polling.
-            let elapsed = loop_start.elapsed();
-            let remaining = window.saturating_sub(elapsed);
-
+            // Recompute remaining each iteration so the window is a real deadline.
             while (batch as usize) < BATCH_SIZE {
+                let remaining = window.saturating_sub(loop_start.elapsed());
                 // Use the remaining timeout for the first recv, then zero
                 // for subsequent ones to drain without blocking.
                 let timeout = if batch == 0 && inline_conns.is_empty() {
                     // No inline conns and nothing batched yet — block for
-                    // the full coalescing window.
-                    window
+                    // the full coalescing window (or what's left of it).
+                    remaining
                 } else if remaining.is_zero() {
                     // Timeout already consumed by inline polling — try_recv only.
                     Duration::ZERO
@@ -188,6 +189,7 @@ impl RxInjectThread {
                         });
                         fire = false;
                         batch = 0;
+                        skip_idle_adapt = true;
                     }
                     std::thread::sleep(DESCRIPTOR_BACKOFF);
 
@@ -201,15 +203,25 @@ impl RxInjectThread {
             }
 
             // Normal end of gather: timeout or BATCH full. Empty idle still
-            // observes so the window can decay after load.
+            // observes so the window can decay after load — except right after
+            // descriptor exhaustion (skip_idle_adapt).
             let filled_early = (batch as usize) >= BATCH_SIZE;
+            let allow_adapt = if batch == 0 && skip_idle_adapt {
+                skip_idle_adapt = false;
+                false
+            } else {
+                if batch > 0 {
+                    skip_idle_adapt = false;
+                }
+                true
+            };
             self.finish_batch(FinishBatch {
                 queue: &queue,
                 batch,
                 fire,
                 window_budget_us,
                 filled_early,
-                allow_adapt: true,
+                allow_adapt,
                 policy: &mut policy,
                 stats: &mut stats,
             });
@@ -242,7 +254,8 @@ impl RxInjectThread {
             f.stats.on_flush(f.batch, f.fire, f.window_budget_us);
         }
         // Always observe (incl. batch == 0 idle) so the window can decay.
-        f.policy.observe(f.batch, f.filled_early, f.allow_adapt);
+        f.policy
+            .observe(f.batch, f.window_budget_us, f.filled_early, f.allow_adapt);
         f.stats.sync_from_policy(f.policy, f.window_budget_us);
         f.stats.maybe_log();
     }

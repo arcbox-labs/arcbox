@@ -7,7 +7,7 @@
 #![allow(clippy::while_float)]
 
 use arcbox_net_inject::coalesce::{
-    BATCH_SIZE, CoalescePolicy, EXPAND_MIN_BATCH, QUIET_MAX_BATCH, WINDOW_DEFAULT_US, WINDOW_MAX_US,
+    BATCH_SIZE, CoalescePolicy, EXPAND_MIN_FPS, QUIET_MAX_BATCH, WINDOW_DEFAULT_US, WINDOW_MAX_US,
 };
 
 fn gather_once(window_us: u32, frames_per_sec: f64) -> (u16, f64, bool) {
@@ -65,7 +65,7 @@ fn simulate(run: &Run) -> ResultRow {
             peak = peak.max(window_us);
         }
         if run.adaptive {
-            policy.observe(batch, filled_early, true);
+            policy.observe(batch, window_us, filled_early, true);
         }
         t += advance;
     }
@@ -108,7 +108,7 @@ fn main() {
     let duration_s = 1.0;
     println!("# Coalesce mechanism model (no VM)");
     println!(
-        "duration={duration_s}s BATCH={BATCH_SIZE} default={WINDOW_DEFAULT_US}µs max={WINDOW_MAX_US}µs expand_min={EXPAND_MIN_BATCH} quiet_max={QUIET_MAX_BATCH}"
+        "duration={duration_s}s BATCH={BATCH_SIZE} default={WINDOW_DEFAULT_US}µs max={WINDOW_MAX_US}µs expand_min_fps={EXPAND_MIN_FPS} quiet_max_batch={QUIET_MAX_BATCH}"
     );
     println!();
     println!(

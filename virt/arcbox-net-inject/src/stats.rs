@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use tracing::Level;
+
 use crate::coalesce::CoalescePolicy;
 
 /// Per-thread inject path counters.
@@ -68,21 +70,29 @@ impl InjectStats {
         } else {
             self.irqs_suppressed += 1;
         }
+        self.note_window(window_us);
+    }
+
+    /// Refresh expand/shrink tallies and window high-water (incl. idle gathers).
+    pub fn sync_from_policy(&mut self, policy: &CoalescePolicy, window_budget_us: u32) {
+        self.expand_events = policy.expand_events();
+        self.shrink_events = policy.shrink_events();
+        self.note_window(window_budget_us);
+    }
+
+    fn note_window(&mut self, window_us: u32) {
         self.window_us = window_us;
         self.window_us_max = self.window_us_max.max(window_us);
     }
 
-    /// Refresh expand/shrink tallies from the policy and note the budget in effect.
-    pub fn sync_from_policy(&mut self, policy: &CoalescePolicy, window_budget_us: u32) {
-        self.expand_events = policy.expand_events();
-        self.shrink_events = policy.shrink_events();
-        self.window_us = window_budget_us;
-    }
-
     /// Log at most once per second at debug level (interval deltas + current window).
     ///
-    /// Runs at 1 Hz only; allocating short display strings for rates is fine.
+    /// No-ops immediately when DEBUG is disabled so the inject hot path does
+    /// not pay for `Instant::now()` under normal logging.
     pub fn maybe_log(&mut self) {
+        if !tracing::enabled!(Level::DEBUG) {
+            return;
+        }
         let now = Instant::now();
         let due = self
             .last_log
