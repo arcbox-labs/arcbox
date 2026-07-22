@@ -199,6 +199,21 @@ fn x1_postgres(data_dir: &Path, metrics: &mut RunMetrics) -> Result<()> {
 /// stage carries a working node.
 fn x2_nextjs(data_dir: &Path, metrics: &mut RunMetrics) -> Result<()> {
     let ctx = fetch_pinned_subdir(data_dir, "nextjs", NEXTJS_PIN)?;
+    // Upstream ships no `packageManager` pin, so corepack pulls the latest
+    // pnpm at build time, whose supply-chain default refuses sharp's build
+    // scripts (ERR_PNPM_IGNORED_BUILDS) — the verbatim build fails on ANY
+    // engine. Apply pnpm's documented escape hatch and keep everything
+    // else verbatim; bail loudly if a pin bump makes the patch stale.
+    let dockerfile = ctx.join("Dockerfile");
+    let content = std::fs::read_to_string(&dockerfile)?;
+    let patched = content.replace(
+        "pnpm install --frozen-lockfile",
+        "pnpm install --frozen-lockfile --dangerously-allow-all-builds",
+    );
+    if patched == content {
+        bail!("nextjs: pnpm install line not found — re-check the accommodation against the pin");
+    }
+    std::fs::write(&dockerfile, patched)?;
     let tag = "arcbox-e2e-external:nextjs";
     let result = (|| {
         build_and_time(data_dir, metrics, "x2_nextjs_build_wall", &ctx, tag)?;
