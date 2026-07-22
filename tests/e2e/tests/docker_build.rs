@@ -1,4 +1,4 @@
-//! docker build e2e — Phases 1–2 (D1–D5, D9–D10) of
+//! docker build e2e — Phases 1–3 (D1–D10) of
 //! internal-docs/plans/docker-build-e2e-matrix.md.
 //!
 //! Where `network_workload` W14 drives *one* build to prove the datapath,
@@ -29,6 +29,17 @@
 //!   `/session` upgrade proxy, previously covered by unit tests only.
 //! - **D5 bind-mount lockfiles** (authentik / immich pnpm shape):
 //!   `RUN --mount=type=bind` consumes a context file without a COPY layer.
+//! - **D6 cross-platform** (vaultwarden / moby shape): `BUILDPLATFORM` /
+//!   `TARGETARCH` expansion on a native build, and a `--platform
+//!   linux/amd64` build whose RUN executes through the binfmt translator
+//!   (asserted in-build via `uname -m`).
+//! - **D7 concurrent builds** (CI shape): four distinct builds plus two
+//!   racing on one shared context, all in flight at once; unique markers
+//!   prove no cross-talk.
+//! - **D8 cancellation** (production reality): the client is SIGKILLed
+//!   mid-RUN and mid-context-upload; the guest must reap the build
+//!   container, the daemon must stay quiet, and the next build must
+//!   succeed promptly.
 //! - **D9 output streaming**: a chatty RUN streamed un-clipped through the
 //!   proxy, and `-q` mode reduced to the bare image ID.
 //! - **D10 exporters**: `--output type=local` and `type=tar` — build
@@ -40,8 +51,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use arcbox_e2e::docker::{docker_ignore, docker_output, ensure_image};
+use anyhow::{Context, Result, anyhow, bail};
+use arcbox_e2e::docker::{docker_host, docker_ignore, docker_output, ensure_image};
 use arcbox_e2e::metrics::RunMetrics;
 use arcbox_e2e::net_fixtures::daemon_log_cursor;
 use arcbox_e2e::scenario::run_vz_scenario_with_log;
@@ -100,6 +111,25 @@ const QUIET_TAG: &str = "arcbox-e2e-build:quiet";
 const EXPORT_DEADLINE: Duration = Duration::from_secs(120);
 const EXPORT_PAYLOAD: &str = "exporter-proof-payload\n";
 
+/// D6: cross-platform args + the amd64 binfmt translator. FEX ships in
+/// every bundle ≥ 0.6.6, so only the provisioned direction is asserted;
+/// the fail-closed unprovisioned direction awaits an e2e knob (see the
+/// plan's phasing note).
+const XPLAT_DEADLINE: Duration = Duration::from_secs(180);
+const XPLAT_ARGS_TAG: &str = "arcbox-e2e-build:xplat-args";
+const XPLAT_AMD64_TAG: &str = "arcbox-e2e-build:xplat-amd64";
+
+/// D7: concurrent builds — distinct contexts plus two racing on one shared
+/// context.
+const CONCURRENT_DISTINCT: usize = 4;
+const CONCURRENT_SHARED: usize = 2;
+const CONCURRENT_DEADLINE: Duration = Duration::from_secs(180);
+
+/// D8: cancellation probes — the mid-upload kill needs a payload big
+/// enough that the transfer is still in flight when the client dies.
+const CANCEL_UPLOAD_PAYLOAD: usize = 256 * 1024 * 1024;
+const CANCEL_DEADLINE: Duration = Duration::from_secs(120);
+
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon; run on the e2e runner"]
 fn docker_build_suite() -> Result<()> {
@@ -114,13 +144,16 @@ fn docker_build_suite() -> Result<()> {
         // every build below.
         let log = daemon_log_cursor(data_dir);
 
-        let scenarios: [(&str, ScenarioFn); 7] = [
+        let scenarios: [(&str, ScenarioFn); 10] = [
             ("stage_graph", stage_graph),
             ("cache_semantics", cache_semantics),
             ("session_secret_ssh", session_secret_ssh),
             ("bind_mounts", bind_mounts),
             ("output_streaming", output_streaming),
             ("exporters", exporters),
+            ("cross_platform", cross_platform),
+            ("concurrent_builds", concurrent_builds),
+            ("cancellation", cancellation),
             ("large_context", large_context),
         ];
         // Diagnostic filter: run only the named scenario, e.g.
@@ -836,6 +869,314 @@ RUN test ! -e /lockfile.txt
         Ok(())
     })();
     docker_ignore(data_dir, &["rmi".into(), "-f".into(), BIND_TAG.into()]);
+    result
+}
+
+/// D6: cross-platform builds. (a) A native build expands
+/// `--platform=$BUILDPLATFORM` and `TARGETARCH` correctly. (b) A
+/// `--platform linux/amd64` build executes its RUN step through the binfmt
+/// translator — asserted in-build via `uname -m`, plus the image's
+/// recorded architecture. This is the surface ABX-494 wedged: the arch
+/// probe behind it now runs on every ListWorkers.
+fn cross_platform(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let ctx = data_dir.join("d6-args-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d6 args context dir")?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r#"FROM --platform=$BUILDPLATFORM {image} AS build
+ARG BUILDPLATFORM
+ARG TARGETARCH
+RUN echo "$BUILDPLATFORM:$TARGETARCH" > /args.txt
+FROM {image}
+COPY --from=build /args.txt /args.txt
+"#
+        ),
+    )
+    .context("writing d6 args Dockerfile")?;
+
+    let args_result = (|| {
+        timed_build(
+            data_dir,
+            metrics,
+            "xplat_args_build_wall",
+            &ctx,
+            XPLAT_ARGS_TAG,
+            &[],
+            XPLAT_DEADLINE,
+        )?;
+        let args = image_file(data_dir, XPLAT_ARGS_TAG, "/args.txt")?;
+        if args != "linux/arm64:arm64" {
+            bail!("cross_platform: platform args expanded to {args:?}, expected linux/arm64:arm64");
+        }
+        Ok(())
+    })();
+    docker_ignore(
+        data_dir,
+        &["rmi".into(), "-f".into(), XPLAT_ARGS_TAG.into()],
+    );
+    args_result?;
+
+    // The amd64 base variant is not in the arm64 tar cache; pull it with
+    // the same retry discipline as `ensure_image`.
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match docker_output(
+            data_dir,
+            &["pull", "--platform", "linux/amd64", image],
+            Duration::from_secs(90),
+        ) {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(attempt, "amd64 variant pull failed: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e).context("pulling amd64 base variant (3 attempts)");
+    }
+
+    let ctx = data_dir.join("d6-amd64-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d6 amd64 context dir")?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r#"FROM {image}
+RUN uname -m > /arch && test "$(cat /arch)" = "x86_64"
+"#
+        ),
+    )
+    .context("writing d6 amd64 Dockerfile")?;
+
+    let amd64_result = (|| {
+        timed_build(
+            data_dir,
+            metrics,
+            "xplat_amd64_build_wall",
+            &ctx,
+            XPLAT_AMD64_TAG,
+            &["--platform", "linux/amd64"],
+            XPLAT_DEADLINE,
+        )?;
+        let arch = docker_output(
+            data_dir,
+            &[
+                "image",
+                "inspect",
+                "-f",
+                "{{.Architecture}}",
+                XPLAT_AMD64_TAG,
+            ],
+            Duration::from_secs(30),
+        )?;
+        if arch.trim() != "amd64" {
+            bail!(
+                "cross_platform: built image records architecture {:?}, expected amd64",
+                arch.trim()
+            );
+        }
+        Ok(())
+    })();
+    docker_ignore(
+        data_dir,
+        &["rmi".into(), "-f".into(), XPLAT_AMD64_TAG.into()],
+    );
+    amd64_result
+}
+
+/// D7: concurrent builds — the CI shape. Four builds with distinct
+/// contexts plus two racing on one shared context all run at once; each
+/// image must carry exactly its own marker (no cross-talk between build
+/// sessions sharing the daemon and builder).
+fn concurrent_builds(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let mut jobs: Vec<(String, std::path::PathBuf, String)> = Vec::new();
+    for i in 0..CONCURRENT_DISTINCT {
+        let ctx = data_dir.join(format!("d7-ctx-{i}"));
+        std::fs::create_dir_all(&ctx)?;
+        let marker = format!("marker-{i}");
+        std::fs::write(
+            ctx.join("Dockerfile"),
+            format!("FROM {image}\nRUN sleep 2 && echo {marker} > /marker\n"),
+        )?;
+        jobs.push((format!("arcbox-e2e-build:conc-{i}"), ctx, marker));
+    }
+    let shared = data_dir.join("d7-ctx-shared");
+    std::fs::create_dir_all(&shared)?;
+    std::fs::write(
+        shared.join("Dockerfile"),
+        format!("FROM {image}\nRUN sleep 2 && echo marker-shared > /marker\n"),
+    )?;
+    for j in 0..CONCURRENT_SHARED {
+        jobs.push((
+            format!("arcbox-e2e-build:conc-shared-{j}"),
+            shared.clone(),
+            "marker-shared".to_owned(),
+        ));
+    }
+
+    let started = Instant::now();
+    let results: Vec<(String, Result<String>)> = std::thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "collect forces every spawn before the first join; a lazy chain would run the builds serially"
+        )]
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|(tag, ctx, _)| {
+                scope.spawn(move || {
+                    let ctx_arg = ctx.display().to_string();
+                    docker_output(
+                        data_dir,
+                        &["build", "-t", tag, &ctx_arg],
+                        CONCURRENT_DEADLINE,
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .zip(&jobs)
+            .map(|(handle, (tag, _, _))| {
+                (
+                    tag.clone(),
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow!("build thread panicked"))),
+                )
+            })
+            .collect()
+    });
+    let elapsed = started.elapsed();
+    metrics.record("concurrent_builds_wall", elapsed.as_secs_f64());
+
+    let result = (|| {
+        for (tag, result) in &results {
+            if let Err(error) = result {
+                bail!("concurrent: {tag} failed: {error:#}");
+            }
+        }
+        if elapsed >= CONCURRENT_DEADLINE {
+            bail!("concurrent: builds took {elapsed:?} (>= {CONCURRENT_DEADLINE:?})");
+        }
+        for (tag, _, marker) in &jobs {
+            let got = image_file(data_dir, tag, "/marker")?;
+            if got != *marker {
+                bail!("concurrent: {tag} carries marker {got:?}, expected {marker:?} — cross-talk");
+            }
+        }
+        Ok(())
+    })();
+    for (tag, _, _) in &jobs {
+        docker_ignore(data_dir, &["rmi".into(), "-f".into(), tag.clone()]);
+    }
+    result
+}
+
+/// Spawns a `docker build` that the caller intends to kill — output goes
+/// to /dev/null since nothing will ever collect it.
+fn spawn_build(data_dir: &Path, ctx: &Path, tag: &str) -> Result<std::process::Child> {
+    std::process::Command::new("docker")
+        .env("DOCKER_HOST", docker_host(data_dir))
+        .args(["build", "-t", tag])
+        .arg(ctx)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawning cancellable docker build")
+}
+
+/// D8: cancellation — the client is SIGKILLed mid-RUN and mid-context-
+/// upload. The guest must reap the cancelled RUN's process, and the next
+/// build must succeed promptly. The suite-level quiet-log check asserts
+/// the daemon rode both kills without proxy ERRORs.
+fn cancellation(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    // (1) Kill mid-RUN: the sleep marker is uniquely greppable guest-side.
+    let ctx = data_dir.join("d8-run-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d8 run context dir")?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!("FROM {image}\nRUN sleep 6543\n"),
+    )?;
+    let mut child = spawn_build(data_dir, &ctx, "arcbox-e2e-build:cancel-run")?;
+    std::thread::sleep(Duration::from_secs(8));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut reaped = false;
+    for _ in 0..15 {
+        let count = docker_output(
+            data_dir,
+            &[
+                "run",
+                "--rm",
+                "--pid=host",
+                image,
+                "sh",
+                "-c",
+                "ps | grep 'sleep [6]543' | wc -l",
+            ],
+            Duration::from_secs(60),
+        )
+        .context("guest process sweep")?;
+        if count.trim() == "0" {
+            reaped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    if !reaped {
+        bail!("cancellation: the cancelled RUN's process is still alive in the guest");
+    }
+
+    // (2) Kill mid-context-upload: 256 MiB is several seconds of transfer.
+    let ctx = data_dir.join("d8-upload-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d8 upload context dir")?;
+    let mut payload = vec![0u8; CANCEL_UPLOAD_PAYLOAD];
+    fill_incompressible(&mut payload);
+    std::fs::write(ctx.join("payload.bin"), &payload).context("writing d8 payload")?;
+    drop(payload);
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!("FROM {image}\nCOPY payload.bin /payload.bin\n"),
+    )?;
+    let mut child = spawn_build(data_dir, &ctx, "arcbox-e2e-build:cancel-upload")?;
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // (3) The daemon must build normally right after both kills.
+    let ctx = data_dir.join("d8-followup-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d8 followup context dir")?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!("FROM {image}\nRUN echo recovered > /marker\n"),
+    )?;
+    let result = (|| {
+        timed_build(
+            data_dir,
+            metrics,
+            "cancel_followup_wall",
+            &ctx,
+            "arcbox-e2e-build:cancel-followup",
+            &[],
+            CANCEL_DEADLINE,
+        )?;
+        if image_file(data_dir, "arcbox-e2e-build:cancel-followup", "/marker")? != "recovered" {
+            bail!("cancellation: follow-up build produced a wrong image");
+        }
+        Ok(())
+    })();
+    for tag in ["cancel-run", "cancel-upload", "cancel-followup"] {
+        docker_ignore(
+            data_dir,
+            &["rmi".into(), "-f".into(), format!("arcbox-e2e-build:{tag}")],
+        );
+    }
     result
 }
 
