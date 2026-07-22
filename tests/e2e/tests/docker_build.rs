@@ -443,8 +443,12 @@ RUN sleep {sleep} && {stamp} > /stamp-leaf
             );
         }
 
-        // Build 2 — unchanged: a full cache hit, so the same image ID and a
-        // wall bounded far below cold (with the usual CI-slack floor).
+        // Build 2 — unchanged: a full cache hit. Image IDs are NOT compared:
+        // BuildKit stamps a fresh `created` timestamp into the config on
+        // every build, so even a fully-cached rebuild gets a new ID. The
+        // per-execution stamps are the execution truth — both must match
+        // the cold build's — plus a wall bound far below cold (with the
+        // usual CI-slack floor).
         let (_, warm_wall) = timed_build(
             data_dir,
             metrics,
@@ -454,17 +458,10 @@ RUN sleep {sleep} && {stamp} > /stamp-leaf
             &[],
             CACHE_BUILD_DEADLINE,
         )?;
-        let id = |tag: &str| {
-            docker_output(
-                data_dir,
-                &["image", "inspect", "-f", "{{.Id}}", tag],
-                Duration::from_secs(30),
-            )
-            .map(|out| out.trim().to_owned())
-        };
-        let (cold_id, warm_id) = (id(cold_tag)?, id(warm_tag)?);
-        if warm_id != cold_id {
-            bail!("cache: unchanged rebuild produced a different image ({cold_id} vs {warm_id})");
+        let warm_stamp_base = image_file(data_dir, warm_tag, "/stamp-base")?;
+        let warm_stamp_leaf = image_file(data_dir, warm_tag, "/stamp-leaf")?;
+        if warm_stamp_base != cold_stamp_base || warm_stamp_leaf != cold_stamp_leaf {
+            bail!("cache: unchanged rebuild re-executed a step (stamps changed)");
         }
         let warm_bound = cold_wall.div_f64(10.0).max(CACHE_WARM_FLOOR);
         if warm_wall > warm_bound {
@@ -747,6 +744,9 @@ RUN test ! -e /run/secrets/build_token
     )
     .context("writing d4 secret Dockerfile")?;
 
+    // Absolute path: BuildKit resolves a relative `src` against the CLI's
+    // working directory, not the build context.
+    let secret_src = format!("id=build_token,src={}", ctx.join("token.txt").display());
     let secret_result = (|| {
         timed_build(
             data_dir,
@@ -754,7 +754,7 @@ RUN test ! -e /run/secrets/build_token
             "session_secret_build_wall",
             &ctx,
             SECRET_TAG,
-            &["--secret", "id=build_token,src=token.txt"],
+            &["--secret", &secret_src],
             SESSION_DEADLINE,
         )?;
         if image_file(data_dir, SECRET_TAG, "/probe")? != "secret-visible" {
