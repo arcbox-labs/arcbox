@@ -1,6 +1,6 @@
 # ext4 Metadata Volume — snapshot-prepare fsync fix (ABX-496)
 
-Status: **Planned** (design locked, awaiting implementation)
+Status: **Implemented** (arcbox#497 + boot-assets#45 / v0.6.11); results in §9
 Owner: ABX-496 (docker build performance vs Colima)
 Companion fix already shipped separately: `rcu_expedited` for runc-create (arcbox#496).
 
@@ -11,10 +11,17 @@ on Colima. Profiling (static strace with `-y` fd resolution, dockerd debug
 lifecycle timeline, `dd conv=fsync` microbench) pinned the cost:
 
 - A single `fsync` on the guest data volume costs **9.5 ms on ArcBox (btrfs)**
-  vs **1.0 ms on Colima (ext4)** on the same virtio-blk stack. The cost is the
+  vs **1.0 ms on Colima (ext4)**. The cost is the
   btrfs commit path (`write_all_supers`: superblock write + FLUSH barriers),
   not COW extent allocation — `chattr +C` (NOCOW) was measured at 9.5 ms vs
   10.5 ms, i.e. no help.
+  **Attribution correction found during implementation (§9):** most of those
+  9.5 ms were not filesystem weight but the *host-side cost of each guest
+  FLUSH* — the VZ disk attachment defaulted to `synchronizationMode = .full`
+  (F_FULLFSYNC ≈ 10 ms per barrier), while Colima ships fsync-level
+  durability. btrfs still amplifies (more FLUSHes per fsync than ext4
+  fast_commit) and the ~90 %-boltdb fsync profile below stands, but the
+  single biggest lever turned out to be the VZ synchronization mode.
 - ~90 % of the fsyncs during a container start hit small boltdb metadata
   files: containerd `io.containerd.metadata.v1.bolt/meta.db` (dominant),
   overlayfs snapshotter `metadata.db`, dockerd `network/files/local-kv.db`
@@ -214,3 +221,42 @@ use case. No new exports, no fsid allocation.
    as separate atomic commits.
 3. Bench + record results on ABX-496; close the snapshot-prepare half of the
    issue.
+
+## 9. Implementation results (2026-07-22)
+
+Shipped as boot-assets#45 (released v0.6.11) + arcbox#497. Two deviations
+from the plan, both improvements:
+
+- **Device discovery**: instead of guest-side probing with a 5 s timeout,
+  the host *declares* the device via `arcbox.docker_metadata_device=/dev/vdc`
+  on the cmdline when it attaches the disk (§2 table updated). Declared but
+  missing → hard fail; undeclared → zero-delay skip.
+- **VZ synchronization mode** (`arcbox-vz` shim): the disk attachment now
+  uses `synchronizationMode: .fsync` instead of the default `.full`
+  (F_FULLFSYNC per guest FLUSH). This aligns VZ with the custom-HV backend,
+  whose block worker has always used plain fsync, and with the durability
+  level Colima/OrbStack ship. Discovered because the metadata volume alone
+  moved the microbench barely at all — see the A/B below.
+
+Measured on the same host, guest `dd bs=1M count=1 conv=fsync`, avg of 20:
+
+| Configuration | ext4 metadata volume | btrfs data volume |
+|---|---|---|
+| VZ, `.full` (before) | 10.3 ms | 11.5 ms |
+| VZ, `.fsync` (after) | **1.7 ms** | 2.1 ms |
+| HV (plain fsync, unchanged) | 2.2 ms | 2.6 ms |
+| Colima (reference) | — | 1.0 ms (ext4) |
+
+End-to-end (10-run averages, same day, same host, VZ):
+
+| Metric | ArcBox before campaign | ArcBox after | Colima |
+|---|---|---|---|
+| `docker create` (contains snapshot-prepare, was ~182 ms alone) | — | **53 ms** | 48 ms |
+| `docker start` | — | 416 ms | 82 ms |
+| `docker run --rm alpine true` | ~700 ms | 496 ms | 173 ms |
+
+Acceptance met: snapshot-prepare cost is gone from the create path
+(53 ms total vs the < 60 ms target for the prepare step alone) and guest
+fsync is at Colima's order of magnitude. The remaining `docker start` gap
+(~330 ms vs Colima) sits in the network-endpoint/iptables portion of start
+— outside both ABX-496 root causes; file separately.
