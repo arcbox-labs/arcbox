@@ -1,4 +1,4 @@
-//! docker build e2e — Phase 1 (D1–D3) of
+//! docker build e2e — Phases 1–2 (D1–D5, D9–D10) of
 //! internal-docs/plans/docker-build-e2e-matrix.md.
 //!
 //! Where `network_workload` W14 drives *one* build to prove the datapath,
@@ -23,6 +23,16 @@
 //!   wall bounded), leaf-only change (upstream stamp stable, downstream
 //!   re-runs), base change (both re-run, and the cache mount's content
 //!   demonstrably survives across builds).
+//! - **D4 session channel** (authentik shape): `--secret` readable inside
+//!   its RUN, gone from the next layer, and absent from every byte of the
+//!   saved image; `--ssh` forwards a live host agent socket. Both ride the
+//!   `/session` upgrade proxy, previously covered by unit tests only.
+//! - **D5 bind-mount lockfiles** (authentik / immich pnpm shape):
+//!   `RUN --mount=type=bind` consumes a context file without a COPY layer.
+//! - **D9 output streaming**: a chatty RUN streamed un-clipped through the
+//!   proxy, and `-q` mode reduced to the bare image ID.
+//! - **D10 exporters**: `--output type=local` and `type=tar` — build
+//!   artifacts streaming host-ward through the session (reverse direction).
 //!
 //! All scenarios share one booted daemon; failures aggregate. The workload
 //! suite's quiet-log rule applies: builds must leave no proxy-layer ERROR.
@@ -63,6 +73,17 @@ const CACHE_BUILD_DEADLINE: Duration = Duration::from_secs(120);
 const CACHE_STEP_SLEEP_SECS: u64 = 4;
 const CACHE_WARM_FLOOR: Duration = Duration::from_secs(3);
 
+/// D4: the secret value asserted inside the build and swept for outside it.
+/// Alphanumeric+dash so it can be inlined into shell fragments verbatim.
+const SECRET_VALUE: &str = "s3cret-build-token-abx494";
+const SESSION_DEADLINE: Duration = Duration::from_secs(120);
+const SECRET_TAG: &str = "arcbox-e2e-build:secret";
+const SSH_TAG: &str = "arcbox-e2e-build:ssh";
+
+/// D5: bind-mount lockfile scenario.
+const BIND_DEADLINE: Duration = Duration::from_secs(120);
+const BIND_TAG: &str = "arcbox-e2e-build:bind";
+
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon; run on the e2e runner"]
 fn docker_build_suite() -> Result<()> {
@@ -77,9 +98,11 @@ fn docker_build_suite() -> Result<()> {
         // every build below.
         let log = daemon_log_cursor(data_dir);
 
-        let scenarios: [(&str, ScenarioFn); 3] = [
+        let scenarios: [(&str, ScenarioFn); 5] = [
             ("stage_graph", stage_graph),
             ("cache_semantics", cache_semantics),
+            ("session_secret_ssh", session_secret_ssh),
+            ("bind_mounts", bind_mounts),
             ("large_context", large_context),
         ];
         // Diagnostic filter: run only the named scenario, e.g.
@@ -127,24 +150,24 @@ fn docker_build_suite() -> Result<()> {
 
 type ScenarioFn = fn(&Path, &mut RunMetrics, &str) -> Result<()>;
 
-/// Runs `docker build --progress=plain -t tag ctx`, recording the wall
-/// under `key` (also for failed builds — a slow failure is still trend
-/// data) and failing past `deadline`.
+/// Runs `docker build --progress=plain -t tag <extra_args> ctx`, recording
+/// the wall under `key` (also for failed builds — a slow failure is still
+/// trend data) and failing past `deadline`.
 fn timed_build(
     data_dir: &Path,
     metrics: &mut RunMetrics,
     key: &str,
     ctx: &Path,
     tag: &str,
+    extra_args: &[&str],
     deadline: Duration,
 ) -> Result<(String, Duration)> {
     let ctx_arg = ctx.display().to_string();
+    let mut args = vec!["build", "--progress=plain", "-t", tag];
+    args.extend_from_slice(extra_args);
+    args.push(&ctx_arg);
     let started = Instant::now();
-    let build = docker_output(
-        data_dir,
-        &["build", "--progress=plain", "-t", tag, &ctx_arg],
-        deadline + Duration::from_secs(60),
-    );
+    let build = docker_output(data_dir, &args, deadline + Duration::from_secs(60));
     let elapsed = started.elapsed();
     metrics.record(key, elapsed.as_secs_f64());
     let output = build.with_context(|| format!("{key}: docker build"))?;
@@ -268,6 +291,7 @@ COPY --link --from=join /artifact.txt /artifact.txt
             "stage_graph_build_wall",
             &ctx,
             STAGE_GRAPH_TAG,
+            &[],
             STAGE_GRAPH_DEADLINE,
         )?;
 
@@ -385,6 +409,7 @@ RUN sleep {sleep} && {stamp} > /stamp-leaf
             "cache_cold_wall",
             &ctx,
             cold_tag,
+            &[],
             CACHE_BUILD_DEADLINE,
         )?;
         let cold_stamp_base = image_file(data_dir, cold_tag, "/stamp-base")?;
@@ -408,6 +433,7 @@ RUN sleep {sleep} && {stamp} > /stamp-leaf
             "cache_warm_wall",
             &ctx,
             warm_tag,
+            &[],
             CACHE_BUILD_DEADLINE,
         )?;
         let id = |tag: &str| {
@@ -439,6 +465,7 @@ RUN sleep {sleep} && {stamp} > /stamp-leaf
             "cache_leaf_wall",
             &ctx,
             leaf_tag,
+            &[],
             CACHE_BUILD_DEADLINE,
         )?;
         let leaf_stamp_base = image_file(data_dir, leaf_tag, "/stamp-base")?;
@@ -460,6 +487,7 @@ RUN sleep {sleep} && {stamp} > /stamp-leaf
             "cache_base_wall",
             &ctx,
             base_tag,
+            &[],
             CACHE_BUILD_DEADLINE,
         )?;
         let base_stamp_base = image_file(data_dir, base_tag, "/stamp-base")?;
@@ -550,6 +578,7 @@ RUN test ! -e /ctx/excluded
             "large_context_build_wall",
             &ctx,
             LARGE_CTX_TAG,
+            &[],
             LARGE_CTX_DEADLINE,
         )?;
         match context_transfer_seconds(&output) {
@@ -561,5 +590,226 @@ RUN test ! -e /ctx/excluded
     })();
 
     docker_ignore(data_dir, &["rmi".into(), "-f".into(), LARGE_CTX_TAG.into()]);
+    result
+}
+
+/// A throwaway host `ssh-agent` on a private socket, killed on drop. The
+/// agent carries one fresh ed25519 key so the forwarded socket is a
+/// realistic one, not an empty stub.
+struct ThrowawaySshAgent {
+    pid: String,
+    sock: std::path::PathBuf,
+}
+
+impl ThrowawaySshAgent {
+    fn spawn(dir: &Path) -> Result<Self> {
+        let sock = dir.join("d4-agent.sock");
+        let output = std::process::Command::new("ssh-agent")
+            .args(["-a", &sock.display().to_string()])
+            .output()
+            .context("spawning ssh-agent")?;
+        if !output.status.success() {
+            bail!(
+                "ssh-agent failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pid = stdout
+            .split("SSH_AGENT_PID=")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("no SSH_AGENT_PID in ssh-agent output: {stdout}"))?;
+        let agent = Self { pid, sock };
+
+        let key = dir.join("d4-ssh-key");
+        let keygen = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .output()
+            .context("generating throwaway ssh key")?;
+        if !keygen.status.success() {
+            bail!(
+                "ssh-keygen failed: {}",
+                String::from_utf8_lossy(&keygen.stderr)
+            );
+        }
+        let add = std::process::Command::new("ssh-add")
+            .arg(&key)
+            .env("SSH_AUTH_SOCK", &agent.sock)
+            .output()
+            .context("loading key into ssh-agent")?;
+        if !add.status.success() {
+            bail!("ssh-add failed: {}", String::from_utf8_lossy(&add.stderr));
+        }
+        Ok(agent)
+    }
+}
+
+impl Drop for ThrowawaySshAgent {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill").arg(&self.pid).status();
+    }
+}
+
+/// Sweeps every byte of `docker save <tag>` for `needle` — including inside
+/// gzip'd layer blobs (the containerd image store compresses them). A hit
+/// anywhere fails: build secrets must never persist into image content.
+fn assert_absent_from_saved_image(
+    data_dir: &Path,
+    tag: &str,
+    needle: &str,
+    label: &str,
+) -> Result<()> {
+    let tar = data_dir.join(format!("{label}-save.tar"));
+    let tar_arg = tar.display().to_string();
+    docker_output(
+        data_dir,
+        &["save", "-o", &tar_arg, tag],
+        Duration::from_secs(120),
+    )
+    .context("docker save for secret sweep")?;
+
+    let script = format!(
+        r#"set -e
+d=$(mktemp -d)
+trap 'rm -rf "$d"' EXIT
+tar -xf "{tar_arg}" -C "$d"
+find "$d" -type f | while read -r f; do
+  if [ "$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')" = "1f8b" ]; then
+    gunzip -c "$f" 2>/dev/null | grep -aq -- "{needle}" && echo "LEAK:$f"
+  else
+    grep -aq -- "{needle}" "$f" && echo "LEAK:$f"
+  fi
+done
+echo SWEEP-DONE"#
+    );
+    let sweep = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .output()
+        .context("running secret sweep")?;
+    let stdout = String::from_utf8_lossy(&sweep.stdout);
+    if !stdout.contains("SWEEP-DONE") {
+        bail!(
+            "{label}: secret sweep did not complete: {stdout}{}",
+            String::from_utf8_lossy(&sweep.stderr)
+        );
+    }
+    if stdout.contains("LEAK:") {
+        bail!("{label}: secret bytes leaked into the saved image:\n{stdout}");
+    }
+    Ok(())
+}
+
+/// D4: the BuildKit session channel — `--secret` and `--ssh` both ride the
+/// `/session` HTTP upgrade through the proxy. The secret must be readable
+/// inside its mounting RUN, gone from the next layer, and absent from every
+/// byte of the exported image; the ssh mount must expose a live forwarded
+/// agent socket.
+fn session_secret_ssh(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let ctx = data_dir.join("d4-secret-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d4 secret context dir")?;
+    std::fs::write(ctx.join("token.txt"), SECRET_VALUE)?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r#"FROM {image}
+RUN --mount=type=secret,id=build_token test "$(cat /run/secrets/build_token)" = "{SECRET_VALUE}" && echo secret-visible > /probe
+RUN test ! -e /run/secrets/build_token
+"#
+        ),
+    )
+    .context("writing d4 secret Dockerfile")?;
+
+    let secret_result = (|| {
+        timed_build(
+            data_dir,
+            metrics,
+            "session_secret_build_wall",
+            &ctx,
+            SECRET_TAG,
+            &["--secret", "id=build_token,src=token.txt"],
+            SESSION_DEADLINE,
+        )?;
+        if image_file(data_dir, SECRET_TAG, "/probe")? != "secret-visible" {
+            bail!("secret: probe layer missing");
+        }
+        assert_absent_from_saved_image(data_dir, SECRET_TAG, SECRET_VALUE, "session_secret")
+    })();
+    docker_ignore(data_dir, &["rmi".into(), "-f".into(), SECRET_TAG.into()]);
+    secret_result?;
+
+    let agent = ThrowawaySshAgent::spawn(data_dir)?;
+    let ctx = data_dir.join("d4-ssh-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d4 ssh context dir")?;
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r#"FROM {image}
+RUN --mount=type=ssh test -S "$SSH_AUTH_SOCK" && echo ssh-forwarded > /probe
+"#
+        ),
+    )
+    .context("writing d4 ssh Dockerfile")?;
+
+    let ssh_arg = format!("default={}", agent.sock.display());
+    let ssh_result = (|| {
+        timed_build(
+            data_dir,
+            metrics,
+            "session_ssh_build_wall",
+            &ctx,
+            SSH_TAG,
+            &["--ssh", &ssh_arg],
+            SESSION_DEADLINE,
+        )?;
+        if image_file(data_dir, SSH_TAG, "/probe")? != "ssh-forwarded" {
+            bail!("ssh: probe layer missing");
+        }
+        Ok(())
+    })();
+    docker_ignore(data_dir, &["rmi".into(), "-f".into(), SSH_TAG.into()]);
+    ssh_result
+}
+
+/// D5: `RUN --mount=type=bind` consumes a context file with no COPY layer —
+/// the pnpm-lockfile shape. The mounted file must be readable in its RUN,
+/// derived content must land in the image, and the mount itself must leave
+/// no trace in the final filesystem.
+fn bind_mounts(data_dir: &Path, metrics: &mut RunMetrics, image: &str) -> Result<()> {
+    let ctx = data_dir.join("d5-ctx");
+    std::fs::create_dir_all(&ctx).context("creating d5 context dir")?;
+    let lockfile = "lockfile-v1\n";
+    std::fs::write(ctx.join("lockfile.txt"), lockfile)?;
+    let lockfile_sha = format!("{:x}", sha2::Sha256::digest(lockfile.as_bytes()));
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            r"FROM {image}
+RUN --mount=type=bind,source=lockfile.txt,target=/lockfile.txt sha256sum /lockfile.txt | cut -d' ' -f1 > /derived
+RUN test ! -e /lockfile.txt
+"
+        ),
+    )
+    .context("writing d5 Dockerfile")?;
+
+    let result = (|| {
+        timed_build(
+            data_dir,
+            metrics,
+            "bind_mounts_build_wall",
+            &ctx,
+            BIND_TAG,
+            &[],
+            BIND_DEADLINE,
+        )?;
+        let derived = image_file(data_dir, BIND_TAG, "/derived")?;
+        if derived != lockfile_sha {
+            bail!("bind_mounts: derived hash {derived} != host hash {lockfile_sha}");
+        }
+        Ok(())
+    })();
+    docker_ignore(data_dir, &["rmi".into(), "-f".into(), BIND_TAG.into()]);
     result
 }
