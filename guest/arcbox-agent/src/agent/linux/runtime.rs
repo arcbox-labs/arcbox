@@ -835,6 +835,15 @@ async fn try_start_bundled_runtime() -> String {
 
     let mut notes = Vec::new();
 
+    // Ensure kernel/filesystem prerequisites before spawning daemons — and
+    // before mounting the runtime image below, since that mounts under /run
+    // and the prerequisites are what guarantee /run is a writable tmpfs.
+    let prereq_notes = ensure_runtime_prerequisites();
+    if !prereq_notes.is_empty() {
+        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
+    }
+    notes.extend(prereq_notes);
+
     // Mount the runtime image (when this release ships one) before probing
     // for the runtime binaries, so the probe can prefer it.
     mount_runtime_image(&mut notes);
@@ -847,13 +856,6 @@ async fn try_start_bundled_runtime() -> String {
         runtime_bin_dir = %runtime_bin_dir.display(),
         "starting bundled runtime"
     );
-
-    // Ensure kernel/filesystem prerequisites before spawning daemons.
-    let prereq_notes = ensure_runtime_prerequisites();
-    if !prereq_notes.is_empty() {
-        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
-    }
-    notes.extend(prereq_notes);
     match ensure_data_mount() {
         Ok(note) => notes.push(note),
         Err(e) => return format!("data volume setup failed: {}", e),
