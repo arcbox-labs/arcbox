@@ -907,7 +907,10 @@ mod tests {
         );
         let local = path.find("/run/arcbox/runtime-bin").unwrap();
         let vfs = path.find("/arcbox/runtime/bin").unwrap();
-        assert!(local < vfs, "local staged dir must precede the VirtioFS dir");
+        assert!(
+            local < vfs,
+            "local staged dir must precede the VirtioFS dir"
+        );
     }
 
     #[test]
