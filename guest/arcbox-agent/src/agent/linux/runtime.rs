@@ -263,12 +263,18 @@ fn stage_hot_runtime_binaries(vfs_dir: &Path, notes: &mut Vec<String>) {
     }
     for bin in HOT_STAGED_BINARIES {
         let dst = Path::new(LOCAL_RUNTIME_BIN_DIR).join(bin);
-        if let Err(e) = std::fs::copy(vfs_dir.join(bin), &dst) {
-            notes.push(format!("stage {bin} failed({e})"));
-            return;
-        }
-        if let Err(e) = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)) {
-            notes.push(format!("stage {bin} chmod failed({e})"));
+        let staged = std::fs::copy(vfs_dir.join(bin), &dst)
+            .and_then(|_| std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)));
+        if let Err(e) = staged {
+            // A failed copy can leave a truncated binary at `dst`. If the
+            // PATH check then trusted the local dir, containerd would exec
+            // the truncated file — turning "best-effort, only slower" into a
+            // broken runtime. Wipe the whole staged set so the check falls
+            // back to VirtioFS cleanly.
+            let _ = std::fs::remove_dir_all(LOCAL_RUNTIME_BIN_DIR);
+            notes.push(format!(
+                "stage {bin} failed({e}); using VirtioFS runtime bins"
+            ));
             return;
         }
     }
@@ -303,7 +309,12 @@ fn compose_runtime_path(
 
 pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
     let local = PathBuf::from(LOCAL_RUNTIME_BIN_DIR);
-    let staged = local.join("runc").is_file();
+    // Trust the local dir only when the FULL hot set is present. Staging
+    // wipes the dir on any failure, so a partial/truncated set never
+    // survives to here — this all-present check is the second guard.
+    let staged = HOT_STAGED_BINARIES
+        .iter()
+        .all(|bin| local.join(bin).is_file());
     let existing = std::env::var("PATH").ok();
     compose_runtime_path(
         staged.then_some(local.as_path()),
