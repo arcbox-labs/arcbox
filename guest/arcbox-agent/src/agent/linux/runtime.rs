@@ -257,21 +257,36 @@ pub(super) async fn direct_container_routing_loop() {
 fn stage_hot_runtime_binaries(vfs_dir: &Path, notes: &mut Vec<String>) {
     use std::os::unix::fs::PermissionsExt as _;
 
-    if let Err(e) = std::fs::create_dir_all(LOCAL_RUNTIME_BIN_DIR) {
+    let local = Path::new(LOCAL_RUNTIME_BIN_DIR);
+    // Idempotent: a prior start attempt in this same boot may have staged
+    // the full set, and containerd may already be live exec'ing it (the
+    // dockerd-readiness path re-enters try_start_bundled_runtime on retry).
+    // The binaries never change within a boot, so re-staging would only risk
+    // disturbing files in use — skip when the full set is already present.
+    if HOT_STAGED_BINARIES
+        .iter()
+        .all(|bin| local.join(bin).is_file())
+    {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(local) {
         notes.push(format!("stage runtime-bin mkdir failed({e})"));
         return;
     }
     for bin in HOT_STAGED_BINARIES {
-        let dst = Path::new(LOCAL_RUNTIME_BIN_DIR).join(bin);
-        let staged = std::fs::copy(vfs_dir.join(bin), &dst)
-            .and_then(|_| std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)));
+        let dst = local.join(bin);
+        let tmp = local.join(format!("{bin}.partial"));
+        // Copy to a temp name and atomically rename into place. A failed or
+        // interrupted copy leaves only the temp (never a truncated final
+        // name), and the rename never O_TRUNCs a binary that a live
+        // containerd might be exec'ing — the two hazards flagged in review.
+        let staged = std::fs::copy(vfs_dir.join(bin), &tmp)
+            .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
+            .and_then(|_| std::fs::rename(&tmp, &dst));
         if let Err(e) = staged {
-            // A failed copy can leave a truncated binary at `dst`. If the
-            // PATH check then trusted the local dir, containerd would exec
-            // the truncated file — turning "best-effort, only slower" into a
-            // broken runtime. Wipe the whole staged set so the check falls
-            // back to VirtioFS cleanly.
-            let _ = std::fs::remove_dir_all(LOCAL_RUNTIME_BIN_DIR);
+            // Drop only our own temp; never remove a published binary that
+            // an earlier attempt's containerd may already resolve.
+            let _ = std::fs::remove_file(&tmp);
             notes.push(format!(
                 "stage {bin} failed({e}); using VirtioFS runtime bins"
             ));
