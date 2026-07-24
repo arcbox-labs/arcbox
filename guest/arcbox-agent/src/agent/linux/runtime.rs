@@ -42,6 +42,23 @@ const REQUIRED_RUNTIME_BINARIES: &[&str] = &[
     "docker-init",
 ];
 
+/// Guest-local tmpfs dir holding the per-container-start hot-path binaries.
+///
+/// The runtime binaries live on the host-backed `arcbox` VirtioFS share
+/// (`ARCBOX_RUNTIME_BIN_DIR`), so executing them pages the binary in over
+/// VirtioFS — ~8x slower than a guest-local exec, measured, and paid on
+/// *every* container start. Since every `docker build` RUN/COPY step is a
+/// container, that overhead dominates build wall time (ABX-496). Staging
+/// the hot-path binaries to this tmpfs dir and resolving them from here
+/// makes the exec local.
+const LOCAL_RUNTIME_BIN_DIR: &str = "/run/arcbox/runtime-bin";
+
+/// Binaries on the per-container-start hot path, staged to guest-local
+/// tmpfs. `containerd` and `dockerd` are deliberately excluded: they are
+/// long-lived (paged in once at boot), whereas `runc` and the shim are
+/// exec'd on every container start.
+const HOT_STAGED_BINARIES: &[&str] = &["runc", "containerd-shim-runc-v2"];
+
 /// Minimum "sane" UNIX timestamp for TLS certificate validation.
 ///
 /// Chosen to be old enough that it's always in the past, but recent
@@ -231,14 +248,68 @@ pub(super) async fn direct_container_routing_loop() {
     }
 }
 
-pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
-    let standard = "/usr/sbin:/usr/bin:/sbin:/bin";
-    match std::env::var("PATH") {
-        Ok(existing) if !existing.is_empty() => {
-            format!("{}:{}:{}", runtime_bin_dir.display(), existing, standard)
-        }
-        _ => format!("{}:{}", runtime_bin_dir.display(), standard),
+/// Copies the per-container hot-path binaries from the VirtioFS runtime
+/// share to guest-local tmpfs (ABX-496). Best-effort: on any failure the
+/// caller keeps resolving them from VirtioFS — slower, never broken. One
+/// VirtioFS page-in is paid here (the copy read); every later exec is
+/// local. tmpfs is re-created empty each boot, so this always stages the
+/// binaries the current daemon shipped — no staleness check needed.
+fn stage_hot_runtime_binaries(vfs_dir: &Path, notes: &mut Vec<String>) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Err(e) = std::fs::create_dir_all(LOCAL_RUNTIME_BIN_DIR) {
+        notes.push(format!("stage runtime-bin mkdir failed({e})"));
+        return;
     }
+    for bin in HOT_STAGED_BINARIES {
+        let dst = Path::new(LOCAL_RUNTIME_BIN_DIR).join(bin);
+        if let Err(e) = std::fs::copy(vfs_dir.join(bin), &dst) {
+            notes.push(format!("stage {bin} failed({e})"));
+            return;
+        }
+        if let Err(e) = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)) {
+            notes.push(format!("stage {bin} chmod failed({e})"));
+            return;
+        }
+    }
+    notes.push(format!(
+        "staged {} hot runtime binaries to {LOCAL_RUNTIME_BIN_DIR}",
+        HOT_STAGED_BINARIES.len()
+    ));
+}
+
+/// Composes the PATH for launching containerd/dockerd. When the hot-path
+/// binaries have been staged locally, `local_staged` goes FIRST so
+/// containerd and the shim resolve `runc`/the shim from guest-local tmpfs
+/// rather than over VirtioFS (ABX-496); the VirtioFS `runtime_bin_dir`
+/// follows as the fallback that still carries the un-staged binaries.
+fn compose_runtime_path(
+    local_staged: Option<&Path>,
+    runtime_bin_dir: &Path,
+    existing: Option<&str>,
+) -> String {
+    let standard = "/usr/sbin:/usr/bin:/sbin:/bin";
+    let mut head = String::new();
+    if let Some(local) = local_staged {
+        head.push_str(&local.display().to_string());
+        head.push(':');
+    }
+    head.push_str(&runtime_bin_dir.display().to_string());
+    match existing {
+        Some(existing) if !existing.is_empty() => format!("{head}:{existing}:{standard}"),
+        _ => format!("{head}:{standard}"),
+    }
+}
+
+pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
+    let local = PathBuf::from(LOCAL_RUNTIME_BIN_DIR);
+    let staged = local.join("runc").is_file();
+    let existing = std::env::var("PATH").ok();
+    compose_runtime_path(
+        staged.then_some(local.as_path()),
+        runtime_bin_dir,
+        existing.as_deref(),
+    )
 }
 
 pub(super) fn ensure_shared_runtime_dirs(notes: &mut Vec<String>) {
@@ -788,6 +859,11 @@ async fn try_start_bundled_runtime() -> String {
 
     ensure_shared_runtime_dirs(&mut notes);
 
+    // Copy runc + the shim to guest-local tmpfs so containerd doesn't page
+    // them in over VirtioFS on every container start (ABX-496). Must run
+    // before containerd starts, since its PATH is built once at launch.
+    stage_hot_runtime_binaries(&runtime_bin_dir, &mut notes);
+
     if !ensure_containerd_ready(&runtime_bin_dir, &mut notes).await {
         return notes.join("; ");
     }
@@ -812,7 +888,41 @@ fn setup_nfs_export(notes: &mut Vec<String>) {
 mod tests {
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
 
-    use super::{DockerProbe, shared_containerd_config};
+    use std::path::Path;
+
+    use super::{DockerProbe, compose_runtime_path, shared_containerd_config};
+
+    #[test]
+    fn runtime_path_prefers_local_staged_dir_then_virtiofs() {
+        // The staged local dir must come first so containerd/the shim
+        // resolve runc locally; the VirtioFS dir follows as fallback.
+        let path = compose_runtime_path(
+            Some(Path::new("/run/arcbox/runtime-bin")),
+            Path::new("/arcbox/runtime/bin"),
+            Some("/existing"),
+        );
+        assert_eq!(
+            path,
+            "/run/arcbox/runtime-bin:/arcbox/runtime/bin:/existing:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        let local = path.find("/run/arcbox/runtime-bin").unwrap();
+        let vfs = path.find("/arcbox/runtime/bin").unwrap();
+        assert!(local < vfs, "local staged dir must precede the VirtioFS dir");
+    }
+
+    #[test]
+    fn runtime_path_without_staging_falls_back_to_virtiofs() {
+        // No local staging: the VirtioFS dir leads, behavior unchanged from
+        // before the ABX-496 fix.
+        assert_eq!(
+            compose_runtime_path(None, Path::new("/arcbox/runtime/bin"), None),
+            "/arcbox/runtime/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        assert_eq!(
+            compose_runtime_path(None, Path::new("/arcbox/runtime/bin"), Some("")),
+            "/arcbox/runtime/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+    }
 
     #[test]
     fn shared_containerd_config_uses_k3s_cni_paths() {
