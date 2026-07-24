@@ -5,6 +5,7 @@ use std::path::Path;
 use arcbox_constants::cmdline::{
     DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY,
     DOCKER_METADATA_DEVICE_KEY as DOCKER_METADATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
+    RUNTIME_IMAGE_DEVICE_KEY,
 };
 use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
 use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
@@ -65,6 +66,13 @@ pub(super) fn docker_data_device() -> String {
 /// declares instead). `None` means an older daemon that never attached one.
 pub(super) fn declared_docker_metadata_device() -> Option<String> {
     cmdline_value(DOCKER_METADATA_DEVICE_CMDLINE_KEY).filter(|v| !v.trim().is_empty())
+}
+
+/// The read-only runtime-image device the host declared when it attached the
+/// image. `None` means this boot release ships no runtime image, so the guest
+/// keeps exec'ing the container runtime over VirtioFS.
+pub(super) fn declared_runtime_image_device() -> Option<String> {
+    cmdline_value(RUNTIME_IMAGE_DEVICE_KEY).filter(|v| !v.trim().is_empty())
 }
 
 pub(super) fn kubernetes_api_vsock_port() -> u32 {

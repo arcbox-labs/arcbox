@@ -189,6 +189,7 @@ fn machine_drift_detects_each_overridable_field() {
         kernel: "/k".to_string(),
         cmdline: "console=hvc0 earlycon".to_string(),
         rootfs_image: std::path::PathBuf::from("/rootfs.erofs"),
+        runtime_image: None,
     };
     let current = sample_machine(want.cpus, want.memory_mb, &boot.kernel, &boot.cmdline);
 
@@ -216,8 +217,32 @@ fn machine_drift_detects_each_overridable_field() {
 
     // A machine persisted before the ext4 metadata volume (two disks) must
     // be recreated so the guest receives vdc.
-    let mut m = current;
+    let mut m = current.clone();
     m.block_devices.pop();
+    assert_eq!(
+        machine_drift_reason(&m, &want, &boot),
+        Some("block_devices")
+    );
+
+    // The runtime image adds a fourth disk, so the expected count follows the
+    // release: a three-disk machine drifts once the release ships an image,
+    // and a four-disk machine drifts back once it stops.
+    let boot_with_image = DesiredBoot {
+        kernel: boot.kernel.clone(),
+        cmdline: boot.cmdline.clone(),
+        rootfs_image: boot.rootfs_image.clone(),
+        runtime_image: Some(std::path::PathBuf::from("/runtime.erofs")),
+    };
+    assert_eq!(
+        machine_drift_reason(&current, &want, &boot_with_image),
+        Some("block_devices")
+    );
+    let mut m = current;
+    m.block_devices.push(crate::vm::BlockDeviceConfig {
+        path: "/boot/runtime.erofs".to_string(),
+        read_only: true,
+    });
+    assert_eq!(machine_drift_reason(&m, &want, &boot_with_image), None);
     assert_eq!(
         machine_drift_reason(&m, &want, &boot),
         Some("block_devices")
