@@ -324,9 +324,10 @@ fn compose_runtime_path(
 
 pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
     let local = PathBuf::from(LOCAL_RUNTIME_BIN_DIR);
-    // Trust the local dir only when the FULL hot set is present. Staging
-    // wipes the dir on any failure, so a partial/truncated set never
-    // survives to here — this all-present check is the second guard.
+    // Trust the local dir only when the FULL hot set is present. Staging is
+    // atomic (copy to a temp, then rename), so a failed stage leaves the set
+    // incomplete rather than truncated — this all-present check then fails
+    // and the PATH falls back to VirtioFS.
     let staged = HOT_STAGED_BINARIES
         .iter()
         .all(|bin| local.join(bin).is_file());
