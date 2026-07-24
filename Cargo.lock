@@ -271,19 +271,22 @@ dependencies = [
 
 [[package]]
 name = "arcbox-boot"
-version = "0.5.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73e728afead5d82392eb81911a43ef556e32a3df2a0d4e6bc3e74c5def33f8ce"
+checksum = "2925f99fcc4097b1b8eeb12bd1364f858aeefd9426ee57e8c94229a3b6b002d5"
 dependencies = [
+ "camino",
  "dirs",
+ "fs-err",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "toml 1.1.0+spec-1.1.0",
+ "url",
 ]
 
 [[package]]
@@ -1553,6 +1556,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "camino"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2576,6 +2585,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs-err"
+version = "3.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b91aa448ca50d7e79433bdf3ee8d99215430d2ec02ade5aefab2a073a1822e8a"
+dependencies = [
+ "autocfg",
 ]
 
 [[package]]
