@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3](https://github.com/arcboxlabs/arcbox/compare/v0.5.2...v0.5.3) (2026-07-24)
+
+
+### Bug Fixes
+
+* **net:** detect and reap zombie fast-path flows on both legs ([dc0295e](https://github.com/arcboxlabs/arcbox/commit/dc0295e358fb00b1c70af7cae59e503d18d767bc))
+* **net:** start the dead-flow deadline at solicitation, not the last guest frame ([bafee56](https://github.com/arcboxlabs/arcbox/commit/bafee564189f6e06da7e63dc40d7909c7f9e46bd))
+* **virtio:** drop RX frames that don't fit the chain instead of truncating ([b341beb](https://github.com/arcboxlabs/arcbox/commit/b341bebe4ac7820fae4cc8212c08a5582bda4136))
+* **virtio:** poison a chain on an out-of-RAM descriptor; update poll_rx docs ([f33337c](https://github.com/arcboxlabs/arcbox/commit/f33337c80efe707552326cb106cb69cd5339a986))
+
+
+### Performance Improvements
+
+* **agent:** expedite RCU grace periods to cut runc create ~8x (ABX-496) ([6e67d6f](https://github.com/arcboxlabs/arcbox/commit/6e67d6f2d432724d7b04a1569c75c2634e5c8ddd))
+* **runtime:** exec the container runtime from a read-only block image (ABX-498) ([#499](https://github.com/arcboxlabs/arcbox/issues/499)) ([bde8fb0](https://github.com/arcboxlabs/arcbox/commit/bde8fb01a3f01503be1bec8457423a52c3b67018))
+* **storage:** ext4 metadata volume for fsync-hot boltdb state (ABX-496) ([#497](https://github.com/arcboxlabs/arcbox/issues/497)) ([e4aca03](https://github.com/arcboxlabs/arcbox/commit/e4aca033b1eb7818601b48c71137711a24e1a6b5))
+
+
+### Tests
+
+* **e2e:** live validation of the host-networking reconciler ([#352](https://github.com/arcboxlabs/arcbox/issues/352)) ([696ea7f](https://github.com/arcboxlabs/arcbox/commit/696ea7f8a41dbae6f010386b9dcff9ffb864bd95))
+* **e2e:** observe the removal before timing the sweep; pin the fail-safe ([d46dbcd](https://github.com/arcboxlabs/arcbox/commit/d46dbcd5be270feffd1b0a7e43d67a12ebac4570))
+
+
+### Styles
+
+* **e2e:** apply rustfmt to reconciler_teardown test ([f2a1050](https://github.com/arcboxlabs/arcbox/commit/f2a1050d4ba87421fe964891cbf4d1276276b784))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.6.10 (FEX procfs fix, ABX-494) ([4b52760](https://github.com/arcboxlabs/arcbox/commit/4b52760046499b74dc7fd057a2d842f9462a3aca))
+
 ## [0.5.2](https://github.com/arcboxlabs/arcbox/compare/v0.5.1...v0.5.2) (2026-07-21)
 
 
