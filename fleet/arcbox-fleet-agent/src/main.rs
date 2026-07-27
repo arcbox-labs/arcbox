@@ -48,6 +48,7 @@ mod vm;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
@@ -242,15 +243,28 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let token = resolve_enrollment_token(token_file, token)?;
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetLifecycleServiceClient::new(channel);
-            let response = client
-                .enroll(control_proto::EnrollRequest {
-                    enrollment_token: token,
-                    control_plane: String::new(),
-                })
-                .await
-                .context("Enroll RPC failed")?
-                .into_inner();
-            println!("enrolled (machine_id={})", response.machine_id);
+            let request = control_proto::EnrollRequest {
+                enrollment_token: token,
+                control_plane: String::new(),
+            };
+            let machine_id = match client.enroll(request.clone()).await {
+                Ok(response) => response.into_inner().machine_id,
+                // A gateway that pins a different build refuses the
+                // enrollment, and the agent self-updates and re-execs on the
+                // spot — so a connection that drops mid-call is the expected
+                // shape of "it updated", not a failure to report.
+                Err(status) if is_connection_lost(&status) => {
+                    println!(
+                        "agent restarted mid-enroll (a version refusal self-updates in place); \
+                         waiting for it to come back"
+                    );
+                    resume_enroll_after_restart(&config, request).await?
+                }
+                Err(status) => {
+                    return Err(anyhow::Error::new(status).context("Enroll RPC failed"));
+                }
+            };
+            println!("enrolled (machine_id={machine_id})");
             Ok(())
         }
         Command::Quick(QuickCommand::Enroll(EnrollArgs { token_file, token })) => {
@@ -649,6 +663,130 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
     Ok(token)
 }
 
+/// How long `enroll` waits for the agent to come back after it self-updates
+/// and re-execs mid-call. The download and its checksum verification both
+/// finish before the exec, so this only has to cover process restart and the
+/// control socket rebind.
+const RESTART_WAIT: Duration = Duration::from_secs(30);
+/// Gap between reconnect attempts inside [`RESTART_WAIT`].
+const RESTART_POLL: Duration = Duration::from_millis(250);
+
+/// Whether the RPC failed because the connection went away rather than
+/// because the agent chose to answer that way. `Enroll`'s own refusals all
+/// carry a specific code (`InvalidArgument` for an empty token,
+/// `FailedPrecondition` for a state or operator-action refusal, `Internal`
+/// for a fault), so only transport-level codes reach the resume path.
+fn is_connection_lost(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unknown | tonic::Code::Unavailable | tonic::Code::Cancelled
+    )
+}
+
+/// What a post-restart `GetStatus` says to do about the enrollment this CLI
+/// still owes its caller.
+#[derive(Debug, PartialEq, Eq)]
+enum PostRestart {
+    /// Definitively not enrolled — replay the enrollment.
+    Replay,
+    /// Enrolled, with the id to report.
+    Enrolled(String),
+    /// Enrolled-ish but no machine id yet: `AgentSupervisor::enroll`
+    /// publishes `Attaching` with an empty id for the whole of its gateway
+    /// round-trip, and `status` reports that as `Enrolled`. So this is
+    /// somebody else's `Enroll` still in flight — it may yet fail and leave
+    /// the agent unenrolled. Neither answer is known; look again.
+    InProgress,
+    /// A state this build does not model.
+    Unknown,
+}
+
+/// Classify a post-restart status. Split out as a pure function because it
+/// carries the whole double-enroll argument: `Replay` may only be returned
+/// when the agent is *definitively* unenrolled, never while an enrollment is
+/// merely unresolved.
+fn post_restart(state: control_proto::ConnectionState, machine_id: &str) -> PostRestart {
+    use control_proto::ConnectionState;
+    match state {
+        ConnectionState::Unenrolled => PostRestart::Replay,
+        ConnectionState::Unspecified => PostRestart::Unknown,
+        _ if machine_id.is_empty() => PostRestart::InProgress,
+        _ => PostRestart::Enrolled(machine_id.to_owned()),
+    }
+}
+
+/// One attempt at reading the restarting agent's enrollment. `Err` is a
+/// retryable "not back yet": no socket, or a socket whose server is still
+/// coming up.
+async fn poll_post_restart(
+    config: &AgentConfig,
+) -> Result<(
+    FleetLifecycleServiceClient<tonic::transport::Channel>,
+    PostRestart,
+)> {
+    let mut client =
+        FleetLifecycleServiceClient::new(control::client::connect_default(config).await?);
+    let status = client
+        .get_status(control_proto::GetStatusRequest {})
+        .await
+        .context("GetStatus RPC failed after the agent restarted")?
+        .into_inner();
+    let state = control_proto::ConnectionState::try_from(status.state)
+        .unwrap_or(control_proto::ConnectionState::Unspecified);
+    Ok((client, post_restart(state, &status.machine_id)))
+}
+
+/// Finish an `Enroll` whose connection dropped because the agent
+/// self-updated and re-exec'd. Polls until the replacement process has
+/// rebound the control socket *and* reports a settled enrollment, then
+/// replays the enrollment — the join token is multi-use, so replaying it is
+/// safe. Guarded by [`post_restart`]: the replay happens only while the
+/// agent is definitively unenrolled, so an enrollment that did land — or one
+/// another caller is still driving — can never enroll the machine twice.
+async fn resume_enroll_after_restart(
+    config: &AgentConfig,
+    request: control_proto::EnrollRequest,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + RESTART_WAIT;
+    let mut client = loop {
+        // Every arm that doesn't resolve the enrollment yields the reason to
+        // report if the deadline expires while we keep waiting on it.
+        let waiting_on = match poll_post_restart(config).await {
+            Ok((client, PostRestart::Replay)) => break client,
+            Ok((_, PostRestart::Enrolled(machine_id))) => return Ok(machine_id),
+            Ok((_, PostRestart::Unknown)) => {
+                anyhow::bail!("agent reported an unknown state after restarting")
+            }
+            Ok((_, PostRestart::InProgress)) => {
+                anyhow::anyhow!("another enrollment is still in progress")
+            }
+            Err(error) => error,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                waiting_on.context("the agent never came back ready to enroll after restarting")
+            );
+        }
+        tokio::time::sleep(RESTART_POLL).await;
+    };
+
+    let info = client
+        .get_agent_info(control_proto::GetAgentInfoRequest {})
+        .await
+        .context("GetAgentInfo RPC failed after the agent restarted")?
+        .into_inner();
+    println!(
+        "agent is back on {}; finishing enrollment",
+        info.agent_version
+    );
+    Ok(client
+        .enroll(request)
+        .await
+        .context("Enroll RPC failed after the agent self-updated")?
+        .into_inner()
+        .machine_id)
+}
+
 /// Run the startup probes and assemble the backend registry: any
 /// Docker-served Linux capabilities, windows via WSL interop when that
 /// probe passed, plus the native pair — VM-served when the daemon backend
@@ -925,5 +1063,71 @@ mod tests {
             resolve_enrollment_token(Some(path.clone()), Some("ignored".to_owned())).unwrap();
         assert_eq!(token, "flt_from_file");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Only a lost connection may trigger the resume path. A deliberate
+    /// refusal reaching it would replay an enrollment the agent already
+    /// answered.
+    #[test]
+    fn only_transport_failures_count_as_a_lost_connection() {
+        for code in [
+            tonic::Code::Unknown,
+            tonic::Code::Unavailable,
+            tonic::Code::Cancelled,
+        ] {
+            assert!(
+                is_connection_lost(&tonic::Status::new(code, "")),
+                "{code:?}"
+            );
+        }
+        for code in [
+            tonic::Code::FailedPrecondition,
+            tonic::Code::InvalidArgument,
+            tonic::Code::Internal,
+        ] {
+            assert!(
+                !is_connection_lost(&tonic::Status::new(code, "")),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// The double-enroll guard. `Replay` is only ever correct when the agent
+    /// is definitively unenrolled — an enrolled state reports its id, and an
+    /// enrollment still in flight (`Attaching`, which `status` reports as
+    /// `Enrolled` with no id yet) is unresolved, not a licence to replay.
+    #[test]
+    fn post_restart_replays_only_a_definitely_unenrolled_agent() {
+        use control_proto::ConnectionState;
+
+        assert_eq!(
+            post_restart(ConnectionState::Unenrolled, ""),
+            PostRestart::Replay
+        );
+        assert_eq!(
+            post_restart(ConnectionState::Enrolled, "fltm_test"),
+            PostRestart::Enrolled("fltm_test".to_owned())
+        );
+        // Another caller's Enroll is mid-round-trip: no id published yet.
+        assert_eq!(
+            post_restart(ConnectionState::Enrolled, ""),
+            PostRestart::InProgress
+        );
+        assert_eq!(
+            post_restart(ConnectionState::Unspecified, ""),
+            PostRestart::Unknown
+        );
+        // Every other enrolled-ish state reports its machine, never replays.
+        for state in [
+            ConnectionState::Draining,
+            ConnectionState::Detached,
+            ConnectionState::CredentialRejected,
+        ] {
+            assert_eq!(
+                post_restart(state, "fltm_test"),
+                PostRestart::Enrolled("fltm_test".to_owned()),
+                "{state:?}"
+            );
+        }
     }
 }
