@@ -137,6 +137,7 @@ message AttachRequest {
     RunnerAccepted runner_accepted = 3;
     RunnerRejected runner_rejected = 4;
     RunnerExited runner_exited = 5;
+    RunnerLogChunk runner_log = 6;
   }
 }
 
@@ -208,6 +209,31 @@ message RunnerExited {
   // Resend-dedup correlation token, echoed back in OfferVerdictAck. Not an
   // offer token — this event belongs to the job, not to any single offer.
   string ack_token = 2;
+}
+
+// A slice of a started runner's combined stdout/stderr, for live viewing while
+// the job runs. Deliberately the one lossy message on this stream: unlike
+// verdicts it is never tracked for resend and never acked, because the attach
+// stream is a control plane whose heartbeat must not queue behind runner
+// output. A chunk that cannot be sent immediately is dropped, and the bytes it
+// carried are reported in the next chunk's `dropped_bytes`. Nothing persists it
+// — a consumer sees only what arrives while it is subscribed, and GitHub
+// remains the authoritative record of a job's log.
+message RunnerLogChunk {
+  // Prefixed runner job id (`rjob_...`).
+  string job_id = 1;
+  // Per-job counter starting at 0, incremented for every chunk the agent
+  // emits. Consumers detect loss as a gap, never as reordering: one attach
+  // stream delivers in order.
+  uint64 seq = 2;
+  // Raw output bytes. Not line-aligned and not guaranteed UTF-8 — a chunk
+  // boundary can split a line or a multi-byte character.
+  bytes data = 3;
+  // Best-effort count of bytes shed since the previous chunk on this job —
+  // the rate-budget and queue-full drops the agent observed directly. Zero in
+  // the steady state. A `seq` gap is the authoritative loss signal: a chunk
+  // discarded further down the agent's egress path is not counted here.
+  uint64 dropped_bytes = 4;
 }
 
 message AttachResponse {
