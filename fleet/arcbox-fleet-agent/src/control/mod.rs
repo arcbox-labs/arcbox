@@ -36,7 +36,7 @@ use crate::credentials::Credential;
 use crate::runner::RunnerSupervisor;
 use crate::settings::SettingsStore;
 use crate::state::AgentState;
-use crate::{attach, enroll};
+use crate::{attach, enroll, update};
 use image::ImageService;
 use lifecycle::LifecycleService;
 use settings::SettingsService;
@@ -398,9 +398,11 @@ impl AgentSupervisor {
 
         // The gateway round-trip must not hold `state` locked.
         let credential =
-            enroll::enroll(&self.config, token, self.backends.capabilities(), &gateway)
-                .await
-                .map_err(Internal)?;
+            match enroll::enroll(&self.config, token, self.backends.capabilities(), &gateway).await
+            {
+                Ok(credential) => credential,
+                Err(error) => return Err(self.refused_enrollment(error).await),
+            };
 
         let mut state = self.state.lock().await;
         // `check_enrollable` refuses `Enrolling`, so nothing else can
@@ -446,6 +448,43 @@ impl AgentSupervisor {
         let machine_id = credential.machine_id.clone();
         *state = State::Attached(self.attach(credential, gateway));
         Ok(machine_id)
+    }
+
+    /// Classify a failed enrollment round-trip, self-updating when it was
+    /// the gateway telling us which build to run. That refusal is the same
+    /// signal `attach` acts on (`AttachRejected`), arriving one step
+    /// earlier — so it gets the same treatment, or enrolling on a stale
+    /// binary would be a dead end that no later attach can rescue.
+    ///
+    /// Nothing to drain here: `check_enrollable` admitted this enroll only
+    /// from `Unenrolled`, so there is no attachment and no in-flight job to
+    /// protect. On success the process is replaced mid-RPC and the caller
+    /// re-issues `Enroll` against the new build; every path that returns
+    /// leaves the observable `Updating` for [`Self::enroll`]'s rollback to
+    /// reset.
+    async fn refused_enrollment(&self, error: anyhow::Error) -> Status {
+        let Some(payload) = enroll::update_payload(&error) else {
+            return Internal(error).into();
+        };
+        info!(
+            expected = %payload.expected_version,
+            current = env!("CARGO_PKG_VERSION"),
+            "gateway requires a different build; self-updating before enrolling"
+        );
+        self.agent_state.set_enrollment(Enrollment::Updating, "");
+        // Returns only on failure; success replaces this process.
+        let update_error = update::apply_and_exec(&self.config, &payload).await;
+        if update_error
+            .chain()
+            .any(|c| c.downcast_ref::<update::UnmanagedBinary>().is_some())
+        {
+            // Not our binary to manage: installing the expected build is the
+            // operator's job, not something to retry.
+            warn!(error = %update_error, "self-update declined");
+            return Status::failed_precondition(format!("{error}; {update_error}"));
+        }
+        warn!(error = %update_error, "self-update failed");
+        Internal(update_error).into()
     }
 
     /// Leave the fleet — terminal. Stops attaching, decommissions the
@@ -794,6 +833,101 @@ mod tests {
             }
         });
         (format!("http://{addr}"), task)
+    }
+
+    /// A gateway that refuses every enrollment with `UpdateRequired`, the
+    /// way a real one meets an agent whose build is not the pinned one,
+    /// pushing `binary_url` as the download to converge on.
+    struct PinnedGateway {
+        binary_url: String,
+    }
+
+    #[tonic::async_trait]
+    impl arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayService for PinnedGateway {
+        async fn enroll(
+            &self,
+            _: tonic::Request<arcbox_fleet_proto::v1::EnrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::EnrollResponse>, Status> {
+            Ok(tonic::Response::new(
+                arcbox_fleet_proto::v1::EnrollResponse {
+                    result: Some(
+                        arcbox_fleet_proto::v1::enroll_response::Result::UpdateRequired(
+                            arcbox_fleet_proto::v1::AgentUpdate {
+                                expected_version: "9.9.9".to_owned(),
+                                binary_url: self.binary_url.clone(),
+                                binary_sha256: "0".repeat(64),
+                            },
+                        ),
+                    ),
+                },
+            ))
+        }
+
+        type AttachStream = tokio_stream::wrappers::ReceiverStream<
+            Result<arcbox_fleet_proto::v1::AttachResponse, Status>,
+        >;
+
+        async fn attach(
+            &self,
+            _: tonic::Request<tonic::Streaming<arcbox_fleet_proto::v1::AttachRequest>>,
+        ) -> Result<tonic::Response<Self::AttachStream>, Status> {
+            Err(Status::unimplemented("enrollment-only test gateway"))
+        }
+
+        async fn unenroll(
+            &self,
+            _: tonic::Request<arcbox_fleet_proto::v1::UnenrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::UnenrollResponse>, Status> {
+            Err(Status::unimplemented("enrollment-only test gateway"))
+        }
+    }
+
+    /// Serve [`PinnedGateway`] on a scratch port and return its URL.
+    async fn pinned_gateway(binary_url: &str) -> String {
+        use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind pinned gateway listener");
+        let addr = listener.local_addr().expect("pinned gateway addr");
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetGatewayServiceServer::new(PinnedGateway {
+                    binary_url: binary_url.to_owned(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        format!("http://{addr}")
+    }
+
+    /// A refusal that does carry a download enters the self-update path —
+    /// which stops at the managed-path check here, because the test binary is
+    /// not the binary the agent owns. Proves the enrollment path reaches the
+    /// updater (nothing is downloaded: `ensure_managed` runs first) and that
+    /// declining still rolls the enrollment back.
+    #[tokio::test]
+    async fn enroll_declines_to_self_update_an_unmanaged_binary() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-enroll-unmanaged-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let supervisor = test_supervisor(&dir, agent_state.clone()).await;
+        // Never fetched — the managed-path refusal precedes the download.
+        let gateway = pinned_gateway("http://127.0.0.1:1/arcbox-fleet-agent").await;
+
+        let err = supervisor
+            .enroll("flt_join_test".to_owned(), Some(&gateway))
+            .await
+            .expect_err("a version-refused enrollment cannot succeed");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("is not the managed"), "{err}");
+        assert!(matches!(*supervisor.state.lock().await, State::Unenrolled));
+        assert_eq!(
+            agent_state.current().enrollment,
+            Enrollment::Unenrolled as i32
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Poll until the observable enrollment reaches `Attaching`, bounded so a

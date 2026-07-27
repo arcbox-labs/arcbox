@@ -48,6 +48,7 @@ mod vm;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
@@ -242,15 +243,28 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let token = resolve_enrollment_token(token_file, token)?;
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetLifecycleServiceClient::new(channel);
-            let response = client
-                .enroll(control_proto::EnrollRequest {
-                    enrollment_token: token,
-                    control_plane: String::new(),
-                })
-                .await
-                .context("Enroll RPC failed")?
-                .into_inner();
-            println!("enrolled (machine_id={})", response.machine_id);
+            let request = control_proto::EnrollRequest {
+                enrollment_token: token,
+                control_plane: String::new(),
+            };
+            let machine_id = match client.enroll(request.clone()).await {
+                Ok(response) => response.into_inner().machine_id,
+                // A gateway that pins a different build refuses the
+                // enrollment, and the agent self-updates and re-execs on the
+                // spot — so a connection that drops mid-call is the expected
+                // shape of "it updated", not a failure to report.
+                Err(status) if is_connection_lost(&status) => {
+                    println!(
+                        "agent restarted mid-enroll (a version refusal self-updates in place); \
+                         waiting for it to come back"
+                    );
+                    resume_enroll_after_restart(&config, request).await?
+                }
+                Err(status) => {
+                    return Err(anyhow::Error::new(status).context("Enroll RPC failed"));
+                }
+            };
+            println!("enrolled (machine_id={machine_id})");
             Ok(())
         }
         Command::Quick(QuickCommand::Enroll(EnrollArgs { token_file, token })) => {
@@ -647,6 +661,82 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
         anyhow::bail!("enrollment token is empty");
     }
     Ok(token)
+}
+
+/// How long `enroll` waits for the agent to come back after it self-updates
+/// and re-execs mid-call. The download and its checksum verification both
+/// finish before the exec, so this only has to cover process restart and the
+/// control socket rebind.
+const RESTART_WAIT: Duration = Duration::from_secs(30);
+/// Gap between reconnect attempts inside [`RESTART_WAIT`].
+const RESTART_POLL: Duration = Duration::from_millis(250);
+
+/// Whether the RPC failed because the connection went away rather than
+/// because the agent chose to answer that way. `Enroll`'s own refusals all
+/// carry a specific code (`InvalidArgument` for an empty token,
+/// `FailedPrecondition` for a state or operator-action refusal, `Internal`
+/// for a fault), so only transport-level codes reach the resume path.
+fn is_connection_lost(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unknown | tonic::Code::Unavailable | tonic::Code::Cancelled
+    )
+}
+
+/// Finish an `Enroll` whose connection dropped because the agent
+/// self-updated and re-exec'd. Waits for the replacement process to rebind
+/// the control socket, then replays the enrollment — the join token is
+/// multi-use, so replaying it is safe. Guarded by `GetStatus`: the replay
+/// only happens while the agent reports itself unenrolled, so an enrollment
+/// that did land and whose response we merely lost can never enroll the
+/// machine a second time.
+async fn resume_enroll_after_restart(
+    config: &AgentConfig,
+    request: control_proto::EnrollRequest,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + RESTART_WAIT;
+    let mut client = loop {
+        match control::client::connect_default(config).await {
+            Ok(channel) => break FleetLifecycleServiceClient::new(channel),
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(error.context("the agent went away mid-enroll and never came back"));
+            }
+            Err(_) => tokio::time::sleep(RESTART_POLL).await,
+        }
+    };
+
+    let info = client
+        .get_agent_info(control_proto::GetAgentInfoRequest {})
+        .await
+        .context("GetAgentInfo RPC failed after the agent restarted")?
+        .into_inner();
+    let status = client
+        .get_status(control_proto::GetStatusRequest {})
+        .await
+        .context("GetStatus RPC failed after the agent restarted")?
+        .into_inner();
+    match control_proto::ConnectionState::try_from(status.state)
+        .unwrap_or(control_proto::ConnectionState::Unspecified)
+    {
+        control_proto::ConnectionState::Unenrolled => {}
+        control_proto::ConnectionState::Unspecified => {
+            anyhow::bail!("agent reported an unknown state after restarting");
+        }
+        // Enrolled after all: the pre-restart attempt persisted its
+        // credential and only the response was lost with the connection.
+        _ => return Ok(status.machine_id),
+    }
+
+    println!(
+        "agent is back on {}; finishing enrollment",
+        info.agent_version
+    );
+    Ok(client
+        .enroll(request)
+        .await
+        .context("Enroll RPC failed after the agent self-updated")?
+        .into_inner()
+        .machine_id)
 }
 
 /// Run the startup probes and assemble the backend registry: any
