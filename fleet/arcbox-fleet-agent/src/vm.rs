@@ -37,6 +37,7 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 use crate::host;
+use crate::joblog::JobLogSink;
 
 /// Guest login and runner location — the ArcBox macOS runner image contract
 /// (see the module doc).
@@ -380,13 +381,20 @@ impl RunningVm {
     /// follow with [`destroy`](Self::destroy). The agent reports no outcome
     /// upstream (the GitHub webhook is authoritative); the code is for
     /// logging.
-    pub async fn wait(&mut self) -> Option<u32> {
+    ///
+    /// The guest is destroyed on every exit path, so this session is the only
+    /// chance to observe the runner's output: it is forwarded to `sink` as it
+    /// arrives rather than collected, since nothing here should hold a whole
+    /// job's log in memory.
+    pub async fn wait(&mut self, sink: &JobLogSink) -> Option<u32> {
         let mut code = None;
         while let Some(msg) = self.channel.wait().await {
             match msg {
-                // Runner output stays in the disposable guest; nothing to
-                // collect here.
-                ChannelMsg::Data { .. } | ChannelMsg::ExtendedData { .. } => {}
+                // stdout and the stderr extension both carry runner output;
+                // the guest's own interleaving is the order worth preserving.
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    sink.write(&data);
+                }
                 ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
                 _ => {}
             }
@@ -508,7 +516,7 @@ mod tests {
             )
             .await
             .expect("provision guest and exec");
-        assert_eq!(running.wait().await, Some(0));
+        assert_eq!(running.wait(&JobLogSink::discarding()).await, Some(0));
         running.destroy().await;
     }
 

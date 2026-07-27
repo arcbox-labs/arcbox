@@ -8,12 +8,14 @@ use anyhow::{Context, Result};
 use bollard::Docker;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, RemoveContainerOptions, WaitContainerOptions,
+    CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
+    WaitContainerOptions,
 };
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::host;
+use crate::joblog::JobLogSink;
 
 /// Everything the Docker runner needs to execute one job.
 pub struct RunSpec<'a> {
@@ -40,6 +42,38 @@ pub struct RunningContainer {
 }
 
 impl RunningContainer {
+    /// Stream this container's combined output into `sink` for the rest of its
+    /// life, in a detached task.
+    ///
+    /// Detaching is safe because the stream is bounded by the container: it
+    /// ends when the container exits or is removed, which every exit path from
+    /// [`wait`](Self::wait) leads to. Docker holds the output itself, so unlike
+    /// the pipe-backed backends nothing blocks if this task falls behind.
+    pub fn follow_logs(&self, sink: JobLogSink) {
+        let client = self.client.clone();
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            let options = LogsOptions {
+                follow: true,
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            };
+            let mut stream = client.logs(&id, Some(options));
+            while let Some(frame) = stream.next().await {
+                match frame {
+                    Ok(output) => sink.write(&output.into_bytes()),
+                    // Teardown closes the stream mid-read; the job's own exit
+                    // path reports the outcome, so this is not an error here.
+                    Err(e) => {
+                        debug!(container = %id, error = %e, "container log stream ended");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     /// Block until the container exits and return its exit code. No cleanup —
     /// follow with [`remove`](Self::remove). The agent reports no outcome
     /// upstream (the GitHub webhook is authoritative); the code is for logging.

@@ -320,14 +320,16 @@ impl AgentSupervisor {
         // process-lifetime state, so clear any stale draining flag rather than
         // letting a re-enroll inherit it.
         self.agent_state.set_draining(false);
-        let (supervisor, egress_rx) =
+        let handles =
             attach::spawn_supervisor(&self.config, self.backends(), self.agent_state.clone());
+        let supervisor = handles.supervisor;
         let shutdown = self.process_shutdown.child_token();
         let task = tokio::spawn(attach::run(
             self.config.clone(),
             credential.clone(),
             supervisor.clone(),
-            egress_rx,
+            handles.egress_rx,
+            handles.log_rx,
             self.backends(),
             shutdown.clone(),
             self.agent_state.clone(),
@@ -960,7 +962,7 @@ mod tests {
             Ok(())
         });
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
-        let runner = crate::runner::RunnerSupervisor::new(
+        let runner = crate::runner::RunnerSupervisor::without_logs(
             events,
             None,
             Backends::new(false, None, None, None, agent_state.clone()),
@@ -1106,7 +1108,7 @@ mod tests {
             Ok(())
         });
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
-        let runner = crate::runner::RunnerSupervisor::new(
+        let runner = crate::runner::RunnerSupervisor::without_logs(
             events,
             None,
             Backends::new(false, None, None, None, agent_state.clone()),

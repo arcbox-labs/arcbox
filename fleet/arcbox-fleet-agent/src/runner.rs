@@ -16,6 +16,7 @@
 //! so a busy host simply rejects and the platform re-offers elsewhere.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ use tracing::{info, warn};
 use crate::backends::Backends;
 use crate::docker::RunSpec;
 use crate::host;
+use crate::joblog::JobLogSink;
 use crate::state::AgentState;
 
 /// Watchdog on a VM job's runtime: GitHub concludes jobs at 6 h, so a
@@ -152,6 +154,9 @@ pub struct RunnerSupervisor {
 struct Inner {
     /// Outbound channel to the gateway (offer verdicts).
     events: mpsc::Sender<AttachRequest>,
+    /// Outbound channel for runner output. Separate from `events` so a chatty
+    /// job can never delay a verdict or a heartbeat; see [`crate::joblog`].
+    logs: mpsc::Sender<AttachRequest>,
     /// Verdicts sent but not yet acknowledged by the gateway, keyed by
     /// `offer_token`. Resent until an `OfferVerdictAck` arrives so a gateway
     /// crash-after-read cannot lose the verdict. There is no local expiry: the
@@ -209,14 +214,15 @@ impl Drop for ReleaseGuard {
 }
 
 impl RunnerSupervisor {
-    /// Create a supervisor that emits verdicts on `events`. Routing comes
-    /// live from `backends` — the same registry the advertised capability
-    /// set derives from, so routing and advertisement agree by construction.
-    /// `load_ceiling`/`mem_floor_mib` are not parameters: `admit()` reads
-    /// them live from `state`, which is the single source of truth settings
-    /// write through.
+    /// Create a supervisor that emits verdicts on `events` and runner output
+    /// on `logs`. Routing comes live from `backends` — the same registry the
+    /// advertised capability set derives from, so routing and advertisement
+    /// agree by construction. `load_ceiling`/`mem_floor_mib` are not
+    /// parameters: `admit()` reads them live from `state`, which is the single
+    /// source of truth settings write through.
     pub fn new(
         events: mpsc::Sender<AttachRequest>,
+        logs: mpsc::Sender<AttachRequest>,
         runner_script: Option<PathBuf>,
         backends: Arc<Backends>,
         state: AgentState,
@@ -224,6 +230,7 @@ impl RunnerSupervisor {
         Self {
             inner: Arc::new(Inner {
                 events,
+                logs,
                 outstanding: DashMap::new(),
                 in_flight: DashMap::new(),
                 runner_script,
@@ -509,6 +516,26 @@ impl RunnerSupervisor {
         }
     }
 
+    /// Test constructor with no runner-output consumer, so every chunk is
+    /// shed. For the many tests that exercise admission, verdicts and job
+    /// lifecycle without asserting on output.
+    #[cfg(test)]
+    pub fn without_logs(
+        events: mpsc::Sender<AttachRequest>,
+        runner_script: Option<PathBuf>,
+        backends: Arc<Backends>,
+        state: AgentState,
+    ) -> Self {
+        Self::new(events, mpsc::channel(1).0, runner_script, backends, state)
+    }
+
+    /// Open the runner-output sink for a job. Created before the runner starts
+    /// so no backend has to retrofit capture onto an already-running process;
+    /// a job that never starts simply writes nothing to it.
+    fn log_sink(&self, job_id: &str) -> JobLogSink {
+        JobLogSink::new(job_id, self.inner.logs.clone())
+    }
+
     /// Start the runner for an accepted offer, then accept once it is actually
     /// running. A failure to start rejects instead, so the platform re-offers.
     async fn run_job(
@@ -613,8 +640,9 @@ impl RunnerSupervisor {
             Canceled,
             Watchdog,
         }
+        let sink = self.log_sink(job_id);
         let exited = {
-            let wait = std::pin::pin!(running.wait());
+            let wait = std::pin::pin!(running.wait(&sink));
             tokio::select! {
                 exit = wait => VmExit::Exited(exit),
                 () = cancel.cancelled() => VmExit::Canceled,
@@ -667,7 +695,8 @@ impl RunnerSupervisor {
         // on degraded interop and must not make the agent deaf to
         // CancelRunner — mirror the VM startup path.
         let spawned = {
-            let spawn = std::pin::pin!(interop.spawn(&order.encoded_jit_config));
+            let spawn =
+                std::pin::pin!(interop.spawn(&order.encoded_jit_config, self.log_sink(job_id)));
             tokio::select! {
                 result = spawn => Some(result),
                 () = cancel.cancelled() => None,
@@ -748,6 +777,18 @@ impl RunnerSupervisor {
                 return;
             }
         };
+
+        // Drain both pipes for the job's lifetime. This is not optional: with
+        // `Stdio::piped()` a runner that outruns the reader would block on a
+        // full pipe buffer, so capture and liveness are the same concern here.
+        let sink = self.log_sink(job_id);
+        let inner = child.inner();
+        if let Some(stdout) = inner.stdout.take() {
+            sink.pipe(stdout);
+        }
+        if let Some(stderr) = inner.stderr.take() {
+            sink.pipe(stderr);
+        }
 
         // group_spawn is synchronous, but cancellation is handled on another
         // runtime thread. Arbitrate through the slot before accepting.
@@ -832,6 +873,12 @@ impl RunnerSupervisor {
                 return;
             }
         };
+
+        // Follow from here rather than before `start`: the log stream is keyed
+        // on the container, which only exists now. Docker retains output from
+        // the container's first instant, so nothing produced during startup is
+        // missed.
+        running.follow_logs(self.log_sink(job_id));
 
         // The container is running. Cancellation and acceptance arbitrate
         // through the slot before any verdict is sent.
@@ -993,9 +1040,20 @@ impl RunnerSupervisor {
 /// point (`run.sh`); no `.current_dir()` is set because the wrapper script
 /// locates its own sibling files via `$0`'s dirname, not the caller's
 /// working directory.
+///
+/// Both output streams are piped rather than inherited, so they can be
+/// attributed to this job and streamed to the gateway. The caller must drain
+/// them (see [`RunnerSupervisor::run_host_job`]) or a chatty runner blocks on a
+/// full pipe. This is why host-runner output no longer appears in the service
+/// manager's stdout/stderr capture, where it used to land interleaved and
+/// unattributed.
 fn runner_command(script: &Path, encoded_jit_config: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(script);
-    command.arg("--jitconfig").arg(encoded_jit_config);
+    command
+        .arg("--jitconfig")
+        .arg(encoded_jit_config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     command
 }
 
@@ -1043,7 +1101,7 @@ mod tests {
     fn supervisor(capabilities: Vec<Capability>) -> RunnerSupervisor {
         let (events, _rx) = mpsc::channel(1);
         let state = AgentState::new(&seed());
-        RunnerSupervisor::new(
+        RunnerSupervisor::without_logs(
             events,
             Some(PathBuf::from("/nonexistent")),
             Backends::fixed(capabilities, state.clone()),
@@ -1091,8 +1149,86 @@ mod tests {
             interop,
             state.clone(),
         );
-        let sup = RunnerSupervisor::new(events, None, backends, state);
+        let sup = RunnerSupervisor::without_logs(events, None, backends, state);
         (sup, rx)
+    }
+
+    /// Like [`windows_supervisor_with_rx`], but also hands back the
+    /// runner-output receiver so a test can assert on captured output.
+    fn windows_supervisor_with_logs(
+        interop: Option<InteropRunner>,
+    ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
+        let (events, _events_rx) = mpsc::channel(8);
+        let (logs, logs_rx) = mpsc::channel(64);
+        let state = AgentState::new(&crate::settings::PersistedSettings {
+            load_ceiling: f64::MAX,
+            mem_floor_mib: 0,
+            ..seed()
+        });
+        let backends = Backends::fixed_with_interop(
+            vec![capability("windows", "amd64", Backend::HostRunner)],
+            interop,
+            state.clone(),
+        );
+        // The events receiver is dropped, so verdicts are shed — this test
+        // is about output, and the supervisor must not depend on a live
+        // verdict consumer to capture it.
+        let sup = RunnerSupervisor::new(events, logs, None, backends, state);
+        (sup, logs_rx)
+    }
+
+    /// Output a started runner produces must reach the log queue as chunks
+    /// tagged with the job that produced them. Drives the whole path —
+    /// `handle_provision` → backend routing → interop drain → `JobLogSink` —
+    /// rather than calling the sink directly, so a backend that captures
+    /// nothing fails here.
+    #[tokio::test]
+    async fn started_runner_output_reaches_the_log_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let powershell = interop_stub(
+            dir.path(),
+            "powershell",
+            "echo 'WINPID=4242'\necho 'building the thing'\nexit 0",
+        );
+        let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
+        let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
+
+        // Same ETXTBSY warm-up as the routing test below: a concurrently
+        // forking test can hold the freshly written stub open for writing.
+        for _ in 0..100 {
+            match interop
+                .spawn("dGVzdA==", crate::joblog::JobLogSink::discarding())
+                .await
+            {
+                Ok(mut job) => {
+                    let _ = job.wait().await;
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+
+        let (sup, mut logs_rx) = windows_supervisor_with_logs(Some(interop));
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_win".to_owned(),
+            os: "windows".to_owned(),
+            arch: "amd64".to_owned(),
+            encoded_jit_config: "dGVzdA==".to_owned(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        let chunk = tokio::time::timeout(Duration::from_secs(5), logs_rx.recv())
+            .await
+            .expect("runner output within the handshake budget")
+            .expect("log queue open");
+        match chunk.msg {
+            Some(attach_request::Msg::RunnerLog(chunk)) => {
+                assert_eq!(chunk.job_id, "rjob_win");
+                assert_eq!(chunk.data, b"building the thing\n");
+                assert_eq!(chunk.dropped_bytes, 0);
+            }
+            other => panic!("expected RunnerLog, got {other:?}"),
+        }
     }
 
     /// Write an executable stub standing in for powershell/taskkill.
@@ -1119,7 +1255,7 @@ mod tests {
         // concurrently forking test can hold it open for writing until its
         // own exec) so the spawn inside handle_provision can't hit it.
         for _ in 0..100 {
-            match interop.spawn("dGVzdA==").await {
+            match interop.spawn("dGVzdA==", JobLogSink::discarding()).await {
                 Ok(mut job) => {
                     let _ = job.wait().await;
                     break;
@@ -1315,7 +1451,7 @@ mod tests {
     fn supervisor_with_rx(capacity: usize) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(capacity);
         let state = AgentState::new(&seed());
-        let sup = RunnerSupervisor::new(
+        let sup = RunnerSupervisor::without_logs(
             events,
             Some(PathBuf::from("/nonexistent")),
             Backends::fixed(
@@ -1340,7 +1476,7 @@ mod tests {
             mem_floor_mib: 0,
             ..seed()
         });
-        let sup = RunnerSupervisor::new(
+        let sup = RunnerSupervisor::without_logs(
             events,
             Some(PathBuf::from("/nonexistent")),
             Backends::fixed(
@@ -1693,7 +1829,7 @@ mod tests {
     async fn shutdown_does_not_flip_observable_draining_but_drain_does() {
         let drained = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(
+        RunnerSupervisor::without_logs(
             events,
             None,
             Backends::fixed(Vec::new(), drained.clone()),
@@ -1707,7 +1843,7 @@ mod tests {
 
         let torn_down = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(
+        RunnerSupervisor::without_logs(
             events,
             None,
             Backends::fixed(Vec::new(), torn_down.clone()),

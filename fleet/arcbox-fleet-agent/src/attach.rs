@@ -39,6 +39,11 @@ const VERDICT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OUTBOUND_CAPACITY: usize = 64;
+/// Depth of the runner-output queue. Deep enough to ride out a brief stall in
+/// the gRPC stream, shallow enough that a job outrunning the network is shed
+/// promptly instead of accumulating in agent memory. Separate from
+/// `OUTBOUND_CAPACITY` so output can never occupy a slot a heartbeat needs.
+const LOG_CAPACITY: usize = 256;
 const MACHINE_TOKEN_HEADER: &str = "x-arcbox-machine-token";
 /// How long to wait for runners to be torn down and reaped on shutdown before
 /// giving up. Killing a process group or container is near-instant, so this is a
@@ -124,7 +129,22 @@ fn telemetry_to_control(t: &HostTelemetry) -> control_proto::HostTelemetry {
     }
 }
 
-/// Build the [`RunnerSupervisor`] and its egress queue. The verdict-resend
+/// The [`RunnerSupervisor`] and the two outbound queues it feeds.
+///
+/// A struct rather than a tuple because the two receivers have the same type
+/// but opposite delivery contracts — swapping them would make runner output
+/// durable and verdicts lossy, and compile fine.
+pub struct SupervisorHandles {
+    pub supervisor: RunnerSupervisor,
+    /// Runner lifecycle events: delivered with an awaited send and held in the
+    /// `pending` slot across a reconnect, so a verdict is never lost.
+    pub egress_rx: mpsc::Receiver<AttachRequest>,
+    /// Runner output: delivered with `try_send` and dropped when the stream
+    /// cannot take it. See [`crate::joblog`].
+    pub log_rx: mpsc::Receiver<AttachRequest>,
+}
+
+/// Build the [`RunnerSupervisor`] and its outbound queues. The verdict-resend
 /// loop is started by [`run`] instead, so it shares the attachment's shutdown
 /// token and is reaped with it.
 ///
@@ -136,32 +156,43 @@ pub fn spawn_supervisor(
     config: &AgentConfig,
     backends: Arc<Backends>,
     state: AgentState,
-) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
+) -> SupervisorHandles {
     let (egress_tx, egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
-    let supervisor =
-        RunnerSupervisor::new(egress_tx, config.runner_script.clone(), backends, state);
-    (supervisor, egress_rx)
+    let (log_tx, log_rx) = mpsc::channel::<AttachRequest>(LOG_CAPACITY);
+    let supervisor = RunnerSupervisor::new(
+        egress_tx,
+        log_tx,
+        config.runner_script.clone(),
+        backends,
+        state,
+    );
+    SupervisorHandles {
+        supervisor,
+        egress_rx,
+        log_rx,
+    }
 }
 
 /// Connect and serve the attach stream, reconnecting on any failure until
 /// `shutdown` fires, then stop runners cleanly.
 ///
-/// `supervisor` and `egress_rx` come from [`spawn_supervisor`] and are reused
-/// across reconnects, so in-flight jobs survive a dropped connection and
-/// their verdicts reach the next live stream. On shutdown the loop exits and
-/// hands off to [`RunnerSupervisor::shutdown`], which tears down any
-/// in-flight runners.
+/// `supervisor`, `egress_rx` and `log_rx` come from [`spawn_supervisor`] and
+/// are reused across reconnects, so in-flight jobs survive a dropped
+/// connection and their verdicts reach the next live stream. On shutdown the
+/// loop exits and hands off to [`RunnerSupervisor::shutdown`], which tears
+/// down any in-flight runners.
 #[allow(
     clippy::too_many_arguments,
     reason = "the reconnect loop genuinely needs all of: endpoint config, credential, the \
-              persistent supervisor, the cross-reconnect egress queue, the backend \
-              registry, the shutdown token, and the observable state handle"
+              persistent supervisor, the cross-reconnect egress and runner-output queues, \
+              the backend registry, the shutdown token, and the observable state handle"
 )]
 pub async fn run(
     config: AgentConfig,
     credential: Credential,
     supervisor: RunnerSupervisor,
     mut egress_rx: mpsc::Receiver<AttachRequest>,
+    mut log_rx: mpsc::Receiver<AttachRequest>,
     backends: Arc<Backends>,
     shutdown: CancellationToken,
     state: AgentState,
@@ -193,6 +224,7 @@ pub async fn run(
             &credential,
             &supervisor,
             &mut egress_rx,
+            &mut log_rx,
             &mut pending,
             &mut backoff,
             &backends,
@@ -317,21 +349,22 @@ pub async fn run(
 ///
 /// Outbound traffic is multiplexed onto a fresh per-connection request channel:
 /// connection-scoped heartbeats are sent directly, while runner lifecycle
-/// events are forwarded from the shared egress queue. Inbound orders are routed
-/// to the persistent `supervisor`.
+/// events are forwarded from the shared egress queue and runner output from the
+/// shared log queue. Inbound orders are routed to the persistent `supervisor`.
 #[allow(
     clippy::too_many_arguments,
     reason = "one connection's lifecycle genuinely needs all of: endpoint config, \
-              credential, the persistent supervisor, the cross-reconnect egress queue \
-              and its pending slot, the mutable backoff, advertised capabilities, the \
-              shutdown token, the observable state handle, and the cross-reconnect \
-              update-drain flag"
+              credential, the persistent supervisor, the cross-reconnect egress and \
+              runner-output queues and the egress pending slot, the mutable backoff, \
+              advertised capabilities, the shutdown token, the observable state handle, \
+              and the cross-reconnect update-drain flag"
 )]
 async fn connect_and_serve(
     config: &AgentConfig,
     credential: &Credential,
     supervisor: &RunnerSupervisor,
     egress_rx: &mut mpsc::Receiver<AttachRequest>,
+    log_rx: &mut mpsc::Receiver<AttachRequest>,
     pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
     backends: &Backends,
@@ -494,6 +527,24 @@ async fn connect_and_serve(
                 }
                 // The supervisor holds the only egress sender, so this cannot
                 // happen while the agent runs; treat it as a clean shutdown.
+                None => break Ok(StreamEnd::Closed),
+            },
+            chunk = log_rx.recv() => match chunk {
+                // Runner output, forwarded on the opposite contract to the arm
+                // above: `try_send`, never an awaited send, and never parked in
+                // `pending`. Awaiting here would let a chatty job hold the
+                // request channel long enough to delay the heartbeat, which the
+                // gateway reads as a dead machine; `pending` is the single slot
+                // that makes a verdict survive a reconnect and must not be spent
+                // on a log chunk. A chunk that does not fit is dropped, and the
+                // consumer sees the gap in `seq`.
+                Some(msg) => {
+                    if req_tx.try_send(msg).is_err() {
+                        tracing::trace!("runner log chunk dropped; request channel full");
+                    }
+                }
+                // Same reasoning as the egress arm: the supervisor holds the
+                // only log sender.
                 None => break Ok(StreamEnd::Closed),
             },
             message = inbound.message() => match message {
@@ -722,14 +773,14 @@ mod tests {
             machine_token: "flt_revoked".to_owned(),
         };
         let backends = Backends::fixed(Vec::new(), state.clone());
-        let (supervisor, egress_rx) =
-            spawn_supervisor(&config, Arc::clone(&backends), state.clone());
+        let handles = spawn_supervisor(&config, Arc::clone(&backends), state.clone());
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(run(
             config,
             credential,
-            supervisor,
-            egress_rx,
+            handles.supervisor,
+            handles.egress_rx,
+            handles.log_rx,
             backends,
             shutdown.clone(),
             state.clone(),
@@ -851,6 +902,7 @@ mod tests {
         let backends = Backends::fixed(Vec::new(), AgentState::new(&seed()));
         let mut backends_rx = backends.subscribe();
         let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
+        let (_log_tx, mut log_rx) = mpsc::channel::<AttachRequest>(1);
         let mut pending = None;
         let mut backoff = INITIAL_BACKOFF;
         let shutdown = CancellationToken::new();
@@ -872,6 +924,7 @@ mod tests {
                 &credential,
                 &supervisor,
                 &mut egress_rx,
+                &mut log_rx,
                 &mut pending,
                 &mut backoff,
                 &backends,
@@ -985,14 +1038,14 @@ mod tests {
             ..config()
         };
         let backends = Backends::new(false, None, None, None, state.clone());
-        let (supervisor, egress_rx) =
-            spawn_supervisor(&config, Arc::clone(&backends), state.clone());
+        let handles = spawn_supervisor(&config, Arc::clone(&backends), state.clone());
         let shutdown = CancellationToken::new();
         let run_task = tokio::spawn(run(
             config,
             credential(),
-            supervisor,
-            egress_rx,
+            handles.supervisor,
+            handles.egress_rx,
+            handles.log_rx,
             Arc::clone(&backends),
             shutdown.clone(),
             state,
@@ -1089,12 +1142,174 @@ mod tests {
     fn supervisor() -> RunnerSupervisor {
         let (events, _rx) = mpsc::channel(1);
         let state = AgentState::new(&seed());
-        RunnerSupervisor::new(
+        RunnerSupervisor::without_logs(
             events,
             None,
             Backends::fixed(Vec::new(), state.clone()),
             state,
         )
+    }
+
+    /// A gateway that accepts every `Attach` and records every subsequent
+    /// inbound message, holding the stream open until the client leaves.
+    struct MessageRecordingGateway {
+        seen: Arc<tokio::sync::Mutex<Vec<attach_request::Msg>>>,
+    }
+
+    #[tonic::async_trait]
+    impl arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayService
+        for MessageRecordingGateway
+    {
+        async fn enroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::EnrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::EnrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        type AttachStream = tokio_stream::wrappers::ReceiverStream<
+            Result<arcbox_fleet_proto::v1::AttachResponse, tonic::Status>,
+        >;
+
+        async fn attach(
+            &self,
+            request: Request<tonic::Streaming<AttachRequest>>,
+        ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+            let mut inbound = request.into_inner();
+            let first = inbound
+                .message()
+                .await
+                .map_err(|e| tonic::Status::internal(e.to_string()))?
+                .ok_or_else(|| tonic::Status::internal("closed before Attach"))?;
+            if !matches!(first.msg, Some(attach_request::Msg::Attach(_))) {
+                return Err(tonic::Status::internal("first message was not Attach"));
+            }
+
+            let (tx, rx) = mpsc::channel(4);
+            let _ = tx
+                .send(Ok(arcbox_fleet_proto::v1::AttachResponse {
+                    msg: Some(attach_response::Msg::AttachAccepted(
+                        arcbox_fleet_proto::v1::AttachAccepted {},
+                    )),
+                }))
+                .await;
+            let seen = Arc::clone(&self.seen);
+            tokio::spawn(async move {
+                let _hold = tx;
+                while let Ok(Some(message)) = inbound.message().await {
+                    if let Some(msg) = message.msg {
+                        seen.lock().await.push(msg);
+                    }
+                }
+            });
+            Ok(tonic::Response::new(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+        }
+
+        async fn unenroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::UnenrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::UnenrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    /// Runner output must reach the gateway on the same stream as verdicts,
+    /// while staying out of the machinery that makes verdicts durable.
+    ///
+    /// The `pending` assertion is the one that matters: it is the single slot
+    /// that carries an undelivered verdict across a reconnect, and the log arm
+    /// sits directly beside the egress arm that fills it. A log chunk parked
+    /// there would evict a verdict — the exact bug a copy-paste of the
+    /// neighbouring arm would introduce, and one nothing else would catch.
+    #[tokio::test]
+    async fn log_chunks_reach_the_stream_without_consuming_the_verdict_pending_slot() {
+        use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
+
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetGatewayServiceServer::new(MessageRecordingGateway {
+                    seen: Arc::clone(&seen),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        let state = AgentState::new(&PersistedSettings {
+            gateway: gateway.clone(),
+            ..seed()
+        });
+        let supervisor = supervisor();
+        let backends = Backends::fixed(Vec::new(), AgentState::new(&seed()));
+        let mut backends_rx = backends.subscribe();
+        let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
+
+        // Queue output before the stream exists, the way a job that started on
+        // a previous connection would.
+        let (log_tx, mut log_rx) = mpsc::channel::<AttachRequest>(LOG_CAPACITY);
+        let sink = crate::joblog::JobLogSink::new("rjob_a", log_tx);
+        sink.write(b"hello from the runner\n");
+
+        let mut pending = None;
+        let mut backoff = INITIAL_BACKOFF;
+        let shutdown = CancellationToken::new();
+        let config = AgentConfig {
+            gateway,
+            ..config()
+        };
+        let credential = credential();
+        let mut drained_for_update = false;
+
+        // Leave the stream once the chunk has had time to land; the loop only
+        // ends on shutdown, so drive it with one.
+        let stopper = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            stopper.cancel();
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_and_serve(
+                &config,
+                &credential,
+                &supervisor,
+                &mut egress_rx,
+                &mut log_rx,
+                &mut pending,
+                &mut backoff,
+                &backends,
+                &mut backends_rx,
+                &shutdown,
+                &state,
+                &mut drained_for_update,
+            ),
+        )
+        .await
+        .expect("the serve loop must exit on shutdown, not hang")
+        .expect("clean exit");
+
+        let seen = seen.lock().await;
+        let logs: Vec<_> = seen
+            .iter()
+            .filter_map(|msg| match msg {
+                attach_request::Msg::RunnerLog(chunk) => Some(chunk),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logs.len(), 1, "the queued chunk must reach the gateway");
+        assert_eq!(logs[0].job_id, "rjob_a");
+        assert_eq!(logs[0].data, b"hello from the runner\n");
+
+        assert!(
+            pending.is_none(),
+            "a log chunk must never occupy the slot that makes a verdict survive a reconnect"
+        );
     }
 
     /// The connect + Attach-RPC handshake has no cancellation awareness of
@@ -1110,6 +1325,7 @@ mod tests {
         let backends = Backends::fixed(Vec::new(), AgentState::new(&seed()));
         let mut backends_rx = backends.subscribe();
         let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
+        let (_log_tx, mut log_rx) = mpsc::channel::<AttachRequest>(1);
         let mut pending = None;
         let mut backoff = INITIAL_BACKOFF;
         let shutdown = CancellationToken::new();
@@ -1126,6 +1342,7 @@ mod tests {
                 &credential,
                 &supervisor,
                 &mut egress_rx,
+                &mut log_rx,
                 &mut pending,
                 &mut backoff,
                 &backends,

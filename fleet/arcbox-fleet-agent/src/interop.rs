@@ -30,6 +30,8 @@ use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, warn};
 
+use crate::joblog::JobLogSink;
+
 /// Fixed Windows locations of the interop tools, translated through
 /// `wslpath` at startup so a non-default automount root still resolves.
 /// Windows PowerShell 5.1 ships with every Windows 10/11 install (unlike
@@ -162,7 +164,10 @@ impl InteropRunner {
     /// side and carries the PID that can cancel it. Any failure past the
     /// spawn reaps the relay before returning, so an error never leaks a
     /// process.
-    pub async fn spawn(&self, encoded_jit_config: &str) -> Result<InteropJob> {
+    ///
+    /// Everything the wrapper prints after the handshake is the runner's own
+    /// output and goes to `sink`.
+    pub async fn spawn(&self, encoded_jit_config: &str, sink: JobLogSink) -> Result<InteropJob> {
         validate_jit_config(&self.script, encoded_jit_config)?;
 
         let mut child = tokio::process::Command::new(&self.powershell)
@@ -170,9 +175,17 @@ impl InteropRunner {
             .arg(wrapper_command(&self.script, encoded_jit_config))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("spawning the interop wrapper")?;
+
+        // Piped, so it must be drained for the same reason stdout is. The
+        // handshake only reads stdout, so this starts immediately rather than
+        // after it.
+        if let Some(stderr) = child.stderr.take() {
+            sink.pipe(stderr);
+        }
 
         let stdout = child
             .stdout
@@ -206,11 +219,21 @@ impl InteropRunner {
         // Keep the pipe drained for the rest of the job — the runner's
         // output flows through the wrapper's console — so a chatty runner
         // can never fill the pipe and wedge itself. Ends at EOF when the
-        // relay exits; detaching the handle is deliberate.
+        // relay exits; detaching the handle is deliberate. The reader stays
+        // line-oriented rather than switching to `sink.pipe`: the handshake
+        // already wrapped stdout in a `BufReader`, which may hold buffered
+        // bytes that a raw read of the underlying pipe would skip.
         tokio::spawn(async move {
             loop {
                 match lines.next_line().await {
-                    Ok(Some(line)) => debug!(line, "windows runner output"),
+                    // Restore the terminator `next_line` stripped, and ship the
+                    // line whole: two writes would split every line across two
+                    // chunks, doubling the message count for no benefit.
+                    Ok(Some(line)) => {
+                        let mut framed = line.into_bytes();
+                        framed.push(b'\n');
+                        sink.write(&framed);
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         debug!(error = %e, "windows runner output stream failed");
@@ -435,7 +458,7 @@ mod tests {
     /// spawns long-existing Windows binaries, never freshly written ones.
     async fn spawn_retrying(runner: &InteropRunner, jit: &str) -> Result<InteropJob> {
         for _ in 0..100 {
-            match runner.spawn(jit).await {
+            match runner.spawn(jit, JobLogSink::discarding()).await {
                 Err(e) if format!("{e:#}").contains("Text file busy") => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -589,7 +612,10 @@ mod tests {
         std::fs::write(&staged, "@echo off\r\nping -n 60 127.0.0.1 >NUL\r\n").unwrap();
 
         let runner = InteropRunner::new(&script).await.expect("probe");
-        let mut job = runner.spawn("dGVzdA==").await.expect("spawn");
+        let mut job = runner
+            .spawn("dGVzdA==", JobLogSink::discarding())
+            .await
+            .expect("spawn");
         assert!(job.windows_pid() > 0);
 
         let start = tokio::time::Instant::now();

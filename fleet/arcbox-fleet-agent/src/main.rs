@@ -36,6 +36,7 @@ mod enroll;
 mod fsutil;
 mod host;
 mod interop;
+mod joblog;
 #[cfg(test)]
 mod mock_daemon;
 mod runner;
@@ -326,13 +327,14 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 shutdown.clone(),
             );
 
-            let (supervisor, egress_rx) =
+            let handles =
                 attach::spawn_supervisor(&config, Arc::clone(&backends), agent_state.clone());
             attach::run(
                 config,
                 credential,
-                supervisor,
-                egress_rx,
+                handles.supervisor,
+                handles.egress_rx,
+                handles.log_rx,
                 backends,
                 shutdown,
                 agent_state,
