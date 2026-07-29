@@ -178,14 +178,20 @@ impl RealBalloonDeps {
 impl BalloonDeps for RealBalloonDeps {
     type Watch = AgentPressureWatch;
 
-    /// Only the custom HV backend reclaims: its balloon device
-    /// `madvise(MADV_DONTNEED)`s inflated pages (`arcbox-virtio-balloon`).
-    /// VZ inflation is a host-side no-op — measured 2026-07-29 on macOS
-    /// 26.4: guest gave up 15.35 GB, daemon `phys_footprint` never moved,
-    /// and under real host memory pressure the kernel *compressed* the
-    /// ballooned pages as live data instead of discarding them.
+    /// No macOS backend reclaims ballooned memory today (measured and
+    /// calibrated 2026-07-29 on macOS 26.4):
+    /// - VZ: Apple applies neither `vm_deallocate` nor any `madvise` to
+    ///   inflated pages — a 15.35 GB inflation left the daemon's
+    ///   `phys_footprint` byte-identical, and real host pressure
+    ///   *compressed* the pages as live data.
+    /// - HV: `arcbox-virtio-balloon` inflates with `MADV_DONTNEED`, which
+    ///   Darwin treats as a deactivation hint — calibrated
+    ///   footprint-inert, contents preserved (compressed, not discarded,
+    ///   under pressure). Flip HV to `true` only after the device switches
+    ///   to `MADV_FREE_REUSABLE` and a real HV boot shows the host
+    ///   footprint dropping on inflate.
     fn reclaim_capable(&self) -> bool {
-        matches!(self.shared.backend(), arcbox_vmm::VmBackend::Hv)
+        false
     }
 
     fn full_memory_bytes(&self) -> Option<u64> {

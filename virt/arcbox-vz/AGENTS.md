@@ -76,7 +76,8 @@ the ABI.
   — host `phys_footprint` stays at the configured memory size from boot,
   and under host memory pressure the kernel compresses ballooned pages as
   live data. `set_target_memory_size` only resizes what the *guest* may
-  use. This is why the idle balloon is HV-only (`app/AGENTS.md`).
+  use. This is one half of why the idle balloon never engages on macOS
+  (the other is HV's Darwin-inert `MADV_DONTNEED` — see `app/AGENTS.md`).
 - `VZLinuxRosettaAvailability` raw values are notSupported=0, notInstalled=1,
   installed=2 (a hand-written mapping once had 1 and 2 swapped; the shim now
   returns raw values and Rust maps them — keep them aligned with the SDK).

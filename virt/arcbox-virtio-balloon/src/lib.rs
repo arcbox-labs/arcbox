@@ -32,11 +32,17 @@
 //! When the guest inflates the balloon, it writes a descriptor chain
 //! containing `u32` PFNs (4 KiB granularity) into the inflate queue.
 //! For each PFN, the host calls `madvise(MADV_DONTNEED)` on the
-//! corresponding page of the guest RAM mapping. The physical page is
-//! released back to the kernel's free pool. A subsequent access from
-//! the guest will re-fault a zero page — acceptable per §5.5.1: the
-//! guest has promised not to use the page until it tells the host via
-//! the deflate queue.
+//! corresponding page of the guest RAM mapping. On Linux hosts this
+//! releases the physical page back to the kernel's free pool and a
+//! subsequent guest access re-faults a zero page — acceptable per
+//! §5.5.1: the guest has promised not to use the page until it tells
+//! the host via the deflate queue. On Darwin, `MADV_DONTNEED` is only
+//! a deactivation hint: page contents are preserved (compressed, not
+//! discarded, under host pressure) and `phys_footprint` never drops
+//! (calibrated 2026-07-29 on macOS 26.4). Real Darwin reclaim needs
+//! `MADV_FREE_REUSABLE`, so macOS HV ballooning reclaims nothing yet
+//! and `vm_lifecycle` keeps its idle balloon disabled there
+//! (`BalloonDeps::reclaim_capable`).
 //!
 //! ## Deflate semantics
 //!
@@ -337,11 +343,12 @@ fn handle_pfn_list(buf: &[u8], ram_base: *mut u8, ram_len: usize, gpa_base: usiz
         }
         // SAFETY: ram_base points to a live host mapping of the guest
         // RAM region, valid for ram_len bytes. offset..offset+page_size
-        // was bounds-checked above. madvise on a host mapping with
-        // MADV_DONTNEED is documented to release physical backing
-        // without invalidating the virtual mapping; subsequent access
-        // re-faults zero-filled pages — which is exactly the balloon
-        // contract (§5.5.1).
+        // was bounds-checked above. MADV_DONTNEED never invalidates the
+        // virtual mapping, so later guest access stays valid: on Linux
+        // it re-faults a zero page (real reclaim); on Darwin the
+        // original contents survive (deactivation hint only — see the
+        // module docs). Either way the balloon contract (§5.5.1) holds:
+        // the guest promised not to read the page while ballooned.
         let ret =
             unsafe { libc::madvise(ram_base.add(offset).cast(), page_size, libc::MADV_DONTNEED) };
         if ret != 0 {

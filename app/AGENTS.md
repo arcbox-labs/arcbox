@@ -118,16 +118,19 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   + large `docker.img` mount under CPU/I/O pressure). A tight 30s budget
   raced the cold-boot path into "timeout waiting for agent" loops — do not
   tighten it toward the <1.5s cold-boot target.
-- **The idle balloon shrinks only on reclaim-capable backends** — on VZ it
-  is disabled by `BalloonDeps::reclaim_capable` (`balloon/controller.rs`),
-  and this gate is load-bearing: VZ inflation releases NOTHING host-side
-  (measured 2026-07-29, macOS 26.4 — 15.35 GB inflated, daemon
-  `phys_footprint` byte-identical, pages *compressed as live data* under
-  real host pressure; full evidence in `balloon/mod.rs` docs). VZ host
-  footprint ≈ configured `memory_mb` from boot; the only VZ memory levers
-  are `memory_mb` itself and the macOS compressor. Do not "re-enable VZ
-  ballooning" without first proving host-side reclaim on the target macOS.
-  Only HV reclaims (`arcbox-virtio-balloon` `MADV_DONTNEED`).
+- **The idle balloon never shrinks today: no macOS backend reclaims** —
+  the gate is `BalloonDeps::reclaim_capable` (`balloon/controller.rs`),
+  false on both backends, and it is load-bearing (measured 2026-07-29,
+  macOS 26.4; full evidence in `balloon/mod.rs` docs). VZ inflation
+  releases NOTHING host-side (15.35 GB inflated, daemon `phys_footprint`
+  byte-identical, pages *compressed as live data* under real host
+  pressure). HV inflates via `MADV_DONTNEED`, which Darwin treats as a
+  deactivation hint (calibrated footprint-inert; contents preserved).
+  Host footprint ≈ configured `memory_mb` from boot; the only macOS
+  memory levers are `memory_mb` itself and the macOS compressor. Do not
+  flip a backend to reclaim-capable without a measured host
+  `phys_footprint` drop on inflate (HV path: switch the device to
+  `MADV_FREE_REUSABLE` first).
 - `set_backend` only changes the backend used on the next (re)boot; it does
   NOT stop or restart a running VM. To apply immediately the caller forces a
   recreate via `Runtime::switch_system_vm_backend`. The backend is seeded
