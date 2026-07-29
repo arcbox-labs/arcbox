@@ -82,8 +82,10 @@ pub(in crate::vm_lifecycle) trait BalloonDeps:
     /// Whether inflating the balloon actually releases host memory on the
     /// current backend. When `false`, idle shrinking is pure cost (guest
     /// scarcity + reclaim CPU) with zero host-side benefit, and the
-    /// controller must not shrink at all. See the module docs for the VZ
-    /// measurement behind this.
+    /// controller must not shrink at all. No macOS backend qualifies
+    /// today — see the module docs for the per-backend measurements (VZ:
+    /// Apple no-op; HV: Darwin-inert `MADV_DONTNEED`) and what flipping a
+    /// backend requires.
     fn reclaim_capable(&self) -> bool;
 
     /// Configured full memory of the machine, if the machine record exists.
@@ -664,9 +666,9 @@ mod tests {
     /// First staged step from 16 GiB full memory.
     const FIRST_STEP: u64 = FULL - super::super::SHRINK_STEP;
 
-    /// A reclaim-incapable backend (VZ) must make idle entry fully inert:
-    /// no stats probe, no shrink, no retry timer — and the controller stays
-    /// responsive to later cycles.
+    /// A reclaim-incapable backend (today: every macOS backend) must make
+    /// idle entry fully inert: no stats probe, no shrink, no retry timer —
+    /// and the controller stays responsive to later cycles.
     #[tokio::test(start_paused = true)]
     async fn reclaim_incapable_backend_never_shrinks() {
         let mut deps = FakeDeps::new(Some(FULL));

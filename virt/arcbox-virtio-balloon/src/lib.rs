@@ -6,8 +6,9 @@
 //! - Feature bit `VIRTIO_BALLOON_F_DEFLATE_ON_OOM` (bit 2) — the guest may
 //!   reclaim balloon pages on OOM without host permission. Safe for us
 //!   because we use `madvise(MADV_DONTNEED)` which does not unmap the
-//!   guest-visible region; reclaimed pages simply re-fault zero-filled,
-//!   matching the balloon contract.
+//!   guest-visible region; reclaimed pages stay accessible (on Linux they
+//!   re-fault zero-filled, on Darwin the original contents survive — see
+//!   the inflate section), matching the balloon contract either way.
 //! - Two config-space fields: `num_pages` (host → guest target, read-only
 //!   from the guest) and `actual` (guest → host current, written by the
 //!   guest as pages are inflated/deflated).
@@ -17,9 +18,11 @@
 //!   on `reporting_vq` (transport index computed from the negotiated
 //!   feature set — see [`reporting_queue_index`]); the host
 //!   `madvise(MADV_DONTNEED)`s the ranges and completes the buffers.
-//!   Combined with
-//!   `DEFLATE_ON_OOM` this lets the guest kernel self-manage: idle memory
-//!   drains back to the host with no balloon-target policy at all.
+//!   Combined with `DEFLATE_ON_OOM` this is designed to let the guest
+//!   kernel self-manage — idle memory draining back to the host with no
+//!   balloon-target policy at all — but that drain is real only where
+//!   `MADV_DONTNEED` reclaims (Linux hosts); on Darwin it is a
+//!   deactivation hint and nothing is released (see the inflate section).
 //!
 //! Not implemented (all optional per spec):
 //! - Stats virtqueue (`VIRTIO_BALLOON_F_STATS_VQ`)
@@ -364,10 +367,11 @@ fn handle_pfn_list(buf: &[u8], ram_base: *mut u8, ram_len: usize, gpa_base: usiz
     handled
 }
 
-/// Releases one guest-reported free range via `madvise(MADV_DONTNEED)`,
-/// returning the number of 4 KiB pages released. The range is
-/// guest-controlled: it must be page-aligned, non-empty, and fully inside
-/// the guest RAM mapping, or it is logged and skipped.
+/// `madvise(MADV_DONTNEED)`s one guest-reported free range, returning the
+/// number of 4 KiB pages madvised (released on Linux; deactivation hint
+/// only on Darwin — see the module docs). The range is guest-controlled:
+/// it must be page-aligned, non-empty, and fully inside the guest RAM
+/// mapping, or it is logged and skipped.
 fn handle_reported_range(
     addr: u64,
     len: u32,
@@ -397,10 +401,12 @@ fn handle_reported_range(
     }
     // SAFETY: ram_base points to a live host mapping of the guest RAM
     // region, valid for ram_len bytes; offset..end was bounds-checked
-    // above. MADV_DONTNEED releases the physical backing without
-    // invalidating the mapping; the guest re-faults zero pages, which is
-    // the free-page-reporting contract (the pages are free right now and
-    // the guest keeps them off-limits until the buffer completes).
+    // above. MADV_DONTNEED never invalidates the mapping, so later guest
+    // access stays valid: on Linux it re-faults a zero page (real
+    // reclaim), on Darwin the original contents survive (deactivation
+    // hint only — see the module docs). Either way the reporting contract
+    // holds: the pages are free right now and the guest keeps them
+    // off-limits until the buffer completes.
     let ret = unsafe { libc::madvise(ram_base.add(offset).cast(), len, libc::MADV_DONTNEED) };
     if ret != 0 {
         tracing::warn!(
