@@ -71,6 +71,12 @@ the ABI.
 
 - Lifecycle ops resolve on VZ completion handlers — there is no state
   polling; do not reintroduce it.
+- **Balloon inflation is a host-side no-op** (measured 2026-07-29, macOS
+  26.4): Apple neither deallocates nor `madvise`s pages the guest gives up
+  — host `phys_footprint` stays at the configured memory size from boot,
+  and under host memory pressure the kernel compresses ballooned pages as
+  live data. `set_target_memory_size` only resizes what the *guest* may
+  use. This is why the idle balloon is HV-only (`app/AGENTS.md`).
 - `VZLinuxRosettaAvailability` raw values are notSupported=0, notInstalled=1,
   installed=2 (a hand-written mapping once had 1 and 2 swapped; the shim now
   returns raw values and Rust maps them — keep them aligned with the SDK).

@@ -178,6 +178,16 @@ impl RealBalloonDeps {
 impl BalloonDeps for RealBalloonDeps {
     type Watch = AgentPressureWatch;
 
+    /// Only the custom HV backend reclaims: its balloon device
+    /// `madvise(MADV_DONTNEED)`s inflated pages (`arcbox-virtio-balloon`).
+    /// VZ inflation is a host-side no-op — measured 2026-07-29 on macOS
+    /// 26.4: guest gave up 15.35 GB, daemon `phys_footprint` never moved,
+    /// and under real host memory pressure the kernel *compressed* the
+    /// ballooned pages as live data instead of discarding them.
+    fn reclaim_capable(&self) -> bool {
+        matches!(self.shared.backend(), arcbox_vmm::VmBackend::Hv)
+    }
+
     fn full_memory_bytes(&self) -> Option<u64> {
         self.shared
             .machine_manager

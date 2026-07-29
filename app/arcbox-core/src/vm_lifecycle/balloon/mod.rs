@@ -18,6 +18,17 @@
 //!   very numbers a host-side re-computation would need, so pressure
 //!   detection is delegated to the guest (see `WatchMemoryPressure`)
 //!   and the only moves are "keep" or "give it all back".
+//! - **Idle shrinking runs only on reclaim-capable backends** (2026-07-29
+//!   measurement). On VZ, inflation is a host-side no-op: Apple neither
+//!   deallocates nor `madvise`s the pages the guest gives up — a 15.35 GB
+//!   inflation left the daemon's `phys_footprint` byte-identical, and under
+//!   real host memory pressure the kernel *compressed* the ballooned pages
+//!   as live data (calibrated against `MADV_FREE`/`MADV_FREE_REUSABLE`
+//!   probes, which are discarded within seconds under the same pressure).
+//!   VZ host footprint is pinned at the configured `memory_mb` from boot,
+//!   so shrinking there is guest starvation with zero host benefit. Only
+//!   the HV backend reclaims (`arcbox-virtio-balloon` MADV_DONTNEED); see
+//!   [`controller::BalloonDeps::reclaim_capable`].
 
 pub(super) mod controller;
 
