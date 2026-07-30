@@ -36,11 +36,7 @@ pub fn bench_sequential_read(target: &str, size_mb: u64) -> BenchmarkMetrics {
 
     let start = Instant::now();
     let output = Command::new("dd")
-        .args([
-            &format!("if={}", test_file),
-            "of=/dev/null",
-            "bs=1048576",
-        ])
+        .args([&format!("if={}", test_file), "of=/dev/null", "bs=1048576"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output();
@@ -204,11 +200,14 @@ fn bench_random_read_4k_rust(target: &str, num_ops: u64) -> BenchmarkMetrics {
     let start = Instant::now();
     for _ in 0..num_ops {
         // Linear congruential generator.
-        rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        rng_state = rng_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         let offset = (rng_state % max_offset) * 4096;
         f.seek(SeekFrom::Start(offset))
             .expect("failed to seek in test file");
-        f.read_exact(&mut buf).expect("failed to read from test file");
+        f.read_exact(&mut buf)
+            .expect("failed to read from test file");
     }
     let elapsed = start.elapsed();
 
@@ -373,12 +372,8 @@ fn parse_dd_throughput(stderr: &str) -> Option<f64> {
         let secs: f64 = time_str.parse().ok()?;
 
         // Find bytes count at the start of the line.
-        let line_start = stderr[..copied_idx]
-            .rfind('\n')
-            .map_or(0, |i| i + 1);
-        let bytes_str = stderr[line_start..copied_idx]
-            .split_whitespace()
-            .next()?;
+        let line_start = stderr[..copied_idx].rfind('\n').map_or(0, |i| i + 1);
+        let bytes_str = stderr[line_start..copied_idx].split_whitespace().next()?;
         let bytes: f64 = bytes_str.parse().ok()?;
 
         return Some(bytes / secs / (1024.0 * 1024.0));

@@ -49,11 +49,7 @@ impl BenchmarkRunner {
         let mut all_metrics = Vec::with_capacity(self.measured_iterations as usize);
 
         for i in 0..self.measured_iterations {
-            eprintln!(
-                "  [iter {}/{}] {name}",
-                i + 1,
-                self.measured_iterations
-            );
+            eprintln!("  [iter {}/{}] {name}", i + 1, self.measured_iterations);
             let start = Instant::now();
             let metrics = f();
             let elapsed = start.elapsed();
@@ -89,10 +85,7 @@ impl BenchmarkRunner {
         }
 
         // Sort durations for percentile computation.
-        let mut sorted_ms: Vec<f64> = durations
-            .iter()
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .collect();
+        let mut sorted_ms: Vec<f64> = durations.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
         sorted_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let p50 = percentile(&sorted_ms, 50.0);

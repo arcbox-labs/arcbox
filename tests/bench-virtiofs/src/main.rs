@@ -114,7 +114,9 @@ fn main() {
     } else if let Some(ref name) = cli.benchmark {
         vec![name.as_str()]
     } else {
-        eprintln!("Error: specify --all or --benchmark <name>. Use --list to see available benchmarks.");
+        eprintln!(
+            "Error: specify --all or --benchmark <name>. Use --list to see available benchmarks."
+        );
         process::exit(1);
     };
     // A skip entry that matches nothing would silently re-include a
@@ -173,8 +175,7 @@ fn main() {
         // Try micro first, then macro.
         let result = if micro::all_micro_benchmarks().contains(bench_name) {
             runner.run(&name, &cli.platform, || {
-                micro::run_micro_benchmark(bench_name, &target)
-                    .expect("unknown micro-benchmark")
+                micro::run_micro_benchmark(bench_name, &target).expect("unknown micro-benchmark")
             })
         } else if macro_bench::all_macro_benchmarks().contains(bench_name) {
             runner.run(&name, &cli.platform, || {
@@ -256,17 +257,19 @@ fn main() {
     }
 
     if cli.fail_on_regression && has_regressions {
-        eprintln!("\nFAILED: regressions detected beyond {:.1}% threshold", cli.threshold);
+        eprintln!(
+            "\nFAILED: regressions detected beyond {:.1}% threshold",
+            cli.threshold
+        );
         process::exit(1);
     }
 }
 
 /// Prints a human-readable summary of a single benchmark result.
 fn print_result_text(result: &runner::BenchmarkResult) {
-    eprintln!("  Duration:  {:.2}ms (p50: {:.2}ms, p99: {:.2}ms)",
-        result.metrics.duration_ms,
-        result.metrics.duration_p50_ms,
-        result.metrics.duration_p99_ms,
+    eprintln!(
+        "  Duration:  {:.2}ms (p50: {:.2}ms, p99: {:.2}ms)",
+        result.metrics.duration_ms, result.metrics.duration_p50_ms, result.metrics.duration_p99_ms,
     );
     if let Some(mb_s) = result.metrics.mb_per_sec {
         eprintln!("  Throughput: {:.1} MB/s", mb_s);
