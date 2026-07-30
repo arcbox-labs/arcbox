@@ -78,7 +78,10 @@ struct Cli {
     /// I/O engine for `random_read_4k`: the in-process buffered reader
     /// (hermetic default) or fio with O_DIRECT (must be installed). The
     /// fio engine reports under `random_read_4k_fio`, so numbers from
-    /// different engines can never be joined by name.
+    /// different engines can never be joined by name — which also means
+    /// a fio run's random-read row matches neither `TARGETS` nor a
+    /// baseline produced with the internal engine: gates and comparisons
+    /// only apply when both sides used the same engine.
     #[arg(long, default_value = "internal")]
     random_read_engine: RandomReadEngine,
 
