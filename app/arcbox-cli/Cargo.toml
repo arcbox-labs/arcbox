@@ -49,6 +49,7 @@ hex = "0.4"
 tokio-stream.workspace = true
 arcbox-helper.workspace = true
 chrono.workspace = true
+tar = "0.4.46"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }

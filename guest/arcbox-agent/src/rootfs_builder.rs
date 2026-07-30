@@ -4,9 +4,10 @@
 //! `arcbox-ext4` stack (no external binary, no mount, no root required for
 //! the ext4 write itself):
 //!
-//! - [`convert_layer_to_rootfs`] — convert a Docker overlay2 layer directory
-//!   to ext4, then inject `/sbin/vm-agent` via loop mount. Cached ext4
-//!   images are reused to avoid redundant conversions.
+//! - [`convert_layer_to_rootfs`] — convert a host-staged OCI image layout (or
+//!   a Docker overlay2 layer directory) to ext4, then inject `/sbin/vm-agent`
+//!   via loop mount. Cached ext4 images are reused to avoid redundant
+//!   conversions.
 //! - [`ensure_default_rootfs`] — build the default busybox + vm-agent image
 //!   used when `CreateSandboxRequest` supplies no rootfs. Rebuilt when the
 //!   source binaries are newer than the cached image.
@@ -46,18 +47,32 @@ pub fn has_ext4_magic(path: &Path) -> bool {
         && magic == [0x53, 0xEF]
 }
 
-/// Convert an overlay2 layer directory to a bootable ext4 rootfs.
+/// Marker file that identifies an OCI image layout directory.
+const OCI_LAYOUT_MARKER: &str = "oci-layout";
+
+/// True when `dir` is an OCI image layout rather than an overlay2 layer.
 ///
-/// `layer_path` is a guest-visible overlay2 chain-id directory
-/// (e.g. `/var/lib/docker/overlay2/<chain-id>`).
+/// Dispatching on the marker keeps the choice explicit: a `docker save`
+/// layout also carries a legacy `manifest.json`, so leaning on the
+/// `oci2rootfs` autodetect heuristics would be guesswork.
+fn is_oci_layout(dir: &Path) -> bool {
+    dir.join(OCI_LAYOUT_MARKER).is_file()
+}
+
+/// Convert an image source directory to a bootable ext4 rootfs.
+///
+/// `layer_path` is a guest-visible directory: either an OCI image layout
+/// staged by the host CLI (the `--from-image` / `--from-dockerfile` path) or a
+/// Docker overlay2 chain-id directory (e.g.
+/// `/var/lib/docker/overlay2/<chain-id>`).
 /// Returns the path to the generated (or cached) ext4 image.
 pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
     if !Path::new(layer_path).exists() {
         bail!("layer path not found: {layer_path}");
     }
 
-    // Cache key derived from the layer path (overlay2 chain-id directories
-    // are content-addressed, so the path is a stable identifier).
+    // Cache key derived from the layer path. Both source kinds carry the image
+    // digest in the directory name, so the path is a stable identifier.
     let hash = path_hash(layer_path);
     let ext4_path = format!("{ROOTFS_CACHE_DIR}/rootfs-{hash}.ext4");
 
@@ -75,16 +90,25 @@ pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
     let ext4_tmp = format!("{ROOTFS_CACHE_DIR}/.rootfs-{req_id}.ext4.tmp");
 
     // Convert via the oci2rootfs library (blocking CPU/IO work).
-    tracing::info!(layer = %layer_path, ext4 = %ext4_path, "converting overlay2 layer to ext4");
+    tracing::info!(layer = %layer_path, ext4 = %ext4_path, "converting image layer to ext4");
     {
         let layer = layer_path.to_owned();
         let out = ext4_tmp.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let source = oci2rootfs::Overlay2Source::open(&layer)
-                .context("failed to open overlay2 layer")?;
-            oci2rootfs::Converter::new(&out)
-                .convert(source)
-                .context("overlay2 → ext4 conversion failed")?;
+            let converter = oci2rootfs::Converter::new(&out);
+            if is_oci_layout(Path::new(&layer)) {
+                let source = oci2rootfs::OciLayoutSource::open(&layer)
+                    .context("failed to open OCI image layout")?;
+                converter
+                    .convert(source)
+                    .context("OCI layout → ext4 conversion failed")?;
+            } else {
+                let source = oci2rootfs::Overlay2Source::open(&layer)
+                    .context("failed to open overlay2 layer")?;
+                converter
+                    .convert(source)
+                    .context("overlay2 → ext4 conversion failed")?;
+            }
             Ok(())
         })
         .await
@@ -417,6 +441,24 @@ mod tests {
     #[test]
     fn test_has_ext4_magic_nonexistent() {
         assert!(!has_ext4_magic(Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn is_oci_layout_detects_the_layout_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // An overlay2 chain-id directory has no marker.
+        std::fs::create_dir(dir.path().join("diff")).unwrap();
+        assert!(!is_oci_layout(dir.path()));
+
+        // A `docker save` export does, alongside a legacy manifest.json.
+        std::fs::write(dir.path().join("manifest.json"), "[]").unwrap();
+        std::fs::write(
+            dir.path().join(OCI_LAYOUT_MARKER),
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        assert!(is_oci_layout(dir.path()));
     }
 
     #[test]
