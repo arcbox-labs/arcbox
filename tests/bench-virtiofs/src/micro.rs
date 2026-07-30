@@ -36,11 +36,7 @@ pub fn bench_sequential_read(target: &str, size_mb: u64) -> BenchmarkMetrics {
 
     let start = Instant::now();
     let output = Command::new("dd")
-        .args([
-            &format!("if={}", test_file),
-            "of=/dev/null",
-            "bs=1048576",
-        ])
+        .args([&format!("if={}", test_file), "of=/dev/null", "bs=1048576"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output();
@@ -111,23 +107,8 @@ pub fn bench_sequential_write(target: &str, size_mb: u64) -> BenchmarkMetrics {
     }
 }
 
-/// Random 4K read benchmark.
-///
-/// If `fio` is available, delegates to it for accurate IOPS measurement.
-/// Otherwise falls back to a pure-Rust implementation using random seeks.
-pub fn bench_random_read_4k(target: &str, num_ops: u64) -> BenchmarkMetrics {
-    // Check if fio is available.
-    let fio_available = Command::new("fio").arg("--version").output().is_ok();
-
-    if fio_available {
-        bench_random_read_4k_fio(target, num_ops)
-    } else {
-        bench_random_read_4k_rust(target, num_ops)
-    }
-}
-
-/// Random 4K read using fio for accurate IOPS measurement.
-fn bench_random_read_4k_fio(target: &str, num_ops: u64) -> BenchmarkMetrics {
+/// Random 4K read using fio (`--direct=1`) for O_DIRECT IOPS measurement.
+pub fn bench_random_read_4k_fio(target: &str, num_ops: u64) -> BenchmarkMetrics {
     let test_file = format!("{}/bench_rand_read.dat", target);
 
     // Create a 256MB test file for random reads.
@@ -179,8 +160,14 @@ fn bench_random_read_4k_fio(target: &str, num_ops: u64) -> BenchmarkMetrics {
     }
 }
 
-/// Pure-Rust fallback for random 4K reads when fio is unavailable.
-fn bench_random_read_4k_rust(target: &str, num_ops: u64) -> BenchmarkMetrics {
+/// Random 4K read benchmark — the in-process buffered reader (the
+/// `internal` engine, hermetic default).
+///
+/// Engine selection is explicit (no PATH sniffing): the fio/O_DIRECT
+/// variant is opt-in via the CLI's `--random-read-engine` flag and
+/// reports under `random_read_4k_fio` so numbers from different engines
+/// can never be joined by name.
+pub fn bench_random_read_4k(target: &str, num_ops: u64) -> BenchmarkMetrics {
     let test_file = format!("{}/bench_rand_read.dat", target);
     let file_size: u64 = 256 * 1024 * 1024; // 256 MB
 
@@ -204,11 +191,14 @@ fn bench_random_read_4k_rust(target: &str, num_ops: u64) -> BenchmarkMetrics {
     let start = Instant::now();
     for _ in 0..num_ops {
         // Linear congruential generator.
-        rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        rng_state = rng_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         let offset = (rng_state % max_offset) * 4096;
         f.seek(SeekFrom::Start(offset))
             .expect("failed to seek in test file");
-        f.read_exact(&mut buf).expect("failed to read from test file");
+        f.read_exact(&mut buf)
+            .expect("failed to read from test file");
     }
     let elapsed = start.elapsed();
 
@@ -373,12 +363,8 @@ fn parse_dd_throughput(stderr: &str) -> Option<f64> {
         let secs: f64 = time_str.parse().ok()?;
 
         // Find bytes count at the start of the line.
-        let line_start = stderr[..copied_idx]
-            .rfind('\n')
-            .map_or(0, |i| i + 1);
-        let bytes_str = stderr[line_start..copied_idx]
-            .split_whitespace()
-            .next()?;
+        let line_start = stderr[..copied_idx].rfind('\n').map_or(0, |i| i + 1);
+        let bytes_str = stderr[line_start..copied_idx].split_whitespace().next()?;
         let bytes: f64 = bytes_str.parse().ok()?;
 
         return Some(bytes / secs / (1024.0 * 1024.0));
@@ -409,12 +395,15 @@ pub fn all_micro_benchmarks() -> Vec<&'static str> {
     ]
 }
 
+/// Operation count for the random-read benchmark, shared by both engines.
+pub const RANDOM_READ_OPS: u64 = 10_000;
+
 /// Dispatches a micro-benchmark by name, returning None if the name is unknown.
 pub fn run_micro_benchmark(name: &str, target: &str) -> Option<BenchmarkMetrics> {
     match name {
         "sequential_read" => Some(bench_sequential_read(target, 512)),
         "sequential_write" => Some(bench_sequential_write(target, 512)),
-        "random_read_4k" => Some(bench_random_read_4k(target, 10_000)),
+        "random_read_4k" => Some(bench_random_read_4k(target, RANDOM_READ_OPS)),
         "metadata_stat" => Some(bench_metadata_stat(target, 10_000)),
         "create_delete" => Some(bench_create_delete(target, 10_000)),
         "negative_lookup" => Some(bench_negative_lookup(target, 100_000)),

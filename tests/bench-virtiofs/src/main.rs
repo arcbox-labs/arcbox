@@ -70,6 +70,21 @@ struct Cli {
     #[arg(long, default_value = "arcbox-hv")]
     platform: String,
 
+    /// Comma-separated benchmark names to exclude (e.g. network-dependent
+    /// macros like `npm_install,git_clone` in hermetic environments).
+    #[arg(long, value_delimiter = ',')]
+    skip: Vec<String>,
+
+    /// I/O engine for `random_read_4k`: the in-process buffered reader
+    /// (hermetic default) or fio with O_DIRECT (must be installed). The
+    /// fio engine reports under `random_read_4k_fio`, so numbers from
+    /// different engines can never be joined by name — which also means
+    /// a fio run's random-read row matches neither `TARGETS` nor a
+    /// baseline produced with the internal engine: gates and comparisons
+    /// only apply when both sides used the same engine.
+    #[arg(long, default_value = "internal")]
+    random_read_engine: RandomReadEngine,
+
     /// List all available benchmarks and exit.
     #[arg(long)]
     list: bool,
@@ -79,6 +94,14 @@ struct Cli {
 enum OutputFormat {
     Text,
     Json,
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum RandomReadEngine {
+    /// In-process buffered reader — no external dependency.
+    Internal,
+    /// fio with `--direct=1` — requires fio on PATH.
+    Fio,
 }
 
 fn main() {
@@ -109,9 +132,31 @@ fn main() {
     } else if let Some(ref name) = cli.benchmark {
         vec![name.as_str()]
     } else {
-        eprintln!("Error: specify --all or --benchmark <name>. Use --list to see available benchmarks.");
+        eprintln!(
+            "Error: specify --all or --benchmark <name>. Use --list to see available benchmarks."
+        );
         process::exit(1);
     };
+    // A skip entry that matches nothing would silently re-include a
+    // benchmark (e.g. the network-dependent macros a hermetic caller
+    // relies on excluding) — hard-error instead.
+    {
+        let mut known = micro::all_micro_benchmarks();
+        known.extend(macro_bench::all_macro_benchmarks());
+        for skip in &cli.skip {
+            if !known.contains(&skip.as_str()) {
+                eprintln!(
+                    "Error: --skip '{skip}' matches no benchmark. \
+                     Use --list to see available benchmarks."
+                );
+                process::exit(1);
+            }
+        }
+    }
+    let benchmarks_to_run: Vec<&str> = benchmarks_to_run
+        .into_iter()
+        .filter(|name| !cli.skip.iter().any(|skip| skip == name))
+        .collect();
 
     // Verify target directory exists.
     if !std::path::Path::new(&cli.target).is_dir() {
@@ -120,6 +165,18 @@ fn main() {
              Use --target to specify a valid VirtioFS mount point.",
             cli.target
         );
+        process::exit(1);
+    }
+
+    // The fio engine is opt-in and must actually be present — an implicit
+    // fallback would silently compare engines across the two phases.
+    if cli.random_read_engine == RandomReadEngine::Fio
+        && std::process::Command::new("fio")
+            .arg("--version")
+            .output()
+            .is_err()
+    {
+        eprintln!("Error: --random-read-engine fio requested but fio is not on PATH.");
         process::exit(1);
     }
 
@@ -146,10 +203,17 @@ fn main() {
         let name = bench_name.to_string();
 
         // Try micro first, then macro.
-        let result = if micro::all_micro_benchmarks().contains(bench_name) {
+        let result = if *bench_name == "random_read_4k"
+            && cli.random_read_engine == RandomReadEngine::Fio
+        {
+            // The fio engine reports under its own name so numbers from
+            // different engines can never be joined.
+            runner.run("random_read_4k_fio", &cli.platform, || {
+                micro::bench_random_read_4k_fio(&target, micro::RANDOM_READ_OPS)
+            })
+        } else if micro::all_micro_benchmarks().contains(bench_name) {
             runner.run(&name, &cli.platform, || {
-                micro::run_micro_benchmark(bench_name, &target)
-                    .expect("unknown micro-benchmark")
+                micro::run_micro_benchmark(bench_name, &target).expect("unknown micro-benchmark")
             })
         } else if macro_bench::all_macro_benchmarks().contains(bench_name) {
             runner.run(&name, &cli.platform, || {
@@ -231,17 +295,19 @@ fn main() {
     }
 
     if cli.fail_on_regression && has_regressions {
-        eprintln!("\nFAILED: regressions detected beyond {:.1}% threshold", cli.threshold);
+        eprintln!(
+            "\nFAILED: regressions detected beyond {:.1}% threshold",
+            cli.threshold
+        );
         process::exit(1);
     }
 }
 
 /// Prints a human-readable summary of a single benchmark result.
 fn print_result_text(result: &runner::BenchmarkResult) {
-    eprintln!("  Duration:  {:.2}ms (p50: {:.2}ms, p99: {:.2}ms)",
-        result.metrics.duration_ms,
-        result.metrics.duration_p50_ms,
-        result.metrics.duration_p99_ms,
+    eprintln!(
+        "  Duration:  {:.2}ms (p50: {:.2}ms, p99: {:.2}ms)",
+        result.metrics.duration_ms, result.metrics.duration_p50_ms, result.metrics.duration_p99_ms,
     );
     if let Some(mb_s) = result.metrics.mb_per_sec {
         eprintln!("  Throughput: {:.1} MB/s", mb_s);
