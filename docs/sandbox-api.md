@@ -10,6 +10,9 @@ Proto source of truth: `rpc/arcbox-protocol/proto/sandbox.proto`
 (package `sandbox.v1`). Server implementation:
 `app/arcbox-api/src/grpc/{sandbox,snapshot}.rs`.
 
+For the end-user CLI feature built on this API — running a coding agent in a
+sandbox — see [agent-sandbox.md](agent-sandbox.md).
+
 ## Requirements
 
 Sandboxes need **nested virtualization**: the VZ backend on Apple Silicon
