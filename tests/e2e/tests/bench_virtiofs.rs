@@ -191,8 +191,32 @@ fn scenario(
     // Persist both reports outside the (deleted-on-success) data dir.
     let results = root.join("target/bench-virtiofs");
     std::fs::create_dir_all(&results)?;
-    std::fs::write(results.join("guest-vz.json"), &guest_json)?;
-    std::fs::write(results.join("native.json"), &native_json)?;
+    std::fs::write(
+        results.join("guest-vz.json"),
+        extract_json_object(&guest_json)?,
+    )?;
+    std::fs::write(
+        results.join("native.json"),
+        extract_json_object(&native_json)?,
+    )?;
     tracing::info!(dir = %results.display(), "bench reports written");
     Ok(())
+}
+
+/// Cuts a bench report down to its top-level JSON object and validates it.
+///
+/// `docker_output` merges the container's stdout and stderr, and the bench
+/// prints progress text to stderr even in JSON mode — so the guest capture
+/// is a pretty-printed JSON object followed by loose text. The object's
+/// closing brace is the only column-0 `}` (nested closes are indented).
+fn extract_json_object(raw: &str) -> Result<String> {
+    let start = raw.find('{').context("no JSON object in bench output")?;
+    let end = raw[start..]
+        .find("\n}")
+        .map(|i| start + i + 2)
+        .context("no top-level closing brace in bench output")?;
+    let json = &raw[start..end];
+    serde_json::from_str::<serde_json::Value>(json)
+        .context("extracted bench report is not valid JSON")?;
+    Ok(json.to_owned())
 }
