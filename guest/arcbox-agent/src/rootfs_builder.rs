@@ -12,8 +12,9 @@
 //!   used when `CreateSandboxRequest` supplies no rootfs. Rebuilt when the
 //!   source binaries are newer than the cached image.
 
+use std::collections::BTreeSet;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use arcbox_ext4::constants::file_mode;
@@ -65,8 +66,16 @@ fn is_oci_layout(dir: &Path) -> bool {
 /// staged by the host CLI (the `--from-image` / `--from-dockerfile` path) or a
 /// Docker overlay2 chain-id directory (e.g.
 /// `/var/lib/docker/overlay2/<chain-id>`).
+///
+/// `pinned` are images that must survive the superseded-image sweep because a
+/// snapshot still needs them as its dm-snapshot origin
+/// (`SandboxManager::pinned_rootfs_paths`).
+///
 /// Returns the path to the generated (or cached) ext4 image.
-pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
+pub async fn convert_layer_to_rootfs(
+    layer_path: &str,
+    pinned: &BTreeSet<PathBuf>,
+) -> Result<String> {
     if !Path::new(layer_path).exists() {
         bail!("layer path not found: {layer_path}");
     }
@@ -132,7 +141,7 @@ pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
         .await
         .context("failed to rename ext4 into cache")?;
 
-    sweep_superseded(&layer_key, &agent_key).await;
+    sweep_superseded(Path::new(ROOTFS_CACHE_DIR), &layer_key, &agent_key, pinned).await;
 
     tracing::info!(path = %ext4_path, "rootfs ready");
     Ok(ext4_path)
@@ -156,18 +165,39 @@ async fn vm_agent_key() -> Result<String> {
 /// Delete images for `layer_key` built against a different `vm-agent`.
 ///
 /// Bounds the cache at one image per layer instead of accumulating one per
-/// agent version. Best-effort: an image a live sandbox still has open unlinks
-/// fine on Linux and frees its space when the last reference closes.
-async fn sweep_superseded(layer_key: &str, agent_key: &str) {
-    let Ok(mut entries) = tokio::fs::read_dir(ROOTFS_CACHE_DIR).await else {
+/// agent version.
+///
+/// Two kinds of reference survive this:
+///
+/// - a live sandbox's open image, which unlinks fine on Linux and frees its
+///   space when the last reference closes;
+/// - anything in `pinned`, i.e. an image a snapshot records as its
+///   dm-snapshot origin. That reference is durable (it lives in the snapshot
+///   catalog's `meta.json`, so it outlasts reboots) and unrepairable:
+///   re-converting the layer with a different `vm-agent` yields different bytes
+///   than the snapshot's guest memory was captured against, so a regenerated
+///   image is worse than none.
+async fn sweep_superseded(
+    cache_dir: &Path,
+    layer_key: &str,
+    agent_key: &str,
+    pinned: &BTreeSet<PathBuf>,
+) {
+    let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await else {
         return;
     };
     let mut removed = 0usize;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_superseded_image(&name, layer_key, agent_key)
-            && tokio::fs::remove_file(entry.path()).await.is_ok()
-        {
+        if !is_superseded_image(&name, layer_key, agent_key) {
+            continue;
+        }
+        let path = entry.path();
+        if pinned.contains(&path) {
+            tracing::debug!(path = %path.display(), "keeping superseded rootfs: pinned by a snapshot");
+            continue;
+        }
+        if tokio::fs::remove_file(&path).await.is_ok() {
             removed += 1;
         }
     }
@@ -557,6 +587,32 @@ mod tests {
         )
         .unwrap();
         assert!(is_oci_layout(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn sweep_superseded_keeps_images_a_snapshot_still_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = |name: &str| dir.path().join(name);
+        for name in [
+            "rootfs-aaaa-0000.ext4",
+            "rootfs-aaaa.ext4",
+            "rootfs-aaaa-1111.ext4",
+            "rootfs-bbbb-0000.ext4",
+        ] {
+            std::fs::write(image(name), b"x").unwrap();
+        }
+        let pinned = BTreeSet::from([image("rootfs-aaaa.ext4")]);
+
+        sweep_superseded(dir.path(), "aaaa", "1111", &pinned).await;
+
+        // Superseded and unreferenced: gone.
+        assert!(!image("rootfs-aaaa-0000.ext4").exists());
+        // Superseded but a snapshot records it as its dm-snapshot origin, and a
+        // re-conversion would not reproduce those bytes.
+        assert!(image("rootfs-aaaa.ext4").exists());
+        // Current image and other layers are untouched.
+        assert!(image("rootfs-aaaa-1111.ext4").exists());
+        assert!(image("rootfs-bbbb-0000.ext4").exists());
     }
 
     #[test]

@@ -24,6 +24,14 @@ async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 impl SandboxManager {
+    /// Rootfs images that existing snapshots need to stay restorable.
+    ///
+    /// Exposed so whoever owns the converted-rootfs cache can pin them; see
+    /// [`SnapshotCatalog::referenced_rootfs_paths`].
+    pub fn pinned_rootfs_paths(&self) -> Result<std::collections::BTreeSet<PathBuf>> {
+        self.snapshots.referenced_rootfs_paths()
+    }
+
     pub async fn checkpoint_sandbox(
         &self,
         sandbox_id: &SandboxId,
