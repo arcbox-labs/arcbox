@@ -27,10 +27,14 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code@2.1.220
 
 # Claude Code refuses to skip permission prompts while running as root, and
-# skipping them is the point of running inside a microVM.
-RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
-    && mkdir -p /workspace \
-    && chown agent:agent /workspace
+# skipping them is the point of running inside a microVM. The node images
+# already ship a uid-1000 `node` user, so reuse it rather than adding a second
+# one (useradd --uid 1000 would fail with "UID already in use").
+RUN mkdir -p /workspace && chown node:node /workspace
 
-USER agent
+# Only the filesystem is converted into the sandbox rootfs — image config is
+# not carried over, so USER/WORKDIR/ENV here document intent and keep
+# `docker run` on this image usable. The sandbox identity, working directory
+# and environment are set per session by the caller.
+USER node
 WORKDIR /workspace

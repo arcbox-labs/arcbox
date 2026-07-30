@@ -11,10 +11,10 @@
 //! `GraphDriver` and there is no `UpperDir` to point at.
 //!
 //! The export is staged where the guest can read it back over VirtioFS —
-//! `~/Library/Caches/arcbox/sandbox-oci/<digest>` when the user's cache
+//! `~/Library/Caches/arcbox/sandbox-oci/<content-key>` when the user's cache
 //! directory is under `/Users`, since the `users` share maps it to the
 //! identical guest path and macOS reclaims `Library/Caches` on its own.
-//! Otherwise it falls back to `<data_dir>/cache/sandbox-oci/<digest>`, which
+//! Otherwise it falls back to `<data_dir>/cache/sandbox-oci/<content-key>`, which
 //! the guest sees below `/arcbox`. Staging in `$TMPDIR` would be preferable
 //! but the `/private` share never mounts in the guest (CORE-41).
 
@@ -151,13 +151,12 @@ fn docker_platform() -> Result<&'static str> {
 
 /// Export `image_ref` to an OCI image layout and return its guest-visible path.
 ///
-/// Reuses an existing export for the same image digest, so repeat runs skip
+/// Reuses an existing export for the same filesystem content, so repeat runs skip
 /// both the `docker save` and the guest-side ext4 conversion (the guest keys
-/// its rootfs cache off this path, which is digest-derived and therefore
-/// stable).
+/// its rootfs cache off this path, which is content-derived and therefore
+/// stable across rebuilds).
 async fn resolve_layout(image_ref: &str) -> Result<String> {
-    let digest = image_digest(image_ref).await?;
-    let dir_name = digest_dir_name(&digest)?;
+    let dir_name = format!("layers-{}", image_fs_key(image_ref).await?);
     let (host_root, guest_root) = staging_paths(dirs::cache_dir().as_deref(), &data_dir());
     let host_dir = host_root.join(&dir_name);
     let guest_path = format!("{guest_root}/{dir_name}");
@@ -197,8 +196,20 @@ fn staging_paths(cache_dir: Option<&Path>, data_dir: &Path) -> (PathBuf, String)
     )
 }
 
-/// Resolve an image reference to its content digest.
-async fn image_digest(image_ref: &str) -> Result<String> {
+/// Identify an image by the content of its filesystem.
+///
+/// Deliberately NOT `.Id`: the config digest changes on every `docker build`
+/// even when the result is byte-identical, because BuildKit stamps fresh
+/// metadata into the config. Keying the export on it meant every create
+/// re-ran `docker save` and re-converted the image to ext4 in the guest —
+/// minutes of work per sandbox. The layer diff IDs are stable across such
+/// rebuilds and change exactly when the filesystem changes, which is both
+/// what the converter consumes and what the guest's rootfs cache keys on
+/// (by path).
+///
+/// Hashing the list also makes the key safe as a path component whatever
+/// `docker` reported.
+async fn image_fs_key(image_ref: &str) -> Result<String> {
     let output = Command::new("docker")
         .args([
             "--context",
@@ -206,7 +217,7 @@ async fn image_digest(image_ref: &str) -> Result<String> {
             "image",
             "inspect",
             "--format",
-            "{{.Id}}",
+            "{{join .RootFS.Layers \",\"}}",
             image_ref,
         ])
         .output()
@@ -217,34 +228,14 @@ async fn image_digest(image_ref: &str) -> Result<String> {
         bail!("docker image inspect failed (is the image present?):\n{stderr}");
     }
 
-    let digest = String::from_utf8(output.stdout)
+    let layers = String::from_utf8(output.stdout)
         .context("docker image inspect returned non-UTF-8 output")?
         .trim()
         .to_string();
-    if digest.is_empty() {
-        bail!("docker image inspect returned an empty digest for {image_ref}");
+    if layers.is_empty() {
+        bail!("docker image inspect reported no layers for {image_ref}");
     }
-    Ok(digest)
-}
-
-/// Convert an image digest into a single path component (`sha256:ab…` →
-/// `sha256-ab…`).
-///
-/// The digest reaches us from `docker image inspect` and becomes a directory
-/// name that the guest later opens, so the character set is checked rather
-/// than assumed.
-fn digest_dir_name(digest: &str) -> Result<String> {
-    let (algorithm, hex) = digest.split_once(':').with_context(|| {
-        format!("malformed image digest {digest:?}: expected <algorithm>:<hex>")
-    })?;
-    let valid = !algorithm.is_empty()
-        && !hex.is_empty()
-        && algorithm.bytes().all(|b| b.is_ascii_alphanumeric())
-        && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    if !valid {
-        bail!("malformed image digest {digest:?}: expected <algorithm>:<hex>");
-    }
-    Ok(format!("{algorithm}-{hex}"))
+    Ok(cache_key(layers.as_bytes()))
 }
 
 /// Export an image into `dest` as an OCI image layout.
@@ -388,33 +379,6 @@ mod tests {
     #[test]
     fn test_has_ext4_magic_nonexistent() {
         assert!(!has_ext4_magic(Path::new("/nonexistent")));
-    }
-
-    #[test]
-    fn digest_dir_name_replaces_the_algorithm_separator() {
-        let hex = "a".repeat(64);
-        assert_eq!(
-            digest_dir_name(&format!("sha256:{hex}")).unwrap(),
-            format!("sha256-{hex}")
-        );
-    }
-
-    #[test]
-    fn digest_dir_name_rejects_values_that_are_not_a_digest() {
-        // Each of these would otherwise become a directory name the guest opens.
-        for bad in [
-            "sha256:../../etc/passwd",
-            "sha256:abc/def",
-            "sha256:",
-            ":abcdef",
-            "abcdef",
-            "sha256:not-hex",
-        ] {
-            assert!(
-                digest_dir_name(bad).is_err(),
-                "{bad} should be rejected as a digest"
-            );
-        }
     }
 
     #[test]

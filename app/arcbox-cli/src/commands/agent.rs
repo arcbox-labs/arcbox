@@ -54,6 +54,16 @@ pub struct AgentDef {
     pub user: &'static str,
     /// Working directory for the session.
     pub workdir: &'static str,
+    /// Environment the session cannot do without.
+    ///
+    /// Only the image's filesystem is converted into the sandbox rootfs, so
+    /// its `ENV` never reaches the process: `vm-agent` runs as PID 1 with the
+    /// kernel's environment (`HOME=/`, `TERM=linux`) plus whatever the caller
+    /// sends. That makes `PATH` and `HOME` this layer's responsibility —
+    /// without `PATH`, `execvp` falls back to `/bin:/usr/bin` and cannot find
+    /// an npm-installed CLI in `/usr/local/bin`; without a writable `HOME`,
+    /// the agent cannot store its own state.
+    pub base_env: &'static [(&'static str, &'static str)],
 }
 
 /// Claude Code.
@@ -65,8 +75,17 @@ pub const CLAUDE: AgentDef = AgentDef {
     bypass_flag: "--dangerously-skip-permissions",
     env_prefixes: &["ANTHROPIC_", "CLAUDE_"],
     required_env: &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
-    user: "agent",
+    // The node images ship this uid-1000 user; the template gives it
+    // /workspace.
+    user: "node",
     workdir: "/workspace",
+    base_env: &[
+        (
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ),
+        ("HOME", "/home/node"),
+    ],
 };
 
 #[derive(Args)]
@@ -126,7 +145,12 @@ fn collect_env<I>(def: &AgentDef, host_vars: I) -> Result<HashMap<String, String
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let mut env = HashMap::new();
+    let mut env: HashMap<String, String> = def
+        .base_env
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+
     for (key, value) in host_vars {
         let forward = PASSTHROUGH_ENV.contains(&key.as_str())
             || def
@@ -324,9 +348,15 @@ mod tests {
         assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "key");
         assert_eq!(env.get("CLAUDE_CODE_EXTRA").unwrap(), "1");
         assert_eq!(env.get("TERM").unwrap(), "xterm-256color");
+        // Without these the session cannot start at all: execvp would miss
+        // /usr/local/bin, and HOME would be the unwritable kernel default.
+        assert!(env.get("PATH").unwrap().contains("/usr/local/bin"));
+        assert_eq!(env.get("HOME").unwrap(), "/home/node");
         // Unrelated host secrets must not leak into the sandbox.
         assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
-        assert!(!env.contains_key("PATH"));
+        // The host's own PATH is a macOS path list and must not win over the
+        // sandbox one.
+        assert_ne!(env.get("PATH").unwrap(), "/usr/bin");
     }
 
     #[test]
