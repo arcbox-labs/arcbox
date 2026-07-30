@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4](https://github.com/arcboxlabs/arcbox/compare/v0.5.3...v0.5.4) (2026-07-30)
+
+
+### Bug Fixes
+
+* **core:** disable the idle balloon — no macOS backend reclaims ballooned memory ([#504](https://github.com/arcboxlabs/arcbox/issues/504)) ([6cb174a](https://github.com/arcboxlabs/arcbox/commit/6cb174a005d1a5a9ba5a018c21e4d1dded6db060))
+
+
+### Tests
+
+* **e2e:** VirtioFS guest-vs-native benchmark driver ([#507](https://github.com/arcboxlabs/arcbox/issues/507)) ([4e5f676](https://github.com/arcboxlabs/arcbox/commit/4e5f676525f3d2f0426bc6f09eb1b63d73ff4ff4))
+
 ## [0.5.3](https://github.com/arcboxlabs/arcbox/compare/v0.5.2...v0.5.3) (2026-07-24)
 
 
