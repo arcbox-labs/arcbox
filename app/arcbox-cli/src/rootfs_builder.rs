@@ -75,28 +75,45 @@ pub async fn resolve_from_dockerfile(dockerfile_path: &str) -> Result<String> {
     let content = tokio::fs::read(dockerfile)
         .await
         .context("failed to read Dockerfile")?;
-    let hash = cache_key(&content);
-    let tag = format!("arcbox-sandbox:{hash}");
+    let context_dir = dockerfile.parent().unwrap_or_else(|| Path::new("."));
 
-    let context_dir = dockerfile
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_string_lossy()
-        .to_string();
+    build_and_resolve(&content, dockerfile, context_dir).await
+}
 
-    // docker build
+/// Build an in-memory Dockerfile and return the guest-visible path of its
+/// exported OCI image layout.
+///
+/// Used for the built-in templates ([`crate::templates`]), which have no file
+/// on disk. The Dockerfile is written into a private temp directory that also
+/// serves as the (empty) build context, so a template must not `COPY` local
+/// paths.
+pub async fn resolve_from_dockerfile_contents(contents: &[u8]) -> Result<String> {
+    let context = tempfile::TempDir::new().context("failed to create image build directory")?;
+    let dockerfile = context.path().join("Dockerfile");
+    tokio::fs::write(&dockerfile, contents)
+        .await
+        .context("failed to stage Dockerfile")?;
+
+    build_and_resolve(contents, &dockerfile, context.path()).await
+}
+
+/// Shared `docker build` step: tag by content hash, then export the layout.
+///
+/// The tag is derived from the Dockerfile contents, so an unchanged
+/// Dockerfile resolves to the same image (and therefore the same exported
+/// layout and guest-side ext4) on every run.
+async fn build_and_resolve(
+    contents: &[u8],
+    dockerfile: &Path,
+    context_dir: &Path,
+) -> Result<String> {
+    let tag = format!("arcbox-sandbox:{}", cache_key(contents));
+
     eprintln!("Building Docker image...");
     let output = Command::new("docker")
-        .args([
-            "--context",
-            docker_context(),
-            "build",
-            "-t",
-            &tag,
-            "-f",
-            dockerfile_path,
-            &context_dir,
-        ])
+        .args(["--context", docker_context(), "build", "-t", &tag, "-f"])
+        .arg(dockerfile)
+        .arg(context_dir)
         .output()
         .await
         .context("failed to spawn docker build")?;
