@@ -70,6 +70,11 @@ struct Cli {
     #[arg(long, default_value = "arcbox-hv")]
     platform: String,
 
+    /// Comma-separated benchmark names to exclude (e.g. network-dependent
+    /// macros like `npm_install,git_clone` in hermetic environments).
+    #[arg(long, value_delimiter = ',')]
+    skip: Vec<String>,
+
     /// List all available benchmarks and exit.
     #[arg(long)]
     list: bool,
@@ -112,6 +117,10 @@ fn main() {
         eprintln!("Error: specify --all or --benchmark <name>. Use --list to see available benchmarks.");
         process::exit(1);
     };
+    let benchmarks_to_run: Vec<&str> = benchmarks_to_run
+        .into_iter()
+        .filter(|name| !cli.skip.iter().any(|skip| skip == name))
+        .collect();
 
     // Verify target directory exists.
     if !std::path::Path::new(&cli.target).is_dir() {

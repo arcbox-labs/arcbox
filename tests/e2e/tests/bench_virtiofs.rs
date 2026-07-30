@@ -8,6 +8,11 @@
 //! this test measures and records; it does not assert a ratio (there is
 //! no baseline yet to regress against).
 //!
+//! The network-dependent macro benchmarks (`npm_install`, `git_clone`) are
+//! skipped on both sides: they need npm/git in the guest image (absent
+//! from the minimal bench image, where they fail instantly and report
+//! nonsense) and would hit the real registry/GitHub from the native run.
+//!
 //! Prerequisites (bailed on, not built here — keep the run's timing
 //! honest): both bench binaries must exist:
 //!
@@ -18,42 +23,29 @@
 //! ```
 
 use std::path::Path;
-use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
-use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle};
-use arcbox_e2e::docker::{docker_output, ensure_image};
+use arcbox_e2e::daemon::DaemonHandle;
+use arcbox_e2e::docker::{docker_output, ensure_image, run_with_timeout};
 use arcbox_e2e::metrics::RunMetrics;
-
-static TRACING: Once = Once::new();
+use arcbox_e2e::scenario::run_vz_scenario_with_log;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
-/// Ceiling for the full in-guest suite (dozens of benchmarks, files up to
-/// 256 MB, over VirtioFS).
+/// Ceiling for one full suite run (dozens of benchmarks, files up to
+/// 256 MB); applied to the guest and the native phase alike.
 const BENCH_BUDGET: Duration = Duration::from_secs(1800);
 /// First-baseline iteration counts: bounded runtime beats tight variance
 /// until a committed baseline exists.
 const WARMUP: &str = "1";
 const ITERATIONS: &str = "3";
-
-fn init_tracing() {
-    TRACING.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .try_init();
-    });
-}
+/// Network-dependent macro benchmarks, excluded on both sides (see the
+/// module docs).
+const SKIP_BENCHES: &str = "npm_install,git_clone";
 
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon and runs the VirtioFS benchmark suite"]
 fn virtiofs_guest_vs_native_baseline() -> Result<()> {
-    init_tracing();
-
     let root = arcbox_e2e::repo_root();
     let bench_dir = root.join("tests/bench-virtiofs/target");
     let guest_bin = bench_dir.join("aarch64-unknown-linux-musl/release/arcbox-bench-virtiofs");
@@ -67,46 +59,9 @@ fn virtiofs_guest_vs_native_baseline() -> Result<()> {
         }
     }
 
-    if !arcbox_e2e::env_flag("SKIP_BUILD") {
-        let shell = xshell::Shell::new()?;
-        shell.change_dir(&root);
-        xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
-    }
-
-    let version = resolve_boot_version(&root)?;
-    let data_dir = tempfile::Builder::new()
-        .prefix("arcbox-bench-virtiofs-")
-        .tempdir()?;
-    stage_dev_boot_assets(&root, data_dir.path(), &version)?;
-
-    let mut daemon = DaemonHandle::spawn(DaemonConfig {
-        binary: root.join("target/release/arcbox-daemon"),
-        data_dir: data_dir.path().to_owned(),
-        args: vec![],
-        env: vec![
-            ("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version),
-            ("ARCBOX_VM_BACKEND".to_owned(), "vz".to_owned()),
-        ],
-    })?;
-
-    let mut metrics = RunMetrics::new("bench_virtiofs", Some("vz"));
-    let result = scenario(
-        &mut daemon,
-        data_dir.path(),
-        &root,
-        &guest_bin,
-        &host_bin,
-        &mut metrics,
-    );
-    metrics.passed = result.is_ok();
-    if let Err(error) = metrics.write(Some(data_dir.path())) {
-        tracing::warn!("writing run metrics failed: {error:#}");
-    }
-    if result.is_err() {
-        let kept = data_dir.keep();
-        tracing::warn!(path = %kept.display(), "preserving test directory");
-    }
-    result
+    run_vz_scenario_with_log("bench_virtiofs", "info", |daemon, data_dir, metrics| {
+        scenario(daemon, data_dir, &root, &guest_bin, &host_bin, metrics)
+    })
 }
 
 fn scenario(
@@ -132,7 +87,7 @@ fn scenario(
         .context("staging guest bench binary into the share")?;
 
     // In-guest run against the VirtioFS share (scratch inside the share).
-    let guest_json = metrics.time("guest_bench", || {
+    let guest_output = metrics.time("guest_bench", || {
         docker_output(
             data_dir,
             &[
@@ -143,6 +98,8 @@ fn scenario(
                 &image,
                 "/b/arcbox-bench-virtiofs",
                 "--all",
+                "--skip",
+                SKIP_BENCHES,
                 "--format",
                 "json",
                 "--target",
@@ -162,23 +119,25 @@ fn scenario(
     // Native baseline on the host, same volume as the data dir.
     let native_scratch = data_dir.join("bench/native-scratch");
     std::fs::create_dir_all(&native_scratch)?;
-    let native_json = metrics.time("native_bench", || -> Result<String> {
-        let out = std::process::Command::new(host_bin)
-            .args([
-                "--all",
-                "--format",
-                "json",
-                "--target",
-                native_scratch.to_str().context("non-UTF8 scratch path")?,
-                "--platform",
-                "native",
-                "--warmup",
-                WARMUP,
-                "--iterations",
-                ITERATIONS,
-            ])
-            .output()
-            .context("running native bench suite")?;
+    let native_output = metrics.time("native_bench", || -> Result<String> {
+        let mut command = std::process::Command::new(host_bin);
+        command.args([
+            "--all",
+            "--skip",
+            SKIP_BENCHES,
+            "--format",
+            "json",
+            "--target",
+            native_scratch.to_str().context("non-UTF8 scratch path")?,
+            "--platform",
+            "native",
+            "--warmup",
+            WARMUP,
+            "--iterations",
+            ITERATIONS,
+        ]);
+        let out =
+            run_with_timeout(&mut command, BENCH_BUDGET).context("running native bench suite")?;
         if !out.status.success() {
             bail!(
                 "native bench failed: {}",
@@ -191,32 +150,48 @@ fn scenario(
     // Persist both reports outside the (deleted-on-success) data dir.
     let results = root.join("target/bench-virtiofs");
     std::fs::create_dir_all(&results)?;
-    std::fs::write(
-        results.join("guest-vz.json"),
-        extract_json_object(&guest_json)?,
-    )?;
-    std::fs::write(
-        results.join("native.json"),
-        extract_json_object(&native_json)?,
-    )?;
+    persist_report(&results, "guest-vz", &guest_output)?;
+    persist_report(&results, "native", &native_output)?;
     tracing::info!(dir = %results.display(), "bench reports written");
     Ok(())
 }
 
-/// Cuts a bench report down to its top-level JSON object and validates it.
+/// Writes `<name>.json` with the report extracted from a raw capture; on
+/// extraction failure the raw capture is preserved as `<name>.raw` so a
+/// failed 100+-second run never evaporates.
+fn persist_report(results: &Path, name: &str, raw: &str) -> Result<()> {
+    match extract_json_object(raw) {
+        Ok(json) => std::fs::write(results.join(format!("{name}.json")), json)
+            .with_context(|| format!("writing {name}.json")),
+        Err(error) => {
+            let raw_path = results.join(format!("{name}.raw"));
+            if let Err(write_error) = std::fs::write(&raw_path, raw) {
+                tracing::warn!("preserving raw {name} capture failed: {write_error:#}");
+            }
+            Err(error.context(format!(
+                "extracting the {name} report (raw capture preserved at {})",
+                raw_path.display()
+            )))
+        }
+    }
+}
+
+/// Extracts the first JSON value from a bench capture and re-serializes it.
 ///
 /// `docker_output` merges the container's stdout and stderr, and the bench
-/// prints progress text to stderr even in JSON mode — so the guest capture
-/// is a pretty-printed JSON object followed by loose text. The object's
-/// closing brace is the only column-0 `}` (nested closes are indented).
+/// prints progress text to stderr even in JSON mode — so the capture is
+/// one JSON object surrounded by loose text. The streaming deserializer
+/// consumes exactly one value wherever it ends, with no assumptions about
+/// the report's formatting.
 fn extract_json_object(raw: &str) -> Result<String> {
-    let start = raw.find('{').context("no JSON object in bench output")?;
-    let end = raw[start..]
-        .find("\n}")
-        .map(|i| start + i + 2)
-        .context("no top-level closing brace in bench output")?;
-    let json = &raw[start..end];
-    serde_json::from_str::<serde_json::Value>(json)
-        .context("extracted bench report is not valid JSON")?;
-    Ok(json.to_owned())
+    let excerpt: String = raw.chars().take(200).collect();
+    let start = raw
+        .find('{')
+        .with_context(|| format!("no JSON object in bench output: {excerpt:?}"))?;
+    let value = serde_json::Deserializer::from_str(&raw[start..])
+        .into_iter::<serde_json::Value>()
+        .next()
+        .with_context(|| format!("empty JSON stream in bench output: {excerpt:?}"))?
+        .with_context(|| format!("bench output is not valid JSON: {excerpt:?}"))?;
+    Ok(serde_json::to_string_pretty(&value)?)
 }
