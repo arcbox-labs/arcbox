@@ -50,7 +50,7 @@ tokio-stream.workspace = true
 arcbox-helper.workspace = true
 chrono.workspace = true
 tar = "0.4.46"
-tempfile = "3.14"
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }
@@ -59,7 +59,6 @@ macos-resolver = { workspace = true }
 default = []
 
 [dev-dependencies]
-tempfile = "3.14"
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

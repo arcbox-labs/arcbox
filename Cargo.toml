@@ -265,7 +265,7 @@ arcbox-api = { version = "0.5.4", path = "app/arcbox-api" } # x-release-please-v
 arcbox-migration = { version = "0.5.4", path = "app/arcbox-migration" } # x-release-please-version
 arcbox-logging = { version = "0.5.4", path = "common/arcbox-logging", default-features = false } # x-release-please-version
 
-# Test infrastructure
+# Temporary files and directories (tests, staging paths)
 tempfile = "3"
 
 [workspace.lints.clippy]
