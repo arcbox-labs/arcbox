@@ -682,8 +682,16 @@ pub(super) async fn exec_session(
             }
         }
         if output.done {
+            // `done` carries the exit status and is the last frame of the
+            // session, so stop here instead of waiting for the server to close
+            // the stream: it will not while our request stream is still open
+            // (the stdin pump keeps it alive for the whole session), which hung
+            // the client after the workload had already exited — including
+            // after a Ctrl-C the remote handled correctly. Returning drops the
+            // request stream, which the guest treats as a disconnect.
             exit_code = output.exit_code;
             received_done = true;
+            break;
         }
     }
 
