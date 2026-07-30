@@ -117,6 +117,22 @@ fn main() {
         eprintln!("Error: specify --all or --benchmark <name>. Use --list to see available benchmarks.");
         process::exit(1);
     };
+    // A skip entry that matches nothing would silently re-include a
+    // benchmark (e.g. the network-dependent macros a hermetic caller
+    // relies on excluding) — hard-error instead.
+    {
+        let mut known = micro::all_micro_benchmarks();
+        known.extend(macro_bench::all_macro_benchmarks());
+        for skip in &cli.skip {
+            if !known.contains(&skip.as_str()) {
+                eprintln!(
+                    "Error: --skip '{skip}' matches no benchmark. \
+                     Use --list to see available benchmarks."
+                );
+                process::exit(1);
+            }
+        }
+    }
     let benchmarks_to_run: Vec<&str> = benchmarks_to_run
         .into_iter()
         .filter(|name| !cli.skip.iter().any(|skip| skip == name))

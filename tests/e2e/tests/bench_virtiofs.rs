@@ -40,8 +40,17 @@ const BENCH_BUDGET: Duration = Duration::from_secs(1800);
 const WARMUP: &str = "1";
 const ITERATIONS: &str = "3";
 /// Network-dependent macro benchmarks, excluded on both sides (see the
-/// module docs).
+/// module docs). The bench CLI hard-errors on a name that matches no
+/// benchmark, so a rename upstream cannot silently re-include them.
 const SKIP_BENCHES: &str = "npm_install,git_clone";
+/// Benchmarks that shell out to userland tools (`rm`, `find`) resolved
+/// from `PATH` — busybox in the guest image vs BSD binaries on the host.
+/// Their absolute numbers are real signal (`rm_rf` is a known VirtioFS
+/// pain point), but their guest-vs-native *ratios* conflate toolchains
+/// with the filesystem: any future ratio assertion must exclude these
+/// names, and `find_recursive`'s flattering ratio must never be read as
+/// the perf table's File I/O target being met.
+const TOOLCHAIN_BOUND_BENCHES: &[&str] = &["rm_rf", "find_recursive"];
 
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon and runs the VirtioFS benchmark suite"]
@@ -153,6 +162,11 @@ fn scenario(
     persist_report(&results, "guest-vz", &guest_output)?;
     persist_report(&results, "native", &native_output)?;
     tracing::info!(dir = %results.display(), "bench reports written");
+    tracing::info!(
+        toolchain_bound = ?TOOLCHAIN_BOUND_BENCHES,
+        "these rows compare userland tools as much as the filesystem — \
+         exclude them from any guest-vs-native ratio"
+    );
     Ok(())
 }
 
