@@ -71,10 +71,15 @@ pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
         bail!("layer path not found: {layer_path}");
     }
 
-    // Cache key derived from the layer path. Both source kinds carry the image
-    // digest in the directory name, so the path is a stable identifier.
-    let hash = path_hash(layer_path);
-    let ext4_path = format!("{ROOTFS_CACHE_DIR}/rootfs-{hash}.ext4");
+    // The cached image has two ingredients, so the key names both: the layer
+    // (whose directory name carries the image digest for either source kind,
+    // making the path a stable identifier) and the `vm-agent` binary injected
+    // below. Keying on the layer alone meant a newer agent never reached an
+    // already-converted image — the sandbox kept booting the old init with no
+    // sign anything was stale.
+    let layer_key = path_hash(layer_path);
+    let agent_key = vm_agent_key().await?;
+    let ext4_path = format!("{ROOTFS_CACHE_DIR}/rootfs-{layer_key}-{agent_key}.ext4");
 
     // Check cache.
     if Path::new(&ext4_path).exists() && has_ext4_magic(Path::new(&ext4_path)) {
@@ -127,8 +132,65 @@ pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
         .await
         .context("failed to rename ext4 into cache")?;
 
+    sweep_superseded(&layer_key, &agent_key).await;
+
     tracing::info!(path = %ext4_path, "rootfs ready");
     Ok(ext4_path)
+}
+
+/// Content key for the `vm-agent` binary that gets injected into every image.
+///
+/// Content rather than mtime: this binary is copied into place by installers and
+/// by hand during development, so an older build can easily carry a newer
+/// timestamp — which an mtime check would read as fresh and then bake in.
+async fn vm_agent_key() -> Result<String> {
+    use std::hash::Hasher;
+    let bytes = tokio::fs::read(VM_AGENT_BIN)
+        .await
+        .with_context(|| format!("failed to read {VM_AGENT_BIN}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(&bytes);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+/// Delete images for `layer_key` built against a different `vm-agent`.
+///
+/// Bounds the cache at one image per layer instead of accumulating one per
+/// agent version. Best-effort: an image a live sandbox still has open unlinks
+/// fine on Linux and frees its space when the last reference closes.
+async fn sweep_superseded(layer_key: &str, agent_key: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(ROOTFS_CACHE_DIR).await else {
+        return;
+    };
+    let mut removed = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_superseded_image(&name, layer_key, agent_key)
+            && tokio::fs::remove_file(entry.path()).await.is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, layer = %layer_key, "removed superseded rootfs images");
+    }
+}
+
+/// True when `name` is a cached image for `layer_key` built against some other
+/// `vm-agent` than `agent_key`.
+fn is_superseded_image(name: &str, layer_key: &str, agent_key: &str) -> bool {
+    let Some(keys) = name
+        .strip_prefix("rootfs-")
+        .and_then(|rest| rest.strip_suffix(".ext4"))
+    else {
+        return false;
+    };
+    let Some((layer, agent)) = keys.split_once('-') else {
+        // Pre-`agent_key` naming (`rootfs-<layer>.ext4`): its injected agent is
+        // unknown, so treat it as superseded rather than keep it forever.
+        return keys == layer_key;
+    };
+    layer == layer_key && agent != agent_key
 }
 
 /// Ensure the default busybox + vm-agent rootfs exists at `path` and is
@@ -441,6 +503,42 @@ mod tests {
     #[test]
     fn test_has_ext4_magic_nonexistent() {
         assert!(!has_ext4_magic(Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn is_superseded_image_matches_only_the_same_layer_with_another_agent() {
+        // Same layer, older agent build: must go, or the sandbox keeps booting
+        // the stale init.
+        assert!(is_superseded_image("rootfs-aaaa-0000.ext4", "aaaa", "1111"));
+        // The image we just published.
+        assert!(!is_superseded_image(
+            "rootfs-aaaa-1111.ext4",
+            "aaaa",
+            "1111"
+        ));
+        // A different layer is a different image, not a superseded one.
+        assert!(!is_superseded_image(
+            "rootfs-bbbb-0000.ext4",
+            "aaaa",
+            "1111"
+        ));
+        // Legacy name from before the agent key existed: same layer, unknown
+        // agent, so treat as superseded; other layers stay.
+        assert!(is_superseded_image("rootfs-aaaa.ext4", "aaaa", "1111"));
+        assert!(!is_superseded_image("rootfs-bbbb.ext4", "aaaa", "1111"));
+        // Anything that is not a published image is left alone, including the
+        // in-progress temp files sweep_stale_tmp owns.
+        assert!(!is_superseded_image(
+            ".rootfs-aaaa-1111.ext4.tmp",
+            "aaaa",
+            "1111"
+        ));
+        assert!(!is_superseded_image("default.ext4", "aaaa", "1111"));
+        assert!(!is_superseded_image(
+            "rootfs-aaaa-1111.ext4.bak",
+            "aaaa",
+            "1111"
+        ));
     }
 
     #[test]
