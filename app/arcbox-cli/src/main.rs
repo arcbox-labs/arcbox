@@ -71,6 +71,9 @@ fn main() -> Result<()> {
                 Commands::Macos(cmd) => commands::macos::execute(cmd).await,
                 Commands::Migrate(cmd) => commands::migrate::execute(cmd).await,
                 Commands::Sandbox(cmd) => commands::sandbox::execute(cmd).await,
+                Commands::Claude(args) => {
+                    commands::agent::execute(&commands::agent::CLAUDE, args).await
+                }
                 Commands::Docker(cmd) => commands::docker::execute(cmd, cli.format).await,
                 Commands::Kubernetes(cmd) => commands::kubernetes::execute(cmd).await,
                 Commands::System(cmd) => commands::system::execute(cmd).await,
