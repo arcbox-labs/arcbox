@@ -143,8 +143,14 @@ impl SandboxService {
                 .map_err(|e| SandboxError::Internal(format!("default rootfs: {e}")))?;
             spec.rootfs.clone_from(&self.default_rootfs);
         } else if std::path::Path::new(&spec.rootfs).is_dir() {
-            // Directory → overlay2 layer needing conversion.
-            let ext4_path = crate::rootfs_builder::convert_layer_to_rootfs(&spec.rootfs)
+            // Directory → overlay2 layer needing conversion. Pass the images
+            // snapshots depend on so the conversion's cache sweep leaves them
+            // alone — a restore has no way to rebuild its dm-snapshot origin.
+            let pinned = self
+                .manager
+                .pinned_rootfs_paths()
+                .map_err(SandboxError::from)?;
+            let ext4_path = crate::rootfs_builder::convert_layer_to_rootfs(&spec.rootfs, &pinned)
                 .await
                 .map_err(|e| SandboxError::Internal(format!("rootfs build failed: {e}")))?;
             spec.rootfs = ext4_path;

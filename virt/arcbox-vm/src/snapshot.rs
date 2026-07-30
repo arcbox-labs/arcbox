@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -195,6 +196,39 @@ impl SnapshotCatalog {
         Ok(all)
     }
 
+    /// Rootfs images that catalogued snapshots depend on.
+    ///
+    /// Restore rebuilds the dm-snapshot origin from
+    /// [`SnapshotMeta::rootfs_path`], and the guest memory in the snapshot was
+    /// captured against those exact bytes — re-converting the same image with a
+    /// different `vm-agent` produces a different file and is not a substitute.
+    /// Anything that garbage-collects rootfs images must treat these as pinned.
+    pub fn referenced_rootfs_paths(&self) -> Result<BTreeSet<PathBuf>> {
+        if !self.root.exists() {
+            return Ok(BTreeSet::new());
+        }
+        let mut pinned = BTreeSet::new();
+        for vm in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
+            let vm_dir = vm.map_err(VmmError::Io)?.path();
+            if !vm_dir.is_dir() {
+                continue;
+            }
+            for snapshot in std::fs::read_dir(&vm_dir).map_err(VmmError::Io)? {
+                let snapshot_dir = snapshot.map_err(VmmError::Io)?.path();
+                if !snapshot_dir.is_dir() {
+                    continue;
+                }
+                // Deliberately strict: an unreadable meta.json means unknown
+                // references, and guessing there would delete an image a
+                // restore still needs.
+                if let Some(rootfs) = self.read_meta(&snapshot_dir)?.rootfs_path {
+                    pinned.insert(PathBuf::from(rootfs));
+                }
+            }
+        }
+        Ok(pinned)
+    }
+
     /// Delete a snapshot knowing only its ID (searches across all owner directories).
     pub fn delete_by_id(&self, snapshot_id: &str) -> Result<()> {
         let meta = self.find_by_id(snapshot_id)?;
@@ -221,7 +255,12 @@ impl SnapshotCatalog {
         let dir = self.snapshot_dir(&meta.vm_id, &meta.id);
         std::fs::create_dir_all(&dir).map_err(VmmError::Io)?;
         let json = serde_json::to_string_pretty(meta)?;
-        std::fs::write(Self::meta_path(&dir), json).map_err(VmmError::Io)?;
+        // Write-and-rename: a meta.json torn by a crash mid-write would be an
+        // unreadable snapshot record, and readers treat that as an error rather
+        // than as "no references".
+        let tmp = dir.join("meta.json.tmp");
+        std::fs::write(&tmp, json).map_err(VmmError::Io)?;
+        std::fs::rename(&tmp, Self::meta_path(&dir)).map_err(VmmError::Io)?;
         Ok(())
     }
 
@@ -250,6 +289,53 @@ mod tests {
                 None,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn referenced_rootfs_paths_spans_every_vm_and_skips_snapshots_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        assert!(catalog.referenced_rootfs_paths().unwrap().is_empty());
+
+        let register_with_rootfs = |vm_id: &str, rootfs: Option<String>| {
+            catalog
+                .register(
+                    vm_id,
+                    None,
+                    SnapshotType::Full,
+                    PathBuf::from("/tmp/vmstate"),
+                    None,
+                    None,
+                    None,
+                    rootfs,
+                )
+                .unwrap()
+        };
+        register_with_rootfs("vm-1", Some("/var/lib/arcbox/sandbox/rootfs-a.ext4".into()));
+        register_with_rootfs("vm-2", Some("/var/lib/arcbox/sandbox/rootfs-b.ext4".into()));
+        register_with_rootfs("vm-2", None);
+
+        assert_eq!(
+            catalog.referenced_rootfs_paths().unwrap(),
+            BTreeSet::from([
+                PathBuf::from("/var/lib/arcbox/sandbox/rootfs-a.ext4"),
+                PathBuf::from("/var/lib/arcbox/sandbox/rootfs-b.ext4"),
+            ])
+        );
+    }
+
+    #[test]
+    fn referenced_rootfs_paths_fails_on_an_unreadable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = register_one(&catalog, "vm-1");
+        std::fs::write(
+            SnapshotCatalog::meta_path(&catalog.snapshot_dir("vm-1", &meta.id)),
+            "{ truncated",
+        )
+        .unwrap();
+        // Guessing "no references" here would delete an image a restore needs.
+        assert!(catalog.referenced_rootfs_paths().is_err());
     }
 
     #[test]
