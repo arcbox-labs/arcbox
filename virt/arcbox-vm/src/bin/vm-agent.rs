@@ -932,6 +932,9 @@ mod agent {
                 drop(slave);
                 let writer: Arc<Mutex<VsockStream>> = Arc::new(Mutex::new(conn));
 
+                let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
+                let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
+
                 let w_read = Arc::clone(&writer);
                 let t_pty = thread::spawn(move || {
                     let mut buf = [0u8; 4096];
@@ -949,10 +952,29 @@ mod agent {
                             }
                         }
                     }
-                });
 
-                let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
-                let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
+                    // The master read only ends when every slave fd is closed,
+                    // i.e. the session's processes are gone. Report the status
+                    // here rather than after the input loop: that loop is parked
+                    // in read_frame waiting for host frames, and the host is
+                    // waiting for this status, so leaving it until then
+                    // deadlocked every interactive session that exited on its
+                    // own (^D at a shell, an agent quitting on ^C) until the
+                    // client gave up or was killed.
+                    let exit_code = exit_rx.recv().unwrap_or(-1);
+                    let _ = write_frame(
+                        &mut *w_read.lock().unwrap(),
+                        MSG_EXIT,
+                        &exit_code.to_le_bytes(),
+                    );
+
+                    // Unblock the input loop so the session tears down without
+                    // depending on the client noticing first.
+                    // SAFETY: read_fd is a live dup of the connection owned by
+                    // the input loop; shutting down its read half makes a
+                    // blocked read return instead of waiting for host input.
+                    unsafe { libc::shutdown(read_fd, libc::SHUT_RD) };
+                });
                 // SAFETY: master_fd is valid; File takes ownership for writes.
                 let mut master_writer = unsafe { std::fs::File::from_raw_fd(master_fd) };
 
@@ -982,15 +1004,9 @@ mod agent {
                     }
                 }
 
+                // The PTY thread owns reporting the exit status (see above), so
+                // joining it is all that is left.
                 let _ = t_pty.join();
-
-                // The reaper owns waitpid; block on the routed exit code.
-                let exit_code = exit_rx.recv().unwrap_or(-1);
-                let _ = write_frame(
-                    &mut *writer.lock().unwrap(),
-                    MSG_EXIT,
-                    &exit_code.to_le_bytes(),
-                );
             }
         }
     }
