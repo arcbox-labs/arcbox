@@ -85,5 +85,12 @@ A template can also be used directly, without the `claude` wrapper:
 $ abctl sandbox create --id t1 --from-template claude --memory 2048
 ```
 
-Keep in mind Claude Code refuses to skip permission prompts as root, which is
-why the template creates a non-root `agent` user that owns `/workspace`.
+Two things to keep in mind when writing your own image:
+
+- Claude Code refuses to skip permission prompts as root, so the session runs
+  as the image's non-root `node` user (uid 1000), which owns `/workspace`.
+- Only the image's **filesystem** is converted into the sandbox rootfs — its
+  `ENV`, `USER`, `WORKDIR` and `ENTRYPOINT` are not carried over. `abctl claude`
+  therefore supplies `PATH`, `HOME`, the working directory and the user itself;
+  a hand-built image driven through `abctl sandbox exec` has to do the same
+  (`--user`, absolute paths, or an explicit `PATH`).
