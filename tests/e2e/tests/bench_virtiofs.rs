@@ -43,14 +43,23 @@ const ITERATIONS: &str = "3";
 /// module docs). The bench CLI hard-errors on a name that matches no
 /// benchmark, so a rename upstream cannot silently re-include them.
 const SKIP_BENCHES: &str = "npm_install,git_clone";
-/// Benchmarks that shell out to userland tools (`rm`, `find`) resolved
-/// from `PATH` — busybox in the guest image vs BSD binaries on the host.
-/// Their absolute numbers are real signal (`rm_rf` is a known VirtioFS
-/// pain point), but their guest-vs-native *ratios* conflate toolchains
-/// with the filesystem: any future ratio assertion must exclude these
-/// names, and `find_recursive`'s flattering ratio must never be read as
-/// the perf table's File I/O target being met.
-const TOOLCHAIN_BOUND_BENCHES: &[&str] = &["rm_rf", "find_recursive"];
+/// Benchmarks whose guest-vs-native *ratio* is confounded by something
+/// other than the filesystem: `rm`/`find` resolve from `PATH` (busybox in
+/// the guest vs BSD on the host), the sequential pair shells out to `dd`
+/// and the read side also calls the macOS-only `purge` (cache-cold host
+/// vs warm guest), and `random_read_4k` is buffered-in-process while the
+/// perf-table targets imply O_DIRECT-class measurement (the engine is now
+/// pinned per invocation; fio reports under `random_read_4k_fio`).
+/// Absolute numbers are real signal (`rm_rf` is a known VirtioFS pain
+/// point), but any future ratio assertion may only use the genuinely
+/// in-process trio: `metadata_stat`, `create_delete`, `negative_lookup`.
+const CONFOUNDED_RATIO_BENCHES: &[&str] = &[
+    "sequential_read",
+    "sequential_write",
+    "random_read_4k",
+    "rm_rf",
+    "find_recursive",
+];
 
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon and runs the VirtioFS benchmark suite"]
@@ -163,8 +172,8 @@ fn scenario(
     persist_report(&results, "native", &native_output)?;
     tracing::info!(dir = %results.display(), "bench reports written");
     tracing::info!(
-        toolchain_bound = ?TOOLCHAIN_BOUND_BENCHES,
-        "these rows compare userland tools as much as the filesystem — \
+        confounded_ratio = ?CONFOUNDED_RATIO_BENCHES,
+        "these rows are confounded by more than the filesystem — \
          exclude them from any guest-vs-native ratio"
     );
     Ok(())

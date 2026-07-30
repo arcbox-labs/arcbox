@@ -107,23 +107,18 @@ pub fn bench_sequential_write(target: &str, size_mb: u64) -> BenchmarkMetrics {
     }
 }
 
-/// Random 4K read benchmark.
+/// Random 4K read benchmark — the in-process buffered reader.
 ///
-/// If `fio` is available, delegates to it for accurate IOPS measurement.
-/// Otherwise falls back to a pure-Rust implementation using random seeks.
+/// Engine selection is explicit (no PATH sniffing): this is the hermetic
+/// default, and the fio/O_DIRECT variant is opt-in via the CLI's
+/// `--random-read-engine` flag, reporting under `random_read_4k_fio` so
+/// numbers from different engines can never be joined by name.
 pub fn bench_random_read_4k(target: &str, num_ops: u64) -> BenchmarkMetrics {
-    // Check if fio is available.
-    let fio_available = Command::new("fio").arg("--version").output().is_ok();
-
-    if fio_available {
-        bench_random_read_4k_fio(target, num_ops)
-    } else {
-        bench_random_read_4k_rust(target, num_ops)
-    }
+    bench_random_read_4k_rust(target, num_ops)
 }
 
-/// Random 4K read using fio for accurate IOPS measurement.
-fn bench_random_read_4k_fio(target: &str, num_ops: u64) -> BenchmarkMetrics {
+/// Random 4K read using fio (`--direct=1`) for O_DIRECT IOPS measurement.
+pub fn bench_random_read_4k_fio(target: &str, num_ops: u64) -> BenchmarkMetrics {
     let test_file = format!("{}/bench_rand_read.dat", target);
 
     // Create a 256MB test file for random reads.
@@ -175,7 +170,7 @@ fn bench_random_read_4k_fio(target: &str, num_ops: u64) -> BenchmarkMetrics {
     }
 }
 
-/// Pure-Rust fallback for random 4K reads when fio is unavailable.
+/// The in-process buffered random 4K reader (the `internal` engine).
 fn bench_random_read_4k_rust(target: &str, num_ops: u64) -> BenchmarkMetrics {
     let test_file = format!("{}/bench_rand_read.dat", target);
     let file_size: u64 = 256 * 1024 * 1024; // 256 MB
@@ -405,11 +400,14 @@ pub fn all_micro_benchmarks() -> Vec<&'static str> {
 }
 
 /// Dispatches a micro-benchmark by name, returning None if the name is unknown.
+/// Operation count for the random-read benchmark, shared by both engines.
+pub const RANDOM_READ_OPS: u64 = 10_000;
+
 pub fn run_micro_benchmark(name: &str, target: &str) -> Option<BenchmarkMetrics> {
     match name {
         "sequential_read" => Some(bench_sequential_read(target, 512)),
         "sequential_write" => Some(bench_sequential_write(target, 512)),
-        "random_read_4k" => Some(bench_random_read_4k(target, 10_000)),
+        "random_read_4k" => Some(bench_random_read_4k(target, RANDOM_READ_OPS)),
         "metadata_stat" => Some(bench_metadata_stat(target, 10_000)),
         "create_delete" => Some(bench_create_delete(target, 10_000)),
         "negative_lookup" => Some(bench_negative_lookup(target, 100_000)),

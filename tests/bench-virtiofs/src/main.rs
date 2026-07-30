@@ -75,6 +75,13 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     skip: Vec<String>,
 
+    /// I/O engine for `random_read_4k`: the in-process buffered reader
+    /// (hermetic default) or fio with O_DIRECT (must be installed). The
+    /// fio engine reports under `random_read_4k_fio`, so numbers from
+    /// different engines can never be joined by name.
+    #[arg(long, default_value = "internal")]
+    random_read_engine: RandomReadEngine,
+
     /// List all available benchmarks and exit.
     #[arg(long)]
     list: bool,
@@ -84,6 +91,14 @@ struct Cli {
 enum OutputFormat {
     Text,
     Json,
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum RandomReadEngine {
+    /// In-process buffered reader — no external dependency.
+    Internal,
+    /// fio with `--direct=1` — requires fio on PATH.
+    Fio,
 }
 
 fn main() {
@@ -150,6 +165,18 @@ fn main() {
         process::exit(1);
     }
 
+    // The fio engine is opt-in and must actually be present — an implicit
+    // fallback would silently compare engines across the two phases.
+    if cli.random_read_engine == RandomReadEngine::Fio
+        && std::process::Command::new("fio")
+            .arg("--version")
+            .output()
+            .is_err()
+    {
+        eprintln!("Error: --random-read-engine fio requested but fio is not on PATH.");
+        process::exit(1);
+    }
+
     let runner = BenchmarkRunner::new(cli.warmup, cli.iterations);
     let mut results = Vec::new();
 
@@ -173,7 +200,15 @@ fn main() {
         let name = bench_name.to_string();
 
         // Try micro first, then macro.
-        let result = if micro::all_micro_benchmarks().contains(bench_name) {
+        let result = if *bench_name == "random_read_4k"
+            && cli.random_read_engine == RandomReadEngine::Fio
+        {
+            // The fio engine reports under its own name so numbers from
+            // different engines can never be joined.
+            runner.run("random_read_4k_fio", &cli.platform, || {
+                micro::bench_random_read_4k_fio(&target, micro::RANDOM_READ_OPS)
+            })
+        } else if micro::all_micro_benchmarks().contains(bench_name) {
             runner.run(&name, &cli.platform, || {
                 micro::run_micro_benchmark(bench_name, &target).expect("unknown micro-benchmark")
             })
