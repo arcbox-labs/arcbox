@@ -178,6 +178,22 @@ impl RealBalloonDeps {
 impl BalloonDeps for RealBalloonDeps {
     type Watch = AgentPressureWatch;
 
+    /// No macOS backend reclaims ballooned memory today (measured and
+    /// calibrated 2026-07-29 on macOS 26.4):
+    /// - VZ: Apple applies neither `vm_deallocate` nor any `madvise` to
+    ///   inflated pages — a 15.35 GB inflation left the daemon's
+    ///   `phys_footprint` byte-identical, and real host pressure
+    ///   *compressed* the pages as live data.
+    /// - HV: `arcbox-virtio-balloon` inflates with `MADV_DONTNEED`, which
+    ///   Darwin treats as a deactivation hint — calibrated
+    ///   footprint-inert, contents preserved (compressed, not discarded,
+    ///   under pressure). Flip HV to `true` only after the device switches
+    ///   to `MADV_FREE_REUSABLE` and a real HV boot shows the host
+    ///   footprint dropping on inflate.
+    fn reclaim_capable(&self) -> bool {
+        false
+    }
+
     fn full_memory_bytes(&self) -> Option<u64> {
         self.shared
             .machine_manager

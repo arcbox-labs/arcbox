@@ -18,6 +18,21 @@
 //!   very numbers a host-side re-computation would need, so pressure
 //!   detection is delegated to the guest (see `WatchMemoryPressure`)
 //!   and the only moves are "keep" or "give it all back".
+//! - **Idle shrinking runs only on reclaim-capable backends — and no macOS
+//!   backend is one today** (2026-07-29 measurements, macOS 26.4). VZ:
+//!   Apple neither deallocates nor `madvise`s the pages the guest gives up
+//!   — a 15.35 GB inflation left the daemon's `phys_footprint`
+//!   byte-identical, and under real host memory pressure the kernel
+//!   *compressed* the ballooned pages as live data (calibrated against a
+//!   `MADV_FREE` probe, which the same pressure discards within seconds).
+//!   HV: its device inflates with `MADV_DONTNEED`, which Darwin treats as
+//!   a deactivation hint — calibrated footprint-inert, contents preserved
+//!   (compressed, never discarded, under pressure); real Darwin reclaim
+//!   needs `MADV_FREE_REUSABLE` (calibrated: footprint drops instantly).
+//!   Host footprint stays pinned at the configured `memory_mb`, so
+//!   shrinking is guest starvation with zero host benefit on either
+//!   backend. See [`controller::BalloonDeps::reclaim_capable`]; flip a
+//!   backend only with a measured host footprint drop on inflate.
 
 pub(super) mod controller;
 
