@@ -60,42 +60,52 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("Failed to build tokio runtime")
-        .block_on(async {
-            match cli.command {
-                Commands::Machine(cmd) => commands::machine::execute(cmd).await,
-                #[cfg(target_os = "macos")]
-                Commands::Macos(cmd) => commands::macos::execute(cmd).await,
-                Commands::Migrate(cmd) => commands::migrate::execute(cmd).await,
-                Commands::Sandbox(cmd) => commands::sandbox::execute(cmd).await,
-                Commands::Claude(args) => {
-                    commands::agent::execute(&commands::agent::CLAUDE, args).await
-                }
-                Commands::Docker(cmd) => commands::docker::execute(cmd, cli.format).await,
-                Commands::Kubernetes(cmd) => commands::kubernetes::execute(cmd).await,
-                Commands::System(cmd) => commands::system::execute(cmd).await,
-                Commands::Boot(cmd) => commands::boot::execute(cmd, cli.format).await,
-                Commands::Disk(cmd) => commands::disk::execute(cmd).await,
-                #[cfg(target_os = "macos")]
-                Commands::Dns(cmd) => commands::dns::execute(cmd).await,
-                Commands::Daemon(args) => commands::daemon::execute(args).await,
-                Commands::Logs(args) => commands::logs::execute(args).await,
-                Commands::Setup(cmd) => commands::setup::execute(cmd, cli.format).await,
-                Commands::Doctor => commands::doctor::execute().await,
-                Commands::Top(args) => commands::top::execute(args, cli.format).await,
-                #[cfg(target_os = "macos")]
-                Commands::Install(args) => commands::install::execute(args).await,
-                #[cfg(target_os = "macos")]
-                Commands::Uninstall(args) => commands::uninstall::execute(args).await,
-                #[cfg(target_os = "macos")]
-                Commands::Internal(cmd) => commands::internal::execute(cmd).await,
-                Commands::Info => execute_info().await,
-                Commands::Version => commands::version::execute().await,
+        .expect("Failed to build tokio runtime");
+
+    let result = runtime.block_on(async {
+        match cli.command {
+            Commands::Machine(cmd) => commands::machine::execute(cmd).await,
+            #[cfg(target_os = "macos")]
+            Commands::Macos(cmd) => commands::macos::execute(cmd).await,
+            Commands::Migrate(cmd) => commands::migrate::execute(cmd).await,
+            Commands::Sandbox(cmd) => commands::sandbox::execute(cmd).await,
+            Commands::Claude(args) => {
+                commands::agent::execute(&commands::agent::CLAUDE, args).await
             }
-        })
+            Commands::Docker(cmd) => commands::docker::execute(cmd, cli.format).await,
+            Commands::Kubernetes(cmd) => commands::kubernetes::execute(cmd).await,
+            Commands::System(cmd) => commands::system::execute(cmd).await,
+            Commands::Boot(cmd) => commands::boot::execute(cmd, cli.format).await,
+            Commands::Disk(cmd) => commands::disk::execute(cmd).await,
+            #[cfg(target_os = "macos")]
+            Commands::Dns(cmd) => commands::dns::execute(cmd).await,
+            Commands::Daemon(args) => commands::daemon::execute(args).await,
+            Commands::Logs(args) => commands::logs::execute(args).await,
+            Commands::Setup(cmd) => commands::setup::execute(cmd, cli.format).await,
+            Commands::Doctor => commands::doctor::execute().await,
+            Commands::Top(args) => commands::top::execute(args, cli.format).await,
+            #[cfg(target_os = "macos")]
+            Commands::Install(args) => commands::install::execute(args).await,
+            #[cfg(target_os = "macos")]
+            Commands::Uninstall(args) => commands::uninstall::execute(args).await,
+            #[cfg(target_os = "macos")]
+            Commands::Internal(cmd) => commands::internal::execute(cmd).await,
+            Commands::Info => execute_info().await,
+            Commands::Version => commands::version::execute().await,
+        }
+    });
+
+    // Interactive sessions leave a `tokio::io::stdin()` read parked on a
+    // blocking thread, and that read cannot be cancelled — dropping the runtime
+    // would wait for it, so a clean exit would not return the shell until the
+    // user pressed Enter. Detaching those threads lets `main` return normally
+    // and still runs the sentry guard's flush on the way out.
+    runtime.shutdown_background();
+
+    result
 }
 
 /// Display system-wide information.
