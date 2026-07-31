@@ -12,7 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * **cli:** abctl claude — coding-agent TUI in a sandbox ([bd558cd](https://github.com/arcboxlabs/arcbox/commit/bd558cdf7bbf9d6a5771d058d3203cb1c90bb616))
 * **cli:** embedded sandbox image templates ([aa00154](https://github.com/arcboxlabs/arcbox/commit/aa001540284855e106c70ce4fb6bd08515fa4c36))
-* **fleet:** restart the agent process in place ([c8649a5](https://github.com/arcboxlabs/arcbox/commit/c8649a5ae9dd219874ec86fe479d79d6d484fe56))
 
 
 ### Bug Fixes
