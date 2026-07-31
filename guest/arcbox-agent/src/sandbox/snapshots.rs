@@ -1,0 +1,88 @@
+//! Sandbox checkpoint / restore handlers.
+
+use arcbox_protocol::sandbox_v1;
+use arcbox_vm::RestoreSandboxSpec;
+use prost::Message;
+
+use super::{SandboxService, convert, register_sandbox_dns};
+use crate::error::SandboxError;
+
+impl SandboxService {
+    /// Checkpoint a sandbox.
+    pub async fn checkpoint(
+        &self,
+        payload: &[u8],
+    ) -> Result<sandbox_v1::CheckpointResponse, SandboxError> {
+        let req = sandbox_v1::CheckpointRequest::decode(payload)
+            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let info = self
+            .manager
+            .checkpoint_sandbox(&req.sandbox_id, req.name)
+            .await
+            .map_err(SandboxError::from)?;
+        Ok(convert::checkpoint_to_proto(info))
+    }
+
+    /// Restore a sandbox from a snapshot.
+    pub async fn restore(
+        &self,
+        payload: &[u8],
+    ) -> Result<sandbox_v1::RestoreResponse, SandboxError> {
+        let req = sandbox_v1::RestoreRequest::decode(payload)
+            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let spec = RestoreSandboxSpec {
+            id: if req.id.is_empty() {
+                None
+            } else {
+                Some(req.id)
+            },
+            snapshot_id: req.snapshot_id,
+            labels: req.labels,
+            network_override: req.network_override,
+            ttl_seconds: req.ttl_seconds,
+        };
+        let (id, ip_address) = self
+            .manager
+            .restore_sandbox(spec)
+            .await
+            .map_err(SandboxError::from)?;
+        register_sandbox_dns(&id, &ip_address);
+        Ok(sandbox_v1::RestoreResponse { id, ip_address })
+    }
+
+    /// List snapshots (id-ordered, paginated).
+    pub fn list_snapshots(
+        &self,
+        payload: &[u8],
+    ) -> Result<sandbox_v1::ListSnapshotsResponse, SandboxError> {
+        let req = sandbox_v1::ListSnapshotsRequest::decode(payload)
+            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let filter = if req.sandbox_id.is_empty() {
+            None
+        } else {
+            Some(req.sandbox_id.as_str())
+        };
+        let summaries = self
+            .manager
+            .list_checkpoints(filter)
+            .map_err(SandboxError::from)?;
+        let (page, next_page_token) =
+            convert::paginate(summaries, |s| &s.id, req.page_size, &req.page_token);
+        Ok(sandbox_v1::ListSnapshotsResponse {
+            snapshots: page
+                .into_iter()
+                .map(convert::checkpoint_summary_to_proto)
+                .collect(),
+            next_page_token,
+        })
+    }
+
+    /// Delete a snapshot.
+    pub fn delete_snapshot(&self, payload: &[u8]) -> Result<(), SandboxError> {
+        let req = sandbox_v1::DeleteSnapshotRequest::decode(payload)
+            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        self.manager
+            .delete_checkpoint(&req.snapshot_id)
+            .map_err(SandboxError::from)
+    }
+}

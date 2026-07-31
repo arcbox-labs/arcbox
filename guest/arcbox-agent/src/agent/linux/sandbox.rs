@@ -3,7 +3,7 @@
 //! The sandbox service is initialised lazily as a process-wide singleton.
 //! `handle_sandbox_message` routes vsock frames to the right `SandboxService`
 //! method and writes either a single response frame or a stream of frames
-//! for streaming requests (Run / Events / Exec).
+//! for streaming requests (execution attach / Events / file reads).
 
 use std::sync::{Arc, OnceLock};
 
@@ -19,6 +19,15 @@ use crate::sandbox::SandboxService;
 fn port_forwards() -> &'static Mutex<PortForwardManager> {
     static MANAGER: OnceLock<Mutex<PortForwardManager>> = OnceLock::new();
     MANAGER.get_or_init(|| Mutex::new(PortForwardManager::default()))
+}
+
+/// Map the wire protocol enum onto the forwarder's protocol
+/// (`UNSPECIFIED` defaults to TCP).
+fn wire_protocol(protocol: arcbox_protocol::sandbox_v1::PortProtocol) -> Protocol {
+    match protocol {
+        arcbox_protocol::sandbox_v1::PortProtocol::Udp => Protocol::Udp,
+        _ => Protocol::Tcp,
+    }
 }
 
 /// Returns the global [`SandboxService`] singleton.
@@ -59,7 +68,7 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
 /// Stop/Remove, TTL expiry, and boot failures — without threading cleanup
 /// hooks through each of them.
 fn spawn_port_forward_cleanup(svc: &Arc<SandboxService>) {
-    use arcbox_protocol::sandbox_v1::{SandboxEvent, SandboxEventsRequest};
+    use arcbox_protocol::sandbox_v1::{SandboxEvent, SandboxEventKind, SandboxEventsRequest};
 
     let payload = SandboxEventsRequest::default().encode_to_vec();
     let mut rx = match svc.subscribe_events(&payload) {
@@ -74,7 +83,10 @@ fn spawn_port_forward_cleanup(svc: &Arc<SandboxService>) {
             let Ok(event) = SandboxEvent::decode(encoded.as_slice()) else {
                 continue;
             };
-            if event.action == "stopped" || event.action == "removed" || event.action == "failed" {
+            if matches!(
+                event.kind(),
+                SandboxEventKind::Stopped | SandboxEventKind::Removed | SandboxEventKind::Failed
+            ) {
                 port_forwards()
                     .lock()
                     .await
@@ -174,22 +186,100 @@ where
             }
         },
         // -----------------------------------------------------------------
-        // Streaming: Run
+        // Executions (protocol v2)
         // -----------------------------------------------------------------
-        MessageType::SandboxRunRequest => {
-            svc.handle_run(stream, trace_id, payload).await?;
+        MessageType::SandboxExecStartRequest => match svc.start_execution(payload).await {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxExecStartResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxExecAttachRequest => {
+            svc.handle_attach(stream, trace_id, payload).await?;
         }
+        MessageType::SandboxStdinWriteRequest => match svc.write_stdin(payload).await {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxStdinStatus,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxStdinStatusRequest => match svc.stdin_status(payload) {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxStdinStatus,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxExecSignalRequest => match svc.signal_execution(payload).await {
+            Ok(()) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxExecSignalResponse,
+                    trace_id,
+                    &[],
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxExecResizeRequest => match svc.resize_execution(payload).await {
+            Ok(()) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxExecResizeResponse,
+                    trace_id,
+                    &[],
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxExecWaitRequest => match svc.wait_execution(payload).await {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxExecWaitResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
         // -----------------------------------------------------------------
         // Streaming: Events
         // -----------------------------------------------------------------
         MessageType::SandboxEventsRequest => {
             svc.handle_events(stream, trace_id, payload).await?;
-        }
-        // -----------------------------------------------------------------
-        // Streaming: Exec
-        // -----------------------------------------------------------------
-        MessageType::SandboxExecRequest => {
-            svc.handle_exec(stream, trace_id, payload).await?;
         }
         // -----------------------------------------------------------------
         // File I/O
@@ -312,7 +402,7 @@ where
                 .ok()
                 .filter(|p| *p != 0)
                 .ok_or_else(|| format!("invalid sandbox port {}", req.sandbox_port))?;
-            let proto = Protocol::parse(&req.protocol).map_err(|e| e.to_string())?;
+            let proto = wire_protocol(req.protocol());
             Ok((req, port, proto))
         }) {
         Ok(parsed) => parsed,
@@ -376,7 +466,7 @@ where
                 .ok()
                 .filter(|p| *p != 0)
                 .ok_or_else(|| format!("invalid sandbox port {}", req.sandbox_port))?;
-            let proto = Protocol::parse(&req.protocol).map_err(|e| e.to_string())?;
+            let proto = wire_protocol(req.protocol());
             Ok((req, port, proto))
         }) {
         Ok(parsed) => parsed,

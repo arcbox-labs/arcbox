@@ -245,9 +245,14 @@ impl Execution {
         self.version.send_modify(|v| *v += 1);
     }
 
-    /// Record the session's end and wake all subscribers.
+    /// Record the session's end and wake all subscribers. Idempotent: the
+    /// first outcome wins (a teardown purge and the session's own exit path
+    /// can race).
     fn mark_exited(&self, outcome: &std::result::Result<ExitStatus, String>) {
         let mut st = self.state.lock().unwrap();
+        if st.exited_at.is_some() {
+            return;
+        }
         st.exited_at = Some(Utc::now());
         match outcome {
             Ok(status) => st.exit_status = Some(*status),
@@ -497,30 +502,29 @@ impl ExecutionRegistry {
         }
     }
 
-    /// Drop every execution of a sandbox, marking still-running ones as torn
-    /// down so parked attach/wait subscribers resolve.
-    fn purge_sandbox(&self, sandbox_id: &str) {
-        let removed: Vec<Arc<Execution>> = {
-            let mut inner = self.inner.lock().unwrap();
-            let keys: Vec<ExecKey> = inner
+    /// Mark every still-running execution of a sandbox as torn down so
+    /// parked attach/wait subscribers resolve. Entries stay registered —
+    /// their buffered output remains readable until the per-execution
+    /// retention GC drops them.
+    fn interrupt_sandbox(&self, sandbox_id: &str) {
+        let executions: Vec<Arc<Execution>> = {
+            let inner = self.inner.lock().unwrap();
+            inner
                 .live
-                .keys()
-                .filter(|(sid, _)| sid == sandbox_id)
-                .cloned()
-                .collect();
-            keys.iter().filter_map(|k| inner.live.remove(k)).collect()
+                .iter()
+                .filter(|((sid, _), _)| sid == sandbox_id)
+                .map(|(_, exec)| Arc::clone(exec))
+                .collect()
         };
-        for exec in removed {
-            if !exec.has_exited() {
-                exec.mark_exited(&Err("sandbox stopped".to_owned()));
-            }
+        for exec in executions {
+            exec.mark_exited(&Err("sandbox stopped".to_owned()));
         }
     }
 }
 
-/// Purge executions when their sandbox reaches a terminal state. Covers every
-/// teardown path (stop, remove, TTL expiry, boot failure) without threading
-/// the registry through each of them.
+/// Interrupt executions when their sandbox reaches a terminal state. Covers
+/// every teardown path (stop, remove, TTL expiry, boot failure) without
+/// threading the registry through each of them.
 pub(super) fn spawn_teardown_purge(
     registry: Arc<ExecutionRegistry>,
     mut events: broadcast::Receiver<SandboxEvent>,
@@ -529,7 +533,7 @@ pub(super) fn spawn_teardown_purge(
         loop {
             match events.recv().await {
                 Ok(ev) if matches!(ev.action.as_str(), "stopped" | "removed" | "failed") => {
-                    registry.purge_sandbox(&ev.sandbox_id);
+                    registry.interrupt_sandbox(&ev.sandbox_id);
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -1023,7 +1027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_sandbox_marks_running_executions_as_torn_down() {
+    async fn interrupt_sandbox_marks_running_executions_but_keeps_them_readable() {
         let registry = Arc::new(ExecutionRegistry::default());
         let (exec, _rx) = test_execution(&stdin_spec());
         registry
@@ -1033,11 +1037,25 @@ mod tests {
             .live
             .insert(("sandbox-1".into(), "exec-1".into()), Arc::clone(&exec));
 
-        registry.purge_sandbox("sandbox-1");
-        assert!(registry.get("sandbox-1", "exec-1").is_err());
+        registry.interrupt_sandbox("sandbox-1");
+        // Still registered: buffered output stays readable until the
+        // retention GC, but the execution is resolved as torn down.
+        assert!(registry.get("sandbox-1", "exec-1").is_ok());
         let snap = exec.snapshot();
         assert!(!snap.is_running());
         assert_eq!(snap.error.as_deref(), Some("sandbox stopped"));
+
+        // An already-exited execution keeps its original outcome.
+        let (done, _rx2) = test_execution(&stdin_spec());
+        done.mark_exited(&Ok(ExitStatus::Code(3)));
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .live
+            .insert(("sandbox-1".into(), "exec-2".into()), Arc::clone(&done));
+        registry.interrupt_sandbox("sandbox-1");
+        assert_eq!(done.snapshot().exit_status, Some(ExitStatus::Code(3)));
     }
 
     #[tokio::test]
