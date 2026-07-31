@@ -16,6 +16,20 @@ use xtask_kit::repo;
 
 use crate::{E2eArgs, E2eBackend};
 
+/// Targets that drive their daemon through `scenario::run_vz_scenario*`,
+/// which hardcodes `ARCBOX_VM_BACKEND=vz` (`tests/e2e/src/scenario.rs`) and
+/// stamps `"vz"` into their metrics. The runner's `--backend` cannot move
+/// them, so honoring an HV request would archive a VZ run under an HV label
+/// and corrupt any backend comparison read from it.
+const VZ_PINNED_TESTS: &[&str] = &[
+    "docker_build",
+    "docker_build_external",
+    "egress_throughput",
+    "network_fault",
+    "network_workload",
+    "reconciler_teardown",
+];
+
 /// One test-run outcome for the final summary.
 struct RunOutcome {
     label: String,
@@ -42,6 +56,15 @@ pub fn run(args: E2eArgs) -> Result<()> {
         E2eBackend::Hv => &[Some("hv")],
         E2eBackend::Both => &[Some("vz"), Some("hv")],
     };
+    if !matches!(args.backend, E2eBackend::Vz) && VZ_PINNED_TESTS.contains(&args.test.as_str()) {
+        bail!(
+            "test `{}` pins ARCBOX_VM_BACKEND=vz in its scenario harness, so the \
+             requested backend cannot take effect — the run would be VZ while the \
+             label, metrics, and archive said HV. Re-run with `--backend vz`, or \
+             move the target off scenario::run_vz_scenario first.",
+            args.test,
+        );
+    }
 
     // Build what the selected test would build, once, so every repeat
     // runs with SKIP_BUILD=1 instead of re-invoking cargo.

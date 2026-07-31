@@ -647,6 +647,10 @@ RUN test ! -e /ctx/excluded
 struct ThrowawaySshAgent {
     pid: String,
     sock: std::path::PathBuf,
+    /// `SHA256:…` fingerprint of the loaded key. The build asserts the
+    /// forwarded agent reports exactly this, which only a working
+    /// round-trip can produce.
+    fingerprint: String,
 }
 
 impl ThrowawaySshAgent {
@@ -669,8 +673,6 @@ impl ThrowawaySshAgent {
             .and_then(|rest| rest.split(';').next())
             .map(str::to_owned)
             .ok_or_else(|| anyhow::anyhow!("no SSH_AGENT_PID in ssh-agent output: {stdout}"))?;
-        let agent = Self { pid, sock };
-
         let key = dir.join("d4-ssh-key");
         let keygen = std::process::Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
@@ -685,13 +687,40 @@ impl ThrowawaySshAgent {
         }
         let add = std::process::Command::new("ssh-add")
             .arg(&key)
-            .env("SSH_AUTH_SOCK", &agent.sock)
+            .env("SSH_AUTH_SOCK", &sock)
             .output()
             .context("loading key into ssh-agent")?;
         if !add.status.success() {
             bail!("ssh-add failed: {}", String::from_utf8_lossy(&add.stderr));
         }
-        Ok(agent)
+
+        // `ssh-keygen -lf` prints "<bits> SHA256:<base64> <comment> (ED25519)";
+        // the fingerprint token is what `ssh-add -l` echoes back inside the
+        // build, so the two are directly comparable.
+        let pub_key = key.with_extension("pub");
+        let show = std::process::Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(&pub_key)
+            .output()
+            .context("fingerprinting throwaway ssh key")?;
+        if !show.status.success() {
+            bail!(
+                "ssh-keygen -lf failed: {}",
+                String::from_utf8_lossy(&show.stderr)
+            );
+        }
+        let listing = String::from_utf8_lossy(&show.stdout);
+        let fingerprint = listing
+            .split_whitespace()
+            .find(|token| token.starts_with("SHA256:"))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("no SHA256 fingerprint in: {listing}"))?;
+
+        Ok(Self {
+            pid,
+            sock,
+            fingerprint,
+        })
     }
 }
 
@@ -801,12 +830,28 @@ RUN test ! -e /run/secrets/build_token
     let agent = ThrowawaySshAgent::spawn(data_dir)?;
     let ctx = data_dir.join("d4-ssh-ctx");
     std::fs::create_dir_all(&ctx).context("creating d4 ssh context dir")?;
+    // `test -S` only stats the socket inode BuildKit created — it passes even
+    // when no agent traffic survives the crossing, which is the half that can
+    // actually break. Query the agent instead and require the throwaway key's
+    // own fingerprint back: that answer can only come from a completed
+    // request/response round-trip over the forwarded socket.
+    //
+    // `apk` is the one image assumption in this suite; it holds for the
+    // default `alpine:latest` and any alpine mirror `ARCBOX_E2E_IMAGE` points
+    // at. A non-alpine override fails here loudly rather than silently
+    // weakening the check.
     std::fs::write(
         ctx.join("Dockerfile"),
         format!(
             r#"FROM {image}
-RUN --mount=type=ssh test -S "$SSH_AUTH_SOCK" && echo ssh-forwarded > /probe
-"#
+RUN --mount=type=ssh set -e; \
+    test -S "$SSH_AUTH_SOCK"; \
+    apk add --no-cache openssh-client >/dev/null; \
+    ssh-add -l | tee /probe-identities; \
+    grep -q '{fingerprint}' /probe-identities; \
+    echo ssh-forwarded > /probe
+"#,
+            fingerprint = agent.fingerprint,
         ),
     )
     .context("writing d4 ssh Dockerfile")?;

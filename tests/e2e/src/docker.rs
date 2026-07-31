@@ -6,6 +6,7 @@
 //! daemon stay untouched (see tests/e2e/README.md on isolation).
 
 use std::io::Read as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -141,6 +142,19 @@ pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
     Err(last_err.expect("loop ran at least once")).context("docker pull (3 attempts)")
 }
 
+/// SIGKILLs the child's whole process group, falling back to the direct
+/// child if the group is already gone.
+fn kill_process_group(child: &mut std::process::Child) {
+    let pgid = i32::try_from(child.id()).expect("pid fits in i32");
+    // SAFETY: `killpg` is async-signal-safe and takes no pointers. `pgid` is
+    // this child's pid, which is also its group id (`process_group(0)`), and
+    // the child has not been reaped yet, so the id cannot have been recycled.
+    let killed = unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0;
+    if !killed {
+        let _ = child.kill();
+    }
+}
+
 /// Runs a command, killing it once `timeout` passes.
 ///
 /// Both pipes are drained on background threads for the whole run: an
@@ -148,10 +162,18 @@ pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
 /// chatty command (a `--progress=plain` build, a large pull) into a bogus
 /// timeout. On a real timeout the error carries the output tail, so a
 /// killed command still leaves forensics.
+///
+/// The child leads its own process group and the timeout path signals the
+/// whole group. Killing just the direct child is not enough: `docker build`
+/// runs the build in a `docker-buildx` grandchild that inherits these pipes,
+/// so the write end stays open and the drain-thread joins below block past
+/// the deadline — indefinitely if that descendant is itself wedged, which is
+/// exactly what this suite exists to catch.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         thread::spawn(move || {
@@ -189,9 +211,10 @@ pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std:
         thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = child.kill();
+    kill_process_group(&mut child);
     let _ = child.wait();
-    // Killing the child EOFs the pipes, so the drain threads finish.
+    // The whole group is gone, so every inherited write end is closed and the
+    // drain threads see EOF.
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
     let combined = format!(
@@ -232,14 +255,31 @@ mod tests {
         assert!(output.stdout.len() > 64 * 1024);
     }
 
-    /// A genuine timeout must surface the output tail for forensics.
+    /// A genuine timeout must surface the output tail for forensics, and
+    /// must return at the deadline even though the shell leaves a `sleep`
+    /// descendant holding the inherited pipes. Killing only the direct child
+    /// leaves that write end open, so the drain-thread joins block until the
+    /// descendant exits — ~30s here, unbounded when the survivor is a wedged
+    /// `docker-buildx`, which is the shape this suite hits for real.
+    ///
+    /// `sleep 30 & wait` is deliberate: with a plain `sleep 30` the shell
+    /// `exec`s it as the last command, so there is no grandchild and the bug
+    /// hides. Backgrounding forces the shell to stay alive as a real parent.
+    /// The elapsed bound is the regression; the tail is the original contract.
     #[test]
-    fn timeout_error_carries_output_tail() {
+    fn timeout_returns_at_deadline_despite_surviving_descendant() {
+        let start = Instant::now();
         let error = run_with_timeout(
-            Command::new("sh").args(["-c", "echo tail-marker; sleep 30"]),
+            Command::new("sh").args(["-c", "echo tail-marker; sleep 30 & wait"]),
             Duration::from_secs(1),
         )
         .expect_err("command must time out");
+        let elapsed = start.elapsed();
         assert!(error.to_string().contains("tail-marker"));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "timeout took {elapsed:?}; the `sleep` descendant outlived the \
+             kill and held the pipes open"
+        );
     }
 }

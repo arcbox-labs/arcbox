@@ -45,6 +45,18 @@ Note `virtio_debug` and `daemon_failure` deliberately have NO recipe and
 their profiles differ (release vs debug daemon). If you ever add a recipe
 for either, it must reproduce that exact profile.
 
+## `xtask e2e` — `--backend` cannot move a VZ-pinned target
+
+`scenario::run_vz_scenario*` hardcodes `ARCBOX_VM_BACKEND=vz` and stamps
+`"vz"` into the run's metrics, so the runner's `--backend` env is ignored by
+every target built on it. `VZ_PINNED_TESTS` (`commands/e2e.rs`) lists them
+and the runner **errors** on `--backend hv`/`both` for those targets. WHY:
+the alternative is a VZ run archived under an HV label — the same
+ghost-debugging class as a mismatched `SKIP_BUILD` recipe, and it silently
+corrupts any HV↔VZ oracle comparison read from the artifacts. Moving a
+target off `run_vz_scenario` means removing it from that list in the same
+change.
+
 ### Extending — adding a new e2e target (lockstep set)
 1. The test must gate its build on `arcbox_e2e::env_flag("SKIP_BUILD")`,
    or `xtask e2e` cannot prebuild it and it rebuilds every repeat.
@@ -52,6 +64,8 @@ for either, it must reproduce that exact profile.
    or accept the self-build fallback — never a half-match.
 3. If you add a recipe, verify the packages AND profile match the test's
    own `cargo build` line character-for-character.
+4. If the target runs through `scenario::run_vz_scenario*`, add it to
+   `VZ_PINNED_TESTS` so `--backend hv` fails loudly instead of mislabeling.
 
 ## `xtask e2e` — forensics linkage (fragile string/env coupling)
 
