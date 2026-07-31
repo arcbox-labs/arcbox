@@ -1,9 +1,11 @@
 //! Sandbox e2e smoke: the full stack over the real gRPC surface.
 //!
-//! Drives `CLI-equivalent` tonic clients against an isolated daemon:
-//! create (with an initial cmd) → ready → initial-cmd idle → Run →
-//! file round-trip (WriteFile/ReadFile) → Checkpoint → Restore
-//! (network_override) → Run in the restored sandbox → Stop/Remove.
+//! Drives CLI-equivalent tonic clients against an isolated daemon:
+//! create (with an initial cmd) → ready → initial-cmd idle → execution
+//! round-trip → CORE-55 acceptance (attach-resume without loss, offset-
+//! idempotent stdin, signal without a stream, idle keepalive) → file
+//! round-trip (WriteFile/ReadFile) → Checkpoint → Restore
+//! (network_override) → execution in the restored sandbox → Stop/Remove.
 //!
 //! Requires nested virtualization (VZ backend on Apple Silicon M3+ with
 //! macOS 15+): without `/dev/kvm` in the guest, Create fails with
@@ -16,9 +18,12 @@ use anyhow::{Context, Result, bail};
 use arcbox_grpc::sandbox_v1::sandbox_service_client::SandboxServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
 use arcbox_protocol::sandbox_v1::{
-    CheckpointRequest, CreateSandboxRequest, FileChunk, InspectSandboxRequest,
-    ListSandboxesRequest, ReadFileRequest, RemoveSandboxRequest, ResourceLimits, RestoreRequest,
-    RunRequest, StopSandboxRequest, WriteFileOpen, WriteFileRequest, write_file_request,
+    AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, Execution, ExecutionEvent,
+    FileChunk, GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ReadFileRequest,
+    RemoveSandboxRequest, ResourceLimits, RestoreRequest, SandboxState, Signal,
+    SignalExecutionRequest, StartExecutionRequest, StdioChannel, StopSandboxRequest,
+    WaitExecutionRequest, WriteFileOpen, WriteFileRequest, WriteStdinRequest, execution_event,
+    exit_status, write_file_request,
 };
 use tonic::transport::Channel;
 use tracing::{info, warn};
@@ -186,46 +191,77 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
         .context("Create failed")?
         .into_inner();
     metrics.record("sandbox_create", create_started.elapsed().as_secs_f64());
-    info!(id = %created.id, ip = %created.ip_address, state = %created.state, "sandbox created");
-    if created.state != "starting" {
-        bail!("unexpected create state {}", created.state);
+    info!(id = %created.id, ip = %created.ip_address, state = ?created.state(), "sandbox created");
+    if created.state() != SandboxState::Starting {
+        bail!("unexpected create state {:?}", created.state());
     }
 
     // -- Wait for ready + the initial cmd's idle ---------------------------
     let ready_started = Instant::now();
-    wait_for_state(&mut sandboxes, "smoke1", "ready", SANDBOX_READY_TIMEOUT).await?;
+    wait_for_state(
+        &mut sandboxes,
+        "smoke1",
+        SandboxState::Ready,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
     metrics.record("sandbox_ready", ready_started.elapsed().as_secs_f64());
 
     let info = inspect(&mut sandboxes, "smoke1").await?;
-    if info.last_exited_at == 0 {
+    if info.last_exited_at.is_none() {
         // The initial cmd may still be racing the readiness flip; give it a
         // short grace period before asserting.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let info = inspect(&mut sandboxes, "smoke1").await?;
-            if info.last_exited_at > 0 {
+            if info.last_exited_at.is_some() {
                 break;
             }
             if Instant::now() > deadline {
-                bail!("initial cmd never ran (last_exited_at still 0)");
+                bail!("initial cmd never ran (last_exited_at still unset)");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
     let info = inspect(&mut sandboxes, "smoke1").await?;
-    if info.last_exit_code != 0 {
-        bail!("initial cmd exited with {}", info.last_exit_code);
+    match info.last_exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(0)) => {}
+        other => bail!("initial cmd exit status: {other:?}"),
     }
     info!("initial cmd ran and sandbox returned to ready");
 
-    // -- Run ----------------------------------------------------------------
+    // -- Execution round-trip (run semantics) ------------------------------
     let run_started = Instant::now();
     let stdout = run_and_collect(&mut sandboxes, "smoke1", &["/bin/echo", "hello-sandbox"]).await?;
     if !stdout.contains("hello-sandbox") {
         bail!("run output missing marker: {stdout:?}");
     }
     metrics.record("sandbox_run", run_started.elapsed().as_secs_f64());
-    wait_for_state(&mut sandboxes, "smoke1", "ready", Duration::from_secs(30)).await?;
+    wait_ready(&mut sandboxes, "smoke1").await?;
+
+    // -- CORE-55 acceptance: drop the attach mid-output, resume without loss
+    let resume_started = Instant::now();
+    exec_attach_resume(&mut sandboxes, "smoke1").await?;
+    metrics.record(
+        "sandbox_exec_resume",
+        resume_started.elapsed().as_secs_f64(),
+    );
+    wait_ready(&mut sandboxes, "smoke1").await?;
+
+    // -- CORE-55 acceptance: offset-idempotent stdin -----------------------
+    let stdin_started = Instant::now();
+    exec_stdin_idempotent(&mut sandboxes, "smoke1").await?;
+    metrics.record("sandbox_exec_stdin", stdin_started.elapsed().as_secs_f64());
+    wait_ready(&mut sandboxes, "smoke1").await?;
+
+    // -- CORE-55 acceptance: signal without a stream + idle keepalive ------
+    let signal_started = Instant::now();
+    exec_signal_and_keepalive(&mut sandboxes, "smoke1").await?;
+    metrics.record(
+        "sandbox_exec_signal",
+        signal_started.elapsed().as_secs_f64(),
+    );
+    wait_ready(&mut sandboxes, "smoke1").await?;
 
     // -- File round-trip ------------------------------------------------
     let file_started = Instant::now();
@@ -290,7 +326,7 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
 
     // The vsock channel working proves nothing about the new TAP. Assert the
     // guest actually re-addressed eth0 to the fresh allocation…
-    wait_for_state(&mut sandboxes, "smoke3", "ready", Duration::from_secs(30)).await?;
+    wait_ready(&mut sandboxes, "smoke3").await?;
     let addr = run_and_collect(
         &mut sandboxes,
         "smoke3",
@@ -315,7 +351,7 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
     // point-to-point links, so peers are deliberately unreachable). Deriving
     // the gateway from `ip route` also proves the reconfig re-installed the
     // default route.
-    wait_for_state(&mut sandboxes, "smoke3", "ready", Duration::from_secs(30)).await?;
+    wait_ready(&mut sandboxes, "smoke3").await?;
     let ping = run_and_collect(
         &mut sandboxes,
         "smoke3",
@@ -332,10 +368,10 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
     }
 
     let origin = inspect(&mut sandboxes, "smoke1").await?;
-    if origin.state != "ready" {
+    if origin.state() != SandboxState::Ready {
         bail!(
-            "origin should keep running through a fresh-network restore, state={}",
-            origin.state
+            "origin should keep running through a fresh-network restore, state={:?}",
+            origin.state()
         );
     }
     metrics.record(
@@ -409,6 +445,256 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
     Ok(())
 }
 
+/// CORE-55 acceptance: kill the attach stream mid-output, re-attach at the
+/// recorded offset, and require the assembled output to be byte-exact.
+async fn exec_attach_resume(
+    client: &mut SandboxServiceClient<Channel>,
+    sandbox_id: &str,
+) -> Result<()> {
+    use std::fmt::Write as _;
+
+    const LINES: usize = 200;
+    let expected = (0..LINES).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "line-{i}");
+        s
+    });
+
+    let script = format!("i=0; while [ $i -lt {LINES} ]; do echo line-$i; i=$((i+1)); done");
+    let execution = start_execution(
+        client,
+        sandbox_id,
+        "resume-exec",
+        &["/bin/sh", "-c", &script],
+        false,
+    )
+    .await?;
+
+    // First attach: consume a handful of output events, then drop the stream
+    // mid-execution (the client "dies").
+    let mut assembled = String::new();
+    let mut next_offset = 0u64;
+    {
+        let mut stream = attach(client, sandbox_id, &execution.id, 0).await?;
+        let mut outputs = 0;
+        while let Some(event) = stream.message().await.context("first attach stream")? {
+            match event.event {
+                Some(execution_event::Event::Output(output)) => {
+                    if output.channel() != StdioChannel::Stdout {
+                        continue;
+                    }
+                    if output.offset != next_offset {
+                        bail!(
+                            "unexpected gap on live attach: offset {} after {}",
+                            output.offset,
+                            next_offset
+                        );
+                    }
+                    assembled.push_str(&String::from_utf8_lossy(&output.data));
+                    next_offset = output.offset + output.data.len() as u64;
+                    outputs += 1;
+                    if outputs >= 3 {
+                        break; // drop the stream mid-output
+                    }
+                }
+                Some(execution_event::Event::Exited(_)) => break,
+                _ => {}
+            }
+        }
+        // Dropping `stream` here severs the connection without any goodbye.
+    }
+    info!(
+        resumed_from = next_offset,
+        "dropped first attach mid-output; re-attaching"
+    );
+
+    // Second attach from the recorded offset: the rest must arrive with no
+    // loss and no duplication, ending in a clean exit.
+    let mut stream = attach(client, sandbox_id, &execution.id, next_offset).await?;
+    let mut exited = None;
+    while let Some(event) = stream.message().await.context("resumed attach stream")? {
+        match event.event {
+            Some(execution_event::Event::Output(output)) => {
+                if output.channel() != StdioChannel::Stdout {
+                    continue;
+                }
+                if output.offset != next_offset {
+                    bail!(
+                        "resume lost bytes: expected offset {}, got {}",
+                        next_offset,
+                        output.offset
+                    );
+                }
+                assembled.push_str(&String::from_utf8_lossy(&output.data));
+                next_offset = output.offset + output.data.len() as u64;
+            }
+            Some(execution_event::Event::Exited(done)) => {
+                exited = done.execution;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let done = exited.context("resumed attach ended without an exit event")?;
+    match done.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(0)) => {}
+        other => bail!("resume execution exit status: {other:?}"),
+    }
+    if assembled != expected {
+        bail!(
+            "resumed output is not byte-exact: {} bytes vs expected {}",
+            assembled.len(),
+            expected.len()
+        );
+    }
+    info!("attach-resume reassembled the full output without loss");
+    Ok(())
+}
+
+/// CORE-55 acceptance: retried stdin writes are deduplicated by offset and
+/// GetStdinStatus reports the resume point.
+async fn exec_stdin_idempotent(
+    client: &mut SandboxServiceClient<Channel>,
+    sandbox_id: &str,
+) -> Result<()> {
+    let execution = start_execution(client, sandbox_id, "stdin-exec", &["/bin/cat"], true).await?;
+
+    let write = |data: &[u8], offset: u64, eof: bool| WriteStdinRequest {
+        sandbox_id: sandbox_id.to_owned(),
+        execution_id: execution.id.clone(),
+        offset,
+        data: data.to_vec(),
+        eof,
+    };
+
+    let st = client
+        .write_stdin(with_machine(write(b"hello ", 0, false)))
+        .await
+        .context("first stdin write")?
+        .into_inner();
+    if st.bytes_written != 6 {
+        bail!("expected 6 bytes accepted, got {}", st.bytes_written);
+    }
+
+    // Retry the exact same write, as if the first response was lost: the
+    // bytes must be deduplicated, not double-fed to `cat`.
+    let st = client
+        .write_stdin(with_machine(write(b"hello ", 0, false)))
+        .await
+        .context("retried stdin write")?
+        .into_inner();
+    if st.bytes_written != 6 {
+        bail!("retry moved the offset: {}", st.bytes_written);
+    }
+
+    // A write past the accepted count is a gap and must be rejected.
+    let gap = client
+        .write_stdin(with_machine(write(b"x", 99, false)))
+        .await;
+    match gap {
+        Err(status) if status.code() == tonic::Code::OutOfRange => {}
+        Err(status) => bail!("gap write failed with {:?}, expected OutOfRange", status),
+        Ok(_) => bail!("gap write was accepted"),
+    }
+
+    // Resync exactly the way a real client would: ask for the resume point.
+    let st = client
+        .get_stdin_status(with_machine(GetStdinStatusRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: execution.id.clone(),
+        }))
+        .await
+        .context("stdin status")?
+        .into_inner();
+    if st.bytes_written != 6 || st.closed {
+        bail!("unexpected stdin status: {st:?}");
+    }
+
+    // Finish the stream and close stdin so `cat` exits.
+    client
+        .write_stdin(with_machine(write(b"world\n", st.bytes_written, true)))
+        .await
+        .context("final stdin write")?;
+
+    // The process must have seen the deduplicated byte stream exactly once.
+    let (stdout, done) = collect_output(client, sandbox_id, &execution.id).await?;
+    match done.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(0)) => {}
+        other => bail!("cat exit status: {other:?}"),
+    }
+    if stdout != "hello world\n" {
+        bail!("stdin dedup failed, cat echoed {stdout:?}");
+    }
+    info!("offset-idempotent stdin verified");
+    Ok(())
+}
+
+/// CORE-55 acceptance: a keepalive arrives on an idle attach stream, and a
+/// signal delivered with no stream attached kills the process, reported as a
+/// signal death (not an exit code).
+async fn exec_signal_and_keepalive(
+    client: &mut SandboxServiceClient<Channel>,
+    sandbox_id: &str,
+) -> Result<()> {
+    let execution = start_execution(
+        client,
+        sandbox_id,
+        "signal-exec",
+        &["/bin/sleep", "300"],
+        false,
+    )
+    .await?;
+
+    // The workload is silent: the first frame after the Started preamble on
+    // an idle stream must be a daemon keepalive (15s cadence).
+    let mut stream = attach(client, sandbox_id, &execution.id, 0).await?;
+    let keepalive_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), stream.message())
+            .await
+            .context("idle attach produced nothing (keepalive missing)")?
+            .context("idle attach stream")?
+            .context("idle attach closed unexpectedly")?;
+        match event.event {
+            Some(execution_event::Event::KeepAlive(_)) => break,
+            Some(execution_event::Event::Exited(_)) => {
+                bail!("sleep exited before the keepalive check")
+            }
+            _ if Instant::now() > keepalive_deadline => {
+                bail!("no keepalive within 30s on an idle stream")
+            }
+            _ => {}
+        }
+    }
+    drop(stream);
+    info!("idle-stream keepalive observed");
+
+    // Signal the process while holding no stream at all.
+    client
+        .signal_execution(with_machine(SignalExecutionRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: execution.id.clone(),
+            signal: Signal::Sigkill.into(),
+        }))
+        .await
+        .context("SignalExecution failed")?;
+
+    let done = client
+        .wait_execution(with_machine(WaitExecutionRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: execution.id.clone(),
+            timeout_seconds: 30,
+        }))
+        .await
+        .context("WaitExecution failed")?
+        .into_inner();
+    match done.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Signal(9)) => {}
+        other => bail!("expected a SIGKILL death, got {other:?}"),
+    }
+    info!("stream-free signal delivered and reported as a signal death");
+    Ok(())
+}
+
 async fn inspect(
     client: &mut SandboxServiceClient<Channel>,
     id: &str,
@@ -421,63 +707,126 @@ async fn inspect(
 }
 
 /// Polls Inspect until the sandbox reaches `state`, failing fast on
-/// `failed` with the daemon-reported error.
+/// `FAILED` with the daemon-reported error.
 async fn wait_for_state(
     client: &mut SandboxServiceClient<Channel>,
     id: &str,
-    state: &str,
+    state: SandboxState,
     timeout: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let info = inspect(client, id).await?;
-        if info.state == state {
+        if info.state() == state {
             return Ok(());
         }
-        if info.state == "failed" {
+        if info.state() == SandboxState::Failed {
             bail!("sandbox {id} failed: {}", info.error);
         }
         if Instant::now() > deadline {
             bail!(
-                "sandbox {id} did not reach {state} within {timeout:?} (state: {})",
-                info.state
+                "sandbox {id} did not reach {state:?} within {timeout:?} (state: {:?})",
+                info.state()
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
-/// Runs a command and returns concatenated stdout, asserting exit code 0.
+/// Waits for the post-execution `RUNNING → READY` flip.
+async fn wait_ready(client: &mut SandboxServiceClient<Channel>, id: &str) -> Result<()> {
+    wait_for_state(client, id, SandboxState::Ready, Duration::from_secs(30)).await
+}
+
+/// Starts an execution with a fixed id (idempotent per command).
+async fn start_execution(
+    client: &mut SandboxServiceClient<Channel>,
+    sandbox_id: &str,
+    execution_id: &str,
+    cmd: &[&str],
+    stdin: bool,
+) -> Result<Execution> {
+    Ok(client
+        .start_execution(with_machine(StartExecutionRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: execution_id.to_owned(),
+            cmd: cmd.iter().map(|s| (*s).to_owned()).collect(),
+            stdin,
+            ..Default::default()
+        }))
+        .await
+        .context("StartExecution failed")?
+        .into_inner())
+}
+
+/// Attaches to an execution's stdout from `stdout_offset`.
+async fn attach(
+    client: &mut SandboxServiceClient<Channel>,
+    sandbox_id: &str,
+    execution_id: &str,
+    stdout_offset: u64,
+) -> Result<tonic::Streaming<ExecutionEvent>> {
+    Ok(client
+        .attach_execution(with_machine(AttachExecutionRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: execution_id.to_owned(),
+            stdout_offset,
+            stderr_offset: 0,
+        }))
+        .await
+        .context("AttachExecution failed")?
+        .into_inner())
+}
+
+/// Attaches from offset 0 and drains stdout until the execution exits.
+async fn collect_output(
+    client: &mut SandboxServiceClient<Channel>,
+    sandbox_id: &str,
+    execution_id: &str,
+) -> Result<(String, Execution)> {
+    let mut stream = attach(client, sandbox_id, execution_id, 0).await?;
+    let mut stdout = String::new();
+    while let Some(event) = stream.message().await.context("attach stream error")? {
+        match event.event {
+            Some(execution_event::Event::Output(output)) => {
+                if output.channel() != StdioChannel::Stderr {
+                    stdout.push_str(&String::from_utf8_lossy(&output.data));
+                }
+            }
+            Some(execution_event::Event::Exited(done)) => {
+                let execution = done
+                    .execution
+                    .context("exit event without an execution state")?;
+                return Ok((stdout, execution));
+            }
+            _ => {}
+        }
+    }
+    bail!("attach stream ended without an exit event")
+}
+
+/// Runs a command via the execution API and returns stdout, asserting a
+/// zero exit code.
 async fn run_and_collect(
     client: &mut SandboxServiceClient<Channel>,
     id: &str,
     cmd: &[&str],
 ) -> Result<String> {
-    let mut stream = client
-        .run(with_machine(RunRequest {
-            id: id.into(),
+    let execution = client
+        .start_execution(with_machine(StartExecutionRequest {
+            sandbox_id: id.to_owned(),
             cmd: cmd.iter().map(|s| (*s).to_owned()).collect(),
+            stdin: false,
             ..Default::default()
         }))
         .await
-        .context("Run failed")?
+        .context("StartExecution failed")?
         .into_inner();
 
-    let mut stdout = String::new();
-    let mut exit_code = None;
-    while let Some(output) = stream.message().await.context("run stream error")? {
-        if output.stream == "stdout" {
-            stdout.push_str(&String::from_utf8_lossy(&output.data));
-        }
-        if output.done {
-            exit_code = Some(output.exit_code);
-            break;
-        }
-    }
-    match exit_code {
-        Some(0) => Ok(stdout),
-        Some(code) => bail!("command {cmd:?} exited with {code}: {stdout:?}"),
-        None => bail!("run stream ended without a done frame"),
+    let (stdout, done) = collect_output(client, id, &execution.id).await?;
+    match done.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(0)) => Ok(stdout),
+        other => bail!("command {cmd:?} exit status {other:?}: {stdout:?}"),
     }
 }
 
