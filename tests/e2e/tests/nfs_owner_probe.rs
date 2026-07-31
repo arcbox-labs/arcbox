@@ -130,26 +130,36 @@ fn run_probe(root: &Path, test_dir: &Path, version: &str) -> Result<()> {
     // ready and the export is populated, so a file that will not read is a
     // failure, not an absence. The retry covers the `actimeo=10` attribute
     // cache a freshly mounted export sits behind.
-    read_through_check(&mount_dir, &entries)?;
+    read_through_check(&mount_dir)?;
 
     daemon.shutdown()?;
     Ok(())
 }
 
 /// Reads a real guest file through the mount, preferring dockerd's `engine-id`
-/// and falling back to any regular file at the export root.
-fn read_through_check(mount_dir: &Path, entries: &[fs::DirEntry]) -> Result<()> {
+/// and otherwise scanning the export root for the first regular file.
+///
+/// The scan is this function's own `read_dir`, not the uid loop's sample: that
+/// one is an arbitrary five entries, and dockerd's data root is nearly all
+/// directories at the top level, so a sample can legitimately contain no
+/// regular file at all. Absence of a candidate and failure to read one are
+/// reported as the different things they are.
+fn read_through_check(mount_dir: &Path) -> Result<()> {
     const READ_RETRY: Duration = Duration::from_secs(20);
 
+    // `symlink_metadata`, so a symlink is not mistaken for its target.
+    let is_regular_file = |path: &Path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file());
+
     let engine_id = mount_dir.join("engine-id");
-    let candidates = std::iter::once(engine_id).chain(entries.iter().filter_map(|entry| {
-        let path = entry.path();
-        // `symlink_metadata`, so a symlink is not mistaken for its target.
-        fs::symlink_metadata(&path)
-            .ok()
-            .filter(std::fs::Metadata::is_file)
-            .map(|_| path)
-    }));
+    let candidates = std::iter::once(engine_id)
+        .filter(|path| is_regular_file(path))
+        .chain(
+            fs::read_dir(mount_dir)
+                .with_context(|| format!("scanning {} for a file", mount_dir.display()))?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| is_regular_file(path)),
+        );
 
     let mut attempts = Vec::new();
     for path in candidates {
@@ -163,12 +173,14 @@ fn read_through_check(mount_dir: &Path, entries: &[fs::DirEntry]) -> Result<()> 
         }
     }
 
+    if attempts.is_empty() {
+        bail!(
+            "the export root {} holds no regular file, so the read-through check had no candidate",
+            mount_dir.display()
+        );
+    }
     bail!(
-        "no file could be read through the mount, so the read-through check never ran ({})",
-        if attempts.is_empty() {
-            "no regular file at the export root".to_owned()
-        } else {
-            attempts.join("; ")
-        }
+        "no file could be read through the mount: {}",
+        attempts.join("; ")
     )
 }
