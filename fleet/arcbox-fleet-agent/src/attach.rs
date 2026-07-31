@@ -261,7 +261,7 @@ pub async fn run(
                 // running (a mid-stream drain that lost its connection, or a
                 // reconnect that got version-rejected). Never kill them for
                 // an update.
-                supervisor.drain_for_replacement();
+                supervisor.drain_for_update();
                 drained_for_update = true;
                 tokio::select! {
                     biased;
@@ -508,7 +508,7 @@ async fn connect_and_serve(
                                 current = env!("CARGO_PKG_VERSION"),
                                 "gateway pushed an update; draining before the swap"
                             );
-                            supervisor.drain_for_replacement();
+                            supervisor.drain_for_update();
                             *drained_for_update = true;
                             pending_update = Some(AgentUpdateRequired::from(update.clone()));
                         }

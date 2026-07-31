@@ -10,10 +10,10 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::config::AgentConfig;
-use crate::control;
+use crate::control::{self, RestartIntent};
 use crate::settings::SettingsStore;
 use crate::state::AgentState;
-use crate::{backends, init_backends, load_or_seed_settings, spawn_shutdown_signal};
+use crate::{backends, init_backends, load_or_seed_settings, shutdown};
 
 /// How the `serve` process is meant to end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +37,16 @@ pub async fn serve(config: AgentConfig) -> Result<Outcome> {
 
     // Cascades to every attach task's child token, so runners still
     // drain on SIGTERM even though `Unenroll` can also cancel one
-    // independently.
-    let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
+    // independently. The signal and the restart path share this token, so
+    // the signal vetoes any pending restart before cancelling it: otherwise
+    // a SIGTERM landing on an agent that is waiting out its last job would
+    // be indistinguishable from the restart it was waiting for, and this
+    // process would come back instead of stopping.
+    let restart = Arc::new(RestartIntent::default());
+    let shutdown = shutdown::spawn_with("termination signal received; shutting down", {
+        let restart = Arc::clone(&restart);
+        move || restart.terminate()
+    });
     backends::spawn_vm_reprobe(
         &backends,
         agent_state.clone(),
@@ -54,6 +62,7 @@ pub async fn serve(config: AgentConfig) -> Result<Outcome> {
             shutdown.clone(),
             agent_state.clone(),
             settings_store.clone(),
+            Arc::clone(&restart),
         )
         .await?,
     );
@@ -70,7 +79,10 @@ pub async fn serve(config: AgentConfig) -> Result<Outcome> {
     // live attach task its own shutdown grace before the process exits.
     supervisor.join().await;
     let _ = reconciler.await;
-    Ok(if supervisor.restart_mode().is_some() {
+    // Read after the teardown, not at request time: a termination signal
+    // arriving mid-restart clears the intent, so "a restart was requested"
+    // and "this shutdown is a restart" are not the same question.
+    Ok(if restart.mode().is_some() {
         Outcome::Restart
     } else {
         Outcome::Exit

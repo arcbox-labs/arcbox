@@ -364,7 +364,6 @@ async fn restart_reexecs_the_agent_in_place() {
     let socket_path = data_dir.join("agent.sock");
 
     let mut agent = spawn_agent(&data_dir);
-    let pid = agent.0.id();
     let mut client = FleetLifecycleServiceClient::new(connect(&socket_path).await);
     let before = client
         .get_agent_info(GetAgentInfoRequest {})
@@ -387,7 +386,7 @@ async fn restart_reexecs_the_agent_in_place() {
     }
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    let after = loop {
+    loop {
         // Both the connect and the RPC can fail while the replacement image
         // has not rebound the socket yet.
         if let Ok(channel) = Endpoint::from_static("http://[::]:50051")
@@ -398,9 +397,8 @@ async fn restart_reexecs_the_agent_in_place() {
                 .get_agent_info(GetAgentInfoRequest {})
                 .await;
             if let Ok(info) = info {
-                let instance_id = info.into_inner().instance_id;
-                if instance_id != before {
-                    break instance_id;
+                if info.into_inner().instance_id != before {
+                    break;
                 }
             }
         }
@@ -408,19 +406,15 @@ async fn restart_reexecs_the_agent_in_place() {
             Instant::now() < deadline,
             "the agent never came back with a new instance_id after Restart"
         );
+        // The load-bearing pin: nothing respawned the agent, so the process
+        // that answers with a new instance_id below is the same one that was
+        // spawned — it re-exec'd rather than exiting and being replaced.
         assert!(
             matches!(agent.0.try_wait(), Ok(None)),
             "the agent exited instead of re-execing"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-
-    assert_ne!(after, before);
-    assert_eq!(agent.0.id(), pid, "exec must preserve the PID");
-    assert!(
-        matches!(agent.0.try_wait(), Ok(None)),
-        "the restarted agent must still be running"
-    );
+    }
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&data_dir);

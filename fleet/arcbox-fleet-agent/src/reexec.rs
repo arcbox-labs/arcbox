@@ -8,7 +8,11 @@
 //! operator `Restart` (exec'ing the running executable) go through here.
 //!
 //! Note that `exec` runs no destructors: anything that must be flushed —
-//! notably the logging guard — has to be dropped before calling this.
+//! notably the logging guard — has to be dropped before calling this. The
+//! operator restart honors that (`main` drops the runtime, then the guard);
+//! self-update cannot, because it execs from inside the attach task, and so
+//! loses whatever the non-blocking log writer had buffered. Pre-existing, and
+//! fixable only by plumbing the update payload out to `main`.
 
 use std::path::Path;
 

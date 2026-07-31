@@ -184,7 +184,12 @@ struct Inner {
     /// self-update or an operator restart); no new jobs are accepted. Kept
     /// separate from `draining` so a moot update (the pin moved back to this
     /// build before the swap) can resume without clearing an operator drain.
-    draining_for_replacement: std::sync::atomic::AtomicBool,
+    draining_for_update: std::sync::atomic::AtomicBool,
+    /// Set once an operator restart is committed to; no new jobs are
+    /// accepted. Latching, unlike `draining_for_update`: a restart always
+    /// ends in a re-exec, so nothing may reopen admission for a process that
+    /// is only waiting for its last job to finish.
+    draining_for_restart: std::sync::atomic::AtomicBool,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers.
     state: AgentState,
 }
@@ -230,7 +235,8 @@ impl RunnerSupervisor {
                 runner_script,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
-                draining_for_replacement: std::sync::atomic::AtomicBool::new(false),
+                draining_for_update: std::sync::atomic::AtomicBool::new(false),
+                draining_for_restart: std::sync::atomic::AtomicBool::new(false),
                 state,
             }),
         }
@@ -336,10 +342,7 @@ impl RunnerSupervisor {
             .inner
             .draining
             .load(std::sync::atomic::Ordering::Relaxed)
-            || self
-                .inner
-                .draining_for_replacement
-                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.replacement_pending()
         {
             return Admission::Reject("host is draining".to_owned());
         }
@@ -415,45 +418,61 @@ impl RunnerSupervisor {
         self.inner
             .draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.inner
-            .state
-            .set_draining(self.draining_for_replacement());
+        self.inner.state.set_draining(self.replacement_pending());
         info!("resumed: accepting new offers");
     }
 
-    fn draining_for_replacement(&self) -> bool {
+    /// Whether this process image is on its way out — a pending self-update
+    /// or a committed restart. Either one keeps admission closed for as long
+    /// as it holds, independently of an operator drain.
+    fn replacement_pending(&self) -> bool {
         self.inner
-            .draining_for_replacement
+            .draining_for_update
             .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .inner
+                .draining_for_restart
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Stop accepting new offers because this process image is about to be
-    /// replaced — a pending self-update, or an operator `Restart`. The
-    /// operator's own drain flag is untouched, so
+    /// Stop accepting new offers because a self-update is pending. Revocable:
+    /// the operator's own drain flag is untouched, so
     /// [`Self::resume_after_moot_update`] can undo exactly this without
     /// cancelling a deliberate local drain.
-    pub fn drain_for_replacement(&self) {
+    pub fn drain_for_update(&self) {
         self.inner
-            .draining_for_replacement
+            .draining_for_update
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.inner.state.set_draining(true);
-        info!("draining before process replacement: no new offers will be accepted");
+        info!("draining for self-update: no new offers will be accepted");
     }
 
-    /// Clear the replacement drain after a pending update became moot — the
-    /// pin moved back to this build before the swap happened (a rollback
-    /// racing the drain). An operator drain, if any, stays in force. Only
-    /// the update path can become moot this way; a `Restart` always ends in
-    /// a re-exec.
+    /// Stop accepting new offers because an operator restart is committed to.
+    /// Latching, so neither [`Self::resume`] nor
+    /// [`Self::resume_after_moot_update`] can reopen admission while the
+    /// process waits out its last job before re-execing.
+    pub fn drain_for_restart(&self) {
+        self.inner
+            .draining_for_restart
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.state.set_draining(true);
+        info!("draining for restart: no new offers will be accepted");
+    }
+
+    /// Clear the self-update drain after the update became moot — the pin
+    /// moved back to this build before the swap happened (a rollback racing
+    /// the drain). An operator drain, or a restart this process is committed
+    /// to, stays in force.
     pub fn resume_after_moot_update(&self) {
         self.inner
-            .draining_for_replacement
+            .draining_for_update
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let operator_drain = self
+        let still_draining = self
             .inner
             .draining
-            .load(std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(operator_drain);
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self.replacement_pending();
+        self.inner.state.set_draining(still_draining);
         info!("self-update became moot; resuming");
     }
 
@@ -1291,6 +1310,52 @@ mod tests {
         ));
 
         sup.resume();
+        assert!(!sup.inner.state.current().draining);
+        assert_eq!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Accept(Backend::HostRunner)
+        );
+    }
+
+    /// A restart drain latches: neither an operator `Resume` nor a self-update
+    /// that became moot may reopen admission for a process that is committed
+    /// to re-exec, or the jobs admitted in that window get killed by the
+    /// teardown the restart is waiting to run.
+    #[test]
+    fn nothing_reopens_admission_once_a_restart_is_committed() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        // The order the bug needs: an update arms the revocable drain first,
+        // then the operator restart arms the latching one.
+        sup.drain_for_update();
+        sup.drain_for_restart();
+
+        sup.resume_after_moot_update();
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+
+        sup.resume();
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+    }
+
+    /// Without a restart in the picture, a moot update still resumes — the
+    /// latching flag must not make the revocable one permanent.
+    #[test]
+    fn a_moot_update_resumes_when_no_restart_is_pending() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        sup.drain_for_update();
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+
+        sup.resume_after_moot_update();
         assert!(!sup.inner.state.current().draining);
         assert_eq!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
