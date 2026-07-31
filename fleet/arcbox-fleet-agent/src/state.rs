@@ -16,6 +16,7 @@ use arcbox_fleet_control_proto::v1::{
 use tokio::sync::watch;
 
 use crate::config::{DockerMode, VmMode};
+use crate::handover::ReasonCell;
 use crate::settings::PersistedSettings;
 
 /// Bound on `recent_verdicts` so a long-lived agent's snapshot doesn't grow
@@ -132,15 +133,21 @@ pub struct AgentState {
 struct Inner {
     tx: watch::Sender<AgentStateSnapshot>,
     /// The two independent inputs to the snapshot's `draining` flag. Both
-    /// close admission, and the flag is their OR — kept here rather than at
+    /// close admission, and the flag is their OR — derived here rather than at
     /// each writer because the writers never see each other: the operator's
     /// `Drain`/`Resume` lives on the per-attachment [`crate::runner::
-    /// RunnerSupervisor`], while the handover input is set by
-    /// [`crate::handover::Handover`], which outlives every attachment. Each
+    /// RunnerSupervisor`], while the handover outlives every attachment. Each
     /// side setting `draining` directly is how one of them ends up clearing
     /// the other's.
+    ///
+    /// Neither is ever *handed* to this type as a computed bool. Both are read
+    /// live inside [`Self::refresh_draining`], so two racing writers cannot
+    /// publish a value derived from a pre-store snapshot — see [`ReasonCell`].
     operator_draining: AtomicBool,
-    handover_pending: AtomicBool,
+    /// The handover's reason cell, allocated here so every `AgentState` has
+    /// exactly one and [`crate::handover::Handover::new`] can adopt it without
+    /// a binding step to forget. Written only by that type; read-only here.
+    handover: Arc<ReasonCell>,
 }
 
 impl AgentState {
@@ -210,7 +217,7 @@ impl AgentState {
             inner: Arc::new(Inner {
                 tx,
                 operator_draining: AtomicBool::new(false),
-                handover_pending: AtomicBool::new(false),
+                handover: Arc::new(ReasonCell::new()),
             }),
         }
     }
@@ -288,23 +295,22 @@ impl AgentState {
         self.refresh_draining();
     }
 
-    /// Whether this process image is on its way out — the other input. Set
-    /// only by [`crate::handover::Handover`], which owns that fact.
-    pub fn set_handover_pending(&self, pending: bool) {
-        self.inner
-            .handover_pending
-            .store(pending, Ordering::Relaxed);
-        self.refresh_draining();
+    /// The cell holding the other input: whether this process image is on its
+    /// way out. Adopted by [`crate::handover::Handover::new`], the only writer.
+    pub(crate) fn handover_reason(&self) -> &Arc<ReasonCell> {
+        &self.inner.handover
     }
 
-    fn refresh_draining(&self) {
+    /// Recompute and publish the `draining` flag. Called by whichever side just
+    /// changed one of its inputs; it takes no argument on purpose.
+    pub(crate) fn refresh_draining(&self) {
         // Both inputs are read inside `send_modify`, under the watch channel's
         // write lock: two concurrent refreshes would otherwise each compute
         // from their own pre-store snapshot, and the loser would republish a
         // stale value that no later write corrects.
         self.inner.tx.send_modify(|s| {
             s.draining = self.inner.operator_draining.load(Ordering::Relaxed)
-                || self.inner.handover_pending.load(Ordering::Relaxed);
+                || self.inner.handover.pending();
         });
     }
 
@@ -863,23 +869,27 @@ mod tests {
 
     /// The observable flag is the OR of two independent inputs, and neither
     /// writer sees the other — so clearing one while the other holds must not
-    /// report the host as accepting work.
+    /// report the host as accepting work. The handover side is driven through
+    /// its owner, since nothing else may write that cell.
     #[test]
     fn draining_is_the_or_of_its_two_inputs() {
+        use crate::handover::{Handover, Reason};
+
         let state = AgentState::new(&seed());
+        let handover = Handover::new(state.clone());
         assert!(!state.current().draining);
 
         state.set_operator_draining(true);
-        state.set_handover_pending(true);
+        handover.request(Reason::Update);
         assert!(state.current().draining);
 
-        state.set_handover_pending(false);
+        handover.update_became_moot();
         assert!(state.current().draining, "the operator drain still holds");
 
         state.set_operator_draining(false);
         assert!(!state.current().draining);
 
-        state.set_handover_pending(true);
+        handover.request(Reason::Restart);
         state.set_operator_draining(false);
         assert!(state.current().draining, "the handover still holds");
     }

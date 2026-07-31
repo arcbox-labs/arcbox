@@ -68,9 +68,66 @@ impl Reason {
             2 => Self::Restart,
             3 => Self::ForcedRestart,
             4 => Self::Terminating,
-            // Only `Handover` writes this cell, and only from `Reason as u8`.
+            // Only `ReasonCell` writes this cell, and only from `Reason as u8`.
             _ => Self::None,
         }
+    }
+}
+
+/// The single cell holding the [`Reason`] in force, shared between
+/// [`Handover`] and the [`AgentState`] that publishes the observable draining
+/// flag.
+///
+/// It is a type of its own for one reason: the flag must be *derived* from the
+/// live reason inside the watch channel's write lock
+/// ([`AgentState::refresh_draining`]), never mirrored from a bool computed
+/// before that lock is taken. A precomputed mirror loses updates — two
+/// transitions racing each compute from their own pre-store snapshot, and the
+/// loser republishes a value that nothing afterwards corrects, because a
+/// handover happens a handful of times per process and never unwinds.
+///
+/// [`Handover`] is the only writer, and every transition rule lives there.
+pub struct ReasonCell(AtomicU8);
+
+impl ReasonCell {
+    pub(crate) fn new() -> Self {
+        Self(AtomicU8::new(Reason::None as u8))
+    }
+
+    /// The reason in force.
+    pub fn current(&self) -> Reason {
+        Reason::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Whether this image is on its way out — what admission and the
+    /// observable flag consult. True for a termination too: the process is
+    /// stopping either way, and admitting a job into a teardown only means
+    /// killing it.
+    pub fn pending(&self) -> bool {
+        self.current() != Reason::None
+    }
+
+    /// Climb the lattice to `reason`, returning what was in force before.
+    fn escalate(&self, reason: Reason) -> Reason {
+        Reason::from_u8(self.0.fetch_max(reason as u8, Ordering::Relaxed))
+    }
+
+    /// Drop back to [`Reason::None`] from exactly [`Reason::Update`], leaving
+    /// anything that escalated past it in force. Reports whether it cleared.
+    fn revoke_update(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Reason::Update as u8,
+                Reason::None as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Jump to the top of the lattice, unconditionally.
+    fn terminate(&self) {
+        self.0.store(Reason::Terminating as u8, Ordering::Relaxed);
     }
 }
 
@@ -105,7 +162,9 @@ pub enum Outcome {
 /// the attach loop (self-updates), the runner supervisor (which reads it to
 /// close admission) and the signal handler (which vetoes the lot).
 pub struct Handover {
-    reason: AtomicU8,
+    /// The reason cell `state` derives its observable draining flag from — the
+    /// same allocation, not a copy, so the two can never disagree.
+    reason: Arc<ReasonCell>,
     /// The image to replace this one with, recorded by [`Handover::commit`].
     /// Set at most once — see there for why first-commit-wins is the right
     /// tie-break.
@@ -115,12 +174,12 @@ pub struct Handover {
 }
 
 impl Handover {
-    /// Build a handover over a fresh shutdown token. `state` receives the
-    /// observable draining flag on every transition, so no caller has to
-    /// remember to mirror one.
+    /// Build a handover over a fresh shutdown token, writing into the reason
+    /// cell `state` already holds. Every transition republishes the observable
+    /// draining flag, so no caller has to remember to mirror one.
     pub fn new(state: AgentState) -> Arc<Self> {
         Arc::new(Self {
-            reason: AtomicU8::new(Reason::None as u8),
+            reason: Arc::clone(state.handover_reason()),
             exec: OnceLock::new(),
             shutdown: CancellationToken::new(),
             state,
@@ -140,7 +199,7 @@ impl Handover {
     /// caller's next step, because a graceful restart has to wait for the
     /// supervisor to quiesce first (see [`Self::commit`]).
     pub fn request(&self, reason: Reason) -> Requested {
-        let previous = Reason::from_u8(self.reason.fetch_max(reason as u8, Ordering::Relaxed));
+        let previous = self.reason.escalate(reason);
         let requested = if previous == Reason::Terminating {
             Requested::ShuttingDown
         } else if previous >= reason {
@@ -160,16 +219,7 @@ impl Handover {
     /// is the whole reason this is not a plain store — a process committed to
     /// re-exec must not start admitting jobs that its own teardown will kill.
     pub fn update_became_moot(&self) {
-        if self
-            .reason
-            .compare_exchange(
-                Reason::Update as u8,
-                Reason::None as u8,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
+        if self.reason.revoke_update() {
             self.mirror();
             info!("self-update became moot; resuming");
         }
@@ -207,22 +257,20 @@ impl Handover {
     /// order, so no task can observe the cancellation before the veto and
     /// mistake a termination for the restart it was waiting on.
     pub fn terminate(&self) {
-        self.reason
-            .store(Reason::Terminating as u8, Ordering::Relaxed);
+        self.reason.terminate();
         self.mirror();
         self.shutdown.cancel();
     }
 
     /// The reason in force.
     pub fn reason(&self) -> Reason {
-        Reason::from_u8(self.reason.load(Ordering::Relaxed))
+        self.reason.current()
     }
 
-    /// Whether this image is on its way out — what admission consults. True
-    /// for a termination too: the process is stopping either way, and
-    /// admitting a job into a teardown only means killing it.
+    /// Whether this image is on its way out — what admission consults; see
+    /// [`ReasonCell::pending`].
     pub fn pending(&self) -> bool {
-        self.reason() != Reason::None
+        self.reason.pending()
     }
 
     /// How to end the process. Read after the teardown, not at request time: a
@@ -244,8 +292,11 @@ impl Handover {
         }
     }
 
+    /// Republish the observable draining flag. Deliberately passes no value:
+    /// the state reads this very cell under its write lock, which is what keeps
+    /// two racing transitions from publishing a stale flag (see [`ReasonCell`]).
     fn mirror(&self) {
-        self.state.set_handover_pending(self.pending());
+        self.state.refresh_draining();
     }
 }
 
