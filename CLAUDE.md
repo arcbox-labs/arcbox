@@ -29,18 +29,11 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `virt/` — Virtualization.framework bindings, cross-platform hypervisor traits, VMM, VirtIO devices, VirtioFS, networking (NAT/DHCP/DNS)
 - `rpc/` — protobuf definitions, gRPC services, vsock/unix transport
 - `runtime/` — container state, OCI image/runtime
-- `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`abctl`), daemon binary (`arcbox-daemon`), facade crate
+- `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`abctl`, not `arcbox`), daemon binary (`arcbox-daemon`), facade crate
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — test resources and fixture build scripts
 - `.agents/skills/` — shared Claude Code skills (symlinked from `.claude/skills/`)
 - `docs/` — supplementary documentation (boot assets, daemon lifecycle)
-
-- **CLI binary is `abctl`.** The `arcbox` binary is a deprecated compat shim
-  that `exec`s `abctl` and will be removed. Never write `arcbox <subcommand>`
-  in code, help text, docs, or scripts — use `abctl <subcommand>`. The name
-  `arcbox` remains correct for the project, crates, `arcbox-daemon`/
-  `arcbox-helper` binaries, `~/.arcbox`, the Docker context, and firewall
-  chain tags.
 
 ## Component Rules
 
