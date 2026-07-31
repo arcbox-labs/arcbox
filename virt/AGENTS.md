@@ -187,6 +187,14 @@ Counters") or it falsifies the metrics.
   build.rs landmines. VZ has no Rust-side ObjC interop anymore; fix VZ bugs
   there.
 
+- `docs/fs-perf-limits.md` — the settled VirtioFS story: the per-op
+  cross-vCPU IPI mechanism, the kernel `fuse-spin-wait` fix (+58%
+  metadata_stat), everything ruled out en route (dax was never active on
+  VZ; idle=poll, sched features, kernel version all measured), and the
+  measurement discipline (same-context/same-day pairing; only the
+  in-process trio is ratio-safe). Read this before any "make file I/O
+  faster" work. VZ runs Apple's virtio-fs device — the custom VirtioFS
+  is HV-only and still unmeasured.
 - `docs/net-perf-limits.md` — the settled multi-flow Host→VM ceiling
   (~10–12 Gbps combined vs ~22–29 Gbps single-flow) and its root cause
   (per-IRQ host-side cost: `hv_vcpus_exit` / `hv_gic_set_spi` /

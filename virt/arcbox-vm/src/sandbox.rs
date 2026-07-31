@@ -26,7 +26,7 @@ use crate::boot_proto::KernelIpParam;
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
-use crate::snapshot::SnapshotCatalog;
+use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager};
 use crate::spawn::{spawn_direct, spawn_jailer};
 use crate::vsock::{self, ExecInputMsg, OutputChunk, StartCommand};
@@ -98,8 +98,9 @@ impl SandboxManager {
             let config = Arc::clone(&config);
             let network = Arc::clone(&network);
             let cow_manager = Arc::clone(&cow_manager);
+            let snapshots = Arc::clone(&snapshots);
             tokio::spawn(async move {
-                reconcile::sweep_orphans(&config, &network, &cow_manager).await;
+                reconcile::sweep_orphans(&config, &network, &cow_manager, &snapshots).await;
                 let _ = reconcile_tx.send(true);
             });
         } else {

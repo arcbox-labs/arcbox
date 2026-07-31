@@ -15,7 +15,7 @@ use crate::config::{RateLimitSpec, RestoreSpec, SnapshotRequest, SnapshotType, V
 use crate::error::{Result, VmmError};
 use crate::instance::{VmId, VmInfo, VmInstance, VmMetrics, VmState, VmSummary};
 use crate::network::NetworkManager;
-use crate::snapshot::{SnapshotCatalog, SnapshotInfo};
+use crate::snapshot::{SnapshotCatalog, SnapshotDraft, SnapshotInfo};
 use crate::spawn::{spawn_direct, spawn_jailer};
 use crate::store::VmStore;
 
@@ -427,8 +427,8 @@ impl VmmManager {
             self.pause_vm(id).await?;
         }
 
-        let snapshot_id = Uuid::new_v4().to_string();
-        let snap_dir = self.snapshots.prepare_dir(id, &snapshot_id)?;
+        let pending = self.snapshots.begin(id)?;
+        let snap_dir = pending.dir();
         let vmstate_path = snap_dir.join("vmstate");
         let mem_path = snap_dir.join("mem");
 
@@ -446,16 +446,13 @@ impl VmmManager {
             }
         }
 
-        let meta = self.snapshots.register(
-            id,
-            req.name,
-            req.snapshot_type,
-            vmstate_path,
-            Some(mem_path),
-            None,
-            None,
-            None,
-        )?;
+        let meta = pending.commit(SnapshotDraft {
+            name: req.name,
+            snapshot_type: req.snapshot_type,
+            parent_id: None,
+            kernel_path: None,
+            rootfs_path: None,
+        })?;
 
         if was_running {
             self.resume_vm(id).await?;

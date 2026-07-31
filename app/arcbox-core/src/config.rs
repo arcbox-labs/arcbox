@@ -179,6 +179,15 @@ impl Config {
     pub fn docker_img_path(&self) -> PathBuf {
         self.data_subdir().join("docker.img")
     }
+
+    /// Returns the path to the Docker metadata image (`data/docker-meta.img`).
+    ///
+    /// Paired with [`Self::docker_img_path`]: the ext4 volume carrying the
+    /// fsync-hot boltdb metadata (see internal-docs/plans/ext4-metadata-volume.md).
+    #[must_use]
+    pub fn docker_meta_img_path(&self) -> PathBuf {
+        self.data_subdir().join("docker-meta.img")
+    }
 }
 
 /// Default VM configuration.
@@ -194,7 +203,7 @@ pub struct VmDefaults {
     /// macOS hypervisor backend for the System VM (`"vz"` or `"hv"`).
     ///
     /// First-boot default only: once the machine exists, its persisted
-    /// backend (as switched via `arcbox system backend`) wins. Settable
+    /// backend (as switched via `abctl system backend`) wins. Settable
     /// non-interactively via `ARCBOX_VM_BACKEND` or `config.toml` — the
     /// entry point for the dual-backend e2e matrix.
     pub backend: arcbox_vmm::VmBackend,

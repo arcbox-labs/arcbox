@@ -290,7 +290,7 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
     println!("  Disk:   {} GB", args.disk);
     println!();
     println!("To start the machine, run:");
-    println!("  arcbox machine start {}", args.name);
+    println!("  abctl machine start {}", args.name);
 
     Ok(())
 }
@@ -402,7 +402,7 @@ async fn execute_list(args: ListArgs) -> Result<()> {
         println!("No machines found.");
         println!();
         println!("To create a machine, run:");
-        println!("  arcbox machine create <name>");
+        println!("  abctl machine create <name>");
         return Ok(());
     }
 

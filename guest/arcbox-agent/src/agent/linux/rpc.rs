@@ -147,6 +147,7 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
             RequestResult::Single(handle_container_fs_paths(req).await)
         }
         RpcRequest::ImageFsPaths(req) => RequestResult::Single(handle_image_fs_paths(req).await),
+        RpcRequest::EnsureNfsExport(_) => RequestResult::Single(handle_ensure_nfs_export().await),
         RpcRequest::KillAgent => RequestResult::Single(handle_kill_agent()),
         RpcRequest::WatchReadiness(_) => unreachable!("watch readiness is streaming"),
         RpcRequest::WatchMemoryPressure(_) => {
@@ -382,6 +383,24 @@ async fn handle_image_fs_paths(req: arcbox_protocol::agent::ImageFsPathsRequest)
         Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
             libc::EIO,
             format!("image fs paths: {e}"),
+        )),
+    }
+}
+
+/// Handles an `EnsureNfsExport` request.
+///
+/// Brings up the read-only NFS export of the docker data mount so the host
+/// can browse it at `~/ArcBox`. The host daemon sends this only when the
+/// mount is enabled, so the guest runs no nfsd unless asked. Runtime startup
+/// no longer sets the export up itself, so this is the sole entry point.
+async fn handle_ensure_nfs_export() -> RpcResponse {
+    match super::runtime::ensure_nfs_export().await {
+        Ok(notes) => {
+            RpcResponse::EnsureNfsExport(arcbox_protocol::agent::EnsureNfsExportResponse { notes })
+        }
+        Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
+            libc::EIO,
+            format!("ensure nfs export: {e}"),
         )),
     }
 }

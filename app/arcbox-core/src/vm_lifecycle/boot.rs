@@ -16,13 +16,15 @@ use crate::error::{CoreError, Result};
 use crate::event::Event;
 use crate::machine::MachineConfig;
 use arcbox_constants::cmdline::{
-    DEBUG_CONSOLE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE,
+    DEBUG_CONSOLE_KEY, DOCKER_METADATA_DEVICE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
+    HV_EARLYCON_DIRECTIVE, RUNTIME_IMAGE_DEVICE_KEY,
 };
+use arcbox_constants::devices::{DOCKER_METADATA_BLOCK_DEVICE, RUNTIME_IMAGE_BLOCK_DEVICE};
 use arcbox_error::CommonError;
 
 use super::actor::{Completion, InternalEvent, LifecycleShared};
-use super::types::{DesiredBoot, machine_drift_reason};
-use super::{DOCKER_DATA_IMAGE_SIZE_BYTES, RecoveryAction};
+use super::types::{DesiredBoot, machine_drift_reason, metadata_image_filename};
+use super::{DOCKER_DATA_IMAGE_SIZE_BYTES, DOCKER_METADATA_IMAGE_SIZE_BYTES, RecoveryAction};
 
 impl LifecycleShared {
     /// Boots the VM end-to-end (create if needed, start with retries, wait for
@@ -342,7 +344,8 @@ impl LifecycleShared {
     ///
     /// Block devices:
     /// - vda: rootfs.erofs (read-only)
-    /// - vdb: docker-data.img (read-write)
+    /// - vdb: docker-data.img (read-write, btrfs bulk data)
+    /// - vdc: docker-meta.img (read-write, ext4 metadata volume)
     async fn create_default_machine(&self) -> Result<()> {
         let boot = self.resolve_desired_boot().await?;
         let rootfs_path = boot.rootfs_image.to_string_lossy().to_string();
@@ -367,6 +370,33 @@ impl LifecycleShared {
             path: docker_data_image.to_string_lossy().to_string(),
             read_only: false,
         });
+
+        // Attach the ext4 metadata volume (vdc): the fsync-hot boltdb
+        // metadata lives there while bulk data stays on the btrfs data disk.
+        // The two images are a paired set — see
+        // internal-docs/plans/ext4-metadata-volume.md.
+        let metadata_image = self
+            .data_dir
+            .join(arcbox_constants::paths::host::DATA)
+            .join(metadata_image_filename(&self.data_image_filename));
+        ensure_sparse_block_image(&metadata_image, DOCKER_METADATA_IMAGE_SIZE_BYTES)?;
+        block_devices.push(crate::vm::BlockDeviceConfig {
+            path: metadata_image.to_string_lossy().to_string(),
+            read_only: false,
+        });
+
+        // Attach the read-only runtime image when the pinned boot release
+        // ships one: the guest execs dockerd/containerd/the shim/runc from
+        // this block device instead of over VirtioFS, which costs a FUSE
+        // round-trip per exec (~7-10x more, measured) on every container
+        // start. Releases predating it leave this None and the guest keeps
+        // using the VirtioFS copies (ABX-498).
+        if let Some(ref runtime_image) = boot.runtime_image {
+            block_devices.push(crate::vm::BlockDeviceConfig {
+                path: runtime_image.to_string_lossy().to_string(),
+                read_only: true,
+            });
+        }
 
         let config = MachineConfig {
             name: self.machine_name.clone(),
@@ -444,6 +474,36 @@ impl LifecycleShared {
             }
         }
 
+        // Declare the ext4 metadata device this machine attaches as vdc.
+        // Unlike the data device (auto-detected for its HVC fast path), the
+        // declaration is authoritative: key present → the agent waits for
+        // the node and hard-fails if it never appears; key absent (older
+        // daemon) → the agent skips the metadata volume without probing.
+        if !cmdline
+            .split_whitespace()
+            .any(|token| token.starts_with(DOCKER_METADATA_DEVICE_KEY))
+        {
+            cmdline.push(' ');
+            cmdline.push_str(DOCKER_METADATA_DEVICE_KEY);
+            cmdline.push_str(DOCKER_METADATA_BLOCK_DEVICE);
+        }
+
+        // Declare the runtime-image device only when this release ships one.
+        // Its presence is the guest's signal to mount the image and exec the
+        // runtime from it; its absence means "keep using VirtioFS". Injecting
+        // it here (rather than at create time) also makes the cmdline drift
+        // check recreate the machine when a release starts or stops shipping
+        // the image, which is exactly when the disk set changes.
+        if assets.runtime_image.is_some()
+            && !cmdline
+                .split_whitespace()
+                .any(|token| token.starts_with(RUNTIME_IMAGE_DEVICE_KEY))
+        {
+            cmdline.push(' ');
+            cmdline.push_str(RUNTIME_IMAGE_DEVICE_KEY);
+            cmdline.push_str(RUNTIME_IMAGE_BLOCK_DEVICE);
+        }
+
         // Always attach an interactive debug console on the custom-HV backend.
         // An operator can `socat - UNIX-CONNECT:<sock>` to get a serial root
         // shell into the guest even when early boot hangs before networking
@@ -479,6 +539,7 @@ impl LifecycleShared {
             kernel: assets.kernel.to_string_lossy().to_string(),
             cmdline,
             rootfs_image: assets.rootfs_image,
+            runtime_image: assets.runtime_image,
         })
     }
 

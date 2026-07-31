@@ -1,20 +1,23 @@
-//! Idle-balloon regression e2e (2026-07-15 incident).
+//! Idle-balloon regression e2e (2026-07-15 incident → 2026-07-29 verdict).
 //!
-//! The incident: a VM running containers idled after 5 quiet minutes, the
-//! balloon was shrunk to an unconditional 128 MB, and nothing could ever
-//! restore it — 18 hours of reclaim thrash with dockerd and the agent
-//! starved unresponsive.
+//! History: the 2026-07-15 incident (an unconditional shrink to 128 MB
+//! starved a running compose stack for 18 hours) led to the usage-aware
+//! staged-descent redesign this test originally exercised. The 2026-07-29
+//! measurements then showed no macOS backend actually reclaims ballooned
+//! memory (VZ: Apple applies no madvise at all; HV: `MADV_DONTNEED` is a
+//! Darwin deactivation hint) — shrinking was guest starvation with zero
+//! host benefit, so the idle balloon is disabled on macOS entirely. See
+//! `app/arcbox-core/src/vm_lifecycle/balloon/mod.rs` for the evidence.
 //!
-//! This scenario replays the shape on a real VZ daemon with a short idle
-//! timeout: hold a memory workload, let the VM idle-shrink, then grow the
-//! workload *inside the guest* (no host API traffic, exactly like the
-//! incident) and require the guest-driven pressure exit: balloon restored,
-//! Docker responsive, no reclaim storm.
+//! This scenario pins the new contract on a real VZ daemon with a short
+//! idle timeout, while a container runs in the guest and a persistent
+//! `docker events` subscription is held open (the desktop-UI shape that
+//! once pinned `active_ops` and disabled idle handling outright):
 //!
-//! The whole cycle runs under a persistent `docker events` subscription —
-//! the desktop UI holds one for its entire lifetime, and counting that
-//! passive stream as VM activity once pinned `active_ops` and disabled
-//! idle reclaim outright on desktop installs.
+//! - idle must still ENGAGE (the disabled-balloon line is the witness);
+//! - the balloon must never shrink or restore — no descent, no
+//!   `Out of puff` reclaim storm, no 8.5-minute shrink/restore cycle;
+//! - Docker must be responsive afterwards.
 //!
 //! Balloon moves have no RPC surface; the daemon log is the only oracle
 //! for them. That is an explicit exception to the "readiness only via
@@ -34,21 +37,16 @@ static TRACING: Once = Once::new();
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Idle timeout under test (knob). The actor's idle ticker runs every 10s,
-/// so the shrink lands within ~30s of the last docker call.
+/// so idle entry lands within ~30s of the last docker call.
 const IDLE_TIMEOUT_SECS: u64 = 20;
-/// Budget for observing the idle shrink in the daemon log.
-const SHRINK_BUDGET: Duration = Duration::from_secs(120);
-/// Budget from ballast growth until the balloon must be restored. Covers
-/// the slow path where growth lands while the guest is still settling and
-/// the agent's never-settled cap (180 samples) has to fire.
-const RESTORE_BUDGET: Duration = Duration::from_secs(150);
+/// Budget for observing the disabled-balloon line in the daemon log.
+const IDLE_BUDGET: Duration = Duration::from_secs(120);
+/// Quiet window after idle entry in which no shrink may appear. Longer
+/// than `IDLE_ENTRY_RETRY` (30s), so a regression that arms the retry
+/// timer instead of staying inert is caught too.
+const QUIET_WINDOW: Duration = Duration::from_secs(90);
 /// Ceiling for one docker CLI invocation.
 const DOCKER_ATTEMPT: Duration = Duration::from_secs(30);
-/// Delay inside the ballast container before it grows its memory. Sized
-/// past the idle timeout (~20s) + ticker (10s) + the full staged descent
-/// (~7 steps × 15s dwell) + the final step's settle, so growth hits a
-/// shrunk, settled, armed guest and exercises the fast pressure path.
-const BALLAST_GROW_DELAY_SECS: u64 = 180;
 
 fn init_tracing() {
     TRACING.call_once(|| {
@@ -62,8 +60,8 @@ fn init_tracing() {
 }
 
 #[test]
-#[ignore = "boots a VZ System VM through a real daemon and drives an idle-shrink/pressure-restore cycle"]
-fn idle_shrink_is_usage_aware_and_pressure_restores() -> Result<()> {
+#[ignore = "boots a VZ System VM through a real daemon and verifies idle entry never shrinks the balloon"]
+fn idle_entry_never_shrinks_on_macos() -> Result<()> {
     init_tracing();
 
     let root = arcbox_e2e::repo_root();
@@ -112,129 +110,61 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
     metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
 
-    // Persistent observer, held open for the whole cycle: the idle shrink
-    // below must engage despite this live `/events` subscription.
+    // Persistent observer, held open for the whole cycle: idle entry below
+    // must engage despite this live `/events` subscription.
     let mut events = docker_stream(data_dir, &["events"]).context("subscribing to events")?;
 
-    // The ballast: hold ~256 MB immediately (tmpfs pages persist regardless
-    // of process lifetime), then grow by 2 GiB after the VM has idled and
-    // shrunk. The growth happens entirely inside the guest — no host API
-    // traffic — exactly the incident shape. `--shm-size` matters: Docker's
-    // default /dev/shm is 64 MB, which silently neuters the ballast.
-    let ballast_script = format!(
-        "dd if=/dev/zero of=/dev/shm/hold bs=1M count=256 && sleep {BALLAST_GROW_DELAY_SECS} && \
-         dd if=/dev/zero of=/dev/shm/grow bs=1M count=2048; sleep 900"
-    );
-    metrics.time("ballast_start", || {
+    // An in-guest workload: container load never counts as host activity
+    // (the incident shape), so it must not block idle entry either.
+    metrics.time("workload_start", || {
         docker_output(
             data_dir,
-            &[
-                "run",
-                "-d",
-                "--shm-size=3g",
-                "--name",
-                "ballast",
-                &image,
-                "sh",
-                "-c",
-                &ballast_script,
-            ],
+            &["run", "-d", "--name", "workload", &image, "sleep", "900"],
             DOCKER_ATTEMPT,
         )
-        .context("starting ballast container")
+        .context("starting workload container")
     })?;
-    let ballast_started = Instant::now();
 
-    // Phase 1 — the idle shrink must be usage-aware.
-    let shrink = metrics.time("idle_shrink", || {
-        wait_for_log(
-            data_dir,
-            "idle balloon shrunk to guest usage + headroom",
-            SHRINK_BUDGET,
-        )
+    // Phase 1 — idle must engage, and the balloon gate must answer it with
+    // the disabled line (not a shrink).
+    let disabled = metrics.time("idle_disabled", || {
+        wait_for_log(data_dir, "idle balloon disabled", IDLE_BUDGET)
     })?;
-    let target_mb =
-        extract_u64_field(&shrink, "target_mb").context("shrink log line carries no target_mb")?;
-    let final_mb =
-        extract_u64_field(&shrink, "final_mb").context("shrink log line carries no final_mb")?;
-    tracing::info!(target_mb, final_mb, "idle balloon descent started");
-    if final_mb < 384 {
-        bail!("final target {final_mb}MB below the 384MB floor (incident-style blind shrink?)");
-    }
-    if final_mb >= 16384 {
-        bail!("final target {final_mb}MB is not usage-aware (no reclaim planned)");
-    }
+    tracing::info!(line = %disabled, "idle entry answered by the disabled gate");
 
-    // The staged dev agent must support the pressure watch; a fallback to
-    // polling means a stale agent and would validate the wrong path.
-    if log_contains(data_dir, "pressure watch unavailable")? {
-        bail!("controller degraded to polling — staged agent lacks WatchMemoryPressure");
-    }
-
-    // Phase 2 — the shrink must survive the post-inflation transient.
-    // Hardware regression guard: inflating the balloon evicts the page
-    // cache, and the resulting refault burst once tripped a restore one
-    // second after the shrink.
-    let grow_at = ballast_started + Duration::from_secs(BALLAST_GROW_DELAY_SECS);
-    let quiet_until = grow_at
-        .checked_sub(Duration::from_secs(5))
-        .unwrap_or(grow_at);
-    metrics.time("shrink_survives_transient", || -> Result<()> {
-        while Instant::now() < quiet_until {
-            if log_contains(data_dir, "balloon restored to full memory")? {
-                bail!("balloon restored before the in-guest growth");
+    // Phase 2 — the quiet window: nothing balloon-shaped may happen. This
+    // is the anti-regression for both the descent (would log a shrink) and
+    // the thrash cycle (would log a restore + Out-of-puff storm).
+    metrics.time("quiet_window", || -> Result<()> {
+        let deadline = Instant::now() + QUIET_WINDOW;
+        while Instant::now() < deadline {
+            for forbidden in ["idle balloon shrunk", "balloon restored to full memory"] {
+                if log_contains(data_dir, forbidden)? {
+                    bail!("daemon log contains {forbidden:?} — the reclaim gate did not hold");
+                }
             }
             std::thread::sleep(Duration::from_millis(500));
         }
         Ok(())
     })?;
-
-    // Phase 3 — in-guest growth must be answered by a guest-driven restore.
-    let restore_deadline = grow_at + RESTORE_BUDGET;
-    let restored = wait_for_log_until(
-        data_dir,
-        "balloon restored to full memory",
-        restore_deadline,
-    )?;
-    let restore_latency = Instant::now().saturating_duration_since(grow_at);
-    tracing::info!(line = %restored, latency_secs = restore_latency.as_secs(), "balloon restored");
-    metrics.record("pressure_restore_latency", restore_latency.as_secs_f64());
-
-    // The fast (armed) pressure path must have answered — not the bounded
-    // never-settled cap. The staged descent exists precisely so the guest
-    // settles and arms before real pressure can arrive.
-    if !agent_log_contains(data_dir, "memory pressure detector armed")? {
-        bail!("guest never armed — staged descent did not settle before growth");
-    }
-    if restore_latency > Duration::from_secs(30) {
-        bail!(
-            "restore took {}s — cap path, not the armed fast path",
-            restore_latency.as_secs()
-        );
-    }
-
-    // Phase 4 — the incident signature must be absent and Docker must be
-    // responsive right after the restore.
     let storm_lines = count_log_matches(data_dir, "Out of puff")?;
-    if storm_lines > 20 {
-        bail!("guest logged {storm_lines} 'Out of puff' lines — reclaim storm not prevented");
+    if storm_lines > 0 {
+        bail!("guest logged {storm_lines} 'Out of puff' lines with the balloon disabled");
     }
-    metrics.time("docker_after_restore", || {
-        docker_output(data_dir, &["ps"], Duration::from_secs(10)).context("docker ps after restore")
+
+    // Phase 3 — Docker responsive after the idle window (this call also
+    // exits idle, which must work without any balloon bookkeeping).
+    metrics.time("docker_after_idle", || {
+        docker_output(data_dir, &["ps"], Duration::from_secs(10)).context("docker ps after idle")
     })?;
 
-    // The exit must have gone through the state machine (idle → running).
-    if !log_contains(data_dir, r#""from":"idle","to":"running""#)? {
-        bail!("balloon restore did not ride the lifecycle state machine");
-    }
-
     // The whole cycle ran under a live events subscription — prove the
-    // observer survived, so the shrink above really happened despite it.
+    // observer survived, so idle entry above really engaged despite it.
     events
         .assert_alive()
         .context("events subscription died mid-scenario")?;
 
-    docker_output(data_dir, &["rm", "-f", "ballast"], DOCKER_ATTEMPT).ok();
+    docker_output(data_dir, &["rm", "-f", "workload"], DOCKER_ATTEMPT).ok();
     Ok(())
 }
 
@@ -255,27 +185,13 @@ fn log_contains(data_dir: &Path, needle: &str) -> Result<bool> {
     Ok(read_log(data_dir)?.contains(needle))
 }
 
-/// The guest agent's log, exported to the host via VirtioFS.
-fn agent_log_contains(data_dir: &Path, needle: &str) -> Result<bool> {
-    let path = data_dir.join("log/agent.log");
-    if !path.exists() {
-        return Ok(false);
-    }
-    Ok(std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .contains(needle))
-}
-
 fn count_log_matches(data_dir: &Path, needle: &str) -> Result<usize> {
     Ok(read_log(data_dir)?.matches(needle).count())
 }
 
 /// Polls the daemon log for a line containing `needle`, returning that line.
 fn wait_for_log(data_dir: &Path, needle: &str, budget: Duration) -> Result<String> {
-    wait_for_log_until(data_dir, needle, Instant::now() + budget)
-}
-
-fn wait_for_log_until(data_dir: &Path, needle: &str, deadline: Instant) -> Result<String> {
+    let deadline = Instant::now() + budget;
     loop {
         if let Some(line) = read_log(data_dir)?.lines().find(|l| l.contains(needle)) {
             return Ok(line.to_owned());
@@ -285,12 +201,4 @@ fn wait_for_log_until(data_dir: &Path, needle: &str, deadline: Instant) -> Resul
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-}
-
-/// Extracts a numeric field (`"name":123`) from a structured log line.
-fn extract_u64_field(line: &str, name: &str) -> Option<u64> {
-    let key = format!("\"{name}\":");
-    let rest = &line[line.find(&key)? + key.len()..];
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
 }

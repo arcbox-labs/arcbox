@@ -23,6 +23,11 @@ mod memory_pressure;
 #[cfg(target_os = "linux")]
 mod stats;
 
+// Same arrangement for the ext4 metadata-volume migration state machine
+// (pure std::fs; the mount syscalls live in agent/linux/metadata_volume.rs).
+#[cfg(target_os = "linux")]
+mod metadata_migrate;
+
 #[cfg(target_os = "linux")]
 mod error;
 

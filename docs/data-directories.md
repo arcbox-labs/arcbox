@@ -57,6 +57,7 @@ Defined in `app/arcbox-core/src/config.rs`.
 | `data/machines/` | Virtual machine data | daemon |
 | `data/volumes/` | Named volumes | daemon |
 | `data/docker.img` | Docker persistent disk image (Btrfs) | daemon |
+| `data/docker-meta.img` | Docker metadata disk image (ext4, fsync-hot boltdb state); paired with `docker.img` — back up or move the two together | daemon |
 
 ### 1.4 `boot/` — Boot Asset Cache
 
@@ -251,7 +252,7 @@ Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
 | `/run/arcbox/vmm.sock` | Guest VMM gRPC socket | agent |
 | `/var/lib/arcbox/sandboxes` | Firecracker sandbox data | agent |
 | `/var/lib/arcbox/sandbox/rootfs.ext4` | Default sandbox rootfs (busybox + vm-agent, auto-built) | agent |
-| `/var/lib/arcbox/sandbox/rootfs-<hash>.ext4` | Converted overlay2 rootfs cache | agent |
+| `/var/lib/arcbox/sandbox/rootfs-<layer>-<agent>.ext4` | Converted image rootfs cache, keyed on the source layer and the injected `vm-agent`; superseded entries are swept on the next conversion unless a snapshot still needs them as its dm-snapshot origin | agent |
 | `/var/lib/arcbox/jailer` | Firecracker jailer chroots | agent |
 | `/arcbox/runtime/bin/{firecracker,jailer}` | Firecracker binaries (boot manifest, via VirtioFS) | host daemon |
 | `/arcbox/runtime/kernel/vmlinux` | Sandbox guest kernel (boot manifest, via VirtioFS) | host daemon |

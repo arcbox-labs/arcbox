@@ -33,10 +33,11 @@ use tracing::{info, warn};
 use crate::backends::Backends;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
+use crate::handover::{Handover, Reason, Requested};
 use crate::runner::RunnerSupervisor;
 use crate::settings::SettingsStore;
 use crate::state::AgentState;
-use crate::{attach, enroll};
+use crate::{attach, enroll, update};
 use image::ImageService;
 use lifecycle::LifecycleService;
 use settings::SettingsService;
@@ -172,7 +173,8 @@ fn check_enrollable(state: &State) -> Result<(), &'static str> {
 /// still goes through [`AgentState`].
 struct Attachment {
     supervisor: RunnerSupervisor,
-    /// Child of [`AgentSupervisor::process_shutdown`]: cancelling it stops
+    /// Child of the process shutdown token ([`Handover::shutdown`]):
+    /// cancelling it stops
     /// only this attachment (`Unenroll`); cancelling the parent (process
     /// shutdown) cascades to it too, so runners still drain on SIGTERM.
     shutdown: CancellationToken,
@@ -232,9 +234,6 @@ pub struct AgentSupervisor {
     /// The live backend registry: runtimes and the capability set they
     /// serve, shared with every attachment and with `FleetImageService`.
     backends: Arc<Backends>,
-    /// Cancelled on process shutdown (SIGTERM/Ctrl-C); every attachment's
-    /// `shutdown` is a child of this token.
-    process_shutdown: CancellationToken,
     state: Mutex<State>,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers —
     /// the single source of truth `status()` reads from below, so it never
@@ -243,6 +242,15 @@ pub struct AgentSupervisor {
     /// Persists an `Enroll`-provided gateway override the same way
     /// `FleetSettingsService.UpdateSettings` persists any other setting.
     settings_store: SettingsStore,
+    /// How this process image ends. Owns the process shutdown token every
+    /// attachment's own token descends from, so an operator `Restart` and a
+    /// termination signal bring the agent down the same way and only
+    /// [`Handover::outcome`] tells them apart afterwards.
+    handover: Arc<Handover>,
+    /// Identifies this process image (see `GetAgentInfoResponse.instance_id`):
+    /// a client watching a restart cannot use the PID, which `exec`
+    /// preserves, so it compares this instead.
+    instance_id: String,
 }
 
 impl AgentSupervisor {
@@ -251,17 +259,18 @@ impl AgentSupervisor {
     pub async fn new(
         config: AgentConfig,
         backends: Arc<Backends>,
-        process_shutdown: CancellationToken,
         agent_state: AgentState,
         settings_store: SettingsStore,
+        handover: Arc<Handover>,
     ) -> Result<Self> {
         let this = Self {
             config,
             backends,
-            process_shutdown,
             state: Mutex::new(State::Unenrolled),
             agent_state,
             settings_store,
+            handover,
+            instance_id: uuid::Uuid::new_v4().to_string(),
         };
         let gateway = this.agent_state.gateway_target();
         let existing = this.config.credential_store_for(&gateway).load()?;
@@ -317,12 +326,17 @@ impl AgentSupervisor {
         self.agent_state.set_participate_current(true);
         // A fresh attachment always starts accepting: `Drain` is runtime-only
         // (never persisted), and the previous attachment's teardown shares this
-        // process-lifetime state, so clear any stale draining flag rather than
-        // letting a re-enroll inherit it.
-        self.agent_state.set_draining(false);
-        let (supervisor, egress_rx) =
-            attach::spawn_supervisor(&self.config, self.backends(), self.agent_state.clone());
-        let shutdown = self.process_shutdown.child_token();
+        // process-lifetime state, so clear any stale operator drain rather than
+        // letting a re-enroll inherit it. A pending handover is untouched — it
+        // outlives attachments by design.
+        self.agent_state.set_operator_draining(false);
+        let (supervisor, egress_rx) = attach::spawn_supervisor(
+            &self.config,
+            self.backends(),
+            self.agent_state.clone(),
+            Arc::clone(&self.handover),
+        );
+        let shutdown = self.handover.shutdown().child_token();
         let task = tokio::spawn(attach::run(
             self.config.clone(),
             credential.clone(),
@@ -331,6 +345,7 @@ impl AgentSupervisor {
             self.backends(),
             shutdown.clone(),
             self.agent_state.clone(),
+            Arc::clone(&self.handover),
         ));
         Attachment {
             supervisor,
@@ -398,9 +413,11 @@ impl AgentSupervisor {
 
         // The gateway round-trip must not hold `state` locked.
         let credential =
-            enroll::enroll(&self.config, token, self.backends.capabilities(), &gateway)
-                .await
-                .map_err(Internal)?;
+            match enroll::enroll(&self.config, token, self.backends.capabilities(), &gateway).await
+            {
+                Ok(credential) => credential,
+                Err(error) => return Err(self.refused_enrollment(error).await),
+            };
 
         let mut state = self.state.lock().await;
         // `check_enrollable` refuses `Enrolling`, so nothing else can
@@ -446,6 +463,57 @@ impl AgentSupervisor {
         let machine_id = credential.machine_id.clone();
         *state = State::Attached(self.attach(credential, gateway));
         Ok(machine_id)
+    }
+
+    /// Classify a failed enrollment round-trip, self-updating when it was
+    /// the gateway telling us which build to run. That refusal is the same
+    /// signal `attach` acts on (`AttachRejected`), arriving one step
+    /// earlier — so it gets the same treatment, or enrolling on a stale
+    /// binary would be a dead end that no later attach can rescue.
+    ///
+    /// Nothing to drain here: `check_enrollable` admitted this enroll only
+    /// from `Unenrolled`, so there is no attachment and no in-flight job to
+    /// protect. On success the agent shuts down to come back on the new build
+    /// and the caller re-issues `Enroll` against it; every path that returns
+    /// leaves the observable `Updating` for [`Self::enroll`]'s rollback to
+    /// reset.
+    async fn refused_enrollment(&self, error: anyhow::Error) -> Status {
+        let Some(payload) = enroll::update_payload(&error) else {
+            return Internal(error).into();
+        };
+        info!(
+            expected = %payload.expected_version,
+            current = env!("CARGO_PKG_VERSION"),
+            "gateway requires a different build; self-updating before enrolling"
+        );
+        self.agent_state.set_enrollment(Enrollment::Updating, "");
+        let update_error = match update::apply(&self.config, &payload).await {
+            Ok(managed) => {
+                self.handover.request(Reason::Update);
+                self.handover.commit(managed);
+                // UNAVAILABLE, not an error the caller should give up on: the
+                // agent is coming back on the required build, and this is the
+                // code `main`'s enroll path already treats as "restarted
+                // mid-call; wait and resume". Reported rather than raced —
+                // the exec used to happen here, so whether the caller saw a
+                // status or a dropped connection was a coin flip.
+                return Status::unavailable(
+                    "agent is restarting onto the required build; retry once it is back",
+                );
+            }
+            Err(update_error) => update_error,
+        };
+        if update_error
+            .chain()
+            .any(|c| c.downcast_ref::<update::UnmanagedBinary>().is_some())
+        {
+            // Not our binary to manage: installing the expected build is the
+            // operator's job, not something to retry.
+            warn!(error = %update_error, "self-update declined");
+            return Status::failed_precondition(format!("{error}; {update_error}"));
+        }
+        warn!(error = %update_error, "self-update failed");
+        Internal(update_error).into()
     }
 
     /// Leave the fleet — terminal. Stops attaching, decommissions the
@@ -652,6 +720,83 @@ impl AgentSupervisor {
         }
     }
 
+    /// Restart this process: bring the agent down the same way a SIGTERM
+    /// does, so [`crate::serve`] can re-exec once the teardown finishes.
+    /// Sharing that one teardown path is deliberate — see [`Handover`].
+    ///
+    /// Accepted from every enrollment state — it replaces the process, not
+    /// the enrollment — and idempotent: a repeated request rides the shutdown
+    /// already in progress, while a forced request arriving after a graceful
+    /// one escalates it instead of waiting further. Refused only once a
+    /// termination signal has claimed the shutdown, which no restart may turn
+    /// back into a re-exec.
+    ///
+    /// A graceful restart with jobs in flight returns as soon as the drain is
+    /// armed; the re-exec then waits for the supervisor to quiesce —
+    /// unbounded on the jobs themselves, bounded on the verdict acks that
+    /// follow them.
+    pub async fn restart(&self, force: bool) -> Result<(), Status> {
+        // Resolved before anything is armed, so an unresolvable executable is
+        // an error the operator sees on this call rather than a process that
+        // tears itself down and then fails to come back.
+        let binary = std::env::current_exe().map_err(|e| {
+            Status::failed_precondition(format!("resolving the current binary path: {e}"))
+        })?;
+        let reason = if force {
+            Reason::ForcedRestart
+        } else {
+            Reason::Restart
+        };
+        match self.handover.request(reason) {
+            Requested::Recorded => {}
+            Requested::AlreadyPending => {
+                info!(?reason, "restart already in progress");
+                return Ok(());
+            }
+            Requested::ShuttingDown => {
+                return Err(Status::failed_precondition(
+                    "the agent is shutting down; it will not come back on its own",
+                ));
+            }
+        }
+        // Nothing to protect: either no attachment exists, or the operator
+        // asked to take in-flight jobs down with the process.
+        let runners = if force {
+            None
+        } else {
+            match &*self.state.lock().await {
+                State::Attached(a) => Some(a.supervisor.clone()),
+                State::Unenrolled
+                | State::Enrolling
+                | State::Unenrolling
+                | State::Detaching
+                | State::Detached { .. } => None,
+            }
+        };
+        let Some(runners) = runners else {
+            info!(?reason, "restarting");
+            self.handover.commit(binary);
+            return Ok(());
+        };
+
+        info!("restarting once in-flight jobs finish");
+        let handover = Arc::clone(&self.handover);
+        tokio::spawn(async move {
+            // The attach stream is live here, so the ack grace is real: the
+            // last job's verdict is queued as it exits, and re-execing before
+            // the gateway settles it would strand the outcome.
+            runners.quiesce(crate::runner::VERDICT_ACK_GRACE).await;
+            info!("in-flight work settled; restarting");
+            handover.commit(binary);
+        });
+        Ok(())
+    }
+
+    /// This process image's identity, reported by `GetAgentInfo`.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
     /// Current lifecycle state and machine id (empty when unenrolled),
     /// derived from [`AgentState`] rather than the resource-holding
     /// `Mutex<State>` above — the two must agree, and `AgentState` is the
@@ -753,13 +898,25 @@ mod tests {
         dir: &std::path::Path,
         agent_state: AgentState,
     ) -> Arc<AgentSupervisor> {
+        let handover = Handover::new(agent_state.clone());
+        test_supervisor_with_handover(dir, agent_state, handover).await
+    }
+
+    /// As [`test_supervisor`], sharing the handover with the caller — what
+    /// `serve` and the shutdown-signal handler both hold, and what a restart
+    /// is observed through.
+    async fn test_supervisor_with_handover(
+        dir: &std::path::Path,
+        agent_state: AgentState,
+        handover: Arc<Handover>,
+    ) -> Arc<AgentSupervisor> {
         Arc::new(
             AgentSupervisor::new(
                 test_config(dir.to_path_buf()),
                 Backends::new(false, None, None, None, agent_state.clone()),
-                CancellationToken::new(),
                 agent_state,
                 SettingsStore::new(dir.join("settings.json")),
+                handover,
             )
             .await
             .expect("no credential on disk, so no attach on startup"),
@@ -796,6 +953,101 @@ mod tests {
         (format!("http://{addr}"), task)
     }
 
+    /// A gateway that refuses every enrollment with `UpdateRequired`, the
+    /// way a real one meets an agent whose build is not the pinned one,
+    /// pushing `binary_url` as the download to converge on.
+    struct PinnedGateway {
+        binary_url: String,
+    }
+
+    #[tonic::async_trait]
+    impl arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayService for PinnedGateway {
+        async fn enroll(
+            &self,
+            _: tonic::Request<arcbox_fleet_proto::v1::EnrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::EnrollResponse>, Status> {
+            Ok(tonic::Response::new(
+                arcbox_fleet_proto::v1::EnrollResponse {
+                    result: Some(
+                        arcbox_fleet_proto::v1::enroll_response::Result::UpdateRequired(
+                            arcbox_fleet_proto::v1::AgentUpdate {
+                                expected_version: "9.9.9".to_owned(),
+                                binary_url: self.binary_url.clone(),
+                                binary_sha256: "0".repeat(64),
+                            },
+                        ),
+                    ),
+                },
+            ))
+        }
+
+        type AttachStream = tokio_stream::wrappers::ReceiverStream<
+            Result<arcbox_fleet_proto::v1::AttachResponse, Status>,
+        >;
+
+        async fn attach(
+            &self,
+            _: tonic::Request<tonic::Streaming<arcbox_fleet_proto::v1::AttachRequest>>,
+        ) -> Result<tonic::Response<Self::AttachStream>, Status> {
+            Err(Status::unimplemented("enrollment-only test gateway"))
+        }
+
+        async fn unenroll(
+            &self,
+            _: tonic::Request<arcbox_fleet_proto::v1::UnenrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::UnenrollResponse>, Status> {
+            Err(Status::unimplemented("enrollment-only test gateway"))
+        }
+    }
+
+    /// Serve [`PinnedGateway`] on a scratch port and return its URL.
+    async fn pinned_gateway(binary_url: &str) -> String {
+        use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind pinned gateway listener");
+        let addr = listener.local_addr().expect("pinned gateway addr");
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetGatewayServiceServer::new(PinnedGateway {
+                    binary_url: binary_url.to_owned(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        format!("http://{addr}")
+    }
+
+    /// A refusal that does carry a download enters the self-update path —
+    /// which stops at the managed-path check here, because the test binary is
+    /// not the binary the agent owns. Proves the enrollment path reaches the
+    /// updater (nothing is downloaded: `ensure_managed` runs first) and that
+    /// declining still rolls the enrollment back.
+    #[tokio::test]
+    async fn enroll_declines_to_self_update_an_unmanaged_binary() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-enroll-unmanaged-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let supervisor = test_supervisor(&dir, agent_state.clone()).await;
+        // Never fetched — the managed-path refusal precedes the download.
+        let gateway = pinned_gateway("http://127.0.0.1:1/arcbox-fleet-agent").await;
+
+        let err = supervisor
+            .enroll("flt_join_test".to_owned(), Some(&gateway))
+            .await
+            .expect_err("a version-refused enrollment cannot succeed");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("is not the managed"), "{err}");
+        assert!(matches!(*supervisor.state.lock().await, State::Unenrolled));
+        assert_eq!(
+            agent_state.current().enrollment,
+            Enrollment::Unenrolled as i32
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Poll until the observable enrollment reaches `Attaching`, bounded so a
     /// stuck transition fails the test instead of hanging it.
     async fn wait_for_attaching(agent_state: &AgentState) {
@@ -819,7 +1071,7 @@ mod tests {
         let supervisor = test_supervisor(&dir, agent_state.clone()).await;
 
         // Inject a live attachment whose task observes its cancel promptly.
-        let shutdown = supervisor.process_shutdown.child_token();
+        let shutdown = supervisor.handover.shutdown().child_token();
         let task_token = shutdown.clone();
         let task = tokio::spawn(async move {
             task_token.cancelled().await;
@@ -831,6 +1083,7 @@ mod tests {
             None,
             Backends::new(false, None, None, None, agent_state.clone()),
             agent_state.clone(),
+            Handover::new(agent_state.clone()),
         );
         *supervisor.state.lock().await = State::Attached(Attachment {
             supervisor: runner,
@@ -922,9 +1175,9 @@ mod tests {
         let supervisor = AgentSupervisor::new(
             config,
             Backends::new(false, None, None, None, agent_state.clone()),
-            CancellationToken::new(),
             agent_state.clone(),
             SettingsStore::new(dir.join("settings.json")),
+            Handover::new(agent_state.clone()),
         )
         .await
         .expect("startup with credential");
@@ -954,9 +1207,9 @@ mod tests {
             AgentSupervisor::new(
                 test_config(dir.clone()),
                 Backends::new(false, None, None, None, agent_state.clone()),
-                CancellationToken::new(),
                 agent_state.clone(),
                 SettingsStore::new(dir.join("settings.json")),
+                Handover::new(agent_state.clone()),
             )
             .await
             .expect("no credential on disk, so no attach on startup"),
@@ -964,7 +1217,7 @@ mod tests {
 
         // Inject a live attachment whose task takes a while to observe its
         // cancel — the teardown grace window the race lives in.
-        let shutdown = supervisor.process_shutdown.child_token();
+        let shutdown = supervisor.handover.shutdown().child_token();
         let task_token = shutdown.clone();
         let task = tokio::spawn(async move {
             task_token.cancelled().await;
@@ -976,7 +1229,8 @@ mod tests {
             events,
             None,
             Backends::new(false, None, None, None, agent_state.clone()),
-            agent_state,
+            agent_state.clone(),
+            Handover::new(agent_state),
         );
         // A persisted credential, so the completed unenroll can prove the
         // local clear happens even though this gateway is unreachable (the
@@ -1160,5 +1414,86 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "must return once the task joins, not wait out the full grace"
         );
+    }
+
+    /// With no attachment there is no work to protect, so both modes cancel
+    /// the process shutdown immediately and record the reason `serve` reads.
+    #[tokio::test]
+    async fn restart_without_an_attachment_shuts_the_process_down_at_once() {
+        for (force, expected) in [(false, Reason::Restart), (true, Reason::ForcedRestart)] {
+            let dir = std::env::temp_dir().join(format!(
+                "fleet-restart-{:?}-{}",
+                expected,
+                std::process::id()
+            ));
+            let agent_state = AgentState::new(&seed());
+            let handover = Handover::new(agent_state.clone());
+            let supervisor =
+                test_supervisor_with_handover(&dir, agent_state, Arc::clone(&handover)).await;
+
+            assert_eq!(handover.reason(), Reason::None);
+            supervisor
+                .restart(force)
+                .await
+                .expect("restart is accepted");
+
+            assert!(handover.shutdown().is_cancelled());
+            assert_eq!(handover.reason(), expected);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A repeat is a no-op rather than an error, so an operator running the
+    /// command twice — or a client retrying a response lost to the re-exec —
+    /// does not see a failure for a restart that is already under way. The
+    /// escalation ordering itself belongs to [`Handover`] and is tested there.
+    #[tokio::test]
+    async fn a_repeated_restart_request_is_accepted_not_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-restart-escalate-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let handover = Handover::new(agent_state.clone());
+        let supervisor =
+            test_supervisor_with_handover(&dir, agent_state, Arc::clone(&handover)).await;
+
+        supervisor
+            .restart(false)
+            .await
+            .expect("restart is accepted");
+        supervisor
+            .restart(true)
+            .await
+            .expect("an escalation is accepted");
+        supervisor
+            .restart(false)
+            .await
+            .expect("a late graceful request is a no-op, not an error");
+
+        assert_eq!(handover.reason(), Reason::ForcedRestart);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Once a termination signal has claimed the shutdown there is nothing to
+    /// come back from, so a restart is refused rather than quietly leaving the
+    /// operator waiting on a process that is going away.
+    #[tokio::test]
+    async fn restart_is_refused_once_the_process_is_terminating() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-restart-terminating-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let handover = Handover::new(agent_state.clone());
+        let supervisor =
+            test_supervisor_with_handover(&dir, agent_state, Arc::clone(&handover)).await;
+
+        // What the shutdown-signal handler does.
+        handover.terminate();
+
+        let err = supervisor
+            .restart(true)
+            .await
+            .expect_err("a terminating process cannot be restarted");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(handover.outcome(), crate::handover::Outcome::Exit);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

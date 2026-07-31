@@ -32,6 +32,7 @@ use tracing::{info, warn};
 
 use crate::backends::Backends;
 use crate::docker::RunSpec;
+use crate::handover::Handover;
 use crate::host;
 use crate::state::AgentState;
 
@@ -39,6 +40,22 @@ use crate::state::AgentState;
 /// session still open past that (plus slack) means the guest wedged — treat
 /// it as a cancellation and destroy the guest.
 const MAX_VM_JOB_RUNTIME: Duration = Duration::from_secs(6 * 3600 + 1800);
+
+/// Polling interval of [`RunnerSupervisor::quiesce`]. Both maps it watches
+/// are `DashMap`s with no completion signal, so the wait is polled rather
+/// than notified.
+const QUIESCE_POLL: Duration = Duration::from_millis(200);
+
+/// How long [`RunnerSupervisor::quiesce`] waits for the gateway to ack
+/// outstanding verdicts before handing over without them.
+///
+/// Sized to cover one verdict-resend interval (`attach`'s
+/// `VERDICT_RESEND_INTERVAL`, 10s) plus an ack round-trip, so a verdict whose
+/// first non-blocking send lost the race to a full egress queue still gets one
+/// resend before the process image is replaced. Only paid when something is
+/// actually outstanding — acks are sub-second, so in the steady state
+/// `quiesce` finds the map empty and returns at once.
+pub const VERDICT_ACK_GRACE: Duration = Duration::from_secs(12);
 
 /// Outcome of the admission decision for an incoming offer.
 #[derive(Debug, PartialEq, Eq)]
@@ -178,12 +195,14 @@ struct Inner {
     /// capability and the `(os, arch)` → backend routing, read per offer so
     /// routing always agrees with what is currently advertised.
     backends: Arc<Backends>,
-    /// Set once `Drain` is received; no new jobs are accepted.
+    /// Set by `Drain`, and by [`RunnerSupervisor::shutdown`]; no new jobs are
+    /// accepted. Attachment-scoped, unlike `handover` below.
     draining: std::sync::atomic::AtomicBool,
-    /// Set while a self-update is pending; no new jobs are accepted. Kept
-    /// separate from `draining` so a moot update (the pin moved back to this
-    /// build before the swap) can resume without clearing an operator drain.
-    draining_for_update: std::sync::atomic::AtomicBool,
+    /// Whether this process image is on its way out. Also closes admission,
+    /// but owned elsewhere and read-only here: it outlives this attachment,
+    /// and its revocation rules (a moot self-update reopens, a committed
+    /// restart never does) belong to the type that owns them.
+    handover: Arc<Handover>,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers.
     state: AgentState,
 }
@@ -220,6 +239,7 @@ impl RunnerSupervisor {
         runner_script: Option<PathBuf>,
         backends: Arc<Backends>,
         state: AgentState,
+        handover: Arc<Handover>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -229,7 +249,7 @@ impl RunnerSupervisor {
                 runner_script,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
-                draining_for_update: std::sync::atomic::AtomicBool::new(false),
+                handover,
                 state,
             }),
         }
@@ -335,10 +355,7 @@ impl RunnerSupervisor {
             .inner
             .draining
             .load(std::sync::atomic::Ordering::Relaxed)
-            || self
-                .inner
-                .draining_for_update
-                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.inner.handover.pending()
         {
             return Admission::Reject("host is draining".to_owned());
         }
@@ -402,78 +419,62 @@ impl RunnerSupervisor {
     /// Stop accepting new work; in-flight jobs run to completion.
     pub fn handle_drain(&self) {
         self.stop_accepting();
-        self.inner.state.set_draining(true);
+        self.inner.state.set_operator_draining(true);
         info!("draining: no new offers will be accepted");
     }
 
-    /// Resume accepting new work after a local [`Self::handle_drain`]. This
-    /// is the local control-plane's `Resume`, distinct from the gateway's
-    /// own `Drain` push (e.g. a machine being decommissioned), which this
-    /// agent has no way to countermand.
+    /// Resume accepting new work after a local [`Self::handle_drain`] — the
+    /// operator's own drain only. Distinct from the gateway's `Drain` push
+    /// (e.g. a machine being decommissioned), which this agent has no way to
+    /// countermand, and from a pending handover, which keeps admission closed
+    /// regardless: that is not this method's to clear, and a process committed
+    /// to re-exec must not start jobs its own teardown will kill.
     pub fn resume(&self) {
         self.inner
             .draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(self.draining_for_update());
+        self.inner.state.set_operator_draining(false);
         info!("resumed: accepting new offers");
     }
 
-    fn draining_for_update(&self) -> bool {
-        self.inner
-            .draining_for_update
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Stop accepting new offers because a self-update is pending. The
-    /// operator's own drain flag is untouched, so
-    /// [`Self::resume_after_moot_update`] can undo exactly this without
-    /// cancelling a deliberate local drain.
-    pub fn drain_for_update(&self) {
-        self.inner
-            .draining_for_update
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(true);
-        info!("draining for self-update: no new offers will be accepted");
-    }
-
-    /// Clear the update drain after the update became moot — the pin moved
-    /// back to this build before the swap happened (a rollback racing the
-    /// drain). An operator drain, if any, stays in force.
-    pub fn resume_after_moot_update(&self) {
-        self.inner
-            .draining_for_update
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        let operator_drain = self
-            .inner
-            .draining
-            .load(std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(operator_drain);
-        info!("self-update became moot; resuming");
-    }
-
-    /// True when nothing runs here and no verdict awaits its ack — the
-    /// point at which the process can be replaced without losing work.
-    pub fn is_settled(&self) -> bool {
-        self.inner.in_flight.is_empty() && self.inner.outstanding.is_empty()
-    }
-
-    /// Wait until every in-flight job releases its slot. Unbounded — a
-    /// self-update must never kill a customer's running job — and polled,
-    /// like [`Self::shutdown`]'s drain. Used off-stream, where `outstanding`
-    /// verdicts cannot drain (delivering them needs a live attach), so only
-    /// `in_flight` gates.
-    pub async fn drained_of_jobs(&self) {
+    /// Wait until this supervisor's work can be abandoned without losing any
+    /// of it: every job has released its slot, and every verdict has been
+    /// acked. The single wait before the process image is replaced — a
+    /// self-update swap or an operator restart.
+    ///
+    /// The job wait is unbounded: a handover must never kill a customer's
+    /// running job. The ack wait is not, because `outstanding` only drains
+    /// while an attach stream is live — off-stream, or against a gateway that
+    /// has gone away, it would never finish. `ack_grace` bounds it, and
+    /// callers that know nothing can ack (no live stream) pass
+    /// [`Duration::ZERO`].
+    ///
+    /// The ack clock starts only once the jobs are gone: a job's verdict is
+    /// queued when it finishes, so starting the clock earlier would let a
+    /// long-running job burn the whole grace before there was anything to
+    /// wait for.
+    pub async fn quiesce(&self, ack_grace: Duration) {
         while !self.inner.in_flight.is_empty() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(QUIESCE_POLL).await;
         }
-    }
-
-    /// Wait for [`Self::is_settled`]. Only meaningful while attached (acks
-    /// must be able to arrive); polled for the same reason as
-    /// [`Self::drained_of_jobs`].
-    pub async fn settled(&self) {
-        while !self.is_settled() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = tokio::time::Instant::now() + ack_grace;
+        while !self.inner.outstanding.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(QUIESCE_POLL).await;
+        }
+        // Whatever is left dies with the process image, so name it: these are
+        // job outcomes the gateway will never hear, and it has to fall back on
+        // the webhook (or its absence) to conclude them.
+        let stranded: Vec<String> = self
+            .inner
+            .outstanding
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        if !stranded.is_empty() {
+            warn!(
+                ?stranded,
+                "handing over with unacked verdicts; the gateway will not hear them"
+            );
         }
     }
 
@@ -1004,6 +1005,7 @@ mod tests {
     use arcbox_fleet_proto::v1::Capability;
 
     use super::*;
+    use crate::handover::Reason;
     use crate::interop::InteropRunner;
 
     fn capability(os: &str, arch: &str, backend: Backend) -> Capability {
@@ -1041,14 +1043,25 @@ mod tests {
     }
 
     fn supervisor(capabilities: Vec<Capability>) -> RunnerSupervisor {
+        supervisor_with_handover(capabilities).0
+    }
+
+    /// As [`supervisor`], with the handover in the caller's hands — what a
+    /// pending self-update or restart is driven through.
+    fn supervisor_with_handover(
+        capabilities: Vec<Capability>,
+    ) -> (RunnerSupervisor, Arc<Handover>) {
         let (events, _rx) = mpsc::channel(1);
         let state = AgentState::new(&seed());
-        RunnerSupervisor::new(
+        let handover = Handover::new(state.clone());
+        let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
             Backends::fixed(capabilities, state.clone()),
             state,
-        )
+            Arc::clone(&handover),
+        );
+        (sup, handover)
     }
 
     // Idle host: plenty of headroom.
@@ -1091,7 +1104,8 @@ mod tests {
             interop,
             state.clone(),
         );
-        let sup = RunnerSupervisor::new(events, None, backends, state);
+        let sup =
+            RunnerSupervisor::new(events, None, backends, state.clone(), Handover::new(state));
         (sup, rx)
     }
 
@@ -1292,6 +1306,60 @@ mod tests {
         );
     }
 
+    /// A pending handover closes admission on its own, and `Resume` — which
+    /// owns only the operator's drain — must not reopen it. The jobs admitted
+    /// in that window would be killed by the teardown the handover is waiting
+    /// to run. Which handovers are revocable is [`Handover`]'s to decide, and
+    /// tested there.
+    #[test]
+    fn resume_does_not_reopen_admission_under_a_pending_handover() {
+        let (sup, handover) =
+            supervisor_with_handover(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        handover.request(Reason::Restart);
+
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+
+        sup.resume();
+
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+    }
+
+    /// And the converse: an operator `Drain` outlives a handover that was
+    /// revoked, so a moot self-update cannot resume a host the operator took
+    /// out of rotation.
+    #[test]
+    fn a_revoked_handover_does_not_clear_an_operator_drain() {
+        let (sup, handover) =
+            supervisor_with_handover(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        sup.handle_drain();
+        handover.request(Reason::Update);
+
+        handover.update_became_moot();
+
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+
+        // ...and clearing the operator drain, with nothing else in force,
+        // does resume.
+        sup.resume();
+        assert!(!sup.inner.state.current().draining);
+        assert_eq!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Accept(Backend::HostRunner)
+        );
+    }
+
     #[test]
     fn rejects_when_load_or_memory_over_budget() {
         let sup = supervisor(vec![capability("linux", "amd64", Backend::Docker)]);
@@ -1322,7 +1390,8 @@ mod tests {
                 vec![capability("darwin", "arm64", Backend::HostRunner)],
                 state.clone(),
             ),
-            state,
+            state.clone(),
+            Handover::new(state),
         );
         (sup, rx)
     }
@@ -1347,7 +1416,8 @@ mod tests {
                 vec![capability("darwin", "arm64", Backend::HostRunner)],
                 state.clone(),
             ),
-            state,
+            state.clone(),
+            Handover::new(state),
         );
         (sup, rx)
     }
@@ -1683,6 +1753,62 @@ mod tests {
         assert!(!sup.inner.in_flight.is_empty());
     }
 
+    /// A job that has just exited queued its verdict on the way out, so the
+    /// map being empty of jobs is not the same as its work being safe to
+    /// abandon. Quiescing must hold the process image until the gateway
+    /// settles that verdict — the exec that follows discards `outstanding`,
+    /// and the gateway is then left waiting on a webhook that may never come.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_waits_out_the_ack_grace_for_an_unacked_verdict() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+        assert!(sup.inner.in_flight.is_empty(), "no job is running");
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(VERDICT_ACK_GRACE).await;
+
+        assert!(
+            started.elapsed() >= VERDICT_ACK_GRACE,
+            "must not hand over while a verdict is unacked"
+        );
+    }
+
+    /// ...but the grace is a ceiling, not a cost: the common case is an ack
+    /// within a round-trip, and a restart must not sit out the full wait for
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_returns_as_soon_as_the_last_verdict_is_acked() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+
+        let gateway = sup.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            gateway.handle_ack("exit:rjob_a");
+        });
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(VERDICT_ACK_GRACE).await;
+
+        assert!(
+            started.elapsed() < VERDICT_ACK_GRACE,
+            "an acked verdict releases the wait early"
+        );
+    }
+
+    /// Off-stream — a version-refused reconnect — nothing can deliver an ack,
+    /// so the caller passes no grace and the wait must not be paid at all.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_without_a_grace_does_not_wait_for_acks_that_cannot_arrive() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(Duration::ZERO).await;
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
     /// The user-facing `Drain` flips the observable `AgentState.draining`
     /// flag, but teardown (`shutdown`) must not: that flag is process-lifetime
     /// and shared across attachments, so an unenroll that faked a drain would
@@ -1698,6 +1824,7 @@ mod tests {
             None,
             Backends::fixed(Vec::new(), drained.clone()),
             drained.clone(),
+            Handover::new(drained.clone()),
         )
         .handle_drain();
         assert!(
@@ -1712,6 +1839,7 @@ mod tests {
             None,
             Backends::fixed(Vec::new(), torn_down.clone()),
             torn_down.clone(),
+            Handover::new(torn_down.clone()),
         )
         .shutdown(Duration::from_secs(1))
         .await;

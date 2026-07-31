@@ -11,13 +11,14 @@ use arcbox_constants::ports::AGENT_PORT;
 use arcbox_constants::wire::MessageType;
 use arcbox_protocol::agent::{
     ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
-    ImageFsPathsRequest, ImageFsPathsResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
-    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
-    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-    KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
-    MmapReadFileRequest, MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    SystemInfo, WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+    EnsureNfsExportRequest, EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse,
+    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+    KubernetesStopResponse, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
+    MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest,
+    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
+    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
@@ -938,6 +939,40 @@ impl AgentClient {
             MessageType::ImageFsPathsRequest,
             &payload,
             MessageType::ImageFsPathsResponse,
+        )
+    }
+
+    /// Asks the guest to bring up the read-only NFS export of the docker data
+    /// mount (browsable on the host at `~/ArcBox`). Idempotent: the agent
+    /// ensures the data mount exists and converges an existing export.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the guest could not establish
+    /// the export.
+    pub async fn ensure_nfs_export(&mut self) -> Result<EnsureNfsExportResponse> {
+        let payload = EnsureNfsExportRequest {}.encode_to_vec();
+        self.unary_rpc(
+            MessageType::EnsureNfsExportRequest,
+            &payload,
+            MessageType::EnsureNfsExportResponse,
+        )
+        .await
+    }
+
+    /// Blocking variant of [`Self::ensure_nfs_export`] for the HV socketpair
+    /// transport. Call from `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the guest could not establish
+    /// the export.
+    pub fn ensure_nfs_export_blocking(&mut self) -> Result<EnsureNfsExportResponse> {
+        let payload = EnsureNfsExportRequest {}.encode_to_vec();
+        self.unary_rpc_blocking(
+            MessageType::EnsureNfsExportRequest,
+            &payload,
+            MessageType::EnsureNfsExportResponse,
         )
     }
 

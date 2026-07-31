@@ -1,8 +1,8 @@
 # macOS Guest VMs
 
-> Status: implemented on branch `feat/macos-guest-vz` (PLAN.md slices 1–6). The macOS
-> VM stack (install → clone → boot) is verified on real Apple Silicon via the
-> `arcbox-vz` examples — see "Verification status" below.
+> Status: shipped on `master`. The macOS VM stack (install → clone → boot) is
+> verified on real Apple Silicon via the `arcbox-vz` examples — see
+> "Verification status" below.
 
 ArcBox can run **disposable macOS guests** on Apple Silicon: pull a pre-baked base
 image once from ArcBox's distribution bucket, then copy-on-write clone that image to

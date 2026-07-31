@@ -6,6 +6,10 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 `docs/daemon-lifecycle.md` (lock/handoff, residual-state tables) and
 `docs/data-directories.md` (filesystem paths) — point there, don't restate.
 
+`arcbox-cli` ships two binaries: `abctl` (the real CLI) and `arcbox` (a
+deprecated shim that `exec`s `abctl`, pending removal). User-facing strings
+must name `abctl`.
+
 ## Startup & readiness contract
 
 - Startup is a phased, typed pipeline and the order is load-bearing — see
@@ -118,6 +122,19 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   + large `docker.img` mount under CPU/I/O pressure). A tight 30s budget
   raced the cold-boot path into "timeout waiting for agent" loops — do not
   tighten it toward the <1.5s cold-boot target.
+- **The idle balloon never shrinks today: no macOS backend reclaims** —
+  the gate is `BalloonDeps::reclaim_capable` (`balloon/controller.rs`),
+  false on both backends, and it is load-bearing (measured 2026-07-29,
+  macOS 26.4; full evidence in `balloon/mod.rs` docs). VZ inflation
+  releases NOTHING host-side (15.35 GB inflated, daemon `phys_footprint`
+  byte-identical, pages *compressed as live data* under real host
+  pressure). HV inflates via `MADV_DONTNEED`, which Darwin treats as a
+  deactivation hint (calibrated footprint-inert; contents preserved).
+  Host footprint ≈ configured `memory_mb` from boot; the only macOS
+  memory levers are `memory_mb` itself and the macOS compressor. Do not
+  flip a backend to reclaim-capable without a measured host
+  `phys_footprint` drop on inflate (HV path: switch the device to
+  `MADV_FREE_REUSABLE` first).
 - `set_backend` only changes the backend used on the next (re)boot; it does
   NOT stop or restart a running VM. To apply immediately the caller forces a
   recreate via `Runtime::switch_system_vm_backend`. The backend is seeded
@@ -140,6 +157,21 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   RPCs into a VM whose agent/dockerd is not up. The `MachineManager`
   `MachineState` lives outside the lifecycle actor on purpose (physical vs
   logical layering) — do not unify them.
+- **`restart_generation` reports departures, not arrivals.** It is bumped on
+  VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
+  `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
+  START of the gap where no guest exists. Under
+  `switch_system_vm_backend` it then races the reboot with the same
+  `DEFAULT_STARTUP_TIMEOUT_SECS` budget the boot itself gets; after a plain
+  stop with the daemon still alive, no guest is coming at all. Anything that
+  must act when the VM comes *up* watches
+  `VmLifecycleManager::subscribe_state` (`Runtime::subscribe_system_vm_state`)
+  instead: wait for `VmLifecycleState::is_ready`, do the work, then wait for
+  it to clear. Reference consumer: the `~/ArcBox` export reconcile
+  (`arcbox-daemon/src/nfs_mount.rs`), whose per-incarnation supervisor loop
+  also carries the companion rule — one pass's failure must be retried, not
+  propagated out of the loop, or every later incarnation inherits the broken
+  state (ABX-426).
 - Two startup timeouts cover SEQUENTIAL phases; don't conflate them.
   `DEFAULT_STARTUP_TIMEOUT_SECS = 90` (`mod.rs`) budgets VM boot → agent
   ready; `ContainerRuntimeConfig::startup_timeout_ms = 150_000`
@@ -156,8 +188,11 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 `mod.rs` holds only the read accessor). The Docker proxy compares it via
 the request path to detect a
 System VM restart (backend switch / recovery) and reset stale state
-(`arcbox-docker/src/proxy/state.rs`). When editing either side, keep in
-lockstep:
+(`arcbox-docker/src/proxy/state.rs`). Reading a stop-edge counter is correct
+*here* precisely because the proxy acts on its next request, which by
+definition arrives once the VM is back — do not copy the pattern into a task
+that must act at the restart itself (see "reports departures, not arrivals"
+above). When editing either side, keep in lockstep:
 
 - `reset_if_restarted` must drop the pooled connections BEFORE flipping
   cached readiness to `Unverified`. WHY: a concurrent verifier that sees

@@ -34,7 +34,7 @@ pub(super) fn check_executable(path: &Path, context: &str) -> Result<()> {
 /// directories. Called before VM start. Fails fast if any binary is missing or
 /// not executable.
 ///
-/// These binaries are provisioned by `arcbox boot prefetch` (release builds) or
+/// These binaries are provisioned by `abctl boot prefetch` (release builds) or
 /// manually by developers (see `cargo xtask dev boot-assets`). This function
 /// only validates — it does not download or install anything.
 pub(super) fn ensure_guest_binaries(data_dir: &Path) -> Result<()> {

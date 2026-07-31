@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5](https://github.com/arcboxlabs/arcbox/compare/v0.5.4...v0.5.5) (2026-07-31)
+
+
+### Features
+
+* **cli:** abctl claude — coding-agent TUI in a sandbox ([bd558cd](https://github.com/arcboxlabs/arcbox/commit/bd558cdf7bbf9d6a5771d058d3203cb1c90bb616))
+* **cli:** embedded sandbox image templates ([aa00154](https://github.com/arcboxlabs/arcbox/commit/aa001540284855e106c70ce4fb6bd08515fa4c36))
+
+
+### Bug Fixes
+
+* **cli:** do not wait for the parked stdin read when the runtime shuts down ([94c1ad5](https://github.com/arcboxlabs/arcbox/commit/94c1ad522ae983837c0bc8f6c01003b77ac35819))
+* **cli:** end an exec session when the workload exits ([050ff66](https://github.com/arcboxlabs/arcbox/commit/050ff66f996734646f9bef2f454196e31c6804cb))
+* **cli:** key the image layout cache on filesystem content, not image id ([75aaa6f](https://github.com/arcboxlabs/arcbox/commit/75aaa6f417e09ebea578e4d68ad4b17a6b7dcb86))
+* **sandbox:** invalidate converted rootfs images when vm-agent changes ([df66e8c](https://github.com/arcboxlabs/arcbox/commit/df66e8c92a6ddad686f69cc5371b53be05d03ccc))
+* **sandbox:** keep converted rootfs images that snapshots restore from ([3837c08](https://github.com/arcboxlabs/arcbox/commit/3837c08c6e96671b2b82a1eea2cc03162889b91b))
+* **sandbox:** report an interactive workload's exit status when it exits ([9bcf94c](https://github.com/arcboxlabs/arcbox/commit/9bcf94c7907dc1a44022e0d0a7fc78def9e04358))
+* **sandbox:** resolve docker images through an OCI layout export ([96740ca](https://github.com/arcboxlabs/arcbox/commit/96740ca3497c7516170ffb57ba6210b7ca86c55f))
+* **vz:** build the Swift shim with SwiftPM's native build system ([19e46b7](https://github.com/arcboxlabs/arcbox/commit/19e46b748626cdc8432db3ec530c9df204013812))
+
+
+### Code Refactoring
+
+* **vm:** publish snapshots atomically instead of piecewise ([419b270](https://github.com/arcboxlabs/arcbox/commit/419b2705450fd0617ba0a5ab5d95bdf0dd776607))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.6.13 (fuse spin-wait, CORE-48) ([#513](https://github.com/arcboxlabs/arcbox/issues/513)) ([098771c](https://github.com/arcboxlabs/arcbox/commit/098771c0bb65fea9ce6f59aa679187770ec65e2f))
+* **tools:** bump Docker toolchain to latest stable versions ([#502](https://github.com/arcboxlabs/arcbox/issues/502)) ([a44178b](https://github.com/arcboxlabs/arcbox/commit/a44178b0729ec61a7100c4546144a8dbd73d72e9))
+
+## [0.5.4](https://github.com/arcboxlabs/arcbox/compare/v0.5.3...v0.5.4) (2026-07-30)
+
+
+### Bug Fixes
+
+* **core:** disable the idle balloon — no macOS backend reclaims ballooned memory ([#504](https://github.com/arcboxlabs/arcbox/issues/504)) ([6cb174a](https://github.com/arcboxlabs/arcbox/commit/6cb174a005d1a5a9ba5a018c21e4d1dded6db060))
+
+
+### Tests
+
+* **e2e:** VirtioFS guest-vs-native benchmark driver ([#507](https://github.com/arcboxlabs/arcbox/issues/507)) ([4e5f676](https://github.com/arcboxlabs/arcbox/commit/4e5f676525f3d2f0426bc6f09eb1b63d73ff4ff4))
+
+## [0.5.3](https://github.com/arcboxlabs/arcbox/compare/v0.5.2...v0.5.3) (2026-07-24)
+
+
+### Bug Fixes
+
+* **net:** detect and reap zombie fast-path flows on both legs ([dc0295e](https://github.com/arcboxlabs/arcbox/commit/dc0295e358fb00b1c70af7cae59e503d18d767bc))
+* **net:** start the dead-flow deadline at solicitation, not the last guest frame ([bafee56](https://github.com/arcboxlabs/arcbox/commit/bafee564189f6e06da7e63dc40d7909c7f9e46bd))
+* **virtio:** drop RX frames that don't fit the chain instead of truncating ([b341beb](https://github.com/arcboxlabs/arcbox/commit/b341bebe4ac7820fae4cc8212c08a5582bda4136))
+* **virtio:** poison a chain on an out-of-RAM descriptor; update poll_rx docs ([f33337c](https://github.com/arcboxlabs/arcbox/commit/f33337c80efe707552326cb106cb69cd5339a986))
+
+
+### Performance Improvements
+
+* **agent:** expedite RCU grace periods to cut runc create ~8x (ABX-496) ([6e67d6f](https://github.com/arcboxlabs/arcbox/commit/6e67d6f2d432724d7b04a1569c75c2634e5c8ddd))
+* **runtime:** exec the container runtime from a read-only block image (ABX-498) ([#499](https://github.com/arcboxlabs/arcbox/issues/499)) ([bde8fb0](https://github.com/arcboxlabs/arcbox/commit/bde8fb01a3f01503be1bec8457423a52c3b67018))
+* **storage:** ext4 metadata volume for fsync-hot boltdb state (ABX-496) ([#497](https://github.com/arcboxlabs/arcbox/issues/497)) ([e4aca03](https://github.com/arcboxlabs/arcbox/commit/e4aca033b1eb7818601b48c71137711a24e1a6b5))
+
+
+### Tests
+
+* **e2e:** live validation of the host-networking reconciler ([#352](https://github.com/arcboxlabs/arcbox/issues/352)) ([696ea7f](https://github.com/arcboxlabs/arcbox/commit/696ea7f8a41dbae6f010386b9dcff9ffb864bd95))
+* **e2e:** observe the removal before timing the sweep; pin the fail-safe ([d46dbcd](https://github.com/arcboxlabs/arcbox/commit/d46dbcd5be270feffd1b0a7e43d67a12ebac4570))
+
+
+### Styles
+
+* **e2e:** apply rustfmt to reconciler_teardown test ([f2a1050](https://github.com/arcboxlabs/arcbox/commit/f2a1050d4ba87421fe964891cbf4d1276276b784))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.6.10 (FEX procfs fix, ABX-494) ([4b52760](https://github.com/arcboxlabs/arcbox/commit/4b52760046499b74dc7fd057a2d842f9462a3aca))
+
 ## [0.5.2](https://github.com/arcboxlabs/arcbox/compare/v0.5.1...v0.5.2) (2026-07-21)
 
 

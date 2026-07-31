@@ -47,6 +47,7 @@ plist = "1.10.0"
 libc.workspace = true
 sha2.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true
@@ -56,3 +57,4 @@ keyring = "4"
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

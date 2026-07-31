@@ -79,6 +79,15 @@ pub(in crate::vm_lifecycle) trait BalloonDeps:
     /// The watch type produced by [`Self::open_pressure_watch`].
     type Watch: PressureWatch;
 
+    /// Whether inflating the balloon actually releases host memory on the
+    /// current backend. When `false`, idle shrinking is pure cost (guest
+    /// scarcity + reclaim CPU) with zero host-side benefit, and the
+    /// controller must not shrink at all. No macOS backend qualifies
+    /// today — see the module docs for the per-backend measurements (VZ:
+    /// Apple no-op; HV: Darwin-inert `MADV_DONTNEED`) and what flipping a
+    /// backend requires.
+    fn reclaim_capable(&self) -> bool;
+
     /// Configured full memory of the machine, if the machine record exists.
     fn full_memory_bytes(&self) -> Option<u64>;
 
@@ -318,6 +327,15 @@ impl<D: BalloonDeps> BalloonController<D> {
 
     /// Entry probe: size the balloon from clean (balloon-empty) stats.
     async fn enter_idle(&mut self) -> Mode<D::Watch> {
+        if !self.deps.reclaim_capable() {
+            // No retry timer: the answer is a property of the backend, not
+            // a transient. The next real idle entry re-asks (the backend
+            // can change across a VM recreate).
+            tracing::info!(
+                "idle balloon disabled: backend does not release ballooned memory to the host"
+            );
+            return Mode::Active;
+        }
         let Some(full) = self.deps.full_memory_bytes() else {
             return Mode::IdleUnshrunk;
         };
@@ -473,6 +491,9 @@ mod tests {
 
     /// Test double with scripted stats/watch behavior and recorded targets.
     struct FakeDeps {
+        /// Backend reclaim capability (default `true`: the shrink paths
+        /// under test assume an HV-class backend).
+        reclaim_capable: bool,
         full: Option<u64>,
         stats: Mutex<Vec<Option<GuestStats>>>,
         /// Injected latency for `guest_stats` (probe-race tests).
@@ -490,6 +511,7 @@ mod tests {
     impl FakeDeps {
         fn new(full: Option<u64>) -> Self {
             Self {
+                reclaim_capable: true,
                 full,
                 stats: Mutex::new(Vec::new()),
                 stats_delay: Duration::ZERO,
@@ -520,6 +542,10 @@ mod tests {
 
     impl BalloonDeps for Arc<FakeDeps> {
         type Watch = FakeWatch;
+
+        fn reclaim_capable(&self) -> bool {
+            self.reclaim_capable
+        }
 
         fn full_memory_bytes(&self) -> Option<u64> {
             self.full
@@ -639,6 +665,37 @@ mod tests {
     const FINAL_TARGET: u64 = 4 * GIB + super::super::IDLE_BALLOON_HEADROOM;
     /// First staged step from 16 GiB full memory.
     const FIRST_STEP: u64 = FULL - super::super::SHRINK_STEP;
+
+    /// A reclaim-incapable backend (today: every macOS backend) must make
+    /// idle entry fully inert: no stats probe, no shrink, no retry timer —
+    /// and the controller stays responsive to later cycles.
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_incapable_backend_never_shrinks() {
+        let mut deps = FakeDeps::new(Some(FULL));
+        deps.reclaim_capable = false;
+        deps.push_stats(Some(idle_stats()));
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        // Well past IDLE_ENTRY_RETRY: no timer may have re-entered.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        h.settle().await;
+
+        assert_eq!(h.targets(), Vec::<u64>::new());
+        assert_eq!(h.deps.set_attempts.load(Ordering::SeqCst), 0);
+        // The gate fires before the stats probe: the scripted reply is
+        // still queued.
+        assert_eq!(h.deps.stats.lock().unwrap().len(), 1);
+        assert_eq!(h.deps.watches_opened.load(Ordering::SeqCst), 0);
+
+        // Still alive for the next cycle.
+        h.commands.send(BalloonCommand::ExitIdle).unwrap();
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(h.deps.set_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.activity_count(), 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn enter_idle_takes_first_staged_step_and_watches() {

@@ -16,8 +16,8 @@ use crate::host;
 use crate::update::UpdatePayload;
 
 /// Enrollment refused because the gateway pins a different build. Carries
-/// the pushed download (when the gateway had one for this platform) so the
-/// CLI enroll path can self-update and re-exec into a retry.
+/// the pushed download (when the gateway had one for this platform) so both
+/// enroll paths can self-update and re-exec into a retry.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "enrollment refused: gateway expects agent version {expected_version}, \
@@ -54,8 +54,10 @@ const GATEWAY_UNENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// A gateway that expects a different agent build refuses enrollment with
 /// `EnrollResponse::update_required`, surfaced as [`EnrollUpdateRequired`]:
-/// the CLI enroll path self-updates and retries when the refusal carries a
-/// download, and otherwise shows the operator the expected version.
+/// both enroll paths self-update and re-exec when the refusal carries a
+/// download, and otherwise show the operator the expected version. `quick
+/// enroll` re-execs into a retry of itself; the control-plane RPC re-execs
+/// `serve`, and its caller re-issues `Enroll` against the new build.
 pub async fn enroll(
     config: &AgentConfig,
     token: String,
