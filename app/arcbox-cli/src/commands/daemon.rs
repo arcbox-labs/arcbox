@@ -381,7 +381,7 @@ fn resolve_daemon_binary() -> Result<PathBuf> {
         return Ok(path);
     }
 
-    bail!("Failed to locate `arcbox-daemon` next to `arcbox` or in PATH");
+    bail!("Failed to locate `arcbox-daemon` next to `abctl` or in PATH");
 }
 
 fn find_in_path(binary: &str) -> Option<PathBuf> {
