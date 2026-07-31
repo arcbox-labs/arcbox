@@ -16,19 +16,25 @@ use xtask_kit::repo;
 
 use crate::{E2eArgs, E2eBackend};
 
-/// Targets that drive their daemon through `scenario::run_vz_scenario*`,
+/// Whether `test` drives its daemon through `scenario::run_vz_scenario*`,
 /// which hardcodes `ARCBOX_VM_BACKEND=vz` (`tests/e2e/src/scenario.rs`) and
-/// stamps `"vz"` into their metrics. The runner's `--backend` cannot move
-/// them, so honoring an HV request would archive a VZ run under an HV label
-/// and corrupt any backend comparison read from it.
-const VZ_PINNED_TESTS: &[&str] = &[
-    "docker_build",
-    "docker_build_external",
-    "egress_throughput",
-    "network_fault",
-    "network_workload",
-    "reconciler_teardown",
-];
+/// stamps `"vz"` into the metrics. The runner's `--backend` cannot move such
+/// a target, so honoring an HV request would archive a VZ run under an HV
+/// label and corrupt any backend comparison read from it.
+///
+/// Read from the target's source rather than kept as a list here: the set
+/// grows whenever someone writes a scenario-based test, and a list would
+/// silently go stale exactly when a new target needs the guard most. A
+/// target with no source file (an unknown name) is not pinned — cargo
+/// reports that better than we can.
+fn is_vz_pinned(root: &std::path::Path, test: &str) -> Result<bool> {
+    let path = root.join("tests/e2e/tests").join(format!("{test}.rs"));
+    match fs::read_to_string(&path) {
+        Ok(source) => Ok(source.contains("run_vz_scenario")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
 
 /// One test-run outcome for the final summary.
 struct RunOutcome {
@@ -56,7 +62,7 @@ pub fn run(args: E2eArgs) -> Result<()> {
         E2eBackend::Hv => &[Some("hv")],
         E2eBackend::Both => &[Some("vz"), Some("hv")],
     };
-    if !matches!(args.backend, E2eBackend::Vz) && VZ_PINNED_TESTS.contains(&args.test.as_str()) {
+    if !matches!(args.backend, E2eBackend::Vz) && is_vz_pinned(&root, &args.test)? {
         bail!(
             "test `{}` pins ARCBOX_VM_BACKEND=vz in its scenario harness, so the \
              requested backend cannot take effect — the run would be VZ while the \

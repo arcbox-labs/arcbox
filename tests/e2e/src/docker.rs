@@ -142,17 +142,15 @@ pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
     Err(last_err.expect("loop ran at least once")).context("docker pull (3 attempts)")
 }
 
-/// SIGKILLs the child's whole process group, falling back to the direct
-/// child if the group is already gone.
-fn kill_process_group(child: &mut std::process::Child) {
-    let pgid = i32::try_from(child.id()).expect("pid fits in i32");
-    // SAFETY: `killpg` is async-signal-safe and takes no pointers. `pgid` is
-    // this child's pid, which is also its group id (`process_group(0)`), and
-    // the child has not been reaped yet, so the id cannot have been recycled.
-    let killed = unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0;
-    if !killed {
-        let _ = child.kill();
-    }
+/// SIGKILLs the process group led by `pgid`, which `process_group(0)` made
+/// equal to the spawned child's pid. Safe to call after the leader has been
+/// reaped: POSIX forbids reusing a pid while it is still the group id of an
+/// existing group, so this either reaches that group or nothing at all
+/// (`ESRCH`), never an unrelated one.
+fn kill_process_group(pgid: i32) {
+    // SAFETY: `killpg` takes no pointers and cannot fail unsoundly; a stale
+    // or empty group yields ESRCH, which we ignore.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
 }
 
 /// Runs a command, killing it once `timeout` passes.
@@ -163,18 +161,23 @@ fn kill_process_group(child: &mut std::process::Child) {
 /// timeout. On a real timeout the error carries the output tail, so a
 /// killed command still leaves forensics.
 ///
-/// The child leads its own process group and the timeout path signals the
-/// whole group. Killing just the direct child is not enough: `docker build`
-/// runs the build in a `docker-buildx` grandchild that inherits these pipes,
-/// so the write end stays open and the drain-thread joins below block past
-/// the deadline — indefinitely if that descendant is itself wedged, which is
-/// exactly what this suite exists to catch.
+/// The child leads its own process group and **both** exit paths signal the
+/// whole group before joining. Killing just the direct child is not enough:
+/// `docker build` runs the build in a `docker-buildx` grandchild that
+/// inherits these pipes, so the write end stays open and the drain-thread
+/// joins block past the deadline — indefinitely if that descendant is itself
+/// wedged, which is exactly what this suite exists to catch. The same holds
+/// when the command *succeeds* while leaving a descendant behind, so the
+/// group kill is not conditional on timing out: once the direct child is
+/// gone, nothing else may hold pipes this function is about to join on.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()?;
+    // Captured before any reap: `Child::id` is not meaningful afterwards.
+    let pgid = i32::try_from(child.id()).expect("pid fits in i32");
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         thread::spawn(move || {
             let mut buf = Vec::new();
@@ -200,6 +203,7 @@ pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std:
     let start = Instant::now();
     while start.elapsed() < timeout {
         if let Some(status) = child.try_wait()? {
+            kill_process_group(pgid);
             let stdout = stdout_thread.join().unwrap_or_default();
             let stderr = stderr_thread.join().unwrap_or_default();
             return Ok(std::process::Output {
@@ -211,7 +215,7 @@ pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std:
         thread::sleep(Duration::from_millis(100));
     }
 
-    kill_process_group(&mut child);
+    kill_process_group(pgid);
     let _ = child.wait();
     // The whole group is gone, so every inherited write end is closed and the
     // drain threads see EOF.
@@ -253,6 +257,28 @@ mod tests {
         .expect("chatty command must not time out");
         assert!(output.status.success());
         assert!(output.stdout.len() > 64 * 1024);
+    }
+
+    /// The success path has the same hazard as the timeout path: a command
+    /// can exit promptly while leaving a descendant holding the inherited
+    /// pipes, and the drain-thread joins would then block on that descendant
+    /// with no deadline left to enforce. Returns in ~0s once the group is
+    /// killed, ~30s if the success branch stops doing so.
+    #[test]
+    fn success_returns_promptly_despite_surviving_descendant() {
+        let start = Instant::now();
+        let output = run_with_timeout(
+            Command::new("sh").args(["-c", "echo done; sleep 30 & exit 0"]),
+            Duration::from_secs(60),
+        )
+        .expect("command must succeed");
+        let elapsed = start.elapsed();
+        assert!(output.status.success());
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "success took {elapsed:?}; a descendant outlived the command and \
+             held the pipes open"
+        );
     }
 
     /// A genuine timeout must surface the output tail for forensics, and

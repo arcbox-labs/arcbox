@@ -49,13 +49,18 @@ for either, it must reproduce that exact profile.
 
 `scenario::run_vz_scenario*` hardcodes `ARCBOX_VM_BACKEND=vz` and stamps
 `"vz"` into the run's metrics, so the runner's `--backend` env is ignored by
-every target built on it. `VZ_PINNED_TESTS` (`commands/e2e.rs`) lists them
-and the runner **errors** on `--backend hv`/`both` for those targets. WHY:
-the alternative is a VZ run archived under an HV label — the same
-ghost-debugging class as a mismatched `SKIP_BUILD` recipe, and it silently
-corrupts any HV↔VZ oracle comparison read from the artifacts. Moving a
-target off `run_vz_scenario` means removing it from that list in the same
-change.
+every target built on it. The runner **errors** on `--backend hv`/`both` for
+those targets. WHY: the alternative is a VZ run archived under an HV label —
+the same ghost-debugging class as a mismatched `SKIP_BUILD` recipe, and it
+silently corrupts any HV↔VZ oracle comparison read from the artifacts.
+
+`is_vz_pinned` (`commands/e2e.rs`) decides this by reading
+`tests/e2e/tests/<target>.rs` for `run_vz_scenario`, deliberately NOT from a
+list here or in the code: the set grows whenever someone writes a
+scenario-based test, and a hardcoded list goes stale exactly when a new
+target needs the guard most. Nothing to keep in lockstep — but if you move a
+target off `run_vz_scenario`, the guard stops applying on its own, so make
+sure the target really honors `ARCBOX_VM_BACKEND` before relying on that.
 
 ### Extending — adding a new e2e target (lockstep set)
 1. The test must gate its build on `arcbox_e2e::env_flag("SKIP_BUILD")`,
@@ -64,8 +69,8 @@ change.
    or accept the self-build fallback — never a half-match.
 3. If you add a recipe, verify the packages AND profile match the test's
    own `cargo build` line character-for-character.
-4. If the target runs through `scenario::run_vz_scenario*`, add it to
-   `VZ_PINNED_TESTS` so `--backend hv` fails loudly instead of mislabeling.
+4. Nothing to do for the VZ pin — `is_vz_pinned` reads it off the target's
+   source, so a scenario-based target gets the `--backend hv` guard for free.
 
 ## `xtask e2e` — forensics linkage (fragile string/env coupling)
 
