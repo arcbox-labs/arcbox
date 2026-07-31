@@ -36,7 +36,9 @@ the FUSE wait point. Double-gated: only virtio-class transports
 behavior) and only non-blocking opcodes (READ/WRITE/FLUSH/FSYNC/FSYNCDIR/
 COPY_FILE_RANGE/SETLKW excluded — an ungated spin cost **−54%** sequential
 read). Reference ceiling: `taskset` + IRQ-affinity pinning reaches 54.6k
-stat ops/s; the patch reaches ~97% of it with zero affinity management.
+stat ops/s (+82% over that run's same-boot 29.9k stock baseline); the
+headline patched cell reaches 92% of that ceiling — 50.3k, with zero
+affinity management.
 
 ## Competitor context (Colima, Apple virtio-fs, Ubuntu 6.8 guest)
 
@@ -79,7 +81,8 @@ OrbStack, Docker Desktop, and our own HV backend.
   (2.4× worse); the 6.18 bump was a large improvement.
 - **Wake latency / placement knobs**: `idle=poll` ±0; `__wake_up_sync` +11%;
   best sched-feature toggle (`NO_TTWU_QUEUE`) +12%; 2-vCPU boot ±0. None
-  approach the pinning ceiling (+82%) — hence the spin-wait design.
+  approach the pinning ceiling (+82% in its same-boot pair, 29.9k → 54.6k)
+  — hence the spin-wait design.
 - **`PARAVIRT_TIME_ACCOUNTING`**: inert — VZ offers no ARM PV_TIME, the
   static key never enables.
 
@@ -111,3 +114,8 @@ OrbStack, Docker Desktop, and our own HV backend.
 - Extend the bench driver to `ARCBOX_VM_BACKEND=hv` to get the first
   numbers for the custom VirtioFS (feeds RES-17 / Paper B).
 - Fix the agent's misleading dax log (records intent, not outcome).
+- The bench binary's own `TARGETS` table (`tests/bench-virtiofs/src/main.rs`)
+  still gates `metadata_stat`/`negative_lookup` as percent-of-native, so its
+  "Target Compliance" block prints a permanent FAIL for rows this doc rules
+  out as native-ratio'able. Known-stale, non-gating; the code fix lands with
+  the perf-target policy revision.
