@@ -12,10 +12,18 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 |--------|--------|----------|
 | Cold boot | <1.5s | ~2s |
 | Warm boot | <500ms | <1s |
-| Idle memory | <150MB | ~200MB |
+| Idle memory | <150MB (HV backend)¹ | ~200MB |
 | Idle CPU | <0.05% | <0.1% |
-| File I/O (vs native) | >90% | 75-95% |
+| File I/O | ≥100% of the best competitor guest² | 75-95% (vs native, their claim) |
 | Network throughput | >50 Gbps | ~45 Gbps |
+
+¹ Physically unreachable on VZ: host footprint pins at the configured
+  `memory_mb` from boot and ballooning cannot return it (evidence in
+  `app/arcbox-core/src/vm_lifecycle/balloon/mod.rs`). The VZ memory story
+  is right-sizing `memory_mb`.
+² Same-context comparison (container vs container, same-day pairing).
+  Cache-hot native is not a valid denominator for FUSE metadata —
+  methodology and current numbers in `docs/fs-perf-limits.md`.
 
 ## Platform Priority
 
