@@ -423,14 +423,12 @@ impl RunnerSupervisor {
         info!("draining: no new offers will be accepted");
     }
 
-    /// Resume accepting new work after a local [`Self::handle_drain`]. This
-    /// is the local control-plane's `Resume`, distinct from the gateway's
-    /// own `Drain` push (e.g. a machine being decommissioned), which this
-    /// agent has no way to countermand.
-    /// Resume accepting new work — the operator's own drain only. A pending
-    /// handover keeps admission closed regardless: it is not this method's to
-    /// clear, and a process committed to re-exec must not start jobs its own
-    /// teardown will kill.
+    /// Resume accepting new work after a local [`Self::handle_drain`] — the
+    /// operator's own drain only. Distinct from the gateway's `Drain` push
+    /// (e.g. a machine being decommissioned), which this agent has no way to
+    /// countermand, and from a pending handover, which keeps admission closed
+    /// regardless: that is not this method's to clear, and a process committed
+    /// to re-exec must not start jobs its own teardown will kill.
     pub fn resume(&self) {
         self.inner
             .draining
