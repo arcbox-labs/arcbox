@@ -8,6 +8,7 @@
 pub mod client;
 mod image;
 mod lifecycle;
+mod restart;
 mod settings;
 mod watch;
 
@@ -39,6 +40,8 @@ use crate::state::AgentState;
 use crate::{attach, enroll, update};
 use image::ImageService;
 use lifecycle::LifecycleService;
+use restart::RestartIntent;
+pub use restart::RestartMode;
 use settings::SettingsService;
 use watch::WatchService;
 
@@ -243,6 +246,13 @@ pub struct AgentSupervisor {
     /// Persists an `Enroll`-provided gateway override the same way
     /// `FleetSettingsService.UpdateSettings` persists any other setting.
     settings_store: SettingsStore,
+    /// Set by `Restart`; read by [`crate::serve`] after shutdown completes,
+    /// to decide between exiting and re-execing.
+    restart: RestartIntent,
+    /// Identifies this process image (see `GetAgentInfoResponse.instance_id`):
+    /// a client watching a restart cannot use the PID, which `exec`
+    /// preserves, so it compares this instead.
+    instance_id: String,
 }
 
 impl AgentSupervisor {
@@ -262,6 +272,8 @@ impl AgentSupervisor {
             state: Mutex::new(State::Unenrolled),
             agent_state,
             settings_store,
+            restart: RestartIntent::default(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
         };
         let gateway = this.agent_state.gateway_target();
         let existing = this.config.credential_store_for(&gateway).load()?;
@@ -691,6 +703,64 @@ impl AgentSupervisor {
         }
     }
 
+    /// Restart this process: bring the agent down the same way a SIGTERM
+    /// does, so [`crate::serve`] can re-exec once the teardown finishes
+    /// (see [`restart`] for why the shutdown path is shared).
+    ///
+    /// Accepted from every state — it replaces the process, not the
+    /// enrollment — and idempotent: a repeated request rides the shutdown
+    /// already in progress, while a [`RestartMode::Force`] arriving after a
+    /// graceful one escalates it instead of waiting further.
+    ///
+    /// A [`RestartMode::Graceful`] restart with jobs in flight returns as
+    /// soon as the drain is armed; the re-exec then waits, unbounded, for
+    /// the last job to release its slot.
+    pub async fn restart(&self, mode: RestartMode) -> Result<(), Status> {
+        if !self.restart.request(mode) {
+            info!(?mode, "restart already in progress");
+            return Ok(());
+        }
+        // Nothing to protect: either no attachment exists, or the operator
+        // asked to take in-flight jobs down with the process.
+        let runners = match mode {
+            RestartMode::Force => None,
+            RestartMode::Graceful => match &*self.state.lock().await {
+                State::Attached(a) => Some(a.supervisor.clone()),
+                State::Unenrolled
+                | State::Enrolling
+                | State::Unenrolling
+                | State::Detaching
+                | State::Detached { .. } => None,
+            },
+        };
+        let Some(runners) = runners else {
+            info!(?mode, "restarting");
+            self.process_shutdown.cancel();
+            return Ok(());
+        };
+
+        info!("restarting once in-flight jobs finish");
+        runners.drain_for_replacement();
+        let shutdown = self.process_shutdown.clone();
+        tokio::spawn(async move {
+            runners.drained_of_jobs().await;
+            info!("in-flight jobs finished; restarting");
+            shutdown.cancel();
+        });
+        Ok(())
+    }
+
+    /// The requested restart mode, or `None` when the shutdown came from a
+    /// termination signal. Read once, after shutdown, by [`crate::serve`].
+    pub fn restart_mode(&self) -> Option<RestartMode> {
+        self.restart.mode()
+    }
+
+    /// This process image's identity, reported by `GetAgentInfo`.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
     /// Current lifecycle state and machine id (empty when unenrolled),
     /// derived from [`AgentState`] rather than the resource-holding
     /// `Mutex<State>` above — the two must agree, and `AgentState` is the
@@ -792,11 +862,21 @@ mod tests {
         dir: &std::path::Path,
         agent_state: AgentState,
     ) -> Arc<AgentSupervisor> {
+        test_supervisor_with_shutdown(dir, agent_state, CancellationToken::new()).await
+    }
+
+    /// As [`test_supervisor`], with the process shutdown token in the
+    /// caller's hands — what a restart is observed through.
+    async fn test_supervisor_with_shutdown(
+        dir: &std::path::Path,
+        agent_state: AgentState,
+        shutdown: CancellationToken,
+    ) -> Arc<AgentSupervisor> {
         Arc::new(
             AgentSupervisor::new(
                 test_config(dir.to_path_buf()),
                 Backends::new(false, None, None, None, agent_state.clone()),
-                CancellationToken::new(),
+                shutdown,
                 agent_state,
                 SettingsStore::new(dir.join("settings.json")),
             )
@@ -1294,5 +1374,59 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "must return once the task joins, not wait out the full grace"
         );
+    }
+
+    /// With no attachment there is no work to protect, so both modes cancel
+    /// the process shutdown immediately and record the intent `serve` reads.
+    #[tokio::test]
+    async fn restart_without_an_attachment_shuts_the_process_down_at_once() {
+        for (mode, expected) in [
+            (RestartMode::Graceful, RestartMode::Graceful),
+            (RestartMode::Force, RestartMode::Force),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "fleet-restart-{:?}-{}",
+                expected,
+                std::process::id()
+            ));
+            let shutdown = CancellationToken::new();
+            let supervisor =
+                test_supervisor_with_shutdown(&dir, AgentState::new(&seed()), shutdown.clone())
+                    .await;
+
+            assert_eq!(supervisor.restart_mode(), None);
+            supervisor.restart(mode).await.expect("restart is accepted");
+
+            assert!(shutdown.is_cancelled());
+            assert_eq!(supervisor.restart_mode(), Some(expected));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The intent survives a repeated request and escalates on `force`, so a
+    /// second call can't undo a restart already under way.
+    #[tokio::test]
+    async fn a_force_restart_escalates_a_pending_graceful_one() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-restart-escalate-{}", std::process::id()));
+        let shutdown = CancellationToken::new();
+        let supervisor =
+            test_supervisor_with_shutdown(&dir, AgentState::new(&seed()), shutdown.clone()).await;
+
+        supervisor
+            .restart(RestartMode::Graceful)
+            .await
+            .expect("restart is accepted");
+        supervisor
+            .restart(RestartMode::Force)
+            .await
+            .expect("an escalation is accepted");
+        supervisor
+            .restart(RestartMode::Graceful)
+            .await
+            .expect("a late graceful request is a no-op, not an error");
+
+        assert_eq!(supervisor.restart_mode(), Some(RestartMode::Force));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -38,7 +38,9 @@ mod host;
 mod interop;
 #[cfg(test)]
 mod mock_daemon;
+mod reexec;
 mod runner;
+mod serve;
 #[cfg(target_os = "macos")]
 mod service;
 mod settings;
@@ -64,6 +66,7 @@ use crate::backends::Backends;
 use crate::config::{AgentConfig, DockerMode, VmMode};
 use crate::docker::DockerRunner;
 use crate::interop::InteropRunner;
+use crate::serve::Outcome;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
 use crate::vm::VmRunner;
@@ -221,7 +224,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = AgentConfig::from_env()?;
 
-    let _log_guard = arcbox_logging::init(LogConfig {
+    let log_guard = arcbox_logging::init(LogConfig {
         log_dir: config.data_dir.join("log"),
         file_name: "fleet-agent.log".to_string(),
         default_filter: "info".to_string(),
@@ -234,11 +237,34 @@ fn main() -> Result<()> {
         .build()
         .context("building tokio runtime")?;
 
-    runtime.block_on(run(cli.command, config))
+    let outcome = runtime.block_on(run(cli.command, config))?;
+    if outcome == Outcome::Exit {
+        return Ok(());
+    }
+    // `exec` runs no destructors, so everything that needs draining has to
+    // be dropped here: the runtime's worker threads first, then the logging
+    // guard that flushes the non-blocking writer.
+    drop(runtime);
+    drop(log_guard);
+    Err(reexec::exec(
+        &std::env::current_exe().context("resolving the current binary path")?,
+    ))
 }
 
-async fn run(command: Command, config: AgentConfig) -> Result<()> {
+/// Dispatch the parsed subcommand. Only `serve` can ask for anything other
+/// than a plain exit, so every other arm is mapped onto [`Outcome::Exit`]
+/// here rather than threading the outcome through each one.
+async fn run(command: Command, config: AgentConfig) -> Result<Outcome> {
     match command {
+        Command::Serve => serve::serve(config).await,
+        other => run_command(other, config).await.map(|()| Outcome::Exit),
+    }
+}
+
+async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
+    match command {
+        // Handled by `run` above, which owns the restart outcome.
+        Command::Serve => unreachable!("dispatched in run()"),
         Command::Enroll(EnrollArgs { token_file, token }) => {
             let token = resolve_enrollment_token(token_file, token)?;
             let channel = control::client::connect_default(&config).await?;
@@ -348,50 +374,6 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 .context("not enrolled")?;
             enroll::unenroll_and_clear(&config, &seed.gateway, &credential).await?;
             println!("unenrolled");
-            Ok(())
-        }
-        Command::Serve => {
-            let settings_store = SettingsStore::new(config.settings_path());
-            let seed = load_or_seed_settings(&settings_store, &config)?;
-            let agent_state = AgentState::new(&seed);
-            let backends = init_backends(&config, &seed, agent_state.clone()).await?;
-            let socket_path = config.control_socket_path();
-
-            // Cascades to every attach task's child token, so runners still
-            // drain on SIGTERM even though `Unenroll` can also cancel one
-            // independently.
-            let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
-            backends::spawn_vm_reprobe(
-                &backends,
-                agent_state.clone(),
-                seed.vm_mode,
-                config.vm.daemon_socket.clone(),
-                shutdown.clone(),
-            );
-
-            let supervisor = Arc::new(
-                control::AgentSupervisor::new(
-                    config,
-                    backends,
-                    shutdown.clone(),
-                    agent_state.clone(),
-                    settings_store.clone(),
-                )
-                .await?,
-            );
-            let reconciler = supervisor.spawn_participation_reconciler(shutdown.clone());
-            control::serve(
-                &socket_path,
-                Arc::clone(&supervisor),
-                agent_state,
-                settings_store,
-                shutdown,
-            )
-            .await?;
-            // The control server has stopped accepting connections; give any
-            // live attach task its own shutdown grace before the process exits.
-            supervisor.join().await;
-            let _ = reconciler.await;
             Ok(())
         }
         Command::Status => {

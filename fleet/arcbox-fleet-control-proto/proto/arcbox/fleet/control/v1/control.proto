@@ -31,6 +31,19 @@ service FleetLifecycleService {
   // later Enroll joins as a new machine.
   rpc Unenroll(UnenrollRequest) returns (UnenrollResponse);
 
+  // Restarts the agent process in place: it stops accepting new offers,
+  // lets in-flight jobs finish (unless `force`), then re-execs itself.
+  // `exec` keeps the PID, so a launchd job's bookkeeping is undisturbed.
+  //
+  // Accepted from every state and idempotent; a `force` request escalates a
+  // graceful restart that is still waiting on a job. While the restart is
+  // pending the agent reports DRAINING, exactly as a self-update does
+  // before its swap. The response can be lost when the process image is
+  // replaced before it flushes, so treat a transport-level failure as
+  // success and wait for the agent to come back (a changed
+  // GetAgentInfo.instance_id is the signal that it did).
+  rpc Restart(RestartRequest) returns (RestartResponse);
+
   // Current lifecycle/attachment status.
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 }
@@ -45,6 +58,10 @@ message GetAgentInfoResponse {
   // Forward-compatible capability flags a client can probe for instead of
   // gating behavior on `api_version` alone.
   repeated string features = 3;
+  // Identifies this process image: random at startup, regenerated on every
+  // re-exec (self-update or Restart). A client that needs to know a restart
+  // landed compares it, because `exec` preserves the PID.
+  string instance_id = 4;
 }
 
 message EnrollRequest {
@@ -67,6 +84,13 @@ message ResumeResponse {}
 
 message UnenrollRequest {}
 message UnenrollResponse {}
+
+message RestartRequest {
+  // Don't wait for in-flight jobs: cancel them, tearing down their runner
+  // process groups and containers, and restart now.
+  bool force = 1;
+}
+message RestartResponse {}
 
 // Lifecycle state of the agent's relationship to the gateway. Distinguishing
 // a live gateway connection from a reconnect-in-progress ("attaching" vs

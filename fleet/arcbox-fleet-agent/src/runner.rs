@@ -180,10 +180,11 @@ struct Inner {
     backends: Arc<Backends>,
     /// Set once `Drain` is received; no new jobs are accepted.
     draining: std::sync::atomic::AtomicBool,
-    /// Set while a self-update is pending; no new jobs are accepted. Kept
+    /// Set while this process image is about to be replaced (a pending
+    /// self-update or an operator restart); no new jobs are accepted. Kept
     /// separate from `draining` so a moot update (the pin moved back to this
     /// build before the swap) can resume without clearing an operator drain.
-    draining_for_update: std::sync::atomic::AtomicBool,
+    draining_for_replacement: std::sync::atomic::AtomicBool,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers.
     state: AgentState,
 }
@@ -229,7 +230,7 @@ impl RunnerSupervisor {
                 runner_script,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
-                draining_for_update: std::sync::atomic::AtomicBool::new(false),
+                draining_for_replacement: std::sync::atomic::AtomicBool::new(false),
                 state,
             }),
         }
@@ -337,7 +338,7 @@ impl RunnerSupervisor {
             .load(std::sync::atomic::Ordering::Relaxed)
             || self
                 .inner
-                .draining_for_update
+                .draining_for_replacement
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
             return Admission::Reject("host is draining".to_owned());
@@ -414,34 +415,39 @@ impl RunnerSupervisor {
         self.inner
             .draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(self.draining_for_update());
+        self.inner
+            .state
+            .set_draining(self.draining_for_replacement());
         info!("resumed: accepting new offers");
     }
 
-    fn draining_for_update(&self) -> bool {
+    fn draining_for_replacement(&self) -> bool {
         self.inner
-            .draining_for_update
+            .draining_for_replacement
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Stop accepting new offers because a self-update is pending. The
+    /// Stop accepting new offers because this process image is about to be
+    /// replaced — a pending self-update, or an operator `Restart`. The
     /// operator's own drain flag is untouched, so
     /// [`Self::resume_after_moot_update`] can undo exactly this without
     /// cancelling a deliberate local drain.
-    pub fn drain_for_update(&self) {
+    pub fn drain_for_replacement(&self) {
         self.inner
-            .draining_for_update
+            .draining_for_replacement
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.inner.state.set_draining(true);
-        info!("draining for self-update: no new offers will be accepted");
+        info!("draining before process replacement: no new offers will be accepted");
     }
 
-    /// Clear the update drain after the update became moot — the pin moved
-    /// back to this build before the swap happened (a rollback racing the
-    /// drain). An operator drain, if any, stays in force.
+    /// Clear the replacement drain after a pending update became moot — the
+    /// pin moved back to this build before the swap happened (a rollback
+    /// racing the drain). An operator drain, if any, stays in force. Only
+    /// the update path can become moot this way; a `Restart` always ends in
+    /// a re-exec.
     pub fn resume_after_moot_update(&self) {
         self.inner
-            .draining_for_update
+            .draining_for_replacement
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let operator_drain = self
             .inner

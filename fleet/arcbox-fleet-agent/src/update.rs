@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::config::AgentConfig;
+use crate::reexec;
 
 /// Name of the previous binary, kept beside the managed one after a swap —
 /// forensics only; recovery from a bad release is re-promoting the previous
@@ -153,7 +154,7 @@ pub async fn apply_and_exec(config: &AgentConfig, payload: &UpdatePayload) -> an
         Ok(managed) => managed,
         Err(error) => return error,
     };
-    exec_replacement(&managed)
+    reexec::exec(&managed)
 }
 
 /// Everything up to (not including) the exec: leaves the verified new binary
@@ -191,16 +192,6 @@ async fn apply(config: &AgentConfig, payload: &UpdatePayload) -> Result<PathBuf>
         .with_context(|| format!("installing new binary at {}", managed.display()))?;
     info!(version = %payload.expected_version, "self-update: binary swapped; re-executing");
     Ok(managed)
-}
-
-/// Replace this process image with `binary`, preserving argv. Returns only
-/// the exec error.
-fn exec_replacement(binary: &Path) -> anyhow::Error {
-    use std::os::unix::process::CommandExt;
-    let error = std::process::Command::new(binary)
-        .args(std::env::args_os().skip(1))
-        .exec();
-    anyhow::Error::new(error).context(format!("exec {}", binary.display()))
 }
 
 /// Self-update owns exactly the managed path; refuse anything else.
