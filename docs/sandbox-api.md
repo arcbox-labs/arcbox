@@ -25,9 +25,10 @@ message (`/dev/kvm` is absent in the guest).
 ## Connection
 
 - Socket: `~/.arcbox/run/arcbox.sock` (Unix domain socket, HTTP/2).
-- Every request must carry the `x-machine` metadata header naming the
-  target machine (`default` unless you manage extra machines). Missing
-  header → `INVALID_ARGUMENT`.
+- No routing metadata is required. Local clients MAY set the `x-machine`
+  header to target a named VM; absent (or empty) it resolves to the
+  System VM. The header is local transport metadata, not part of the
+  product contract — a cloud client never sends one.
 - **Transport & auth posture (V1)**: UDS only — there is no TCP listener,
   and no authentication beyond the socket's file permissions. This is a
   single-user local API; remote access requires your own proxy in front of
@@ -38,8 +39,8 @@ message (`/dev/kvm` is absent in the guest).
 
   ```console
   $ grpcurl -unix -plaintext ~/.arcbox/run/arcbox.sock list
-  $ grpcurl -unix -plaintext -H 'x-machine: default' \
-        -d '{}' ~/.arcbox/run/arcbox.sock sandbox.v1.SandboxService/List
+  $ grpcurl -unix -plaintext -d '{}' \
+        ~/.arcbox/run/arcbox.sock sandbox.v1.SandboxService/List
   ```
 
 ## Proto stability
@@ -87,11 +88,34 @@ Key fields:
 |---|---|
 | `id` | caller-supplied for idempotency; empty → UUID |
 | `limits.vcpus` / `limits.memory_mib` | 0 → daemon defaults (1 vCPU, 512 MiB) |
-| `rootfs` | ext4 image path (guest view), an overlay2 layer directory (auto-converted), or empty for the **default busybox rootfs** (auto-built with the vm-agent init) |
+| `template` | opaque reference to what boots — see **Templates** below |
 | `cmd`, `env`, `working_dir`, `user` | initial workload launched automatically once ready; exit returns the sandbox to `READY` with an `IDLE` event |
 | `network.mode` | `NETWORK_MODE_ENABLED` (default, IP from 172.20.0.0/16) or `NETWORK_MODE_NONE` |
 | `ttl_seconds` | auto-destroy timer from creation (not reset by activity) |
-| `image`, `mounts`, `ssh_public_key` | **rejected in V1** with `FAILED_PRECONDITION` (see Proto stability) |
+| `mounts`, `ssh_public_key` | **rejected in V1** with `FAILED_PRECONDITION` (see Proto stability) |
+
+### Templates
+
+`template` is the only way to say what runs inside a sandbox, and it is
+deliberately opaque: no host path, image store layout, or boot recipe
+crosses the API (CORE-54). Local mode accepts:
+
+| Value | Meaning |
+|---|---|
+| `""` | the built-in minimal image (busybox + init), built on first use |
+| `"docker:<ref>"` | a Docker image in the guest's own image store |
+
+Anything else is rejected with `INVALID_ARGUMENT` — a bare name is
+reserved for the cloud template registry (CORE-21), so it is never
+guessed at as an image reference.
+
+A `docker:` template is resolved **inside the VM**: the guest exports the
+image from its own dockerd, converts it to ext4, and caches the result
+keyed on the image's layer diff IDs, so an unchanged image is converted
+once. Make the image available first — `docker pull` / `docker build`
+through the ArcBox Docker context both land in that store. CLI:
+`abctl sandbox create --from-image <ref>` / `--from-dockerfile <path>` /
+`--from-template <name>` produce the reference for you.
 
 ### Executions (CORE-55)
 
@@ -183,8 +207,8 @@ mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
 
 ### Inspect / List / Events
 
-- `Inspect` → full `SandboxInfo` (state, limits, network incl. IP,
-  timestamps, `last_exit_status`, `error`).
+- `Inspect` → full `SandboxInfo` (state, limits, network incl. IP and
+  gateway, timestamps, `last_exit_status`, `error`).
 - `List{state, labels, page_size, page_token}` → `SandboxSummary` per
   sandbox, id-ordered; follow `next_page_token` until it is empty
   (default page size 100, capped at 1000).
@@ -197,7 +221,7 @@ mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
 
 | RPC | Behavior |
 |---|---|
-| `Checkpoint{sandbox_id, name}` | pause → snapshot (vmstate + mem) → resume; requires state `READY` |
+| `Checkpoint{sandbox_id, name}` | pause → snapshot (vmstate + mem) → resume; requires state `READY`; returns the snapshot ID (its on-disk location stays inside the guest) |
 | `Restore{snapshot_id, id, network_override, ttl_seconds}` | new sandbox in `READY` state with near-zero boot; set `network_override` for a fresh TAP/IP when restoring concurrently |
 | `ListSnapshots` / `DeleteSnapshot` | catalog management; `ListSnapshots` paginates like `List` |
 
@@ -229,7 +253,7 @@ map onto gRPC statuses:
 
 ## Typical client flow
 
-1. `Create({id, limits, cmd})` → `STARTING`
+1. `Create({id, template, limits, cmd})` → `STARTING`
 2. `Events({sandbox_id, kind: READY})` → wait for readiness
 3. `WriteFile` project files in, `StartExecution` + `AttachExecution`
    workloads (`WriteStdin` for input), `ExposePort` for services,

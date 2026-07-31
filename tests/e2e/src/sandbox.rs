@@ -148,7 +148,7 @@ fn run_scenario(
 
     let scenario = rt.block_on(async {
         let channel = connect_unix(&grpc_socket).await?;
-        drive_sandboxes(channel, metrics).await
+        drive_sandboxes(channel, data_dir, metrics).await
     });
 
     // Always shut the daemon down; a teardown failure must not mask the
@@ -171,7 +171,11 @@ fn with_machine<T>(msg: T) -> tonic::Request<T> {
     request
 }
 
-async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<()> {
+async fn drive_sandboxes(
+    channel: Channel,
+    data_dir: &std::path::Path,
+    metrics: &mut RunMetrics,
+) -> Result<()> {
     let mut sandboxes = SandboxServiceClient::new(channel.clone());
     let mut snapshots = SandboxSnapshotServiceClient::new(channel);
 
@@ -262,6 +266,14 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
         signal_started.elapsed().as_secs_f64(),
     );
     wait_ready(&mut sandboxes, "smoke1").await?;
+
+    // -- CORE-54: create from a docker: template ---------------------------
+    let template_started = Instant::now();
+    sandbox_from_docker_template(&mut sandboxes, data_dir).await?;
+    metrics.record(
+        "sandbox_docker_template",
+        template_started.elapsed().as_secs_f64(),
+    );
 
     // -- File round-trip ------------------------------------------------
     let file_started = Instant::now();
@@ -419,7 +431,7 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
 
     // -- Teardown -----------------------------------------------------------
     let teardown_started = Instant::now();
-    for id in ["smoke1", "smoke2", "smoke3"] {
+    for id in ["smoke1", "smoke2", "smoke3", "smoke-template"] {
         sandboxes
             .remove(with_machine(RemoveSandboxRequest {
                 id: id.into(),
@@ -442,6 +454,62 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
     metrics.record("sandbox_teardown", teardown_started.elapsed().as_secs_f64());
 
     info!("sandbox smoke passed");
+    Ok(())
+}
+
+/// CORE-54 acceptance: a sandbox is created knowing only a template
+/// reference — no kernel, rootfs, or any other host path crosses the API.
+///
+/// The image is pulled through the daemon's Docker proxy into the guest's own
+/// image store, then resolved to a bootable rootfs entirely inside the VM.
+async fn sandbox_from_docker_template(
+    client: &mut SandboxServiceClient<Channel>,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
+
+    // The pull goes to the guest dockerd, which is exactly where the guest
+    // template resolver will look for it.
+    crate::docker::docker_output(data_dir, &["pull", &image], Duration::from_secs(300))
+        .with_context(|| format!("docker pull {image} failed"))?;
+
+    let created = client
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-template".into(),
+            template: format!("docker:{image}"),
+            limits: Some(ResourceLimits {
+                vcpus: 1,
+                memory_mib: 256,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .context("Create from docker template failed")?
+        .into_inner();
+    info!(id = %created.id, %image, "sandbox created from a docker template");
+
+    // Conversion of a real image runs on the first create, so allow the same
+    // budget as a cold sandbox boot.
+    wait_for_state(
+        client,
+        "smoke-template",
+        SandboxState::Ready,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
+
+    // The workload must be the template's filesystem, not the built-in
+    // busybox image: /etc/os-release only exists in the pulled image.
+    let os_release = run_and_collect(
+        client,
+        "smoke-template",
+        &["/bin/sh", "-c", "cat /etc/os-release"],
+    )
+    .await?;
+    if !os_release.to_ascii_lowercase().contains("id=") {
+        bail!("template sandbox is not running the pulled image: {os_release:?}");
+    }
+    info!("docker template resolved and booted inside the guest");
     Ok(())
 }
 
