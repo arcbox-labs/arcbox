@@ -263,10 +263,12 @@ pub async fn run(
                 // an update.
                 supervisor.drain_for_update();
                 drained_for_update = true;
+                // Off-stream, so no ack can arrive: waiting one out would only
+                // delay the swap by the full grace on every version refusal.
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => break,
-                    () = supervisor.drained_of_jobs() => {}
+                    () = supervisor.quiesce(Duration::ZERO) => {}
                 }
                 // Returns only on failure; success replaces this process.
                 let error = update::apply_and_exec(&config, &payload).await;
@@ -459,15 +461,22 @@ async fn connect_and_serve(
     }
 
     // A mid-stream update pushed on a HeartbeatAck. The stream stays live
-    // while the supervisor drains — cancels keep arriving and verdicts keep
-    // delivering — and only once everything is settled does the loop leave
-    // with `AgentUpdateRequired`, handing the swap to the reconnect loop.
+    // while the supervisor quiesces — cancels keep arriving and verdicts keep
+    // delivering, which is why the ack grace is worth paying here — and only
+    // then does the loop leave with `AgentUpdateRequired`, handing the swap to
+    // the reconnect loop.
     let mut pending_update: Option<AgentUpdateRequired> = None;
+    // Built once and polled across iterations, not rebuilt per `select!` pass:
+    // a fresh future each time round would restart the ack grace every time
+    // any other branch fired, and a stream carrying heartbeats never goes
+    // quiet for that long. Futures are lazy, so the grace starts on the first
+    // poll — which the guard below defers until an update is actually pending.
+    let mut quiescing = std::pin::pin!(supervisor.quiesce(crate::runner::VERDICT_ACK_GRACE));
 
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break Ok(StreamEnd::Closed),
-            () = supervisor.settled(), if pending_update.is_some() => {
+            () = &mut quiescing, if pending_update.is_some() => {
                 break Err(anyhow::Error::new(
                     pending_update.take().expect("guarded by is_some"),
                 ));

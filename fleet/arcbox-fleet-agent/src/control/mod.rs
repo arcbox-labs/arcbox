@@ -718,8 +718,9 @@ impl AgentSupervisor {
     /// may turn back into a re-exec.
     ///
     /// A [`RestartMode::Graceful`] restart with jobs in flight returns as
-    /// soon as the drain is armed; the re-exec then waits, unbounded, for
-    /// the last job to release its slot.
+    /// soon as the drain is armed; the re-exec then waits for the supervisor
+    /// to quiesce — unbounded on the jobs themselves, bounded on the verdict
+    /// acks that follow them.
     pub async fn restart(&self, mode: RestartMode) -> Result<(), Status> {
         match self.restart.request(mode) {
             Requested::Recorded => {}
@@ -756,8 +757,11 @@ impl AgentSupervisor {
         runners.drain_for_restart();
         let shutdown = self.process_shutdown.clone();
         tokio::spawn(async move {
-            runners.drained_of_jobs().await;
-            info!("in-flight jobs finished; restarting");
+            // The attach stream is live here, so the ack grace is real: the
+            // last job's verdict is queued as it exits, and re-execing before
+            // the gateway settles it would strand the outcome.
+            runners.quiesce(crate::runner::VERDICT_ACK_GRACE).await;
+            info!("in-flight work settled; restarting");
             shutdown.cancel();
         });
         Ok(())

@@ -40,6 +40,22 @@ use crate::state::AgentState;
 /// it as a cancellation and destroy the guest.
 const MAX_VM_JOB_RUNTIME: Duration = Duration::from_secs(6 * 3600 + 1800);
 
+/// Polling interval of [`RunnerSupervisor::quiesce`]. Both maps it watches
+/// are `DashMap`s with no completion signal, so the wait is polled rather
+/// than notified.
+const QUIESCE_POLL: Duration = Duration::from_millis(200);
+
+/// How long [`RunnerSupervisor::quiesce`] waits for the gateway to ack
+/// outstanding verdicts before handing over without them.
+///
+/// Sized to cover one verdict-resend interval (`attach`'s
+/// `VERDICT_RESEND_INTERVAL`, 10s) plus an ack round-trip, so a verdict whose
+/// first non-blocking send lost the race to a full egress queue still gets one
+/// resend before the process image is replaced. Only paid when something is
+/// actually outstanding — acks are sub-second, so in the steady state
+/// `quiesce` finds the map empty and returns at once.
+pub const VERDICT_ACK_GRACE: Duration = Duration::from_secs(12);
+
 /// Outcome of the admission decision for an incoming offer.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
@@ -476,29 +492,44 @@ impl RunnerSupervisor {
         info!("self-update became moot; resuming");
     }
 
-    /// True when nothing runs here and no verdict awaits its ack — the
-    /// point at which the process can be replaced without losing work.
-    pub fn is_settled(&self) -> bool {
-        self.inner.in_flight.is_empty() && self.inner.outstanding.is_empty()
-    }
-
-    /// Wait until every in-flight job releases its slot. Unbounded — a
-    /// self-update must never kill a customer's running job — and polled,
-    /// like [`Self::shutdown`]'s drain. Used off-stream, where `outstanding`
-    /// verdicts cannot drain (delivering them needs a live attach), so only
-    /// `in_flight` gates.
-    pub async fn drained_of_jobs(&self) {
+    /// Wait until this supervisor's work can be abandoned without losing any
+    /// of it: every job has released its slot, and every verdict has been
+    /// acked. The single wait before the process image is replaced — a
+    /// self-update swap or an operator restart.
+    ///
+    /// The job wait is unbounded: a handover must never kill a customer's
+    /// running job. The ack wait is not, because `outstanding` only drains
+    /// while an attach stream is live — off-stream, or against a gateway that
+    /// has gone away, it would never finish. `ack_grace` bounds it, and
+    /// callers that know nothing can ack (no live stream) pass
+    /// [`Duration::ZERO`].
+    ///
+    /// The ack clock starts only once the jobs are gone: a job's verdict is
+    /// queued when it finishes, so starting the clock earlier would let a
+    /// long-running job burn the whole grace before there was anything to
+    /// wait for.
+    pub async fn quiesce(&self, ack_grace: Duration) {
         while !self.inner.in_flight.is_empty() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(QUIESCE_POLL).await;
         }
-    }
-
-    /// Wait for [`Self::is_settled`]. Only meaningful while attached (acks
-    /// must be able to arrive); polled for the same reason as
-    /// [`Self::drained_of_jobs`].
-    pub async fn settled(&self) {
-        while !self.is_settled() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = tokio::time::Instant::now() + ack_grace;
+        while !self.inner.outstanding.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(QUIESCE_POLL).await;
+        }
+        // Whatever is left dies with the process image, so name it: these are
+        // job outcomes the gateway will never hear, and it has to fall back on
+        // the webhook (or its absence) to conclude them.
+        let stranded: Vec<String> = self
+            .inner
+            .outstanding
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        if !stranded.is_empty() {
+            warn!(
+                ?stranded,
+                "handing over with unacked verdicts; the gateway will not hear them"
+            );
         }
     }
 
@@ -1752,6 +1783,62 @@ mod tests {
         sup.shutdown(Duration::from_millis(250)).await;
 
         assert!(!sup.inner.in_flight.is_empty());
+    }
+
+    /// A job that has just exited queued its verdict on the way out, so the
+    /// map being empty of jobs is not the same as its work being safe to
+    /// abandon. Quiescing must hold the process image until the gateway
+    /// settles that verdict — the exec that follows discards `outstanding`,
+    /// and the gateway is then left waiting on a webhook that may never come.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_waits_out_the_ack_grace_for_an_unacked_verdict() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+        assert!(sup.inner.in_flight.is_empty(), "no job is running");
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(VERDICT_ACK_GRACE).await;
+
+        assert!(
+            started.elapsed() >= VERDICT_ACK_GRACE,
+            "must not hand over while a verdict is unacked"
+        );
+    }
+
+    /// ...but the grace is a ceiling, not a cost: the common case is an ack
+    /// within a round-trip, and a restart must not sit out the full wait for
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_returns_as_soon_as_the_last_verdict_is_acked() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+
+        let gateway = sup.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            gateway.handle_ack("exit:rjob_a");
+        });
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(VERDICT_ACK_GRACE).await;
+
+        assert!(
+            started.elapsed() < VERDICT_ACK_GRACE,
+            "an acked verdict releases the wait early"
+        );
+    }
+
+    /// Off-stream — a version-refused reconnect — nothing can deliver an ack,
+    /// so the caller passes no grace and the wait must not be paid at all.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_without_a_grace_does_not_wait_for_acks_that_cannot_arrive() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(Duration::ZERO).await;
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     /// The user-facing `Drain` flips the observable `AgentState.draining`
