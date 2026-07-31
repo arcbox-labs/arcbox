@@ -659,8 +659,11 @@ impl SandboxManager {
                 return Err(e);
             }
         };
-        if !spec.stdin {
-            // Run semantics: the process starts with stdin at EOF.
+        if !spec.stdin && !spec.tty {
+            // Run semantics: the process starts with stdin at EOF. TTY
+            // executions are exempt — a PTY has no out-of-band EOF, and the
+            // vm-agent's TTY session stops reading input frames (signals,
+            // resizes) once it sees one.
             let _ = input_tx.send(ExecInputMsg::Eof).await;
         }
 
