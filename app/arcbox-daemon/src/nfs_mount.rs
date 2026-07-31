@@ -136,29 +136,51 @@ async fn reconcile(
 ///
 /// A pre-delivery failure must be retried, not swallowed: the agent no longer
 /// starts nfsd on its own, so if the request never lands the guest has no
-/// server and `mount_with_retry` can only fail. A read timeout after delivery
-/// is fine — the guest handler runs to completion regardless — and a retry
-/// then finds the export already up (the handler is idempotent).
+/// server and `mount_with_retry` can only fail. Each attempt is bounded and
+/// races shutdown, because the guest handler holds the runtime-start lock for
+/// the whole cold boot and neither transport self-limits usefully here: the HV
+/// blocking RPC deadline (5s) is far shorter than a cold start, and the VZ
+/// async path has no read deadline at all, so an unbounded attempt could hang
+/// reconcile until — or past — a wedged runtime start. A per-attempt timeout
+/// makes both backends retry across the cold-start window, and the handler is
+/// idempotent so a retry after the export is already up just confirms it.
 async fn ensure_guest_export(runtime: &Arc<Runtime>, shutdown: &CancellationToken) -> Result<()> {
-    const ENSURE_TIMEOUT: Duration = Duration::from_secs(90);
+    const ENSURE_TIMEOUT: Duration = Duration::from_secs(120);
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
     const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
     let deadline = tokio::time::Instant::now() + ENSURE_TIMEOUT;
     loop {
-        if shutdown.is_cancelled() {
-            bail!("daemon shutdown before the guest NFS export was established");
-        }
-        match send_ensure_export(runtime).await {
-            Ok(notes) => {
+        let attempt = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                bail!("daemon shutdown before the guest NFS export was established");
+            }
+            result = tokio::time::timeout(ATTEMPT_TIMEOUT, send_ensure_export(runtime)) => result,
+        };
+        match attempt {
+            Ok(Ok(notes)) => {
                 debug!(notes = ?notes, "guest nfs export ensured");
                 return Ok(());
             }
-            Err(e) if tokio::time::Instant::now() >= deadline => {
-                return Err(e).context("guest did not establish the NFS export in time");
+            outcome if tokio::time::Instant::now() >= deadline => {
+                return match outcome {
+                    Ok(Err(e)) => Err(e).context("guest did not establish the NFS export in time"),
+                    _ => Err(anyhow::anyhow!(
+                        "guest did not establish the NFS export within {ENSURE_TIMEOUT:?}"
+                    )),
+                };
             }
-            Err(e) => debug!(error = %e, "ensure guest nfs export attempt failed, retrying"),
+            Ok(Err(e)) => debug!(error = %e, "ensure guest nfs export attempt failed, retrying"),
+            Err(_) => debug!("ensure guest nfs export attempt timed out, retrying"),
         }
-        tokio::time::sleep(RETRY_INTERVAL).await;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                bail!("daemon shutdown before the guest NFS export was established");
+            }
+            () = tokio::time::sleep(RETRY_INTERVAL) => {}
+        }
     }
 }
 

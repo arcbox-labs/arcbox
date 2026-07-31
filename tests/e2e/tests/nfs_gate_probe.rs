@@ -60,6 +60,14 @@ fn nfs_gate_probe() -> Result<()> {
         env: vec![
             ("ARCBOX_BOOT_ASSET_VERSION".into(), version),
             ("ARCBOX_DNS_PORT".into(), "5555".into()),
+            // Isolate the host mount off the developer's real ~/ArcBox — both so
+            // this probe never touches it and so the host-side assertion below
+            // actually catches a daemon that ignored --no-mount-nfs (it would
+            // populate this dir instead of silently mounting elsewhere).
+            (
+                "ARCBOX_HOST_MOUNT_DIR".into(),
+                test_dir.join("ArcBox").to_string_lossy().into_owned(),
+            ),
         ],
     })?;
     daemon.wait_ready_blocking(READY_TIMEOUT)?;
