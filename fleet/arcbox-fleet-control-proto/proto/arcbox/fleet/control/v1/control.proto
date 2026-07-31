@@ -36,7 +36,9 @@ service FleetLifecycleService {
   // `exec` keeps the PID, so a launchd job's bookkeeping is undisturbed.
   //
   // Accepted from every state and idempotent; a `force` request escalates a
-  // graceful restart that is still waiting on a job. While the restart is
+  // graceful restart that is still waiting on a job. Refused with
+  // FAILED_PRECONDITION once the agent is already shutting down for good,
+  // which no restart may turn back into a re-exec. While the restart is
   // pending the agent reports DRAINING, exactly as a self-update does
   // before its swap. The response can be lost when the process image is
   // replaced before it flushes, so treat a transport-level failure as

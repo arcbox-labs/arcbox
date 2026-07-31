@@ -44,6 +44,7 @@ mod serve;
 #[cfg(target_os = "macos")]
 mod service;
 mod settings;
+mod shutdown;
 mod state;
 mod update;
 mod vm;
@@ -59,7 +60,6 @@ use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecyc
 use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
 use arcbox_logging::LogConfig;
 use clap::{Args, Parser, Subcommand};
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::backends::Backends;
@@ -353,7 +353,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
 
             // `attach::run` stops accepting work and tears down in-flight
             // runners once this fires.
-            let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
+            let shutdown = shutdown::spawn("termination signal received; draining runners");
             backends::spawn_vm_reprobe(
                 &backends,
                 agent_state.clone(),
@@ -585,52 +585,6 @@ fn uninstall_service() -> Result<()> {
     )
 }
 
-/// Build a `CancellationToken` cancelled on the first termination signal
-/// (see [`shutdown_signal`]), logging `message` when it fires. Shared by
-/// `quick run` and `serve`, whose shutdown trigger is otherwise identical.
-fn spawn_shutdown_signal(message: &'static str) -> CancellationToken {
-    let shutdown = CancellationToken::new();
-    let signal_token = shutdown.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        info!("{message}");
-        signal_token.cancel();
-    });
-    shutdown
-}
-
-/// Resolve when the process receives a termination signal: Ctrl-C, or
-/// SIGTERM (e.g. a service-manager stop) — every supported target (macOS,
-/// Linux) is Unix, so SIGTERM handling is unconditional. If a listener
-/// cannot be installed, that signal simply never fires rather than aborting
-/// startup.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            warn!(error = %e, "failed to listen for Ctrl-C; ignoring");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to listen for SIGTERM; ignoring");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
-    }
-}
-
 /// Resolve the enrollment token from its chosen source: a file, an explicit
 /// `--token`, or stdin when neither is given (the two flags are mutually
 /// exclusive). Surrounding whitespace — a trailing newline from a file or
@@ -656,10 +610,13 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
     Ok(token)
 }
 
-/// How long `enroll` waits for the agent to come back after it self-updates
-/// and re-execs mid-call. The download and its checksum verification both
-/// finish before the exec, so this only has to cover process restart and the
-/// control socket rebind.
+/// How long the CLI waits for an agent that is replacing its process image
+/// to answer again: `enroll` when a version refusal self-updates mid-call,
+/// and `restart` for the re-exec it asked for. It covers the exec and the
+/// control-socket rebind, but deliberately not the replacement's full
+/// startup — which re-runs the backend probes, including a runner-image pull
+/// per candidate arch — so callers report an unreachable agent as "restarting,
+/// not yet serving" rather than a failure.
 const RESTART_WAIT: Duration = Duration::from_secs(30);
 /// Gap between reconnect attempts inside [`RESTART_WAIT`].
 const RESTART_POLL: Duration = Duration::from_millis(250);
@@ -816,15 +773,24 @@ async fn restart(config: &AgentConfig, force: bool) -> Result<()> {
     }
 
     match wait_for_restart(config, &before.instance_id).await {
-        Some(version) => {
+        Restarted::NewInstance(version) => {
             println!("agent restarted (version {version})");
             Ok(())
         }
-        None if force => anyhow::bail!(
-            "the agent did not come back within {}s",
+        // The old image stopped answering, so the restart did happen; the
+        // replacement is still working through its startup probes (which pull
+        // the runner image per arch before binding the socket). Reporting
+        // this as a failure would send the operator back to the service
+        // manager for a restart that worked.
+        Restarted::NotServingYet => {
+            println!("agent restarted; still starting up (it has not rebound its control socket)");
+            Ok(())
+        }
+        Restarted::SameInstance if force => anyhow::bail!(
+            "the agent did not restart within {}s",
             RESTART_WAIT.as_secs()
         ),
-        None => {
+        Restarted::SameInstance => {
             println!(
                 "restart requested; the agent is still finishing in-flight jobs and restarts \
                  once the last one releases"
@@ -834,13 +800,30 @@ async fn restart(config: &AgentConfig, force: bool) -> Result<()> {
     }
 }
 
+/// What [`wait_for_restart`] saw before it gave up waiting.
+#[derive(Debug, PartialEq, Eq)]
+enum Restarted {
+    /// The replacement image is serving, with its version.
+    NewInstance(String),
+    /// The old image never stopped answering: it is still waiting to be
+    /// replaced (in-flight jobs), or the restart never took.
+    SameInstance,
+    /// The old image is gone — the restart landed — but nothing answers on
+    /// the socket yet.
+    NotServingYet,
+}
+
 /// Poll the control socket until it answers from a process image other than
-/// `previous`, returning that image's version. `None` once [`RESTART_WAIT`]
-/// expires: the old image is still running (`GetAgentInfo` keeps reporting
-/// `previous`), or the replacement has not rebound the socket yet — the
-/// caller decides which of those is an error.
-async fn wait_for_restart(config: &AgentConfig, previous: &str) -> Option<String> {
+/// `previous`, or [`RESTART_WAIT`] expires.
+///
+/// The two ways of running out of time are not the same event, so they are
+/// reported apart: an agent that kept answering as `previous` has not
+/// restarted, while one that stopped answering has — only its replacement is
+/// not serving yet. Collapsing them would make a slow-starting replacement
+/// indistinguishable from a restart that never happened.
+async fn wait_for_restart(config: &AgentConfig, previous: &str) -> Restarted {
     let deadline = tokio::time::Instant::now() + RESTART_WAIT;
+    let mut previous_answered = false;
     loop {
         if let Ok(channel) = control::client::connect_default(config).await {
             let info = FleetLifecycleServiceClient::new(channel)
@@ -848,14 +831,24 @@ async fn wait_for_restart(config: &AgentConfig, previous: &str) -> Option<String
                 .await;
             if let Ok(info) = info {
                 let info = info.into_inner();
-                if info.instance_id != previous {
-                    return Some(info.agent_version);
+                if info.instance_id == previous {
+                    previous_answered = true;
+                } else {
+                    return Restarted::NewInstance(info.agent_version);
                 }
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            // Keyed on the *last* observation, not on whether the old image
+            // was ever seen: it answering early and going silent later is the
+            // restart in progress.
+            return if previous_answered {
+                Restarted::SameInstance
+            } else {
+                Restarted::NotServingYet
+            };
         }
+        previous_answered = false;
         tokio::time::sleep(RESTART_POLL).await;
     }
 }
