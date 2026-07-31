@@ -117,7 +117,7 @@ When asked to plan, the plan must be fully resolved before implementation begins
   ```
 - Requires Developer ID certificate (`.p12`) + provisioning profile (`.provisionprofile`). See `CONTRIBUTING.md` "Code Signing" section for setup.
 - Requires Xcode Command Line Tools
-- Some tasks require a running daemon. Start it in a background terminal: `arcbox daemon start`
+- Some tasks require a running daemon. Start it in a background terminal: `abctl daemon start`
 
 ## Guest Agent Cross-Compilation
 
