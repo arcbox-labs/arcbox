@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arcbox_constants::wire::MessageType;
 use arcbox_protocol::sandbox_v1;
 use arcbox_vm::{
-    CheckpointInfo, CheckpointSummary, ExecInputMsg, RestoreSandboxSpec,
+    CheckpointInfo, CheckpointSummary, ExecInputMsg, OutputChunk, RestoreSandboxSpec,
     SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxManager, SandboxMountSpec,
     SandboxNetworkSpec, SandboxSpec, SandboxSummary, VmmConfig,
 };
@@ -30,6 +30,17 @@ use crate::rpc::{ErrorResponse, read_message, write_message};
 /// This is safe because exec sessions are one-shot: the host consumes its
 /// `AgentClient` via `into_split()`, so the vsock connection is never
 /// reused for subsequent requests.
+/// Flatten an [`OutputChunk`] into the legacy stringly wire shape
+/// (`stream`, `data`, `exit_code`, `done`) still carried by the v1
+/// `RunOutput` / `ExecOutput` messages.
+fn legacy_output_parts(chunk: OutputChunk) -> (String, Vec<u8>, i32, bool) {
+    match chunk {
+        OutputChunk::Stdout(data) => ("stdout".into(), data, 0, false),
+        OutputChunk::Stderr(data) => ("stderr".into(), data, 0, false),
+        OutputChunk::Exit(status) => ("exit".into(), Vec::new(), status.conventional_code(), true),
+    }
+}
+
 async fn drain_trailing_input<S: AsyncRead + Unpin>(stream: &mut S) {
     use tokio::time::{Duration, timeout};
     let _ = timeout(Duration::from_millis(100), async {
@@ -265,11 +276,11 @@ impl SandboxService {
                         break;
                     }
                 };
-                let is_done = chunk.stream == "exit";
+                let (stream, data, exit_code, is_done) = legacy_output_parts(chunk);
                 let msg = sandbox_v1::RunOutput {
-                    stream: chunk.stream,
-                    data: chunk.data,
-                    exit_code: chunk.exit_code,
+                    stream,
+                    data,
+                    exit_code,
                     done: is_done,
                 };
                 if tx.send(msg.encode_to_vec()).is_err() {
@@ -342,11 +353,11 @@ impl SandboxService {
                         break;
                     }
                 };
-                let is_done = chunk.stream == "exit";
+                let (stream, data, exit_code, is_done) = legacy_output_parts(chunk);
                 let msg = sandbox_v1::ExecOutput {
-                    stream: chunk.stream,
-                    data: chunk.data,
-                    exit_code: chunk.exit_code,
+                    stream,
+                    data,
+                    exit_code,
                     done: is_done,
                 };
                 if tx.send(msg.encode_to_vec()).is_err() {
@@ -888,7 +899,9 @@ fn vm_info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
         created_at: info.created_at.timestamp(),
         ready_at: info.ready_at.map_or(0, |t| t.timestamp()),
         last_exited_at: info.last_exited_at.map_or(0, |t| t.timestamp()),
-        last_exit_code: info.last_exit_code.unwrap_or(0),
+        last_exit_code: info
+            .last_exit_status
+            .map_or(0, arcbox_vm::ExitStatus::conventional_code),
         error: info.error.unwrap_or_default(),
     }
 }

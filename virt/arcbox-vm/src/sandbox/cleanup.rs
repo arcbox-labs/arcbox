@@ -178,7 +178,7 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
         created_at: inst.created_at,
         ready_at: inst.ready_at,
         last_exited_at: inst.last_exited_at,
-        last_exit_code: inst.last_exit_code,
+        last_exit_status: inst.last_exit_status,
         error: inst.error.clone(),
     }
 }

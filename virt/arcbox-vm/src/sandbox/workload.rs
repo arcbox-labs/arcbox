@@ -49,9 +49,9 @@ fn release_running(id: &SandboxId, instances: &InstanceMap) {
 /// an active state (`Running` during a normal workload, `Stopping` while a
 /// `stop` drains — where the flip is the drain's completion signal); a sandbox
 /// already driven to `Stopped` is never resurrected.
-fn finish_workload(
+pub(super) fn finish_workload(
     id: &SandboxId,
-    exit_code: i32,
+    status: ExitStatus,
     instances: &InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) {
@@ -59,14 +59,18 @@ fn finish_workload(
     let arc = instances.read().unwrap().get(id).cloned();
     if let Some(arc) = arc {
         let mut inst = arc.lock().unwrap();
-        inst.last_exit_code = Some(exit_code);
+        inst.last_exit_status = Some(status);
         inst.last_exited_at = Some(Utc::now());
         if matches!(inst.state, SandboxState::Running | SandboxState::Stopping) {
             inst.state = SandboxState::Ready;
         }
     }
-    let _ = events_tx
-        .send(SandboxEvent::new(id, "idle").with_attr("exit_code", &exit_code.to_string()));
+    let mut event = SandboxEvent::new(id, "idle")
+        .with_attr("exit_code", &status.conventional_code().to_string());
+    if let ExitStatus::Signaled(signal) = status {
+        event = event.with_attr("signal", &signal.to_string());
+    }
+    let _ = events_tx.send(event);
 }
 
 /// Spawn the watcher that mirrors a workload's output to the caller and drives
@@ -93,10 +97,8 @@ fn spawn_exit_watcher(
         let mut consumer_gone = false;
         while let Some(result) = inner_rx.recv().await {
             // Handle the exit chunk regardless of the consumer's presence.
-            if let Ok(chunk) = &result
-                && chunk.stream == "exit"
-            {
-                finish_workload(&sandbox_id, chunk.exit_code, &instances, &events_tx);
+            if let Ok(OutputChunk::Exit(status)) = &result {
+                finish_workload(&sandbox_id, *status, &instances, &events_tx);
             }
             // Forward until the consumer goes away, then keep draining so the
             // exit chunk above is still reached.
@@ -294,19 +296,11 @@ mod tests {
         drop(wrapped_rx); // consumer gone immediately
 
         inner_tx
-            .send(Ok(OutputChunk {
-                stream: "stdout".into(),
-                data: b"noise".to_vec(),
-                exit_code: 0,
-            }))
+            .send(Ok(OutputChunk::Stdout(b"noise".to_vec())))
             .await
             .unwrap();
         inner_tx
-            .send(Ok(OutputChunk {
-                stream: "exit".into(),
-                data: vec![],
-                exit_code: 7,
-            }))
+            .send(Ok(OutputChunk::Exit(ExitStatus::Code(7))))
             .await
             .unwrap();
         drop(inner_tx); // guest side closes after exit
@@ -319,11 +313,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(state_of("s", &instances), SandboxState::Ready);
-        let last_exit_code = {
+        let last_exit_status = {
             let guard = instances.read().unwrap();
-            guard["s"].lock().unwrap().last_exit_code
+            guard["s"].lock().unwrap().last_exit_status
         };
-        assert_eq!(last_exit_code, Some(7));
+        assert_eq!(last_exit_status, Some(ExitStatus::Code(7)));
     }
 
     #[tokio::test]
@@ -335,29 +329,21 @@ mod tests {
         let mut wrapped_rx = spawn_exit_watcher(&"s".to_owned(), inner_rx, &instances, &events_tx);
 
         inner_tx
-            .send(Ok(OutputChunk {
-                stream: "stdout".into(),
-                data: b"hello".to_vec(),
-                exit_code: 0,
-            }))
+            .send(Ok(OutputChunk::Stdout(b"hello".to_vec())))
             .await
             .unwrap();
         let first = wrapped_rx.recv().await.unwrap().unwrap();
-        assert_eq!(first.data, b"hello");
+        assert!(matches!(first, OutputChunk::Stdout(data) if data == b"hello"));
 
         inner_tx
-            .send(Ok(OutputChunk {
-                stream: "exit".into(),
-                data: vec![],
-                exit_code: 0,
-            }))
+            .send(Ok(OutputChunk::Exit(ExitStatus::Code(0))))
             .await
             .unwrap();
         drop(inner_tx);
 
         // The forwarded exit chunk arrives, then the channel closes.
         let exit = wrapped_rx.recv().await.unwrap().unwrap();
-        assert_eq!(exit.stream, "exit");
+        assert!(matches!(exit, OutputChunk::Exit(ExitStatus::Code(0))));
         assert!(wrapped_rx.recv().await.is_none());
         assert_eq!(state_of("s", &instances), SandboxState::Ready);
 

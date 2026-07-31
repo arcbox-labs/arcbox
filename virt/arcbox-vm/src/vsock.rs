@@ -18,16 +18,17 @@
 //! [u8: msg_type][u32 LE: payload_len][payload_len bytes: payload]
 //! ```
 //!
-//! | Type | Direction   | Payload                          |
-//! |------|-------------|----------------------------------|
-//! | 0x01 | Host→Agent  | JSON-encoded `StartCommand`      |
-//! | 0x02 | Host→Agent  | raw stdin bytes                  |
-//! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`  |
-//! | 0x04 | Host→Agent  | empty — signals stdin EOF        |
-//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]`    |
-//! | 0x10 | Agent→Host  | raw stdout bytes                 |
-//! | 0x11 | Agent→Host  | raw stderr bytes                 |
-//! | 0x12 | Agent→Host  | `[i32 LE exit_code]`             |
+//! | Type | Direction   | Payload                                    |
+//! |------|-------------|--------------------------------------------|
+//! | 0x01 | Host→Agent  | JSON-encoded `StartCommand`                |
+//! | 0x02 | Host→Agent  | raw stdin bytes                            |
+//! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`            |
+//! | 0x04 | Host→Agent  | empty — signals stdin EOF                  |
+//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]`              |
+//! | 0x07 | Host→Agent  | `[i32 LE signal]` — deliver to workload    |
+//! | 0x10 | Agent→Host  | raw stdout bytes                           |
+//! | 0x11 | Agent→Host  | raw stderr bytes                           |
+//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` (signal 0 = normal exit; old agents send only the 4-byte code) |
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,6 +56,10 @@ pub(crate) const MSG_CLOCK_SYNC: u8 = 0x05;
 /// Re-address the guest network after a fresh-network snapshot restore.
 /// Payload: JSON [`NetReconfigCommand`](crate::boot_proto::NetReconfigCommand).
 pub(crate) const MSG_NET_RECONFIG: u8 = 0x06;
+/// Deliver a POSIX signal to the workload's process group.
+/// Payload: `[i32 LE signal]` (4 bytes). Old vm-agents ignore unknown frame
+/// types, so sending this to a pre-signal agent is a silent no-op.
+const MSG_SIGNAL: u8 = 0x07;
 
 // Frame type constants — Agent → Host (exec channel).
 const MSG_STDOUT: u8 = 0x10;
@@ -68,15 +73,56 @@ pub(crate) const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 // Public types
 // =============================================================================
 
+/// How a guest workload terminated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitStatus {
+    /// The process exited normally with this code.
+    Code(i32),
+    /// The process was killed by this POSIX signal.
+    Signaled(i32),
+}
+
+impl ExitStatus {
+    /// Shell-convention scalar: the exit code itself, or `128 + signal` for a
+    /// signal death. For consumers that can only carry one integer.
+    #[must_use]
+    pub const fn conventional_code(self) -> i32 {
+        match self {
+            Self::Code(code) => code,
+            Self::Signaled(signal) => 128 + signal,
+        }
+    }
+
+    /// Decode a `MSG_EXIT` payload.
+    ///
+    /// New agents send `[i32 LE code][i32 LE signal]`; agents from before the
+    /// signal extension (e.g. inside restored snapshots) send only the 4-byte
+    /// code, in which case a signal death arrives collapsed as `128 + signal`.
+    fn from_exit_payload(payload: &[u8]) -> Self {
+        if payload.len() >= 8 {
+            let signal = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            if signal != 0 {
+                return Self::Signaled(signal);
+            }
+        }
+        let code = if payload.len() >= 4 {
+            i32::from_le_bytes(payload[..4].try_into().unwrap())
+        } else {
+            0
+        };
+        Self::Code(code)
+    }
+}
+
 /// A chunk of output emitted by a guest process.
 #[derive(Debug, Clone)]
-pub struct OutputChunk {
-    /// `"stdout"`, `"stderr"`, or `"exit"`.
-    pub stream: String,
-    /// Raw bytes (empty when `stream == "exit"`).
-    pub data: Vec<u8>,
-    /// Exit code — only meaningful when `stream == "exit"`.
-    pub exit_code: i32,
+pub enum OutputChunk {
+    /// Bytes from the process's stdout (the merged PTY stream for `tty` sessions).
+    Stdout(Vec<u8>),
+    /// Bytes from the process's stderr (never emitted for `tty` sessions).
+    Stderr(Vec<u8>),
+    /// The process terminated. Always the final chunk of a session.
+    Exit(ExitStatus),
 }
 
 /// A message the host sends to the guest during an exec/run session.
@@ -86,6 +132,8 @@ pub enum ExecInputMsg {
     Stdin(Vec<u8>),
     /// Resize the pseudo-TTY.
     Resize { width: u16, height: u16 },
+    /// Deliver a POSIX signal to the workload's process group.
+    Signal(i32),
     /// Signal EOF on the process's stdin.
     Eof,
 }
@@ -239,29 +287,11 @@ async fn drain_output<R: AsyncReadExt + Unpin>(
         match read_frame(&mut read_half).await {
             Ok((msg_type, payload)) => {
                 let chunk = match msg_type {
-                    MSG_STDOUT => OutputChunk {
-                        stream: "stdout".into(),
-                        data: payload,
-                        exit_code: 0,
-                    },
-                    MSG_STDERR => OutputChunk {
-                        stream: "stderr".into(),
-                        data: payload,
-                        exit_code: 0,
-                    },
+                    MSG_STDOUT => OutputChunk::Stdout(payload),
+                    MSG_STDERR => OutputChunk::Stderr(payload),
                     MSG_EXIT => {
-                        let code = if payload.len() >= 4 {
-                            i32::from_le_bytes(payload[..4].try_into().unwrap())
-                        } else {
-                            0
-                        };
-                        let _ = tx
-                            .send(Ok(OutputChunk {
-                                stream: "exit".into(),
-                                data: vec![],
-                                exit_code: code,
-                            }))
-                            .await;
+                        let status = ExitStatus::from_exit_payload(&payload);
+                        let _ = tx.send(Ok(OutputChunk::Exit(status))).await;
                         break;
                     }
                     other => {
@@ -360,6 +390,9 @@ pub async fn exec(
                     buf[..2].copy_from_slice(&width.to_le_bytes());
                     buf[2..].copy_from_slice(&height.to_le_bytes());
                     write_frame(&mut write_half, MSG_RESIZE, &buf).await
+                }
+                ExecInputMsg::Signal(signal) => {
+                    write_frame(&mut write_half, MSG_SIGNAL, &signal.to_le_bytes()).await
                 }
                 ExecInputMsg::Eof => write_frame(&mut write_half, MSG_EOF, &[]).await,
             };
@@ -541,6 +574,46 @@ mod tests {
         assert_eq!(msg_type, MSG_EXIT);
         let decoded = i32::from_le_bytes(payload[..4].try_into().unwrap());
         assert_eq!(decoded, 42);
+    }
+
+    #[test]
+    fn exit_payload_decodes_legacy_and_signal_forms() {
+        // Legacy 4-byte form (old vm-agent): always a plain code.
+        assert_eq!(
+            ExitStatus::from_exit_payload(&7i32.to_le_bytes()),
+            ExitStatus::Code(7)
+        );
+        // 8-byte form, signal 0: a normal exit — even for code 137, which the
+        // legacy form could not distinguish from a SIGKILL death.
+        let mut normal_137 = Vec::new();
+        normal_137.extend_from_slice(&137i32.to_le_bytes());
+        normal_137.extend_from_slice(&0i32.to_le_bytes());
+        assert_eq!(
+            ExitStatus::from_exit_payload(&normal_137),
+            ExitStatus::Code(137)
+        );
+        // 8-byte form, signal set: a signal death.
+        let mut sigkill = Vec::new();
+        sigkill.extend_from_slice(&137i32.to_le_bytes());
+        sigkill.extend_from_slice(&9i32.to_le_bytes());
+        assert_eq!(
+            ExitStatus::from_exit_payload(&sigkill),
+            ExitStatus::Signaled(9)
+        );
+        assert_eq!(ExitStatus::Signaled(9).conventional_code(), 137);
+        // Truncated payload degrades to code 0 (matches the old lenient parse).
+        assert_eq!(ExitStatus::from_exit_payload(&[1, 2]), ExitStatus::Code(0));
+    }
+
+    #[tokio::test]
+    async fn signal_frame_round_trips() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        write_frame(&mut a, MSG_SIGNAL, &15i32.to_le_bytes())
+            .await
+            .unwrap();
+        let (msg_type, payload) = read_frame(&mut b).await.unwrap();
+        assert_eq!(msg_type, MSG_SIGNAL);
+        assert_eq!(i32::from_le_bytes(payload[..4].try_into().unwrap()), 15);
     }
 
     #[tokio::test]

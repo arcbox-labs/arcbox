@@ -23,9 +23,10 @@
 //! | 0x04 | Host→Agent  | empty — stdin EOF                |
 //! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]` — clock sync |
 //! | 0x06 | Host→Agent  | JSON `NetReconfigCommand` — re-address eth0 |
+//! | 0x07 | Host→Agent  | `[i32 LE signal]` — signal the workload's process group |
 //! | 0x10 | Agent→Host  | raw stdout bytes                 |
 //! | 0x11 | Agent→Host  | raw stderr bytes                 |
-//! | 0x12 | Agent→Host  | `[i32 LE exit_code]`             |
+//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` — signal 0 = normal exit |
 //!
 //! This binary requires Linux — it uses AF_VSOCK, accept4, openpty, and fork,
 //! none of which are available on other platforms.  The workspace compiles the
@@ -59,6 +60,7 @@ mod agent {
     const MSG_EOF: u8 = 0x04;
     const MSG_CLOCK_SYNC: u8 = 0x05;
     const MSG_NET_RECONFIG: u8 = 0x06;
+    const MSG_SIGNAL: u8 = 0x07;
     const MSG_STDOUT: u8 = 0x10;
     const MSG_STDERR: u8 = 0x11;
     const MSG_EXIT: u8 = 0x12;
@@ -575,8 +577,32 @@ mod agent {
     /// sender; reparented orphans are simply reaped and dropped. Handlers must
     /// therefore never call `waitpid`/`Child::wait` themselves — that would race
     /// the reaper and either lose an exit code or double-reap.
-    fn reap_registry() -> &'static Mutex<HashMap<libc::pid_t, mpsc::Sender<i32>>> {
-        static REGISTRY: OnceLock<Mutex<HashMap<libc::pid_t, mpsc::Sender<i32>>>> = OnceLock::new();
+    /// How a reaped workload terminated: a normal exit code or a fatal signal.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WaitOutcome {
+        Exited(i32),
+        Signaled(i32),
+    }
+
+    /// Encode the `MSG_EXIT` payload: `[i32 LE code][i32 LE signal]`.
+    ///
+    /// The code slot keeps the shell convention (`128 + signal` for signal
+    /// deaths) so a reader that parses only the first 4 bytes sees the same
+    /// value the pre-signal protocol carried.
+    fn exit_payload(outcome: WaitOutcome) -> [u8; 8] {
+        let (code, signal) = match outcome {
+            WaitOutcome::Exited(code) => (code, 0),
+            WaitOutcome::Signaled(signal) => (128 + signal, signal),
+        };
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&code.to_le_bytes());
+        buf[4..].copy_from_slice(&signal.to_le_bytes());
+        buf
+    }
+
+    fn reap_registry() -> &'static Mutex<HashMap<libc::pid_t, mpsc::Sender<WaitOutcome>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<libc::pid_t, mpsc::Sender<WaitOutcome>>>> =
+            OnceLock::new();
         REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
@@ -587,14 +613,40 @@ mod agent {
         id as libc::pid_t
     }
 
-    /// Map a raw `wait` status to an exit code (128 + signal when killed).
-    fn wait_status_to_code(status: libc::c_int) -> Option<i32> {
+    /// Map a raw `wait` status to a termination outcome.
+    fn wait_status_to_outcome(status: libc::c_int) -> Option<WaitOutcome> {
         if libc::WIFEXITED(status) {
-            Some(libc::WEXITSTATUS(status))
+            Some(WaitOutcome::Exited(libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
-            Some(128 + libc::WTERMSIG(status))
+            Some(WaitOutcome::Signaled(libc::WTERMSIG(status)))
         } else {
             None // stopped / continued — not a termination
+        }
+    }
+
+    /// Deliver a host-requested signal to the workload's process group.
+    ///
+    /// Both exec paths `setsid` the child, so its pgid equals its pid; the
+    /// group kill reaches descendants, matching `kill_if_alive` semantics.
+    fn deliver_signal(pid: libc::pid_t, payload: &[u8]) {
+        let Some(bytes) = payload.get(..4) else {
+            eprintln!(
+                "agent: MSG_SIGNAL payload too short ({} bytes)",
+                payload.len()
+            );
+            return;
+        };
+        let signal = i32::from_le_bytes(bytes.try_into().unwrap());
+        if !(1..=64).contains(&signal) {
+            eprintln!("agent: MSG_SIGNAL rejected out-of-range signal {signal}");
+            return;
+        }
+        // SAFETY: signal 0 on the leader only probes liveness; the group kill
+        // targets the setsid'd process group led by `pid`.
+        unsafe {
+            if libc::kill(pid, 0) == 0 {
+                let _ = libc::kill(-pid, signal);
+            }
         }
     }
 
@@ -612,14 +664,14 @@ mod agent {
                     thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }
-                let Some(code) = wait_status_to_code(status) else {
+                let Some(outcome) = wait_status_to_outcome(status) else {
                     continue;
                 };
                 // Drop the registry lock before sending so a handler's recv
                 // never contends with it.
                 let waiter = reap_registry().lock().unwrap().remove(&pid);
                 if let Some(tx) = waiter {
-                    let _ = tx.send(code);
+                    let _ = tx.send(outcome);
                 }
                 // Otherwise a reparented orphan: reaped above, nothing to route.
             }
@@ -678,7 +730,7 @@ mod agent {
         // Spawn and register for reaping under one lock: if the child exits
         // immediately, the reaper blocks on the registry lock until the insert
         // below completes, so its exit code is never lost as an "orphan".
-        let (exit_tx, exit_rx) = mpsc::channel::<i32>();
+        let (exit_tx, exit_rx) = mpsc::channel::<WaitOutcome>();
         let mut child = {
             let mut registry = reap_registry().lock().unwrap();
             match cmd.spawn() {
@@ -696,7 +748,7 @@ mod agent {
         };
         let child_pid = as_pid(child.id());
 
-        let mut child_stdin = child.stdin.take().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
         let child_stdout = child.stdout.take().unwrap();
         let child_stderr = child.stderr.take().unwrap();
 
@@ -735,46 +787,63 @@ mod agent {
             spawn_timeout_killer(child_pid, start.timeout_seconds);
         }
 
-        // Read stdin frames from the host and forward to the child.
+        // Input loop on its own thread, mirroring the TTY path: the exit
+        // report below must never be gated on host input, and the session must
+        // keep accepting MSG_SIGNAL after a clean stdin EOF. Reporting the exit
+        // from the input loop (the old shape) deadlocked any session whose
+        // process exited while the host was still holding stdin open.
         // SAFETY: dup gives us a second fd for reading while the Arc owns the write fd.
         let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
-        let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
-        let mut host_disconnected = false;
-        loop {
-            match read_frame(&mut reader) {
-                Ok((MSG_STDIN, data)) => {
-                    if child_stdin.write_all(&data).is_err() {
-                        break;
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exited_in_loop = Arc::clone(&exited);
+        let t_input = thread::spawn(move || {
+            // SAFETY: read_fd is a fresh dup owned by this thread.
+            let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
+            let mut stdin = Some(child_stdin);
+            loop {
+                match read_frame(&mut reader) {
+                    Ok((MSG_STDIN, data)) => {
+                        if let Some(ref mut s) = stdin
+                            && s.write_all(&data).is_err()
+                        {
+                            stdin = None;
+                        }
                     }
+                    Ok((MSG_EOF, _)) => {
+                        // Clean stdin EOF: close the child's stdin but keep the
+                        // loop alive for signal frames.
+                        stdin = None;
+                    }
+                    Ok((MSG_SIGNAL, data)) => deliver_signal(child_pid, &data),
+                    Err(_) => {
+                        // Read shutdown after exit is routine teardown; a real
+                        // host disconnect must not leave the workload headless.
+                        if !exited_in_loop.load(Ordering::Relaxed) {
+                            kill_if_alive(child_pid);
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
                 }
-                Ok((MSG_EOF, _)) => {
-                    // Clean stdin EOF: stop forwarding but let the process run to
-                    // completion (its output still flows back).
-                    drop(child_stdin);
-                    break;
-                }
-                Err(_) => {
-                    // Host connection gone: don't leave the workload running
-                    // headless — kill it and let the reaper collect it.
-                    host_disconnected = true;
-                    break;
-                }
-                Ok(_) => {}
             }
-        }
-        if host_disconnected {
-            kill_if_alive(child_pid);
-        }
+        });
 
         let _ = t_stdout.join();
         let _ = t_stderr.join();
-        // The reaper owns waitpid; block on the routed exit code.
-        let exit_code = exit_rx.recv().unwrap_or(-1);
+        // The reaper owns waitpid; block on the routed exit outcome.
+        let outcome = exit_rx.recv().unwrap_or(WaitOutcome::Exited(-1));
         let _ = write_frame(
             &mut *writer.lock().unwrap(),
             MSG_EXIT,
-            &exit_code.to_le_bytes(),
+            &exit_payload(outcome),
         );
+        exited.store(true, Ordering::Relaxed);
+        // Unblock the input thread's read so the session tears down without
+        // depending on the host noticing first.
+        // SAFETY: read_fd stays open until t_input drops its VsockStream;
+        // shutting down the read half only wakes the blocked read.
+        unsafe { libc::shutdown(read_fd, libc::SHUT_RD) };
+        let _ = t_input.join();
     }
 
     /// SIGKILL `pid` after `timeout_seconds`, if it is still alive.
@@ -846,7 +915,7 @@ mod agent {
         // Hold the reap registry lock across fork + register so the single
         // reaper thread can't route (and discard) the child's exit status
         // before it is registered below.
-        let (exit_tx, exit_rx) = mpsc::channel::<i32>();
+        let (exit_tx, exit_rx) = mpsc::channel::<WaitOutcome>();
         let mut registry = reap_registry().lock().unwrap();
         match unsafe { fork() } {
             Err(e) => {
@@ -961,11 +1030,11 @@ mod agent {
                     // deadlocked every interactive session that exited on its
                     // own (^D at a shell, an agent quitting on ^C) until the
                     // client gave up or was killed.
-                    let exit_code = exit_rx.recv().unwrap_or(-1);
+                    let outcome = exit_rx.recv().unwrap_or(WaitOutcome::Exited(-1));
                     let _ = write_frame(
                         &mut *w_read.lock().unwrap(),
                         MSG_EXIT,
-                        &exit_code.to_le_bytes(),
+                        &exit_payload(outcome),
                     );
 
                     // Unblock the input loop so the session tears down without
@@ -993,6 +1062,7 @@ mod agent {
                             // SAFETY: master_fd is valid.
                             unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize) };
                         }
+                        Ok((MSG_SIGNAL, data)) => deliver_signal(child_pid, &data),
                         Ok((MSG_EOF, _)) => break,
                         Err(_) => {
                             // Host gone: kill the session's process group leader
@@ -1231,22 +1301,41 @@ mod agent {
         #[test]
         fn normal_exit_decodes_to_its_code() {
             // Linux wait status encodes a normal exit as `code << 8`.
-            assert_eq!(wait_status_to_code(0), Some(0));
-            assert_eq!(wait_status_to_code(42 << 8), Some(42));
-            assert_eq!(wait_status_to_code(127 << 8), Some(127));
+            assert_eq!(wait_status_to_outcome(0), Some(WaitOutcome::Exited(0)));
+            assert_eq!(
+                wait_status_to_outcome(42 << 8),
+                Some(WaitOutcome::Exited(42))
+            );
+            assert_eq!(
+                wait_status_to_outcome(127 << 8),
+                Some(WaitOutcome::Exited(127))
+            );
         }
 
         #[test]
-        fn signal_death_maps_to_128_plus_signal() {
+        fn signal_death_keeps_the_signal() {
             // A process killed by signal N has N in the low 7 status bits.
             assert_eq!(
-                wait_status_to_code(libc::SIGKILL),
-                Some(128 + libc::SIGKILL)
+                wait_status_to_outcome(libc::SIGKILL),
+                Some(WaitOutcome::Signaled(libc::SIGKILL))
             );
             assert_eq!(
-                wait_status_to_code(libc::SIGTERM),
-                Some(128 + libc::SIGTERM)
+                wait_status_to_outcome(libc::SIGTERM),
+                Some(WaitOutcome::Signaled(libc::SIGTERM))
             );
+        }
+
+        #[test]
+        fn exit_payload_encodes_code_and_signal_slots() {
+            let normal = exit_payload(WaitOutcome::Exited(42));
+            assert_eq!(i32::from_le_bytes(normal[..4].try_into().unwrap()), 42);
+            assert_eq!(i32::from_le_bytes(normal[4..].try_into().unwrap()), 0);
+
+            // Signal deaths keep the shell convention in the code slot so a
+            // 4-byte legacy reader sees the value the old protocol carried.
+            let killed = exit_payload(WaitOutcome::Signaled(9));
+            assert_eq!(i32::from_le_bytes(killed[..4].try_into().unwrap()), 137);
+            assert_eq!(i32::from_le_bytes(killed[4..].try_into().unwrap()), 9);
         }
     }
 }

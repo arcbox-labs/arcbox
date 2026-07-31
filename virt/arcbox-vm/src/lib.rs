@@ -55,7 +55,7 @@ pub use sandbox::{
     SandboxState, SandboxSummary,
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
-pub use vsock::{ExecInputMsg, OutputChunk, StartCommand};
+pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 
 // Re-export VmState for system_svc compatibility (internal use only).
 pub use instance::VmState;

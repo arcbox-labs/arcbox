@@ -138,8 +138,8 @@ pub struct SandboxInstance {
     pub ready_at: Option<DateTime<Utc>>,
     /// When the last workload exited.
     pub last_exited_at: Option<DateTime<Utc>>,
-    /// Exit code of the last workload.
-    pub last_exit_code: Option<i32>,
+    /// How the last workload terminated.
+    pub last_exit_status: Option<ExitStatus>,
     /// Human-readable error (only set when state == `Failed`).
     pub error: Option<String>,
     /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
@@ -170,7 +170,7 @@ impl SandboxInstance {
             created_at: Utc::now(),
             ready_at: None,
             last_exited_at: None,
-            last_exit_code: None,
+            last_exit_status: None,
             error: None,
             cow_handle: None,
             restore_origin_dir: None,
@@ -206,7 +206,7 @@ pub struct SandboxInfo {
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub last_exited_at: Option<DateTime<Utc>>,
-    pub last_exit_code: Option<i32>,
+    pub last_exit_status: Option<ExitStatus>,
     pub error: Option<String>,
 }
 

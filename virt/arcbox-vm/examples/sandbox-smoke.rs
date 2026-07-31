@@ -347,11 +347,12 @@ async fn run_cmd(
     let mut exit_code = 0;
     while let Some(chunk) = rx.recv().await {
         let chunk = chunk.context("output chunk")?;
-        match chunk.stream.as_str() {
-            "stdout" => stdout.extend_from_slice(&chunk.data),
-            "stderr" => eprint!("{}", String::from_utf8_lossy(&chunk.data)),
-            "exit" => exit_code = chunk.exit_code,
-            _ => {}
+        match chunk {
+            arcbox_vm::OutputChunk::Stdout(data) => stdout.extend_from_slice(&data),
+            arcbox_vm::OutputChunk::Stderr(data) => {
+                eprint!("{}", String::from_utf8_lossy(&data));
+            }
+            arcbox_vm::OutputChunk::Exit(status) => exit_code = status.conventional_code(),
         }
     }
 
