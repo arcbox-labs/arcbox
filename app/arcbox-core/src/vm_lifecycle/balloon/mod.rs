@@ -8,8 +8,11 @@
 //!
 //! - Never shrink without a fresh guest memory reading. An unreachable
 //!   agent means we know nothing about guest load — keep the balloon.
-//! - The idle target tracks actual guest usage plus headroom; it is never
-//!   an unconditional constant. A guest that is actively *working* (load)
+//! - The idle target tracks actual guest usage plus a reserve; it is never
+//!   an unconditional constant, and it never plans the guest's
+//!   `MemAvailable` to zero — a policy that walks the guest to the cliff
+//!   edge needs a millisecond-class rescue path to survive, and one that
+//!   stays clear of it does not. A guest that is actively *working* (load)
 //!   is not idle at all, no matter how quiet the host-side API is.
 //! - Entry-time stats are the only ones used for sizing: they are taken
 //!   while the balloon is empty, the one state where `/proc/meminfo` is
@@ -48,12 +51,28 @@ pub(super) mod controller;
 /// Bytes per MiB.
 const MIB: u64 = 1024 * 1024;
 
-/// Headroom added above observed guest usage when computing an idle target.
-pub(super) const IDLE_BALLOON_HEADROOM: u64 = 256 * MIB;
+/// Guest `MemAvailable` that an idle shrink must leave behind.
+///
+/// The target is never planned below `used + this`, so an idle guest keeps a
+/// working reserve instead of being walked to the edge. The predecessor
+/// constant was 256 MiB, which for an idle guest (`used ≈ 0`) collapsed the
+/// target onto the absolute floor: measured 2026-07-29 on a 16 GB VM, the
+/// descent asked for 15.8 GB of the guest's 15.96 GB available and pinned
+/// `MemAvailable` at literally 0 for ~98 s per cycle, which is both an OOM
+/// hazard for running containers and ~14 cores of reclaim spin.
+pub(super) const IDLE_MIN_RESERVE: u64 = 1024 * MIB;
 
-/// Absolute floor for a computed idle target. Below this the guest kernel
-/// itself becomes unstable regardless of workload.
-pub(super) const IDLE_BALLOON_FLOOR: u64 = 384 * MIB;
+/// Divisor bounding how much of the guest's available memory a single idle
+/// entry may reclaim (2 ⇒ at most half).
+///
+/// The reserve alone still permits a violent single step — on that same 16 GB
+/// idle guest it would allow reclaiming 14.9 GB. Leaving as much as we take
+/// bounds the guest-side reclaim cost of any one entry.
+pub(super) const IDLE_RECLAIM_DIVISOR: u64 = 2;
+
+/// Smallest reclaim worth a shrink at all. Below this the guest-side reclaim
+/// cost is not repaid by the memory returned.
+pub(super) const MIN_WORTHWHILE_RECLAIM: u64 = 512 * MIB;
 
 /// A guest with at least this 1-minute load average is doing real work —
 /// it is not idle, regardless of host-side API silence (in-guest workloads
@@ -103,13 +122,26 @@ pub(super) enum EntryDecision {
     Keep,
 }
 
-/// Computes the idle balloon target for the observed guest usage:
-/// used memory plus [`IDLE_BALLOON_HEADROOM`], clamped to
-/// [`IDLE_BALLOON_FLOOR`] and the full configured size.
+/// Computes the idle balloon target for the observed guest usage.
+///
+/// Two independent floors, whichever is higher:
+///
+/// - `used` plus [`IDLE_MIN_RESERVE`] — the guest keeps a working reserve;
+/// - `total` minus `available` over [`IDLE_RECLAIM_DIVISOR`] — one entry
+///   reclaims at most a bounded share of the slack.
+///
+/// The result never exceeds the full configured size. Note the target only
+/// ever *approaches* the guest's usage from above, so it stays usage-aware
+/// without ever planning `MemAvailable` to zero. The reserve also subsumes
+/// the old absolute floor — no computed target can land near the level where
+/// the guest kernel itself destabilises.
 pub(super) fn idle_target(stats: GuestStats, full: u64) -> u64 {
     let used = stats.total.saturating_sub(stats.available);
-    used.saturating_add(IDLE_BALLOON_HEADROOM)
-        .clamp(IDLE_BALLOON_FLOOR, full)
+    let reserve_floor = used.saturating_add(IDLE_MIN_RESERVE);
+    let share_floor = stats
+        .total
+        .saturating_sub(stats.available / IDLE_RECLAIM_DIVISOR);
+    reserve_floor.max(share_floor).min(full)
 }
 
 /// Decides the balloon move when the VM enters idle.
@@ -130,7 +162,7 @@ pub(super) fn entry_decision(stats: Option<GuestStats>, full: u64) -> EntryDecis
         return EntryDecision::NotIdle;
     }
     let target = idle_target(stats, full);
-    if target >= full {
+    if full.saturating_sub(target) < MIN_WORTHWHILE_RECLAIM {
         EntryDecision::Keep
     } else {
         EntryDecision::Shrink(target)
@@ -154,16 +186,58 @@ mod tests {
 
     #[test]
     fn idle_target_tracks_guest_usage() {
-        // 12 GiB used → target must follow usage, not a constant.
+        // 12 GiB used, 4 GiB available → the share floor binds: reclaim at
+        // most half the slack (2 GiB), never a constant.
         let t = idle_target(stats(FULL, 4 * GIB), FULL);
-        assert_eq!(t, 12 * GIB + IDLE_BALLOON_HEADROOM);
+        assert_eq!(t, FULL - 2 * GIB);
     }
 
     #[test]
-    fn idle_target_clamps_to_floor() {
-        // Near-empty guest: 100 MiB used + headroom is below the floor.
-        let t = idle_target(stats(FULL, FULL - 100 * MIB), FULL);
-        assert_eq!(t, IDLE_BALLOON_FLOOR);
+    fn idle_target_reserve_binds_when_slack_is_small() {
+        // 15 GiB used, 1 GiB available: half the slack (512 MiB) would leave
+        // the guest under the reserve, so `used + reserve` wins.
+        let t = idle_target(stats(FULL, GIB), FULL);
+        assert_eq!(t, 15 * GIB + IDLE_MIN_RESERVE);
+    }
+
+    /// CORE-45: the defect this policy replaced. With `used + 256 MiB` an
+    /// idle guest collapsed onto the floor — the descent asked for nearly
+    /// all of `MemAvailable` and pinned it at zero for ~98 s per cycle.
+    #[test]
+    fn idle_guest_is_never_walked_to_the_floor() {
+        let available = FULL - 100 * MIB;
+        let t = idle_target(stats(FULL, available), FULL);
+
+        assert!(
+            t >= FULL / 2,
+            "an idle guest must not be squeezed to a sliver, got {t}"
+        );
+        // Reclaim is bounded by the share cap ...
+        assert_eq!(FULL - t, available / 2);
+        // ... and what the guest keeps available stays far above the reserve.
+        assert!(available - (FULL - t) >= IDLE_MIN_RESERVE);
+    }
+
+    /// The planned reclaim must never eat into the reserve, at any usage.
+    #[test]
+    fn planned_reclaim_always_leaves_the_reserve() {
+        for available_gib in 0..=16 {
+            let available = available_gib * GIB;
+            let t = idle_target(stats(FULL, available), FULL);
+            let reclaim = FULL.saturating_sub(t);
+            assert!(
+                available.saturating_sub(reclaim) >= IDLE_MIN_RESERVE.min(available),
+                "available {available} reclaim {reclaim} breaches the reserve"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_target_never_exceeds_a_tiny_configured_size() {
+        // A configured size below the reserve must not produce a target above
+        // it (the old `clamp(floor, full)` would have panicked here).
+        let t = idle_target(stats(256 * MIB, 200 * MIB), 256 * MIB);
+        assert_eq!(t, 256 * MIB);
     }
 
     #[test]
@@ -175,9 +249,10 @@ mod tests {
 
     #[test]
     fn idle_target_saturates_on_inconsistent_stats() {
-        // available > total must not underflow.
+        // available > total must not underflow: used saturates to 0, so the
+        // reserve floor carries the result.
         let t = idle_target(stats(4 * GIB, 8 * GIB), FULL);
-        assert_eq!(t, IDLE_BALLOON_FLOOR);
+        assert_eq!(t, IDLE_MIN_RESERVE);
     }
 
     /// Incident guard #1: the 2026-07-15 thrash began with an unconditional
@@ -189,15 +264,22 @@ mod tests {
 
     #[test]
     fn entry_shrinks_to_usage_aware_target() {
-        // 4 GiB used: shrink, but to usage + headroom — not to a constant.
+        // 4 GiB used, 12 GiB available: reclaim half the slack, not a constant.
         let d = entry_decision(Some(stats(FULL, 12 * GIB)), FULL);
-        assert_eq!(d, EntryDecision::Shrink(4 * GIB + IDLE_BALLOON_HEADROOM));
+        assert_eq!(d, EntryDecision::Shrink(FULL - 6 * GIB));
     }
 
     #[test]
     fn entry_with_no_reclaimable_memory_keeps() {
-        // Usage + headroom ≥ full: nothing to reclaim.
+        // Usage + reserve ≥ full: nothing to reclaim.
         let d = entry_decision(Some(stats(FULL, 100 * MIB)), FULL);
+        assert_eq!(d, EntryDecision::Keep);
+    }
+
+    #[test]
+    fn entry_keeps_when_the_reclaim_is_not_worth_it() {
+        // 800 MiB available ⇒ half is 400 MiB, below the worthwhile bar.
+        let d = entry_decision(Some(stats(FULL, 800 * MIB)), FULL);
         assert_eq!(d, EntryDecision::Keep);
     }
 

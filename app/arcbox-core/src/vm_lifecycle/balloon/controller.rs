@@ -661,8 +661,11 @@ mod tests {
         }
     }
 
-    /// Final descent target for `idle_stats` (usage + headroom).
-    const FINAL_TARGET: u64 = 4 * GIB + super::super::IDLE_BALLOON_HEADROOM;
+    /// Final descent target for `idle_stats`. Derived from the policy rather
+    /// than restated, so a policy change cannot silently desync this test.
+    fn final_target() -> u64 {
+        super::super::idle_target(idle_stats(), FULL)
+    }
     /// First staged step from 16 GiB full memory.
     const FIRST_STEP: u64 = FULL - super::super::SHRINK_STEP;
 
@@ -717,23 +720,21 @@ mod tests {
     /// fresh watch (fresh settling detector).
     #[tokio::test(start_paused = true)]
     async fn staged_descent_steps_on_settled_frames() {
-        const STEP: u64 = super::super::SHRINK_STEP;
+        // Derive the whole descent from the policy: SHRINK_STEP increments
+        // from full down to the target, the last one clamping.
+        let expected: Vec<u64> = std::iter::successors(Some(FULL), |&cur| {
+            (cur > final_target()).then(|| super::super::next_step(cur, final_target()))
+        })
+        .skip(1)
+        .collect();
+
         let deps = FakeDeps::new(Some(FULL));
         deps.push_stats(Some(idle_stats()));
-        let watches: Vec<_> = (0..6).map(|_| deps.push_watch()).collect();
+        let watches: Vec<_> = (0..expected.len()).map(|_| deps.push_watch()).collect();
         let h = Harness::spawn(deps);
 
         h.commands.send(BalloonCommand::EnterIdle).unwrap();
         h.settle().await;
-
-        let expected = [
-            FULL - STEP,     // 14 GiB
-            FULL - 2 * STEP, // 12 GiB
-            FULL - 3 * STEP, // 10 GiB
-            FULL - 4 * STEP, // 8 GiB
-            FULL - 5 * STEP, // 6 GiB
-            FINAL_TARGET,    // clamp
-        ];
         for (i, watch) in watches.iter().enumerate().take(expected.len() - 1) {
             watch.send(WatchFrame::Settled).unwrap();
             h.settle().await;
@@ -754,9 +755,11 @@ mod tests {
         assert_eq!(h.activity_count(), 0, "descent is not activity");
 
         // At the final target, further Settled frames change nothing.
-        watches[5].send(WatchFrame::Settled).unwrap();
+        watches[expected.len() - 1]
+            .send(WatchFrame::Settled)
+            .unwrap();
         h.settle().await;
-        assert_eq!(h.targets(), expected.to_vec());
+        assert_eq!(h.targets(), expected);
     }
 
     #[tokio::test(start_paused = true)]
