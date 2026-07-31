@@ -96,20 +96,14 @@ pub struct CreateArgs {
     /// Caller-supplied sandbox ID (empty = auto-generated)
     #[arg(long)]
     pub id: Option<String>,
-    /// Kernel image path (empty = daemon default)
-    #[arg(long)]
-    pub kernel: Option<String>,
-    /// Root filesystem ext4 image path (empty = daemon default)
-    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image", "from_template"])]
-    pub rootfs: Option<String>,
-    /// Build sandbox rootfs from a Dockerfile
-    #[arg(long, conflicts_with_all = ["rootfs", "from_image", "from_template"])]
+    /// Build the sandbox image from a Dockerfile
+    #[arg(long, conflicts_with_all = ["from_image", "from_template"])]
     pub from_dockerfile: Option<String>,
-    /// Build sandbox rootfs from an existing Docker image
-    #[arg(long, conflicts_with_all = ["rootfs", "from_dockerfile", "from_template"])]
+    /// Use an existing Docker image as the sandbox image
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_template"])]
     pub from_image: Option<String>,
-    /// Build sandbox rootfs from a built-in template (see `sandbox templates`)
-    #[arg(long, conflicts_with_all = ["rootfs", "from_dockerfile", "from_image"])]
+    /// Use a built-in template as the sandbox image (see `sandbox templates`)
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image"])]
     pub from_template: Option<String>,
     /// Number of vCPUs (0 = daemon default)
     #[arg(long, default_value = "0")]
@@ -298,11 +292,11 @@ pub async fn execute(cmd: SandboxCommands) -> Result<()> {
     }
 }
 
-/// Build a built-in template and return the guest-visible rootfs path.
+/// Build a built-in template and return its sandbox template reference.
 ///
 /// Shared with the agent-session commands (`abctl claude`), which select their
 /// image by template name.
-pub(super) async fn resolve_template_rootfs(name: &str) -> Result<String> {
+pub(super) async fn resolve_template(name: &str) -> Result<String> {
     let template = arcbox_cli::templates::find(name).with_context(|| {
         format!(
             "unknown template '{name}' (available: {})",
@@ -441,8 +435,9 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
 
     let labels = parse_labels(&args.label)?;
 
-    // Resolve rootfs from whichever flag was provided.
-    let rootfs = if let Some(path) = &args.from_dockerfile {
+    // Resolve whichever selector was given to a template reference. An
+    // absent selector leaves it empty: the built-in minimal image.
+    let template = if let Some(path) = &args.from_dockerfile {
         arcbox_cli::rootfs_builder::resolve_from_dockerfile(path)
             .await
             .context("Failed to build Docker image from Dockerfile")?
@@ -451,16 +446,15 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
             .await
             .context("Failed to resolve Docker image")?
     } else if let Some(name) = &args.from_template {
-        resolve_template_rootfs(name).await?
+        resolve_template(name).await?
     } else {
-        args.rootfs.clone().unwrap_or_default()
+        String::new()
     };
 
     let req = CreateSandboxRequest {
         id: args.id.unwrap_or_default(),
         labels,
-        kernel: args.kernel.unwrap_or_default(),
-        rootfs,
+        template,
         limits: Some(ResourceLimits {
             vcpus: args.cpus,
             memory_mib: args.memory,
@@ -601,7 +595,6 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
         "network": info.network.map(|n| serde_json::json!({
             "ip_address": n.ip_address,
             "gateway": n.gateway,
-            "tap_name": n.tap_name,
         })),
         "created_at": format_timestamp(info.created_at.as_ref()),
         "ready_at": format_timestamp(info.ready_at.as_ref()),
@@ -910,10 +903,9 @@ async fn execute_checkpoint(args: CheckpointArgs) -> Result<()> {
         .into_inner();
 
     println!("Snapshot created");
-    println!("  Snapshot ID:  {}", resp.snapshot_id);
-    println!("  Snapshot dir: {}", resp.snapshot_dir);
+    println!("  Snapshot ID: {}", resp.snapshot_id);
     println!(
-        "  Created at:   {}",
+        "  Created at:  {}",
         format_timestamp(resp.created_at.as_ref())
     );
     Ok(())

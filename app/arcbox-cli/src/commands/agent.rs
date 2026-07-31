@@ -275,12 +275,12 @@ async fn create(
     vcpus: u32,
     memory_mib: u64,
 ) -> Result<()> {
-    let rootfs = super::sandbox::resolve_template_rootfs(def.template).await?;
+    let template = super::sandbox::resolve_template(def.template).await?;
 
     let request = attach_machine(tonic::Request::new(CreateSandboxRequest {
         id: id.to_string(),
         labels: HashMap::from([("arcbox.agent".to_string(), def.name.to_string())]),
-        rootfs,
+        template,
         limits: Some(ResourceLimits { vcpus, memory_mib }),
         // No TTL: expiry would take /workspace with it mid-session.
         ttl_seconds: 0,
