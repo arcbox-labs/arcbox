@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5](https://github.com/arcboxlabs/arcbox/compare/v0.5.4...v0.5.5) (2026-07-31)
+
+
+### Features
+
+* **cli:** abctl claude — coding-agent TUI in a sandbox ([bd558cd](https://github.com/arcboxlabs/arcbox/commit/bd558cdf7bbf9d6a5771d058d3203cb1c90bb616))
+* **cli:** embedded sandbox image templates ([aa00154](https://github.com/arcboxlabs/arcbox/commit/aa001540284855e106c70ce4fb6bd08515fa4c36))
+* **fleet:** restart the agent process in place ([c8649a5](https://github.com/arcboxlabs/arcbox/commit/c8649a5ae9dd219874ec86fe479d79d6d484fe56))
+
+
+### Bug Fixes
+
+* **cli:** do not wait for the parked stdin read when the runtime shuts down ([94c1ad5](https://github.com/arcboxlabs/arcbox/commit/94c1ad522ae983837c0bc8f6c01003b77ac35819))
+* **cli:** end an exec session when the workload exits ([050ff66](https://github.com/arcboxlabs/arcbox/commit/050ff66f996734646f9bef2f454196e31c6804cb))
+* **cli:** key the image layout cache on filesystem content, not image id ([75aaa6f](https://github.com/arcboxlabs/arcbox/commit/75aaa6f417e09ebea578e4d68ad4b17a6b7dcb86))
+* **sandbox:** invalidate converted rootfs images when vm-agent changes ([df66e8c](https://github.com/arcboxlabs/arcbox/commit/df66e8c92a6ddad686f69cc5371b53be05d03ccc))
+* **sandbox:** keep converted rootfs images that snapshots restore from ([3837c08](https://github.com/arcboxlabs/arcbox/commit/3837c08c6e96671b2b82a1eea2cc03162889b91b))
+* **sandbox:** report an interactive workload's exit status when it exits ([9bcf94c](https://github.com/arcboxlabs/arcbox/commit/9bcf94c7907dc1a44022e0d0a7fc78def9e04358))
+* **sandbox:** resolve docker images through an OCI layout export ([96740ca](https://github.com/arcboxlabs/arcbox/commit/96740ca3497c7516170ffb57ba6210b7ca86c55f))
+* **vz:** build the Swift shim with SwiftPM's native build system ([19e46b7](https://github.com/arcboxlabs/arcbox/commit/19e46b748626cdc8432db3ec530c9df204013812))
+
+
+### Code Refactoring
+
+* **vm:** publish snapshots atomically instead of piecewise ([419b270](https://github.com/arcboxlabs/arcbox/commit/419b2705450fd0617ba0a5ab5d95bdf0dd776607))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.6.13 (fuse spin-wait, CORE-48) ([#513](https://github.com/arcboxlabs/arcbox/issues/513)) ([098771c](https://github.com/arcboxlabs/arcbox/commit/098771c0bb65fea9ce6f59aa679187770ec65e2f))
+* **tools:** bump Docker toolchain to latest stable versions ([#502](https://github.com/arcboxlabs/arcbox/issues/502)) ([a44178b](https://github.com/arcboxlabs/arcbox/commit/a44178b0729ec61a7100c4546144a8dbd73d72e9))
+
 ## [0.5.4](https://github.com/arcboxlabs/arcbox/compare/v0.5.3...v0.5.4) (2026-07-30)
 
 
