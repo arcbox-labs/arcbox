@@ -6,12 +6,16 @@
 use anyhow::{Context, Result};
 use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
 use arcbox_grpc::{SandboxServiceClient, SandboxSnapshotServiceClient};
+use arcbox_protocol::pbjson_types::Timestamp;
 use arcbox_protocol::sandbox_v1::{
-    CheckpointRequest, CreateSandboxRequest, DeleteSnapshotRequest, ExecInput, ExecRequest,
-    ExposePortRequest, FileChunk, InspectSandboxRequest, ListSandboxesRequest,
-    ListSnapshotsRequest, ReadFileRequest, RemoveSandboxRequest, ResourceLimits, RestoreRequest,
-    RunRequest, SandboxEventsRequest, StopSandboxRequest, TerminalSize as ProtoTerminalSize,
-    UnexposePortRequest, WriteFileOpen, WriteFileRequest, exec_input, write_file_request,
+    AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, DeleteSnapshotRequest,
+    Execution, ExposePortRequest, FileChunk, InspectSandboxRequest, ListSandboxesRequest,
+    ListSnapshotsRequest, PortProtocol, ReadFileRequest, RemoveSandboxRequest,
+    ResizeExecutionTtyRequest, ResourceLimits, RestoreRequest, SandboxEventKind,
+    SandboxEventsRequest, SandboxState, StartExecutionRequest, StdioChannel, StopSandboxRequest,
+    TerminalSize as ProtoTerminalSize, UnexposePortRequest, WaitExecutionRequest, WriteFileOpen,
+    WriteFileRequest, WriteStdinRequest, execution_event, exit_status, watch_events_response,
+    write_file_request,
 };
 use clap::{Args, Subcommand};
 use std::collections::HashMap;
@@ -63,7 +67,7 @@ pub enum SandboxCommands {
     Inspect(InspectArgs),
     /// Run a command inside a sandbox (streaming output, no stdin)
     Run(RunArgs),
-    /// Execute an interactive command inside a sandbox (bidirectional)
+    /// Execute an interactive command inside a sandbox
     Exec(ExecArgs),
     /// Subscribe to sandbox lifecycle events
     Events(EventsArgs),
@@ -141,7 +145,7 @@ pub struct RemoveArgs {
 
 #[derive(Args)]
 pub struct ListArgs {
-    /// Filter by state (starting/ready/running/stopped/failed)
+    /// Filter by state (starting/ready/running/stopping/stopped/failed)
     #[arg(long)]
     pub state: Option<String>,
     /// Only show IDs
@@ -190,9 +194,9 @@ pub struct EventsArgs {
     /// Filter by sandbox ID (empty = all sandboxes)
     #[arg(long)]
     pub id: Option<String>,
-    /// Filter by action (empty = all actions)
+    /// Filter by event kind (created/ready/running/idle/stopping/stopped/failed/removed)
     #[arg(long)]
-    pub action: Option<String>,
+    pub kind: Option<String>,
 }
 
 #[derive(Args)]
@@ -342,6 +346,95 @@ fn parse_labels(raw: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Human-readable name of a sandbox state.
+pub(super) fn state_name(state: SandboxState) -> &'static str {
+    match state {
+        SandboxState::Unspecified => "unknown",
+        SandboxState::Starting => "starting",
+        SandboxState::Ready => "ready",
+        SandboxState::Running => "running",
+        SandboxState::Stopping => "stopping",
+        SandboxState::Stopped => "stopped",
+        SandboxState::Failed => "failed",
+    }
+}
+
+/// Parse a `--state` filter value.
+fn parse_state(value: &str) -> Result<SandboxState> {
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "starting" => SandboxState::Starting,
+        "ready" => SandboxState::Ready,
+        "running" => SandboxState::Running,
+        "stopping" => SandboxState::Stopping,
+        "stopped" => SandboxState::Stopped,
+        "failed" => SandboxState::Failed,
+        other => anyhow::bail!(
+            "unknown state '{other}' (expected starting/ready/running/stopping/stopped/failed)"
+        ),
+    })
+}
+
+/// Parse a `--kind` event filter value.
+fn parse_event_kind(value: &str) -> Result<SandboxEventKind> {
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "created" => SandboxEventKind::Created,
+        "ready" => SandboxEventKind::Ready,
+        "running" => SandboxEventKind::Running,
+        "idle" => SandboxEventKind::Idle,
+        "stopping" => SandboxEventKind::Stopping,
+        "stopped" => SandboxEventKind::Stopped,
+        "failed" => SandboxEventKind::Failed,
+        "removed" => SandboxEventKind::Removed,
+        other => anyhow::bail!(
+            "unknown event kind '{other}' (expected \
+             created/ready/running/idle/stopping/stopped/failed/removed)"
+        ),
+    })
+}
+
+/// Human-readable name of an event kind.
+fn event_kind_name(kind: SandboxEventKind) -> &'static str {
+    match kind {
+        SandboxEventKind::Unspecified => "unknown",
+        SandboxEventKind::Created => "created",
+        SandboxEventKind::Ready => "ready",
+        SandboxEventKind::Running => "running",
+        SandboxEventKind::Idle => "idle",
+        SandboxEventKind::Stopping => "stopping",
+        SandboxEventKind::Stopped => "stopped",
+        SandboxEventKind::Failed => "failed",
+        SandboxEventKind::Removed => "removed",
+    }
+}
+
+/// Parse a `--protocol` flag value.
+fn parse_protocol(value: &str) -> Result<PortProtocol> {
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "" | "tcp" => PortProtocol::Tcp,
+        "udp" => PortProtocol::Udp,
+        other => anyhow::bail!("unsupported protocol '{other}' (expected tcp or udp)"),
+    })
+}
+
+/// Render a proto timestamp as RFC3339 (empty when unset).
+fn format_timestamp(ts: Option<&Timestamp>) -> String {
+    ts.and_then(|t| {
+        chrono::DateTime::from_timestamp(t.seconds, u32::try_from(t.nanos).unwrap_or(0))
+    })
+    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    .unwrap_or_default()
+}
+
+/// Shell-convention scalar exit code of a finished execution
+/// (`128 + signal` for signal deaths; 1 when torn down without an exit).
+fn exit_code_of(execution: &Execution) -> i32 {
+    match execution.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(code)) => code,
+        Some(exit_status::Status::Signal(signal)) => 128 + signal,
+        None => 1,
+    }
+}
+
 async fn execute_create(args: CreateArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
@@ -385,7 +478,7 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
     println!("Sandbox created");
     println!("  ID:    {}", resp.id);
     println!("  IP:    {}", resp.ip_address);
-    println!("  State: {}", resp.state);
+    println!("  State: {}", state_name(resp.state()));
     Ok(())
 }
 
@@ -427,16 +520,31 @@ async fn execute_list(args: ListArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
 
-    let req = ListSandboxesRequest {
-        state: args.state.unwrap_or_default(),
-        labels: HashMap::new(),
+    let state = match &args.state {
+        Some(value) => parse_state(value)?,
+        None => SandboxState::Unspecified,
     };
-    let sandboxes = client
-        .list(attach_machine(tonic::Request::new(req)))
-        .await
-        .context("Failed to list sandboxes")?
-        .into_inner()
-        .sandboxes;
+    // Follow continuation tokens so the human view stays complete.
+    let mut sandboxes = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = ListSandboxesRequest {
+            state: state.into(),
+            labels: HashMap::new(),
+            page_size: 0,
+            page_token: page_token.clone(),
+        };
+        let mut resp = client
+            .list(attach_machine(tonic::Request::new(req)))
+            .await
+            .context("Failed to list sandboxes")?
+            .into_inner();
+        sandboxes.append(&mut resp.sandboxes);
+        if resp.next_page_token.is_empty() {
+            break;
+        }
+        page_token = resp.next_page_token;
+    }
 
     if args.quiet {
         for sb in &sandboxes {
@@ -454,7 +562,10 @@ async fn execute_list(args: ListArgs) -> Result<()> {
     for sb in &sandboxes {
         println!(
             "{:<36} {:<12} {:<18} {}",
-            sb.id, sb.state, sb.ip_address, sb.created_at,
+            sb.id,
+            state_name(sb.state()),
+            sb.ip_address,
+            format_timestamp(sb.created_at.as_ref()),
         );
     }
     Ok(())
@@ -471,9 +582,17 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
         .context("Failed to inspect sandbox")?
         .into_inner();
 
+    let last_exit_status = info
+        .last_exit_status
+        .as_ref()
+        .and_then(|s| s.status)
+        .map(|status| match status {
+            exit_status::Status::Code(code) => serde_json::json!({ "code": code }),
+            exit_status::Status::Signal(signal) => serde_json::json!({ "signal": signal }),
+        });
     let payload = serde_json::json!({
         "id": info.id,
-        "state": info.state,
+        "state": state_name(info.state()),
         "labels": info.labels,
         "limits": info.limits.map(|l| serde_json::json!({
             "vcpus": l.vcpus,
@@ -484,10 +603,10 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
             "gateway": n.gateway,
             "tap_name": n.tap_name,
         })),
-        "created_at": info.created_at,
-        "ready_at": info.ready_at,
-        "last_exited_at": info.last_exited_at,
-        "last_exit_code": info.last_exit_code,
+        "created_at": format_timestamp(info.created_at.as_ref()),
+        "ready_at": format_timestamp(info.ready_at.as_ref()),
+        "last_exited_at": format_timestamp(info.last_exited_at.as_ref()),
+        "last_exit_status": last_exit_status,
         "error": info.error,
     });
 
@@ -502,45 +621,17 @@ async fn execute_run(args: RunArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
 
-    let req = RunRequest {
-        id: args.id,
+    let start = StartExecutionRequest {
+        sandbox_id: args.id,
         cmd: args.cmd,
         tty: args.tty,
+        tty_size: current_tty_size(args.tty),
         timeout_seconds: args.timeout,
+        stdin: false,
         ..Default::default()
     };
 
-    let mut stream = client
-        .run(attach_machine(tonic::Request::new(req)))
-        .await
-        .context("Failed to run command in sandbox")?
-        .into_inner();
-
-    let mut exit_code = 0i32;
-    while let Some(output) = stream
-        .message()
-        .await
-        .context("Failed to read run output")?
-    {
-        if !output.data.is_empty() {
-            match output.stream.as_str() {
-                "stderr" => {
-                    std::io::stderr()
-                        .write_all(&output.data)
-                        .context("Failed to write stderr")?;
-                }
-                _ => {
-                    std::io::stdout()
-                        .write_all(&output.data)
-                        .context("Failed to write stdout")?;
-                }
-            }
-        }
-        if output.done {
-            exit_code = output.exit_code;
-        }
-    }
-
+    let exit_code = exec_session(&mut client, start).await?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -551,16 +642,17 @@ async fn execute_exec(args: ExecArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
 
-    let init = ExecRequest {
-        id: args.id,
+    let start = StartExecutionRequest {
+        sandbox_id: args.id,
         cmd: args.cmd,
         tty: args.tty,
         tty_size: current_tty_size(args.tty),
         timeout_seconds: args.timeout,
+        stdin: true,
         ..Default::default()
     };
 
-    let exit_code = exec_session(&mut client, init).await?;
+    let exit_code = exec_session(&mut client, start).await?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -578,25 +670,26 @@ pub(super) fn current_tty_size(tty: bool) -> Option<ProtoTerminalSize> {
     })
 }
 
-/// Run one interactive exec session and return the command's exit code.
+/// Start an execution, stream its output, and return the exit code.
 ///
-/// Owns the whole bidirectional stream: the init frame, raw terminal mode,
-/// SIGWINCH forwarding, the stdin pump, and copying output back out. Callers
-/// decide what an exit code means — nothing here terminates the process.
+/// Owns the whole session: StartExecution, the attach stream, raw terminal
+/// mode, SIGWINCH forwarding via ResizeExecutionTty, and (when `stdin` is
+/// requested) the offset-tracked WriteStdin pump. Callers decide what an exit
+/// code means — nothing here terminates the process.
 pub(super) async fn exec_session(
     client: &mut SandboxServiceClient<Channel>,
-    init: ExecRequest,
+    start: StartExecutionRequest,
 ) -> Result<i32> {
-    let tty = init.tty;
-    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<ExecInput>(16);
+    let tty = start.tty;
+    let stdin = start.stdin;
+    let sandbox_id = start.sandbox_id.clone();
 
-    // The first message in the stream must be the Init payload.
-    msg_tx
-        .send(ExecInput {
-            payload: Some(exec_input::Payload::Init(init)),
-        })
+    let execution = client
+        .start_execution(attach_machine(tonic::Request::new(start)))
         .await
-        .context("Failed to send exec init")?;
+        .context("Failed to start execution in sandbox")?
+        .into_inner();
+    let execution_id = execution.id.clone();
 
     // Enable raw terminal mode when TTY is requested.
     let raw_guard = if tty {
@@ -605,20 +698,28 @@ pub(super) async fn exec_session(
         None
     };
 
-    // Resize pump: SIGWINCH → gRPC resize frames (TTY sessions only).
+    // Resize pump: SIGWINCH → unary resize calls (TTY sessions only).
     if tty {
-        let resize_tx = msg_tx.clone();
+        let mut resize_client = client.clone();
+        let sandbox_id = sandbox_id.clone();
+        let execution_id = execution_id.clone();
         match arcbox_cli::terminal::ResizeWatcher::new() {
             Ok(mut watcher) => {
                 tokio::spawn(async move {
                     while let Some(size) = watcher.recv().await {
-                        let msg = ExecInput {
-                            payload: Some(exec_input::Payload::Resize(ProtoTerminalSize {
+                        let req = ResizeExecutionTtyRequest {
+                            sandbox_id: sandbox_id.clone(),
+                            execution_id: execution_id.clone(),
+                            size: Some(ProtoTerminalSize {
                                 width: u32::from(size.cols),
                                 height: u32::from(size.rows),
-                            })),
+                            }),
                         };
-                        if resize_tx.send(msg).await.is_err() {
+                        if resize_client
+                            .resize_execution_tty(attach_machine(tonic::Request::new(req)))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -628,90 +729,139 @@ pub(super) async fn exec_session(
         }
     }
 
-    // Stdin pump: local terminal → gRPC stream.
-    let stdin_tx = msg_tx;
-    tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 1024];
-        loop {
-            match stdin.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin_tx
-                        .send(ExecInput {
-                            payload: Some(exec_input::Payload::Stdin(buf[..n].to_vec())),
-                        })
-                        .await
-                        .is_err()
-                    {
+    // Stdin pump: local terminal → offset-tracked WriteStdin calls. The
+    // returned `bytes_written` is the next offset, so a retried or partially
+    // deduplicated write can never double-feed the process.
+    let stdin_pump = stdin.then(|| {
+        let mut stdin_client = client.clone();
+        let sandbox_id = sandbox_id.clone();
+        let execution_id = execution_id.clone();
+        tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 4096];
+            let mut offset = 0u64;
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) | Err(_) => {
+                        // Local EOF. PTY sessions carry EOF in-band (Ctrl-D);
+                        // for pipes, close the remote stdin explicitly.
+                        if !tty {
+                            let req = WriteStdinRequest {
+                                sandbox_id: sandbox_id.clone(),
+                                execution_id: execution_id.clone(),
+                                offset,
+                                data: Vec::new(),
+                                eof: true,
+                            };
+                            let _ = stdin_client
+                                .write_stdin(attach_machine(tonic::Request::new(req)))
+                                .await;
+                        }
                         break;
+                    }
+                    Ok(n) => {
+                        let req = WriteStdinRequest {
+                            sandbox_id: sandbox_id.clone(),
+                            execution_id: execution_id.clone(),
+                            offset,
+                            data: buf[..n].to_vec(),
+                            eof: false,
+                        };
+                        match stdin_client
+                            .write_stdin(attach_machine(tonic::Request::new(req)))
+                            .await
+                        {
+                            Ok(resp) => offset = resp.into_inner().bytes_written,
+                            // The execution exited (or the daemon went away);
+                            // the attach stream reports the outcome.
+                            Err(_) => break,
+                        }
                     }
                 }
             }
-        }
+        })
     });
 
-    let request = attach_machine(tonic::Request::new(ReceiverStream::new(msg_rx)));
+    // Attach from the beginning of both channels and copy output out.
+    let attach = AttachExecutionRequest {
+        sandbox_id: sandbox_id.clone(),
+        execution_id: execution_id.clone(),
+        stdout_offset: 0,
+        stderr_offset: 0,
+    };
     let mut stream = client
-        .exec(request)
+        .attach_execution(attach_machine(tonic::Request::new(attach)))
         .await
-        .context("Failed to exec in sandbox")?
+        .context("Failed to attach to execution")?
         .into_inner();
 
-    let mut exit_code = 0i32;
-    let mut received_done = false;
-    while let Some(output) = stream
+    let mut result: Option<Execution> = None;
+    while let Some(event) = stream
         .message()
         .await
-        .context("Failed to read exec output")?
+        .context("Failed to read execution output")?
     {
-        if !output.data.is_empty() {
-            match output.stream.as_str() {
-                "stderr" => {
+        match event.event {
+            Some(execution_event::Event::Output(output)) => {
+                if output.data.is_empty() {
+                    continue;
+                }
+                if output.channel() == StdioChannel::Stderr {
                     std::io::stderr()
                         .write_all(&output.data)
                         .context("Failed to write stderr")?;
                     std::io::stderr().flush()?;
-                }
-                _ => {
+                } else {
                     std::io::stdout()
                         .write_all(&output.data)
                         .context("Failed to write stdout")?;
                     std::io::stdout().flush()?;
                 }
             }
-        }
-        if output.done {
-            // `done` carries the exit status and is the last frame of the
-            // session, so stop here instead of waiting for the server to close
-            // the stream: it will not while our request stream is still open
-            // (the stdin pump keeps it alive for the whole session), which hung
-            // the client after the workload had already exited — including
-            // after a Ctrl-C the remote handled correctly. Returning drops the
-            // request stream, which the guest treats as a disconnect.
-            exit_code = output.exit_code;
-            received_done = true;
-            break;
+            Some(execution_event::Event::Exited(exited)) => {
+                result = exited.execution;
+                break;
+            }
+            // The Started preamble and idle keepalives carry no output.
+            Some(execution_event::Event::Started(_) | execution_event::Event::KeepAlive(_))
+            | None => {}
         }
     }
 
+    if let Some(pump) = stdin_pump {
+        pump.abort();
+    }
     // Drop the raw mode guard before returning so the terminal is restored.
     drop(raw_guard);
 
-    if !received_done {
-        anyhow::bail!("exec stream closed without a terminal status frame");
-    }
-
-    Ok(exit_code)
+    let execution = match result {
+        Some(execution) => execution,
+        // The attach stream broke (daemon restart, connection cut): the
+        // execution survives server-side, so fetch its state directly.
+        None => client
+            .wait_execution(attach_machine(tonic::Request::new(WaitExecutionRequest {
+                sandbox_id,
+                execution_id,
+                timeout_seconds: 0,
+            })))
+            .await
+            .context("attach stream closed without an exit event")?
+            .into_inner(),
+    };
+    Ok(exit_code_of(&execution))
 }
 
 async fn execute_events(args: EventsArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
 
+    let kind = match &args.kind {
+        Some(value) => parse_event_kind(value)?,
+        None => SandboxEventKind::Unspecified,
+    };
     let req = SandboxEventsRequest {
-        id: args.id.unwrap_or_default(),
-        action: args.action.unwrap_or_default(),
+        sandbox_id: args.id.unwrap_or_default(),
+        kind: kind.into(),
     };
 
     let mut stream = client
@@ -721,14 +871,19 @@ async fn execute_events(args: EventsArgs) -> Result<()> {
         .into_inner();
 
     println!("Listening for sandbox events (Ctrl+C to stop)...");
-    while let Some(event) = stream
+    while let Some(frame) = stream
         .message()
         .await
         .context("Failed to read sandbox event")?
     {
+        let Some(watch_events_response::Payload::Event(event)) = frame.payload else {
+            continue; // keepalive
+        };
         println!(
-            "[{}] sandbox={} action={}",
-            event.timestamp, event.sandbox_id, event.action
+            "[{}] sandbox={} kind={}",
+            format_timestamp(event.time.as_ref()),
+            event.sandbox_id,
+            event_kind_name(event.kind()),
         );
         if !event.attributes.is_empty() {
             for (k, v) in &event.attributes {
@@ -757,7 +912,10 @@ async fn execute_checkpoint(args: CheckpointArgs) -> Result<()> {
     println!("Snapshot created");
     println!("  Snapshot ID:  {}", resp.snapshot_id);
     println!("  Snapshot dir: {}", resp.snapshot_dir);
-    println!("  Created at:   {}", resp.created_at);
+    println!(
+        "  Created at:   {}",
+        format_timestamp(resp.created_at.as_ref())
+    );
     Ok(())
 }
 
@@ -787,16 +945,27 @@ async fn execute_list_snapshots(args: ListSnapshotsArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxSnapshotServiceClient::new(channel);
 
-    let req = ListSnapshotsRequest {
-        sandbox_id: args.sandbox_id.unwrap_or_default(),
-        labels: HashMap::new(),
-    };
-    let snapshots = client
-        .list_snapshots(attach_machine(tonic::Request::new(req)))
-        .await
-        .context("Failed to list snapshots")?
-        .into_inner()
-        .snapshots;
+    // Follow continuation tokens so the human view stays complete.
+    let mut snapshots = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = ListSnapshotsRequest {
+            sandbox_id: args.sandbox_id.clone().unwrap_or_default(),
+            labels: HashMap::new(),
+            page_size: 0,
+            page_token: page_token.clone(),
+        };
+        let mut resp = client
+            .list_snapshots(attach_machine(tonic::Request::new(req)))
+            .await
+            .context("Failed to list snapshots")?
+            .into_inner();
+        snapshots.append(&mut resp.snapshots);
+        if resp.next_page_token.is_empty() {
+            break;
+        }
+        page_token = resp.next_page_token;
+    }
 
     if snapshots.is_empty() {
         println!("No snapshots found.");
@@ -810,7 +979,10 @@ async fn execute_list_snapshots(args: ListSnapshotsArgs) -> Result<()> {
     for snap in &snapshots {
         println!(
             "{:<36} {:<36} {:<20} {}",
-            snap.id, snap.sandbox_id, snap.name, snap.created_at,
+            snap.id,
+            snap.sandbox_id,
+            snap.name,
+            format_timestamp(snap.created_at.as_ref()),
         );
     }
     Ok(())
@@ -954,11 +1126,12 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
 async fn execute_expose(args: ExposeArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
+    let protocol = parse_protocol(&args.protocol)?;
     let request = attach_machine(tonic::Request::new(ExposePortRequest {
         id: args.id.clone(),
         sandbox_port: u32::from(args.port),
         host_port: u32::from(args.host_port),
-        protocol: args.protocol.clone(),
+        protocol: protocol.into(),
     }));
     let resp = client
         .expose_port(request)
@@ -975,10 +1148,11 @@ async fn execute_expose(args: ExposeArgs) -> Result<()> {
 async fn execute_unexpose(args: UnexposeArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
+    let protocol = parse_protocol(&args.protocol)?;
     let request = attach_machine(tonic::Request::new(UnexposePortRequest {
         id: args.id.clone(),
         sandbox_port: u32::from(args.port),
-        protocol: args.protocol.clone(),
+        protocol: protocol.into(),
     }));
     client
         .unexpose_port(request)

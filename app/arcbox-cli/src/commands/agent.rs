@@ -14,8 +14,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use arcbox_grpc::SandboxServiceClient;
 use arcbox_protocol::sandbox_v1::{
-    CreateSandboxRequest, ExecRequest, InspectSandboxRequest, RemoveSandboxRequest, ResourceLimits,
-    SandboxInfo,
+    CreateSandboxRequest, InspectSandboxRequest, RemoveSandboxRequest, ResourceLimits, SandboxInfo,
+    SandboxState, StartExecutionRequest,
 };
 use clap::Args;
 use tonic::transport::Channel;
@@ -123,15 +123,15 @@ enum Action {
 }
 
 /// Decide how to reach a usable sandbox from its current state.
-fn plan_action(state: Option<&str>) -> Action {
+fn plan_action(state: Option<SandboxState>) -> Action {
     match state {
         None => Action::Create,
-        Some("ready") => Action::Attach,
-        Some("starting") => Action::WaitReady,
+        Some(SandboxState::Ready) => Action::Attach,
+        Some(SandboxState::Starting) => Action::WaitReady,
         // `Stop` tears down the CoW overlay, so a stopped sandbox has lost
         // everything under /workspace and is only a name.
-        Some("stopped" | "failed") => Action::Recreate,
-        // "running" means a workload already holds the sandbox; anything else
+        Some(SandboxState::Stopped | SandboxState::Failed) => Action::Recreate,
+        // RUNNING means a workload already holds the sandbox; anything else
         // is a state this build does not know about.
         Some(_) => Action::Refuse,
     }
@@ -184,11 +184,11 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     let mut client = SandboxServiceClient::new(channel);
 
     let existing = inspect(&mut client, &id).await?;
-    match plan_action(existing.as_ref().map(|info| info.state.as_str())) {
+    match plan_action(existing.as_ref().map(SandboxInfo::state)) {
         Action::Attach => {}
         Action::WaitReady => wait_ready(&mut client, &id).await?,
         Action::Refuse => {
-            let state = existing.map(|info| info.state).unwrap_or_default();
+            let state = existing.map_or("unknown", |info| super::sandbox::state_name(info.state()));
             bail!(
                 "sandbox '{id}' is {state} — a session may already be active. \
                  Use --id <name> for a second one, or remove it with \
@@ -212,18 +212,19 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     }
     cmd.extend(args.args);
 
-    let init = ExecRequest {
-        id: id.clone(),
+    let start = StartExecutionRequest {
+        sandbox_id: id.clone(),
         cmd,
         env,
         working_dir: def.workdir.to_string(),
         user: def.user.to_string(),
         tty: true,
         tty_size: current_tty_size(true),
+        stdin: true,
         ..Default::default()
     };
 
-    let exit_code = exec_session(&mut client, init).await?;
+    let exit_code = exec_session(&mut client, start).await?;
 
     eprintln!(
         "\nSandbox '{id}' is still running: reopen with `abctl {}`, copy work out with \
@@ -297,8 +298,8 @@ async fn wait_ready(client: &mut SandboxServiceClient<Channel>, id: &str) -> Res
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         match inspect(client, id).await? {
-            Some(info) if info.state == "ready" => return Ok(()),
-            Some(info) if info.state == "failed" => {
+            Some(info) if info.state() == SandboxState::Ready => return Ok(()),
+            Some(info) if info.state() == SandboxState::Failed => {
                 let detail = if info.error.is_empty() {
                     "no reason reported".to_string()
                 } else {
@@ -379,13 +380,13 @@ mod tests {
     #[test]
     fn plan_action_maps_every_sandbox_state() {
         assert_eq!(plan_action(None), Action::Create);
-        assert_eq!(plan_action(Some("ready")), Action::Attach);
-        assert_eq!(plan_action(Some("starting")), Action::WaitReady);
-        assert_eq!(plan_action(Some("stopped")), Action::Recreate);
-        assert_eq!(plan_action(Some("failed")), Action::Recreate);
+        assert_eq!(plan_action(Some(SandboxState::Ready)), Action::Attach);
+        assert_eq!(plan_action(Some(SandboxState::Starting)), Action::WaitReady);
+        assert_eq!(plan_action(Some(SandboxState::Stopped)), Action::Recreate);
+        assert_eq!(plan_action(Some(SandboxState::Failed)), Action::Recreate);
         // A live workload holds the sandbox; never destroy it from under one.
-        assert_eq!(plan_action(Some("running")), Action::Refuse);
-        assert_eq!(plan_action(Some("stopping")), Action::Refuse);
-        assert_eq!(plan_action(Some("something-new")), Action::Refuse);
+        assert_eq!(plan_action(Some(SandboxState::Running)), Action::Refuse);
+        assert_eq!(plan_action(Some(SandboxState::Stopping)), Action::Refuse);
+        assert_eq!(plan_action(Some(SandboxState::Unspecified)), Action::Refuse);
     }
 }
