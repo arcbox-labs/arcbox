@@ -169,59 +169,6 @@ impl SandboxManager {
 
         start_run_workload(id, &uds_path, start, &self.instances, &self.events_tx).await
     }
-
-    /// Start an interactive exec session inside a ready sandbox.
-    ///
-    /// The sandbox must be in `Ready` state.  It transitions to `Running`
-    /// immediately and back to `Ready` when the session ends.
-    ///
-    /// Returns `(input_sender, output_receiver)`:
-    /// - Push [`ExecInputMsg`]s (stdin bytes, TTY resize, EOF) into `input_sender`.
-    /// - Read [`OutputChunk`]s from `output_receiver` for stdout, stderr, and exit.
-    #[allow(clippy::too_many_arguments, reason = "public API mirrors exec request")]
-    pub async fn exec_in_sandbox(
-        &self,
-        id: &SandboxId,
-        cmd: Vec<String>,
-        env: HashMap<String, String>,
-        working_dir: String,
-        user: String,
-        tty: bool,
-        tty_size: Option<(u16, u16)>,
-        timeout_seconds: u32,
-    ) -> Result<(
-        tokio::sync::mpsc::Sender<ExecInputMsg>,
-        tokio::sync::mpsc::Receiver<Result<OutputChunk>>,
-    )> {
-        let uds_path = self.require_ready_vsock(id)?;
-
-        let start = StartCommand {
-            cmd,
-            env,
-            working_dir,
-            user,
-            tty,
-            tty_width: tty_size.map_or(80, |(w, _)| w),
-            tty_height: tty_size.map_or(24, |(_, h)| h),
-            timeout_seconds,
-        };
-
-        // Claim BEFORE opening the session (see start_run_workload): a losing
-        // racer must not launch an interactive process in the guest.
-        claim_running(id, &self.instances)?;
-
-        let (in_tx, inner_rx) = match vsock::exec(&uds_path, start).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                release_running(id, &self.instances);
-                return Err(e);
-            }
-        };
-        let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
-
-        let wrapped_rx = spawn_exit_watcher(id, inner_rx, &self.instances, &self.events_tx);
-        Ok((in_tx, wrapped_rx))
-    }
 }
 
 #[cfg(test)]
