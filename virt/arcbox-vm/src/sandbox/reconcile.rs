@@ -126,7 +126,8 @@ pub(super) fn clear_state_record(vm_dir: &Path) {
     let _ = std::fs::remove_file(vm_dir.join(STATE_FILE));
 }
 
-/// Sweep `<data_dir>/sandboxes/*/state.json` and tear down every leftover.
+/// Sweep `<data_dir>/sandboxes/*/state.json` and tear down every leftover,
+/// plus snapshots a checkpoint never finished writing.
 ///
 /// Runs once per manager construction, in the background. Ordering per
 /// sandbox mirrors live teardown: kill Firecracker → wait for exit → dm
@@ -135,7 +136,12 @@ pub(super) async fn sweep_orphans(
     config: &VmmConfig,
     network: &NetworkManager,
     cow_manager: &CowManager,
+    snapshots: &crate::snapshot::SnapshotCatalog,
 ) {
+    // Snapshots staged by a checkpoint that died mid-flight: unfinished by
+    // definition, and each can hold a full memory dump.
+    snapshots.sweep_incomplete();
+
     let sandboxes_dir = PathBuf::from(&config.firecracker.data_dir).join("sandboxes");
     let Ok(entries) = std::fs::read_dir(&sandboxes_dir) else {
         return;

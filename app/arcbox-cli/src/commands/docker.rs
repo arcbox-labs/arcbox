@@ -75,7 +75,7 @@ pub(super) fn context_manager() -> Result<DockerContextManager> {
 // Setup — NDJSON progress
 // =============================================================================
 
-/// NDJSON progress line for `arcbox docker setup --format json`.
+/// NDJSON progress line for `abctl docker setup --format json`.
 #[derive(Serialize, Default)]
 struct SetupProgress {
     phase: String,
@@ -388,7 +388,7 @@ fn execute_enable(manager: &DockerContextManager) -> Result<()> {
     println!("  docker ps");
     println!("  docker run alpine echo hello");
     println!();
-    println!("To disable, run: arcbox docker disable");
+    println!("To disable, run: abctl docker disable");
 
     // Warn if socket doesn't exist.
     if !manager.socket_path().exists() {
@@ -449,9 +449,9 @@ fn execute_status(manager: &DockerContextManager) {
         println!("        Start the ArcBox daemon to use docker commands");
     } else if status.context_exists {
         println!("Status: Context exists but not default");
-        println!("        Run 'arcbox docker enable' to activate");
+        println!("        Run 'abctl docker enable' to activate");
     } else {
         println!("Status: Not configured");
-        println!("        Run 'arcbox docker enable' to set up");
+        println!("        Run 'abctl docker enable' to set up");
     }
 }

@@ -1,4 +1,9 @@
-//! Self-update executor: download → verify → probe → swap → re-exec.
+//! Self-update executor: download → verify → probe → swap.
+//!
+//! The exec is deliberately *not* here. [`apply`] leaves the verified binary
+//! at the managed path and hands it back; the caller records it on the
+//! [`crate::handover::Handover`], and `main` execs it once the process has
+//! torn down. See [`crate::reexec`] for why that ordering matters.
 //!
 //! Two trigger paths feed the same download-verify-swap pipeline, and they
 //! rest on **different trust models** — reason about them separately:
@@ -144,23 +149,14 @@ pub async fn resolve_latest(host_os: &str, host_arch: &str) -> Result<UpdatePayl
     })
 }
 
-/// Download, verify, probe, and swap `payload` into the managed path, then
-/// re-exec it with this process's arguments. Returns only on failure; on
-/// success the process image is replaced (same PID, so launchd's job
-/// bookkeeping is undisturbed).
-pub async fn apply_and_exec(config: &AgentConfig, payload: &UpdatePayload) -> anyhow::Error {
-    let managed = match apply(config, payload).await {
-        Ok(managed) => managed,
-        Err(error) => return error,
-    };
-    exec_replacement(&managed)
-}
-
-/// Everything up to (not including) the exec: leaves the verified new binary
-/// at the managed path and the old one beside it as `.prev`. Split from
-/// [`apply_and_exec`] so tests can exercise the full pipeline — exec is
-/// untestable in-process.
-async fn apply(config: &AgentConfig, payload: &UpdatePayload) -> Result<PathBuf> {
+/// Download, verify, probe, and swap `payload` into the managed path,
+/// returning that path — the image the process should come back as.
+///
+/// Everything up to, and not including, the exec: the new binary is left at
+/// the managed path and the old one beside it as `.prev`. Nothing here
+/// replaces the process, so the whole pipeline is testable in-process, and the
+/// exec happens where destructors have already run.
+pub async fn apply(config: &AgentConfig, payload: &UpdatePayload) -> Result<PathBuf> {
     let managed = managed_binary(config);
     let current = std::env::current_exe().context("resolving the current binary path")?;
     ensure_managed(&current, &managed)?;
@@ -191,16 +187,6 @@ async fn apply(config: &AgentConfig, payload: &UpdatePayload) -> Result<PathBuf>
         .with_context(|| format!("installing new binary at {}", managed.display()))?;
     info!(version = %payload.expected_version, "self-update: binary swapped; re-executing");
     Ok(managed)
-}
-
-/// Replace this process image with `binary`, preserving argv. Returns only
-/// the exec error.
-fn exec_replacement(binary: &Path) -> anyhow::Error {
-    use std::os::unix::process::CommandExt;
-    let error = std::process::Command::new(binary)
-        .args(std::env::args_os().skip(1))
-        .exec();
-    anyhow::Error::new(error).context(format!("exec {}", binary.display()))
 }
 
 /// Self-update owns exactly the managed path; refuse anything else.

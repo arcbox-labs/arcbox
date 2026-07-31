@@ -24,7 +24,7 @@ use tonic::transport::Channel;
 use super::machine::UnixConnector;
 use arcbox_cli::terminal::{RawModeGuard, TerminalSize};
 
-async fn sandbox_channel() -> Result<Channel> {
+pub(super) async fn sandbox_channel() -> Result<Channel> {
     let socket_path = super::resolve_grpc_socket_path();
     tonic::transport::Endpoint::from_static("http://[::]:50051")
         .connect_with_connector(UnixConnector::new(socket_path.clone()))
@@ -39,7 +39,7 @@ async fn sandbox_channel() -> Result<Channel> {
 
 /// Attaches the default `x-machine` metadata header to a tonic request for
 /// daemon-side routing to the guest VM agent.
-fn attach_machine<T>(mut request: tonic::Request<T>) -> tonic::Request<T> {
+pub(super) fn attach_machine<T>(mut request: tonic::Request<T>) -> tonic::Request<T> {
     // SAFETY: DEFAULT_MACHINE_NAME is a valid ASCII string.
     let val = MetadataValue::from_static(DEFAULT_MACHINE_NAME);
     request.metadata_mut().insert("x-machine", val);
@@ -83,6 +83,8 @@ pub enum SandboxCommands {
     /// Delete a snapshot
     #[command(name = "snapshot-rm")]
     DeleteSnapshot(DeleteSnapshotArgs),
+    /// List built-in rootfs templates
+    Templates(TemplatesArgs),
 }
 
 #[derive(Args)]
@@ -94,14 +96,17 @@ pub struct CreateArgs {
     #[arg(long)]
     pub kernel: Option<String>,
     /// Root filesystem ext4 image path (empty = daemon default)
-    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image"])]
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image", "from_template"])]
     pub rootfs: Option<String>,
     /// Build sandbox rootfs from a Dockerfile
-    #[arg(long, conflicts_with_all = ["rootfs", "from_image"])]
+    #[arg(long, conflicts_with_all = ["rootfs", "from_image", "from_template"])]
     pub from_dockerfile: Option<String>,
     /// Build sandbox rootfs from an existing Docker image
-    #[arg(long, conflicts_with_all = ["rootfs", "from_dockerfile"])]
+    #[arg(long, conflicts_with_all = ["rootfs", "from_dockerfile", "from_template"])]
     pub from_image: Option<String>,
+    /// Build sandbox rootfs from a built-in template (see `sandbox templates`)
+    #[arg(long, conflicts_with_all = ["rootfs", "from_dockerfile", "from_image"])]
+    pub from_template: Option<String>,
     /// Number of vCPUs (0 = daemon default)
     #[arg(long, default_value = "0")]
     pub cpus: u32,
@@ -257,6 +262,16 @@ pub struct DeleteSnapshotArgs {
     pub snapshot_id: String,
 }
 
+#[derive(Args)]
+pub struct TemplatesArgs {
+    /// Print a template's Dockerfile instead of listing names
+    ///
+    /// Redirect it to a file to customize a template, then build the result
+    /// with `--from-dockerfile`.
+    #[arg(long, value_name = "NAME")]
+    pub show: Option<String>,
+}
+
 /// Executes a sandbox subcommand.
 pub async fn execute(cmd: SandboxCommands) -> Result<()> {
     match cmd {
@@ -275,7 +290,42 @@ pub async fn execute(cmd: SandboxCommands) -> Result<()> {
         SandboxCommands::Restore(args) => execute_restore(args).await,
         SandboxCommands::ListSnapshots(args) => execute_list_snapshots(args).await,
         SandboxCommands::DeleteSnapshot(args) => execute_delete_snapshot(args).await,
+        SandboxCommands::Templates(args) => execute_templates(args),
     }
+}
+
+/// Build a built-in template and return the guest-visible rootfs path.
+///
+/// Shared with the agent-session commands (`abctl claude`), which select their
+/// image by template name.
+pub(super) async fn resolve_template_rootfs(name: &str) -> Result<String> {
+    let template = arcbox_cli::templates::find(name).with_context(|| {
+        format!(
+            "unknown template '{name}' (available: {})",
+            arcbox_cli::templates::names()
+        )
+    })?;
+    arcbox_cli::rootfs_builder::resolve_from_dockerfile_contents(template.dockerfile.as_bytes())
+        .await
+        .with_context(|| format!("Failed to build the '{name}' template image"))
+}
+
+fn execute_templates(args: TemplatesArgs) -> Result<()> {
+    if let Some(name) = args.show {
+        let template = arcbox_cli::templates::find(&name).with_context(|| {
+            format!(
+                "unknown template '{name}' (available: {})",
+                arcbox_cli::templates::names()
+            )
+        })?;
+        print!("{}", template.dockerfile);
+        return Ok(());
+    }
+
+    for template in arcbox_cli::templates::TEMPLATES {
+        println!("{:<10} {}", template.name, template.description);
+    }
+    Ok(())
 }
 
 fn parse_labels(raw: &[String]) -> Result<HashMap<String, String>> {
@@ -307,6 +357,8 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         arcbox_cli::rootfs_builder::resolve_from_image(image_ref)
             .await
             .context("Failed to resolve Docker image")?
+    } else if let Some(name) = &args.from_template {
+        resolve_template_rootfs(name).await?
     } else {
         args.rootfs.clone().unwrap_or_default()
     };
@@ -499,42 +551,62 @@ async fn execute_exec(args: ExecArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
     let mut client = SandboxServiceClient::new(channel);
 
-    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<ExecInput>(16);
-
-    // Detect initial terminal size when TTY is requested.
-    let tty_size = if args.tty {
-        TerminalSize::current().ok().map(|s| ProtoTerminalSize {
-            width: u32::from(s.cols),
-            height: u32::from(s.rows),
-        })
-    } else {
-        None
+    let init = ExecRequest {
+        id: args.id,
+        cmd: args.cmd,
+        tty: args.tty,
+        tty_size: current_tty_size(args.tty),
+        timeout_seconds: args.timeout,
+        ..Default::default()
     };
+
+    let exit_code = exec_session(&mut client, init).await?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// Initial terminal size to report, when a TTY was requested.
+pub(super) fn current_tty_size(tty: bool) -> Option<ProtoTerminalSize> {
+    if !tty {
+        return None;
+    }
+    TerminalSize::current().ok().map(|s| ProtoTerminalSize {
+        width: u32::from(s.cols),
+        height: u32::from(s.rows),
+    })
+}
+
+/// Run one interactive exec session and return the command's exit code.
+///
+/// Owns the whole bidirectional stream: the init frame, raw terminal mode,
+/// SIGWINCH forwarding, the stdin pump, and copying output back out. Callers
+/// decide what an exit code means — nothing here terminates the process.
+pub(super) async fn exec_session(
+    client: &mut SandboxServiceClient<Channel>,
+    init: ExecRequest,
+) -> Result<i32> {
+    let tty = init.tty;
+    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<ExecInput>(16);
 
     // The first message in the stream must be the Init payload.
     msg_tx
         .send(ExecInput {
-            payload: Some(exec_input::Payload::Init(ExecRequest {
-                id: args.id,
-                cmd: args.cmd,
-                tty: args.tty,
-                tty_size,
-                timeout_seconds: args.timeout,
-                ..Default::default()
-            })),
+            payload: Some(exec_input::Payload::Init(init)),
         })
         .await
         .context("Failed to send exec init")?;
 
     // Enable raw terminal mode when TTY is requested.
-    let raw_guard = if args.tty {
+    let raw_guard = if tty {
         Some(RawModeGuard::new()?)
     } else {
         None
     };
 
     // Resize pump: SIGWINCH → gRPC resize frames (TTY sessions only).
-    if args.tty {
+    if tty {
         let resize_tx = msg_tx.clone();
         match arcbox_cli::terminal::ResizeWatcher::new() {
             Ok(mut watcher) => {
@@ -610,22 +682,27 @@ async fn execute_exec(args: ExecArgs) -> Result<()> {
             }
         }
         if output.done {
+            // `done` carries the exit status and is the last frame of the
+            // session, so stop here instead of waiting for the server to close
+            // the stream: it will not while our request stream is still open
+            // (the stdin pump keeps it alive for the whole session), which hung
+            // the client after the workload had already exited — including
+            // after a Ctrl-C the remote handled correctly. Returning drops the
+            // request stream, which the guest treats as a disconnect.
             exit_code = output.exit_code;
             received_done = true;
+            break;
         }
     }
 
-    // Drop the raw mode guard before exiting so the terminal is restored.
+    // Drop the raw mode guard before returning so the terminal is restored.
     drop(raw_guard);
 
     if !received_done {
         anyhow::bail!("exec stream closed without a terminal status frame");
     }
 
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-    Ok(())
+    Ok(exit_code)
 }
 
 async fn execute_events(args: EventsArgs) -> Result<()> {

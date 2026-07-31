@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-container",
  "arcbox-core",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-agent"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "arcbox-constants",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-api"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-constants",
  "arcbox-core",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-asset"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "futures-util",
  "reqwest 0.12.28",
@@ -271,24 +271,27 @@ dependencies = [
 
 [[package]]
 name = "arcbox-boot"
-version = "0.5.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73e728afead5d82392eb81911a43ef556e32a3df2a0d4e6bc3e74c5def33f8ce"
+checksum = "2925f99fcc4097b1b8eeb12bd1364f858aeefd9426ee57e8c94229a3b6b002d5"
 dependencies = [
+ "camino",
  "dirs",
+ "fs-err",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "toml 1.1.0+spec-1.1.0",
+ "url",
 ]
 
 [[package]]
 name = "arcbox-cli"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "arcbox-asset",
@@ -313,6 +316,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -323,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-conntrack"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-datapath",
  "arcbox-packet",
@@ -332,14 +336,14 @@ dependencies = [
 
 [[package]]
 name = "arcbox-constants"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "dirs",
 ]
 
 [[package]]
 name = "arcbox-container"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-error",
  "async-trait",
@@ -353,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-core"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-boot",
  "arcbox-constants",
@@ -365,6 +369,7 @@ dependencies = [
  "arcbox-migration",
  "arcbox-net",
  "arcbox-protocol",
+ "arcbox-route",
  "arcbox-transport",
  "arcbox-virtio",
  "arcbox-vmm",
@@ -397,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-daemon"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "arcbox-api",
@@ -409,6 +414,7 @@ dependencies = [
  "arcbox-helper",
  "arcbox-logging",
  "arcbox-net",
+ "arcbox-route",
  "arcbox-transport",
  "async-trait",
  "axum",
@@ -434,14 +440,14 @@ dependencies = [
 
 [[package]]
 name = "arcbox-datapath"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "arcbox-dhcp"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "thiserror",
  "tracing",
@@ -449,14 +455,14 @@ dependencies = [
 
 [[package]]
 name = "arcbox-dns"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "arcbox-docker"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-core",
  "arcbox-error",
@@ -490,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-docker-tools"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-asset",
  "flate2",
@@ -506,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-e2e"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "arcbox-constants",
@@ -532,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-error"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "thiserror",
 ]
@@ -550,14 +556,14 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fakeip"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "arcbox-fleet-agent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arcbox-constants",
@@ -591,11 +597,12 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "arcbox-fleet-control-proto"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "prost",
  "tonic",
@@ -605,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fleet-proto"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "prost",
  "tonic",
@@ -615,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fs"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-error",
  "arcbox-virtio",
@@ -631,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-grpc"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-protocol",
  "prost",
@@ -646,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-helper"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "arcbox-constants",
  "arcbox-logging",
@@ -676,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-hypervisor"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-error",
  "arcbox-vz",
@@ -696,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-logging"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "parking_lot",
  "sentry",
@@ -708,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-migration"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "dirs",
  "serde",
@@ -721,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-net"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "arcbox-conntrack",
@@ -757,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-net-inject"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio",
  "crossbeam-channel",
@@ -767,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-net-virtio"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-conntrack",
  "arcbox-virtio",
@@ -777,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-oci"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-error",
  "chrono",
@@ -792,11 +799,11 @@ dependencies = [
 
 [[package]]
 name = "arcbox-packet"
-version = "0.5.0"
+version = "0.5.5"
 
 [[package]]
 name = "arcbox-protocol"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "prost",
  "prost-build",
@@ -808,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-proxy"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-fakeip",
  "arcbox-packet",
@@ -821,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-pty"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "libc",
  "nix 0.29.0",
@@ -829,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-route"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "libc",
  "tracing",
@@ -837,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-transport"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-constants",
  "arcbox-error",
@@ -853,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-error",
  "arcbox-hypervisor",
@@ -879,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-balloon"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio-core",
  "libc",
@@ -888,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-blk"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio-core",
  "async-trait",
@@ -900,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-console"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio-core",
  "async-trait",
@@ -911,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-core"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-error",
  "thiserror",
@@ -921,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-fs"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio-core",
  "bytes",
@@ -932,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-net"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio-core",
  "async-trait",
@@ -944,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-rng"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio-core",
  "getrandom 0.2.17",
@@ -953,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio-vsock"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-virtio-core",
  "libc",
@@ -963,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vm"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -983,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vmm"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-constants",
  "arcbox-dns",
@@ -1018,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vmnet"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "libc",
  "thiserror",
@@ -1030,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vz"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "libc",
  "thiserror",
@@ -1041,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-xnu-net"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "criterion",
  "libc",
@@ -1549,6 +1556,12 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "camino"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
 
 [[package]]
 name = "cast"
@@ -2574,6 +2587,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs-err"
+version = "3.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b91aa448ca50d7e79433bdf3ee8d99215430d2ec02ade5aefab2a073a1822e8a"
+dependencies = [
+ "autocfg",
 ]
 
 [[package]]
@@ -6001,7 +6023,7 @@ dependencies = [
 
 [[package]]
 name = "splicetcp"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "arcbox-datapath",
  "arcbox-fakeip",
@@ -7825,7 +7847,7 @@ checksum = "32ac00cd3f8ec9c1d33fb3e7958a82df6989c42d747bd326c822b1d625283547"
 
 [[package]]
 name = "xtask"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "arcbox-constants",

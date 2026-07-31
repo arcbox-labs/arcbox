@@ -8,6 +8,7 @@ use arcbox_constants::ports::AGENT_PORT;
 use super::disk::fstrim_loop;
 use super::proxy::{run_docker_api_proxy, run_kubernetes_api_proxy};
 use super::rpc::handle_connection;
+use super::runtime::direct_container_routing_loop;
 use super::sandbox::sandbox_service;
 use super::vsock::{bind_vsock_listener_with_retry, is_peer_closed_error};
 
@@ -56,6 +57,10 @@ impl Agent {
 
         // Periodic fstrim to reclaim sparse file space on the host.
         tokio::spawn(fstrim_loop());
+
+        // Docker recreates its firewall chains on restart. Keep the direct
+        // host-to-container rule present after the initial readiness gate.
+        tokio::spawn(direct_container_routing_loop());
 
         let mut listener = bind_vsock_listener_with_retry(AGENT_PORT, "agent rpc listener").await?;
 

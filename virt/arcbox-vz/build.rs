@@ -57,6 +57,14 @@ fn main() {
     let scratch = PathBuf::from(env::var("OUT_DIR").unwrap()).join("swiftpm-scratch");
 
     // Shared by `build` and `--show-bin-path` so both resolve the same layout.
+    //
+    // `--build-system native` is load-bearing on a Command-Line-Tools-only
+    // host, which is the setup CONTRIBUTING.md asks for: SwiftPM's newer
+    // default (swiftbuild/XCBuild) needs a full Xcode.app and otherwise dies
+    // with `SessionFailedError(... "Unknown error parsing property list")`
+    // before compiling anything. CI runners ship full Xcode, so dropping this
+    // breaks contributors without breaking CI. The flag is deprecated
+    // upstream — revisit when SwiftPM removes it.
     let common = [
         "--package-path",
         pkg.to_str().unwrap(),
@@ -68,6 +76,8 @@ fn main() {
         triple,
         "--product",
         "ArcBoxVZShim",
+        "--build-system",
+        "native",
     ];
 
     let out = xcrun()

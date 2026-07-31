@@ -13,8 +13,7 @@
 //!
 //! # Operations
 //!
-//! - [`add`] — Add a subnet route via an interface. Falls back to
-//!   `RTM_CHANGE` if the route already exists (atomic replace).
+//! - [`add`] — Add a subnet route via an interface without replacing conflicts.
 //! - [`remove`] — Delete a subnet route. Idempotent (missing route = Ok).
 //! - [`get`] — Query the current route for a subnet.
 //!
@@ -33,8 +32,11 @@
 pub mod msg;
 pub(crate) mod sockaddr;
 
+use std::ffi::{CStr, CString};
 use std::fmt;
+use std::io;
 use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 
 // ── Ipv4Net: validated network type ────────────────────────────────────
@@ -168,12 +170,78 @@ impl fmt::Display for Ipv4Net {
 // ── RouteInfo ──────────────────────────────────────────────────────────
 
 /// Information about an existing route, returned by [`get`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteInfo {
     /// Kernel interface index the route points to.
     pub ifindex: u16,
     /// Route flags (`RTF_*`).
     pub flags: i32,
+}
+
+/// Result of a non-destructive route-add attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// The route was added.
+    Added,
+    /// An exact route already exists and was left untouched.
+    Conflict,
+}
+
+/// A routing-table mutation observed through [`RouteWatcher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteEvent {
+    /// Exact IPv4 network changed by the event, when the message carries one.
+    pub network: Option<Ipv4Net>,
+}
+
+/// Nonblocking listener for macOS routing-table mutations.
+pub struct RouteWatcher {
+    fd: OwnedFd,
+}
+
+impl RouteWatcher {
+    /// Opens an unprivileged PF_ROUTE listener.
+    pub fn open() -> io::Result<Self> {
+        let fd = msg::open_route_socket()?;
+        // Safety: `fd` is a valid open file descriptor.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Safety: `fd` remains valid and `flags | O_NONBLOCK` is a valid flag set.
+        let result =
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    /// Reads one pending route message.
+    ///
+    /// Returns `Ok(None)` for non-mutation messages. Returns `WouldBlock` when
+    /// all pending messages have been consumed.
+    pub fn read_event(&self) -> io::Result<Option<RouteEvent>> {
+        let mut buffer = [0u8; 512];
+        // Safety: `fd` is valid and `buffer` is writable for its full length.
+        let count = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        decode_route_event(&buffer[..count as usize])
+    }
+}
+
+impl AsRawFd for RouteWatcher {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
 }
 
 // ── Public API ─────────────────────────────────────────────────────────
@@ -182,14 +250,10 @@ pub struct RouteInfo {
 ///
 /// Equivalent to: `route -n add -net <net> -interface <iface>`
 ///
-/// If the route already exists (`EEXIST`), atomically replaces it via
-/// `RTM_CHANGE`. This fixes the bug where a pre-existing route pointing
-/// to a different gateway/interface was silently left in place.
-///
 /// # Errors
 ///
 /// Returns an error string if the kernel rejects the route operation.
-pub fn add(net: Ipv4Net, iface: &str) -> Result<(), String> {
+pub fn add(net: Ipv4Net, iface: &str) -> Result<AddOutcome, String> {
     let dst = sockaddr::make_dst(net);
     let mask = sockaddr::make_netmask(net);
     let gw = sockaddr::make_gateway_dl(iface)
@@ -201,11 +265,11 @@ pub fn add(net: Ipv4Net, iface: &str) -> Result<(), String> {
     match msg::route_write(&add_msg) {
         Ok(()) => {
             tracing::debug!(iface, net = %net, "route added");
-            Ok(())
+            Ok(AddOutcome::Added)
         }
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-            tracing::debug!(iface, net = %net, "route exists, replacing via RTM_CHANGE");
-            send_change(net, iface, &dst, &gw, &mask)
+            tracing::debug!(iface, net = %net, "exact route already exists");
+            Ok(AddOutcome::Conflict)
         }
         Err(e) => Err(format!("RTM_ADD {net} via {iface}: {e}")),
     }
@@ -259,30 +323,99 @@ pub fn get(net: Ipv4Net) -> Result<Option<RouteInfo>, String> {
         .map_err(|e| format!("RTM_GET {net}: failed to build message: {e}"))?;
 
     match msg::route_query(&get_msg) {
-        Ok(reply) => Ok(Some(RouteInfo {
-            ifindex: reply.ifindex,
-            flags: reply.flags,
-        })),
+        Ok(reply) => {
+            let prefix = prefix_from_mask(reply.netmask)
+                .ok_or_else(|| format!("RTM_GET {net}: kernel returned non-contiguous netmask"))?;
+            let matched_address =
+                Ipv4Addr::from(u32::from(reply.destination) & u32::from(reply.netmask));
+            let matched = Ipv4Net::new(matched_address, prefix)
+                .map_err(|e| format!("RTM_GET {net}: invalid matched route: {e}"))?;
+            if matched != net {
+                return Ok(None);
+            }
+            Ok(Some(RouteInfo {
+                ifindex: reply.ifindex,
+                flags: reply.flags,
+            }))
+        }
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
         Err(e) => Err(format!("RTM_GET {net}: {e}")),
     }
 }
 
-// ── Internal helpers ───────────────────────────────────────────────────
+/// Resolves an interface name to its kernel index.
+pub fn interface_index(interface: &str) -> Result<u16, String> {
+    let interface = CString::new(interface).map_err(|e| format!("invalid interface name: {e}"))?;
+    // Safety: `interface` is a valid NUL-terminated string.
+    let raw_index = unsafe { libc::if_nametoindex(interface.as_ptr()) };
+    if raw_index == 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    u16::try_from(raw_index).map_err(|_| format!("interface index {raw_index} exceeds u16"))
+}
 
-/// Sends an RTM_CHANGE message — extracted to eliminate duplication in [`add`].
-fn send_change(
-    net: Ipv4Net,
-    iface: &str,
-    dst: &libc::sockaddr_in,
-    gw: &libc::sockaddr_dl,
-    mask: &libc::sockaddr_in,
-) -> Result<(), String> {
-    let change_msg = msg::build_msg(msg::MsgType::Change, dst, Some(gw), mask)
-        .map_err(|e| format!("RTM_CHANGE {net} via {iface}: failed to build message: {e}"))?;
-    msg::route_write(&change_msg).map_err(|e| format!("RTM_CHANGE {net} via {iface}: {e}"))?;
-    tracing::debug!(net = %net, "route replaced");
-    Ok(())
+/// Resolves a kernel interface index to its name.
+pub fn interface_name(index: u16) -> Result<String, String> {
+    let mut name = [0i8; libc::IF_NAMESIZE];
+    // Safety: `name` has IF_NAMESIZE writable bytes and `index` is promoted losslessly.
+    let result = unsafe { libc::if_indextoname(u32::from(index), name.as_mut_ptr()) };
+    if result.is_null() {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    // Safety: `if_indextoname` wrote a NUL-terminated interface name into `name`.
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+    name.to_str()
+        .map(str::to_owned)
+        .map_err(|e| format!("interface name is not UTF-8: {e}"))
+}
+
+fn prefix_from_mask(mask: Ipv4Addr) -> Option<u8> {
+    let mask = u32::from(mask);
+    let prefix = mask.leading_ones() as u8;
+    let expected = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (mask == expected).then_some(prefix)
+}
+
+fn decode_route_event(message: &[u8]) -> io::Result<Option<RouteEvent>> {
+    if message.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "routing event is shorter than its common header",
+        ));
+    }
+    if message[2] != libc::RTM_VERSION as u8
+        || !matches!(
+            i32::from(message[3]),
+            libc::RTM_ADD | libc::RTM_CHANGE | libc::RTM_DELETE
+        )
+    {
+        return Ok(None);
+    }
+
+    let header_size = std::mem::size_of::<libc::rt_msghdr>();
+    if message.len() < header_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "route mutation event is shorter than rt_msghdr",
+        ));
+    }
+    // Safety: the length check above guarantees a full header; routing socket
+    // buffers have no alignment guarantee, so use an unaligned read.
+    let header = unsafe { std::ptr::read_unaligned(message.as_ptr().cast::<libc::rt_msghdr>()) };
+
+    let network =
+        msg::parse_ipv4_route(message, &header)
+            .ok()
+            .and_then(|(destination, netmask)| {
+                let prefix = prefix_from_mask(netmask)?;
+                let address = Ipv4Addr::from(u32::from(destination) & u32::from(netmask));
+                Ipv4Net::new(address, prefix).ok()
+            });
+    Ok(Some(RouteEvent { network }))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -365,5 +498,54 @@ mod tests {
             "0.0.0.0/0".parse::<Ipv4Net>().unwrap().mask(),
             Ipv4Addr::UNSPECIFIED
         );
+    }
+
+    #[test]
+    fn route_event_decoder_ignores_queries() {
+        let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
+        let destination = sockaddr::make_dst(net);
+        let netmask = sockaddr::make_netmask(net);
+        let message = msg::build_msg(msg::MsgType::Get, &destination, None, &netmask).unwrap();
+
+        assert_eq!(decode_route_event(&message).unwrap(), None);
+    }
+
+    #[test]
+    fn route_event_decoder_reports_changed_network() {
+        let net: Ipv4Net = "172.24.0.0/13".parse().unwrap();
+        let destination = sockaddr::make_dst(net);
+        let netmask = sockaddr::make_netmask(net);
+        let message = msg::build_msg(msg::MsgType::Delete, &destination, None, &netmask).unwrap();
+
+        assert_eq!(
+            decode_route_event(&message).unwrap(),
+            Some(RouteEvent { network: Some(net) })
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root to mutate the macOS routing table"]
+    fn existing_gateway_route_is_not_replaced() {
+        use std::process::Command;
+
+        let net: Ipv4Net = "198.51.100.0/24".parse().unwrap();
+        remove(net).unwrap();
+
+        let output = Command::new("/sbin/route")
+            .args(["-n", "add", "-net", &net.to_string(), "127.0.0.1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to install gateway-route fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let outcome = add(net, "lo0").unwrap();
+        let route = get(net).unwrap().expect("gateway route should remain");
+        remove(net).unwrap();
+
+        assert_eq!(outcome, AddOutcome::Conflict);
+        assert_ne!(route.flags & libc::RTF_GATEWAY, 0);
     }
 }

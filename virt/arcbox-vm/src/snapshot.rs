@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::SnapshotType;
@@ -60,6 +61,128 @@ impl From<&SnapshotMeta> for SnapshotInfo {
     }
 }
 
+/// Name of the VM-state file inside a snapshot directory.
+const VMSTATE_FILE: &str = "vmstate";
+
+/// Name of the memory file inside a snapshot directory.
+const MEM_FILE: &str = "mem";
+
+/// Suffix marking a staging directory, i.e. a snapshot still being written.
+///
+/// The leading dot keeps it out of the catalog's `{snapshot_id}` namespace:
+/// snapshot IDs are UUIDs, so no published entry can collide with one.
+const STAGING_SUFFIX: &str = ".partial";
+
+/// True when `path` is a published snapshot directory.
+///
+/// Staging directories are named `.{snapshot_id}.partial` and are not catalog
+/// members until [`PendingSnapshot::commit`] renames them.
+fn is_catalog_entry(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| !name.starts_with('.'))
+}
+
+/// What a caller knows about a snapshot before it is published.
+///
+/// The file layout (`vmstate`, `mem`) is the catalog's business, so it is not
+/// part of this: [`PendingSnapshot::commit`] fills those paths in.
+#[derive(Debug)]
+pub struct SnapshotDraft {
+    /// Optional human-readable label.
+    pub name: Option<String>,
+    pub snapshot_type: SnapshotType,
+    /// Parent snapshot ID (diff chain).
+    pub parent_id: Option<String>,
+    /// Host-absolute kernel path (required for jailer-mode restore staging).
+    pub kernel_path: Option<String>,
+    /// Host-absolute rootfs path (required for restore to rebuild the
+    /// dm-snapshot origin).
+    pub rootfs_path: Option<String>,
+}
+
+/// A snapshot being written, not yet part of the catalog.
+///
+/// Firecracker writes into [`Self::dir`], a staging directory that is
+/// deliberately outside the catalog's namespace, and [`Self::commit`] writes
+/// `meta.json` there and renames the whole directory into place. That single
+/// atomic publish is what lets every reader assume a catalogued directory has
+/// a readable record: a snapshot is either complete or not there at all.
+///
+/// Dropping without committing removes the staging directory, so a failed
+/// checkpoint leaves neither a record-less entry nor a partial `vmstate`/`mem`
+/// behind. A crash leaves the staging directory, which
+/// [`SnapshotCatalog::sweep_incomplete`] reclaims on the next start.
+pub struct PendingSnapshot<'a> {
+    catalog: &'a SnapshotCatalog,
+    vm_id: String,
+    id: String,
+    published: bool,
+}
+
+impl PendingSnapshot<'_> {
+    /// Identifier the snapshot will carry once published.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Staging directory to write `vmstate` and `mem` into.
+    pub fn dir(&self) -> PathBuf {
+        self.catalog.staging_dir(&self.vm_id, &self.id)
+    }
+
+    /// Publish the snapshot: write the record, then rename it into the catalog.
+    ///
+    /// The `mem` file is recorded when the staging directory actually holds one
+    /// (diff snapshots and jailer moves may not produce it).
+    pub fn commit(mut self, draft: SnapshotDraft) -> Result<SnapshotMeta> {
+        let staging = self.dir();
+        let published = self.catalog.snapshot_dir(&self.vm_id, &self.id);
+        let has_mem = staging.join(MEM_FILE).exists();
+
+        let meta = SnapshotMeta {
+            id: self.id.clone(),
+            vm_id: self.vm_id.clone(),
+            name: draft.name,
+            snapshot_type: draft.snapshot_type,
+            vmstate_path: published.join(VMSTATE_FILE),
+            mem_path: has_mem.then(|| published.join(MEM_FILE)),
+            created_at: Utc::now(),
+            parent_id: draft.parent_id,
+            kernel_path: draft.kernel_path,
+            rootfs_path: draft.rootfs_path,
+        };
+
+        let json = serde_json::to_string_pretty(&meta)?;
+        std::fs::write(SnapshotCatalog::meta_path(&staging), json).map_err(VmmError::Io)?;
+        std::fs::rename(&staging, &published).map_err(VmmError::Io)?;
+        self.published = true;
+
+        info!(snapshot_id = %meta.id, vm_id = %meta.vm_id, "snapshot registered");
+        Ok(meta)
+    }
+}
+
+impl Drop for PendingSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        let dir = self.dir();
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                info!(snapshot_id = %self.id, vm_id = %self.vm_id, "discarded incomplete snapshot");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(path = %dir.display(), error = %e, "failed to discard incomplete snapshot");
+            }
+        }
+    }
+}
+
 /// Manages the on-disk snapshot catalog for all VMs.
 ///
 /// Layout:
@@ -68,7 +191,13 @@ impl From<&SnapshotMeta> for SnapshotInfo {
 ///     vmstate
 ///     mem          (full only)
 ///     meta.json
+/// {data_dir}/snapshots/{vm_id}/.{snapshot_id}.partial/   (being written)
 /// ```
+///
+/// Every catalogued directory carries a readable `meta.json`, because a
+/// snapshot is written into a `.partial` staging directory and renamed in as a
+/// whole (see [`PendingSnapshot`]). Readers therefore treat a missing or
+/// unparseable record as corruption rather than as a normal lifecycle state.
 pub struct SnapshotCatalog {
     root: PathBuf,
 }
@@ -81,35 +210,19 @@ impl SnapshotCatalog {
         }
     }
 
-    /// Register a freshly-created snapshot.
-    #[allow(clippy::too_many_arguments)]
-    pub fn register(
-        &self,
-        vm_id: &str,
-        name: Option<String>,
-        snapshot_type: SnapshotType,
-        vmstate_path: PathBuf,
-        mem_path: Option<PathBuf>,
-        parent_id: Option<String>,
-        kernel_path: Option<String>,
-        rootfs_path: Option<String>,
-    ) -> Result<SnapshotMeta> {
-        let id = Uuid::new_v4().to_string();
-        let meta = SnapshotMeta {
-            id: id.clone(),
+    /// Start a new snapshot for `vm_id`.
+    ///
+    /// Creates the staging directory; the snapshot enters the catalog only on
+    /// [`PendingSnapshot::commit`].
+    pub fn begin(&self, vm_id: &str) -> Result<PendingSnapshot<'_>> {
+        let pending = PendingSnapshot {
+            catalog: self,
             vm_id: vm_id.to_owned(),
-            name,
-            snapshot_type,
-            vmstate_path,
-            mem_path,
-            created_at: Utc::now(),
-            parent_id,
-            kernel_path,
-            rootfs_path,
+            id: Uuid::new_v4().to_string(),
+            published: false,
         };
-        self.write_meta(&meta)?;
-        info!(snapshot_id = %id, vm_id, "snapshot registered");
-        Ok(meta)
+        std::fs::create_dir_all(pending.dir()).map_err(VmmError::Io)?;
+        Ok(pending)
     }
 
     /// List all snapshots for a VM, sorted by creation time (oldest first).
@@ -121,9 +234,9 @@ impl SnapshotCatalog {
         let mut entries: Vec<SnapshotMeta> = std::fs::read_dir(&dir)
             .map_err(VmmError::Io)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| self.read_meta(&e.path()).ok())
-            .collect();
+            .filter(|e| is_catalog_entry(&e.path()))
+            .map(|e| self.read_meta(&e.path()))
+            .collect::<Result<_>>()?;
         entries.sort_by_key(|m| m.created_at);
         Ok(entries.iter().map(SnapshotInfo::from).collect())
     }
@@ -147,11 +260,35 @@ impl SnapshotCatalog {
         Ok(())
     }
 
-    /// Return the canonical directory for a new snapshot (creates it).
-    pub fn prepare_dir(&self, vm_id: &str, snapshot_id: &str) -> Result<PathBuf> {
-        let dir = self.snapshot_dir(vm_id, snapshot_id);
-        std::fs::create_dir_all(&dir).map_err(VmmError::Io)?;
-        Ok(dir)
+    /// Remove staging directories left behind by a crash mid-checkpoint.
+    ///
+    /// A committed snapshot is renamed into place atomically, so anything still
+    /// staged when the process died is unfinished by definition — and can be
+    /// holding a full memory dump.
+    pub fn sweep_incomplete(&self) {
+        let Ok(vms) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        for vm in vms.flatten() {
+            let Ok(entries) = std::fs::read_dir(vm.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let staged = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with('.') && name.ends_with(STAGING_SUFFIX));
+                if staged && path.is_dir() {
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => info!(path = %path.display(), "removed incomplete snapshot"),
+                        Err(e) => {
+                            warn!(path = %path.display(), error = %e, "failed to remove incomplete snapshot");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Find a snapshot by ID alone, searching across all owner directories.
@@ -165,10 +302,8 @@ impl SnapshotCatalog {
             let entry = entry.map_err(VmmError::Io)?;
             if entry.path().is_dir() {
                 let snap_path = entry.path().join(snapshot_id);
-                if snap_path.is_dir()
-                    && let Ok(meta) = self.read_meta(&snap_path)
-                {
-                    return Ok(meta);
+                if is_catalog_entry(&snap_path) {
+                    return self.read_meta(&snap_path);
                 }
             }
         }
@@ -195,6 +330,40 @@ impl SnapshotCatalog {
         Ok(all)
     }
 
+    /// Rootfs images that catalogued snapshots depend on.
+    ///
+    /// Restore rebuilds the dm-snapshot origin from
+    /// [`SnapshotMeta::rootfs_path`], and the guest memory in the snapshot was
+    /// captured against those exact bytes — re-converting the same image with a
+    /// different `vm-agent` produces a different file and is not a substitute.
+    /// Anything that garbage-collects rootfs images must treat these as pinned.
+    pub fn referenced_rootfs_paths(&self) -> Result<BTreeSet<PathBuf>> {
+        if !self.root.exists() {
+            return Ok(BTreeSet::new());
+        }
+        let mut pinned = BTreeSet::new();
+        for vm in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
+            let vm_dir = vm.map_err(VmmError::Io)?.path();
+            if !vm_dir.is_dir() {
+                continue;
+            }
+            for snapshot in std::fs::read_dir(&vm_dir).map_err(VmmError::Io)? {
+                let snapshot_dir = snapshot.map_err(VmmError::Io)?.path();
+                if !is_catalog_entry(&snapshot_dir) {
+                    continue;
+                }
+                // Strict by design: a catalogued directory always carries a
+                // readable record (see [`PendingSnapshot`]), so a failure here
+                // is real corruption — and treating unknown references as "none"
+                // is what would delete an image a restore still needs.
+                if let Some(rootfs) = self.read_meta(&snapshot_dir)?.rootfs_path {
+                    pinned.insert(PathBuf::from(rootfs));
+                }
+            }
+        }
+        Ok(pinned)
+    }
+
     /// Delete a snapshot knowing only its ID (searches across all owner directories).
     pub fn delete_by_id(&self, snapshot_id: &str) -> Result<()> {
         let meta = self.find_by_id(snapshot_id)?;
@@ -213,16 +382,13 @@ impl SnapshotCatalog {
         self.vm_dir(vm_id).join(snapshot_id)
     }
 
-    fn meta_path(dir: &Path) -> PathBuf {
-        dir.join("meta.json")
+    fn staging_dir(&self, vm_id: &str, snapshot_id: &str) -> PathBuf {
+        self.vm_dir(vm_id)
+            .join(format!(".{snapshot_id}{STAGING_SUFFIX}"))
     }
 
-    fn write_meta(&self, meta: &SnapshotMeta) -> Result<()> {
-        let dir = self.snapshot_dir(&meta.vm_id, &meta.id);
-        std::fs::create_dir_all(&dir).map_err(VmmError::Io)?;
-        let json = serde_json::to_string_pretty(meta)?;
-        std::fs::write(Self::meta_path(&dir), json).map_err(VmmError::Io)?;
-        Ok(())
+    fn meta_path(dir: &Path) -> PathBuf {
+        dir.join("meta.json")
     }
 
     fn read_meta(&self, dir: &Path) -> Result<SnapshotMeta> {
@@ -237,19 +403,136 @@ mod tests {
     use super::*;
     use crate::config::SnapshotType;
 
+    /// Publish a snapshot the way a producer does: stage, write a `vmstate`,
+    /// then commit.
+    fn publish(catalog: &SnapshotCatalog, vm_id: &str, draft: SnapshotDraft) -> SnapshotMeta {
+        let pending = catalog.begin(vm_id).unwrap();
+        std::fs::write(pending.dir().join(VMSTATE_FILE), b"vmstate").unwrap();
+        pending.commit(draft).unwrap()
+    }
+
+    fn draft() -> SnapshotDraft {
+        SnapshotDraft {
+            name: None,
+            snapshot_type: SnapshotType::Full,
+            parent_id: None,
+            kernel_path: None,
+            rootfs_path: None,
+        }
+    }
+
     fn register_one(catalog: &SnapshotCatalog, vm_id: &str) -> SnapshotMeta {
-        catalog
-            .register(
+        publish(catalog, vm_id, draft())
+    }
+
+    #[test]
+    fn commit_publishes_atomically_and_records_catalog_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+
+        let pending = catalog.begin("vm-1").unwrap();
+        let staging = pending.dir();
+        let id = pending.id().to_owned();
+        std::fs::write(staging.join(VMSTATE_FILE), b"vmstate").unwrap();
+        std::fs::write(staging.join(MEM_FILE), b"mem").unwrap();
+        // Nothing is catalogued while the snapshot is still being written.
+        assert!(catalog.list("vm-1").unwrap().is_empty());
+
+        let meta = pending.commit(draft()).unwrap();
+
+        assert!(!staging.exists());
+        let published = catalog.snapshot_dir("vm-1", &id);
+        assert_eq!(meta.vmstate_path, published.join(VMSTATE_FILE));
+        assert_eq!(meta.mem_path, Some(published.join(MEM_FILE)));
+        assert_eq!(catalog.list("vm-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn commit_records_no_mem_when_the_snapshot_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = register_one(&catalog, "vm-1");
+        assert_eq!(meta.mem_path, None);
+    }
+
+    #[test]
+    fn dropping_without_commit_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+
+        let staging = {
+            let pending = catalog.begin("vm-1").unwrap();
+            let staging = pending.dir();
+            // A failed checkpoint can leave a partial memory dump behind.
+            std::fs::write(staging.join(MEM_FILE), b"partial").unwrap();
+            staging
+        };
+
+        assert!(!staging.exists());
+        assert!(catalog.list("vm-1").unwrap().is_empty());
+        // No record-less directory to trip readers up.
+        assert!(catalog.referenced_rootfs_paths().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweep_incomplete_reclaims_staging_left_by_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let kept = register_one(&catalog, "vm-1");
+
+        // Simulate a process death between `begin` and `commit`: the staging
+        // directory survives because `Drop` never ran.
+        let orphan = catalog.staging_dir("vm-1", "22222222-dead-beef");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(MEM_FILE), b"partial").unwrap();
+
+        catalog.sweep_incomplete();
+
+        assert!(!orphan.exists());
+        assert!(catalog.get("vm-1", &kept.id).is_ok());
+    }
+
+    #[test]
+    fn referenced_rootfs_paths_spans_every_vm_and_skips_snapshots_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        assert!(catalog.referenced_rootfs_paths().unwrap().is_empty());
+
+        let with_rootfs = |vm_id: &str, rootfs: Option<String>| {
+            publish(
+                &catalog,
                 vm_id,
-                None,
-                SnapshotType::Full,
-                PathBuf::from("/tmp/vmstate"),
-                None,
-                None,
-                None,
-                None,
+                SnapshotDraft {
+                    rootfs_path: rootfs,
+                    ..draft()
+                },
             )
-            .unwrap()
+        };
+        with_rootfs("vm-1", Some("/var/lib/arcbox/sandbox/rootfs-a.ext4".into()));
+        with_rootfs("vm-2", Some("/var/lib/arcbox/sandbox/rootfs-b.ext4".into()));
+        with_rootfs("vm-2", None);
+
+        assert_eq!(
+            catalog.referenced_rootfs_paths().unwrap(),
+            BTreeSet::from([
+                PathBuf::from("/var/lib/arcbox/sandbox/rootfs-a.ext4"),
+                PathBuf::from("/var/lib/arcbox/sandbox/rootfs-b.ext4"),
+            ])
+        );
+    }
+
+    #[test]
+    fn referenced_rootfs_paths_fails_on_an_unreadable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = register_one(&catalog, "vm-1");
+        std::fs::write(
+            SnapshotCatalog::meta_path(&catalog.snapshot_dir("vm-1", &meta.id)),
+            "{ truncated",
+        )
+        .unwrap();
+        // Guessing "no references" here would delete an image a restore needs.
+        assert!(catalog.referenced_rootfs_paths().is_err());
     }
 
     #[test]
@@ -275,18 +558,15 @@ mod tests {
     fn test_register_and_get() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
-        let meta = catalog
-            .register(
-                "vm-2",
-                Some("my-snap".into()),
-                SnapshotType::Diff,
-                PathBuf::from("/tmp/vmstate"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
+        let meta = publish(
+            &catalog,
+            "vm-2",
+            SnapshotDraft {
+                name: Some("my-snap".into()),
+                snapshot_type: SnapshotType::Diff,
+                ..draft()
+            },
+        );
         let loaded = catalog.get("vm-2", &meta.id).unwrap();
         assert_eq!(loaded.id, meta.id);
         assert_eq!(loaded.snapshot_type, SnapshotType::Diff);

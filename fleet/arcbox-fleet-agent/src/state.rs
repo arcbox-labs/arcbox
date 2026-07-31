@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arcbox_fleet_control_proto::v1::{
     AgentSettings, AgentStateSnapshot, BoolSetting, Capability, DockerModeSetting, DoubleSetting,
@@ -15,6 +16,7 @@ use arcbox_fleet_control_proto::v1::{
 use tokio::sync::watch;
 
 use crate::config::{DockerMode, VmMode};
+use crate::handover::ReasonCell;
 use crate::settings::PersistedSettings;
 
 /// Bound on `recent_verdicts` so a long-lived agent's snapshot doesn't grow
@@ -125,7 +127,27 @@ fn settings_mut(snapshot: &mut AgentStateSnapshot) -> &mut AgentSettings {
 /// called from non-async contexts like `Drop` impls.
 #[derive(Clone)]
 pub struct AgentState {
-    tx: Arc<watch::Sender<AgentStateSnapshot>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    tx: watch::Sender<AgentStateSnapshot>,
+    /// The two independent inputs to the snapshot's `draining` flag. Both
+    /// close admission, and the flag is their OR — derived here rather than at
+    /// each writer because the writers never see each other: the operator's
+    /// `Drain`/`Resume` lives on the per-attachment [`crate::runner::
+    /// RunnerSupervisor`], while the handover outlives every attachment. Each
+    /// side setting `draining` directly is how one of them ends up clearing
+    /// the other's.
+    ///
+    /// Neither is ever *handed* to this type as a computed bool. Both are read
+    /// live inside [`Self::refresh_draining`], so two racing writers cannot
+    /// publish a value derived from a pre-store snapshot — see [`ReasonCell`].
+    operator_draining: AtomicBool,
+    /// The handover's reason cell, allocated here so every `AgentState` has
+    /// exactly one and [`crate::handover::Handover::new`] can adopt it without
+    /// a binding step to forget. Written only by that type; read-only here.
+    handover: Arc<ReasonCell>,
 }
 
 impl AgentState {
@@ -191,23 +213,29 @@ impl AgentState {
             telemetry: None,
             settings: Some(settings),
         });
-        Self { tx: Arc::new(tx) }
+        Self {
+            inner: Arc::new(Inner {
+                tx,
+                operator_draining: AtomicBool::new(false),
+                handover: Arc::new(ReasonCell::new()),
+            }),
+        }
     }
 
     /// Subscribe to future changes. `FleetStateService::watch` yields the
     /// current value first (`borrow_and_update`), then one per change.
     pub fn subscribe(&self) -> watch::Receiver<AgentStateSnapshot> {
-        self.tx.subscribe()
+        self.inner.tx.subscribe()
     }
 
     /// A snapshot of the current state.
     pub fn current(&self) -> AgentStateSnapshot {
-        self.tx.borrow().clone()
+        self.inner.tx.borrow().clone()
     }
 
     /// The current settings, for `GetSettings`.
     pub fn settings(&self) -> AgentSettings {
-        settings_of(&self.tx.borrow()).clone()
+        settings_of(&self.inner.tx.borrow()).clone()
     }
 
     /// The current settings, projected down to their persisted
@@ -216,7 +244,7 @@ impl AgentState {
     /// computes "effective post-update" values against before applying a
     /// request.
     pub fn persisted_settings(&self) -> PersistedSettings {
-        let snapshot = self.tx.borrow();
+        let snapshot = self.inner.tx.borrow();
         let s = settings_of(&snapshot);
         PersistedSettings {
             load_ceiling: s.load_ceiling.as_ref().expect(SETTINGS_INVARIANT).target,
@@ -252,35 +280,61 @@ impl AgentState {
     }
 
     pub fn set_enrollment(&self, enrollment: Enrollment, machine_id: &str) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             s.enrollment = enrollment as i32;
             machine_id.clone_into(&mut s.machine_id);
         });
     }
 
-    pub fn set_draining(&self, draining: bool) {
-        self.tx.send_modify(|s| s.draining = draining);
+    /// The operator's `Drain`/`Resume`, one of the two inputs to the
+    /// observable flag (see [`Inner::operator_draining`]).
+    pub fn set_operator_draining(&self, draining: bool) {
+        self.inner
+            .operator_draining
+            .store(draining, Ordering::Relaxed);
+        self.refresh_draining();
     }
 
-    /// Advertised capabilities are static for an attachment's lifetime, so
-    /// this is set once rather than tracked incrementally.
+    /// The cell holding the other input: whether this process image is on its
+    /// way out. Adopted by [`crate::handover::Handover::new`], the only writer.
+    pub(crate) fn handover_reason(&self) -> &Arc<ReasonCell> {
+        &self.inner.handover
+    }
+
+    /// Recompute and publish the `draining` flag. Called by whichever side just
+    /// changed one of its inputs; it takes no argument on purpose.
+    pub(crate) fn refresh_draining(&self) {
+        // Both inputs are read inside `send_modify`, under the watch channel's
+        // write lock: two concurrent refreshes would otherwise each compute
+        // from their own pre-store snapshot, and the loser would republish a
+        // stale value that no later write corrects.
+        self.inner.tx.send_modify(|s| {
+            s.draining = self.inner.operator_draining.load(Ordering::Relaxed)
+                || self.inner.handover.pending();
+        });
+    }
+
+    /// Mirror the advertised capability set. Written only by the backend
+    /// registry (`crate::backends`): once at construction and again on
+    /// every backend activation.
     pub fn set_capabilities(&self, capabilities: Vec<Capability>) {
-        self.tx.send_modify(|s| s.capabilities = capabilities);
+        self.inner.tx.send_modify(|s| s.capabilities = capabilities);
     }
 
     pub fn add_in_flight(&self, job: InFlightJob) {
-        self.tx.send_modify(|s| s.in_flight.push(job));
+        self.inner.tx.send_modify(|s| s.in_flight.push(job));
     }
 
     pub fn remove_in_flight(&self, job_id: &str) {
-        self.tx
+        self.inner
+            .tx
             .send_modify(|s| s.in_flight.retain(|j| j.job_id != job_id));
     }
 
     /// Append a verdict, dropping the oldest once [`RECENT_VERDICTS_CAP`] is
     /// exceeded. Most-recent-last.
     pub fn push_verdict(&self, verdict: OfferVerdict) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             s.recent_verdicts.push(verdict);
             if s.recent_verdicts.len() > RECENT_VERDICTS_CAP {
                 s.recent_verdicts.remove(0);
@@ -289,14 +343,14 @@ impl AgentState {
     }
 
     pub fn set_telemetry(&self, telemetry: HostTelemetry) {
-        self.tx.send_modify(|s| s.telemetry = Some(telemetry));
+        self.inner.tx.send_modify(|s| s.telemetry = Some(telemetry));
     }
 
     // -- Settings: cheap reads for the engine's hot paths (admit(), image
     // pulls) — extract just the one field needed, no whole-snapshot clone.
 
     pub fn load_ceiling_current(&self) -> f64 {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .load_ceiling
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -304,7 +358,7 @@ impl AgentState {
     }
 
     pub fn mem_floor_mib_current(&self) -> u64 {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .mem_floor_mib
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -312,7 +366,7 @@ impl AgentState {
     }
 
     pub fn linux_runner_image_current(&self) -> String {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .linux_runner_image
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -323,7 +377,7 @@ impl AgentState {
     /// The desired image — what `FleetImageService.Prepare` verifies and
     /// then promotes to `current`.
     pub fn linux_runner_image_target(&self) -> String {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .linux_runner_image
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -332,7 +386,7 @@ impl AgentState {
     }
 
     pub fn macos_runner_image_current(&self) -> String {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .macos_runner_image
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -340,10 +394,24 @@ impl AgentState {
             .clone()
     }
 
+    /// The `vm_mode` this process runs with (`current` is restart-scoped —
+    /// seeded at startup, never moved by `UpdateSettings`). Gates whether
+    /// `FleetImageService.Prepare` may dial the daemon for an inactive VM
+    /// backend.
+    pub fn vm_mode_current(&self) -> VmMode {
+        vm_mode_from_wire(
+            settings_of(&self.inner.tx.borrow())
+                .vm_mode
+                .as_ref()
+                .expect(SETTINGS_INVARIANT)
+                .current,
+        )
+    }
+
     /// The desired macOS image — what `FleetImageService.Prepare` pulls
     /// through the daemon and then promotes to `current`.
     pub fn macos_runner_image_target(&self) -> String {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .macos_runner_image
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -354,7 +422,7 @@ impl AgentState {
     /// The desired participation — what `AgentSupervisor`'s reconciler
     /// converges the attachment onto.
     pub fn participate_target(&self) -> bool {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .participate
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -366,7 +434,7 @@ impl AgentState {
     /// was last dialed outside of the full `settings()`/`persisted_settings()`
     /// snapshots, which `GetSettings`/`Watch` already expose it through.
     pub fn gateway_target(&self) -> String {
-        settings_of(&self.tx.borrow())
+        settings_of(&self.inner.tx.borrow())
             .gateway
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -397,7 +465,7 @@ impl AgentState {
     // `current` when the detach/reattach completes.
 
     pub fn set_load_ceiling(&self, value: f64) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             let setting = settings_mut(s)
                 .load_ceiling
                 .as_mut()
@@ -408,7 +476,7 @@ impl AgentState {
     }
 
     pub fn set_mem_floor_mib(&self, value: u64) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             let setting = settings_mut(s)
                 .mem_floor_mib
                 .as_mut()
@@ -419,7 +487,7 @@ impl AgentState {
     }
 
     pub fn set_linux_runner_image_target(&self, value: &str) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             value.clone_into(
                 &mut settings_mut(s)
                     .linux_runner_image
@@ -431,7 +499,7 @@ impl AgentState {
     }
 
     pub fn set_linux_runner_image_current(&self, value: &str) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             value.clone_into(
                 &mut settings_mut(s)
                     .linux_runner_image
@@ -443,7 +511,7 @@ impl AgentState {
     }
 
     pub fn set_gateway_target(&self, value: &str) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             value.clone_into(
                 &mut settings_mut(s)
                     .gateway
@@ -468,7 +536,7 @@ impl AgentState {
     /// wrote the other. Returns the observed enrollment on refusal.
     pub fn try_set_gateway_target(&self, value: &str) -> Result<(), Enrollment> {
         let mut observed: Result<(), Enrollment> = Ok(());
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             let enrollment = Enrollment::try_from(s.enrollment).unwrap_or(Enrollment::Unenrolled);
             if enrollment != Enrollment::Unenrolled {
                 observed = Err(enrollment);
@@ -486,7 +554,7 @@ impl AgentState {
     }
 
     pub fn set_gateway_current(&self, value: &str) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             value.clone_into(
                 &mut settings_mut(s)
                     .gateway
@@ -499,7 +567,7 @@ impl AgentState {
 
     pub fn set_docker_mode_target(&self, mode: DockerMode) {
         let mode = docker_mode_to_control(mode) as i32;
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             settings_mut(s)
                 .docker_mode
                 .as_mut()
@@ -510,7 +578,7 @@ impl AgentState {
 
     pub fn set_vm_mode_target(&self, mode: VmMode) {
         let mode = vm_mode_to_control(mode) as i32;
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             settings_mut(s)
                 .vm_mode
                 .as_mut()
@@ -520,7 +588,7 @@ impl AgentState {
     }
 
     pub fn set_macos_runner_image_target(&self, value: &str) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             value.clone_into(
                 &mut settings_mut(s)
                     .macos_runner_image
@@ -532,7 +600,7 @@ impl AgentState {
     }
 
     pub fn set_macos_runner_image_current(&self, value: &str) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             value.clone_into(
                 &mut settings_mut(s)
                     .macos_runner_image
@@ -545,7 +613,7 @@ impl AgentState {
 
     pub fn set_runner_script_target(&self, script: Option<&Path>) {
         let value = path_to_setting_value(script);
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             settings_mut(s)
                 .runner_script
                 .as_mut()
@@ -558,7 +626,7 @@ impl AgentState {
     /// started with. `script` uses the same empty-means-unset encoding.
     pub fn set_windows_runner_script_target(&self, script: &str) {
         let value = script.to_owned();
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             settings_mut(s)
                 .windows_runner_script
                 .as_mut()
@@ -568,7 +636,7 @@ impl AgentState {
     }
 
     pub fn set_participate_target(&self, value: bool) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             settings_mut(s)
                 .participate
                 .as_mut()
@@ -578,7 +646,7 @@ impl AgentState {
     }
 
     pub fn set_participate_current(&self, value: bool) {
-        self.tx.send_modify(|s| {
+        self.inner.tx.send_modify(|s| {
             settings_mut(s)
                 .participate
                 .as_mut()
@@ -799,12 +867,30 @@ mod tests {
         assert_eq!(snap.machine_id, "fltm_test");
     }
 
+    /// The observable flag is the OR of two independent inputs, and neither
+    /// writer sees the other — so clearing one while the other holds must not
+    /// report the host as accepting work. The handover side is driven through
+    /// its owner, since nothing else may write that cell.
     #[test]
-    fn set_draining_toggles() {
+    fn draining_is_the_or_of_its_two_inputs() {
+        use crate::handover::{Handover, Reason};
+
         let state = AgentState::new(&seed());
-        state.set_draining(true);
-        assert!(state.current().draining);
-        state.set_draining(false);
+        let handover = Handover::new(state.clone());
         assert!(!state.current().draining);
+
+        state.set_operator_draining(true);
+        handover.request(Reason::Update);
+        assert!(state.current().draining);
+
+        handover.update_became_moot();
+        assert!(state.current().draining, "the operator drain still holds");
+
+        state.set_operator_draining(false);
+        assert!(!state.current().draining);
+
+        handover.request(Reason::Restart);
+        state.set_operator_draining(false);
+        assert!(state.current().draining, "the handover still holds");
     }
 }

@@ -512,3 +512,22 @@ fn test_concurrent_operations() {
         handle.join().expect("Thread panicked");
     }
 }
+
+/// Security regression: a name that is not a single safe path component must be
+/// rejected at lookup, so the guest cannot obtain a nodeid outside the shared
+/// root (which it could then read/write or DAX-map).
+#[test]
+fn lookup_rejects_path_traversal_names() {
+    let (temp, fs) = setup_test_fs();
+    for name in ["..", ".", "", "../etc/passwd", "/etc/passwd", "a/b"] {
+        assert!(
+            fs.lookup(PassthroughFs::ROOT_INODE, OsStr::new(name))
+                .is_err(),
+            "unsafe FUSE name {name:?} must be rejected, not resolved"
+        );
+    }
+    // A normal single component still resolves.
+    std::fs::write(temp.path().join("normal.txt"), b"x").unwrap();
+    fs.lookup(PassthroughFs::ROOT_INODE, OsStr::new("normal.txt"))
+        .expect("a safe name must resolve normally");
+}

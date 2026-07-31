@@ -164,6 +164,9 @@ pub(super) struct DesiredBoot {
     pub(super) cmdline: String,
     /// EROFS rootfs image path (read-only vda).
     pub(super) rootfs_image: PathBuf,
+    /// Read-only image of the guest container-runtime binaries, when the
+    /// pinned boot release ships one (ABX-498).
+    pub(super) runtime_image: Option<PathBuf>,
 }
 
 /// Returns the first daemon-overridable field that differs between a persisted
@@ -188,7 +191,36 @@ pub(super) fn machine_drift_reason(
         Some("kernel")
     } else if persisted.cmdline.as_deref() != Some(boot.cmdline.as_str()) {
         Some("cmdline")
+    } else if persisted.block_devices.len() != boot.expected_disk_count() {
+        // A machine persisted before a disk was added (the ext4 metadata
+        // volume, or the runtime image) carries fewer disks; recreating
+        // rewrites the machine record — image files are untouched — so the
+        // guest receives the new device.
+        Some("block_devices")
     } else {
         None
     }
+}
+
+/// Block devices `create_default_machine` always attaches: EROFS rootfs
+/// (vda), btrfs data image (vdb), ext4 metadata image (vdc).
+const BASE_MACHINE_DISK_COUNT: usize = 3;
+
+impl DesiredBoot {
+    /// Number of block devices a machine created from these boot params
+    /// carries: the always-present three, plus the read-only runtime image
+    /// when the pinned boot release ships one.
+    pub(super) fn expected_disk_count(&self) -> usize {
+        BASE_MACHINE_DISK_COUNT + usize::from(self.runtime_image.is_some())
+    }
+}
+
+/// Derives the metadata-volume image filename paired with a data image:
+/// `docker.img` → `docker-meta.img`, `docker-rosetta.img` →
+/// `docker-rosetta-meta.img`.
+pub(super) fn metadata_image_filename(data_image_filename: &str) -> String {
+    let stem = data_image_filename
+        .strip_suffix(".img")
+        .unwrap_or(data_image_filename);
+    format!("{stem}-meta.img")
 }

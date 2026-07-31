@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -23,7 +24,7 @@ use arcbox_protocol::agent::{
 };
 
 use super::btrfs::ensure_data_mount;
-use super::cmdline::docker_api_vsock_port;
+use super::cmdline::{declared_runtime_image_device, docker_api_vsock_port};
 use super::probe::{probe_docker_api_ready, probe_first_ready_socket, probe_unix_socket};
 use super::rpc::sync_clock_from_host;
 use crate::agent::ensure_runtime;
@@ -47,6 +48,12 @@ const REQUIRED_RUNTIME_BINARIES: &[&str] = &[
 /// enough that TLS certificates issued after 2020 pass validation.
 /// 2020-01-01T00:00:00Z
 const MIN_SANE_EPOCH: u64 = 1_577_836_800;
+
+/// All Docker bridge subnets routed from macOS through the bridge NIC.
+const CONTAINER_SUBNET: &str = "172.16.0.0/12";
+
+/// Polling fallback for firewall managers that recreate `DOCKER-USER`.
+const DIRECT_ROUTING_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Idempotent, non-blocking EnsureRuntime handler.
 ///
@@ -90,19 +97,30 @@ async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
         status = collect_runtime_status().await;
     }
 
-    let mut message = status.detail.clone();
-    if !notes.is_empty() {
-        message = format!("{}; {}", notes.join("; "), status.detail);
+    let routing_error = if status.docker_ready {
+        ensure_direct_container_routing().await.err()
+    } else {
+        None
+    };
+
+    let mut message = if notes.is_empty() {
+        status.detail.clone()
+    } else {
+        format!("{}; {}", notes.join("; "), status.detail)
+    };
+    if let Some(error) = &routing_error {
+        message = format!("{message}; direct container routing setup failed: {error:#}");
     }
 
-    let result_status = if status.docker_ready {
+    let ready = status.docker_ready && routing_error.is_none();
+    let result_status = if ready {
         ensure_runtime::STATUS_STARTED.to_string()
     } else {
         ensure_runtime::STATUS_FAILED.to_string()
     };
 
     RuntimeEnsureResponse {
-        ready: status.docker_ready,
+        ready,
         endpoint: status.endpoint,
         message,
         status: result_status,
@@ -126,6 +144,91 @@ async fn do_ensure_runtime_probe() -> RuntimeEnsureResponse {
 
 pub(super) async fn handle_runtime_status(_req: RuntimeStatusRequest) -> RpcResponse {
     RpcResponse::RuntimeStatus(collect_runtime_status().await)
+}
+
+/// Allows traffic arriving on the vmnet bridge NIC to reach Docker bridge
+/// subnets routed from macOS.
+///
+/// Docker creates `DOCKER-USER` only after it starts. Installing this rule
+/// before dockerd is ineffective, and inserting directly into `FORWARD` is
+/// unstable because Docker prepends its own chains on startup. The matching
+/// daemon option `allow-direct-routing` removes Docker's earlier raw-table
+/// per-container drops; this rule then bypasses its unpublished-port drop.
+async fn ensure_direct_container_routing() -> Result<()> {
+    let _guard = direct_routing_lock().lock().await;
+    let Some(bridge_iface) = crate::init::detect_bridge_interface() else {
+        tracing::debug!("no bridge NIC found; skipping direct container routing rule");
+        return Ok(());
+    };
+
+    let rule = [
+        "DOCKER-USER",
+        "-i",
+        bridge_iface.as_str(),
+        "-d",
+        CONTAINER_SUBNET,
+        "-j",
+        "ACCEPT",
+    ];
+    let check = Command::new("/sbin/iptables")
+        .args(["-w", "2", "-C"])
+        .args(rule)
+        .output()
+        .await
+        .context("checking DOCKER-USER rule")?;
+    if check.status.success() {
+        return Ok(());
+    }
+    if check.status.code() != Some(1) {
+        bail!(
+            "iptables check failed: {}",
+            String::from_utf8_lossy(&check.stderr).trim()
+        );
+    }
+
+    let install = Command::new("/sbin/iptables")
+        .args(["-w", "2", "-I"])
+        .args(rule)
+        .output()
+        .await
+        .context("installing DOCKER-USER rule")?;
+    if !install.status.success() {
+        bail!(
+            "iptables failed: {}",
+            String::from_utf8_lossy(&install.stderr).trim()
+        );
+    }
+
+    tracing::info!(
+        interface = bridge_iface,
+        subnet = CONTAINER_SUBNET,
+        "direct container routing rule installed"
+    );
+    Ok(())
+}
+
+fn direct_routing_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Restores the direct-routing firewall rule if Docker recreates its chains.
+pub(super) async fn direct_container_routing_loop() {
+    let mut ticker = tokio::time::interval(DIRECT_ROUTING_RECONCILE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Initial runtime setup owns the readiness gate and first installation.
+    // Delay this fallback's first check to avoid duplicating startup probes.
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        if !probe_docker_api_ready(DOCKER_API_UNIX_SOCKET).await {
+            continue;
+        }
+        if let Err(error) = ensure_direct_container_routing().await {
+            tracing::warn!(%error, "failed to reconcile direct container routing rule");
+        }
+    }
 }
 
 pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
@@ -405,7 +508,88 @@ fn runtime_start_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Read-only mount point of the block-backed runtime image.
+///
+/// The runtime binaries otherwise live on the host-backed `arcbox` VirtioFS
+/// share, where every exec costs a FUSE round-trip — measured 7-10x more than
+/// exec'ing the same binary from block-backed storage, and paid on *every*
+/// container start (so on every `docker build` step). When the boot release
+/// ships a runtime image the host attaches it as a read-only disk and the
+/// guest execs from here instead (ABX-498).
+const RUNTIME_IMAGE_MOUNT: &str = "/run/arcbox/runtime";
+
+/// Mounts the read-only runtime image the host declared on the cmdline.
+/// Returns whether the mount is available afterward.
+///
+/// Best-effort by design: the VirtioFS copies stay as the fallback, so a
+/// release without an image, or a failed mount, costs exec speed but never
+/// correctness.
+fn mount_runtime_image(notes: &mut Vec<String>) -> bool {
+    if crate::mount::is_mounted(RUNTIME_IMAGE_MOUNT) {
+        return true;
+    }
+    let Some(device) = declared_runtime_image_device() else {
+        return false;
+    };
+    // The node can lag guest boot; wait briefly rather than silently taking
+    // the slow path for the rest of this boot.
+    if !wait_for_runtime_image_device(&device) {
+        notes.push(format!("runtime image device {device} never appeared"));
+        return false;
+    }
+    if let Err(e) = std::fs::create_dir_all(RUNTIME_IMAGE_MOUNT) {
+        notes.push(format!("runtime image mkdir failed({e})"));
+        return false;
+    }
+    match std::process::Command::new("/bin/busybox")
+        .args([
+            "mount",
+            "-t",
+            "erofs",
+            "-o",
+            "ro",
+            &device,
+            RUNTIME_IMAGE_MOUNT,
+        ])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            notes.push(format!("mounted runtime image from {device}"));
+            true
+        }
+        _ => {
+            notes.push(format!(
+                "runtime image mount failed ({device}); using VirtioFS"
+            ));
+            false
+        }
+    }
+}
+
+/// Waits up to 5 s for the declared device node (same budget and rationale as
+/// the data-device wait in `btrfs.rs`).
+fn wait_for_runtime_image_device(device: &str) -> bool {
+    for attempt in 0..50 {
+        if Path::new(device).exists() {
+            if attempt > 0 {
+                tracing::info!(device, attempt, "waited for runtime image device");
+            }
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
 fn detect_runtime_bin_dir() -> Option<PathBuf> {
+    // Prefer the block-backed runtime image when it is mounted — exec from
+    // it is 7-10x cheaper than over VirtioFS. Everything downstream (the
+    // containerd/dockerd spawns and the PATH they inherit) follows this one
+    // directory, so preferring it here is the whole switch.
+    let image = PathBuf::from(RUNTIME_IMAGE_MOUNT);
+    if missing_runtime_binaries_at(&image).is_empty() {
+        return Some(image);
+    }
     let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
     if missing_runtime_binaries_at(&dir).is_empty() {
         Some(dir)
@@ -520,6 +704,20 @@ pub(super) fn ensure_runtime_prerequisites() -> Vec<String> {
         notes.push("enabled ip_forward".to_string());
     }
 
+    // Expedite RCU grace periods. Every container start's `runc create`
+    // (and network-namespace teardown) calls synchronize_rcu; on the
+    // non-expedited guest kernel each grace period parks runc ~70 ms in
+    // uninterruptible sleep (`__wait_rcu_gp`), which is the dominant
+    // runc-create cost — profiled at ~88 ms → ~10 ms with this set, an 8x
+    // cut (ABX-496). Expedited grace periods use IPIs (µs, not ms); the
+    // trade is more IPIs under RCU load, the right call for a
+    // container/build runtime with heavy netns churn.
+    if let Err(e) = std::fs::write("/sys/kernel/rcu_expedited", b"1\n") {
+        notes.push(format!("rcu_expedited failed({e})"));
+    } else {
+        notes.push("enabled rcu_expedited".to_string());
+    }
+
     // Load overlay module (needed for Docker's overlay2 storage driver).
     if !Path::new("/sys/module/overlay").exists() {
         let rc = std::process::Command::new("/sbin/modprobe")
@@ -627,13 +825,24 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
 async fn try_start_bundled_runtime() -> String {
     let _guard = runtime_start_lock().lock().await;
 
-    // Whenever dockerd is up its data mount exists, so the NFS export can be
-    // (re)established on warm boots too — set it up before the early return.
     if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
-        let mut notes = vec!["docker socket already ready".to_string()];
-        setup_nfs_export(&mut notes);
-        return notes.join("; ");
+        return "docker socket already ready".to_string();
     }
+
+    let mut notes = Vec::new();
+
+    // Ensure kernel/filesystem prerequisites before spawning daemons — and
+    // before mounting the runtime image below, since that mounts under /run
+    // and the prerequisites are what guarantee /run is a writable tmpfs.
+    let prereq_notes = ensure_runtime_prerequisites();
+    if !prereq_notes.is_empty() {
+        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
+    }
+    notes.extend(prereq_notes);
+
+    // Mount the runtime image (when this release ships one) before probing
+    // for the runtime binaries, so the probe can prefer it.
+    mount_runtime_image(&mut notes);
 
     let Some(runtime_bin_dir) = detect_runtime_bin_dir() else {
         return runtime_missing_detail();
@@ -643,22 +852,19 @@ async fn try_start_bundled_runtime() -> String {
         runtime_bin_dir = %runtime_bin_dir.display(),
         "starting bundled runtime"
     );
-
-    let mut notes = Vec::new();
-
-    // Ensure kernel/filesystem prerequisites before spawning daemons.
-    let prereq_notes = ensure_runtime_prerequisites();
-    if !prereq_notes.is_empty() {
-        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
-    }
-    notes.extend(prereq_notes);
     match ensure_data_mount() {
         Ok(note) => notes.push(note),
         Err(e) => return format!("data volume setup failed: {}", e),
     }
 
-    // The docker data mount now exists; export it read-only over NFS.
-    setup_nfs_export(&mut notes);
+    // Bind the fsync-hot metadata dirs onto the ext4 volume before the
+    // daemons open their boltdb files. A hard error means the volume exists
+    // but is unusable — starting dockerd against the stale shadowed btrfs
+    // state would fork it, so abort instead.
+    match super::metadata_volume::ensure_metadata_mount() {
+        Ok(note) => notes.push(note),
+        Err(e) => return format!("metadata volume setup failed: {}", e),
+    }
 
     ensure_shared_runtime_dirs(&mut notes);
 
@@ -671,15 +877,21 @@ async fn try_start_bundled_runtime() -> String {
     notes.join("; ")
 }
 
-/// Establishes the read-only NFSv3 export of the docker data mount, best-effort.
+/// Brings up the read-only NFS export of the docker data mount so the host
+/// can browse it at `~/ArcBox`.
 ///
-/// The export is an auxiliary feature (host `~/ArcBox` browsing); its failure
-/// must never block the container runtime, so errors are logged, not returned.
-fn setup_nfs_export(notes: &mut Vec<String>) {
-    match crate::nfs::ensure_docker_export() {
-        Ok(export_notes) => notes.extend(export_notes),
-        Err(e) => tracing::warn!(error = %e, "nfs export setup failed (non-fatal)"),
-    }
+/// Called on demand by the host daemon (`EnsureNfsExportRequest`), which only
+/// sends it when the mount is enabled — so a `--no-mount-nfs` daemon leaves
+/// the guest with no nfsd at all. Ensures the docker data mount exists first
+/// (idempotent), so it is safe to call at any point after the agent is up;
+/// the runtime-start lock serializes it against the startup path's own
+/// data-mount setup.
+pub(super) async fn ensure_nfs_export() -> Result<Vec<String>, String> {
+    let _guard = runtime_start_lock().lock().await;
+
+    let mut notes = vec![ensure_data_mount()?];
+    notes.extend(crate::nfs::ensure_docker_export()?);
+    Ok(notes)
 }
 
 #[cfg(test)]

@@ -1,8 +1,10 @@
 //! Runner supervision: the agent is the admission authority. On each offer it
 //! decides — against live host state — whether to run the job, starts the
 //! runner, and answers the gateway with **accept** (the runner started) or
-//! **reject** (try another host). It reports no terminal event; the GitHub
-//! webhook is the authoritative outcome.
+//! **reject** (try another host). It reports no authoritative outcome — the
+//! GitHub webhook concludes the job — but a started runner's exit does emit
+//! a `RunnerExited` liveness hint so the platform can fail fast when no
+//! webhook is ever coming (the runner died before completing anything).
 //!
 //! Backend is chosen from the agent's own advertised capabilities: Linux jobs a
 //! Docker capability serves run in a container (isolation); darwin jobs a `vm`
@@ -13,14 +15,13 @@
 //! Capacity is never a number — admission gates on live load and free memory,
 //! so a busy host simply rejects and the platform re-offers elsewhere.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::{
-    AttachRequest, Backend, Capability, HostTelemetry, ProvisionRunner, RunnerAccepted,
+    AttachRequest, Backend, HostTelemetry, ProvisionRunner, RunnerAccepted, RunnerExited,
     RunnerRejected, attach_request,
 };
 use command_group::AsyncCommandGroup;
@@ -29,44 +30,134 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::docker::{DockerRunner, RunSpec};
+use crate::backends::Backends;
+use crate::docker::RunSpec;
+use crate::handover::Handover;
 use crate::host;
-use crate::interop::InteropRunner;
 use crate::state::AgentState;
-use crate::vm::VmRunner;
 
 /// Watchdog on a VM job's runtime: GitHub concludes jobs at 6 h, so a
 /// session still open past that (plus slack) means the guest wedged — treat
 /// it as a cancellation and destroy the guest.
 const MAX_VM_JOB_RUNTIME: Duration = Duration::from_secs(6 * 3600 + 1800);
 
-/// Convert a gateway-advertised capability into its control-plane
-/// counterpart. A plain function, not `From`: both `Capability` types are
-/// generated in other crates, so Rust's orphan rule blocks implementing a
-/// foreign trait (`From`) for two foreign types here.
-fn capability_to_control(c: &Capability) -> control_proto::Capability {
-    let backed_by = match Backend::try_from(c.backed_by) {
-        Ok(Backend::HostRunner) => control_proto::Backend::HostRunner,
-        Ok(Backend::Docker) => control_proto::Backend::Docker,
-        Ok(Backend::Vm) => control_proto::Backend::Vm,
-        Ok(Backend::Unspecified) | Err(_) => control_proto::Backend::Unspecified,
-    };
-    control_proto::Capability {
-        os: c.os.clone(),
-        arch: c.arch.clone(),
-        backed_by: backed_by as i32,
-    }
-}
+/// Polling interval of [`RunnerSupervisor::quiesce`]. Both maps it watches
+/// are `DashMap`s with no completion signal, so the wait is polled rather
+/// than notified.
+const QUIESCE_POLL: Duration = Duration::from_millis(200);
+
+/// How long [`RunnerSupervisor::quiesce`] waits for the gateway to ack
+/// outstanding verdicts before handing over without them.
+///
+/// Sized to cover one verdict-resend interval (`attach`'s
+/// `VERDICT_RESEND_INTERVAL`, 10s) plus an ack round-trip, so a verdict whose
+/// first non-blocking send lost the race to a full egress queue still gets one
+/// resend before the process image is replaced. Only paid when something is
+/// actually outstanding — acks are sub-second, so in the steady state
+/// `quiesce` finds the map empty and returns at once.
+pub const VERDICT_ACK_GRACE: Duration = Duration::from_secs(12);
 
 /// Outcome of the admission decision for an incoming offer.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
     /// Run the job via this backend.
     Accept(Backend),
-    /// The job is already running here; re-accept idempotently, don't restart.
+    /// The job is already in flight here; never start a second runner. The
+    /// redelivered offer is re-accepted once the runner has started, or
+    /// parked on the job's slot until the start settles.
     Duplicate,
+    /// The runner has exited and its accepted verdict is still awaiting an
+    /// ack. Re-accept without starting the single-use JIT config again.
+    ReplayAccepted,
     /// Decline the offer; `reason` is echoed back for debuggability.
     Reject(String),
+}
+
+/// Supervision state of one in-flight job.
+///
+/// The state transition is the linearization point between runner startup and
+/// cancellation. A redelivery racing that transition either parks while the
+/// outcome is unknown or observes the settled outcome; no token can arrive
+/// after a one-shot drain and be lost.
+struct JobSlot {
+    /// Level-triggered cancel signal delivered to the job's `run_job` task;
+    /// see [`RunnerSupervisor::handle_cancel`].
+    cancel: CancellationToken,
+    state: JobState,
+}
+
+enum JobState {
+    /// The runner has not settled startup. Each redelivery has its own
+    /// awakeable and waits here for the same accept/reject outcome.
+    Starting { parked_offers: Vec<String> },
+    /// The runner started, so redeliveries are re-accepted immediately.
+    Started,
+    /// Startup failed, so redeliveries receive the same rejection while the
+    /// slot remains present.
+    Rejected { reason: String },
+    /// The platform concluded the job. No verdict is owed for any offer.
+    Cancelled,
+}
+
+enum DuplicateVerdict {
+    Deferred,
+    Accept,
+    Reject(String),
+    Ignore,
+}
+
+impl JobSlot {
+    fn new(cancel: CancellationToken) -> Self {
+        Self {
+            cancel,
+            state: JobState::Starting {
+                parked_offers: Vec::new(),
+            },
+        }
+    }
+
+    fn duplicate_verdict(&mut self, token: &str) -> DuplicateVerdict {
+        match &mut self.state {
+            JobState::Starting { parked_offers } => {
+                if !parked_offers.iter().any(|parked| parked == token) {
+                    parked_offers.push(token.to_owned());
+                }
+                DuplicateVerdict::Deferred
+            }
+            JobState::Started => DuplicateVerdict::Accept,
+            JobState::Rejected { reason } => DuplicateVerdict::Reject(reason.clone()),
+            JobState::Cancelled => DuplicateVerdict::Ignore,
+        }
+    }
+
+    fn accept_start(&mut self) -> Option<Vec<String>> {
+        let parked = match &mut self.state {
+            JobState::Starting { parked_offers } => std::mem::take(parked_offers),
+            JobState::Cancelled => return None,
+            JobState::Started => panic!("runner start accepted twice"),
+            JobState::Rejected { .. } => panic!("runner start accepted after rejection"),
+        };
+        self.state = JobState::Started;
+        Some(parked)
+    }
+
+    fn reject_start(&mut self, reason: &str) -> Option<Vec<String>> {
+        let parked = match &mut self.state {
+            JobState::Starting { parked_offers } => std::mem::take(parked_offers),
+            JobState::Cancelled => return None,
+            JobState::Started => panic!("runner start rejected after acceptance"),
+            JobState::Rejected { .. } => panic!("runner start rejected twice"),
+        };
+        self.state = JobState::Rejected {
+            reason: reason.to_owned(),
+        };
+        Some(parked)
+    }
+
+    fn cancel(&mut self) {
+        self.state = JobState::Cancelled;
+        self.cancel.cancel();
+    }
 }
 
 /// Spawns and tracks runner processes, answering each offer with accept/reject.
@@ -87,32 +178,31 @@ struct Inner {
     /// through that is exactly the recovery we want. Growth is bounded because
     /// offers originate from the same parked workflows the acks come from.
     outstanding: DashMap<String, attach_request::Msg>,
-    /// Jobs currently running here, each with its cancellation token — one map
-    /// for duplicate detection, cancel delivery, and release. Cancelling a token
-    /// makes the job's `run_job` tear down the runner — the whole process group
+    /// Jobs currently running here, each with its supervision state
+    /// ([`JobSlot`]) — one map for duplicate detection, redelivered-offer
+    /// parking, cancel delivery, and release. Cancelling a slot's token makes
+    /// the job's `run_job` tear down the runner — the whole process group
     /// (host), the container (Docker), the guest (VM), or the Windows process
     /// tree (interop) — awaited, before the entry is released.
     /// The token is level-triggered, so a cancel that lands while the runner is
     /// still starting is observed at the next cancellation point rather than
     /// lost; see [`RunnerSupervisor::handle_cancel`].
-    in_flight: DashMap<String, CancellationToken>,
+    in_flight: DashMap<String, JobSlot>,
     /// Path to the installed runner's entry point (`run.sh`). `None` when
     /// only Docker-based execution is configured.
     runner_script: Option<PathBuf>,
-    /// Docker runtime for Linux jobs, if available.
-    docker: Option<DockerRunner>,
-    /// macOS VM backend for darwin jobs, if the local daemon serves it.
-    vm: Option<VmRunner>,
-    /// WSL interop backend for windows jobs, if the startup probe passed.
-    interop: Option<InteropRunner>,
-    /// The backend serving each advertised `(os, arch)` — the routing table.
-    backends: HashMap<(String, String), Backend>,
-    /// Set once `Drain` is received; no new jobs are accepted.
+    /// The live backend registry: the runtimes behind each advertised
+    /// capability and the `(os, arch)` → backend routing, read per offer so
+    /// routing always agrees with what is currently advertised.
+    backends: Arc<Backends>,
+    /// Set by `Drain`, and by [`RunnerSupervisor::shutdown`]; no new jobs are
+    /// accepted. Attachment-scoped, unlike `handover` below.
     draining: std::sync::atomic::AtomicBool,
-    /// Set while a self-update is pending; no new jobs are accepted. Kept
-    /// separate from `draining` so a moot update (the pin moved back to this
-    /// build before the swap) can resume without clearing an operator drain.
-    draining_for_update: std::sync::atomic::AtomicBool,
+    /// Whether this process image is on its way out. Also closes admission,
+    /// but owned elsewhere and read-only here: it outlives this attachment,
+    /// and its revocation rules (a moot self-update reopens, a committed
+    /// restart never does) belong to the type that owns them.
+    handover: Arc<Handover>,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers.
     state: AgentState,
 }
@@ -138,43 +228,28 @@ impl Drop for ReleaseGuard {
 }
 
 impl RunnerSupervisor {
-    /// Create a supervisor that emits verdicts on `events`. `capabilities` is the
-    /// same set advertised to the gateway, so routing and advertisement agree.
+    /// Create a supervisor that emits verdicts on `events`. Routing comes
+    /// live from `backends` — the same registry the advertised capability
+    /// set derives from, so routing and advertisement agree by construction.
     /// `load_ceiling`/`mem_floor_mib` are not parameters: `admit()` reads
     /// them live from `state`, which is the single source of truth settings
     /// write through.
     pub fn new(
         events: mpsc::Sender<AttachRequest>,
         runner_script: Option<PathBuf>,
-        docker: Option<DockerRunner>,
-        vm: Option<VmRunner>,
-        interop: Option<InteropRunner>,
-        capabilities: Vec<Capability>,
+        backends: Arc<Backends>,
         state: AgentState,
+        handover: Arc<Handover>,
     ) -> Self {
-        // Static for the attachment's lifetime, so this is set once rather
-        // than tracked incrementally alongside `backends` below.
-        state.set_capabilities(capabilities.iter().map(capability_to_control).collect());
-        let backends = capabilities
-            .into_iter()
-            .filter_map(|c| {
-                Backend::try_from(c.backed_by)
-                    .ok()
-                    .map(|b| ((c.os, c.arch), b))
-            })
-            .collect();
         Self {
             inner: Arc::new(Inner {
                 events,
                 outstanding: DashMap::new(),
                 in_flight: DashMap::new(),
                 runner_script,
-                docker,
-                vm,
-                interop,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
-                draining_for_update: std::sync::atomic::AtomicBool::new(false),
+                handover,
                 state,
             }),
         }
@@ -194,39 +269,68 @@ impl RunnerSupervisor {
             info!(job_id, "offer replayed; verdict already pending");
             return;
         }
-        match self.admit(&job_id, &order.os, &order.arch, &host::telemetry()) {
-            Admission::Duplicate => {
-                // At-least-once delivery: a re-offer of a job started here must
-                // never start a second runner, but must still resolve this
-                // offer — with the new token, since each offer has its own
-                // awakeable and the old one is dead.
-                info!(job_id, "duplicate offer; re-accepting");
-                self.accept(&job_id, &token);
-            }
-            Admission::Reject(reason) => self.reject(&job_id, &token, &reason),
-            Admission::Accept(backend) => {
-                // Reserve synchronously so a follow-up offer sees the job in
-                // flight before the spawned task starts the runner. The token
-                // travels with the entry: cancelling it makes `run_job` tear
-                // down the runner — process group (host) or container (Docker),
-                // awaited — so `CancelRunner` never orphans the runner's work.
-                let cancel = CancellationToken::new();
-                self.inner.in_flight.insert(job_id.clone(), cancel.clone());
-                self.inner.state.add_in_flight(control_proto::InFlightJob {
-                    job_id,
-                    os: order.os.clone(),
-                    arch: order.arch.clone(),
-                });
-                let sup = self.clone();
-                tokio::spawn(async move {
-                    // The guard releases the job on any task exit, including a
-                    // panic, so the ID never leaks in `in_flight`.
-                    let _release = ReleaseGuard {
-                        inner: sup.inner.clone(),
-                        job_id: order.job_id.clone(),
+        loop {
+            match self.admit(&job_id, &order.os, &order.arch, &host::telemetry()) {
+                Admission::Duplicate => {
+                    // The slot may disappear after admit() observes it. Retry
+                    // admission instead of assuming that a missing slot means
+                    // the runner started: a failed start removes the slot too.
+                    let Some(mut slot) = self.inner.in_flight.get_mut(&job_id) else {
+                        continue;
                     };
-                    sup.run_job(order, backend, token, cancel).await;
-                });
+                    match slot.duplicate_verdict(&token) {
+                        DuplicateVerdict::Deferred => {
+                            info!(job_id, "duplicate offer while starting; verdict deferred");
+                        }
+                        DuplicateVerdict::Accept => {
+                            info!(job_id, "duplicate offer; re-accepting");
+                            self.accept(&job_id, &token);
+                        }
+                        DuplicateVerdict::Reject(reason) => {
+                            self.reject(&job_id, &token, &reason);
+                        }
+                        DuplicateVerdict::Ignore => {
+                            info!(job_id, "duplicate offer for canceled job; no verdict owed");
+                        }
+                    }
+                    return;
+                }
+                Admission::ReplayAccepted => {
+                    info!(
+                        job_id,
+                        "completed runner's accept still pending; re-accepting"
+                    );
+                    self.accept(&job_id, &token);
+                    return;
+                }
+                Admission::Reject(reason) => {
+                    self.reject(&job_id, &token, &reason);
+                    return;
+                }
+                Admission::Accept(backend) => {
+                    // Reserve synchronously so a follow-up offer sees the job
+                    // in flight before the spawned task starts the runner.
+                    let cancel = CancellationToken::new();
+                    self.inner
+                        .in_flight
+                        .insert(job_id.clone(), JobSlot::new(cancel.clone()));
+                    self.inner.state.add_in_flight(control_proto::InFlightJob {
+                        job_id,
+                        os: order.os.clone(),
+                        arch: order.arch.clone(),
+                    });
+                    let sup = self.clone();
+                    tokio::spawn(async move {
+                        // The guard releases the job on any task exit,
+                        // including a panic, so the ID never leaks.
+                        let _release = ReleaseGuard {
+                            inner: sup.inner.clone(),
+                            job_id: order.job_id.clone(),
+                        };
+                        sup.run_job(order, backend, token, cancel).await;
+                    });
+                    return;
+                }
             }
         }
     }
@@ -241,21 +345,21 @@ impl RunnerSupervisor {
         // can finish (releasing `in_flight`) while its accept is still unacked,
         // and a re-offer of that job must replay "started here" — not admit a
         // fresh runner for a job whose single-use JIT config is already spent.
-        if self.inner.in_flight.contains_key(job_id) || self.has_unacked_accept(job_id) {
+        if self.inner.in_flight.contains_key(job_id) {
             return Admission::Duplicate;
+        }
+        if self.has_unacked_accept(job_id) {
+            return Admission::ReplayAccepted;
         }
         if self
             .inner
             .draining
             .load(std::sync::atomic::Ordering::Relaxed)
-            || self
-                .inner
-                .draining_for_update
-                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.inner.handover.pending()
         {
             return Admission::Reject("host is draining".to_owned());
         }
-        let Some(&backend) = self.inner.backends.get(&(os.to_owned(), arch.to_owned())) else {
+        let Some(backend) = self.inner.backends.backend_for(os, arch) else {
             return Admission::Reject(format!("no capability for {os}/{arch}"));
         };
         let load_per_core = if telemetry.cpu_count > 0 {
@@ -294,8 +398,8 @@ impl RunnerSupervisor {
     /// entry stays until that release: cancellation is a state the job observes,
     /// not an event that can race past it.
     pub fn handle_cancel(&self, job_id: &str) {
-        if let Some(entry) = self.inner.in_flight.get(job_id) {
-            entry.value().cancel();
+        if let Some(mut slot) = self.inner.in_flight.get_mut(job_id) {
+            slot.cancel();
             warn!(job_id, "runner cancel requested");
         }
     }
@@ -315,78 +419,62 @@ impl RunnerSupervisor {
     /// Stop accepting new work; in-flight jobs run to completion.
     pub fn handle_drain(&self) {
         self.stop_accepting();
-        self.inner.state.set_draining(true);
+        self.inner.state.set_operator_draining(true);
         info!("draining: no new offers will be accepted");
     }
 
-    /// Resume accepting new work after a local [`Self::handle_drain`]. This
-    /// is the local control-plane's `Resume`, distinct from the gateway's
-    /// own `Drain` push (e.g. a machine being decommissioned), which this
-    /// agent has no way to countermand.
+    /// Resume accepting new work after a local [`Self::handle_drain`] — the
+    /// operator's own drain only. Distinct from the gateway's `Drain` push
+    /// (e.g. a machine being decommissioned), which this agent has no way to
+    /// countermand, and from a pending handover, which keeps admission closed
+    /// regardless: that is not this method's to clear, and a process committed
+    /// to re-exec must not start jobs its own teardown will kill.
     pub fn resume(&self) {
         self.inner
             .draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(self.draining_for_update());
+        self.inner.state.set_operator_draining(false);
         info!("resumed: accepting new offers");
     }
 
-    fn draining_for_update(&self) -> bool {
-        self.inner
-            .draining_for_update
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Stop accepting new offers because a self-update is pending. The
-    /// operator's own drain flag is untouched, so
-    /// [`Self::resume_after_moot_update`] can undo exactly this without
-    /// cancelling a deliberate local drain.
-    pub fn drain_for_update(&self) {
-        self.inner
-            .draining_for_update
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(true);
-        info!("draining for self-update: no new offers will be accepted");
-    }
-
-    /// Clear the update drain after the update became moot — the pin moved
-    /// back to this build before the swap happened (a rollback racing the
-    /// drain). An operator drain, if any, stays in force.
-    pub fn resume_after_moot_update(&self) {
-        self.inner
-            .draining_for_update
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        let operator_drain = self
-            .inner
-            .draining
-            .load(std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(operator_drain);
-        info!("self-update became moot; resuming");
-    }
-
-    /// True when nothing runs here and no verdict awaits its ack — the
-    /// point at which the process can be replaced without losing work.
-    pub fn is_settled(&self) -> bool {
-        self.inner.in_flight.is_empty() && self.inner.outstanding.is_empty()
-    }
-
-    /// Wait until every in-flight job releases its slot. Unbounded — a
-    /// self-update must never kill a customer's running job — and polled,
-    /// like [`Self::shutdown`]'s drain. Used off-stream, where `outstanding`
-    /// verdicts cannot drain (delivering them needs a live attach), so only
-    /// `in_flight` gates.
-    pub async fn drained_of_jobs(&self) {
+    /// Wait until this supervisor's work can be abandoned without losing any
+    /// of it: every job has released its slot, and every verdict has been
+    /// acked. The single wait before the process image is replaced — a
+    /// self-update swap or an operator restart.
+    ///
+    /// The job wait is unbounded: a handover must never kill a customer's
+    /// running job. The ack wait is not, because `outstanding` only drains
+    /// while an attach stream is live — off-stream, or against a gateway that
+    /// has gone away, it would never finish. `ack_grace` bounds it, and
+    /// callers that know nothing can ack (no live stream) pass
+    /// [`Duration::ZERO`].
+    ///
+    /// The ack clock starts only once the jobs are gone: a job's verdict is
+    /// queued when it finishes, so starting the clock earlier would let a
+    /// long-running job burn the whole grace before there was anything to
+    /// wait for.
+    pub async fn quiesce(&self, ack_grace: Duration) {
         while !self.inner.in_flight.is_empty() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(QUIESCE_POLL).await;
         }
-    }
-
-    /// Wait for [`Self::is_settled`]. Only meaningful while attached (acks
-    /// must be able to arrive); polled for the same reason as
-    /// [`Self::drained_of_jobs`].
-    pub async fn settled(&self) {
-        while !self.is_settled() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = tokio::time::Instant::now() + ack_grace;
+        while !self.inner.outstanding.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(QUIESCE_POLL).await;
+        }
+        // Whatever is left dies with the process image, so name it: these are
+        // job outcomes the gateway will never hear, and it has to fall back on
+        // the webhook (or its absence) to conclude them.
+        let stranded: Vec<String> = self
+            .inner
+            .outstanding
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        if !stranded.is_empty() {
+            warn!(
+                ?stranded,
+                "handing over with unacked verdicts; the gateway will not hear them"
+            );
         }
     }
 
@@ -399,8 +487,8 @@ impl RunnerSupervisor {
         self.stop_accepting();
         // Cancelling is idempotent, so jobs already mid-cancel just keep
         // tearing down and are covered by the wait below.
-        for entry in &self.inner.in_flight {
-            entry.value().cancel();
+        for mut slot in self.inner.in_flight.iter_mut() {
+            slot.cancel();
         }
         if self.inner.in_flight.is_empty() {
             return;
@@ -446,7 +534,7 @@ impl RunnerSupervisor {
             // Never advertised, so admit() never routes here; reject
             // defensively rather than panic if it ever slips through.
             Backend::Unspecified => {
-                self.reject(&job_id, &token, "backend not supported by this agent");
+                self.reject_start(&job_id, &token, "backend not supported by this agent");
             }
         }
     }
@@ -464,13 +552,13 @@ impl RunnerSupervisor {
         token: &str,
         cancel: CancellationToken,
     ) {
-        // Invariant: the vm capability is only advertised when the daemon
-        // probe succeeded, so admit() routes here only with `vm` set.
-        let vm = self
-            .inner
-            .vm
-            .as_ref()
-            .expect("vm backend implies a vm runner");
+        // A vm capability is only advertised while the registry's VM slot
+        // is filled, and activation is one-way, so this cannot be empty;
+        // reject defensively rather than panic if that ever breaks.
+        let Some(vm) = self.inner.backends.vm() else {
+            self.reject_start(job_id, token, "macOS VM backend is not available");
+            return;
+        };
 
         // Startup (clone, boot, DHCP wait, ssh) takes minutes and must not
         // make the agent deaf to CancelRunner.
@@ -491,7 +579,7 @@ impl RunnerSupervisor {
             Some(Err(e)) => {
                 // Includes the daemon's two-guest license-cap refusal: reject
                 // and the platform re-offers elsewhere.
-                self.reject(
+                self.reject_start(
                     job_id,
                     token,
                     &format!("failed to start macOS guest: {e:#}"),
@@ -509,29 +597,47 @@ impl RunnerSupervisor {
             }
         };
 
-        // The runner command has been issued in the guest: accept the offer.
-        self.accept(job_id, token);
+        // The runner command has been issued in the guest. Cancellation and
+        // acceptance arbitrate through the slot before any verdict is sent.
+        if !self.accept_started(job_id, token) {
+            running.destroy().await;
+            info!(job_id, "runner canceled during startup");
+            return;
+        }
         info!(job_id, "runner started (vm)");
 
+        // The watchdog is distinct from a cancel: the runner is gone without
+        // the platform having concluded the job, so it still gets the
+        // runner-exited hint below — a cancel does not.
+        enum VmExit {
+            Exited(Option<u32>),
+            Canceled,
+            Watchdog,
+        }
         let exited = {
             let wait = std::pin::pin!(running.wait());
             tokio::select! {
-                exit = wait => Some(exit),
-                () = cancel.cancelled() => None,
+                exit = wait => VmExit::Exited(exit),
+                () = cancel.cancelled() => VmExit::Canceled,
                 () = tokio::time::sleep(MAX_VM_JOB_RUNTIME) => {
                     warn!(job_id, "vm job exceeded the runtime watchdog; destroying guest");
-                    None
+                    VmExit::Watchdog
                 }
             }
         };
         match exited {
-            Some(exit_status) => {
+            VmExit::Exited(exit_status) => {
                 info!(job_id, ?exit_status, "runner exited");
                 running.destroy().await;
+                self.notify_runner_exited(job_id);
             }
-            // CancelRunner or the watchdog: destroy the guest, awaited, so
-            // the in-flight slot outlives the guest — never the reverse.
-            None => {
+            VmExit::Watchdog => {
+                running.destroy().await;
+                self.notify_runner_exited(job_id);
+            }
+            // CancelRunner: destroy the guest, awaited, so the in-flight
+            // slot outlives the guest — never the reverse.
+            VmExit::Canceled => {
                 running.destroy().await;
                 info!(job_id, "runner canceled");
             }
@@ -553,8 +659,8 @@ impl RunnerSupervisor {
         // Invariant: a windows capability is only advertised when the
         // interop probe passed, so admit() routes here only with `interop`
         // set; reject defensively rather than panic if that ever breaks.
-        let Some(interop) = &self.inner.interop else {
-            self.reject(job_id, token, "windows jobs are not served by this agent");
+        let Some(interop) = self.inner.backends.interop() else {
+            self.reject_start(job_id, token, "windows jobs are not served by this agent");
             return;
         };
 
@@ -571,7 +677,7 @@ impl RunnerSupervisor {
         let mut job = match spawned {
             Some(Ok(job)) => job,
             Some(Err(e)) => {
-                self.reject(
+                self.reject_start(
                     job_id,
                     token,
                     &format!("failed to spawn windows runner: {e:#}"),
@@ -589,16 +695,14 @@ impl RunnerSupervisor {
             }
         };
 
-        // A cancel that landed while the spawn was completing: the platform
-        // already concluded the job, so don't resolve the offer — tear the
-        // job down instead of accepting it just to kill it.
-        if cancel.is_cancelled() {
+        // A cancel that landed while the spawn was completing wins the slot
+        // transition, so no verdict is sent for the runner we tear down.
+        if !self.accept_started(job_id, token) {
             job.kill().await;
             info!(job_id, "runner canceled during interop spawn");
             return;
         }
 
-        self.accept(job_id, token);
         info!(
             job_id,
             windows_pid = job.windows_pid(),
@@ -606,9 +710,12 @@ impl RunnerSupervisor {
         );
 
         tokio::select! {
-            result = job.wait() => match result {
-                Ok(status) => info!(job_id, success = status.success(), "runner exited"),
-                Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+            result = job.wait() => {
+                match result {
+                    Ok(status) => info!(job_id, success = status.success(), "runner exited"),
+                    Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+                }
+                self.notify_runner_exited(job_id);
             },
             // CancelRunner: taskkill the Windows tree and reap the relay,
             // awaited, so the slot outlives the teardown.
@@ -630,7 +737,7 @@ impl RunnerSupervisor {
         cancel: CancellationToken,
     ) {
         let Some(runner_script) = &self.inner.runner_script else {
-            self.reject(job_id, token, "no host runner script configured");
+            self.reject_start(job_id, token, "no host runner script configured");
             return;
         };
 
@@ -638,19 +745,29 @@ impl RunnerSupervisor {
         let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(e) => {
-                self.reject(job_id, token, &format!("failed to spawn runner: {e}"));
+                self.reject_start(job_id, token, &format!("failed to spawn runner: {e}"));
                 return;
             }
         };
 
-        // The runner is running: accept the offer.
-        self.accept(job_id, token);
+        // group_spawn is synchronous, but cancellation is handled on another
+        // runtime thread. Arbitrate through the slot before accepting.
+        if !self.accept_started(job_id, token) {
+            if let Err(e) = child.kill().await {
+                warn!(job_id, error = %e, "killing runner process group failed");
+            }
+            info!(job_id, "runner canceled during host spawn");
+            return;
+        }
         info!(job_id, "runner started (host)");
 
         tokio::select! {
-            result = child.wait() => match result {
-                Ok(status) => info!(job_id, success = status.success(), "runner exited"),
-                Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+            result = child.wait() => {
+                match result {
+                    Ok(status) => info!(job_id, success = status.success(), "runner exited"),
+                    Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+                }
+                self.notify_runner_exited(job_id);
             },
             // CancelRunner: SIGKILL the whole process group and reap it. The
             // token is level-triggered, so a cancel that fired while the runner
@@ -675,13 +792,13 @@ impl RunnerSupervisor {
         token: &str,
         cancel: CancellationToken,
     ) {
-        // Invariant: a Docker-backed capability is only advertised when Docker
-        // is present, so admit() routes here only with `docker` set.
-        let docker = self
-            .inner
-            .docker
-            .as_ref()
-            .expect("docker backend implies a docker runtime");
+        // A Docker-backed capability is only advertised while the registry's
+        // Docker slot is filled, so this cannot be empty; reject defensively
+        // rather than panic if that ever breaks.
+        let Some(docker) = self.inner.backends.docker() else {
+            self.reject_start(job_id, token, "docker runtime is not available");
+            return;
+        };
 
         // Startup is cancellation-aware: a slow image pull must not make the
         // agent deaf to CancelRunner and then accept a job the platform has
@@ -702,7 +819,7 @@ impl RunnerSupervisor {
         let running = match started {
             Some(Ok(running)) => running,
             Some(Err(e)) => {
-                self.reject(job_id, token, &format!("failed to start container: {e}"));
+                self.reject_start(job_id, token, &format!("failed to start container: {e}"));
                 return;
             }
             None => {
@@ -717,8 +834,13 @@ impl RunnerSupervisor {
             }
         };
 
-        // The container is running: accept the offer.
-        self.accept(job_id, token);
+        // The container is running. Cancellation and acceptance arbitrate
+        // through the slot before any verdict is sent.
+        if !self.accept_started(job_id, token) {
+            running.cancel().await;
+            info!(job_id, "runner canceled during startup");
+            return;
+        }
         info!(job_id, arch = %order.arch, "runner started (docker)");
 
         let exited = {
@@ -732,10 +854,12 @@ impl RunnerSupervisor {
             Some(Ok(exit_code)) => {
                 info!(job_id, exit_code, "runner exited");
                 running.remove().await;
+                self.notify_runner_exited(job_id);
             }
             Some(Err(e)) => {
                 warn!(job_id, error = %e, "waiting on container failed");
                 running.remove().await;
+                self.notify_runner_exited(job_id);
             }
             // CancelRunner: kill and remove the container, awaited, so the
             // in-flight slot outlives the container — never the reverse.
@@ -744,6 +868,64 @@ impl RunnerSupervisor {
                 info!(job_id, "runner canceled");
             }
         }
+    }
+
+    /// Settle startup as accepted and answer every parked redelivery. Returns
+    /// false when cancellation won the state transition, in which case the
+    /// caller must tear down the runner without sending a verdict.
+    fn accept_started(&self, job_id: &str, token: &str) -> bool {
+        let mut slot = self
+            .inner
+            .in_flight
+            .get_mut(job_id)
+            .unwrap_or_else(|| panic!("in-flight slot disappeared while starting {job_id}"));
+        let parked = slot.accept_start();
+        let Some(parked) = parked else {
+            return false;
+        };
+        self.accept(job_id, token);
+        for parked_token in &parked {
+            self.accept(job_id, parked_token);
+        }
+        true
+    }
+
+    /// Settle startup as rejected and answer every parked redelivery. A
+    /// redelivery arriving after the drain observes the stored rejection and
+    /// receives the same verdict. Cancellation suppresses every verdict.
+    fn reject_start(&self, job_id: &str, token: &str, reason: &str) {
+        let mut slot = self
+            .inner
+            .in_flight
+            .get_mut(job_id)
+            .unwrap_or_else(|| panic!("in-flight slot disappeared while starting {job_id}"));
+        let parked = slot.reject_start(reason);
+        let Some(parked) = parked else {
+            return;
+        };
+        self.reject(job_id, token, reason);
+        for parked_token in &parked {
+            self.reject(job_id, parked_token, reason);
+        }
+    }
+
+    /// Report that a started runner exited. A liveness hint for the platform
+    /// — the GitHub webhook stays the authoritative outcome, and successful
+    /// jobs emit this too, right before their webhook — letting it fail fast
+    /// a job whose completion webhook never comes (the runner died before
+    /// completing anything). Tracked and resent until acked, like a verdict;
+    /// the deterministic token collapses resends and replays onto one
+    /// outstanding entry. Never called for canceled jobs: the platform
+    /// already concluded those and owes them nothing.
+    fn notify_runner_exited(&self, job_id: &str) {
+        let token = format!("exit:{job_id}");
+        self.send_verdict(
+            &token,
+            attach_request::Msg::RunnerExited(RunnerExited {
+                job_id: job_id.to_owned(),
+                ack_token: token.clone(),
+            }),
+        );
     }
 
     /// Accept an offer (the runner has started).
@@ -820,7 +1002,11 @@ fn runner_command(script: &Path, encoded_jit_config: &str) -> tokio::process::Co
 
 #[cfg(test)]
 mod tests {
+    use arcbox_fleet_proto::v1::Capability;
+
     use super::*;
+    use crate::handover::Reason;
+    use crate::interop::InteropRunner;
 
     fn capability(os: &str, arch: &str, backend: Backend) -> Capability {
         Capability {
@@ -857,31 +1043,30 @@ mod tests {
     }
 
     fn supervisor(capabilities: Vec<Capability>) -> RunnerSupervisor {
+        supervisor_with_handover(capabilities).0
+    }
+
+    /// As [`supervisor`], with the handover in the caller's hands — what a
+    /// pending self-update or restart is driven through.
+    fn supervisor_with_handover(
+        capabilities: Vec<Capability>,
+    ) -> (RunnerSupervisor, Arc<Handover>) {
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(
+        let state = AgentState::new(&seed());
+        let handover = Handover::new(state.clone());
+        let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
-            None,
-            None,
-            None,
-            capabilities,
-            AgentState::new(&seed()),
-        )
+            Backends::fixed(capabilities, state.clone()),
+            state,
+            Arc::clone(&handover),
+        );
+        (sup, handover)
     }
 
     // Idle host: plenty of headroom.
     fn idle() -> HostTelemetry {
         telemetry(0.5, 8192)
-    }
-
-    #[test]
-    fn constructor_mirrors_capabilities_into_state() {
-        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
-        let caps = sup.inner.state.current().capabilities;
-        assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].os, "darwin");
-        assert_eq!(caps[0].arch, "arm64");
-        assert_eq!(caps[0].backed_by, control_proto::Backend::HostRunner as i32);
     }
 
     #[test]
@@ -909,19 +1094,18 @@ mod tests {
         interop: Option<InteropRunner>,
     ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(8);
-        let sup = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            interop,
+        let state = AgentState::new(&crate::settings::PersistedSettings {
+            load_ceiling: f64::MAX,
+            mem_floor_mib: 0,
+            ..seed()
+        });
+        let backends = Backends::fixed_with_interop(
             vec![capability("windows", "amd64", Backend::HostRunner)],
-            AgentState::new(&crate::settings::PersistedSettings {
-                load_ceiling: f64::MAX,
-                mem_floor_mib: 0,
-                ..seed()
-            }),
+            interop,
+            state.clone(),
         );
+        let sup =
+            RunnerSupervisor::new(events, None, backends, state.clone(), Handover::new(state));
         (sup, rx)
     }
 
@@ -985,6 +1169,16 @@ mod tests {
         })
         .await
         .expect("slot released once the runner exited");
+
+        // The started runner's exit emits the tracked runner-exited hint.
+        let exited = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("runner-exited event after the runner finished")
+            .expect("egress channel open");
+        match exited.msg {
+            Some(attach_request::Msg::RunnerExited(e)) => assert_eq!(e.job_id, "rjob_win"),
+            other => panic!("expected RunnerExited, got {other:?}"),
+        }
     }
 
     /// A cancel that arrives while the interop spawn is still in the WINPID
@@ -1077,7 +1271,7 @@ mod tests {
         let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
         sup.inner
             .in_flight
-            .insert("rjob_a".to_owned(), CancellationToken::new());
+            .insert("rjob_a".to_owned(), JobSlot::new(CancellationToken::new()));
         sup.inner
             .draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1112,6 +1306,60 @@ mod tests {
         );
     }
 
+    /// A pending handover closes admission on its own, and `Resume` — which
+    /// owns only the operator's drain — must not reopen it. The jobs admitted
+    /// in that window would be killed by the teardown the handover is waiting
+    /// to run. Which handovers are revocable is [`Handover`]'s to decide, and
+    /// tested there.
+    #[test]
+    fn resume_does_not_reopen_admission_under_a_pending_handover() {
+        let (sup, handover) =
+            supervisor_with_handover(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        handover.request(Reason::Restart);
+
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+
+        sup.resume();
+
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+    }
+
+    /// And the converse: an operator `Drain` outlives a handover that was
+    /// revoked, so a moot self-update cannot resume a host the operator took
+    /// out of rotation.
+    #[test]
+    fn a_revoked_handover_does_not_clear_an_operator_drain() {
+        let (sup, handover) =
+            supervisor_with_handover(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        sup.handle_drain();
+        handover.request(Reason::Update);
+
+        handover.update_became_moot();
+
+        assert!(sup.inner.state.current().draining);
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+
+        // ...and clearing the operator drain, with nothing else in force,
+        // does resume.
+        sup.resume();
+        assert!(!sup.inner.state.current().draining);
+        assert_eq!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Accept(Backend::HostRunner)
+        );
+    }
+
     #[test]
     fn rejects_when_load_or_memory_over_budget() {
         let sup = supervisor(vec![capability("linux", "amd64", Backend::Docker)]);
@@ -1134,14 +1382,16 @@ mod tests {
 
     fn supervisor_with_rx(capacity: usize) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(capacity);
+        let state = AgentState::new(&seed());
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
-            None,
-            None,
-            None,
-            vec![capability("darwin", "arm64", Backend::HostRunner)],
-            AgentState::new(&seed()),
+            Backends::fixed(
+                vec![capability("darwin", "arm64", Backend::HostRunner)],
+                state.clone(),
+            ),
+            state.clone(),
+            Handover::new(state),
         );
         (sup, rx)
     }
@@ -1154,18 +1404,20 @@ mod tests {
         capacity: usize,
     ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(capacity);
+        let state = AgentState::new(&crate::settings::PersistedSettings {
+            load_ceiling: f64::MAX,
+            mem_floor_mib: 0,
+            ..seed()
+        });
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
-            None,
-            None,
-            None,
-            vec![capability("darwin", "arm64", Backend::HostRunner)],
-            AgentState::new(&crate::settings::PersistedSettings {
-                load_ceiling: f64::MAX,
-                mem_floor_mib: 0,
-                ..seed()
-            }),
+            Backends::fixed(
+                vec![capability("darwin", "arm64", Backend::HostRunner)],
+                state.clone(),
+            ),
+            state.clone(),
+            Handover::new(state),
         );
         (sup, rx)
     }
@@ -1284,7 +1536,7 @@ mod tests {
         sup.accept("rjob_a", "tok1");
         assert_eq!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
-            Admission::Duplicate
+            Admission::ReplayAccepted
         );
 
         // Once the gateway settles the accept, the job is genuinely done here.
@@ -1312,13 +1564,146 @@ mod tests {
     }
 
     /// Register an in-flight job with its cancel token, mirroring what
-    /// `handle_provision` sets up before spawning `run_job`.
+    /// `handle_provision` sets up before spawning `run_job` (start not yet
+    /// settled).
     fn register_in_flight(sup: &RunnerSupervisor, job_id: &str) -> CancellationToken {
         let cancel = CancellationToken::new();
         sup.inner
             .in_flight
-            .insert(job_id.to_owned(), cancel.clone());
+            .insert(job_id.to_owned(), JobSlot::new(cancel.clone()));
         cancel
+    }
+
+    fn provision(job_id: &str, offer_token: &str) -> ProvisionRunner {
+        ProvisionRunner {
+            job_id: job_id.to_owned(),
+            os: "darwin".to_owned(),
+            arch: "arm64".to_owned(),
+            encoded_jit_config: String::new(),
+            offer_token: offer_token.to_owned(),
+        }
+    }
+
+    /// An offer redelivered while the runner is still starting must not be
+    /// answered early — accept claims "the runner is running", which is not
+    /// yet true. The token parks on the slot (deduplicated) and the start
+    /// outcome resolves it alongside the original offer; redeliveries after
+    /// the start re-accept instantly.
+    #[tokio::test]
+    async fn offer_redelivered_while_starting_is_answered_by_the_start_outcome() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        register_in_flight(&sup, "rjob_a");
+
+        sup.handle_provision(provision("rjob_a", "tok_redelivered"));
+        sup.handle_provision(provision("rjob_a", "tok_redelivered"));
+        assert!(
+            rx.try_recv().is_err(),
+            "no verdict may resolve an offer whose runner is still starting"
+        );
+
+        assert!(sup.accept_started("rjob_a", "tok_orig"));
+        let mut accepted = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg.msg {
+                Some(attach_request::Msg::RunnerAccepted(a)) => accepted.push(a.offer_token),
+                other => panic!("expected RunnerAccepted, got {other:?}"),
+            }
+        }
+        assert_eq!(accepted, vec!["tok_orig", "tok_redelivered"]);
+
+        // Started: a further redelivery is re-accepted instantly.
+        sup.handle_provision(provision("rjob_a", "tok_late"));
+        match rx.try_recv().expect("instant re-accept once started").msg {
+            Some(attach_request::Msg::RunnerAccepted(a)) => assert_eq!(a.offer_token, "tok_late"),
+            other => panic!("expected RunnerAccepted, got {other:?}"),
+        }
+    }
+
+    /// The runner-exited event is tracked like a verdict: emitted with a
+    /// deterministic per-job token, resent until the gateway acks it.
+    #[tokio::test]
+    async fn runner_exited_is_tracked_until_acked() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+
+        sup.notify_runner_exited("rjob_a");
+        match rx.try_recv().expect("event emitted").msg {
+            Some(attach_request::Msg::RunnerExited(e)) => {
+                assert_eq!(e.job_id, "rjob_a");
+                assert_eq!(e.ack_token, "exit:rjob_a");
+            }
+            other => panic!("expected RunnerExited, got {other:?}"),
+        }
+        assert!(sup.inner.outstanding.contains_key("exit:rjob_a"));
+
+        sup.handle_ack("exit:rjob_a");
+        assert!(!sup.inner.outstanding.contains_key("exit:rjob_a"));
+    }
+
+    /// A start failure rejects the parked redeliveries too — every offer of
+    /// the job was promised the start outcome, and an unanswered token would
+    /// strand its awakeable until the platform-side offer deadline.
+    #[tokio::test]
+    async fn start_failure_rejects_parked_offers_too() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        register_in_flight(&sup, "rjob_a");
+
+        sup.handle_provision(provision("rjob_a", "tok_redelivered"));
+        assert!(rx.try_recv().is_err());
+
+        sup.reject_start("rjob_a", "tok_orig", "boot failed");
+        let mut rejected = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg.msg {
+                Some(attach_request::Msg::RunnerRejected(r)) => {
+                    assert_eq!(r.reason, "boot failed");
+                    rejected.push(r.offer_token);
+                }
+                other => panic!("expected RunnerRejected, got {other:?}"),
+            }
+        }
+        assert_eq!(rejected, vec!["tok_orig", "tok_redelivered"]);
+    }
+
+    /// Once startup rejects, a redelivery racing slot release observes the
+    /// stored outcome instead of parking after the one-shot drain.
+    #[tokio::test]
+    async fn redelivery_after_start_rejection_is_rejected_immediately() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        register_in_flight(&sup, "rjob_a");
+
+        sup.reject_start("rjob_a", "tok_orig", "boot failed");
+        rx.try_recv().expect("original rejection");
+
+        sup.handle_provision(provision("rjob_a", "tok_late"));
+        match rx.try_recv().expect("late redelivery rejected").msg {
+            Some(attach_request::Msg::RunnerRejected(rejected)) => {
+                assert_eq!(rejected.offer_token, "tok_late");
+                assert_eq!(rejected.reason, "boot failed");
+            }
+            other => panic!("expected RunnerRejected, got {other:?}"),
+        }
+    }
+
+    /// Cancellation is a terminal startup outcome: a backend completing after
+    /// the cancel must tear down without resolving the original or parked
+    /// offers as accepted or rejected.
+    #[tokio::test]
+    async fn cancellation_wins_late_start_settlement() {
+        let (accepted, mut accepted_rx) = supervisor_with_rx(8);
+        register_in_flight(&accepted, "rjob_accept");
+        accepted.handle_provision(provision("rjob_accept", "tok_parked"));
+        accepted.handle_cancel("rjob_accept");
+
+        assert!(!accepted.accept_started("rjob_accept", "tok_orig"));
+        assert!(accepted_rx.try_recv().is_err());
+
+        let (rejected, mut rejected_rx) = supervisor_with_rx(8);
+        register_in_flight(&rejected, "rjob_reject");
+        rejected.handle_provision(provision("rjob_reject", "tok_parked"));
+        rejected.handle_cancel("rjob_reject");
+
+        rejected.reject_start("rjob_reject", "tok_orig", "boot failed");
+        assert!(rejected_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1368,6 +1753,62 @@ mod tests {
         assert!(!sup.inner.in_flight.is_empty());
     }
 
+    /// A job that has just exited queued its verdict on the way out, so the
+    /// map being empty of jobs is not the same as its work being safe to
+    /// abandon. Quiescing must hold the process image until the gateway
+    /// settles that verdict — the exec that follows discards `outstanding`,
+    /// and the gateway is then left waiting on a webhook that may never come.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_waits_out_the_ack_grace_for_an_unacked_verdict() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+        assert!(sup.inner.in_flight.is_empty(), "no job is running");
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(VERDICT_ACK_GRACE).await;
+
+        assert!(
+            started.elapsed() >= VERDICT_ACK_GRACE,
+            "must not hand over while a verdict is unacked"
+        );
+    }
+
+    /// ...but the grace is a ceiling, not a cost: the common case is an ack
+    /// within a round-trip, and a restart must not sit out the full wait for
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_returns_as_soon_as_the_last_verdict_is_acked() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+
+        let gateway = sup.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            gateway.handle_ack("exit:rjob_a");
+        });
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(VERDICT_ACK_GRACE).await;
+
+        assert!(
+            started.elapsed() < VERDICT_ACK_GRACE,
+            "an acked verdict releases the wait early"
+        );
+    }
+
+    /// Off-stream — a version-refused reconnect — nothing can deliver an ack,
+    /// so the caller passes no grace and the wait must not be paid at all.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_without_a_grace_does_not_wait_for_acks_that_cannot_arrive() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.notify_runner_exited("rjob_a");
+
+        let started = tokio::time::Instant::now();
+        sup.quiesce(Duration::ZERO).await;
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
     /// The user-facing `Drain` flips the observable `AgentState.draining`
     /// flag, but teardown (`shutdown`) must not: that flag is process-lifetime
     /// and shared across attachments, so an unenroll that faked a drain would
@@ -1378,8 +1819,14 @@ mod tests {
     async fn shutdown_does_not_flip_observable_draining_but_drain_does() {
         let drained = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, None, None, Vec::new(), drained.clone())
-            .handle_drain();
+        RunnerSupervisor::new(
+            events,
+            None,
+            Backends::fixed(Vec::new(), drained.clone()),
+            drained.clone(),
+            Handover::new(drained.clone()),
+        )
+        .handle_drain();
         assert!(
             drained.current().draining,
             "Drain flips the observable flag"
@@ -1390,11 +1837,9 @@ mod tests {
         RunnerSupervisor::new(
             events,
             None,
-            None,
-            None,
-            None,
-            Vec::new(),
+            Backends::fixed(Vec::new(), torn_down.clone()),
             torn_down.clone(),
+            Handover::new(torn_down.clone()),
         )
         .shutdown(Duration::from_secs(1))
         .await;

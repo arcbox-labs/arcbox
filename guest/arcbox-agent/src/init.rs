@@ -586,39 +586,11 @@ exit 0
     /// (socketpair datapath), while the bridge NIC is reachable from the host
     /// for inbound container traffic.
     fn configure_bridge_nic() {
-        // Find the bridge NIC: it's the non-loopback interface that is NOT
-        // the primary interface. The primary interface was already configured
-        // by configure_primary_interface_dhcp() and has an IP in 10.0.2.0/24.
-        let primary = detect_primary_interface();
-        let entries = match fs::read_dir("/sys/class/net") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut bridge_iface: Option<String> = None;
-        for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            // Skip loopback, virtual, and the primary interface.
-            if name == "lo"
-                || name.starts_with("dummy")
-                || name.starts_with("veth")
-                || name.starts_with("br-")
-                || name.starts_with("docker")
-                || name.starts_with("vmtap")
-                || name.starts_with("sit")
-                || primary.as_deref() == Some(&name)
-            {
-                continue;
-            }
-            bridge_iface = Some(name);
-            break;
-        }
-
-        let Some(bridge_iface) = bridge_iface.as_deref() else {
+        let Some(bridge_iface) = detect_bridge_interface() else {
             tracing::debug!("no bridge NIC found");
             return;
         };
+        let bridge_iface = bridge_iface.as_str();
 
         // Bring up the interface.
         run_init_cmd(
@@ -681,28 +653,25 @@ exit 0
         } else {
             tracing::info!(interface = bridge_iface, "proxy ARP enabled");
         }
+    }
 
-        // Add iptables FORWARD rules for the bridge NIC so container
-        // traffic can flow through.
-        run_iptables(
-            &["-I", "FORWARD", "-i", bridge_iface, "-j", "ACCEPT"],
-            "FORWARD accept from bridge NIC",
-        );
-        run_iptables(
-            &[
-                "-I",
-                "FORWARD",
-                "-o",
-                bridge_iface,
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "RELATED,ESTABLISHED",
-                "-j",
-                "ACCEPT",
-            ],
-            "FORWARD accept established to bridge NIC",
-        );
+    /// Finds the bridge NIC: the non-loopback physical interface that is not
+    /// the primary 10.0.2.0/24 interface.
+    pub fn detect_bridge_interface() -> Option<String> {
+        let primary = detect_primary_interface();
+        let entries = fs::read_dir("/sys/class/net").ok()?;
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !is_uplink_interface(&name) || primary.as_deref() == Some(&name) {
+                continue;
+            }
+            candidates.push(name);
+        }
+        candidates.sort();
+        candidates.into_iter().next()
     }
 
     /// Install iptables FORWARD rules for sandbox networking.
@@ -807,19 +776,19 @@ exit 0
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            // Skip loopback and virtual interfaces that are not real NICs.
-            if name == "lo"
-                || name.starts_with("dummy")
-                || name.starts_with("veth")
-                || name.starts_with("br-")
-                || name.starts_with("docker")
-            {
+            if !is_uplink_interface(&name) {
                 continue;
             }
             candidates.push(name);
         }
         candidates.sort();
         candidates.into_iter().next()
+    }
+
+    /// Physical NICs use the kernel's predictable Ethernet prefixes; virtual
+    /// interfaces such as docker0, cni0, flannel.1, and veth* do not.
+    fn is_uplink_interface(name: &str) -> bool {
+        name.starts_with("eth") || name.starts_with("en")
     }
 
     fn write_etc_resolv_conf() {
@@ -833,7 +802,7 @@ exit 0
         }
     }
 
-    /// Writes Docker daemon configuration (DNS + default ulimits).
+    /// Writes Docker daemon configuration (DNS, direct routing, and ulimits).
     ///
     /// Containers get their DNS from the Docker daemon config, NOT from the
     /// guest's /etc/resolv.conf. We point them to 10.0.2.1 (the gateway)
@@ -906,9 +875,9 @@ const NOFILE_LIMIT: u64 = 1_048_576;
 
 /// Returns the Docker daemon.json content as a string.
 ///
-/// Extracted as a pure function so the output contract (DNS + default
-/// ulimits + containerd image store) is testable independently of the
-/// filesystem and platform.
+/// Extracted as a pure function so the output contract (DNS, direct routing,
+/// default ulimits, and containerd image store) is testable independently of
+/// the filesystem and platform.
 ///
 /// `containerd-snapshotter` stays explicitly `true` even though dockerd ≥ 29
 /// defaults to the containerd image store: without the explicit flag, dockerd
@@ -920,6 +889,7 @@ const NOFILE_LIMIT: u64 = 1_048_576;
 fn docker_daemon_json() -> String {
     serde_json::json!({
         "dns": ["10.0.2.1"],
+        "allow-direct-routing": true,
         "default-ulimits": {
             "nofile": { "Name": "nofile", "Soft": NOFILE_LIMIT, "Hard": NOFILE_LIMIT }
         },
@@ -930,6 +900,8 @@ fn docker_daemon_json() -> String {
     .to_string()
 }
 
+#[cfg(target_os = "linux")]
+pub use platform::detect_bridge_interface;
 #[cfg(target_os = "linux")]
 pub use platform::{init_system, machine_init};
 
@@ -1007,6 +979,13 @@ mod tests {
         let json = docker_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["dns"][0], "10.0.2.1");
+    }
+
+    #[test]
+    fn daemon_json_allows_direct_container_routing() {
+        let json = docker_daemon_json();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["allow-direct-routing"], true);
     }
 
     #[test]

@@ -12,7 +12,18 @@ func storageDiskImageNew(
 ) -> UnsafeMutableRawPointer? {
     let url = URL(fileURLWithPath: String(cString: path))
     do {
-        let attachment = try VZDiskImageStorageDeviceAttachment(url: url, readOnly: readOnly)
+        // fsync-level durability, NOT the default .full (F_FULLFSYNC): a
+        // guest FLUSH under .full costs ~10 ms of host F_FULLFSYNC per
+        // barrier — the dominant cost of every guest fsync (ABX-496). The
+        // custom-HV backend's block worker has always used plain fsync for
+        // guest FLUSH, so .fsync makes both backends give the same
+        // power-loss window; Colima/OrbStack ship the same durability level.
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: url,
+            readOnly: readOnly,
+            cachingMode: .automatic,
+            synchronizationMode: .fsync
+        )
         return abxRetainedHandle(VZVirtioBlockDeviceConfiguration(attachment: attachment))
     } catch {
         errorOut?.pointee = abxErrorString(error)

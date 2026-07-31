@@ -84,6 +84,12 @@ const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
 /// only consumes actual disk space for written blocks. 8 TiB matches OrbStack
 /// and prevents users from hitting artificial limits.
 const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+/// Persistent guest metadata image size (2 GiB sparse file).
+///
+/// The ext4 volume holds only the fsync-hot boltdb metadata directories —
+/// bulk data stays on the btrfs data image — so 2 GiB is ~100x headroom.
+/// See internal-docs/plans/ext4-metadata-volume.md.
+const DOCKER_METADATA_IMAGE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub(crate) use boot::ensure_sparse_block_image;
 pub use health::HealthMonitor;
@@ -303,6 +309,17 @@ impl VmLifecycleManager {
     #[allow(clippy::unused_async, reason = "public API compatibility")]
     pub async fn state(&self) -> VmLifecycleState {
         *self.state_rx.borrow()
+    }
+
+    /// Subscribes to lifecycle state transitions.
+    ///
+    /// Prefer this over polling [`Self::restart_generation`] when a task must
+    /// react to the VM coming *up*: the generation counter is bumped on stop,
+    /// so it marks the start of the gap where no guest exists, not the arrival
+    /// of the next one.
+    #[must_use]
+    pub fn subscribe_state(&self) -> watch::Receiver<VmLifecycleState> {
+        self.state_rx.clone()
     }
 
     /// Returns true if the VM is running and ready.

@@ -19,12 +19,13 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use arcbox_constants::ports::NFS_NFSD_RELAY_PORT;
-use arcbox_core::{DEFAULT_MACHINE_NAME, Runtime};
+use arcbox_core::{DEFAULT_MACHINE_NAME, Runtime, VmLifecycleState};
 use arcbox_transport::vsock::{VsockShutdown, VsockStream};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -32,6 +33,9 @@ use crate::context::DaemonContext;
 
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 const MOUNT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Pause before retrying a failed incarnation, so a guest that is up but not
+/// yet able to serve the export is retried without spinning.
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Path this daemon successfully mounted, set once by the reconcile task.
 /// [`cleanup`] only unmounts what this process created — a daemon that never
@@ -91,17 +95,192 @@ async fn reconcile(
         bail!("could not determine home directory for ~/ArcBox mount");
     };
 
-    // One localhost TCP proxy to the guest nfsd, bridged over vsock.
+    // One localhost TCP proxy to the guest nfsd, bridged over vsock. It outlives
+    // VM restarts: each connection dials `connect_vsock_port` against whatever
+    // guest is current, so the same local port keeps working across reboots.
     let nfsd_port = spawn_proxy(&runtime, &shutdown, NFS_NFSD_RELAY_PORT).await?;
 
-    reconcile_existing_mount(&mount_path)?;
-    std::fs::create_dir_all(&mount_path)?;
+    // Re-establish the export for every VM incarnation. The agent no longer
+    // starts nfsd on its own, so each guest — the first boot and every restart
+    // (backend switch, crash recovery) — has no NFS server until we ask; a
+    // `--no-mount-nfs` daemon never reaches here, so its guests run none.
+    //
+    // The trigger is the lifecycle *ready* edge, never the restart generation:
+    // that counter is bumped when the VM stops, so acting on it would send the
+    // request into the gap where no guest exists and burn the retry budget on a
+    // VM that is still booting — or, after a plain `arcbox stop`, on one that is
+    // not coming back until the next on-demand start.
+    let mut state = runtime.subscribe_system_vm_state();
+    let mut first = true;
 
-    if expect_hosts_alias {
-        wait_for_hosts_alias(&shutdown).await;
+    while wait_for_state(&mut state, &shutdown, VmLifecycleState::is_ready).await {
+        // The one fatal condition: the mount point holds a mount this daemon
+        // did not create, and no retry or VM restart can free it.
+        let occupancy = classify_mount_point(&mount_path)?;
+
+        // The hosts alias only needs waiting for on the very first mount.
+        if first && expect_hosts_alias {
+            wait_for_hosts_alias(&shutdown).await;
+        }
+        first = false;
+
+        // A failed attempt must not end the supervisor: the next ready VM — or
+        // this one after a backoff — gets another chance. Losing the loop would
+        // leave every later incarnation with no nfsd at all.
+        if let Err(e) = establish(&runtime, occupancy, &mount_path, nfsd_port, &shutdown).await {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            warn!(error = %e, "could not establish the ~/ArcBox export; retrying");
+            if !sleep_unless_shutdown(RETRY_BACKOFF, &shutdown).await {
+                break;
+            }
+            continue;
+        }
+
+        // Hold until this incarnation goes away, then loop to rebuild the
+        // export on the next guest and remount over the now-stale mount.
+        if !wait_for_state(&mut state, &shutdown, |s| !s.is_ready()).await {
+            break;
+        }
+        info!("system VM stopped; the ~/ArcBox export will be rebuilt when it returns");
     }
+    Ok(())
+}
 
-    mount_with_retry(&mount_path, nfsd_port, &shutdown).await
+/// Brings the guest export up and mounts it — the per-incarnation work.
+///
+/// Everything here is retryable, including reclaiming our own stale mount: the
+/// previous incarnation's mount can take a moment to release once its guest is
+/// gone, and a failed `umount` must not be terminal.
+async fn establish(
+    runtime: &Arc<Runtime>,
+    occupancy: MountPoint,
+    mount_path: &Path,
+    nfsd_port: u16,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    if occupancy == MountPoint::Stale {
+        info!(path = %mount_path.display(), "replacing stale ~/ArcBox NFS mount");
+        unmount(mount_path)?;
+    }
+    std::fs::create_dir_all(mount_path)?;
+
+    // The request must actually land — a pre-delivery failure (agent still
+    // coming up, connect/send error) leaves the guest with no nfsd and the
+    // mount below could only retry forever, so retry until the agent confirms.
+    ensure_guest_export(runtime, shutdown).await?;
+    mount_with_retry(mount_path, nfsd_port, shutdown).await
+}
+
+/// Waits until the System VM's lifecycle state satisfies `pred`.
+///
+/// Returns `false` when the daemon shut down or the lifecycle manager was
+/// dropped first — in both cases there is nothing left to reconcile.
+async fn wait_for_state(
+    state: &mut watch::Receiver<VmLifecycleState>,
+    shutdown: &CancellationToken,
+    pred: fn(&VmLifecycleState) -> bool,
+) -> bool {
+    loop {
+        if shutdown.is_cancelled() {
+            return false;
+        }
+        if pred(&state.borrow_and_update()) {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return false,
+            changed = state.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Sleeps for `duration`, returning `false` if the daemon shut down instead.
+async fn sleep_unless_shutdown(duration: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        () = tokio::time::sleep(duration) => true,
+    }
+}
+
+/// Asks the guest agent to bring up the export, retrying until it confirms,
+/// the deadline passes, or shutdown.
+///
+/// A pre-delivery failure must be retried, not swallowed: the agent no longer
+/// starts nfsd on its own, so if the request never lands the guest has no
+/// server and `mount_with_retry` can only fail.
+///
+/// The caller only sends once the VM is ready, so the agent is up — but the
+/// handler takes the runtime-start lock, which the in-flight dockerd start
+/// holds for far longer (its own budget is 150s), and neither transport
+/// self-limits usefully across that: the HV blocking RPC deadline (5s) is much
+/// shorter, and the VZ async path has no read deadline at all, so an unbounded
+/// attempt could hang the reconcile until — or past — a wedged runtime start.
+/// Bounding each attempt and racing shutdown makes both backends retry across
+/// that window, and the handler is idempotent so a retry after the export is
+/// already up just confirms it.
+async fn ensure_guest_export(runtime: &Arc<Runtime>, shutdown: &CancellationToken) -> Result<()> {
+    const ENSURE_TIMEOUT: Duration = Duration::from_secs(120);
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+    const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+    let deadline = tokio::time::Instant::now() + ENSURE_TIMEOUT;
+    loop {
+        let attempt = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                bail!("daemon shutdown before the guest NFS export was established");
+            }
+            result = tokio::time::timeout(ATTEMPT_TIMEOUT, send_ensure_export(runtime)) => result,
+        };
+        match attempt {
+            Ok(Ok(notes)) => {
+                debug!(notes = ?notes, "guest nfs export ensured");
+                return Ok(());
+            }
+            outcome if tokio::time::Instant::now() >= deadline => {
+                return match outcome {
+                    Ok(Err(e)) => Err(e).context("guest did not establish the NFS export in time"),
+                    _ => Err(anyhow::anyhow!(
+                        "guest did not establish the NFS export within {ENSURE_TIMEOUT:?}"
+                    )),
+                };
+            }
+            Ok(Err(e)) => debug!(error = %e, "ensure guest nfs export attempt failed, retrying"),
+            Err(_) => debug!("ensure guest nfs export attempt timed out, retrying"),
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                bail!("daemon shutdown before the guest NFS export was established");
+            }
+            () = tokio::time::sleep(RETRY_INTERVAL) => {}
+        }
+    }
+}
+
+/// One `EnsureNfsExport` round-trip to the guest agent.
+///
+/// `connect_agent` is a blocking hypervisor call on both backends; on HV the
+/// whole agent transport is blocking, on VZ only the connect is. Mirrors the
+/// `sync_guest_clock` backend dispatch in `arcbox-core`.
+async fn send_ensure_export(runtime: &Arc<Runtime>) -> Result<Vec<String>> {
+    let machine = DEFAULT_MACHINE_NAME.to_string();
+    let rt = Arc::clone(runtime);
+    let mut agent = tokio::task::spawn_blocking(move || rt.get_agent(&machine)).await??;
+    let resp = if agent.is_blocking() {
+        tokio::task::spawn_blocking(move || agent.ensure_nfs_export_blocking()).await??
+    } else {
+        agent.ensure_nfs_export().await?
+    };
+    Ok(resp.notes)
 }
 
 /// Bounded wait for the `ArcBox` hosts alias the concurrent self-setup task
@@ -293,8 +472,17 @@ fn mount_source_for(alias_installed: bool) -> String {
 ///   of hanging Finder forever (macOS rejects `soft` with `vers=4`).
 /// - `rdirplus`: fetch attributes with directory entries — fewer round trips.
 /// - `actimeo=10`: modest attribute cache for a browse mount.
+/// - `noowners`: display-only owner mapping (ABX-427). The guest's uids are
+///   meaningless on the host, so the export otherwise lists as `root` and bare
+///   numbers. This is `MNT_IGNORE_OWNERSHIP` — Finder's "Ignore ownership on
+///   this volume" — under which every object reports uid 99, which the VFS
+///   renders as the *current* user. Presentational only, and safe precisely
+///   because it is: the server stays the sole authority (`ro` export,
+///   `all_squash,anonuid=0`, so it already evaluates ACCESS as root), and the
+///   mount is `ro` besides. The local check it drops was only ever able to
+///   refuse reads the server would have granted.
 fn render_mount_opts(nfsd_port: u16) -> String {
-    format!("ro,vers=4,rdirplus,actimeo=10,deadtimeout=60,port={nfsd_port}")
+    format!("ro,noowners,vers=4,rdirplus,actimeo=10,deadtimeout=60,port={nfsd_port}")
 }
 
 /// Host mount point: `$ARCBOX_HOST_MOUNT_DIR` when set (so a test daemon stays
@@ -310,25 +498,32 @@ fn resolve_mount_path_from_home(home: &Path) -> PathBuf {
     home.join("ArcBox")
 }
 
-/// Removes a stale ArcBox NFS mount, or errors if the path is otherwise taken.
+/// What currently holds the mount point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountPoint {
+    /// Nothing mounted there — free to use.
+    Free,
+    /// A mount matching our exact shape, left over from a previous daemon or a
+    /// previous incarnation whose guest is gone. Dead weight; reclaimable.
+    Stale,
+}
+
+/// Classifies the mount point, erroring when it is held by a mount this daemon
+/// did not create.
 ///
-/// Only a mount matching our exact shape (`nfs` from `127.0.0.1:/`) is
-/// replaced — that is a leftover from a previous daemon whose local proxy is
-/// gone, so it is dead weight. Anything else at the path, including a foreign
-/// NFS mount, is someone else's and makes the reconcile bail.
-fn reconcile_existing_mount(mount_path: &Path) -> Result<()> {
+/// Anything that is not our own shape — including a foreign NFS mount — is
+/// someone else's, and no retry or VM restart can free it, so it is the one
+/// condition that ends the reconcile.
+fn classify_mount_point(mount_path: &Path) -> Result<MountPoint> {
     match current_mount_info(mount_path) {
-        Some(info) if is_arcbox_nfs_mount(&info) => {
-            info!(path = %mount_path.display(), "replacing stale ~/ArcBox NFS mount");
-            unmount(mount_path)
-        }
+        None => Ok(MountPoint::Free),
+        Some(info) if is_arcbox_nfs_mount(&info) => Ok(MountPoint::Stale),
         Some(info) => bail!(
             "~/ArcBox path {} already occupied by {} ({})",
             mount_path.display(),
             info.source,
             info.fstype
         ),
-        None => Ok(()),
     }
 }
 
@@ -394,10 +589,12 @@ fn unmount(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MountInfo, is_arcbox_nfs_mount, mount_source_for, parse_mount_line, render_mount_opts,
-        resolve_mount_path_from_home,
+        MountInfo, VmLifecycleState, is_arcbox_nfs_mount, mount_source_for, parse_mount_line,
+        render_mount_opts, resolve_mount_path_from_home, wait_for_state,
     };
     use std::path::{Path, PathBuf};
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn only_our_exact_mount_shape_is_reclaimed() {
@@ -441,12 +638,59 @@ mod tests {
         assert!(opts.contains("port=51000"));
         // Must never request write access to a read-only export.
         assert!(!opts.contains("rw"));
+        // Guest uids mean nothing on the host; show the browsing user instead.
+        assert!(opts.contains("noowners"));
     }
 
     #[test]
     fn mount_source_is_the_v4_pseudo_root_under_both_names() {
         assert_eq!(mount_source_for(false), "127.0.0.1:/");
         assert_eq!(mount_source_for(true), "ArcBox:/");
+    }
+
+    /// The whole point of watching lifecycle state instead of the restart
+    /// generation: the export must be (re)built when a guest arrives, not when
+    /// one leaves. `Stopped` is where the generation counter fires — waiting
+    /// there would send the request into the gap with no guest in it.
+    #[tokio::test]
+    async fn ready_wait_resumes_on_the_arrival_edge_not_the_departure() {
+        let (tx, mut rx) = watch::channel(VmLifecycleState::Running);
+        let shutdown = CancellationToken::new();
+
+        // A running VM satisfies the predicate immediately.
+        assert!(wait_for_state(&mut rx, &shutdown, VmLifecycleState::is_ready).await);
+
+        // Departure: intermediate states must not be mistaken for arrival.
+        for state in [VmLifecycleState::Stopping, VmLifecycleState::Stopped] {
+            tx.send_replace(state);
+            assert!(wait_for_state(&mut rx, &shutdown, |s| !s.is_ready()).await);
+        }
+
+        // A restart passes through Starting, which is not yet usable; only
+        // Running releases the waiter.
+        tx.send_replace(VmLifecycleState::Starting);
+        let waiter = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let mut rx = rx.clone();
+            async move { wait_for_state(&mut rx, &shutdown, VmLifecycleState::is_ready).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "Starting is not an arrival");
+
+        tx.send_replace(VmLifecycleState::Running);
+        assert!(waiter.await.expect("waiter panicked"));
+    }
+
+    #[tokio::test]
+    async fn ready_wait_gives_up_on_shutdown_and_on_a_dropped_lifecycle() {
+        let (tx, mut rx) = watch::channel(VmLifecycleState::Stopped);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert!(!wait_for_state(&mut rx, &shutdown, VmLifecycleState::is_ready).await);
+
+        drop(tx);
+        let shutdown = CancellationToken::new();
+        assert!(!wait_for_state(&mut rx, &shutdown, VmLifecycleState::is_ready).await);
     }
 
     #[test]

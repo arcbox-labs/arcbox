@@ -604,3 +604,146 @@ fn test_handle_tx_normal_packet_uses_send() {
         "send should be called for normal packets"
     );
 }
+
+/// Harness for `poll_rx`: scratch guest RAM with one RX chain of write-only
+/// descriptors (`descs` = (addr, len) each, linked with NEXT), a datagram
+/// socketpair as the host fd, and one queued `frame`. Returns (guest memory,
+/// poll result), with the used ring at 0x300.
+fn poll_rx_one_frame(descs: &[(u64, u32)], frame: &[u8]) -> (Vec<u8>, bool) {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::AtomicU16;
+
+    use arcbox_virtio_core::queue::flags;
+    use arcbox_virtio_core::{DeviceCtx, QueueConfig};
+
+    use crate::config::NetPort;
+
+    let q_size: u16 = 4;
+    let (desc_addr, avail_addr, used_addr) = (0x100usize, 0x200, 0x300);
+    let mut mem = vec![0u8; 0x1000];
+
+    // One chain of write-only descriptors, head 0, linked with NEXT.
+    for (i, &(addr, len)) in descs.iter().enumerate() {
+        let d = desc_addr + i * 16;
+        let last = i == descs.len() - 1;
+        let f = if last {
+            flags::WRITE
+        } else {
+            flags::WRITE | flags::NEXT
+        };
+        mem[d..d + 8].copy_from_slice(&addr.to_le_bytes());
+        mem[d + 8..d + 12].copy_from_slice(&len.to_le_bytes());
+        mem[d + 12..d + 14].copy_from_slice(&f.to_le_bytes());
+        mem[d + 14..d + 16].copy_from_slice(&((i as u16) + 1).to_le_bytes());
+    }
+    // Avail ring: one posted chain (head 0).
+    mem[avail_addr + 2..avail_addr + 4].copy_from_slice(&1u16.to_le_bytes());
+    mem[avail_addr + 4..avail_addr + 6].copy_from_slice(&0u16.to_le_bytes());
+
+    // Host fd: a datagram pair with the frame already queued.
+    let (tx, rx) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    tx.send(frame).unwrap();
+
+    let mut net = VirtioNet::new(NetConfig::default());
+    // SAFETY: `mem` outlives `net` (returned to the caller after `net` is
+    // dropped at the end of this function) and is not moved while the raw
+    // pointer is held by the bound context.
+    let ctx = DeviceCtx {
+        mem: Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0)
+        }),
+        raise_irq: Arc::new(|_| {}),
+    };
+    net.bind_ctx(ctx);
+    net.bind_port(NetPort {
+        host_fd: rx.as_raw_fd(),
+        last_avail_tx: AtomicU16::new(0),
+    })
+    .expect("bind port");
+
+    let qcfg = QueueConfig {
+        desc_addr: desc_addr as u64,
+        avail_addr: avail_addr as u64,
+        used_addr: used_addr as u64,
+        size: q_size,
+        ready: true,
+        gpa_base: 0,
+    };
+    let published = net.poll_rx(&qcfg);
+    drop(net);
+    (mem, published)
+}
+
+#[test]
+fn poll_rx_delivers_whole_frame_and_stamps_num_buffers() {
+    let frame = [0xABu8; 100];
+    let (mem, published) = poll_rx_one_frame(&[(0x400, 256)], &frame);
+    assert!(published);
+
+    let used_addr = 0x300usize;
+    let used_idx = u16::from_le_bytes([mem[used_addr + 2], mem[used_addr + 3]]);
+    assert_eq!(used_idx, 1, "one completion");
+    let used_len = u32::from_le_bytes([
+        mem[used_addr + 8],
+        mem[used_addr + 9],
+        mem[used_addr + 10],
+        mem[used_addr + 11],
+    ]);
+    assert_eq!(used_len, 12 + 100, "header + payload delivered whole");
+
+    // num_buffers (header offset 10..12) = 1 for spec compliance on
+    // VERSION_1 headers without MRG_RXBUF.
+    let num_buffers = u16::from_le_bytes([mem[0x400 + 10], mem[0x400 + 11]]);
+    assert_eq!(num_buffers, 1);
+    assert_eq!(&mem[0x400 + 12..0x400 + 112], &frame[..], "payload intact");
+}
+
+#[test]
+fn poll_rx_drops_frame_exceeding_chain_capacity() {
+    // 100-byte frame + 12-byte header = 112 > the chain's 64 bytes. The
+    // device never offers MRG_RXBUF on this path, so spanning is not an
+    // option: the frame must be dropped whole (zero-length completion the
+    // guest reclaims), never delivered truncated — the guest would parse a
+    // truncated buffer as a complete frame.
+    let frame = [0xCDu8; 100];
+    let (mem, published) = poll_rx_one_frame(&[(0x400, 64)], &frame);
+    assert!(published, "the consumed chain still needs its interrupt");
+
+    let used_addr = 0x300usize;
+    let used_idx = u16::from_le_bytes([mem[used_addr + 2], mem[used_addr + 3]]);
+    assert_eq!(used_idx, 1, "chain returned to the used ring");
+    let used_len = u32::from_le_bytes([
+        mem[used_addr + 8],
+        mem[used_addr + 9],
+        mem[used_addr + 10],
+        mem[used_addr + 11],
+    ]);
+    assert_eq!(used_len, 0, "no truncated delivery — dropped whole");
+}
+
+#[test]
+fn poll_rx_oob_descriptor_poisons_chain() {
+    // Chain: valid 64B → OOB 64B (outside the 0x1000 scratch RAM) → valid
+    // 64B. Numeric capacity (192) covers the 112-byte frame, and skipping
+    // the OOB descriptor while filling the tail would still reach `total` —
+    // delivering a full-length frame with a hole in the middle. The chain
+    // must be poisoned instead: zero-length completion, nothing delivered.
+    let frame = [0xEFu8; 100];
+    let (mem, published) = poll_rx_one_frame(&[(0x400, 64), (0x10_0000, 64), (0x500, 64)], &frame);
+    assert!(published, "the consumed chain still needs its interrupt");
+
+    let used_addr = 0x300usize;
+    let used_idx = u16::from_le_bytes([mem[used_addr + 2], mem[used_addr + 3]]);
+    assert_eq!(used_idx, 1, "chain returned to the used ring");
+    let used_len = u32::from_le_bytes([
+        mem[used_addr + 8],
+        mem[used_addr + 9],
+        mem[used_addr + 10],
+        mem[used_addr + 11],
+    ]);
+    assert_eq!(used_len, 0, "a holed chain must complete at zero length");
+    assert!(
+        mem[0x500..0x540].iter().all(|&b| b == 0),
+        "nothing may be scattered past the refused descriptor"
+    );
+}

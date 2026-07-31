@@ -174,11 +174,15 @@ fn requirement_string(identifier: &str, team_id: &str) -> String {
     )
 }
 
-/// `kSecCSCheckNestedCode | kSecCSStrictValidate`.
-#[cfg(not(debug_assertions))]
-fn check_flags() -> security_framework::os::macos::code_signing::Flags {
+/// Flags accepted by `SecCodeCheckValidity` for a live process.
+///
+/// Strict validation retains additional bundle-structure checks. Nested-code
+/// recursion is static-only and makes the dynamic API fail with
+/// `errSecCSInvalidFlags`.
+#[cfg(all(target_os = "macos", any(test, not(debug_assertions))))]
+fn dynamic_validation_flags() -> security_framework::os::macos::code_signing::Flags {
     use security_framework::os::macos::code_signing::Flags;
-    Flags::CHECK_NESTED_CODE | Flags::STRICT_VALIDATE
+    Flags::STRICT_VALIDATE
 }
 
 #[cfg(not(debug_assertions))]
@@ -193,7 +197,8 @@ fn check_code_signature_pid(pid: i32, identifier: &str, team_id: &str) -> bool {
     let Ok(req) = requirement_string(identifier, team_id).parse::<SecRequirement>() else {
         return false;
     };
-    code.check_validity(check_flags(), &req).is_ok()
+    code.check_validity(dynamic_validation_flags(), &req)
+        .is_ok()
 }
 
 #[cfg(not(debug_assertions))]
@@ -212,7 +217,8 @@ fn check_code_signature_audit(token: &AuditToken, identifier: &str, team_id: &st
     let Ok(req) = requirement_string(identifier, team_id).parse::<SecRequirement>() else {
         return false;
     };
-    code.check_validity(check_flags(), &req).is_ok()
+    code.check_validity(dynamic_validation_flags(), &req)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -230,11 +236,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(debug_assertions))]
-    fn check_flags_include_nested_and_strict() {
-        use security_framework::os::macos::code_signing::Flags;
-        let f = super::check_flags();
-        assert!(f.contains(Flags::CHECK_NESTED_CODE));
-        assert!(f.contains(Flags::STRICT_VALIDATE));
+    #[cfg(target_os = "macos")]
+    fn dynamic_validation_flags_are_accepted_by_security_framework() {
+        use security_framework::os::macos::code_signing::{Flags, SecCode, SecRequirement};
+
+        let code = SecCode::for_self(Flags::NONE).expect("test process should be inspectable");
+        let requirement = "true"
+            .parse::<SecRequirement>()
+            .expect("unconditional requirement should parse");
+
+        code.check_validity(super::dynamic_validation_flags(), &requirement)
+            .expect("dynamic code validation flags should be accepted");
     }
 }

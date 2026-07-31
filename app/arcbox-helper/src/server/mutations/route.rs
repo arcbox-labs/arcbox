@@ -7,7 +7,12 @@ use arcbox_route::Ipv4Net;
 /// Adds a route for `subnet` via `iface`.
 pub fn add(subnet: &Subnet, iface: &BridgeIface) -> Result<(), HelperError> {
     let net = to_ipv4net(subnet)?;
-    arcbox_route::add(net, iface.as_str()).map_err(HelperError::other)
+    match arcbox_route::add(net, iface.as_str()).map_err(HelperError::other)? {
+        arcbox_route::AddOutcome::Added => Ok(()),
+        arcbox_route::AddOutcome::Conflict => Err(HelperError::RouteConflict {
+            subnet: subnet.to_string(),
+        }),
+    }
 }
 
 /// Removes the route for `subnet`.

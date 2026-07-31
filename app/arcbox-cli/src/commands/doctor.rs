@@ -5,7 +5,6 @@
 //! (on macOS) L3 container routing.
 
 use anyhow::Result;
-use std::process::Command;
 
 /// Runs all diagnostic checks and prints a report.
 pub async fn execute() -> Result<()> {
@@ -44,7 +43,7 @@ pub async fn execute() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         check!("Bridge NIC", check_bridge_nic());
-        check!("Container route", check_container_route());
+        check!("Container route", check_container_route().await);
         check!("ArcBoxHelper", check_helper().await);
     }
 
@@ -181,33 +180,21 @@ fn check_bridge_nic() -> CheckResult {
 
 /// Check if the container subnet route is installed correctly.
 #[cfg(target_os = "macos")]
-fn check_container_route() -> CheckResult {
-    let Ok(output) = Command::new("route")
-        .args(["-n", "get", "172.16.0.0"])
-        .output()
-    else {
-        return CheckResult::Fail("route command failed".into());
+async fn check_container_route() -> CheckResult {
+    let Some((bridge, _)) = arcbox_core::bridge_discovery::find_bridge_with_vmenet() else {
+        return CheckResult::Fail("cannot identify ArcBox bridge".into());
     };
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    let mut iface = None;
-    let mut gateway = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(val) = trimmed.strip_prefix("interface:") {
-            iface = Some(val.trim().to_string());
-        } else if let Some(val) = trimmed.strip_prefix("gateway:") {
-            gateway = Some(val.trim().to_string());
+    match arcbox_core::route_reconciler::container_route_mode(&bridge).await {
+        Ok(Some(arcbox_core::route_reconciler::RouteMode::Preferred)) => {
+            CheckResult::Pass(format!("172.16.0.0/12 → {bridge}"))
         }
-    }
-
-    match iface.as_deref() {
-        Some(i) if i.starts_with("bridge") => CheckResult::Pass(format!("172.16.0.0/12 → {i}")),
-        Some(i) => CheckResult::Fail(format!(
-            "172.16.0.0/12 → {i} (expected bridge*, got wrong interface; gateway={:?})",
-            gateway
+        Ok(Some(arcbox_core::route_reconciler::RouteMode::SplitFallback)) => CheckResult::Pass(
+            format!("172.16.0.0/13 + 172.24.0.0/13 → {bridge} (VPN-compatible fallback)"),
+        ),
+        Ok(None) => CheckResult::Fail(format!(
+            "neither 172.16.0.0/12 nor both split /13 routes point to {bridge}"
         )),
-        None => CheckResult::Fail("no route for 172.16.0.0/12".into()),
+        Err(error) => CheckResult::Fail(format!("route query failed: {error}")),
     }
 }
 

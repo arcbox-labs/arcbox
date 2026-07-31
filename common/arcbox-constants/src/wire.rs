@@ -67,6 +67,11 @@ pub enum MessageType {
     /// Resolve an image's layer directories from containerd snapshot
     /// metadata (payload: `arcbox.agent.ImageFsPathsRequest`).
     ImageFsPathsRequest = 0x0012,
+    /// Bring up the read-only NFS export of the docker data mount (payload:
+    /// `arcbox.agent.EnsureNfsExportRequest`). Sent by the host daemon only
+    /// when the `~/ArcBox` mount is enabled; a `--no-mount-nfs` daemon never
+    /// sends it, so the guest runs no nfsd.
+    EnsureNfsExportRequest = 0x0013,
 
     // Sandbox CRUD request types (0x0020 - 0x0026).
     SandboxCreateRequest = 0x0020,
@@ -150,6 +155,9 @@ pub enum MessageType {
     /// Answers [`Self::ImageFsPathsRequest`] (payload:
     /// `arcbox.agent.ImageFsPathsResponse`).
     ImageFsPathsResponse = 0x1012,
+    /// Answers [`Self::EnsureNfsExportRequest`] (payload:
+    /// `arcbox.agent.EnsureNfsExportResponse`).
+    EnsureNfsExportResponse = 0x1013,
     PortBindingsChanged = 0x1030,
     PortBindingsRemoved = 0x1031,
 
@@ -213,6 +221,7 @@ impl MessageType {
             0x0010 => Some(Self::WatchStatsRequest),
             0x0011 => Some(Self::ContainerFsPathsRequest),
             0x0012 => Some(Self::ImageFsPathsRequest),
+            0x0013 => Some(Self::EnsureNfsExportRequest),
             // Sandbox CRUD requests.
             0x0020 => Some(Self::SandboxCreateRequest),
             0x0021 => Some(Self::SandboxStopRequest),
@@ -258,6 +267,7 @@ impl MessageType {
             0x1010 => Some(Self::MachineStats),
             0x1011 => Some(Self::ContainerFsPathsResponse),
             0x1012 => Some(Self::ImageFsPathsResponse),
+            0x1013 => Some(Self::EnsureNfsExportResponse),
             0x1030 => Some(Self::PortBindingsChanged),
             0x1031 => Some(Self::PortBindingsRemoved),
             // Sandbox CRUD responses.
@@ -350,10 +360,12 @@ mod tests {
             (0x0010, MessageType::WatchStatsRequest),
             (0x0011, MessageType::ContainerFsPathsRequest),
             (0x0012, MessageType::ImageFsPathsRequest),
+            (0x0013, MessageType::EnsureNfsExportRequest),
             (0x100F, MessageType::MemoryPressureEvent),
             (0x1010, MessageType::MachineStats),
             (0x1011, MessageType::ContainerFsPathsResponse),
             (0x1012, MessageType::ImageFsPathsResponse),
+            (0x1013, MessageType::EnsureNfsExportResponse),
             (0x1001, MessageType::PingResponse),
             (0x1002, MessageType::GetSystemInfoResponse),
             (0x1003, MessageType::EnsureRuntimeResponse),

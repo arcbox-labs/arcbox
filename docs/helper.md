@@ -7,19 +7,19 @@ perform: `/usr/local/bin` CLI symlinks, `/var/run/docker.sock`, `/etc/resolver`,
 ## Independent version
 
 `arcbox-helper` owns its **own** Cargo package version
-(`app/arcbox-helper/Cargo.toml`), currently `1.0.0`. It is **not** tied to
-`workspace.package.version` (`0.4.x`).
+(`app/arcbox-helper/Cargo.toml`), currently `1.0.2`. It is **not** tied to
+`workspace.package.version`.
 
 | Pin | Location |
 |-----|----------|
-| Helper package version | `app/arcbox-helper/Cargo.toml` → `version = "1.0.0"` |
-| Workspace path-dep | root `Cargo.toml` → `arcbox-helper = { version = "1.0.0", path = ... }` (**no** `x-release-please-version`) |
+| Helper package version | `app/arcbox-helper/Cargo.toml` → `version = "1.0.2"` |
+| Workspace path-dep | root `Cargo.toml` → `arcbox-helper = { version = "1.0.2", path = ... }` (**no** `x-release-please-version`) |
 | Daemon/CLI floor | `arcbox_constants::helper::MIN_HELPER_VERSION` |
 
 `arcbox-helper --version` and the tarpc `version` RPC both print:
 
 ```text
-arcbox-helper 1.0.0
+arcbox-helper 1.0.2
 ```
 
 Desktop and daemon parse that line with
@@ -64,6 +64,7 @@ signature verification on every accept (`peer_auth::verify`):
 1. Prefer `LOCAL_PEERTOKEN` (audit token) — binds to the live connecting process.
 2. Fall back to `LOCAL_PEERPID`.
 3. `SecCodeCopyGuestWithAttributes` → `SecCodeCheckValidity` with
+   strict dynamic-validation (without the static-only nested-code flag) and
    `identifier "…" and anchor apple generic and certificate leaf[subject.OU] = "TEAM"`.
 4. Allow-list: `com.arcboxlabs.desktop{,.dev}{,.daemon,.cli}`.
 

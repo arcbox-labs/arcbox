@@ -268,7 +268,7 @@ fn verify_nfs_export(ctx: &TestContext) -> Result<()> {
 }
 
 /// Waits until the daemon's NFS mount is populated with docker's data root.
-fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
+pub fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if mount_dir.join("volumes").is_dir() || mount_dir.join("overlay2").is_dir() {
@@ -287,7 +287,7 @@ fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
 
 /// Reads `path`, retrying briefly while the just-written file propagates
 /// through the NFS attribute cache.
-fn read_file_with_retry(path: &Path, timeout: Duration) -> Result<String> {
+pub fn read_file_with_retry(path: &Path, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
         match fs::read_to_string(path) {

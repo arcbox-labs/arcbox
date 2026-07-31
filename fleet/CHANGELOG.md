@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.3](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.2...fleet-agent-v0.1.3) (2026-07-21)
+
+
+### Features
+
+* **fleet:** live VM backend activation — re-probe, re-attach, Prepare bootstrap ([#465](https://github.com/arcboxlabs/arcbox/issues/465)) ([715e5fc](https://github.com/arcboxlabs/arcbox/commit/715e5fcbecb95493c560fbc84cfd7ed4de66ed79))
+* **fleet:** windows capability via WSL interop ([#405](https://github.com/arcboxlabs/arcbox/issues/405)) ([520dd19](https://github.com/arcboxlabs/arcbox/commit/520dd1943e755705c5eedccea6abe08ca4aa529b))
+
+
+### Bug Fixes
+
+* **fleet:** defer redelivered-offer verdicts and add stream keepalive ([#468](https://github.com/arcboxlabs/arcbox/issues/468)) ([25e1b6f](https://github.com/arcboxlabs/arcbox/commit/25e1b6fb9dc5b19b588cd6d8289b3b462dd1cf94))
+
+
+### Documentation
+
+* **macos:** refresh stale CLI name and image-version examples ([#459](https://github.com/arcboxlabs/arcbox/issues/459)) ([d6a646a](https://github.com/arcboxlabs/arcbox/commit/d6a646a5cae0c83c79012648264059ab80b81490))
+
 ## [0.1.2](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.1...fleet-agent-v0.1.2) (2026-07-16)
 
 

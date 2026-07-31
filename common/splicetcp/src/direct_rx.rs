@@ -256,6 +256,12 @@ async fn read_promoted_conn(
 ) {
     let mut buf = vec![0u8; 32 * 1024];
     loop {
+        // The bridge sets `dead` when it tears the flow down (guest FIN/RST or
+        // a host error): stop and drop our cloned fd instead of spinning on a
+        // now-frozen send window.
+        if conn.dead.load(Ordering::Relaxed) {
+            return;
+        }
         // Never read (hence send) beyond the guest's advertised receive
         // window (capped at `HONORED_WINDOW_CAP`, 256 KiB) — see
         // `tcp_bridge::send_budget`. When window-limited, the guest's next

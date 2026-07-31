@@ -351,8 +351,12 @@ mod macos {
     impl RouteGuard {
         fn install(cidr: &str, iface: &str) -> Result<Self> {
             let net = parse_cidr(cidr).with_context(|| format!("invalid --route CIDR: {cidr}"))?;
-            arcbox_route::add(net, iface)
+            let outcome = arcbox_route::add(net, iface)
                 .map_err(|e| anyhow::anyhow!("add route {cidr} via {iface}: {e}"))?;
+            anyhow::ensure!(
+                outcome == arcbox_route::AddOutcome::Added,
+                "route {cidr} already exists and was left untouched"
+            );
             tracing::info!(%cidr, iface, "installed scoped route");
             Ok(Self { net })
         }

@@ -87,7 +87,9 @@ impl TcpBridge {
 
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
-        if frame.len() < l4_start + 20 {
+        // IHL < 20 would collapse l4_start into the IP header, so every TCP
+        // field below (ports, seq/ack, flags) would be read from IP bytes.
+        if ihl < 20 || frame.len() < l4_start + 20 {
             return None;
         }
 
@@ -115,6 +117,9 @@ impl TcpBridge {
         };
 
         let conn = self.fast_path_conns.get_mut(&key)?;
+        // Any guest frame for the flow — data, ACK, dup-ACK, even a bare
+        // window probe — is its sign of life for the dead-flow reaper.
+        conn.last_guest_activity = std::time::Instant::now();
 
         let guest_seq = u32::from_be_bytes([
             frame[l4_start + 4],
@@ -137,6 +142,11 @@ impl TcpBridge {
         let ip_total_len = u16::from_be_bytes([frame[ip_start + 2], frame[ip_start + 3]]) as usize;
         let ip_end = ip_start + ip_total_len;
         let tcp_data_offset = ((frame[l4_start + 12] >> 4) as usize) * 4;
+        // The data offset must cover the 20-byte TCP header; a smaller value
+        // would splice TCP header bytes into the payload written to the host.
+        if tcp_data_offset < 20 || l4_start + tcp_data_offset > frame.len() {
+            return None;
+        }
         let payload_start = l4_start + tcp_data_offset;
         let payload_end = ip_end.min(frame.len());
         let payload_len = payload_end.saturating_sub(payload_start);
@@ -197,13 +207,17 @@ impl TcpBridge {
         }
 
         // Write payload to host stream (if any). The invariant that keeps
-        // uploads lossless with no shim-side buffering: `last_ack` advances
-        // ONLY over bytes actually written, in order, to the host socket.
-        // Everything else (out-of-order arrival, WouldBlock, the unwritten
-        // tail of a short write) stays un-ACKed, so the guest's own
-        // fast-retransmit/RTO machinery repairs the stream — dup-ACKs from
-        // the fall-through below are the recovery signal. ACKing past
-        // unwritten bytes is how uploads silently lost data (2026-07-19).
+        // uploads lossless: `last_ack` advances ONLY over bytes actually
+        // written, in order, to the host socket. Everything else
+        // (WouldBlock, the unwritten tail of a short write) stays un-ACKed,
+        // so the guest's own fast-retransmit/RTO machinery repairs the
+        // stream — dup-ACKs from the fall-through below are the recovery
+        // signal. ACKing past unwritten bytes is how uploads silently lost
+        // data (2026-07-19). Out-of-order segments are parked un-ACKed in
+        // `ooo_segs` and written once the hole before them fills — parking
+        // (vs the old drop) is what keeps one lost frame from forcing the
+        // guest to retransmit the entire in-flight window.
+        let mut in_order_advanced = false;
         if payload_len > 0 {
             use std::io::Write;
             let seq_end = guest_seq.wrapping_add(payload_len as u32);
@@ -221,17 +235,20 @@ impl TcpBridge {
                 let overlap = conn.last_ack.wrapping_sub(guest_seq);
                 if overlap >= 0x8000_0000 {
                     // guest_seq is ahead of the cursor: a hole precedes this
-                    // segment. Writing it would corrupt the byte stream and
-                    // ACKing it would bury the hole forever. Leave last_ack
-                    // alone — the ACK below is a dup-ACK, which is exactly
-                    // what makes the guest fast-retransmit the gap.
+                    // segment. Writing it now would corrupt the byte stream
+                    // and ACKing it would bury the hole forever. Park it
+                    // (bounded) for delivery once the hole fills; leave
+                    // last_ack alone — the ACK below is a dup-ACK, which is
+                    // exactly what makes the guest fast-retransmit the gap.
                     conn.up_out_of_order += 1;
+                    conn.buffer_ooo_segment(guest_seq, &frame[payload_start..payload_end]);
                 } else {
                     let fresh = &frame[payload_start + overlap as usize..payload_end];
                     match conn.stream.write(fresh) {
                         Ok(n) => {
                             conn.up_bytes += n as u64;
                             conn.set_last_ack(conn.last_ack.wrapping_add(n as u32));
+                            in_order_advanced = true;
                             if n < fresh.len() {
                                 // Host socket buffer filled mid-segment: ACK
                                 // covers only what was written; the guest
@@ -249,6 +266,7 @@ impl TcpBridge {
                             // Peer closed; inject already relayed FIN. ACK at
                             // TCP layer so the guest stops retransmitting.
                             conn.set_last_ack(seq_end);
+                            in_order_advanced = true;
                             tracing::debug!(
                                 "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} Broken pipe, draining {payload_len} bytes"
                             );
@@ -279,6 +297,30 @@ impl TcpBridge {
             }
         }
 
+        // A cursor advance may have landed right behind parked out-of-order
+        // segments — flush them now so the ACK below leaps over everything
+        // contiguous instead of forcing the guest to retransmit data that
+        // already arrived.
+        if in_order_advanced
+            && !conn.ooo_segs.is_empty()
+            && let Err(e) = conn.drain_parked_segments()
+        {
+            tracing::warn!("Fast path TX drain error, RST to guest: {e}");
+            let rst = crate::ethernet::build_tcp_rst_frame(&crate::ethernet::TcpFrameParams {
+                src_ip: conn.remote_ip,
+                dst_ip: conn.guest_ip,
+                src_port: conn.remote_port,
+                dst_port: conn.guest_port,
+                seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                ack: conn.last_ack,
+                window: 0,
+                src_mac: self.fast_path_gateway_mac,
+                dst_mac: self.fast_path_guest_mac.unwrap_or([0xFF; 6]),
+            });
+            self.close_fast_path(&key);
+            return Some(rst);
+        }
+
         // FIN handling — only once every byte before it has been written and
         // ACKed. A FIN whose sequence position is beyond `last_ack` (data
         // still missing, or its own payload only partially written) must not
@@ -288,13 +330,42 @@ impl TcpBridge {
         if flags & 0x01 != 0 {
             let fin_seq = guest_seq.wrapping_add(payload_len as u32);
             if fin_seq == conn.last_ack {
-                tracing::debug!(
-                    "Fast path: FIN from guest {src_ip}:{src_port}→{dst_ip}:{dst_port}"
-                );
                 // FIN consumes 1 sequence number (in addition to any data
                 // bytes already accounted for above).
                 conn.set_last_ack(conn.last_ack.wrapping_add(1));
                 let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
+                // Non-inline flow whose host side is still open: a genuine
+                // half-close. Shut only the upstream's receive side (the guest
+                // will send no more), keep relaying host→guest until the host
+                // EOFs on its own (poll then emits OUR FIN), and just ACK the
+                // FIN here — reaping happens in poll once both sides are closed.
+                // A full close here would truncate the still-in-flight response
+                // and, with unread bytes buffered, RST the real upstream.
+                // Inline flows (whose reader owns host→guest) and flows where
+                // the host already closed fall through to the full teardown.
+                if !conn.host_eof && !conn.inline_owned {
+                    tracing::debug!(
+                        "Fast path: guest half-close {src_ip}:{src_port}→{dst_ip}:{dst_port}"
+                    );
+                    let _ = conn.stream.shutdown(std::net::Shutdown::Write);
+                    conn.guest_fin_at = Some(std::time::Instant::now());
+                    let ack =
+                        crate::ethernet::build_tcp_ack_frame(&crate::ethernet::TcpFrameParams {
+                            src_ip: conn.remote_ip,
+                            dst_ip: conn.guest_ip,
+                            src_port: conn.remote_port,
+                            dst_port: conn.guest_port,
+                            seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                            ack: conn.last_ack,
+                            window: 65535,
+                            src_mac: self.fast_path_gateway_mac,
+                            dst_mac: guest_mac,
+                        });
+                    return Some(ack);
+                }
+                tracing::debug!(
+                    "Fast path: FIN from guest {src_ip}:{src_port}→{dst_ip}:{dst_port}"
+                );
                 let fin_ack =
                     crate::ethernet::build_tcp_fin_frame(&crate::ethernet::TcpFrameParams {
                         src_ip: conn.remote_ip,
@@ -316,10 +387,15 @@ impl TcpBridge {
             );
         }
 
-        // Only ACK frames that carried payload or a deferred FIN — replying
-        // to a pure ACK would create a dup-ACK loop that triggers fast
-        // retransmits on the peer and tanks host→VM throughput.
-        if payload_len == 0 && flags & 0x01 == 0 {
+        // Only ACK frames that carried payload, a deferred FIN, or a SYN.
+        // Replying to a pure ACK would create a dup-ACK loop that triggers
+        // fast retransmits on the peer and tanks host→VM throughput. A
+        // retransmitted SYN-ACK (the guest never saw our completing ACK, common
+        // on the inbound ActiveOpen path) is the one no-payload-no-FIN frame we
+        // must still ACK, or the guest retransmits until it times out — any
+        // data or FIN it carried was already handled by the paths above, so it
+        // is never dropped.
+        if payload_len == 0 && flags & (0x01 | 0x02) == 0 {
             return Some(Vec::new());
         }
 
@@ -355,6 +431,7 @@ impl TcpBridge {
             guest_mac,
         };
         let now = std::time::Instant::now();
+        let dead_flow_timeout = self.dead_flow_timeout;
 
         for (key, conn) in &mut self.fast_path_conns {
             if conn.inline_owned {
@@ -372,8 +449,134 @@ impl TcpBridge {
                     .is_some_and(|d| d.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     to_remove.push(*key);
+                    continue;
+                }
+
+                // Zero-window persist for the inline path. The inject thread /
+                // direct_rx reader stops reading at a zero send budget and can't
+                // probe on its own, so a lost guest window-update ACK would
+                // deadlock the download forever. Emit a keepalive-style probe —
+                // one byte at `our_seq - 1`, an old duplicate — which a
+                // zero-window guest must answer with a window-bearing ACK
+                // (RFC 793 §3.9). It consumes no sequence space and touches no
+                // shared state, so a lost probe is harmlessly re-sent next
+                // interval with no stream gap (the inline path has no
+                // retransmit). Gated on nothing-in-flight: the guest has ACKed
+                // up to `our_seq`, so `our_seq - 1` is always an old byte, and
+                // any in-flight data would elicit its own window-bearing ACKs.
+                let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
+                let acked = conn.guest_acked.load(std::sync::atomic::Ordering::Relaxed);
+                let window = conn
+                    .guest_window
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .min(super::HONORED_WINDOW_CAP);
+                let in_flight = sent.wrapping_sub(acked);
+                let nothing_in_flight = in_flight == 0 || in_flight >= 0x8000_0000;
+                // Dead-flow give-up: the inline path has no RTO, so a guest
+                // that vanished with data in flight freezes the send budget
+                // and would hold the entry, host fd, and owner task forever
+                // (the persist probe below never fires while bytes are
+                // outstanding). Soliciting = unACKed data outstanding or a
+                // closed window under persist; either demands a guest reply,
+                // so prolonged unanswered soliciting means the endpoint is
+                // gone. Both clocks must be stale — the soliciting clock
+                // starts fresh when a long-idle flow's owner resumes sending,
+                // so its guest gets the full deadline to answer.
+                let soliciting = !nothing_in_flight || conn.window_stalled_at.is_some();
+                if !soliciting {
+                    conn.soliciting_since = None;
+                } else if conn.soliciting_since.is_none() {
+                    conn.soliciting_since = Some(now);
+                }
+                if conn
+                    .soliciting_since
+                    .is_some_and(|since| now.duration_since(since) >= dead_flow_timeout)
+                    && now.duration_since(conn.last_guest_activity) >= dead_flow_timeout
+                {
+                    tracing::warn!(
+                        "Fast path: guest silent {:?} on soliciting inline flow {}:{} → {}:{}, RST + reap",
+                        dead_flow_timeout,
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
+                    );
+                    frames.push(crate::ethernet::build_tcp_rst_frame(
+                        &crate::ethernet::TcpFrameParams {
+                            src_ip: conn.remote_ip,
+                            dst_ip: conn.guest_ip,
+                            src_port: conn.remote_port,
+                            dst_port: conn.guest_port,
+                            seq: sent,
+                            ack: conn.last_ack,
+                            window: 0,
+                            src_mac: gw_mac,
+                            dst_mac: guest_mac,
+                        },
+                    ));
+                    to_remove.push(*key);
+                    continue;
+                }
+                if super::send_budget(sent, acked, window) == 0 && nothing_in_flight {
+                    match conn.window_stalled_at {
+                        None => conn.window_stalled_at = Some(now),
+                        Some(at)
+                            if now.duration_since(at) >= super::ZERO_WINDOW_PERSIST_INTERVAL =>
+                        {
+                            conn.window_stalled_at = Some(now);
+                            frames.push(crate::ethernet::build_tcp_data_frame(
+                                &crate::ethernet::TcpFrameParams {
+                                    src_ip: conn.remote_ip,
+                                    dst_ip: conn.guest_ip,
+                                    src_port: conn.remote_port,
+                                    dst_port: conn.guest_port,
+                                    seq: sent.wrapping_sub(1),
+                                    ack: conn.last_ack,
+                                    window: 65535,
+                                    src_mac: gw_mac,
+                                    dst_mac: guest_mac,
+                                },
+                                &[0u8],
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                } else {
+                    conn.window_stalled_at = None;
                 }
                 continue;
+            }
+            // A half-closed non-inline flow is fully done once the host has
+            // also EOF'd (our FIN was sent) and the guest ACKed that FIN.
+            if let Some(fin_at) = conn.guest_fin_at {
+                if conn.host_eof {
+                    if let Some(fin_seq) = conn.fin_seq {
+                        let acked_past_fin = conn
+                            .guest_acked
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .wrapping_sub(fin_seq);
+                        if (1..0x8000_0000).contains(&acked_past_fin) {
+                            to_remove.push(*key);
+                            continue;
+                        }
+                    }
+                }
+                // FIN_WAIT2 leak guard: the guest finished sending but the
+                // upstream keeps its write side open (or the guest silently
+                // dropped its FIN_WAIT2 state). The clock is refreshed on every
+                // host→guest byte below, so this only fires on a truly idle
+                // half-open — reap it instead of holding the entry + fd forever.
+                if now.duration_since(fin_at) >= super::HALF_CLOSE_TIMEOUT {
+                    tracing::debug!(
+                        "Fast path: half-close idle timeout, reaping {}:{} → {}:{}",
+                        key.src_ip,
+                        key.src_port,
+                        key.dst_ip,
+                        key.dst_port,
+                    );
+                    to_remove.push(*key);
+                    continue;
+                }
             }
             // ---- Sender-side loss recovery (runs for host_eof flows too:
             // in-flight data and the FIN itself still need repair) ----
@@ -391,6 +594,51 @@ impl TcpBridge {
             }
             let sent = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
             let in_flight = sent.wrapping_sub(acked);
+            // Dead-flow give-up: while soliciting (unACKed data or FIN being
+            // RTO-retransmitted, or a closed window under persist probes) a
+            // live guest always answers — with at least a dup-ACK or a
+            // window-bearing ACK. Prolonged unanswered soliciting means the
+            // guest endpoint is gone; without this the RTO path retransmits
+            // forever and the entry leaks its fd and retransmission buffer.
+            // Both clocks must be stale: a long-idle flow whose upstream just
+            // woke up starts the soliciting clock here and now, so its guest
+            // gets the full deadline to answer despite an ancient last frame.
+            let soliciting =
+                (in_flight > 0 && in_flight < 0x8000_0000) || conn.window_stalled_at.is_some();
+            if !soliciting {
+                conn.soliciting_since = None;
+            } else if conn.soliciting_since.is_none() {
+                conn.soliciting_since = Some(now);
+            }
+            if conn
+                .soliciting_since
+                .is_some_and(|since| now.duration_since(since) >= dead_flow_timeout)
+                && now.duration_since(conn.last_guest_activity) >= dead_flow_timeout
+            {
+                tracing::warn!(
+                    "Fast path: guest silent {:?} on soliciting flow {}:{} → {}:{}, RST + reap",
+                    dead_flow_timeout,
+                    key.src_ip,
+                    key.src_port,
+                    key.dst_ip,
+                    key.dst_port,
+                );
+                frames.push(crate::ethernet::build_tcp_rst_frame(
+                    &crate::ethernet::TcpFrameParams {
+                        src_ip: conn.remote_ip,
+                        dst_ip: conn.guest_ip,
+                        src_port: conn.remote_port,
+                        dst_port: conn.guest_port,
+                        seq: sent,
+                        ack: conn.last_ack,
+                        window: 0,
+                        src_mac: gw_mac,
+                        dst_mac: guest_mac,
+                    },
+                ));
+                to_remove.push(*key);
+                continue;
+            }
             if in_flight > 0 && in_flight < 0x8000_0000 {
                 let timed_out = now.duration_since(conn.last_progress) >= conn.rto;
                 if conn.fast_retransmit || timed_out {
@@ -464,9 +712,10 @@ impl TcpBridge {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .min(super::HONORED_WINDOW_CAP);
             let budget = super::send_budget(sent, acked, window) as usize;
-            if budget == 0 {
+            let cap = if budget == 0 {
                 if !conn.window_stalled {
                     conn.window_stalled = true;
+                    conn.window_stalled_at = Some(now);
                     tracing::debug!(
                         "Fast path window stall {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
                         conn.remote_ip,
@@ -475,19 +724,37 @@ impl TcpBridge {
                         conn.guest_port,
                     );
                 }
-                continue;
-            }
-            if conn.window_stalled {
-                conn.window_stalled = false;
-                tracing::debug!(
-                    "Fast path window reopened {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
-                    conn.remote_ip,
-                    conn.remote_port,
-                    conn.guest_ip,
-                    conn.guest_port,
-                );
-            }
-            let cap = budget.min(conn.read_buf.len());
+                // Zero-window persist: a window closed with nothing in flight is
+                // reopened only by a guest window-update ACK; if that ACK is
+                // lost the flow deadlocks. Probe with a single byte past the
+                // window on a timer to force the guest to re-advertise it. Once
+                // the probe byte is in flight, the RTO retransmit path above
+                // keeps probing on its own, so this only kicks the first byte.
+                let in_flight = sent.wrapping_sub(acked);
+                let nothing_in_flight = in_flight == 0 || in_flight >= 0x8000_0000;
+                let probe_due = conn.window_stalled_at.is_some_and(|at| {
+                    now.duration_since(at) >= super::ZERO_WINDOW_PERSIST_INTERVAL
+                });
+                if nothing_in_flight && probe_due {
+                    conn.window_stalled_at = Some(now);
+                    1 // one byte beyond the closed window
+                } else {
+                    continue;
+                }
+            } else {
+                if conn.window_stalled {
+                    conn.window_stalled = false;
+                    conn.window_stalled_at = None;
+                    tracing::debug!(
+                        "Fast path window reopened {}:{} → {}:{} (sent={sent}, acked={acked}, window={window})",
+                        conn.remote_ip,
+                        conn.remote_port,
+                        conn.guest_ip,
+                        conn.guest_port,
+                    );
+                }
+                budget.min(conn.read_buf.len())
+            };
 
             use std::io::Read;
             match conn.stream.read(&mut conn.read_buf[..cap]) {
@@ -519,6 +786,11 @@ impl TcpBridge {
                 }
                 Ok(n) => {
                     conn.down_bytes += n as u64;
+                    // Host→guest progress refreshes the half-close idle clock so
+                    // a slow but live streamed response is never reaped.
+                    if conn.guest_fin_at.is_some() {
+                        conn.guest_fin_at = Some(now);
+                    }
                     let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
                     conn.retransmit_buf.extend(&conn.read_buf[..n]);
                     emit_data_frames(&ctx, conn, seq_now, &conn.read_buf[..n], &mut frames);
@@ -571,10 +843,22 @@ impl TcpBridge {
         let Some(conn) = self.fast_path_conns.remove(key) else {
             return;
         };
+        // An inline flow shares its host socket with an independent reader (the
+        // inject thread / direct_rx task) holding a cloned fd. Dropping only our
+        // clone leaves that reader running on the sibling fd — spinning forever
+        // once its send window freezes. Signal its cancel flag and shut the
+        // socket so it exits and releases the fd (guest-initiated FIN/RST, and
+        // the host-error paths, all funnel through here).
+        if conn.inline_owned {
+            if let Some(dead) = &conn.dead {
+                dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+        }
         if conn.up_would_block + conn.up_short_writes + conn.up_out_of_order + conn.retransmits > 0
         {
             tracing::debug!(
-                "Fast path close {}:{} → {}:{}: loss recovery (up: would_block={}, short_writes={}, out_of_order={}; down: retransmits={})",
+                "Fast path close {}:{} → {}:{}: loss recovery (up: would_block={}, short_writes={}, out_of_order={}, ooo_dropped={}; down: retransmits={})",
                 key.src_ip,
                 key.src_port,
                 key.dst_ip,
@@ -582,6 +866,7 @@ impl TcpBridge {
                 conn.up_would_block,
                 conn.up_short_writes,
                 conn.up_out_of_order,
+                conn.up_ooo_dropped,
                 conn.retransmits,
             );
         }
@@ -621,6 +906,17 @@ impl TcpBridge {
         // Set non-blocking for polling in the event loop.
         stream.set_nonblocking(true).ok();
         stream.set_nodelay(true).ok();
+        // Keepalive on the upstream leg: a silently dead upstream (route
+        // flap, crashed proxy) otherwise never errors, leaving the guest leg
+        // ESTABLISHED forever. Applies to the underlying socket, so inline
+        // owners reading a cloned fd inherit it. See UPSTREAM_KEEPALIVE_*.
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(super::UPSTREAM_KEEPALIVE_IDLE)
+            .with_interval(super::UPSTREAM_KEEPALIVE_INTERVAL)
+            .with_retries(super::UPSTREAM_KEEPALIVE_RETRIES);
+        if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+            tracing::warn!("Fast path: keepalive setup failed for {key:?}: {e}");
+        }
 
         let last_ack_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(last_ack));
         let our_seq_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(our_seq));
@@ -720,7 +1016,11 @@ impl TcpBridge {
                 up_would_block: 0,
                 up_short_writes: 0,
                 up_out_of_order: 0,
+                ooo_segs: std::collections::VecDeque::new(),
+                ooo_bytes: 0,
+                up_ooo_dropped: 0,
                 window_stalled: false,
+                window_stalled_at: None,
                 retransmit_buf: std::collections::VecDeque::new(),
                 retransmit_seq: our_seq,
                 last_progress: std::time::Instant::now(),
@@ -735,11 +1035,14 @@ impl TcpBridge {
                     vec![0u8; 32768]
                 },
                 host_eof: false,
+                guest_fin_at: None,
                 inline_owned,
                 up_bytes: 0,
                 down_bytes: 0,
                 down_shared: if inline_owned { down_shared } else { None },
                 dead,
+                last_guest_activity: std::time::Instant::now(),
+                soliciting_since: None,
             },
         );
     }

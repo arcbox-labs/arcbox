@@ -358,8 +358,18 @@ pub mod privileged_log {
 
 /// Guest-side subdirectory names within `/arcbox/`.
 pub mod guest {
+    /// Mount point of the host data directory inside the guest.
+    ///
+    /// The `arcbox` VirtioFS tag is mounted here, so a host path under the
+    /// data directory is visible to the guest at the same relative path
+    /// below this prefix.
+    pub const MOUNT: &str = "/arcbox";
+
     /// Log directory inside the VirtioFS mount.
     pub const LOG: &str = "log";
+
+    /// Host-built artifacts the guest reads back (e.g. exported OCI layouts).
+    pub const CACHE: &str = "cache";
 }
 
 #[cfg(all(test, feature = "std"))]

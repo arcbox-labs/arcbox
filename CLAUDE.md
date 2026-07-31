@@ -12,10 +12,18 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 |--------|--------|----------|
 | Cold boot | <1.5s | ~2s |
 | Warm boot | <500ms | <1s |
-| Idle memory | <150MB | ~200MB |
+| Idle memory | <150MB (HV backend)¹ | ~200MB |
 | Idle CPU | <0.05% | <0.1% |
-| File I/O (vs native) | >90% | 75-95% |
+| File I/O | ≥100% of the best competitor guest² | 75-95% (vs native, their claim) |
 | Network throughput | >50 Gbps | ~45 Gbps |
+
+¹ Physically unreachable on VZ: host footprint pins at the configured
+  `memory_mb` from boot and ballooning cannot return it (evidence in
+  `app/arcbox-core/src/vm_lifecycle/balloon/mod.rs`). The VZ memory story
+  is right-sizing `memory_mb`.
+² Same-context comparison (container vs container, same-day pairing).
+  Cache-hot native is not a valid denominator for FUSE metadata —
+  methodology and current numbers in `docs/fs-perf-limits.md`.
 
 ## Platform Priority
 
@@ -29,7 +37,7 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `virt/` — Virtualization.framework bindings, cross-platform hypervisor traits, VMM, VirtIO devices, VirtioFS, networking (NAT/DHCP/DNS)
 - `rpc/` — protobuf definitions, gRPC services, vsock/unix transport
 - `runtime/` — container state, OCI image/runtime
-- `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`arcbox`), daemon binary (`arcbox-daemon`), facade crate
+- `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`abctl`, not `arcbox`), daemon binary (`arcbox-daemon`), facade crate
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — test resources and fixture build scripts
 - `.agents/skills/` — shared Claude Code skills (symlinked from `.claude/skills/`)
@@ -117,7 +125,7 @@ When asked to plan, the plan must be fully resolved before implementation begins
   ```
 - Requires Developer ID certificate (`.p12`) + provisioning profile (`.provisionprofile`). See `CONTRIBUTING.md` "Code Signing" section for setup.
 - Requires Xcode Command Line Tools
-- Some tasks require a running daemon. Start it in a background terminal: `arcbox daemon start`
+- Some tasks require a running daemon. Start it in a background terminal: `abctl daemon start`
 
 ## Guest Agent Cross-Compilation
 

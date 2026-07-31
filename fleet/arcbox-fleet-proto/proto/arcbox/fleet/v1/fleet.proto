@@ -136,6 +136,7 @@ message AttachRequest {
     Heartbeat heartbeat = 2;
     RunnerAccepted runner_accepted = 3;
     RunnerRejected runner_rejected = 4;
+    RunnerExited runner_exited = 5;
   }
 }
 
@@ -194,6 +195,21 @@ message RunnerRejected {
   string reason = 3;
 }
 
+// The runner of a started (accepted) job exited. A liveness hint, not an
+// outcome: every runner emits this when it finishes — on success right before
+// the job's own completion webhook — so the platform uses it only to fail fast
+// when no webhook follows within a grace window (the runner died before
+// completing anything: crashed guest, spent JIT config, refused registration).
+// Never sent for canceled jobs; the platform already concluded those. Resent
+// until acked via OfferVerdictAck echoing `ack_token`.
+message RunnerExited {
+  // Prefixed runner job id (`rjob_...`).
+  string job_id = 1;
+  // Resend-dedup correlation token, echoed back in OfferVerdictAck. Not an
+  // offer token — this event belongs to the job, not to any single offer.
+  string ack_token = 2;
+}
+
 message AttachResponse {
   oneof msg {
     // Handshake success — client proceeds to the heartbeat loop.
@@ -228,16 +244,17 @@ message HeartbeatAck {
   AgentUpdate update = 1;
 }
 
-// Tells the agent to stop resending an offer verdict
-// (RunnerAccepted/RunnerRejected): the gateway either durably handed it off to
-// the workflow (which also covers an offer whose workflow already moved on or
-// expired — the completion is accepted and dropped) or proved the verdict can
-// never be delivered — resending can achieve nothing more. Until it arrives,
-// the agent resends the same verdict so a gateway crash-after-read cannot
-// lose it; the echoed token lets the agent match the ack to the verdict it is
-// retrying.
+// Tells the agent to stop resending a tracked event — an offer verdict
+// (RunnerAccepted/RunnerRejected) or a RunnerExited: the gateway either
+// durably handed it off to the workflow (which also covers an offer whose
+// workflow already moved on or expired — the completion is accepted and
+// dropped) or proved the event can never be delivered — resending can achieve
+// nothing more. Until it arrives, the agent resends the same event so a
+// gateway crash-after-read cannot lose it; the echoed token lets the agent
+// match the ack to the event it is retrying.
 message OfferVerdictAck {
-  // Opaque correlation token from the offer, echoed back from the verdict.
+  // Opaque correlation token echoed back from the tracked event: the offer
+  // token of a verdict, or a RunnerExited `ack_token`.
   string offer_token = 1;
 }
 

@@ -42,6 +42,7 @@ pub fn resolve_grpc_socket_path() -> PathBuf {
     arcbox_constants::paths::HostLayout::from_env_or_default().grpc_socket
 }
 
+pub mod agent;
 pub mod boot;
 pub mod cli_plugins;
 pub mod daemon;
@@ -129,6 +130,9 @@ pub enum Commands {
     /// Manage sandboxes inside a machine
     #[command(subcommand)]
     Sandbox(sandbox::SandboxCommands),
+
+    /// Open Claude Code in a dedicated sandbox
+    Claude(agent::AgentArgs),
 
     /// Manage Docker CLI integration
     #[command(subcommand)]

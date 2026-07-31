@@ -391,10 +391,12 @@ impl NetworkManager {
     /// Handles a full DNS query: local resolution first, then upstream forwarding.
     /// This blocks on network I/O for upstream queries.
     pub fn handle_dns_query(&self, query: &[u8]) -> Result<Vec<u8>> {
-        // handle_query needs &mut self for cache updates, so take a write lock.
-        let mut forwarder = self
+        // Only a read lock: `handle_query` takes `&self` (its cache is behind
+        // an inner `Mutex`), so a slow upstream forward held here no longer
+        // blocks the `.read()`-taking local-resolution path.
+        let forwarder = self
             .dns_forwarder
-            .write()
+            .read()
             .map_err(|_| NetError::config("dns forwarder lock poisoned".to_string()))?;
         forwarder.handle_query(query)
     }

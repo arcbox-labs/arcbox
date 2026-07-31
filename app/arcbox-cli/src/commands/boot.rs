@@ -47,7 +47,7 @@ pub struct StatusArgs {
 // JSON output structures
 // =============================================================================
 
-/// JSON output for `arcbox boot status`.
+/// JSON output for `abctl boot status`.
 #[derive(Serialize)]
 struct StatusOutput {
     version: String,
@@ -81,7 +81,7 @@ struct ManifestInfo {
     source_sha: Option<String>,
 }
 
-/// NDJSON progress line for `arcbox boot prefetch`.
+/// NDJSON progress line for `abctl boot prefetch`.
 #[derive(Serialize, Default)]
 struct PrefetchProgress {
     phase: String,
@@ -101,13 +101,13 @@ struct PrefetchProgress {
     error: Option<String>,
 }
 
-/// JSON output for `arcbox boot list`.
+/// JSON output for `abctl boot list`.
 #[derive(Serialize)]
 struct ListOutput {
     versions: Vec<String>,
 }
 
-/// JSON output for `arcbox boot clear`.
+/// JSON output for `abctl boot clear`.
 #[derive(Serialize)]
 struct ClearOutput {
     cleared: bool,
@@ -243,7 +243,7 @@ async fn status(data_dir: PathBuf, args: StatusArgs, format: OutputFormat) -> an
                         println!("  Error:     {}", e);
                         println!();
                         println!("Boot will FAIL with the current assets.");
-                        println!("Run 'arcbox boot prefetch --force' to re-download.");
+                        println!("Run 'abctl boot prefetch --force' to re-download.");
                     }
                 }
             } else {
@@ -275,7 +275,7 @@ async fn status(data_dir: PathBuf, args: StatusArgs, format: OutputFormat) -> an
 
                 println!();
                 println!("Boot will FAIL without valid cached assets.");
-                println!("Run 'arcbox boot prefetch' to download boot assets.");
+                println!("Run 'abctl boot prefetch' to download boot assets.");
             }
         }
     }
@@ -535,7 +535,7 @@ async fn list(data_dir: PathBuf, format: OutputFormat) -> anyhow::Result<()> {
         OutputFormat::Table | OutputFormat::Quiet => {
             if versions.is_empty() {
                 println!("No cached versions found.");
-                println!("Run 'arcbox boot prefetch' to download boot assets.");
+                println!("Run 'abctl boot prefetch' to download boot assets.");
             } else {
                 println!("Cached versions:");
                 for version in versions {

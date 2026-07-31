@@ -15,14 +15,15 @@ pub use arcbox_constants::wire::MessageType;
 use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
     ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
-    ImageFsPathsRequest, ImageFsPathsResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
-    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
-    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-    KubernetesStopRequest, KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest,
-    MmapReadFileResponse, PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved,
-    ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
-    RuntimeStatusResponse, ShutdownRequest, ShutdownResponse, SystemInfo,
-    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+    EnsureNfsExportRequest, EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse,
+    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+    KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest, MmapReadFileResponse,
+    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+    ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
+    WatchReadinessRequest, WatchStatsRequest,
 };
 
 /// Agent version string.
@@ -84,6 +85,7 @@ pub enum RpcRequest {
     DiskTrim(DiskTrimRequest),
     ContainerFsPaths(ContainerFsPathsRequest),
     ImageFsPaths(ImageFsPathsRequest),
+    EnsureNfsExport(EnsureNfsExportRequest),
     WatchReadiness(WatchReadinessRequest),
     WatchMemoryPressure(WatchMemoryPressureRequest),
     WatchStats(WatchStatsRequest),
@@ -114,6 +116,7 @@ pub enum RpcResponse {
     MmapReadFile(MmapReadFileResponse),
     ContainerFsPaths(ContainerFsPathsResponse),
     ImageFsPaths(ImageFsPathsResponse),
+    EnsureNfsExport(EnsureNfsExportResponse),
     /// Test-only: acknowledgement for [`RpcRequest::KillAgent`].
     KillAgent,
 }
@@ -142,6 +145,7 @@ impl RpcResponse {
             Self::MmapReadFile(_) => MessageType::MmapReadFileResponse,
             Self::ContainerFsPaths(_) => MessageType::ContainerFsPathsResponse,
             Self::ImageFsPaths(_) => MessageType::ImageFsPathsResponse,
+            Self::EnsureNfsExport(_) => MessageType::EnsureNfsExportResponse,
             Self::KillAgent => MessageType::KillAgentResponse,
         }
     }
@@ -169,6 +173,7 @@ impl RpcResponse {
             Self::MmapReadFile(msg) => msg.encode_to_vec(),
             Self::ContainerFsPaths(msg) => msg.encode_to_vec(),
             Self::ImageFsPaths(msg) => msg.encode_to_vec(),
+            Self::EnsureNfsExport(msg) => msg.encode_to_vec(),
             Self::KillAgent => Empty::default().encode_to_vec(),
         }
     }
@@ -348,6 +353,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::ImageFsPathsRequest => {
             let req = ImageFsPathsRequest::decode(payload)?;
             Ok(RpcRequest::ImageFsPaths(req))
+        }
+        MessageType::EnsureNfsExportRequest => {
+            let req = EnsureNfsExportRequest::decode(payload)?;
+            Ok(RpcRequest::EnsureNfsExport(req))
         }
         MessageType::WatchReadinessRequest => {
             let req = WatchReadinessRequest::decode(payload)?;

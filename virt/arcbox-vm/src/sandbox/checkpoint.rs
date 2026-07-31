@@ -24,6 +24,14 @@ async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 impl SandboxManager {
+    /// Rootfs images that existing snapshots need to stay restorable.
+    ///
+    /// Exposed so whoever owns the converted-rootfs cache can pin them; see
+    /// [`SnapshotCatalog::referenced_rootfs_paths`].
+    pub fn pinned_rootfs_paths(&self) -> Result<std::collections::BTreeSet<PathBuf>> {
+        self.snapshots.referenced_rootfs_paths()
+    }
+
     pub async fn checkpoint_sandbox(
         &self,
         sandbox_id: &SandboxId,
@@ -45,20 +53,26 @@ impl SandboxManager {
         };
 
         let vm = self.get_vm_handle(sandbox_id)?;
-        let snapshot_id = Uuid::new_v4().to_string();
+
+        // Staging directory outside the catalog: the snapshot becomes visible
+        // only on commit, and dropping `pending` on any error below takes the
+        // directory and whatever partial vmstate/mem it holds with it.
+        let pending = self.snapshots.begin(sandbox_id)?;
+        let snapshot_id = pending.id().to_owned();
+        let staging_dir = pending.dir();
 
         // Pause before snapshotting.
         vm.pause().await.map_err(VmmError::from)?;
 
         // Everything between pause and resume is fallible (chroot dir setup,
-        // chown, catalog dir prep, the snapshot RPC). Run it in a block whose
-        // result is handled only AFTER an unconditional resume — a bare `?`
-        // here previously left the guest paused forever, wedging every later
-        // RPC. Returns the chroot snapshot dir (jailer mode) to move afterward.
+        // chown, the snapshot RPC). Run it in a block whose result is handled
+        // only AFTER an unconditional resume — a bare `?` here previously left
+        // the guest paused forever, wedging every later RPC. Returns the chroot
+        // snapshot dir (jailer mode) to move afterward.
         //
         // In jailer mode FC runs inside a chroot and can only write to paths
         // within it, so the snapshot is written to a chroot-local dir and moved
-        // to the catalog after resume.
+        // into staging after resume.
         let paused: Result<Option<PathBuf>> = async {
             let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
                 if let Some(ref jc) = self.config.firecracker.jailer {
@@ -77,10 +91,9 @@ impl SandboxManager {
                     let fc_mem = format!("/snapshots/{snapshot_id}/mem");
                     (fc_vmstate, fc_mem, Some(chroot_snap))
                 } else {
-                    let snap_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
                     (
-                        snap_dir.join("vmstate").to_str().unwrap().to_owned(),
-                        snap_dir.join("mem").to_str().unwrap().to_owned(),
+                        staging_dir.join("vmstate").to_str().unwrap().to_owned(),
+                        staging_dir.join("mem").to_str().unwrap().to_owned(),
                         None,
                     )
                 };
@@ -97,40 +110,30 @@ impl SandboxManager {
 
         let chroot_snap_dir_opt = paused?;
 
-        // If jailer mode, move snapshot files from chroot to the catalog dir.
-        let (vmstate_path, mem_path) = if let Some(chroot_snap) = chroot_snap_dir_opt {
-            let catalog_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
-            let dst_vmstate = catalog_dir.join("vmstate");
-            let dst_mem = catalog_dir.join("mem");
-            move_file(&chroot_snap.join("vmstate"), &dst_vmstate)
+        // If jailer mode, move snapshot files from the chroot into staging.
+        if let Some(chroot_snap) = chroot_snap_dir_opt {
+            move_file(&chroot_snap.join("vmstate"), &staging_dir.join("vmstate"))
                 .await
                 .map_err(VmmError::Io)?;
             if chroot_snap.join("mem").exists() {
-                move_file(&chroot_snap.join("mem"), &dst_mem)
+                move_file(&chroot_snap.join("mem"), &staging_dir.join("mem"))
                     .await
                     .map_err(VmmError::Io)?;
             }
             let _ = tokio::fs::remove_dir_all(&chroot_snap).await;
-            (dst_vmstate, dst_mem)
-        } else {
-            let snap_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
-            (snap_dir.join("vmstate"), snap_dir.join("mem"))
-        };
+        }
 
         // Store kernel/rootfs template paths so restore can re-derive them.
         // Jailer mode needs them for chroot staging; direct mode needs the
         // rootfs path to set up a fresh dm-snapshot and retarget the
         // vmstate-recorded symlink.
-        let meta = self.snapshots.register(
-            sandbox_id,
-            Some(name),
-            crate::config::SnapshotType::Full,
-            vmstate_path,
-            Some(mem_path),
-            None,
-            Some(kernel_path),
-            Some(rootfs_path),
-        )?;
+        let meta = pending.commit(SnapshotDraft {
+            name: Some(name),
+            snapshot_type: crate::config::SnapshotType::Full,
+            parent_id: None,
+            kernel_path: Some(kernel_path),
+            rootfs_path: Some(rootfs_path),
+        })?;
 
         let snap_dir_path = meta
             .vmstate_path

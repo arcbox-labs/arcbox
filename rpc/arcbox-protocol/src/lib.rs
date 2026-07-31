@@ -94,16 +94,16 @@ pub mod image {
 pub mod agent {
     pub use super::v1::{
         AgentPingRequest, AgentPingResponse, ContainerFsPathsRequest, ContainerFsPathsResponse,
-        ContainerStats, DiskTrimRequest, DiskTrimResponse, ImageFsPathsRequest,
-        ImageFsPathsResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
-        KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
-        KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-        KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
-        MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved,
-        ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
-        RuntimeStatusResponse, ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo,
-        WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
-        memory_pressure_event, readiness_event,
+        ContainerStats, DiskTrimRequest, DiskTrimResponse, EnsureNfsExportRequest,
+        EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse,
+        KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+        KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+        KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+        KubernetesStopResponse, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
+        MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
+        RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+        ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
+        WatchReadinessRequest, WatchStatsRequest, memory_pressure_event, readiness_event,
     };
 
     // Backward compatibility type aliases (short names without Agent prefix).

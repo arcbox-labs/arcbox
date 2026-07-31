@@ -55,7 +55,7 @@ pub fn hosts_alias_installed(hosts_content: &str) -> bool {
 #[tarpc::service]
 pub trait HelperService {
     /// Adds a host route for `subnet` via `iface`.
-    /// Idempotent: returns Ok if the route already exists.
+    /// Returns `RouteConflict` without modifying an exact existing route.
     async fn route_add(subnet: String, iface: String) -> Result<(), HelperError>;
 
     /// Removes the host route for `subnet`.

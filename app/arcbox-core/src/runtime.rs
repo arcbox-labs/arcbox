@@ -15,7 +15,9 @@ use crate::machine::{MachineManager, MachineState};
 use crate::macos::MacMachineManager;
 use crate::migration::MigrationManager;
 use crate::vm::VmManager;
-use crate::vm_lifecycle::{DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager};
+use crate::vm_lifecycle::{
+    DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager, VmLifecycleState,
+};
 use arcbox_net::NetworkManager;
 #[cfg(target_os = "macos")]
 use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
@@ -35,6 +37,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::watch;
 
 /// Default guest VM IP address in NAT network (used by PortForwarder fallback).
 #[cfg(not(target_os = "macos"))]
@@ -482,6 +485,15 @@ impl Runtime {
     #[must_use]
     pub fn system_vm_restart_generation(&self) -> u64 {
         self.vm_lifecycle.restart_generation()
+    }
+
+    /// Subscribes to the System VM's lifecycle state transitions.
+    ///
+    /// This is the only signal that reports the VM coming *up*; the restart
+    /// generation above only marks it going down.
+    #[must_use]
+    pub fn subscribe_system_vm_state(&self) -> watch::Receiver<VmLifecycleState> {
+        self.vm_lifecycle.subscribe_state()
     }
 
     /// Returns the guest dockerd vsock port for the System VM.

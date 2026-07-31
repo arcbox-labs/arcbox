@@ -6,8 +6,8 @@ use std::sync::Arc;
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_server::FleetLifecycleService;
 use arcbox_fleet_control_proto::v1::{
     DrainRequest, DrainResponse, EnrollRequest, EnrollResponse, GetAgentInfoRequest,
-    GetAgentInfoResponse, GetStatusRequest, GetStatusResponse, ResumeRequest, ResumeResponse,
-    UnenrollRequest, UnenrollResponse,
+    GetAgentInfoResponse, GetStatusRequest, GetStatusResponse, RestartRequest, RestartResponse,
+    ResumeRequest, ResumeResponse, UnenrollRequest, UnenrollResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -35,6 +35,9 @@ impl FleetLifecycleService for LifecycleService {
         _request: Request<GetAgentInfoRequest>,
     ) -> Result<Response<GetAgentInfoResponse>, Status> {
         let mut features = Vec::new();
+        // Restarting the process in place is a capability older builds
+        // lack, so clients probe for it instead of gating on the version.
+        features.push("restart".to_owned());
         if self.supervisor.vm_active() {
             // The local daemon serves disposable macOS guests for darwin
             // jobs (see crate::vm).
@@ -49,6 +52,7 @@ impl FleetLifecycleService for LifecycleService {
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
             api_version: API_VERSION,
             features,
+            instance_id: self.supervisor.instance_id().to_owned(),
         }))
     }
 
@@ -90,6 +94,14 @@ impl FleetLifecycleService for LifecycleService {
     ) -> Result<Response<UnenrollResponse>, Status> {
         self.supervisor.unenroll().await?;
         Ok(Response::new(UnenrollResponse {}))
+    }
+
+    async fn restart(
+        &self,
+        request: Request<RestartRequest>,
+    ) -> Result<Response<RestartResponse>, Status> {
+        self.supervisor.restart(request.into_inner().force).await?;
+        Ok(Response::new(RestartResponse {}))
     }
 
     async fn get_status(

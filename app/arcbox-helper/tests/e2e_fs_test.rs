@@ -44,14 +44,15 @@ impl HelperFixture {
         fs::write(etc.join("hosts"), "##\n127.0.0.1\tlocalhost\n").unwrap();
 
         let home = std::env::var("HOME").expect("HOME required for CliTarget-shaped paths");
-        // Unique per fixture so parallel tokio tests do not collide.
+        // Unique per fixture so parallel tokio tests do not collide. All tests
+        // share one process, so the PID is not distinguishing; a monotonic
+        // counter guarantees a distinct root even when two fixtures start
+        // within the same nanosecond.
+        static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let home_root = PathBuf::from(&home).join(format!(
             ".arcbox-helper-e2e-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&home_root);
         fs::create_dir_all(&home_root).unwrap();

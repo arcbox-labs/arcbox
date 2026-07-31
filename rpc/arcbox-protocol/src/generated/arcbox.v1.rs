@@ -3372,6 +3372,26 @@ pub struct ImageFsPathsResponse {
     #[prost(string, repeated, tag = "1")]
     pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// Ask the guest agent to bring up the read-only NFS export of the docker
+/// data mount (browsable on the host at `~/ArcBox`). The host daemon sends
+/// this only when the mount is enabled, so a daemon started with
+/// `--no-mount-nfs` never sends it and the guest runs no nfsd at all. The
+/// agent ensures the docker data mount exists first, so the request is safe
+/// to send at any point after the agent is up.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnsureNfsExportRequest {}
+/// Response to `EnsureNfsExportRequest`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnsureNfsExportResponse {
+    /// Human-readable setup notes (mounts bound, exportfs refreshed, nfsd
+    /// threads started).
+    #[prost(string, repeated, tag = "1")]
+    pub notes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
 /// Subscription request for machine stats.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
