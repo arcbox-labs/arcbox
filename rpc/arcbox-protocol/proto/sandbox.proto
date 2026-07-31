@@ -2,69 +2,104 @@
 //
 // A sandbox is a short-lived, strongly-isolated microVM bound to a single
 // workload (function, task, or container). Unlike MachineService VMs, a
-// sandbox is decoupled from its workload: the initial cmd process exiting does
-// NOT destroy the sandbox — it simply transitions back to "ready" and continues
-// accepting Run calls until an explicit Stop/Remove or TTL expiry.
+// sandbox is decoupled from its workload: an execution exiting does NOT
+// destroy the sandbox — it transitions back to READY and continues accepting
+// StartExecution calls until an explicit Stop/Remove or TTL expiry.
 //
-// Create returns immediately with state "starting"; callers subscribe to
-// Events (action="ready") or poll Inspect to learn when the sandbox is usable.
+// Create returns immediately with state STARTING; callers subscribe to
+// Events (kind READY) or poll Inspect to learn when the sandbox is usable.
+//
+// Executions are addressable and resumable (CORE-55): StartExecution gives a
+// process an identity that survives any client connection. Output is
+// offset-addressed per channel, so a client that loses its AttachExecution
+// stream re-attaches at its last offsets and re-reads without loss; stdin
+// writes are offset-idempotent, so a retried WriteStdin never double-feeds
+// the process. Signals, TTY resize, and exit status go through the execution
+// id, never through a stream.
 //
 // Two services are defined:
-//   - SandboxService         : core lifecycle (create / run / exec / stop / remove)
+//   - SandboxService         : lifecycle, executions, files, ports, events
 //   - SandboxSnapshotService : checkpoint / restore for cold-start optimisation
 
 syntax = "proto3";
 
 package sandbox.v1;
 
-// =============================================================================
-// SandboxService
-// =============================================================================
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 // SandboxService manages short-lived, strongly-isolated microVM sandboxes.
 service SandboxService {
-    // Create a sandbox and return immediately with state "starting".
-    // Subscribe to Events or poll Inspect to wait for state "ready".
+    // Create a sandbox and return immediately with state STARTING.
+    // Subscribe to Events or poll Inspect to wait for state READY.
     rpc Create(CreateSandboxRequest) returns (CreateSandboxResponse);
 
-    // Run a command inside a sandbox and stream its output.
-    // The stream closes with a final RunOutput{done: true} carrying the exit
-    // code. The sandbox remains alive after the command exits.
-    rpc Run(RunRequest) returns (stream RunOutput);
+    // Start an execution inside a READY sandbox and return its identity.
+    // Retrying with the same execution_id and command is idempotent: the
+    // existing execution is returned instead of a second process starting.
+    // Consume output via AttachExecution; await the result via WaitExecution.
+    rpc StartExecution(StartExecutionRequest) returns (Execution);
 
-    // Execute an interactive command inside a sandbox with full stdin support.
-    // Send ExecInput{init: ...} as the first message to start the process,
-    // then stream ExecInput{stdin: ...} for input and ExecInput{resize: ...}
-    // for TTY resize events.
-    rpc Exec(stream ExecInput) returns (stream ExecOutput);
+    // Stream an execution's output from the given per-channel offsets.
+    // Buffered output replays first (from the earliest retained byte when
+    // retention already dropped the requested offset — chunk offsets expose
+    // the gap), then live output follows. The stream ends with an Exited
+    // event. KeepAlive frames are interleaved while idle so proxies do not
+    // cut the connection. Multiple concurrent attaches are allowed.
+    rpc AttachExecution(AttachExecutionRequest) returns (stream ExecutionEvent);
 
-    // Stop a sandbox gracefully (waits for any active workload to exit, then
-    // shuts down the VM).
-    rpc Stop(StopSandboxRequest) returns (Empty);
+    // Write stdin bytes at an absolute offset (offset-idempotent).
+    // Bytes below the accepted count are deduplicated; an offset past the
+    // accepted count fails with OUT_OF_RANGE carrying the resume point.
+    rpc WriteStdin(WriteStdinRequest) returns (StdinStatus);
+
+    // Client-streaming variant of WriteStdin for high-volume stdin. Frames
+    // follow the same offset semantics; the final status is returned once.
+    rpc StreamStdin(stream WriteStdinRequest) returns (StdinStatus);
+
+    // Report how many stdin bytes the server has accepted — the offset a
+    // client must resume from after a lost WriteStdin response.
+    rpc GetStdinStatus(GetStdinStatusRequest) returns (StdinStatus);
+
+    // Deliver a POSIX signal to a running execution's process group,
+    // without holding any stream.
+    rpc SignalExecution(SignalExecutionRequest) returns (google.protobuf.Empty);
+
+    // Resize a TTY execution's terminal.
+    rpc ResizeExecutionTty(ResizeExecutionTtyRequest) returns (google.protobuf.Empty);
+
+    // Wait until an execution exits or the timeout elapses, then return its
+    // state (a zero timeout polls). The exit status distinguishes a normal
+    // exit code from death by signal.
+    rpc WaitExecution(WaitExecutionRequest) returns (Execution);
+
+    // Stop a sandbox gracefully (waits for any active execution to exit,
+    // then shuts down the VM).
+    rpc Stop(StopSandboxRequest) returns (google.protobuf.Empty);
 
     // Forcibly destroy a sandbox and release all resources immediately.
-    rpc Remove(RemoveSandboxRequest) returns (Empty);
+    rpc Remove(RemoveSandboxRequest) returns (google.protobuf.Empty);
 
     // Return the current state and metadata of a sandbox.
     rpc Inspect(InspectSandboxRequest) returns (SandboxInfo);
 
-    // List sandboxes, optionally filtered by state or labels.
+    // List sandboxes, optionally filtered by state or labels. Paginated.
     rpc List(ListSandboxesRequest) returns (ListSandboxesResponse);
 
-    // Subscribe to sandbox lifecycle events.
-    // Emitted actions: "created" | "ready" | "running" | "idle" |
-    //                  "stopping" | "stopped" | "failed" | "removed"
-    rpc Events(SandboxEventsRequest) returns (stream SandboxEvent);
+    // Subscribe to sandbox lifecycle events. KeepAlive frames are
+    // interleaved while idle so proxies do not cut the connection.
+    rpc Events(SandboxEventsRequest) returns (stream WatchEventsResponse);
 
     // Read a file from inside a sandbox as a stream of chunks.
     // The final chunk has done == true. The sandbox must be alive
-    // (ready or running). Limited to 256 MiB per file.
+    // (READY or RUNNING). Limited to 256 MiB per file. Servers may emit
+    // empty non-final chunks as keepalives.
     rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
 
     // Write a file into a sandbox. The first message must carry `open`;
     // subsequent messages stream `chunk` payloads, the last one with
     // done == true. Limited to 256 MiB per file.
-    rpc WriteFile(stream WriteFileRequest) returns (Empty);
+    rpc WriteFile(stream WriteFileRequest) returns (google.protobuf.Empty);
 
     // Expose a sandbox port on the host. The guest installs a DNAT rule from
     // a reserved guest port (40000-49999) to the sandbox, and the daemon
@@ -73,12 +108,8 @@ service SandboxService {
     rpc ExposePort(ExposePortRequest) returns (ExposePortResponse);
 
     // Remove a previously exposed port mapping.
-    rpc UnexposePort(UnexposePortRequest) returns (Empty);
+    rpc UnexposePort(UnexposePortRequest) returns (google.protobuf.Empty);
 }
-
-// =============================================================================
-// SandboxSnapshotService
-// =============================================================================
 
 // SandboxSnapshotService provides checkpoint / restore for cold-start
 // optimisation. A snapshot captures a fully-booted, idle sandbox so that
@@ -86,35 +117,129 @@ service SandboxService {
 service SandboxSnapshotService {
     // Checkpoint a sandbox into a reusable snapshot.
     // The sandbox is paused, snapshotted, then resumed automatically.
-    // The sandbox must be in "ready" or "idle" state.
+    // The sandbox must be in READY state with no active execution.
     rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
 
     // Restore a new sandbox from a previously created snapshot.
-    // The restored sandbox starts in "ready" state; boot time is near-zero.
+    // The restored sandbox starts in READY state; boot time is near-zero.
     rpc Restore(RestoreRequest) returns (RestoreResponse);
 
-    // List all snapshots, optionally filtered by origin sandbox or label.
+    // List snapshots, optionally filtered by origin sandbox or label.
+    // Paginated.
     rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
 
     // Delete a snapshot and its on-disk data.
-    rpc DeleteSnapshot(DeleteSnapshotRequest) returns (Empty);
+    rpc DeleteSnapshot(DeleteSnapshotRequest) returns (google.protobuf.Empty);
 }
 
-// =============================================================================
-// Common
-// =============================================================================
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
 
-// Empty response / request.
-message Empty {}
+// Lifecycle state of a sandbox.
+//
+// State machine:
+//
+//   STARTING ──► READY ──► RUNNING ──► READY  (execution exited, sandbox alive)
+//                  │          │
+//                  └──────────┴──► STOPPING ──► STOPPED
+//                                       │
+//                                    FAILED
+enum SandboxState {
+    SANDBOX_STATE_UNSPECIFIED = 0;
+    // Firecracker process spawned; VM still booting.
+    SANDBOX_STATE_STARTING = 1;
+    // VM booted and accepting executions (or the last execution exited).
+    SANDBOX_STATE_READY = 2;
+    // An execution is currently running inside the VM.
+    SANDBOX_STATE_RUNNING = 3;
+    // Stop called; draining the workload and shutting down the VM.
+    SANDBOX_STATE_STOPPING = 4;
+    // VM has shut down cleanly.
+    SANDBOX_STATE_STOPPED = 5;
+    // Unrecoverable error occurred.
+    SANDBOX_STATE_FAILED = 6;
+}
 
-// =============================================================================
+// Kind of a sandbox lifecycle event.
+enum SandboxEventKind {
+    SANDBOX_EVENT_KIND_UNSPECIFIED = 0;
+    // Sandbox record created, VM booting.
+    SANDBOX_EVENT_KIND_CREATED = 1;
+    // VM booted, sandbox accepting executions.
+    SANDBOX_EVENT_KIND_READY = 2;
+    // An execution started.
+    SANDBOX_EVENT_KIND_RUNNING = 3;
+    // The active execution exited; sandbox back to READY. Attributes carry
+    // "exit_code" (shell convention) and "signal" when killed by one, or
+    // "error" when the session broke before an exit was observed.
+    SANDBOX_EVENT_KIND_IDLE = 4;
+    // Stop called, draining the workload.
+    SANDBOX_EVENT_KIND_STOPPING = 5;
+    // VM shut down.
+    SANDBOX_EVENT_KIND_STOPPED = 6;
+    // Unrecoverable error; attributes carry "error".
+    SANDBOX_EVENT_KIND_FAILED = 7;
+    // Sandbox deleted.
+    SANDBOX_EVENT_KIND_REMOVED = 8;
+}
+
+// Lifecycle state of an execution.
+enum ExecutionState {
+    EXECUTION_STATE_UNSPECIFIED = 0;
+    EXECUTION_STATE_RUNNING = 1;
+    EXECUTION_STATE_EXITED = 2;
+}
+
+// Stdio channel of an execution output chunk. Offsets are tracked per
+// channel. A TTY execution produces one merged stream on PTY (stdout and
+// stderr are indistinguishable once a terminal is allocated); non-TTY
+// executions produce STDOUT and STDERR.
+enum StdioChannel {
+    STDIO_CHANNEL_UNSPECIFIED = 0;
+    STDIO_CHANNEL_STDOUT = 1;
+    STDIO_CHANNEL_STDERR = 2;
+    STDIO_CHANNEL_PTY = 3;
+}
+
+// Sandbox network mode.
+enum NetworkMode {
+    // Daemon default (currently ENABLED).
+    NETWORK_MODE_UNSPECIFIED = 0;
+    // Networked sandbox with an IP from the sandbox pool.
+    NETWORK_MODE_ENABLED = 1;
+    // No network device.
+    NETWORK_MODE_NONE = 2;
+}
+
+// Transport protocol of an exposed port.
+enum PortProtocol {
+    // Defaults to TCP.
+    PORT_PROTOCOL_UNSPECIFIED = 0;
+    PORT_PROTOCOL_TCP = 1;
+    PORT_PROTOCOL_UDP = 2;
+}
+
+// Deliverable POSIX signals. Values match the POSIX signal numbers.
+enum Signal {
+    SIGNAL_UNSPECIFIED = 0;
+    SIGNAL_SIGHUP = 1;
+    SIGNAL_SIGINT = 2;
+    SIGNAL_SIGQUIT = 3;
+    SIGNAL_SIGKILL = 9;
+    SIGNAL_SIGUSR1 = 10;
+    SIGNAL_SIGUSR2 = 12;
+    SIGNAL_SIGTERM = 15;
+}
+
+// ---------------------------------------------------------------------------
 // Resource primitives
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Network configuration for a sandbox.
 message NetworkSpec {
-    // Network mode: "tap" (default, TAP + IP pool) or "none" (no network).
-    string mode = 1;
+    // Network mode (UNSPECIFIED = daemon default).
+    NetworkMode mode = 1;
 }
 
 // A single bind mount into the sandbox.
@@ -135,7 +260,7 @@ message ResourceLimits {
     uint64 memory_mib = 2;
 }
 
-// Terminal size for TTY resize events.
+// Terminal size for TTY executions.
 message TerminalSize {
     // Terminal width in columns.
     uint32 width = 1;
@@ -143,9 +268,24 @@ message TerminalSize {
     uint32 height = 2;
 }
 
-// =============================================================================
+// How a process terminated: a normal exit code or death by signal.
+// Exactly one is set once the execution has exited.
+message ExitStatus {
+    oneof status {
+        // The process exited normally with this code.
+        int32 code = 1;
+        // The process was killed by this POSIX signal.
+        int32 signal = 2;
+    }
+}
+
+// An empty frame keeping an otherwise idle stream alive through proxies and
+// load balancers.
+message KeepAlive {}
+
+// ---------------------------------------------------------------------------
 // CreateSandbox
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Request to create a sandbox.
 message CreateSandboxRequest {
@@ -175,9 +315,9 @@ message CreateSandboxRequest {
     // oci2rootfs release.
     string image = 7;
     // Initial command launched automatically after boot.
-    // Empty = sandbox enters "ready" without running anything.
-    // When this process exits the sandbox transitions back to "ready"
-    // (NOT destroyed) and continues accepting Run calls.
+    // Empty = sandbox enters READY without running anything.
+    // When this process exits the sandbox transitions back to READY
+    // (NOT destroyed) and continues accepting executions.
     repeated string cmd = 8;
     // Environment variables for the initial command.
     map<string, string> env = 9;
@@ -202,111 +342,193 @@ message CreateSandboxRequest {
 
     // --- Provisioning ---
     // NOT supported in Sandbox V1: a set value is rejected with
-    // FAILED_PRECONDITION. Use Exec for interactive access.
+    // FAILED_PRECONDITION. Use executions for interactive access.
     optional string ssh_public_key = 15;
 
     reserved 16;
 }
 
 // Response to CreateSandbox.
-// Returned immediately; the sandbox may still be booting (state "starting").
+// Returned immediately; the sandbox may still be booting (state STARTING).
 message CreateSandboxResponse {
     // Assigned or caller-supplied sandbox ID.
     string id = 1;
-    // IP address pre-allocated for the sandbox (empty if mode = "none").
-    // Available even while state is "starting".
+    // IP address pre-allocated for the sandbox (empty when network mode is
+    // NONE). Available even while state is STARTING.
     string ip_address = 2;
-    // State at time of response: always "starting".
-    string state = 3;
+    // State at time of response: always STARTING.
+    SandboxState state = 3;
 }
 
-// =============================================================================
-// Run
-// =============================================================================
+// ---------------------------------------------------------------------------
+// Executions
+// ---------------------------------------------------------------------------
 
-// Request to run a command inside a ready sandbox.
-// The sandbox must be in "ready" or "idle" state; if it is "running" the call
-// returns FAILED_PRECONDITION.
-message RunRequest {
-    // Sandbox ID.
+// The state of an execution — the resource all execution RPCs address.
+message Execution {
+    // Execution ID, unique within its sandbox.
     string id = 1;
+    // Owning sandbox.
+    string sandbox_id = 2;
+    // Current state.
+    ExecutionState state = 3;
+    // Whether the process runs on a pseudo-TTY.
+    bool tty = 4;
+    // When the process was dispatched.
+    google.protobuf.Timestamp started_at = 5;
+    // When the process terminated (unset while running).
+    google.protobuf.Timestamp exited_at = 6;
+    // How the process terminated. Unset while running, and also when the
+    // execution ended without an observed exit (see `error`).
+    ExitStatus exit_status = 7;
+    // Set when the execution ended without an observed exit (e.g. the
+    // sandbox stopped or the in-guest session broke).
+    string error = 8;
+    // Total bytes produced on stdout/PTY so far (monotonic; the high-water
+    // offset for AttachExecution resume).
+    uint64 stdout_len = 9;
+    // Total bytes produced on stderr so far.
+    uint64 stderr_len = 10;
+    // Stdin acceptance state.
+    StdinStatus stdin = 11;
+}
+
+// Request to start an execution.
+message StartExecutionRequest {
+    // Target sandbox. Must be READY.
+    string sandbox_id = 1;
+    // Caller-supplied execution ID (unique within the sandbox) making the
+    // start idempotent across retries. Empty = server generates a UUID.
+    string execution_id = 2;
     // Command and arguments.
-    repeated string cmd = 2;
+    repeated string cmd = 3;
     // Environment variable overrides.
-    map<string, string> env = 3;
+    map<string, string> env = 4;
     // Working directory (empty = rootfs default).
-    string working_dir = 4;
+    string working_dir = 5;
     // User to run as (empty = rootfs default).
-    string user = 5;
-    // Allocate a pseudo-TTY.
-    bool tty = 6;
-    // Kill the command after this many seconds (0 = no timeout).
-    uint32 timeout_seconds = 7;
+    string user = 6;
+    // Allocate a pseudo-TTY. Output then arrives on the PTY channel and
+    // stdin cannot be closed via `eof` (send Ctrl-D instead).
+    bool tty = 7;
+    // Initial terminal size (only meaningful when tty == true).
+    TerminalSize tty_size = 8;
+    // Kill the process after this many seconds (0 = no timeout).
+    uint32 timeout_seconds = 9;
+    // Keep stdin open for WriteStdin. When false the process starts with
+    // stdin already at EOF (run semantics).
+    bool stdin = 10;
 }
 
-// A single chunk of streaming output from Run.
-message RunOutput {
-    // Stream name: "stdout" | "stderr" | "exit".
-    string stream = 1;
-    // Raw output bytes (empty when stream == "exit").
-    bytes data = 2;
-    // Process exit code. Only valid on the final message (done == true).
-    int32 exit_code = 3;
-    // True on the last message of the stream.
-    bool done = 4;
+// Request to attach to an execution's output.
+message AttachExecutionRequest {
+    // Owning sandbox.
+    string sandbox_id = 1;
+    // Execution to attach to.
+    string execution_id = 2;
+    // Resume offset for the stdout/PTY channel (0 = from the beginning of
+    // the retained buffer).
+    uint64 stdout_offset = 3;
+    // Resume offset for the stderr channel.
+    uint64 stderr_offset = 4;
 }
 
-// =============================================================================
-// Exec  (bidirectional stream)
-// =============================================================================
-
-// A single message sent by the client during an Exec session.
-message ExecInput {
-    oneof payload {
-        // Must be the first message in the stream. Carries command parameters.
-        ExecRequest init = 1;
-        // Subsequent messages: raw bytes forwarded to the process stdin.
-        bytes stdin = 2;
-        // Resize the pseudo-TTY. Only valid when ExecRequest.tty == true.
-        TerminalSize resize = 3;
+// One frame of an AttachExecution stream.
+message ExecutionEvent {
+    oneof event {
+        // First frame of every attach: the execution's current state.
+        ExecutionStarted started = 1;
+        // A chunk of process output.
+        ExecutionOutput output = 2;
+        // Final frame: the execution terminated.
+        ExecutionExited exited = 3;
+        // Idle-stream keepalive; carries no data.
+        KeepAlive keep_alive = 4;
     }
 }
 
-// Parameters for starting an exec session. Sent as ExecInput{init: ...}.
-message ExecRequest {
-    // Sandbox ID.
-    string id = 1;
-    // Command and arguments.
-    repeated string cmd = 2;
-    // Environment variable overrides.
-    map<string, string> env = 3;
-    // Working directory.
-    string working_dir = 4;
-    // User to run as.
-    string user = 5;
-    // Allocate a pseudo-TTY.
-    bool tty = 6;
-    // Initial terminal size (required when tty == true).
-    TerminalSize tty_size = 7;
-    // Kill the command after this many seconds (0 = no timeout).
-    uint32 timeout_seconds = 8;
+// Attach preamble carrying the execution's state at attach time.
+message ExecutionStarted {
+    Execution execution = 1;
 }
 
-// A single chunk of streaming output from Exec.
-message ExecOutput {
-    // Stream name: "stdout" | "stderr" | "exit".
-    string stream = 1;
-    // Raw output bytes (empty when stream == "exit").
-    bytes data = 2;
-    // Process exit code. Only valid on the final message (done == true).
-    int32 exit_code = 3;
-    // True on the last message of the stream.
-    bool done = 4;
+// An offset-addressed chunk of execution output.
+message ExecutionOutput {
+    // Source channel (PTY for tty executions, STDOUT/STDERR otherwise).
+    StdioChannel channel = 1;
+    // Absolute offset of data[0] within the channel's byte stream. May be
+    // greater than the requested resume offset when retention already
+    // dropped older bytes — the jump is the client's signal of a gap.
+    uint64 offset = 2;
+    // Raw output bytes.
+    bytes data = 3;
 }
 
-// =============================================================================
+// Final frame of an attach stream: the execution's terminal state,
+// including exit_status / error and the final channel lengths.
+message ExecutionExited {
+    Execution execution = 1;
+}
+
+// Request to write stdin bytes at an absolute offset.
+message WriteStdinRequest {
+    // Owning sandbox.
+    string sandbox_id = 1;
+    // Target execution.
+    string execution_id = 2;
+    // Absolute offset of data[0] within the stdin byte stream. Bytes below
+    // the server's accepted count are deduplicated (idempotent retry); an
+    // offset above it fails with OUT_OF_RANGE.
+    uint64 offset = 3;
+    // Bytes to feed to the process's stdin.
+    bytes data = 4;
+    // Close stdin after this write. Rejected for TTY executions — send
+    // Ctrl-D (0x04) as data instead.
+    bool eof = 5;
+}
+
+// Stdin acceptance state.
+message StdinStatus {
+    // Bytes accepted and forwarded so far — the offset the next
+    // WriteStdin must start at.
+    uint64 bytes_written = 1;
+    // Whether stdin has been closed.
+    bool closed = 2;
+}
+
+// Request for the current stdin acceptance state.
+message GetStdinStatusRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+}
+
+// Request to signal a running execution.
+message SignalExecutionRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+    // Signal to deliver to the process group.
+    Signal signal = 3;
+}
+
+// Request to resize a TTY execution's terminal.
+message ResizeExecutionTtyRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+    TerminalSize size = 3;
+}
+
+// Request to wait for an execution to exit.
+message WaitExecutionRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+    // Give up after this many seconds and return the current state
+    // (0 = return immediately — a poll).
+    uint32 timeout_seconds = 3;
+}
+
+// ---------------------------------------------------------------------------
 // File I/O
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Request to read a file from a sandbox.
 message ReadFileRequest {
@@ -318,7 +540,7 @@ message ReadFileRequest {
 
 // One chunk of file data in a ReadFile / WriteFile stream.
 message FileChunk {
-    // Raw bytes (may be empty on the final chunk).
+    // Raw bytes (may be empty on the final chunk, or on a keepalive).
     bytes data = 1;
     // True on the last chunk of the stream.
     bool done = 2;
@@ -344,9 +566,9 @@ message WriteFileRequest {
     }
 }
 
-// =============================================================================
+// ---------------------------------------------------------------------------
 // Port exposure
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Request to expose a sandbox port on the host.
 message ExposePortRequest {
@@ -356,8 +578,8 @@ message ExposePortRequest {
     uint32 sandbox_port = 2;
     // Host port to bind (0 = reuse the allocated guest relay port).
     uint32 host_port = 3;
-    // "tcp" (default) or "udp".
-    string protocol = 4;
+    // Transport protocol (UNSPECIFIED = TCP).
+    PortProtocol protocol = 4;
 }
 
 // Response to ExposePort.
@@ -374,8 +596,8 @@ message UnexposePortRequest {
     string id = 1;
     // The sandbox port previously passed to ExposePort.
     uint32 sandbox_port = 2;
-    // "tcp" (default) or "udp".
-    string protocol = 3;
+    // Transport protocol (UNSPECIFIED = TCP).
+    PortProtocol protocol = 3;
 }
 
 // --- agent wire payloads (vsock, not served over gRPC) ---
@@ -386,8 +608,8 @@ message SandboxPortForwardRequest {
     string id = 1;
     // Destination port inside the sandbox.
     uint32 sandbox_port = 2;
-    // "tcp" (default) or "udp".
-    string protocol = 3;
+    // Transport protocol (UNSPECIFIED = TCP).
+    PortProtocol protocol = 3;
 }
 
 // Guest agent's answer: the allocated reserved-range guest port.
@@ -402,19 +624,19 @@ message SandboxPortForwardRemoveRequest {
     string id = 1;
     // The sandbox port previously forwarded.
     uint32 sandbox_port = 2;
-    // "tcp" (default) or "udp".
-    string protocol = 3;
+    // Transport protocol (UNSPECIFIED = TCP).
+    PortProtocol protocol = 3;
 }
 
-// =============================================================================
+// ---------------------------------------------------------------------------
 // Stop / Remove
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Request to stop a sandbox gracefully.
 message StopSandboxRequest {
     // Sandbox ID.
     string id = 1;
-    // Seconds to wait for any active workload to exit before force-killing
+    // Seconds to wait for any active execution to exit before force-killing
     // the VM (0 = daemon default of 30 s).
     uint32 timeout_seconds = 2;
 }
@@ -423,13 +645,13 @@ message StopSandboxRequest {
 message RemoveSandboxRequest {
     // Sandbox ID.
     string id = 1;
-    // Force removal even if the sandbox is in "running" state.
+    // Force removal even if the sandbox is in RUNNING state.
     bool force = 2;
 }
 
-// =============================================================================
+// ---------------------------------------------------------------------------
 // Inspect / List
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Request to inspect a sandbox.
 message InspectSandboxRequest {
@@ -437,38 +659,28 @@ message InspectSandboxRequest {
     string id = 1;
 }
 
-// Full sandbox state.
-//
-// State machine:
-//
-//   starting ──► ready ──► running ──► ready   (cmd/Run exited, sandbox alive)
-//                  │          │
-//                  └──────────┴──► stopping ──► stopped
-//                                       │
-//                                    failed
-//
-// "idle" is an alias for "ready" used in event payloads to signal that a
-// previously running workload has just finished.
+// Full sandbox state. See SandboxState for the state machine.
 message SandboxInfo {
     // Sandbox ID.
     string id = 1;
-    // State: starting | ready | running | stopping | stopped | failed.
-    string state = 2;
+    // Lifecycle state.
+    SandboxState state = 2;
     // User-supplied labels.
     map<string, string> labels = 3;
     // Effective resource limits.
     ResourceLimits limits = 4;
     // Network information.
     SandboxNetwork network = 5;
-    // Creation timestamp (Unix seconds).
-    int64 created_at = 6;
-    // Timestamp when the sandbox first became ready (Unix seconds, 0 if not yet).
-    int64 ready_at = 7;
-    // Timestamp when the last workload exited (Unix seconds, 0 if none has run).
-    int64 last_exited_at = 8;
-    // Exit code of the last workload (only meaningful when last_exited_at > 0).
-    int32 last_exit_code = 9;
-    // Human-readable error message (only set when state == "failed").
+    // Creation time.
+    google.protobuf.Timestamp created_at = 6;
+    // When the sandbox first became READY (unset if not yet).
+    google.protobuf.Timestamp ready_at = 7;
+    // When the last execution exited (unset if none has run).
+    google.protobuf.Timestamp last_exited_at = 8;
+    // How the last execution terminated (unset if none has run, or when the
+    // last execution ended without an observed exit).
+    ExitStatus last_exit_status = 9;
+    // Human-readable error message (only set when state == FAILED).
     string error = 10;
 }
 
@@ -484,71 +696,78 @@ message SandboxNetwork {
 
 // Request to list sandboxes.
 message ListSandboxesRequest {
-    // Filter by state (empty = all states).
-    string state = 1;
+    // Filter by state (UNSPECIFIED = all states).
+    SandboxState state = 1;
     // Filter by labels (all key-value pairs must match).
     map<string, string> labels = 2;
+    // Maximum entries per page (0 = server default of 100; capped at 1000).
+    uint32 page_size = 3;
+    // Continuation token from a previous response (empty = first page).
+    string page_token = 4;
 }
 
 // Response to ListSandboxes.
 message ListSandboxesResponse {
     repeated SandboxSummary sandboxes = 1;
+    // Token for the next page; empty when this is the last page.
+    string next_page_token = 2;
 }
 
 // Lightweight sandbox summary for List.
 message SandboxSummary {
     // Sandbox ID.
     string id = 1;
-    // State.
-    string state = 2;
+    // Lifecycle state.
+    SandboxState state = 2;
     // Labels.
     map<string, string> labels = 3;
     // IP address.
     string ip_address = 4;
-    // Creation timestamp (Unix seconds).
-    int64 created_at = 5;
+    // Creation time.
+    google.protobuf.Timestamp created_at = 5;
 }
 
-// =============================================================================
+// ---------------------------------------------------------------------------
 // Events
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Request to subscribe to sandbox lifecycle events.
 message SandboxEventsRequest {
     // Filter by sandbox ID (empty = all sandboxes).
-    string id = 1;
-    // Filter by event action (empty = all actions).
-    string action = 2;
+    string sandbox_id = 1;
+    // Filter by event kind (UNSPECIFIED = all kinds).
+    SandboxEventKind kind = 2;
+}
+
+// One frame of an Events stream.
+message WatchEventsResponse {
+    oneof payload {
+        // A lifecycle event.
+        SandboxEvent event = 1;
+        // Idle-stream keepalive; carries no data.
+        KeepAlive keep_alive = 2;
+    }
 }
 
 // A sandbox lifecycle event.
 message SandboxEvent {
     // Sandbox ID.
     string sandbox_id = 1;
-    // Action:
-    //   "created"  — sandbox record created, VM booting
-    //   "ready"    — VM booted, sandbox accepting workloads
-    //   "running"  — a workload (cmd or Run) started
-    //   "idle"     — active workload exited, sandbox back to ready
-    //   "stopping" — Stop called, draining workload
-    //   "stopped"  — VM shut down
-    //   "failed"   — unrecoverable error
-    //   "removed"  — sandbox deleted
-    string action = 2;
-    // Unix nanoseconds.
-    int64 timestamp = 3;
-    // Additional context, e.g.:
-    //   "exit_code" on "idle" / "stopped"
-    //   "error"     on "failed"
+    // What happened; see SandboxEventKind for per-kind attributes.
+    SandboxEventKind kind = 2;
+    // When it happened.
+    google.protobuf.Timestamp time = 3;
+    // Additional context (e.g. "exit_code" / "signal" on IDLE,
+    // "error" on FAILED).
     map<string, string> attributes = 4;
 }
 
-// =============================================================================
+// ---------------------------------------------------------------------------
 // Checkpoint / Restore
-// =============================================================================
+// ---------------------------------------------------------------------------
 
 // Request to checkpoint a sandbox.
-// The sandbox must be in "ready" or "idle" state (no active workload).
+// The sandbox must be in READY state (no active execution).
 message CheckpointRequest {
     // Sandbox ID to checkpoint.
     string sandbox_id = 1;
@@ -564,8 +783,8 @@ message CheckpointResponse {
     string snapshot_id = 1;
     // On-disk directory containing vmstate and mem files.
     string snapshot_dir = 2;
-    // Creation timestamp (RFC3339).
-    string created_at = 3;
+    // Creation time.
+    google.protobuf.Timestamp created_at = 3;
 }
 
 // Request to restore a sandbox from a snapshot.
@@ -590,7 +809,7 @@ message RestoreRequest {
 }
 
 // Response to Restore.
-// The restored sandbox starts in "ready" state immediately.
+// The restored sandbox starts in READY state immediately.
 message RestoreResponse {
     // ID of the newly created sandbox.
     string id = 1;
@@ -604,11 +823,17 @@ message ListSnapshotsRequest {
     string sandbox_id = 1;
     // Filter by labels.
     map<string, string> labels = 2;
+    // Maximum entries per page (0 = server default of 100; capped at 1000).
+    uint32 page_size = 3;
+    // Continuation token from a previous response (empty = first page).
+    string page_token = 4;
 }
 
 // Response to ListSnapshots.
 message ListSnapshotsResponse {
     repeated SnapshotSummary snapshots = 1;
+    // Token for the next page; empty when this is the last page.
+    string next_page_token = 2;
 }
 
 // Lightweight snapshot summary.
@@ -623,8 +848,8 @@ message SnapshotSummary {
     map<string, string> labels = 4;
     // On-disk directory.
     string snapshot_dir = 5;
-    // Creation timestamp (RFC3339).
-    string created_at = 6;
+    // Creation time.
+    google.protobuf.Timestamp created_at = 6;
 }
 
 // Request to delete a snapshot.

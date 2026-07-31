@@ -1,0 +1,13 @@
+# Config for the CI breaking-change gate (ci.yml "proto" job), which runs
+# `buf breaking` against the PR's base branch with this file's rules.
+version: v2
+modules:
+  - path: .
+breaking:
+  use:
+    - FILE
+  ignore:
+    # Pre-release surface being redesigned contract-first under CORE-52
+    # (Sandbox SDK); CORE-55/56 intentionally break it. Remove this
+    # exemption once the sandbox API ships in a public SDK.
+    - sandbox.proto

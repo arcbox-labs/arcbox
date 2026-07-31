@@ -52,9 +52,18 @@ This file is only the non-obvious operational knowledge.
   comment; diverge and cross-backend frames silently mismatch.
 - **`AgentClient::connect()` is a no-op on the blocking path** — the HV
   transport is connected at creation (`from_fd`); only the async path dials.
-- **No `buf.yaml` under `arcbox-protocol/proto/`** — the CI `buf breaking`
-  gate runs against buf defaults and covers only this dir. The fleet protos'
+- **`arcbox-protocol/proto/buf.yaml` exempts ONLY `sandbox.proto` from the
+  CI `buf breaking` gate** — the sandbox surface is pre-release and being
+  redesigned contract-first (CORE-52); every other proto in the dir stays
+  under the default `FILE` breaking rules. Remove the exemption when the
+  sandbox API ships in a public SDK. The fleet protos'
   `fleet/arcbox-fleet-proto/buf.yaml` is a separate, unrelated gate.
+- **Well-known types map to `pbjson-types`, not `prost-types`**
+  (`extern_path(".google.protobuf", "::pbjson_types")` in BOTH
+  `arcbox-protocol/build.rs` and `arcbox-grpc/build.rs` — keep them in
+  lockstep). WHY: every message derives serde (see above) and
+  `prost_types::Timestamp` has no serde impls; `pbjson_types` serializes
+  WKTs per the canonical protobuf JSON mapping (Timestamp → RFC3339).
 
 ## Extending checklists (change every path together)
 

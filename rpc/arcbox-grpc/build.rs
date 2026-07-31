@@ -34,6 +34,10 @@ fn main() {
         .extern_path(".arcbox.v1", "::arcbox_protocol::v1")
         // Map sandbox.v1 package to arcbox_protocol::sandbox_v1 types
         .extern_path(".sandbox.v1", "::arcbox_protocol::sandbox_v1")
+        // Well-known types map to pbjson-types, matching arcbox-protocol's
+        // prost build (serde-capable Timestamp/Empty); see its build.rs.
+        .compile_well_known_types(true)
+        .extern_path(".google.protobuf", "::pbjson_types")
         // Generate client code
         .build_client(true)
         // Generate server code

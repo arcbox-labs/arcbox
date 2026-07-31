@@ -45,6 +45,14 @@ fn main() {
     config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
     config.type_attribute(".", "#[serde(rename_all = \"camelCase\")]");
 
+    // Well-known types (Timestamp, Empty) map to pbjson-types, whose types
+    // carry serde impls following the canonical protobuf JSON mapping —
+    // prost-types has no serde support, which would break the blanket
+    // serde derives above. compile_well_known_types() drops prost-build's
+    // implicit prost-types mapping so the extern_path below can take over.
+    config.compile_well_known_types();
+    config.extern_path(".google.protobuf", "::pbjson_types");
+
     // Compile proto files.
     config
         .compile_protos(&protos, &[proto_dir])
