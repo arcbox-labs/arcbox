@@ -94,6 +94,16 @@ async fn reconcile(
     // One localhost TCP proxy to the guest nfsd, bridged over vsock.
     let nfsd_port = spawn_proxy(&runtime, &shutdown, NFS_NFSD_RELAY_PORT).await?;
 
+    // Ask the guest to bring up the export. The agent no longer starts nfsd on
+    // its own, so this request is what gives a mount-enabled daemon an export
+    // at all — and a `--no-mount-nfs` daemon never reaches here, so its guest
+    // runs none. Best-effort: the guest handler runs to completion even if this
+    // RPC read times out (it may still be waiting on dockerd's data mount), and
+    // `mount_with_retry` below is the readiness signal.
+    if let Err(e) = ensure_guest_export(&runtime).await {
+        debug!(error = %e, "guest nfs export request did not confirm; relying on mount retry");
+    }
+
     reconcile_existing_mount(&mount_path)?;
     std::fs::create_dir_all(&mount_path)?;
 
@@ -102,6 +112,24 @@ async fn reconcile(
     }
 
     mount_with_retry(&mount_path, nfsd_port, &shutdown).await
+}
+
+/// Asks the guest agent to bring up the read-only NFS export.
+///
+/// `connect_agent` is a blocking hypervisor call on both backends; on HV the
+/// whole agent transport is blocking, on VZ only the connect is. Mirrors the
+/// `sync_guest_clock` backend dispatch in `arcbox-core`.
+async fn ensure_guest_export(runtime: &Arc<Runtime>) -> Result<()> {
+    let machine = DEFAULT_MACHINE_NAME.to_string();
+    let rt = Arc::clone(runtime);
+    let mut agent = tokio::task::spawn_blocking(move || rt.get_agent(&machine)).await??;
+    let resp = if agent.is_blocking() {
+        tokio::task::spawn_blocking(move || agent.ensure_nfs_export_blocking()).await??
+    } else {
+        agent.ensure_nfs_export().await?
+    };
+    debug!(notes = ?resp.notes, "guest nfs export ensured");
+    Ok(())
 }
 
 /// Bounded wait for the `ArcBox` hosts alias the concurrent self-setup task
