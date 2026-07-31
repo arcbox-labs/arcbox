@@ -38,7 +38,23 @@ cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
 # Native baseline (run against a local directory)
 cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
     --all --platform native --target /tmp/bench --format json > native.json
+
+# Hermetic run: exclude the network-dependent macros (npm/git). An entry
+# that matches no benchmark is a hard error, so a rename cannot silently
+# re-include them.
+cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
+    --all --skip npm_install,git_clone --target /arcbox
+
+# random_read_4k engine is explicit (default: the in-process buffered
+# reader). The fio/O_DIRECT engine is opt-in, errors when fio is absent,
+# and reports under `random_read_4k_fio` so numbers from different
+# engines can never be joined by name.
+cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
+    --benchmark random_read_4k --random-read-engine fio --target /arcbox
 ```
+
+Guest-vs-native comparison methodology (which ratios are meaningful, the
+same-context rule, and current numbers) lives in `docs/fs-perf-limits.md`.
 
 ## Benchmarks
 
