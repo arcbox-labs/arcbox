@@ -175,7 +175,7 @@ the helper is reachable, use the Rust client:
 make run-helper   # terminal 1
 make run-daemon   # terminal 2 — look for "configured" in logs
 
-# Or check via `arcbox doctor`:
+# Or check via `abctl doctor`:
 ./target/debug/abctl doctor   # "ArcBoxHelper" check
 ```
 

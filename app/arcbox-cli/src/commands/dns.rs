@@ -4,9 +4,9 @@
 //! The resolver file points to `127.0.0.1:5553` where the ArcBox daemon
 //! provides DNS service.
 //!
-//! - `arcbox dns install`   — create resolver file (requires sudo)
-//! - `arcbox dns uninstall` — remove resolver file (requires sudo)
-//! - `arcbox dns status`    — check resolver file and DNS reachability
+//! - `abctl dns install`   — create resolver file (requires sudo)
+//! - `abctl dns uninstall` — remove resolver file (requires sudo)
+//! - `abctl dns status`    — check resolver file and DNS reachability
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -83,7 +83,7 @@ async fn execute_install() -> Result<()> {
             eprintln!("Error: permission denied writing to /etc/resolver/");
             eprintln!();
             eprintln!("Run with sudo:");
-            eprintln!("  sudo arcbox dns install");
+            eprintln!("  sudo abctl dns install");
             std::process::exit(1);
         }
         Err(e) => Err(e).context("Failed to install DNS resolver"),
@@ -104,7 +104,7 @@ async fn execute_uninstall() -> Result<()> {
             eprintln!("Error: permission denied removing /etc/resolver/{domain}");
             eprintln!();
             eprintln!("Run with sudo:");
-            eprintln!("  sudo arcbox dns uninstall");
+            eprintln!("  sudo abctl dns uninstall");
             std::process::exit(1);
         }
         Err(e) => Err(e).context("Failed to uninstall DNS resolver"),
@@ -133,7 +133,7 @@ async fn execute_status() -> Result<()> {
 
     if !installed {
         println!();
-        println!("Run 'sudo arcbox dns install' to enable *.{domain} DNS resolution.");
+        println!("Run 'sudo abctl dns install' to enable *.{domain} DNS resolution.");
     }
     if !reachable {
         println!();

@@ -121,8 +121,8 @@ File transfer with a 256 MiB per-file cap, usable while the sandbox is
 - `WriteFile` starts with `WriteFileRequest{open: {id, path, mode}}`
   (mode 0 → 0644), followed by `chunk` payloads, last one `done == true`.
 
-CLI: `arcbox sandbox cp ./local <id>:/path` and
-`arcbox sandbox cp <id>:/path ./local`.
+CLI: `abctl sandbox cp ./local <id>:/path` and
+`abctl sandbox cp <id>:/path ./local`.
 
 ### ExposePort / UnexposePort
 
@@ -140,7 +140,7 @@ host listener :H → inbound relay → guest :G (reserved 40000-49999)
 
 `host_port: 0` reuses the allocated guest relay port for a stable
 mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
-`arcbox sandbox expose <id> <port>` / `unexpose`.
+`abctl sandbox expose <id> <port>` / `unexpose`.
 
 ### Stop / Remove
 

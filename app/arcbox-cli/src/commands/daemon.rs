@@ -1,10 +1,10 @@
 //! Daemon command implementation.
 //!
 //! This command controls the lifecycle of the `arcbox-daemon` binary:
-//! - start in background (`arcbox daemon start`)
-//! - run in foreground (`arcbox daemon start -f`)
-//! - stop a running daemon (`arcbox daemon stop`)
-//! - inspect daemon status (`arcbox daemon status`)
+//! - start in background (`abctl daemon start`)
+//! - run in foreground (`abctl daemon start -f`)
+//! - stop a running daemon (`abctl daemon stop`)
+//! - inspect daemon status (`abctl daemon status`)
 
 use super::machine::UnixConnector;
 use anyhow::{Context, Result, bail};
@@ -233,7 +233,7 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
     std::fs::create_dir_all(&layout.run_dir).context("Failed to create daemon run directory")?;
     std::fs::create_dir_all(&layout.log_dir).context("Failed to create daemon log directory")?;
 
-    // Serialize concurrent `arcbox daemon start` invocations. The alive
+    // Serialize concurrent `abctl daemon start` invocations. The alive
     // probe releases its flock immediately, so two racing starts could
     // both see "not running" and both spawn a daemon — the flock loser
     // then SIGTERMs the winner mid-boot via the stale-daemon takeover.
@@ -322,7 +322,7 @@ fn wait_for_lock_handoff(
     }
 }
 
-/// Exclusive lock serializing `arcbox daemon start` spawners.
+/// Exclusive lock serializing `abctl daemon start` spawners.
 ///
 /// Held via RAII; the flock is released when the value drops. A held
 /// lock means another start is mid-spawn: acquisition blocks (the
@@ -351,7 +351,7 @@ impl SpawnLock {
             if err.raw_os_error() == Some(libc::EWOULDBLOCK)
                 || err.raw_os_error() == Some(libc::EAGAIN)
             {
-                println!("Another `arcbox daemon start` is in progress, waiting...");
+                println!("Another `abctl daemon start` is in progress, waiting...");
                 // SAFETY: blocking flock on the same valid fd; bounded by
                 // the holder's spawn-handoff timeout.
                 let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
