@@ -57,3 +57,4 @@ keyring = "4"
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
