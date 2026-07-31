@@ -74,8 +74,6 @@ pub struct SandboxSpec {
     pub vcpus: u32,
     /// Memory in MiB (0 = daemon default).
     pub memory_mib: u64,
-    /// OCI image reference (empty = use rootfs directly; reserved for future use).
-    pub image: String,
     /// Initial command launched automatically after boot (empty = none).
     pub cmd: Vec<String>,
     /// Environment variables for the initial command.

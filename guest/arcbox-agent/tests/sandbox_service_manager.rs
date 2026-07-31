@@ -72,11 +72,9 @@ async fn sandbox_service_calls_sandbox_manager() {
     let create_req = CreateSandboxRequest {
         id: String::new(),
         labels: HashMap::from([("suite".to_string(), "svc-manager".to_string())]),
-        kernel: String::new(),
-        rootfs: String::new(),
-        boot_args: String::new(),
+        // Empty template = the built-in busybox image.
+        template: String::new(),
         limits: None,
-        image: String::new(),
         cmd: Vec::new(),
         env: HashMap::new(),
         working_dir: String::new(),

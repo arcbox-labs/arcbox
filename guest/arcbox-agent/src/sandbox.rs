@@ -10,6 +10,7 @@ mod events;
 mod execution;
 mod files;
 mod snapshots;
+mod template;
 
 use std::sync::Arc;
 
@@ -65,16 +66,19 @@ impl SandboxService {
 
     /// Create a sandbox.
     ///
-    /// When the rootfs path points to a directory (overlay2 layer), the agent
-    /// converts it to ext4 via the `oci2rootfs` library and injects `vm-agent`
-    /// before booting. Ext4 images are used directly. An empty rootfs selects
-    /// the default busybox + vm-agent image, auto-built on first use.
+    /// The request names what boots with an opaque template reference; the
+    /// boot recipe (kernel, rootfs, cmdline) is resolved here and never
+    /// crosses the API (CORE-54). A `docker:<ref>` template is exported from
+    /// the guest's own dockerd, converted to ext4 via the `oci2rootfs`
+    /// library, and gets `vm-agent` injected before booting; the empty
+    /// template selects the built-in busybox image, built on first use.
     pub async fn create(
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
         let req = sandbox_v1::CreateSandboxRequest::decode(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let template = template::Template::parse(&req.template)?;
         let mut spec = proto_to_spec(req);
 
         // V1 contract: reject declared-but-unimplemented spec fields
@@ -93,35 +97,8 @@ impl SandboxService {
                     .into(),
             ));
         }
-        if !spec.image.is_empty() {
-            return Err(SandboxError::Unsupported(
-                "registry image pull is not supported in Sandbox V1; build the \
-                 rootfs from a local Docker image with `abctl sandbox create \
-                 --from-image` instead"
-                    .into(),
-            ));
-        }
 
-        if spec.rootfs.is_empty() {
-            // Default rootfs: build the busybox + vm-agent image on first use
-            // (rebuilt when the staged vm-agent is newer than the image).
-            crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
-                .await
-                .map_err(|e| SandboxError::Internal(format!("default rootfs: {e}")))?;
-            spec.rootfs.clone_from(&self.default_rootfs);
-        } else if std::path::Path::new(&spec.rootfs).is_dir() {
-            // Directory → overlay2 layer needing conversion. Pass the images
-            // snapshots depend on so the conversion's cache sweep leaves them
-            // alone — a restore has no way to rebuild its dm-snapshot origin.
-            let pinned = self
-                .manager
-                .pinned_rootfs_paths()
-                .map_err(SandboxError::from)?;
-            let ext4_path = crate::rootfs_builder::convert_layer_to_rootfs(&spec.rootfs, &pinned)
-                .await
-                .map_err(|e| SandboxError::Internal(format!("rootfs build failed: {e}")))?;
-            spec.rootfs = ext4_path;
-        }
+        spec.rootfs = self.resolve_template(&template).await?;
 
         let (id, ip_address) = self
             .manager
@@ -134,6 +111,38 @@ impl SandboxService {
             ip_address,
             state: sandbox_v1::SandboxState::Starting.into(),
         })
+    }
+
+    /// Resolve a template to the guest path of a bootable ext4 rootfs.
+    async fn resolve_template(
+        &self,
+        template: &template::Template,
+    ) -> Result<String, SandboxError> {
+        match template {
+            template::Template::Default => {
+                // Built on first use, and rebuilt when the staged vm-agent is
+                // newer than the cached image.
+                crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
+                    .await
+                    .map_err(|e| SandboxError::Internal(format!("default template: {e}")))?;
+                Ok(self.default_rootfs.clone())
+            }
+            template::Template::DockerImage(image) => {
+                let layout = template::export_docker_image(image)
+                    .await
+                    .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))?;
+                // Pass the images snapshots depend on so the conversion's
+                // cache sweep leaves them alone — a restore has no way to
+                // rebuild its dm-snapshot origin.
+                let pinned = self
+                    .manager
+                    .pinned_rootfs_paths()
+                    .map_err(SandboxError::from)?;
+                crate::rootfs_builder::convert_layer_to_rootfs(&layout, &pinned)
+                    .await
+                    .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))
+            }
+        }
     }
 
     /// Stop a sandbox.
@@ -234,12 +243,13 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
             Some(req.id)
         },
         labels: req.labels,
-        kernel: req.kernel,
-        rootfs: req.rootfs,
-        boot_args: req.boot_args,
+        // Boot recipe fields are resolved from the template, never from the
+        // request (CORE-54); the manager fills kernel/boot_args defaults.
+        kernel: String::new(),
+        rootfs: String::new(),
+        boot_args: String::new(),
         vcpus: limits.vcpus,
         memory_mib: limits.memory_mib,
-        image: req.image,
         cmd: req.cmd,
         env: req.env,
         working_dir: req.working_dir,

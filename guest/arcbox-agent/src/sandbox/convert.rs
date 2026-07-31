@@ -134,10 +134,11 @@ pub(super) fn vm_event_to_proto(e: VmSandboxEvent) -> sandbox_v1::SandboxEvent {
 }
 
 pub(super) fn info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
+    // The host TAP name is deliberately not exposed (CORE-54): it is a host
+    // interface a tenant can neither see nor use.
     let network = info.network.map(|n| sandbox_v1::SandboxNetwork {
         ip_address: n.ip_address,
         gateway: n.gateway,
-        tap_name: n.tap_name,
     });
     sandbox_v1::SandboxInfo {
         id: info.id,
@@ -166,10 +167,12 @@ pub(super) fn summary_to_proto(s: SandboxSummary) -> sandbox_v1::SandboxSummary 
     }
 }
 
+// Snapshots are identified by id on the wire; their on-disk directory is a
+// host path and stays inside the guest (CORE-54).
+
 pub(super) fn checkpoint_to_proto(info: CheckpointInfo) -> sandbox_v1::CheckpointResponse {
     sandbox_v1::CheckpointResponse {
         snapshot_id: info.snapshot_id,
-        snapshot_dir: info.snapshot_dir,
         created_at: timestamp_from_rfc3339(&info.created_at),
     }
 }
@@ -180,7 +183,6 @@ pub(super) fn checkpoint_summary_to_proto(s: CheckpointSummary) -> sandbox_v1::S
         sandbox_id: s.sandbox_id,
         name: s.name,
         labels: s.labels,
-        snapshot_dir: s.snapshot_dir,
         created_at: timestamp_from_rfc3339(&s.created_at),
     }
 }

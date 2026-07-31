@@ -89,27 +89,10 @@ pub struct CreateSandboxRequest {
     #[prost(map = "string, string", tag = "2")]
     pub labels:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// --- VM image ---
-    /// Kernel image path (empty = daemon default).
-    #[prost(string, tag = "3")]
-    pub kernel: ::prost::alloc::string::String,
-    /// Root filesystem image path (empty = daemon default).
-    #[prost(string, tag = "4")]
-    pub rootfs: ::prost::alloc::string::String,
-    /// Kernel command-line arguments (empty = daemon default).
-    #[prost(string, tag = "5")]
-    pub boot_args: ::prost::alloc::string::String,
     /// --- Resources ---
     #[prost(message, optional, tag = "6")]
     pub limits: ::core::option::Option<ResourceLimits>,
     /// --- Initial workload (optional) ---
-    /// OCI image reference. NOT supported in Sandbox V1: a non-empty value is
-    /// rejected with FAILED_PRECONDITION. Build the rootfs from a local
-    /// Docker image instead (CLI --from-image resolves the overlay2 layer and
-    /// passes it as `rootfs`). Registry pull lands with a rustls-capable
-    /// oci2rootfs release.
-    #[prost(string, tag = "7")]
-    pub image: ::prost::alloc::string::String,
     /// Initial command launched automatically after boot.
     /// Empty = sandbox enters READY without running anything.
     /// When this process exits the sandbox transitions back to READY
@@ -145,6 +128,15 @@ pub struct CreateSandboxRequest {
     /// FAILED_PRECONDITION. Use executions for interactive access.
     #[prost(string, optional, tag = "15")]
     pub ssh_public_key: ::core::option::Option<::prost::alloc::string::String>,
+    /// Opaque reference to what boots inside the sandbox. Local mode accepts:
+    ///    ""             — the built-in minimal template (busybox + init)
+    ///    "docker:<ref>" — a local Docker image reference, resolved and
+    ///                     converted inside the VM
+    /// Cloud mode resolves names against the tenant's template registry;
+    /// first-class templates are designed in CORE-21. Anything else is
+    /// rejected with INVALID_ARGUMENT.
+    #[prost(string, tag = "17")]
+    pub template: ::prost::alloc::string::String,
 }
 /// Response to CreateSandbox.
 /// Returned immediately; the sandbox may still be booting (state STARTING).
@@ -640,9 +632,6 @@ pub struct SandboxNetwork {
     /// Gateway address.
     #[prost(string, tag = "2")]
     pub gateway: ::prost::alloc::string::String,
-    /// TAP interface name on the host.
-    #[prost(string, tag = "3")]
-    pub tap_name: ::prost::alloc::string::String,
 }
 /// Request to list sandboxes.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -775,9 +764,6 @@ pub struct CheckpointResponse {
     /// Snapshot ID.
     #[prost(string, tag = "1")]
     pub snapshot_id: ::prost::alloc::string::String,
-    /// On-disk directory containing vmstate and mem files.
-    #[prost(string, tag = "2")]
-    pub snapshot_dir: ::prost::alloc::string::String,
     /// Creation time.
     #[prost(message, optional, tag = "3")]
     pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,
@@ -872,9 +858,6 @@ pub struct SnapshotSummary {
     #[prost(map = "string, string", tag = "4")]
     pub labels:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// On-disk directory.
-    #[prost(string, tag = "5")]
-    pub snapshot_dir: ::prost::alloc::string::String,
     /// Creation time.
     #[prost(message, optional, tag = "6")]
     pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,

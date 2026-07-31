@@ -31,11 +31,9 @@ mod linux {
         let create = CreateSandboxRequest {
             id: String::new(),
             labels: HashMap::from([("suite".to_string(), "agent-smoke".to_string())]),
-            kernel: String::new(),
-            rootfs: String::new(),
-            boot_args: String::new(),
+            // Empty template = the built-in busybox image.
+            template: String::new(),
             limits: None,
-            image: String::new(),
             cmd: Vec::new(),
             env: HashMap::new(),
             working_dir: String::new(),

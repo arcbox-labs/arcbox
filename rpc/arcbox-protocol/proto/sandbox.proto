@@ -296,24 +296,15 @@ message CreateSandboxRequest {
     // Arbitrary key-value metadata (used for filtering in List / Events).
     map<string, string> labels = 2;
 
-    // --- VM image ---
-    // Kernel image path (empty = daemon default).
-    string kernel = 3;
-    // Root filesystem image path (empty = daemon default).
-    string rootfs = 4;
-    // Kernel command-line arguments (empty = daemon default).
-    string boot_args = 5;
+    // 3-5 carried host kernel/rootfs/boot_args paths and 7 an OCI image
+    // reference; all replaced by `template` (CORE-54). Do not reuse.
+    reserved 3, 4, 5, 7;
+    reserved "kernel", "rootfs", "boot_args", "image";
 
     // --- Resources ---
     ResourceLimits limits = 6;
 
     // --- Initial workload (optional) ---
-    // OCI image reference. NOT supported in Sandbox V1: a non-empty value is
-    // rejected with FAILED_PRECONDITION. Build the rootfs from a local
-    // Docker image instead (CLI --from-image resolves the overlay2 layer and
-    // passes it as `rootfs`). Registry pull lands with a rustls-capable
-    // oci2rootfs release.
-    string image = 7;
     // Initial command launched automatically after boot.
     // Empty = sandbox enters READY without running anything.
     // When this process exits the sandbox transitions back to READY
@@ -346,6 +337,15 @@ message CreateSandboxRequest {
     optional string ssh_public_key = 15;
 
     reserved 16;
+
+    // Opaque reference to what boots inside the sandbox. Local mode accepts:
+    //   ""             — the built-in minimal template (busybox + init)
+    //   "docker:<ref>" — a local Docker image reference, resolved and
+    //                    converted inside the VM
+    // Cloud mode resolves names against the tenant's template registry;
+    // first-class templates are designed in CORE-21. Anything else is
+    // rejected with INVALID_ARGUMENT.
+    string template = 17;
 }
 
 // Response to CreateSandbox.
@@ -690,8 +690,9 @@ message SandboxNetwork {
     string ip_address = 1;
     // Gateway address.
     string gateway = 2;
-    // TAP interface name on the host.
-    string tap_name = 3;
+    // 3 carried the host TAP interface name (CORE-54). Do not reuse.
+    reserved 3;
+    reserved "tap_name";
 }
 
 // Request to list sandboxes.
@@ -781,8 +782,9 @@ message CheckpointRequest {
 message CheckpointResponse {
     // Snapshot ID.
     string snapshot_id = 1;
-    // On-disk directory containing vmstate and mem files.
-    string snapshot_dir = 2;
+    // 2 carried the host snapshot directory (CORE-54). Do not reuse.
+    reserved 2;
+    reserved "snapshot_dir";
     // Creation time.
     google.protobuf.Timestamp created_at = 3;
 }
@@ -846,8 +848,9 @@ message SnapshotSummary {
     string name = 3;
     // Labels.
     map<string, string> labels = 4;
-    // On-disk directory.
-    string snapshot_dir = 5;
+    // 5 carried the host snapshot directory (CORE-54). Do not reuse.
+    reserved 5;
+    reserved "snapshot_dir";
     // Creation time.
     google.protobuf.Timestamp created_at = 6;
 }
