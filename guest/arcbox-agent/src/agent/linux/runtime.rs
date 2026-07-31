@@ -825,12 +825,8 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
 async fn try_start_bundled_runtime() -> String {
     let _guard = runtime_start_lock().lock().await;
 
-    // Whenever dockerd is up its data mount exists, so the NFS export can be
-    // (re)established on warm boots too — set it up before the early return.
     if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
-        let mut notes = vec!["docker socket already ready".to_string()];
-        setup_nfs_export(&mut notes);
-        return notes.join("; ");
+        return "docker socket already ready".to_string();
     }
 
     let mut notes = Vec::new();
@@ -870,9 +866,6 @@ async fn try_start_bundled_runtime() -> String {
         Err(e) => return format!("metadata volume setup failed: {}", e),
     }
 
-    // The docker data mount now exists; export it read-only over NFS.
-    setup_nfs_export(&mut notes);
-
     ensure_shared_runtime_dirs(&mut notes);
 
     if !ensure_containerd_ready(&runtime_bin_dir, &mut notes).await {
@@ -884,15 +877,21 @@ async fn try_start_bundled_runtime() -> String {
     notes.join("; ")
 }
 
-/// Establishes the read-only NFSv3 export of the docker data mount, best-effort.
+/// Brings up the read-only NFS export of the docker data mount so the host
+/// can browse it at `~/ArcBox`.
 ///
-/// The export is an auxiliary feature (host `~/ArcBox` browsing); its failure
-/// must never block the container runtime, so errors are logged, not returned.
-fn setup_nfs_export(notes: &mut Vec<String>) {
-    match crate::nfs::ensure_docker_export() {
-        Ok(export_notes) => notes.extend(export_notes),
-        Err(e) => tracing::warn!(error = %e, "nfs export setup failed (non-fatal)"),
-    }
+/// Called on demand by the host daemon (`EnsureNfsExportRequest`), which only
+/// sends it when the mount is enabled — so a `--no-mount-nfs` daemon leaves
+/// the guest with no nfsd at all. Ensures the docker data mount exists first
+/// (idempotent), so it is safe to call at any point after the agent is up;
+/// the runtime-start lock serializes it against the startup path's own
+/// data-mount setup.
+pub(super) async fn ensure_nfs_export() -> Result<Vec<String>, String> {
+    let _guard = runtime_start_lock().lock().await;
+
+    let mut notes = vec![ensure_data_mount()?];
+    notes.extend(crate::nfs::ensure_docker_export()?);
+    Ok(notes)
 }
 
 #[cfg(test)]

@@ -311,6 +311,17 @@ impl VmLifecycleManager {
         *self.state_rx.borrow()
     }
 
+    /// Subscribes to lifecycle state transitions.
+    ///
+    /// Prefer this over polling [`Self::restart_generation`] when a task must
+    /// react to the VM coming *up*: the generation counter is bumped on stop,
+    /// so it marks the start of the gap where no guest exists, not the arrival
+    /// of the next one.
+    #[must_use]
+    pub fn subscribe_state(&self) -> watch::Receiver<VmLifecycleState> {
+        self.state_rx.clone()
+    }
+
     /// Returns true if the VM is running and ready.
     #[allow(clippy::unused_async, reason = "public API compatibility")]
     pub async fn is_running(&self) -> bool {
