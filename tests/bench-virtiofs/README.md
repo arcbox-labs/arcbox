@@ -78,10 +78,17 @@ same-context rule, and current numbers) lives in `docs/fs-perf-limits.md`.
 | `rm_rf` | `rm -rf` of a 5000-file directory tree | wall time |
 | `find_recursive` | `find -name "*.ts"` over 2000 files | wall time |
 
-## Performance Targets
+## Performance Targets (legacy — do not gate on these)
 
-These are the minimum acceptable performance levels as a percentage of
-native macOS filesystem performance:
+> **Superseded by `docs/fs-perf-limits.md`.** These percent-of-native
+> targets (and the same table printed by `--list` / checked by the
+> binary) predate the CORE-48 methodology work, which showed that
+> cache-hot native is not a valid denominator for FUSE metadata and that
+> only the in-process trio (`metadata_stat`, `create_delete`,
+> `negative_lookup`) is ratio-safe at all. The table is kept verbatim
+> until the perf-target policy revision (proposed alongside
+> fs-perf-limits.md) is approved; until then, treat competitor-guest
+> same-context comparisons as the bar and never use these rows as gates.
 
 | Benchmark | Target |
 |-----------|--------|
