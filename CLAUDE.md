@@ -35,6 +35,13 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `.agents/skills/` — shared Claude Code skills (symlinked from `.claude/skills/`)
 - `docs/` — supplementary documentation (boot assets, daemon lifecycle)
 
+- **CLI binary is `abctl`.** The `arcbox` binary is a deprecated compat shim
+  that `exec`s `abctl` and will be removed. Never write `arcbox <subcommand>`
+  in code, help text, docs, or scripts — use `abctl <subcommand>`. The name
+  `arcbox` remains correct for the project, crates, `arcbox-daemon`/
+  `arcbox-helper` binaries, `~/.arcbox`, the Docker context, and firewall
+  chain tags.
+
 ## Component Rules
 
 Per-directory agent rules live in `AGENTS.md` files next to the code they
