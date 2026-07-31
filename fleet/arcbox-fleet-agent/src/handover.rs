@@ -188,7 +188,12 @@ impl Handover {
     pub fn commit(&self, binary: PathBuf) {
         if let Err(ignored) = self.exec.set(binary) {
             // Two commits raced — a forced restart landing while a graceful
-            // one was still quiescing. First wins; both name this executable.
+            // one was still quiescing, or a self-update landing during a
+            // restart's drain. First wins, and that is safe because every
+            // path names the same file: a restart commits `current_exe`, and
+            // self-update refuses to run unless `current_exe` *is* the managed
+            // binary (`update::ensure_managed`), whose new bytes are already
+            // swapped in before it commits.
             info!(
                 ignored = %ignored.display(),
                 committed = %self.exec.get().expect("set() only fails when already set").display(),

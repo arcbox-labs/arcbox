@@ -298,9 +298,14 @@ impl AgentState {
     }
 
     fn refresh_draining(&self) {
-        let draining = self.inner.operator_draining.load(Ordering::Relaxed)
-            || self.inner.handover_pending.load(Ordering::Relaxed);
-        self.inner.tx.send_modify(|s| s.draining = draining);
+        // Both inputs are read inside `send_modify`, under the watch channel's
+        // write lock: two concurrent refreshes would otherwise each compute
+        // from their own pre-store snapshot, and the loser would republish a
+        // stale value that no later write corrects.
+        self.inner.tx.send_modify(|s| {
+            s.draining = self.inner.operator_draining.load(Ordering::Relaxed)
+                || self.inner.handover_pending.load(Ordering::Relaxed);
+        });
     }
 
     /// Mirror the advertised capability set. Written only by the backend
