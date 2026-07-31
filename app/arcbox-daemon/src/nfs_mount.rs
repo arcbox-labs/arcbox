@@ -19,7 +19,7 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use arcbox_constants::ports::NFS_NFSD_RELAY_PORT;
 use arcbox_core::{DEFAULT_MACHINE_NAME, Runtime};
 use arcbox_transport::vsock::{VsockShutdown, VsockStream};
@@ -91,35 +91,83 @@ async fn reconcile(
         bail!("could not determine home directory for ~/ArcBox mount");
     };
 
-    // One localhost TCP proxy to the guest nfsd, bridged over vsock.
+    // One localhost TCP proxy to the guest nfsd, bridged over vsock. It outlives
+    // VM restarts: each connection dials `connect_vsock_port` against whatever
+    // guest is current, so the same local port keeps working across reboots.
     let nfsd_port = spawn_proxy(&runtime, &shutdown, NFS_NFSD_RELAY_PORT).await?;
 
-    // Ask the guest to bring up the export. The agent no longer starts nfsd on
-    // its own, so this request is what gives a mount-enabled daemon an export
-    // at all — and a `--no-mount-nfs` daemon never reaches here, so its guest
-    // runs none. Best-effort: the guest handler runs to completion even if this
-    // RPC read times out (it may still be waiting on dockerd's data mount), and
-    // `mount_with_retry` below is the readiness signal.
-    if let Err(e) = ensure_guest_export(&runtime).await {
-        debug!(error = %e, "guest nfs export request did not confirm; relying on mount retry");
+    // Re-establish the export for every VM incarnation. The agent no longer
+    // starts nfsd on its own, so each guest — the first boot and every restart
+    // (backend switch, crash recovery) — has no NFS server until we ask; a
+    // `--no-mount-nfs` daemon never reaches here, so its guests run none.
+    let mut first = true;
+    while !shutdown.is_cancelled() {
+        let generation = runtime.system_vm_restart_generation();
+
+        // The request must actually land — a pre-delivery failure (agent still
+        // coming up, connect/send error) leaves the guest with no nfsd and the
+        // mount below would retry forever, so retry until the agent confirms.
+        ensure_guest_export(&runtime, &shutdown).await?;
+
+        reconcile_existing_mount(&mount_path)?;
+        std::fs::create_dir_all(&mount_path)?;
+
+        // The hosts alias only needs waiting for on the very first mount.
+        if first && expect_hosts_alias {
+            wait_for_hosts_alias(&shutdown).await;
+        }
+        first = false;
+
+        mount_with_retry(&mount_path, nfsd_port, &shutdown).await?;
+
+        // Hold until the System VM restarts, then loop to rebuild the export on
+        // the new guest and remount over the now-stale mount.
+        wait_for_vm_restart(&runtime, generation, &shutdown).await;
+        if shutdown.is_cancelled() {
+            break;
+        }
+        info!("system VM restarted; re-establishing the ~/ArcBox export");
     }
-
-    reconcile_existing_mount(&mount_path)?;
-    std::fs::create_dir_all(&mount_path)?;
-
-    if expect_hosts_alias {
-        wait_for_hosts_alias(&shutdown).await;
-    }
-
-    mount_with_retry(&mount_path, nfsd_port, &shutdown).await
+    Ok(())
 }
 
-/// Asks the guest agent to bring up the read-only NFS export.
+/// Asks the guest agent to bring up the export, retrying until it confirms,
+/// the deadline passes, or shutdown.
+///
+/// A pre-delivery failure must be retried, not swallowed: the agent no longer
+/// starts nfsd on its own, so if the request never lands the guest has no
+/// server and `mount_with_retry` can only fail. A read timeout after delivery
+/// is fine — the guest handler runs to completion regardless — and a retry
+/// then finds the export already up (the handler is idempotent).
+async fn ensure_guest_export(runtime: &Arc<Runtime>, shutdown: &CancellationToken) -> Result<()> {
+    const ENSURE_TIMEOUT: Duration = Duration::from_secs(90);
+    const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+    let deadline = tokio::time::Instant::now() + ENSURE_TIMEOUT;
+    loop {
+        if shutdown.is_cancelled() {
+            bail!("daemon shutdown before the guest NFS export was established");
+        }
+        match send_ensure_export(runtime).await {
+            Ok(notes) => {
+                debug!(notes = ?notes, "guest nfs export ensured");
+                return Ok(());
+            }
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                return Err(e).context("guest did not establish the NFS export in time");
+            }
+            Err(e) => debug!(error = %e, "ensure guest nfs export attempt failed, retrying"),
+        }
+        tokio::time::sleep(RETRY_INTERVAL).await;
+    }
+}
+
+/// One `EnsureNfsExport` round-trip to the guest agent.
 ///
 /// `connect_agent` is a blocking hypervisor call on both backends; on HV the
 /// whole agent transport is blocking, on VZ only the connect is. Mirrors the
 /// `sync_guest_clock` backend dispatch in `arcbox-core`.
-async fn ensure_guest_export(runtime: &Arc<Runtime>) -> Result<()> {
+async fn send_ensure_export(runtime: &Arc<Runtime>) -> Result<Vec<String>> {
     let machine = DEFAULT_MACHINE_NAME.to_string();
     let rt = Arc::clone(runtime);
     let mut agent = tokio::task::spawn_blocking(move || rt.get_agent(&machine)).await??;
@@ -128,8 +176,28 @@ async fn ensure_guest_export(runtime: &Arc<Runtime>) -> Result<()> {
     } else {
         agent.ensure_nfs_export().await?
     };
-    debug!(notes = ?resp.notes, "guest nfs export ensured");
-    Ok(())
+    Ok(resp.notes)
+}
+
+/// Blocks until the System VM's restart generation advances past `generation`
+/// (backend switch, crash recovery) or the daemon shuts down.
+async fn wait_for_vm_restart(
+    runtime: &Arc<Runtime>,
+    generation: u64,
+    shutdown: &CancellationToken,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(POLL_INTERVAL) => {
+                if runtime.system_vm_restart_generation() != generation {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Bounded wait for the `ArcBox` hosts alias the concurrent self-setup task
