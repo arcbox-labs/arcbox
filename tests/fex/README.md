@@ -67,7 +67,7 @@ interpreter at registration time so containers inherit it across mount
 namespaces. (This registration lives in the `boot-assets` rootfs init, not the
 ArcBox guest agent.)
 
-Manual guest-side confirmation (until `arcbox exec` diag is wired):
+Manual guest-side confirmation (until `abctl exec` diag is wired):
 
 ```bash
 # inside the HV guest:

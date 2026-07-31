@@ -115,7 +115,7 @@ impl SandboxService {
         if !spec.mounts.is_empty() {
             return Err(SandboxError::Unsupported(
                 "mounts are not supported in Sandbox V1; copy files in with \
-                 WriteFile (`arcbox sandbox cp`) instead"
+                 WriteFile (`abctl sandbox cp`) instead"
                     .into(),
             ));
         }
@@ -129,7 +129,7 @@ impl SandboxService {
         if !spec.image.is_empty() {
             return Err(SandboxError::Unsupported(
                 "registry image pull is not supported in Sandbox V1; build the \
-                 rootfs from a local Docker image with `arcbox sandbox create \
+                 rootfs from a local Docker image with `abctl sandbox create \
                  --from-image` instead"
                     .into(),
             ));

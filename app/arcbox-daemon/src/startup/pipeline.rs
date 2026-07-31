@@ -182,7 +182,7 @@ impl RuntimeServicesStarted {
             println!("  Data:       {}", self.ctx.layout.data_dir.display());
             println!();
             if self.linux_vm {
-                println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
+                println!("Use 'abctl docker enable' to configure Docker CLI integration.");
             } else {
                 println!(
                     "Running as a VM host only (--no-linux-vm): Docker and Kubernetes are disabled."
@@ -204,7 +204,7 @@ impl RuntimeServicesStarted {
 fn check_resolver_installed(domain: &str) {
     let resolver = FileResolver::new("arcbox");
     if !resolver.is_registered(domain) {
-        println!("Hint: Run 'sudo arcbox dns install' to enable *.{domain} DNS resolution.");
+        println!("Hint: Run 'sudo abctl dns install' to enable *.{domain} DNS resolution.");
     }
 }
 

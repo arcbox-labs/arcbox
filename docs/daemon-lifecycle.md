@@ -237,14 +237,14 @@ descriptor, not the PID. Even if the kernel reuses a PID for an unrelated
 process, the new daemon detects that the lock is not held (because the
 original holder's fd was closed on exit) and proceeds immediately.
 
-The CLI (`arcbox daemon status/stop/start`) also uses `flock` probing
+The CLI (`abctl daemon status/stop/start`) also uses `flock` probing
 (`LOCK_EX | LOCK_NB`) rather than `kill(pid, 0)` for liveness detection.
 PID is only read from the lock file for SIGTERM delivery and display.
 
 ### Spawn serialization (`daemon-spawn.lock`)
 
 The alive probe releases its flock immediately, so two racing
-`arcbox daemon start` invocations could both observe "not running" and
+`abctl daemon start` invocations could both observe "not running" and
 both spawn a daemon — the flock loser would then displace the winner
 mid-boot via the stale-daemon takeover. To close this TOCTOU, the CLI
 holds a separate `daemon-spawn.lock` (in the run directory) from the

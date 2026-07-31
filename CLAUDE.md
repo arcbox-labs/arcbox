@@ -29,7 +29,7 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `virt/` — Virtualization.framework bindings, cross-platform hypervisor traits, VMM, VirtIO devices, VirtioFS, networking (NAT/DHCP/DNS)
 - `rpc/` — protobuf definitions, gRPC services, vsock/unix transport
 - `runtime/` — container state, OCI image/runtime
-- `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`arcbox`), daemon binary (`arcbox-daemon`), facade crate
+- `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`abctl`, not `arcbox`), daemon binary (`arcbox-daemon`), facade crate
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — test resources and fixture build scripts
 - `.agents/skills/` — shared Claude Code skills (symlinked from `.claude/skills/`)
@@ -117,7 +117,7 @@ When asked to plan, the plan must be fully resolved before implementation begins
   ```
 - Requires Developer ID certificate (`.p12`) + provisioning profile (`.provisionprofile`). See `CONTRIBUTING.md` "Code Signing" section for setup.
 - Requires Xcode Command Line Tools
-- Some tasks require a running daemon. Start it in a background terminal: `arcbox daemon start`
+- Some tasks require a running daemon. Start it in a background terminal: `abctl daemon start`
 
 ## Guest Agent Cross-Compilation
 

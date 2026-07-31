@@ -3,7 +3,7 @@
 #
 # Reproducible spike for "FEX as the default linux/amd64 runtime inside the
 # single HV utility VM". Run this on Apple Silicon macOS with a running,
-# Developer-ID-signed `arcbox daemon` and the `arcbox` Docker context active.
+# Developer-ID-signed `abctl daemon` and the `arcbox` Docker context active.
 #
 # It exercises PLAN.md Decision Gates A/B/C and records an environment header
 # so results are reproducible. Every check prints exactly one tagged line:
@@ -53,12 +53,12 @@ printf 'docker context    %s\n' "$CONTEXT"
   | sed 's/^/server version    /' || tag INFRA "daemon not reachable on context '$CONTEXT'"
 
 # Guest-side facts (best effort; require the daemon to expose an exec/diag path).
-# These mirror PLAN.md Observability. If `arcbox` CLI exposes a guest exec, wire
+# These mirror PLAN.md Observability. If the `abctl` CLI exposes a guest exec, wire
 # it here; otherwise these are documented manual checks in README.md.
-if command -v arcbox >/dev/null 2>&1; then
-  printf 'guest kernel      %s\n' "$(arcbox exec -- uname -r 2>/dev/null || echo '? (run manually in guest)')"
-  printf 'fex version       %s\n' "$(arcbox exec -- /arcbox/runtime/bin/FEX --version 2>/dev/null || echo '? (run manually in guest)')"
-  printf 'binfmt x86_64     %s\n' "$(arcbox exec -- sh -c 'cat /proc/sys/fs/binfmt_misc/FEX-x86_64 2>/dev/null | head -1' 2>/dev/null || echo '? (run manually in guest)')"
+if command -v abctl >/dev/null 2>&1; then
+  printf 'guest kernel      %s\n' "$(abctl exec -- uname -r 2>/dev/null || echo '? (run manually in guest)')"
+  printf 'fex version       %s\n' "$(abctl exec -- /arcbox/runtime/bin/FEX --version 2>/dev/null || echo '? (run manually in guest)')"
+  printf 'binfmt x86_64     %s\n' "$(abctl exec -- sh -c 'cat /proc/sys/fs/binfmt_misc/FEX-x86_64 2>/dev/null | head -1' 2>/dev/null || echo '? (run manually in guest)')"
 fi
 
 if [ "$infra" -gt 0 ]; then
@@ -99,9 +99,9 @@ fi
 
 # No VZ runtime VM may be started for default amd64 runtime. The daemon should
 # expose this; until a diag endpoint exists, README.md documents the manual
-# `arcbox info` / process check.
-if command -v arcbox >/dev/null 2>&1; then
-  if arcbox info 2>/dev/null | grep -qi 'rosetta.*running\|vz.*runtime.*running'; then
+# `abctl info` / process check.
+if command -v abctl >/dev/null 2>&1; then
+  if abctl info 2>/dev/null | grep -qi 'rosetta.*running\|vz.*runtime.*running'; then
     tag FAIL "a VZ/Rosetta runtime VM is running for default amd64 (PLAN forbids)"
   else
     tag PASS "no VZ/Rosetta runtime VM active for default amd64 runtime"

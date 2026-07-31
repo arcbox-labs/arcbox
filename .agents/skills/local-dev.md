@@ -148,7 +148,7 @@ The daemon uses `flock(2)` on `~/.arcbox/run/daemon.lock` for exclusive
 ownership. Key behaviors:
 
 - **No stale PID issues**: lock auto-releases on process exit/crash
-- **CLI uses flock probe**: `arcbox daemon status` checks if lock is held,
+- **CLI uses flock probe**: `abctl daemon status` checks if lock is held,
   not whether a PID is alive
 - **Startup order**: `init_early` → `acquire_lock` → `start_grpc` →
   `wait_for_resources` → `init_runtime`

@@ -203,7 +203,7 @@ pub struct VmDefaults {
     /// macOS hypervisor backend for the System VM (`"vz"` or `"hv"`).
     ///
     /// First-boot default only: once the machine exists, its persisted
-    /// backend (as switched via `arcbox system backend`) wins. Settable
+    /// backend (as switched via `abctl system backend`) wins. Settable
     /// non-interactively via `ARCBOX_VM_BACKEND` or `config.toml` — the
     /// entry point for the dual-backend e2e matrix.
     pub backend: arcbox_vmm::VmBackend,
