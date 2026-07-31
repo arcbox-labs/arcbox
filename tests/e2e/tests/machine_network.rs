@@ -29,6 +29,7 @@
 //! Requires internet (create pulls alpine from the live CDN mirror) and a
 //! musl-cross `arcbox-agent`, like `machine.rs`.
 
+use std::net::Ipv4Addr;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -281,9 +282,42 @@ async fn m1_egress_tcp(machines: &mut MachineServiceClient<Channel>) -> Result<(
     Ok(())
 }
 
+/// Extracts the *answer* addresses from busybox `nslookup` stdout.
+///
+/// The output is two blocks — a resolver preamble, then the answer:
+///
+/// ```text
+/// Server:    10.0.2.1
+/// Address:   10.0.2.1:53
+///
+/// Name:      host.docker.internal
+/// Address 1: 10.0.2.1
+/// ```
+///
+/// busybox echoes the configured resolver in that preamble unconditionally
+/// and exits 0 even on NXDOMAIN, so a whole-output substring match for the
+/// gateway is a tautology here: the resolver *is* the expected answer. Only
+/// the block after the `Name:` line is an answer, so parse from there. A
+/// successful reverse lookup appends a hostname to the address
+/// (`Address 1: 10.0.2.1 host.docker.internal`), hence the first-token split.
+fn nslookup_answer_addrs(out: &str) -> Vec<Ipv4Addr> {
+    out.lines()
+        .skip_while(|line| !line.trim_start().starts_with("Name:"))
+        .skip(1)
+        .filter_map(|line| line.trim_start().strip_prefix("Address"))
+        .filter_map(|rest| rest.split_once(':'))
+        .filter_map(|(_, value)| value.split_whitespace().next())
+        .filter_map(|token| token.parse::<Ipv4Addr>().ok())
+        .collect()
+}
+
 /// M2: the Machine's resolver (`10.0.2.1`, from DHCP) answers the
-/// gateway-internal names via the in-VMM `DnsForwarder`.
+/// gateway-internal names via the in-VMM `DnsForwarder`. Both names are
+/// registered into the `LocalHostsTable` the daemon shares with every VM
+/// (`register_host_dns`, `app/arcbox-daemon/src/services.rs`), so a Machine
+/// resolves them exactly like a container does.
 async fn m2_dns(machines: &mut MachineServiceClient<Channel>) -> Result<()> {
+    let gateway: Ipv4Addr = GATEWAY.parse().expect("GATEWAY is an IPv4 literal");
     for name in ["host.docker.internal", "gateway.docker.internal"] {
         let (out, exit) = exec_capture(
             machines,
@@ -291,9 +325,12 @@ async fn m2_dns(machines: &mut MachineServiceClient<Channel>) -> Result<()> {
             RPC_BUDGET,
         )
         .await?;
-        // busybox nslookup exits 0 on NXDOMAIN too, so assert on the answer.
-        if !out.contains(GATEWAY) {
-            bail!("nslookup {name} did not resolve to {GATEWAY} (exit {exit}): {out:?}");
+        let answers = nslookup_answer_addrs(&out);
+        if !answers.contains(&gateway) {
+            bail!(
+                "nslookup {name} answered {answers:?}, expected {GATEWAY} \
+                 (exit {exit}); full output: {out:?}"
+            );
         }
     }
     Ok(())
@@ -318,6 +355,11 @@ async fn m3_egress_volume(machines: &mut MachineServiceClient<Channel>) -> Resul
 
 /// M4: `inspect` reports the gateway and DNS the Machine actually uses —
 /// metadata the lifecycle test never checks.
+///
+/// Scope note: gateway and `dns_servers` are gated; `ip_address` is only
+/// characterized (valid, non-special IPv4 + a WARN on a non-datapath value),
+/// because that field is fed by a known-broken producer — see the comment at
+/// the check.
 async fn m4_network_metadata(machines: &mut MachineServiceClient<Channel>) -> Result<()> {
     let info = machines
         .inspect(InspectMachineRequest {
@@ -336,13 +378,23 @@ async fn m4_network_metadata(machines: &mut MachineServiceClient<Channel>) -> Re
             net.dns_servers
         );
     }
-    // The reported IP must be a real, usable IPv4 — but NOT hardcoded to the
-    // datapath's 10.0.2.0/24: `select_routable_ip` picks from the agent's
-    // enumerated addresses, and on this host it returned 198.18.11.51 (the
-    // Surge/Clash fake-IP range) while the datapath IP is 10.0.2.2. That
-    // disagreement is worth a look (see the plan's findings) but is
-    // host-environment-tangled, so flag it rather than gate on it.
-    let addr: std::net::Ipv4Addr = net
+    // `ip_address` is characterized, NOT gated, and the weak check below is
+    // deliberate: the field's producer is broken, so gating would pin the bug.
+    // `select_routable_ip` (`app/arcbox-core/src/machine.rs`) picks the first
+    // usable address out of `SystemInfo.ip_addresses`, which the guest agent
+    // fills from `hostname -I` falling back to `hostname -i`
+    // (`guest/arcbox-agent/src/agent/linux/system_info.rs`). Alpine ships
+    // busybox `hostname`, which has no `-I`; its `-i` does not enumerate
+    // interfaces at all — it *resolves the guest's own hostname through DNS*.
+    // So on this host the field came back 198.18.11.51 (a Surge/Clash fake-IP
+    // answer) while the datapath address is 10.0.2.2: a resolver artifact, not
+    // an address the Machine holds. Asserting datapath membership would fail
+    // for that reason rather than a datapath reason, and asserting the address
+    // against the guest's real interfaces would fail too — so assert only what
+    // holds regardless (syntactically valid, not a special-use address) and
+    // WARN the mismatch. Fixing the producer is a guest-agent change, tracked
+    // separately; when it lands, tighten this to the datapath subnet.
+    let addr: Ipv4Addr = net
         .ip_address
         .parse()
         .with_context(|| format!("machine IP {:?} is not a valid IPv4", net.ip_address))?;
@@ -353,11 +405,46 @@ async fn m4_network_metadata(machines: &mut MachineServiceClient<Channel>) -> Re
         tracing::warn!(
             ip = %net.ip_address,
             "machine's reported IP is outside the datapath 10.0.2.0/24 (gateway 10.0.2.1, \
-             guest 10.0.2.2) — select_routable_ip picked a non-datapath address; \
-             investigate on a non-fake-IP host"
+             guest 10.0.2.2) — busybox `hostname -i` resolved the guest hostname via DNS \
+             instead of enumerating interfaces; see the plan's finding"
         );
     }
     Ok(())
+}
+
+/// The regression M2 shipped with: the resolver preamble echoes `10.0.2.1`
+/// on a *failed* lookup too, so a whole-output match could never fail. These
+/// run without a VM, so the parser stays honest even when nobody runs the
+/// `#[ignore]`d scenario.
+#[test]
+fn nslookup_preamble_is_not_an_answer() {
+    // busybox on NXDOMAIN: preamble on stdout, the error goes to stderr
+    // (which `exec_capture` drops), and it still exits 0.
+    let out = "Server:\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n";
+    assert!(nslookup_answer_addrs(out).is_empty());
+}
+
+#[test]
+fn nslookup_answer_block_is_parsed() {
+    let out = "Server:\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
+               Name:      host.docker.internal\nAddress 1: 10.0.2.1\n";
+    assert_eq!(
+        nslookup_answer_addrs(out),
+        vec![Ipv4Addr::new(10, 0, 2, 1)],
+        "the answer address must be read from the block after `Name:`"
+    );
+}
+
+#[test]
+fn nslookup_wrong_answer_is_distinguishable() {
+    // The failure M2 must catch: resolver is the gateway, answer is not.
+    let out = "Server:\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
+               Name:      host.docker.internal\nAddress 1: 203.0.113.9 wrong.example\n";
+    assert_eq!(
+        nslookup_answer_addrs(out),
+        vec![Ipv4Addr::new(203, 0, 113, 9)],
+        "a reverse-resolved hostname must not swallow the address"
+    );
 }
 
 /// M5: host→Machine SSH is not implemented; pin that contract so a future
