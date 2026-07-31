@@ -16,8 +16,8 @@
 //! `quick enroll` (the socketless headless/farm path) and does nothing else.
 //! `serve` additionally exposes the local control-plane API on `agent.sock`,
 //! and does not require a credential up front — `enroll`/`drain`/`resume`/
-//! `unenroll` can drive it from another invocation of this CLI, or from the
-//! desktop app, while it runs.
+//! `unenroll`/`restart` can drive it from another invocation of this CLI, or
+//! from the desktop app, while it runs.
 
 // The local control-plane API (agent.sock) is a Unix domain socket with no
 // Windows equivalent implemented, so this crate targets macOS and Linux
@@ -105,6 +105,16 @@ enum Command {
     /// credential; the server keeps the machine record, so a fresh `enroll`
     /// joins as a new machine.
     Unenroll,
+    /// Restart the running agent in place: it stops accepting new offers,
+    /// waits for in-flight jobs, then re-execs itself — same PID, so a
+    /// launchd job is undisturbed. Unavailable under `quick run`, which
+    /// serves no control socket.
+    Restart {
+        /// Don't wait for in-flight jobs: cancel them, tearing down their
+        /// runner process groups and containers, and restart now.
+        #[arg(long)]
+        force: bool,
+    },
     /// Get or update the running agent's live-settable configuration.
     #[command(subcommand)]
     Settings(SettingsCommand),
@@ -441,6 +451,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
             println!("unenrolled");
             Ok(())
         }
+        Command::Restart { force } => restart(&config, force).await,
         Command::Settings(SettingsCommand::Get) => {
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetSettingsServiceClient::new(channel);
@@ -767,6 +778,86 @@ async fn resume_enroll_after_restart(
         .context("Enroll RPC failed after the agent self-updated")?
         .into_inner()
         .machine_id)
+}
+
+/// Restart the running agent, then wait for the replacement process image to
+/// answer on the control socket.
+///
+/// A graceful restart waits, unbounded, for in-flight jobs — so a wait that
+/// runs past [`RESTART_WAIT`] is reported as "still draining" and is not an
+/// error, whereas `--force` restarts promptly or not at all.
+async fn restart(config: &AgentConfig, force: bool) -> Result<()> {
+    let mut client =
+        FleetLifecycleServiceClient::new(control::client::connect_default(config).await?);
+    let before = client
+        .get_agent_info(control_proto::GetAgentInfoRequest {})
+        .await
+        .context("GetAgentInfo RPC failed")?
+        .into_inner();
+    // The capability handshake, not a version comparison: an agent without
+    // it would answer `Unimplemented` and leave nothing to wait for.
+    if !before.features.iter().any(|f| f == "restart") {
+        anyhow::bail!(
+            "the running agent ({}) does not support `restart`; restart it through its service \
+             manager (`launchctl kickstart -k gui/$UID/com.arcboxlabs.fleet.agent` on macOS)",
+            before.agent_version
+        );
+    }
+
+    match client
+        .restart(control_proto::RestartRequest { force })
+        .await
+    {
+        Ok(_) => {}
+        // The re-exec can replace the process before the response flushes;
+        // that is the restart landing, not a failure to report.
+        Err(status) if is_connection_lost(&status) => {}
+        Err(status) => return Err(anyhow::Error::new(status).context("Restart RPC failed")),
+    }
+
+    match wait_for_restart(config, &before.instance_id).await {
+        Some(version) => {
+            println!("agent restarted (version {version})");
+            Ok(())
+        }
+        None if force => anyhow::bail!(
+            "the agent did not come back within {}s",
+            RESTART_WAIT.as_secs()
+        ),
+        None => {
+            println!(
+                "restart requested; the agent is still finishing in-flight jobs and restarts \
+                 once the last one releases"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Poll the control socket until it answers from a process image other than
+/// `previous`, returning that image's version. `None` once [`RESTART_WAIT`]
+/// expires: the old image is still running (`GetAgentInfo` keeps reporting
+/// `previous`), or the replacement has not rebound the socket yet — the
+/// caller decides which of those is an error.
+async fn wait_for_restart(config: &AgentConfig, previous: &str) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + RESTART_WAIT;
+    loop {
+        if let Ok(channel) = control::client::connect_default(config).await {
+            let info = FleetLifecycleServiceClient::new(channel)
+                .get_agent_info(control_proto::GetAgentInfoRequest {})
+                .await;
+            if let Ok(info) = info {
+                let info = info.into_inner();
+                if info.instance_id != previous {
+                    return Some(info.agent_version);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(RESTART_POLL).await;
+    }
 }
 
 /// Run the startup probes and assemble the backend registry: any
