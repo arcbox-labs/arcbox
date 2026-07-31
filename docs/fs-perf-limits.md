@@ -115,7 +115,9 @@ OrbStack, Docker Desktop, and our own HV backend.
   numbers for the custom VirtioFS (feeds RES-17 / Paper B).
 - Fix the agent's misleading dax log (records intent, not outcome).
 - The bench binary's own `TARGETS` table (`tests/bench-virtiofs/src/main.rs`)
-  still gates `metadata_stat`/`negative_lookup` as percent-of-native, so its
-  "Target Compliance" block prints a permanent FAIL for rows this doc rules
-  out as native-ratio'able. Known-stale, non-gating; the code fix lands with
-  the perf-target policy revision.
+  still frames `metadata_stat`/`negative_lookup` as percent-of-native, but
+  the gate is inert: nothing ever populates `percent_of_native`, so the
+  "Target Compliance" block can only print "no native baseline available"
+  (and the e2e driver runs `--format json`, which skips the block
+  entirely). Known-stale and never able to evaluate; the code fix lands
+  with the perf-target policy revision.

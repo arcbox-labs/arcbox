@@ -81,8 +81,8 @@ same-context rule, and current numbers) lives in `docs/fs-perf-limits.md`.
 ## Performance Targets (legacy — do not gate on these)
 
 > **Superseded by `docs/fs-perf-limits.md`.** These percent-of-native
-> targets (and the same table printed by `--list` / checked by the
-> binary) predate the CORE-48 methodology work, which showed that
+> targets (and the same table printed by `--list`; the binary's runtime
+> check is inert — nothing populates `percent_of_native`) predate the CORE-48 methodology work, which showed that
 > cache-hot native is not a valid denominator for FUSE metadata and that
 > only the in-process trio (`metadata_stat`, `create_delete`,
 > `negative_lookup`) is ratio-safe at all. The table is kept verbatim
