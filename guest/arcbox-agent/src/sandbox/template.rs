@@ -223,11 +223,20 @@ mod docker {
     }
 
     /// `GET /images/{ref}/get`, streamed into `sink` (an OCI-layout tar).
+    ///
+    /// The export is pinned to this guest's platform. A multi-platform image
+    /// otherwise exports an index naming manifests for platforms that were
+    /// never pulled, and the converter fails on the first missing layer with
+    /// a bare `blob not found: sha256:…` that names nothing about platforms.
     pub(super) async fn get_image_export<W>(image_ref: &str, sink: &mut W) -> Result<()>
     where
         W: AsyncWrite + Unpin,
     {
-        let path = format!("/images/{}/get", urlencode(image_ref));
+        let path = format!(
+            "/images/{}/get?platform={}",
+            urlencode(image_ref),
+            urlencode(&platform_json()?)
+        );
         let mut response = get(&path).await?;
         let status = response.status();
         if !status.is_success() {
@@ -278,6 +287,17 @@ mod docker {
             .context("failed to send the docker request")
     }
 
+    /// This guest's platform as the JSON-encoded OCI platform the Engine API
+    /// expects (`{"architecture":…,"os":"linux"}`).
+    fn platform_json() -> Result<String> {
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            other => bail!("unsupported guest architecture for sandbox images: {other}"),
+        };
+        Ok(format!(r#"{{"architecture":"{arch}","os":"linux"}}"#))
+    }
+
     /// Percent-encode an image reference for a path segment.
     ///
     /// References carry `/` and `:` (`ghcr.io/org/img:tag`), which would
@@ -301,7 +321,20 @@ mod docker {
 
     #[cfg(test)]
     mod tests {
-        use super::urlencode;
+        use super::{platform_json, urlencode};
+
+        #[test]
+        fn platform_json_is_the_guest_platform() {
+            let platform = platform_json().expect("supported test architecture");
+            assert!(platform.contains(r#""os":"linux""#), "{platform}");
+            // Docker's OCI platform names, not Rust's target names.
+            assert!(
+                platform.contains(r#""architecture":"arm64""#)
+                    || platform.contains(r#""architecture":"amd64""#),
+                "{platform}"
+            );
+            assert!(!platform.contains("aarch64"), "{platform}");
+        }
 
         #[test]
         fn urlencode_escapes_registry_refs() {
