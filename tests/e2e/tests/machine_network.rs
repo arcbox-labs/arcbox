@@ -66,6 +66,9 @@ const VOLUME_BYTES: usize = 16 * 1024 * 1024;
 /// Pattern seed for M3's origin. Any fixed value works; distinct from
 /// `network_workload`'s so a crossed-wires fixture cannot hash-match.
 const VOLUME_SEED: u64 = 0x004D_3E2E_5345_4544;
+/// SHA-256 of the empty input — what `sha256sum` reports when the download
+/// delivered nothing at all. See `m3_egress_volume`.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn init_tracing() {
     TRACING.call_once(|| {
@@ -373,6 +376,21 @@ async fn m3_egress_volume(machines: &mut MachineServiceClient<Channel>) -> Resul
         bail!("volume wget exited {exit} (out: {out:?})");
     }
     let got = out.trim();
+    // A pipeline's status is its last stage's, so a wget that delivered
+    // nothing still exits 0 here and hands sha256sum an empty stream —
+    // whose digest is a perfectly valid hash to compare against. Name that
+    // case instead of reporting it as generic corruption.
+    if got == EMPTY_SHA256 {
+        bail!(
+            "machine received no data at all: wget delivered nothing and the \
+             pipeline masked its failure (hash is the empty-input digest). \
+             Known cause: CORE-66 — the Machine's guest route table goes \
+             empty mid-session, so the connect fails with ENETUNREACH before \
+             any datapath code runs. Confirm with `cat /proc/net/route` in \
+             the Machine (`ip` is unusable there); a header-only table is \
+             CORE-66, anything else is a new failure"
+        );
+    }
     if got != server.sha256() {
         bail!(
             "machine received a corrupt {VOLUME_BYTES}-byte blob: sha256 {got}, \

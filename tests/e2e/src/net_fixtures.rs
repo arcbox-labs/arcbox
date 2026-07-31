@@ -221,7 +221,16 @@ pub fn spawn_pattern_server(len: usize, seed: u64) -> Result<PatternServer> {
                 if stream.write_all(header.as_bytes()).is_err() {
                     return;
                 }
-                let _ = stream.write_all(&body);
+                if stream.write_all(&body).is_err() {
+                    return;
+                }
+                // Wait for the client to close before dropping the socket, as
+                // `spawn_blob_server` does: a real HTTP origin does not slam
+                // the socket shut the moment the body is queued, and two
+                // fixtures modelling the same thing should not differ in when
+                // they close.
+                let mut sink = [0u8; 1024];
+                while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
             });
         }
     });
