@@ -473,8 +473,8 @@ impl AgentSupervisor {
     ///
     /// Nothing to drain here: `check_enrollable` admitted this enroll only
     /// from `Unenrolled`, so there is no attachment and no in-flight job to
-    /// protect. On success the process is replaced mid-RPC and the caller
-    /// re-issues `Enroll` against the new build; every path that returns
+    /// protect. On success the agent shuts down to come back on the new build
+    /// and the caller re-issues `Enroll` against it; every path that returns
     /// leaves the observable `Updating` for [`Self::enroll`]'s rollback to
     /// reset.
     async fn refused_enrollment(&self, error: anyhow::Error) -> Status {
@@ -487,8 +487,22 @@ impl AgentSupervisor {
             "gateway requires a different build; self-updating before enrolling"
         );
         self.agent_state.set_enrollment(Enrollment::Updating, "");
-        // Returns only on failure; success replaces this process.
-        let update_error = update::apply_and_exec(&self.config, &payload).await;
+        let update_error = match update::apply(&self.config, &payload).await {
+            Ok(managed) => {
+                self.handover.request(Reason::Update);
+                self.handover.commit(managed);
+                // UNAVAILABLE, not an error the caller should give up on: the
+                // agent is coming back on the required build, and this is the
+                // code `main`'s enroll path already treats as "restarted
+                // mid-call; wait and resume". Reported rather than raced —
+                // the exec used to happen here, so whether the caller saw a
+                // status or a dropped connection was a coin flip.
+                return Status::unavailable(
+                    "agent is restarting onto the required build; retry once it is back",
+                );
+            }
+            Err(update_error) => update_error,
+        };
         if update_error
             .chain()
             .any(|c| c.downcast_ref::<update::UnmanagedBinary>().is_some())
@@ -722,6 +736,12 @@ impl AgentSupervisor {
     /// unbounded on the jobs themselves, bounded on the verdict acks that
     /// follow them.
     pub async fn restart(&self, force: bool) -> Result<(), Status> {
+        // Resolved before anything is armed, so an unresolvable executable is
+        // an error the operator sees on this call rather than a process that
+        // tears itself down and then fails to come back.
+        let binary = std::env::current_exe().map_err(|e| {
+            Status::failed_precondition(format!("resolving the current binary path: {e}"))
+        })?;
         let reason = if force {
             Reason::ForcedRestart
         } else {
@@ -755,7 +775,7 @@ impl AgentSupervisor {
         };
         let Some(runners) = runners else {
             info!(?reason, "restarting");
-            self.handover.commit();
+            self.handover.commit(binary);
             return Ok(());
         };
 
@@ -767,7 +787,7 @@ impl AgentSupervisor {
             // the gateway settles it would strand the outcome.
             runners.quiesce(crate::runner::VERDICT_ACK_GRACE).await;
             info!("in-flight work settled; restarting");
-            handover.commit();
+            handover.commit(binary);
         });
         Ok(())
     }

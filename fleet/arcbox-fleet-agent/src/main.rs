@@ -248,34 +248,27 @@ fn main() -> Result<()> {
         .build()
         .context("building tokio runtime")?;
 
-    let outcome = runtime.block_on(run(cli.command, config))?;
-    if outcome == Outcome::Exit {
+    let Outcome::Exec(binary) = runtime.block_on(run(cli.command, config))? else {
         return Ok(());
-    }
-    // `exec` runs no destructors, so everything that needs draining has to
-    // be dropped here: the runtime's worker threads first, then the logging
-    // guard that flushes the non-blocking writer.
+    };
+    // The one exec site in the process. `exec` runs no destructors, so
+    // everything that needs draining has to be dropped here: the runtime's
+    // worker threads first, then the logging guard that flushes the
+    // non-blocking writer.
     drop(runtime);
     drop(log_guard);
-    Err(reexec::exec(
-        &std::env::current_exe().context("resolving the current binary path")?,
-    ))
+    Err(reexec::exec(&binary))
 }
 
-/// Dispatch the parsed subcommand. Only `serve` can ask for anything other
-/// than a plain exit, so every other arm is mapped onto [`Outcome::Exit`]
-/// here rather than threading the outcome through each one.
+/// Dispatch the parsed subcommand.
+///
+/// Three of these arms can end by replacing this process image — `serve` (an
+/// operator `Restart` or a gateway-pushed self-update), `quick run` (the same
+/// push), and the two self-update entry points. None of them exec: they name
+/// the image and return it here, so [`main`] runs the teardown first.
 async fn run(command: Command, config: AgentConfig) -> Result<Outcome> {
     match command {
         Command::Serve => serve::serve(config).await,
-        other => run_command(other, config).await.map(|()| Outcome::Exit),
-    }
-}
-
-async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
-    match command {
-        // Handled by `run` above, which owns the restart outcome.
-        Command::Serve => unreachable!("dispatched in run()"),
         Command::Enroll(EnrollArgs { token_file, token }) => {
             let token = resolve_enrollment_token(token_file, token)?;
             let channel = control::client::connect_default(&config).await?;
@@ -302,7 +295,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 }
             };
             println!("enrolled (machine_id={machine_id})");
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Quick(QuickCommand::Enroll(EnrollArgs { token_file, token })) => {
             let token = resolve_enrollment_token(token_file, token)?;
@@ -328,8 +321,12 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                             expected = %payload.expected_version,
                             "gateway requires a different build; self-updating before enrolling"
                         );
-                        let update_error = update::apply_and_exec(&config, &payload).await;
-                        warn!(error = %update_error, "self-update failed");
+                        match update::apply(&config, &payload).await {
+                            Ok(managed) => return Ok(Outcome::Exec(managed)),
+                            Err(update_error) => {
+                                warn!(error = %update_error, "self-update failed");
+                            }
+                        }
                     }
                     return Err(error);
                 }
@@ -337,7 +334,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
             config
                 .credential_store_for(&seed.gateway)
                 .store(&credential)?;
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Quick(QuickCommand::Run) => {
             let settings_store = SettingsStore::new(config.settings_path());
@@ -384,9 +381,10 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 backends,
                 shutdown,
                 agent_state,
-                handover,
+                Arc::clone(&handover),
             )
-            .await
+            .await?;
+            Ok(handover.outcome())
         }
         Command::Quick(QuickCommand::Unenroll) => {
             let settings_store = SettingsStore::new(config.settings_path());
@@ -397,7 +395,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 .context("not enrolled")?;
             enroll::unenroll_and_clear(&config, &seed.gateway, &credential).await?;
             println!("unenrolled");
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Status => {
             let channel = control::client::connect_default(&config).await?;
@@ -432,7 +430,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 }
                 control_proto::ConnectionState::Unspecified => println!("unknown state"),
             }
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Drain => {
             let channel = control::client::connect_default(&config).await?;
@@ -442,7 +440,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 .await
                 .context("Drain RPC failed")?;
             println!("draining");
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Resume => {
             let channel = control::client::connect_default(&config).await?;
@@ -452,7 +450,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 .await
                 .context("Resume RPC failed")?;
             println!("resumed");
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Unenroll => {
             let channel = control::client::connect_default(&config).await?;
@@ -462,9 +460,9 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 .await
                 .context("Unenroll RPC failed")?;
             println!("unenrolled");
-            Ok(())
+            Ok(Outcome::Exit)
         }
-        Command::Restart { force } => restart(&config, force).await,
+        Command::Restart { force } => restart(&config, force).await.map(|()| Outcome::Exit),
         Command::Settings(SettingsCommand::Get) => {
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetSettingsServiceClient::new(channel);
@@ -478,7 +476,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                     .settings
                     .context("GetSettings response missing settings")?,
             );
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Settings(SettingsCommand::Set {
             load_ceiling,
@@ -525,7 +523,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                     .settings
                     .context("UpdateSettings response missing settings")?,
             );
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Prepare { kinds } => {
             let kinds = kinds
@@ -542,30 +540,34 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
             while let Some(event) = stream.message().await.context("prepare failed")? {
                 print_prepare_event(&event);
             }
-            Ok(())
+            Ok(Outcome::Exit)
         }
-        Command::Quick(QuickCommand::InstallService) => install_service(&config),
-        Command::Quick(QuickCommand::UninstallService) => uninstall_service(),
+        Command::Quick(QuickCommand::InstallService) => {
+            install_service(&config).map(|()| Outcome::Exit)
+        }
+        Command::Quick(QuickCommand::UninstallService) => {
+            uninstall_service().map(|()| Outcome::Exit)
+        }
         Command::Quick(QuickCommand::SelfUpdate) => self_update(&config).await,
     }
 }
 
 /// Manual self-update: resolve `latest.json` on the CDN, compare against
-/// `CARGO_PKG_VERSION`, and hand off to [`update::apply_and_exec`] when
-/// a newer build exists. Returns `Ok(())` on the already-latest no-op;
-/// the update path only returns on failure (success re-execs).
-async fn self_update(config: &AgentConfig) -> Result<()> {
+/// `CARGO_PKG_VERSION`, and swap in the newer build when there is one.
+/// [`Outcome::Exit`] on the already-latest no-op, otherwise the freshly
+/// installed binary for [`main`] to exec into.
+async fn self_update(config: &AgentConfig) -> Result<Outcome> {
     let payload = update::resolve_latest(&host::host_os(), &host::host_arch()).await?;
     if payload.expected_version == env!("CARGO_PKG_VERSION") {
         println!("already at latest ({})", payload.expected_version);
-        return Ok(());
+        return Ok(Outcome::Exit);
     }
     info!(
         current = env!("CARGO_PKG_VERSION"),
         expected = %payload.expected_version,
         "self-updating from CDN's latest"
     );
-    Err(update::apply_and_exec(config, &payload).await)
+    Ok(Outcome::Exec(update::apply(config, &payload).await?))
 }
 
 /// macOS: install the LaunchAgent via [`service::install`]. Other Unix

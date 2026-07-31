@@ -30,11 +30,12 @@
 //! exactly [`Reason::Update`], which is why it cannot clear a restart that has
 //! escalated past it.
 
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::state::AgentState;
 
@@ -71,11 +72,6 @@ impl Reason {
             _ => Self::None,
         }
     }
-
-    /// Whether this reason ends in the process coming back on its own.
-    fn is_restart(self) -> bool {
-        matches!(self, Self::Restart | Self::ForcedRestart)
-    }
 }
 
 /// What a [`Handover::request`] did.
@@ -91,12 +87,14 @@ pub enum Requested {
 }
 
 /// How the process is meant to end, read once the teardown has finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Terminate normally.
     Exit,
-    /// Replace this process image, preserving argv (see [`crate::reexec`]).
-    Restart,
+    /// Replace this process image with this binary, preserving argv (see
+    /// [`crate::reexec`]). The running executable for a restart, the freshly
+    /// swapped managed binary for a self-update.
+    Exec(PathBuf),
 }
 
 /// The shared "this image is going away" fact: which reason is in force, the
@@ -108,6 +106,10 @@ pub enum Outcome {
 /// close admission) and the signal handler (which vetoes the lot).
 pub struct Handover {
     reason: AtomicU8,
+    /// The image to replace this one with, recorded by [`Handover::commit`].
+    /// Set at most once — see there for why first-commit-wins is the right
+    /// tie-break.
+    exec: OnceLock<PathBuf>,
     shutdown: CancellationToken,
     state: AgentState,
 }
@@ -119,6 +121,7 @@ impl Handover {
     pub fn new(state: AgentState) -> Arc<Self> {
         Arc::new(Self {
             reason: AtomicU8::new(Reason::None as u8),
+            exec: OnceLock::new(),
             shutdown: CancellationToken::new(),
             state,
         })
@@ -172,9 +175,26 @@ impl Handover {
         }
     }
 
-    /// Commit to the handover: bring the process down so the teardown can run
-    /// and [`Self::outcome`] be read on the other side.
-    pub fn commit(&self) {
+    /// Commit to the handover: record `binary` as the image to come back as,
+    /// then bring the process down so the teardown can run and
+    /// [`Self::outcome`] be read on the other side.
+    ///
+    /// `binary` is resolved before the teardown starts, never after: the
+    /// restart path resolves `current_exe` while answering the RPC, and the
+    /// self-update path has already swapped the managed binary into place. A
+    /// path that cannot be produced is therefore an error the caller can still
+    /// report, rather than one that surfaces after the agent has torn itself
+    /// down with nothing to come back as.
+    pub fn commit(&self, binary: PathBuf) {
+        if let Err(ignored) = self.exec.set(binary) {
+            // Two commits raced — a forced restart landing while a graceful
+            // one was still quiescing. First wins; both name this executable.
+            info!(
+                ignored = %ignored.display(),
+                committed = %self.exec.get().expect("set() only fails when already set").display(),
+                "handover already committed to an image"
+            );
+        }
         self.shutdown.cancel();
     }
 
@@ -205,10 +225,17 @@ impl Handover {
     /// restart was requested" and "this shutdown is a restart" are different
     /// questions.
     pub fn outcome(&self) -> Outcome {
-        if self.reason().is_restart() {
-            Outcome::Restart
-        } else {
-            Outcome::Exit
+        match (self.reason(), self.exec.get()) {
+            (Reason::None | Reason::Terminating, _) => Outcome::Exit,
+            (_, Some(binary)) => Outcome::Exec(binary.clone()),
+            // Unreachable in practice: only `commit` and `terminate` cancel
+            // the shutdown, and the first arm covers the latter. Exiting is
+            // the safe reading of "something else stopped us" — coming back
+            // uncommitted would defy whatever did.
+            (reason, None) => {
+                warn!(?reason, "shutdown without a committed image; exiting");
+                Outcome::Exit
+            }
         }
     }
 
@@ -284,6 +311,35 @@ mod tests {
             handover.request(Reason::ForcedRestart),
             Requested::ShuttingDown
         );
+        assert_eq!(handover.outcome(), Outcome::Exit);
+    }
+
+    /// A committed handover names the image `main` comes back as.
+    #[test]
+    fn a_committed_handover_yields_the_image_to_exec() {
+        let handover = handover();
+        handover.request(Reason::Restart);
+        handover.commit(PathBuf::from("/opt/arcbox-fleet-agent"));
+
+        assert!(handover.shutdown().is_cancelled());
+        assert_eq!(
+            handover.outcome(),
+            Outcome::Exec(PathBuf::from("/opt/arcbox-fleet-agent"))
+        );
+    }
+
+    /// The signal wins even against a restart that already committed: both
+    /// cancel the same token, so without the veto the process would come back
+    /// after being told to stop. This is the window between a graceful
+    /// restart's last job releasing and `serve` reading the outcome.
+    #[test]
+    fn termination_after_a_commit_still_exits() {
+        let handover = handover();
+        handover.request(Reason::Restart);
+        handover.commit(PathBuf::from("/opt/arcbox-fleet-agent"));
+
+        handover.terminate();
+
         assert_eq!(handover.outcome(), Outcome::Exit);
     }
 
