@@ -15,7 +15,8 @@
 //!   — first proof a Machine can reach the network at all.
 //! - **M2 DNS**: `nslookup host.docker.internal` / `gateway.docker.internal`
 //!   resolve to the gateway via the in-VMM `DnsForwarder`.
-//! - **M3 egress volume**: a larger download, byte-exact and bounded.
+//! - **M3 egress volume**: a larger download, hashed in-guest against the
+//!   origin's SHA-256 and bounded.
 //! - **M4 metadata**: `inspect` reports gateway `10.0.2.1` and that gateway
 //!   as a DNS server.
 //! - **M5 SSH contract**: `ssh_info` is still `unimplemented` — pins the
@@ -37,7 +38,7 @@ use anyhow::{Context, Result, bail};
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
 use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, connect_unix};
 use arcbox_e2e::metrics::RunMetrics;
-use arcbox_e2e::net_fixtures::spawn_blob_server;
+use arcbox_e2e::net_fixtures::{spawn_blob_server, spawn_pattern_server};
 use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
 use arcbox_protocol::v1::{
     CreateMachineRequest, InspectMachineRequest, MachineExecRequest, RemoveMachineRequest,
@@ -62,6 +63,9 @@ const GATEWAY: &str = "10.0.2.1";
 /// M3 download size — enough to span many segments, small enough to stay
 /// quick over the loopback-backed egress path.
 const VOLUME_BYTES: usize = 16 * 1024 * 1024;
+/// Pattern seed for M3's origin. Any fixed value works; distinct from
+/// `network_workload`'s so a crossed-wires fixture cannot hash-match.
+const VOLUME_SEED: u64 = 0x004D_3E2E_5345_4544;
 
 fn init_tracing() {
     TRACING.call_once(|| {
@@ -351,19 +355,30 @@ async fn m2_dns(machines: &mut MachineServiceClient<Channel>) -> Result<()> {
     Ok(())
 }
 
-/// M3: a larger download completes, byte-exact and within budget — the
-/// Machine egress path sustains volume, not just a token request.
+/// M3: a larger download arrives byte-for-byte correct and within budget —
+/// the Machine egress path sustains volume, not just a token request.
+///
+/// Hashed in-guest rather than counted: `spawn_blob_server` repeats one
+/// 64 KiB all-zero chunk, so `wc -c` passes on any stream that happens to
+/// arrive 16 MiB long, however reordered, duplicated, or corrupted. The
+/// pattern origin serves a seeded xorshift fill whose SHA-256 the host
+/// knows, which is what makes this a content check (same construction as
+/// `network_workload`'s W15).
 async fn m3_egress_volume(machines: &mut MachineServiceClient<Channel>) -> Result<()> {
-    let server = spawn_blob_server(VOLUME_BYTES)?;
+    let server = spawn_pattern_server(VOLUME_BYTES, VOLUME_SEED)?;
     let url = format!("http://{GATEWAY}:{}/blob", server.port());
-    let cmd = format!("wget -q -O - '{url}' | wc -c");
+    let cmd = format!("wget -q -O - '{url}' | sha256sum | cut -d' ' -f1");
     let (out, exit) = exec_capture(machines, &["/bin/sh", "-c", &cmd], NET_BUDGET).await?;
     if exit != 0 {
         bail!("volume wget exited {exit} (out: {out:?})");
     }
-    let got: usize = out.trim().parse().context("parsing wc -c output")?;
-    if got != VOLUME_BYTES {
-        bail!("machine received {got} of {VOLUME_BYTES} bytes");
+    let got = out.trim();
+    if got != server.sha256() {
+        bail!(
+            "machine received a corrupt {VOLUME_BYTES}-byte blob: sha256 {got}, \
+             expected {}",
+            server.sha256()
+        );
     }
     Ok(())
 }

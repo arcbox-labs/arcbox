@@ -36,7 +36,7 @@ commands even while testing the network.
 |---|---|---|
 | M1 | egress TCP | `wget` a host-local origin at `10.0.2.1:<port>`; `wc -c` byte-exact — first proof a Machine reaches the network *(implemented)* |
 | M2 | DNS | `nslookup host.docker.internal` / `gateway.docker.internal` resolve to `10.0.2.1` via the in-VMM `DnsForwarder`. Asserted on the parsed **answer block only** — busybox echoes its resolver (`Server: 10.0.2.1`) and exits 0 on NXDOMAIN, so matching whole output is a tautology when the resolver is the expected answer *(implemented)* |
-| M3 | egress volume | 16 MiB download, byte-exact and bounded *(implemented)* |
+| M3 | egress volume | 16 MiB download from a seeded-pattern origin, hashed in-guest (`sha256sum`) against the origin's digest and bounded — `wc -c` against `spawn_blob_server`'s repeated all-zero chunk would pass on any stream of the right length, however reordered or corrupted *(implemented)* |
 | M4 | metadata | `inspect` reports gateway `10.0.2.1` and it as a DNS server (gated); `ip_address` is characterized only — see the finding below *(implemented)* |
 | M5 | SSH contract | `ssh_info` is still `Unimplemented` — pins the gap so a future SSH feature trips this test *(implemented)* |
 
