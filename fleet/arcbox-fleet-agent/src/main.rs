@@ -34,6 +34,7 @@ mod credentials;
 mod docker;
 mod enroll;
 mod fsutil;
+mod handover;
 mod host;
 mod interop;
 #[cfg(test)]
@@ -65,8 +66,8 @@ use tracing::{info, warn};
 use crate::backends::Backends;
 use crate::config::{AgentConfig, DockerMode, VmMode};
 use crate::docker::DockerRunner;
+use crate::handover::{Handover, Outcome};
 use crate::interop::InteropRunner;
-use crate::serve::Outcome;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
 use crate::vm::VmRunner;
@@ -352,8 +353,15 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
             info!(machine_id = %credential.machine_id, "starting fleet agent");
 
             // `attach::run` stops accepting work and tears down in-flight
-            // runners once this fires.
-            let shutdown = shutdown::spawn("termination signal received; draining runners");
+            // runners once this fires. No control socket here, so a
+            // gateway-pushed self-update is the only thing that can record a
+            // handover — an operator `Restart` needs `serve`.
+            let handover = Handover::new(agent_state.clone());
+            shutdown::arm(
+                Arc::clone(&handover),
+                "termination signal received; draining runners",
+            );
+            let shutdown = handover.shutdown().clone();
             backends::spawn_vm_reprobe(
                 &backends,
                 agent_state.clone(),
@@ -362,8 +370,12 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 shutdown.clone(),
             );
 
-            let (supervisor, egress_rx) =
-                attach::spawn_supervisor(&config, Arc::clone(&backends), agent_state.clone());
+            let (supervisor, egress_rx) = attach::spawn_supervisor(
+                &config,
+                Arc::clone(&backends),
+                agent_state.clone(),
+                Arc::clone(&handover),
+            );
             attach::run(
                 config,
                 credential,
@@ -372,6 +384,7 @@ async fn run_command(command: Command, config: AgentConfig) -> Result<()> {
                 backends,
                 shutdown,
                 agent_state,
+                handover,
             )
             .await
         }

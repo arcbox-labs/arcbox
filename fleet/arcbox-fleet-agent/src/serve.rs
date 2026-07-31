@@ -10,19 +10,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::config::AgentConfig;
-use crate::control::{self, RestartIntent};
+use crate::control;
+use crate::handover::{Handover, Outcome};
 use crate::settings::SettingsStore;
 use crate::state::AgentState;
 use crate::{backends, init_backends, load_or_seed_settings, shutdown};
-
-/// How the `serve` process is meant to end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    /// Terminate normally.
-    Exit,
-    /// Re-exec this executable, preserving argv (see [`crate::reexec`]).
-    Restart,
-}
 
 /// Start the local control-plane API and run until shutdown, attaching to
 /// the gateway whenever a credential is available. Returns
@@ -35,18 +27,15 @@ pub async fn serve(config: AgentConfig) -> Result<Outcome> {
     let backends = init_backends(&config, &seed, agent_state.clone()).await?;
     let socket_path = config.control_socket_path();
 
-    // Cascades to every attach task's child token, so runners still
-    // drain on SIGTERM even though `Unenroll` can also cancel one
-    // independently. The signal and the restart path share this token, so
-    // the signal vetoes any pending restart before cancelling it: otherwise
-    // a SIGTERM landing on an agent that is waiting out its last job would
-    // be indistinguishable from the restart it was waiting for, and this
-    // process would come back instead of stopping.
-    let restart = Arc::new(RestartIntent::default());
-    let shutdown = shutdown::spawn_with("termination signal received; shutting down", {
-        let restart = Arc::clone(&restart);
-        move || restart.terminate()
-    });
+    // One shutdown token for every way this process can end, cascading to
+    // every attach task's child token so runners drain the same way whichever
+    // it is. Which one it was is the handover's to answer, below.
+    let handover = Handover::new(agent_state.clone());
+    shutdown::arm(
+        Arc::clone(&handover),
+        "termination signal received; shutting down",
+    );
+    let shutdown = handover.shutdown().clone();
     backends::spawn_vm_reprobe(
         &backends,
         agent_state.clone(),
@@ -59,10 +48,9 @@ pub async fn serve(config: AgentConfig) -> Result<Outcome> {
         control::AgentSupervisor::new(
             config,
             backends,
-            shutdown.clone(),
             agent_state.clone(),
             settings_store.clone(),
-            Arc::clone(&restart),
+            Arc::clone(&handover),
         )
         .await?,
     );
@@ -79,12 +67,5 @@ pub async fn serve(config: AgentConfig) -> Result<Outcome> {
     // live attach task its own shutdown grace before the process exits.
     supervisor.join().await;
     let _ = reconciler.await;
-    // Read after the teardown, not at request time: a termination signal
-    // arriving mid-restart clears the intent, so "a restart was requested"
-    // and "this shutdown is a restart" are not the same question.
-    Ok(if restart.mode().is_some() {
-        Outcome::Restart
-    } else {
-        Outcome::Exit
-    })
+    Ok(handover.outcome())
 }

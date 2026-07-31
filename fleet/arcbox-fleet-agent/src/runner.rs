@@ -32,6 +32,7 @@ use tracing::{info, warn};
 
 use crate::backends::Backends;
 use crate::docker::RunSpec;
+use crate::handover::Handover;
 use crate::host;
 use crate::state::AgentState;
 
@@ -194,18 +195,14 @@ struct Inner {
     /// capability and the `(os, arch)` → backend routing, read per offer so
     /// routing always agrees with what is currently advertised.
     backends: Arc<Backends>,
-    /// Set once `Drain` is received; no new jobs are accepted.
+    /// Set by `Drain`, and by [`RunnerSupervisor::shutdown`]; no new jobs are
+    /// accepted. Attachment-scoped, unlike `handover` below.
     draining: std::sync::atomic::AtomicBool,
-    /// Set while this process image is about to be replaced (a pending
-    /// self-update or an operator restart); no new jobs are accepted. Kept
-    /// separate from `draining` so a moot update (the pin moved back to this
-    /// build before the swap) can resume without clearing an operator drain.
-    draining_for_update: std::sync::atomic::AtomicBool,
-    /// Set once an operator restart is committed to; no new jobs are
-    /// accepted. Latching, unlike `draining_for_update`: a restart always
-    /// ends in a re-exec, so nothing may reopen admission for a process that
-    /// is only waiting for its last job to finish.
-    draining_for_restart: std::sync::atomic::AtomicBool,
+    /// Whether this process image is on its way out. Also closes admission,
+    /// but owned elsewhere and read-only here: it outlives this attachment,
+    /// and its revocation rules (a moot self-update reopens, a committed
+    /// restart never does) belong to the type that owns them.
+    handover: Arc<Handover>,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers.
     state: AgentState,
 }
@@ -242,6 +239,7 @@ impl RunnerSupervisor {
         runner_script: Option<PathBuf>,
         backends: Arc<Backends>,
         state: AgentState,
+        handover: Arc<Handover>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -251,8 +249,7 @@ impl RunnerSupervisor {
                 runner_script,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
-                draining_for_update: std::sync::atomic::AtomicBool::new(false),
-                draining_for_restart: std::sync::atomic::AtomicBool::new(false),
+                handover,
                 state,
             }),
         }
@@ -358,7 +355,7 @@ impl RunnerSupervisor {
             .inner
             .draining
             .load(std::sync::atomic::Ordering::Relaxed)
-            || self.replacement_pending()
+            || self.inner.handover.pending()
         {
             return Admission::Reject("host is draining".to_owned());
         }
@@ -422,7 +419,7 @@ impl RunnerSupervisor {
     /// Stop accepting new work; in-flight jobs run to completion.
     pub fn handle_drain(&self) {
         self.stop_accepting();
-        self.inner.state.set_draining(true);
+        self.inner.state.set_operator_draining(true);
         info!("draining: no new offers will be accepted");
     }
 
@@ -430,66 +427,16 @@ impl RunnerSupervisor {
     /// is the local control-plane's `Resume`, distinct from the gateway's
     /// own `Drain` push (e.g. a machine being decommissioned), which this
     /// agent has no way to countermand.
+    /// Resume accepting new work — the operator's own drain only. A pending
+    /// handover keeps admission closed regardless: it is not this method's to
+    /// clear, and a process committed to re-exec must not start jobs its own
+    /// teardown will kill.
     pub fn resume(&self) {
         self.inner
             .draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(self.replacement_pending());
+        self.inner.state.set_operator_draining(false);
         info!("resumed: accepting new offers");
-    }
-
-    /// Whether this process image is on its way out — a pending self-update
-    /// or a committed restart. Either one keeps admission closed for as long
-    /// as it holds, independently of an operator drain.
-    fn replacement_pending(&self) -> bool {
-        self.inner
-            .draining_for_update
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || self
-                .inner
-                .draining_for_restart
-                .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Stop accepting new offers because a self-update is pending. Revocable:
-    /// the operator's own drain flag is untouched, so
-    /// [`Self::resume_after_moot_update`] can undo exactly this without
-    /// cancelling a deliberate local drain.
-    pub fn drain_for_update(&self) {
-        self.inner
-            .draining_for_update
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(true);
-        info!("draining for self-update: no new offers will be accepted");
-    }
-
-    /// Stop accepting new offers because an operator restart is committed to.
-    /// Latching, so neither [`Self::resume`] nor
-    /// [`Self::resume_after_moot_update`] can reopen admission while the
-    /// process waits out its last job before re-execing.
-    pub fn drain_for_restart(&self) {
-        self.inner
-            .draining_for_restart
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(true);
-        info!("draining for restart: no new offers will be accepted");
-    }
-
-    /// Clear the self-update drain after the update became moot — the pin
-    /// moved back to this build before the swap happened (a rollback racing
-    /// the drain). An operator drain, or a restart this process is committed
-    /// to, stays in force.
-    pub fn resume_after_moot_update(&self) {
-        self.inner
-            .draining_for_update
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        let still_draining = self
-            .inner
-            .draining
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || self.replacement_pending();
-        self.inner.state.set_draining(still_draining);
-        info!("self-update became moot; resuming");
     }
 
     /// Wait until this supervisor's work can be abandoned without losing any
@@ -1060,6 +1007,7 @@ mod tests {
     use arcbox_fleet_proto::v1::Capability;
 
     use super::*;
+    use crate::handover::Reason;
     use crate::interop::InteropRunner;
 
     fn capability(os: &str, arch: &str, backend: Backend) -> Capability {
@@ -1097,14 +1045,25 @@ mod tests {
     }
 
     fn supervisor(capabilities: Vec<Capability>) -> RunnerSupervisor {
+        supervisor_with_handover(capabilities).0
+    }
+
+    /// As [`supervisor`], with the handover in the caller's hands — what a
+    /// pending self-update or restart is driven through.
+    fn supervisor_with_handover(
+        capabilities: Vec<Capability>,
+    ) -> (RunnerSupervisor, Arc<Handover>) {
         let (events, _rx) = mpsc::channel(1);
         let state = AgentState::new(&seed());
-        RunnerSupervisor::new(
+        let handover = Handover::new(state.clone());
+        let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
             Backends::fixed(capabilities, state.clone()),
             state,
-        )
+            Arc::clone(&handover),
+        );
+        (sup, handover)
     }
 
     // Idle host: plenty of headroom.
@@ -1147,7 +1106,8 @@ mod tests {
             interop,
             state.clone(),
         );
-        let sup = RunnerSupervisor::new(events, None, backends, state);
+        let sup =
+            RunnerSupervisor::new(events, None, backends, state.clone(), Handover::new(state));
         (sup, rx)
     }
 
@@ -1348,19 +1308,17 @@ mod tests {
         );
     }
 
-    /// A restart drain latches: neither an operator `Resume` nor a self-update
-    /// that became moot may reopen admission for a process that is committed
-    /// to re-exec, or the jobs admitted in that window get killed by the
-    /// teardown the restart is waiting to run.
+    /// A pending handover closes admission on its own, and `Resume` — which
+    /// owns only the operator's drain — must not reopen it. The jobs admitted
+    /// in that window would be killed by the teardown the handover is waiting
+    /// to run. Which handovers are revocable is [`Handover`]'s to decide, and
+    /// tested there.
     #[test]
-    fn nothing_reopens_admission_once_a_restart_is_committed() {
-        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
-        // The order the bug needs: an update arms the revocable drain first,
-        // then the operator restart arms the latching one.
-        sup.drain_for_update();
-        sup.drain_for_restart();
+    fn resume_does_not_reopen_admission_under_a_pending_handover() {
+        let (sup, handover) =
+            supervisor_with_handover(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        handover.request(Reason::Restart);
 
-        sup.resume_after_moot_update();
         assert!(sup.inner.state.current().draining);
         assert!(matches!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
@@ -1368,6 +1326,7 @@ mod tests {
         ));
 
         sup.resume();
+
         assert!(sup.inner.state.current().draining);
         assert!(matches!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
@@ -1375,18 +1334,27 @@ mod tests {
         ));
     }
 
-    /// Without a restart in the picture, a moot update still resumes — the
-    /// latching flag must not make the revocable one permanent.
+    /// And the converse: an operator `Drain` outlives a handover that was
+    /// revoked, so a moot self-update cannot resume a host the operator took
+    /// out of rotation.
     #[test]
-    fn a_moot_update_resumes_when_no_restart_is_pending() {
-        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
-        sup.drain_for_update();
+    fn a_revoked_handover_does_not_clear_an_operator_drain() {
+        let (sup, handover) =
+            supervisor_with_handover(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        sup.handle_drain();
+        handover.request(Reason::Update);
+
+        handover.update_became_moot();
+
+        assert!(sup.inner.state.current().draining);
         assert!(matches!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
             Admission::Reject(_)
         ));
 
-        sup.resume_after_moot_update();
+        // ...and clearing the operator drain, with nothing else in force,
+        // does resume.
+        sup.resume();
         assert!(!sup.inner.state.current().draining);
         assert_eq!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
@@ -1424,7 +1392,8 @@ mod tests {
                 vec![capability("darwin", "arm64", Backend::HostRunner)],
                 state.clone(),
             ),
-            state,
+            state.clone(),
+            Handover::new(state),
         );
         (sup, rx)
     }
@@ -1449,7 +1418,8 @@ mod tests {
                 vec![capability("darwin", "arm64", Backend::HostRunner)],
                 state.clone(),
             ),
-            state,
+            state.clone(),
+            Handover::new(state),
         );
         (sup, rx)
     }
@@ -1856,6 +1826,7 @@ mod tests {
             None,
             Backends::fixed(Vec::new(), drained.clone()),
             drained.clone(),
+            Handover::new(drained.clone()),
         )
         .handle_drain();
         assert!(
@@ -1870,6 +1841,7 @@ mod tests {
             None,
             Backends::fixed(Vec::new(), torn_down.clone()),
             torn_down.clone(),
+            Handover::new(torn_down.clone()),
         )
         .shutdown(Duration::from_secs(1))
         .await;
