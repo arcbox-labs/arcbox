@@ -1,11 +1,9 @@
 mod common;
 
-use std::path::PathBuf;
-
 use arcbox_vm::config::SnapshotType;
 #[cfg(target_os = "linux")]
 use arcbox_vm::network::{NetworkAllocation, NetworkManager};
-use arcbox_vm::snapshot::SnapshotCatalog;
+use arcbox_vm::snapshot::{SnapshotCatalog, SnapshotDraft};
 
 // ---------------------------------------------------------------------------
 // Snapshot persistence
@@ -20,17 +18,16 @@ fn snapshot_catalog_persists_across_instances() {
 
     let id = {
         let catalog = SnapshotCatalog::new(data_dir);
-        catalog
-            .register(
-                "vm-persist",
-                Some("checkpoint-1".into()),
-                SnapshotType::Full,
-                PathBuf::from("/tmp/vmstate"),
-                None,
-                None,
-                None,
-                None,
-            )
+        let pending = catalog.begin("vm-persist").unwrap();
+        std::fs::write(pending.dir().join("vmstate"), b"vmstate").unwrap();
+        pending
+            .commit(SnapshotDraft {
+                name: Some("checkpoint-1".into()),
+                snapshot_type: SnapshotType::Full,
+                parent_id: None,
+                kernel_path: None,
+                rootfs_path: None,
+            })
             .unwrap()
             .id
     }; // catalog is dropped; all state must come from disk
