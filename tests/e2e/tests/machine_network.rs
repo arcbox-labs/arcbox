@@ -284,22 +284,37 @@ async fn m1_egress_tcp(machines: &mut MachineServiceClient<Channel>) -> Result<(
 
 /// Extracts the *answer* addresses from busybox `nslookup` stdout.
 ///
-/// The output is two blocks — a resolver preamble, then the answer:
+/// The output is always a resolver preamble, a blank line, then the answer.
+/// busybox emits the preamble unconditionally and exits 0 even on NXDOMAIN,
+/// so a whole-output substring match for the gateway is a tautology here —
+/// the resolver *is* the expected answer. Only the block after the `Name:`
+/// line is an answer, so parse from there.
+///
+/// busybox 1.37.0 (`networking/nslookup.c`) ships two formats and both must
+/// parse. With `FEATURE_NSLOOKUP_BIG` (Alpine's build) the preamble address
+/// carries the port, because it formats through `xmalloc_sockaddr2dotted`
+/// rather than the `_noport` variant the answers use:
+///
+/// ```text
+/// Server:         10.0.2.1
+/// Address:        10.0.2.1:53
+///
+/// Name:   host.docker.internal
+/// Address: 10.0.2.1
+/// ```
+///
+/// The legacy build routes both through `print_host`, so the preamble
+/// address is bare — parseable, and thus indistinguishable from an answer
+/// without the `Name:` gate. Answers there are numbered, and a successful
+/// reverse lookup appends the hostname, hence the first-token split:
 ///
 /// ```text
 /// Server:    10.0.2.1
-/// Address:   10.0.2.1:53
+/// Address 1: 10.0.2.1
 ///
 /// Name:      host.docker.internal
-/// Address 1: 10.0.2.1
+/// Address 1: 10.0.2.1 host.docker.internal
 /// ```
-///
-/// busybox echoes the configured resolver in that preamble unconditionally
-/// and exits 0 even on NXDOMAIN, so a whole-output substring match for the
-/// gateway is a tautology here: the resolver *is* the expected answer. Only
-/// the block after the `Name:` line is an answer, so parse from there. A
-/// successful reverse lookup appends a hostname to the address
-/// (`Address 1: 10.0.2.1 host.docker.internal`), hence the first-token split.
 fn nslookup_answer_addrs(out: &str) -> Vec<Ipv4Addr> {
     out.lines()
         .skip_while(|line| !line.trim_start().starts_with("Name:"))
@@ -415,19 +430,39 @@ async fn m4_network_metadata(machines: &mut MachineServiceClient<Channel>) -> Re
 /// The regression M2 shipped with: the resolver preamble echoes `10.0.2.1`
 /// on a *failed* lookup too, so a whole-output match could never fail. These
 /// run without a VM, so the parser stays honest even when nobody runs the
-/// `#[ignore]`d scenario.
+/// `#[ignore]`d scenario. Fixtures are transcribed from busybox 1.37.0
+/// `networking/nslookup.c`; both builds are covered because the preamble
+/// address is bare in one and ported in the other.
+///
+/// This is the fixture that makes the `Name:` gate load-bearing: the legacy
+/// build's preamble address parses cleanly as an IPv4, so a parser that
+/// scanned the whole output would report it as an answer and M2 would go
+/// back to passing on a dead resolver.
 #[test]
-fn nslookup_preamble_is_not_an_answer() {
-    // busybox on NXDOMAIN: preamble on stdout, the error goes to stderr
-    // (which `exec_capture` drops), and it still exits 0.
-    let out = "Server:\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n";
+fn nslookup_bare_preamble_address_is_not_an_answer() {
+    // NXDOMAIN: preamble on stdout, the error goes to stderr (which
+    // `exec_capture` drops), and busybox still exits 0.
+    let out = "Server:    10.0.2.1\nAddress 1: 10.0.2.1\n\n";
+    assert!(
+        nslookup_answer_addrs(out).is_empty(),
+        "the preamble address must not count as an answer"
+    );
+}
+
+/// Alpine's `FEATURE_NSLOOKUP_BIG` build, which is what M2 actually runs
+/// against. Its preamble address carries `:53`, so it fails to parse even
+/// without the gate — hence the bare-address fixture above carries the
+/// regression, and this one pins the shape M2 really sees.
+#[test]
+fn nslookup_ported_preamble_address_is_not_an_answer() {
+    let out = "Server:\t\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n";
     assert!(nslookup_answer_addrs(out).is_empty());
 }
 
 #[test]
-fn nslookup_answer_block_is_parsed() {
-    let out = "Server:\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
-               Name:      host.docker.internal\nAddress 1: 10.0.2.1\n";
+fn nslookup_big_answer_is_parsed() {
+    let out = "Server:\t\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
+               Name:\thost.docker.internal\nAddress: 10.0.2.1\n";
     assert_eq!(
         nslookup_answer_addrs(out),
         vec![Ipv4Addr::new(10, 0, 2, 1)],
@@ -436,14 +471,26 @@ fn nslookup_answer_block_is_parsed() {
 }
 
 #[test]
+fn nslookup_legacy_answer_is_parsed() {
+    let out = "Server:    10.0.2.1\nAddress 1: 10.0.2.1\n\n\
+               Name:      host.docker.internal\n\
+               Address 1: 10.0.2.1 host.docker.internal\n";
+    assert_eq!(
+        nslookup_answer_addrs(out),
+        vec![Ipv4Addr::new(10, 0, 2, 1)],
+        "a reverse-resolved hostname must not swallow the address"
+    );
+}
+
+#[test]
 fn nslookup_wrong_answer_is_distinguishable() {
     // The failure M2 must catch: resolver is the gateway, answer is not.
-    let out = "Server:\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
-               Name:      host.docker.internal\nAddress 1: 203.0.113.9 wrong.example\n";
+    let out = "Server:\t\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
+               Name:\thost.docker.internal\nAddress: 203.0.113.9\n";
     assert_eq!(
         nslookup_answer_addrs(out),
         vec![Ipv4Addr::new(203, 0, 113, 9)],
-        "a reverse-resolved hostname must not swallow the address"
+        "a wrong answer must not be masked by the gateway in the preamble"
     );
 }
 
