@@ -472,8 +472,17 @@ fn mount_source_for(alias_installed: bool) -> String {
 ///   of hanging Finder forever (macOS rejects `soft` with `vers=4`).
 /// - `rdirplus`: fetch attributes with directory entries — fewer round trips.
 /// - `actimeo=10`: modest attribute cache for a browse mount.
+/// - `noowners`: display-only owner mapping (ABX-427). The guest's uids are
+///   meaningless on the host, so the export otherwise lists as `root` and bare
+///   numbers. This is `MNT_IGNORE_OWNERSHIP` — Finder's "Ignore ownership on
+///   this volume" — under which every object reports uid 99, which the VFS
+///   renders as the *current* user. Presentational only, and safe precisely
+///   because it is: the server stays the sole authority (`ro` export,
+///   `all_squash,anonuid=0`, so it already evaluates ACCESS as root), and the
+///   mount is `ro` besides. The local check it drops was only ever able to
+///   refuse reads the server would have granted.
 fn render_mount_opts(nfsd_port: u16) -> String {
-    format!("ro,vers=4,rdirplus,actimeo=10,deadtimeout=60,port={nfsd_port}")
+    format!("ro,noowners,vers=4,rdirplus,actimeo=10,deadtimeout=60,port={nfsd_port}")
 }
 
 /// Host mount point: `$ARCBOX_HOST_MOUNT_DIR` when set (so a test daemon stays
@@ -629,6 +638,8 @@ mod tests {
         assert!(opts.contains("port=51000"));
         // Must never request write access to a read-only export.
         assert!(!opts.contains("rw"));
+        // Guest uids mean nothing on the host; show the browsing user instead.
+        assert!(opts.contains("noowners"));
     }
 
     #[test]

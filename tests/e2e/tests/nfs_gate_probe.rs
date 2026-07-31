@@ -57,10 +57,7 @@ fn nfs_gate_probe() -> Result<()> {
             "--guest-docker-vsock-port".into(),
             "2375".into(),
         ],
-        env: vec![
-            ("ARCBOX_BOOT_ASSET_VERSION".into(), version),
-            ("ARCBOX_DNS_PORT".into(), "5555".into()),
-        ],
+        env: vec![("ARCBOX_BOOT_ASSET_VERSION".into(), version)],
     })?;
     daemon.wait_ready_blocking(READY_TIMEOUT)?;
 
