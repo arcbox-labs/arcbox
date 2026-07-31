@@ -1,9 +1,11 @@
 //! The `serve` subcommand: the long-running agent process.
 //!
 //! Assembles the backend registry, the enrollment supervisor and the local
-//! control-plane server, then runs until a termination signal or an operator
-//! `Restart` brings it down. What it returns tells [`crate::main`] how to
-//! leave: exit, or replace this process image.
+//! control-plane server, then runs until a termination signal, an operator
+//! `Restart`, or a gateway-pushed self-update brings it down. All three take
+//! the same teardown path; the [`Handover`] is what tells them apart, and what
+//! it says on the far side tells [`crate::main`] how to leave — exit, or
+//! replace this process image.
 
 use std::sync::Arc;
 
@@ -18,8 +20,8 @@ use crate::{backends, init_backends, load_or_seed_settings, shutdown};
 
 /// Start the local control-plane API and run until shutdown, attaching to
 /// the gateway whenever a credential is available. Returns
-/// [`Outcome::Restart`] when the shutdown was an operator `Restart` rather
-/// than a termination signal.
+/// [`Outcome::Exec`] when the shutdown was an operator `Restart` or a
+/// gateway-pushed self-update rather than a termination signal.
 pub async fn serve(config: AgentConfig) -> Result<Outcome> {
     let settings_store = SettingsStore::new(config.settings_path());
     let seed = load_or_seed_settings(&settings_store, &config)?;

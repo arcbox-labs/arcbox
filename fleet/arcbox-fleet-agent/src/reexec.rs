@@ -7,12 +7,15 @@
 //! ([`crate::update`], exec'ing the swapped managed binary) and the
 //! operator `Restart` (exec'ing the running executable) go through here.
 //!
-//! Note that `exec` runs no destructors: anything that must be flushed —
-//! notably the logging guard — has to be dropped before calling this. The
-//! operator restart honors that (`main` drops the runtime, then the guard);
-//! self-update cannot, because it execs from inside the attach task, and so
-//! loses whatever the non-blocking log writer had buffered. Pre-existing, and
-//! fixable only by plumbing the update payload out to `main`.
+//! `exec` runs no destructors, so anything that must be flushed has to be
+//! dropped first — which is why [`crate::main`] is the only caller. Both
+//! triggers name their image on the [`crate::handover::Handover`]
+//! ([`Outcome::Exec`](crate::handover::Outcome::Exec)) and let the normal
+//! teardown run; `main` then drops the tokio runtime, drops the logging guard
+//! that flushes the non-blocking writer, and only then replaces the image.
+//! Exec'ing from inside a task instead — as self-update used to — skips the
+//! runner teardown, leaves the control socket bound, and loses whatever the
+//! log writer had buffered.
 
 use std::path::Path;
 

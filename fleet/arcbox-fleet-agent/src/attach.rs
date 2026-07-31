@@ -274,8 +274,17 @@ pub async fn run(
                     () = shutdown.cancelled() => break,
                     () = supervisor.quiesce(Duration::ZERO) => {}
                 }
-                // Returns only on failure; success replaces this process.
-                let error = update::apply_and_exec(&config, &payload).await;
+                let error = match update::apply(&config, &payload).await {
+                    Ok(managed) => {
+                        // The swap is done; committing brings the process down
+                        // through this same loop's shutdown so runners are torn
+                        // down and the log buffer flushed before `main` execs
+                        // the new image.
+                        handover.commit(managed);
+                        break;
+                    }
+                    Err(error) => error,
+                };
                 if error
                     .chain()
                     .any(|c| c.downcast_ref::<update::UnmanagedBinary>().is_some())
@@ -307,7 +316,10 @@ pub async fn run(
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 
-    info!("shutdown signal received; stopping runners");
+    // Reached on a shutdown (signal, unenroll, operator restart) and on a
+    // staged self-update alike — the swap goes out through the same teardown
+    // so no runner is left orphaned by the exec that follows.
+    info!("attachment ending; stopping runners");
     supervisor.shutdown(SHUTDOWN_GRACE).await;
     // The loop only exits once `shutdown` is cancelled, so the resend task has
     // already broken out of its own loop; await it so it's fully reaped before
