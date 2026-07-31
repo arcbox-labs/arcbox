@@ -8,7 +8,7 @@ use super::*;
 /// `WrongState` *without* having launched a process. A blind assignment here
 /// was the original defect: two concurrent `Run`s would both dispatch, then
 /// one would be told it lost — after its command was already executing.
-fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
+pub(super) fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
     let arc = instances
         .read()
         .unwrap()
@@ -32,7 +32,7 @@ fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
 /// Only downgrades when the sandbox is still `Running` (i.e. this claim still
 /// owns it). If a concurrent `stop` moved it to `Stopping`, that transition is
 /// left intact — stop owns the teardown from there.
-fn release_running(id: &SandboxId, instances: &InstanceMap) {
+pub(super) fn release_running(id: &SandboxId, instances: &InstanceMap) {
     // Drop the map read guard before taking the instance lock.
     let arc = instances.read().unwrap().get(id).cloned();
     if let Some(arc) = arc {

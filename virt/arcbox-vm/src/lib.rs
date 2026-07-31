@@ -54,6 +54,9 @@ pub use sandbox::{
     SandboxManager, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec,
     SandboxState, SandboxSummary,
 };
+pub use sandbox::{
+    ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
+};
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
 pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 
