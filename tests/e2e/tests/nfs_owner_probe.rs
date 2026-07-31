@@ -24,7 +24,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tracing_subscriber::EnvFilter;
 
-use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets, wait_for_nfs_mount};
+use arcbox_e2e::boot_assets::{
+    read_file_with_retry, resolve_boot_version, stage_dev_boot_assets, wait_for_nfs_mount,
+};
 use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle};
 use arcbox_e2e::repo_root;
 
@@ -64,10 +66,7 @@ fn run_probe(root: &Path, test_dir: &Path, version: &str) -> Result<()> {
         binary: root.join("target/release/arcbox-daemon"),
         data_dir: test_dir.to_owned(),
         args: vec!["--guest-docker-vsock-port".into(), "2375".into()],
-        env: vec![
-            ("ARCBOX_BOOT_ASSET_VERSION".into(), version.to_owned()),
-            ("ARCBOX_DNS_PORT".into(), "5557".into()),
-        ],
+        env: vec![("ARCBOX_BOOT_ASSET_VERSION".into(), version.to_owned())],
     })?;
     daemon.wait_ready_blocking(READY_TIMEOUT)?;
 
@@ -125,18 +124,51 @@ fn run_probe(root: &Path, test_dir: &Path, version: &str) -> Result<()> {
         checked.len()
     );
 
-    // The display fix must not have cost us read access.
-    let engine_id = mount_dir.join("engine-id");
-    if engine_id.is_file() {
-        let content = fs::read_to_string(&engine_id).context("reading engine-id through NFS")?;
-        if content.trim().is_empty() {
-            bail!("engine-id read through the mount was empty");
-        }
-        println!("OK: engine-id still readable through the mount");
-    } else {
-        println!("note: engine-id absent; skipped the read-through check");
-    }
+    // The display fix must not have cost us read access. This is the only
+    // check here that reads *content* — the loop above exercises getattr and
+    // readdir only — so it must never degrade into a skip: the daemon is
+    // ready and the export is populated, so a file that will not read is a
+    // failure, not an absence. The retry covers the `actimeo=10` attribute
+    // cache a freshly mounted export sits behind.
+    read_through_check(&mount_dir, &entries)?;
 
     daemon.shutdown()?;
     Ok(())
+}
+
+/// Reads a real guest file through the mount, preferring dockerd's `engine-id`
+/// and falling back to any regular file at the export root.
+fn read_through_check(mount_dir: &Path, entries: &[fs::DirEntry]) -> Result<()> {
+    const READ_RETRY: Duration = Duration::from_secs(20);
+
+    let engine_id = mount_dir.join("engine-id");
+    let candidates = std::iter::once(engine_id).chain(entries.iter().filter_map(|entry| {
+        let path = entry.path();
+        // `symlink_metadata`, so a symlink is not mistaken for its target.
+        fs::symlink_metadata(&path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|_| path)
+    }));
+
+    let mut attempts = Vec::new();
+    for path in candidates {
+        match read_file_with_retry(&path, READ_RETRY) {
+            Ok(content) if !content.trim().is_empty() => {
+                println!("OK: {} still readable through the mount", path.display());
+                return Ok(());
+            }
+            Ok(_) => attempts.push(format!("{} read empty", path.display())),
+            Err(e) => attempts.push(format!("{} failed: {e:#}", path.display())),
+        }
+    }
+
+    bail!(
+        "no file could be read through the mount, so the read-through check never ran ({})",
+        if attempts.is_empty() {
+            "no regular file at the export root".to_owned()
+        } else {
+            attempts.join("; ")
+        }
+    )
 }

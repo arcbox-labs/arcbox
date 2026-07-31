@@ -287,7 +287,7 @@ pub fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
 
 /// Reads `path`, retrying briefly while the just-written file propagates
 /// through the NFS attribute cache.
-fn read_file_with_retry(path: &Path, timeout: Duration) -> Result<String> {
+pub fn read_file_with_retry(path: &Path, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
         match fs::read_to_string(path) {

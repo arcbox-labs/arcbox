@@ -79,7 +79,6 @@ fn run_probe(root: &Path, test_dir: &Path, version: &str, image: &str) -> Result
         args: vec!["--guest-docker-vsock-port".into(), "2375".into()],
         env: vec![
             ("ARCBOX_BOOT_ASSET_VERSION".into(), version.to_owned()),
-            ("ARCBOX_DNS_PORT".into(), "5556".into()),
             ("ARCBOX_VM_BACKEND".into(), "vz".into()),
         ],
     })?;
