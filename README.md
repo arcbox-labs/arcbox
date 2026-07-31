@@ -75,9 +75,9 @@ docker build -t myapp .
 ```
 
 Containers, images, builds (BuildKit/Buildx), Compose, port forwarding, bind
-mounts, named volumes, and interactive `exec` all work today. ArcBox manages the
-matching `docker`, `buildx`, `compose`, and `kubectl` binaries for you
-(`abctl docker setup`).
+mounts, named volumes, and interactive `exec` all work today. `abctl docker setup`
+installs and manages the matching `docker`, `buildx`, and `compose` binaries for
+you.
 
 ### amd64 and arm64 images
 
@@ -96,10 +96,12 @@ A local k3s cluster, managed by the daemon, with host integration for `kubectl`.
 
 ```bash
 abctl k8s start
-abctl k8s enable                     # point kubectl at the ArcBox cluster
-abctl k8s kubeconfig >> ~/.kube/config
+abctl k8s enable      # installs kubectl, merges the kubeconfig, switches context
 kubectl get nodes
 ```
+
+`abctl k8s kubeconfig` prints the managed kubeconfig on its own, if you would
+rather wire it into your own tooling than let `enable` touch `~/.kube/config`.
 
 ### Container files in Finder
 
@@ -119,7 +121,9 @@ abctl top          # streaming CPU, memory, disk, and network for the System VM
 abctl disk usage   # Docker data image usage; `abctl disk compact` reclaims free blocks
 ```
 
-Per-container stats are available over the API and in the desktop app.
+`abctl top` adds a per-container table — CPU, memory against the limit, disk and
+network rates, PIDs — whenever containers are running. The same samples feed the
+API and the desktop app.
 
 ### Migrate from Docker Desktop or OrbStack
 
