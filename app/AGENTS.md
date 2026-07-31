@@ -157,6 +157,21 @@ must name `abctl`.
   RPCs into a VM whose agent/dockerd is not up. The `MachineManager`
   `MachineState` lives outside the lifecycle actor on purpose (physical vs
   logical layering) — do not unify them.
+- **`restart_generation` reports departures, not arrivals.** It is bumped on
+  VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
+  `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
+  START of the gap where no guest exists. Under
+  `switch_system_vm_backend` it then races the reboot with the same
+  `DEFAULT_STARTUP_TIMEOUT_SECS` budget the boot itself gets; after a plain
+  stop with the daemon still alive, no guest is coming at all. Anything that
+  must act when the VM comes *up* watches
+  `VmLifecycleManager::subscribe_state` (`Runtime::subscribe_system_vm_state`)
+  instead: wait for `VmLifecycleState::is_ready`, do the work, then wait for
+  it to clear. Reference consumer: the `~/ArcBox` export reconcile
+  (`arcbox-daemon/src/nfs_mount.rs`), whose per-incarnation supervisor loop
+  also carries the companion rule — one pass's failure must be retried, not
+  propagated out of the loop, or every later incarnation inherits the broken
+  state (ABX-426).
 - Two startup timeouts cover SEQUENTIAL phases; don't conflate them.
   `DEFAULT_STARTUP_TIMEOUT_SECS = 90` (`mod.rs`) budgets VM boot → agent
   ready; `ContainerRuntimeConfig::startup_timeout_ms = 150_000`
@@ -173,8 +188,11 @@ must name `abctl`.
 `mod.rs` holds only the read accessor). The Docker proxy compares it via
 the request path to detect a
 System VM restart (backend switch / recovery) and reset stale state
-(`arcbox-docker/src/proxy/state.rs`). When editing either side, keep in
-lockstep:
+(`arcbox-docker/src/proxy/state.rs`). Reading a stop-edge counter is correct
+*here* precisely because the proxy acts on its next request, which by
+definition arrives once the VM is back — do not copy the pattern into a task
+that must act at the restart itself (see "reports departures, not arrivals"
+above). When editing either side, keep in lockstep:
 
 - `reset_if_restarted` must drop the pooled connections BEFORE flipping
   cached readiness to `Unverified`. WHY: a concurrent verifier that sees
