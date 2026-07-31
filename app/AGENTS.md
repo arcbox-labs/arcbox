@@ -130,11 +130,16 @@ must name `abctl`.
   byte-identical, pages *compressed as live data* under real host
   pressure). HV inflates via `MADV_DONTNEED`, which Darwin treats as a
   deactivation hint (calibrated footprint-inert; contents preserved).
-  Host footprint ≈ configured `memory_mb` from boot; the only macOS
-  memory levers are `memory_mb` itself and the macOS compressor. Do not
-  flip a backend to reclaim-capable without a measured host
-  `phys_footprint` drop on inflate (HV path: switch the device to
-  `MADV_FREE_REUSABLE` first).
+  Host footprint is NOT the configured `memory_mb` — VZ commits guest RAM
+  lazily, so the cost is the high-water mark of guest-*touched* pages
+  (measured 2026-08-01: a fresh idle 16 GB VM = ~718MB; the guest
+  allocating 3GB of tmpfs takes it to 3717MB and freeing it changes
+  nothing). With no reclaim path that mark is a one-way ratchet, and
+  `memory_mb` is a ceiling on the eventual cost rather than an upfront
+  charge. The only macOS levers are `memory_mb`, a VM restart, and the
+  macOS compressor. Do not flip a backend to reclaim-capable without a
+  measured host `phys_footprint` drop on inflate (HV path: switch the
+  device to `MADV_FREE_REUSABLE` first).
 - `set_backend` only changes the backend used on the next (re)boot; it does
   NOT stop or restart a running VM. To apply immediately the caller forces a
   recreate via `Runtime::switch_system_vm_backend`. The backend is seeded

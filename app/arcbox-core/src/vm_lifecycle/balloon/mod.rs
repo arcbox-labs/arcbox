@@ -29,10 +29,19 @@
 //!   a deactivation hint — calibrated footprint-inert, contents preserved
 //!   (compressed, never discarded, under pressure); real Darwin reclaim
 //!   needs `MADV_FREE_REUSABLE` (calibrated: footprint drops instantly).
-//!   Host footprint stays pinned at the configured `memory_mb`, so
-//!   shrinking is guest starvation with zero host benefit on either
+//!   So shrinking is guest starvation with zero host benefit on either
 //!   backend. See [`controller::BalloonDeps::reclaim_capable`]; flip a
 //!   backend only with a measured host footprint drop on inflate.
+//! - **What the host actually pays is the high-water mark of guest-touched
+//!   pages, not the configured `memory_mb`** (2026-08-01, VZ, macOS 26.4).
+//!   A fresh idle 16 GB VM costs ~718 MB of host `phys_footprint`; the
+//!   guest allocating 3 GB of tmpfs takes it to 3717 MB, and the guest
+//!   freeing that memory leaves it at 3717 MB. Absent any reclaim path the
+//!   mark only ratchets upward, which is precisely the cost a working
+//!   balloon would release. Measure the XPC helper process
+//!   (`com.apple.Virtualization.VirtualMachine`) on VZ, not the daemon —
+//!   guest RAM lives there, which is also why VZ can never be made
+//!   reclaim-capable: that memory is not ours to `madvise`.
 
 pub(super) mod controller;
 

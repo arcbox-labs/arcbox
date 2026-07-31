@@ -12,15 +12,18 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 |--------|--------|----------|
 | Cold boot | <1.5s | ~2s |
 | Warm boot | <500ms | <1s |
-| Idle memory | <150MB (HV backend)¹ | ~200MB |
+| Idle memory | <150MB¹ | ~200MB |
 | Idle CPU | <0.05% | <0.1% |
 | File I/O | ≥100% of the best competitor guest² | 75-95% (vs native, their claim) |
 | Network throughput | >50 Gbps | ~45 Gbps |
 
-¹ Physically unreachable on VZ: host footprint pins at the configured
-  `memory_mb` from boot and ballooning cannot return it (evidence in
-  `app/arcbox-core/src/vm_lifecycle/balloon/mod.rs`). The VZ memory story
-  is right-sizing `memory_mb`.
+¹ Host cost is the high-water mark of guest-*touched* pages, not the
+  configured `memory_mb`: a fresh idle 16 GB VZ VM measured ~718MB of
+  host `phys_footprint` (2026-08-01). But no macOS backend reclaims, so
+  that mark is a one-way ratchet — the guest freeing 3GB leaves the host
+  paying for it forever. Only HV can ever release it (VZ guest RAM lives
+  in Apple's XPC process, unreachable by `madvise`). Evidence in
+  `app/arcbox-core/src/vm_lifecycle/balloon/mod.rs`.
 ² Same-context comparison (container vs container, same-day pairing).
   Cache-hot native is not a valid denominator for FUSE metadata —
   methodology and current numbers in `docs/fs-perf-limits.md`.
