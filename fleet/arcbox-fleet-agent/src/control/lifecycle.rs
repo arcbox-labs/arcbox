@@ -11,7 +11,7 @@ use arcbox_fleet_control_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{AgentSupervisor, RestartMode};
+use super::AgentSupervisor;
 
 /// Bumped only on breaking control-API changes. Clients call `GetAgentInfo`
 /// and adapt to what it reports rather than gating behavior on an exact
@@ -100,12 +100,7 @@ impl FleetLifecycleService for LifecycleService {
         &self,
         request: Request<RestartRequest>,
     ) -> Result<Response<RestartResponse>, Status> {
-        let mode = if request.into_inner().force {
-            RestartMode::Force
-        } else {
-            RestartMode::Graceful
-        };
-        self.supervisor.restart(mode).await?;
+        self.supervisor.restart(request.into_inner().force).await?;
         Ok(Response::new(RestartResponse {}))
     }
 

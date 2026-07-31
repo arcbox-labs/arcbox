@@ -8,7 +8,6 @@
 pub mod client;
 mod image;
 mod lifecycle;
-mod restart;
 mod settings;
 mod watch;
 
@@ -34,14 +33,13 @@ use tracing::{info, warn};
 use crate::backends::Backends;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
+use crate::handover::{Handover, Reason, Requested};
 use crate::runner::RunnerSupervisor;
 use crate::settings::SettingsStore;
 use crate::state::AgentState;
 use crate::{attach, enroll, update};
 use image::ImageService;
 use lifecycle::LifecycleService;
-use restart::Requested;
-pub use restart::{RestartIntent, RestartMode};
 use settings::SettingsService;
 use watch::WatchService;
 
@@ -175,7 +173,8 @@ fn check_enrollable(state: &State) -> Result<(), &'static str> {
 /// still goes through [`AgentState`].
 struct Attachment {
     supervisor: RunnerSupervisor,
-    /// Child of [`AgentSupervisor::process_shutdown`]: cancelling it stops
+    /// Child of the process shutdown token ([`Handover::shutdown`]):
+    /// cancelling it stops
     /// only this attachment (`Unenroll`); cancelling the parent (process
     /// shutdown) cascades to it too, so runners still drain on SIGTERM.
     shutdown: CancellationToken,
@@ -235,9 +234,6 @@ pub struct AgentSupervisor {
     /// The live backend registry: runtimes and the capability set they
     /// serve, shared with every attachment and with `FleetImageService`.
     backends: Arc<Backends>,
-    /// Cancelled on process shutdown (SIGTERM/Ctrl-C); every attachment's
-    /// `shutdown` is a child of this token.
-    process_shutdown: CancellationToken,
     state: Mutex<State>,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers —
     /// the single source of truth `status()` reads from below, so it never
@@ -246,11 +242,11 @@ pub struct AgentSupervisor {
     /// Persists an `Enroll`-provided gateway override the same way
     /// `FleetSettingsService.UpdateSettings` persists any other setting.
     settings_store: SettingsStore,
-    /// Shared with the shutdown-signal handler, which vetoes a pending
-    /// restart when the process is told to stop; read by [`crate::serve`]
-    /// after the shutdown completes, to decide between exiting and
-    /// re-execing.
-    restart: Arc<RestartIntent>,
+    /// How this process image ends. Owns the process shutdown token every
+    /// attachment's own token descends from, so an operator `Restart` and a
+    /// termination signal bring the agent down the same way and only
+    /// [`Handover::outcome`] tells them apart afterwards.
+    handover: Arc<Handover>,
     /// Identifies this process image (see `GetAgentInfoResponse.instance_id`):
     /// a client watching a restart cannot use the PID, which `exec`
     /// preserves, so it compares this instead.
@@ -263,19 +259,17 @@ impl AgentSupervisor {
     pub async fn new(
         config: AgentConfig,
         backends: Arc<Backends>,
-        process_shutdown: CancellationToken,
         agent_state: AgentState,
         settings_store: SettingsStore,
-        restart: Arc<RestartIntent>,
+        handover: Arc<Handover>,
     ) -> Result<Self> {
         let this = Self {
             config,
             backends,
-            process_shutdown,
             state: Mutex::new(State::Unenrolled),
             agent_state,
             settings_store,
-            restart,
+            handover,
             instance_id: uuid::Uuid::new_v4().to_string(),
         };
         let gateway = this.agent_state.gateway_target();
@@ -332,12 +326,17 @@ impl AgentSupervisor {
         self.agent_state.set_participate_current(true);
         // A fresh attachment always starts accepting: `Drain` is runtime-only
         // (never persisted), and the previous attachment's teardown shares this
-        // process-lifetime state, so clear any stale draining flag rather than
-        // letting a re-enroll inherit it.
-        self.agent_state.set_draining(false);
-        let (supervisor, egress_rx) =
-            attach::spawn_supervisor(&self.config, self.backends(), self.agent_state.clone());
-        let shutdown = self.process_shutdown.child_token();
+        // process-lifetime state, so clear any stale operator drain rather than
+        // letting a re-enroll inherit it. A pending handover is untouched — it
+        // outlives attachments by design.
+        self.agent_state.set_operator_draining(false);
+        let (supervisor, egress_rx) = attach::spawn_supervisor(
+            &self.config,
+            self.backends(),
+            self.agent_state.clone(),
+            Arc::clone(&self.handover),
+        );
+        let shutdown = self.handover.shutdown().child_token();
         let task = tokio::spawn(attach::run(
             self.config.clone(),
             credential.clone(),
@@ -346,6 +345,7 @@ impl AgentSupervisor {
             self.backends(),
             shutdown.clone(),
             self.agent_state.clone(),
+            Arc::clone(&self.handover),
         ));
         Attachment {
             supervisor,
@@ -707,25 +707,30 @@ impl AgentSupervisor {
     }
 
     /// Restart this process: bring the agent down the same way a SIGTERM
-    /// does, so [`crate::serve`] can re-exec once the teardown finishes
-    /// (see [`restart`] for why the shutdown path is shared).
+    /// does, so [`crate::serve`] can re-exec once the teardown finishes.
+    /// Sharing that one teardown path is deliberate — see [`Handover`].
     ///
     /// Accepted from every enrollment state — it replaces the process, not
     /// the enrollment — and idempotent: a repeated request rides the shutdown
-    /// already in progress, while a [`RestartMode::Force`] arriving after a
-    /// graceful one escalates it instead of waiting further. Refused only
-    /// once a termination signal has claimed the shutdown, which no restart
-    /// may turn back into a re-exec.
+    /// already in progress, while a forced request arriving after a graceful
+    /// one escalates it instead of waiting further. Refused only once a
+    /// termination signal has claimed the shutdown, which no restart may turn
+    /// back into a re-exec.
     ///
-    /// A [`RestartMode::Graceful`] restart with jobs in flight returns as
-    /// soon as the drain is armed; the re-exec then waits for the supervisor
-    /// to quiesce — unbounded on the jobs themselves, bounded on the verdict
-    /// acks that follow them.
-    pub async fn restart(&self, mode: RestartMode) -> Result<(), Status> {
-        match self.restart.request(mode) {
+    /// A graceful restart with jobs in flight returns as soon as the drain is
+    /// armed; the re-exec then waits for the supervisor to quiesce —
+    /// unbounded on the jobs themselves, bounded on the verdict acks that
+    /// follow them.
+    pub async fn restart(&self, force: bool) -> Result<(), Status> {
+        let reason = if force {
+            Reason::ForcedRestart
+        } else {
+            Reason::Restart
+        };
+        match self.handover.request(reason) {
             Requested::Recorded => {}
             Requested::AlreadyPending => {
-                info!(?mode, "restart already in progress");
+                info!(?reason, "restart already in progress");
                 return Ok(());
             }
             Requested::ShuttingDown => {
@@ -736,44 +741,35 @@ impl AgentSupervisor {
         }
         // Nothing to protect: either no attachment exists, or the operator
         // asked to take in-flight jobs down with the process.
-        let runners = match mode {
-            RestartMode::Force => None,
-            RestartMode::Graceful => match &*self.state.lock().await {
+        let runners = if force {
+            None
+        } else {
+            match &*self.state.lock().await {
                 State::Attached(a) => Some(a.supervisor.clone()),
                 State::Unenrolled
                 | State::Enrolling
                 | State::Unenrolling
                 | State::Detaching
                 | State::Detached { .. } => None,
-            },
+            }
         };
         let Some(runners) = runners else {
-            info!(?mode, "restarting");
-            self.process_shutdown.cancel();
+            info!(?reason, "restarting");
+            self.handover.commit();
             return Ok(());
         };
 
         info!("restarting once in-flight jobs finish");
-        runners.drain_for_restart();
-        let shutdown = self.process_shutdown.clone();
+        let handover = Arc::clone(&self.handover);
         tokio::spawn(async move {
             // The attach stream is live here, so the ack grace is real: the
             // last job's verdict is queued as it exits, and re-execing before
             // the gateway settles it would strand the outcome.
             runners.quiesce(crate::runner::VERDICT_ACK_GRACE).await;
             info!("in-flight work settled; restarting");
-            shutdown.cancel();
+            handover.commit();
         });
         Ok(())
-    }
-
-    /// The requested restart mode, or `None` when no restart was requested
-    /// or a termination signal vetoed it. [`crate::serve`] reads the shared
-    /// intent directly; this is the same answer, for callers holding only the
-    /// supervisor.
-    #[cfg(test)]
-    fn restart_mode(&self) -> Option<RestartMode> {
-        self.restart.mode()
     }
 
     /// This process image's identity, reported by `GetAgentInfo`.
@@ -882,41 +878,25 @@ mod tests {
         dir: &std::path::Path,
         agent_state: AgentState,
     ) -> Arc<AgentSupervisor> {
-        test_supervisor_with_shutdown(dir, agent_state, CancellationToken::new()).await
+        let handover = Handover::new(agent_state.clone());
+        test_supervisor_with_handover(dir, agent_state, handover).await
     }
 
-    /// As [`test_supervisor`], with the process shutdown token in the
-    /// caller's hands — what a restart is observed through.
-    async fn test_supervisor_with_shutdown(
+    /// As [`test_supervisor`], sharing the handover with the caller — what
+    /// `serve` and the shutdown-signal handler both hold, and what a restart
+    /// is observed through.
+    async fn test_supervisor_with_handover(
         dir: &std::path::Path,
         agent_state: AgentState,
-        shutdown: CancellationToken,
-    ) -> Arc<AgentSupervisor> {
-        test_supervisor_with_restart(
-            dir,
-            agent_state,
-            shutdown,
-            Arc::new(RestartIntent::default()),
-        )
-        .await
-    }
-
-    /// As [`test_supervisor_with_shutdown`], sharing the restart intent with
-    /// the caller — what `serve` and the shutdown-signal handler both hold.
-    async fn test_supervisor_with_restart(
-        dir: &std::path::Path,
-        agent_state: AgentState,
-        shutdown: CancellationToken,
-        restart: Arc<RestartIntent>,
+        handover: Arc<Handover>,
     ) -> Arc<AgentSupervisor> {
         Arc::new(
             AgentSupervisor::new(
                 test_config(dir.to_path_buf()),
                 Backends::new(false, None, None, None, agent_state.clone()),
-                shutdown,
                 agent_state,
                 SettingsStore::new(dir.join("settings.json")),
-                restart,
+                handover,
             )
             .await
             .expect("no credential on disk, so no attach on startup"),
@@ -1071,7 +1051,7 @@ mod tests {
         let supervisor = test_supervisor(&dir, agent_state.clone()).await;
 
         // Inject a live attachment whose task observes its cancel promptly.
-        let shutdown = supervisor.process_shutdown.child_token();
+        let shutdown = supervisor.handover.shutdown().child_token();
         let task_token = shutdown.clone();
         let task = tokio::spawn(async move {
             task_token.cancelled().await;
@@ -1083,6 +1063,7 @@ mod tests {
             None,
             Backends::new(false, None, None, None, agent_state.clone()),
             agent_state.clone(),
+            Handover::new(agent_state.clone()),
         );
         *supervisor.state.lock().await = State::Attached(Attachment {
             supervisor: runner,
@@ -1174,10 +1155,9 @@ mod tests {
         let supervisor = AgentSupervisor::new(
             config,
             Backends::new(false, None, None, None, agent_state.clone()),
-            CancellationToken::new(),
             agent_state.clone(),
             SettingsStore::new(dir.join("settings.json")),
-            Arc::new(RestartIntent::default()),
+            Handover::new(agent_state.clone()),
         )
         .await
         .expect("startup with credential");
@@ -1207,10 +1187,9 @@ mod tests {
             AgentSupervisor::new(
                 test_config(dir.clone()),
                 Backends::new(false, None, None, None, agent_state.clone()),
-                CancellationToken::new(),
                 agent_state.clone(),
                 SettingsStore::new(dir.join("settings.json")),
-                Arc::new(RestartIntent::default()),
+                Handover::new(agent_state.clone()),
             )
             .await
             .expect("no credential on disk, so no attach on startup"),
@@ -1218,7 +1197,7 @@ mod tests {
 
         // Inject a live attachment whose task takes a while to observe its
         // cancel — the teardown grace window the race lives in.
-        let shutdown = supervisor.process_shutdown.child_token();
+        let shutdown = supervisor.handover.shutdown().child_token();
         let task_token = shutdown.clone();
         let task = tokio::spawn(async move {
             task_token.cancelled().await;
@@ -1230,7 +1209,8 @@ mod tests {
             events,
             None,
             Backends::new(false, None, None, None, agent_state.clone()),
-            agent_state,
+            agent_state.clone(),
+            Handover::new(agent_state),
         );
         // A persisted credential, so the completed unenroll can prove the
         // local clear happens even though this gateway is unreachable (the
@@ -1417,56 +1397,59 @@ mod tests {
     }
 
     /// With no attachment there is no work to protect, so both modes cancel
-    /// the process shutdown immediately and record the intent `serve` reads.
+    /// the process shutdown immediately and record the reason `serve` reads.
     #[tokio::test]
     async fn restart_without_an_attachment_shuts_the_process_down_at_once() {
-        for (mode, expected) in [
-            (RestartMode::Graceful, RestartMode::Graceful),
-            (RestartMode::Force, RestartMode::Force),
-        ] {
+        for (force, expected) in [(false, Reason::Restart), (true, Reason::ForcedRestart)] {
             let dir = std::env::temp_dir().join(format!(
                 "fleet-restart-{:?}-{}",
                 expected,
                 std::process::id()
             ));
-            let shutdown = CancellationToken::new();
+            let agent_state = AgentState::new(&seed());
+            let handover = Handover::new(agent_state.clone());
             let supervisor =
-                test_supervisor_with_shutdown(&dir, AgentState::new(&seed()), shutdown.clone())
-                    .await;
+                test_supervisor_with_handover(&dir, agent_state, Arc::clone(&handover)).await;
 
-            assert_eq!(supervisor.restart_mode(), None);
-            supervisor.restart(mode).await.expect("restart is accepted");
+            assert_eq!(handover.reason(), Reason::None);
+            supervisor
+                .restart(force)
+                .await
+                .expect("restart is accepted");
 
-            assert!(shutdown.is_cancelled());
-            assert_eq!(supervisor.restart_mode(), Some(expected));
+            assert!(handover.shutdown().is_cancelled());
+            assert_eq!(handover.reason(), expected);
             let _ = std::fs::remove_dir_all(dir);
         }
     }
 
-    /// The intent survives a repeated request and escalates on `force`, so a
-    /// second call can't undo a restart already under way.
+    /// A repeat is a no-op rather than an error, so an operator running the
+    /// command twice — or a client retrying a response lost to the re-exec —
+    /// does not see a failure for a restart that is already under way. The
+    /// escalation ordering itself belongs to [`Handover`] and is tested there.
     #[tokio::test]
-    async fn a_force_restart_escalates_a_pending_graceful_one() {
+    async fn a_repeated_restart_request_is_accepted_not_refused() {
         let dir =
             std::env::temp_dir().join(format!("fleet-restart-escalate-{}", std::process::id()));
-        let shutdown = CancellationToken::new();
+        let agent_state = AgentState::new(&seed());
+        let handover = Handover::new(agent_state.clone());
         let supervisor =
-            test_supervisor_with_shutdown(&dir, AgentState::new(&seed()), shutdown.clone()).await;
+            test_supervisor_with_handover(&dir, agent_state, Arc::clone(&handover)).await;
 
         supervisor
-            .restart(RestartMode::Graceful)
+            .restart(false)
             .await
             .expect("restart is accepted");
         supervisor
-            .restart(RestartMode::Force)
+            .restart(true)
             .await
             .expect("an escalation is accepted");
         supervisor
-            .restart(RestartMode::Graceful)
+            .restart(false)
             .await
             .expect("a late graceful request is a no-op, not an error");
 
-        assert_eq!(supervisor.restart_mode(), Some(RestartMode::Force));
+        assert_eq!(handover.reason(), Reason::ForcedRestart);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1477,24 +1460,20 @@ mod tests {
     async fn restart_is_refused_once_the_process_is_terminating() {
         let dir =
             std::env::temp_dir().join(format!("fleet-restart-terminating-{}", std::process::id()));
-        let restart = Arc::new(RestartIntent::default());
-        let supervisor = test_supervisor_with_restart(
-            &dir,
-            AgentState::new(&seed()),
-            CancellationToken::new(),
-            Arc::clone(&restart),
-        )
-        .await;
+        let agent_state = AgentState::new(&seed());
+        let handover = Handover::new(agent_state.clone());
+        let supervisor =
+            test_supervisor_with_handover(&dir, agent_state, Arc::clone(&handover)).await;
 
-        // What `serve`'s shutdown-signal hook does before it cancels.
-        restart.terminate();
+        // What the shutdown-signal handler does.
+        handover.terminate();
 
         let err = supervisor
-            .restart(RestartMode::Force)
+            .restart(true)
             .await
             .expect_err("a terminating process cannot be restarted");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(supervisor.restart_mode(), None);
+        assert_eq!(handover.outcome(), crate::handover::Outcome::Exit);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

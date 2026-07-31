@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use crate::backends::Backends;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
+use crate::handover::{Handover, Reason};
 use crate::host;
 use crate::runner::RunnerSupervisor;
 use crate::state::AgentState;
@@ -136,10 +137,16 @@ pub fn spawn_supervisor(
     config: &AgentConfig,
     backends: Arc<Backends>,
     state: AgentState,
+    handover: Arc<Handover>,
 ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
     let (egress_tx, egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
-    let supervisor =
-        RunnerSupervisor::new(egress_tx, config.runner_script.clone(), backends, state);
+    let supervisor = RunnerSupervisor::new(
+        egress_tx,
+        config.runner_script.clone(),
+        backends,
+        state,
+        handover,
+    );
     (supervisor, egress_rx)
 }
 
@@ -155,7 +162,8 @@ pub fn spawn_supervisor(
     clippy::too_many_arguments,
     reason = "the reconnect loop genuinely needs all of: endpoint config, credential, the \
               persistent supervisor, the cross-reconnect egress queue, the backend \
-              registry, the shutdown token, and the observable state handle"
+              registry, the shutdown token, the observable state handle, and the handover \
+              a pushed self-update records itself on"
 )]
 pub async fn run(
     config: AgentConfig,
@@ -165,6 +173,7 @@ pub async fn run(
     backends: Arc<Backends>,
     shutdown: CancellationToken,
     state: AgentState,
+    handover: Arc<Handover>,
 ) -> Result<()> {
     let mut backoff = INITIAL_BACKOFF;
     // Activation notifications; each connection marks the current value
@@ -174,10 +183,6 @@ pub async fn run(
     // connection dropped; re-sent first on the next connection so a terminal
     // event is never lost to a closed stream.
     let mut pending: Option<AttachRequest> = None;
-    // Whether the supervisor is draining for a self-update. Spans reconnects
-    // so a successful re-attach (the pin moved back to this build) can undo
-    // exactly the update drain and nothing else.
-    let mut drained_for_update = false;
 
     // Attachment-scoped: resend unacked verdicts across reconnects within this
     // attachment, exiting when `shutdown` fires. Tied to the attachment rather
@@ -199,7 +204,7 @@ pub async fn run(
             &mut backends_rx,
             &shutdown,
             &state,
-            &mut drained_for_update,
+            &handover,
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -261,8 +266,7 @@ pub async fn run(
                 // running (a mid-stream drain that lost its connection, or a
                 // reconnect that got version-rejected). Never kill them for
                 // an update.
-                supervisor.drain_for_update();
-                drained_for_update = true;
+                handover.request(Reason::Update);
                 // Off-stream, so no ack can arrive: waiting one out would only
                 // delay the swap by the full grace on every version refusal.
                 tokio::select! {
@@ -340,7 +344,7 @@ async fn connect_and_serve(
     backends_rx: &mut watch::Receiver<()>,
     shutdown: &CancellationToken,
     state: &AgentState,
-    drained_for_update: &mut bool,
+    handover: &Arc<Handover>,
 ) -> Result<StreamEnd> {
     // The desired (`target`) gateway, not `config.gateway` directly —
     // `AgentSupervisor` seeds it from config, and an `Enroll` gateway
@@ -430,10 +434,7 @@ async fn connect_and_serve(
             // A drain begun for an update that never happened (the pin moved
             // back to this build before the swap) is moot once the gateway
             // accepts this build again.
-            if *drained_for_update {
-                supervisor.resume_after_moot_update();
-                *drained_for_update = false;
-            }
+            handover.update_became_moot();
         }
         Some(attach_response::Msg::AttachRejected(update)) => {
             return Err(anyhow::Error::new(AgentUpdateRequired::from(update)));
@@ -517,8 +518,7 @@ async fn connect_and_serve(
                                 current = env!("CARGO_PKG_VERSION"),
                                 "gateway pushed an update; draining before the swap"
                             );
-                            supervisor.drain_for_update();
-                            *drained_for_update = true;
+                            handover.request(Reason::Update);
                             pending_update = Some(AgentUpdateRequired::from(update.clone()));
                         }
                         continue;
@@ -731,8 +731,13 @@ mod tests {
             machine_token: "flt_revoked".to_owned(),
         };
         let backends = Backends::fixed(Vec::new(), state.clone());
-        let (supervisor, egress_rx) =
-            spawn_supervisor(&config, Arc::clone(&backends), state.clone());
+        let handover = Handover::new(state.clone());
+        let (supervisor, egress_rx) = spawn_supervisor(
+            &config,
+            Arc::clone(&backends),
+            state.clone(),
+            Arc::clone(&handover),
+        );
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(run(
             config,
@@ -742,6 +747,7 @@ mod tests {
             backends,
             shutdown.clone(),
             state.clone(),
+            handover,
         ));
 
         // The loop must reach the parked state rather than retry-looping.
@@ -873,7 +879,7 @@ mod tests {
         // A generous-but-bounded deadline distinguishes "worked" from
         // "deadlocked with the mock" without depending on any real network
         // timeout.
-        let mut drained_for_update = false;
+        let handover = Handover::new(state.clone());
         tokio::time::timeout(
             Duration::from_secs(3),
             connect_and_serve(
@@ -887,7 +893,7 @@ mod tests {
                 &mut backends_rx,
                 &shutdown,
                 &state,
-                &mut drained_for_update,
+                &handover,
             ),
         )
         .await
@@ -994,8 +1000,13 @@ mod tests {
             ..config()
         };
         let backends = Backends::new(false, None, None, None, state.clone());
-        let (supervisor, egress_rx) =
-            spawn_supervisor(&config, Arc::clone(&backends), state.clone());
+        let handover = Handover::new(state.clone());
+        let (supervisor, egress_rx) = spawn_supervisor(
+            &config,
+            Arc::clone(&backends),
+            state.clone(),
+            Arc::clone(&handover),
+        );
         let shutdown = CancellationToken::new();
         let run_task = tokio::spawn(run(
             config,
@@ -1005,6 +1016,7 @@ mod tests {
             Arc::clone(&backends),
             shutdown.clone(),
             state,
+            handover,
         ));
 
         async fn wait_for_attaches(
@@ -1102,7 +1114,8 @@ mod tests {
             events,
             None,
             Backends::fixed(Vec::new(), state.clone()),
-            state,
+            state.clone(),
+            Handover::new(state),
         )
     }
 
@@ -1127,7 +1140,7 @@ mod tests {
         let config = config();
         let credential = credential();
 
-        let mut drained_for_update = false;
+        let handover = Handover::new(state.clone());
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             connect_and_serve(
@@ -1141,7 +1154,7 @@ mod tests {
                 &mut backends_rx,
                 &shutdown,
                 &state,
-                &mut drained_for_update,
+                &handover,
             ),
         )
         .await

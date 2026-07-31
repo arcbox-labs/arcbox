@@ -1,36 +1,25 @@
-//! Termination-signal handling: the `CancellationToken` every long-running
-//! subcommand shuts down on.
+//! Termination-signal handling.
 //!
-//! `serve` shares that token with its own restart path, so the signal handler
-//! takes a hook that runs *before* the cancellation — that is where a
-//! termination signal vetoes a pending restart, so a shutdown can never be
-//! mistaken for one (see [`crate::control::RestartIntent::terminate`]).
+//! The signal does not cancel the shutdown token directly: it goes through
+//! [`Handover::terminate`], which records the veto *before* it cancels. Every
+//! long-running subcommand shuts down on that one token, so without the veto a
+//! SIGTERM landing on an agent waiting out its last job would be
+//! indistinguishable from the restart it was waiting for.
 
-use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
+
 use tracing::{info, warn};
 
-/// Build a `CancellationToken` cancelled on the first termination signal (see
-/// [`signal`]), logging `message` when it fires.
-pub fn spawn(message: &'static str) -> CancellationToken {
-    spawn_with(message, || {})
-}
+use crate::handover::Handover;
 
-/// As [`spawn`], running `on_signal` before the token is cancelled, so a task
-/// waiting on the token cannot observe the cancellation before the hook's
-/// effects.
-pub fn spawn_with(
-    message: &'static str,
-    on_signal: impl FnOnce() + Send + 'static,
-) -> CancellationToken {
-    let shutdown = CancellationToken::new();
-    let signal_token = shutdown.clone();
+/// Terminate `handover` on the first termination signal (see [`signal`]),
+/// logging `message` when it fires.
+pub fn arm(handover: Arc<Handover>, message: &'static str) {
     tokio::spawn(async move {
         signal().await;
         info!("{message}");
-        on_signal();
-        signal_token.cancel();
+        handover.terminate();
     });
-    shutdown
 }
 
 /// Resolve when the process receives a termination signal: Ctrl-C, or
