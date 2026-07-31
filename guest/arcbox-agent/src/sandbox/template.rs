@@ -179,14 +179,22 @@ async fn image_content_key(image_ref: &str) -> Result<String> {
 
 /// Minimal Docker Engine API client over the guest's own dockerd socket.
 ///
-/// Two calls, both raw HTTP/1.1: inspect (small JSON) and export (a tar
-/// stream of unbounded size, so it is written straight to disk rather than
-/// buffered). The daemon-side proxy is not involved — dockerd is a local
-/// socket away from the agent.
+/// Two calls: inspect (small JSON) and export (a tar stream of unbounded
+/// size, written straight to disk rather than buffered). The daemon-side
+/// proxy is not involved — dockerd is a local socket away from the agent.
+///
+/// Both go through hyper rather than hand-rolled HTTP. dockerd is Go
+/// `net/http`, which sends a streamed body with no Content-Length as
+/// **chunked** transfer-encoding; copying the raw connection bytes splices
+/// the chunk headers into the tar and it fails to unpack with an opaque
+/// "archive header checksum mismatch". Let the HTTP library do framing.
 mod docker {
     use anyhow::{Context, Result, bail};
     use arcbox_constants::paths::DOCKER_API_UNIX_SOCKET;
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+    use http_body_util::{BodyExt as _, Empty};
+    use hyper::body::Bytes;
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncWrite, AsyncWriteExt as _};
     use tokio::net::UnixStream;
 
     /// Largest inspect response accepted (guards a hostile/broken dockerd).
@@ -195,20 +203,22 @@ mod docker {
     /// `GET /images/{ref}/json`, parsed as JSON.
     pub(super) async fn inspect_image(image_ref: &str) -> Result<serde_json::Value> {
         let path = format!("/images/{}/json", urlencode(image_ref));
-        let mut stream = request(&path).await?;
-        let (status, reader) = read_headers(&mut stream).await?;
-        if status != 200 {
+        let mut response = get(&path).await?;
+        let status = response.status();
+        if !status.is_success() {
             bail!("docker image inspect {image_ref} returned HTTP {status}");
         }
 
         let mut body = Vec::new();
-        reader
-            .take(MAX_INSPECT_BYTES as u64)
-            .read_to_end(&mut body)
-            .await
-            .context("failed to read the docker inspect response")?;
-        // dockerd answers inspect with Content-Length, so the body is the
-        // remaining bytes verbatim.
+        while let Some(frame) = response.frame().await {
+            let frame = frame.context("failed to read the docker inspect response")?;
+            if let Some(chunk) = frame.data_ref() {
+                if body.len() + chunk.len() > MAX_INSPECT_BYTES {
+                    bail!("docker inspect response exceeds {MAX_INSPECT_BYTES} bytes");
+                }
+                body.extend_from_slice(chunk);
+            }
+        }
         serde_json::from_slice(&body).context("failed to parse the docker inspect response")
     }
 
@@ -218,67 +228,54 @@ mod docker {
         W: AsyncWrite + Unpin,
     {
         let path = format!("/images/{}/get", urlencode(image_ref));
-        let mut stream = request(&path).await?;
-        let (status, mut reader) = read_headers(&mut stream).await?;
-        if status != 200 {
+        let mut response = get(&path).await?;
+        let status = response.status();
+        if !status.is_success() {
             bail!("docker image export {image_ref} returned HTTP {status}");
         }
 
-        // The export is sent with `Connection: close` and no chunking, so the
-        // rest of the connection is the tar stream.
-        tokio::io::copy(&mut reader, sink)
-            .await
-            .context("failed to stream the docker image export")?;
+        while let Some(frame) = response.frame().await {
+            let frame = frame.context("failed to stream the docker image export")?;
+            if let Some(chunk) = frame.data_ref() {
+                sink.write_all(chunk)
+                    .await
+                    .context("failed to write the docker image export")?;
+            }
+        }
         Ok(())
     }
 
-    /// Open the socket and send a `GET` with `Connection: close`.
-    async fn request(path: &str) -> Result<UnixStream> {
-        let mut stream = UnixStream::connect(DOCKER_API_UNIX_SOCKET)
+    /// Dial the docker socket and issue a `GET`, returning the response.
+    ///
+    /// The connection task is detached: it drives the HTTP state machine
+    /// while the caller consumes the body, and ends when the body does.
+    async fn get(path: &str) -> Result<hyper::Response<hyper::body::Incoming>> {
+        let stream = UnixStream::connect(DOCKER_API_UNIX_SOCKET)
             .await
             .with_context(|| format!("failed to connect {DOCKER_API_UNIX_SOCKET}"))?;
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: */*\r\n\r\n"
-        );
-        stream
-            .write_all(req.as_bytes())
+
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
-            .context("failed to send the docker request")?;
-        Ok(stream)
-    }
+            .context("docker HTTP handshake failed")?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!(error = %e, "docker connection closed");
+            }
+        });
 
-    /// Read the status line and headers, returning the status code and a
-    /// reader positioned at the first body byte.
-    async fn read_headers(
-        stream: &mut UnixStream,
-    ) -> Result<(u16, tokio::io::BufReader<&mut UnixStream>)> {
-        let mut reader = tokio::io::BufReader::new(stream);
+        // The authority is unused (the connector dials a fixed socket) but
+        // HTTP/1.1 requires a Host header.
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(path)
+            .header(hyper::header::HOST, "localhost")
+            .body(Empty::<Bytes>::new())
+            .context("failed to build the docker request")?;
 
-        let mut status_line = String::new();
-        reader
-            .read_line(&mut status_line)
+        sender
+            .send_request(request)
             .await
-            .context("failed to read the docker response status")?;
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .with_context(|| format!("unparseable docker status line: {status_line:?}"))?;
-
-        loop {
-            let mut line = String::new();
-            let n = reader
-                .read_line(&mut line)
-                .await
-                .context("failed to read the docker response headers")?;
-            if n == 0 {
-                bail!("docker closed the connection mid-headers");
-            }
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-        }
-        Ok((status, reader))
+            .context("failed to send the docker request")
     }
 
     /// Percent-encode an image reference for a path segment.
