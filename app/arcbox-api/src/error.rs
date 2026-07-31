@@ -56,6 +56,8 @@ impl From<ApiError> for tonic::Status {
                 404 => Self::not_found(message),
                 409 => Self::already_exists(message),
                 412 => Self::failed_precondition(message),
+                // Stdin offset gap: the client resyncs via GetStdinStatus.
+                416 => Self::out_of_range(message),
                 503 => Self::unavailable(message),
                 _ => Self::internal(message),
             },

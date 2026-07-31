@@ -1,28 +1,54 @@
 //! Sandbox service gRPC implementation.
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use arcbox_grpc::SandboxService;
-use arcbox_protocol::sandbox_v1::Empty as SandboxEmpty;
+use arcbox_protocol::pbjson_types::Empty;
 use arcbox_protocol::sandbox_v1::{
-    CreateSandboxRequest, CreateSandboxResponse, ExecInput, ExecOutput, ExposePortRequest,
-    ExposePortResponse, FileChunk, InspectSandboxRequest, ListSandboxesRequest,
-    ListSandboxesResponse, ReadFileRequest, RemoveSandboxRequest, RunOutput, RunRequest,
-    SandboxEvent, SandboxEventsRequest, SandboxInfo, SandboxPortForwardRemoveRequest,
-    SandboxPortForwardRequest, StopSandboxRequest, UnexposePortRequest, WriteFileRequest,
-    exec_input, write_file_request,
+    AttachExecutionRequest, CreateSandboxRequest, CreateSandboxResponse, Execution, ExecutionEvent,
+    ExposePortRequest, ExposePortResponse, FileChunk, GetStdinStatusRequest, InspectSandboxRequest,
+    KeepAlive, ListSandboxesRequest, ListSandboxesResponse, PortProtocol, ReadFileRequest,
+    RemoveSandboxRequest, ResizeExecutionTtyRequest, SandboxEventsRequest, SandboxInfo,
+    SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SignalExecutionRequest,
+    StartExecutionRequest, StdinStatus, StopSandboxRequest, UnexposePortRequest,
+    WaitExecutionRequest, WatchEventsResponse, WriteFileRequest, WriteStdinRequest,
+    execution_event, watch_events_response, write_file_request,
 };
-use tokio_stream::Stream;
-use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt as _};
 use tonic::codec::Streaming;
 use tonic::{Request, Response, Status};
 
-use arcbox_core::{ExecSessionInput, SandboxPortExposure, WriteFileChunk};
+use arcbox_core::{SandboxPortExposure, WriteFileChunk};
 
 use crate::ApiError;
 
 use super::{RequestExt, SharedRuntime, SharedRuntimeExt};
+
+/// Idle interval after which a server stream emits a keepalive frame, so
+/// proxies and load balancers never see a silent connection (CORE-55).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Interleave keepalive items whenever `stream` stays idle for
+/// [`KEEPALIVE_INTERVAL`].
+fn with_keepalive<S, T>(stream: S, keepalive: fn() -> T) -> impl Stream<Item = Result<T, Status>>
+where
+    S: Stream<Item = Result<T, Status>>,
+{
+    stream
+        .timeout(KEEPALIVE_INTERVAL)
+        .map(move |item| item.unwrap_or_else(|_elapsed| Ok(keepalive())))
+}
+
+/// Map the wire port protocol onto the host-side exposure key
+/// (`UNSPECIFIED` defaults to TCP).
+fn protocol_key(protocol: PortProtocol) -> &'static str {
+    match protocol {
+        PortProtocol::Udp => "udp",
+        _ => "tcp",
+    }
+}
 
 /// Sandbox service implementation.
 ///
@@ -69,9 +95,30 @@ impl SandboxService for SandboxServiceImpl {
         Ok(Response::new(resp))
     }
 
-    type RunStream = Pin<Box<dyn Stream<Item = Result<RunOutput, Status>> + Send + 'static>>;
+    async fn start_execution(
+        &self,
+        request: Request<StartExecutionRequest>,
+    ) -> Result<Response<Execution>, Status> {
+        let machine = request.machine_id()?;
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        let execution = agent
+            .sandbox_exec_start(request.into_inner())
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Response::new(execution))
+    }
 
-    async fn run(&self, request: Request<RunRequest>) -> Result<Response<Self::RunStream>, Status> {
+    type AttachExecutionStream =
+        Pin<Box<dyn Stream<Item = Result<ExecutionEvent, Status>> + Send + 'static>>;
+
+    async fn attach_execution(
+        &self,
+        request: Request<AttachExecutionRequest>,
+    ) -> Result<Response<Self::AttachExecutionStream>, Status> {
         let machine = request.machine_id()?;
         let agent = self
             .runtime
@@ -79,74 +126,128 @@ impl SandboxService for SandboxServiceImpl {
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let rx = agent
-            .sandbox_run(request.into_inner())
+            .sandbox_exec_attach(request.into_inner())
             .await
             .map_err(ApiError::from)?;
         let stream =
             ReceiverStream::new(rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        let stream = with_keepalive(stream, || ExecutionEvent {
+            event: Some(execution_event::Event::KeepAlive(KeepAlive {})),
+        });
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type ExecStream = Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
-
-    async fn exec(
+    async fn write_stdin(
         &self,
-        request: Request<Streaming<ExecInput>>,
-    ) -> Result<Response<Self::ExecStream>, Status> {
+        request: Request<WriteStdinRequest>,
+    ) -> Result<Response<StdinStatus>, Status> {
         let machine = request.machine_id()?;
-        let agent = self
+        let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
-
-        let mut stream = request.into_inner();
-
-        // The first message in the stream must carry the Init payload.
-        let first = stream
-            .next()
-            .await
-            .ok_or_else(|| Status::invalid_argument("exec: stream closed before Init message"))??;
-
-        let exec_req = match first.payload {
-            Some(exec_input::Payload::Init(req)) => req,
-            _ => return Err(Status::invalid_argument("exec: first message must be Init")),
-        };
-
-        // Feed remaining gRPC input (stdin + TTY resizes) into a channel for
-        // the core layer. Stream end sends the empty-stdin EOF sentinel.
-        let (in_tx, in_rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
-            while let Some(Ok(input)) = stream.next().await {
-                let msg = match input.payload {
-                    Some(exec_input::Payload::Stdin(data)) => ExecSessionInput::Stdin(data),
-                    Some(exec_input::Payload::Resize(size)) => ExecSessionInput::Resize {
-                        width: u16::try_from(size.width).unwrap_or(u16::MAX),
-                        height: u16::try_from(size.height).unwrap_or(u16::MAX),
-                    },
-                    _ => continue,
-                };
-                if in_tx.send(msg).await.is_err() {
-                    return;
-                }
-            }
-            let _ = in_tx.send(ExecSessionInput::Stdin(Vec::new())).await;
-        });
-
-        let out_rx = agent
-            .sandbox_exec(exec_req, in_rx)
+        let status = agent
+            .sandbox_stdin_write(request.into_inner())
             .await
             .map_err(ApiError::from)?;
-
-        let out_stream =
-            ReceiverStream::new(out_rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
-        Ok(Response::new(Box::pin(out_stream)))
+        Ok(Response::new(status))
     }
 
-    async fn stop(
+    async fn stream_stdin(
         &self,
-        request: Request<StopSandboxRequest>,
-    ) -> Result<Response<SandboxEmpty>, Status> {
+        request: Request<Streaming<WriteStdinRequest>>,
+    ) -> Result<Response<StdinStatus>, Status> {
+        let machine = request.machine_id()?;
+        let mut stream = request.into_inner();
+
+        let mut last = None;
+        while let Some(req) = stream.message().await? {
+            let mut agent = self
+                .runtime
+                .ready()?
+                .get_agent(&machine)
+                .map_err(ApiError::from)?;
+            last = Some(
+                agent
+                    .sandbox_stdin_write(req)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+        }
+        last.map(Response::new)
+            .ok_or_else(|| Status::invalid_argument("stream_stdin: empty request stream"))
+    }
+
+    async fn get_stdin_status(
+        &self,
+        request: Request<GetStdinStatusRequest>,
+    ) -> Result<Response<StdinStatus>, Status> {
+        let machine = request.machine_id()?;
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        let status = agent
+            .sandbox_stdin_status(request.into_inner())
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Response::new(status))
+    }
+
+    async fn signal_execution(
+        &self,
+        request: Request<SignalExecutionRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let machine = request.machine_id()?;
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        agent
+            .sandbox_exec_signal(request.into_inner())
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn resize_execution_tty(
+        &self,
+        request: Request<ResizeExecutionTtyRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let machine = request.machine_id()?;
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        agent
+            .sandbox_exec_resize(request.into_inner())
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn wait_execution(
+        &self,
+        request: Request<WaitExecutionRequest>,
+    ) -> Result<Response<Execution>, Status> {
+        let machine = request.machine_id()?;
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        let execution = agent
+            .sandbox_exec_wait(request.into_inner())
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Response::new(execution))
+    }
+
+    async fn stop(&self, request: Request<StopSandboxRequest>) -> Result<Response<Empty>, Status> {
         let machine = request.machine_id()?;
         let sandbox_id = request.get_ref().id.clone();
         let mut agent = self
@@ -163,13 +264,13 @@ impl SandboxService for SandboxServiceImpl {
         runtime.deregister_dns_by_id(&sandbox_id).await;
         runtime.remove_sandbox_ports(&sandbox_id).await;
 
-        Ok(Response::new(SandboxEmpty {}))
+        Ok(Response::new(Empty {}))
     }
 
     async fn remove(
         &self,
         request: Request<RemoveSandboxRequest>,
-    ) -> Result<Response<SandboxEmpty>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let machine = request.machine_id()?;
         let sandbox_id = request.get_ref().id.clone();
         let mut agent = self
@@ -186,7 +287,7 @@ impl SandboxService for SandboxServiceImpl {
         runtime.deregister_dns_by_id(&sandbox_id).await;
         runtime.remove_sandbox_ports(&sandbox_id).await;
 
-        Ok(Response::new(SandboxEmpty {}))
+        Ok(Response::new(Empty {}))
     }
 
     async fn inspect(
@@ -241,13 +342,18 @@ impl SandboxService for SandboxServiceImpl {
             .map_err(ApiError::from)?;
         let stream =
             ReceiverStream::new(rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        // Keepalives are empty non-final chunks, as documented in the proto.
+        let stream = with_keepalive(stream, || FileChunk {
+            data: Vec::new(),
+            done: false,
+        });
         Ok(Response::new(Box::pin(stream)))
     }
 
     async fn write_file(
         &self,
         request: Request<Streaming<WriteFileRequest>>,
-    ) -> Result<Response<SandboxEmpty>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let machine = request.machine_id()?;
         let agent = self
             .runtime
@@ -304,7 +410,7 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_write_file(open, rx)
             .await
             .map_err(ApiError::from)?;
-        Ok(Response::new(SandboxEmpty {}))
+        Ok(Response::new(Empty {}))
     }
 
     async fn expose_port(
@@ -319,11 +425,7 @@ impl SandboxService for SandboxServiceImpl {
             .ok_or_else(|| Status::invalid_argument("sandbox_port must be 1-65535"))?;
         let host_port = u16::try_from(req.host_port)
             .map_err(|_| Status::invalid_argument("host_port must be 0-65535"))?;
-        let protocol = if req.protocol.is_empty() {
-            "tcp".to_owned()
-        } else {
-            req.protocol.to_ascii_lowercase()
-        };
+        let protocol = protocol_key(req.protocol()).to_owned();
 
         // Guest half: allocate the reserved relay port and install the DNAT.
         let mut agent = self
@@ -335,7 +437,7 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_port_forward(SandboxPortForwardRequest {
                 id: req.id.clone(),
                 sandbox_port: u32::from(sandbox_port),
-                protocol: protocol.clone(),
+                protocol: req.protocol,
             })
             .await
             .map_err(ApiError::from)?;
@@ -372,7 +474,7 @@ impl SandboxService for SandboxServiceImpl {
                 .sandbox_port_forward_remove(SandboxPortForwardRemoveRequest {
                     id: req.id,
                     sandbox_port: u32::from(sandbox_port),
-                    protocol,
+                    protocol: req.protocol,
                 })
                 .await;
             return Err(ApiError::from(e).into());
@@ -387,18 +489,14 @@ impl SandboxService for SandboxServiceImpl {
     async fn unexpose_port(
         &self,
         request: Request<UnexposePortRequest>,
-    ) -> Result<Response<SandboxEmpty>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let machine = request.machine_id()?;
         let req = request.into_inner();
         let sandbox_port = u16::try_from(req.sandbox_port)
             .ok()
             .filter(|p| *p != 0)
             .ok_or_else(|| Status::invalid_argument("sandbox_port must be 1-65535"))?;
-        let protocol = if req.protocol.is_empty() {
-            "tcp".to_owned()
-        } else {
-            req.protocol.to_ascii_lowercase()
-        };
+        let protocol = protocol_key(req.protocol());
 
         let mut agent = self
             .runtime
@@ -409,20 +507,21 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_port_forward_remove(SandboxPortForwardRemoveRequest {
                 id: req.id.clone(),
                 sandbox_port: u32::from(sandbox_port),
-                protocol: protocol.clone(),
+                protocol: req.protocol,
             })
             .await
             .map_err(ApiError::from)?;
 
         self.runtime
             .ready()?
-            .unexpose_sandbox_port(&req.id, sandbox_port, &protocol)
+            .unexpose_sandbox_port(&req.id, sandbox_port, protocol)
             .await;
 
-        Ok(Response::new(SandboxEmpty {}))
+        Ok(Response::new(Empty {}))
     }
 
-    type EventsStream = Pin<Box<dyn Stream<Item = Result<SandboxEvent, Status>> + Send + 'static>>;
+    type EventsStream =
+        Pin<Box<dyn Stream<Item = Result<WatchEventsResponse, Status>> + Send + 'static>>;
 
     async fn events(
         &self,
@@ -438,8 +537,15 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_events(request.into_inner())
             .await
             .map_err(ApiError::from)?;
-        let stream =
-            ReceiverStream::new(rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        let stream = ReceiverStream::new(rx).map(|r| {
+            r.map(|event| WatchEventsResponse {
+                payload: Some(watch_events_response::Payload::Event(event)),
+            })
+            .map_err(|e| Status::from(ApiError::from(e)))
+        });
+        let stream = with_keepalive(stream, || WatchEventsResponse {
+            payload: Some(watch_events_response::Payload::KeepAlive(KeepAlive {})),
+        });
         Ok(Response::new(Box::pin(stream)))
     }
 }
