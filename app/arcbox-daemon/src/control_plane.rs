@@ -89,6 +89,39 @@ pub fn compose(tonic_routes: tonic::service::Routes, connect: connectrpc::Router
         .fallback_service(connect.into_axum_service())
 }
 
+/// Builds the Connect half: the sandbox services plus server reflection.
+///
+/// Reflection is served here rather than by tonic so that one
+/// implementation covers gRPC, gRPC-Web, and Connect alike. Both `v1` and
+/// the legacy `v1alpha` are registered, since `grpcurl` still asks for
+/// `v1alpha` by default.
+///
+/// One limit is worth knowing before chasing it: `ServerReflectionInfo` is
+/// bidi-streaming, and the Connect protocol carries bidi streams only over
+/// HTTP/2. A plain HTTP/1.1 Connect client therefore gets `501` from
+/// reflection — a property of that RPC's shape, not of this wiring. Unary
+/// calls are unaffected, which is why `curl --unix-socket` still works for
+/// the sandbox API itself.
+///
+/// The descriptor set is the whole daemon's, not just the sandbox package:
+/// it is standard protobuf wire bytes, so the same set `arcbox-grpc` emits
+/// for its prost build describes every service either stack serves.
+///
+/// # Errors
+///
+/// Returns an error if the embedded descriptor set cannot be parsed, which
+/// would mean the build emitted a corrupt one.
+pub fn connect_router(runtime: arcbox_api::SharedRuntime) -> Result<connectrpc::Router> {
+    let reflector = connectrpc_reflection::Reflector::from_descriptor_set_bytes(
+        arcbox_grpc::FILE_DESCRIPTOR_SET,
+    )
+    .context("parsing the embedded file descriptor set for reflection")?;
+    Ok(connectrpc_reflection::install(
+        arcbox_api::connect::router(runtime),
+        reflector,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, OnceLock};
@@ -110,13 +143,11 @@ mod tests {
         let socket = dir.path().join("arcbox.sock");
         let runtime: arcbox_api::SharedRuntime = Arc::new(OnceLock::new());
 
-        let routes = tonic::service::Routes::default().add_service(
-            tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
-                .build_v1()
-                .expect("reflection service"),
-        );
-        let app = compose(routes, arcbox_api::connect::router(runtime));
+        // The Connect half is built by the same function the daemon uses, so
+        // a service or reflection wired up only in production would fail
+        // here too.
+        let connect = connect_router(runtime).expect("connect router");
+        let app = compose(tonic::service::Routes::default(), connect);
 
         let listener = bind(&socket).expect("bind temp socket");
         let shutdown = CancellationToken::new();
