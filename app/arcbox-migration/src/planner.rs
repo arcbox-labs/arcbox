@@ -150,6 +150,7 @@ impl MigrationPlanner {
             &network_plans,
             &container_plans,
         );
+        let warnings = collect_missing_bind_sources(&container_plans);
 
         Ok(MigrationPlan {
             source: normalize_source_info(source, source_info),
@@ -159,6 +160,7 @@ impl MigrationPlanner {
             networks: network_plans,
             containers: container_plans,
             unsupported_resources,
+            warnings,
             replacements,
             blockers,
         })
@@ -407,6 +409,29 @@ fn normalized_network_attachments(
     attachments
 }
 
+/// Flags bind mounts whose source path is absent on this host.
+///
+/// Source and target run on the same machine, so a bind mount that resolved
+/// under the old runtime normally still resolves. When it does not the
+/// container starts against an empty directory instead of failing, which is
+/// hard to attribute afterwards — surface it before the migration runs.
+fn collect_missing_bind_sources(containers: &[ContainerPlan]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for container in containers {
+        for mount in &container.spec.mounts {
+            if let ContainerMount::Bind { source, target, .. } = mount {
+                if !std::path::Path::new(source).exists() {
+                    warnings.push(format!(
+                        "container '{}' binds '{source}' to '{target}', but that path does not exist on this host",
+                        container.name
+                    ));
+                }
+            }
+        }
+    }
+    warnings
+}
+
 fn build_replacements(
     images: &[ImagePlan],
     volumes: &[VolumePlan],
@@ -507,6 +532,38 @@ mod tests {
             vec!["myapp:dev".to_string(), "myapp:latest".to_string()]
         );
         assert_eq!(plans[0].primary_reference(), "myapp:dev");
+    }
+
+    fn plan_with_bind(name: &str, source: &str) -> ContainerPlan {
+        ContainerPlan {
+            name: name.into(),
+            id: "id".into(),
+            image_reference: "img".into(),
+            spec: ContainerSpec {
+                mounts: vec![ContainerMount::Bind {
+                    source: source.into(),
+                    target: "/app".into(),
+                    rw: true,
+                }],
+                ..ContainerSpec::default()
+            },
+            extra_networks: Vec::new(),
+            replace_existing: false,
+        }
+    }
+
+    #[test]
+    fn missing_bind_source_is_warned_about() {
+        let present = tempfile::tempdir().unwrap();
+        let plans = [
+            plan_with_bind("ok", &present.path().to_string_lossy()),
+            plan_with_bind("broken", "/definitely/not/a/real/path"),
+        ];
+
+        let warnings = collect_missing_bind_sources(&plans);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("broken"));
+        assert!(warnings[0].contains("/definitely/not/a/real/path"));
     }
 
     #[test]

@@ -339,6 +339,10 @@ impl DockerCliRunner {
     }
 
     /// Streams a container path into a tempfile via `docker cp`.
+    ///
+    /// `--archive` is required on both halves of a volume transfer: without it
+    /// `docker cp` takes ownership from the destination, so every file would
+    /// arrive owned by root and databases would refuse to start.
     pub async fn copy_from_container(
         &self,
         container: &str,
@@ -351,6 +355,7 @@ impl DockerCliRunner {
             .args([
                 "container",
                 "cp",
+                "--archive",
                 &format!("{container}:{source_path}"),
                 "-",
             ])
@@ -384,6 +389,8 @@ impl DockerCliRunner {
     }
 
     /// Streams a tar archive tempfile into a container via `docker cp`.
+    ///
+    /// See [`Self::copy_from_container`] for why `--archive` is mandatory.
     pub async fn copy_to_container(
         &self,
         source_archive: &Path,
@@ -395,6 +402,7 @@ impl DockerCliRunner {
             .args([
                 "container",
                 "cp",
+                "--archive",
                 "-",
                 &format!("{container}:{target_path}"),
             ])

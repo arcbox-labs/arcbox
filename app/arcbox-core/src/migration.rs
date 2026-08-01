@@ -80,6 +80,7 @@ impl MigrationManager {
                 blocker.containers.join(", ")
             )
         }));
+        warnings.extend(plan.warnings.iter().cloned());
 
         Ok(PrepareMigrationResponse {
             plan_id,
@@ -260,6 +261,7 @@ mod tests {
             networks: Vec::new(),
             containers: Vec::new(),
             unsupported_resources: Vec::new(),
+            warnings: Vec::new(),
             replacements: ReplacementSummary {
                 containers: vec!["conflict".to_string()],
                 ..Default::default()

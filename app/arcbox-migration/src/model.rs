@@ -67,8 +67,12 @@ pub struct MigrationPlan {
     pub networks: Vec<NetworkPlan>,
     /// Containers that will be recreated in ArcBox.
     pub containers: Vec<ContainerPlan>,
-    /// Resources that are out of scope for v1.
+    /// Resources that are out of scope for v1. Blocking: execution refuses to
+    /// start while any are present.
     pub unsupported_resources: Vec<String>,
+    /// Advisory problems that do not block execution but will likely surprise
+    /// the user (for example, a bind mount whose source is missing).
+    pub warnings: Vec<String>,
     /// Replace actions that require confirmation.
     pub replacements: ReplacementSummary,
     /// Source volume blockers caused by running containers.
@@ -160,7 +164,7 @@ pub struct ContainerPlan {
 }
 
 /// Container creation spec translated from inspect output.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerSpec {
     /// Hostname.
     pub hostname: Option<String>,
