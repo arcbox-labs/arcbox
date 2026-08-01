@@ -47,6 +47,7 @@ members = [
     # ============================================
     "rpc/arcbox-protocol",
     "rpc/arcbox-grpc",
+    "rpc/arcbox-connect",
     "rpc/arcbox-transport",
 
     # ============================================
@@ -253,6 +254,7 @@ arcbox-dhcp = { version = "0.5.5", path = "virt/arcbox-dhcp" } # x-release-pleas
 arcbox-container = { version = "0.5.5", path = "runtime/arcbox-container" } # x-release-please-version
 arcbox-protocol = { version = "0.5.5", path = "rpc/arcbox-protocol" } # x-release-please-version
 arcbox-grpc = { version = "0.5.5", path = "rpc/arcbox-grpc" } # x-release-please-version
+arcbox-connect = { version = "0.5.5", path = "rpc/arcbox-connect" } # x-release-please-version
 arcbox-transport = { version = "0.5.5", path = "rpc/arcbox-transport" } # x-release-please-version
 arcbox-fleet-proto = { version = "0.5.5", path = "fleet/arcbox-fleet-proto" } # x-release-please-version
 arcbox-fleet-control-proto = { version = "0.5.5", path = "fleet/arcbox-fleet-control-proto" } # x-release-please-version
