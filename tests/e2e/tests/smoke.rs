@@ -52,12 +52,14 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// **A regression backstop, not the performance target.** The span is the
 /// guest boot on its own — guest binaries are staged before `VmStarting` and
 /// the agent has answered by `VmReady` (CORE-67) — so it is directly
-/// comparable to the ~1.5 s cold-boot target. The default sits well above
-/// that: a CI runner under load boots slower than a developer's machine, and
-/// a ceiling tight enough to be a target would buy flakes rather than
-/// signal. Tighten via `ARCBOX_E2E_BOOT_BUDGET_SECS` as `metrics.json`
-/// accumulates a distribution to argue from.
-const BOOT_BUDGET_DEFAULT_SECS: f64 = 30.0;
+/// comparable to the ~1.5 s cold-boot target, unlike the `AssetsReady →
+/// Ready` window it replaced. Measured 1.55 s and 2.29 s on an M-series
+/// developer machine under VZ (2026-08-01); the ceiling leaves roughly 4×
+/// for a loaded CI runner, because a bound tight enough to double as the
+/// target would buy flakes rather than signal. Tighten via
+/// `ARCBOX_E2E_BOOT_BUDGET_SECS` as `metrics.json` accumulates a
+/// distribution to argue from.
+const BOOT_BUDGET_DEFAULT_SECS: f64 = 10.0;
 
 /// Phases a healthy cold start publishes, in order.
 ///
@@ -162,17 +164,16 @@ fn check_phase_progression(marks: &PhaseMarks) -> Result<()> {
 /// so runtime construction, asset preparation, the dockerd wait, and host
 /// service startup all fall outside it (CORE-67).
 ///
-/// A missing mark is **not** a failure here. [`check_phase_progression`]
-/// already fails the run when the daemon publishes neither, so the only way
-/// to reach this without both marks is a `--no-linux-vm` daemon, which boots
-/// no guest and has no boot span to budget.
+/// Both marks are required, not skipped when absent: they are published long
+/// after the harness subscribes, so a missing one means the daemon never sent
+/// it — which is unobservable as a gap and would otherwise pass as a silent
+/// skip (CORE-67).
 fn check_boot_budget(marks: &PhaseMarks, metrics: &mut RunMetrics) -> Result<()> {
     let Some(span) = marks.span(Phase::VmStarting, Phase::VmReady) else {
-        tracing::warn!(
-            "boot span unavailable — no VmStarting → VmReady pair was observed; skipping the \
-             ABX-309 budget check for this run"
+        bail!(
+            "no VmStarting → VmReady pair on the setup stream, so the guest boot cannot be \
+             measured at all"
         );
-        return Ok(());
     };
     metrics.record("boot_span", span.as_secs_f64());
 
