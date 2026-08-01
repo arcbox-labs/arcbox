@@ -13,11 +13,36 @@ Basics live in the crate READMEs — don't duplicate them:
 
 This file is only the non-obvious operational knowledge.
 
-## Two protocols in one directory (read this first)
+## Three surfaces in one directory (read this first)
 
 - **Daemon control plane = gRPC/tonic** (`arcbox-grpc`), served over the Unix
   socket. The daemon `add_service()`s exactly: Machine, Kubernetes, Migration,
-  Sandbox, SandboxSnapshot, System, Icon (`app/arcbox-daemon/src/services.rs`).
+  System, Stats, Icon, plus Macos on macOS
+  (`app/arcbox-daemon/src/services.rs`).
+- **The sandbox API = Connect** (`arcbox-connect`), served on the **same**
+  socket. `connectrpc` is bound to `buffa::Message` and has no prost interop,
+  so the four `arcbox.sandbox.v1` protos are generated **twice**: buffa types
+  for the public boundary, prost types for the vsock payloads. Both encode
+  standard protobuf bytes, so the two are wire-identical and the guest agent
+  stays on prost. `app/arcbox-api/src/connect/bridge.rs` is the crossing — a
+  decode of the bytes already in hand, never a conversion table. WHY: one set
+  of handlers answers Connect (HTTP POST, JSON or binary), gRPC, and
+  gRPC-Web, so a caller with no proto toolchain can `curl --unix-socket` the
+  API while native clients keep gRPC.
+  - Composition lives in `app/arcbox-daemon/src/control_plane.rs`: tonic
+    claims a route per registered service, the Connect router is the
+    fallback, and connections are served by hyper's protocol-detecting
+    builder (HTTP/1.1 **and** HTTP/2) rather than tonic's HTTP/2-only server.
+    Registering a sandbox service on tonic would shadow its Connect handler —
+    add it to `arcbox_api::connect::router` instead.
+  - Reflection is served by `connectrpc-reflection` from the whole daemon's
+    descriptor set, so it covers every service on both stacks. It answers
+    `501` over HTTP/1.1 Connect because `ServerReflectionInfo` is
+    bidi-streaming and Connect carries bidi only over HTTP/2 — that is the
+    RPC's shape, not a wiring bug.
+  - The generated tonic sandbox **clients** are deliberately kept and used by
+    the CLI and e2e: unchanged, they are the standing proof that the gRPC
+    format still answers at the same endpoint.
 - **Host↔guest agent channel is NOT gRPC.** `service AgentService`
   (`arcbox-protocol/proto/agent.proto`) is schema-only and **never served** —
   `AgentServiceClient/Server` are re-exported (`arcbox-grpc/src/lib.rs`) with
@@ -52,10 +77,12 @@ This file is only the non-obvious operational knowledge.
   comment; diverge and cross-backend frames silently mismatch.
 - **`AgentClient::connect()` is a no-op on the blocking path** — the HV
   transport is connected at creation (`from_fd`); only the async path dials.
-- **`arcbox-protocol/proto/buf.yaml` exempts ONLY `sandbox.proto` from the
-  CI `buf breaking` gate** — the sandbox surface is pre-release and being
-  redesigned contract-first (CORE-52); every other proto in the dir stays
-  under the default `FILE` breaking rules. Remove the exemption when the
+- **`arcbox-protocol/proto/buf.yaml` exempts ONLY the sandbox surface from
+  the CI `buf breaking` gate** — both `arcbox/sandbox/v1` (the package dir)
+  and the flat `sandbox.proto` it replaced, since deleting a file is itself a
+  break. The sandbox surface is pre-release and being redesigned
+  contract-first (CORE-52); every other proto in the dir stays under the
+  default `FILE` breaking rules. Remove the exemption when the
   sandbox API ships in a public SDK. The fleet protos'
   `fleet/arcbox-fleet-proto/buf.yaml` is a separate, unrelated gate.
 - **Well-known types map to `pbjson-types`, not `prost-types`**
@@ -79,6 +106,20 @@ This file is only the non-obvious operational knowledge.
    or checks these; a new message is invisible downstream until listed.
 5. If it's a new gRPC service the daemon must serve, `add_service()` it in
    `app/arcbox-daemon/src/services.rs`.
+
+**Add/change something under `arcbox.sandbox.v1` (the Connect surface):**
+1. Edit the `.proto`, then add a *new* file to `arcbox-connect/build.rs` as
+   well as the two arrays above — the sandbox package is compiled by three
+   build scripts, and connectrpc codegen is the one that emits the service
+   traits the daemon implements.
+2. Implement the method in `app/arcbox-api/src/connect/` against the
+   connectrpc trait, not a tonic one. Cross to the prost twin with
+   `bridge::wire_request` / `wire_response`; do not hand-map fields.
+3. A new *service* goes on `arcbox_api::connect::router`, never on the tonic
+   `Routes` — the Connect router is the fallback, so a tonic registration
+   would shadow it.
+4. Nothing else changes: the guest agent, `AgentClient`, and the vsock frames
+   keep using the prost types, and the two encodings are identical bytes.
 
 **Add a host↔guest agent RPC (NOT a tonic method):**
 1. Define the proto *message* in `agent.proto`.
@@ -108,6 +149,15 @@ This file is only the non-obvious operational knowledge.
   `rg -n "check_agent_protocol" app` — confirm all three call sites present.
   Cause: a handshake gate arm was missed. (Stale-agent selection itself: newest
   mtime across dev tree / musl target / `~/.arcbox/bin` — see `tests/e2e`.)
+- **A sandbox RPC returns `unimplemented` or 404 while its neighbours work.**
+  `rg -n "add_service" app/arcbox-daemon/src/services.rs` — if the method's
+  service is registered on the tonic `Routes`, it shadows the Connect handler
+  (tonic matches the path first; the Connect router only sees what tonic
+  declines). Move it to `arcbox_api::connect::router`.
+- **A sandbox field is silently empty on one surface only.** Both codegens
+  read the same `.proto`, so this is a stale build, not drift: rebuild
+  `arcbox-connect` (its `build.rs` reruns on the proto files) and re-check.
+  `bridge` never copies fields, so there is no mapping to have missed.
 - **`cargo fmt --check` fails only in CI.** `git status
   rpc/arcbox-protocol/src/generated/` → cause: you edited a `.proto` without
   rebuilding (or rebuilt without rustfmt), shipping stale/unformatted
@@ -120,6 +170,10 @@ This file is only the non-obvious operational knowledge.
 
 1. `cargo test -p arcbox-protocol -p arcbox-grpc -p arcbox-transport`
    (frame roundtrip, `MessageType` roundtrip, handshake unit tests).
+   For the Connect surface add `-p arcbox-api` (the buffa/prost wire-identity
+   test) and `cargo test -p arcbox-daemon control_plane` (one endpoint
+   answering Connect, gRPC, and gRPC-Web, plus reflection) — both are
+   VM-free.
 2. Reproduce the CI proto gate locally (compares PR against its base, not a
    hardcoded master):
    `buf breaking rpc/arcbox-protocol/proto --against '.git#branch=origin/master,subdir=rpc/arcbox-protocol/proto'`.
