@@ -5,6 +5,7 @@
 //! This crate hosts service implementations consumed by the `arcbox-daemon`
 //! binary. It provides machine, sandbox, migration, and system gRPC services.
 
+pub mod connect;
 pub mod error;
 // tonic::Status is ~176 bytes — every gRPC method returns Result<_, Status>,
 // so this lint is unavoidable throughout the module tree.
