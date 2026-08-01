@@ -4,8 +4,8 @@ use arcbox_connect::sandbox_v1 as pb;
 use buffa_types::google::protobuf::Empty;
 use connectrpc::{PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult};
 
+use super::SharedRuntime;
 use crate::ApiError;
-use crate::grpc::SharedRuntime;
 
 use super::bridge::{wire_request, wire_response};
 use super::{ConnectRuntimeExt as _, ContextExt as _};

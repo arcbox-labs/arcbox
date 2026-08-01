@@ -13,7 +13,7 @@ use connectrpc::{
 };
 use tokio_stream::StreamExt as _;
 
-use crate::grpc::SharedRuntime;
+use super::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
 use super::bridge::{wire_request, wire_response, wire_stream_item};

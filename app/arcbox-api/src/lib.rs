@@ -7,10 +7,6 @@
 
 pub mod connect;
 pub mod error;
-// tonic::Status is ~176 bytes — every gRPC method returns Result<_, Status>,
-// so this lint is unavoidable throughout the module tree.
-#[allow(clippy::result_large_err)]
-pub mod grpc;
 
 // Re-export gRPC service types from arcbox-grpc for convenience.
 pub use arcbox_grpc::v1::{
@@ -22,6 +18,9 @@ pub use arcbox_grpc::v1::{
 pub use arcbox_grpc::v1::{macos_service_client, macos_service_server};
 
 pub use arcbox_protocol::v1::setup_status::Phase as SetupPhase;
+#[cfg(target_os = "macos")]
+pub use connect::MacosServiceImpl;
+pub use connect::SharedRuntime;
 pub use connect::{
     IconServiceImpl, KubernetesServiceImpl, MachineServiceImpl, MigrationServiceImpl,
     SandboxFilesystemServiceImpl, SandboxProcessServiceImpl, SandboxServiceImpl,
@@ -29,6 +28,3 @@ pub use connect::{
 };
 pub use connect::{SetupState, SystemServiceImpl};
 pub use error::{ApiError, Result};
-#[cfg(target_os = "macos")]
-pub use grpc::MacosServiceImpl;
-pub use grpc::SharedRuntime;

@@ -14,8 +14,8 @@ use connectrpc::{
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use super::SharedRuntime;
 use crate::error::ApiError;
-use crate::grpc::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
 use super::bridge::{wire_request, wire_response};
