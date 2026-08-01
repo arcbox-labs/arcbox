@@ -5,7 +5,8 @@
 //! round-trip → CORE-55 acceptance (attach-resume without loss, offset-
 //! idempotent stdin, signal without a stream, idle keepalive) → file
 //! round-trip (WriteFile/ReadFile) → Checkpoint → Restore
-//! (network_override) → execution in the restored sandbox → Stop/Remove.
+//! (network_override) → execution in the restored sandbox → CORE-53
+//! acceptance (the same endpoint answers a plain JSON POST) → Stop/Remove.
 //!
 //! Requires nested virtualization (VZ backend on Apple Silicon M3+ with
 //! macOS 15+): without `/dev/kvm` in the guest, Create fails with
@@ -150,7 +151,7 @@ fn run_scenario(
 
     let scenario = rt.block_on(async {
         let channel = connect_unix(&grpc_socket).await?;
-        drive_sandboxes(channel, data_dir, metrics).await
+        drive_sandboxes(channel, &grpc_socket, data_dir, metrics).await
     });
 
     // Always shut the daemon down; a teardown failure must not mask the
@@ -161,6 +162,94 @@ fn run_scenario(
     }
 
     scenario
+}
+
+/// CORE-53 acceptance, against a daemon that is actually serving: the same
+/// endpoint every other call in this scenario reached over gRPC also answers
+/// a caller with no proto toolchain.
+///
+/// The request is written as raw bytes because that is exactly what
+/// `curl --unix-socket -X POST -H 'Content-Type: application/json' -d '{}'`
+/// puts on the wire — a passing assertion here is the claim itself, not a
+/// client library's interpretation of it. The sandboxes this scenario just
+/// created must come back in the JSON, so this proves a real response body
+/// rather than only that an error is well-formed.
+async fn assert_connect_json_lists_sandboxes(
+    socket: &std::path::Path,
+    expected: &[&str],
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let request = "POST /arcbox.sandbox.v1.SandboxService/List HTTP/1.1\r\n\
+         Host: localhost\r\nContent-Type: application/json\r\n\
+         Connection: close\r\nContent-Length: 2\r\n\r\n{}";
+
+    let mut stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .context("connecting to the control-plane socket")?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .context("writing the Connect request")?;
+    stream.flush().await.context("flushing")?;
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut raw))
+        .await
+        .context("Connect JSON response timed out")?
+        .context("reading the Connect response")?;
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+
+    if !raw.starts_with("HTTP/1.1 200") {
+        bail!("Connect JSON List did not succeed: {raw}");
+    }
+    let body = dechunk(&raw);
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("Connect body was not JSON: {body}"))?;
+
+    let listed: Vec<&str> = json
+        .get("sandboxes")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|s| s.get("id").and_then(serde_json::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in expected {
+        if !listed.contains(id) {
+            bail!("Connect JSON List missing {id}; got {listed:?} from {body}");
+        }
+    }
+
+    info!(
+        sandboxes = listed.len(),
+        "Connect JSON reached the same endpoint and returned live data"
+    );
+    Ok(())
+}
+
+/// Reassembles a `Transfer-Encoding: chunked` body.
+///
+/// The daemon streams the response, so there is no Content-Length. Real
+/// clients hide this; reading the socket directly does not.
+fn dechunk(response: &str) -> String {
+    let Some((_, mut rest)) = response.split_once("\r\n\r\n") else {
+        return String::new();
+    };
+    let mut body = String::new();
+    while let Some((size, tail)) = rest.split_once("\r\n") {
+        let Ok(size) = usize::from_str_radix(size.trim(), 16) else {
+            break;
+        };
+        if size == 0 || tail.len() < size {
+            break;
+        }
+        body.push_str(&tail[..size]);
+        rest = tail[size..].trim_start_matches("\r\n");
+    }
+    body
 }
 
 /// Attach the default `x-machine` routing header.
@@ -175,6 +264,7 @@ fn with_machine<T>(msg: T) -> tonic::Request<T> {
 
 async fn drive_sandboxes(
     channel: Channel,
+    socket: &std::path::Path,
     data_dir: &std::path::Path,
     metrics: &mut RunMetrics,
 ) -> Result<()> {
@@ -437,6 +527,10 @@ async fn drive_sandboxes(
     }
 
     // -- Teardown -----------------------------------------------------------
+    let connect_started = Instant::now();
+    assert_connect_json_lists_sandboxes(socket, &["smoke1", "smoke2", "smoke3"]).await?;
+    metrics.record("connect_json", connect_started.elapsed().as_secs_f64());
+
     let teardown_started = Instant::now();
     for id in ["smoke1", "smoke2", "smoke3", "smoke-template"] {
         sandboxes
