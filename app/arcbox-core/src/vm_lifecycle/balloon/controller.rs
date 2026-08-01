@@ -336,6 +336,18 @@ impl<D: BalloonDeps> BalloonController<D> {
             );
             return Mode::Active;
         }
+        // A restore that exhausted its retries deliberately leaves `applied`
+        // set. Nothing else reads it, so without this the guest stays squeezed
+        // indefinitely — and any decision made now would violate the sizing
+        // invariant anyway, since the stats would be taken while the balloon
+        // is still inflated. Give the memory back first; if that still fails,
+        // retry later rather than size from perturbed stats.
+        if self.applied.is_some() {
+            self.restore("stale shrink before idle re-entry");
+            if self.applied.is_some() {
+                return Mode::IdleUnshrunk;
+            }
+        }
         let Some(full) = self.deps.full_memory_bytes() else {
             return Mode::IdleUnshrunk;
         };
@@ -429,7 +441,8 @@ impl<D: BalloonDeps> BalloonController<D> {
     /// Retried a few times on failure; if all attempts fail, the shrunk
     /// bookkeeping is kept so the next idle entry knows memory was never
     /// given back (a restore that silently "succeeds" in bookkeeping only
-    /// would leave the guest squeezed with nobody retrying).
+    /// would leave the guest squeezed with nobody retrying). `enter_idle`
+    /// is the retrier: it restores before probing whenever `applied` is set.
     fn restore(&mut self, reason: &str) {
         let Some(full) = self.deps.full_memory_bytes() else {
             // No machine record: the VM is gone, and so is its balloon.
@@ -728,6 +741,26 @@ mod tests {
         .skip(1)
         .collect();
 
+        // The sequence is derived from the policy helpers, so pin its shape
+        // independently: a self-consistent but wrong policy change must not
+        // slip through by rewriting the oracle along with the code.
+        assert_eq!(
+            expected.first().copied(),
+            Some(FULL - super::super::SHRINK_STEP)
+        );
+        assert_eq!(expected.last().copied(), Some(final_target()));
+        for pair in std::iter::once(FULL)
+            .chain(expected.iter().copied())
+            .collect::<Vec<_>>()
+            .windows(2)
+        {
+            let drop = pair[0] - pair[1];
+            assert!(
+                drop == super::super::SHRINK_STEP || pair[1] == final_target(),
+                "every move is a full step except the clamping last one: {pair:?}"
+            );
+        }
+
         let deps = FakeDeps::new(Some(FULL));
         deps.push_stats(Some(idle_stats()));
         let watches: Vec<_> = (0..expected.len()).map(|_| deps.push_watch()).collect();
@@ -1008,6 +1041,47 @@ mod tests {
             h.activity_count(),
             1,
             "idle exit still rides the state machine"
+        );
+    }
+
+    /// Review finding (greptile P1): after a restore exhausts its retries the
+    /// guest is still squeezed and `applied` stays set — but nothing read it,
+    /// so a later entry that decided `Keep` left the guest restricted forever.
+    /// Entry is the retrier: it must give the memory back before probing,
+    /// which the sizing invariant (balloon-empty stats) demands anyway.
+    #[tokio::test(start_paused = true)]
+    async fn stale_shrink_is_restored_on_next_entry() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        // Second entry sees a guest with almost nothing to give: the decision
+        // is `Keep`, the path that used to strand the stale shrink.
+        deps.push_stats(Some(GuestStats {
+            total: FULL,
+            available: 512 * MIB,
+            loadavg1: 0.1,
+        }));
+        let watch = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
+
+        // Restore fails every attempt: the guest stays shrunk.
+        h.deps.fail_set_target.store(true, Ordering::SeqCst);
+        watch.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP], "restore did not land");
+
+        // Next idle entry, with the backend healthy again.
+        h.deps.fail_set_target.store(false, Ordering::SeqCst);
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL],
+            "entry must hand the memory back before deciding"
         );
     }
 

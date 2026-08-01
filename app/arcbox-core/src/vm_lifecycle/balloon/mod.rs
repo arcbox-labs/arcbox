@@ -124,24 +124,31 @@ pub(super) enum EntryDecision {
 
 /// Computes the idle balloon target for the observed guest usage.
 ///
-/// Two independent floors, whichever is higher:
+/// Two independent caps on the reclaim, whichever is smaller:
 ///
-/// - `used` plus [`IDLE_MIN_RESERVE`] — the guest keeps a working reserve;
-/// - `total` minus `available` over [`IDLE_RECLAIM_DIVISOR`] — one entry
-///   reclaims at most a bounded share of the slack.
+/// - `available` minus [`IDLE_MIN_RESERVE`] — the guest keeps a working
+///   reserve;
+/// - `available` over [`IDLE_RECLAIM_DIVISOR`] — one entry reclaims at most a
+///   bounded share of the slack.
 ///
-/// The result never exceeds the full configured size. Note the target only
-/// ever *approaches* the guest's usage from above, so it stays usage-aware
-/// without ever planning `MemAvailable` to zero. The reserve also subsumes
-/// the old absolute floor — no computed target can land near the level where
-/// the guest kernel itself destabilises.
+/// Both are expressed as a *reclaim* subtracted from `full`, never from the
+/// guest's `MemTotal`. The two are not the same number — the guest kernel
+/// reserves memory at boot, so `MemTotal` sits below the configured size (a
+/// 16384 MB VM reports 15.6 GiB) — and the balloon target the controller
+/// applies is in the configured domain. Computing a target from `MemTotal`
+/// and applying it against `full` reclaims that gap *on top of* the intended
+/// amount, eating into the very reserve this function exists to protect.
+/// `available` is used only as a delta, which is domain-free.
+///
+/// The reserve also subsumes the old absolute floor — no computed target can
+/// land near the level where the guest kernel itself destabilises.
 pub(super) fn idle_target(stats: GuestStats, full: u64) -> u64 {
-    let used = stats.total.saturating_sub(stats.available);
-    let reserve_floor = used.saturating_add(IDLE_MIN_RESERVE);
-    let share_floor = stats
-        .total
-        .saturating_sub(stats.available / IDLE_RECLAIM_DIVISOR);
-    reserve_floor.max(share_floor).min(full)
+    // `available` cannot exceed the guest's own total, nor the configured
+    // size; an inconsistent reading must not turn into a larger reclaim.
+    let available = stats.available.min(stats.total).min(full);
+    let by_reserve = available.saturating_sub(IDLE_MIN_RESERVE);
+    let by_share = available / IDLE_RECLAIM_DIVISOR;
+    full.saturating_sub(by_reserve.min(by_share))
 }
 
 /// Decides the balloon move when the VM enters idle.
@@ -194,10 +201,34 @@ mod tests {
 
     #[test]
     fn idle_target_reserve_binds_when_slack_is_small() {
-        // 15 GiB used, 1 GiB available: half the slack (512 MiB) would leave
-        // the guest under the reserve, so `used + reserve` wins.
-        let t = idle_target(stats(FULL, GIB), FULL);
-        assert_eq!(t, 15 * GIB + IDLE_MIN_RESERVE);
+        // 1.5 GiB available: half of it (768 MiB) would leave the guest under
+        // the 1 GiB reserve, so the reserve cap wins at 512 MiB.
+        let t = idle_target(stats(FULL, GIB + 512 * MIB), FULL);
+        assert_eq!(t, FULL - 512 * MIB);
+    }
+
+    /// The guest's `MemTotal` is always below the configured size (kernel
+    /// reservations at boot: a 16384 MB VM reports ~15.6 GiB). Computing the
+    /// target in the guest's domain and applying it against `full` would
+    /// reclaim that gap on top of the intended share.
+    #[test]
+    fn reclaim_ignores_the_memtotal_to_configured_gap() {
+        let mem_total = FULL - 400 * MIB;
+        let available = 15 * GIB;
+        let t = idle_target(
+            GuestStats {
+                total: mem_total,
+                available,
+                loadavg1: 0.1,
+            },
+            FULL,
+        );
+        assert_eq!(
+            FULL - t,
+            available / 2,
+            "reclaim must be the promised share, not the share plus the gap"
+        );
+        assert!(available - (FULL - t) >= IDLE_MIN_RESERVE);
     }
 
     /// CORE-45: the defect this policy replaced. With `used + 256 MiB` an
@@ -249,10 +280,10 @@ mod tests {
 
     #[test]
     fn idle_target_saturates_on_inconsistent_stats() {
-        // available > total must not underflow: used saturates to 0, so the
-        // reserve floor carries the result.
+        // available > total is not a real reading; it must be clamped down
+        // rather than inflate the reclaim.
         let t = idle_target(stats(4 * GIB, 8 * GIB), FULL);
-        assert_eq!(t, IDLE_MIN_RESERVE);
+        assert_eq!(t, FULL - 2 * GIB);
     }
 
     /// Incident guard #1: the 2026-07-15 thrash began with an unconditional
@@ -278,8 +309,9 @@ mod tests {
 
     #[test]
     fn entry_keeps_when_the_reclaim_is_not_worth_it() {
-        // 800 MiB available ⇒ half is 400 MiB, below the worthwhile bar.
-        let d = entry_decision(Some(stats(FULL, 800 * MIB)), FULL);
+        // 1.25 GiB available ⇒ the reserve caps the reclaim at 256 MiB,
+        // below the worthwhile bar.
+        let d = entry_decision(Some(stats(FULL, GIB + 256 * MIB)), FULL);
         assert_eq!(d, EntryDecision::Keep);
     }
 
