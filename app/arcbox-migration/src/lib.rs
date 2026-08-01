@@ -22,5 +22,5 @@ pub use model::{
 };
 pub use planner::MigrationPlanner;
 pub use progress::{MigrationProgress, MigrationStage};
-pub use runner::DockerCliRunner;
+pub use runner::{DockerCliRunner, ImageTransfer};
 pub use source::{DockerDesktopSource, MigrationSource, OrbStackSource, resolve_source};

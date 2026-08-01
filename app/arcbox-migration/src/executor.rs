@@ -7,6 +7,7 @@ use crate::model::{
 };
 use crate::progress::{MigrationProgress, MigrationStage};
 use crate::runner::{CreateNetworkOptions, DockerCliRunner};
+use std::collections::HashMap;
 
 /// Execution options approved by the caller.
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,10 +70,11 @@ impl MigrationExecutor {
         source_runner.ensure_helper_image().await?;
         self.target.ensure_helper_image().await?;
 
-        import_images(&source_runner, &self.target, plan, &mut progress).await?;
+        let image_rewrites =
+            import_images(&source_runner, &self.target, plan, &mut progress).await?;
         import_volumes(&source_runner, &self.target, plan, &mut progress).await?;
         recreate_networks(&self.target, plan, &mut progress).await?;
-        recreate_containers(&self.target, plan, &mut progress).await?;
+        recreate_containers(&self.target, plan, &image_rewrites, &mut progress).await?;
         if options.start_containers {
             start_containers(&self.target, plan, &mut progress).await?;
         }
@@ -164,15 +166,24 @@ where
     Ok(())
 }
 
+/// Imports every planned image, returning the references that changed on the
+/// way across.
+///
+/// `docker load` reassigns image IDs when the two daemons use different image
+/// stores. Tagged images are unaffected because containers reference them by
+/// tag, but an untagged image is referenced by ID, and the source ID does not
+/// exist on the target — so the container must be rewritten to the ID the
+/// target actually assigned.
 async fn import_images<F>(
     source: &DockerCliRunner,
     target: &DockerCliRunner,
     plan: &MigrationPlan,
     progress: &mut F,
-) -> Result<()>
+) -> Result<HashMap<String, String>>
 where
     F: FnMut(MigrationProgress),
 {
+    let mut rewrites = HashMap::new();
     let total = u32::try_from(plan.images.len()).unwrap_or(0);
     for (index, image) in plan.images.iter().enumerate() {
         progress(MigrationProgress {
@@ -183,11 +194,24 @@ where
             current: Some(u32::try_from(index + 1).unwrap_or(total)),
             total: Some(total),
         });
-        source
+        let transfer = source
             .pipe_save_into(target, &image.export_references)
             .await?;
+
+        if !image.repo_tags.is_empty() {
+            continue;
+        }
+        // Untagged: without the assigned ID there is no reference that resolves
+        // on the target, so fail here rather than at container create.
+        let assigned = transfer.loaded_image_id.ok_or_else(|| {
+            MigrationError::Docker(format!(
+                "docker load reported no image ID for untagged image '{}'",
+                image.image_id
+            ))
+        })?;
+        rewrites.insert(image.primary_reference().to_string(), assigned);
     }
-    Ok(())
+    Ok(rewrites)
 }
 
 async fn import_volumes<F>(
@@ -311,6 +335,7 @@ where
 async fn recreate_containers<F>(
     target: &DockerCliRunner,
     plan: &MigrationPlan,
+    image_rewrites: &HashMap<String, String>,
     progress: &mut F,
 ) -> Result<()>
 where
@@ -326,7 +351,7 @@ where
             current: Some(u32::try_from(index + 1).unwrap_or(total)),
             total: Some(total),
         });
-        let create_args = build_create_args(container);
+        let create_args = build_create_args(container, resolve_image(container, image_rewrites));
         let container_id = target.create_container(create_args).await?;
         if container.spec.network_mode.forbids_extra_networks() {
             continue;
@@ -373,10 +398,17 @@ where
     Ok(())
 }
 
-fn build_create_args(plan: &ContainerPlan) -> Vec<String> {
+/// Returns the reference that resolves on the target for this container.
+fn resolve_image<'a>(plan: &'a ContainerPlan, rewrites: &'a HashMap<String, String>) -> &'a str {
+    rewrites
+        .get(&plan.image_reference)
+        .map_or(plan.image_reference.as_str(), String::as_str)
+}
+
+fn build_create_args(plan: &ContainerPlan, image_reference: &str) -> Vec<String> {
     let mut args = vec!["--name".to_string(), plan.name.clone()];
     append_container_spec_args(&mut args, &plan.spec);
-    args.push(plan.image_reference.clone());
+    args.push(image_reference.to_string());
     args.extend(final_command(&plan.spec));
     args
 }
@@ -680,6 +712,40 @@ mod tests {
                 "{flag} should be absent"
             );
         }
+    }
+
+    fn container_on(image_reference: &str) -> ContainerPlan {
+        ContainerPlan {
+            name: "demo".into(),
+            id: "cid".into(),
+            image_reference: image_reference.into(),
+            spec: ContainerSpec::default(),
+            extra_networks: Vec::new(),
+            replace_existing: false,
+            was_running: false,
+            created: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_untagged_image_reference_is_rewritten_to_the_assigned_id() {
+        // docker load reassigns IDs across image stores, so the source ID in
+        // the plan would not resolve on the target.
+        let rewrites = HashMap::from([("sha256:source".to_string(), "sha256:target".to_string())]);
+        let container = container_on("sha256:source");
+
+        assert_eq!(resolve_image(&container, &rewrites), "sha256:target");
+        assert_eq!(
+            build_create_args(&container, resolve_image(&container, &rewrites)).last(),
+            Some(&"sha256:target".to_string())
+        );
+    }
+
+    #[test]
+    fn tagged_image_references_pass_through_untouched() {
+        let rewrites = HashMap::from([("sha256:source".to_string(), "sha256:target".to_string())]);
+        let container = container_on("myapp:dev");
+        assert_eq!(resolve_image(&container, &rewrites), "myapp:dev");
     }
 
     #[test]
