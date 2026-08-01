@@ -1,12 +1,16 @@
-//! Icon service gRPC implementation.
+//! Icon service — image icon lookups.
+//!
+//! The first of the daemon's own services to move off tonic (CORE-68). It
+//! reaches nothing but `dimicon`, so it is the cheapest place to prove the
+//! pattern: the handler body is unchanged, only the trait it implements and
+//! the router it registers on differ.
 
-use arcbox_grpc::IconService;
-use arcbox_protocol::v1::{GetImageIconRequest, GetImageIconResponse};
-use tonic::{Request, Response, Status};
+use arcbox_connect::v1 as pb;
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 
 struct ResolvedIcon(Option<dimicon::IconSource>);
 
-impl From<ResolvedIcon> for GetImageIconResponse {
+impl From<ResolvedIcon> for pb::GetImageIconResponse {
     fn from(resolved: ResolvedIcon) -> Self {
         match resolved.0 {
             Some(source) => {
@@ -22,11 +26,13 @@ impl From<ResolvedIcon> for GetImageIconResponse {
                 Self {
                     url: source.url().to_string(),
                     source: name.to_string(),
+                    ..Default::default()
                 }
             }
             None => Self {
                 url: String::new(),
                 source: "not_found".to_string(),
+                ..Default::default()
             },
         }
     }
@@ -53,20 +59,24 @@ impl IconServiceImpl {
     }
 }
 
-#[tonic::async_trait]
-impl IconService for IconServiceImpl {
+#[allow(
+    refining_impl_trait,
+    reason = "the trait returns `impl Encodable<M>`; naming the concrete body \
+              type is strictly more informative and these impls are registered on a \
+              Router rather than named by callers"
+)]
+impl pb::IconService for IconServiceImpl {
     async fn get_image_icon(
         &self,
-        request: Request<GetImageIconRequest>,
-    ) -> Result<Response<GetImageIconResponse>, Status> {
-        let fqin = request.into_inner().fqin;
-
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::GetImageIconRequest>,
+    ) -> ServiceResult<pb::GetImageIconResponse> {
         let icon = self
             .icon_service
-            .get_icon(&fqin)
+            .get_icon(request.fqin)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
-        Ok(Response::new(ResolvedIcon(icon).into()))
+        Response::ok(ResolvedIcon(icon).into())
     }
 }

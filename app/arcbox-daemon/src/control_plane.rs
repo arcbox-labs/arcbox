@@ -322,6 +322,23 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// CORE-68 moves the daemon's own services onto the Connect router one
+    /// at a time. Registration is what decides which stack serves a path —
+    /// tonic matches first, so a service left on both would silently keep
+    /// answering over tonic only. Asserting the route directly is hermetic;
+    /// driving Icon end-to-end would reach the network.
+    #[test]
+    fn migrated_daemon_services_are_registered_on_the_connect_router() {
+        let runtime: arcbox_api::SharedRuntime = Arc::new(OnceLock::new());
+        let router = connect_router(runtime).expect("connect router");
+
+        assert!(
+            router.has_method("arcbox.v1.IconService/GetImageIcon"),
+            "Icon has moved to Connect; available: {:?}",
+            router.methods().collect::<Vec<_>>()
+        );
+    }
+
     /// Reflection has to keep answering through the composed router, or
     /// `grpcurl` and `buf curl` lose the ability to discover the API without
     /// vendoring the protos.

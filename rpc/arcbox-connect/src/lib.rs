@@ -26,3 +26,7 @@ connectrpc::include_generated!();
 /// against `arcbox_protocol::sandbox_v1` and the two are told apart by the
 /// crate, not by a path shape.
 pub use arcbox::sandbox::v1 as sandbox_v1;
+
+/// The daemon's own package, under the same short alias `arcbox-protocol`
+/// uses for its prost twin (CORE-68).
+pub use arcbox::v1;
