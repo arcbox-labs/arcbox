@@ -53,8 +53,8 @@ tar = "0.4.46"
 tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 arcbox-connect.workspace = true
-connectrpc = { version = "0.8.1", features = ["client"] }
-buffa = { version = "0.8.1", features = ["json"] }
+connectrpc = { version = "0.8.1", features = ["client"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
+buffa = { version = "0.9.1", features = ["json"] }
 prost.workspace = true
 tower.workspace = true
 
