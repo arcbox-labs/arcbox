@@ -80,14 +80,10 @@ impl MigrationExecutor {
             start_containers(&self.target, plan, &mut progress).await?;
         }
 
-        progress(MigrationProgress {
-            stage: MigrationStage::Complete,
-            detail: "migration completed".to_string(),
-            resource_type: None,
-            resource_name: None,
-            current: None,
-            total: None,
-        });
+        // No completion event here: returning `Ok` is the signal. Only the
+        // caller knows whether the run as a whole succeeded, so it owns the
+        // single terminal event -- emitting one here too printed `[complete]`
+        // twice, with only the caller's carrying `done`.
         Ok(())
     }
 }

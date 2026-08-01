@@ -131,14 +131,9 @@ impl MigrationPlanner {
 
         let image_plan_data =
             normalize_images(&source_images, &source_containers, &target_image_tags);
-        let image_reference_by_id: HashMap<_, _> = image_plan_data
+        let image_refs_by_id: HashMap<_, _> = image_plan_data
             .iter()
-            .map(|image| {
-                (
-                    image.image_id.clone(),
-                    image.primary_reference().to_string(),
-                )
-            })
+            .map(|image| (image.image_id.clone(), image.export_references.clone()))
             .collect();
 
         let mut warnings = Vec::new();
@@ -148,7 +143,7 @@ impl MigrationPlanner {
                 normalize_container(
                     container,
                     &target_containers,
-                    &image_reference_by_id,
+                    &image_refs_by_id,
                     &migrated_network_names,
                     &mut warnings,
                     &mut unsupported_resources,
@@ -318,18 +313,32 @@ fn classify_network_mode(
     }
 }
 
+/// Picks which of an image's references to recreate a container against.
+///
+/// Prefers the name the container was originally created under, so a container
+/// built from `myapp:dev` does not come back reporting a sibling tag that
+/// happens to sort first. Falls back to the plan's primary reference when the
+/// original name is not one the image still carries.
+fn preferred_reference(references: &[String], requested: &str) -> Option<String> {
+    references
+        .iter()
+        .find(|reference| reference.as_str() == requested)
+        .or_else(|| references.first())
+        .cloned()
+}
+
 fn normalize_container(
     container: ContainerInspect,
     target_containers: &BTreeSet<String>,
-    image_reference_by_id: &HashMap<String, String>,
+    image_refs_by_id: &HashMap<String, Vec<String>>,
     migrated_network_names: &BTreeSet<String>,
     warnings: &mut Vec<String>,
     unsupported: &mut Vec<String>,
 ) -> ContainerPlan {
     let name = trimmed_name(&container).to_string();
-    let image_reference = image_reference_by_id
+    let image_reference = image_refs_by_id
         .get(&container.image)
-        .cloned()
+        .and_then(|references| preferred_reference(references, &container.config.image))
         .unwrap_or_else(|| {
             if container.config.image.is_empty() {
                 container.image.clone()
@@ -612,6 +621,38 @@ mod tests {
             repo_tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             repo_digests: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_container_keeps_the_tag_it_was_created_under() {
+        // One image, three tags: the container must come back as the tag it
+        // was created from, not whichever one Docker happens to list first.
+        let references = vec![
+            "alpine:3.21".to_string(),
+            "smoke-app:dev".to_string(),
+            "smoke-app:latest".to_string(),
+        ];
+        assert_eq!(
+            preferred_reference(&references, "smoke-app:dev").as_deref(),
+            Some("smoke-app:dev")
+        );
+    }
+
+    #[test]
+    fn an_unknown_original_name_falls_back_to_the_primary_reference() {
+        let references = vec!["alpine:3.21".to_string(), "smoke-app:dev".to_string()];
+        // The tag it was created under is gone from the image.
+        assert_eq!(
+            preferred_reference(&references, "smoke-app:gone").as_deref(),
+            Some("alpine:3.21")
+        );
+        // An untagged image exports by ID, which is also the fallback, so the
+        // executor's rewrite key still matches.
+        assert_eq!(
+            preferred_reference(&["sha256:abc".to_string()], "abc").as_deref(),
+            Some("sha256:abc")
+        );
+        assert_eq!(preferred_reference(&[], "anything"), None);
     }
 
     #[test]
