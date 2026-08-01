@@ -177,6 +177,15 @@ impl DaemonHandle {
         self.child.id()
     }
 
+    /// Whether the daemon has exited, reaping it when it has.
+    ///
+    /// The reaping is the point: an exited child this handle has not waited
+    /// on stays a zombie, and a zombie still answers `kill(pid, 0)`, so a
+    /// signal-0 probe would report it alive forever.
+    pub fn has_exited(&mut self) -> Result<bool> {
+        Ok(self.child.try_wait().context("polling daemon")?.is_some())
+    }
+
     /// The Docker API socket under the handle's data directory.
     pub fn docker_socket(&self) -> PathBuf {
         self.data_dir.join("run/docker.sock")
