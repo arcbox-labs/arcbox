@@ -22,13 +22,24 @@ use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+/// Concurrent HTTP/2 streams allowed per client connection.
+///
+/// tonic's server left this unlimited; hyper's builder defaults it to 200.
+/// Keeping a cap is deliberate — a desktop client multiplexes every watch,
+/// exec, and read stream over one connection, and a stream leak there
+/// should back-pressure that client instead of growing the daemon without
+/// bound — but the number is pinned here so it is a decision rather than
+/// an inherited default.
+const MAX_HTTP2_STREAMS: u32 = 200;
+
 /// Accepts connections on `listener` until `shutdown` fires, serving `app`.
 ///
 /// Returns once every in-flight connection has finished, so the socket is
 /// free before the daemon drops its lock.
 pub async fn serve(listener: UnixListener, app: axum::Router, shutdown: CancellationToken) {
     let graceful = GracefulShutdown::new();
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http2().max_concurrent_streams(MAX_HTTP2_STREAMS);
 
     loop {
         let stream = tokio::select! {
@@ -171,12 +182,15 @@ mod tests {
 
         let mut response = Vec::new();
         // The daemon keeps HTTP/1.1 connections alive, so read only until
-        // the body arrives rather than to EOF.
+        // the body arrives rather than to EOF. Transport failures panic
+        // with their own message here — otherwise they surface as a JSON
+        // parse error on an empty body, which points at the one thing that
+        // is not broken.
         let deadline = std::time::Duration::from_secs(5);
-        let _ = tokio::time::timeout(deadline, async {
+        tokio::time::timeout(deadline, async {
             let mut buf = [0u8; 4096];
             loop {
-                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let n = stream.read(&mut buf).await.expect("read response");
                 if n == 0 {
                     break;
                 }
@@ -188,7 +202,8 @@ mod tests {
                 }
             }
         })
-        .await;
+        .await
+        .expect("daemon did not answer within 5s");
         String::from_utf8_lossy(&response).into_owned()
     }
 
