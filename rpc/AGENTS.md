@@ -15,34 +15,30 @@ This file is only the non-obvious operational knowledge.
 
 ## Three surfaces in one directory (read this first)
 
-- **Daemon control plane = gRPC/tonic** (`arcbox-grpc`), served over the Unix
-  socket. The daemon `add_service()`s exactly: Machine, Kubernetes, Migration,
-  System, Stats, Icon, plus Macos on macOS
-  (`app/arcbox-daemon/src/services.rs`).
-- **The sandbox API = Connect** (`arcbox-connect`), served on the **same**
-  socket. `connectrpc` is bound to `buffa::Message` and has no prost interop,
-  so the four `arcbox.sandbox.v1` protos are generated **twice**: buffa types
-  for the public boundary, prost types for the vsock payloads. Both encode
-  standard protobuf bytes, so the two are wire-identical and the guest agent
-  stays on prost. `app/arcbox-api/src/connect/bridge.rs` is the crossing — a
-  decode of the bytes already in hand, never a conversion table. WHY: one set
-  of handlers answers Connect (HTTP POST, JSON or binary), gRPC, and
+- **Daemon control plane = Connect** (`arcbox-connect` + `connectrpc`),
+  served over the Unix socket. Every daemon service — Machine, Kubernetes,
+  Migration, System, Stats, Icon, the four sandbox services, plus Macos on
+  macOS — registers on `arcbox_api::connect::router`, and
+  `app/arcbox-daemon/src/control_plane.rs` serves that router directly
+  through hyper's protocol-detecting builder (HTTP/1.1 **and** HTTP/2). WHY:
+  one set of handlers answers Connect (HTTP POST, JSON or binary), gRPC, and
   gRPC-Web, so a caller with no proto toolchain can `curl --unix-socket` the
-  API while native clients keep gRPC.
-  - Composition lives in `app/arcbox-daemon/src/control_plane.rs`: tonic
-    claims a route per registered service, the Connect router is the
-    fallback, and connections are served by hyper's protocol-detecting
-    builder (HTTP/1.1 **and** HTTP/2) rather than tonic's HTTP/2-only server.
-    Registering a sandbox service on tonic would shadow its Connect handler —
-    add it to `arcbox_api::connect::router` instead.
+  API while native clients keep gRPC. tonic is no longer in the serving
+  path; `arcbox-grpc`'s generated tonic **clients** are deliberately kept
+  and used by e2e and the daemon's own tests as the standing proof that the
+  gRPC format still answers at the same endpoint. (The CLI has none: `abctl`
+  speaks Connect only, and `tonic` is absent from its dependency tree.)
+  - `connectrpc` is bound to `buffa::Message` and has no prost interop, so
+    every served proto package is generated **twice**: buffa types for the
+    public boundary, prost types for the internal and vsock payloads. Both
+    encode standard protobuf bytes, so the two are wire-identical and the
+    guest agent stays on prost. `app/arcbox-api/src/connect/bridge.rs` is
+    the crossing — a decode of the bytes already in hand, never a conversion
+    table.
   - Reflection is served by `connectrpc-reflection` from the whole daemon's
-    descriptor set, so it covers every service on both stacks. It answers
-    `501` over HTTP/1.1 Connect because `ServerReflectionInfo` is
-    bidi-streaming and Connect carries bidi only over HTTP/2 — that is the
-    RPC's shape, not a wiring bug.
-  - The generated tonic sandbox **clients** are deliberately kept and used by
-    the CLI and e2e: unchanged, they are the standing proof that the gRPC
-    format still answers at the same endpoint.
+    descriptor set. It answers `501` over HTTP/1.1 Connect because
+    `ServerReflectionInfo` is bidi-streaming and Connect carries bidi only
+    over HTTP/2 — that is the RPC's shape, not a wiring bug.
 - **Host↔guest agent channel is NOT gRPC.** `service AgentService`
   (`arcbox-protocol/proto/agent.proto`) is schema-only and **never served** —
   `AgentServiceClient/Server` are re-exported (`arcbox-grpc/src/lib.rs`) with
@@ -115,9 +111,11 @@ This file is only the non-obvious operational knowledge.
 2. Implement the method in `app/arcbox-api/src/connect/` against the
    connectrpc trait, not a tonic one. Cross to the prost twin with
    `bridge::wire_request` / `wire_response`; do not hand-map fields.
-3. A new *service* goes on `arcbox_api::connect::router`, never on the tonic
-   `Routes` — the Connect router is the fallback, so a tonic registration
-   would shadow it.
+3. A new *service* goes on `arcbox_api::connect::router` (or
+   `router_with_system`). The daemon serves only that router, so a service
+   missing there is a 404 on every format — the
+   `migrated_daemon_services_are_registered_on_the_connect_router` test in
+   `control_plane.rs` is where that surfaces.
 4. Nothing else changes: the guest agent, `AgentClient`, and the vsock frames
    keep using the prost types, and the two encodings are identical bytes.
 
@@ -149,11 +147,11 @@ This file is only the non-obvious operational knowledge.
   `rg -n "check_agent_protocol" app` — confirm all three call sites present.
   Cause: a handshake gate arm was missed. (Stale-agent selection itself: newest
   mtime across dev tree / musl target / `~/.arcbox/bin` — see `tests/e2e`.)
-- **A sandbox RPC returns `unimplemented` or 404 while its neighbours work.**
-  `rg -n "add_service" app/arcbox-daemon/src/services.rs` — if the method's
-  service is registered on the tonic `Routes`, it shadows the Connect handler
-  (tonic matches the path first; the Connect router only sees what tonic
-  declines). Move it to `arcbox_api::connect::router`.
+- **An RPC returns 404 on every format while its neighbours work.**
+  `rg -n "add_service" app/arcbox-api/src/connect/mod.rs` — the service was
+  never added to `arcbox_api::connect::router`, and the daemon serves only
+  that router. The registration test in `control_plane.rs` pins the full
+  service list; extend it with the new service.
 - **A sandbox field is silently empty on one surface only.** Both codegens
   read the same `.proto`, so this is a stale build, not drift: rebuild
   `arcbox-connect` (its `build.rs` reruns on the proto files) and re-check.

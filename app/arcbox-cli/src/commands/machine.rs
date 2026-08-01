@@ -14,63 +14,8 @@ use arcbox_protocol::v1::{
 use clap::{Args, Subcommand};
 use humantime::format_duration;
 use std::collections::HashMap;
-use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 use tokio::io::AsyncReadExt as _;
-use tokio::net::UnixStream;
-use tokio_stream::wrappers::ReceiverStream;
-
-pub struct UnixConnector {
-    socket_path: PathBuf,
-}
-
-impl UnixConnector {
-    pub(crate) fn new(socket_path: PathBuf) -> Self {
-        Self { socket_path }
-    }
-}
-
-impl tonic::codegen::Service<tonic::transport::Uri> for UnixConnector {
-    type Response = hyper_util::rt::TokioIo<UnixStream>;
-    type Error = std::io::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: tonic::transport::Uri) -> Self::Future {
-        let socket_path = self.socket_path.clone();
-        Box::pin(async move {
-            let stream = UnixStream::connect(socket_path).await?;
-            Ok(hyper_util::rt::TokioIo::new(stream))
-        })
-    }
-}
-
-/// A tonic client, kept only for the interactive exec session.
-///
-/// See the call site in [`exec_session`] for why that one RPC cannot use the
-/// Connect client yet. The daemon serves both formats at the same endpoint,
-/// so this reaches identical handlers.
-async fn legacy_machine_client()
--> Result<arcbox_grpc::v1::machine_service_client::MachineServiceClient<tonic::transport::Channel>>
-{
-    let socket_path = super::resolve_grpc_socket_path();
-    let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to the ArcBox daemon at {}",
-                socket_path.display()
-            )
-        })?;
-    Ok(arcbox_grpc::v1::machine_service_client::MachineServiceClient::new(channel))
-}
 
 pub fn machine_client() -> MachineServiceClient<connectrpc::client::SharedHttp2Connection> {
     let (transport, config) = crate::connect::daemon(&super::resolve_grpc_socket_path());
@@ -602,7 +547,7 @@ async fn execute_ssh(args: SshArgs) -> Result<()> {
 /// Runs an interactive PTY session in a machine: local terminal in raw mode,
 /// stdin and SIGWINCH resizes pumped up, merged PTY output written to stdout.
 async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
-    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<MachineExecInput>(16);
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<MachineExecInput>(16);
 
     let tty_size = TerminalSize::current().ok().map(|s| ProtoTerminalSize {
         width: u32::from(s.cols),
@@ -669,25 +614,44 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
         }
     });
 
-    // The one call still on tonic. `connectrpc::client::BidiStream` takes
-    // `&mut self` for both `send` and `message` and exposes no split, so a
-    // bidi stream cannot be driven from both directions at once — which is
-    // exactly what an interactive PTY needs. Everything else in the CLI has
-    // moved; this waits on a split (or an owned sender) upstream.
-    let mut stream = legacy_machine_client()
-        .await?
-        .exec_session(tonic::Request::new(ReceiverStream::new(msg_rx)))
+    // An interactive PTY drives both directions at once, so split the bidi
+    // stream into independently owned halves: the send half moves into a
+    // forwarder task, the receive half stays here.
+    let client = machine_client();
+    let stream = client
+        .exec_session()
         .await
-        .context("Failed to open machine exec session")?
-        .into_inner();
+        .context("Failed to open machine exec session")?;
+    let (mut send, mut recv) = stream.into_split();
+
+    // Forwarder: prost inputs from the pumps → wire. When every pump has
+    // dropped its sender the channel drains, and closing the send half ends
+    // the request body cleanly; the session keeps running until the server
+    // finishes the response side.
+    tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            let req = match crate::connect::request::<pb::MachineExecInput, _>(&msg) {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::error!(error = %e, "dropping exec session input");
+                    break;
+                }
+            };
+            if send.send(req).await.is_err() {
+                break;
+            }
+        }
+        send.close_send();
+    });
 
     let mut exit_code = 0i32;
     let mut received_done = false;
-    while let Some(output) = stream
-        .message()
+    while let Some(item) = recv
+        .message::<pb::MachineExecOutput>()
         .await
         .context("Failed to read session output")?
     {
+        let output: arcbox_protocol::v1::MachineExecOutput = item.prost()?;
         if !output.data.is_empty() {
             // The PTY merges stdout/stderr into one stream.
             std::io::stdout()
