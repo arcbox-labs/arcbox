@@ -1,4 +1,5 @@
 use super::boot::chroot_root;
+use super::types::action;
 use super::*;
 
 #[allow(
@@ -52,7 +53,7 @@ pub(super) async fn remove_sandbox_impl(
             map.remove(id);
         }
     }
-    let _ = events_tx.send(SandboxEvent::new(id, "removed"));
+    let _ = events_tx.send(SandboxEvent::new(id, action::REMOVED));
 }
 
 /// True when `armed_for` still refers to the instance currently registered

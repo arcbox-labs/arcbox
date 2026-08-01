@@ -153,6 +153,12 @@ async fn stage_layout(image_ref: &str, archive: &Path, staged: &Path) -> Result<
 /// into the config on every build, so keying on it would re-export and
 /// re-convert a byte-identical image on every create. Diff IDs change exactly
 /// when the filesystem changes, which is what the converter consumes.
+///
+/// The key names a **persisted** directory that is trusted as authoritative
+/// on a later hit, so it must be stable across toolchains (`DefaultHasher`
+/// is not — its algorithm is unspecified per release) and collision-resistant
+/// against attacker-chosen layer content. SHA-256 with a 16-byte hex prefix,
+/// matching the host-side rootfs cache key (`rootfs_builder::cache_key`).
 async fn image_content_key(image_ref: &str) -> Result<String> {
     let inspect = docker::inspect_image(image_ref).await?;
     let layers = inspect
@@ -171,10 +177,13 @@ async fn image_content_key(image_ref: &str) -> Result<String> {
         bail!("docker reported unreadable layer digests for image {image_ref}");
     }
 
-    use std::hash::Hasher as _;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(joined.as_bytes());
-    Ok(format!("{:016x}", hasher.finish()))
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(joined.as_bytes());
+    use std::fmt::Write as _;
+    Ok(digest.iter().take(16).fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    }))
 }
 
 /// Minimal Docker Engine API client over the guest's own dockerd socket.

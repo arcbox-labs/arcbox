@@ -217,12 +217,28 @@ pub struct SandboxNetworkInfo {
 
 // Events
 
+/// The `action` values a [`SandboxEvent`] carries, in lifecycle order.
+///
+/// `action` stays a `String` on the event (it crosses the API as one), but
+/// every emit site and match in this crate goes through these constants, so
+/// renaming or adding an action is a change here — not a grep for string
+/// literals whose miss surfaces as silently skipped teardown handling.
+pub mod action {
+    pub const CREATED: &str = "created";
+    pub const READY: &str = "ready";
+    pub const RUNNING: &str = "running";
+    pub const IDLE: &str = "idle";
+    pub const STOPPING: &str = "stopping";
+    pub const STOPPED: &str = "stopped";
+    pub const FAILED: &str = "failed";
+    pub const REMOVED: &str = "removed";
+}
+
 /// A sandbox lifecycle event broadcast to subscribers.
 #[derive(Debug, Clone)]
 pub struct SandboxEvent {
     pub sandbox_id: SandboxId,
-    /// Action: `"created"` | `"ready"` | `"running"` | `"idle"` |
-    ///         `"stopping"` | `"stopped"` | `"failed"` | `"removed"`
+    /// One of the [`action`] constants.
     pub action: String,
     /// Unix nanoseconds.
     pub timestamp_ns: i64,
@@ -243,6 +259,17 @@ impl SandboxEvent {
     pub(super) fn with_attr(mut self, key: &str, value: &str) -> Self {
         self.attributes.insert(key.to_owned(), value.to_owned());
         self
+    }
+
+    /// Whether this event marks the sandbox's teardown — nothing can run in
+    /// it afterwards. A new terminal action must be added here, or torn-down
+    /// sandboxes silently stop purging their executions.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.action.as_str(),
+            action::STOPPED | action::FAILED | action::REMOVED
+        )
     }
 }
 

@@ -1,5 +1,6 @@
 use super::boot::boot_sandbox;
 use super::cleanup::{inst_to_info, remove_sandbox_impl};
+use super::types::action;
 use super::*;
 
 impl SandboxManager {
@@ -84,7 +85,7 @@ impl SandboxManager {
         reservation.commit();
 
         // Broadcast "created" event.
-        let _ = self.events_tx.send(SandboxEvent::new(&id, "created"));
+        let _ = self.events_tx.send(SandboxEvent::new(&id, action::CREATED));
 
         // Spawn background boot task.
         {
@@ -169,7 +170,7 @@ impl SandboxManager {
             (was_running, inst.vm.as_ref().map(Arc::clone))
         };
 
-        let _ = self.events_tx.send(SandboxEvent::new(id, "stopping"));
+        let _ = self.events_tx.send(SandboxEvent::new(id, action::STOPPING));
 
         // Drain: give an active workload the budget to finish. The run/exec
         // watcher flips the state to Ready (over our Stopping) when the exit
@@ -225,7 +226,7 @@ impl SandboxManager {
             super::reconcile::clear_state_record(&inst.vm_dir);
         }
 
-        let _ = self.events_tx.send(SandboxEvent::new(id, "stopped"));
+        let _ = self.events_tx.send(SandboxEvent::new(id, action::STOPPED));
         info!(sandbox_id = %id, "sandbox stopped");
         Ok(())
     }

@@ -31,9 +31,17 @@ use tonic::transport::Channel;
 use super::machine::UnixConnector;
 use arcbox_cli::terminal::{RawModeGuard, TerminalSize};
 
-/// How many times an interrupted attach stream is resumed before giving up
-/// and asking the daemon for the execution's outcome directly.
+/// How many **consecutive** failures to re-establish an interrupted attach
+/// stream are tolerated before giving up on streaming and asking the daemon
+/// for the execution's outcome directly. Receiving any event resets the
+/// budget, so a long session that resumes cleanly many times never
+/// exhausts it.
 const ATTACH_RESUME_ATTEMPTS: usize = 3;
+
+/// Base pause between attach resume attempts (grows linearly with the
+/// attempt number), so a daemon mid-restart is not burned through in
+/// milliseconds against a socket that is not listening yet.
+const ATTACH_RESUME_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Long-poll budget when falling back to `WaitExecution`, in seconds.
 const EXEC_WAIT_TIMEOUT_SECS: u32 = 3600;
@@ -752,7 +760,7 @@ pub(super) async fn exec_session(
             let mut stdin = tokio::io::stdin();
             let mut buf = [0u8; 4096];
             let mut offset = 0u64;
-            loop {
+            'pump: loop {
                 match stdin.read(&mut buf).await {
                     Ok(0) | Err(_) => {
                         // Local EOF. PTY sessions carry EOF in-band (Ctrl-D);
@@ -772,21 +780,36 @@ pub(super) async fn exec_session(
                         break;
                     }
                     Ok(n) => {
-                        let req = WriteStdinRequest {
-                            sandbox_id: sandbox_id.clone(),
-                            execution_id: execution_id.clone(),
-                            offset,
-                            data: buf[..n].to_vec(),
-                            eof: false,
-                        };
-                        match stdin_client
-                            .write_stdin(attach_machine(tonic::Request::new(req)))
-                            .await
-                        {
-                            Ok(resp) => offset = resp.into_inner().bytes_written,
-                            // The execution exited (or the daemon went away);
-                            // the attach stream reports the outcome.
-                            Err(_) => break,
+                        // A broken write gets the same grace as the attach
+                        // stream: writes are offset-addressed, so retrying
+                        // the same chunk can never double-feed the process.
+                        let mut failures = 0usize;
+                        loop {
+                            let req = WriteStdinRequest {
+                                sandbox_id: sandbox_id.clone(),
+                                execution_id: execution_id.clone(),
+                                offset,
+                                data: buf[..n].to_vec(),
+                                eof: false,
+                            };
+                            match stdin_client
+                                .write_stdin(attach_machine(tonic::Request::new(req)))
+                                .await
+                            {
+                                Ok(resp) => {
+                                    offset = resp.into_inner().bytes_written;
+                                    break;
+                                }
+                                Err(_) if failures < ATTACH_RESUME_ATTEMPTS => {
+                                    failures += 1;
+                                    tokio::time::sleep(ATTACH_RESUME_BACKOFF * failures as u32)
+                                        .await;
+                                }
+                                // The execution exited (or the daemon is gone
+                                // for good); the attach stream reports the
+                                // outcome.
+                                Err(_) => break 'pump,
+                            }
                         }
                     }
                 }
@@ -802,7 +825,12 @@ pub(super) async fn exec_session(
     let mut stderr_offset = 0u64;
     let mut result: Option<Execution> = None;
 
-    'resume: for attempt in 0..=ATTACH_RESUME_ATTEMPTS {
+    // Consecutive failures to (re-)establish the stream. Reset every time an
+    // event arrives, so the budget means "streaming is not coming back", not
+    // "the session broke N times over its whole lifetime".
+    let mut attempt = 0usize;
+
+    'resume: loop {
         let attach = AttachExecutionRequest {
             sandbox_id: sandbox_id.clone(),
             execution_id: execution_id.clone(),
@@ -814,11 +842,20 @@ pub(super) async fn exec_session(
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) if attempt < ATTACH_RESUME_ATTEMPTS => {
+            Err(status) => {
+                attempt += 1;
+                if attempt > ATTACH_RESUME_ATTEMPTS {
+                    // Streaming is not coming back, but the execution may
+                    // have finished fine — fall through to the authoritative
+                    // wait rather than reporting a transport error as the
+                    // command's outcome.
+                    tracing::warn!(%status, "giving up on the attach stream");
+                    break 'resume;
+                }
                 tracing::warn!(%status, "re-attaching to the execution");
+                tokio::time::sleep(ATTACH_RESUME_BACKOFF * attempt as u32).await;
                 continue;
             }
-            Err(status) => return Err(status).context("Failed to attach to execution"),
         };
 
         loop {
@@ -827,12 +864,19 @@ pub(super) async fn exec_session(
                 // Clean end without an exit event: fall through to the
                 // authoritative wait below.
                 Ok(None) => break 'resume,
-                Err(status) if attempt < ATTACH_RESUME_ATTEMPTS => {
+                Err(status) => {
+                    attempt += 1;
+                    if attempt > ATTACH_RESUME_ATTEMPTS {
+                        tracing::warn!(%status, "giving up on the attach stream");
+                        break 'resume;
+                    }
                     tracing::warn!(%status, stdout_offset, "attach stream broke; resuming");
+                    tokio::time::sleep(ATTACH_RESUME_BACKOFF * attempt as u32).await;
                     continue 'resume;
                 }
-                Err(status) => return Err(status).context("Failed to read execution output"),
             };
+            // Anything received proves the stream re-established.
+            attempt = 0;
 
             match event.event {
                 Some(execution_event::Event::Output(output)) => {

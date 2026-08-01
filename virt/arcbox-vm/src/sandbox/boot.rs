@@ -1,3 +1,4 @@
+use super::types::action;
 use super::*;
 
 #[allow(
@@ -82,7 +83,7 @@ pub(super) async fn boot_sandbox(
                 return;
             }
 
-            let _ = events_tx.send(SandboxEvent::new(&id, "ready"));
+            let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
             info!(sandbox_id = %id, "sandbox booted and ready");
 
             // Launch the initial workload, if the spec carries one. The
@@ -104,8 +105,8 @@ pub(super) async fn boot_sandbox(
             if let Some(ref net) = net_alloc {
                 network.release(net);
             }
-            let _ =
-                events_tx.send(SandboxEvent::new(&id, "failed").with_attr("error", &e.to_string()));
+            let _ = events_tx
+                .send(SandboxEvent::new(&id, action::FAILED).with_attr("error", &e.to_string()));
             error!(sandbox_id = %id, error = %e, "sandbox boot failed");
         }
     }

@@ -84,10 +84,10 @@ pub enum MessageType {
     SandboxInspectRequest = 0x0023,
     SandboxListRequest = 0x0024,
     /// DNAT a reserved guest port to a sandbox port (payload:
-    /// `sandbox.v1.SandboxPortForwardRequest`).
+    /// `arcbox.v1.SandboxPortForwardRequest`).
     SandboxPortForwardRequest = 0x0025,
     /// Remove a sandbox DNAT mapping (payload:
-    /// `sandbox.v1.SandboxPortForwardRemoveRequest`).
+    /// `arcbox.v1.SandboxPortForwardRemoveRequest`).
     SandboxPortForwardRemoveRequest = 0x0026,
 
     // Sandbox workload request types.
@@ -95,15 +95,15 @@ pub enum MessageType {
     // 0x0033 (SandboxExecInput), and 0x0034 (SandboxExecResize) were
     // retired by the execution redesign (protocol v2); do not reuse.
     SandboxEventsRequest = 0x0032,
-    /// Read a file from a sandbox (payload: `sandbox.v1.ReadFileRequest`).
+    /// Read a file from a sandbox (payload: `arcbox.sandbox.v1.ReadFileRequest`).
     /// The agent answers with a stream of [`Self::SandboxFileData`] frames.
     SandboxFileReadRequest = 0x0035,
     /// Open a file-write stream into a sandbox (payload:
-    /// `sandbox.v1.WriteFileOpen`), followed by [`Self::SandboxFileChunk`]
+    /// `arcbox.sandbox.v1.WriteFileOpen`), followed by [`Self::SandboxFileChunk`]
     /// frames and answered with [`Self::SandboxFileWriteResponse`].
     SandboxFileWriteRequest = 0x0036,
     /// One chunk of file content during a write stream (payload:
-    /// `sandbox.v1.FileChunk`; `done == true` on the last chunk).
+    /// `arcbox.sandbox.v1.FileChunk`; `done == true` on the last chunk).
     SandboxFileChunk = 0x0037,
 
     // Sandbox snapshot request types (0x0040 - 0x0043).
@@ -114,32 +114,32 @@ pub enum MessageType {
 
     // Sandbox execution request types (0x0060 - 0x0066), protocol v2.
     /// Start an addressable execution (payload:
-    /// `sandbox.v1.StartExecutionRequest`). Answered with
+    /// `arcbox.sandbox.v1.StartExecutionRequest`). Answered with
     /// [`Self::SandboxExecStartResponse`].
     SandboxExecStartRequest = 0x0060,
     /// Attach to an execution's output from per-channel offsets (payload:
-    /// `sandbox.v1.AttachExecutionRequest`). The agent answers with a
+    /// `arcbox.sandbox.v1.AttachExecutionRequest`). The agent answers with a
     /// stream of [`Self::SandboxExecEvent`] frames ending in an `exited`
     /// event.
     SandboxExecAttachRequest = 0x0061,
     /// Offset-idempotent stdin write (payload:
-    /// `sandbox.v1.WriteStdinRequest`). Answered with
+    /// `arcbox.sandbox.v1.WriteStdinRequest`). Answered with
     /// [`Self::SandboxStdinStatus`].
     SandboxStdinWriteRequest = 0x0062,
     /// Query stdin acceptance state (payload:
-    /// `sandbox.v1.GetStdinStatusRequest`). Answered with
+    /// `arcbox.sandbox.v1.GetStdinStatusRequest`). Answered with
     /// [`Self::SandboxStdinStatus`].
     SandboxStdinStatusRequest = 0x0063,
     /// Signal an execution's process group (payload:
-    /// `sandbox.v1.SignalExecutionRequest`). Answered with
+    /// `arcbox.sandbox.v1.SignalExecutionRequest`). Answered with
     /// [`Self::SandboxExecSignalResponse`].
     SandboxExecSignalRequest = 0x0064,
     /// Resize a TTY execution's terminal (payload:
-    /// `sandbox.v1.ResizeExecutionTtyRequest`). Answered with
+    /// `arcbox.sandbox.v1.ResizeExecutionTtyRequest`). Answered with
     /// [`Self::SandboxExecResizeResponse`].
     SandboxExecResizeRequest = 0x0065,
     /// Wait for an execution to exit (payload:
-    /// `sandbox.v1.WaitExecutionRequest`). Answered with
+    /// `arcbox.sandbox.v1.WaitExecutionRequest`). Answered with
     /// [`Self::SandboxExecWaitResponse`].
     SandboxExecWaitRequest = 0x0066,
 
@@ -198,7 +198,7 @@ pub enum MessageType {
     SandboxInspectResponse = 0x1023,
     SandboxListResponse = 0x1024,
     /// Answers [`Self::SandboxPortForwardRequest`] (payload:
-    /// `sandbox.v1.SandboxPortForwardResponse`).
+    /// `arcbox.v1.SandboxPortForwardResponse`).
     SandboxPortForwardResponse = 0x1025,
     /// Acknowledges [`Self::SandboxPortForwardRemoveRequest`] (empty payload).
     SandboxPortForwardRemoveResponse = 0x1026,
@@ -207,10 +207,10 @@ pub enum MessageType {
     // 0x1035 (SandboxRunOutput) and 0x1036 (SandboxExecOutput) were
     // retired by the execution redesign (protocol v2); do not reuse.
     /// One lifecycle event answering [`Self::SandboxEventsRequest`]
-    /// (payload: `sandbox.v1.SandboxEvent`).
+    /// (payload: `arcbox.sandbox.v1.SandboxEvent`).
     SandboxEvent = 0x1037,
     /// One chunk of file content answering [`Self::SandboxFileReadRequest`]
-    /// (payload: `sandbox.v1.FileChunk`; `done == true` on the last chunk).
+    /// (payload: `arcbox.sandbox.v1.FileChunk`; `done == true` on the last chunk).
     SandboxFileData = 0x1038,
     /// Acknowledges a completed file-write stream (empty payload).
     SandboxFileWriteResponse = 0x1039,
@@ -223,21 +223,21 @@ pub enum MessageType {
 
     // Sandbox execution response types (0x1060 - 0x1066), protocol v2.
     /// Answers [`Self::SandboxExecStartRequest`] (payload:
-    /// `sandbox.v1.Execution`).
+    /// `arcbox.sandbox.v1.Execution`).
     SandboxExecStartResponse = 0x1060,
     /// One frame of an execution attach stream (payload:
-    /// `sandbox.v1.ExecutionEvent`; the `exited` event is terminal).
+    /// `arcbox.sandbox.v1.ExecutionEvent`; the `exited` event is terminal).
     SandboxExecEvent = 0x1061,
     /// Answers [`Self::SandboxStdinWriteRequest`] and
     /// [`Self::SandboxStdinStatusRequest`] (payload:
-    /// `sandbox.v1.StdinStatus`).
+    /// `arcbox.sandbox.v1.StdinStatus`).
     SandboxStdinStatus = 0x1062,
     /// Acknowledges [`Self::SandboxExecSignalRequest`] (empty payload).
     SandboxExecSignalResponse = 0x1064,
     /// Acknowledges [`Self::SandboxExecResizeRequest`] (empty payload).
     SandboxExecResizeResponse = 0x1065,
     /// Answers [`Self::SandboxExecWaitRequest`] (payload:
-    /// `sandbox.v1.Execution`).
+    /// `arcbox.sandbox.v1.Execution`).
     SandboxExecWaitResponse = 0x1066,
 
     /// One machine exec output frame (payload: `arcbox.v1.MachineExecOutput`;

@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 
 use tokio::sync::{mpsc, watch};
 
+use super::types::action;
 use super::*;
 
 /// Retained bytes per stdio channel. Older bytes are dropped and the buffer's
@@ -569,7 +570,7 @@ pub(super) fn spawn_teardown_purge(
     tokio::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(ev) if matches!(ev.action.as_str(), "stopped" | "removed" | "failed") => {
+                Ok(ev) if ev.is_terminal() => {
                     registry.interrupt_sandbox(&ev.sandbox_id);
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -596,7 +597,7 @@ fn abort_workload(
             inst.state = SandboxState::Ready;
         }
     }
-    let _ = events_tx.send(SandboxEvent::new(id, "idle").with_attr("error", error));
+    let _ = events_tx.send(SandboxEvent::new(id, action::IDLE).with_attr("error", error));
 }
 
 /// Drain a session's output into the execution's buffers until it exits,
@@ -726,7 +727,7 @@ impl SandboxManager {
         slot.commit(&exec);
         let _ = self
             .events_tx
-            .send(SandboxEvent::new(sandbox_id, "running"));
+            .send(SandboxEvent::new(sandbox_id, action::RUNNING));
 
         tokio::spawn(run_session(
             Arc::clone(&exec),

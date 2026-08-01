@@ -46,6 +46,7 @@ arcbox-ext4 = "0.1.2"
 arcbox-logging.workspace = true
 hyper = { workspace = true, features = ["http1", "client"] }
 http-body-util = "0.1.4"
+sha2.workspace = true
 
 # vsock and arcbox-vm are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]

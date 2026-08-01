@@ -1,3 +1,4 @@
+use super::types::action;
 use super::*;
 
 /// Guarded `Ready → Running` transition.
@@ -65,7 +66,7 @@ pub(super) fn finish_workload(
             inst.state = SandboxState::Ready;
         }
     }
-    let mut event = SandboxEvent::new(id, "idle")
+    let mut event = SandboxEvent::new(id, action::IDLE)
         .with_attr("exit_code", &status.conventional_code().to_string());
     if let ExitStatus::Signaled(signal) = status {
         event = event.with_attr("signal", &signal.to_string());
@@ -133,7 +134,7 @@ pub(super) async fn start_run_workload(
             return Err(e);
         }
     };
-    let _ = events_tx.send(SandboxEvent::new(id, "running"));
+    let _ = events_tx.send(SandboxEvent::new(id, action::RUNNING));
 
     Ok(spawn_exit_watcher(id, inner_rx, instances, events_tx))
 }
