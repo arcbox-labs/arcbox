@@ -12,15 +12,16 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use arcbox_grpc::SandboxServiceClient;
+use arcbox_connect::sandbox_v1 as pb;
+use arcbox_connect::sandbox_v1::SandboxServiceClient;
 use arcbox_protocol::sandbox_v1::{
     CreateSandboxRequest, InspectSandboxRequest, RemoveSandboxRequest, ResourceLimits, SandboxInfo,
     SandboxState, StartExecutionRequest,
 };
 use clap::Args;
-use tonic::transport::Channel;
 
-use super::sandbox::{attach_machine, current_tty_size, exec_session, sandbox_channel};
+use super::sandbox::{current_tty_size, exec_session, sandbox_channel};
+use crate::connect::UnaryExt as _;
 
 /// How long to wait for a freshly created sandbox to become ready.
 ///
@@ -180,13 +181,13 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     // Fail before any image work if the credentials are not there.
     let env = collect_env(def, std::env::vars())?;
 
-    let channel = sandbox_channel().await?;
-    let mut client = SandboxServiceClient::new(channel.clone());
+    let (transport, config) = sandbox_channel();
+    let client = SandboxServiceClient::new(transport.clone(), config.clone());
 
-    let existing = inspect(&mut client, &id).await?;
+    let existing = inspect(&client, &id).await?;
     match plan_action(existing.as_ref().map(SandboxInfo::state)) {
         Action::Attach => {}
-        Action::WaitReady => wait_ready(&mut client, &id).await?,
+        Action::WaitReady => wait_ready(&client, &id).await?,
         Action::Refuse => {
             let state = existing.map_or("unknown", |info| super::sandbox::state_name(info.state()));
             bail!(
@@ -196,13 +197,13 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
             );
         }
         Action::Recreate => {
-            remove(&mut client, &id).await?;
-            create(&mut client, def, &id, args.cpus, args.memory).await?;
-            wait_ready(&mut client, &id).await?;
+            remove(&client, &id).await?;
+            create(&client, def, &id, args.cpus, args.memory).await?;
+            wait_ready(&client, &id).await?;
         }
         Action::Create => {
-            create(&mut client, def, &id, args.cpus, args.memory).await?;
-            wait_ready(&mut client, &id).await?;
+            create(&client, def, &id, args.cpus, args.memory).await?;
+            wait_ready(&client, &id).await?;
         }
     }
 
@@ -224,7 +225,7 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let exit_code = exec_session(channel, start).await?;
+    let exit_code = exec_session(transport, config, start).await?;
 
     eprintln!(
         "\nSandbox '{id}' is still running: reopen with `abctl {}`, copy work out with \
@@ -241,25 +242,29 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
 
 /// Fetch a sandbox, or `None` when it does not exist.
 async fn inspect(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
     id: &str,
 ) -> Result<Option<SandboxInfo>> {
-    let request = attach_machine(tonic::Request::new(InspectSandboxRequest {
-        id: id.to_string(),
-    }));
+    let request =
+        crate::connect::request::<pb::InspectSandboxRequest, _>(&InspectSandboxRequest {
+            id: id.to_string(),
+        })?;
     match client.inspect(request).await {
-        Ok(response) => Ok(Some(response.into_inner())),
-        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+        Ok(response) => Ok(Some(response.prost()?)),
+        Err(status) if status.code == connectrpc::ErrorCode::NotFound => Ok(None),
         Err(status) => Err(status).context("Failed to inspect sandbox")?,
     }
 }
 
 /// Remove a sandbox that cannot be reused.
-async fn remove(client: &mut SandboxServiceClient<Channel>, id: &str) -> Result<()> {
-    let request = attach_machine(tonic::Request::new(RemoveSandboxRequest {
+async fn remove(
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
+    id: &str,
+) -> Result<()> {
+    let request = crate::connect::request::<pb::RemoveSandboxRequest, _>(&RemoveSandboxRequest {
         id: id.to_string(),
         force: true,
-    }));
+    })?;
     client
         .remove(request)
         .await
@@ -269,7 +274,7 @@ async fn remove(client: &mut SandboxServiceClient<Channel>, id: &str) -> Result<
 
 /// Build the agent image if needed and create the sandbox.
 async fn create(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
     def: &AgentDef,
     id: &str,
     vcpus: u32,
@@ -277,7 +282,7 @@ async fn create(
 ) -> Result<()> {
     let template = super::sandbox::resolve_template(def.template).await?;
 
-    let request = attach_machine(tonic::Request::new(CreateSandboxRequest {
+    let request = crate::connect::request::<pb::CreateSandboxRequest, _>(&CreateSandboxRequest {
         id: id.to_string(),
         labels: HashMap::from([("arcbox.agent".to_string(), def.name.to_string())]),
         template,
@@ -285,7 +290,7 @@ async fn create(
         // No TTL: expiry would take /workspace with it mid-session.
         ttl_seconds: 0,
         ..Default::default()
-    }));
+    })?;
     client
         .create(request)
         .await
@@ -294,7 +299,10 @@ async fn create(
 }
 
 /// Block until the sandbox reports `ready`.
-async fn wait_ready(client: &mut SandboxServiceClient<Channel>, id: &str) -> Result<()> {
+async fn wait_ready(
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
+    id: &str,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         match inspect(client, id).await? {
