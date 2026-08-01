@@ -242,6 +242,11 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     ctx.early_runtime
         .set(Arc::clone(&runtime))
         .map_err(|_| anyhow::anyhow!("init_runtime called twice"))?;
+    // Armed before `init` for the same reason `early_runtime` is published
+    // here: the VM reaches its ready state partway through the call below, so
+    // a mirror started after it returns would report the VM down across the
+    // whole window between the agent answering and dockerd coming up.
+    crate::services::spawn_vm_running_mirror(ctx, &runtime);
     // The guest boot is the longest stretch of startup and the only one a
     // client cannot infer from anything else, so the runtime reports its
     // milestones from inside and they are published as they arrive.

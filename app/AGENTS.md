@@ -91,7 +91,13 @@ must name `abctl`.
   cold-start recovery on a successful guest query and never cleared, so it
   read `true` for the rest of the daemon's life after any stop (CORE-70). A
   second writer re-introduces that class of drift — the loop owns both
-  edges. Regression: `vm_running_loop_follows_the_lifecycle_both_ways`.
+  edges. It is armed from `init_runtime` *before* `Runtime::init`, not from
+  `start_services`: the VM goes ready partway through `init`, so a later
+  start would report it down for the whole dockerd wait. And it is only as
+  good as the lifecycle state — an unmanaged guest crash leaves that
+  `Running` (ABX-414: no `HealthMonitor` loop), so the flag says "the daemon
+  believes the VM is up", not "the VM answered just now". Regression:
+  `vm_running_loop_follows_the_lifecycle_both_ways`.
 - Startup-cancellation invariant: the flock (`daemon_lock`) and
   `early_runtime` are held in `StartupHandles`, not only in pipeline-local
   context (`context.rs`, `main::run` keeps a clone). WHY: a signal can drop
