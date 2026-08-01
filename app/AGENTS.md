@@ -41,6 +41,26 @@ must name `abctl`.
   restarts install the route outside the cold-start path that sets the flag
   directly, so without the bridge the flag goes stale until the next daemon
   restart.
+- **A `SetupStatus.Phase` value that nothing publishes is invisible as a
+  gap** — it simply never arrives, so a client waits forever or reports a
+  plausible zero. Declaring a phase in `api.proto` therefore obliges you to
+  publish it; the happy-path progression and which phases are conditional
+  live in the enum's own doc comment (`api.proto`) and
+  `docs/daemon-lifecycle.md`, and must be updated with any change. This
+  was CORE-67: `VM_STARTING`/`VM_READY`/`NETWORK_READY` sat declared and
+  unpublished, leaving the slowest stretch of startup silent.
+- **The VM phases are reported from inside `Runtime::init`, not derived
+  from pipeline order** (`InitProgress` → `SetupPhase` in
+  `startup/mod.rs::init_runtime`). WHY: `boot_runtime` is one stage that
+  stages guest binaries, boots the VM, waits for the agent, then waits for
+  dockerd. Publishing at the stage boundaries would bill the binary
+  download to `VM_STARTING` and make `VM_READY` mean "dockerd answered" —
+  the span ABX-309 budgets would measure the wrong thing. `init` reports
+  `SystemVmStarting` after the binaries are staged and `SystemVmReady` when
+  `vm_lifecycle.ensure_ready` returns (readiness level 2 below); the
+  dockerd wait lands in the `VM_READY → NETWORK_READY` window. `init`
+  reports nothing under `--no-linux-vm`, which is what keeps the VM pair
+  off the wire when no guest boots.
 - Startup-cancellation invariant: the flock (`daemon_lock`) and
   `early_runtime` are held in `StartupHandles`, not only in pipeline-local
   context (`context.rs`, `main::run` keeps a clone). WHY: a signal can drop

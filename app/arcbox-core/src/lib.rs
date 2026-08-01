@@ -69,7 +69,7 @@ pub use macos::{
 #[cfg(feature = "macos-ipsw-install")]
 pub use macos::{PullPhase, PullSource};
 pub use migration::MigrationManager;
-pub use runtime::{Runtime, SandboxPortExposure};
+pub use runtime::{InitProgress, Runtime, SandboxPortExposure};
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
 pub use vm_lifecycle::{
     ActivityScope, DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig,

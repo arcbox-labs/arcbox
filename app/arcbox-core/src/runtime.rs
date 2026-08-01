@@ -2,9 +2,12 @@
 
 mod assets;
 mod kubeconfig;
+mod progress;
 
 #[cfg(test)]
 mod tests;
+
+pub use progress::InitProgress;
 
 use crate::config::Config;
 use crate::container_backend::{DynContainerBackend, create_backend};
@@ -711,10 +714,15 @@ impl Runtime {
     /// Validates that all guest binaries (agent + runtime) are present and
     /// executable before starting the VM. This is a boot-blocking check.
     ///
+    /// `progress` observes the [`InitProgress`] milestones as they are
+    /// reached — this is the only way to see inside the call, which spans
+    /// the slowest part of daemon startup. It is never invoked in
+    /// VM-host-only mode, where no VM starts.
+    ///
     /// # Errors
     ///
     /// Returns an error if initialization fails or guest binaries are missing.
-    pub async fn init(&self) -> Result<()> {
+    pub async fn init(&self, progress: impl Fn(InitProgress) + Send) -> Result<()> {
         // Create data directories.
         tokio::fs::create_dir_all(&self.config.data_dir).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
@@ -745,6 +753,15 @@ impl Runtime {
 
         // Validate all guest binaries are present and executable (boot-blocking).
         ensure_guest_binaries(&self.config.data_dir)?;
+
+        // Boot the VM through the lifecycle manager first so the agent
+        // handshake is observable on its own: `ensure_vm_ready` below covers
+        // the VM *and* the guest container runtime with no boundary between
+        // them. With the VM already up it short-circuits on the lifecycle
+        // actor's cached CID and only waits for dockerd.
+        progress(InitProgress::SystemVmStarting);
+        self.vm_lifecycle.ensure_ready().await?;
+        progress(InitProgress::SystemVmReady);
 
         self.ensure_vm_ready().await?;
 
