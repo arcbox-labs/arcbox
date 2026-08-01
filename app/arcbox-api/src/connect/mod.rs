@@ -13,8 +13,8 @@
 //! - [`snapshot`] — checkpoint / restore
 //!
 //! The rest are the daemon's own services, migrating off tonic one at a
-//! time (CORE-68): [`icon`], [`kubernetes`], [`migration`], [`stats`],
-//! [`system`].
+//! time (CORE-68): [`icon`], [`kubernetes`], [`machine`], [`migration`],
+//! [`stats`], [`system`].
 //!
 //! Request and response types are buffa-generated (`arcbox-connect`)
 //! because that is what `connectrpc` binds to, while the host↔guest vsock
@@ -27,6 +27,7 @@ mod control;
 mod filesystem;
 mod icon;
 mod kubernetes;
+mod machine;
 mod migration;
 mod process;
 mod snapshot;
@@ -45,6 +46,7 @@ pub use control::SandboxServiceImpl;
 pub use filesystem::SandboxFilesystemServiceImpl;
 pub use icon::IconServiceImpl;
 pub use kubernetes::KubernetesServiceImpl;
+pub use machine::MachineServiceImpl;
 pub use migration::MigrationServiceImpl;
 pub use process::SandboxProcessServiceImpl;
 pub use snapshot::SandboxSnapshotServiceImpl;
@@ -163,6 +165,7 @@ pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
         .add_service(Arc::new(StatsServiceImpl::new(clone())))
         .add_service(Arc::new(KubernetesServiceImpl::new(clone())))
         .add_service(Arc::new(MigrationServiceImpl::new(clone())))
+        .add_service(Arc::new(MachineServiceImpl::new(clone())))
 }
 
 /// Registers the services plus the ones needing extra state the router

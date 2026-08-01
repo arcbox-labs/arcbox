@@ -353,6 +353,7 @@ mod tests {
             "arcbox.v1.SystemService/WatchSetupStatus",
             "arcbox.v1.KubernetesService/Status",
             "arcbox.v1.MigrationService/RunMigration",
+            "arcbox.v1.MachineService/ExecSession",
         ] {
             assert!(
                 router.has_method(path),
