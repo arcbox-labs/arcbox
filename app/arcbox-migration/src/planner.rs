@@ -5,7 +5,7 @@ use crate::docker_types::{
     VolumeInspect,
 };
 use crate::error::Result;
-use crate::helper_image::helper_image_reference;
+use crate::helper_image::{helper_image_reference, is_helper_object};
 use crate::model::{
     ContainerMount, ContainerNetworkAttachment, ContainerPlan, ContainerSpec, ImagePlan,
     MigrationPlan, NetworkModeSpec, NetworkPlan, PortPublish, ReplacementSummary,
@@ -45,7 +45,16 @@ impl MigrationPlanner {
         let source_images = source_runner.list_images().await?;
         let source_volumes = source_runner.list_volumes().await?;
         let source_networks = source_runner.list_networks().await?;
-        let source_containers = source_runner.list_containers().await?;
+        // Drop migration's own scaffolding before anything derives from it, so
+        // it cannot leak into volume usage, blockers, or the container plan.
+        // `ensure_helper_image` leaves its image behind on both daemons, and a
+        // crashed run can strand helper containers.
+        let source_containers: Vec<_> = source_runner
+            .list_containers()
+            .await?
+            .into_iter()
+            .filter(|container| !is_helper_object(trimmed_name(container)))
+            .collect();
 
         let mut unsupported_resources = Vec::new();
 
@@ -193,6 +202,9 @@ fn normalize_images(
 
     for image in images {
         let tags = meaningful_tags(&image.repo_tags);
+        if tags.iter().any(|tag| is_helper_object(tag)) {
+            continue;
+        }
         if !tags.is_empty() {
             ordered.insert(
                 image.id.clone(),
@@ -600,6 +612,26 @@ mod tests {
             repo_tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             repo_digests: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_helper_image_is_never_planned() {
+        // ensure_helper_image leaves it behind on both daemons, so without
+        // this every run after the first would offer it as user data.
+        let images = [
+            image_inspect(
+                "sha256:helper",
+                &[crate::helper_image::helper_image_reference()],
+            ),
+            image_inspect("sha256:real", &["postgres:16"]),
+        ];
+        let plans = normalize_images(&images, &[], &BTreeSet::new());
+
+        let refs: Vec<_> = plans
+            .iter()
+            .flat_map(|plan| plan.export_references.clone())
+            .collect();
+        assert_eq!(refs, vec!["postgres:16".to_string()]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Migration execution.
 
 use crate::error::{MigrationError, Result};
+use crate::helper_image::HELPER_OBJECT_PREFIX;
 use crate::model::{
     ContainerMount, ContainerPlan, ContainerSpec, MigrationPlan, NetworkModeSpec, PortPublish,
     SourceConfig,
@@ -250,8 +251,12 @@ where
             )
             .await?;
 
-        let source_helper_name = format!("arcbox-migration-src-{}", sanitize_name(&volume.name));
-        let target_helper_name = format!("arcbox-migration-dst-{}", sanitize_name(&volume.name));
+        // The prefix is what keeps planning from mistaking a stranded helper
+        // for a user container; see `helper_image::HELPER_OBJECT_PREFIX`.
+        let source_helper_name =
+            format!("{HELPER_OBJECT_PREFIX}src-{}", sanitize_name(&volume.name));
+        let target_helper_name =
+            format!("{HELPER_OBJECT_PREFIX}dst-{}", sanitize_name(&volume.name));
 
         let source_helper = source
             .create_helper_container(&source_helper_name, &volume.name)
