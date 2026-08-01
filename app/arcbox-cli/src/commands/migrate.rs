@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use arcbox_grpc::v1::migration_service_client::MigrationServiceClient;
+use arcbox_migration::{MigrationPlan, NetworkModeSpec};
 use arcbox_protocol::v1::{
     PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
@@ -294,62 +295,61 @@ fn print_blocking_issues(prepare: &PrepareMigrationResponse) {
     }
 }
 
-/// Prints the per-resource breakdown parsed out of the daemon's plan JSON.
+/// Prints the per-resource breakdown of the plan.
 fn print_plan_details(plan_json: &str) -> Result<()> {
     if plan_json.is_empty() {
         return Ok(());
     }
-    let plan: serde_json::Value =
+    // Deserialized into the daemon's own plan type rather than picked apart as
+    // untyped JSON: `abctl` and `arcbox-daemon` build and ship together, so the
+    // type is the contract and a field rename is a compile error here.
+    let plan: MigrationPlan =
         serde_json::from_str(plan_json).context("Failed to parse migration plan")?;
 
-    print_section("Images", plan["images"].as_array(), |image| {
-        let tags: Vec<_> = image["export_references"]
-            .as_array()
-            .map(|refs| refs.iter().filter_map(|r| r.as_str()).collect())
-            .unwrap_or_default();
-        tags.join(", ")
+    print_section("Images", &plan.images, |image| {
+        image.export_references.join(", ")
     });
-    print_section("Volumes", plan["volumes"].as_array(), |volume| {
-        let attached = volume["attached_containers"].as_array().map_or(0, Vec::len);
+    print_section("Volumes", &plan.volumes, |volume| {
         format!(
-            "{} ({attached} container(s))",
-            volume["name"].as_str().unwrap_or("?")
+            "{} ({} container(s))",
+            volume.name,
+            volume.attached_containers.len()
         )
     });
-    print_section("Networks", plan["networks"].as_array(), |network| {
-        network["name"].as_str().unwrap_or("?").to_string()
-    });
-    print_section("Containers", plan["containers"].as_array(), |container| {
+    print_section("Networks", &plan.networks, |network| network.name.clone());
+    print_section("Containers", &plan.containers, |container| {
         format!(
             "{} [{}] image={} network={}",
-            container["name"].as_str().unwrap_or("?"),
-            if container["was_running"].as_bool() == Some(true) {
+            container.name,
+            if container.was_running {
                 "will start"
             } else {
                 "stopped"
             },
-            container["image_reference"].as_str().unwrap_or("?"),
-            describe_network_mode(&container["spec"]["network_mode"]),
+            container.image_reference,
+            describe_network_mode(&container.spec.network_mode),
         )
     });
     Ok(())
 }
 
-/// Renders the externally-tagged `NetworkModeSpec` as a short label.
-fn describe_network_mode(mode: &serde_json::Value) -> String {
-    if let Some(name) = mode.as_str() {
-        return name.to_ascii_lowercase();
+/// Renders a network mode as a short label.
+fn describe_network_mode(mode: &NetworkModeSpec) -> String {
+    match mode {
+        NetworkModeSpec::Default => "default".to_string(),
+        NetworkModeSpec::Host => "host".to_string(),
+        NetworkModeSpec::None => "none".to_string(),
+        NetworkModeSpec::Named(attachment) => attachment.network.clone(),
     }
-    mode["Named"]["network"].as_str().unwrap_or("?").to_string()
 }
 
-fn print_section<F>(title: &str, items: Option<&Vec<serde_json::Value>>, describe: F)
+fn print_section<T, F>(title: &str, items: &[T], describe: F)
 where
-    F: Fn(&serde_json::Value) -> String,
+    F: Fn(&T) -> String,
 {
-    let Some(items) = items.filter(|items| !items.is_empty()) else {
+    if items.is_empty() {
         return;
-    };
+    }
     println!();
     println!("{title}:");
     for item in items {
@@ -421,7 +421,7 @@ fn print_progress_event(event: &RunMigrationEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MigrationSourceKind, describe_network_mode, is_confirmation_yes};
+    use super::{MigrationSourceKind, NetworkModeSpec, describe_network_mode, is_confirmation_yes};
 
     #[test]
     fn docker_desktop_default_socket_ends_with_expected_path() {
@@ -442,22 +442,17 @@ mod tests {
     }
 
     #[test]
-    fn network_mode_labels_match_the_daemon_encoding() {
-        // Mirrors `network_mode_serializes_to_the_shape_the_cli_parses` in
-        // arcbox-migration; the two must move together.
+    fn network_modes_render_as_short_labels() {
+        assert_eq!(describe_network_mode(&NetworkModeSpec::Host), "host");
+        assert_eq!(describe_network_mode(&NetworkModeSpec::Default), "default");
         assert_eq!(
-            describe_network_mode(&serde_json::json!("Host")),
-            "host".to_string()
-        );
-        assert_eq!(
-            describe_network_mode(&serde_json::json!("Default")),
-            "default".to_string()
-        );
-        assert_eq!(
-            describe_network_mode(
-                &serde_json::json!({"Named": {"network": "usernet", "aliases": ["api"]}})
-            ),
-            "usernet".to_string()
+            describe_network_mode(&NetworkModeSpec::Named(
+                arcbox_migration::ContainerNetworkAttachment {
+                    network: "usernet".into(),
+                    aliases: vec!["api".into()],
+                }
+            )),
+            "usernet"
         );
     }
 

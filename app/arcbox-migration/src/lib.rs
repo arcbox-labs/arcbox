@@ -17,8 +17,8 @@ pub use error::{MigrationError, Result};
 pub use executor::{MigrationExecutor, MigrationExecutorOptions, MigrationOutcome};
 pub use model::{
     ContainerMount, ContainerNetworkAttachment, ContainerPlan, ContainerSpec, ImagePlan,
-    MigrationPlan, NetworkPlan, PortPublish, ReplacementSummary, RestartPolicySpec,
-    RunningVolumeBlocker, SourceConfig, SourceInfo, SourceKind, VolumePlan,
+    MigrationPlan, NetworkModeSpec, NetworkPlan, PortPublish, ReplacementSummary,
+    RestartPolicySpec, RunningVolumeBlocker, SourceConfig, SourceInfo, SourceKind, VolumePlan,
 };
 pub use planner::MigrationPlanner;
 pub use progress::{MigrationProgress, MigrationStage};

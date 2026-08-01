@@ -301,6 +301,7 @@ dependencies = [
  "arcbox-docker-tools",
  "arcbox-grpc",
  "arcbox-helper",
+ "arcbox-migration",
  "arcbox-protocol",
  "chrono",
  "clap",
