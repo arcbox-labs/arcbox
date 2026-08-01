@@ -32,7 +32,7 @@ libc = { workspace = true }
 arcbox-constants = { workspace = true }
 arcbox-net = { workspace = true }
 serde_json.workspace = true
-axum.workspace = true
+axum = "0.8"
 bytes.workspace = true
 http-body-util = "0.1"
 tokio-util = "0.7"
@@ -41,6 +41,10 @@ filetime = "0.2.29"
 arcbox-grpc.workspace = true
 tonic-reflection = "0.14"
 arcbox-transport.workspace = true
+connectrpc = { version = "0.8.1", features = ["axum"] }
+hyper-util = { version = "0.1.20", features = ["server", "server-auto", "server-graceful", "tokio", "http1", "http2", "service"] }
+tower.workspace = true
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-route.workspace = true

@@ -10,20 +10,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arcbox_api::{
     IconServiceImpl, IconServiceServer, KubernetesServiceImpl, MachineServiceImpl,
-    MigrationServiceImpl, MigrationServiceServer, SandboxFilesystemServiceImpl,
-    SandboxFilesystemServiceServer, SandboxProcessServiceImpl, SandboxProcessServiceServer,
-    SandboxServiceImpl, SandboxServiceServer, SandboxSnapshotServiceImpl,
-    SandboxSnapshotServiceServer, SharedRuntime, StatsServiceImpl, SystemServiceImpl,
-    SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
+    MigrationServiceImpl, MigrationServiceServer, SharedRuntime, StatsServiceImpl,
+    SystemServiceImpl, SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
     machine_service_server::MachineServiceServer, stats_service_server::StatsServiceServer,
 };
 #[cfg(target_os = "macos")]
 use arcbox_api::{MacosServiceImpl, macos_service_server::MacosServiceServer};
 use arcbox_core::Runtime;
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
-use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
-use tonic::transport::Server;
+use tonic::service::Routes;
 use tracing::{info, warn};
 
 use crate::context::{DaemonContext, ServiceHandles};
@@ -44,32 +39,21 @@ pub async fn start_grpc(
     shared_runtime: SharedRuntime,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let socket_path = &ctx.layout.grpc_socket;
-    let _ = std::fs::remove_file(socket_path);
+    let listener = crate::control_plane::bind(socket_path)?;
 
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create socket directory")?;
-    }
-
-    let listener = UnixListener::bind(socket_path).context(format!(
-        "Failed to bind gRPC socket: {}",
-        socket_path.display()
-    ))?;
-    let incoming = UnixListenerStream::new(listener);
-
-    info!(socket = %socket_path.display(), "gRPC server listening");
+    info!(socket = %socket_path.display(), "control plane listening (Connect + gRPC + gRPC-Web)");
 
     let machine_service = MachineServiceImpl::new(Arc::clone(&shared_runtime));
     #[cfg(target_os = "macos")]
     let macos_service = MacosServiceImpl::new(Arc::clone(&shared_runtime));
     let kubernetes_service = KubernetesServiceImpl::new(Arc::clone(&shared_runtime));
     let migration_service = MigrationServiceImpl::new(Arc::clone(&shared_runtime));
-    let sandbox_service = SandboxServiceImpl::new(Arc::clone(&shared_runtime));
-    // Data-plane halves of the sandbox API (CORE-57): separate services so a
-    // cloud deployment can serve them from a different process than the
-    // control plane. Locally the daemon serves all of them.
-    let sandbox_process_service = SandboxProcessServiceImpl::new(Arc::clone(&shared_runtime));
-    let sandbox_filesystem_service = SandboxFilesystemServiceImpl::new(Arc::clone(&shared_runtime));
-    let sandbox_snapshot_service = SandboxSnapshotServiceImpl::new(Arc::clone(&shared_runtime));
+    // The four sandbox services are served over Connect, not tonic (CORE-53),
+    // so they are built as one Connect router rather than added individually
+    // below. The split along the control/data-plane seam (CORE-57) is
+    // preserved: they remain four services a cloud deployment can host in
+    // different processes.
+    let sandbox = arcbox_api::connect::router(Arc::clone(&shared_runtime));
     let system_service = SystemServiceImpl::new(
         Arc::clone(&ctx.setup_state),
         Arc::clone(&shared_runtime),
@@ -90,36 +74,26 @@ pub async fn start_grpc(
         .build_v1alpha()
         .context("building gRPC reflection service (v1alpha)")?;
 
-    let shutdown = ctx.shutdown.clone();
-    let handle = tokio::spawn(async move {
-        let router = Server::builder()
-            .add_service(MachineServiceServer::new(machine_service))
-            .add_service(KubernetesServiceServer::new(kubernetes_service))
-            .add_service(MigrationServiceServer::new(migration_service))
-            .add_service(SandboxServiceServer::new(sandbox_service))
-            .add_service(SandboxProcessServiceServer::new(sandbox_process_service))
-            .add_service(SandboxFilesystemServiceServer::new(
-                sandbox_filesystem_service,
-            ))
-            .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
-            .add_service(SystemServiceServer::new(system_service))
-            .add_service(StatsServiceServer::new(stats_service))
-            .add_service(IconServiceServer::new(icon_service));
-        // macOS guests are served only on Apple Silicon hosts; on other
-        // platforms the service is simply absent (the CLI `macos` noun is
-        // likewise macOS-only).
-        #[cfg(target_os = "macos")]
-        let router = router.add_service(MacosServiceServer::new(macos_service));
-        let result = router
-            .add_service(reflection_v1)
-            .add_service(reflection_v1alpha)
-            .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
-            .await;
+    let routes = Routes::default()
+        .add_service(MachineServiceServer::new(machine_service))
+        .add_service(KubernetesServiceServer::new(kubernetes_service))
+        .add_service(MigrationServiceServer::new(migration_service))
+        .add_service(SystemServiceServer::new(system_service))
+        .add_service(StatsServiceServer::new(stats_service))
+        .add_service(IconServiceServer::new(icon_service));
+    // macOS guests are served only on Apple Silicon hosts; on other
+    // platforms the service is simply absent (the CLI `macos` noun is
+    // likewise macOS-only).
+    #[cfg(target_os = "macos")]
+    let routes = routes.add_service(MacosServiceServer::new(macos_service));
+    let routes = routes
+        .add_service(reflection_v1)
+        .add_service(reflection_v1alpha);
 
-        if let Err(e) = result {
-            tracing::error!("gRPC server error: {}", e);
-        }
-    });
+    let app = crate::control_plane::compose(routes, sandbox);
+
+    let shutdown = ctx.shutdown.clone();
+    let handle = tokio::spawn(crate::control_plane::serve(listener, app, shutdown));
 
     Ok(handle)
 }

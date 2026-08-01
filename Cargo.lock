@@ -441,9 +441,12 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "connectrpc",
  "dirs",
  "filetime",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "libproc",
  "macos-resolver",
@@ -455,6 +458,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-reflection",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1931,6 +1935,7 @@ checksum = "e4d1bbfc95ed1f4f31a027f5b97ff981be2617bc8a5c800fd6fcc701867bb97f"
 dependencies = [
  "async-compression",
  "async-trait",
+ "axum",
  "base64",
  "buffa",
  "bytes",
