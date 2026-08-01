@@ -339,3 +339,26 @@ pub struct RunningVolumeBlocker {
     /// Running source containers using the volume.
     pub containers: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CLI hand-parses this shape out of the daemon's plan JSON, so the
+    /// representation is a cross-crate contract, not an internal detail.
+    #[test]
+    fn network_mode_serializes_to_the_shape_the_cli_parses() {
+        let unit = serde_json::to_string(&NetworkModeSpec::Host).unwrap();
+        assert_eq!(unit, r#""Host""#);
+
+        let named = serde_json::to_string(&NetworkModeSpec::Named(ContainerNetworkAttachment {
+            network: "usernet".into(),
+            aliases: vec!["api".into()],
+        }))
+        .unwrap();
+        assert_eq!(
+            named,
+            r#"{"Named":{"network":"usernet","aliases":["api"]}}"#
+        );
+    }
+}

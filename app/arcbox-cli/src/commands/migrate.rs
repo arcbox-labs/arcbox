@@ -42,6 +42,15 @@ pub struct MigrateSourceArgs {
     /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Show what would be migrated and exit without changing anything
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Print the migration plan as JSON
+    #[arg(long, requires = "dry_run")]
+    pub json: bool,
+    /// Recreate containers but leave them stopped
+    #[arg(long)]
+    pub no_start: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +118,9 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
         .unwrap_or_else(|| source_kind.default_socket_path());
     ensure_source_socket_exists(source_kind, &source_socket)?;
 
-    println!("Preparing migration from {}...", source_kind.display_name());
+    if !args.json {
+        println!("Preparing migration from {}...", source_kind.display_name());
+    }
 
     let mut client = migration_client().await?;
     let prepare = client
@@ -117,16 +128,28 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
             source_kind: source_kind.as_str().to_string(),
             source_socket_path: source_socket.to_string_lossy().into_owned(),
             allow_replacements: true,
+            dry_run: args.dry_run,
         }))
         .await
         .context("Failed to prepare migration")?
         .into_inner();
+
+    if args.dry_run {
+        return report_dry_run(source_kind, &prepare, args.json);
+    }
 
     if prepare.plan_id.is_empty() {
         bail!("Migration prepare response did not include a plan ID");
     }
 
     print_prepare_summary(source_kind, &prepare);
+    print_blocking_issues(&prepare);
+    if !prepare.unsupported_resources.is_empty() {
+        bail!(
+            "Migration cannot run until the blocking issues above are resolved. \
+             Re-run with --dry-run to inspect the full plan."
+        );
+    }
 
     if !args.yes && !confirm_migration(&prepare)? {
         println!("Migration cancelled.");
@@ -147,6 +170,7 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
             // (either via interactive prompt or --yes), so allow both
             // replacements and stopping blocker containers.
             allow_replacements: true,
+            skip_start: args.no_start,
         }))
         .await
         .context("Failed to start migration")?
@@ -214,6 +238,108 @@ fn print_prepare_summary(source_kind: MigrationSourceKind, prepare: &PrepareMigr
     }
 }
 
+/// Renders a dry run and reports whether the plan could actually be executed.
+fn report_dry_run(
+    source_kind: MigrationSourceKind,
+    prepare: &PrepareMigrationResponse,
+    as_json: bool,
+) -> Result<()> {
+    if as_json {
+        // The daemon already serialized the plan; reprinting it verbatim keeps
+        // the CLI from becoming a second, drifting view of the same model.
+        println!("{}", prepare.plan_json);
+        return Ok(());
+    }
+
+    print_prepare_summary(source_kind, prepare);
+    print_plan_details(&prepare.plan_json)?;
+    print_blocking_issues(prepare);
+
+    println!();
+    if prepare.unsupported_resources.is_empty() {
+        println!("Dry run only; nothing was changed. Re-run without --dry-run to migrate.");
+    } else {
+        println!(
+            "Dry run only; nothing was changed. Migration is blocked until the issues above are resolved."
+        );
+    }
+    Ok(())
+}
+
+fn print_blocking_issues(prepare: &PrepareMigrationResponse) {
+    if prepare.unsupported_resources.is_empty() {
+        return;
+    }
+    println!();
+    println!("Blocking issues:");
+    for issue in &prepare.unsupported_resources {
+        println!("  - {issue}");
+    }
+}
+
+/// Prints the per-resource breakdown parsed out of the daemon's plan JSON.
+fn print_plan_details(plan_json: &str) -> Result<()> {
+    if plan_json.is_empty() {
+        return Ok(());
+    }
+    let plan: serde_json::Value =
+        serde_json::from_str(plan_json).context("Failed to parse migration plan")?;
+
+    print_section("Images", plan["images"].as_array(), |image| {
+        let tags: Vec<_> = image["export_references"]
+            .as_array()
+            .map(|refs| refs.iter().filter_map(|r| r.as_str()).collect())
+            .unwrap_or_default();
+        tags.join(", ")
+    });
+    print_section("Volumes", plan["volumes"].as_array(), |volume| {
+        let attached = volume["attached_containers"].as_array().map_or(0, Vec::len);
+        format!(
+            "{} ({attached} container(s))",
+            volume["name"].as_str().unwrap_or("?")
+        )
+    });
+    print_section("Networks", plan["networks"].as_array(), |network| {
+        network["name"].as_str().unwrap_or("?").to_string()
+    });
+    print_section("Containers", plan["containers"].as_array(), |container| {
+        format!(
+            "{} [{}] image={} network={}",
+            container["name"].as_str().unwrap_or("?"),
+            if container["was_running"].as_bool() == Some(true) {
+                "will start"
+            } else {
+                "stopped"
+            },
+            container["image_reference"].as_str().unwrap_or("?"),
+            describe_network_mode(&container["spec"]["network_mode"]),
+        )
+    });
+    Ok(())
+}
+
+/// Renders the externally-tagged `NetworkModeSpec` as a short label.
+fn describe_network_mode(mode: &serde_json::Value) -> String {
+    if let Some(name) = mode.as_str() {
+        return name.to_ascii_lowercase();
+    }
+    mode["Named"]["network"].as_str().unwrap_or("?").to_string()
+}
+
+fn print_section<F>(title: &str, items: Option<&Vec<serde_json::Value>>, describe: F)
+where
+    F: Fn(&serde_json::Value) -> String,
+{
+    let Some(items) = items.filter(|items| !items.is_empty()) else {
+        return;
+    };
+    println!();
+    println!("{title}:");
+    for item in items {
+        println!("  - {}", describe(item));
+    }
+}
+
 fn confirm_migration(prepare: &PrepareMigrationResponse) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!("Migration confirmation requires a terminal. Re-run with --yes to continue.");
@@ -278,7 +404,7 @@ fn print_progress_event(event: &RunMigrationEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MigrationSourceKind, is_confirmation_yes};
+    use super::{MigrationSourceKind, describe_network_mode, is_confirmation_yes};
 
     #[test]
     fn docker_desktop_default_socket_ends_with_expected_path() {
@@ -295,6 +421,26 @@ mod tests {
             MigrationSourceKind::Orbstack
                 .default_socket_path()
                 .ends_with(".orbstack/run/docker.sock")
+        );
+    }
+
+    #[test]
+    fn network_mode_labels_match_the_daemon_encoding() {
+        // Mirrors `network_mode_serializes_to_the_shape_the_cli_parses` in
+        // arcbox-migration; the two must move together.
+        assert_eq!(
+            describe_network_mode(&serde_json::json!("Host")),
+            "host".to_string()
+        );
+        assert_eq!(
+            describe_network_mode(&serde_json::json!("Default")),
+            "default".to_string()
+        );
+        assert_eq!(
+            describe_network_mode(
+                &serde_json::json!({"Named": {"network": "usernet", "aliases": ["api"]}})
+            ),
+            "usernet".to_string()
         );
     }
 

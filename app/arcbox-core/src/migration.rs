@@ -56,21 +56,25 @@ impl MigrationManager {
             .await
             .map_err(map_migration_error)?;
 
-        if !plan.unsupported_resources.is_empty() {
-            return Err(CoreError::config(format!(
-                "source contains unsupported resources: {}",
-                plan.unsupported_resources.join(", ")
-            )));
-        }
-
-        let plan_id = Uuid::new_v4().to_string();
-        self.prepared.write().await.insert(
-            plan_id.clone(),
-            PreparedMigration {
-                source,
-                plan: plan.clone(),
-            },
-        );
+        // Unsupported resources are reported rather than raised here: the
+        // executor already refuses to run a plan that has any, and callers
+        // inspecting a plan need to see *why* it is blocked.
+        //
+        // A dry run keeps nothing, so repeated inspection cannot accumulate
+        // plans in the daemon.
+        let plan_id = if request.dry_run {
+            String::new()
+        } else {
+            let plan_id = Uuid::new_v4().to_string();
+            self.prepared.write().await.insert(
+                plan_id.clone(),
+                PreparedMigration {
+                    source,
+                    plan: plan.clone(),
+                },
+            );
+            plan_id
+        };
 
         let mut warnings = Vec::new();
         warnings.extend(plan.blockers.iter().map(|blocker| {
@@ -242,9 +246,65 @@ mod tests {
     use super::*;
     use arcbox_migration::{MigrationPlan, ReplacementSummary, SourceInfo};
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Mutex;
+    use std::path::Path;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Serializes the tests that repoint `PATH` at a `docker` stand-in.
+    ///
+    /// A tokio mutex so it can be held across the awaits it guards; `PATH` is
+    /// process-global, so releasing it earlier would let concurrent tests
+    /// observe each other's shim.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Installs an executable `docker` in `dir` and points `PATH` at it.
+    ///
+    /// Returns the previous `PATH` so the caller can restore it.
+    fn install_docker_shim(dir: &Path, script: &str) -> Option<std::ffi::OsString> {
+        let docker_path = dir.join("docker");
+        std::fs::write(&docker_path, script).unwrap();
+        let mut permissions = std::fs::metadata(&docker_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker_path, permissions).unwrap();
+
+        let previous = std::env::var_os("PATH");
+        // SAFETY: env mutation in tests is serialized by ENV_LOCK.
+        unsafe { std::env::set_var("PATH", dir) };
+        previous
+    }
+
+    fn restore_path(previous: Option<std::ffi::OsString>) {
+        // SAFETY: env mutation in tests is serialized by ENV_LOCK.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// A `docker` that reports a reachable but completely empty daemon.
+    ///
+    /// Every listing comes back empty, so `inspect_many` short-circuits and
+    /// planning only ever needs a real answer for `docker info`.
+    const EMPTY_DAEMON_SHIM: &str = r#"#!/bin/sh
+case "$*" in
+  *"info --format"*)
+    echo '{"Name":"orbstack","ServerVersion":"29.0","OperatingSystem":"OrbStack","Architecture":"aarch64"}'
+    ;;
+esac
+exit 0
+"#;
+
+    const FAILING_SHIM: &str = "#!/bin/sh\nexit 1\n";
+
+    /// Builds a prepare request against a source socket that exists.
+    fn prepare_request(socket: &Path, dry_run: bool) -> PrepareMigrationRequest {
+        PrepareMigrationRequest {
+            source_kind: "orbstack".to_string(),
+            source_socket_path: socket.to_string_lossy().into_owned(),
+            allow_replacements: true,
+            dry_run,
+        }
+    }
 
     fn sample_plan() -> MigrationPlan {
         MigrationPlan {
@@ -316,22 +376,9 @@ mod tests {
             },
         );
 
+        let _env_lock = ENV_LOCK.lock().await;
         let temp_dir = tempfile::tempdir().unwrap();
-        let docker_path = temp_dir.path().join("docker");
-        std::fs::write(&docker_path, "#!/bin/sh\nexit 1\n").unwrap();
-        let mut permissions = std::fs::metadata(&docker_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&docker_path, permissions).unwrap();
-
-        // Hold ENV_LOCK only during the synchronous env mutation; drop
-        // it before any `.await` to satisfy clippy::await_holding_lock.
-        {
-            let _env_lock = ENV_LOCK.lock().unwrap();
-            // SAFETY: tests serialize environment mutation with ENV_LOCK.
-            unsafe {
-                std::env::set_var("PATH", temp_dir.path());
-            }
-        }
+        let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
 
         let _ = manager
             .run_migration(RunMigrationRequest {
@@ -342,14 +389,92 @@ mod tests {
             .await
             .unwrap();
 
-        {
-            let _env_lock = ENV_LOCK.lock().unwrap();
-            // SAFETY: tests serialize environment mutation with ENV_LOCK.
-            unsafe {
-                std::env::remove_var("PATH");
-            }
-        }
+        restore_path(previous_path);
 
         assert!(!manager.prepared.read().await.contains_key(&plan_id));
+    }
+
+    #[tokio::test]
+    async fn unsupported_resources_fail_the_run_rather_than_the_prepare() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        let plan_id = "test-plan".to_string();
+        manager.prepared.write().await.insert(
+            plan_id.clone(),
+            PreparedMigration {
+                source: SourceConfig {
+                    kind: SourceKind::DockerDesktop,
+                    socket_path: PathBuf::from("/tmp/docker.sock"),
+                },
+                plan: MigrationPlan {
+                    replacements: ReplacementSummary::default(),
+                    unsupported_resources: vec!["container 'vpn-client' shares".to_string()],
+                    ..sample_plan()
+                },
+            },
+        );
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
+
+        let mut events = manager
+            .run_migration(RunMigrationRequest {
+                plan_id,
+                allow_replacements: true,
+                skip_start: false,
+            })
+            .await
+            .unwrap();
+        let event = events.recv().await.unwrap().unwrap();
+
+        restore_path(previous_path);
+
+        assert!(event.done);
+        assert!(!event.success);
+        assert!(event.message.contains("unsupported resources"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_the_plan_without_storing_it() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), EMPTY_DAEMON_SHIM);
+        let socket = temp_dir.path().join("docker.sock");
+        std::fs::write(&socket, "").unwrap();
+
+        let manager = MigrationManager::new(temp_dir.path().join("arcbox-docker.sock"));
+        let response = manager
+            .prepare_migration(prepare_request(&socket, true))
+            .await;
+
+        restore_path(previous_path);
+        let response = response.unwrap();
+
+        assert!(response.plan_id.is_empty(), "a dry run issues no plan id");
+        assert!(!response.plan_json.is_empty());
+        assert!(
+            manager.prepared.read().await.is_empty(),
+            "a dry run must not accumulate plans in the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_prepare_stores_the_plan_and_issues_an_id() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), EMPTY_DAEMON_SHIM);
+        let socket = temp_dir.path().join("docker.sock");
+        std::fs::write(&socket, "").unwrap();
+
+        let manager = MigrationManager::new(temp_dir.path().join("arcbox-docker.sock"));
+        let response = manager
+            .prepare_migration(prepare_request(&socket, false))
+            .await;
+
+        restore_path(previous_path);
+        let response = response.unwrap();
+
+        assert!(!response.plan_id.is_empty());
+        assert_eq!(manager.prepared.read().await.len(), 1);
     }
 }
