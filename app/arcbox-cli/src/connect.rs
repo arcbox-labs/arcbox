@@ -41,6 +41,18 @@ pub fn daemon(socket: &Path) -> (SharedHttp2Connection, ClientConfig) {
     (transport, config)
 }
 
+/// The same, with a machine-routing header set on every call.
+///
+/// "Which local VM to target" is transport metadata a local client may set,
+/// never part of the sandbox product contract (CORE-54). Setting it once on
+/// the config beats attaching it per request — a call that forgot would
+/// silently route to the default rather than fail.
+#[must_use]
+pub fn daemon_for_machine(socket: &Path, machine: &str) -> (SharedHttp2Connection, ClientConfig) {
+    let (transport, config) = daemon(socket);
+    (transport, config.with_default_header("x-machine", machine))
+}
+
 /// Builds a Connect request from its prost twin.
 ///
 /// The two representations come from the same `.proto` and encode identical
