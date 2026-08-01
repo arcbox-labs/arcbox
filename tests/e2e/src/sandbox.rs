@@ -15,6 +15,8 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use arcbox_grpc::sandbox_v1::sandbox_filesystem_service_client::SandboxFilesystemServiceClient;
+use arcbox_grpc::sandbox_v1::sandbox_process_service_client::SandboxProcessServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_service_client::SandboxServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
 use arcbox_protocol::sandbox_v1::{
@@ -176,7 +178,12 @@ async fn drive_sandboxes(
     data_dir: &std::path::Path,
     metrics: &mut RunMetrics,
 ) -> Result<()> {
+    // One client per service: the daemon serves all four together, but the
+    // split (CORE-57) is what lets a cloud deployment put the data plane
+    // somewhere else, so the test drives them as separate endpoints.
     let mut sandboxes = SandboxServiceClient::new(channel.clone());
+    let mut processes = SandboxProcessServiceClient::new(channel.clone());
+    let mut files = SandboxFilesystemServiceClient::new(channel.clone());
     let mut snapshots = SandboxSnapshotServiceClient::new(channel);
 
     // -- Create (with an initial cmd, exercising the auto-run path) --------
@@ -236,7 +243,7 @@ async fn drive_sandboxes(
 
     // -- Execution round-trip (run semantics) ------------------------------
     let run_started = Instant::now();
-    let stdout = run_and_collect(&mut sandboxes, "smoke1", &["/bin/echo", "hello-sandbox"]).await?;
+    let stdout = run_and_collect(&mut processes, "smoke1", &["/bin/echo", "hello-sandbox"]).await?;
     if !stdout.contains("hello-sandbox") {
         bail!("run output missing marker: {stdout:?}");
     }
@@ -245,7 +252,7 @@ async fn drive_sandboxes(
 
     // -- CORE-55 acceptance: drop the attach mid-output, resume without loss
     let resume_started = Instant::now();
-    exec_attach_resume(&mut sandboxes, "smoke1").await?;
+    exec_attach_resume(&mut processes, "smoke1").await?;
     metrics.record(
         "sandbox_exec_resume",
         resume_started.elapsed().as_secs_f64(),
@@ -254,13 +261,13 @@ async fn drive_sandboxes(
 
     // -- CORE-55 acceptance: offset-idempotent stdin -----------------------
     let stdin_started = Instant::now();
-    exec_stdin_idempotent(&mut sandboxes, "smoke1").await?;
+    exec_stdin_idempotent(&mut processes, "smoke1").await?;
     metrics.record("sandbox_exec_stdin", stdin_started.elapsed().as_secs_f64());
     wait_ready(&mut sandboxes, "smoke1").await?;
 
     // -- CORE-55 acceptance: signal without a stream + idle keepalive ------
     let signal_started = Instant::now();
-    exec_signal_and_keepalive(&mut sandboxes, "smoke1").await?;
+    exec_signal_and_keepalive(&mut processes, "smoke1").await?;
     metrics.record(
         "sandbox_exec_signal",
         signal_started.elapsed().as_secs_f64(),
@@ -269,7 +276,7 @@ async fn drive_sandboxes(
 
     // -- CORE-54: create from a docker: template ---------------------------
     let template_started = Instant::now();
-    sandbox_from_docker_template(&mut sandboxes, data_dir).await?;
+    sandbox_from_docker_template(&mut sandboxes, &mut processes, data_dir).await?;
     metrics.record(
         "sandbox_docker_template",
         template_started.elapsed().as_secs_f64(),
@@ -278,8 +285,8 @@ async fn drive_sandboxes(
     // -- File round-trip ------------------------------------------------
     let file_started = Instant::now();
     let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
-    write_file(&mut sandboxes, "smoke1", "/tmp/smoke.bin", &payload).await?;
-    let back = read_file(&mut sandboxes, "smoke1", "/tmp/smoke.bin").await?;
+    write_file(&mut files, "smoke1", "/tmp/smoke.bin", &payload).await?;
+    let back = read_file(&mut files, "smoke1", "/tmp/smoke.bin").await?;
     if back != payload {
         bail!(
             "file round-trip mismatch: sent {} bytes, got {}",
@@ -331,7 +338,7 @@ async fn drive_sandboxes(
             cloned.ip_address
         );
     }
-    let stdout = run_and_collect(&mut sandboxes, "smoke3", &["/bin/echo", "hello-clone"]).await?;
+    let stdout = run_and_collect(&mut processes, "smoke3", &["/bin/echo", "hello-clone"]).await?;
     if !stdout.contains("hello-clone") {
         bail!("fresh-network clone run output missing marker: {stdout:?}");
     }
@@ -340,7 +347,7 @@ async fn drive_sandboxes(
     // guest actually re-addressed eth0 to the fresh allocation…
     wait_ready(&mut sandboxes, "smoke3").await?;
     let addr = run_and_collect(
-        &mut sandboxes,
+        &mut processes,
         "smoke3",
         &["/bin/sh", "-c", "ip addr show eth0"],
     )
@@ -365,7 +372,7 @@ async fn drive_sandboxes(
     // default route.
     wait_ready(&mut sandboxes, "smoke3").await?;
     let ping = run_and_collect(
-        &mut sandboxes,
+        &mut processes,
         "smoke3",
         &[
             "/bin/sh",
@@ -414,14 +421,14 @@ async fn drive_sandboxes(
         .context("Restore failed")?
         .into_inner();
     info!(id = %restored.id, "sandbox restored");
-    let stdout = run_and_collect(&mut sandboxes, "smoke2", &["/bin/echo", "hello-restore"]).await?;
+    let stdout = run_and_collect(&mut processes, "smoke2", &["/bin/echo", "hello-restore"]).await?;
     if !stdout.contains("hello-restore") {
         bail!("restored sandbox run output missing marker: {stdout:?}");
     }
     metrics.record("sandbox_restore", restore_started.elapsed().as_secs_f64());
 
     // The file written before the checkpoint must exist in the restore.
-    let restored_file = read_file(&mut sandboxes, "smoke2", "/tmp/smoke.bin").await?;
+    let restored_file = read_file(&mut files, "smoke2", "/tmp/smoke.bin").await?;
     if restored_file.len() != 1024 * 1024 {
         bail!(
             "restored sandbox lost the pre-checkpoint file ({} bytes)",
@@ -464,6 +471,7 @@ async fn drive_sandboxes(
 /// image store, then resolved to a bootable rootfs entirely inside the VM.
 async fn sandbox_from_docker_template(
     client: &mut SandboxServiceClient<Channel>,
+    processes: &mut SandboxProcessServiceClient<Channel>,
     data_dir: &std::path::Path,
 ) -> Result<()> {
     let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
@@ -501,7 +509,7 @@ async fn sandbox_from_docker_template(
     // The workload must be the template's filesystem, not the built-in
     // busybox image: /etc/os-release only exists in the pulled image.
     let os_release = run_and_collect(
-        client,
+        processes,
         "smoke-template",
         &["/bin/sh", "-c", "cat /etc/os-release"],
     )
@@ -516,7 +524,7 @@ async fn sandbox_from_docker_template(
 /// CORE-55 acceptance: kill the attach stream mid-output, re-attach at the
 /// recorded offset, and require the assembled output to be byte-exact.
 async fn exec_attach_resume(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxProcessServiceClient<Channel>,
     sandbox_id: &str,
 ) -> Result<()> {
     use std::fmt::Write as _;
@@ -621,7 +629,7 @@ async fn exec_attach_resume(
 /// CORE-55 acceptance: retried stdin writes are deduplicated by offset and
 /// GetStdinStatus reports the resume point.
 async fn exec_stdin_idempotent(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxProcessServiceClient<Channel>,
     sandbox_id: &str,
 ) -> Result<()> {
     let execution = start_execution(client, sandbox_id, "stdin-exec", &["/bin/cat"], true).await?;
@@ -700,7 +708,7 @@ async fn exec_stdin_idempotent(
 /// signal delivered with no stream attached kills the process, reported as a
 /// signal death (not an exit code).
 async fn exec_signal_and_keepalive(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxProcessServiceClient<Channel>,
     sandbox_id: &str,
 ) -> Result<()> {
     let execution = start_execution(
@@ -808,7 +816,7 @@ async fn wait_ready(client: &mut SandboxServiceClient<Channel>, id: &str) -> Res
 
 /// Starts an execution with a fixed id (idempotent per command).
 async fn start_execution(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxProcessServiceClient<Channel>,
     sandbox_id: &str,
     execution_id: &str,
     cmd: &[&str],
@@ -829,7 +837,7 @@ async fn start_execution(
 
 /// Attaches to an execution's stdout from `stdout_offset`.
 async fn attach(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxProcessServiceClient<Channel>,
     sandbox_id: &str,
     execution_id: &str,
     stdout_offset: u64,
@@ -848,7 +856,7 @@ async fn attach(
 
 /// Attaches from offset 0 and drains stdout until the execution exits.
 async fn collect_output(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxProcessServiceClient<Channel>,
     sandbox_id: &str,
     execution_id: &str,
 ) -> Result<(String, Execution)> {
@@ -876,7 +884,7 @@ async fn collect_output(
 /// Runs a command via the execution API and returns stdout, asserting a
 /// zero exit code.
 async fn run_and_collect(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxProcessServiceClient<Channel>,
     id: &str,
     cmd: &[&str],
 ) -> Result<String> {
@@ -899,7 +907,7 @@ async fn run_and_collect(
 }
 
 async fn write_file(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxFilesystemServiceClient<Channel>,
     id: &str,
     path: &str,
     data: &[u8],
@@ -934,7 +942,7 @@ async fn write_file(
 }
 
 async fn read_file(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &mut SandboxFilesystemServiceClient<Channel>,
     id: &str,
     path: &str,
 ) -> Result<Vec<u8>> {

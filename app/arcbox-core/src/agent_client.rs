@@ -26,9 +26,11 @@ use arcbox_protocol::sandbox_v1::{
     GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, ReadFileRequest, RemoveSandboxRequest,
     ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent, SandboxEventsRequest,
-    SandboxInfo, SandboxPortForwardRemoveRequest, SandboxPortForwardRequest,
-    SandboxPortForwardResponse, SignalExecutionRequest, StartExecutionRequest, StdinStatus,
-    StopSandboxRequest, WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
+    SandboxInfo, SignalExecutionRequest, StartExecutionRequest, StdinStatus, StopSandboxRequest,
+    WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
+};
+use arcbox_protocol::v1::{
+    SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SandboxPortForwardResponse,
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};

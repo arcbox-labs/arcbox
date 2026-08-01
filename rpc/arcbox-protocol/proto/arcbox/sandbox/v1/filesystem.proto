@@ -1,0 +1,65 @@
+// Sandbox filesystem data plane.
+//
+// File transfer in and out of a running sandbox. **Data plane**: the calls
+// carry file bytes and address one specific sandbox, so they are served by
+// whatever is co-located with it rather than routed through the
+// control-plane entry point. See `sandbox.proto` for the control plane.
+//
+// Directory operations (stat, list, mkdir, move, remove, watch) are not here
+// yet — the surface is whole-file-only in V1 (CORE-62).
+
+syntax = "proto3";
+
+package arcbox.sandbox.v1;
+
+import "google/protobuf/empty.proto";
+
+// SandboxFilesystemService moves files in and out of a sandbox.
+service SandboxFilesystemService {
+    // Read a file from inside a sandbox as a stream of chunks.
+    // The final chunk has done == true. The sandbox must be alive
+    // (READY or RUNNING). Limited to 256 MiB per file. Servers may emit
+    // empty non-final chunks as keepalives.
+    rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+
+    // Write a file into a sandbox. The first message must carry `open`;
+    // subsequent messages stream `chunk` payloads, the last one with
+    // done == true. Limited to 256 MiB per file.
+    rpc WriteFile(stream WriteFileRequest) returns (google.protobuf.Empty);
+}
+
+// Request to read a file from a sandbox.
+message ReadFileRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute path inside the sandbox rootfs.
+    string path = 2;
+}
+
+// One chunk of file data in a ReadFile / WriteFile stream.
+message FileChunk {
+    // Raw bytes (may be empty on the final chunk, or on a keepalive).
+    bytes data = 1;
+    // True on the last chunk of the stream.
+    bool done = 2;
+}
+
+// Opens a WriteFile stream. Must be the first WriteFileRequest message.
+message WriteFileOpen {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute destination path inside the sandbox rootfs.
+    string path = 2;
+    // Unix permission bits for the created file (0 = 0644).
+    uint32 mode = 3;
+}
+
+// A single client message in a WriteFile stream.
+message WriteFileRequest {
+    oneof payload {
+        // Stream header — sandbox, path, and mode.
+        WriteFileOpen open = 1;
+        // File content chunk; the last one has done == true.
+        FileChunk chunk = 2;
+    }
+}

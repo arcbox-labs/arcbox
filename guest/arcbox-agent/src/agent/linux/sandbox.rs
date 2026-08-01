@@ -21,11 +21,14 @@ fn port_forwards() -> &'static Mutex<PortForwardManager> {
     MANAGER.get_or_init(|| Mutex::new(PortForwardManager::default()))
 }
 
-/// Map the wire protocol enum onto the forwarder's protocol
+/// Map the host↔guest wire protocol enum onto the forwarder's protocol
 /// (`UNSPECIFIED` defaults to TCP).
-fn wire_protocol(protocol: arcbox_protocol::sandbox_v1::PortProtocol) -> Protocol {
+///
+/// This is the vsock payload's own enum, not the published sandbox
+/// contract's — the two are deliberately separate (CORE-57).
+fn wire_protocol(protocol: arcbox_protocol::v1::SandboxPortProtocol) -> Protocol {
     match protocol {
-        arcbox_protocol::sandbox_v1::PortProtocol::Udp => Protocol::Udp,
+        arcbox_protocol::v1::SandboxPortProtocol::Udp => Protocol::Udp,
         _ => Protocol::Tcp,
     }
 }
@@ -393,7 +396,7 @@ async fn handle_port_forward<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    use arcbox_protocol::sandbox_v1::{SandboxPortForwardRequest, SandboxPortForwardResponse};
+    use arcbox_protocol::v1::{SandboxPortForwardRequest, SandboxPortForwardResponse};
 
     let (req, sandbox_port, protocol) = match SandboxPortForwardRequest::decode(payload)
         .map_err(|e| format!("decode error: {e}"))
@@ -457,7 +460,7 @@ async fn handle_port_forward_remove<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    use arcbox_protocol::sandbox_v1::SandboxPortForwardRemoveRequest;
+    use arcbox_protocol::v1::SandboxPortForwardRemoveRequest;
 
     let (req, sandbox_port, protocol) = match SandboxPortForwardRemoveRequest::decode(payload)
         .map_err(|e| format!("decode error: {e}"))

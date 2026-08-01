@@ -484,3 +484,48 @@ message EnsureNfsExportResponse {
     // threads started).
     repeated string notes = 1;
 }
+
+// --- Sandbox port forwarding (host↔guest vsock only) ---
+//
+// These are host↔guest wire messages, not part of the sandbox product API:
+// the daemon asks the guest agent to install or remove a DNAT rule while
+// serving `arcbox.sandbox.v1.SandboxService.ExposePort`. They live here,
+// with the other agent wire payloads, so nothing vsock-only ships in the
+// published sandbox contract (CORE-57).
+
+// Transport protocol of a forwarded sandbox port.
+//
+// Deliberately separate from `arcbox.sandbox.v1.PortProtocol`: the public
+// contract must not be imported by the internal wire, or the two evolve
+// together by accident.
+enum SandboxPortProtocol {
+    SANDBOX_PORT_PROTOCOL_UNSPECIFIED = 0;
+    SANDBOX_PORT_PROTOCOL_TCP = 1;
+    SANDBOX_PORT_PROTOCOL_UDP = 2;
+}
+
+// Ask the guest agent to DNAT a reserved guest port to a sandbox port.
+message SandboxPortForwardRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Destination port inside the sandbox.
+    uint32 sandbox_port = 2;
+    // Transport protocol (UNSPECIFIED = TCP).
+    SandboxPortProtocol protocol = 3;
+}
+
+// Guest agent's answer: the allocated reserved-range guest port.
+message SandboxPortForwardResponse {
+    // Guest port now DNATed to the sandbox.
+    uint32 guest_port = 1;
+}
+
+// Ask the guest agent to remove a DNAT mapping.
+message SandboxPortForwardRemoveRequest {
+    // Sandbox ID.
+    string id = 1;
+    // The sandbox port previously forwarded.
+    uint32 sandbox_port = 2;
+    // Transport protocol (UNSPECIFIED = TCP).
+    SandboxPortProtocol protocol = 3;
+}

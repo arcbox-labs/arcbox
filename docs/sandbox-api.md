@@ -8,9 +8,26 @@ for SDK authors and frontend clients. Executions are addressable and
 resumable: a process's identity, output offsets, and stdin offsets all
 outlive any single connection (CORE-55).
 
-Proto source of truth: `rpc/arcbox-protocol/proto/sandbox.proto`
-(package `sandbox.v1`). Server implementation:
-`app/arcbox-api/src/grpc/{sandbox,snapshot}.rs`.
+Proto source of truth: `rpc/arcbox-protocol/proto/arcbox/sandbox/v1/`
+(package `arcbox.sandbox.v1`), split along the control-plane / data-plane
+seam (CORE-57):
+
+| File | Service | Plane |
+|---|---|---|
+| `sandbox.proto` | `SandboxService` | control — lifecycle, events, published ports |
+| `process.proto` | `SandboxProcessService` | data — executions |
+| `filesystem.proto` | `SandboxFilesystemService` | data — file transfer |
+| `snapshot.proto` | `SandboxSnapshotService` | checkpoint / restore |
+
+The split is what lets a deployment put the two planes in different places:
+control-plane calls address a fleet and can be served by a multi-tenant
+front door, while data-plane calls carry a specific sandbox's stdio and
+file bytes and are served by whatever is co-located with it. Locally the
+daemon serves all four on the same socket, so a client may hold one
+channel and four stubs.
+
+Server implementation: `app/arcbox-api/src/grpc/sandbox/` (one module per
+service) and `.../grpc/snapshot.rs`.
 
 For the end-user CLI feature built on this API — running a coding agent in a
 sandbox — see [agent-sandbox.md](agent-sandbox.md).
@@ -40,12 +57,12 @@ message (`/dev/kvm` is absent in the guest).
   ```console
   $ grpcurl -unix -plaintext ~/.arcbox/run/arcbox.sock list
   $ grpcurl -unix -plaintext -d '{}' \
-        ~/.arcbox/run/arcbox.sock sandbox.v1.SandboxService/List
+        ~/.arcbox/run/arcbox.sock arcbox.sandbox.v1.SandboxService/List
   ```
 
 ## Proto stability
 
-`sandbox.v1` is **pre-release**: it is being redesigned contract-first
+`arcbox.sandbox.v1` is **pre-release**: it is being redesigned contract-first
 under CORE-52 (the execution API below is the CORE-55/56 shape) and is
 exempted from the CI `buf breaking` gate until it ships in a public SDK
 (`rpc/arcbox-protocol/proto/buf.yaml`). Every other proto in the

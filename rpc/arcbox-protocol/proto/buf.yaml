@@ -8,6 +8,10 @@ breaking:
     - FILE
   ignore:
     # Pre-release surface being redesigned contract-first under CORE-52
-    # (Sandbox SDK); CORE-55/56 intentionally break it. Remove this
+    # (Sandbox SDK); CORE-54/55/56 intentionally break it. Remove this
     # exemption once the sandbox API ships in a public SDK.
+    - arcbox/sandbox/v1
+    # The flat file this replaced (CORE-57 moved it into the package
+    # directory above). Kept so the gate does not read its deletion as a
+    # break; drop it once master no longer has it.
     - sandbox.proto

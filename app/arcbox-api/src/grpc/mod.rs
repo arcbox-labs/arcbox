@@ -20,7 +20,7 @@ pub use kubernetes::KubernetesServiceImpl;
 pub use machine::MachineServiceImpl;
 #[cfg(target_os = "macos")]
 pub use macos::MacosServiceImpl;
-pub use sandbox::SandboxServiceImpl;
+pub use sandbox::{SandboxFilesystemServiceImpl, SandboxProcessServiceImpl, SandboxServiceImpl};
 pub use snapshot::SandboxSnapshotServiceImpl;
 pub use stats::StatsServiceImpl;
 

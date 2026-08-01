@@ -181,7 +181,7 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     let env = collect_env(def, std::env::vars())?;
 
     let channel = sandbox_channel().await?;
-    let mut client = SandboxServiceClient::new(channel);
+    let mut client = SandboxServiceClient::new(channel.clone());
 
     let existing = inspect(&mut client, &id).await?;
     match plan_action(existing.as_ref().map(SandboxInfo::state)) {
@@ -224,7 +224,7 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let exit_code = exec_session(&mut client, start).await?;
+    let exit_code = exec_session(channel, start).await?;
 
     eprintln!(
         "\nSandbox '{id}' is still running: reopen with `abctl {}`, copy work out with \

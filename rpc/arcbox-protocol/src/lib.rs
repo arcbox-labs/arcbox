@@ -38,7 +38,7 @@ mod generated;
 pub use generated::arcbox_v1 as v1;
 
 // Re-export the sandbox.v1 generated module.
-pub use generated::sandbox_v1;
+pub use generated::arcbox_sandbox_v1 as sandbox_v1;
 
 // Well-known types (google.protobuf.Timestamp / Empty) are generated against
 // pbjson-types (see build.rs); re-export the crate so consumers construct

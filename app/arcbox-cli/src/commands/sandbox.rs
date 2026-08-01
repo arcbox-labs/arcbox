@@ -5,7 +5,10 @@
 
 use anyhow::{Context, Result};
 use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
-use arcbox_grpc::{SandboxServiceClient, SandboxSnapshotServiceClient};
+use arcbox_grpc::{
+    SandboxFilesystemServiceClient, SandboxProcessServiceClient, SandboxServiceClient,
+    SandboxSnapshotServiceClient,
+};
 use arcbox_protocol::pbjson_types::Timestamp;
 use arcbox_protocol::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, DeleteSnapshotRequest,
@@ -619,7 +622,6 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
 
 async fn execute_run(args: RunArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
-    let mut client = SandboxServiceClient::new(channel);
 
     let start = StartExecutionRequest {
         sandbox_id: args.id,
@@ -631,7 +633,7 @@ async fn execute_run(args: RunArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let exit_code = exec_session(&mut client, start).await?;
+    let exit_code = exec_session(channel, start).await?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -640,7 +642,6 @@ async fn execute_run(args: RunArgs) -> Result<()> {
 
 async fn execute_exec(args: ExecArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
-    let mut client = SandboxServiceClient::new(channel);
 
     let start = StartExecutionRequest {
         sandbox_id: args.id,
@@ -652,7 +653,7 @@ async fn execute_exec(args: ExecArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let exit_code = exec_session(&mut client, start).await?;
+    let exit_code = exec_session(channel, start).await?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -677,9 +678,13 @@ pub(super) fn current_tty_size(tty: bool) -> Option<ProtoTerminalSize> {
 /// requested) the offset-tracked WriteStdin pump. Callers decide what an exit
 /// code means — nothing here terminates the process.
 pub(super) async fn exec_session(
-    client: &mut SandboxServiceClient<Channel>,
+    channel: Channel,
     mut start: StartExecutionRequest,
 ) -> Result<i32> {
+    // Executions are the data plane (CORE-57): a separate service from the
+    // lifecycle calls, so this builds its own client rather than borrowing
+    // the caller's control-plane one.
+    let mut client = SandboxProcessServiceClient::new(channel);
     let tty = start.tty;
     let stdin = start.stdin;
     let sandbox_id = start.sandbox_id.clone();
@@ -1060,7 +1065,7 @@ fn parse_cp_endpoint(spec: &str) -> CpEndpoint {
 
 async fn execute_cp(args: CpArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
-    let mut client = SandboxServiceClient::new(channel);
+    let mut client = SandboxFilesystemServiceClient::new(channel);
 
     match (parse_cp_endpoint(&args.src), parse_cp_endpoint(&args.dst)) {
         (CpEndpoint::Local(src), CpEndpoint::Sandbox { id, path }) => {

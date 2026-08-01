@@ -28,7 +28,10 @@ fn main() {
         "proto/agent.proto",
         "proto/api.proto",
         "proto/kubernetes.proto",
-        "proto/sandbox.proto",
+        "proto/arcbox/sandbox/v1/sandbox.proto",
+        "proto/arcbox/sandbox/v1/process.proto",
+        "proto/arcbox/sandbox/v1/filesystem.proto",
+        "proto/arcbox/sandbox/v1/snapshot.proto",
         "proto/stats.proto",
     ];
 
@@ -61,7 +64,7 @@ fn main() {
     // Format generated code so `cargo fmt --check` stays clean.
     let generated_file = out_dir.join("arcbox.v1.rs");
     let _ = Command::new("rustfmt").arg(&generated_file).status();
-    let generated_file = out_dir.join("sandbox.v1.rs");
+    let generated_file = out_dir.join("arcbox.sandbox.v1.rs");
     let _ = Command::new("rustfmt").arg(&generated_file).status();
 
     // Tell cargo to recompile if any proto file changes.
