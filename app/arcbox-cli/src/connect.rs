@@ -41,6 +41,31 @@ pub fn daemon(socket: &Path) -> (SharedHttp2Connection, ClientConfig) {
     (transport, config)
 }
 
+/// Builds a Connect request from its prost twin.
+///
+/// The two representations come from the same `.proto` and encode identical
+/// bytes, so this is a re-encode rather than a field-by-field mapping — the
+/// same argument as the daemon's own bridge. It lets each command keep
+/// building requests from the prost types its argument parsing already
+/// produces, including enum discriminants.
+///
+/// # Errors
+///
+/// Returns an error if the bytes do not decode as `B`, which would mean the
+/// two generated representations disagree — a build fault, not a user one.
+pub fn request<B, P>(msg: &P) -> Result<B>
+where
+    B: buffa::Message + Default,
+    P: prost::Message,
+{
+    B::decode_from_slice(&msg.encode_to_vec()).with_context(|| {
+        format!(
+            "daemon request did not encode as {}",
+            std::any::type_name::<B>()
+        )
+    })
+}
+
 /// Reads a Connect response back as its prost twin.
 ///
 /// The response arrives as a zero-copy view over the wire bytes; this
@@ -63,6 +88,34 @@ impl<V: buffa::view::MessageView<'static>> UnaryExt for UnaryResponse<OwnedView<
         P::decode(self.into_view().bytes().clone()).with_context(|| {
             format!(
                 "daemon response did not decode as {}",
+                std::any::type_name::<P>()
+            )
+        })
+    }
+}
+
+/// The same crossing for one item of a server stream.
+///
+/// Streaming items arrive as views over retained wire bytes, exactly as
+/// unary responses do, so progress-rendering code keeps working on the
+/// prost types it already matches on.
+pub trait StreamItemExt {
+    /// The prost message this item's bytes decode as.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes do not decode as `P`.
+    fn prost<P: prost::Message + Default>(&self) -> Result<P>;
+}
+
+impl<M> StreamItemExt for connectrpc::StreamMessage<M>
+where
+    M: buffa::Message + connectrpc::HasMessageView,
+{
+    fn prost<P: prost::Message + Default>(&self) -> Result<P> {
+        P::decode(self.bytes().clone()).with_context(|| {
+            format!(
+                "daemon stream item did not decode as {}",
                 std::any::type_name::<P>()
             )
         })

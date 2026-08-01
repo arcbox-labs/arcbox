@@ -4,7 +4,8 @@
 //! gRPC service for importing local Docker Desktop and OrbStack workloads.
 
 use anyhow::{Context, Result, bail};
-use arcbox_grpc::v1::migration_service_client::MigrationServiceClient;
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::MigrationServiceClient;
 use arcbox_protocol::v1::{
     PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
@@ -12,9 +13,8 @@ use clap::{Args, Subcommand};
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use tonic::transport::{Channel, Endpoint};
 
-use super::machine::UnixConnector;
+use crate::connect::{self, StreamItemExt as _, UnaryExt as _};
 
 /// Runtime migration commands.
 #[derive(Subcommand)]
@@ -74,20 +74,9 @@ impl MigrationSourceKind {
     }
 }
 
-async fn migration_client() -> Result<MigrationServiceClient<Channel>> {
-    let socket_path = super::resolve_grpc_socket_path();
-
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-
-    Ok(MigrationServiceClient::new(channel))
+fn migration_client() -> MigrationServiceClient<connectrpc::client::SharedHttp2Connection> {
+    let (transport, config) = connect::daemon(&super::resolve_grpc_socket_path());
+    MigrationServiceClient::new(transport, config)
 }
 
 /// Executes a runtime migration subcommand.
@@ -111,16 +100,18 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
 
     println!("Preparing migration from {}...", source_kind.display_name());
 
-    let mut client = migration_client().await?;
+    let client = migration_client();
     let prepare = client
-        .prepare_migration(tonic::Request::new(PrepareMigrationRequest {
-            source_kind: source_kind.as_str().to_string(),
-            source_socket_path: source_socket.to_string_lossy().into_owned(),
-            allow_replacements: true,
-        }))
+        .prepare_migration(connect::request::<pb::PrepareMigrationRequest, _>(
+            &PrepareMigrationRequest {
+                source_kind: source_kind.as_str().to_string(),
+                source_socket_path: source_socket.to_string_lossy().into_owned(),
+                allow_replacements: true,
+            },
+        )?)
         .await
         .context("Failed to prepare migration")?
-        .into_inner();
+        .prost::<PrepareMigrationResponse>()?;
 
     if prepare.plan_id.is_empty() {
         bail!("Migration prepare response did not include a plan ID");
@@ -141,23 +132,25 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
     println!("Running migration...");
 
     let mut stream = client
-        .run_migration(tonic::Request::new(RunMigrationRequest {
-            plan_id: prepare.plan_id.clone(),
-            // We only reach this point after the user has explicitly confirmed
-            // (either via interactive prompt or --yes), so allow both
-            // replacements and stopping blocker containers.
-            allow_replacements: true,
-        }))
+        .run_migration(connect::request::<pb::RunMigrationRequest, _>(
+            &RunMigrationRequest {
+                plan_id: prepare.plan_id.clone(),
+                // We only reach this point after the user has explicitly confirmed
+                // (either via interactive prompt or --yes), so allow both
+                // replacements and stopping blocker containers.
+                allow_replacements: true,
+            },
+        )?)
         .await
-        .context("Failed to start migration")?
-        .into_inner();
+        .context("Failed to start migration")?;
 
     let mut final_status = None;
-    while let Some(event) = stream
-        .message()
+    while let Some(item) = stream
+        .message::<pb::RunMigrationEvent>()
         .await
         .context("Failed to read migration progress")?
     {
+        let event: RunMigrationEvent = item.prost()?;
         print_progress_event(&event);
         if event.done {
             final_status = Some(event.success);

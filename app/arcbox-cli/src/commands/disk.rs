@@ -141,11 +141,14 @@ async fn execute_compact() -> Result<()> {
     // through virtio-blk, which punches holes in this sparse image, so the
     // physical footprint we re-stat below shrinks by the freed amount.
     println!("Compacting Docker data disk (running fstrim in the guest)...");
-    let mut client = super::machine::machine_client().await?;
+    let client = super::machine::machine_client();
     client
-        .compact_disk(tonic::Request::new(MachineAgentRequest {
+        .compact_disk(crate::connect::request::<
+            arcbox_connect::v1::MachineAgentRequest,
+            _,
+        >(&MachineAgentRequest {
             id: DEFAULT_MACHINE.to_string(),
-        }))
+        })?)
         .await
         .context("Failed to compact data disk via the daemon")?;
 

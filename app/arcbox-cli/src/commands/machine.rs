@@ -1,8 +1,10 @@
 //! Machine management commands.
 
+use crate::connect::{StreamItemExt as _, UnaryExt as _};
 use anyhow::{Context, Result};
 use arcbox_cli::terminal::{RawModeGuard, TerminalSize};
-use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::MachineServiceClient;
 use arcbox_protocol::v1::TerminalSize as ProtoTerminalSize;
 use arcbox_protocol::v1::{
     CreateMachineRequest, DirectoryMount, InspectMachineRequest, ListMachinesRequest,
@@ -11,7 +13,6 @@ use arcbox_protocol::v1::{
 };
 use clap::{Args, Subcommand};
 use humantime::format_duration;
-use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
@@ -21,24 +22,6 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::codegen::{Service, http::Uri};
-use tonic::transport::{Channel, Endpoint};
-
-pub async fn machine_client() -> Result<MachineServiceClient<Channel>> {
-    let socket_path = super::resolve_grpc_socket_path();
-
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-
-    Ok(MachineServiceClient::new(channel))
-}
 
 pub struct UnixConnector {
     socket_path: PathBuf,
@@ -50,8 +33,8 @@ impl UnixConnector {
     }
 }
 
-impl Service<Uri> for UnixConnector {
-    type Response = TokioIo<UnixStream>;
+impl tonic::codegen::Service<tonic::transport::Uri> for UnixConnector {
+    type Response = hyper_util::rt::TokioIo<UnixStream>;
     type Error = std::io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -59,24 +42,55 @@ impl Service<Uri> for UnixConnector {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: Uri) -> Self::Future {
+    fn call(&mut self, _: tonic::transport::Uri) -> Self::Future {
         let socket_path = self.socket_path.clone();
         Box::pin(async move {
             let stream = UnixStream::connect(socket_path).await?;
-            Ok(TokioIo::new(stream))
+            Ok(hyper_util::rt::TokioIo::new(stream))
         })
     }
 }
 
+/// A tonic client, kept only for the interactive exec session.
+///
+/// See the call site in [`exec_session`] for why that one RPC cannot use the
+/// Connect client yet. The daemon serves both formats at the same endpoint,
+/// so this reaches identical handlers.
+async fn legacy_machine_client()
+-> Result<arcbox_grpc::v1::machine_service_client::MachineServiceClient<tonic::transport::Channel>>
+{
+    let socket_path = super::resolve_grpc_socket_path();
+    let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(UnixConnector::new(socket_path.clone()))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect to the ArcBox daemon at {}",
+                socket_path.display()
+            )
+        })?;
+    Ok(arcbox_grpc::v1::machine_service_client::MachineServiceClient::new(channel))
+}
+
+pub fn machine_client() -> MachineServiceClient<connectrpc::client::SharedHttp2Connection> {
+    let (transport, config) = crate::connect::daemon(&super::resolve_grpc_socket_path());
+    MachineServiceClient::new(transport, config)
+}
+
 /// Returns the number of machines visible through the daemon gRPC API.
 pub async fn machine_count() -> Result<usize> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let response = client
-        .list(tonic::Request::new(ListMachinesRequest { all: true }))
+        .list(crate::connect::request::<pb::ListMachinesRequest, _>(
+            &ListMachinesRequest { all: true },
+        )?)
         .await
         .context("Failed to list machines")?;
 
-    Ok(response.into_inner().machines.len())
+    Ok(response
+        .prost::<arcbox_protocol::v1::ListMachinesResponse>()?
+        .machines
+        .len())
 }
 
 fn parse_mount(mount: &str) -> Result<DirectoryMount> {
@@ -256,7 +270,7 @@ pub async fn execute(cmd: MachineCommands) -> Result<()> {
 }
 
 async fn execute_create(args: CreateArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let mounts = args
         .mount
         .iter()
@@ -264,20 +278,22 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     client
-        .create(tonic::Request::new(CreateMachineRequest {
-            name: args.name.clone(),
-            // 0 = let the daemon apply its default (host core count).
-            cpus: args.cpus.unwrap_or(0),
-            memory: args.memory.saturating_mul(1024_u64 * 1024),
-            disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
-            distro: args.distro.clone().unwrap_or_default(),
-            version: args.distro_version.clone().unwrap_or_default(),
-            arch: std::env::consts::ARCH.to_string(),
-            mounts,
-            ssh_public_key: String::new(),
-            kernel: args.kernel.clone().unwrap_or_default(),
-            cmdline: args.cmdline.clone().unwrap_or_default(),
-        }))
+        .create(crate::connect::request::<pb::CreateMachineRequest, _>(
+            &CreateMachineRequest {
+                name: args.name.clone(),
+                // 0 = let the daemon apply its default (host core count).
+                cpus: args.cpus.unwrap_or(0),
+                memory: args.memory.saturating_mul(1024_u64 * 1024),
+                disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
+                distro: args.distro.clone().unwrap_or_default(),
+                version: args.distro_version.clone().unwrap_or_default(),
+                arch: std::env::consts::ARCH.to_string(),
+                mounts,
+                ssh_public_key: String::new(),
+                kernel: args.kernel.clone().unwrap_or_default(),
+                cmdline: args.cmdline.clone().unwrap_or_default(),
+            },
+        )?)
         .await
         .context("Failed to create machine")?;
 
@@ -296,14 +312,16 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
 }
 
 async fn execute_start(args: StartArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
 
     println!("Starting machine '{}'...", args.name);
 
     client
-        .start(tonic::Request::new(StartMachineRequest {
-            id: args.name.clone(),
-        }))
+        .start(crate::connect::request::<pb::StartMachineRequest, _>(
+            &StartMachineRequest {
+                id: args.name.clone(),
+            },
+        )?)
         .await
         .context("Failed to start machine")?;
 
@@ -311,9 +329,11 @@ async fn execute_start(args: StartArgs) -> Result<()> {
     let mut delay = std::time::Duration::from_millis(200);
     for attempt in 1..=MAX_AGENT_WAIT_ATTEMPTS {
         match client
-            .ping(tonic::Request::new(MachineAgentRequest {
-                id: args.name.clone(),
-            }))
+            .ping(crate::connect::request::<pb::MachineAgentRequest, _>(
+                &MachineAgentRequest {
+                    id: args.name.clone(),
+                },
+            )?)
             .await
         {
             Ok(_) => break,
@@ -330,12 +350,14 @@ async fn execute_start(args: StartArgs) -> Result<()> {
 
     println!("Machine '{}' started", args.name);
     if let Ok(resp) = client
-        .inspect(tonic::Request::new(InspectMachineRequest {
-            id: args.name.clone(),
-        }))
+        .inspect(crate::connect::request::<pb::InspectMachineRequest, _>(
+            &InspectMachineRequest {
+                id: args.name.clone(),
+            },
+        )?)
         .await
     {
-        if let Some(network) = resp.into_inner().network {
+        if let Some(network) = resp.prost::<arcbox_protocol::v1::MachineInfo>()?.network {
             if !network.ip_address.is_empty() {
                 println!("IP:      {}", network.ip_address);
             }
@@ -346,15 +368,17 @@ async fn execute_start(args: StartArgs) -> Result<()> {
 }
 
 async fn execute_stop(args: StopArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
 
     println!("Stopping machine '{}'...", args.name);
 
     client
-        .stop(tonic::Request::new(StopMachineRequest {
-            id: args.name.clone(),
-            force: args.force,
-        }))
+        .stop(crate::connect::request::<pb::StopMachineRequest, _>(
+            &StopMachineRequest {
+                id: args.name.clone(),
+                force: args.force,
+            },
+        )?)
         .await
         .context("Failed to stop machine")?;
 
@@ -364,16 +388,18 @@ async fn execute_stop(args: StopArgs) -> Result<()> {
 }
 
 async fn execute_remove(args: RemoveArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
 
     client
-        .remove(tonic::Request::new(RemoveMachineRequest {
-            id: args.name.clone(),
-            force: args.force,
-            // Removal always deletes the machine directory; the wire field
-            // is retained for compatibility only.
-            volumes: false,
-        }))
+        .remove(crate::connect::request::<pb::RemoveMachineRequest, _>(
+            &RemoveMachineRequest {
+                id: args.name.clone(),
+                force: args.force,
+                // Removal always deletes the machine directory; the wire field
+                // is retained for compatibility only.
+                volumes: false,
+            },
+        )?)
         .await
         .context("Failed to remove machine")?;
 
@@ -383,12 +409,14 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
 }
 
 async fn execute_list(args: ListArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let machines = client
-        .list(tonic::Request::new(ListMachinesRequest { all: args.all }))
+        .list(crate::connect::request::<pb::ListMachinesRequest, _>(
+            &ListMachinesRequest { all: args.all },
+        )?)
         .await
         .context("Failed to list machines")?
-        .into_inner()
+        .prost::<arcbox_protocol::v1::ListMachinesResponse>()?
         .machines;
 
     if args.quiet {
@@ -436,14 +464,16 @@ async fn execute_list(args: ListArgs) -> Result<()> {
 }
 
 async fn execute_status(args: StatusArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let machine = client
-        .inspect(tonic::Request::new(InspectMachineRequest {
-            id: args.name.clone(),
-        }))
+        .inspect(crate::connect::request::<pb::InspectMachineRequest, _>(
+            &InspectMachineRequest {
+                id: args.name.clone(),
+            },
+        )?)
         .await
         .context("Failed to get machine status")?
-        .into_inner();
+        .prost::<arcbox_protocol::v1::MachineInfo>()?;
 
     let cpus = machine.hardware.as_ref().map_or(0, |h| h.cpus);
     let memory_mb = machine
@@ -473,14 +503,16 @@ async fn execute_status(args: StatusArgs) -> Result<()> {
 }
 
 async fn execute_inspect(args: InspectArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let machine = client
-        .inspect(tonic::Request::new(InspectMachineRequest {
-            id: args.name.clone(),
-        }))
+        .inspect(crate::connect::request::<pb::InspectMachineRequest, _>(
+            &InspectMachineRequest {
+                id: args.name.clone(),
+            },
+        )?)
         .await
         .context("Failed to inspect machine")?
-        .into_inner();
+        .prost::<arcbox_protocol::v1::MachineInfo>()?;
 
     let payload = serde_json::json!({
         "id": machine.id,
@@ -504,15 +536,17 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
 }
 
 async fn execute_ping(args: PingArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let started = std::time::Instant::now();
     let response = client
-        .ping(tonic::Request::new(MachineAgentRequest {
-            id: args.name.clone(),
-        }))
+        .ping(crate::connect::request::<pb::MachineAgentRequest, _>(
+            &MachineAgentRequest {
+                id: args.name.clone(),
+            },
+        )?)
         .await
         .context("Failed to ping agent")?
-        .into_inner();
+        .prost::<arcbox_protocol::v1::MachinePingResponse>()?;
     let elapsed = started.elapsed();
 
     println!(
@@ -525,14 +559,16 @@ async fn execute_ping(args: PingArgs) -> Result<()> {
 }
 
 async fn execute_info(args: InfoArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let info = client
-        .get_system_info(tonic::Request::new(MachineAgentRequest {
-            id: args.name.clone(),
-        }))
+        .get_system_info(crate::connect::request::<pb::MachineAgentRequest, _>(
+            &MachineAgentRequest {
+                id: args.name.clone(),
+            },
+        )?)
         .await
         .context("Failed to get system info")?
-        .into_inner();
+        .prost::<arcbox_protocol::v1::MachineSystemInfo>()?;
 
     let total_mb = info.total_memory / 1024 / 1024;
     let available_mb = info.available_memory / 1024 / 1024;
@@ -566,8 +602,6 @@ async fn execute_ssh(args: SshArgs) -> Result<()> {
 /// Runs an interactive PTY session in a machine: local terminal in raw mode,
 /// stdin and SIGWINCH resizes pumped up, merged PTY output written to stdout.
 async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
-    let mut client = machine_client().await?;
-
     let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<MachineExecInput>(16);
 
     let tty_size = TerminalSize::current().ok().map(|s| ProtoTerminalSize {
@@ -635,7 +669,13 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
         }
     });
 
-    let mut stream = client
+    // The one call still on tonic. `connectrpc::client::BidiStream` takes
+    // `&mut self` for both `send` and `message` and exposes no split, so a
+    // bidi stream cannot be driven from both directions at once — which is
+    // exactly what an interactive PTY needs. Everything else in the CLI has
+    // moved; this waits on a split (or an owned sender) upstream.
+    let mut stream = legacy_machine_client()
+        .await?
         .exec_session(tonic::Request::new(ReceiverStream::new(msg_rx)))
         .await
         .context("Failed to open machine exec session")?
@@ -684,27 +724,29 @@ async fn exec_via_grpc(
     env: HashMap<String, String>,
     tty: bool,
 ) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let mut stream = client
-        .exec(tonic::Request::new(MachineExecRequest {
-            id: name.to_string(),
-            cmd,
-            working_dir: String::new(),
-            user: String::new(),
-            env,
-            tty,
-            tty_size: None,
-        }))
+        .exec(crate::connect::request::<pb::MachineExecRequest, _>(
+            &MachineExecRequest {
+                id: name.to_string(),
+                cmd,
+                working_dir: String::new(),
+                user: String::new(),
+                env,
+                tty,
+                tty_size: None,
+            },
+        )?)
         .await
-        .context("Failed to execute command in machine")?
-        .into_inner();
+        .context("Failed to execute command in machine")?;
 
     let mut exit_code = 0i32;
-    while let Some(output) = stream
-        .message()
+    while let Some(item) = stream
+        .message::<pb::MachineExecOutput>()
         .await
         .context("Failed to read exec output")?
     {
+        let output: arcbox_protocol::v1::MachineExecOutput = item.prost()?;
         if !output.data.is_empty() {
             match output.stream.as_str() {
                 "stderr" => {
