@@ -13,11 +13,16 @@ use arcbox_protocol::v1::{
     SystemVmBackendInfo, VcpuDebug, VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug,
     setup_status,
 };
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::grpc::{SharedRuntime, SharedRuntimeExt};
+
+/// Buffered updates per streaming client. Startup publishes on the order of a
+/// dozen; the margin covers a client that stalls briefly mid-boot without
+/// dropping a phase.
+const UPDATE_BUFFER: usize = 64;
 
 /// Shared state tracking daemon startup progress.
 ///
@@ -25,7 +30,17 @@ use crate::grpc::{SharedRuntime, SharedRuntimeExt};
 /// Observed by `SystemServiceImpl` to serve gRPC queries.
 #[derive(Debug, Clone)]
 pub struct SetupState {
+    /// Latest snapshot, for `GetSetupStatus` and for seeding a new stream.
     tx: Arc<watch::Sender<SetupStatus>>,
+    /// Every update, in order.
+    ///
+    /// A `watch` keeps only the newest value, so two updates in quick
+    /// succession collapse into one for a subscriber that has not polled in
+    /// between — and a phase a client never receives is indistinguishable
+    /// from one the daemon never published. `NETWORK_READY` and `READY` are
+    /// ~300 µs apart with no await point between them, so on that pair the
+    /// collapse is a live race rather than a theoretical one.
+    updates: broadcast::Sender<SetupStatus>,
 }
 
 impl SetupState {
@@ -42,22 +57,39 @@ impl SetupState {
             error: String::new(),
         };
         let (tx, _) = watch::channel(initial);
-        Self { tx: Arc::new(tx) }
+        Self {
+            tx: Arc::new(tx),
+            updates: broadcast::channel(UPDATE_BUFFER).0,
+        }
+    }
+
+    /// Applies an update to the snapshot and publishes it to every stream.
+    ///
+    /// The broadcast happens inside `send_modify`, under the write lock, so a
+    /// concurrent publisher cannot interleave the two halves and deliver
+    /// updates in an order the snapshot never passed through — recovery and
+    /// the route loop write flags while startup writes phases.
+    fn publish(&self, update: impl FnOnce(&mut SetupStatus)) {
+        self.tx.send_modify(|status| {
+            update(status);
+            // Fails only when nobody is streaming, which is the common case.
+            let _ = self.updates.send(status.clone());
+        });
     }
 
     /// Updates the current setup phase.
     pub fn set_phase(&self, phase: setup_status::Phase, message: &str) {
-        self.tx.send_modify(|s| {
+        self.publish(|s| {
             s.phase = phase.into();
             message.clone_into(&mut s.message);
         });
     }
 
     /// Marks startup as fatally failed. The daemon exits shortly after;
-    /// the error rides the final watch update so streaming clients learn
+    /// the error rides the final update so streaming clients learn
     /// the cause instead of seeing a bare disconnect.
     pub fn set_failed(&self, error: &str) {
-        self.tx.send_modify(|s| {
+        self.publish(|s| {
             s.phase = setup_status::Phase::Failed.into();
             "Daemon startup failed".clone_into(&mut s.message);
             error.clone_into(&mut s.error);
@@ -66,30 +98,36 @@ impl SetupState {
 
     /// Updates a specific infrastructure flag.
     pub fn set_dns_installed(&self, installed: bool) {
-        self.tx
-            .send_modify(|s| s.dns_resolver_installed = installed);
+        self.publish(|s| s.dns_resolver_installed = installed);
     }
 
     pub fn set_docker_socket_linked(&self, linked: bool) {
-        self.tx.send_modify(|s| s.docker_socket_linked = linked);
+        self.publish(|s| s.docker_socket_linked = linked);
     }
 
     pub fn set_route_installed(&self, installed: bool) {
-        self.tx.send_modify(|s| s.route_installed = installed);
+        self.publish(|s| s.route_installed = installed);
     }
 
     pub fn set_vm_running(&self, running: bool) {
-        self.tx.send_modify(|s| s.vm_running = running);
+        self.publish(|s| s.vm_running = running);
     }
 
     pub fn set_docker_tools_installed(&self, installed: bool) {
-        self.tx
-            .send_modify(|s| s.docker_tools_installed = installed);
+        self.publish(|s| s.docker_tools_installed = installed);
     }
 
-    /// Returns a watch receiver for streaming updates.
-    fn subscribe(&self) -> watch::Receiver<SetupStatus> {
-        self.tx.subscribe()
+    /// Returns the current snapshot plus a receiver for every update after it.
+    ///
+    /// Both are taken while holding the snapshot's read lock, which excludes
+    /// [`Self::publish`]'s write lock. Subscribing after reading the snapshot
+    /// would drop an update landing between the two; reading the snapshot
+    /// after subscribing could replay one already folded into it, walking a
+    /// client's phase backwards.
+    fn subscribe(&self) -> (SetupStatus, broadcast::Receiver<SetupStatus>) {
+        let snapshot = self.tx.borrow();
+        let updates = self.updates.subscribe();
+        (snapshot.clone(), updates)
     }
 
     /// Returns the current status snapshot.
@@ -241,15 +279,21 @@ impl SystemService for SystemServiceImpl {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::WatchSetupStatusStream>, Status> {
-        let mut rx = self.setup_state.subscribe();
+        let (initial, mut updates) = self.setup_state.subscribe();
         let stream = async_stream::stream! {
-            // Send current state immediately.
-            let initial = rx.borrow_and_update().clone();
+            // Send current state immediately, then every update after it.
             yield Ok(initial);
-            // Then stream changes.
-            while rx.changed().await.is_ok() {
-                let status = rx.borrow_and_update().clone();
-                yield Ok(status);
+            loop {
+                match updates.recv().await {
+                    Ok(status) => yield Ok(status),
+                    // Too slow to keep up: the next recv resumes from the
+                    // oldest retained update, so the client stays live and
+                    // converges — it has only missed intermediate phases.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "setup status client lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         };
         Ok(Response::new(Box::pin(stream)))
@@ -353,5 +397,65 @@ impl SystemService for SystemServiceImpl {
         Ok(Response::new(SystemVmBackendInfo {
             backend: backend_to_proto(runtime.system_vm_backend()) as i32,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every update currently buffered for `updates`, as phases.
+    fn drain(updates: &mut broadcast::Receiver<SetupStatus>) -> Vec<setup_status::Phase> {
+        std::iter::from_fn(|| updates.try_recv().ok())
+            .map(|status| status.phase())
+            .collect()
+    }
+
+    /// The regression this exists for: `NETWORK_READY` and `READY` are
+    /// published ~300 µs apart with no await point between them, so a
+    /// snapshot-only channel hands a client just the last one — a phase that
+    /// was published but never observed, which is exactly what CORE-67 set
+    /// out to make impossible.
+    #[test]
+    fn back_to_back_phases_are_all_delivered() {
+        let state = SetupState::new();
+        let (_snapshot, mut updates) = state.subscribe();
+
+        state.set_phase(setup_status::Phase::NetworkReady, "network");
+        state.set_phase(setup_status::Phase::Ready, "ready");
+
+        assert_eq!(
+            drain(&mut updates),
+            [
+                setup_status::Phase::NetworkReady,
+                setup_status::Phase::Ready
+            ]
+        );
+    }
+
+    /// A subscriber's snapshot already folds in every earlier update, so
+    /// replaying one would walk the client's phase backwards.
+    #[test]
+    fn the_snapshot_is_not_replayed_as_an_update() {
+        let state = SetupState::new();
+        state.set_phase(setup_status::Phase::AssetsReady, "assets");
+
+        let (snapshot, mut updates) = state.subscribe();
+
+        assert_eq!(snapshot.phase(), setup_status::Phase::AssetsReady);
+        assert!(drain(&mut updates).is_empty());
+    }
+
+    /// Flags travel the same path as phases: a client watching for the route
+    /// must not have to wait for an unrelated phase change to learn of it.
+    #[test]
+    fn flag_updates_reach_subscribers() {
+        let state = SetupState::new();
+        let (_snapshot, mut updates) = state.subscribe();
+
+        state.set_route_installed(true);
+
+        let update = updates.try_recv().expect("flag update delivered");
+        assert!(update.route_installed);
     }
 }

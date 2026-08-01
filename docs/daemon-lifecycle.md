@@ -49,7 +49,18 @@ startup failure.
   daemon, which boots no guest. `DEGRADED` is reserved and never emitted.
 - A phase the daemon had already left before a client subscribed is never
   observed. Treat a missing phase as unknown, not as zero elapsed and not
-  as a reason to keep waiting — the stream never replays it.
+  as a reason to keep waiting — the stream never replays it. Once
+  subscribed, though, no transition is dropped: `WatchSetupStatus` streams
+  every update rather than the newest snapshot, because `NETWORK_READY` and
+  `READY` are published ~300 µs apart with no await point between them and
+  a snapshot channel would collapse them (see `SetupState` in
+  `arcbox-api/src/system.rs`).
+- `NETWORK_READY` means the host services were *started*, not that they are
+  reachable: `DnsService::bind` propagates its error, but
+  `DockerApiServer::run` binds inside its spawned task and only logs, and
+  the Kubernetes proxy tolerates a taken 16443 by design. A Docker socket
+  that fails to bind therefore still reaches `READY` — a pre-existing gap,
+  not something the phase introduces.
 - Enum ordinal ≠ progression order (`DOWNLOADING_ASSETS = 8` occurs before
   `READY = 6`). Clients must match on the value, never compare ordinals.
   New phases are appended with the next free number regardless of where

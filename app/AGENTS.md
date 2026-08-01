@@ -61,6 +61,24 @@ must name `abctl`.
   dockerd wait lands in the `VM_READY → NETWORK_READY` window. `init`
   reports nothing under `--no-linux-vm`, which is what keeps the VM pair
   off the wire when no guest boots.
+- **`SetupState` streams every update, not the newest snapshot**
+  (`arcbox-api/src/system.rs`: a `watch` for `GetSetupStatus`, a `broadcast`
+  for `WatchSetupStatus`). WHY: `NETWORK_READY` and `READY` are published
+  ~300 µs apart with no await point between them, so a snapshot channel
+  hands a subscriber only `READY` whenever it does not get scheduled in
+  that window — indistinguishable from a phase that was never published,
+  and the exact bug CORE-67 set out to remove. `subscribe` takes the
+  snapshot and the receiver together under the write lock; splitting them
+  either drops an update or replays one already folded in, walking a
+  client's phase backwards. Regressions: `back_to_back_phases_are_all_
+  delivered`, `the_snapshot_is_not_replayed_as_an_update`.
+- `NETWORK_READY` means the host services were *started*, not that they are
+  reachable. `DnsService::bind` propagates its error, but
+  `DockerApiServer::run` binds inside its spawned task and only logs there,
+  and the Kubernetes proxy tolerates a taken 16443 by design — so a Docker
+  socket that fails to bind still reaches `READY`. Pre-existing; if you fix
+  it, bind before returning from `services::start_services` so the failure
+  reaches the pipeline.
 - Startup-cancellation invariant: the flock (`daemon_lock`) and
   `early_runtime` are held in `StartupHandles`, not only in pipeline-local
   context (`context.rs`, `main::run` keeps a clone). WHY: a signal can drop
