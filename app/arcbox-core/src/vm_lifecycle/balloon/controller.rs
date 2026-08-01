@@ -88,7 +88,16 @@ pub(in crate::vm_lifecycle) trait BalloonDeps:
     /// backend requires.
     fn reclaim_capable(&self) -> bool;
 
-    /// Configured full memory of the machine, if the machine record exists.
+    /// Configured full memory of the VM whose balloon can be addressed right
+    /// now, or `None` when there is none — no machine record, or a VM that
+    /// is not running.
+    ///
+    /// `None` is a *terminal* answer, not a transient one: a stopped guest is
+    /// unsqueezed by the stop itself and a fresh boot starts with an empty
+    /// balloon, so nothing is owed. The controller drops any booked shrink on
+    /// it rather than retrying a target that nothing can accept — an
+    /// implementation that reported a stopped VM's size here would spin
+    /// forever on a call the VM layer rejects.
     fn full_memory_bytes(&self) -> Option<u64>;
 
     /// Applies a balloon target on the hypervisor device.
@@ -489,7 +498,10 @@ impl<D: BalloonDeps> BalloonController<D> {
                   keep it booked and retry"]
     fn restore(&mut self, reason: &str) -> bool {
         let Some(full) = self.deps.full_memory_bytes() else {
-            // No machine record: the VM is gone, and so is its balloon.
+            // No addressable balloon: the VM is gone or stopped, so the guest
+            // is already unsqueezed and a fresh boot starts empty. Nothing is
+            // owed — book it as settled instead of retrying forever against a
+            // VM that cannot accept a target.
             self.shrink = None;
             return true;
         };
@@ -548,7 +560,9 @@ mod tests {
         /// Backend reclaim capability (default `true`: the shrink paths
         /// under test assume an HV-class backend).
         reclaim_capable: bool,
-        full: Option<u64>,
+        /// `None` models "no addressable balloon" (VM gone or stopped);
+        /// mutable so a test can stop the VM mid-flight.
+        full: Mutex<Option<u64>>,
         stats: Mutex<Vec<Option<GuestStats>>>,
         /// Injected latency for `guest_stats` (probe-race tests).
         stats_delay: Duration,
@@ -566,7 +580,7 @@ mod tests {
         fn new(full: Option<u64>) -> Self {
             Self {
                 reclaim_capable: true,
-                full,
+                full: Mutex::new(full),
                 stats: Mutex::new(Vec::new()),
                 stats_delay: Duration::ZERO,
                 targets: Arc::new(Mutex::new(Vec::new())),
@@ -602,7 +616,7 @@ mod tests {
         }
 
         fn full_memory_bytes(&self) -> Option<u64> {
-            self.full
+            *self.full.lock().unwrap()
         }
 
         fn set_balloon_target(&self, bytes: u64) -> Result<()> {
@@ -1118,6 +1132,51 @@ mod tests {
             h.targets(),
             vec![FIRST_STEP, FULL],
             "an active guest must not stay squeezed waiting for idle"
+        );
+    }
+
+    /// Review finding (pullfrog): the stranded-shrink retry needs a terminal
+    /// condition. A *stopped* VM keeps its machine record but rejects every
+    /// balloon target, so retrying against it would warn/error every 30 s for
+    /// the daemon's remaining lifetime — a worse shape than the silent
+    /// one-shot failure the retry replaced.
+    #[tokio::test(start_paused = true)]
+    async fn stranded_shrink_stops_retrying_once_the_vm_stops() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        let watch = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+
+        h.deps.fail_set_target.store(true, Ordering::SeqCst);
+        watch.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP], "restore did not land");
+
+        // The VM stops: no balloon left to address.
+        *h.deps.full.lock().unwrap() = None;
+        let attempts_before = h.deps.set_attempts.load(Ordering::SeqCst);
+        tokio::time::advance(STRANDED_RESTORE_RETRY * 4).await;
+        h.settle().await;
+
+        assert_eq!(
+            h.deps.set_attempts.load(Ordering::SeqCst),
+            attempts_before,
+            "a stopped VM cannot accept a target; the retry must terminate"
+        );
+
+        // And the booking is cleared, so a later boot starts clean rather
+        // than inheriting a shrink the new guest never had.
+        *h.deps.full.lock().unwrap() = Some(FULL);
+        h.deps.fail_set_target.store(false, Ordering::SeqCst);
+        tokio::time::advance(STRANDED_RESTORE_RETRY * 2).await;
+        h.settle().await;
+        assert_eq!(
+            h.deps.set_attempts.load(Ordering::SeqCst),
+            attempts_before,
+            "nothing is owed after the stop; no restore should fire"
         );
     }
 

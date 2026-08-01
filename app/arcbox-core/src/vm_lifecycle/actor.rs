@@ -194,10 +194,15 @@ impl BalloonDeps for RealBalloonDeps {
         false
     }
 
+    /// Gated on the machine actually running: `VmManager::set_balloon_target`
+    /// rejects any VM that is not `Running`, and a stopped machine keeps its
+    /// record, so reporting its size here would leave the controller retrying
+    /// a call that can never succeed.
     fn full_memory_bytes(&self) -> Option<u64> {
         self.shared
             .machine_manager
             .get(&self.shared.machine_name)
+            .filter(|info| info.state == crate::machine::MachineState::Running)
             .map(|info| info.memory_mb * 1024 * 1024)
     }
 
