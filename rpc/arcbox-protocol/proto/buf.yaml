@@ -31,3 +31,9 @@ breaking:
     # directory above). Kept so the gate does not read its deletion as a
     # break; drop it once master no longer has it.
     - sandbox.proto
+    # Never files in this repo: with the single pre-split module, buf
+    # materialized the well-known types as image files, and the module
+    # split above stops doing so — which the gate would otherwise read as
+    # deleting them. Drop once master carries the split config.
+    - google/protobuf/empty.proto
+    - google/protobuf/timestamp.proto
