@@ -1,0 +1,18 @@
+[package]
+name = "arcbox-connect"
+description = "Connect RPC surface for the ArcBox sandbox API (connectrpc + buffa)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+buffa = { version = "0.8.1", features = ["json"] }
+buffa-types = { version = "0.8.1", features = ["json"] }
+connectrpc = "0.8.1"
+serde = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+connectrpc-build = "0.8"
