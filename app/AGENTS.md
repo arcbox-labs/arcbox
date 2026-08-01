@@ -72,13 +72,15 @@ must name `abctl`.
   either drops an update or replays one already folded in, walking a
   client's phase backwards. Regressions: `back_to_back_phases_are_all_
   delivered`, `the_snapshot_is_not_replayed_as_an_update`.
-- `NETWORK_READY` means the host services were *started*, not that they are
-  reachable. `DnsService::bind` propagates its error, but
-  `DockerApiServer::run` binds inside its spawned task and only logs there,
-  and the Kubernetes proxy tolerates a taken 16443 by design — so a Docker
-  socket that fails to bind still reaches `READY`. Pre-existing; if you fix
-  it, bind before returning from `services::start_services` so the failure
-  reaches the pipeline.
+- `NETWORK_READY` covers whichever services this daemon runs and means they
+  were *started*, not that they are reachable. `--no-linux-vm` reaches it
+  with DNS alone (`start_services` skips the Docker API and the Kubernetes
+  proxy), and of the three only DNS is guaranteed bound: `DnsService::bind`
+  propagates its error, while `DockerApiServer::run` binds inside its
+  spawned task and only logs there, and the Kubernetes proxy tolerates a
+  taken 16443 by design — so a Docker socket that fails to bind still
+  reaches `READY`. Pre-existing; if you fix it, bind before returning from
+  `services::start_services` so the failure reaches the pipeline.
 - Startup-cancellation invariant: the flock (`daemon_lock`) and
   `early_runtime` are held in `StartupHandles`, not only in pipeline-local
   context (`context.rs`, `main::run` keeps a clone). WHY: a signal can drop
