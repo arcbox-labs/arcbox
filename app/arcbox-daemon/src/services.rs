@@ -53,7 +53,9 @@ pub async fn start_grpc(
     // below. The split along the control/data-plane seam (CORE-57) is
     // preserved: they remain four services a cloud deployment can host in
     // different processes.
-    let sandbox = arcbox_api::connect::router(Arc::clone(&shared_runtime));
+    // Reflection rides with them so it answers over all three wire
+    // formats, not just gRPC.
+    let sandbox = crate::control_plane::connect_router(Arc::clone(&shared_runtime))?;
     let system_service = SystemServiceImpl::new(
         Arc::clone(&ctx.setup_state),
         Arc::clone(&shared_runtime),
@@ -61,18 +63,6 @@ pub async fn start_grpc(
     );
     let stats_service = StatsServiceImpl::new(Arc::clone(&shared_runtime));
     let icon_service = IconServiceImpl::new();
-
-    // Server reflection lets SDK authors and grpcurl discover the API
-    // without vendoring the protos (both v1 and the legacy v1alpha are
-    // served — grpcurl still speaks v1alpha by default).
-    let reflection_v1 = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .context("building gRPC reflection service")?;
-    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
-        .build_v1alpha()
-        .context("building gRPC reflection service (v1alpha)")?;
 
     let routes = Routes::default()
         .add_service(MachineServiceServer::new(machine_service))
@@ -86,9 +76,6 @@ pub async fn start_grpc(
     // likewise macOS-only).
     #[cfg(target_os = "macos")]
     let routes = routes.add_service(MacosServiceServer::new(macos_service));
-    let routes = routes
-        .add_service(reflection_v1)
-        .add_service(reflection_v1alpha);
 
     let app = crate::control_plane::compose(routes, sandbox);
 

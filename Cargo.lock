@@ -442,6 +442,7 @@ dependencies = [
  "bytes",
  "clap",
  "connectrpc",
+ "connectrpc-reflection",
  "dirs",
  "filetime",
  "http-body-util",
@@ -1944,6 +1945,9 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
  "percent-encoding",
  "pin-project",
  "serde",
@@ -1952,6 +1956,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tower-http",
  "tracing",
  "wasm-bindgen-futures",
  "zstd",
@@ -1984,6 +1989,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "connectrpc-reflection"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a63da01ba84368dcc8acbfc4675ca1977af47c4e4c85c3e281f49a071169beeb"
+dependencies = [
+ "buffa",
+ "buffa-descriptor",
+ "connectrpc",
+ "futures",
+ "http-body",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -6894,6 +6915,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tower",
