@@ -106,6 +106,10 @@ pub(in crate::vm_lifecycle) trait BalloonDeps:
 /// Retry cadence while idle but not (yet) shrunk.
 const IDLE_ENTRY_RETRY: Duration = Duration::from_secs(30);
 
+/// Retry cadence for a shrink whose restore exhausted its attempts. Applies
+/// while the VM is active, where nothing else would re-attempt it.
+const STRANDED_RESTORE_RETRY: Duration = Duration::from_secs(30);
+
 /// Minimum dwell at each descent step before taking the next one.
 ///
 /// The guest's `SETTLED` frame proves the guest is healthy at the current
@@ -207,11 +211,32 @@ impl<D: BalloonDeps> BalloonController<D> {
         let mut mode = Mode::Active;
         loop {
             mode = match mode {
-                Mode::Active => match self.commands.recv().await {
-                    Some(BalloonCommand::EnterIdle) => self.enter_idle().await,
-                    Some(BalloonCommand::ExitIdle) => Mode::Active,
-                    None => return,
-                },
+                Mode::Active => {
+                    // A restore that exhausted its retries leaves the guest
+                    // squeezed with `applied` still set. Active is when it can
+                    // least afford that — the guest is working, and a
+                    // fail-open restore usually follows guest memory pressure
+                    // — and an active VM may never go idle again, so waiting
+                    // for the next idle entry is not a retry at all.
+                    let stranded = self.applied.is_some();
+                    tokio::select! {
+                        cmd = self.commands.recv() => match cmd {
+                            Some(BalloonCommand::EnterIdle) => self.enter_idle().await,
+                            Some(BalloonCommand::ExitIdle) => Mode::Active,
+                            None => return,
+                        },
+                        () = async {
+                            if stranded {
+                                tokio::time::sleep(STRANDED_RESTORE_RETRY).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            self.restore("retrying a stranded shrink");
+                            Mode::Active
+                        }
+                    }
+                }
                 Mode::IdleUnshrunk => {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
@@ -1041,6 +1066,41 @@ mod tests {
             h.activity_count(),
             1,
             "idle exit still rides the state machine"
+        );
+    }
+
+    /// Review finding (greptile P1, round 2): a fail-open restore that
+    /// exhausts its attempts lands in `Active` with the shrink still applied.
+    /// An active VM may never go idle again, so retrying only on idle entry
+    /// leaves a *working* guest squeezed indefinitely — the worst case, since
+    /// fail-open usually follows guest memory pressure.
+    #[tokio::test(start_paused = true)]
+    async fn stranded_shrink_is_retried_while_active() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        let watch = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
+
+        // Pressure fails open, but every restore attempt fails: the
+        // controller returns to Active with the guest still shrunk.
+        h.deps.fail_set_target.store(true, Ordering::SeqCst);
+        watch.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP], "restore did not land");
+
+        // The backend recovers. No idle entry ever happens.
+        h.deps.fail_set_target.store(false, Ordering::SeqCst);
+        tokio::time::advance(STRANDED_RESTORE_RETRY + Duration::from_secs(1)).await;
+        h.settle().await;
+
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL],
+            "an active guest must not stay squeezed waiting for idle"
         );
     }
 
