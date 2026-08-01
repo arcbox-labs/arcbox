@@ -3423,6 +3423,81 @@ pub struct EnsureNfsExportResponse {
     #[prost(string, repeated, tag = "1")]
     pub notes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// Ask the guest agent to DNAT a reserved guest port to a sandbox port.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxPortForwardRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Destination port inside the sandbox.
+    #[prost(uint32, tag = "2")]
+    pub sandbox_port: u32,
+    /// Transport protocol (UNSPECIFIED = TCP).
+    #[prost(enumeration = "SandboxPortProtocol", tag = "3")]
+    pub protocol: i32,
+}
+/// Guest agent's answer: the allocated reserved-range guest port.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxPortForwardResponse {
+    /// Guest port now DNATed to the sandbox.
+    #[prost(uint32, tag = "1")]
+    pub guest_port: u32,
+}
+/// Ask the guest agent to remove a DNAT mapping.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxPortForwardRemoveRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// The sandbox port previously forwarded.
+    #[prost(uint32, tag = "2")]
+    pub sandbox_port: u32,
+    /// Transport protocol (UNSPECIFIED = TCP).
+    #[prost(enumeration = "SandboxPortProtocol", tag = "3")]
+    pub protocol: i32,
+}
+/// Transport protocol of a forwarded sandbox port.
+///
+/// Deliberately separate from `arcbox.sandbox.v1.PortProtocol`: the public
+/// contract must not be imported by the internal wire, or the two evolve
+/// together by accident.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SandboxPortProtocol {
+    Unspecified = 0,
+    Tcp = 1,
+    Udp = 2,
+}
+impl SandboxPortProtocol {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SANDBOX_PORT_PROTOCOL_UNSPECIFIED",
+            Self::Tcp => "SANDBOX_PORT_PROTOCOL_TCP",
+            Self::Udp => "SANDBOX_PORT_PROTOCOL_UDP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SANDBOX_PORT_PROTOCOL_UNSPECIFIED" => Some(Self::Unspecified),
+            "SANDBOX_PORT_PROTOCOL_TCP" => Some(Self::Tcp),
+            "SANDBOX_PORT_PROTOCOL_UDP" => Some(Self::Udp),
+            _ => None,
+        }
+    }
+}
 /// Subscription request for machine stats.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

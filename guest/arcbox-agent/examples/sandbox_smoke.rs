@@ -12,8 +12,10 @@ mod linux {
     use arcbox_constants::ports::AGENT_PORT;
     use arcbox_constants::wire::MessageType;
     use arcbox_protocol::sandbox_v1::{
-        CreateSandboxRequest, CreateSandboxResponse, InspectSandboxRequest, ListSandboxesRequest,
-        ListSandboxesResponse, RemoveSandboxRequest, RunOutput, RunRequest, StopSandboxRequest,
+        AttachExecutionRequest, CreateSandboxRequest, CreateSandboxResponse, Execution,
+        ExecutionEvent, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
+        RemoveSandboxRequest, SandboxState, StartExecutionRequest, StopSandboxRequest,
+        execution_event, exit_status,
     };
     use bytes::{Buf, BufMut, BytesMut};
     use prost::Message;
@@ -29,11 +31,9 @@ mod linux {
         let create = CreateSandboxRequest {
             id: String::new(),
             labels: HashMap::from([("suite".to_string(), "agent-smoke".to_string())]),
-            kernel: String::new(),
-            rootfs: String::new(),
-            boot_args: String::new(),
+            // Empty template = the built-in busybox image.
+            template: String::new(),
             limits: None,
-            image: String::new(),
             cmd: Vec::new(),
             env: HashMap::new(),
             working_dir: String::new(),
@@ -66,10 +66,7 @@ mod linux {
             &mut stream,
             MessageType::SandboxListRequest,
             MessageType::SandboxListResponse,
-            &ListSandboxesRequest {
-                state: String::new(),
-                labels: HashMap::new(),
-            },
+            &ListSandboxesRequest::default(),
         )
         .await
         .context("sandbox list failed")?;
@@ -79,8 +76,9 @@ mod linux {
 
         wait_until_ready(&mut stream, &sandbox_id, Duration::from_secs(45)).await?;
 
-        let run_req = RunRequest {
-            id: sandbox_id.clone(),
+        let start_req = StartExecutionRequest {
+            sandbox_id: sandbox_id.clone(),
+            execution_id: "agent-smoke-echo".to_string(),
             cmd: vec![
                 "/bin/sh".to_string(),
                 "-lc".to_string(),
@@ -90,9 +88,11 @@ mod linux {
             working_dir: String::new(),
             user: String::new(),
             tty: false,
+            tty_size: None,
             timeout_seconds: 30,
+            stdin: false,
         };
-        run_and_assert_success(&mut stream, run_req).await?;
+        execute_and_assert_success(&mut stream, start_req).await?;
 
         rpc_unary_empty(
             &mut stream,
@@ -168,10 +168,10 @@ mod linux {
             )
             .await?;
 
-            if info.state == "ready" {
+            if info.state() == SandboxState::Ready {
                 return Ok(());
             }
-            if info.state == "failed" {
+            if info.state() == SandboxState::Failed {
                 bail!("sandbox transitioned to failed state: {}", info.error);
             }
             if Instant::now() >= deadline {
@@ -181,37 +181,65 @@ mod linux {
         }
     }
 
-    async fn run_and_assert_success(stream: &mut VsockStream, req: RunRequest) -> Result<()> {
-        let payload = req.encode_to_vec();
-        write_message(stream, MessageType::SandboxRunRequest, "", &payload).await?;
+    /// Start an execution, attach to its output, and assert a zero exit.
+    async fn execute_and_assert_success(
+        stream: &mut VsockStream,
+        req: StartExecutionRequest,
+    ) -> Result<()> {
+        let started: Execution = rpc_unary(
+            stream,
+            MessageType::SandboxExecStartRequest,
+            MessageType::SandboxExecStartResponse,
+            &req,
+        )
+        .await
+        .context("start execution failed")?;
+
+        let attach = AttachExecutionRequest {
+            sandbox_id: req.sandbox_id.clone(),
+            execution_id: started.id.clone(),
+            stdout_offset: 0,
+            stderr_offset: 0,
+        };
+        write_message(
+            stream,
+            MessageType::SandboxExecAttachRequest,
+            "",
+            &attach.encode_to_vec(),
+        )
+        .await?;
 
         loop {
             let (resp_type_raw, _trace, resp_payload) = read_message(stream).await?;
 
             if resp_type_raw == MessageType::Error as u32 {
                 let msg = parse_error_response(&resp_payload);
-                bail!("sandbox run returned error: {msg}");
+                bail!("execution attach returned error: {msg}");
             }
-            if resp_type_raw != MessageType::SandboxRunOutput as u32 {
-                bail!("unexpected response while run streaming: 0x{resp_type_raw:04x}");
-            }
-
-            let output = RunOutput::decode(resp_payload.as_slice())
-                .context("decode SandboxRunOutput payload failed")?;
-
-            if output.stream == "stdout" || output.stream == "stderr" {
-                let text = String::from_utf8_lossy(&output.data);
-                print!("{text}");
+            if resp_type_raw != MessageType::SandboxExecEvent as u32 {
+                bail!("unexpected response while attached: 0x{resp_type_raw:04x}");
             }
 
-            if output.done {
-                if output.exit_code != 0 {
-                    bail!("run exited with non-zero status: {}", output.exit_code);
+            let event = ExecutionEvent::decode(resp_payload.as_slice())
+                .context("decode ExecutionEvent payload failed")?;
+            match event.event {
+                Some(execution_event::Event::Output(output)) => {
+                    print!("{}", String::from_utf8_lossy(&output.data));
                 }
-                break;
+                Some(execution_event::Event::Exited(exited)) => {
+                    let status = exited
+                        .execution
+                        .and_then(|e| e.exit_status)
+                        .and_then(|s| s.status);
+                    match status {
+                        Some(exit_status::Status::Code(0)) => return Ok(()),
+                        other => bail!("execution did not exit cleanly: {other:?}"),
+                    }
+                }
+                Some(execution_event::Event::Started(_) | execution_event::Event::KeepAlive(_))
+                | None => {}
             }
         }
-        Ok(())
     }
 
     async fn rpc_unary<TReq, TResp>(

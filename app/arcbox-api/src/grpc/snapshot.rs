@@ -1,7 +1,7 @@
 //! Sandbox snapshot service gRPC implementation.
 
 use arcbox_grpc::SandboxSnapshotService;
-use arcbox_protocol::sandbox_v1::Empty as SandboxEmpty;
+use arcbox_protocol::pbjson_types::Empty;
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, DeleteSnapshotRequest, ListSnapshotsRequest,
     ListSnapshotsResponse, RestoreRequest, RestoreResponse,
@@ -90,7 +90,7 @@ impl SandboxSnapshotService for SandboxSnapshotServiceImpl {
     async fn delete_snapshot(
         &self,
         request: Request<DeleteSnapshotRequest>,
-    ) -> Result<Response<SandboxEmpty>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let machine = request.machine_id()?;
         let mut agent = self
             .runtime
@@ -101,6 +101,6 @@ impl SandboxSnapshotService for SandboxSnapshotServiceImpl {
             .sandbox_delete_snapshot(request.into_inner())
             .await
             .map_err(ApiError::from)?;
-        Ok(Response::new(SandboxEmpty {}))
+        Ok(Response::new(Empty {}))
     }
 }

@@ -1,4 +1,5 @@
 use super::boot::chroot_root;
+use super::types::action;
 use super::*;
 
 #[allow(
@@ -52,7 +53,7 @@ pub(super) async fn remove_sandbox_impl(
             map.remove(id);
         }
     }
-    let _ = events_tx.send(SandboxEvent::new(id, "removed"));
+    let _ = events_tx.send(SandboxEvent::new(id, action::REMOVED));
 }
 
 /// True when `armed_for` still refers to the instance currently registered
@@ -178,7 +179,7 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
         created_at: inst.created_at,
         ready_at: inst.ready_at,
         last_exited_at: inst.last_exited_at,
-        last_exit_code: inst.last_exit_code,
+        last_exit_status: inst.last_exit_status,
         error: inst.error.clone(),
     }
 }

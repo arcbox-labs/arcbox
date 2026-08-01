@@ -20,13 +20,14 @@ pub use kubernetes::KubernetesServiceImpl;
 pub use machine::MachineServiceImpl;
 #[cfg(target_os = "macos")]
 pub use macos::MacosServiceImpl;
-pub use sandbox::SandboxServiceImpl;
+pub use sandbox::{SandboxFilesystemServiceImpl, SandboxProcessServiceImpl, SandboxServiceImpl};
 pub use snapshot::SandboxSnapshotServiceImpl;
 pub use stats::StatsServiceImpl;
 
 use std::sync::{Arc, OnceLock};
 
 use arcbox_core::Runtime;
+use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
 use tonic::Status;
 
 /// Drives a `!Send` macOS VM future to completion on a dedicated blocking thread.
@@ -77,22 +78,54 @@ impl SharedRuntimeExt for SharedRuntime {
 
 /// Extension trait for extracting routing metadata from gRPC requests.
 trait RequestExt {
-    /// Returns the target machine name from the `x-machine` metadata header.
+    /// Returns the target machine name, defaulting to the System VM.
     fn machine_id(&self) -> Result<String, Status>;
 }
 
 impl<T> RequestExt for tonic::Request<T> {
+    /// Reads the optional `x-machine` metadata header.
+    ///
+    /// "Which local VM to target" is a host-local concept with no meaning in
+    /// a multi-tenant cloud, so it is transport metadata a local client MAY
+    /// set — never part of the product contract (CORE-54). Absent, requests
+    /// go to the System VM, which is the only machine a sandbox client has.
     fn machine_id(&self) -> Result<String, Status> {
         match self.metadata().get("x-machine") {
-            None => Err(Status::invalid_argument(
-                "missing x-machine metadata header",
-            )),
+            None => Ok(DEFAULT_MACHINE_NAME.to_owned()),
             Some(value) => match value.to_str() {
+                Ok("") => Ok(DEFAULT_MACHINE_NAME.to_owned()),
                 Ok(s) => Ok(s.to_string()),
                 Err(_) => Err(Status::invalid_argument(
                     "invalid x-machine metadata header: must be valid UTF-8",
                 )),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_MACHINE_NAME, RequestExt};
+
+    #[test]
+    fn machine_id_defaults_to_the_system_vm() {
+        // No header: a cloud-shaped client never sends one.
+        let request = tonic::Request::new(());
+        assert_eq!(request.machine_id().unwrap(), DEFAULT_MACHINE_NAME);
+
+        // Explicitly empty is the same as absent.
+        let mut request = tonic::Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-machine", tonic::metadata::MetadataValue::from_static(""));
+        assert_eq!(request.machine_id().unwrap(), DEFAULT_MACHINE_NAME);
+
+        // A local client targeting a named machine still wins.
+        let mut request = tonic::Request::new(());
+        request.metadata_mut().insert(
+            "x-machine",
+            tonic::metadata::MetadataValue::from_static("other"),
+        );
+        assert_eq!(request.machine_id().unwrap(), "other");
     }
 }

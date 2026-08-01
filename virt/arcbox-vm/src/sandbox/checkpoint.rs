@@ -2,6 +2,7 @@ use super::boot::{
     chroot_root, cleanup_pending_restore, create_rootfs_symlink, kill_and_reap_fc,
     stage_kernel_for_jailer, stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer,
 };
+use super::types::action;
 use super::*;
 
 /// Move a file even when source and destination sit on different mounts.
@@ -36,6 +37,7 @@ impl SandboxManager {
         &self,
         sandbox_id: &SandboxId,
         name: String,
+        labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
         // Verify state and capture the kernel/rootfs paths for jailer re-staging.
         let (kernel_path, rootfs_path) = {
@@ -129,6 +131,7 @@ impl SandboxManager {
         // vmstate-recorded symlink.
         let meta = pending.commit(SnapshotDraft {
             name: Some(name),
+            labels,
             snapshot_type: crate::config::SnapshotType::Full,
             parent_id: None,
             kernel_path: Some(kernel_path),
@@ -566,7 +569,9 @@ impl SandboxManager {
         reservation.commit();
         let ttl_armed_for = Arc::downgrade(&arc);
 
-        let _ = self.events_tx.send(SandboxEvent::new(&new_id, "ready"));
+        let _ = self
+            .events_tx
+            .send(SandboxEvent::new(&new_id, action::READY));
 
         // TTL expiry task — identity-guarded so a stale timer can't remove a
         // same-id sandbox re-created after this one (see expire_sandbox).
@@ -608,7 +613,7 @@ impl SandboxManager {
                 id: s.id,
                 sandbox_id: s.vm_id,
                 name: s.name.unwrap_or_default(),
-                labels: HashMap::new(),
+                labels: s.labels,
                 snapshot_dir: s
                     .vmstate_path
                     .parent()

@@ -310,10 +310,12 @@ async fn e2e_run_command() {
     let mut exit_code: i32 = -1;
     while let Some(result) = rx.recv().await {
         let chunk = result.unwrap();
-        match chunk.stream.as_str() {
-            "stdout" => stdout.push_str(&String::from_utf8_lossy(&chunk.data)),
-            "exit" => exit_code = chunk.exit_code,
-            _ => {}
+        match chunk {
+            arcbox_vm::OutputChunk::Stdout(data) => {
+                stdout.push_str(&String::from_utf8_lossy(&data));
+            }
+            arcbox_vm::OutputChunk::Exit(status) => exit_code = status.conventional_code(),
+            arcbox_vm::OutputChunk::Stderr(_) => {}
         }
     }
 

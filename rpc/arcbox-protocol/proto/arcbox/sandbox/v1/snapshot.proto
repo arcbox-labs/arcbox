@@ -1,0 +1,130 @@
+// Sandbox checkpoint / restore.
+//
+// A snapshot captures a fully-booted, idle sandbox so that future sandboxes
+// can be restored from it instead of booting from scratch.
+//
+// Checkpoint and Restore act on a specific sandbox / a specific node's
+// snapshot store, so they sit with the data plane; the snapshot *catalog*
+// (List / Delete) is control-plane-shaped and lives here with them because
+// a snapshot is meaningless apart from the store that holds it.
+
+syntax = "proto3";
+
+package arcbox.sandbox.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// SandboxSnapshotService provides checkpoint / restore for cold-start
+// optimisation.
+service SandboxSnapshotService {
+    // Checkpoint a sandbox into a reusable snapshot.
+    // The sandbox is paused, snapshotted, then resumed automatically.
+    // The sandbox must be in READY state with no active execution.
+    rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+
+    // Restore a new sandbox from a previously created snapshot.
+    // The restored sandbox starts in READY state; boot time is near-zero.
+    rpc Restore(RestoreRequest) returns (RestoreResponse);
+
+    // List snapshots, optionally filtered by origin sandbox or label.
+    // Paginated.
+    rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+    // Delete a snapshot and its on-disk data.
+    rpc DeleteSnapshot(DeleteSnapshotRequest) returns (google.protobuf.Empty);
+}
+
+// Request to checkpoint a sandbox.
+// The sandbox must be in READY state (no active execution).
+message CheckpointRequest {
+    // Sandbox ID to checkpoint.
+    string sandbox_id = 1;
+    // Human-readable label for the snapshot.
+    string name = 2;
+    // Labels attached to the snapshot, filterable in ListSnapshots.
+    map<string, string> labels = 3;
+}
+
+// Response to Checkpoint.
+message CheckpointResponse {
+    // Snapshot ID.
+    string snapshot_id = 1;
+    // 2 carried the host snapshot directory (CORE-54). Do not reuse.
+    reserved 2;
+    reserved "snapshot_dir";
+    // Creation time.
+    google.protobuf.Timestamp created_at = 3;
+}
+
+// Request to restore a sandbox from a snapshot.
+//
+// Direct-mode (non-jailer) limitation: the snapshot's vmstate records the
+// origin sandbox's absolute vsock socket path, so concurrent restores from
+// the same snapshot — or restoring while the origin sandbox is still
+// running — fail with FAILED_PRECONDITION on the vsock conflict. Jailer
+// mode restores into per-sandbox chroots and has no such constraint.
+message RestoreRequest {
+    // Caller-supplied ID for the new sandbox (empty = auto-generated).
+    string id = 1;
+    // Source snapshot ID.
+    string snapshot_id = 2;
+    // Labels to assign to the restored sandbox.
+    map<string, string> labels = 3;
+    // Assign a fresh TAP interface and IP. Required when running multiple
+    // sandboxes restored from the same snapshot concurrently.
+    bool network_override = 4;
+    // TTL for the restored sandbox in seconds (0 = no limit).
+    uint32 ttl_seconds = 5;
+}
+
+// Response to Restore.
+// The restored sandbox starts in READY state immediately.
+message RestoreResponse {
+    // ID of the newly created sandbox.
+    string id = 1;
+    // Allocated IP address.
+    string ip_address = 2;
+}
+
+// Request to list snapshots.
+message ListSnapshotsRequest {
+    // Filter by the origin sandbox ID (empty = all).
+    string sandbox_id = 1;
+    // Filter by labels (all key-value pairs must match).
+    map<string, string> labels = 2;
+    // Maximum entries per page (0 = server default of 100; capped at 1000).
+    uint32 page_size = 3;
+    // Continuation token from a previous response (empty = first page).
+    string page_token = 4;
+}
+
+// Response to ListSnapshots.
+message ListSnapshotsResponse {
+    repeated SnapshotSummary snapshots = 1;
+    // Token for the next page; empty when this is the last page.
+    string next_page_token = 2;
+}
+
+// Lightweight snapshot summary.
+message SnapshotSummary {
+    // Snapshot ID.
+    string id = 1;
+    // ID of the sandbox that was checkpointed.
+    string sandbox_id = 2;
+    // Human-readable label.
+    string name = 3;
+    // Labels recorded at checkpoint time.
+    map<string, string> labels = 4;
+    // 5 carried the host snapshot directory (CORE-54). Do not reuse.
+    reserved 5;
+    reserved "snapshot_dir";
+    // Creation time.
+    google.protobuf.Timestamp created_at = 6;
+}
+
+// Request to delete a snapshot.
+message DeleteSnapshotRequest {
+    // Snapshot ID.
+    string snapshot_id = 1;
+}

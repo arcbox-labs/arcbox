@@ -21,13 +21,16 @@ use arcbox_protocol::agent::{
     WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 use arcbox_protocol::sandbox_v1::{
-    CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
-    DeleteSnapshotRequest, ExecOutput, ExecRequest, FileChunk, InspectSandboxRequest,
-    ListSandboxesRequest, ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    ReadFileRequest, RemoveSandboxRequest, RestoreRequest, RestoreResponse, RunOutput, RunRequest,
-    SandboxEvent, SandboxEventsRequest, SandboxInfo, SandboxPortForwardRemoveRequest,
-    SandboxPortForwardRequest, SandboxPortForwardResponse, StopSandboxRequest, TerminalSize,
-    WriteFileOpen,
+    AttachExecutionRequest, CheckpointRequest, CheckpointResponse, CreateSandboxRequest,
+    CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk,
+    GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ReadFileRequest, RemoveSandboxRequest,
+    ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent, SandboxEventsRequest,
+    SandboxInfo, SignalExecutionRequest, StartExecutionRequest, StdinStatus, StopSandboxRequest,
+    WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
+};
+use arcbox_protocol::v1::{
+    SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SandboxPortForwardResponse,
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
@@ -36,7 +39,7 @@ use prost::Message;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// A single client→sandbox message during an interactive exec session.
+/// A single client→guest message during an interactive machine exec session.
 #[derive(Debug)]
 pub enum ExecSessionInput {
     /// Raw bytes for the process's stdin. An empty payload signals EOF and
@@ -1465,27 +1468,120 @@ impl AgentClient {
         Ok(out_rx)
     }
 
-    /// Runs a command inside a sandbox and returns a channel of streaming output.
+    /// Starts an addressable execution inside a sandbox.
     ///
-    /// Consumes the client because the stream task requires exclusive transport access.
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_exec_start(&mut self, req: StartExecutionRequest) -> Result<Execution> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxExecStartRequest,
+            &payload,
+            MessageType::SandboxExecStartResponse,
+        )
+        .await
+    }
+
+    /// Writes stdin bytes to an execution at an absolute offset
+    /// (offset-idempotent; see the sandbox proto contract).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_stdin_write(&mut self, req: WriteStdinRequest) -> Result<StdinStatus> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxStdinWriteRequest,
+            &payload,
+            MessageType::SandboxStdinStatus,
+        )
+        .await
+    }
+
+    /// Reports how many stdin bytes the execution has accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_stdin_status(
+        &mut self,
+        req: GetStdinStatusRequest,
+    ) -> Result<StdinStatus> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxStdinStatusRequest,
+            &payload,
+            MessageType::SandboxStdinStatus,
+        )
+        .await
+    }
+
+    /// Delivers a POSIX signal to an execution's process group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_exec_signal(&mut self, req: SignalExecutionRequest) -> Result<()> {
+        let payload = req.encode_to_vec();
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxExecSignalRequest, &payload)
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxExecSignalResponse)
+    }
+
+    /// Resizes a TTY execution's terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_exec_resize(&mut self, req: ResizeExecutionTtyRequest) -> Result<()> {
+        let payload = req.encode_to_vec();
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxExecResizeRequest, &payload)
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxExecResizeResponse)
+    }
+
+    /// Waits for an execution to exit (zero timeout polls) and returns its
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_exec_wait(&mut self, req: WaitExecutionRequest) -> Result<Execution> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxExecWaitRequest,
+            &payload,
+            MessageType::SandboxExecWaitResponse,
+        )
+        .await
+    }
+
+    /// Attaches to an execution's output and returns a channel of
+    /// [`ExecutionEvent`]s. The stream ends after the `exited` event.
+    ///
+    /// Consumes the client because the stream task requires exclusive
+    /// transport access.
     ///
     /// # Errors
     ///
     /// Returns an error if the initial send fails.
-    pub async fn sandbox_run(
+    pub async fn sandbox_exec_attach(
         mut self,
-        req: RunRequest,
-    ) -> Result<mpsc::Receiver<Result<RunOutput>>> {
+        req: AttachExecutionRequest,
+    ) -> Result<mpsc::Receiver<Result<ExecutionEvent>>> {
         if !self.connected {
             self.connect().await?;
         }
 
         let payload = req.encode_to_vec();
-        let buf = wire::build_message(MessageType::SandboxRunRequest, "", &payload);
+        let buf = wire::build_message(MessageType::SandboxExecAttachRequest, "", &payload);
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send run request: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("failed to send attach request: {}", e)))?;
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         tokio::spawn(async move {
@@ -1515,7 +1611,7 @@ impl AgentClient {
                     break;
                 }
 
-                if resp_type != MessageType::SandboxRunOutput as u32 {
+                if resp_type != MessageType::SandboxExecEvent as u32 {
                     let _ = tx
                         .send(Err(CoreError::Machine(format!(
                             "unexpected response type: 0x{:04x}",
@@ -1525,12 +1621,12 @@ impl AgentClient {
                     break;
                 }
 
-                match RunOutput::decode(&resp_payload[..]) {
-                    Ok(output) => {
-                        let done = output.done;
+                match ExecutionEvent::decode(&resp_payload[..]) {
+                    Ok(event) => {
+                        let done = matches!(event.event, Some(execution_event::Event::Exited(_)));
                         // Stop reading if the consumer dropped, so a spewing
                         // sandbox isn't drained into the void indefinitely.
-                        if tx.send(Ok(output)).await.is_err() || done {
+                        if tx.send(Ok(event)).await.is_err() || done {
                             break;
                         }
                     }
@@ -1626,139 +1722,6 @@ impl AgentClient {
         });
 
         Ok(rx)
-    }
-
-    /// Starts an interactive exec session inside a sandbox.
-    ///
-    /// Consumes the client because the stream task requires exclusive transport
-    /// access.  The caller supplies a receiver of [`ExecSessionInput`]s (stdin
-    /// bytes, TTY resizes, or EOF).  Returns an output receiver of
-    /// [`ExecOutput`] frames.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the initial send fails.
-    pub async fn sandbox_exec(
-        mut self,
-        req: ExecRequest,
-        mut input_rx: mpsc::Receiver<ExecSessionInput>,
-    ) -> Result<mpsc::Receiver<Result<ExecOutput>>> {
-        if !self.connected {
-            self.connect().await?;
-        }
-
-        let payload = req.encode_to_vec();
-        let buf = wire::build_message(MessageType::SandboxExecRequest, "", &payload);
-        self.transport
-            .async_send(buf)
-            .await
-            .map_err(|e| CoreError::Machine(format!("failed to send exec request: {}", e)))?;
-
-        let (mut sender, mut receiver) = self
-            .transport
-            .into_split()
-            .map_err(|e| CoreError::Machine(format!("failed to split transport: {e}")))?;
-
-        let (out_tx, out_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
-
-        // Input pump: channel → SandboxExecInput / SandboxExecResize frames.
-        let stdin_handle = tokio::spawn(async move {
-            loop {
-                match input_rx.recv().await {
-                    Some(ExecSessionInput::Stdin(data)) => {
-                        let is_eof = data.is_empty();
-                        let frame = wire::build_message(MessageType::SandboxExecInput, "", &data);
-                        if sender.send(frame).await.is_err() || is_eof {
-                            break;
-                        }
-                    }
-                    Some(ExecSessionInput::Resize { width, height }) => {
-                        let size = TerminalSize {
-                            width: u32::from(width),
-                            height: u32::from(height),
-                        };
-                        let frame = wire::build_message(
-                            MessageType::SandboxExecResize,
-                            "",
-                            &size.encode_to_vec(),
-                        );
-                        if sender.send(frame).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => {
-                        // Channel closed without explicit EOF; send best-effort EOF frame
-                        // so the guest-side exec session doesn't hang waiting on stdin.
-                        let eof = wire::build_message(MessageType::SandboxExecInput, "", &[]);
-                        let _ = sender.send(eof).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Output pump: SandboxExecOutput frames → channel.
-        // When the loop exits (process done / error / receiver dropped), the
-        // stdin pump is aborted so the transport write half is released promptly.
-        tokio::spawn(async move {
-            loop {
-                let raw = match receiver.recv().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = out_tx
-                            .send(Err(CoreError::Machine(format!("recv error: {}", e))))
-                            .await;
-                        break;
-                    }
-                };
-
-                let (resp_type, _, resp_payload) = match wire::parse_response(&raw) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = out_tx.send(Err(e)).await;
-                        break;
-                    }
-                };
-
-                if resp_type == MessageType::Error as u32 {
-                    let (code, message) = wire::parse_error_response(&resp_payload)
-                        .unwrap_or_else(|_| (500, "unknown error".to_string()));
-                    let _ = out_tx.send(Err(CoreError::Agent { code, message })).await;
-                    break;
-                }
-
-                if resp_type != MessageType::SandboxExecOutput as u32 {
-                    let _ = out_tx
-                        .send(Err(CoreError::Machine(format!(
-                            "unexpected response type: 0x{:04x}",
-                            resp_type
-                        ))))
-                        .await;
-                    break;
-                }
-
-                match ExecOutput::decode(&resp_payload[..]) {
-                    Ok(output) => {
-                        let done = output.done;
-                        if out_tx.send(Ok(output)).await.is_err() {
-                            break;
-                        }
-                        if done {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = out_tx
-                            .send(Err(CoreError::Machine(format!("decode error: {}", e))))
-                            .await;
-                        break;
-                    }
-                }
-            }
-            stdin_handle.abort();
-        });
-
-        Ok(out_rx)
     }
 
     /// Checkpoints a sandbox (creates a snapshot).

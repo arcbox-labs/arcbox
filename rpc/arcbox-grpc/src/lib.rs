@@ -10,7 +10,9 @@
 //! - `AgentService` - Guest agent communication
 //! - `MigrationService` - Host-side runtime migration planning and execution
 //! - `VolumeService` - Volume management (from api.proto)
-//! - `SandboxService` - Sandbox lifecycle (create / run / exec / stop / remove)
+//! - `SandboxService` - Sandbox lifecycle (control plane)
+//! - `SandboxProcessService` - Sandbox executions (data plane)
+//! - `SandboxFilesystemService` - Sandbox file transfer (data plane)
 //! - `SandboxSnapshotService` - Sandbox checkpoint and restore
 //!
 //! # Usage
@@ -39,7 +41,7 @@ pub use arcbox_protocol;
 pub use tonic;
 
 /// Compiled file descriptor set of every ArcBox proto, for gRPC server
-/// reflection (`tonic-reflection`). Covers `arcbox.v1` and `sandbox.v1`.
+/// reflection (`tonic-reflection`). Covers `arcbox.v1` and `arcbox.sandbox.v1`.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/arcbox_descriptor.bin"));
 
@@ -54,18 +56,24 @@ pub mod v1 {
     tonic::include_proto!("arcbox.v1");
 }
 
-/// gRPC services from the sandbox.v1 package.
+/// gRPC services from the arcbox.sandbox.v1 package.
 ///
-/// This module contains tonic-generated client and server code for:
-/// - SandboxService - Sandbox lifecycle (create / run / exec / stop / remove)
-/// - SandboxSnapshotService - Checkpoint and restore
+/// Split along the control-plane / data-plane seam (CORE-57), so a cloud
+/// deployment can serve the control plane from a multi-tenant front door
+/// and the data plane from whatever is co-located with the sandbox:
+/// - SandboxService - control plane: lifecycle, events, published ports
+/// - SandboxProcessService - data plane: executions (exec family)
+/// - SandboxFilesystemService - data plane: file transfer
+/// - SandboxSnapshotService - checkpoint and restore
 ///
 /// Message types are imported from `arcbox_protocol::sandbox_v1`.
 pub mod sandbox_v1 {
     #![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
-    tonic::include_proto!("sandbox.v1");
+    tonic::include_proto!("arcbox.sandbox.v1");
 }
 
+pub use sandbox_v1::sandbox_filesystem_service_client::SandboxFilesystemServiceClient;
+pub use sandbox_v1::sandbox_process_service_client::SandboxProcessServiceClient;
 pub use sandbox_v1::sandbox_service_client::SandboxServiceClient;
 pub use sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
 pub use v1::agent_service_client::AgentServiceClient;
@@ -76,6 +84,12 @@ pub use v1::migration_service_client::MigrationServiceClient;
 pub use v1::system_service_client::SystemServiceClient;
 pub use v1::volume_service_client::VolumeServiceClient;
 
+pub use sandbox_v1::sandbox_filesystem_service_server::{
+    SandboxFilesystemService, SandboxFilesystemServiceServer,
+};
+pub use sandbox_v1::sandbox_process_service_server::{
+    SandboxProcessService, SandboxProcessServiceServer,
+};
 pub use sandbox_v1::sandbox_service_server::{SandboxService, SandboxServiceServer};
 pub use sandbox_v1::sandbox_snapshot_service_server::{
     SandboxSnapshotService, SandboxSnapshotServiceServer,

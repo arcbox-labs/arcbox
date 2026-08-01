@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use arcbox_agent::sandbox::SandboxService;
 use arcbox_protocol::sandbox_v1::{
-    CreateSandboxRequest, InspectSandboxRequest, ListSandboxesRequest, NetworkSpec,
-    RemoveSandboxRequest, RunOutput, RunRequest, StopSandboxRequest,
+    CreateSandboxRequest, InspectSandboxRequest, ListSandboxesRequest, NetworkMode, NetworkSpec,
+    RemoveSandboxRequest, SandboxState, StartExecutionRequest, StopSandboxRequest,
+    WaitExecutionRequest, exit_status,
 };
 use arcbox_vm::VmmConfig;
 use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
@@ -71,18 +72,16 @@ async fn sandbox_service_calls_sandbox_manager() {
     let create_req = CreateSandboxRequest {
         id: String::new(),
         labels: HashMap::from([("suite".to_string(), "svc-manager".to_string())]),
-        kernel: String::new(),
-        rootfs: String::new(),
-        boot_args: String::new(),
+        // Empty template = the built-in busybox image.
+        template: String::new(),
         limits: None,
-        image: String::new(),
         cmd: Vec::new(),
         env: HashMap::new(),
         working_dir: String::new(),
         user: String::new(),
         mounts: Vec::new(),
         network: Some(NetworkSpec {
-            mode: "none".to_string(),
+            mode: NetworkMode::None.into(),
         }),
         ttl_seconds: 0,
         ssh_public_key: None,
@@ -103,10 +102,10 @@ async fn sandbox_service_calls_sandbox_manager() {
         let inspect_payload = inspect_req.encode_to_vec();
         let info = service.inspect(&inspect_payload).expect("inspect failed");
 
-        if info.state == "ready" {
+        if info.state() == SandboxState::Ready {
             break;
         }
-        if info.state == "failed" {
+        if info.state() == SandboxState::Failed {
             cleanup_sandbox(&service, &sandbox_id).await;
             panic!("sandbox entered failed state: {}", info.error);
         }
@@ -117,19 +116,16 @@ async fn sandbox_service_calls_sandbox_manager() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    let list_payload = ListSandboxesRequest {
-        state: String::new(),
-        labels: HashMap::new(),
-    }
-    .encode_to_vec();
+    let list_payload = ListSandboxesRequest::default().encode_to_vec();
     let list = service.list(&list_payload).expect("list failed");
     assert!(
         list.sandboxes.iter().any(|s| s.id == sandbox_id),
         "created sandbox not found in list"
     );
 
-    let run_payload = RunRequest {
-        id: sandbox_id.clone(),
+    let start_payload = StartExecutionRequest {
+        sandbox_id: sandbox_id.clone(),
+        execution_id: "svc-manager-echo".to_string(),
         cmd: vec![
             "/bin/sh".to_string(),
             "-lc".to_string(),
@@ -139,25 +135,40 @@ async fn sandbox_service_calls_sandbox_manager() {
         working_dir: String::new(),
         user: String::new(),
         tty: false,
+        tty_size: None,
+        timeout_seconds: 30,
+        stdin: false,
+    }
+    .encode_to_vec();
+    let started = service
+        .start_execution(&start_payload)
+        .await
+        .expect("start_execution should succeed");
+    assert_eq!(started.id, "svc-manager-echo");
+
+    let wait_payload = WaitExecutionRequest {
+        sandbox_id: sandbox_id.clone(),
+        execution_id: started.id.clone(),
         timeout_seconds: 30,
     }
     .encode_to_vec();
-
-    let mut run_rx = service
-        .run(&run_payload)
+    let finished = service
+        .wait_execution(&wait_payload)
         .await
-        .expect("run should start successfully");
-
-    let mut got_done = false;
-    while let Some(frame) = run_rx.recv().await {
-        let out = RunOutput::decode(frame.as_slice()).expect("invalid RunOutput frame");
-        if out.done {
-            got_done = true;
-            assert_eq!(out.exit_code, 0, "run exited with non-zero code");
-            break;
-        }
-    }
-    assert!(got_done, "run stream ended without done=true frame");
+        .expect("wait_execution failed");
+    let status = finished
+        .exit_status
+        .and_then(|s| s.status)
+        .expect("execution should report an exit status");
+    assert_eq!(
+        status,
+        exit_status::Status::Code(0),
+        "echo exited with a non-zero status"
+    );
+    assert!(
+        finished.stdout_len > 0,
+        "execution produced no stdout bytes"
+    );
 
     let stop_payload = StopSandboxRequest {
         id: sandbox_id.clone(),

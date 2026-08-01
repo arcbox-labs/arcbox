@@ -37,15 +37,6 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    /// Parse a wire protocol string; empty selects TCP.
-    pub fn parse(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "" | "tcp" => Ok(Self::Tcp),
-            "udp" => Ok(Self::Udp),
-            other => bail!("unsupported protocol '{other}' (expected tcp or udp)"),
-        }
-    }
-
     const fn iptables_name(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
@@ -267,14 +258,6 @@ async fn run_iptables(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protocol_parses_and_defaults_to_tcp() {
-        assert_eq!(Protocol::parse("").unwrap(), Protocol::Tcp);
-        assert_eq!(Protocol::parse("TCP").unwrap(), Protocol::Tcp);
-        assert_eq!(Protocol::parse("udp").unwrap(), Protocol::Udp);
-        assert!(Protocol::parse("sctp").is_err());
-    }
 
     #[test]
     fn dnat_spec_is_symmetric_and_tagged() {

@@ -74,8 +74,6 @@ pub struct SandboxSpec {
     pub vcpus: u32,
     /// Memory in MiB (0 = daemon default).
     pub memory_mib: u64,
-    /// OCI image reference (empty = use rootfs directly; reserved for future use).
-    pub image: String,
     /// Initial command launched automatically after boot (empty = none).
     pub cmd: Vec<String>,
     /// Environment variables for the initial command.
@@ -138,8 +136,8 @@ pub struct SandboxInstance {
     pub ready_at: Option<DateTime<Utc>>,
     /// When the last workload exited.
     pub last_exited_at: Option<DateTime<Utc>>,
-    /// Exit code of the last workload.
-    pub last_exit_code: Option<i32>,
+    /// How the last workload terminated.
+    pub last_exit_status: Option<ExitStatus>,
     /// Human-readable error (only set when state == `Failed`).
     pub error: Option<String>,
     /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
@@ -170,7 +168,7 @@ impl SandboxInstance {
             created_at: Utc::now(),
             ready_at: None,
             last_exited_at: None,
-            last_exit_code: None,
+            last_exit_status: None,
             error: None,
             cow_handle: None,
             restore_origin_dir: None,
@@ -206,7 +204,7 @@ pub struct SandboxInfo {
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub last_exited_at: Option<DateTime<Utc>>,
-    pub last_exit_code: Option<i32>,
+    pub last_exit_status: Option<ExitStatus>,
     pub error: Option<String>,
 }
 
@@ -219,12 +217,28 @@ pub struct SandboxNetworkInfo {
 
 // Events
 
+/// The `action` values a [`SandboxEvent`] carries, in lifecycle order.
+///
+/// `action` stays a `String` on the event (it crosses the API as one), but
+/// every emit site and match in this crate goes through these constants, so
+/// renaming or adding an action is a change here — not a grep for string
+/// literals whose miss surfaces as silently skipped teardown handling.
+pub mod action {
+    pub const CREATED: &str = "created";
+    pub const READY: &str = "ready";
+    pub const RUNNING: &str = "running";
+    pub const IDLE: &str = "idle";
+    pub const STOPPING: &str = "stopping";
+    pub const STOPPED: &str = "stopped";
+    pub const FAILED: &str = "failed";
+    pub const REMOVED: &str = "removed";
+}
+
 /// A sandbox lifecycle event broadcast to subscribers.
 #[derive(Debug, Clone)]
 pub struct SandboxEvent {
     pub sandbox_id: SandboxId,
-    /// Action: `"created"` | `"ready"` | `"running"` | `"idle"` |
-    ///         `"stopping"` | `"stopped"` | `"failed"` | `"removed"`
+    /// One of the [`action`] constants.
     pub action: String,
     /// Unix nanoseconds.
     pub timestamp_ns: i64,
@@ -245,6 +259,17 @@ impl SandboxEvent {
     pub(super) fn with_attr(mut self, key: &str, value: &str) -> Self {
         self.attributes.insert(key.to_owned(), value.to_owned());
         self
+    }
+
+    /// Whether this event marks the sandbox's teardown — nothing can run in
+    /// it afterwards. A new terminal action must be added here, or torn-down
+    /// sandboxes silently stop purging their executions.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.action.as_str(),
+            action::STOPPED | action::FAILED | action::REMOVED
+        )
     }
 }
 

@@ -10,9 +10,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arcbox_api::{
     IconServiceImpl, IconServiceServer, KubernetesServiceImpl, MachineServiceImpl,
-    MigrationServiceImpl, MigrationServiceServer, SandboxServiceImpl, SandboxServiceServer,
-    SandboxSnapshotServiceImpl, SandboxSnapshotServiceServer, SharedRuntime, StatsServiceImpl,
-    SystemServiceImpl, SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
+    MigrationServiceImpl, MigrationServiceServer, SandboxFilesystemServiceImpl,
+    SandboxFilesystemServiceServer, SandboxProcessServiceImpl, SandboxProcessServiceServer,
+    SandboxServiceImpl, SandboxServiceServer, SandboxSnapshotServiceImpl,
+    SandboxSnapshotServiceServer, SharedRuntime, StatsServiceImpl, SystemServiceImpl,
+    SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
     machine_service_server::MachineServiceServer, stats_service_server::StatsServiceServer,
 };
 #[cfg(target_os = "macos")]
@@ -62,6 +64,11 @@ pub async fn start_grpc(
     let kubernetes_service = KubernetesServiceImpl::new(Arc::clone(&shared_runtime));
     let migration_service = MigrationServiceImpl::new(Arc::clone(&shared_runtime));
     let sandbox_service = SandboxServiceImpl::new(Arc::clone(&shared_runtime));
+    // Data-plane halves of the sandbox API (CORE-57): separate services so a
+    // cloud deployment can serve them from a different process than the
+    // control plane. Locally the daemon serves all of them.
+    let sandbox_process_service = SandboxProcessServiceImpl::new(Arc::clone(&shared_runtime));
+    let sandbox_filesystem_service = SandboxFilesystemServiceImpl::new(Arc::clone(&shared_runtime));
     let sandbox_snapshot_service = SandboxSnapshotServiceImpl::new(Arc::clone(&shared_runtime));
     let system_service = SystemServiceImpl::new(
         Arc::clone(&ctx.setup_state),
@@ -90,6 +97,10 @@ pub async fn start_grpc(
             .add_service(KubernetesServiceServer::new(kubernetes_service))
             .add_service(MigrationServiceServer::new(migration_service))
             .add_service(SandboxServiceServer::new(sandbox_service))
+            .add_service(SandboxProcessServiceServer::new(sandbox_process_service))
+            .add_service(SandboxFilesystemServiceServer::new(
+                sandbox_filesystem_service,
+            ))
             .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
             .add_service(SystemServiceServer::new(system_service))
             .add_service(StatsServiceServer::new(stats_service))

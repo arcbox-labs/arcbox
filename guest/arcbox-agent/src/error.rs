@@ -15,12 +15,15 @@ pub enum SandboxError {
     /// The request is malformed or violates a constraint (e.g. an invalid
     /// sandbox id or an out-of-range field).
     InvalidArgument(String),
-    /// The referenced sandbox / snapshot does not exist.
+    /// The referenced sandbox / snapshot / execution does not exist.
     NotFound(String),
-    /// A sandbox with the requested ID already exists.
+    /// A sandbox or execution with the requested ID already exists.
     AlreadyExists(String),
     /// The sandbox is not in a state that allows the operation.
     WrongState(String),
+    /// A stdin write's offset is past the accepted byte count; the client
+    /// must resync via `GetStdinStatus` and resume from the reported offset.
+    StdinGap(String),
     /// The host / guest lacks a prerequisite (e.g. nested virtualization).
     Unsupported(String),
     /// A runtime or business-logic error.
@@ -35,6 +38,7 @@ impl fmt::Display for SandboxError {
             | Self::NotFound(msg)
             | Self::AlreadyExists(msg)
             | Self::WrongState(msg)
+            | Self::StdinGap(msg)
             | Self::Unsupported(msg)
             | Self::Internal(msg) => f.write_str(msg),
         }
@@ -46,13 +50,14 @@ impl SandboxError {
     ///
     /// The host maps these onto gRPC statuses: 400 → `INVALID_ARGUMENT`,
     /// 404 → `NOT_FOUND`, 409 → `ALREADY_EXISTS`, 412 → `FAILED_PRECONDITION`,
-    /// 503 → `UNAVAILABLE`, anything else → `INTERNAL`.
+    /// 416 → `OUT_OF_RANGE`, 503 → `UNAVAILABLE`, anything else → `INTERNAL`.
     pub const fn status_code(&self) -> i32 {
         match self {
             Self::Decode(_) | Self::InvalidArgument(_) => 400,
             Self::NotFound(_) => 404,
             Self::AlreadyExists(_) => 409,
             Self::WrongState(_) | Self::Unsupported(_) => 412,
+            Self::StdinGap(_) => 416,
             Self::Internal(_) => 500,
         }
     }
@@ -65,6 +70,7 @@ impl From<arcbox_vm::VmmError> for SandboxError {
             VmmError::NotFound(_) => Self::NotFound(e.to_string()),
             VmmError::AlreadyExists(_) => Self::AlreadyExists(e.to_string()),
             VmmError::WrongState { .. } => Self::WrongState(e.to_string()),
+            VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
             // Invalid caller input (e.g. a rejected sandbox id) is a 400, not a
             // 500 — otherwise a bad request surfaces as INTERNAL to the client.
             VmmError::Config(_) => Self::InvalidArgument(e.to_string()),
@@ -88,5 +94,15 @@ mod tests {
     fn runtime_errors_stay_500() {
         let err = SandboxError::from(arcbox_vm::VmmError::Vsock("boom".into()));
         assert_eq!(err.status_code(), 500);
+    }
+
+    #[test]
+    fn stdin_gap_maps_to_416() {
+        let err = SandboxError::from(arcbox_vm::VmmError::StdinGap {
+            accepted: 7,
+            offset: 9,
+        });
+        assert!(matches!(err, SandboxError::StdinGap(_)));
+        assert_eq!(err.status_code(), 416);
     }
 }

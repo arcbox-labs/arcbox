@@ -29,16 +29,20 @@ use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager};
 use crate::spawn::{spawn_direct, spawn_jailer};
-use crate::vsock::{self, ExecInputMsg, OutputChunk, StartCommand};
+use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 
 mod boot;
 mod checkpoint;
 mod cleanup;
+mod execution;
 mod lifecycle;
 mod reconcile;
 mod types;
 mod workload;
 
+pub use execution::{
+    ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
+};
 pub use types::{
     CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
     SandboxInstance, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec,
@@ -58,6 +62,8 @@ pub struct SandboxManager {
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
+    /// Addressable executions (CORE-55); see `execution.rs`.
+    executions: Arc<execution::ExecutionRegistry>,
     /// Flips to `true` once the startup orphan sweep has finished. Create and
     /// restore gate on it so a re-created same-id sandbox can never race the
     /// sweep (see [`SandboxManager::await_reconcile`]).
@@ -94,6 +100,7 @@ impl SandboxManager {
         // down mid-flight. Only meaningful inside a tokio runtime; sync
         // constructions (unit tests) have no previous instance to reconcile.
         let (reconcile_tx, reconcile_done) = tokio::sync::watch::channel(false);
+        let executions = Arc::new(execution::ExecutionRegistry::default());
         if tokio::runtime::Handle::try_current().is_ok() {
             let config = Arc::clone(&config);
             let network = Arc::clone(&network);
@@ -103,6 +110,10 @@ impl SandboxManager {
                 reconcile::sweep_orphans(&config, &network, &cow_manager, &snapshots).await;
                 let _ = reconcile_tx.send(true);
             });
+            // Executions die with their sandbox; purge on terminal events so
+            // every teardown path (stop / remove / TTL / boot failure) is
+            // covered without threading the registry through each of them.
+            execution::spawn_teardown_purge(Arc::clone(&executions), events_tx.subscribe());
         } else {
             let _ = reconcile_tx.send(true);
         }
@@ -114,6 +125,7 @@ impl SandboxManager {
             config,
             events_tx,
             cow_manager,
+            executions,
             reconcile_done,
         })
     }

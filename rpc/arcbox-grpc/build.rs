@@ -18,7 +18,10 @@ fn main() {
         "../arcbox-protocol/proto/agent.proto",
         "../arcbox-protocol/proto/api.proto",
         "../arcbox-protocol/proto/kubernetes.proto",
-        "../arcbox-protocol/proto/sandbox.proto",
+        "../arcbox-protocol/proto/arcbox/sandbox/v1/sandbox.proto",
+        "../arcbox-protocol/proto/arcbox/sandbox/v1/process.proto",
+        "../arcbox-protocol/proto/arcbox/sandbox/v1/filesystem.proto",
+        "../arcbox-protocol/proto/arcbox/sandbox/v1/snapshot.proto",
         "../arcbox-protocol/proto/stats.proto",
     ];
 
@@ -33,7 +36,11 @@ fn main() {
         // Map arcbox.v1 package to arcbox_protocol::v1 types
         .extern_path(".arcbox.v1", "::arcbox_protocol::v1")
         // Map sandbox.v1 package to arcbox_protocol::sandbox_v1 types
-        .extern_path(".sandbox.v1", "::arcbox_protocol::sandbox_v1")
+        .extern_path(".arcbox.sandbox.v1", "::arcbox_protocol::sandbox_v1")
+        // Well-known types map to pbjson-types, matching arcbox-protocol's
+        // prost build (serde-capable Timestamp/Empty); see its build.rs.
+        .compile_well_known_types(true)
+        .extern_path(".google.protobuf", "::pbjson_types")
         // Generate client code
         .build_client(true)
         // Generate server code

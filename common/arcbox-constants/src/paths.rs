@@ -368,7 +368,12 @@ pub mod guest {
     /// Log directory inside the VirtioFS mount.
     pub const LOG: &str = "log";
 
-    /// Host-built artifacts the guest reads back (e.g. exported OCI layouts).
+    /// Host-built artifacts the guest reads back.
+    ///
+    /// Currently unused: the sandbox image staging that lived here moved
+    /// into the guest when templates replaced host rootfs paths (CORE-54).
+    /// Kept as the agreed name for this seam so a future host-staged
+    /// artifact does not invent a second one.
     pub const CACHE: &str = "cache";
 }
 
