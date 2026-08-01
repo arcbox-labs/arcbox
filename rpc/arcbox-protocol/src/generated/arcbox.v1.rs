@@ -1009,7 +1009,10 @@ pub mod setup_status {
         /// The System VM booted and its guest agent answered, so the VM
         /// accepts commands. Its container runtime may still be starting.
         VmReady = 4,
-        /// DNS, the Docker API, and the Kubernetes proxy are listening.
+        /// Host services for the VM are up: the DNS server is bound, and the
+        /// Docker API and Kubernetes proxies have been started. Neither proxy
+        /// aborts startup when its bind fails, so this means "started", not
+        /// "proven reachable" — clients still handle a connection error.
         NetworkReady = 5,
         /// Startup complete.
         Ready = 6,

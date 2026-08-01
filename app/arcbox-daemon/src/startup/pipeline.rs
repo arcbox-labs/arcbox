@@ -149,10 +149,12 @@ impl RuntimeBooted {
             Ok(handles)
         })
         .await?;
-        // DNS, the Docker API, and the Kubernetes proxy are listening: every
-        // path a client reaches the VM through is open. What recovery spawned
-        // (route reconcile, self-setup) reports separately through the
-        // SetupStatus flags, not through this phase.
+        // DNS is bound; the Docker API and Kubernetes proxies are started.
+        // Neither proxy's bind failure reaches this stage — `DockerApiServer`
+        // binds inside its spawned task and only logs, and a taken 16443 is
+        // tolerated by design — so the phase means "services started", not
+        // "proven reachable". What recovery spawned (route reconcile,
+        // self-setup) reports through the SetupStatus flags instead.
         self.ctx
             .setup_state
             .set_phase(SetupPhase::NetworkReady, "Network services ready");
