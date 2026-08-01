@@ -67,6 +67,42 @@ impl From<ApiError> for tonic::Status {
     }
 }
 
+/// The sandbox services answer over Connect, so their errors must land as
+/// `ConnectError` rather than `Status`.
+///
+/// The gRPC status code is the shared vocabulary between the two, and
+/// [`tonic::Status`] above already owns the one mapping table from
+/// `ApiError` to a code. Routing through it keeps that table single-source:
+/// a new `ApiError` variant is classified once and both surfaces follow.
+impl From<ApiError> for connectrpc::ConnectError {
+    fn from(err: ApiError) -> Self {
+        use connectrpc::ErrorCode;
+        use tonic::Code;
+
+        let status = tonic::Status::from(err);
+        let code = match status.code() {
+            Code::Cancelled => ErrorCode::Canceled,
+            Code::InvalidArgument => ErrorCode::InvalidArgument,
+            Code::DeadlineExceeded => ErrorCode::DeadlineExceeded,
+            Code::NotFound => ErrorCode::NotFound,
+            Code::AlreadyExists => ErrorCode::AlreadyExists,
+            Code::PermissionDenied => ErrorCode::PermissionDenied,
+            Code::ResourceExhausted => ErrorCode::ResourceExhausted,
+            Code::FailedPrecondition => ErrorCode::FailedPrecondition,
+            Code::Aborted => ErrorCode::Aborted,
+            Code::OutOfRange => ErrorCode::OutOfRange,
+            Code::Unimplemented => ErrorCode::Unimplemented,
+            Code::Unavailable => ErrorCode::Unavailable,
+            Code::DataLoss => ErrorCode::DataLoss,
+            Code::Unauthenticated => ErrorCode::Unauthenticated,
+            // `Ok` never reaches here (an ApiError always maps to a
+            // failure), and `Unknown`/`Internal` share one bucket.
+            Code::Ok | Code::Unknown | Code::Internal => ErrorCode::Internal,
+        };
+        Self::new(code, status.message())
+    }
+}
+
 impl ApiError {
     /// Creates a new configuration error.
     #[must_use]

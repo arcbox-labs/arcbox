@@ -26,6 +26,12 @@ async-stream = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 dimicon = { version = "0.2.0", features = ["devicon", "simpleicon"] }
+http = "1.5.0"
+bytes.workspace = true
+arcbox-connect.workspace = true
+connectrpc = "0.8.1"
+buffa = { version = "0.8.1", features = ["json"] }
+buffa-types = { version = "0.8.1", features = ["json"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
