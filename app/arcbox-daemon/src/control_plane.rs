@@ -1,21 +1,12 @@
-//! The daemon's control-plane socket: two RPC stacks, one endpoint.
+//! The daemon's control-plane socket.
 //!
-//! The sandbox API is served over Connect (CORE-53), and the daemon's own
-//! services are moving there too, one at a time (CORE-68); whatever has not
-//! moved yet is still on tonic. Both are `tower` services over HTTP, so they
-//! compose into one axum router and share a single Unix socket: tonic
-//! registers a route per service name, and anything it does not claim falls
-//! through to the Connect handlers. A client therefore reaches every service
-//! at the same address, and no path prefix has to be kept in sync by hand.
-//!
-//! Registration is what decides which stack serves a path. tonic matches
-//! first, so a service listed on both would keep answering over tonic alone
-//! — migrating a service means removing it from `Routes` in the same change
-//! that adds it to the Connect router.
+//! Every service is served over Connect (CORE-53 for the sandbox API,
+//! CORE-68 for the rest), so one set of handlers answers Connect, gRPC, and
+//! gRPC-Web at a single address.
 //!
 //! Connections are served with hyper's protocol-detecting builder rather
-//! than tonic's HTTP/2-only server, which is what makes the acceptance
-//! criterion reachable: gRPC clients arrive over HTTP/2 while
+//! than an HTTP/2-only server, which is what makes all three formats
+//! reachable at once: gRPC clients arrive over HTTP/2 while
 //! `curl --unix-socket` posting JSON arrives over HTTP/1.1, and the same
 //! handlers answer both.
 
@@ -91,25 +82,10 @@ pub fn bind(socket_path: &std::path::Path) -> Result<UnixListener> {
     ))
 }
 
-/// Composes the tonic services and the Connect services into one router.
+/// Builds the router: every service, plus server reflection.
 ///
-/// `tonic` claims `/{service}/{method}` for each service registered on it;
-/// the Connect router is the fallback, so it receives exactly the paths
-/// tonic does not serve. Adding a service to either side needs no change
-/// here.
-pub fn compose(tonic_routes: tonic::service::Routes, connect: connectrpc::Router) -> axum::Router {
-    tonic_routes
-        // Lets axum flatten its route table once instead of per request.
-        .prepare()
-        .into_axum_router()
-        .fallback_service(connect.into_axum_service())
-}
-
-/// Builds the Connect half: every service already migrated, plus reflection.
-///
-/// Reflection is served here rather than by tonic so that one
-/// implementation covers gRPC, gRPC-Web, and Connect alike. Both `v1` and
-/// the legacy `v1alpha` are registered, since `grpcurl` still asks for
+/// Reflection covers gRPC, gRPC-Web, and Connect alike. Both `v1` and the
+/// legacy `v1alpha` are registered, since `grpcurl` still asks for
 /// `v1alpha` by default.
 ///
 /// One limit is worth knowing before chasing it: `ServerReflectionInfo` is
@@ -119,9 +95,8 @@ pub fn compose(tonic_routes: tonic::service::Routes, connect: connectrpc::Router
 /// calls are unaffected, which is why `curl --unix-socket` still works for
 /// the services themselves.
 ///
-/// The descriptor set is the whole daemon's, not just the sandbox package:
-/// it is standard protobuf wire bytes, so the same set `arcbox-grpc` emits
-/// for its prost build describes every service either stack serves.
+/// The descriptor set is standard protobuf wire bytes, so the same one
+/// `arcbox-grpc` emits for its prost build describes every service here.
 ///
 /// # Errors
 ///
@@ -141,6 +116,15 @@ pub fn connect_router(
     ))
 }
 
+/// Turns the router into the HTTP service the socket serves.
+///
+/// Kept separate from [`connect_router`] so tests can inspect the routing
+/// table — once it is an `axum::Router` the registered method paths are no
+/// longer visible.
+pub fn into_app(router: connectrpc::Router) -> axum::Router {
+    router.into_axum_router()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, OnceLock};
@@ -150,7 +134,7 @@ mod tests {
 
     use super::*;
 
-    /// Brings up the real composed control plane on a temp socket.
+    /// Brings up the real control plane on a temp socket.
     ///
     /// The runtime handle is deliberately left empty: every sandbox call
     /// then answers `unavailable`, which is enough to prove the transport —
@@ -170,8 +154,7 @@ mod tests {
             Arc::clone(&runtime),
             Arc::clone(&runtime),
         );
-        let connect = connect_router(runtime, system).expect("connect router");
-        let app = compose(tonic::service::Routes::default(), connect);
+        let app = into_app(connect_router(runtime, system).expect("connect router"));
 
         let listener = bind(&socket).expect("bind temp socket");
         let shutdown = CancellationToken::new();
@@ -276,7 +259,9 @@ mod tests {
             "Connect puts the error code in the JSON body: {json}"
         );
 
-        // 2. gRPC over HTTP/2 — the generated tonic client, unchanged.
+        // 2. gRPC over HTTP/2 — driven by a generated tonic client, which
+        //    is now purely a test dependency: it is the independent
+        //    implementation that keeps the gRPC claim honest.
         let channel = tonic::transport::Endpoint::try_from("http://localhost")
             .expect("endpoint")
             .connect_with_connector(tower::service_fn({
@@ -332,11 +317,11 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// CORE-68 moves the daemon's own services onto the Connect router one
-    /// at a time. Registration is what decides which stack serves a path —
-    /// tonic matches first, so a service left on both would silently keep
-    /// answering over tonic only. Asserting the route directly is hermetic;
-    /// driving Icon end-to-end would reach the network.
+    /// Every service must actually be registered, or its path 404s: the
+    /// router serves exactly what it was given, and a service dropped
+    /// during the tonic migration (CORE-68) would fail nowhere else.
+    /// Asserting the routes directly is hermetic; driving Icon end-to-end
+    /// would reach the network.
     #[test]
     fn migrated_daemon_services_are_registered_on_the_connect_router() {
         let runtime: arcbox_api::SharedRuntime = Arc::new(OnceLock::new());
@@ -354,6 +339,7 @@ mod tests {
             "arcbox.v1.KubernetesService/Status",
             "arcbox.v1.MigrationService/RunMigration",
             "arcbox.v1.MachineService/ExecSession",
+            "arcbox.v1.MacosService/List",
         ] {
             assert!(
                 router.has_method(path),
@@ -363,11 +349,11 @@ mod tests {
         }
     }
 
-    /// Reflection has to keep answering through the composed router, or
+    /// Reflection has to keep answering through the real router, or
     /// `grpcurl` and `buf curl` lose the ability to discover the API without
     /// vendoring the protos.
     #[tokio::test]
-    async fn reflection_answers_through_the_composed_router() {
+    async fn reflection_answers_through_the_real_router() {
         let (_dir, socket, shutdown) = spawn_control_plane().await;
 
         let channel = tonic::transport::Endpoint::try_from("http://localhost")

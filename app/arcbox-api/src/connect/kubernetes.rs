@@ -8,7 +8,7 @@ use connectrpc::{
     ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
 };
 
-use crate::grpc::SharedRuntime;
+use super::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
 use super::bridge::wire_response;

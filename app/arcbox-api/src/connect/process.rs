@@ -10,8 +10,8 @@ use connectrpc::{
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::SharedRuntime;
 use crate::ApiError;
-use crate::grpc::SharedRuntime;
 
 use super::bridge::{wire_request, wire_response, wire_stream_item};
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};

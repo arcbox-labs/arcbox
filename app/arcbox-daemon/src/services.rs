@@ -8,12 +8,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-#[cfg(target_os = "macos")]
-use arcbox_api::{MacosServiceImpl, macos_service_server::MacosServiceServer};
 use arcbox_api::{SharedRuntime, SystemServiceImpl};
 use arcbox_core::Runtime;
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
-use tonic::service::Routes;
 use tracing::{info, warn};
 
 use crate::context::{DaemonContext, ServiceHandles};
@@ -38,30 +35,19 @@ pub async fn start_grpc(
 
     info!(socket = %socket_path.display(), "control plane listening (Connect + gRPC + gRPC-Web)");
 
-    #[cfg(target_os = "macos")]
-    let macos_service = MacosServiceImpl::new(Arc::clone(&shared_runtime));
     let system_service = SystemServiceImpl::new(
         Arc::clone(&ctx.setup_state),
         Arc::clone(&shared_runtime),
         Arc::clone(&ctx.early_runtime),
     );
-    // The Connect half: the four sandbox services (CORE-53), whose
-    // control/data-plane split (CORE-57) is preserved so a cloud deployment
-    // can host them in different processes, plus the daemon's own services
-    // as they migrate off tonic (CORE-68). Reflection rides along so it
-    // answers over all three wire formats rather than gRPC alone.
-    let connect =
-        crate::control_plane::connect_router(Arc::clone(&shared_runtime), system_service)?;
-
-    // Macos is the last service still on tonic (CORE-68). macOS guests are
-    // served only on Apple Silicon hosts; on other platforms the service is
-    // simply absent (the CLI `macos` noun is likewise macOS-only), which is
-    // why this router can be empty.
-    let routes = Routes::default();
-    #[cfg(target_os = "macos")]
-    let routes = routes.add_service(MacosServiceServer::new(macos_service));
-
-    let app = crate::control_plane::compose(routes, connect);
+    // Every service is served over Connect (CORE-53, CORE-68). The sandbox
+    // control/data-plane split (CORE-57) is preserved inside it, so a cloud
+    // deployment can still host those halves in different processes.
+    // Reflection rides along and answers over all three wire formats.
+    let app = crate::control_plane::into_app(crate::control_plane::connect_router(
+        Arc::clone(&shared_runtime),
+        system_service,
+    )?);
 
     let shutdown = ctx.shutdown.clone();
     let handle = tokio::spawn(crate::control_plane::serve(listener, app, shutdown));

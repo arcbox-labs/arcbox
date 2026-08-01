@@ -435,6 +435,7 @@ dependencies = [
  "arcbox-helper",
  "arcbox-logging",
  "arcbox-net",
+ "arcbox-protocol",
  "arcbox-route",
  "arcbox-transport",
  "async-trait",

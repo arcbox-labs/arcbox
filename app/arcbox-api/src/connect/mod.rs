@@ -28,6 +28,8 @@ mod filesystem;
 mod icon;
 mod kubernetes;
 mod machine;
+#[cfg(target_os = "macos")]
+mod macos;
 mod migration;
 mod process;
 mod snapshot;
@@ -36,6 +38,8 @@ mod system;
 
 use std::sync::Arc;
 use std::time::Duration;
+
+use std::sync::OnceLock;
 
 use arcbox_core::Runtime;
 use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
@@ -47,13 +51,20 @@ pub use filesystem::SandboxFilesystemServiceImpl;
 pub use icon::IconServiceImpl;
 pub use kubernetes::KubernetesServiceImpl;
 pub use machine::MachineServiceImpl;
+#[cfg(target_os = "macos")]
+pub use macos::MacosServiceImpl;
 pub use migration::MigrationServiceImpl;
 pub use process::SandboxProcessServiceImpl;
 pub use snapshot::SandboxSnapshotServiceImpl;
 pub use stats::StatsServiceImpl;
 pub use system::{SetupState, SystemServiceImpl};
 
-use crate::grpc::SharedRuntime;
+/// Shared handle to a runtime that may not be initialized yet.
+///
+/// Services are registered before the runtime exists, so each RPC calls
+/// `runtime.ready()`, which answers `Unavailable` while the daemon is still
+/// downloading assets or starting the VM.
+pub type SharedRuntime = Arc<OnceLock<Arc<Runtime>>>;
 
 /// Idle interval after which a server stream emits a keepalive frame, so
 /// proxies and load balancers never see a silent connection (CORE-55).
@@ -71,6 +82,35 @@ where
     stream
         .timeout(KEEPALIVE_INTERVAL)
         .map(move |item| item.unwrap_or_else(|_elapsed| Ok(keepalive())))
+}
+
+/// Drives a `!Send` macOS VM future to completion on a dedicated blocking
+/// thread.
+///
+/// Virtualization.framework operations hold ObjC handles (and the VM's
+/// dispatch queue) across await and are not `Send`, but handler futures must
+/// be `Send` — that was true under tonic and is equally true under
+/// connectrpc. Running the future via a transient current-thread runtime
+/// inside `spawn_blocking` keeps that `!Send` state off the server's worker
+/// threads; the booted VM (which is `Send + Sync`) outlives the transient
+/// runtime.
+#[cfg(target_os = "macos")]
+pub(crate) async fn run_macos_blocking<T, Fut, F>(f: F) -> Result<T, ConnectError>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = arcbox_core::Result<T>>,
+    F: FnOnce() -> Fut + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ConnectError::internal(format!("macOS runtime: {e}")))?
+            .block_on(f())
+            .map_err(|e| ConnectError::internal(e.to_string()))
+    })
+    .await
+    .map_err(|e| ConnectError::internal(format!("macOS task join: {e}")))?
 }
 
 /// Extension trait for obtaining the runtime from a deferred handle.
@@ -154,7 +194,7 @@ fn wire_protocol(
 #[must_use]
 pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
     let clone = || Arc::clone(&runtime);
-    connectrpc::Router::new()
+    let router = connectrpc::Router::new()
         .add_service(Arc::new(SandboxServiceImpl::new(clone())))
         .add_service(Arc::new(SandboxProcessServiceImpl::new(clone())))
         .add_service(Arc::new(SandboxFilesystemServiceImpl::new(clone())))
@@ -165,7 +205,10 @@ pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
         .add_service(Arc::new(StatsServiceImpl::new(clone())))
         .add_service(Arc::new(KubernetesServiceImpl::new(clone())))
         .add_service(Arc::new(MigrationServiceImpl::new(clone())))
-        .add_service(Arc::new(MachineServiceImpl::new(clone())))
+        .add_service(Arc::new(MachineServiceImpl::new(clone())));
+    #[cfg(target_os = "macos")]
+    let router = router.add_service(Arc::new(MacosServiceImpl::new(clone())));
+    router
 }
 
 /// Registers the services plus the ones needing extra state the router

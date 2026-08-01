@@ -13,8 +13,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use arcbox_core::SandboxPortExposure;
 
+use super::SharedRuntime;
 use crate::ApiError;
-use crate::grpc::SharedRuntime;
 
 use super::bridge::{wire_request, wire_response};
 use super::{ConnectRuntimeExt as _, ContextExt as _, protocol_key, wire_protocol, with_keepalive};
