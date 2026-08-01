@@ -93,6 +93,8 @@ impl MigrationManager {
             // are surfaced via `warnings`.
             replacements_required: !plan.replacements.is_empty(),
             warnings,
+            plan_json: serde_json::to_string(&plan).unwrap_or_default(),
+            unsupported_resources: plan.unsupported_resources.clone(),
         })
     }
 
@@ -285,6 +287,7 @@ mod tests {
             .run_migration(RunMigrationRequest {
                 plan_id: plan_id.clone(),
                 allow_replacements: false,
+                skip_start: false,
             })
             .await
             .unwrap_err();
@@ -331,6 +334,7 @@ mod tests {
             .run_migration(RunMigrationRequest {
                 plan_id: plan_id.clone(),
                 allow_replacements: true,
+                skip_start: false,
             })
             .await
             .unwrap();

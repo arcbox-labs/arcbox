@@ -823,6 +823,10 @@ pub struct PrepareMigrationRequest {
     /// Allow prepare to include replace actions in the plan.
     #[prost(bool, tag = "3")]
     pub allow_replacements: bool,
+    /// Compute and return the plan without storing it. No plan_id is issued, so
+    /// the plan cannot subsequently be run.
+    #[prost(bool, tag = "4")]
+    pub dry_run: bool,
 }
 /// Prepared migration summary.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -856,9 +860,18 @@ pub struct PrepareMigrationResponse {
     #[prost(bool, tag = "8")]
     pub replacements_required: bool,
     /// Non-fatal warnings discovered during preparation (for example, volume
-    /// blockers that will require stopping running source containers).
+    /// blockers that will require stopping running source containers, or bind
+    /// mount sources that do not exist on this host).
     #[prost(string, repeated, tag = "9")]
     pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The full migration plan serialized as JSON. Populated on every prepare so
+    /// callers can inspect exactly what would run.
+    #[prost(string, tag = "10")]
+    pub plan_json: ::prost::alloc::string::String,
+    /// Source resources this migration cannot reproduce. Unlike warnings these
+    /// are blocking: RunMigration refuses to execute a plan that has any.
+    #[prost(string, repeated, tag = "11")]
+    pub unsupported_resources: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Request to run a prepared migration.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -871,6 +884,10 @@ pub struct RunMigrationRequest {
     /// Confirms that the caller accepts any replace actions in the plan.
     #[prost(bool, tag = "2")]
     pub allow_replacements: bool,
+    /// Create containers but leave them stopped. By default containers that were
+    /// running on the source are started after the migration completes.
+    #[prost(bool, tag = "3")]
+    pub skip_start: bool,
 }
 /// Streaming migration progress event.
 #[derive(serde::Serialize, serde::Deserialize)]

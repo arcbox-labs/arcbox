@@ -621,6 +621,9 @@ message PrepareMigrationRequest {
     string source_socket_path = 2;
     // Allow prepare to include replace actions in the plan.
     bool allow_replacements = 3;
+    // Compute and return the plan without storing it. No plan_id is issued, so
+    // the plan cannot subsequently be run.
+    bool dry_run = 4;
 }
 
 // Prepared migration summary.
@@ -644,8 +647,15 @@ message PrepareMigrationResponse {
     // RunMigrationRequest.allow_replacements must be set to confirm.
     bool replacements_required = 8;
     // Non-fatal warnings discovered during preparation (for example, volume
-    // blockers that will require stopping running source containers).
+    // blockers that will require stopping running source containers, or bind
+    // mount sources that do not exist on this host).
     repeated string warnings = 9;
+    // The full migration plan serialized as JSON. Populated on every prepare so
+    // callers can inspect exactly what would run.
+    string plan_json = 10;
+    // Source resources this migration cannot reproduce. Unlike warnings these
+    // are blocking: RunMigration refuses to execute a plan that has any.
+    repeated string unsupported_resources = 11;
 }
 
 // Request to run a prepared migration.
@@ -654,6 +664,9 @@ message RunMigrationRequest {
     string plan_id = 1;
     // Confirms that the caller accepts any replace actions in the plan.
     bool allow_replacements = 2;
+    // Create containers but leave them stopped. By default containers that were
+    // running on the source are started after the migration completes.
+    bool skip_start = 3;
 }
 
 // Streaming migration progress event.
