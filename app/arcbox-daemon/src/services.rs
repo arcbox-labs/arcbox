@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arcbox_api::{
-    KubernetesServiceImpl, MachineServiceImpl, MigrationServiceImpl, MigrationServiceServer,
-    SharedRuntime, SystemServiceImpl, kubernetes_service_server::KubernetesServiceServer,
+    MachineServiceImpl, SharedRuntime, SystemServiceImpl,
     machine_service_server::MachineServiceServer,
 };
 #[cfg(target_os = "macos")]
@@ -45,8 +44,6 @@ pub async fn start_grpc(
     let machine_service = MachineServiceImpl::new(Arc::clone(&shared_runtime));
     #[cfg(target_os = "macos")]
     let macos_service = MacosServiceImpl::new(Arc::clone(&shared_runtime));
-    let kubernetes_service = KubernetesServiceImpl::new(Arc::clone(&shared_runtime));
-    let migration_service = MigrationServiceImpl::new(Arc::clone(&shared_runtime));
     let system_service = SystemServiceImpl::new(
         Arc::clone(&ctx.setup_state),
         Arc::clone(&shared_runtime),
@@ -60,10 +57,7 @@ pub async fn start_grpc(
     let connect =
         crate::control_plane::connect_router(Arc::clone(&shared_runtime), system_service)?;
 
-    let routes = Routes::default()
-        .add_service(MachineServiceServer::new(machine_service))
-        .add_service(KubernetesServiceServer::new(kubernetes_service))
-        .add_service(MigrationServiceServer::new(migration_service));
+    let routes = Routes::default().add_service(MachineServiceServer::new(machine_service));
     // macOS guests are served only on Apple Silicon hosts; on other
     // platforms the service is simply absent (the CLI `macos` noun is
     // likewise macOS-only).
