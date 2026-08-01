@@ -75,15 +75,23 @@ must name `abctl`.
   into the snapshot, walking a client's phase backwards. Regressions:
   `back_to_back_phases_are_all_delivered`,
   `the_snapshot_is_not_replayed_as_an_update`.
-- `NETWORK_READY` covers whichever services this daemon runs and means they
-  were *started*, not that they are reachable. `--no-linux-vm` reaches it
-  with DNS alone (`start_services` skips the Docker API and the Kubernetes
-  proxy), and of the three only DNS is guaranteed bound: `DnsService::bind`
-  propagates its error, while `DockerApiServer::run` binds inside its
-  spawned task and only logs there, and the Kubernetes proxy tolerates a
-  taken 16443 by design — so a Docker socket that fails to bind still
-  reaches `READY`. Pre-existing; if you fix it, bind before returning from
-  `services::start_services` so the failure reaches the pipeline.
+- **A listener the phase promises is bound before `start_services` returns,
+  never inside its spawned task** (`DnsService::bind`, then
+  `DockerApiServer::bind` + `serve` — CORE-71). WHY: a task that binds and
+  only logs its error cannot fail startup, so the pipeline publishes
+  `NETWORK_READY` and `READY` for a daemon whose primary API no client can
+  reach. `NETWORK_READY` therefore covers whichever services this daemon
+  runs — `--no-linux-vm` reaches it with DNS alone — and the Kubernetes
+  proxy is the deliberate exception: a taken 16443 is tolerated, so it is
+  started here but not promised. Adding a listener means deciding which of
+  those two it is.
+- **`SetupStatus.vm_running` is owned by `services::vm_running_loop`**, which
+  mirrors `VmLifecycleState::is_ready` (readiness level 2 below) off
+  `Runtime::subscribe_system_vm_state`. WHY: it used to be set once by
+  cold-start recovery on a successful guest query and never cleared, so it
+  read `true` for the rest of the daemon's life after any stop (CORE-70). A
+  second writer re-introduces that class of drift — the loop owns both
+  edges. Regression: `vm_running_loop_follows_the_lifecycle_both_ways`.
 - Startup-cancellation invariant: the flock (`daemon_lock`) and
   `early_runtime` are held in `StartupHandles`, not only in pipeline-local
   context (`context.rs`, `main::run` keeps a clone). WHY: a signal can drop

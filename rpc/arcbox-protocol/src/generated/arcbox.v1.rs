@@ -960,7 +960,10 @@ pub struct SetupStatus {
     /// Whether the container subnet route is installed.
     #[prost(bool, tag = "4")]
     pub route_installed: bool,
-    /// Whether the default VM is running.
+    /// Whether the System VM is up with its guest agent answering — the point
+    /// at which RPCs against it succeed. Follows the VM for the daemon's whole
+    /// life, so it falls on stop (idle, backend switch, crash) and rises again
+    /// on the next boot.
     #[prost(bool, tag = "5")]
     pub vm_running: bool,
     /// Human-readable status message.
@@ -1009,12 +1012,12 @@ pub mod setup_status {
         /// The System VM booted and its guest agent answered, so the VM
         /// accepts commands. Its container runtime may still be starting.
         VmReady = 4,
-        /// The host services this daemon runs are up: the DNS server is
-        /// bound, and — with a Linux VM — the Docker API and Kubernetes
-        /// proxies have been started (a --no-linux-vm daemon runs neither).
-        /// Neither proxy aborts startup when its bind fails, so this means
-        /// "started", not "proven reachable"; clients still handle a
-        /// connection error.
+        /// The host services this daemon runs are up: the DNS server and,
+        /// with a Linux VM, the Docker API are bound (a --no-linux-vm daemon
+        /// runs no Docker API). Both fail startup rather than reaching this
+        /// phase if they cannot bind. The Kubernetes proxy is started here
+        /// too but is best-effort — a port 16443 already in use is tolerated
+        /// — so it is the one service this phase does not promise.
         NetworkReady = 5,
         /// Startup complete.
         Ready = 6,

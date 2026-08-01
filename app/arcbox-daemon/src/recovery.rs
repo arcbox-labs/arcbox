@@ -24,7 +24,7 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
         return;
     }
 
-    recover_container_networking(runtime, &ctx.setup_state).await;
+    recover_container_networking(runtime).await;
 
     // Cold-start route reconcile (non-blocking). This is load-bearing after
     // app updates or daemon restarts where the VM survives but the host route
@@ -252,12 +252,10 @@ async fn ensure_docker_tools(data_dir: &Path) -> anyhow::Result<()> {
 
 /// Re-registers DNS entries and port forwarding for all running containers.
 ///
-/// If the guest VM responds (even with an empty container list), the
-/// `vm_running` flag on `setup_state` is set to `true`.
-async fn recover_container_networking(
-    runtime: &Arc<Runtime>,
-    setup_state: &Arc<arcbox_api::SetupState>,
-) {
+/// Reports nothing about VM liveness: `services::vm_running_loop` owns
+/// `SetupStatus.vm_running` and follows the lifecycle across restarts, which
+/// a one-shot observation made here could not.
+async fn recover_container_networking(runtime: &Arc<Runtime>) {
     use arcbox_docker::guest_query;
     use arcbox_docker::proxy::{GuestHttpClient, VsockConnector};
 
@@ -269,9 +267,6 @@ async fn recover_container_networking(
             return;
         }
     };
-
-    // Successfully queried the guest VM — it is running.
-    setup_state.set_vm_running(true);
 
     let mut recovered_dns = 0u32;
     let mut recovered_ports = 0u32;
