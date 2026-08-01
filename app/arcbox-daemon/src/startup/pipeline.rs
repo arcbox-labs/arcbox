@@ -149,6 +149,13 @@ impl RuntimeBooted {
             Ok(handles)
         })
         .await?;
+        // DNS, the Docker API, and the Kubernetes proxy are listening: every
+        // path a client reaches the VM through is open. What recovery spawned
+        // (route reconcile, self-setup) reports separately through the
+        // SetupStatus flags, not through this phase.
+        self.ctx
+            .setup_state
+            .set_phase(SetupPhase::NetworkReady, "Network services ready");
         Ok(RuntimeServicesStarted {
             ctx: self.ctx,
             handles,

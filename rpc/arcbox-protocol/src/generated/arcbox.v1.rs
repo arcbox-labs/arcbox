@@ -977,21 +977,47 @@ pub struct SetupStatus {
 }
 /// Nested message and enum types in `SetupStatus`.
 pub mod setup_status {
-    /// Daemon startup phases, ordered by progression.
+    /// Daemon startup phases.
+    ///
+    /// Numbers follow the order phases were introduced, NOT the order they
+    /// occur in (DOWNLOADING_ASSETS = 8 precedes READY = 6), so match on the
+    /// value and never compare ordinals. The happy path is:
+    ///
+    ///    INITIALIZING -> \[CLEANING_UP -> INITIALIZING\] -> \[DOWNLOADING_ASSETS\]
+    ///    -> ASSETS_READY -> \[VM_STARTING -> VM_READY\] -> NETWORK_READY -> READY
+    ///
+    /// Bracketed steps are conditional: CLEANING_UP only when a displaced
+    /// daemon's resources must be released, DOWNLOADING_ASSETS only when boot
+    /// assets are missing, and the VM pair only when the Linux VM is enabled
+    /// (a --no-linux-vm daemon boots no guest and publishes neither). FAILED
+    /// can replace any of them. A phase already passed before a client
+    /// subscribes is simply never seen, so treat an unobserved phase as
+    /// unknown rather than waiting for it.
     #[derive(serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Phase {
         Unspecified = 0,
+        /// Host directories, config, and sockets are being prepared.
         Initializing = 1,
+        /// Kernel, rootfs, and guest binaries are present and verified.
         AssetsReady = 2,
+        /// The System VM is booting. Guest binaries are already staged by
+        /// this point, so the phase covers the guest boot and nothing else.
         VmStarting = 3,
+        /// The System VM booted and its guest agent answered, so the VM
+        /// accepts commands. Its container runtime may still be starting.
         VmReady = 4,
+        /// DNS, the Docker API, and the Kubernetes proxy are listening.
         NetworkReady = 5,
+        /// Startup complete.
         Ready = 6,
+        /// Reserved; never published.
         Degraded = 7,
+        /// Boot assets are being downloaded.
         DownloadingAssets = 8,
+        /// Waiting for a displaced daemon to release its disk images.
         CleaningUp = 9,
         /// Startup failed fatally; the daemon exits shortly after
         /// publishing this phase. See the `error` field for the cause.

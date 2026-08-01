@@ -24,11 +24,12 @@ prepare_assets           Seed/download boot assets               variable
     │                    ASSETS_READY.
     │
 boot_runtime             Construct Runtime, boot the System VM   variable
-    │                    Emits no phase of its own; VM/network
-    │                    progress surfaces as SetupStatus infra
-    │                    flags, not phases (see below).
+    │                    Reported as VM_STARTING → VM_READY,
+    │                    published from inside Runtime::init so
+    │                    the span covers the guest boot alone.
     │
 start_runtime_services   DNS, Docker API, recovery               ~instant
+    │                    Reported as NETWORK_READY.
     │
 mark_ready               SetupPhase::Ready
 ```
@@ -41,19 +42,23 @@ startup failure.
 
 ### Phase enum caveats
 
-- The observable progression is `INITIALIZING → [CLEANING_UP] →
-  DOWNLOADING_ASSETS → ASSETS_READY → READY` (or `FAILED`). The
-  `VM_STARTING` / `VM_READY` / `NETWORK_READY` / `DEGRADED` values in
-  `SetupStatus.Phase` are reserved but currently never emitted — do not
-  wait on them.
+- The observable progression is `INITIALIZING → [CLEANING_UP →
+  INITIALIZING] → [DOWNLOADING_ASSETS] → ASSETS_READY → [VM_STARTING →
+  VM_READY] → NETWORK_READY → READY` (or `FAILED`). Bracketed phases are
+  conditional; the VM pair is skipped entirely by a `--no-linux-vm`
+  daemon, which boots no guest. `DEGRADED` is reserved and never emitted.
+- A phase the daemon had already left before a client subscribed is never
+  observed. Treat a missing phase as unknown, not as zero elapsed and not
+  as a reason to keep waiting — the stream never replays it.
 - Enum ordinal ≠ progression order (`DOWNLOADING_ASSETS = 8` occurs before
   `READY = 6`). Clients must match on the value, never compare ordinals.
   New phases are appended with the next free number regardless of where
   they sit in the progression — values are additive-only.
-- VM / route / DNS progress during and after `boot_runtime` is carried by
-  the boolean `SetupStatus` fields (`vm_running`, `route_installed`,
-  `dns_resolver_installed`, …), set by recovery and `route_status_loop`,
-  not by phase transitions.
+- Phases mark the transitions; the boolean `SetupStatus` fields
+  (`vm_running`, `route_installed`, `dns_resolver_installed`, …) carry the
+  state that outlives startup, including work `recovery::run` spawns in
+  the background and anything `route_status_loop` reconciles afterwards.
+  A client wanting "is the route up *now*" reads the flag, not a phase.
 
 ### Why gRPC starts before resource cleanup
 
