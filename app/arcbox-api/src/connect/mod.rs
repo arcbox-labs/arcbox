@@ -20,6 +20,9 @@
 
 pub(crate) mod bridge;
 mod control;
+mod filesystem;
+mod process;
+mod snapshot;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +33,9 @@ use connectrpc::{ConnectError, RequestContext};
 use tokio_stream::{Stream, StreamExt as _};
 
 pub use control::SandboxServiceImpl;
-// pending: pub use filesystem::SandboxFilesystemServiceImpl;
-// pending: pub use process::SandboxProcessServiceImpl;
-// pending: pub use snapshot::SandboxSnapshotServiceImpl;
+pub use filesystem::SandboxFilesystemServiceImpl;
+pub use process::SandboxProcessServiceImpl;
+pub use snapshot::SandboxSnapshotServiceImpl;
 
 use crate::grpc::SharedRuntime;
 
@@ -133,7 +136,15 @@ fn wire_protocol(
 /// call site.
 #[must_use]
 pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
-    connectrpc::Router::new().add_service(Arc::new(SandboxServiceImpl::new(runtime)))
+    connectrpc::Router::new()
+        .add_service(Arc::new(SandboxServiceImpl::new(Arc::clone(&runtime))))
+        .add_service(Arc::new(SandboxProcessServiceImpl::new(Arc::clone(
+            &runtime,
+        ))))
+        .add_service(Arc::new(SandboxFilesystemServiceImpl::new(Arc::clone(
+            &runtime,
+        ))))
+        .add_service(Arc::new(SandboxSnapshotServiceImpl::new(runtime)))
 }
 
 #[cfg(test)]

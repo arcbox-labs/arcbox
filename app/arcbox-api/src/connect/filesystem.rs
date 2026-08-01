@@ -1,24 +1,22 @@
 //! Sandbox filesystem service — data plane.
 
-use std::pin::Pin;
-
-use arcbox_grpc::SandboxFilesystemService;
-use arcbox_protocol::pbjson_types::Empty;
-use arcbox_protocol::sandbox_v1::{
-    FileChunk, ReadFileRequest, WriteFileRequest, write_file_request,
+use arcbox_connect::sandbox_v1 as pb;
+use arcbox_protocol::sandbox_v1::{FileChunk, write_file_request};
+use buffa_types::google::protobuf::Empty;
+use connectrpc::{
+    ConnectError, InboundStream, PreEncoded, RequestContext, Response, ServiceRequest,
+    ServiceResult, ServiceStream,
 };
-use tokio_stream::Stream;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::codec::Streaming;
-use tonic::{Request, Response, Status};
 
 use arcbox_core::WriteFileChunk;
 
 use crate::ApiError;
+use crate::grpc::SharedRuntime;
 
-use super::super::{RequestExt, SharedRuntime, SharedRuntimeExt};
-use super::with_keepalive;
+use super::bridge::{wire_request, wire_response, wire_stream_item};
+use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 
 /// Filesystem service implementation.
 ///
@@ -36,69 +34,81 @@ impl SandboxFilesystemServiceImpl {
     }
 }
 
-#[tonic::async_trait]
-impl SandboxFilesystemService for SandboxFilesystemServiceImpl {
-    type ReadFileStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send + 'static>>;
-
+#[allow(
+    refining_impl_trait,
+    reason = "the trait returns `impl Encodable<M>`; naming the concrete body \
+              type is strictly more informative and these impls are registered on a \
+              Router rather than named by callers"
+)]
+impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
     async fn read_file(
         &self,
-        request: Request<ReadFileRequest>,
-    ) -> Result<Response<Self::ReadFileStream>, Status> {
-        let machine = request.machine_id()?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ReadFileRequest>,
+    ) -> ServiceResult<ServiceStream<PreEncoded<pb::FileChunk>>> {
+        let machine = ctx.machine_id()?;
         let agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let rx = agent
-            .sandbox_read_file(request.into_inner())
+            .sandbox_read_file(wire_request(&request)?)
             .await
             .map_err(ApiError::from)?;
         let stream =
-            ReceiverStream::new(rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+            ReceiverStream::new(rx).map(|r| r.map_err(|e| ConnectError::from(ApiError::from(e))));
         // Keepalives are empty non-final chunks, as documented in the proto.
         let stream = with_keepalive(stream, || FileChunk {
             data: Vec::new(),
             done: false,
         });
-        Ok(Response::new(Box::pin(stream)))
+        let stream = stream.map(|item| item.map(|chunk| wire_response::<pb::FileChunk, _>(&chunk)));
+        Response::ok(Box::pin(stream))
     }
 
     async fn write_file(
         &self,
-        request: Request<Streaming<WriteFileRequest>>,
-    ) -> Result<Response<Empty>, Status> {
-        let machine = request.machine_id()?;
+        ctx: RequestContext,
+        mut requests: InboundStream<pb::WriteFileRequest>,
+    ) -> ServiceResult<Empty> {
+        let machine = ctx.machine_id()?;
         let agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
 
-        let mut stream = request.into_inner();
-
         // The first message in the stream must carry the Open payload.
-        let first = stream.next().await.ok_or_else(|| {
-            Status::invalid_argument("write_file: stream closed before Open message")
+        let first = requests.next().await.ok_or_else(|| {
+            ConnectError::invalid_argument("write_file: stream closed before Open message")
         })??;
+        let first: arcbox_protocol::sandbox_v1::WriteFileRequest = wire_stream_item(&first)?;
         let open = match first.payload {
             Some(write_file_request::Payload::Open(open)) => open,
             _ => {
-                return Err(Status::invalid_argument(
+                return Err(ConnectError::invalid_argument(
                     "write_file: first message must be Open",
                 ));
             }
         };
 
-        // Bridge gRPC chunks into the agent write stream. A clean end (the
+        // Bridge Connect chunks into the agent write stream. A clean end (the
         // client's `done` chunk) closes the channel, which triggers the
         // terminating frame; a client error or a stream that ends *before*
         // `done` sends `Abort` so the partial upload is never finalized.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             loop {
-                match stream.next().await {
-                    Some(Ok(msg)) => {
+                match requests.next().await {
+                    Some(Ok(item)) => {
+                        let Ok(msg) = wire_stream_item::<
+                            arcbox_protocol::sandbox_v1::WriteFileRequest,
+                            _,
+                        >(&item) else {
+                            let _ = tx.send(WriteFileChunk::Abort).await;
+                            return;
+                        };
                         if let Some(write_file_request::Payload::Chunk(chunk)) = msg.payload {
                             let done = chunk.done;
                             if !chunk.data.is_empty()
@@ -124,6 +134,6 @@ impl SandboxFilesystemService for SandboxFilesystemServiceImpl {
             .sandbox_write_file(open, rx)
             .await
             .map_err(ApiError::from)?;
-        Ok(Response::new(Empty {}))
+        Response::ok(Empty::default())
     }
 }

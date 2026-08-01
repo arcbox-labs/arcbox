@@ -5,7 +5,7 @@ use arcbox_protocol::sandbox_v1::{KeepAlive, WatchEventsResponse, watch_events_r
 use arcbox_protocol::v1::{SandboxPortForwardRemoveRequest, SandboxPortForwardRequest};
 use buffa_types::google::protobuf::Empty;
 use connectrpc::{
-    ConnectError, Encodable, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
+    ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
     ServiceStream,
 };
 use tokio_stream::StreamExt as _;
@@ -37,6 +37,12 @@ impl SandboxServiceImpl {
     }
 }
 
+#[allow(
+    refining_impl_trait,
+    reason = "the trait returns `impl Encodable<M>`; naming the concrete body \
+              type is strictly more informative and these impls are registered on a \
+              Router rather than named by callers"
+)]
 impl pb::SandboxService for SandboxServiceImpl {
     async fn create(
         &self,
