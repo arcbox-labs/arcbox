@@ -520,9 +520,13 @@ impl pb::MachineService for MachineServiceImpl {
         let (in_tx, in_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             while let Some(Ok(item)) = stream.next().await {
+                // A decode failure can only mean the two generated
+                // representations disagree — a build fault. Fail toward the
+                // EOF sentinel below, ending the session cleanly, rather
+                // than dropping a frame out of an interactive input stream.
                 let Ok(input) = wire_stream_item::<arcbox_protocol::v1::MachineExecInput, _>(&item)
                 else {
-                    continue;
+                    break;
                 };
                 let msg = match input.payload {
                     Some(machine_exec_input::Payload::Stdin(data)) => ExecSessionInput::Stdin(data),
