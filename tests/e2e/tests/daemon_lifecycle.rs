@@ -28,7 +28,7 @@
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -43,11 +43,32 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(100);
 
-static BUILD: Once = Once::new();
+/// Outcome of the one-time daemon build, shared by every test in this binary.
+///
+/// The result is stored rather than just the fact of having run: tests here
+/// run concurrently, so with a bare `Once` only the thread that happened to
+/// run the closure would see a build failure, and the rest would go on to
+/// spawn a missing or stale binary and fail for reasons that look unrelated.
+/// `anyhow::Error` is not `Clone`, so the message is kept as a `String`.
+static BUILD: OnceLock<Result<(), String>> = OnceLock::new();
 
-// ---------------------------------------------------------------------------
-// Lock probing
-// ---------------------------------------------------------------------------
+/// Builds the release daemon once per test binary, reporting the same
+/// outcome to every caller.
+fn build_daemon_once(root: &Path) -> Result<()> {
+    let outcome = BUILD.get_or_init(|| {
+        (|| {
+            let shell = xshell::Shell::new()?;
+            shell.change_dir(root);
+            xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
+            anyhow::Ok(())
+        })()
+        .map_err(|e| e.to_string())
+    });
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(e) => bail!("building arcbox-daemon: {e}"),
+    }
+}
 
 /// Whether the daemon lock at `path` is currently held by some process.
 ///
@@ -102,16 +123,6 @@ fn wait_until(
     }
 }
 
-/// True once the process has gone away (or become a zombie we can't signal).
-fn process_gone(pid: u32) -> bool {
-    // SAFETY: signal 0 performs error checking without delivering a signal.
-    unsafe { libc::kill(pid.cast_signed(), 0) != 0 }
-}
-
-// ---------------------------------------------------------------------------
-// Daemon scaffolding
-// ---------------------------------------------------------------------------
-
 /// Two daemons in one test need their own spawn path — `run_vz_scenario`
 /// owns a single handle and a scenario closure.
 struct Fixture {
@@ -124,16 +135,7 @@ impl Fixture {
     fn new(name: &str) -> Result<Self> {
         let root = arcbox_e2e::repo_root();
         if !arcbox_e2e::env_flag("SKIP_BUILD") {
-            let mut built = Ok(());
-            BUILD.call_once(|| {
-                built = (|| {
-                    let shell = xshell::Shell::new()?;
-                    shell.change_dir(&root);
-                    xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
-                    anyhow::Ok(())
-                })();
-            });
-            built?;
+            build_daemon_once(&root)?;
         }
         let version = resolve_boot_version(&root)?;
         let data_dir = tempfile::Builder::new()
@@ -180,10 +182,6 @@ impl Fixture {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 /// A running daemon holds the lock and records its own PID in it.
 #[test]
@@ -252,24 +250,23 @@ fn killed_daemon_releases_the_lock_for_the_next_one() -> Result<()> {
 fn second_daemon_displaces_the_first() -> Result<()> {
     let fixture = Fixture::new("lock-takeover")?;
 
-    let first = fixture.spawn()?;
+    let mut first = fixture.spawn()?;
     fixture.wait_lock_held()?;
-    let first_pid = first.pid();
 
     // The displaced daemon is terminated by the newcomer, not by us.
     let second = fixture.spawn()?;
 
+    // Reaping poll rather than `kill(pid, 0)`: the displaced daemon stays a
+    // zombie until this handle waits on it, and a zombie answers signal 0, so
+    // a liveness probe would never see it leave.
     wait_until("the displaced daemon to exit", RELEASE_TIMEOUT, || {
-        Ok(process_gone(first_pid))
+        first.has_exited()
     })?;
 
     let lock = fixture.lock_file();
     wait_until("the newcomer to own the lock", RELEASE_TIMEOUT, || {
         Ok(lock_is_held(&lock)? && lock_pid(&lock) == Some(second.pid()))
     })?;
-
-    // Keep `first` alive as a handle so its Drop reaps the process.
-    drop(first);
     Ok(())
 }
 
@@ -303,10 +300,6 @@ fn graceful_shutdown_releases_lock_and_socket() -> Result<()> {
     })?;
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Probe self-check (no daemon, no VM)
-// ---------------------------------------------------------------------------
 
 /// The probe itself must distinguish held from free, and must not leave the
 /// lock held — otherwise every assertion above would read "held" forever.
