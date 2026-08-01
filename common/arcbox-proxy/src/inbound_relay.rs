@@ -536,6 +536,8 @@ fn create_udp_reply_flow(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     const GW_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 1);
@@ -659,6 +661,101 @@ mod tests {
 
         // The cmd_rx channel should still be valid (no panic).
         assert!(cmd_rx.try_recv().is_err(), "no commands expected yet");
+    }
+
+    /// Probes a free localhost TCP port and releases it.
+    ///
+    /// `add_rule` returns `io::Result<()>`, not the bound port, so a rule
+    /// added on port 0 lands somewhere the test cannot then connect to. The
+    /// bind is dropped before the rule is added — a benign TOCTOU, and the
+    /// same trick `tests/e2e/src/scenario.rs` uses for the DNS port.
+    async fn free_local_port() -> u16 {
+        TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("probing a free port")
+            .local_addr()
+            .expect("probed listener has an address")
+            .port()
+    }
+
+    /// A real host connection to a registered rule produces `TcpAccepted`
+    /// carrying the container port the rule was created with.
+    ///
+    /// `listener_manager_add_and_remove_rule` only exercises the manager's
+    /// bookkeeping — it never connects, so nothing proved the listener task
+    /// actually accepts and reports. The relay's job ends here: SYN
+    /// generation toward the guest belongs to `splicetcp`'s active open.
+    #[tokio::test]
+    async fn host_connection_produces_a_tcp_accepted_command() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+        let host_port = free_local_port().await;
+
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, host_port, 8080, InboundProtocol::Tcp)
+            .await
+            .expect("rule should bind the probed port");
+
+        let _client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+            .await
+            .expect("host should be able to connect to a registered rule");
+
+        let cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("a TcpAccepted command should arrive within 5s")
+            .expect("command channel stayed open");
+
+        match cmd {
+            InboundCommand::TcpAccepted {
+                host_port: got_host,
+                container_port,
+                ..
+            } => {
+                assert_eq!(got_host, host_port, "command reports the wrong host port");
+                assert_eq!(
+                    container_port, 8080,
+                    "command must carry the container port the rule was created with"
+                );
+            }
+            // Named rather than `{:?}`-formatted: deriving Debug on the
+            // command type (it carries a TcpStream) to serve a panic message
+            // would widen production surface for a test's benefit.
+            InboundCommand::UdpReceived { .. } => {
+                panic!("a TCP rule produced UdpReceived instead of TcpAccepted")
+            }
+        }
+    }
+
+    /// Removing a rule closes its listener, so a later connect is refused
+    /// rather than hanging or silently succeeding against a stale listener.
+    #[tokio::test]
+    async fn removing_a_rule_closes_the_listener() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+        let host_port = free_local_port().await;
+
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, host_port, 8080, InboundProtocol::Tcp)
+            .await
+            .expect("rule should bind the probed port");
+        tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+            .await
+            .expect("connect should succeed while the rule exists");
+
+        manager.remove_rule(Ipv4Addr::LOCALHOST, host_port, InboundProtocol::Tcp);
+
+        // Cancellation is cooperative: the listener task observes the token
+        // and drops its socket, so retry briefly rather than racing it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).await {
+                Err(_) => break,
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    panic!("port {host_port} still accepts connections after remove_rule")
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
     }
 
     #[tokio::test]
