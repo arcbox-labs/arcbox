@@ -8,12 +8,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arcbox_api::{
-    MachineServiceImpl, SharedRuntime, SystemServiceImpl,
-    machine_service_server::MachineServiceServer,
-};
 #[cfg(target_os = "macos")]
 use arcbox_api::{MacosServiceImpl, macos_service_server::MacosServiceServer};
+use arcbox_api::{SharedRuntime, SystemServiceImpl};
 use arcbox_core::Runtime;
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use tonic::service::Routes;
@@ -41,7 +38,6 @@ pub async fn start_grpc(
 
     info!(socket = %socket_path.display(), "control plane listening (Connect + gRPC + gRPC-Web)");
 
-    let machine_service = MachineServiceImpl::new(Arc::clone(&shared_runtime));
     #[cfg(target_os = "macos")]
     let macos_service = MacosServiceImpl::new(Arc::clone(&shared_runtime));
     let system_service = SystemServiceImpl::new(
@@ -57,10 +53,11 @@ pub async fn start_grpc(
     let connect =
         crate::control_plane::connect_router(Arc::clone(&shared_runtime), system_service)?;
 
-    let routes = Routes::default().add_service(MachineServiceServer::new(machine_service));
-    // macOS guests are served only on Apple Silicon hosts; on other
-    // platforms the service is simply absent (the CLI `macos` noun is
-    // likewise macOS-only).
+    // Macos is the last service still on tonic (CORE-68). macOS guests are
+    // served only on Apple Silicon hosts; on other platforms the service is
+    // simply absent (the CLI `macos` noun is likewise macOS-only), which is
+    // why this router can be empty.
+    let routes = Routes::default();
     #[cfg(target_os = "macos")]
     let routes = routes.add_service(MacosServiceServer::new(macos_service));
 

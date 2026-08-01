@@ -23,11 +23,12 @@ pub use arcbox_grpc::v1::{macos_service_client, macos_service_server};
 
 pub use arcbox_protocol::v1::setup_status::Phase as SetupPhase;
 pub use connect::{
-    IconServiceImpl, KubernetesServiceImpl, MigrationServiceImpl, SandboxFilesystemServiceImpl,
-    SandboxProcessServiceImpl, SandboxServiceImpl, SandboxSnapshotServiceImpl, StatsServiceImpl,
+    IconServiceImpl, KubernetesServiceImpl, MachineServiceImpl, MigrationServiceImpl,
+    SandboxFilesystemServiceImpl, SandboxProcessServiceImpl, SandboxServiceImpl,
+    SandboxSnapshotServiceImpl, StatsServiceImpl,
 };
 pub use connect::{SetupState, SystemServiceImpl};
 pub use error::{ApiError, Result};
 #[cfg(target_os = "macos")]
 pub use grpc::MacosServiceImpl;
-pub use grpc::{MachineServiceImpl, SharedRuntime};
+pub use grpc::SharedRuntime;
