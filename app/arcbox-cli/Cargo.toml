@@ -52,6 +52,10 @@ chrono.workspace = true
 tar = "0.4.46"
 tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+arcbox-connect.workspace = true
+connectrpc = { version = "0.8.1", features = ["client"] }
+buffa = { version = "0.8.1", features = ["json"] }
+prost.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }
