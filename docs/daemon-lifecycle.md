@@ -73,9 +73,11 @@ startup failure.
   A client wanting "is the route up *now*" reads the flag, not a phase.
   `vm_running` and `route_installed` both track the VM across restarts —
   `services::vm_running_loop` mirrors `VmLifecycleState::is_ready`, and
-  `route_status_loop` mirrors the route events — so both fall on a stop and
-  rise again on the next boot rather than reporting one cold-start
-  observation forever.
+  `route_status_loop` mirrors the route events — so both fall on a
+  lifecycle-managed stop and rise again on the next boot rather than
+  reporting one cold-start observation forever. Neither is a liveness probe:
+  a guest that dies without the lifecycle noticing leaves `vm_running` true,
+  because crash detection is unimplemented (ABX-414).
 
 ### Why gRPC starts before resource cleanup
 
@@ -190,7 +192,7 @@ When the daemon is killed without graceful shutdown:
 | File | State | Next startup |
 |------|-------|-------------|
 | `daemon.lock` | exists, old PID, **lock released** | `try_flock` succeeds instantly |
-| `docker.sock` | **stale** | `DockerApiServer::run` removes before bind |
+| `docker.sock` | **stale** | `DockerApiServer::bind` removes before bind |
 | `arcbox.sock` | **stale** | `start_grpc` removes before bind |
 | disk images | **possibly held by XPC helpers** | `wait_for_resources` waits up to 10 s |
 | VM | non-graceful termination | Virtualization.framework cleans up |
@@ -225,7 +227,7 @@ centrally during startup — each server removes and rebinds independently:
 | Socket | Owner | Cleanup |
 |--------|-------|---------|
 | `arcbox.sock` | `services::start_grpc` | `remove_file` before `UnixListener::bind` |
-| `docker.sock` | `DockerApiServer::run` | `remove_file` before `UnixListener::bind` |
+| `docker.sock` | `DockerApiServer::bind` | `remove_file` before `UnixListener::bind` |
 
 This avoids race conditions where a centralized cleanup could delete a
 socket that another component has already bound.

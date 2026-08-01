@@ -961,9 +961,12 @@ pub struct SetupStatus {
     #[prost(bool, tag = "4")]
     pub route_installed: bool,
     /// Whether the System VM is up with its guest agent answering — the point
-    /// at which RPCs against it succeed. Follows the VM for the daemon's whole
-    /// life, so it falls on stop (idle, backend switch, crash) and rises again
-    /// on the next boot.
+    /// at which RPCs against it succeed. Mirrors the VM's lifecycle state for
+    /// the daemon's whole life, so it falls on a lifecycle-managed stop (idle
+    /// stop, backend switch, shutdown) and rises again on the next boot. A
+    /// guest that dies without the lifecycle noticing keeps it true: there is
+    /// no crash detection yet, so treat it as "the daemon believes the VM is
+    /// up", not as a liveness probe.
     #[prost(bool, tag = "5")]
     pub vm_running: bool,
     /// Human-readable status message.

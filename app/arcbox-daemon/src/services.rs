@@ -148,16 +148,6 @@ pub async fn start_services(
         route_status_loop(route_events, route_state, route_shutdown).await;
     }));
 
-    // Same shape for vm_running, for the same reason: the flag has to follow
-    // the VM across restarts, not just report the one cold-start observation
-    // recovery happened to make.
-    let vm_state = runtime.subscribe_system_vm_state();
-    let vm_running_state = Arc::clone(&ctx.setup_state);
-    let vm_running_shutdown = ctx.shutdown.clone();
-    drop(tokio::spawn(async move {
-        vm_running_loop(vm_state, vm_running_state, vm_running_shutdown).await;
-    }));
-
     #[cfg(target_os = "macos")]
     let route_guard = linux_vm.then(|| {
         let runtime = Arc::clone(runtime);
@@ -182,6 +172,23 @@ pub async fn start_services(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Starts the `vm_running` mirror for the System VM.
+///
+/// Spawned from `init_runtime`, not from [`start_services`]: the VM reaches
+/// `VmLifecycleState::Running` partway through `Runtime::init` — that is what
+/// publishes `VM_READY` — and `init` then waits for the guest container
+/// runtime. A mirror started once `boot_runtime` has returned would report
+/// `vm_running = false` across that whole window while the agent is already
+/// answering, which is exactly what the field promises it is not.
+pub fn spawn_vm_running_mirror(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
+    let state = runtime.subscribe_system_vm_state();
+    let setup_state = Arc::clone(&ctx.setup_state);
+    let shutdown = ctx.shutdown.clone();
+    drop(tokio::spawn(async move {
+        vm_running_loop(state, setup_state, shutdown).await;
+    }));
+}
 
 /// Mirrors the System VM's lifecycle state into `SetupState.vm_running`.
 ///
