@@ -431,3 +431,56 @@ async fn test_create_with_mounts_extends_cmdline_and_persists() {
         .unwrap_err();
     assert!(err.to_string().contains("','"), "{err}");
 }
+
+/// A machine whose distro init is still starting is NOT ready, even though
+/// the agent answered and reported a usable address. This is the CORE-66
+/// gate: the distro reconfigures the network from scratch after the agent
+/// comes up, so an address observed before it settles does not mean the
+/// machine is usable.
+#[test]
+fn readiness_waits_for_the_distro_init_to_settle() {
+    let info = arcbox_protocol::agent::SystemInfo {
+        ip_addresses: vec!["10.0.2.2".to_owned()],
+        distro_init_pending: true,
+        ..Default::default()
+    };
+    assert_eq!(readiness_ip(&info, "m", 1), None);
+}
+
+#[test]
+fn readiness_reports_the_address_once_the_distro_init_has_settled() {
+    let info = arcbox_protocol::agent::SystemInfo {
+        ip_addresses: vec!["10.0.2.2".to_owned()],
+        distro_init_pending: false,
+        ..Default::default()
+    };
+    assert_eq!(readiness_ip(&info, "m", 1), Some("10.0.2.2".to_owned()));
+}
+
+/// The proto3 default must be the pre-CORE-66 behaviour: an agent that
+/// predates the field leaves `distro_init_pending` false, and readiness must
+/// proceed exactly as before rather than waiting out the 60 s timeout on a
+/// signal that agent will never send.
+#[test]
+fn an_agent_without_the_field_is_not_treated_as_pending() {
+    let decoded = arcbox_protocol::agent::SystemInfo::default();
+    assert!(!decoded.distro_init_pending);
+
+    let info = arcbox_protocol::agent::SystemInfo {
+        ip_addresses: vec!["10.0.2.2".to_owned()],
+        ..Default::default()
+    };
+    assert_eq!(readiness_ip(&info, "m", 1), Some("10.0.2.2".to_owned()));
+}
+
+/// A settled init with nothing usable to report still is not ready — the
+/// gate is additive, it does not replace the address requirement.
+#[test]
+fn a_settled_init_without_a_usable_address_is_still_not_ready() {
+    let info = arcbox_protocol::agent::SystemInfo {
+        ip_addresses: vec!["127.0.0.1".to_owned()],
+        distro_init_pending: false,
+        ..Default::default()
+    };
+    assert_eq!(readiness_ip(&info, "m", 1), None);
+}

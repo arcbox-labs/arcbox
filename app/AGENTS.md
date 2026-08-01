@@ -162,6 +162,22 @@ must name `abctl`.
   RPCs into a VM whose agent/dockerd is not up. The `MachineManager`
   `MachineState` lives outside the lifecycle actor on purpose (physical vs
   logical layering) — do not unify them.
+- **A distro Machine is not usable when its agent answers — its own init
+  has not run yet.** The boot shim runs `machine-init`, backgrounds the
+  agent, and only *then* `exec`s the distro's `/sbin/init`
+  (`boot-assets/.../machine-init.sh`), so the distro's networking comes up
+  after the agent is already serving and typically reconfigures the
+  interface from scratch — measured on alpine as a ~20 ms window with zero
+  routes, ~100 ms after `Start` would otherwise have returned (CORE-66).
+  `wait_for_machine_ready` therefore also gates on
+  `SystemInfo.distro_init_pending`, which the agent derives from each init
+  system's own boot-complete signal (`system_info.rs`). Two consequences
+  worth knowing: the field is phrased as *pending* so an agent predating it
+  decodes false and behaves exactly as before; and readiness now costs what
+  the distro's boot costs — ~2.7 s on alpine/openrc, **~14 s on
+  ubuntu/systemd** — because that is when the machine actually becomes
+  usable. Deciding a Machine is ready from any earlier signal reintroduces
+  the race.
 - **`restart_generation` reports departures, not arrivals.** It is bumped on
   VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
   `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
