@@ -1,22 +1,25 @@
-//! The sandbox API, served over Connect.
+//! The daemon's API, served over Connect.
 //!
-//! These are the same four services the proto splits along the
-//! control-plane / data-plane seam (CORE-57), but they are served through
-//! `connectrpc` rather than tonic, so one set of handlers answers Connect
-//! (HTTP POST, JSON or binary protobuf), gRPC, and gRPC-Web on a single
-//! endpoint (CORE-53):
+//! One set of handlers answers Connect (HTTP POST, JSON or binary
+//! protobuf), gRPC, and gRPC-Web on a single endpoint (CORE-53).
 //!
-//! - [`control`] — lifecycle, events, published ports (control plane)
+//! The sandbox half keeps the control-plane / data-plane split the proto
+//! draws (CORE-57), so a cloud deployment can serve the two from different
+//! processes:
+//!
+//! - [`control`] — sandbox lifecycle, events, published ports
 //! - [`process`] — executions (data plane)
 //! - [`filesystem`] — file transfer (data plane)
 //! - [`snapshot`] — checkpoint / restore
 //!
-//! All four route to the `arcbox-agent` in the target guest VM over the
-//! port-1024 vsock binary-frame protocol. Their request and response types
-//! are buffa-generated (`arcbox-connect`) because that is what `connectrpc`
-//! binds to, while the vsock payloads stay prost (`arcbox-protocol`);
-//! [`bridge`] is the crossing, and its module docs explain why it is a
-//! decode rather than a conversion table.
+//! The rest are the daemon's own services, migrating off tonic one at a
+//! time (CORE-68): [`icon`], [`stats`], [`system`].
+//!
+//! Request and response types are buffa-generated (`arcbox-connect`)
+//! because that is what `connectrpc` binds to, while the host↔guest vsock
+//! payloads stay prost (`arcbox-protocol`); [`bridge`] is the crossing, and
+//! its module docs explain why it is a decode rather than a conversion
+//! table.
 
 pub(crate) mod bridge;
 mod control;
@@ -24,6 +27,8 @@ mod filesystem;
 mod icon;
 mod process;
 mod snapshot;
+mod stats;
+mod system;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +43,8 @@ pub use filesystem::SandboxFilesystemServiceImpl;
 pub use icon::IconServiceImpl;
 pub use process::SandboxProcessServiceImpl;
 pub use snapshot::SandboxSnapshotServiceImpl;
+pub use stats::StatsServiceImpl;
+pub use system::{SetupState, SystemServiceImpl};
 
 use crate::grpc::SharedRuntime;
 
@@ -131,25 +138,35 @@ fn wire_protocol(
     }
 }
 
-/// Registers every sandbox service on a Connect router.
+/// Registers every Connect-served service on one router.
 ///
-/// Kept here rather than in the daemon so that adding a fifth sandbox
-/// service is one edit next to the impls, not a silent omission at the
-/// call site.
+/// Kept here rather than in the daemon so that adding a service is one edit
+/// next to the impls, not a silent omission at the call site — and because
+/// registration is what decides which stack serves a path: tonic matches
+/// first, so a service listed on both would keep answering over tonic alone.
 #[must_use]
 pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
+    let clone = || Arc::clone(&runtime);
     connectrpc::Router::new()
-        .add_service(Arc::new(SandboxServiceImpl::new(Arc::clone(&runtime))))
-        .add_service(Arc::new(SandboxProcessServiceImpl::new(Arc::clone(
-            &runtime,
-        ))))
-        .add_service(Arc::new(SandboxFilesystemServiceImpl::new(Arc::clone(
-            &runtime,
-        ))))
-        .add_service(Arc::new(SandboxSnapshotServiceImpl::new(runtime)))
+        .add_service(Arc::new(SandboxServiceImpl::new(clone())))
+        .add_service(Arc::new(SandboxProcessServiceImpl::new(clone())))
+        .add_service(Arc::new(SandboxFilesystemServiceImpl::new(clone())))
+        .add_service(Arc::new(SandboxSnapshotServiceImpl::new(clone())))
         // The daemon's own services migrate onto this router one at a time
-        // (CORE-68); Icon is the first.
+        // (CORE-68).
         .add_service(Arc::new(IconServiceImpl::new()))
+        .add_service(Arc::new(StatsServiceImpl::new(clone())))
+}
+
+/// Registers the services plus the ones needing extra state the router
+/// helper above cannot reach.
+///
+/// `SystemService` is separate because it also observes the setup state and
+/// the early runtime handle — it must answer while `shared_runtime` is still
+/// empty, which is the whole point of a diagnostics RPC.
+#[must_use]
+pub fn router_with_system(runtime: SharedRuntime, system: SystemServiceImpl) -> connectrpc::Router {
+    router(runtime).add_service(Arc::new(system))
 }
 
 #[cfg(test)]

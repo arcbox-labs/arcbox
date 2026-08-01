@@ -1,11 +1,17 @@
 //! The daemon's control-plane socket: two RPC stacks, one endpoint.
 //!
-//! The sandbox API is served over Connect (CORE-53) while the rest of the
-//! daemon's services stay on tonic. Both are `tower` services over HTTP, so
-//! they compose into one axum router and share a single Unix socket: tonic
+//! The sandbox API is served over Connect (CORE-53), and the daemon's own
+//! services are moving there too, one at a time (CORE-68); whatever has not
+//! moved yet is still on tonic. Both are `tower` services over HTTP, so they
+//! compose into one axum router and share a single Unix socket: tonic
 //! registers a route per service name, and anything it does not claim falls
 //! through to the Connect handlers. A client therefore reaches every service
 //! at the same address, and no path prefix has to be kept in sync by hand.
+//!
+//! Registration is what decides which stack serves a path. tonic matches
+//! first, so a service listed on both would keep answering over tonic alone
+//! — migrating a service means removing it from `Routes` in the same change
+//! that adds it to the Connect router.
 //!
 //! Connections are served with hyper's protocol-detecting builder rather
 //! than tonic's HTTP/2-only server, which is what makes the acceptance
@@ -85,8 +91,7 @@ pub fn bind(socket_path: &std::path::Path) -> Result<UnixListener> {
     ))
 }
 
-/// Composes the tonic services and the Connect sandbox services into one
-/// router.
+/// Composes the tonic services and the Connect services into one router.
 ///
 /// `tonic` claims `/{service}/{method}` for each service registered on it;
 /// the Connect router is the fallback, so it receives exactly the paths
@@ -100,7 +105,7 @@ pub fn compose(tonic_routes: tonic::service::Routes, connect: connectrpc::Router
         .fallback_service(connect.into_axum_service())
 }
 
-/// Builds the Connect half: the sandbox services plus server reflection.
+/// Builds the Connect half: every service already migrated, plus reflection.
 ///
 /// Reflection is served here rather than by tonic so that one
 /// implementation covers gRPC, gRPC-Web, and Connect alike. Both `v1` and
@@ -112,7 +117,7 @@ pub fn compose(tonic_routes: tonic::service::Routes, connect: connectrpc::Router
 /// HTTP/2. A plain HTTP/1.1 Connect client therefore gets `501` from
 /// reflection — a property of that RPC's shape, not of this wiring. Unary
 /// calls are unaffected, which is why `curl --unix-socket` still works for
-/// the sandbox API itself.
+/// the services themselves.
 ///
 /// The descriptor set is the whole daemon's, not just the sandbox package:
 /// it is standard protobuf wire bytes, so the same set `arcbox-grpc` emits
@@ -122,13 +127,16 @@ pub fn compose(tonic_routes: tonic::service::Routes, connect: connectrpc::Router
 ///
 /// Returns an error if the embedded descriptor set cannot be parsed, which
 /// would mean the build emitted a corrupt one.
-pub fn connect_router(runtime: arcbox_api::SharedRuntime) -> Result<connectrpc::Router> {
+pub fn connect_router(
+    runtime: arcbox_api::SharedRuntime,
+    system: arcbox_api::SystemServiceImpl,
+) -> Result<connectrpc::Router> {
     let reflector = connectrpc_reflection::Reflector::from_descriptor_set_bytes(
         arcbox_grpc::FILE_DESCRIPTOR_SET,
     )
     .context("parsing the embedded file descriptor set for reflection")?;
     Ok(connectrpc_reflection::install(
-        arcbox_api::connect::router(runtime),
+        arcbox_api::connect::router_with_system(runtime, system),
         reflector,
     ))
 }
@@ -157,7 +165,12 @@ mod tests {
         // The Connect half is built by the same function the daemon uses, so
         // a service or reflection wired up only in production would fail
         // here too.
-        let connect = connect_router(runtime).expect("connect router");
+        let system = arcbox_api::SystemServiceImpl::new(
+            Arc::new(arcbox_api::SetupState::new()),
+            Arc::clone(&runtime),
+            Arc::clone(&runtime),
+        );
+        let connect = connect_router(runtime, system).expect("connect router");
         let app = compose(tonic::service::Routes::default(), connect);
 
         let listener = bind(&socket).expect("bind temp socket");
@@ -218,10 +231,7 @@ mod tests {
             return String::new();
         };
         let mut body = String::new();
-        loop {
-            let Some((size, tail)) = rest.split_once("\r\n") else {
-                break;
-            };
+        while let Some((size, tail)) = rest.split_once("\r\n") {
             let Ok(size) = usize::from_str_radix(size.trim(), 16) else {
                 break;
             };
@@ -330,13 +340,24 @@ mod tests {
     #[test]
     fn migrated_daemon_services_are_registered_on_the_connect_router() {
         let runtime: arcbox_api::SharedRuntime = Arc::new(OnceLock::new());
-        let router = connect_router(runtime).expect("connect router");
-
-        assert!(
-            router.has_method("arcbox.v1.IconService/GetImageIcon"),
-            "Icon has moved to Connect; available: {:?}",
-            router.methods().collect::<Vec<_>>()
+        let system = arcbox_api::SystemServiceImpl::new(
+            Arc::new(arcbox_api::SetupState::new()),
+            Arc::clone(&runtime),
+            Arc::clone(&runtime),
         );
+        let router = connect_router(runtime, system).expect("connect router");
+
+        for path in [
+            "arcbox.v1.IconService/GetImageIcon",
+            "arcbox.v1.StatsService/Watch",
+            "arcbox.v1.SystemService/WatchSetupStatus",
+        ] {
+            assert!(
+                router.has_method(path),
+                "{path} has moved to Connect; available: {:?}",
+                router.methods().collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Reflection has to keep answering through the composed router, or

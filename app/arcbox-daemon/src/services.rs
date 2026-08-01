@@ -10,9 +10,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arcbox_api::{
     KubernetesServiceImpl, MachineServiceImpl, MigrationServiceImpl, MigrationServiceServer,
-    SharedRuntime, StatsServiceImpl, SystemServiceImpl, SystemServiceServer,
-    kubernetes_service_server::KubernetesServiceServer,
-    machine_service_server::MachineServiceServer, stats_service_server::StatsServiceServer,
+    SharedRuntime, SystemServiceImpl, kubernetes_service_server::KubernetesServiceServer,
+    machine_service_server::MachineServiceServer,
 };
 #[cfg(target_os = "macos")]
 use arcbox_api::{MacosServiceImpl, macos_service_server::MacosServiceServer};
@@ -48,34 +47,30 @@ pub async fn start_grpc(
     let macos_service = MacosServiceImpl::new(Arc::clone(&shared_runtime));
     let kubernetes_service = KubernetesServiceImpl::new(Arc::clone(&shared_runtime));
     let migration_service = MigrationServiceImpl::new(Arc::clone(&shared_runtime));
-    // The four sandbox services are served over Connect, not tonic (CORE-53),
-    // so they are built as one Connect router rather than added individually
-    // below. The split along the control/data-plane seam (CORE-57) is
-    // preserved: they remain four services a cloud deployment can host in
-    // different processes.
-    // Reflection rides with them so it answers over all three wire
-    // formats, not just gRPC.
-    let sandbox = crate::control_plane::connect_router(Arc::clone(&shared_runtime))?;
     let system_service = SystemServiceImpl::new(
         Arc::clone(&ctx.setup_state),
         Arc::clone(&shared_runtime),
         Arc::clone(&ctx.early_runtime),
     );
-    let stats_service = StatsServiceImpl::new(Arc::clone(&shared_runtime));
+    // The Connect half: the four sandbox services (CORE-53), whose
+    // control/data-plane split (CORE-57) is preserved so a cloud deployment
+    // can host them in different processes, plus the daemon's own services
+    // as they migrate off tonic (CORE-68). Reflection rides along so it
+    // answers over all three wire formats rather than gRPC alone.
+    let connect =
+        crate::control_plane::connect_router(Arc::clone(&shared_runtime), system_service)?;
 
     let routes = Routes::default()
         .add_service(MachineServiceServer::new(machine_service))
         .add_service(KubernetesServiceServer::new(kubernetes_service))
-        .add_service(MigrationServiceServer::new(migration_service))
-        .add_service(SystemServiceServer::new(system_service))
-        .add_service(StatsServiceServer::new(stats_service));
+        .add_service(MigrationServiceServer::new(migration_service));
     // macOS guests are served only on Apple Silicon hosts; on other
     // platforms the service is simply absent (the CLI `macos` noun is
     // likewise macOS-only).
     #[cfg(target_os = "macos")]
     let routes = routes.add_service(MacosServiceServer::new(macos_service));
 
-    let app = crate::control_plane::compose(routes, sandbox);
+    let app = crate::control_plane::compose(routes, connect);
 
     let shutdown = ctx.shutdown.clone();
     let handle = tokio::spawn(crate::control_plane::serve(listener, app, shutdown));
