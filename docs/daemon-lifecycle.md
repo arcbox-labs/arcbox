@@ -55,15 +55,13 @@ startup failure.
   `READY` are published ~300 µs apart with no await point between them and
   a snapshot channel would collapse them (see `SetupState` in
   `arcbox-api/src/system.rs`).
-- `NETWORK_READY` covers whichever host services this daemon runs, and means
-  they were *started*, not that they are reachable. A `--no-linux-vm` daemon
-  reaches it with DNS alone — `start_services` skips the Docker API and the
-  Kubernetes proxy in that mode. And of the three, only DNS is guaranteed
-  bound: `DnsService::bind` propagates its error, while
-  `DockerApiServer::run` binds inside its spawned task and only logs there,
-  and the Kubernetes proxy tolerates a taken 16443 by design. A Docker
-  socket that fails to bind therefore still reaches `READY` — a pre-existing
-  gap, not something the phase introduces.
+- `NETWORK_READY` covers whichever host services this daemon runs. A
+  `--no-linux-vm` daemon reaches it with DNS alone — `start_services` skips
+  the Docker API and the Kubernetes proxy in that mode. DNS and the Docker
+  API are both *bound* by the time it is published, and a bind failure on
+  either fails startup with `FAILED` instead of reaching this phase. The
+  Kubernetes proxy is the exception: a port 16443 already in use is
+  tolerated by design, so the phase does not promise it.
 - Enum ordinal ≠ progression order (`DOWNLOADING_ASSETS = 8` occurs before
   `READY = 6`). Clients must match on the value, never compare ordinals.
   New phases are appended with the next free number regardless of where
@@ -73,6 +71,11 @@ startup failure.
   state that outlives startup, including work `recovery::run` spawns in
   the background and anything `route_status_loop` reconciles afterwards.
   A client wanting "is the route up *now*" reads the flag, not a phase.
+  `vm_running` and `route_installed` both track the VM across restarts —
+  `services::vm_running_loop` mirrors `VmLifecycleState::is_ready`, and
+  `route_status_loop` mirrors the route events — so both fall on a stop and
+  rise again on the next boot rather than reporting one cold-start
+  observation forever.
 
 ### Why gRPC starts before resource cleanup
 
