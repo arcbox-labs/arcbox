@@ -2,7 +2,8 @@
 
 use crate::error::{MigrationError, Result};
 use crate::model::{
-    ContainerMount, ContainerPlan, ContainerSpec, MigrationPlan, PortPublish, SourceConfig,
+    ContainerMount, ContainerPlan, ContainerSpec, MigrationPlan, NetworkModeSpec, PortPublish,
+    SourceConfig,
 };
 use crate::progress::{MigrationProgress, MigrationStage};
 use crate::runner::{CreateNetworkOptions, DockerCliRunner};
@@ -321,6 +322,9 @@ where
         });
         let create_args = build_create_args(container);
         let container_id = target.create_container(create_args).await?;
+        if container.spec.network_mode.forbids_extra_networks() {
+            continue;
+        }
         for attachment in &container.extra_networks {
             target
                 .connect_network(&attachment.network, &container_id, &attachment.aliases)
@@ -431,14 +435,33 @@ fn append_container_spec_args(args: &mut Vec<String>, spec: &ContainerSpec) {
     if spec.auto_remove {
         args.push("--rm".to_string());
     }
-    if let Some(primary_network) = &spec.primary_network {
-        args.push("--network".to_string());
-        args.push(primary_network.network.clone());
-        for alias in &primary_network.aliases {
-            args.push("--network-alias".to_string());
-            args.push(alias.clone());
+    append_network_args(args, &spec.network_mode);
+}
+
+/// Emits the `--network` flag for the container's network mode.
+///
+/// No flag suppression is needed here: Docker only rejects `--hostname`,
+/// `--dns*`, `--add-host`, `--publish` and `--expose` in `container:<id>` mode,
+/// which planning rejects outright. Under `host` the daemon supplies the
+/// hostname itself and simply discards published ports.
+fn append_network_args(args: &mut Vec<String>, mode: &NetworkModeSpec) {
+    let network = match mode {
+        NetworkModeSpec::Default => return,
+        NetworkModeSpec::Host => "host",
+        NetworkModeSpec::None => "none",
+        NetworkModeSpec::Named(attachment) => {
+            args.push("--network".to_string());
+            args.push(attachment.network.clone());
+            // Network-scoped aliases are only valid on user-defined networks.
+            for alias in &attachment.aliases {
+                args.push("--network-alias".to_string());
+                args.push(alias.clone());
+            }
+            return;
         }
-    }
+    };
+    args.push("--network".to_string());
+    args.push(network.to_string());
 }
 
 fn final_command(spec: &ContainerSpec) -> Vec<String> {
@@ -477,31 +500,24 @@ fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::RestartPolicySpec;
-    use std::collections::HashMap;
+    use crate::model::{ContainerNetworkAttachment, RestartPolicySpec};
+
+    fn args_for(spec: &ContainerSpec) -> Vec<String> {
+        let mut args = Vec::new();
+        append_container_spec_args(&mut args, spec);
+        args
+    }
+
+    fn contains_pair(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2).any(|window| window == [flag, value])
+    }
 
     #[test]
     fn final_command_merges_entrypoint_tail_and_cmd() {
         let spec = ContainerSpec {
-            hostname: None,
-            domainname: None,
-            user: None,
-            env: Vec::new(),
-            labels: HashMap::new(),
-            exposed_ports: Vec::new(),
-            tty: false,
-            open_stdin: false,
-            working_dir: None,
             entrypoint: vec!["/bin/sh".into(), "-c".into()],
             cmd: vec!["echo hi".into()],
-            mounts: Vec::new(),
-            publishes: Vec::new(),
-            restart_policy: None,
-            privileged: false,
-            read_only_rootfs: false,
-            extra_hosts: Vec::new(),
-            auto_remove: false,
-            primary_network: None,
+            ..ContainerSpec::default()
         };
         assert_eq!(
             final_command(&spec),
@@ -522,34 +538,72 @@ mod tests {
     #[test]
     fn restart_policy_on_failure_keeps_retry_count() {
         let spec = ContainerSpec {
-            hostname: None,
-            domainname: None,
-            user: None,
-            env: Vec::new(),
-            labels: HashMap::new(),
-            exposed_ports: Vec::new(),
-            tty: false,
-            open_stdin: false,
-            working_dir: None,
-            entrypoint: Vec::new(),
-            cmd: Vec::new(),
-            mounts: Vec::new(),
-            publishes: Vec::new(),
             restart_policy: Some(RestartPolicySpec {
                 name: "on-failure".into(),
                 maximum_retry_count: Some(5),
             }),
-            privileged: false,
-            read_only_rootfs: false,
-            extra_hosts: Vec::new(),
-            auto_remove: false,
-            primary_network: None,
+            ..ContainerSpec::default()
         };
-        let mut args = Vec::new();
-        append_container_spec_args(&mut args, &spec);
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["--restart", "on-failure:5"])
-        );
+        assert!(contains_pair(&args_for(&spec), "--restart", "on-failure:5"));
+    }
+
+    #[test]
+    fn default_network_mode_emits_no_network_flag() {
+        let args = args_for(&ContainerSpec::default());
+        assert!(!args.iter().any(|arg| arg == "--network"));
+    }
+
+    #[test]
+    fn host_and_none_network_modes_are_emitted_verbatim() {
+        for (mode, expected) in [
+            (NetworkModeSpec::Host, "host"),
+            (NetworkModeSpec::None, "none"),
+        ] {
+            let spec = ContainerSpec {
+                network_mode: mode,
+                ..ContainerSpec::default()
+            };
+            assert!(contains_pair(&args_for(&spec), "--network", expected));
+        }
+    }
+
+    #[test]
+    fn host_mode_keeps_hostname_and_published_ports() {
+        // Docker only rejects these under container:<id> mode, which planning
+        // refuses outright; suppressing them here would lose real settings.
+        let spec = ContainerSpec {
+            network_mode: NetworkModeSpec::Host,
+            hostname: Some("api".into()),
+            publishes: vec![PortPublish {
+                container_port: "80/tcp".into(),
+                host_ip: None,
+                host_port: Some("8080".into()),
+            }],
+            ..ContainerSpec::default()
+        };
+        let args = args_for(&spec);
+        assert!(contains_pair(&args, "--hostname", "api"));
+        assert!(contains_pair(&args, "--publish", "8080:80/tcp"));
+    }
+
+    #[test]
+    fn named_network_carries_its_aliases() {
+        let spec = ContainerSpec {
+            network_mode: NetworkModeSpec::Named(ContainerNetworkAttachment {
+                network: "usernet".into(),
+                aliases: vec!["api".into()],
+            }),
+            ..ContainerSpec::default()
+        };
+        let args = args_for(&spec);
+        assert!(contains_pair(&args, "--network", "usernet"));
+        assert!(contains_pair(&args, "--network-alias", "api"));
+    }
+
+    #[test]
+    fn only_host_mode_forbids_extra_networks() {
+        assert!(NetworkModeSpec::Host.forbids_extra_networks());
+        assert!(!NetworkModeSpec::None.forbids_extra_networks());
+        assert!(!NetworkModeSpec::Default.forbids_extra_networks());
     }
 }

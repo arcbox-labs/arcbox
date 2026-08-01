@@ -192,6 +192,10 @@ pub struct ContainerConfig {
 /// Host config subset.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HostConfig {
+    /// Network mode: `bridge`, `host`, `none`, `container:<name|id>`, or the
+    /// name of a user-defined network.
+    #[serde(rename = "NetworkMode", default)]
+    pub network_mode: String,
     /// Port bindings.
     #[serde(rename = "PortBindings", default)]
     pub port_bindings: Option<HashMap<String, Option<Vec<PortBinding>>>>,

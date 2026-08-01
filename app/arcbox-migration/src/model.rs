@@ -202,8 +202,39 @@ pub struct ContainerSpec {
     pub extra_hosts: Vec<String>,
     /// Auto-remove on exit.
     pub auto_remove: bool,
-    /// Primary network attached during create.
-    pub primary_network: Option<ContainerNetworkAttachment>,
+    /// Network the container joins at create time.
+    pub network_mode: NetworkModeSpec,
+}
+
+/// The network a container joins at create time, from `HostConfig.NetworkMode`.
+///
+/// `container:<name|id>` is deliberately absent: it is rejected during planning
+/// rather than modelled, because reproducing it would require resolving the
+/// peer container and ordering creation around it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkModeSpec {
+    /// The default bridge network; no `--network` flag is emitted.
+    #[default]
+    Default,
+    /// Host networking.
+    Host,
+    /// No networking.
+    None,
+    /// A user-defined network that is part of this migration.
+    Named(ContainerNetworkAttachment),
+}
+
+impl NetworkModeSpec {
+    /// Returns whether this mode shares another namespace, which bars the
+    /// container from joining any further network.
+    ///
+    /// Docker rejects that combination outright ("container sharing network
+    /// namespace with another container or host cannot be connected to any
+    /// other network"), so additional attachments must be skipped.
+    #[must_use]
+    pub const fn forbids_extra_networks(&self) -> bool {
+        matches!(self, Self::Host)
+    }
 }
 
 /// Supported mount definitions.

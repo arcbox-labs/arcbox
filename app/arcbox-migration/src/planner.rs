@@ -8,8 +8,8 @@ use crate::error::Result;
 use crate::helper_image::helper_image_reference;
 use crate::model::{
     ContainerMount, ContainerNetworkAttachment, ContainerPlan, ContainerSpec, ImagePlan,
-    MigrationPlan, NetworkPlan, PortPublish, ReplacementSummary, RestartPolicySpec,
-    RunningVolumeBlocker, SourceConfig, SourceInfo, VolumePlan,
+    MigrationPlan, NetworkModeSpec, NetworkPlan, PortPublish, ReplacementSummary,
+    RestartPolicySpec, RunningVolumeBlocker, SourceConfig, SourceInfo, VolumePlan,
 };
 use crate::runner::DockerCliRunner;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -132,6 +132,7 @@ impl MigrationPlanner {
             })
             .collect();
 
+        let mut warnings = Vec::new();
         let container_plans: Vec<_> = source_containers
             .into_iter()
             .map(|container| {
@@ -140,6 +141,8 @@ impl MigrationPlanner {
                     &target_containers,
                     &image_reference_by_id,
                     &migrated_network_names,
+                    &mut warnings,
+                    &mut unsupported_resources,
                 )
             })
             .collect();
@@ -150,7 +153,7 @@ impl MigrationPlanner {
             &network_plans,
             &container_plans,
         );
-        let warnings = collect_missing_bind_sources(&container_plans);
+        warnings.extend(collect_missing_bind_sources(&container_plans));
 
         Ok(MigrationPlan {
             source: normalize_source_info(source, source_info),
@@ -255,11 +258,56 @@ fn normalize_network(network: NetworkInspect, target_networks: &BTreeSet<String>
     }
 }
 
+/// Outcome of reading `HostConfig.NetworkMode`.
+enum NetworkModeOutcome {
+    Resolved(NetworkModeSpec),
+    /// The mode cannot be reproduced; carries the blocking explanation.
+    Unsupported(String),
+}
+
+/// Classifies `HostConfig.NetworkMode` against the networks being migrated.
+///
+/// Docker's contract: `bridge`, `host`, `none` and `container:<name|id>` are
+/// the standard values, and any other value names a user-defined network.
+fn classify_network_mode(
+    mode: &str,
+    container_name: &str,
+    attachments: &[ContainerNetworkAttachment],
+    warnings: &mut Vec<String>,
+) -> NetworkModeOutcome {
+    match mode {
+        "" | "default" | "bridge" => NetworkModeOutcome::Resolved(NetworkModeSpec::Default),
+        "host" => NetworkModeOutcome::Resolved(NetworkModeSpec::Host),
+        "none" => NetworkModeOutcome::Resolved(NetworkModeSpec::None),
+        other if other.starts_with("container:") => NetworkModeOutcome::Unsupported(format!(
+            "container '{container_name}' shares another container's network namespace ('{other}'), which migration cannot reproduce"
+        )),
+        named => attachments
+            .iter()
+            .find(|attachment| attachment.network == named)
+            .cloned()
+            .map_or_else(
+                || {
+                    // The named network was filtered out of the migration (for
+                    // example a non-bridge driver). Falling back to the default
+                    // bridge keeps the container creatable.
+                    warnings.push(format!(
+                        "container '{container_name}' was on network '{named}', which is not part of this migration; it will join the default bridge instead"
+                    ));
+                    NetworkModeOutcome::Resolved(NetworkModeSpec::Default)
+                },
+                |attachment| NetworkModeOutcome::Resolved(NetworkModeSpec::Named(attachment)),
+            ),
+    }
+}
+
 fn normalize_container(
     container: ContainerInspect,
     target_containers: &BTreeSet<String>,
     image_reference_by_id: &HashMap<String, String>,
     migrated_network_names: &BTreeSet<String>,
+    warnings: &mut Vec<String>,
+    unsupported: &mut Vec<String>,
 ) -> ContainerPlan {
     let name = trimmed_name(&container).to_string();
     let image_reference = image_reference_by_id
@@ -274,9 +322,22 @@ fn normalize_container(
         });
 
     let mut attachments = normalized_network_attachments(&container, migrated_network_names);
-    let primary_network = attachments.first().cloned();
-    if primary_network.is_some() {
-        let _ = attachments.remove(0);
+    // The primary network comes from NetworkMode, not from an arbitrary pick
+    // out of the (alphabetically sorted) attachment list.
+    let network_mode = match classify_network_mode(
+        &container.host_config.network_mode,
+        &name,
+        &attachments,
+        warnings,
+    ) {
+        NetworkModeOutcome::Resolved(mode) => mode,
+        NetworkModeOutcome::Unsupported(reason) => {
+            unsupported.push(reason);
+            NetworkModeSpec::Default
+        }
+    };
+    if let NetworkModeSpec::Named(primary) = &network_mode {
+        attachments.retain(|attachment| attachment.network != primary.network);
     }
 
     ContainerPlan {
@@ -307,7 +368,7 @@ fn normalize_container(
             read_only_rootfs: container.host_config.readonly_rootfs,
             extra_hosts: container.host_config.extra_hosts.unwrap_or_default(),
             auto_remove: container.host_config.auto_remove,
-            primary_network,
+            network_mode,
         },
         extra_networks: attachments,
         replace_existing: target_containers.contains(&name),
@@ -532,6 +593,67 @@ mod tests {
             vec!["myapp:dev".to_string(), "myapp:latest".to_string()]
         );
         assert_eq!(plans[0].primary_reference(), "myapp:dev");
+    }
+
+    fn classify(mode: &str, attachments: &[ContainerNetworkAttachment]) -> NetworkModeOutcome {
+        let mut warnings = Vec::new();
+        classify_network_mode(mode, "demo", attachments, &mut warnings)
+    }
+
+    fn resolved(mode: &str, attachments: &[ContainerNetworkAttachment]) -> NetworkModeSpec {
+        match classify(mode, attachments) {
+            NetworkModeOutcome::Resolved(spec) => spec,
+            NetworkModeOutcome::Unsupported(reason) => panic!("unexpectedly unsupported: {reason}"),
+        }
+    }
+
+    #[test]
+    fn standard_network_modes_are_classified() {
+        for mode in ["", "default", "bridge"] {
+            assert_eq!(resolved(mode, &[]), NetworkModeSpec::Default);
+        }
+        assert_eq!(resolved("host", &[]), NetworkModeSpec::Host);
+        assert_eq!(resolved("none", &[]), NetworkModeSpec::None);
+    }
+
+    #[test]
+    fn named_network_mode_selects_its_attachment() {
+        let attachments = [
+            ContainerNetworkAttachment {
+                network: "aaa-first-alphabetically".into(),
+                aliases: Vec::new(),
+            },
+            ContainerNetworkAttachment {
+                network: "usernet".into(),
+                aliases: vec!["api".into()],
+            },
+        ];
+        // The primary must come from NetworkMode, not from sort order.
+        assert_eq!(
+            resolved("usernet", &attachments),
+            NetworkModeSpec::Named(attachments[1].clone())
+        );
+    }
+
+    #[test]
+    fn container_network_mode_is_unsupported() {
+        let outcome = classify("container:abc123", &[]);
+        let NetworkModeOutcome::Unsupported(reason) = outcome else {
+            panic!("container mode must be rejected");
+        };
+        assert!(reason.contains("container:abc123"));
+    }
+
+    #[test]
+    fn unmigrated_named_network_falls_back_with_a_warning() {
+        let mut warnings = Vec::new();
+        let outcome = classify_network_mode("macvlan0", "demo", &[], &mut warnings);
+        assert!(matches!(
+            outcome,
+            NetworkModeOutcome::Resolved(NetworkModeSpec::Default)
+        ));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("macvlan0"));
     }
 
     fn plan_with_bind(name: &str, source: &str) -> ContainerPlan {
