@@ -30,7 +30,7 @@ arcbox-docker-tools = { workspace = true }
 arcbox-asset = { workspace = true }
 
 tonic = { workspace = true }
-hyper-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }
@@ -56,6 +56,7 @@ arcbox-connect.workspace = true
 connectrpc = { version = "0.8.1", features = ["client"] }
 buffa = { version = "0.8.1", features = ["json"] }
 prost.workspace = true
+tower.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }

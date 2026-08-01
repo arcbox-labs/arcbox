@@ -6,7 +6,6 @@
 //! - stop a running daemon (`abctl daemon stop`)
 //! - inspect daemon status (`abctl daemon status`)
 
-use super::machine::UnixConnector;
 use anyhow::{Context, Result, bail};
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use clap::{Args, ValueEnum};
@@ -18,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 use tokio::time::{Instant, sleep, timeout};
-use tonic::transport::Endpoint;
 use tracing::warn;
 
 /// Arguments for the daemon command.
@@ -207,10 +205,12 @@ async fn grpc_daemon_is_responsive(socket_path: &Path) -> bool {
         return false;
     }
 
-    let endpoint =
-        Endpoint::from_static("http://[::]:50051").connect_timeout(Duration::from_secs(1));
-    let connect_future =
-        endpoint.connect_with_connector(UnixConnector::new(socket_path.to_path_buf()));
+    // Eager rather than lazy on purpose: this asks whether a daemon is
+    // actually there, so the h2c handshake has to happen now.
+    let connect_future = connectrpc::client::Http2Connection::connect_unix(
+        socket_path.to_path_buf(),
+        "http://localhost".parse().expect("static authority parses"),
+    );
     matches!(
         timeout(Duration::from_secs(2), connect_future).await,
         Ok(Ok(_))

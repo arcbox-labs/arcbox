@@ -1,13 +1,12 @@
 //! System VM control commands.
 
 use anyhow::{Context, Result};
-use arcbox_grpc::v1::system_service_client::SystemServiceClient;
-use arcbox_protocol::v1::{Empty, SetSystemVmBackendRequest, SystemVmBackend};
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::SystemServiceClient;
+use arcbox_protocol::v1::{SetSystemVmBackendRequest, SystemVmBackend};
 use clap::{Subcommand, ValueEnum};
-use tonic::Request;
-use tonic::transport::{Channel, Endpoint};
 
-use super::machine::UnixConnector;
+use crate::connect::{self, UnaryExt as _};
 
 #[derive(Debug, Subcommand)]
 pub enum SystemCommands {
@@ -50,43 +49,36 @@ fn label(backend: SystemVmBackend) -> &'static str {
     }
 }
 
-async fn system_client() -> Result<SystemServiceClient<Channel>> {
-    let socket_path = super::resolve_grpc_socket_path();
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-    Ok(SystemServiceClient::new(channel))
+fn system_client() -> SystemServiceClient<connectrpc::client::SharedHttp2Connection> {
+    let (transport, config) = connect::daemon(&super::resolve_grpc_socket_path());
+    SystemServiceClient::new(transport, config)
 }
 
 pub async fn execute(cmd: SystemCommands) -> Result<()> {
     match cmd {
         SystemCommands::Backend { set } => {
-            let mut client = system_client().await?;
+            let client = system_client();
             let info = if let Some(arg) = set {
                 let backend = SystemVmBackend::from(arg);
                 println!(
                     "Switching System VM backend to {} — restarting the System VM...",
                     label(backend)
                 );
-                client
-                    .set_system_vm_backend(Request::new(SetSystemVmBackendRequest {
+                let req: pb::SetSystemVmBackendRequest =
+                    connect::request(&SetSystemVmBackendRequest {
                         backend: backend as i32,
-                    }))
+                    })?;
+                client
+                    .set_system_vm_backend(req)
                     .await
                     .context("failed to switch System VM backend")?
-                    .into_inner()
+                    .prost::<arcbox_protocol::v1::SystemVmBackendInfo>()?
             } else {
                 client
-                    .get_system_vm_backend(Request::new(Empty {}))
+                    .get_system_vm_backend(pb::Empty::default())
                     .await
                     .context("failed to query System VM backend")?
-                    .into_inner()
+                    .prost::<arcbox_protocol::v1::SystemVmBackendInfo>()?
             };
             let current =
                 SystemVmBackend::try_from(info.backend).unwrap_or(SystemVmBackend::Unspecified);
