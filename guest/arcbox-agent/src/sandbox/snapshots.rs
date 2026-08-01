@@ -62,10 +62,20 @@ impl SandboxService {
         } else {
             Some(req.sandbox_id.as_str())
         };
-        let summaries = self
+        let mut summaries = self
             .manager
             .list_checkpoints(filter)
             .map_err(SandboxError::from)?;
+        // Label filter: every requested pair must match, mirroring List.
+        // The manager only filters by origin sandbox, so apply it here
+        // rather than silently returning unrelated snapshots.
+        if !req.labels.is_empty() {
+            summaries.retain(|s| {
+                req.labels
+                    .iter()
+                    .all(|(key, value)| s.labels.get(key) == Some(value))
+            });
+        }
         let (page, next_page_token) =
             convert::paginate(summaries, |s| &s.id, req.page_size, &req.page_token);
         Ok(sandbox_v1::ListSnapshotsResponse {

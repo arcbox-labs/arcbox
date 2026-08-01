@@ -51,6 +51,7 @@ arcbox-helper.workspace = true
 chrono.workspace = true
 tar = "0.4.46"
 tempfile = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }

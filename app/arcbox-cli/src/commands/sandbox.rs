@@ -28,6 +28,13 @@ use tonic::transport::Channel;
 use super::machine::UnixConnector;
 use arcbox_cli::terminal::{RawModeGuard, TerminalSize};
 
+/// How many times an interrupted attach stream is resumed before giving up
+/// and asking the daemon for the execution's outcome directly.
+const ATTACH_RESUME_ATTEMPTS: usize = 3;
+
+/// Long-poll budget when falling back to `WaitExecution`, in seconds.
+const EXEC_WAIT_TIMEOUT_SECS: u32 = 3600;
+
 pub(super) async fn sandbox_channel() -> Result<Channel> {
     let socket_path = super::resolve_grpc_socket_path();
     tonic::transport::Endpoint::from_static("http://[::]:50051")
@@ -671,18 +678,25 @@ pub(super) fn current_tty_size(tty: bool) -> Option<ProtoTerminalSize> {
 /// code means — nothing here terminates the process.
 pub(super) async fn exec_session(
     client: &mut SandboxServiceClient<Channel>,
-    start: StartExecutionRequest,
+    mut start: StartExecutionRequest,
 ) -> Result<i32> {
     let tty = start.tty;
     let stdin = start.stdin;
     let sandbox_id = start.sandbox_id.clone();
 
-    let execution = client
+    // Choose the execution id here, not server-side: if the StartExecution
+    // response is lost in flight the command may already be running, and only
+    // an id we picked beforehand lets us retry idempotently (or address the
+    // survivor) instead of starting a second process.
+    if start.execution_id.is_empty() {
+        start.execution_id = uuid::Uuid::new_v4().to_string();
+    }
+    let execution_id = start.execution_id.clone();
+
+    client
         .start_execution(attach_machine(tonic::Request::new(start)))
         .await
-        .context("Failed to start execution in sandbox")?
-        .into_inner();
-    let execution_id = execution.id.clone();
+        .context("Failed to start execution in sandbox")?;
 
     // Enable raw terminal mode when TTY is requested.
     let raw_guard = if tty {
@@ -775,49 +789,75 @@ pub(super) async fn exec_session(
         })
     });
 
-    // Attach from the beginning of both channels and copy output out.
-    let attach = AttachExecutionRequest {
-        sandbox_id: sandbox_id.clone(),
-        execution_id: execution_id.clone(),
-        stdout_offset: 0,
-        stderr_offset: 0,
-    };
-    let mut stream = client
-        .attach_execution(attach_machine(tonic::Request::new(attach)))
-        .await
-        .context("Failed to attach to execution")?
-        .into_inner();
-
+    // Copy output out, re-attaching at the recorded offsets if the stream
+    // breaks. The execution outlives the connection, so a daemon restart or
+    // a cut connection is a resumable event, not a failed command — this is
+    // the client half of what the offset-addressed protocol buys.
+    let mut stdout_offset = 0u64;
+    let mut stderr_offset = 0u64;
     let mut result: Option<Execution> = None;
-    while let Some(event) = stream
-        .message()
-        .await
-        .context("Failed to read execution output")?
-    {
-        match event.event {
-            Some(execution_event::Event::Output(output)) => {
-                if output.data.is_empty() {
-                    continue;
-                }
-                if output.channel() == StdioChannel::Stderr {
-                    std::io::stderr()
-                        .write_all(&output.data)
-                        .context("Failed to write stderr")?;
-                    std::io::stderr().flush()?;
-                } else {
-                    std::io::stdout()
-                        .write_all(&output.data)
-                        .context("Failed to write stdout")?;
-                    std::io::stdout().flush()?;
-                }
+
+    'resume: for attempt in 0..=ATTACH_RESUME_ATTEMPTS {
+        let attach = AttachExecutionRequest {
+            sandbox_id: sandbox_id.clone(),
+            execution_id: execution_id.clone(),
+            stdout_offset,
+            stderr_offset,
+        };
+        let mut stream = match client
+            .attach_execution(attach_machine(tonic::Request::new(attach)))
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if attempt < ATTACH_RESUME_ATTEMPTS => {
+                tracing::warn!(%status, "re-attaching to the execution");
+                continue;
             }
-            Some(execution_event::Event::Exited(exited)) => {
-                result = exited.execution;
-                break;
+            Err(status) => return Err(status).context("Failed to attach to execution"),
+        };
+
+        loop {
+            let event = match stream.message().await {
+                Ok(Some(event)) => event,
+                // Clean end without an exit event: fall through to the
+                // authoritative wait below.
+                Ok(None) => break 'resume,
+                Err(status) if attempt < ATTACH_RESUME_ATTEMPTS => {
+                    tracing::warn!(%status, stdout_offset, "attach stream broke; resuming");
+                    continue 'resume;
+                }
+                Err(status) => return Err(status).context("Failed to read execution output"),
+            };
+
+            match event.event {
+                Some(execution_event::Event::Output(output)) => {
+                    // Advance past this chunk even when empty, so a resume
+                    // never re-reads it. The server may report a higher
+                    // offset than requested when retention dropped bytes.
+                    let end = output.offset + output.data.len() as u64;
+                    let (target, sink): (&mut u64, &mut dyn Write) =
+                        if output.channel() == StdioChannel::Stderr {
+                            (&mut stderr_offset, &mut std::io::stderr())
+                        } else {
+                            (&mut stdout_offset, &mut std::io::stdout())
+                        };
+                    if end > *target {
+                        *target = end;
+                    }
+                    if !output.data.is_empty() {
+                        sink.write_all(&output.data)
+                            .context("Failed to write execution output")?;
+                        sink.flush()?;
+                    }
+                }
+                Some(execution_event::Event::Exited(exited)) => {
+                    result = exited.execution;
+                    break 'resume;
+                }
+                // The Started preamble and idle keepalives carry no output.
+                Some(execution_event::Event::Started(_) | execution_event::Event::KeepAlive(_))
+                | None => {}
             }
-            // The Started preamble and idle keepalives carry no output.
-            Some(execution_event::Event::Started(_) | execution_event::Event::KeepAlive(_))
-            | None => {}
         }
     }
 
@@ -829,13 +869,14 @@ pub(super) async fn exec_session(
 
     let execution = match result {
         Some(execution) => execution,
-        // The attach stream broke (daemon restart, connection cut): the
-        // execution survives server-side, so fetch its state directly.
+        // The stream ended without an exit event and re-attaching did not
+        // recover it. The execution itself is unaffected, so block on its
+        // real outcome rather than reporting a synthetic failure.
         None => client
             .wait_execution(attach_machine(tonic::Request::new(WaitExecutionRequest {
                 sandbox_id,
                 execution_id,
-                timeout_seconds: 0,
+                timeout_seconds: EXEC_WAIT_TIMEOUT_SECS,
             })))
             .await
             .context("attach stream closed without an exit event")?

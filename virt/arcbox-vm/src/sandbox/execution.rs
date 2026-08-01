@@ -8,7 +8,6 @@
 //! stream. Stdin writes are offset-idempotent: a retried write of already
 //! accepted bytes is deduplicated instead of double-fed to the process.
 
-use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use tokio::sync::{mpsc, watch};
@@ -29,6 +28,10 @@ const ATTACH_CHUNK: usize = 64 * 1024;
 
 /// Buffered chunks between an execution's buffers and one attach consumer.
 const ATTACH_QUEUE: usize = 64;
+
+/// How many times a start re-checks the registry after awaiting an identical
+/// in-flight start. One round is the normal case.
+const MAX_START_RESERVE_ROUNDS: usize = 8;
 
 /// Parameters for starting an execution.
 #[derive(Debug, Clone, Default)]
@@ -414,7 +417,16 @@ struct RegistryInner {
     live: HashMap<ExecKey, Arc<Execution>>,
     /// Keys reserved by an in-flight start, so a duplicate id can never
     /// dispatch a second process (mirrors `reserve_id` for sandboxes).
-    pending: HashSet<ExecKey>,
+    pending: HashMap<ExecKey, PendingStart>,
+}
+
+/// A start that has reserved its key but not finished dispatching.
+struct PendingStart {
+    /// The command being started, so a retry can tell an idempotent replay
+    /// from an id collision before the execution exists.
+    cmd: Vec<String>,
+    /// Fires once the start commits or unwinds, waking matching retries.
+    done: watch::Sender<bool>,
 }
 
 /// Outcome of reserving an execution slot.
@@ -423,6 +435,8 @@ enum Reserve {
     Existing(ExecutionSnapshot),
     /// The slot is reserved; commit or drop to release.
     Slot(SlotGuard),
+    /// An identical start is still in flight; await it, then re-reserve.
+    AwaitPending(watch::Receiver<bool>),
 }
 
 /// RAII reservation for an execution key; removed on drop unless committed.
@@ -435,8 +449,14 @@ struct SlotGuard {
 impl SlotGuard {
     fn commit(mut self, exec: &Arc<Execution>) {
         let mut inner = self.registry.inner.lock().unwrap();
-        inner.pending.remove(&self.key);
+        let pending = inner.pending.remove(&self.key);
         inner.live.insert(self.key.clone(), Arc::clone(exec));
+        drop(inner);
+        // Wake matching retries only after the execution is visible, so the
+        // one that wakes finds it live rather than racing back to pending.
+        if let Some(pending) = pending {
+            let _ = pending.done.send(true);
+        }
         self.committed = true;
     }
 }
@@ -444,12 +464,16 @@ impl SlotGuard {
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         if !self.committed {
-            self.registry
+            let pending = self
+                .registry
                 .inner
                 .lock()
                 .unwrap()
                 .pending
                 .remove(&self.key);
+            if let Some(pending) = pending {
+                let _ = pending.done.send(true);
+            }
         }
     }
 }
@@ -466,12 +490,25 @@ impl ExecutionRegistry {
                 key.1
             )));
         }
-        if !inner.pending.insert(key.clone()) {
+        if let Some(pending) = inner.pending.get(&key) {
+            if pending.cmd == cmd {
+                // A retry inside the start window is still an idempotent
+                // retry: wait for the original rather than failing, or the
+                // contract only holds once the process is already running.
+                return Ok(Reserve::AwaitPending(pending.done.subscribe()));
+            }
             return Err(VmmError::AlreadyExists(format!(
-                "execution '{}' (start in flight)",
+                "execution '{}' (id reused for a different command)",
                 key.1
             )));
         }
+        inner.pending.insert(
+            key.clone(),
+            PendingStart {
+                cmd: cmd.to_vec(),
+                done: watch::channel(false).0,
+            },
+        );
         Ok(Reserve::Slot(SlotGuard {
             registry: Arc::clone(self),
             key,
@@ -628,12 +665,30 @@ impl SandboxManager {
             ));
         }
 
-        let slot = match self
-            .executions
-            .reserve((sandbox_id.clone(), id.clone()), &spec.cmd)?
-        {
-            Reserve::Existing(snapshot) => return Ok(snapshot),
-            Reserve::Slot(slot) => slot,
+        // Resolve the reservation, awaiting an identical in-flight start
+        // rather than failing it. One await is the normal case (the original
+        // commits or unwinds); the bound only stops a pathological interleave
+        // of repeated failing starts from spinning here forever.
+        let mut slot = None;
+        for _ in 0..MAX_START_RESERVE_ROUNDS {
+            match self
+                .executions
+                .reserve((sandbox_id.clone(), id.clone()), &spec.cmd)?
+            {
+                Reserve::Existing(snapshot) => return Ok(snapshot),
+                Reserve::Slot(guard) => {
+                    slot = Some(guard);
+                    break;
+                }
+                Reserve::AwaitPending(mut done) => {
+                    let _ = done.changed().await;
+                }
+            }
+        }
+        let Some(slot) = slot else {
+            return Err(VmmError::AlreadyExists(format!(
+                "execution '{id}' (concurrent starts did not settle)"
+            )));
         };
 
         let uds_path = self.require_ready_vsock(sandbox_id)?;
@@ -1094,18 +1149,75 @@ mod tests {
             Err(VmmError::AlreadyExists(_))
         ));
 
-        // A dropped (uncommitted) reservation frees the slot; an in-flight
-        // duplicate is rejected while reserved.
+        // While a start is in flight, a matching retry waits for it instead
+        // of failing — the idempotency contract holds inside the start
+        // window, not only once the process is already running. A differing
+        // command is still a collision.
         let key2 = ("s".to_owned(), "e2".to_owned());
         {
             let Reserve::Slot(_slot) = registry.reserve(key2.clone(), &cmd).unwrap() else {
                 panic!("expected a fresh slot");
             };
             assert!(matches!(
-                registry.reserve(key2.clone(), &cmd),
+                registry.reserve(key2.clone(), &cmd).unwrap(),
+                Reserve::AwaitPending(_)
+            ));
+            assert!(matches!(
+                registry.reserve(key2.clone(), &["other".to_owned()]),
                 Err(VmmError::AlreadyExists(_))
             ));
         }
+        // A dropped (uncommitted) reservation frees the slot.
+        assert!(matches!(
+            registry.reserve(key2, &cmd).unwrap(),
+            Reserve::Slot(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_wakes_matching_retries_with_the_committed_execution() {
+        let registry = Arc::new(ExecutionRegistry::default());
+        let key = ("s".to_owned(), "e".to_owned());
+        let cmd = vec!["sleep".to_owned()];
+
+        let Reserve::Slot(slot) = registry.reserve(key.clone(), &cmd).unwrap() else {
+            panic!("expected a fresh slot");
+        };
+        let Reserve::AwaitPending(mut waiter) = registry.reserve(key.clone(), &cmd).unwrap() else {
+            panic!("a matching retry must await the in-flight start");
+        };
+
+        // Commit the original; the waiter must then see the live execution.
+        let (tx, _rx) = mpsc::channel(1);
+        let exec = Arc::new(Execution::new(
+            "e".into(),
+            "s".into(),
+            &ExecutionSpec {
+                cmd: cmd.clone(),
+                ..ExecutionSpec::default()
+            },
+            tx,
+        ));
+        slot.commit(&exec);
+
+        waiter.changed().await.expect("pending start signals");
+        assert!(matches!(
+            registry.reserve(key.clone(), &cmd).unwrap(),
+            Reserve::Existing(_)
+        ));
+
+        // A start that unwinds instead wakes waiters too, and the key is
+        // free for the retry to claim.
+        let key2 = ("s".to_owned(), "e2".to_owned());
+        let Reserve::Slot(failed) = registry.reserve(key2.clone(), &cmd).unwrap() else {
+            panic!("expected a fresh slot");
+        };
+        let Reserve::AwaitPending(mut waiter) = registry.reserve(key2.clone(), &cmd).unwrap()
+        else {
+            panic!("a matching retry must await the in-flight start");
+        };
+        drop(failed);
+        waiter.changed().await.expect("unwound start signals");
         assert!(matches!(
             registry.reserve(key2, &cmd).unwrap(),
             Reserve::Slot(_)

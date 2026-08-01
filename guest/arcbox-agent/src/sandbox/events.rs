@@ -9,6 +9,9 @@ use super::{SandboxService, convert};
 use crate::error::SandboxError;
 use crate::rpc::{ErrorResponse, MessageType, write_message};
 
+/// Events buffered between the filter task and one subscriber.
+const EVENT_QUEUE_CAPACITY: usize = 64;
+
 impl SandboxService {
     /// Stream `SandboxEvent` frames from [`SandboxService::subscribe_events`].
     pub async fn handle_events<S>(
@@ -38,17 +41,23 @@ impl SandboxService {
 
     /// Subscribe to sandbox lifecycle events.  Returns a channel of encoded
     /// [`sandbox_v1::SandboxEvent`] payloads.
+    ///
+    /// The channel is bounded: a subscriber that stops reading (a wedged
+    /// transport write, a stalled client) blocks the filter task, which stops
+    /// draining the broadcast and lets it lag — dropping events with a warn,
+    /// the designed overflow behavior. An unbounded channel instead grew
+    /// guest-agent memory for as long as the stall lasted.
     pub fn subscribe_events(
         &self,
         payload: &[u8],
-    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, SandboxError> {
+    ) -> Result<mpsc::Receiver<Vec<u8>>, SandboxError> {
         let req = sandbox_v1::SandboxEventsRequest::decode(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let filter_id = req.sandbox_id.clone();
         let filter_kind = req.kind();
 
         let mut bcast_rx = self.manager.subscribe_events();
-        let (tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, out_rx) = mpsc::channel::<Vec<u8>>(EVENT_QUEUE_CAPACITY);
 
         tokio::spawn(async move {
             loop {
@@ -64,7 +73,7 @@ impl SandboxService {
                             continue;
                         }
                         let msg = convert::vm_event_to_proto(event);
-                        if tx.send(msg.encode_to_vec()).is_err() {
+                        if tx.send(msg.encode_to_vec()).await.is_err() {
                             break;
                         }
                     }
