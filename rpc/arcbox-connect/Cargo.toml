@@ -9,10 +9,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-buffa = { version = "0.8.1", features = ["json"] }
-buffa-types = { version = "0.8.1", features = ["json"] }
-connectrpc = "0.8.1"
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
+connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.1" }
 serde = { workspace = true, features = ["derive"] }
 
 [build-dependencies]
-connectrpc-build = "0.8"
+connectrpc-build = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.0" }

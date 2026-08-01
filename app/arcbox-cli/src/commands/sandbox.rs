@@ -1125,11 +1125,10 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
             };
             let total = data.len();
 
-            // Connect's client-streaming call takes an iterator and pulls
-            // from it with backpressure, so the chunks are produced lazily
-            // here rather than pushed through a channel by a spawned task.
-            // Memory is unchanged either way: the whole file is already read
-            // above.
+            // Connect's client-streaming call takes an async stream and pulls
+            // from it with backpressure; the chunks are ready data (the whole
+            // file is already read above), so a `stream_iter` over the built
+            // requests is enough — no channel or spawned task.
             const CHUNK: usize = 1024 * 1024;
             let open = WriteFileRequest {
                 payload: Some(write_file_request::Payload::Open(WriteFileOpen {
@@ -1156,7 +1155,7 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
                 .map(|msg| crate::connect::request::<pb::WriteFileRequest, _>(&msg))
                 .collect::<Result<Vec<_>>>()?;
             client
-                .write_file(requests)
+                .write_file(connectrpc::client::stream_iter(requests))
                 .await
                 .context("Failed to write file into sandbox")?;
             println!("Copied {total} bytes to {}", args.dst);

@@ -28,9 +28,9 @@ uuid = { workspace = true }
 dimicon = { version = "0.2.0", features = ["devicon", "simpleicon"] }
 bytes.workspace = true
 arcbox-connect.workspace = true
-connectrpc = "0.8.1"
-buffa = { version = "0.8.1", features = ["json"] }
-buffa-types = { version = "0.8.1", features = ["json"] }
+connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.1" }
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
 
 [dev-dependencies]
 http = "1.5.0"
