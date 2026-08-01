@@ -497,6 +497,11 @@ mod platform {
         );
         configure_primary_interface_dhcp();
         write_machine_resolv_conf();
+        // Installed last, and before the shim hands off to the distro's init:
+        // the hook this writes is what tells the host when that init has
+        // settled, so readiness does not return into the window where the
+        // distro reconfigures the interface configured just above (CORE-66).
+        crate::boot_done::install();
     }
 
     /// Points `/etc/resolv.conf` at the NAT gateway resolver (10.0.2.1), but

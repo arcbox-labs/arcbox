@@ -170,14 +170,22 @@ must name `abctl`.
   interface from scratch — measured on alpine as a ~20 ms window with zero
   routes, ~100 ms after `Start` would otherwise have returned (CORE-66).
   `wait_for_machine_ready` therefore also gates on
-  `SystemInfo.distro_init_pending`, which the agent derives from each init
-  system's own boot-complete signal (`system_info.rs`). Two consequences
-  worth knowing: the field is phrased as *pending* so an agent predating it
-  decodes false and behaves exactly as before; and readiness now costs what
-  the distro's boot costs — ~2.7 s on alpine/openrc, **~14 s on
-  ubuntu/systemd** — because that is when the machine actually becomes
-  usable. Deciding a Machine is ready from any earlier signal reintroduces
-  the race.
+  `SystemInfo.distro_init_pending`, which the agent reads from a sentinel
+  (`guest/arcbox-agent/src/boot_done.rs`) written by a hook `machine_init`
+  installs into the distro — a systemd unit ordered `After=multi-user.target`
+  or an openrc service that `depend()`s `after *`. Do NOT replace it with an
+  inspection of the init system's runtime state: `/run/openrc/rc.starting` is
+  absent both *before* openrc runs and after it finishes, so that check
+  reports "settled" during exactly the window it exists to catch — a version
+  built that way shipped and never fired once. Unit ordering is a public
+  contract; a runtime directory's layout is not. Same shape as Lima's
+  `/run/lima-boot-done` and multipass's cloud-init `boot-finished`; cloud-init
+  itself is unavailable because the mirrored images are the linuxcontainers
+  `default` variant, which does not ship it. Two consequences worth knowing:
+  the field is phrased as *pending* so an agent predating it decodes false and
+  behaves exactly as before; and readiness now costs what the distro's boot
+  costs — ~2.2 s on alpine/openrc, **~14 s on ubuntu/systemd** — because that
+  is when the machine actually becomes usable.
 - **`restart_generation` reports departures, not arrivals.** It is bumped on
   VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
   `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
