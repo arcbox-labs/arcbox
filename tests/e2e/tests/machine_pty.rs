@@ -137,48 +137,25 @@ fn scenario(
     })?;
 
     // 2. Resize: SIGWINCH on the CLI must travel resize pump → daemon →
-    //    agent → guest PTY. The guest busybox ships no `stty`, so instead
-    //    of reading the dimensions back, the shell itself witnesses the
-    //    kernel's SIGWINCH — which the guest PTY only delivers when the
-    //    resize ioctl actually reached it. Two shell-isms shape the probe:
-    //    the trap's marker is split for the same echo-vs-output reason as
-    //    above, and the shell parks in the `wait` builtin — a foreground
-    //    simple command would put ITSELF in the tty's foreground process
-    //    group and swallow the SIGWINCH, while during `wait` the shell
-    //    stays foreground and POSIX requires a trapped signal to interrupt
-    //    the wait and run the trap at once.
+    //    agent → guest PTY, where `stty size` reads the exact dimensions
+    //    back. The rootfs lays no `stty` symlink, so the applet is invoked
+    //    through the busybox binary itself. The pump is asynchronous, so
+    //    the guest is polled until the new size lands; "37 91" can only
+    //    come from the readback (the typed command never contains it).
     metrics.time("pty_resize", || {
-        // Handshake instead of a fixed delay: the shell confirms the trap is
-        // installed before the resize is issued, so a slow guest cannot miss
-        // the one SIGWINCH. Once the trap is armed, a signal landing at any
-        // later point — at the prompt, between the fork and `wait` — is
-        // recorded as pending and runs at the next command boundary.
-        writer.write_all(b"trap 'echo re\"\"sized-by-winch' WINCH; echo trap-\"\"-armed\r")?;
-        writer.flush()?;
-        output.wait_for("trap--armed", SHELL_BUDGET)?;
-        writer.write_all(b"sleep 30 & wait\r")?;
-        writer.flush()?;
-        // busybox ash honours the trap only for a signal that ARRIVES while
-        // it is blocked in `wait`; one delivered moments earlier — say,
-        // while the line above is still being read — stays pending and
-        // never runs. "Now inside wait" is not observable from out here, so
-        // resize repeatedly, alternating between two sizes so every attempt
-        // is a real change that fires a fresh SIGWINCH; the first to land
-        // inside `wait` runs the trap.
+        pty.master
+            .resize(PtySize {
+                rows: 37,
+                cols: 91,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("resizing pty")?;
         let deadline = Instant::now() + SHELL_BUDGET;
-        let mut flip = false;
         loop {
-            let (rows, cols) = if flip { (38, 92) } else { (37, 91) };
-            flip = !flip;
-            pty.master
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .context("resizing pty")?;
-            match output.wait_for("resized-by-winch", Duration::from_millis(500)) {
+            writer.write_all(b"busybox stty size\r")?;
+            writer.flush()?;
+            match output.wait_for("37 91", Duration::from_millis(700)) {
                 Ok(()) => break Ok(()),
                 Err(_) if Instant::now() < deadline => {}
                 Err(e) => break Err(e),
