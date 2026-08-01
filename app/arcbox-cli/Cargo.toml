@@ -23,14 +23,10 @@ path = "src/bin/arcbox_placeholder.rs"
 [dependencies]
 arcbox-core = { workspace = true }
 arcbox-docker = { workspace = true }
-arcbox-grpc = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-constants = { workspace = true }
 arcbox-docker-tools = { workspace = true }
 arcbox-asset = { workspace = true }
-
-tonic = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }
@@ -46,7 +42,6 @@ libc = { workspace = true }
 humantime = "2.3.0"
 sha2 = "0.10"
 hex = "0.4"
-tokio-stream.workspace = true
 arcbox-helper.workspace = true
 chrono.workspace = true
 tar = "0.4.46"

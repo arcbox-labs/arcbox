@@ -406,4 +406,65 @@ mod tests {
 
         shutdown.cancel();
     }
+
+    /// A bidirectional call driven from both directions at once, over the
+    /// socket the daemon really serves.
+    ///
+    /// This is the wire shape behind `abctl machine exec -it`: the client
+    /// splits the stream into owned halves, a sender task writes the Init
+    /// frame while the receiver awaits the response. The runtime handle is
+    /// empty, so the deterministic answer is `unavailable` — but for that to
+    /// arrive at all, the h2c bidi stream must open, the send half's frame
+    /// must reach the handler (it reads Init before checking readiness), and
+    /// the handler's error must come back through the receive half.
+    #[tokio::test]
+    async fn a_split_bidi_stream_reaches_the_exec_session_handler() {
+        use arcbox_connect::v1 as pb;
+
+        let (_dir, socket, shutdown) = spawn_control_plane().await;
+
+        let authority = "http://localhost".parse().expect("static authority parses");
+        let transport =
+            connectrpc::client::Http2Connection::lazy_unix(&socket, authority).shared(4);
+        let config = connectrpc::client::ClientConfig::new(
+            "http://localhost".parse().expect("static base URI parses"),
+        );
+        let client = pb::MachineServiceClient::new(transport, config);
+
+        let (mut send, mut recv) = client
+            .exec_session()
+            .await
+            .expect("open the bidi stream")
+            .into_split();
+
+        let sender = tokio::spawn(async move {
+            let init = pb::MachineExecInput {
+                payload: Some(pb::machine_exec_input::Payload::Init(Box::new(
+                    pb::MachineExecRequest {
+                        id: "default".into(),
+                        tty: true,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            };
+            // The send may race the server finishing the RPC; either way the
+            // receive half below sees the handler's verdict.
+            let _ = send.send(init).await;
+            send.close_send();
+        });
+
+        let err = recv
+            .message::<pb::MachineExecOutput>()
+            .await
+            .expect_err("an empty runtime answers every call with an error");
+        assert_eq!(
+            err.code,
+            connectrpc::ErrorCode::Unavailable,
+            "the handler should consume Init and fail on readiness: {err:?}"
+        );
+        sender.await.expect("sender task");
+
+        shutdown.cancel();
+    }
 }

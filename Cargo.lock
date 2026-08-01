@@ -309,7 +309,6 @@ dependencies = [
  "arcbox-core",
  "arcbox-docker",
  "arcbox-docker-tools",
- "arcbox-grpc",
  "arcbox-helper",
  "arcbox-protocol",
  "buffa",
@@ -321,7 +320,6 @@ dependencies = [
  "dirs",
  "hex",
  "humantime",
- "hyper-util",
  "libc",
  "macos-resolver",
  "prost",
@@ -332,8 +330,6 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "tokio-stream",
- "tonic",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -432,6 +428,7 @@ version = "0.5.5"
 dependencies = [
  "anyhow",
  "arcbox-api",
+ "arcbox-connect",
  "arcbox-constants",
  "arcbox-core",
  "arcbox-docker",
@@ -844,7 +841,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tonic",
 ]
 
 [[package]]
