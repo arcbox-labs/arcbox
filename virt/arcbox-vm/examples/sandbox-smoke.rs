@@ -251,7 +251,7 @@ async fn main() -> anyhow::Result<()> {
     let snapshot_id_opt: Option<String> = if run_phase3 {
         println!("\n=== Phase 3: Checkpoint ===");
         let ck = manager
-            .checkpoint_sandbox(&id, "smoke-test".into())
+            .checkpoint_sandbox(&id, "smoke-test".into(), HashMap::new())
             .await
             .context("checkpoint_sandbox")?;
         println!("  [checkpoint] snapshot_id={}", ck.snapshot_id);

@@ -448,6 +448,9 @@ impl VmmManager {
 
         let meta = pending.commit(SnapshotDraft {
             name: req.name,
+            // VM-level snapshots carry no labels; only sandbox checkpoints
+            // expose them on the API.
+            labels: HashMap::new(),
             snapshot_type: req.snapshot_type,
             parent_id: None,
             kernel_path: None,

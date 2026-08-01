@@ -17,7 +17,7 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let info = self
             .manager
-            .checkpoint_sandbox(&req.sandbox_id, req.name)
+            .checkpoint_sandbox(&req.sandbox_id, req.name, req.labels)
             .await
             .map_err(SandboxError::from)?;
         Ok(convert::checkpoint_to_proto(info))

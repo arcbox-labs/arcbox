@@ -36,6 +36,7 @@ impl SandboxManager {
         &self,
         sandbox_id: &SandboxId,
         name: String,
+        labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
         // Verify state and capture the kernel/rootfs paths for jailer re-staging.
         let (kernel_path, rootfs_path) = {
@@ -129,6 +130,7 @@ impl SandboxManager {
         // vmstate-recorded symlink.
         let meta = pending.commit(SnapshotDraft {
             name: Some(name),
+            labels,
             snapshot_type: crate::config::SnapshotType::Full,
             parent_id: None,
             kernel_path: Some(kernel_path),
@@ -608,7 +610,7 @@ impl SandboxManager {
                 id: s.id,
                 sandbox_id: s.vm_id,
                 name: s.name.unwrap_or_default(),
-                labels: HashMap::new(),
+                labels: s.labels,
                 snapshot_dir: s
                     .vmstate_path
                     .parent()

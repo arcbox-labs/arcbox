@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -18,6 +18,12 @@ pub struct SnapshotMeta {
     pub vm_id: String,
     /// Optional human-readable label.
     pub name: Option<String>,
+    /// Arbitrary key-value metadata, used for filtering in ListSnapshots.
+    ///
+    /// `serde(default)` so snapshots catalogued before labels existed still
+    /// load (they read back as unlabelled).
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
     pub snapshot_type: SnapshotType,
     /// Absolute path to the `vmstate` file.
     pub vmstate_path: PathBuf,
@@ -41,6 +47,8 @@ pub struct SnapshotInfo {
     pub id: String,
     pub vm_id: String,
     pub name: Option<String>,
+    /// Arbitrary key-value metadata recorded at checkpoint time.
+    pub labels: HashMap<String, String>,
     pub snapshot_type: SnapshotType,
     pub vmstate_path: PathBuf,
     pub mem_path: Option<PathBuf>,
@@ -53,6 +61,7 @@ impl From<&SnapshotMeta> for SnapshotInfo {
             id: m.id.clone(),
             vm_id: m.vm_id.clone(),
             name: m.name.clone(),
+            labels: m.labels.clone(),
             snapshot_type: m.snapshot_type,
             vmstate_path: m.vmstate_path.clone(),
             mem_path: m.mem_path.clone(),
@@ -93,6 +102,8 @@ fn is_catalog_entry(path: &Path) -> bool {
 pub struct SnapshotDraft {
     /// Optional human-readable label.
     pub name: Option<String>,
+    /// Arbitrary key-value metadata carried onto the snapshot.
+    pub labels: HashMap<String, String>,
     pub snapshot_type: SnapshotType,
     /// Parent snapshot ID (diff chain).
     pub parent_id: Option<String>,
@@ -146,6 +157,7 @@ impl PendingSnapshot<'_> {
             id: self.id.clone(),
             vm_id: self.vm_id.clone(),
             name: draft.name,
+            labels: draft.labels,
             snapshot_type: draft.snapshot_type,
             vmstate_path: published.join(VMSTATE_FILE),
             mem_path: has_mem.then(|| published.join(MEM_FILE)),
@@ -413,6 +425,7 @@ mod tests {
 
     fn draft() -> SnapshotDraft {
         SnapshotDraft {
+            labels: HashMap::new(),
             name: None,
             snapshot_type: SnapshotType::Full,
             parent_id: None,
@@ -453,6 +466,49 @@ mod tests {
         let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
         let meta = register_one(&catalog, "vm-1");
         assert_eq!(meta.mem_path, None);
+    }
+
+    #[test]
+    fn labels_survive_the_catalog_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+
+        let pending = catalog.begin("vm-1").unwrap();
+        std::fs::write(pending.dir().join(VMSTATE_FILE), b"vmstate").unwrap();
+        let labels = HashMap::from([("env".to_owned(), "prod".to_owned())]);
+        pending
+            .commit(SnapshotDraft {
+                labels: labels.clone(),
+                ..draft()
+            })
+            .unwrap();
+
+        // Read back through the catalog (i.e. off disk), not from the meta
+        // the commit returned — labels are only useful if they persist.
+        let listed = catalog.list("vm-1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].labels, labels);
+    }
+
+    #[test]
+    fn snapshots_catalogued_before_labels_existed_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let snap_dir = catalog.snapshot_dir("vm-1", "old-snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        // A meta.json written before the labels field existed.
+        std::fs::write(
+            SnapshotCatalog::meta_path(&snap_dir),
+            r#"{"id":"old-snap","vm_id":"vm-1","name":null,"snapshot_type":"Full",
+                "vmstate_path":"/tmp/vmstate","mem_path":null,
+                "created_at":"2026-01-01T00:00:00Z","parent_id":null,
+                "kernel_path":null,"rootfs_path":null}"#,
+        )
+        .unwrap();
+
+        let listed = catalog.list("vm-1").unwrap();
+        assert_eq!(listed.len(), 1, "pre-labels snapshot must still load");
+        assert!(listed[0].labels.is_empty());
     }
 
     #[test]
