@@ -351,6 +351,8 @@ mod tests {
             "arcbox.v1.IconService/GetImageIcon",
             "arcbox.v1.StatsService/Watch",
             "arcbox.v1.SystemService/WatchSetupStatus",
+            "arcbox.v1.KubernetesService/Status",
+            "arcbox.v1.MigrationService/RunMigration",
         ] {
             assert!(
                 router.has_method(path),
