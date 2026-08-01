@@ -292,10 +292,11 @@ async fn m1_egress_tcp(machines: &mut MachineServiceClient<Channel>) -> Result<(
 /// Extracts the *answer* addresses from busybox `nslookup` stdout.
 ///
 /// The output is always a resolver preamble, a blank line, then the answer.
-/// busybox emits the preamble unconditionally and exits 0 even on NXDOMAIN,
-/// so a whole-output substring match for the gateway is a tautology here —
-/// the resolver *is* the expected answer. Only the block after the `Name:`
-/// line is an answer, so parse from there.
+/// busybox emits that preamble unconditionally — including on NXDOMAIN,
+/// where it echoes the resolver and prints no answer block. Since the
+/// resolver here *is* the expected answer, a whole-output substring match
+/// for the gateway is a tautology. Only the block after the `Name:` line is
+/// an answer, so parse from there.
 ///
 /// busybox 1.37.0 (`networking/nslookup.c`) ships two formats and both must
 /// parse. With `FEATURE_NSLOOKUP_BIG` (Alpine's build) the preamble address
@@ -347,6 +348,13 @@ async fn m2_dns(machines: &mut MachineServiceClient<Channel>) -> Result<()> {
             RPC_BUDGET,
         )
         .await?;
+        // `exit` is reported but deliberately not gated on. busybox does
+        // exit 1 on NXDOMAIN, so it looks like a free extra assertion — but
+        // the `FEATURE_NSLOOKUP_BIG` build Alpine ships queries A *and*
+        // AAAA (`nslookup.c:1345-1347`) and sets `G.exitcode` on either
+        // one's failure. This datapath is IPv4-only by design, so the AAAA
+        // half can legitimately come back NXDOMAIN and turn a perfectly
+        // good A answer into exit 1. The parsed answer is the honest gate.
         let answers = nslookup_answer_addrs(&out);
         if !answers.contains(&gateway) {
             bail!(
@@ -473,8 +481,9 @@ async fn m4_network_metadata(machines: &mut MachineServiceClient<Channel>) -> Re
 /// back to passing on a dead resolver.
 #[test]
 fn nslookup_bare_preamble_address_is_not_an_answer() {
-    // NXDOMAIN: preamble on stdout, the error goes to stderr (which
-    // `exec_capture` drops), and busybox still exits 0.
+    // NXDOMAIN on the legacy build: the preamble goes to stdout and the
+    // error to stderr via `bb_error_msg` (`nslookup.c:132`), which
+    // `exec_capture` drops. Exit is 1 — `return (rc != 0)` at `:139`.
     let out = "Server:    10.0.2.1\nAddress 1: 10.0.2.1\n\n";
     assert!(
         nslookup_answer_addrs(out).is_empty(),
@@ -488,7 +497,12 @@ fn nslookup_bare_preamble_address_is_not_an_answer() {
 /// regression, and this one pins the shape M2 really sees.
 #[test]
 fn nslookup_ported_preamble_address_is_not_an_answer() {
-    let out = "Server:\t\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n";
+    // This build `printf`s its failure to *stdout* (`nslookup.c:1013`), so
+    // unlike the legacy shape the error line is part of what M2 parses —
+    // it must not be mistaken for an answer. Exit is 1 here too
+    // (`G.exitcode = EXIT_FAILURE` at `:1015`, returned at `:1430`).
+    let out = "Server:\t\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
+               ** server can't find host.docker.internal: NXDOMAIN\n";
     assert!(nslookup_answer_addrs(out).is_empty());
 }
 
