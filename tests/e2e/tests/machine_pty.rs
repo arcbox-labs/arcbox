@@ -148,19 +148,42 @@ fn scenario(
     //    stays foreground and POSIX requires a trapped signal to interrupt
     //    the wait and run the trap at once.
     metrics.time("pty_resize", || {
-        writer.write_all(b"trap 'echo re\"\"sized-by-winch' WINCH\r")?;
+        // Handshake instead of a fixed delay: the shell confirms the trap is
+        // installed before the resize is issued, so a slow guest cannot miss
+        // the one SIGWINCH. Once the trap is armed, a signal landing at any
+        // later point — at the prompt, between the fork and `wait` — is
+        // recorded as pending and runs at the next command boundary.
+        writer.write_all(b"trap 'echo re\"\"sized-by-winch' WINCH; echo trap-\"\"-armed\r")?;
+        writer.flush()?;
+        output.wait_for("trap--armed", SHELL_BUDGET)?;
         writer.write_all(b"sleep 30 & wait\r")?;
         writer.flush()?;
-        std::thread::sleep(Duration::from_millis(1000));
-        pty.master
-            .resize(PtySize {
-                rows: 37,
-                cols: 91,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("resizing pty")?;
-        output.wait_for("resized-by-winch", SHELL_BUDGET)
+        // busybox ash honours the trap only for a signal that ARRIVES while
+        // it is blocked in `wait`; one delivered moments earlier — say,
+        // while the line above is still being read — stays pending and
+        // never runs. "Now inside wait" is not observable from out here, so
+        // resize repeatedly, alternating between two sizes so every attempt
+        // is a real change that fires a fresh SIGWINCH; the first to land
+        // inside `wait` runs the trap.
+        let deadline = Instant::now() + SHELL_BUDGET;
+        let mut flip = false;
+        loop {
+            let (rows, cols) = if flip { (38, 92) } else { (37, 91) };
+            flip = !flip;
+            pty.master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("resizing pty")?;
+            match output.wait_for("resized-by-winch", Duration::from_millis(500)) {
+                Ok(()) => break Ok(()),
+                Err(_) if Instant::now() < deadline => {}
+                Err(e) => break Err(e),
+            }
+        }
     })?;
 
     // 3. Exit-code propagation: the shell's exit status must become the CLI
