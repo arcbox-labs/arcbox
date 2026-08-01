@@ -91,21 +91,16 @@ impl DockerApiServer {
 
     /// Serves on an already-bound listener until `shutdown` is cancelled.
     ///
+    /// There is deliberately no `bind`-and-serve convenience wrapper: it
+    /// would only be useful from a spawned task, which is exactly the shape
+    /// that swallows the bind error and lets startup report READY for a
+    /// daemon nobody can reach (CORE-71).
+    ///
     /// # Errors
     ///
     /// Returns an error if serving fails.
     pub async fn serve(&self, listener: UnixListener, shutdown: CancellationToken) -> Result<()> {
         self.run_native_http(listener, shutdown).await
-    }
-
-    /// Binds and serves in one call.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the server fails to start.
-    pub async fn run(&self, shutdown: CancellationToken) -> Result<()> {
-        let listener = self.bind()?;
-        self.serve(listener, shutdown).await
     }
 }
 
