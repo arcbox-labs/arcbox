@@ -49,12 +49,62 @@ pub struct DaemonConfig {
     pub env: Vec<(String, String)>,
 }
 
+/// When each setup phase was first observed on the readiness stream,
+/// relative to the start of [`DaemonHandle::wait_ready`].
+///
+/// Only the FIRST sighting of a phase is kept: the daemon republishes the
+/// current phase to every new subscriber and may re-send one unchanged, and
+/// a span should measure when a stage began, not when it was last echoed.
+///
+/// A phase the daemon had already left before the harness subscribed is
+/// never observed, so every lookup is fallible — callers must treat a
+/// missing mark as "unknown", never as zero.
+#[derive(Debug, Default)]
+pub struct PhaseMarks {
+    marks: Vec<(setup_status::Phase, Duration)>,
+}
+
+impl PhaseMarks {
+    fn mark(&mut self, phase: setup_status::Phase, elapsed: Duration) {
+        if self.marks.iter().any(|(seen, _)| *seen == phase) {
+            return;
+        }
+        self.marks.push((phase, elapsed));
+    }
+
+    /// When `phase` was first observed, if it was.
+    #[must_use]
+    pub fn at(&self, phase: setup_status::Phase) -> Option<Duration> {
+        self.marks
+            .iter()
+            .find(|(seen, _)| *seen == phase)
+            .map(|(_, at)| *at)
+    }
+
+    /// Elapsed time between two observed phases.
+    ///
+    /// `None` when either was missed, or when `to` was seen before `from` —
+    /// an out-of-order pair is a caller error, and a saturating zero would
+    /// read as a suspiciously fast stage.
+    #[must_use]
+    pub fn span(&self, from: setup_status::Phase, to: setup_status::Phase) -> Option<Duration> {
+        self.at(to)?.checked_sub(self.at(from)?)
+    }
+
+    /// Observed phases in sighting order, as `(name, elapsed)` — suitable
+    /// for recording into `metrics.json`.
+    pub fn timeline(&self) -> impl Iterator<Item = (&'static str, Duration)> + '_ {
+        self.marks.iter().map(|(p, at)| (p.as_str_name(), *at))
+    }
+}
+
 /// A running daemon owned by the harness. Dropping the handle terminates
 /// the daemon (SIGTERM, then SIGKILL after a grace period).
 pub struct DaemonHandle {
     child: Child,
     data_dir: PathBuf,
     log_path: PathBuf,
+    phase_marks: PhaseMarks,
 }
 
 impl DaemonHandle {
@@ -106,7 +156,19 @@ impl DaemonHandle {
             child,
             data_dir: config.data_dir,
             log_path,
+            phase_marks: PhaseMarks::default(),
         })
+    }
+
+    /// Setup-phase timings observed during [`Self::wait_ready`].
+    ///
+    /// Empty before a readiness wait. The span most callers want is
+    /// `VmStarting → VmReady`: guest binaries are already staged when the
+    /// daemon publishes `VmStarting`, and the guest agent has answered by
+    /// `VmReady`, so it isolates the guest boot itself (CORE-67).
+    #[must_use]
+    pub fn phase_marks(&self) -> &PhaseMarks {
+        &self.phase_marks
     }
 
     /// The daemon's process ID (for external diagnostics such as `sample`).
@@ -168,6 +230,13 @@ impl DaemonHandle {
             .context("opening WatchSetupStatus stream")?
             .into_inner();
 
+        // Phase marks are relative to the subscription, not to spawn: the
+        // socket-wait above is unmeasured, so an absolute "time since
+        // spawn" would silently fold it in. Spans between two observed
+        // phases are unaffected by the offset.
+        let stream_start = Instant::now();
+        self.phase_marks = PhaseMarks::default();
+
         loop {
             self.check_alive()?;
             if Instant::now() >= deadline {
@@ -179,20 +248,24 @@ impl DaemonHandle {
             match tokio::time::timeout(POLL_TICK, stream.message()).await {
                 // Poll tick elapsed without an update: re-check liveness.
                 Err(_) => {}
-                Ok(Ok(Some(status))) => match status.phase() {
-                    setup_status::Phase::Ready => {
-                        info!("daemon reported READY");
-                        return Ok(());
+                Ok(Ok(Some(status))) => {
+                    let phase = status.phase();
+                    self.phase_marks.mark(phase, stream_start.elapsed());
+                    match phase {
+                        setup_status::Phase::Ready => {
+                            info!("daemon reported READY");
+                            return Ok(());
+                        }
+                        setup_status::Phase::Failed => {
+                            bail!(
+                                "daemon startup failed: {} (log: {})",
+                                status.error,
+                                self.log_path.display()
+                            );
+                        }
+                        phase => info!(?phase, message = %status.message, "setup phase"),
                     }
-                    setup_status::Phase::Failed => {
-                        bail!(
-                            "daemon startup failed: {} (log: {})",
-                            status.error,
-                            self.log_path.display()
-                        );
-                    }
-                    phase => info!(?phase, message = %status.message, "setup phase"),
-                },
+                }
                 // Stream ended or errored — the daemon is going away; the
                 // next liveness check reports its exit status and log tail.
                 Ok(Ok(None) | Err(_)) => {
@@ -377,5 +450,67 @@ mod tests {
         assert_isolated(dir.path()).expect("tempdir must be accepted");
         // Not-yet-created children are fine too — spawn creates them.
         assert_isolated(&dir.path().join("does-not-exist-yet")).expect("child of tempdir");
+    }
+
+    /// A republished phase must not move its mark: the daemon re-sends the
+    /// current phase to every subscriber, and a span has to measure when a
+    /// stage began, not when it was last echoed.
+    #[test]
+    fn phase_marks_keep_the_first_sighting() {
+        let mut marks = PhaseMarks::default();
+        marks.mark(setup_status::Phase::AssetsReady, Duration::from_secs(1));
+        marks.mark(setup_status::Phase::AssetsReady, Duration::from_secs(9));
+        assert_eq!(
+            marks.at(setup_status::Phase::AssetsReady),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn phase_span_measures_between_sightings() {
+        let mut marks = PhaseMarks::default();
+        marks.mark(setup_status::Phase::AssetsReady, Duration::from_secs(2));
+        marks.mark(setup_status::Phase::Ready, Duration::from_secs(5));
+        assert_eq!(
+            marks.span(setup_status::Phase::AssetsReady, setup_status::Phase::Ready),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    /// An unobserved phase yields `None`, never zero — the harness
+    /// subscribes after the socket appears, so an early phase can be missed
+    /// entirely, and a zero would read as an implausibly fast stage.
+    #[test]
+    fn phase_span_is_none_when_a_mark_was_missed() {
+        let mut marks = PhaseMarks::default();
+        marks.mark(setup_status::Phase::Ready, Duration::from_secs(5));
+        assert_eq!(
+            marks.span(setup_status::Phase::AssetsReady, setup_status::Phase::Ready),
+            None
+        );
+        assert_eq!(marks.at(setup_status::Phase::AssetsReady), None);
+    }
+
+    /// Out-of-order pairs are a caller error; saturating to zero would hide
+    /// it behind a plausible-looking number.
+    #[test]
+    fn phase_span_is_none_when_reversed() {
+        let mut marks = PhaseMarks::default();
+        marks.mark(setup_status::Phase::AssetsReady, Duration::from_secs(2));
+        marks.mark(setup_status::Phase::Ready, Duration::from_secs(5));
+        assert_eq!(
+            marks.span(setup_status::Phase::Ready, setup_status::Phase::AssetsReady),
+            None
+        );
+    }
+
+    #[test]
+    fn timeline_reports_sighting_order_with_names() {
+        let mut marks = PhaseMarks::default();
+        marks.mark(setup_status::Phase::Initializing, Duration::from_millis(10));
+        marks.mark(setup_status::Phase::AssetsReady, Duration::from_millis(20));
+        marks.mark(setup_status::Phase::Ready, Duration::from_millis(30));
+        let names: Vec<&str> = marks.timeline().map(|(name, _)| name).collect();
+        assert_eq!(names, ["INITIALIZING", "ASSETS_READY", "READY"]);
     }
 }
