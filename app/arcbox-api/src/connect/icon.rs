@@ -57,6 +57,25 @@ impl IconServiceImpl {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Resolves an icon for a fully-qualified image name.
+    ///
+    /// The RPC method is a thin wrapper over this. Keeping the lookup on an
+    /// inherent method lets tests exercise resolution without constructing a
+    /// request envelope, which is what they actually care about.
+    ///
+    /// # Errors
+    ///
+    /// Returns `internal` if the lookup itself fails; an image with no known
+    /// icon is a successful response with `source = "not_found"`.
+    pub async fn resolve(&self, fqin: &str) -> Result<pb::GetImageIconResponse, ConnectError> {
+        let icon = self
+            .icon_service
+            .get_icon(fqin)
+            .await
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
+        Ok(ResolvedIcon(icon).into())
+    }
 }
 
 #[allow(
@@ -71,12 +90,6 @@ impl pb::IconService for IconServiceImpl {
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::GetImageIconRequest>,
     ) -> ServiceResult<pb::GetImageIconResponse> {
-        let icon = self
-            .icon_service
-            .get_icon(request.fqin)
-            .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
-
-        Response::ok(ResolvedIcon(icon).into())
+        Response::ok(self.resolve(request.fqin).await?)
     }
 }

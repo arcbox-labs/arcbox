@@ -10,13 +10,11 @@ mod kubernetes;
 mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
-mod stats;
 
 pub use kubernetes::KubernetesServiceImpl;
 pub use machine::MachineServiceImpl;
 #[cfg(target_os = "macos")]
 pub use macos::MacosServiceImpl;
-pub use stats::StatsServiceImpl;
 
 use std::sync::{Arc, OnceLock};
 

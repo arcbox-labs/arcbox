@@ -12,7 +12,6 @@ pub mod error;
 #[allow(clippy::result_large_err)]
 pub mod grpc;
 pub mod migration;
-pub mod system;
 
 // Re-export gRPC service types from arcbox-grpc for convenience.
 pub use arcbox_grpc::v1::{
@@ -29,11 +28,11 @@ pub use arcbox_grpc::{
 pub use arcbox_protocol::v1::setup_status::Phase as SetupPhase;
 pub use connect::{
     IconServiceImpl, SandboxFilesystemServiceImpl, SandboxProcessServiceImpl, SandboxServiceImpl,
-    SandboxSnapshotServiceImpl,
+    SandboxSnapshotServiceImpl, StatsServiceImpl,
 };
+pub use connect::{SetupState, SystemServiceImpl};
 pub use error::{ApiError, Result};
 #[cfg(target_os = "macos")]
 pub use grpc::MacosServiceImpl;
-pub use grpc::{KubernetesServiceImpl, MachineServiceImpl, SharedRuntime, StatsServiceImpl};
+pub use grpc::{KubernetesServiceImpl, MachineServiceImpl, SharedRuntime};
 pub use migration::MigrationServiceImpl;
-pub use system::{SetupState, SystemServiceImpl};

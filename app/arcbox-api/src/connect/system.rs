@@ -1,23 +1,29 @@
-//! SystemService gRPC implementation.
+//! System service — daemon readiness, version, and diagnostics.
 //!
-//! Provides setup status queries so the desktop app (or any gRPC client)
-//! can observe daemon readiness without managing its lifecycle.
+//! Provides setup status queries so the desktop app (or any client) can
+//! observe daemon readiness without managing its lifecycle.
+//!
+//! `GetVirtioDebug` is deliberately served from `early_runtime` rather than
+//! the ready handle: a boot that never reaches READY is its main use case.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
-use arcbox_grpc::SystemService;
+use arcbox_connect::v1 as pb;
 use arcbox_protocol::v1::{
-    Empty, ResolveContainerFsRequest, ResolveContainerFsResponse, ResolveImageFsRequest,
-    ResolveImageFsResponse, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend,
+    ResolveContainerFsResponse, ResolveImageFsResponse, SetupStatus, SystemVmBackend,
     SystemVmBackendInfo, VcpuDebug, VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug,
     setup_status,
 };
+use connectrpc::{
+    ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
+    ServiceStream,
+};
 use tokio::sync::{broadcast, watch};
-use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
 
-use crate::grpc::{SharedRuntime, SharedRuntimeExt};
+use super::SharedRuntime;
+
+use super::ConnectRuntimeExt as _;
+use super::bridge::{wire_request, wire_response};
 
 /// Buffered updates per streaming client. Startup publishes on the order of a
 /// dozen; the margin covers a client that stalls briefly mid-boot without
@@ -214,78 +220,86 @@ fn device_debug_to_proto(device: arcbox_core::DeviceDebug) -> VirtioDeviceDebug 
     }
 }
 
-#[tonic::async_trait]
-impl SystemService for SystemServiceImpl {
+#[allow(
+    refining_impl_trait,
+    reason = "the trait returns `impl Encodable<M>`; naming the concrete body \
+              type is strictly more informative and these impls are registered on a \
+              Router rather than named by callers"
+)]
+impl pb::SystemService for SystemServiceImpl {
     async fn get_info(
         &self,
-        _request: Request<arcbox_protocol::v1::GetInfoRequest>,
-    ) -> Result<Response<arcbox_protocol::v1::GetInfoResponse>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetInfoRequest>,
+    ) -> ServiceResult<PreEncoded<pb::GetInfoResponse>> {
         // TODO: Populate from runtime.
-        Err(Status::unimplemented("get_info not yet implemented"))
+        Err(ConnectError::unimplemented("get_info not yet implemented"))
     }
 
     async fn get_version(
         &self,
-        _request: Request<arcbox_protocol::v1::GetVersionRequest>,
-    ) -> Result<Response<arcbox_protocol::v1::GetVersionResponse>, Status> {
-        Ok(Response::new(arcbox_protocol::v1::GetVersionResponse {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetVersionRequest>,
+    ) -> ServiceResult<PreEncoded<pb::GetVersionResponse>> {
+        let resp = arcbox_protocol::v1::GetVersionResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             api_version: "1.0".to_string(),
             min_api_version: "1.0".to_string(),
             ..Default::default()
-        }))
+        };
+        Response::ok(wire_response(&resp))
     }
 
     async fn ping(
         &self,
-        _request: Request<arcbox_protocol::v1::SystemPingRequest>,
-    ) -> Result<Response<arcbox_protocol::v1::SystemPingResponse>, Status> {
-        Ok(Response::new(arcbox_protocol::v1::SystemPingResponse {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::SystemPingRequest>,
+    ) -> ServiceResult<PreEncoded<pb::SystemPingResponse>> {
+        let resp = arcbox_protocol::v1::SystemPingResponse {
             api_version: "1.0".to_string(),
             build_version: env!("CARGO_PKG_VERSION").to_string(),
-        }))
+        };
+        Response::ok(wire_response(&resp))
     }
-
-    type EventsStream =
-        Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::Event, Status>> + Send + 'static>>;
 
     async fn events(
         &self,
-        _request: Request<arcbox_protocol::v1::EventsRequest>,
-    ) -> Result<Response<Self::EventsStream>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::EventsRequest>,
+    ) -> ServiceResult<ServiceStream<PreEncoded<pb::Event>>> {
         // TODO: Implement event streaming.
-        Err(Status::unimplemented("events not yet implemented"))
+        Err(ConnectError::unimplemented("events not yet implemented"))
     }
 
     async fn prune(
         &self,
-        _request: Request<arcbox_protocol::v1::PruneRequest>,
-    ) -> Result<Response<arcbox_protocol::v1::PruneResponse>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::PruneRequest>,
+    ) -> ServiceResult<PreEncoded<pb::PruneResponse>> {
         // TODO: Implement resource pruning.
-        Err(Status::unimplemented("prune not yet implemented"))
+        Err(ConnectError::unimplemented("prune not yet implemented"))
     }
 
     async fn get_setup_status(
         &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<SetupStatus>, Status> {
-        Ok(Response::new(self.setup_state.current()))
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::Empty>,
+    ) -> ServiceResult<PreEncoded<pb::SetupStatus>> {
+        Response::ok(wire_response(&self.setup_state.current()))
     }
-
-    type WatchSetupStatusStream =
-        Pin<Box<dyn Stream<Item = Result<SetupStatus, Status>> + Send + 'static>>;
 
     async fn watch_setup_status(
         &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<Self::WatchSetupStatusStream>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::Empty>,
+    ) -> ServiceResult<ServiceStream<PreEncoded<pb::SetupStatus>>> {
         let (initial, mut updates) = self.setup_state.subscribe();
         let stream = async_stream::stream! {
             // Send current state immediately, then every update after it.
-            yield Ok(initial);
+            yield Ok(wire_response::<pb::SetupStatus, _>(&initial));
             loop {
                 match updates.recv().await {
-                    Ok(status) => yield Ok(status),
+                    Ok(status) => yield Ok(wire_response::<pb::SetupStatus, _>(&status)),
                     // Too slow to keep up: the next recv resumes from the
                     // oldest retained update, so the client stays live and
                     // converges — it has only missed intermediate phases.
@@ -296,30 +310,33 @@ impl SystemService for SystemServiceImpl {
                 }
             }
         };
-        Ok(Response::new(Box::pin(stream)))
+        Response::ok(Box::pin(stream))
     }
 
     async fn get_system_vm_backend(
         &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<SystemVmBackendInfo>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::Empty>,
+    ) -> ServiceResult<PreEncoded<pb::SystemVmBackendInfo>> {
         let runtime = self.runtime.ready()?;
-        Ok(Response::new(SystemVmBackendInfo {
+        let info = SystemVmBackendInfo {
             backend: backend_to_proto(runtime.system_vm_backend()) as i32,
-        }))
+        };
+        Response::ok(wire_response(&info))
     }
 
     async fn get_virtio_debug(
         &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<VirtioDebugInfo>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::Empty>,
+    ) -> ServiceResult<PreEncoded<pb::VirtioDebugInfo>> {
         // The early handle exists as soon as the runtime is constructed —
         // a boot that never reaches READY is this RPC's main use case.
         let runtime = self.early_runtime.ready()?;
         let snapshot = runtime
             .system_vm_debug_snapshot()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        Ok(Response::new(VirtioDebugInfo {
+            .map_err(|e| ConnectError::failed_precondition(e.to_string()))?;
+        let info = VirtioDebugInfo {
             devices: snapshot
                 .devices
                 .into_iter()
@@ -343,60 +360,72 @@ impl SystemService for SystemServiceImpl {
                 .collect(),
             kick_broadcasts: snapshot.kick_broadcasts,
             unpark_broadcasts: snapshot.unpark_broadcasts,
-        }))
+        };
+        Response::ok(wire_response(&info))
     }
 
     async fn resolve_container_fs(
         &self,
-        request: Request<ResolveContainerFsRequest>,
-    ) -> Result<Response<ResolveContainerFsResponse>, Status> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ResolveContainerFsRequest>,
+    ) -> ServiceResult<PreEncoded<pb::ResolveContainerFsResponse>> {
         let runtime = self.runtime.ready()?;
-        let req = request.into_inner();
+        let req: arcbox_protocol::v1::ResolveContainerFsRequest = wire_request(&request)?;
         if req.container_id.is_empty() {
-            return Err(Status::invalid_argument("container_id must not be empty"));
+            return Err(ConnectError::invalid_argument(
+                "container_id must not be empty",
+            ));
         }
         let paths = runtime
             .container_fs_paths(&req.container_id)
             .await
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        Ok(Response::new(ResolveContainerFsResponse {
+            .map_err(|e| ConnectError::failed_precondition(e.to_string()))?;
+        let resp = ResolveContainerFsResponse {
             upper_dir: paths.upper_dir,
             lower_dirs: paths.lower_dirs,
-        }))
+        };
+        Response::ok(wire_response(&resp))
     }
 
     async fn resolve_image_fs(
         &self,
-        request: Request<ResolveImageFsRequest>,
-    ) -> Result<Response<ResolveImageFsResponse>, Status> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ResolveImageFsRequest>,
+    ) -> ServiceResult<PreEncoded<pb::ResolveImageFsResponse>> {
         let runtime = self.runtime.ready()?;
-        let req = request.into_inner();
+        let req: arcbox_protocol::v1::ResolveImageFsRequest = wire_request(&request)?;
         if req.top_chain_id.is_empty() {
-            return Err(Status::invalid_argument("top_chain_id must not be empty"));
+            return Err(ConnectError::invalid_argument(
+                "top_chain_id must not be empty",
+            ));
         }
         let paths = runtime
             .image_fs_paths(&req.top_chain_id)
             .await
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        Ok(Response::new(ResolveImageFsResponse {
+            .map_err(|e| ConnectError::failed_precondition(e.to_string()))?;
+        let resp = ResolveImageFsResponse {
             lower_dirs: paths.lower_dirs,
-        }))
+        };
+        Response::ok(wire_response(&resp))
     }
 
     async fn set_system_vm_backend(
         &self,
-        request: Request<SetSystemVmBackendRequest>,
-    ) -> Result<Response<SystemVmBackendInfo>, Status> {
-        let backend = backend_from_proto(request.into_inner().backend())
-            .ok_or_else(|| Status::invalid_argument("backend must be HV or VZ"))?;
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::SetSystemVmBackendRequest>,
+    ) -> ServiceResult<PreEncoded<pb::SystemVmBackendInfo>> {
+        let req: arcbox_protocol::v1::SetSystemVmBackendRequest = wire_request(&request)?;
+        let backend = backend_from_proto(req.backend())
+            .ok_or_else(|| ConnectError::invalid_argument("backend must be HV or VZ"))?;
         let runtime = self.runtime.ready()?;
         runtime
             .switch_system_vm_backend(backend)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(SystemVmBackendInfo {
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
+        let info = SystemVmBackendInfo {
             backend: backend_to_proto(runtime.system_vm_backend()) as i32,
-        }))
+        };
+        Response::ok(wire_response(&info))
     }
 }
 

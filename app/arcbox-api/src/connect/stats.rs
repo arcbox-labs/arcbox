@@ -1,19 +1,22 @@
-//! Stats service gRPC implementation.
+//! Stats service — live machine and container samples.
 //!
 //! Bridges [`arcbox_core::stats_hub::StatsHub`]'s broadcast channel to a
-//! tonic server stream. Dropping the response stream drops the broadcast
+//! server stream. Dropping the response stream drops the broadcast
 //! receiver, which is what lets the hub stop the guest-side sampling when
 //! the last watcher disconnects.
 
-use std::pin::Pin;
-
+use arcbox_connect::v1 as pb;
 use arcbox_core::{DEFAULT_MACHINE_NAME, Runtime};
-use arcbox_grpc::v1::stats_service_server;
-use arcbox_protocol::v1::{MachineStats, StatsWatchRequest};
-use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
+use arcbox_protocol::v1::MachineStats;
+use connectrpc::{
+    ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
+    ServiceStream,
+};
 
-use super::{SharedRuntime, SharedRuntimeExt};
+use crate::grpc::SharedRuntime;
+
+use super::ConnectRuntimeExt as _;
+use super::bridge::{wire_request, wire_response};
 
 /// Fills each container's display name from the runtime's registry,
 /// leaving the ID-only entries untouched when no name is known (the
@@ -44,15 +47,19 @@ impl StatsServiceImpl {
     }
 }
 
-#[tonic::async_trait]
-impl stats_service_server::StatsService for StatsServiceImpl {
-    type WatchStream = Pin<Box<dyn Stream<Item = Result<MachineStats, Status>> + Send + 'static>>;
-
+#[allow(
+    refining_impl_trait,
+    reason = "the trait returns `impl Encodable<M>`; naming the concrete body \
+              type is strictly more informative and these impls are registered on a \
+              Router rather than named by callers"
+)]
+impl pb::StatsService for StatsServiceImpl {
     async fn watch(
         &self,
-        request: Request<StatsWatchRequest>,
-    ) -> Result<Response<Self::WatchStream>, Status> {
-        let req = request.into_inner();
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::StatsWatchRequest>,
+    ) -> ServiceResult<ServiceStream<PreEncoded<pb::MachineStats>>> {
+        let req: arcbox_protocol::v1::StatsWatchRequest = wire_request(&request)?;
         let machine_id = if req.machine_id.is_empty() {
             DEFAULT_MACHINE_NAME.to_string()
         } else {
@@ -60,7 +67,7 @@ impl stats_service_server::StatsService for StatsServiceImpl {
         };
         let runtime = std::sync::Arc::clone(self.runtime.ready()?);
         if machine_id != DEFAULT_MACHINE_NAME && !runtime.machine_manager().exists(&machine_id) {
-            return Err(Status::not_found(format!("machine '{machine_id}'")));
+            return Err(ConnectError::not_found(format!("machine '{machine_id}'")));
         }
         let mut rx = runtime.subscribe_machine_stats_for(&machine_id).await;
         let stream = async_stream::stream! {
@@ -68,7 +75,7 @@ impl stats_service_server::StatsService for StatsServiceImpl {
                 match rx.recv().await {
                     Ok(mut sample) => {
                         enrich_container_names(&runtime, &mut sample).await;
-                        yield Ok(sample);
+                        yield Ok(wire_response::<pb::MachineStats, _>(&sample));
                     }
                     // This subscriber lagged; newer samples follow, which
                     // is exactly what a live monitor wants.
@@ -77,6 +84,6 @@ impl stats_service_server::StatsService for StatsServiceImpl {
                 }
             }
         };
-        Ok(Response::new(Box::pin(stream)))
+        Response::ok(Box::pin(stream))
     }
 }
