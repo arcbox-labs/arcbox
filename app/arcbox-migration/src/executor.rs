@@ -77,7 +77,7 @@ impl MigrationExecutor {
         recreate_networks(&self.target, plan, &mut progress).await?;
         recreate_containers(&self.target, plan, &image_rewrites, &mut progress).await?;
         if options.start_containers {
-            start_containers(&self.target, plan, &mut progress).await?;
+            start_containers(&self.target, plan, &mut progress).await;
         }
 
         // No completion event here: returning `Ok` is the signal. Only the
@@ -370,11 +370,14 @@ where
 ///
 /// Runs last so every network and volume the containers depend on already
 /// exists, and follows plan order, which is source creation order.
-async fn start_containers<F>(
-    target: &DockerCliRunner,
-    plan: &MigrationPlan,
-    progress: &mut F,
-) -> Result<()>
+///
+/// A start failure is reported and skipped rather than propagated. By this
+/// point every image, volume, network and container has already been created,
+/// so failing the run would describe a completed migration as a failed one and
+/// invite a destructive re-run. Start failures also have causes that are not
+/// migration defects at all — most commonly a published host port still held
+/// by the source container, which is not stopped unless it blocks a volume.
+async fn start_containers<F>(target: &DockerCliRunner, plan: &MigrationPlan, progress: &mut F)
 where
     F: FnMut(MigrationProgress),
 {
@@ -386,17 +389,23 @@ where
 
     let total = u32::try_from(running.len()).unwrap_or(0);
     for (index, container) in running.into_iter().enumerate() {
+        let current = Some(u32::try_from(index + 1).unwrap_or(total));
+        let detail = match target.start_container(&container.name).await {
+            Ok(()) => format!("started container '{}'", container.name),
+            Err(error) => format!(
+                "container '{}' was migrated but did not start: {error}",
+                container.name
+            ),
+        };
         progress(MigrationProgress {
             stage: MigrationStage::StartContainers,
-            detail: format!("starting container '{}'", container.name),
+            detail,
             resource_type: Some("container".to_string()),
             resource_name: Some(container.name.clone()),
-            current: Some(u32::try_from(index + 1).unwrap_or(total)),
+            current,
             total: Some(total),
         });
-        target.start_container(&container.name).await?;
     }
-    Ok(())
 }
 
 /// Returns the reference that resolves on the target for this container.
@@ -513,12 +522,7 @@ fn append_container_spec_args(args: &mut Vec<String>, spec: &ContainerSpec) {
     }
     if let Some(nano_cpus) = spec.nano_cpus {
         args.push("--cpus".to_string());
-        // NanoCpus is a 10^-9 CPU quota; --cpus takes whole CPUs.
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "CPU counts are small; nine significant digits are exact in f64"
-        )]
-        args.push(format!("{:.3}", nano_cpus as f64 / 1e9));
+        args.push(format_cpus(nano_cpus));
     }
     for capability in &spec.cap_add {
         args.push("--cap-add".to_string());
@@ -551,6 +555,21 @@ fn append_network_args(args: &mut Vec<String>, mode: &NetworkModeSpec) {
     };
     args.push("--network".to_string());
     args.push(network.to_string());
+}
+
+/// Renders a `NanoCpus` quota as the decimal `--cpus` expects.
+///
+/// Done in integer arithmetic so the value round-trips exactly: a fixed number
+/// of decimal places would round a quota like 1.234567890 into a different one.
+fn format_cpus(nano_cpus: i64) -> String {
+    const NANOS_PER_CPU: i64 = 1_000_000_000;
+    let whole = nano_cpus / NANOS_PER_CPU;
+    let fraction = nano_cpus % NANOS_PER_CPU;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let fraction = format!("{:09}", fraction.abs());
+    format!("{whole}.{}", fraction.trim_end_matches('0'))
 }
 
 fn final_command(spec: &ContainerSpec) -> Vec<String> {
@@ -699,9 +718,19 @@ mod tests {
         };
         let args = args_for(&spec);
         assert!(contains_pair(&args, "--memory", "536870912"));
-        assert!(contains_pair(&args, "--cpus", "1.500"));
+        assert!(contains_pair(&args, "--cpus", "1.5"));
         assert!(contains_pair(&args, "--cap-add", "NET_ADMIN"));
         assert!(contains_pair(&args, "--cap-add", "SYS_PTRACE"));
+    }
+
+    #[test]
+    fn cpu_quotas_round_trip_exactly() {
+        // A fixed decimal width would turn these into different quotas.
+        assert_eq!(format_cpus(1_234_567_890), "1.23456789");
+        assert_eq!(format_cpus(100_000), "0.0001");
+        assert_eq!(format_cpus(1_500_000_000), "1.5");
+        assert_eq!(format_cpus(2_000_000_000), "2");
+        assert_eq!(format_cpus(1), "0.000000001");
     }
 
     #[test]

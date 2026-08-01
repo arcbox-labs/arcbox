@@ -152,7 +152,11 @@ impl MigrationPlanner {
             .collect();
         // Recreate and start in source creation order: for a compose project
         // that is the order the services were brought up in.
-        container_plans.sort_by(|left, right| left.created.cmp(&right.created));
+        //
+        // Sort on the parsed instant, not the string. Docker formats `Created`
+        // with Go's RFC3339Nano, which strips trailing zeros from the fraction,
+        // so the field is variable-width and byte order can invert real order.
+        container_plans.sort_by_key(|plan| created_at(&plan.created));
 
         let replacements = build_replacements(
             &image_plan_data,
@@ -583,6 +587,17 @@ fn trimmed_name(container: &ContainerInspect) -> &str {
     container.name.trim_start_matches('/')
 }
 
+/// Parses a Docker `Created` timestamp into a sortable instant.
+///
+/// Unparseable stamps sort first, which keeps them out of the way of the
+/// containers whose order actually matters.
+fn created_at(created: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(created)
+        .ok()
+        .and_then(|stamp| stamp.timestamp_nanos_opt())
+        .unwrap_or(i64::MIN)
+}
+
 /// Treats Docker's "unset" sentinel of zero (or a negative) as absent.
 fn positive(value: i64) -> Option<i64> {
     (value > 0).then_some(value)
@@ -771,6 +786,26 @@ mod tests {
             was_running: false,
             created: String::new(),
         }
+    }
+
+    #[test]
+    fn creation_order_survives_stripped_trailing_zeros() {
+        // Docker uses Go's RFC3339Nano, which elides trailing zeros, so the
+        // earlier stamp can be a byte-wise *prefix* of the later one and sort
+        // after it. Whole-second fixtures never expose this.
+        let earlier = "2026-08-01T08:09:16.84759688Z"; // .847596880, zero stripped
+        let later = "2026-08-01T08:09:16.847596885Z";
+        assert!(earlier > later, "precondition: byte order is inverted here");
+        assert!(
+            created_at(earlier) < created_at(later),
+            "parsed order must be chronological"
+        );
+    }
+
+    #[test]
+    fn unparseable_creation_stamps_sort_first() {
+        assert_eq!(created_at(""), i64::MIN);
+        assert!(created_at("") < created_at("2026-08-01T08:09:16Z"));
     }
 
     #[test]

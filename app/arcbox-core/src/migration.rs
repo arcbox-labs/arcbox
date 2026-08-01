@@ -60,11 +60,12 @@ impl MigrationManager {
         // executor already refuses to run a plan that has any, and callers
         // inspecting a plan need to see *why* it is blocked.
         //
-        // A dry run keeps nothing, so repeated inspection cannot accumulate
-        // plans in the daemon.
-        let plan_id = if request.dry_run {
-            String::new()
-        } else {
+        // Nothing is stored unless the plan can actually be run: `run_migration`
+        // is the only thing that removes entries, so storing a plan no caller
+        // will ever run would retain it for the life of the daemon. That covers
+        // both a dry run and a plan the executor would refuse anyway.
+        let runnable = !request.dry_run && plan.unsupported_resources.is_empty();
+        let plan_id = if runnable {
             let plan_id = Uuid::new_v4().to_string();
             self.prepared.write().await.insert(
                 plan_id.clone(),
@@ -74,6 +75,8 @@ impl MigrationManager {
                 },
             );
             plan_id
+        } else {
+            String::new()
         };
 
         let mut warnings = Vec::new();

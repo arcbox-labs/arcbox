@@ -717,6 +717,7 @@ dependencies = [
 name = "arcbox-migration"
 version = "0.5.5"
 dependencies = [
+ "chrono",
  "dirs",
  "serde",
  "serde_json",

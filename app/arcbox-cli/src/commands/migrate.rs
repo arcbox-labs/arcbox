@@ -138,17 +138,18 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
         return report_dry_run(source_kind, &prepare, args.json);
     }
 
-    if prepare.plan_id.is_empty() {
-        bail!("Migration prepare response did not include a plan ID");
-    }
-
     print_prepare_summary(source_kind, &prepare);
     print_blocking_issues(&prepare);
+    // Checked before the plan ID: a blocked plan is deliberately not stored, so
+    // its empty ID is expected and the blocking issues are the useful message.
     if !prepare.unsupported_resources.is_empty() {
         bail!(
             "Migration cannot run until the blocking issues above are resolved. \
              Re-run with --dry-run to inspect the full plan."
         );
+    }
+    if prepare.plan_id.is_empty() {
+        bail!("Migration prepare response did not include a plan ID");
     }
 
     if !args.yes && !confirm_migration(&prepare)? {

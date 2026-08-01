@@ -120,8 +120,11 @@ pub struct ContainerInspect {
     /// Image ID.
     #[serde(rename = "Image")]
     pub image: String,
-    /// Creation timestamp. Docker emits RFC 3339 in UTC with a fixed shape, so
-    /// lexicographic ordering matches chronological ordering.
+    /// Creation timestamp, RFC 3339 in UTC.
+    ///
+    /// Docker formats this with Go's RFC3339Nano, which strips trailing zeros
+    /// from the fractional seconds, so the field is **variable width** and must
+    /// be parsed before comparing — byte order can invert real order.
     #[serde(rename = "Created", default)]
     pub created: String,
     /// Container state.
