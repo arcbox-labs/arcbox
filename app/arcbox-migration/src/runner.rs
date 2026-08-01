@@ -345,9 +345,11 @@ impl DockerCliRunner {
 
     /// Streams a container path into a tempfile via `docker cp`.
     ///
-    /// `--archive` is required on both halves of a volume transfer: without it
-    /// `docker cp` takes ownership from the destination, so every file would
-    /// arrive owned by root and databases would refuse to start.
+    /// `--archive` asks for source ownership explicitly. Note it is belt and
+    /// braces here, not a fix: the `-` stream forms already round-trip uid/gid
+    /// (measured 2026-08-01 — a `1000:1000` volume file survived a migration
+    /// on a build without this flag). The documented "ownership is set at the
+    /// destination" rule applies to path-to-path copies, not to tar streams.
     pub async fn copy_from_container(
         &self,
         container: &str,
@@ -395,7 +397,8 @@ impl DockerCliRunner {
 
     /// Streams a tar archive tempfile into a container via `docker cp`.
     ///
-    /// See [`Self::copy_from_container`] for why `--archive` is mandatory.
+    /// See [`Self::copy_from_container`] for what `--archive` does and does
+    /// not buy here.
     pub async fn copy_to_container(
         &self,
         source_archive: &Path,
