@@ -33,6 +33,10 @@ pub async fn run(ctx: DaemonContext, mut handles: ServiceHandles) -> Result<()> 
     wait_for_signal().await;
     println!("Shutting down guest VM... (press Ctrl+C again to force quit)");
     info!("Shutdown signal received, draining connections...");
+
+    // Keep the NFS proxy and guest alive until macOS has detached the mount.
+    // Cutting either connection first triggers its interrupted-server alert.
+    crate::nfs_mount::cleanup(&ctx);
     ctx.shutdown.cancel();
 
     drain(&mut handles).await;
@@ -123,6 +127,7 @@ async fn cleanup(ctx: &DaemonContext) {
         }
     }
 
+    // Retry if shutdown raced a mount that was still being established.
     crate::nfs_mount::cleanup(ctx);
 
     remove_sockets(ctx);
