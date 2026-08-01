@@ -263,31 +263,79 @@ impl DockerCliRunner {
         wait_for_success(child, "docker image import").await
     }
 
-    /// Saves an image to a tempfile.
-    pub async fn save_image(&self, reference: &str) -> Result<tempfile::NamedTempFile> {
-        let file = tempfile::NamedTempFile::new()?;
-        let path = file.path().to_path_buf();
-        self.status_owned(vec![
-            "image".to_string(),
-            "save".to_string(),
-            "--output".to_string(),
-            path.to_string_lossy().to_string(),
-            reference.to_string(),
-        ])
-        .await?;
-        Ok(file)
-    }
+    /// Streams `docker save` on this daemon straight into `docker load` on
+    /// `target`, returning the number of bytes transferred.
+    ///
+    /// `references` must list every tag to preserve: `docker save` keeps all
+    /// tags of an image only for arguments given without a tag, so naming a
+    /// single `repo:tag` silently drops that image's other tags.
+    pub async fn pipe_save_into(&self, target: &Self, references: &[String]) -> Result<u64> {
+        if references.is_empty() {
+            return Err(MigrationError::InvalidPlan(
+                "image plan has no export references".into(),
+            ));
+        }
 
-    /// Loads an image from a tempfile.
-    pub async fn load_image(&self, path: &Path) -> Result<()> {
-        self.status_owned(vec![
-            "image".to_string(),
-            "load".to_string(),
-            "--quiet".to_string(),
-            "--input".to_string(),
-            path.to_string_lossy().to_string(),
-        ])
-        .await
+        let mut save = self
+            .command()
+            .args(["image", "save"])
+            .args(references)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut load = target
+            .command()
+            .args(["image", "load", "--quiet"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let mut save_stdout = save
+            .stdout
+            .take()
+            .ok_or_else(|| MigrationError::Docker("docker save stdout missing".into()))?;
+        let mut load_stdin = load
+            .stdin
+            .take()
+            .ok_or_else(|| MigrationError::Docker("docker load stdin missing".into()))?;
+
+        let copy_task = tokio::spawn(async move {
+            let copied = tokio::io::copy(&mut save_stdout, &mut load_stdin).await?;
+            load_stdin.shutdown().await?;
+            Ok::<u64, std::io::Error>(copied)
+        });
+        // Drain both stderrs concurrently to prevent pipe buffer deadlocks.
+        let save_stderr = tokio::spawn(take_stderr(save.stderr.take()));
+        let load_stderr = tokio::spawn(take_stderr(load.stderr.take()));
+
+        let save_status = save.wait().await?;
+        let load_status = load.wait().await?;
+        let copied = copy_task
+            .await
+            .map_err(|e| MigrationError::Docker(format!("docker save copy task failed: {e}")))?;
+        let save_stderr = save_stderr.await.map_err(|e| {
+            MigrationError::Docker(format!("docker save stderr task failed: {e}"))
+        })??;
+        let load_stderr = load_stderr.await.map_err(|e| {
+            MigrationError::Docker(format!("docker load stderr task failed: {e}"))
+        })??;
+
+        // Report the producing side first: a `docker load` failure is usually a
+        // downstream symptom of `docker save` dying mid-stream.
+        if !save_status.success() {
+            return Err(MigrationError::Docker(format!(
+                "docker image save failed: {}",
+                save_stderr.trim()
+            )));
+        }
+        if !load_status.success() {
+            return Err(MigrationError::Docker(format!(
+                "docker image load failed: {}",
+                load_stderr.trim()
+            )));
+        }
+        Ok(copied?)
     }
 
     /// Streams a container path into a tempfile via `docker cp`.

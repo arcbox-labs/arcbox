@@ -124,7 +124,12 @@ impl MigrationPlanner {
             normalize_images(&source_images, &source_containers, &target_image_tags);
         let image_reference_by_id: HashMap<_, _> = image_plan_data
             .iter()
-            .map(|image| (image.image_id.clone(), image.export_reference.clone()))
+            .map(|image| {
+                (
+                    image.image_id.clone(),
+                    image.primary_reference().to_string(),
+                )
+            })
             .collect();
 
         let container_plans: Vec<_> = source_containers
@@ -185,7 +190,7 @@ fn normalize_images(
                 image.id.clone(),
                 ImagePlan {
                     image_id: image.id.clone(),
-                    export_reference: tags[0].clone(),
+                    export_references: tags.clone(),
                     replace_tags: tags
                         .iter()
                         .filter(|tag| target_tags.contains(*tag))
@@ -197,13 +202,15 @@ fn normalize_images(
         }
     }
 
+    // Untagged images are only worth carrying when a container references them;
+    // they export by ID and land untagged on the target.
     for container in containers {
         ordered
             .entry(container.image.clone())
             .or_insert_with(|| ImagePlan {
                 image_id: container.image.clone(),
-                export_reference: container.image.clone(),
-                repo_tags: meaningful_tags(&[]),
+                export_references: vec![container.image.clone()],
+                repo_tags: Vec::new(),
                 replace_tags: Vec::new(),
             });
     }
@@ -475,6 +482,53 @@ mod tests {
     fn meaningful_tags_filters_none_entries() {
         let tags = meaningful_tags(&["<none>:<none>".into(), "nginx:latest".into()]);
         assert_eq!(tags, vec!["nginx:latest"]);
+    }
+
+    fn image_inspect(id: &str, tags: &[&str]) -> ImageInspect {
+        ImageInspect {
+            id: id.into(),
+            repo_tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            repo_digests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_tag_of_an_image_is_exported() {
+        let images = [image_inspect(
+            "sha256:abc",
+            &["myapp:dev", "myapp:latest", "<none>:<none>"],
+        )];
+        let plans = normalize_images(&images, &[], &BTreeSet::new());
+
+        assert_eq!(plans.len(), 1);
+        // All tags must reach `docker save`, otherwise the others are dropped.
+        assert_eq!(
+            plans[0].export_references,
+            vec!["myapp:dev".to_string(), "myapp:latest".to_string()]
+        );
+        assert_eq!(plans[0].primary_reference(), "myapp:dev");
+    }
+
+    #[test]
+    fn untagged_image_referenced_by_container_exports_by_id() {
+        let container = ContainerInspect {
+            id: "cid".into(),
+            name: "/demo".into(),
+            image: "sha256:dangling".into(),
+            state: crate::docker_types::ContainerState {
+                status: "exited".into(),
+                running: false,
+            },
+            config: crate::docker_types::ContainerConfig::default(),
+            host_config: crate::docker_types::HostConfig::default(),
+            network_settings: NetworkSettings::default(),
+            mounts: Vec::new(),
+        };
+        let plans = normalize_images(&[], std::slice::from_ref(&container), &BTreeSet::new());
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].export_references, vec!["sha256:dangling"]);
+        assert!(plans[0].repo_tags.is_empty());
     }
 
     #[test]

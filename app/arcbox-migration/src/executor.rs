@@ -170,14 +170,15 @@ where
     for (index, image) in plan.images.iter().enumerate() {
         progress(MigrationProgress {
             stage: MigrationStage::ImportImages,
-            detail: format!("importing image '{}'", image.export_reference),
+            detail: format!("importing image '{}'", image.primary_reference()),
             resource_type: Some("image".to_string()),
-            resource_name: Some(image.export_reference.clone()),
+            resource_name: Some(image.primary_reference().to_string()),
             current: Some(u32::try_from(index + 1).unwrap_or(total)),
             total: Some(total),
         });
-        let archive = source.save_image(&image.export_reference).await?;
-        target.load_image(archive.path()).await?;
+        source
+            .pipe_save_into(target, &image.export_references)
+            .await?;
     }
     Ok(())
 }

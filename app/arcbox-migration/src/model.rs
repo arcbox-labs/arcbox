@@ -80,12 +80,24 @@ pub struct MigrationPlan {
 pub struct ImagePlan {
     /// Source image identifier.
     pub image_id: String,
-    /// Image reference used for export.
-    pub export_reference: String,
+    /// Every reference passed to `docker save`. Listing all tags is what keeps
+    /// them: `docker save` preserves an image's other tags only when the
+    /// argument omits a tag, so exporting one `repo:tag` drops the rest.
+    pub export_references: Vec<String>,
     /// Repo tags preserved by the source daemon.
     pub repo_tags: Vec<String>,
     /// Repo tags that will overwrite an existing ArcBox tag.
     pub replace_tags: Vec<String>,
+}
+
+impl ImagePlan {
+    /// Returns the reference used when a container refers to this image.
+    #[must_use]
+    pub fn primary_reference(&self) -> &str {
+        self.export_references
+            .first()
+            .map_or(self.image_id.as_str(), String::as_str)
+    }
 }
 
 /// Source volume transfer description.
