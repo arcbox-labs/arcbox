@@ -43,5 +43,5 @@ fn main() {
         // intra-package references do not resolve.
         .file_per_package(true)
         .compile()
-        .expect("Failed to compile sandbox protos for Connect");
+        .expect("Failed to compile protos for Connect");
 }

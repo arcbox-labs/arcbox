@@ -115,9 +115,9 @@ where
 
 /// Extension trait for obtaining the runtime from a deferred handle.
 ///
-/// The gRPC services have the same need but answer with `tonic::Status`;
-/// the message and the `UNAVAILABLE`/`Unavailable` code are deliberately
-/// identical so a client sees one behaviour whichever surface it uses.
+/// The message and the `Unavailable` code match what the tonic services
+/// answered before CORE-68, so clients that predate the migration see the
+/// same not-ready behaviour they always did.
 pub(crate) trait ConnectRuntimeExt {
     /// Returns the runtime, or `Unavailable` if it hasn't been initialized.
     fn ready(&self) -> Result<&Arc<Runtime>, ConnectError>;
@@ -189,8 +189,8 @@ fn wire_protocol(
 ///
 /// Kept here rather than in the daemon so that adding a service is one edit
 /// next to the impls, not a silent omission at the call site — and because
-/// registration is what decides which stack serves a path: tonic matches
-/// first, so a service listed on both would keep answering over tonic alone.
+/// registration is what decides whether a path is served at all: the router
+/// answers exactly what it was given, and an omission 404s at runtime.
 #[must_use]
 pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
     let clone = || Arc::clone(&runtime);
@@ -199,8 +199,7 @@ pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
         .add_service(Arc::new(SandboxProcessServiceImpl::new(clone())))
         .add_service(Arc::new(SandboxFilesystemServiceImpl::new(clone())))
         .add_service(Arc::new(SandboxSnapshotServiceImpl::new(clone())))
-        // The daemon's own services migrate onto this router one at a time
-        // (CORE-68).
+        // The daemon's own services, all on Connect since CORE-68.
         .add_service(Arc::new(IconServiceImpl::new()))
         .add_service(Arc::new(StatsServiceImpl::new(clone())))
         .add_service(Arc::new(KubernetesServiceImpl::new(clone())))

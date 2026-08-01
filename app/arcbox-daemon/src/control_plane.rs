@@ -339,6 +339,7 @@ mod tests {
             "arcbox.v1.KubernetesService/Status",
             "arcbox.v1.MigrationService/RunMigration",
             "arcbox.v1.MachineService/ExecSession",
+            #[cfg(target_os = "macos")]
             "arcbox.v1.MacosService/List",
         ] {
             assert!(
