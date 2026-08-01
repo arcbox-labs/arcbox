@@ -67,11 +67,14 @@ must name `abctl`.
   ~300 µs apart with no await point between them, so a snapshot channel
   hands a subscriber only `READY` whenever it does not get scheduled in
   that window — indistinguishable from a phase that was never published,
-  and the exact bug CORE-67 set out to remove. `subscribe` takes the
-  snapshot and the receiver together under the write lock; splitting them
-  either drops an update or replays one already folded in, walking a
-  client's phase backwards. Regressions: `back_to_back_phases_are_all_
-  delivered`, `the_snapshot_is_not_replayed_as_an_update`.
+  and the exact bug CORE-67 set out to remove. The two halves are kept
+  atomic by opposite sides of one lock: `publish` broadcasts from inside
+  `send_modify`, holding the write lock, and `subscribe` takes the snapshot
+  and the receiver together under the read lock that write lock excludes.
+  Split either pair and you drop an update or replay one already folded
+  into the snapshot, walking a client's phase backwards. Regressions:
+  `back_to_back_phases_are_all_delivered`,
+  `the_snapshot_is_not_replayed_as_an_update`.
 - `NETWORK_READY` covers whichever services this daemon runs and means they
   were *started*, not that they are reachable. `--no-linux-vm` reaches it
   with DNS alone (`start_services` skips the Docker API and the Kubernetes
