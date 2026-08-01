@@ -222,7 +222,15 @@ impl<D: BalloonDeps> BalloonController<D> {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
                             Some(BalloonCommand::EnterIdle) => self.enter_idle().await,
-                            Some(BalloonCommand::ExitIdle) => Mode::Active,
+                            Some(BalloonCommand::ExitIdle) => {
+                                // `fail_open` notes activity, so this edge
+                                // arrives right after a failed restore: retry
+                                // here rather than wait out the timer.
+                                if stranded {
+                                    self.restore("stale shrink on activity");
+                                }
+                                Mode::Active
+                            }
                             None => return,
                         },
                         () = async {
@@ -1092,7 +1100,8 @@ mod tests {
         h.settle().await;
         assert_eq!(h.targets(), vec![FIRST_STEP], "restore did not land");
 
-        // The backend recovers. No idle entry ever happens.
+        // The backend recovers. No idle entry and no activity edge ever
+        // happens again — only the timer can rescue this guest.
         h.deps.fail_set_target.store(false, Ordering::SeqCst);
         tokio::time::advance(STRANDED_RESTORE_RETRY + Duration::from_secs(1)).await;
         h.settle().await;
@@ -1101,6 +1110,37 @@ mod tests {
             h.targets(),
             vec![FIRST_STEP, FULL],
             "an active guest must not stay squeezed waiting for idle"
+        );
+    }
+
+    /// Review finding (pullfrog): the activity edge that `fail_open` itself
+    /// emits is the earliest retry point, so recovery should not have to wait
+    /// out the timer when the failure was transient.
+    #[tokio::test(start_paused = true)]
+    async fn stranded_shrink_is_retried_on_the_activity_edge() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        let watch = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+
+        h.deps.fail_set_target.store(true, Ordering::SeqCst);
+        watch.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
+
+        // The actor's ExitIdle lands after the backend recovers, well inside
+        // the retry interval.
+        h.deps.fail_set_target.store(false, Ordering::SeqCst);
+        h.commands.send(BalloonCommand::ExitIdle).unwrap();
+        h.settle().await;
+
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL],
+            "the activity edge must retry without waiting for the timer"
         );
     }
 
