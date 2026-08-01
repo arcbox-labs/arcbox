@@ -161,6 +161,11 @@ pub struct ContainerPlan {
     pub extra_networks: Vec<ContainerNetworkAttachment>,
     /// Whether the target container will be replaced.
     pub replace_existing: bool,
+    /// Whether the container was running on the source, and so should be
+    /// started once the migration finishes.
+    pub was_running: bool,
+    /// Source creation timestamp, used to recreate in the original order.
+    pub created: String,
 }
 
 /// Container creation spec translated from inspect output.
@@ -202,6 +207,12 @@ pub struct ContainerSpec {
     pub extra_hosts: Vec<String>,
     /// Auto-remove on exit.
     pub auto_remove: bool,
+    /// Memory limit in bytes, when one is set.
+    pub memory: Option<i64>,
+    /// CPU quota in units of 10^-9 CPUs, when one is set.
+    pub nano_cpus: Option<i64>,
+    /// Added Linux capabilities.
+    pub cap_add: Vec<String>,
     /// Network the container joins at create time.
     pub network_mode: NetworkModeSpec,
 }

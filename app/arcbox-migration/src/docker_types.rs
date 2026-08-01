@@ -120,6 +120,10 @@ pub struct ContainerInspect {
     /// Image ID.
     #[serde(rename = "Image")]
     pub image: String,
+    /// Creation timestamp. Docker emits RFC 3339 in UTC with a fixed shape, so
+    /// lexicographic ordering matches chronological ordering.
+    #[serde(rename = "Created", default)]
+    pub created: String,
     /// Container state.
     #[serde(rename = "State")]
     pub state: ContainerState,
@@ -214,6 +218,16 @@ pub struct HostConfig {
     /// Auto remove.
     #[serde(rename = "AutoRemove", default)]
     pub auto_remove: bool,
+    /// Memory limit in bytes.
+    #[serde(rename = "Memory", default)]
+    pub memory: i64,
+    /// CPU quota in units of 10^-9 CPUs. Note the casing: `NanoCPUs` is a
+    /// separate Swarm-only field and is not what container inspect returns.
+    #[serde(rename = "NanoCpus", default)]
+    pub nano_cpus: i64,
+    /// Added Linux capabilities.
+    #[serde(rename = "CapAdd", default)]
+    pub cap_add: Option<Vec<String>>,
 }
 
 /// Restart policy subset.

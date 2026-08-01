@@ -116,6 +116,11 @@ impl DockerCliRunner {
         self.status(["container", "stop", "--time", "30", id]).await
     }
 
+    /// Starts a container.
+    pub async fn start_container(&self, id: &str) -> Result<()> {
+        self.status(["container", "start", id]).await
+    }
+
     /// Removes a container forcibly.
     pub async fn remove_container(&self, id: &str) -> Result<()> {
         self.status(["container", "rm", "--force", "--volumes", id])

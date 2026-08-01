@@ -126,6 +126,7 @@ impl MigrationManager {
         let options = MigrationExecutorOptions {
             confirm_replace: request.allow_replacements,
             confirm_stop_source_containers: request.allow_replacements,
+            start_containers: !request.skip_start,
         };
         let plan_id = request.plan_id.clone();
         let prepared = self

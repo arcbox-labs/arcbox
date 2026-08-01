@@ -133,7 +133,7 @@ impl MigrationPlanner {
             .collect();
 
         let mut warnings = Vec::new();
-        let container_plans: Vec<_> = source_containers
+        let mut container_plans: Vec<_> = source_containers
             .into_iter()
             .map(|container| {
                 normalize_container(
@@ -146,6 +146,9 @@ impl MigrationPlanner {
                 )
             })
             .collect();
+        // Recreate and start in source creation order: for a compose project
+        // that is the order the services were brought up in.
+        container_plans.sort_by(|left, right| left.created.cmp(&right.created));
 
         let replacements = build_replacements(
             &image_plan_data,
@@ -350,12 +353,14 @@ fn normalize_container(
             user: non_empty(&container.config.user),
             env: container.config.env.unwrap_or_default(),
             labels: container.config.labels.unwrap_or_default(),
-            exposed_ports: container
-                .config
-                .exposed_ports
-                .unwrap_or_default()
-                .into_keys()
-                .collect(),
+            exposed_ports: sorted(
+                container
+                    .config
+                    .exposed_ports
+                    .unwrap_or_default()
+                    .into_keys()
+                    .collect(),
+            ),
             tty: container.config.tty,
             open_stdin: container.config.open_stdin,
             working_dir: non_empty(&container.config.working_dir),
@@ -368,10 +373,15 @@ fn normalize_container(
             read_only_rootfs: container.host_config.readonly_rootfs,
             extra_hosts: container.host_config.extra_hosts.unwrap_or_default(),
             auto_remove: container.host_config.auto_remove,
+            memory: positive(container.host_config.memory),
+            nano_cpus: positive(container.host_config.nano_cpus),
+            cap_add: sorted(container.host_config.cap_add.unwrap_or_default()),
             network_mode,
         },
         extra_networks: attachments,
         replace_existing: target_containers.contains(&name),
+        was_running: container.state.running,
+        created: container.created,
     }
 }
 
@@ -550,6 +560,18 @@ fn trimmed_name(container: &ContainerInspect) -> &str {
     container.name.trim_start_matches('/')
 }
 
+/// Treats Docker's "unset" sentinel of zero (or a negative) as absent.
+fn positive(value: i64) -> Option<i64> {
+    (value > 0).then_some(value)
+}
+
+/// Sorts a list so generated argument order does not depend on Docker's
+/// response ordering, which keeps generated commands reproducible.
+fn sorted(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values
+}
+
 fn non_empty(value: &str) -> Option<String> {
     if value.is_empty() {
         None
@@ -671,7 +693,46 @@ mod tests {
             },
             extra_networks: Vec::new(),
             replace_existing: false,
+            was_running: false,
+            created: String::new(),
         }
+    }
+
+    #[test]
+    fn zero_resource_limits_are_treated_as_unset() {
+        assert_eq!(positive(0), None);
+        assert_eq!(positive(-1), None);
+        assert_eq!(positive(512), Some(512));
+    }
+
+    #[test]
+    fn running_state_and_creation_order_are_carried_into_the_plan() {
+        let mut warnings = Vec::new();
+        let mut unsupported = Vec::new();
+        let plan = normalize_container(
+            ContainerInspect {
+                id: "cid".into(),
+                name: "/db".into(),
+                image: "postgres".into(),
+                created: "2024-05-02T10:00:00Z".into(),
+                state: crate::docker_types::ContainerState {
+                    status: "running".into(),
+                    running: true,
+                },
+                config: crate::docker_types::ContainerConfig::default(),
+                host_config: crate::docker_types::HostConfig::default(),
+                network_settings: NetworkSettings::default(),
+                mounts: Vec::new(),
+            },
+            &BTreeSet::new(),
+            &HashMap::new(),
+            &BTreeSet::new(),
+            &mut warnings,
+            &mut unsupported,
+        );
+
+        assert!(plan.was_running);
+        assert_eq!(plan.created, "2024-05-02T10:00:00Z");
     }
 
     #[test]
@@ -694,6 +755,7 @@ mod tests {
             id: "cid".into(),
             name: "/demo".into(),
             image: "sha256:dangling".into(),
+            created: "2024-01-01T00:00:00Z".into(),
             state: crate::docker_types::ContainerState {
                 status: "exited".into(),
                 running: false,
@@ -723,6 +785,7 @@ mod tests {
             id: "id".into(),
             name: "/demo".into(),
             image: "img".into(),
+            created: "2024-01-01T00:00:00Z".into(),
             state: crate::docker_types::ContainerState {
                 status: "running".into(),
                 running: true,
