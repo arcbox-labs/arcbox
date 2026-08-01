@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arcbox_api::{
-    IconServiceImpl, IconServiceServer, KubernetesServiceImpl, MachineServiceImpl,
-    MigrationServiceImpl, MigrationServiceServer, SharedRuntime, StatsServiceImpl,
-    SystemServiceImpl, SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
+    KubernetesServiceImpl, MachineServiceImpl, MigrationServiceImpl, MigrationServiceServer,
+    SharedRuntime, StatsServiceImpl, SystemServiceImpl, SystemServiceServer,
+    kubernetes_service_server::KubernetesServiceServer,
     machine_service_server::MachineServiceServer, stats_service_server::StatsServiceServer,
 };
 #[cfg(target_os = "macos")]
@@ -62,15 +62,13 @@ pub async fn start_grpc(
         Arc::clone(&ctx.early_runtime),
     );
     let stats_service = StatsServiceImpl::new(Arc::clone(&shared_runtime));
-    let icon_service = IconServiceImpl::new();
 
     let routes = Routes::default()
         .add_service(MachineServiceServer::new(machine_service))
         .add_service(KubernetesServiceServer::new(kubernetes_service))
         .add_service(MigrationServiceServer::new(migration_service))
         .add_service(SystemServiceServer::new(system_service))
-        .add_service(StatsServiceServer::new(stats_service))
-        .add_service(IconServiceServer::new(icon_service));
+        .add_service(StatsServiceServer::new(stats_service));
     // macOS guests are served only on Apple Silicon hosts; on other
     // platforms the service is simply absent (the CLI `macos` noun is
     // likewise macOS-only).

@@ -6,14 +6,12 @@
 //! APIs use `arcbox_protocol::sandbox_v1` and sandbox service traits
 //! re-exported from `arcbox_grpc` (non-`v1`).
 
-mod icon;
 mod kubernetes;
 mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
 mod stats;
 
-pub use icon::IconServiceImpl;
 pub use kubernetes::KubernetesServiceImpl;
 pub use machine::MachineServiceImpl;
 #[cfg(target_os = "macos")]

@@ -21,6 +21,7 @@
 pub(crate) mod bridge;
 mod control;
 mod filesystem;
+mod icon;
 mod process;
 mod snapshot;
 
@@ -34,6 +35,7 @@ use tokio_stream::{Stream, StreamExt as _};
 
 pub use control::SandboxServiceImpl;
 pub use filesystem::SandboxFilesystemServiceImpl;
+pub use icon::IconServiceImpl;
 pub use process::SandboxProcessServiceImpl;
 pub use snapshot::SandboxSnapshotServiceImpl;
 
@@ -145,6 +147,9 @@ pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
             &runtime,
         ))))
         .add_service(Arc::new(SandboxSnapshotServiceImpl::new(runtime)))
+        // The daemon's own services migrate onto this router one at a time
+        // (CORE-68); Icon is the first.
+        .add_service(Arc::new(IconServiceImpl::new()))
 }
 
 #[cfg(test)]
