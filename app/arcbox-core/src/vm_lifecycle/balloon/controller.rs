@@ -1135,6 +1135,51 @@ mod tests {
         );
     }
 
+    /// Review finding (pullfrog): routing every `ExitIdle` through
+    /// `exit_idle()` also made `IdleUnshrunk` recover on the edge instead of
+    /// waiting out the `Active` timer — a behaviour change, and the one mode
+    /// no test reached. `IdleUnshrunk` can hold a booked shrink because
+    /// `enter_idle` returns it when the stale restore fails.
+    #[tokio::test(start_paused = true)]
+    async fn stranded_shrink_is_restored_on_exit_from_idle_unshrunk() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        let watch = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
+
+        // Fail open with a failing backend: the shrink stays booked.
+        h.deps.fail_set_target.store(true, Ordering::SeqCst);
+        watch.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+
+        // Re-enter idle with the backend still failing: the stale restore
+        // fails, so entry parks in IdleUnshrunk still holding the shrink.
+        let before_entry = h.deps.set_attempts.load(Ordering::SeqCst);
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP], "still nothing given back");
+        // Exactly one failed restore (3 attempts) and no stats probe: that is
+        // the `enter_idle` early return, i.e. we are parked in IdleUnshrunk.
+        assert_eq!(h.deps.set_attempts.load(Ordering::SeqCst) - before_entry, 3);
+        assert_eq!(h.deps.stats.lock().unwrap().len(), 0);
+
+        // Heal the backend and leave idle without advancing the clock, so the
+        // 30s timers cannot be what rescues the guest.
+        h.deps.fail_set_target.store(false, Ordering::SeqCst);
+        h.commands.send(BalloonCommand::ExitIdle).unwrap();
+        h.settle().await;
+
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL],
+            "leaving idle must hand back a shrink booked in IdleUnshrunk"
+        );
+    }
+
     /// Review finding (pullfrog): the stranded-shrink retry needs a terminal
     /// condition. A *stopped* VM keeps its machine record but rejects every
     /// balloon target, so retrying against it would warn/error every 30 s for
