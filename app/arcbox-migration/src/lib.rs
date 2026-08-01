@@ -14,7 +14,7 @@ pub mod runner;
 pub mod source;
 
 pub use error::{MigrationError, Result};
-pub use executor::{MigrationExecutor, MigrationExecutorOptions};
+pub use executor::{MigrationExecutor, MigrationExecutorOptions, MigrationOutcome};
 pub use model::{
     ContainerMount, ContainerNetworkAttachment, ContainerPlan, ContainerSpec, ImagePlan,
     MigrationPlan, NetworkPlan, PortPublish, ReplacementSummary, RestartPolicySpec,

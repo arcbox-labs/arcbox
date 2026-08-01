@@ -650,8 +650,10 @@ message PrepareMigrationResponse {
     // blockers that will require stopping running source containers, or bind
     // mount sources that do not exist on this host).
     repeated string warnings = 9;
-    // The full migration plan serialized as JSON. Populated on every prepare so
-    // callers can inspect exactly what would run.
+    // The full migration plan serialized as JSON, populated only when the
+    // request set `dry_run`. The plan carries each container's environment
+    // verbatim, so it is sent only when a caller explicitly asked to inspect
+    // it rather than on every prepare.
     string plan_json = 10;
     // Source resources this migration cannot reproduce. Unlike warnings these
     // are blocking: RunMigration refuses to execute a plan that has any.
@@ -687,6 +689,11 @@ message RunMigrationEvent {
     bool done = 7;
     // Indicates whether the run completed successfully.
     bool success = 8;
+    // Non-fatal problems encountered during the run, carried on the terminal
+    // event (for example, a container that migrated but did not start). These
+    // do not make the run a failure, so `success` stays true; clients should
+    // surface them alongside the result rather than in place of it.
+    repeated string warnings = 9;
 }
 
 // =============================================================================

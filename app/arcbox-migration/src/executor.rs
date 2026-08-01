@@ -22,6 +22,13 @@ pub struct MigrationExecutorOptions {
     pub start_containers: bool,
 }
 
+/// What a successful migration reports back beyond "it worked".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MigrationOutcome {
+    /// Non-fatal problems, phrased for the user. Empty on a clean run.
+    pub warnings: Vec<String>,
+}
+
 /// Executes migration plans against a source and target Docker daemon.
 #[derive(Debug, Clone)]
 pub struct MigrationExecutor {
@@ -35,14 +42,17 @@ impl MigrationExecutor {
         Self { target }
     }
 
-    /// Executes a migration plan.
+    /// Executes a migration plan, returning any non-fatal problems.
+    ///
+    /// A returned outcome means the migration itself succeeded; its warnings
+    /// describe things the caller should surface alongside that result.
     pub async fn execute<F>(
         &self,
         source: SourceConfig,
         plan: &MigrationPlan,
         options: MigrationExecutorOptions,
         mut progress: F,
-    ) -> Result<()>
+    ) -> Result<MigrationOutcome>
     where
         F: FnMut(MigrationProgress),
     {
@@ -76,15 +86,17 @@ impl MigrationExecutor {
         import_volumes(&source_runner, &self.target, plan, &mut progress).await?;
         recreate_networks(&self.target, plan, &mut progress).await?;
         recreate_containers(&self.target, plan, &image_rewrites, &mut progress).await?;
-        if options.start_containers {
-            start_containers(&self.target, plan, &mut progress).await;
-        }
+        let warnings = if options.start_containers {
+            start_containers(&self.target, plan, &mut progress).await
+        } else {
+            Vec::new()
+        };
 
         // No completion event here: returning `Ok` is the signal. Only the
         // caller knows whether the run as a whole succeeded, so it owns the
         // single terminal event -- emitting one here too printed `[complete]`
         // twice, with only the caller's carrying `done`.
-        Ok(())
+        Ok(MigrationOutcome { warnings })
     }
 }
 
@@ -377,7 +389,11 @@ where
 /// invite a destructive re-run. Start failures also have causes that are not
 /// migration defects at all — most commonly a published host port still held
 /// by the source container, which is not stopped unless it blocks a volume.
-async fn start_containers<F>(target: &DockerCliRunner, plan: &MigrationPlan, progress: &mut F)
+async fn start_containers<F>(
+    target: &DockerCliRunner,
+    plan: &MigrationPlan,
+    progress: &mut F,
+) -> Vec<String>
 where
     F: FnMut(MigrationProgress),
 {
@@ -387,15 +403,20 @@ where
         .filter(|container| container.was_running)
         .collect();
 
+    let mut warnings = Vec::new();
     let total = u32::try_from(running.len()).unwrap_or(0);
     for (index, container) in running.into_iter().enumerate() {
         let current = Some(u32::try_from(index + 1).unwrap_or(total));
         let detail = match target.start_container(&container.name).await {
             Ok(()) => format!("started container '{}'", container.name),
-            Err(error) => format!(
-                "container '{}' was migrated but did not start: {error}",
-                container.name
-            ),
+            Err(error) => {
+                let warning = format!(
+                    "container '{}' was migrated but did not start: {error}",
+                    container.name
+                );
+                warnings.push(warning.clone());
+                warning
+            }
         };
         progress(MigrationProgress {
             stage: MigrationStage::StartContainers,
@@ -406,6 +427,7 @@ where
             total: Some(total),
         });
     }
+    warnings
 }
 
 /// Returns the reference that resolves on the target for this container.

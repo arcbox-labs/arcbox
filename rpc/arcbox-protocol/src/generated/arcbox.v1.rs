@@ -864,8 +864,10 @@ pub struct PrepareMigrationResponse {
     /// mount sources that do not exist on this host).
     #[prost(string, repeated, tag = "9")]
     pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// The full migration plan serialized as JSON. Populated on every prepare so
-    /// callers can inspect exactly what would run.
+    /// The full migration plan serialized as JSON, populated only when the
+    /// request set `dry_run`. The plan carries each container's environment
+    /// verbatim, so it is sent only when a caller explicitly asked to inspect
+    /// it rather than on every prepare.
     #[prost(string, tag = "10")]
     pub plan_json: ::prost::alloc::string::String,
     /// Source resources this migration cannot reproduce. Unlike warnings these
@@ -918,6 +920,12 @@ pub struct RunMigrationEvent {
     /// Indicates whether the run completed successfully.
     #[prost(bool, tag = "8")]
     pub success: bool,
+    /// Non-fatal problems encountered during the run, carried on the terminal
+    /// event (for example, a container that migrated but did not start). These
+    /// do not make the run a failure, so `success` stays true; clients should
+    /// surface them alongside the result rather than in place of it.
+    #[prost(string, repeated, tag = "9")]
+    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Shell input for interactive sessions.
 #[derive(serde::Serialize, serde::Deserialize)]

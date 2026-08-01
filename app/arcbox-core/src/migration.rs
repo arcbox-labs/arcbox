@@ -101,7 +101,14 @@ impl MigrationManager {
             // are surfaced via `warnings`.
             replacements_required: !plan.replacements.is_empty(),
             warnings,
-            plan_json: serde_json::to_string(&plan).unwrap_or_default(),
+            // Only for an explicit dry run: the plan embeds each container's
+            // environment verbatim, so it is not worth shipping on a prepare
+            // whose caller is about to run the migration anyway.
+            plan_json: if request.dry_run {
+                serde_json::to_string(&plan).unwrap_or_default()
+            } else {
+                String::new()
+            },
             unsupported_resources: plan.unsupported_resources.clone(),
         })
     }
@@ -157,12 +164,20 @@ impl MigrationManager {
             };
 
             match executor.execute(source, &plan, options, &mut emit).await {
-                Ok(()) => {
-                    let _ = tx.send(Ok(progress_to_event(
+                Ok(outcome) => {
+                    let detail = if outcome.warnings.is_empty() {
+                        "migration completed".to_string()
+                    } else {
+                        format!(
+                            "migration completed with {} warning(s)",
+                            outcome.warnings.len()
+                        )
+                    };
+                    let mut event = progress_to_event(
                         &plan_id,
                         MigrationProgress {
                             stage: arcbox_migration::MigrationStage::Complete,
-                            detail: "migration completed".to_string(),
+                            detail,
                             resource_type: None,
                             resource_name: None,
                             current: None,
@@ -170,7 +185,9 @@ impl MigrationManager {
                         },
                         true,
                         true,
-                    )));
+                    );
+                    event.warnings = outcome.warnings;
+                    let _ = tx.send(Ok(event));
                 }
                 Err(error) => {
                     let _ = tx.send(Ok(progress_to_event(
@@ -228,6 +245,8 @@ fn progress_to_event(
         total: progress.total.unwrap_or(0),
         done,
         success,
+        // Only the terminal event carries warnings; the caller fills them in.
+        warnings: Vec::new(),
     }
 }
 
@@ -479,5 +498,11 @@ exit 0
 
         assert!(!response.plan_id.is_empty());
         assert_eq!(manager.prepared.read().await.len(), 1);
+        // The plan embeds container environments; it ships only when a caller
+        // explicitly asked to inspect it.
+        assert!(
+            response.plan_json.is_empty(),
+            "a runnable prepare must not ship the plan payload"
+        );
     }
 }

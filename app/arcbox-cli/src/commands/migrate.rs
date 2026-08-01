@@ -177,7 +177,7 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
         .context("Failed to start migration")?
         .into_inner();
 
-    let mut final_status = None;
+    let mut terminal = None;
     while let Some(event) = stream
         .message()
         .await
@@ -185,19 +185,35 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
     {
         print_progress_event(&event);
         if event.done {
-            final_status = Some(event.success);
+            terminal = Some(event);
             break;
         }
     }
 
-    match final_status {
-        Some(true) => {
-            println!("Migration completed successfully.");
-            Ok(())
-        }
-        Some(false) => bail!("Migration failed"),
-        None => bail!("Migration stream ended without a final status event"),
+    let Some(terminal) = terminal else {
+        bail!("Migration stream ended without a final status event");
+    };
+    if !terminal.success {
+        bail!("Migration failed");
     }
+
+    // Warnings ride alongside success: everything migrated, but the user needs
+    // to see what did not come up before they walk away from the terminal.
+    if terminal.warnings.is_empty() {
+        println!("Migration completed successfully.");
+    } else {
+        println!();
+        println!("Warnings:");
+        for warning in &terminal.warnings {
+            println!("  - {warning}");
+        }
+        println!();
+        println!(
+            "Migration completed, but {} item(s) need attention (see above).",
+            terminal.warnings.len()
+        );
+    }
+    Ok(())
 }
 
 fn ensure_source_socket_exists(source_kind: MigrationSourceKind, path: &Path) -> Result<()> {
