@@ -100,6 +100,33 @@ fn networking_test_runtime() -> (Runtime, tempfile::TempDir) {
     (runtime, temp_dir)
 }
 
+/// VM-host-only mode reports no milestones, because no VM starts.
+///
+/// The guarantee is the `!vm.autostart` early return in `init`. Four places
+/// state the invariant — `InitProgress`'s docs, the `Phase` enum in
+/// `api.proto`, `app/AGENTS.md`, `docs/daemon-lifecycle.md` — and nothing
+/// enforced it: work moved above that return would announce `VM_STARTING`
+/// for a daemon that boots no guest, and all four would quietly go false.
+#[tokio::test]
+async fn init_reports_no_milestones_without_a_linux_vm() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: temp_dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    config.vm.autostart = false;
+    let runtime = Runtime::new(config).expect("runtime init should succeed");
+
+    let reported = std::sync::Mutex::new(Vec::new());
+    runtime
+        .init(|milestone| reported.lock().unwrap().push(milestone))
+        .await
+        .expect("VM-host-only init only creates data directories");
+
+    let reported = reported.into_inner().unwrap();
+    assert!(reported.is_empty(), "expected silence, got {reported:?}");
+}
+
 #[tokio::test]
 async fn resolve_registered_container_by_id_alias_and_prefix() {
     let (runtime, _tmp) = networking_test_runtime();
