@@ -88,3 +88,249 @@ pub fn compose(tonic_routes: tonic::service::Routes, connect: connectrpc::Router
         .into_axum_router()
         .fallback_service(connect.into_axum_service())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, OnceLock};
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::UnixStream;
+
+    use super::*;
+
+    /// Brings up the real composed control plane on a temp socket.
+    ///
+    /// The runtime handle is deliberately left empty: every sandbox call
+    /// then answers `unavailable`, which is enough to prove the transport —
+    /// the assertions below are about which wire formats reach a handler and
+    /// how its error comes back, not about sandbox behaviour. Keeping it
+    /// VM-free is what lets this run in CI.
+    async fn spawn_control_plane() -> (tempfile::TempDir, std::path::PathBuf, CancellationToken) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("arcbox.sock");
+        let runtime: arcbox_api::SharedRuntime = Arc::new(OnceLock::new());
+
+        let routes = tonic::service::Routes::default().add_service(
+            tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
+                .build_v1()
+                .expect("reflection service"),
+        );
+        let app = compose(routes, arcbox_api::connect::router(runtime));
+
+        let listener = bind(&socket).expect("bind temp socket");
+        let shutdown = CancellationToken::new();
+        drop(tokio::spawn(serve(listener, app, shutdown.clone())));
+        (dir, socket, shutdown)
+    }
+
+    /// Issues a raw HTTP/1.1 request and returns the whole response.
+    ///
+    /// Written at the byte level on purpose: this is exactly what
+    /// `curl --unix-socket` puts on the wire, so a pass here is the
+    /// "callers with no proto toolchain can reach us" claim, not a
+    /// client-library artifact.
+    async fn http1_request(socket: &std::path::Path, request: &str) -> String {
+        let mut stream = UnixStream::connect(socket).await.expect("connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        stream.flush().await.expect("flush");
+
+        let mut response = Vec::new();
+        // The daemon keeps HTTP/1.1 connections alive, so read only until
+        // the body arrives rather than to EOF.
+        let deadline = std::time::Duration::from_secs(5);
+        let _ = tokio::time::timeout(deadline, async {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buf[..n]);
+                if response.windows(4).any(|w| w == b"\r\n\r\n")
+                    && String::from_utf8_lossy(&response).contains('}')
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Reassembles a `Transfer-Encoding: chunked` body from a raw response.
+    ///
+    /// The handler has no Content-Length to declare (the body is produced as
+    /// it is encoded), so hyper chunks it — the same framing any streaming
+    /// HTTP/1.1 response carries. Real clients handle this transparently;
+    /// this test reads the socket directly, so it has to.
+    fn dechunk(response: &str) -> String {
+        let Some((_, mut rest)) = response.split_once("\r\n\r\n") else {
+            return String::new();
+        };
+        let mut body = String::new();
+        loop {
+            let Some((size, tail)) = rest.split_once("\r\n") else {
+                break;
+            };
+            let Ok(size) = usize::from_str_radix(size.trim(), 16) else {
+                break;
+            };
+            if size == 0 || tail.len() < size {
+                break;
+            }
+            body.push_str(&tail[..size]);
+            rest = tail[size..].trim_start_matches("\r\n");
+        }
+        body
+    }
+
+    /// The acceptance criterion for CORE-53: one endpoint, three formats.
+    ///
+    /// All three target the same path on the same socket. A format that
+    /// reached no handler would surface as a 404 or a connection reset
+    /// rather than a service-level `unavailable`.
+    #[tokio::test]
+    async fn one_endpoint_answers_connect_grpc_and_grpc_web() {
+        let (_dir, socket, shutdown) = spawn_control_plane().await;
+        let path = "/arcbox.sandbox.v1.SandboxService/List";
+
+        // 1. Connect, JSON over HTTP/1.1 — the `curl` case.
+        let response = http1_request(
+            &socket,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                 Content-Length: 2\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(
+            response.contains("HTTP/1.1 503"),
+            "Connect JSON should map unavailable to HTTP 503, got: {response}"
+        );
+        let body = dechunk(&response);
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("Connect errors are a JSON body: {e}; got {body:?}"));
+        assert_eq!(
+            json.get("code").and_then(serde_json::Value::as_str),
+            Some("unavailable"),
+            "Connect puts the error code in the JSON body: {json}"
+        );
+
+        // 2. gRPC over HTTP/2 — the generated tonic client, unchanged.
+        let channel = tonic::transport::Endpoint::try_from("http://localhost")
+            .expect("endpoint")
+            .connect_with_connector(tower::service_fn({
+                let socket = socket.clone();
+                move |_: tonic::transport::Uri| {
+                    let socket = socket.clone();
+                    async move {
+                        Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(socket).await?))
+                    }
+                }
+            }))
+            .await
+            .expect("gRPC connect over the same socket");
+        let status = arcbox_grpc::SandboxServiceClient::new(channel)
+            .list(tonic::Request::new(
+                arcbox_grpc::arcbox_protocol::sandbox_v1::ListSandboxesRequest::default(),
+            ))
+            .await
+            .expect_err("empty runtime is unavailable");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "gRPC must reach the same handler and carry the same code"
+        );
+
+        // 3. gRPC-Web over HTTP/1.1 — a 5-byte-prefixed empty message.
+        let body = [0u8, 0, 0, 0, 0];
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/grpc-web+proto\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        let mut stream = UnixStream::connect(&socket).await.expect("connect");
+        stream.write_all(&request).await.expect("write");
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.contains("HTTP/1.1 200"),
+            "gRPC-Web carries its status in the body, not the HTTP status: {response}"
+        );
+        assert!(
+            response.contains("grpc-status: 14") || response.contains("grpc-status:14"),
+            "gRPC-Web trailers should report unavailable: {response}"
+        );
+
+        shutdown.cancel();
+    }
+
+    /// Reflection has to keep answering through the composed router, or
+    /// `grpcurl` and `buf curl` lose the ability to discover the API without
+    /// vendoring the protos.
+    #[tokio::test]
+    async fn reflection_answers_through_the_composed_router() {
+        let (_dir, socket, shutdown) = spawn_control_plane().await;
+
+        let channel = tonic::transport::Endpoint::try_from("http://localhost")
+            .expect("endpoint")
+            .connect_with_connector(tower::service_fn({
+                let socket = socket.clone();
+                move |_: tonic::transport::Uri| {
+                    let socket = socket.clone();
+                    async move {
+                        Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(socket).await?))
+                    }
+                }
+            }))
+            .await
+            .expect("connect");
+
+        let mut client =
+            tonic_reflection::pb::v1::server_reflection_client::ServerReflectionClient::new(
+                channel,
+            );
+        let request = tonic_reflection::pb::v1::ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(
+                tonic_reflection::pb::v1::server_reflection_request::MessageRequest::ListServices(
+                    String::new(),
+                ),
+            ),
+        };
+        let mut stream = client
+            .server_reflection_info(tokio_stream::iter(vec![request]))
+            .await
+            .expect("reflection call")
+            .into_inner();
+
+        let response = tokio_stream::StreamExt::next(&mut stream)
+            .await
+            .expect("a reflection response")
+            .expect("reflection is not an error");
+        let services = match response.message_response {
+            Some(tonic_reflection::pb::v1::server_reflection_response::MessageResponse::ListServicesResponse(r)) => r.service,
+            other => panic!("expected a service listing, got {other:?}"),
+        };
+        let names: Vec<_> = services.into_iter().map(|s| s.name).collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "arcbox.sandbox.v1.SandboxService"),
+            "the sandbox services must stay discoverable: {names:?}"
+        );
+
+        shutdown.cancel();
+    }
+}
