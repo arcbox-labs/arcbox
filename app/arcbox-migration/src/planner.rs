@@ -212,6 +212,15 @@ fn normalize_images(
 
     // Untagged images are only worth carrying when a container references them;
     // they export by ID and land untagged on the target.
+    //
+    // TODO: the container that references such an image is planned with the
+    // *source* image ID, but `docker load` reassigns IDs when the two daemons
+    // use different image stores (measured OrbStack 29.4.0 -> ArcBox 29.6.1:
+    // sha256:b0249a… arrived as sha256:38c7fd…), so `docker create` then fails
+    // with "No such image". Fix by capturing the `Loaded image ID:` line that
+    // `docker load` prints even under --quiet and remapping the reference; one
+    // image per `pipe_save_into` call makes the mapping unambiguous. Tagged
+    // images are unaffected because containers reference them by tag.
     for container in containers {
         ordered
             .entry(container.image.clone())
