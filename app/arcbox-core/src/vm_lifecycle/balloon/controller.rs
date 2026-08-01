@@ -128,7 +128,9 @@ const WATCH_SILENCE_DEADLINE: Duration = Duration::from_secs(25);
 const DEGRADED_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// `MemAvailable` floor for pressure, both as the watch request threshold
-/// and the degraded-poll check. Safely below the entry headroom (256 MiB).
+/// and the degraded-poll check. Safely below the reserve the entry policy
+/// leaves the guest ([`super::IDLE_MIN_RESERVE`], 1 GiB), so tripping it
+/// means the guest went past what the policy planned for.
 pub(in crate::vm_lifecycle) const PRESSURE_MIN_AVAILABLE: u64 = 128 * 1024 * 1024;
 
 /// Refault-rate threshold (pages/second) for the watch request. Disabled:
@@ -154,6 +156,23 @@ pub(in crate::vm_lifecycle) const WATCH_KEEPALIVE: Duration = Duration::from_sec
 /// Budget for the entry-time guest stats probe.
 const GUEST_STATS_TIMEOUT: Duration = Duration::from_secs(super::GUEST_STATS_TIMEOUT_SECS);
 
+/// An in-effect shrink. Present exactly while the guest is squeezed —
+/// including after a restore exhausted its attempts, which is what makes
+/// `Some` mean "the guest is owed memory" at every read site.
+///
+/// The three fields only ever move together, so they are one value rather
+/// than three parallel `Option`s: the old shape let a caller consult
+/// `applied` alone and miss that a restore had failed.
+#[derive(Debug, Clone, Copy)]
+struct ShrinkState {
+    /// Currently applied balloon target.
+    applied: u64,
+    /// Final descent target; `applied > final_target` means steps pending.
+    final_target: u64,
+    /// When the current step was applied (dwell pacing).
+    step_applied_at: tokio::time::Instant,
+}
+
 /// The controller task. Owns all balloon state; communicates with the world
 /// only through [`BalloonDeps`] (in) and the activity callback (out).
 pub(in crate::vm_lifecycle) struct BalloonController<D: BalloonDeps> {
@@ -161,12 +180,8 @@ pub(in crate::vm_lifecycle) struct BalloonController<D: BalloonDeps> {
     deps: D,
     /// Notes lifecycle activity: resets the idle clock and exits `Idle`.
     activity: Arc<dyn Fn() + Send + Sync>,
-    /// Currently applied balloon target while shrunk.
-    applied: Option<u64>,
-    /// Final descent target; `applied > final` means more steps pending.
-    final_target: Option<u64>,
-    /// When the current step was applied (dwell pacing).
-    step_applied_at: Option<tokio::time::Instant>,
+    /// The shrink currently owed back to the guest, if any.
+    shrink: Option<ShrinkState>,
 }
 
 /// Controller mode; holds the open watch so drops cancel it naturally.
@@ -200,9 +215,7 @@ impl<D: BalloonDeps> BalloonController<D> {
             commands,
             deps,
             activity,
-            applied: None,
-            final_target: None,
-            step_applied_at: None,
+            shrink: None,
         }
     }
 
@@ -212,25 +225,17 @@ impl<D: BalloonDeps> BalloonController<D> {
         loop {
             mode = match mode {
                 Mode::Active => {
-                    // A restore that exhausted its retries leaves the guest
-                    // squeezed with `applied` still set. Active is when it can
-                    // least afford that — the guest is working, and a
-                    // fail-open restore usually follows guest memory pressure
-                    // — and an active VM may never go idle again, so waiting
-                    // for the next idle entry is not a retry at all.
-                    let stranded = self.applied.is_some();
+                    // A restore that exhausted its attempts leaves the guest
+                    // squeezed. Active is when it can least afford that — the
+                    // guest is working, and a fail-open restore usually
+                    // follows guest memory pressure — and an active VM may
+                    // never go idle again, so waiting for the next idle entry
+                    // is not a retry at all.
+                    let stranded = self.shrink.is_some();
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
                             Some(BalloonCommand::EnterIdle) => self.enter_idle().await,
-                            Some(BalloonCommand::ExitIdle) => {
-                                // `fail_open` notes activity, so this edge
-                                // arrives right after a failed restore: retry
-                                // here rather than wait out the timer.
-                                if stranded {
-                                    self.restore("stale shrink on activity");
-                                }
-                                Mode::Active
-                            }
+                            Some(BalloonCommand::ExitIdle) => self.exit_idle(),
                             None => return,
                         },
                         () = async {
@@ -240,7 +245,9 @@ impl<D: BalloonDeps> BalloonController<D> {
                                 std::future::pending::<()>().await;
                             }
                         } => {
-                            self.restore("retrying a stranded shrink");
+                            // Failure is fine here: staying in Active re-arms
+                            // this same timer.
+                            let _ = self.restore("retrying a stranded shrink");
                             Mode::Active
                         }
                     }
@@ -248,8 +255,7 @@ impl<D: BalloonDeps> BalloonController<D> {
                 Mode::IdleUnshrunk => {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
-                            // Nothing was shrunk; nothing to restore.
-                            Some(BalloonCommand::ExitIdle) => Mode::Active,
+                            Some(BalloonCommand::ExitIdle) => self.exit_idle(),
                             Some(BalloonCommand::EnterIdle) => Mode::IdleUnshrunk,
                             None => return,
                         },
@@ -259,10 +265,7 @@ impl<D: BalloonDeps> BalloonController<D> {
                 Mode::Watching(mut watch) => {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
-                            Some(BalloonCommand::ExitIdle) => {
-                                self.restore("idle exit");
-                                Mode::Active
-                            }
+                            Some(BalloonCommand::ExitIdle) => self.exit_idle(),
                             Some(BalloonCommand::EnterIdle) => Mode::Watching(watch),
                             None => return,
                         },
@@ -278,8 +281,10 @@ impl<D: BalloonDeps> BalloonController<D> {
                                     // remaining dwell (still watching for
                                     // pressure) before the next step.
                                     let applied_at = self
-                                        .step_applied_at
-                                        .unwrap_or_else(tokio::time::Instant::now);
+                                        .shrink
+                                        .map_or_else(tokio::time::Instant::now, |s| {
+                                            s.step_applied_at
+                                        });
                                     Mode::Dwelling {
                                         watch,
                                         until: applied_at + STEP_DWELL,
@@ -297,10 +302,7 @@ impl<D: BalloonDeps> BalloonController<D> {
                 Mode::Dwelling { mut watch, until } => {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
-                            Some(BalloonCommand::ExitIdle) => {
-                                self.restore("idle exit");
-                                Mode::Active
-                            }
+                            Some(BalloonCommand::ExitIdle) => self.exit_idle(),
                             Some(BalloonCommand::EnterIdle) => Mode::Dwelling { watch, until },
                             None => return,
                         },
@@ -328,10 +330,7 @@ impl<D: BalloonDeps> BalloonController<D> {
                 Mode::Polling => {
                     tokio::select! {
                         cmd = self.commands.recv() => match cmd {
-                            Some(BalloonCommand::ExitIdle) => {
-                                self.restore("idle exit");
-                                Mode::Active
-                            }
+                            Some(BalloonCommand::ExitIdle) => self.exit_idle(),
                             Some(BalloonCommand::EnterIdle) => Mode::Polling,
                             None => return,
                         },
@@ -369,17 +368,11 @@ impl<D: BalloonDeps> BalloonController<D> {
             );
             return Mode::Active;
         }
-        // A restore that exhausted its retries deliberately leaves `applied`
-        // set. Nothing else reads it, so without this the guest stays squeezed
-        // indefinitely — and any decision made now would violate the sizing
-        // invariant anyway, since the stats would be taken while the balloon
-        // is still inflated. Give the memory back first; if that still fails,
-        // retry later rather than size from perturbed stats.
-        if self.applied.is_some() {
-            self.restore("stale shrink before idle re-entry");
-            if self.applied.is_some() {
-                return Mode::IdleUnshrunk;
-            }
+        // Sizing requires balloon-empty stats, so a shrink still owed back
+        // must be returned before probing — and if it cannot be, retry later
+        // rather than size from numbers the balloon itself is perturbing.
+        if self.shrink.is_some() && !self.restore("stale shrink before idle re-entry") {
+            return Mode::IdleUnshrunk;
         }
         let Some(full) = self.deps.full_memory_bytes() else {
             return Mode::IdleUnshrunk;
@@ -408,13 +401,15 @@ impl<D: BalloonDeps> BalloonController<D> {
                     tracing::warn!("failed to shrink idle balloon: {e}");
                     return Mode::IdleUnshrunk;
                 }
-                self.applied = Some(first);
-                self.final_target = Some(final_target);
-                self.step_applied_at = Some(tokio::time::Instant::now());
+                self.shrink = Some(ShrinkState {
+                    applied: first,
+                    final_target,
+                    step_applied_at: tokio::time::Instant::now(),
+                });
                 tracing::info!(
                     target_mb = first / (1024 * 1024),
                     final_mb = final_target / (1024 * 1024),
-                    "idle balloon shrunk to guest usage + headroom"
+                    "idle balloon shrinking"
                 );
                 self.open_watch().await
             }
@@ -423,21 +418,34 @@ impl<D: BalloonDeps> BalloonController<D> {
 
     /// The next descent step, if the applied target is above the final one.
     fn next_pending_step(&self) -> Option<u64> {
-        let (applied, final_target) = (self.applied?, self.final_target?);
-        (applied > final_target).then(|| super::next_step(applied, final_target))
+        let s = self.shrink?;
+        (s.applied > s.final_target).then(|| super::next_step(s.applied, s.final_target))
     }
 
     /// Applies one descent step (best effort — a failed step leaves the
     /// current, already-settled target in place).
     fn apply_step(&mut self, next: u64) {
+        let Some(state) = self.shrink.as_mut() else {
+            return;
+        };
         match self.deps.set_balloon_target(next) {
             Ok(()) => {
-                self.applied = Some(next);
-                self.step_applied_at = Some(tokio::time::Instant::now());
+                state.applied = next;
+                state.step_applied_at = tokio::time::Instant::now();
                 tracing::info!(target_mb = next / (1024 * 1024), "idle balloon step");
             }
             Err(e) => tracing::warn!("failed to step idle balloon: {e}"),
         }
+    }
+
+    /// Handles the `ExitIdle` edge from any mode: hand back whatever the
+    /// guest is owed, then return to `Active`. A failed restore stays booked
+    /// and the `Active` timer keeps retrying it.
+    fn exit_idle(&mut self) -> Mode<D::Watch> {
+        if self.shrink.is_some() {
+            let _ = self.restore("idle exit");
+        }
+        Mode::Active
     }
 
     /// Continues the staged descent after the guest settled, or keeps
@@ -464,47 +472,47 @@ impl<D: BalloonDeps> BalloonController<D> {
     /// Restores full memory and exits idle via the state machine.
     fn fail_open(&mut self, reason: &str) -> Mode<D::Watch> {
         tracing::info!(reason, "restoring full memory");
-        self.restore(reason);
+        // Failure stays booked; the `Active` timer this returns into retries.
+        let _ = self.restore(reason);
         (self.activity)();
         Mode::Active
     }
 
-    /// Restores the balloon to the machine's full configured memory.
+    /// Restores the balloon to the machine's full configured memory, returning
+    /// whether the guest actually got its memory back.
     ///
-    /// Retried a few times on failure; if all attempts fail, the shrunk
-    /// bookkeeping is kept so the next idle entry knows memory was never
-    /// given back (a restore that silently "succeeds" in bookkeeping only
-    /// would leave the guest squeezed with nobody retrying). `enter_idle`
-    /// is the retrier: it restores before probing whenever `applied` is set.
-    fn restore(&mut self, reason: &str) {
+    /// Retried a few times inline; if every attempt fails the shrink stays
+    /// booked rather than being cleared, so `self.shrink.is_some()` keeps
+    /// meaning "the guest is owed memory" and the retriers (idle entry, the
+    /// `Active` timer, the activity edge) can see it.
+    #[must_use = "a failed restore leaves the guest squeezed — the caller must \
+                  keep it booked and retry"]
+    fn restore(&mut self, reason: &str) -> bool {
         let Some(full) = self.deps.full_memory_bytes() else {
             // No machine record: the VM is gone, and so is its balloon.
-            self.applied = None;
-            self.final_target = None;
-            self.step_applied_at = None;
-            return;
+            self.shrink = None;
+            return true;
         };
         const RESTORE_ATTEMPTS: u32 = 3;
         for attempt in 1..=RESTORE_ATTEMPTS {
             match self.deps.set_balloon_target(full) {
                 Ok(()) => {
-                    self.applied = None;
-                    self.final_target = None;
-                    self.step_applied_at = None;
+                    self.shrink = None;
                     tracing::info!(
                         full_mb = full / (1024 * 1024),
                         reason,
                         "balloon restored to full memory"
                     );
-                    return;
+                    return true;
                 }
                 Err(e) => tracing::warn!(attempt, "failed to restore balloon ({reason}): {e}"),
             }
         }
         tracing::error!(
             reason,
-            "balloon restore failed; guest remains shrunk until the next idle cycle"
+            "balloon restore failed; retrying while the guest stays shrunk"
         );
+        false
     }
 }
 
