@@ -55,12 +55,15 @@ startup failure.
   `READY` are published ~300 µs apart with no await point between them and
   a snapshot channel would collapse them (see `SetupState` in
   `arcbox-api/src/system.rs`).
-- `NETWORK_READY` means the host services were *started*, not that they are
-  reachable: `DnsService::bind` propagates its error, but
-  `DockerApiServer::run` binds inside its spawned task and only logs, and
-  the Kubernetes proxy tolerates a taken 16443 by design. A Docker socket
-  that fails to bind therefore still reaches `READY` — a pre-existing gap,
-  not something the phase introduces.
+- `NETWORK_READY` covers whichever host services this daemon runs, and means
+  they were *started*, not that they are reachable. A `--no-linux-vm` daemon
+  reaches it with DNS alone — `start_services` skips the Docker API and the
+  Kubernetes proxy in that mode. And of the three, only DNS is guaranteed
+  bound: `DnsService::bind` propagates its error, while
+  `DockerApiServer::run` binds inside its spawned task and only logs there,
+  and the Kubernetes proxy tolerates a taken 16443 by design. A Docker
+  socket that fails to bind therefore still reaches `READY` — a pre-existing
+  gap, not something the phase introduces.
 - Enum ordinal ≠ progression order (`DOWNLOADING_ASSETS = 8` occurs before
   `READY = 6`). Clients must match on the value, never compare ordinals.
   New phases are appended with the next free number regardless of where
