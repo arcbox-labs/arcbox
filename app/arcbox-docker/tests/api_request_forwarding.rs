@@ -55,9 +55,9 @@ async fn query_string_reaches_the_guest_verbatim() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let seen = guest.last_request_uri().await.expect("guest saw a request");
-    assert!(
-        seen.ends_with("?force=true&v=true"),
-        "guest received {seen:?}; the query string must survive the proxy hop intact"
+    assert_eq!(
+        seen, "/containers/web?force=true&v=true",
+        "the request target must reach dockerd byte-for-byte"
     );
 }
 
@@ -87,18 +87,24 @@ async fn json_filters_query_is_not_re_encoded() {
     assert_eq!(status, StatusCode::OK);
 
     let seen = guest.last_request_uri().await.expect("guest saw a request");
-    assert!(
-        seen.contains(filters),
-        "guest received {seen:?}; the percent-encoded filters value must not be rewritten"
+    assert_eq!(
+        seen,
+        format!("/containers/json?filters={filters}"),
+        "the percent-encoded filters value must not be rewritten, extended, or joined by \
+         extra query material"
     );
 }
 
-/// The version prefix is stripped from the path without disturbing the query.
+/// A versioned request is forwarded with its prefix intact.
 ///
-/// Stripping is string surgery on the URI (`strip_api_version_prefix`), so the
-/// boundary between path and query is the thing most likely to be got wrong.
+/// `strip_api_version_prefix` strips `/v1.43` for **routing**, so local
+/// handlers match regardless of the client's negotiated version. It does not
+/// rewrite what goes on the wire: dockerd receives the client's original
+/// target, which it accepts. Asserting the full string is what pins that —
+/// an `ends_with` on the query alone would pass under either behavior and
+/// leave the reader guessing which one holds.
 #[tokio::test]
-async fn version_prefix_strip_leaves_the_query_alone() {
+async fn versioned_request_is_forwarded_with_its_prefix() {
     let (router, _runtime, guest, _tmp) = router_with_mock_guest(vec![MockRoute {
         method: "GET",
         path: "/containers/json",
@@ -111,13 +117,9 @@ async fn version_prefix_strip_leaves_the_query_alone() {
     assert_eq!(status, StatusCode::OK);
 
     let seen = guest.last_request_uri().await.expect("guest saw a request");
-    assert!(
-        seen.ends_with("?all=true&limit=5"),
-        "guest received {seen:?}; version stripping must not touch the query"
-    );
-    assert!(
-        seen.contains("/containers/json"),
-        "guest received {seen:?}; the path should still address the collection"
+    assert_eq!(
+        seen, "/v1.43/containers/json?all=true&limit=5",
+        "the client's original target reaches dockerd unchanged, prefix included"
     );
 }
 
@@ -137,9 +139,9 @@ async fn absent_query_stays_absent() {
     assert_eq!(status, StatusCode::OK);
 
     let seen = guest.last_request_uri().await.expect("guest saw a request");
-    assert!(
-        !seen.contains('?'),
-        "guest received {seen:?}; a query-less request must not gain an empty query"
+    assert_eq!(
+        seen, "/containers/json",
+        "a query-less request must not gain an empty query"
     );
 }
 
