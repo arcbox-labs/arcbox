@@ -28,13 +28,13 @@ This file is only the non-obvious operational knowledge.
   and used by e2e and the daemon's own tests as the standing proof that the
   gRPC format still answers at the same endpoint. (The CLI has none: `abctl`
   speaks Connect only, and `tonic` is absent from its dependency tree.)
-  - `connectrpc` is bound to `buffa::Message` and has no prost interop, so
-    every served proto package is generated **twice**: buffa types for the
-    public boundary, prost types for the internal and vsock payloads. Both
-    encode standard protobuf bytes, so the two are wire-identical and the
-    guest agent stays on prost. `app/arcbox-api/src/connect/bridge.rs` is
-    the crossing — a decode of the bytes already in hand, never a conversion
-    table.
+  - `connectrpc` is bound to `buffa::Message`, and since CORE-73 the buffa
+    types in `arcbox-connect` are the ONE runtime representation: daemon
+    handlers, `abctl`, and both ends of the vsock wire. The prost twins in
+    `arcbox-protocol` are still generated, but only the tonic test clients
+    and the reflection descriptor set consume them — the two codegens emit
+    identical bytes, which is what lets a prost test client prove the buffa
+    server's wire format.
   - Reflection is served by `connectrpc-reflection` from the whole daemon's
     descriptor set. It answers `501` over HTTP/1.1 Connect because
     `ServerReflectionInfo` is bidi-streaming and Connect carries bidi only
@@ -106,8 +106,9 @@ This file is only the non-obvious operational knowledge.
 4. Add a hand-written re-export in `arcbox-protocol/src/lib.rs` (the flat
    `pub use v1::{...}` block and the per-module `pub mod`) — nothing generates
    or checks these; a new message is invisible downstream until listed.
-5. If it's a new gRPC service the daemon must serve, `add_service()` it in
-   `app/arcbox-daemon/src/services.rs`.
+5. If it's a new service the daemon must serve, register it on
+   `arcbox_api::connect::router` — the daemon serves only that router
+   (see the sandbox checklist below; `add_service()` died with tonic).
 
 **Add/change something under `arcbox.sandbox.v1` (the Connect surface):**
 1. Edit the `.proto`, then add a *new* file to `arcbox-connect/build.rs` as
@@ -115,15 +116,17 @@ This file is only the non-obvious operational knowledge.
    build scripts, and connectrpc codegen is the one that emits the service
    traits the daemon implements.
 2. Implement the method in `app/arcbox-api/src/connect/` against the
-   connectrpc trait, not a tonic one. Cross to the prost twin with
-   `bridge::wire_request` / `wire_response`; do not hand-map fields.
+   connectrpc trait, not a tonic one, working in the buffa types directly
+   (`request.to_owned_message()` in, owned messages out — the blanket
+   `Encodable` impl covers them). There is no bridge to cross.
 3. A new *service* goes on `arcbox_api::connect::router` (or
    `router_with_system`). The daemon serves only that router, so a service
    missing there is a 404 on every format — the
    `migrated_daemon_services_are_registered_on_the_connect_router` test in
    `control_plane.rs` is where that surfaces.
 4. Nothing else changes: the guest agent, `AgentClient`, and the vsock frames
-   keep using the prost types, and the two encodings are identical bytes.
+   use the same `arcbox-connect` buffa types, so a new message is available
+   to them the moment it is generated.
 
 **Add a host↔guest agent RPC (NOT a tonic method):**
 1. Define the proto *message* in `agent.proto`.
@@ -131,7 +134,7 @@ This file is only the non-obvious operational knowledge.
    `common/arcbox-constants/src/wire.rs` (and a roundtrip test case).
 3. Handle it in the guest dispatcher `guest/arcbox-agent/src/rpc.rs`.
 4. Add a method on `AgentClient` (`app/arcbox-core/src/agent_client.rs`) that
-   prost-encodes and frames the message via `rpc_call`.
+   buffa-encodes and frames the message via `rpc_call`.
 
 **Change the wire contract / add a meaning-bearing field:**
 - Bump `AGENT_PROTOCOL_VERSION` (and `MIN_AGENT_PROTOCOL_VERSION` if dropping

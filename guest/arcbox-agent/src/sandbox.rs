@@ -1,7 +1,7 @@
 //! Sandbox service for the guest agent.
 //!
 //! Wraps [`SandboxManager`] from `arcbox-vm` and translates between the
-//! `sandbox_v1` protobuf types (from `arcbox-protocol`) and the native Rust
+//! `sandbox_v1` protobuf types (from `arcbox-connect`) and the native Rust
 //! types used by `arcbox-vm`. Lifecycle CRUD lives here; executions, events,
 //! file I/O, and snapshots live in the submodules.
 
