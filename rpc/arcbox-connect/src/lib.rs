@@ -16,9 +16,10 @@
 //!   the crate compiles for `aarch64-unknown-linux-musl` (base `connectrpc`
 //!   is transport-free) and must stay musl-clean.
 //! * The **host side of the vsock wire** (`arcbox-core`'s `AgentClient`)
-//!   and the `arcbox-api` handlers use these types too — the daemon is
-//!   single-type end-to-end; `abctl` stays on the prost twins until the
-//!   CLI phase lands.
+//!   and the `arcbox-api` handlers use these types too. The daemon's one
+//!   remaining prost-side runtime dep is `arcbox_grpc::FILE_DESCRIPTOR_SET`
+//!   feeding reflection; `abctl` stays on the prost twins until the CLI
+//!   phase lands.
 //!
 //! buffa and prost encode identical protobuf bytes, so mixed-codec peers
 //! interoperate; both representations are generated from the same `.proto`
