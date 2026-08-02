@@ -30,6 +30,9 @@ impl SandboxService {
     ) -> Result<sandbox_v1::RestoreResponse, SandboxError> {
         let req = sandbox_v1::RestoreRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        if !req.id.is_empty() {
+            self.clear_stale_completed_create(&req.id);
+        }
         let spec = RestoreSandboxSpec {
             id: if req.id.is_empty() {
                 None

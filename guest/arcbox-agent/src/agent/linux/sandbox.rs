@@ -53,7 +53,7 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
                 Ok(svc) => {
                     tracing::info!("sandbox service initialised");
                     let svc = Arc::new(svc);
-                    spawn_port_forward_cleanup(&svc);
+                    spawn_sandbox_cleanup(&svc);
                     Ok(svc)
                 }
                 Err(e) => {
@@ -65,22 +65,24 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
         .as_ref()
 }
 
-/// Drop every DNAT mapping of a sandbox as soon as it stops.
+/// Reconcile process-local state when a sandbox stops.
 ///
 /// Subscribing to lifecycle events covers all teardown paths — explicit
 /// Stop/Remove, TTL expiry, and boot failures — without threading cleanup
-/// hooks through each of them.
-fn spawn_port_forward_cleanup(svc: &Arc<SandboxService>) {
+/// hooks through each of them. Terminal sandboxes also release their retained
+/// idempotent Create response.
+fn spawn_sandbox_cleanup(svc: &Arc<SandboxService>) {
     use arcbox_connect::sandbox_v1::{SandboxEvent, SandboxEventKind, SandboxEventsRequest};
 
     let payload = SandboxEventsRequest::default().encode_to_vec();
     let mut rx = match svc.subscribe_events(&payload) {
         Ok(rx) => rx,
         Err(e) => {
-            tracing::warn!(error = %e, "port-forward cleanup subscription failed");
+            tracing::warn!(error = %e, "sandbox cleanup subscription failed");
             return;
         }
     };
+    let svc = Arc::clone(svc);
     tokio::spawn(async move {
         while let Some(encoded) = rx.recv().await {
             let Ok(event) = SandboxEvent::decode_from_slice(&encoded) else {
@@ -94,6 +96,7 @@ fn spawn_port_forward_cleanup(svc: &Arc<SandboxService>) {
                         | SandboxEventKind::Failed
                 )
             ) {
+                svc.clear_stale_completed_create(&event.sandbox_id);
                 port_forwards()
                     .lock()
                     .await

@@ -29,6 +29,8 @@ mod stats;
 mod metadata_migrate;
 
 #[cfg(target_os = "linux")]
+mod create_registry;
+#[cfg(target_os = "linux")]
 mod error;
 
 mod rpc;

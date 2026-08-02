@@ -15,9 +15,13 @@ mod template;
 use std::sync::Arc;
 
 use arcbox_connect::sandbox_v1;
-use arcbox_vm::{SandboxManager, SandboxMountSpec, SandboxNetworkSpec, SandboxSpec, VmmConfig};
+use arcbox_vm::{
+    SandboxManager, SandboxMountSpec, SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig,
+    VmmError,
+};
 use buffa::Message;
 
+use crate::create_registry::{CreateRegistry, Reserve as CreateReserve};
 use crate::error::SandboxError;
 
 /// Verify the nested-virtualization prerequisite for sandboxes.
@@ -49,6 +53,7 @@ pub fn probe_kvm() -> Result<(), String> {
 /// Thin wrapper around [`SandboxManager`] for use in the agent's RPC layer.
 pub struct SandboxService {
     manager: Arc<SandboxManager>,
+    creates: Arc<CreateRegistry>,
     /// Default rootfs image path; auto-built on first use when missing.
     default_rootfs: String,
 }
@@ -57,9 +62,11 @@ impl SandboxService {
     /// Create a new [`SandboxService`] from the given config.
     pub fn new(config: VmmConfig) -> anyhow::Result<Self> {
         let default_rootfs = config.defaults.rootfs.clone();
-        let manager = SandboxManager::new(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let manager = Arc::new(SandboxManager::new(config).map_err(|e| anyhow::anyhow!("{e}"))?);
+        let creates = Arc::new(CreateRegistry::default());
         Ok(Self {
-            manager: Arc::new(manager),
+            manager,
+            creates,
             default_rootfs,
         })
     }
@@ -76,10 +83,39 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
-        let req = sandbox_v1::CreateSandboxRequest::decode_from_slice(payload)
+        let request = sandbox_v1::CreateSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let template = template::Template::parse(&req.template)?;
-        let mut spec = proto_to_spec(req);
+        if request.id.is_empty() {
+            return self.create_once(request).await;
+        }
+
+        let id = request.id.clone();
+        loop {
+            self.clear_stale_completed_create(&id);
+            match self.creates.reserve(&request).map_err(|_| {
+                SandboxError::AlreadyExists(format!(
+                    "sandbox '{id}' (id reused for a different create request)"
+                ))
+            })? {
+                CreateReserve::Existing(response) => return Ok(response),
+                CreateReserve::Slot(slot) => {
+                    let response = self.create_once(request).await?;
+                    slot.commit(&response);
+                    return Ok(response);
+                }
+                CreateReserve::AwaitPending(mut done) => {
+                    let _ = done.changed().await;
+                }
+            }
+        }
+    }
+
+    async fn create_once(
+        &self,
+        request: sandbox_v1::CreateSandboxRequest,
+    ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
+        let template = template::Template::parse(&request.template)?;
+        let mut spec = proto_to_spec(request);
 
         // V1 contract: reject declared-but-unimplemented spec fields
         // explicitly instead of silently ignoring them.
@@ -167,6 +203,7 @@ impl SandboxService {
             .await
             .map_err(SandboxError::from)?;
         deregister_sandbox_dns(&req.id);
+        self.clear_stale_completed_create(&req.id);
         Ok(())
     }
 
@@ -208,6 +245,29 @@ impl SandboxService {
             .ok_or_else(|| {
                 SandboxError::Internal(format!("sandbox '{sandbox_id}' has no network allocation"))
             })
+    }
+
+    pub(crate) fn clear_stale_completed_create(&self, id: &str) {
+        self.creates.clear_completed_if(id, || {
+            completed_create_is_stale(
+                self.manager
+                    .inspect_sandbox(&id.to_owned())
+                    .map(|info| info.state),
+            )
+        });
+    }
+}
+
+fn completed_create_is_stale(state: Result<SandboxState, VmmError>) -> bool {
+    match state {
+        Ok(SandboxState::Stopped | SandboxState::Failed) | Err(VmmError::NotFound(_)) => true,
+        Ok(
+            SandboxState::Starting
+            | SandboxState::Ready
+            | SandboxState::Running
+            | SandboxState::Stopping,
+        )
+        | Err(_) => false,
     }
 }
 
@@ -271,5 +331,31 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
         network: SandboxNetworkSpec { mode: mode.into() },
         ttl_seconds: req.ttl_seconds,
         ssh_public_key: req.ssh_public_key,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_create_is_stale_only_after_terminal_or_removed_state() {
+        for state in [
+            SandboxState::Starting,
+            SandboxState::Ready,
+            SandboxState::Running,
+            SandboxState::Stopping,
+        ] {
+            assert!(!completed_create_is_stale(Ok(state)));
+        }
+        for state in [SandboxState::Stopped, SandboxState::Failed] {
+            assert!(completed_create_is_stale(Ok(state)));
+        }
+        assert!(completed_create_is_stale(Err(VmmError::NotFound(
+            "removed".into()
+        ))));
+        assert!(!completed_create_is_stale(Err(VmmError::Config(
+            "inspect failed".into()
+        ))));
     }
 }

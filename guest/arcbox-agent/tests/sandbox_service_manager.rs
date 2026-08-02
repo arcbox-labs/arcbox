@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use arcbox_agent::error::SandboxError;
 use arcbox_agent::sandbox::SandboxService;
 use arcbox_connect::sandbox_v1::{
     CreateSandboxRequest, InspectSandboxRequest, ListSandboxesRequest, NetworkMode, NetworkSpec,
@@ -71,6 +72,7 @@ async fn sandbox_service_calls_sandbox_manager() {
 
     // Empty template = the built-in busybox image.
     let create_req = CreateSandboxRequest {
+        id: "svc-manager".to_string(),
         labels: std::iter::once(("suite".to_string(), "svc-manager".to_string())).collect(),
         network: NetworkSpec {
             mode: NetworkMode::None.into(),
@@ -168,6 +170,12 @@ async fn sandbox_service_calls_sandbox_manager() {
     }
     .encode_to_vec();
     service.stop(&stop_payload).await.expect("stop failed");
+
+    let retry_error = match service.create(&create_payload).await {
+        Err(error) => error,
+        Ok(_) => panic!("stopped sandbox must not replay its stale Create response"),
+    };
+    assert!(matches!(retry_error, SandboxError::AlreadyExists(_)));
 
     let remove_payload = RemoveSandboxRequest {
         id: sandbox_id,
