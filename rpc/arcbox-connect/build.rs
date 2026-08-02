@@ -1,12 +1,12 @@
-//! Build script for the sandbox Connect RPC surface.
+//! Build script for the ArcBox Connect RPC surface.
 //!
 //! Generates buffa message types plus ConnectRPC service traits and clients
-//! for the four `arcbox.sandbox.v1` protos. Only the sandbox package is
-//! compiled here: the rest of the daemon's gRPC surface stays on
-//! tonic/prost (`arcbox-grpc`), and the host↔guest vsock payloads stay on
-//! the prost types in `arcbox-protocol`. buffa and prost both emit standard
-//! protobuf bytes, so the two representations are wire-identical and the
-//! guest agent needs no change.
+//! for every ArcBox-owned proto (`arcbox.v1` and `arcbox.sandbox.v1`).
+//! These types serve the daemon's client-facing Connect surface AND the
+//! guest agent's vsock frames (CORE-73); the host side of the vsock wire
+//! still decodes with the prost twins in `arcbox-protocol` until the
+//! remaining convergence phases land — safe because buffa and prost emit
+//! identical protobuf bytes.
 
 fn main() {
     let proto_dir = "../arcbox-protocol/proto";
