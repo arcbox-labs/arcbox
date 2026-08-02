@@ -310,6 +310,7 @@ dependencies = [
  "arcbox-helper",
  "arcbox-protocol",
  "buffa",
+ "buffa-types",
  "chrono",
  "clap",
  "clap_complete",
