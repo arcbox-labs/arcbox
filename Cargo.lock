@@ -183,7 +183,6 @@ dependencies = [
  "arcbox-fs",
  "arcbox-hypervisor",
  "arcbox-net",
- "arcbox-protocol",
  "arcbox-virtio",
  "arcbox-vmm",
 ]
@@ -308,7 +307,6 @@ dependencies = [
  "arcbox-docker",
  "arcbox-docker-tools",
  "arcbox-helper",
- "arcbox-protocol",
  "buffa",
  "buffa-types",
  "chrono",
@@ -321,7 +319,6 @@ dependencies = [
  "humantime",
  "libc",
  "macos-resolver",
- "prost",
  "sentry",
  "serde",
  "serde_json",
@@ -494,7 +491,6 @@ version = "0.5.5"
 dependencies = [
  "arcbox-core",
  "arcbox-error",
- "arcbox-protocol",
  "arcbox-transport",
  "axum",
  "bytes",
@@ -877,7 +873,6 @@ version = "0.5.5"
 dependencies = [
  "arcbox-constants",
  "arcbox-error",
- "arcbox-protocol",
  "async-trait",
  "bytes",
  "libc",

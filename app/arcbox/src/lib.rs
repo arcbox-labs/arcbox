@@ -9,20 +9,17 @@
 //!
 //! - **Hypervisor**: Platform abstraction for virtualization (macOS/Linux)
 //! - **VirtIO**: Virtual device implementations (block, net, fs, console)
-//! - **Protocol**: Protobuf message and service definitions
 //!
 //! # Example
 //!
 //! ```ignore
-//! use arcbox::{protocol, version};
+//! use arcbox::version;
 //!
-//! let _ = protocol::v1::Empty {};
 //! println!("arcbox facade version: {}", version());
 //! ```
 
 // Re-export core crates (available in this version)
 pub use arcbox_hypervisor as hypervisor;
-pub use arcbox_protocol as protocol;
 pub use arcbox_virtio as virtio;
 
 // TODO: uncomment after publishing these crates
