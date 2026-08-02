@@ -12,6 +12,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod agent;
 mod init;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod runtime_materialize;
 mod supervisor;
 
 // Consumed by the Linux agent's WatchMemoryPressure handler; the library

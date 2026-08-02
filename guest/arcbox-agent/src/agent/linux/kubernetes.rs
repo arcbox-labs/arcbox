@@ -28,13 +28,13 @@ use arcbox_protocol::agent::{
     KubernetesStopResponse,
 };
 
-use super::btrfs::ensure_data_mount;
 use super::probe::{probe_first_ready_socket, probe_tcp};
 use super::runtime::{
     CONTAINERD_SOCKET_CANDIDATES, daemon_log_file, ensure_containerd_ready,
     ensure_runtime_prerequisites, ensure_shared_runtime_dirs, missing_binaries_at,
     runtime_path_env,
 };
+use super::runtime_cache::ensure_local_runtime;
 use crate::rpc::{ErrorResponse, RpcResponse};
 
 const K3S_PID_FILE: &str = "/run/arcbox/k3s.pid";
@@ -124,6 +124,18 @@ pub(super) async fn handle_kubernetes_kubeconfig(_req: KubernetesKubeconfigReque
 
 async fn do_start_kubernetes() -> KubernetesStartResponse {
     let _guard = kubernetes_control_lock().lock().await;
+    let mut notes = ensure_runtime_prerequisites();
+    match ensure_local_runtime().await {
+        Ok(note) => notes.push(note),
+        Err(error) => {
+            return KubernetesStartResponse {
+                running: false,
+                api_ready: false,
+                endpoint: KUBERNETES_HOST_ENDPOINT.to_string(),
+                detail: format!("local runtime setup failed: {error}"),
+            };
+        }
+    }
     let runtime_bin_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
     let missing = missing_kubernetes_binaries_at(&runtime_bin_dir);
     if !missing.is_empty() {
@@ -137,19 +149,6 @@ async fn do_start_kubernetes() -> KubernetesStartResponse {
                 missing.join(", ")
             ),
         };
-    }
-
-    let mut notes = ensure_runtime_prerequisites();
-    match ensure_data_mount() {
-        Ok(note) => notes.push(note),
-        Err(e) => {
-            return KubernetesStartResponse {
-                running: false,
-                api_ready: false,
-                endpoint: KUBERNETES_HOST_ENDPOINT.to_string(),
-                detail: format!("data volume setup failed: {e}"),
-            };
-        }
     }
     ensure_shared_runtime_dirs(&mut notes);
 

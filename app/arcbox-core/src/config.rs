@@ -48,6 +48,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Runtime profile selected by the daemon.
+    #[serde(skip)]
+    pub profile: ArcboxProfile,
     /// Data directory.
     pub data_dir: PathBuf,
     /// Default VM configuration.
@@ -78,6 +81,7 @@ impl Config {
     pub fn for_profile(profile: ArcboxProfile) -> Self {
         let layout = HostLayout::for_profile(profile);
         Self {
+            profile,
             data_dir: layout.data_dir,
             vm: VmDefaults::default(),
             machine: MachineDefaults::default(),
@@ -109,13 +113,15 @@ impl Config {
     /// Explicit `ARCBOX_*` environment values and config file values override
     /// profile defaults.
     pub fn load_for_profile(profile: ArcboxProfile) -> Result<Self, Box<figment::Error>> {
-        Figment::new()
+        let mut config: Self = Figment::new()
             .merge(Serialized::defaults(Self::for_profile(profile)))
             .merge(Toml::file(system_config_path()))
             .merge(Toml::file(user_config_path()))
             .merge(Env::prefixed("ARCBOX_").split("_"))
             .extract()
-            .map_err(Box::new)
+            .map_err(Box::new)?;
+        config.profile = profile;
+        Ok(config)
     }
 
     /// Loads configuration from a specific file.
@@ -409,6 +415,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
+        assert_eq!(config.profile, ArcboxProfile::Production);
         assert_eq!(config.vm.cpus, arcbox_hypervisor::default_vm_cpu_count());
         // Default memory is half of host RAM, clamped to [512, 16384] MB.
         let expected_mb = arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024);
@@ -420,6 +427,14 @@ mod tests {
         assert_eq!(
             config.container.guest_docker_vsock_port,
             DOCKER_API_VSOCK_PORT
+        );
+    }
+
+    #[test]
+    fn development_profile_is_preserved_for_runtime_policy() {
+        assert_eq!(
+            Config::for_profile(ArcboxProfile::Development).profile,
+            ArcboxProfile::Development
         );
     }
 

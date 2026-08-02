@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
 use super::port_forward::{PortForwardManager, Protocol};
+use super::runtime_cache::ensure_local_runtime;
 use crate::rpc::{ErrorResponse, MessageType, write_message};
 use crate::sandbox::SandboxService;
 
@@ -114,6 +115,22 @@ pub(super) async fn handle_sandbox_message<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    if matches!(
+        msg_type,
+        MessageType::SandboxCreateRequest | MessageType::SandboxRestoreRequest
+    ) {
+        if let Err(reason) = ensure_local_runtime().await {
+            send_sandbox_error(
+                stream,
+                trace_id,
+                503,
+                &format!("sandbox runtime unavailable: {reason}"),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     let svc = match sandbox_service() {
         Ok(s) => Arc::clone(s),
         Err((code, reason)) => {

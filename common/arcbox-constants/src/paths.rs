@@ -32,9 +32,15 @@ pub const K3S_CNI_CONF_DIR: &str = "/var/lib/rancher/k3s/agent/etc/cni/net.d";
 /// K3s-managed CNI plugin directory used by current releases.
 pub const K3S_CNI_BIN_DIR: &str = "/var/lib/rancher/k3s/data/cni";
 
-/// Directory where runtime binaries (containerd, dockerd, runc, …) are
-/// accessed via VirtioFS live execution.
-pub const ARCBOX_RUNTIME_BIN_DIR: &str = "/arcbox/runtime/bin";
+/// Stable guest-local runtime root.
+///
+/// The guest atomically points this symlink at the active generation on the
+/// persistent Btrfs data disk.
+pub const ARCBOX_RUNTIME_DIR: &str = "/run/arcbox/runtime";
+
+/// Directory where guest runtime binaries (containerd, dockerd, runc, …) are
+/// executed from the persistent Btrfs data disk.
+pub const ARCBOX_RUNTIME_BIN_DIR: &str = "/run/arcbox/runtime/bin";
 
 /// Host-side privileged paths (require root to write).
 pub mod privileged {

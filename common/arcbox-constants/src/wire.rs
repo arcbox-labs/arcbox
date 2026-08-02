@@ -10,14 +10,18 @@
 /// v2: the sandbox execution redesign (CORE-55/56) retired the Run/Exec
 /// streaming types and re-typed the surviving sandbox payloads (enums,
 /// timestamps, exit-status oneof).
-pub const AGENT_PROTOCOL_VERSION: u32 = 2;
+///
+/// v3: runtime startup requires the host-provided
+/// `arcbox.runtime_generation` kernel parameter and materializes runtime
+/// assets onto the guest Btrfs data disk before execution.
+pub const AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest agent protocol version this host still accepts.
 ///
 /// Agents reporting less (including `0` — agents that predate the
 /// handshake field) are rejected at boot with an actionable error
 /// instead of silently misbehaving under field skew.
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 2;
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Number of bytes in the fixed RPC frame header (`length` + `type`).
 pub const FRAME_HEADER_SIZE: usize = 8;

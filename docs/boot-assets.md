@@ -13,7 +13,10 @@ Each release contains per-architecture artifacts plus a unified multi-target man
 - Runtime binaries — dockerd, containerd, containerd-shim-runc-v2, runc, docker-init (from the Docker 29.6.1 static package, shipping containerd 2.2.5) plus k3s, firecracker/jailer, and the microVM vmlinux
 
 No initramfs. The kernel boots directly into the EROFS rootfs (`root=/dev/vda ro rootfstype=erofs`).
-Agent and runtime binaries are distributed via VirtioFS from the host.
+Agent and runtime binaries reach the guest through VirtioFS. Runtime binaries
+are checksum-verified against the pinned manifest, copied into a
+version-keyed generation on the guest Btrfs data disk, and executed only from
+that local generation.
 
 ## Responsibilities In This Repository
 

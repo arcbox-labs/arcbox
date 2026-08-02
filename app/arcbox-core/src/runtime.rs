@@ -192,6 +192,8 @@ impl Runtime {
     ) -> Result<Self> {
         vm_lifecycle_config.guest_docker_vsock_port =
             Some(config.container.guest_docker_vsock_port);
+        vm_lifecycle_config.allow_unpinned_boot_manifest =
+            config.profile == arcbox_constants::paths::ArcboxProfile::Development;
 
         let event_bus = EventBus::new();
         let snapshot_dir = config.data_dir.join("snapshots");
@@ -513,9 +515,9 @@ impl Runtime {
     ///   is disabled the VZ guest has no x86 `binfmt` handler.
     /// - **HV** uses FEX, which requires the interpreter provisioned as a
     ///   runtime binary at `<data_dir>/runtime/bin/FEX` (the same `runtime/bin`
-    ///   set as `dockerd`/`containerd`, surfaced to the guest over the `arcbox`
-    ///   VirtioFS share). The guest rootfs init registers the `binfmt_misc`
-    ///   handler iff that binary is present.
+    ///   set as `dockerd`/`containerd`, transported to the guest over the
+    ///   `arcbox` VirtioFS share). The guest agent registers the `binfmt_misc`
+    ///   handler after verifying and materializing FEX onto Btrfs.
     ///
     /// Fail-closed (ABX-375): when the active backend's translator is
     /// unavailable, amd64 requests must return a clear error rather than
@@ -527,13 +529,19 @@ impl Runtime {
                 cfg!(all(target_os = "macos", target_arch = "aarch64"))
                     && self.vm_lifecycle.config().default_vm.rosetta
             }
-            arcbox_vmm::VmBackend::Hv => self
-                .config
-                .data_dir
-                .join("runtime")
-                .join("bin")
-                .join("FEX")
-                .is_file(),
+            arcbox_vmm::VmBackend::Hv => {
+                self.vm_lifecycle
+                    .boot_assets()
+                    .cached_manifest_has_binary("FEX")
+                    .unwrap_or(false)
+                    && self
+                        .config
+                        .data_dir
+                        .join("runtime")
+                        .join("bin")
+                        .join("FEX")
+                        .is_file()
+            }
         }
     }
 

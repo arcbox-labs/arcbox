@@ -7,6 +7,7 @@
 //! 2. `/etc/arcbox/vmm.toml`
 //! 3. Built-in guest defaults
 
+use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, ARCBOX_RUNTIME_DIR};
 use arcbox_vm::VmmConfig;
 use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
 
@@ -15,19 +16,19 @@ use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkC
 /// These differ from [`VmmConfig::default()`] which targets the host-side
 /// daemon. Paths follow the guest view of host assets:
 ///
-/// - Boot-manifest binaries (firecracker, jailer) download to
-///   `~/.arcbox/runtime/bin` and vmlinux to `~/.arcbox/runtime/kernel`
-///   (`install_dir = "kernel"`); the data dir is VirtioFS-mounted at
-///   `/arcbox`, so the guest sees `/arcbox/runtime/{bin,kernel}`.
+/// - Boot-manifest binaries are materialized onto the guest Btrfs data disk
+///   before the sandbox service can use them.
 /// - The default sandbox rootfs is auto-built by the agent (busybox +
 ///   vm-agent, see `rootfs_builder::ensure_default_rootfs`) on the writable
 ///   btrfs data volume.
 fn guest_defaults() -> VmmConfig {
+    let runtime_bin = std::path::Path::new(ARCBOX_RUNTIME_BIN_DIR);
+    let runtime_root = std::path::Path::new(ARCBOX_RUNTIME_DIR);
     VmmConfig {
         firecracker: FirecrackerConfig {
-            binary: "/arcbox/runtime/bin/firecracker".into(),
+            binary: runtime_bin.join("firecracker").to_string_lossy().into(),
             jailer: Some(arcbox_vm::config::JailerConfig {
-                binary: "/arcbox/runtime/bin/jailer".into(),
+                binary: runtime_bin.join("jailer").to_string_lossy().into(),
                 uid: 0,
                 gid: 0,
                 chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
@@ -57,7 +58,7 @@ fn guest_defaults() -> VmmConfig {
         defaults: DefaultVmConfig {
             vcpus: 1,
             memory_mib: 512,
-            kernel: "/arcbox/runtime/kernel/vmlinux".into(),
+            kernel: runtime_root.join("kernel/vmlinux").to_string_lossy().into(),
             rootfs: "/var/lib/arcbox/sandbox/rootfs.ext4".into(),
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/vm-agent".into(),
         },

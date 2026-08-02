@@ -19,7 +19,7 @@ pub async fn require_amd64_runtime(
     }
     Err(DockerError::NotImplemented(format!(
         "linux/amd64 runtime requires FEX in the HV guest, which is not provisioned \
-         (expected /arcbox/runtime/bin/FEX). amd64 runtime containers are served by FEX \
+         (expected /run/arcbox/runtime/bin/FEX). amd64 runtime containers are served by FEX \
          inside the single HV utility VM; ArcBox does not fall back to a VZ/Rosetta runtime \
          VM. Requested platform: {:?}.",
         route.platform,

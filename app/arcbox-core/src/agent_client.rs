@@ -341,10 +341,10 @@ impl AgentClient {
         if resp.protocol_version < MIN_AGENT_PROTOCOL_VERSION {
             return Err(CoreError::Machine(format!(
                 "guest agent is incompatible with this daemon: agent protocol {} \
-                 (agent version {}), daemon requires >= {}. The staged agent \
+                 (agent version {}, response {:?}), daemon requires >= {}. The staged agent \
                  binary is stale — reinstall or update ArcBox so the bundled \
                  agent is staged again",
-                resp.protocol_version, resp.version, MIN_AGENT_PROTOCOL_VERSION,
+                resp.protocol_version, resp.version, resp.message, MIN_AGENT_PROTOCOL_VERSION,
             )));
         }
         if resp.protocol_version > AGENT_PROTOCOL_VERSION {
@@ -1838,6 +1838,14 @@ mod tests {
         // default 0 → must be rejected, not silently accepted.
         let err = AgentClient::check_agent_protocol(&ping_response(0))
             .expect_err("protocol 0 must be rejected");
+        assert!(err.to_string().contains("incompatible"));
+    }
+
+    #[test]
+    fn previous_protocol_is_rejected() {
+        let previous = arcbox_constants::wire::AGENT_PROTOCOL_VERSION - 1;
+        let err = AgentClient::check_agent_protocol(&ping_response(previous))
+            .expect_err("previous protocol must be rejected");
         assert!(err.to_string().contains("incompatible"));
     }
 

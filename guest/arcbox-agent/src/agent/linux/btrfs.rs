@@ -28,7 +28,7 @@ const BTRFS_TOTAL_BYTES_OFFSET: u64 = 0x10070;
 ///
 /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
 /// while EROFS root is read-only and cannot host dynamic mountpoints.
-const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
+pub(super) const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
 
 fn has_btrfs_superblock(device: &str) -> bool {
     let mut file = match std::fs::File::open(device) {
@@ -126,7 +126,8 @@ fn ensure_btrfs_format(device: &str) -> Result<String, String> {
 /// running containerd/dockerd without persistent storage is unsafe.
 pub(super) fn ensure_data_mount() -> Result<String, String> {
     // Already fully set up?
-    if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
+    if crate::mount::is_mounted(BTRFS_TEMP_MOUNT)
+        && crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
         && crate::mount::is_mounted(CONTAINERD_DATA_MOUNT_POINT)
         && crate::mount::is_mounted(K3S_DATA_MOUNT_POINT)
         && crate::mount::is_mounted(KUBELET_DATA_MOUNT_POINT)

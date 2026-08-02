@@ -1,7 +1,7 @@
 //! Container runtime lifecycle: bring up containerd + dockerd, surface readiness,
 //! and serve the EnsureRuntime/RuntimeStatus RPC handlers.
 //!
-//! Spawns the bundled `containerd` and `dockerd` from the EROFS rootfs, verifies
+//! Materializes the bundled `containerd` and `dockerd` onto Btrfs, verifies
 //! kernel/filesystem prerequisites (cgroup2, overlayfs, devpts, …), and polls
 //! socket readiness with both connect-level and HTTP-level probes.
 
@@ -24,9 +24,10 @@ use arcbox_protocol::agent::{
 };
 
 use super::btrfs::ensure_data_mount;
-use super::cmdline::{declared_runtime_image_device, docker_api_vsock_port};
+use super::cmdline::docker_api_vsock_port;
 use super::probe::{probe_docker_api_ready, probe_first_ready_socket, probe_unix_socket};
 use super::rpc::sync_clock_from_host;
+use super::runtime_cache::ensure_local_runtime;
 use crate::agent::ensure_runtime;
 use crate::rpc::RpcResponse;
 
@@ -79,7 +80,17 @@ pub(super) async fn handle_ensure_runtime(req: RuntimeEnsureRequest) -> RpcRespo
 /// Performs the actual runtime start sequence (called only by the driver).
 async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
     let mut notes = Vec::new();
-    let note = try_start_bundled_runtime().await;
+    let note = match try_start_bundled_runtime().await {
+        Ok(note) => note,
+        Err(message) => {
+            return RuntimeEnsureResponse {
+                ready: false,
+                endpoint: format!("vsock:{}", docker_api_vsock_port()),
+                message,
+                status: ensure_runtime::STATUS_FAILED.to_string(),
+            };
+        }
+    };
     if !note.is_empty() {
         notes.push(note);
     }
@@ -508,102 +519,6 @@ fn runtime_start_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Read-only mount point of the block-backed runtime image.
-///
-/// The runtime binaries otherwise live on the host-backed `arcbox` VirtioFS
-/// share, where every exec costs a FUSE round-trip — measured 7-10x more than
-/// exec'ing the same binary from block-backed storage, and paid on *every*
-/// container start (so on every `docker build` step). When the boot release
-/// ships a runtime image the host attaches it as a read-only disk and the
-/// guest execs from here instead (ABX-498).
-const RUNTIME_IMAGE_MOUNT: &str = "/run/arcbox/runtime";
-
-/// Mounts the read-only runtime image the host declared on the cmdline.
-/// Returns whether the mount is available afterward.
-///
-/// Best-effort by design: the VirtioFS copies stay as the fallback, so a
-/// release without an image, or a failed mount, costs exec speed but never
-/// correctness.
-fn mount_runtime_image(notes: &mut Vec<String>) -> bool {
-    if crate::mount::is_mounted(RUNTIME_IMAGE_MOUNT) {
-        return true;
-    }
-    let Some(device) = declared_runtime_image_device() else {
-        return false;
-    };
-    // The node can lag guest boot; wait briefly rather than silently taking
-    // the slow path for the rest of this boot.
-    if !wait_for_runtime_image_device(&device) {
-        notes.push(format!("runtime image device {device} never appeared"));
-        return false;
-    }
-    if let Err(e) = std::fs::create_dir_all(RUNTIME_IMAGE_MOUNT) {
-        notes.push(format!("runtime image mkdir failed({e})"));
-        return false;
-    }
-    match std::process::Command::new("/bin/busybox")
-        .args([
-            "mount",
-            "-t",
-            "erofs",
-            "-o",
-            "ro",
-            &device,
-            RUNTIME_IMAGE_MOUNT,
-        ])
-        .status()
-    {
-        Ok(status) if status.success() => {
-            notes.push(format!("mounted runtime image from {device}"));
-            true
-        }
-        _ => {
-            notes.push(format!(
-                "runtime image mount failed ({device}); using VirtioFS"
-            ));
-            false
-        }
-    }
-}
-
-/// Waits up to 5 s for the declared device node (same budget and rationale as
-/// the data-device wait in `btrfs.rs`).
-fn wait_for_runtime_image_device(device: &str) -> bool {
-    for attempt in 0..50 {
-        if Path::new(device).exists() {
-            if attempt > 0 {
-                tracing::info!(device, attempt, "waited for runtime image device");
-            }
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    false
-}
-
-fn detect_runtime_bin_dir() -> Option<PathBuf> {
-    // Prefer the block-backed runtime image when it is mounted — exec from
-    // it is 7-10x cheaper than over VirtioFS. Everything downstream (the
-    // containerd/dockerd spawns and the PATH they inherit) follows this one
-    // directory, so preferring it here is the whole switch.
-    let image = PathBuf::from(RUNTIME_IMAGE_MOUNT);
-    if missing_runtime_binaries_at(&image).is_empty() {
-        return Some(image);
-    }
-    let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
-    if missing_runtime_binaries_at(&dir).is_empty() {
-        Some(dir)
-    } else {
-        None
-    }
-}
-
-fn runtime_missing_detail() -> String {
-    let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
-    let missing = missing_runtime_binaries_at(&dir);
-    runtime_missing_detail_from(&missing)
-}
-
 fn runtime_missing_detail_from(missing: &[&'static str]) -> String {
     if missing.is_empty() {
         format!("all runtime binaries present under {ARCBOX_RUNTIME_BIN_DIR}")
@@ -822,40 +737,36 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
     }
 }
 
-async fn try_start_bundled_runtime() -> String {
+async fn try_start_bundled_runtime() -> Result<String, String> {
     let _guard = runtime_start_lock().lock().await;
-
-    if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
-        return "docker socket already ready".to_string();
-    }
-
     let mut notes = Vec::new();
 
-    // Ensure kernel/filesystem prerequisites before spawning daemons — and
-    // before mounting the runtime image below, since that mounts under /run
-    // and the prerequisites are what guarantee /run is a writable tmpfs.
+    match ensure_local_runtime().await {
+        Ok(note) => notes.push(note),
+        Err(error) => return Err(format!("local runtime setup failed: {error}")),
+    }
+    if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
+        notes.push("docker socket already ready".to_string());
+        return Ok(notes.join("; "));
+    }
+
+    // Ensure kernel/filesystem prerequisites before spawning daemons.
     let prereq_notes = ensure_runtime_prerequisites();
     if !prereq_notes.is_empty() {
         tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
     }
     notes.extend(prereq_notes);
 
-    // Mount the runtime image (when this release ships one) before probing
-    // for the runtime binaries, so the probe can prefer it.
-    mount_runtime_image(&mut notes);
-
-    let Some(runtime_bin_dir) = detect_runtime_bin_dir() else {
-        return runtime_missing_detail();
-    };
+    let runtime_bin_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+    let missing = missing_runtime_binaries_at(&runtime_bin_dir);
+    if !missing.is_empty() {
+        return Err(runtime_missing_detail_from(&missing));
+    }
 
     tracing::info!(
         runtime_bin_dir = %runtime_bin_dir.display(),
         "starting bundled runtime"
     );
-    match ensure_data_mount() {
-        Ok(note) => notes.push(note),
-        Err(e) => return format!("data volume setup failed: {}", e),
-    }
 
     // Bind the fsync-hot metadata dirs onto the ext4 volume before the
     // daemons open their boltdb files. A hard error means the volume exists
@@ -863,18 +774,18 @@ async fn try_start_bundled_runtime() -> String {
     // state would fork it, so abort instead.
     match super::metadata_volume::ensure_metadata_mount() {
         Ok(note) => notes.push(note),
-        Err(e) => return format!("metadata volume setup failed: {}", e),
+        Err(e) => return Err(format!("metadata volume setup failed: {e}")),
     }
 
     ensure_shared_runtime_dirs(&mut notes);
 
     if !ensure_containerd_ready(&runtime_bin_dir, &mut notes).await {
-        return notes.join("; ");
+        return Err(notes.join("; "));
     }
 
     ensure_dockerd_ready(&runtime_bin_dir, &mut notes).await;
 
-    notes.join("; ")
+    Ok(notes.join("; "))
 }
 
 /// Brings up the read-only NFS export of the docker data mount so the host
