@@ -33,6 +33,8 @@ use crate::context::DaemonContext;
 
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 const MOUNT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Shutdown may make two attempts; their 10s total is part of launchd's
+/// 45s budget.
 const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pause before retrying a failed incarnation, so a guest that is up but not
 /// yet able to serve the export is retried without spinning.
