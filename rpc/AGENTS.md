@@ -110,8 +110,11 @@ This file is only the non-obvious operational knowledge.
    `pub use v1::{...}` block and the per-module `pub mod`) — nothing generates
    or checks these; a new message is invisible downstream until listed.
 5. If it's a new service the daemon must serve, register it on
-   `arcbox_api::connect::router` — the daemon serves only that router
-   (see the sandbox checklist below; `add_service()` died with tonic).
+   `arcbox_api::connect::router` with `.add_service(...)` — the daemon
+   serves only that router (see the sandbox checklist below). What died
+   with tonic is the daemon's `Server::builder().add_service()` chain in
+   `app/arcbox-daemon/src/services.rs`, not the connectrpc router builder
+   method of the same name.
 
 **Add/change something under `arcbox.sandbox.v1` (the Connect surface):**
 1. Edit the `.proto`, then add a *new* file to `arcbox-connect/build.rs` as
