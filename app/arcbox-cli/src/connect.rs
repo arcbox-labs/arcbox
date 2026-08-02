@@ -12,10 +12,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context as _, Result};
-
-use buffa::view::OwnedView;
-use connectrpc::client::{ClientConfig, Http2Connection, SharedHttp2Connection, UnaryResponse};
+use connectrpc::client::{ClientConfig, Http2Connection, SharedHttp2Connection};
 
 /// Concurrent in-flight requests a single client transport will buffer.
 ///
@@ -51,85 +48,4 @@ pub fn daemon(socket: &Path) -> (SharedHttp2Connection, ClientConfig) {
 pub fn daemon_for_machine(socket: &Path, machine: &str) -> (SharedHttp2Connection, ClientConfig) {
     let (transport, config) = daemon(socket);
     (transport, config.with_default_header("x-machine", machine))
-}
-
-/// Builds a Connect request from its prost twin.
-///
-/// The two representations come from the same `.proto` and encode identical
-/// bytes, so this is a re-encode rather than a field-by-field mapping — the
-/// same argument as the daemon's own bridge. It lets each command keep
-/// building requests from the prost types its argument parsing already
-/// produces, including enum discriminants.
-///
-/// # Errors
-///
-/// Returns an error if the bytes do not decode as `B`, which would mean the
-/// two generated representations disagree — a build fault, not a user one.
-pub fn request<B, P>(msg: &P) -> Result<B>
-where
-    B: buffa::Message + Default,
-    P: prost::Message,
-{
-    B::decode_from_slice(&msg.encode_to_vec()).with_context(|| {
-        format!(
-            "daemon request did not encode as {}",
-            std::any::type_name::<B>()
-        )
-    })
-}
-
-/// Reads a Connect response back as its prost twin.
-///
-/// The response arrives as a zero-copy view over the wire bytes; this
-/// decodes those same bytes as the prost message the rest of the CLI
-/// already formats and serializes. That is what keeps `--json` output
-/// byte-identical across this migration.
-pub trait UnaryExt {
-    /// The prost message the response bytes decode as.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the bytes do not decode as `P`, which would mean
-    /// the two generated representations disagree — a build fault, not a
-    /// user one.
-    fn prost<P: prost::Message + Default>(self) -> Result<P>;
-}
-
-impl<V: buffa::view::MessageView<'static>> UnaryExt for UnaryResponse<OwnedView<V>> {
-    fn prost<P: prost::Message + Default>(self) -> Result<P> {
-        P::decode(self.into_view().bytes().clone()).with_context(|| {
-            format!(
-                "daemon response did not decode as {}",
-                std::any::type_name::<P>()
-            )
-        })
-    }
-}
-
-/// The same crossing for one item of a server stream.
-///
-/// Streaming items arrive as views over retained wire bytes, exactly as
-/// unary responses do, so progress-rendering code keeps working on the
-/// prost types it already matches on.
-pub trait StreamItemExt {
-    /// The prost message this item's bytes decode as.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the bytes do not decode as `P`.
-    fn prost<P: prost::Message + Default>(&self) -> Result<P>;
-}
-
-impl<M> StreamItemExt for connectrpc::StreamMessage<M>
-where
-    M: buffa::Message + connectrpc::HasMessageView,
-{
-    fn prost<P: prost::Message + Default>(&self) -> Result<P> {
-        P::decode(self.bytes().clone()).with_context(|| {
-            format!(
-                "daemon stream item did not decode as {}",
-                std::any::type_name::<P>()
-            )
-        })
-    }
 }

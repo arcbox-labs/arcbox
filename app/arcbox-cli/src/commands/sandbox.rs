@@ -3,16 +3,9 @@
 //! Sandboxes are short-lived, strongly-isolated microVMs. The underlying guest
 //! VM is managed transparently by the daemon and is not visible to the user.
 
-use crate::connect::{StreamItemExt as _, UnaryExt as _};
 use anyhow::{Context, Result};
 use arcbox_connect::sandbox_v1 as pb;
 use arcbox_connect::sandbox_v1::{
-    SandboxFilesystemServiceClient, SandboxProcessServiceClient, SandboxServiceClient,
-    SandboxSnapshotServiceClient,
-};
-use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
-use arcbox_protocol::pbjson_types::Timestamp;
-use arcbox_protocol::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, DeleteSnapshotRequest,
     Execution, ExposePortRequest, FileChunk, InspectSandboxRequest, ListSandboxesRequest,
     ListSnapshotsRequest, PortProtocol, ReadFileRequest, RemoveSandboxRequest,
@@ -20,8 +13,13 @@ use arcbox_protocol::sandbox_v1::{
     SandboxEventsRequest, SandboxState, StartExecutionRequest, StdioChannel, StopSandboxRequest,
     TerminalSize as ProtoTerminalSize, UnexposePortRequest, WaitExecutionRequest, WriteFileOpen,
     WriteFileRequest, WriteStdinRequest, execution_event, exit_status, watch_events_response,
-    write_file_request,
 };
+use arcbox_connect::sandbox_v1::{
+    SandboxFilesystemServiceClient, SandboxProcessServiceClient, SandboxServiceClient,
+    SandboxSnapshotServiceClient,
+};
+use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
+use buffa_types::google::protobuf::Timestamp;
 use clap::{Args, Subcommand};
 use std::collections::HashMap;
 use std::io::Write;
@@ -423,8 +421,10 @@ fn format_timestamp(ts: Option<&Timestamp>) -> String {
 /// Shell-convention scalar exit code of a finished execution
 /// (`128 + signal` for signal deaths; 1 when torn down without an exit).
 fn exit_code_of(execution: &Execution) -> i32 {
-    match execution.exit_status.as_ref().and_then(|s| s.status) {
-        Some(exit_status::Status::Code(code)) => code,
+    // An unset `exit_status` derefs to the default instance, whose oneof is
+    // `None` — the same "torn down without an exit" case as before.
+    match execution.exit_status.status.as_ref() {
+        Some(exit_status::Status::Code(code)) => *code,
         Some(exit_status::Status::Signal(signal)) => 128 + signal,
         None => 1,
     }
@@ -454,26 +454,31 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
 
     let req = CreateSandboxRequest {
         id: args.id.unwrap_or_default(),
-        labels,
+        labels: labels.into_iter().collect(),
         template,
-        limits: Some(ResourceLimits {
+        limits: ResourceLimits {
             vcpus: args.cpus,
             memory_mib: args.memory,
-        }),
+            ..Default::default()
+        }
+        .into(),
         ttl_seconds: args.ttl,
         ..Default::default()
     };
 
-    let resp = client
-        .create(crate::connect::request(&req)?)
+    let resp: pb::CreateSandboxResponse = client
+        .create(req)
         .await
         .context("Failed to create sandbox")?
-        .prost::<arcbox_protocol::sandbox_v1::CreateSandboxResponse>()?;
+        .into_owned();
 
     println!("Sandbox created");
     println!("  ID:    {}", resp.id);
     println!("  IP:    {}", resp.ip_address);
-    println!("  State: {}", state_name(resp.state()));
+    println!(
+        "  State: {}",
+        state_name(resp.state.as_known().unwrap_or_default())
+    );
     Ok(())
 }
 
@@ -481,12 +486,12 @@ async fn execute_stop(args: StopArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxServiceClient::new(transport.clone(), config.clone());
 
-    let req = StopSandboxRequest {
-        id: args.id.clone(),
-        timeout_seconds: args.timeout,
-    };
     client
-        .stop(crate::connect::request(&req)?)
+        .stop(StopSandboxRequest {
+            id: args.id.clone(),
+            timeout_seconds: args.timeout,
+            ..Default::default()
+        })
         .await
         .context("Failed to stop sandbox")?;
 
@@ -498,12 +503,12 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxServiceClient::new(transport.clone(), config.clone());
 
-    let req = RemoveSandboxRequest {
-        id: args.id.clone(),
-        force: args.force,
-    };
     client
-        .remove(crate::connect::request(&req)?)
+        .remove(RemoveSandboxRequest {
+            id: args.id.clone(),
+            force: args.force,
+            ..Default::default()
+        })
         .await
         .context("Failed to remove sandbox")?;
 
@@ -523,17 +528,15 @@ async fn execute_list(args: ListArgs) -> Result<()> {
     let mut sandboxes = Vec::new();
     let mut page_token = String::new();
     loop {
-        let req = ListSandboxesRequest {
-            state: state.into(),
-            labels: HashMap::new(),
-            page_size: 0,
-            page_token: page_token.clone(),
-        };
-        let mut resp = client
-            .list(crate::connect::request(&req)?)
+        let mut resp: pb::ListSandboxesResponse = client
+            .list(ListSandboxesRequest {
+                state: state.into(),
+                page_token: page_token.clone(),
+                ..Default::default()
+            })
             .await
             .context("Failed to list sandboxes")?
-            .prost::<arcbox_protocol::sandbox_v1::ListSandboxesResponse>()?;
+            .into_owned();
         sandboxes.append(&mut resp.sandboxes);
         if resp.next_page_token.is_empty() {
             break;
@@ -558,9 +561,9 @@ async fn execute_list(args: ListArgs) -> Result<()> {
         println!(
             "{:<36} {:<12} {:<18} {}",
             sb.id,
-            state_name(sb.state()),
+            state_name(sb.state.as_known().unwrap_or_default()),
             sb.ip_address,
-            format_timestamp(sb.created_at.as_ref()),
+            format_timestamp(sb.created_at.as_option()),
         );
     }
     Ok(())
@@ -570,36 +573,38 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxServiceClient::new(transport.clone(), config.clone());
 
-    let req = InspectSandboxRequest { id: args.id };
-    let info = client
-        .inspect(crate::connect::request(&req)?)
+    let info: pb::SandboxInfo = client
+        .inspect(InspectSandboxRequest {
+            id: args.id,
+            ..Default::default()
+        })
         .await
         .context("Failed to inspect sandbox")?
-        .prost::<arcbox_protocol::sandbox_v1::SandboxInfo>()?;
+        .into_owned();
 
     let last_exit_status = info
         .last_exit_status
-        .as_ref()
-        .and_then(|s| s.status)
+        .as_option()
+        .and_then(|s| s.status.as_ref())
         .map(|status| match status {
             exit_status::Status::Code(code) => serde_json::json!({ "code": code }),
             exit_status::Status::Signal(signal) => serde_json::json!({ "signal": signal }),
         });
     let payload = serde_json::json!({
         "id": info.id,
-        "state": state_name(info.state()),
+        "state": state_name(info.state.as_known().unwrap_or_default()),
         "labels": info.labels,
-        "limits": info.limits.map(|l| serde_json::json!({
+        "limits": info.limits.as_option().map(|l| serde_json::json!({
             "vcpus": l.vcpus,
             "memory_mib": l.memory_mib,
         })),
-        "network": info.network.map(|n| serde_json::json!({
+        "network": info.network.as_option().map(|n| serde_json::json!({
             "ip_address": n.ip_address,
             "gateway": n.gateway,
         })),
-        "created_at": format_timestamp(info.created_at.as_ref()),
-        "ready_at": format_timestamp(info.ready_at.as_ref()),
-        "last_exited_at": format_timestamp(info.last_exited_at.as_ref()),
+        "created_at": format_timestamp(info.created_at.as_option()),
+        "ready_at": format_timestamp(info.ready_at.as_option()),
+        "last_exited_at": format_timestamp(info.last_exited_at.as_option()),
         "last_exit_status": last_exit_status,
         "error": info.error,
     });
@@ -618,7 +623,7 @@ async fn execute_run(args: RunArgs) -> Result<()> {
         sandbox_id: args.id,
         cmd: args.cmd,
         tty: args.tty,
-        tty_size: current_tty_size(args.tty),
+        tty_size: current_tty_size(args.tty).into(),
         timeout_seconds: args.timeout,
         stdin: false,
         ..Default::default()
@@ -638,7 +643,7 @@ async fn execute_exec(args: ExecArgs) -> Result<()> {
         sandbox_id: args.id,
         cmd: args.cmd,
         tty: args.tty,
-        tty_size: current_tty_size(args.tty),
+        tty_size: current_tty_size(args.tty).into(),
         timeout_seconds: args.timeout,
         stdin: true,
         ..Default::default()
@@ -659,6 +664,7 @@ pub(super) fn current_tty_size(tty: bool) -> Option<ProtoTerminalSize> {
     TerminalSize::current().ok().map(|s| ProtoTerminalSize {
         width: u32::from(s.cols),
         height: u32::from(s.rows),
+        ..Default::default()
     })
 }
 
@@ -691,9 +697,7 @@ pub(super) async fn exec_session(
     let execution_id = start.execution_id.clone();
 
     client
-        .start_execution(crate::connect::request::<pb::StartExecutionRequest, _>(
-            &start,
-        )?)
+        .start_execution(start)
         .await
         .context("Failed to start execution in sandbox")?;
 
@@ -716,18 +720,13 @@ pub(super) async fn exec_session(
                         let req = ResizeExecutionTtyRequest {
                             sandbox_id: sandbox_id.clone(),
                             execution_id: execution_id.clone(),
-                            size: Some(ProtoTerminalSize {
+                            size: ProtoTerminalSize {
                                 width: u32::from(size.cols),
                                 height: u32::from(size.rows),
-                            }),
-                        };
-                        // A conversion failure here can only mean the two
-                        // generated representations disagree, which is a
-                        // build fault; either way this pump is best-effort.
-                        let Ok(req) =
-                            crate::connect::request::<pb::ResizeExecutionTtyRequest, _>(&req)
-                        else {
-                            break;
+                                ..Default::default()
+                            }
+                            .into(),
+                            ..Default::default()
                         };
                         if resize_client.resize_execution_tty(req).await.is_err() {
                             break;
@@ -762,12 +761,9 @@ pub(super) async fn exec_session(
                                 offset,
                                 data: Vec::new(),
                                 eof: true,
+                                ..Default::default()
                             };
-                            if let Ok(req) =
-                                crate::connect::request::<pb::WriteStdinRequest, _>(&req)
-                            {
-                                let _ = stdin_client.write_stdin(req).await;
-                            }
+                            let _ = stdin_client.write_stdin(req).await;
                         }
                         break;
                     }
@@ -783,19 +779,11 @@ pub(super) async fn exec_session(
                                 offset,
                                 data: buf[..n].to_vec(),
                                 eof: false,
-                            };
-                            let Ok(req) = crate::connect::request::<pb::WriteStdinRequest, _>(&req)
-                            else {
-                                break 'pump;
+                                ..Default::default()
                             };
                             match stdin_client.write_stdin(req).await {
                                 Ok(resp) => {
-                                    let Ok(status) =
-                                        resp.prost::<arcbox_protocol::sandbox_v1::StdinStatus>()
-                                    else {
-                                        break 'pump;
-                                    };
-                                    offset = status.bytes_written;
+                                    offset = resp.into_owned().bytes_written;
                                     break;
                                 }
                                 Err(_) if failures < ATTACH_RESUME_ATTEMPTS => {
@@ -834,11 +822,9 @@ pub(super) async fn exec_session(
             execution_id: execution_id.clone(),
             stdout_offset,
             stderr_offset,
+            ..Default::default()
         };
-        let mut stream = match client
-            .attach_execution(crate::connect::request(&attach)?)
-            .await
-        {
+        let mut stream = match client.attach_execution(attach).await {
             Ok(response) => response,
             Err(status) => {
                 attempt += 1;
@@ -858,7 +844,7 @@ pub(super) async fn exec_session(
 
         loop {
             let event = match stream.message::<pb::ExecutionEvent>().await {
-                Ok(Some(item)) => item.prost::<arcbox_protocol::sandbox_v1::ExecutionEvent>()?,
+                Ok(Some(item)) => item.to_owned_message(),
                 // Clean end without an exit event: fall through to the
                 // authoritative wait below.
                 Ok(None) => break 'resume,
@@ -883,7 +869,7 @@ pub(super) async fn exec_session(
                     // offset than requested when retention dropped bytes.
                     let end = output.offset + output.data.len() as u64;
                     let (target, sink): (&mut u64, &mut dyn Write) =
-                        if output.channel() == StdioChannel::Stderr {
+                        if output.channel == StdioChannel::Stderr {
                             (&mut stderr_offset, &mut std::io::stderr())
                         } else {
                             (&mut stdout_offset, &mut std::io::stdout())
@@ -898,7 +884,7 @@ pub(super) async fn exec_session(
                     }
                 }
                 Some(execution_event::Event::Exited(exited)) => {
-                    result = exited.execution;
+                    result = exited.execution.into_option();
                     break 'resume;
                 }
                 // The Started preamble and idle keepalives carry no output.
@@ -920,16 +906,15 @@ pub(super) async fn exec_session(
         // recover it. The execution itself is unaffected, so block on its
         // real outcome rather than reporting a synthetic failure.
         None => client
-            .wait_execution(crate::connect::request::<pb::WaitExecutionRequest, _>(
-                &WaitExecutionRequest {
-                    sandbox_id,
-                    execution_id,
-                    timeout_seconds: EXEC_WAIT_TIMEOUT_SECS,
-                },
-            )?)
+            .wait_execution(WaitExecutionRequest {
+                sandbox_id,
+                execution_id,
+                timeout_seconds: EXEC_WAIT_TIMEOUT_SECS,
+                ..Default::default()
+            })
             .await
             .context("attach stream closed without an exit event")?
-            .prost::<arcbox_protocol::sandbox_v1::Execution>()?,
+            .into_owned(),
     };
     Ok(exit_code_of(&execution))
 }
@@ -942,13 +927,12 @@ async fn execute_events(args: EventsArgs) -> Result<()> {
         Some(value) => parse_event_kind(value)?,
         None => SandboxEventKind::Unspecified,
     };
-    let req = SandboxEventsRequest {
-        sandbox_id: args.id.unwrap_or_default(),
-        kind: kind.into(),
-    };
-
     let mut stream = client
-        .events(crate::connect::request(&req)?)
+        .events(SandboxEventsRequest {
+            sandbox_id: args.id.unwrap_or_default(),
+            kind: kind.into(),
+            ..Default::default()
+        })
         .await
         .context("Failed to subscribe to sandbox events")?;
 
@@ -957,17 +941,16 @@ async fn execute_events(args: EventsArgs) -> Result<()> {
         .message::<pb::WatchEventsResponse>()
         .await
         .context("Failed to read sandbox event")?
-        .map(|item| item.prost::<arcbox_protocol::sandbox_v1::WatchEventsResponse>())
-        .transpose()?
+        .map(|item| item.to_owned_message())
     {
         let Some(watch_events_response::Payload::Event(event)) = frame.payload else {
             continue; // keepalive
         };
         println!(
             "[{}] sandbox={} kind={}",
-            format_timestamp(event.time.as_ref()),
+            format_timestamp(event.time.as_option()),
             event.sandbox_id,
-            event_kind_name(event.kind()),
+            event_kind_name(event.kind.as_known().unwrap_or_default()),
         );
         if !event.attributes.is_empty() {
             for (k, v) in &event.attributes {
@@ -982,22 +965,21 @@ async fn execute_checkpoint(args: CheckpointArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxSnapshotServiceClient::new(transport.clone(), config.clone());
 
-    let req = CheckpointRequest {
-        sandbox_id: args.id,
-        name: args.name,
-        labels: HashMap::new(),
-    };
-    let resp = client
-        .checkpoint(crate::connect::request(&req)?)
+    let resp: pb::CheckpointResponse = client
+        .checkpoint(CheckpointRequest {
+            sandbox_id: args.id,
+            name: args.name,
+            ..Default::default()
+        })
         .await
         .context("Failed to checkpoint sandbox")?
-        .prost::<arcbox_protocol::sandbox_v1::CheckpointResponse>()?;
+        .into_owned();
 
     println!("Snapshot created");
     println!("  Snapshot ID: {}", resp.snapshot_id);
     println!(
         "  Created at:  {}",
-        format_timestamp(resp.created_at.as_ref())
+        format_timestamp(resp.created_at.as_option())
     );
     Ok(())
 }
@@ -1006,17 +988,16 @@ async fn execute_restore(args: RestoreArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxSnapshotServiceClient::new(transport.clone(), config.clone());
 
-    let req = RestoreRequest {
-        id: args.sandbox_id.unwrap_or_default(),
-        snapshot_id: args.snapshot_id,
-        ttl_seconds: args.ttl,
-        ..Default::default()
-    };
-    let resp = client
-        .restore(crate::connect::request(&req)?)
+    let resp: pb::RestoreResponse = client
+        .restore(RestoreRequest {
+            id: args.sandbox_id.unwrap_or_default(),
+            snapshot_id: args.snapshot_id,
+            ttl_seconds: args.ttl,
+            ..Default::default()
+        })
         .await
         .context("Failed to restore sandbox")?
-        .prost::<arcbox_protocol::sandbox_v1::RestoreResponse>()?;
+        .into_owned();
 
     println!("Sandbox restored");
     println!("  ID: {}", resp.id);
@@ -1032,17 +1013,15 @@ async fn execute_list_snapshots(args: ListSnapshotsArgs) -> Result<()> {
     let mut snapshots = Vec::new();
     let mut page_token = String::new();
     loop {
-        let req = ListSnapshotsRequest {
-            sandbox_id: args.sandbox_id.clone().unwrap_or_default(),
-            labels: HashMap::new(),
-            page_size: 0,
-            page_token: page_token.clone(),
-        };
-        let mut resp = client
-            .list_snapshots(crate::connect::request(&req)?)
+        let mut resp: pb::ListSnapshotsResponse = client
+            .list_snapshots(ListSnapshotsRequest {
+                sandbox_id: args.sandbox_id.clone().unwrap_or_default(),
+                page_token: page_token.clone(),
+                ..Default::default()
+            })
             .await
             .context("Failed to list snapshots")?
-            .prost::<arcbox_protocol::sandbox_v1::ListSnapshotsResponse>()?;
+            .into_owned();
         snapshots.append(&mut resp.snapshots);
         if resp.next_page_token.is_empty() {
             break;
@@ -1065,7 +1044,7 @@ async fn execute_list_snapshots(args: ListSnapshotsArgs) -> Result<()> {
             snap.id,
             snap.sandbox_id,
             snap.name,
-            format_timestamp(snap.created_at.as_ref()),
+            format_timestamp(snap.created_at.as_option()),
         );
     }
     Ok(())
@@ -1075,11 +1054,11 @@ async fn execute_delete_snapshot(args: DeleteSnapshotArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxSnapshotServiceClient::new(transport.clone(), config.clone());
 
-    let req = DeleteSnapshotRequest {
-        snapshot_id: args.snapshot_id.clone(),
-    };
     client
-        .delete_snapshot(crate::connect::request(&req)?)
+        .delete_snapshot(DeleteSnapshotRequest {
+            snapshot_id: args.snapshot_id.clone(),
+            ..Default::default()
+        })
         .await
         .context("Failed to delete snapshot")?;
 
@@ -1131,29 +1110,37 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
             // requests is enough — no channel or spawned task.
             const CHUNK: usize = 1024 * 1024;
             let open = WriteFileRequest {
-                payload: Some(write_file_request::Payload::Open(WriteFileOpen {
+                payload: WriteFileOpen {
                     id,
                     path,
                     mode,
-                })),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
             };
             let chunks = data.chunks(CHUNK).map(|part| WriteFileRequest {
-                payload: Some(write_file_request::Payload::Chunk(FileChunk {
+                payload: FileChunk {
                     data: part.to_vec(),
                     done: false,
-                })),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
             });
             let done = WriteFileRequest {
-                payload: Some(write_file_request::Payload::Chunk(FileChunk {
+                payload: FileChunk {
                     data: Vec::new(),
                     done: true,
-                })),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
             };
-            let requests = std::iter::once(open)
+            let requests: Vec<_> = std::iter::once(open)
                 .chain(chunks)
                 .chain(std::iter::once(done))
-                .map(|msg| crate::connect::request::<pb::WriteFileRequest, _>(&msg))
-                .collect::<Result<Vec<_>>>()?;
+                .collect();
             client
                 .write_file(connectrpc::client::stream_iter(requests))
                 .await
@@ -1162,9 +1149,11 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
         }
         (CpEndpoint::Sandbox { id, path }, CpEndpoint::Local(dst)) => {
             let mut stream = client
-                .read_file(crate::connect::request::<pb::ReadFileRequest, _>(
-                    &ReadFileRequest { id, path },
-                )?)
+                .read_file(ReadFileRequest {
+                    id,
+                    path,
+                    ..Default::default()
+                })
                 .await
                 .context("Failed to read file from sandbox")?;
 
@@ -1176,8 +1165,7 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
                 .message::<pb::FileChunk>()
                 .await
                 .context("Failed to read file stream")?
-                .map(|item| item.prost::<arcbox_protocol::sandbox_v1::FileChunk>())
-                .transpose()?
+                .map(|item| item.to_owned_message())
             {
                 if !chunk.data.is_empty() {
                     tokio::io::AsyncWriteExt::write_all(&mut out, &chunk.data)
@@ -1206,17 +1194,17 @@ async fn execute_expose(args: ExposeArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxServiceClient::new(transport.clone(), config.clone());
     let protocol = parse_protocol(&args.protocol)?;
-    let request = crate::connect::request::<pb::ExposePortRequest, _>(&ExposePortRequest {
-        id: args.id.clone(),
-        sandbox_port: u32::from(args.port),
-        host_port: u32::from(args.host_port),
-        protocol: protocol.into(),
-    })?;
-    let resp = client
-        .expose_port(request)
+    let resp: pb::ExposePortResponse = client
+        .expose_port(ExposePortRequest {
+            id: args.id.clone(),
+            sandbox_port: u32::from(args.port),
+            host_port: u32::from(args.host_port),
+            protocol: protocol.into(),
+            ..Default::default()
+        })
         .await
         .context("Failed to expose sandbox port")?
-        .prost::<arcbox_protocol::sandbox_v1::ExposePortResponse>()?;
+        .into_owned();
     println!(
         "{}:{}/{} exposed on localhost:{}",
         args.id, args.port, args.protocol, resp.host_port
@@ -1228,13 +1216,13 @@ async fn execute_unexpose(args: UnexposeArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxServiceClient::new(transport.clone(), config.clone());
     let protocol = parse_protocol(&args.protocol)?;
-    let request = crate::connect::request::<pb::UnexposePortRequest, _>(&UnexposePortRequest {
-        id: args.id.clone(),
-        sandbox_port: u32::from(args.port),
-        protocol: protocol.into(),
-    })?;
     client
-        .unexpose_port(request)
+        .unexpose_port(UnexposePortRequest {
+            id: args.id.clone(),
+            sandbox_port: u32::from(args.port),
+            protocol: protocol.into(),
+            ..Default::default()
+        })
         .await
         .context("Failed to unexpose sandbox port")?;
     println!("{}:{}/{} unexposed", args.id, args.port, args.protocol);
