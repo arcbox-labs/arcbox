@@ -8,9 +8,9 @@
 //! * buffa (`arcbox_connect::v1`) for RPCs whose types stay inside
 //!   `arcbox-core` — the target state.
 //! * prost (`arcbox_protocol`) for the surface whose types still cross into
-//!   `arcbox-api` handlers as prost values (machine exec, kubernetes,
-//!   machine stats). Phase B3 moves those handlers and retires
-//!   the prost half — see [`AgentClient::unary_rpc_prost`].
+//!   `arcbox-api` handlers as prost values (kubernetes). Phase B3 moves
+//!   those handlers and retires the prost half — see
+//!   [`AgentClient::unary_rpc_prost`].
 
 mod transport;
 mod wire;
@@ -29,9 +29,10 @@ use arcbox_connect::sandbox_v1::{
 use arcbox_connect::v1::{
     AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
     ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse, EnsureNfsExportRequest,
-    EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse, MemoryPressureEvent,
-    MmapReadFileRequest, MmapReadFileResponse, ReadinessEvent, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
+    EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse, MachineExecOutput,
+    MachineExecRequest, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
+    MmapReadFileResponse, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
+    RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo, TerminalSize,
     WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 use arcbox_connect::v1::{
@@ -43,7 +44,7 @@ use arcbox_protocol::agent::{
     KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
     KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
     KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, MachineStats,
+    KubernetesStopResponse,
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
@@ -334,11 +335,11 @@ impl AgentClient {
 
     /// [`Self::unary_rpc`] for responses still decoded as prost types.
     ///
-    /// The kubernetes, machine-exec, and machine-stats surfaces
-    /// keep their prost signatures because `arcbox-api` handlers pass and
-    /// forward those exact types (`wire_request`/`wire_response` bound on
-    /// `prost::Message`). Both codegens decode the same bytes, so this is
-    /// only a type-level split; CORE-73 Phase B3 removes it.
+    /// The kubernetes surface keeps its prost signatures because
+    /// `arcbox-api` handlers pass and forward those exact types
+    /// (`wire_request`/`wire_response` bound on `prost::Message`). Both
+    /// codegens decode the same bytes, so this is only a type-level split;
+    /// CORE-73 Phase B3 removes it.
     async fn unary_rpc_prost<T: ProstMessage + Default>(
         &mut self,
         request_type: MessageType,
@@ -792,9 +793,6 @@ impl AgentClient {
         }
     }
 
-    /// Decodes a stats frame as the prost [`MachineStats`]: the sample flows
-    /// through `StatsHub` into `Runtime::subscribe_machine_stats*`, whose
-    /// receivers `arcbox-api` forwards as prost values (B3 worklist).
     fn decode_machine_stats(raw: &[u8]) -> Result<MachineStats> {
         let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
         if resp_type == MessageType::Error as u32 {
@@ -806,7 +804,7 @@ impl AgentClient {
                 "unexpected stats response type: 0x{resp_type:04x}"
             )));
         }
-        MachineStats::decode(&resp_payload[..])
+        MachineStats::decode_from_slice(&resp_payload)
             .map_err(|e| CoreError::Machine(format!("failed to decode machine stats: {e}")))
     }
 
@@ -1329,8 +1327,8 @@ impl AgentClient {
     /// Returns an error if the initial send fails.
     pub async fn machine_exec(
         mut self,
-        req: arcbox_protocol::v1::MachineExecRequest,
-    ) -> Result<mpsc::Receiver<Result<arcbox_protocol::v1::MachineExecOutput>>> {
+        req: MachineExecRequest,
+    ) -> Result<mpsc::Receiver<Result<MachineExecOutput>>> {
         if !self.connected {
             self.connect().await?;
         }
@@ -1380,7 +1378,7 @@ impl AgentClient {
                     break;
                 }
 
-                match arcbox_protocol::v1::MachineExecOutput::decode(&resp_payload[..]) {
+                match MachineExecOutput::decode_from_slice(&resp_payload) {
                     Ok(output) => {
                         let done = output.done;
                         // Stop reading if the consumer dropped, so a spewing
@@ -1407,7 +1405,7 @@ impl AgentClient {
     /// Consumes the client because the stream task requires exclusive
     /// transport access. The caller supplies a receiver of
     /// [`ExecSessionInput`]s (stdin bytes, TTY resizes, or EOF) and gets an
-    /// output receiver of [`arcbox_protocol::v1::MachineExecOutput`] frames
+    /// output receiver of [`MachineExecOutput`] frames
     /// (stdout/stderr merged by the PTY; final frame carries the exit code).
     ///
     /// # Errors
@@ -1415,9 +1413,9 @@ impl AgentClient {
     /// Returns an error if the initial send fails.
     pub async fn machine_exec_session(
         mut self,
-        req: arcbox_protocol::v1::MachineExecRequest,
+        req: MachineExecRequest,
         mut input_rx: mpsc::Receiver<ExecSessionInput>,
-    ) -> Result<mpsc::Receiver<Result<arcbox_protocol::v1::MachineExecOutput>>> {
+    ) -> Result<mpsc::Receiver<Result<MachineExecOutput>>> {
         if !self.connected {
             self.connect().await?;
         }
@@ -1448,9 +1446,10 @@ impl AgentClient {
                         }
                     }
                     Some(ExecSessionInput::Resize { width, height }) => {
-                        let size = arcbox_protocol::v1::TerminalSize {
+                        let size = TerminalSize {
                             width: u32::from(width),
                             height: u32::from(height),
+                            ..Default::default()
                         };
                         let frame = wire::build_message(
                             MessageType::MachineExecResize,
@@ -1510,7 +1509,7 @@ impl AgentClient {
                     break;
                 }
 
-                match arcbox_protocol::v1::MachineExecOutput::decode(&resp_payload[..]) {
+                match MachineExecOutput::decode_from_slice(&resp_payload) {
                     Ok(output) => {
                         let done = output.done;
                         if out_tx.send(Ok(output)).await.is_err() || done {

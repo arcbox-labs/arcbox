@@ -14,11 +14,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arcbox_connect::v1::WatchStatsRequest;
-// `MachineStats` stays on the prost side of the CORE-73 split: samples flow
-// through `Runtime::subscribe_machine_stats*`, whose receivers `arcbox-api`
-// forwards as prost values (Phase B3 worklist).
-use arcbox_protocol::agent::MachineStats;
+use arcbox_connect::v1::{MachineStats, WatchStatsRequest};
 use tokio::sync::broadcast;
 
 use crate::error::Result;
