@@ -370,12 +370,13 @@ mod tests {
     /// rewrites the identifier with a kernel-internal socket id, so a reply
     /// arriving with `ECHO_ID` intact is the whole point.
     ///
-    /// Ignored because it needs an ICMP datagram socket. That is unprivileged
-    /// on macOS but commonly unavailable in container-based CI, where the
-    /// proxy disables itself on `PermissionDenied` and this would time out —
-    /// a sandbox artifact, not a defect worth failing a build over.
+    /// Needs an ICMP datagram socket, which is unprivileged on macOS — and
+    /// the only CI job that runs tests is `runs-on: macos-26`, a full VM, so
+    /// this runs there like any other test. If that job ever moves somewhere
+    /// the socket is denied, `IcmpProxy` self-disables and never replies,
+    /// which surfaces here as the 10 s timeout below; re-gate it then, with
+    /// a reason that matches the CI of the day.
     #[tokio::test]
-    #[ignore = "needs an unprivileged ICMP datagram socket; run locally or on the e2e runner"]
     async fn echo_request_round_trips_with_the_guest_identifier() {
         let (tx, mut rx) = mpsc::channel(8);
         let proxy = IcmpProxy::new(tx, GW_MAC);
