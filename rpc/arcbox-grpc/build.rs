@@ -38,7 +38,8 @@ fn main() {
         // Map sandbox.v1 package to arcbox_protocol::sandbox_v1 types
         .extern_path(".arcbox.sandbox.v1", "::arcbox_protocol::sandbox_v1")
         // Well-known types map to pbjson-types, matching arcbox-protocol's
-        // prost build (serde-capable Timestamp/Empty); see its build.rs.
+        // prost build — the two extern_path calls must stay in lockstep so
+        // Timestamp/Empty are the same Rust types across both codegens.
         .compile_well_known_types(true)
         .extern_path(".google.protobuf", "::pbjson_types")
         // Generate client code
