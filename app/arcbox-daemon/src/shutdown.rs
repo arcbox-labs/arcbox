@@ -36,7 +36,7 @@ pub async fn run(ctx: DaemonContext, mut handles: ServiceHandles) -> Result<()> 
 
     // Keep the NFS proxy and guest alive until macOS has detached the mount.
     // Cutting either connection first triggers its interrupted-server alert.
-    crate::nfs_mount::cleanup(&ctx);
+    crate::nfs_mount::cleanup(&ctx).await;
     ctx.shutdown.cancel();
 
     drain(&mut handles).await;
@@ -128,7 +128,7 @@ async fn cleanup(ctx: &DaemonContext) {
     }
 
     // Retry if shutdown raced a mount that was still being established.
-    crate::nfs_mount::cleanup(ctx);
+    crate::nfs_mount::cleanup(ctx).await;
 
     remove_sockets(ctx);
 }
