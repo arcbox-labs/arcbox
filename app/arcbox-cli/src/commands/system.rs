@@ -3,10 +3,10 @@
 use anyhow::{Context, Result};
 use arcbox_connect::v1 as pb;
 use arcbox_connect::v1::SystemServiceClient;
-use arcbox_protocol::v1::{SetSystemVmBackendRequest, SystemVmBackend};
+use arcbox_connect::v1::SystemVmBackend;
 use clap::{Subcommand, ValueEnum};
 
-use crate::connect::{self, UnaryExt as _};
+use crate::connect;
 
 #[derive(Debug, Subcommand)]
 pub enum SystemCommands {
@@ -58,30 +58,28 @@ pub async fn execute(cmd: SystemCommands) -> Result<()> {
     match cmd {
         SystemCommands::Backend { set } => {
             let client = system_client();
-            let info = if let Some(arg) = set {
+            let info: pb::SystemVmBackendInfo = if let Some(arg) = set {
                 let backend = SystemVmBackend::from(arg);
                 println!(
                     "Switching System VM backend to {} — restarting the System VM...",
                     label(backend)
                 );
-                let req: pb::SetSystemVmBackendRequest =
-                    connect::request(&SetSystemVmBackendRequest {
-                        backend: backend as i32,
-                    })?;
                 client
-                    .set_system_vm_backend(req)
+                    .set_system_vm_backend(pb::SetSystemVmBackendRequest {
+                        backend: backend.into(),
+                        ..Default::default()
+                    })
                     .await
                     .context("failed to switch System VM backend")?
-                    .prost::<arcbox_protocol::v1::SystemVmBackendInfo>()?
+                    .into_owned()
             } else {
                 client
                     .get_system_vm_backend(pb::Empty::default())
                     .await
                     .context("failed to query System VM backend")?
-                    .prost::<arcbox_protocol::v1::SystemVmBackendInfo>()?
+                    .into_owned()
             };
-            let current =
-                SystemVmBackend::try_from(info.backend).unwrap_or(SystemVmBackend::Unspecified);
+            let current = info.backend.as_known().unwrap_or_default();
             println!("System VM backend: {}", label(current));
             Ok(())
         }

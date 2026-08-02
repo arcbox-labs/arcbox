@@ -3,7 +3,6 @@
 //! Inspect and manage the Docker data disk image.
 
 use anyhow::{Context, Result};
-use arcbox_protocol::v1::MachineAgentRequest;
 use clap::Subcommand;
 
 /// Disk management commands.
@@ -143,12 +142,10 @@ async fn execute_compact() -> Result<()> {
     println!("Compacting Docker data disk (running fstrim in the guest)...");
     let client = super::machine::machine_client();
     client
-        .compact_disk(crate::connect::request::<
-            arcbox_connect::v1::MachineAgentRequest,
-            _,
-        >(&MachineAgentRequest {
+        .compact_disk(arcbox_connect::v1::MachineAgentRequest {
             id: DEFAULT_MACHINE.to_string(),
-        })?)
+            ..Default::default()
+        })
         .await
         .context("Failed to compact data disk via the daemon")?;
 
