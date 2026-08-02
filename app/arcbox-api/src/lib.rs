@@ -17,7 +17,7 @@ pub use arcbox_grpc::v1::{
 #[cfg(target_os = "macos")]
 pub use arcbox_grpc::v1::{macos_service_client, macos_service_server};
 
-pub use arcbox_protocol::v1::setup_status::Phase as SetupPhase;
+pub use arcbox_connect::v1::setup_status::Phase as SetupPhase;
 #[cfg(target_os = "macos")]
 pub use connect::MacosServiceImpl;
 pub use connect::SharedRuntime;
