@@ -117,9 +117,9 @@ This file is only the non-obvious operational knowledge.
    method of the same name.
 
 **Add/change something under `arcbox.sandbox.v1` (the Connect surface):**
-1. Edit the `.proto`, then add a *new* file to `arcbox-connect/build.rs` as
-   well as the two arrays above — the sandbox package is compiled by three
-   build scripts, and connectrpc codegen is the one that emits the service
+1. Edit the `.proto`; a *new* file goes into all three build-script arrays
+   listed in step 2 above (`arcbox-connect`, `arcbox-protocol`,
+   `arcbox-grpc`) — connectrpc codegen is the one that emits the service
    traits the daemon implements.
 2. Implement the method in `app/arcbox-api/src/connect/` against the
    connectrpc trait, not a tonic one, working in the buffa types directly
@@ -141,7 +141,11 @@ This file is only the non-obvious operational knowledge.
 1. Define the proto *message* in `agent.proto`.
 2. Add a `MessageType` enum variant **and** its `from_u32` arm in
    `common/arcbox-constants/src/wire.rs` (and a roundtrip test case).
-3. Handle it in the guest dispatcher `guest/arcbox-agent/src/rpc.rs`.
+3. Wire the guest side in BOTH files: the frame codec arms in
+   `guest/arcbox-agent/src/rpc.rs` (`parse_request`, `message_type`,
+   `encode_payload`) and the `handle_request` dispatch in
+   `guest/arcbox-agent/src/agent/linux/rpc.rs` — `guest/AGENTS.md`'s
+   extending checklist is authoritative for this half.
 4. Add a method on `AgentClient` (`app/arcbox-core/src/agent_client.rs`) that
    buffa-encodes and frames the message via `rpc_call`.
 
