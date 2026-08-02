@@ -1,7 +1,7 @@
 //! Sandbox lifecycle event streaming.
 
-use arcbox_protocol::sandbox_v1;
-use prost::Message;
+use arcbox_connect::sandbox_v1;
+use buffa::Message;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
@@ -51,10 +51,11 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<mpsc::Receiver<Vec<u8>>, SandboxError> {
-        let req = sandbox_v1::SandboxEventsRequest::decode(payload)
+        let req = sandbox_v1::SandboxEventsRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let filter_id = req.sandbox_id.clone();
-        let filter_kind = req.kind();
+        // Unknown wire values fall back to UNSPECIFIED (no filter).
+        let filter_kind = req.kind.as_known().unwrap_or_default();
 
         let mut bcast_rx = self.manager.subscribe_events();
         let (tx, out_rx) = mpsc::channel::<Vec<u8>>(EVENT_QUEUE_CAPACITY);

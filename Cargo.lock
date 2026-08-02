@@ -193,14 +193,16 @@ name = "arcbox-agent"
 version = "0.5.5"
 dependencies = [
  "anyhow",
+ "arcbox-connect",
  "arcbox-constants",
  "arcbox-dns",
  "arcbox-ext4",
  "arcbox-logging",
- "arcbox-protocol",
  "arcbox-pty",
  "arcbox-vm",
  "async-trait",
+ "buffa",
+ "buffa-types",
  "bytes",
  "chrono",
  "flate2",

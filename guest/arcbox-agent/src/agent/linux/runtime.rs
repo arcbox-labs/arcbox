@@ -14,14 +14,14 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use arcbox_connect::v1::{
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+};
 use arcbox_constants::paths::{
     ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_SOCKET, DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
     K3S_CNI_BIN_DIR, K3S_CNI_CONF_DIR,
 };
 use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
-use arcbox_protocol::agent::{
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-};
 
 use super::btrfs::ensure_data_mount;
 use super::cmdline::{declared_runtime_image_device, docker_api_vsock_port};
@@ -124,6 +124,7 @@ async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
         endpoint: status.endpoint,
         message,
         status: result_status,
+        ..Default::default()
     }
 }
 
@@ -139,6 +140,7 @@ async fn do_ensure_runtime_probe() -> RuntimeEnsureResponse {
         } else {
             ensure_runtime::STATUS_FAILED.to_string()
         },
+        ..Default::default()
     }
 }
 
@@ -359,7 +361,7 @@ async fn ensure_dockerd_ready(runtime_bin_dir: &Path, notes: &mut Vec<String>) {
 }
 
 async fn collect_runtime_status() -> RuntimeStatusResponse {
-    use arcbox_protocol::agent::ServiceStatus;
+    use arcbox_connect::v1::ServiceStatus;
 
     let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
     // Two-level check: socket connectable (fast) + HTTP API probe (strong).
@@ -399,6 +401,7 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
                     .find(|p| Path::new(p).exists())
                     .unwrap_or(&CONTAINERD_SOCKET_CANDIDATES[0])
             ),
+            ..Default::default()
         }
     } else {
         let socket_paths = CONTAINERD_SOCKET_CANDIDATES
@@ -410,6 +413,7 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
             name: "containerd".to_string(),
             status: SERVICE_NOT_READY.to_string(),
             detail: format!("no reachable socket found; checked: {}", socket_paths),
+            ..Default::default()
         }
     });
 
@@ -423,6 +427,7 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
         endpoint: format!("vsock:{}", docker_api_vsock_port()),
         detail,
         services,
+        ..Default::default()
     }
 }
 
@@ -442,7 +447,7 @@ impl DockerProbe {
         self.api_ok
     }
 
-    fn service_status(&self) -> arcbox_protocol::agent::ServiceStatus {
+    fn service_status(&self) -> arcbox_connect::v1::ServiceStatus {
         let status = if self.ready() {
             SERVICE_READY
         } else if self.socket_ok {
@@ -471,10 +476,11 @@ impl DockerProbe {
             format!("socket missing: {}", DOCKER_API_UNIX_SOCKET)
         };
 
-        arcbox_protocol::agent::ServiceStatus {
+        arcbox_connect::v1::ServiceStatus {
             name: "dockerd".to_string(),
             status: status.to_string(),
             detail,
+            ..Default::default()
         }
     }
 

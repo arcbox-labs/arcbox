@@ -9,10 +9,10 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use prost::Message as _;
+use buffa::Message as _;
 use tokio::io::AsyncWrite;
 
-use arcbox_protocol::agent::{ContainerStats, MachineStats, WatchStatsRequest};
+use arcbox_connect::v1::{ContainerStats, MachineStats, WatchStatsRequest};
 
 use crate::rpc::{MessageType, write_message};
 use crate::stats::{
@@ -133,6 +133,7 @@ fn read_machine_stats() -> Option<MachineStats> {
         net_rx_bytes,
         net_tx_bytes,
         containers: read_container_stats(),
+        ..Default::default()
     })
 }
 
@@ -168,6 +169,7 @@ fn read_container_stats() -> Vec<ContainerStats> {
             pids: parse_u64_file(&read("pids.current")).unwrap_or(0) as u32,
             net_rx_bytes,
             net_tx_bytes,
+            ..Default::default()
         });
     }
     containers

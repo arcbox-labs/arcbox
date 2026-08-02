@@ -9,11 +9,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use prost::Message as _;
+use buffa::Message as _;
 use tokio::io::AsyncWrite;
 
-use arcbox_protocol::agent::memory_pressure_event::Reason;
-use arcbox_protocol::agent::{MemoryPressureEvent, WatchMemoryPressureRequest};
+use arcbox_connect::v1::memory_pressure_event::Reason;
+use arcbox_connect::v1::{MemoryPressureEvent, WatchMemoryPressureRequest};
 
 use crate::memory_pressure::{
     PSI_WINDOW_US, PressureDetector, PressureSignal, PressureThresholds, parse_mem_available,
@@ -342,9 +342,10 @@ where
     S: AsyncWrite + Unpin,
 {
     let event = MemoryPressureEvent {
-        reason: reason as i32,
+        reason: reason.into(),
         available_bytes,
         refault_rate,
+        ..Default::default()
     };
     write_message(
         stream,

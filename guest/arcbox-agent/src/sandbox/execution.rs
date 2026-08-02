@@ -6,9 +6,9 @@
 
 use std::time::Duration;
 
-use arcbox_protocol::sandbox_v1::{self, execution_event};
+use arcbox_connect::sandbox_v1;
 use arcbox_vm::ExecutionSpec;
-use prost::Message;
+use buffa::Message;
 use tokio::io::AsyncWrite;
 
 use super::{SandboxService, convert};
@@ -21,7 +21,7 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::Execution, SandboxError> {
-        let req = sandbox_v1::StartExecutionRequest::decode(payload)
+        let req = sandbox_v1::StartExecutionRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let tty_size = req
             .tty_size
@@ -39,7 +39,7 @@ impl SandboxService {
         let spec = ExecutionSpec {
             id: (!req.execution_id.is_empty()).then(|| req.execution_id.clone()),
             cmd: req.cmd,
-            env: req.env,
+            env: req.env.into_iter().collect(),
             working_dir: req.working_dir,
             user: req.user,
             tty: req.tty,
@@ -67,7 +67,7 @@ impl SandboxService {
     where
         S: AsyncWrite + Unpin,
     {
-        let req = match sandbox_v1::AttachExecutionRequest::decode(payload) {
+        let req = match sandbox_v1::AttachExecutionRequest::decode_from_slice(payload) {
             Ok(r) => r,
             Err(e) => {
                 let err = ErrorResponse::new(400, format!("decode error: {e}"));
@@ -93,11 +93,12 @@ impl SandboxService {
         let tty = snapshot.tty;
 
         let started = sandbox_v1::ExecutionEvent {
-            event: Some(execution_event::Event::Started(
-                sandbox_v1::ExecutionStarted {
-                    execution: Some(convert::execution_to_proto(&snapshot)),
-                },
-            )),
+            event: sandbox_v1::ExecutionStarted {
+                execution: convert::execution_to_proto(&snapshot).into(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
         };
         write_message(
             stream,
@@ -109,13 +110,14 @@ impl SandboxService {
 
         while let Some(chunk) = rx.recv().await {
             let event = sandbox_v1::ExecutionEvent {
-                event: Some(execution_event::Event::Output(
-                    sandbox_v1::ExecutionOutput {
-                        channel: convert::channel_to_proto(chunk.channel, tty).into(),
-                        offset: chunk.offset,
-                        data: chunk.data,
-                    },
-                )),
+                event: sandbox_v1::ExecutionOutput {
+                    channel: convert::channel_to_proto(chunk.channel, tty).into(),
+                    offset: chunk.offset,
+                    data: chunk.data,
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
             };
             write_message(
                 stream,
@@ -144,11 +146,12 @@ impl SandboxService {
             }
         };
         let exited = sandbox_v1::ExecutionEvent {
-            event: Some(execution_event::Event::Exited(
-                sandbox_v1::ExecutionExited {
-                    execution: Some(execution),
-                },
-            )),
+            event: sandbox_v1::ExecutionExited {
+                execution: execution.into(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
         };
         write_message(
             stream,
@@ -165,7 +168,7 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::StdinStatus, SandboxError> {
-        let req = sandbox_v1::WriteStdinRequest::decode(payload)
+        let req = sandbox_v1::WriteStdinRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let state = self
             .manager
@@ -183,7 +186,7 @@ impl SandboxService {
 
     /// Current stdin acceptance state.
     pub fn stdin_status(&self, payload: &[u8]) -> Result<sandbox_v1::StdinStatus, SandboxError> {
-        let req = sandbox_v1::GetStdinStatusRequest::decode(payload)
+        let req = sandbox_v1::GetStdinStatusRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let state = self
             .manager
@@ -194,19 +197,19 @@ impl SandboxService {
 
     /// Deliver a POSIX signal to a running execution.
     pub async fn signal_execution(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::SignalExecutionRequest::decode(payload)
+        let req = sandbox_v1::SignalExecutionRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         // Signal enum values ARE the POSIX numbers; the manager validates
         // the range, so an UNSPECIFIED (0) request is rejected there.
         self.manager
-            .signal_execution(&req.sandbox_id, &req.execution_id, req.signal)
+            .signal_execution(&req.sandbox_id, &req.execution_id, req.signal.to_i32())
             .await
             .map_err(SandboxError::from)
     }
 
     /// Resize a TTY execution's terminal.
     pub async fn resize_execution(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::ResizeExecutionTtyRequest::decode(payload)
+        let req = sandbox_v1::ResizeExecutionTtyRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let size = req
             .size
@@ -227,7 +230,7 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::Execution, SandboxError> {
-        let req = sandbox_v1::WaitExecutionRequest::decode(payload)
+        let req = sandbox_v1::WaitExecutionRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let snapshot = self
             .manager

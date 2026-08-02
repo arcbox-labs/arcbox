@@ -10,8 +10,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arcbox_protocol::agent::PingResponse;
-use prost::Message as _;
+use arcbox_connect::v1::AgentPingResponse as PingResponse;
+use buffa::Message as _;
 
 use crate::rpc::{
     AGENT_VERSION, ErrorResponse, RpcRequest, RpcResponse, parse_request, read_message,
@@ -159,23 +159,22 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
 
 async fn handle_watch_readiness<S>(
     stream: &mut S,
-    req: arcbox_protocol::agent::WatchReadinessRequest,
+    req: arcbox_connect::v1::WatchReadinessRequest,
     trace_id: &str,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    use arcbox_protocol::agent::readiness_event::Kind;
-    use arcbox_protocol::agent::{ReadinessEvent, RuntimeEnsureRequest};
+    use arcbox_connect::v1::readiness_event::Kind;
+    use arcbox_connect::v1::{ReadinessEvent, RuntimeEnsureRequest};
 
     write_readiness_event(
         stream,
         trace_id,
         ReadinessEvent {
-            kind: Kind::AgentReady as i32,
-            endpoint: String::new(),
+            kind: Kind::AgentReady.into(),
             detail: "agent ready".to_string(),
-            services: Vec::new(),
+            ..Default::default()
         },
     )
     .await?;
@@ -188,10 +187,9 @@ where
         stream,
         trace_id,
         ReadinessEvent {
-            kind: Kind::RuntimeStarting as i32,
-            endpoint: String::new(),
+            kind: Kind::RuntimeStarting.into(),
             detail: "ensuring guest runtime".to_string(),
-            services: Vec::new(),
+            ..Default::default()
         },
     )
     .await?;
@@ -202,6 +200,7 @@ where
     loop {
         let response = match super::runtime::handle_ensure_runtime(RuntimeEnsureRequest {
             start_if_needed: true,
+            ..Default::default()
         })
         .await
         {
@@ -213,7 +212,7 @@ where
         let response_message = response.message;
 
         let status = match super::runtime::handle_runtime_status(
-            arcbox_protocol::agent::RuntimeStatusRequest {},
+            arcbox_connect::v1::RuntimeStatusRequest::default(),
         )
         .await
         {
@@ -231,7 +230,7 @@ where
                 stream,
                 trace_id,
                 ReadinessEvent {
-                    kind: Kind::RuntimeReady as i32,
+                    kind: Kind::RuntimeReady.into(),
                     endpoint: if response.endpoint.is_empty() {
                         status.endpoint
                     } else {
@@ -243,6 +242,7 @@ where
                         response_message
                     },
                     services: status.services,
+                    ..Default::default()
                 },
             )
             .await;
@@ -253,7 +253,7 @@ where
                 stream,
                 trace_id,
                 ReadinessEvent {
-                    kind: Kind::RuntimeFailed as i32,
+                    kind: Kind::RuntimeFailed.into(),
                     endpoint: status.endpoint,
                     detail: if response_message.is_empty() {
                         status.detail
@@ -261,6 +261,7 @@ where
                         response_message
                     },
                     services: status.services,
+                    ..Default::default()
                 },
             )
             .await;
@@ -273,7 +274,7 @@ where
 async fn write_readiness_event<S>(
     stream: &mut S,
     trace_id: &str,
-    event: arcbox_protocol::agent::ReadinessEvent,
+    event: arcbox_connect::v1::ReadinessEvent,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -293,7 +294,7 @@ where
 /// shutdown sequence in a background OS thread (not a tokio task) because
 /// [`crate::shutdown::poweroff`] calls blocking libc functions and never
 /// returns.
-fn handle_shutdown(req: arcbox_protocol::agent::ShutdownRequest) -> RpcResponse {
+fn handle_shutdown(req: arcbox_connect::v1::ShutdownRequest) -> RpcResponse {
     let grace = if req.timeout_seconds == 0 {
         Duration::from_secs(u64::from(
             arcbox_constants::timeouts::GUEST_SHUTDOWN_GRACE_SECS,
@@ -307,7 +308,10 @@ fn handle_shutdown(req: arcbox_protocol::agent::ShutdownRequest) -> RpcResponse 
         std::thread::sleep(Duration::from_millis(100));
         crate::shutdown::poweroff(grace);
     });
-    RpcResponse::Shutdown(arcbox_protocol::agent::ShutdownResponse { accepted: true })
+    RpcResponse::Shutdown(arcbox_connect::v1::ShutdownResponse {
+        accepted: true,
+        ..Default::default()
+    })
 }
 
 /// Handles a `KillAgent` request (test-only).
@@ -331,7 +335,7 @@ fn handle_kill_agent() -> RpcResponse {
 /// snapshot key in the moby namespace is the container ID). The host reads
 /// the returned guest paths through the read-only NFS export.
 async fn handle_container_fs_paths(
-    req: arcbox_protocol::agent::ContainerFsPathsRequest,
+    req: arcbox_connect::v1::ContainerFsPathsRequest,
 ) -> RpcResponse {
     let id = req.container_id.as_str();
     // Container IDs are 64 hex chars; bound and charset-check the untrusted
@@ -344,12 +348,11 @@ async fn handle_container_fs_paths(
     }
 
     match crate::containerd::container_snapshot_paths(id).await {
-        Ok(paths) => {
-            RpcResponse::ContainerFsPaths(arcbox_protocol::agent::ContainerFsPathsResponse {
-                upper_dir: paths.upper_dir.unwrap_or_default(),
-                lower_dirs: paths.lower_dirs,
-            })
-        }
+        Ok(paths) => RpcResponse::ContainerFsPaths(arcbox_connect::v1::ContainerFsPathsResponse {
+            upper_dir: paths.upper_dir.unwrap_or_default(),
+            lower_dirs: paths.lower_dirs,
+            ..Default::default()
+        }),
         Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
             libc::EIO,
             format!("container fs paths: {e}"),
@@ -362,7 +365,7 @@ async fn handle_container_fs_paths(
 /// Resolves an image's layer directories from its top layer chain ID via
 /// an ephemeral containerd View snapshot. The host reads the returned
 /// guest paths through the read-only NFS export.
-async fn handle_image_fs_paths(req: arcbox_protocol::agent::ImageFsPathsRequest) -> RpcResponse {
+async fn handle_image_fs_paths(req: arcbox_connect::v1::ImageFsPathsRequest) -> RpcResponse {
     let chain_id = req.top_chain_id.as_str();
     // Chain IDs are `sha256:` + 64 hex chars; charset-check the untrusted
     // input before handing it to containerd as a snapshot key.
@@ -377,8 +380,9 @@ async fn handle_image_fs_paths(req: arcbox_protocol::agent::ImageFsPathsRequest)
     }
 
     match crate::containerd::image_snapshot_paths(chain_id).await {
-        Ok(paths) => RpcResponse::ImageFsPaths(arcbox_protocol::agent::ImageFsPathsResponse {
+        Ok(paths) => RpcResponse::ImageFsPaths(arcbox_connect::v1::ImageFsPathsResponse {
             lower_dirs: paths.lower_dirs,
+            ..Default::default()
         }),
         Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
             libc::EIO,
@@ -395,9 +399,10 @@ async fn handle_image_fs_paths(req: arcbox_protocol::agent::ImageFsPathsRequest)
 /// no longer sets the export up itself, so this is the sole entry point.
 async fn handle_ensure_nfs_export() -> RpcResponse {
     match super::runtime::ensure_nfs_export().await {
-        Ok(notes) => {
-            RpcResponse::EnsureNfsExport(arcbox_protocol::agent::EnsureNfsExportResponse { notes })
-        }
+        Ok(notes) => RpcResponse::EnsureNfsExport(arcbox_connect::v1::EnsureNfsExportResponse {
+            notes,
+            ..Default::default()
+        }),
         Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
             libc::EIO,
             format!("ensure nfs export: {e}"),
@@ -441,16 +446,13 @@ pub(super) fn sync_clock_from_host(timestamp_secs: i64) -> bool {
 /// Page-alignment: `mmap` requires page-aligned offsets, so we round
 /// `offset` down to the nearest page and slice the returned bytes to
 /// compensate. This matches how real userspace code uses `mmap`.
-fn handle_mmap_read_file(req: arcbox_protocol::agent::MmapReadFileRequest) -> RpcResponse {
+fn handle_mmap_read_file(req: arcbox_connect::v1::MmapReadFileRequest) -> RpcResponse {
     use std::os::unix::io::AsRawFd;
 
     const PAGE_SIZE: u64 = 4096;
 
     if req.length == 0 {
-        return RpcResponse::MmapReadFile(arcbox_protocol::agent::MmapReadFileResponse {
-            data: Vec::new(),
-            bytes_read: 0,
-        });
+        return RpcResponse::MmapReadFile(arcbox_connect::v1::MmapReadFileResponse::default());
     }
     // Hard cap to keep the response message size bounded.
     if req.length > 64 * 1024 * 1024 {
@@ -512,11 +514,15 @@ fn handle_mmap_read_file(req: arcbox_protocol::agent::MmapReadFileRequest) -> Rp
     }
 
     let bytes_read = data.len() as u64;
-    RpcResponse::MmapReadFile(arcbox_protocol::agent::MmapReadFileResponse { data, bytes_read })
+    RpcResponse::MmapReadFile(arcbox_connect::v1::MmapReadFileResponse {
+        data,
+        bytes_read,
+        ..Default::default()
+    })
 }
 
 /// Handles a Ping request.
-fn handle_ping(req: arcbox_protocol::agent::PingRequest) -> RpcResponse {
+fn handle_ping(req: arcbox_connect::v1::AgentPingRequest) -> RpcResponse {
     tracing::debug!("Ping request: {:?}", req.message);
     sync_clock_from_host(req.timestamp_secs);
     RpcResponse::Ping(PingResponse {
@@ -527,5 +533,6 @@ fn handle_ping(req: arcbox_protocol::agent::PingRequest) -> RpcResponse {
         },
         version: AGENT_VERSION.to_string(),
         protocol_version: arcbox_constants::wire::AGENT_PROTOCOL_VERSION,
+        ..Default::default()
     })
 }

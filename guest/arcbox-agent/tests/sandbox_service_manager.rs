@@ -1,17 +1,16 @@
 #![cfg(target_os = "linux")]
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use arcbox_agent::sandbox::SandboxService;
-use arcbox_protocol::sandbox_v1::{
+use arcbox_connect::sandbox_v1::{
     CreateSandboxRequest, InspectSandboxRequest, ListSandboxesRequest, NetworkMode, NetworkSpec,
     RemoveSandboxRequest, SandboxState, StartExecutionRequest, StopSandboxRequest,
     WaitExecutionRequest, exit_status,
 };
 use arcbox_vm::VmmConfig;
 use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
-use prost::Message;
+use buffa::Message;
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("required env var is missing: {name}"))
@@ -59,6 +58,7 @@ async fn cleanup_sandbox(service: &SandboxService, sandbox_id: &str) {
     let payload = RemoveSandboxRequest {
         id: sandbox_id.to_string(),
         force: true,
+        ..Default::default()
     }
     .encode_to_vec();
     let _ = service.remove(&payload).await;
@@ -69,22 +69,15 @@ async fn cleanup_sandbox(service: &SandboxService, sandbox_id: &str) {
 async fn sandbox_service_calls_sandbox_manager() {
     let service = SandboxService::new(test_config()).expect("failed to initialize sandbox service");
 
+    // Empty template = the built-in busybox image.
     let create_req = CreateSandboxRequest {
-        id: String::new(),
-        labels: HashMap::from([("suite".to_string(), "svc-manager".to_string())]),
-        // Empty template = the built-in busybox image.
-        template: String::new(),
-        limits: None,
-        cmd: Vec::new(),
-        env: HashMap::new(),
-        working_dir: String::new(),
-        user: String::new(),
-        mounts: Vec::new(),
-        network: Some(NetworkSpec {
+        labels: std::iter::once(("suite".to_string(), "svc-manager".to_string())).collect(),
+        network: NetworkSpec {
             mode: NetworkMode::None.into(),
-        }),
-        ttl_seconds: 0,
-        ssh_public_key: None,
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
     };
     let create_payload = create_req.encode_to_vec();
     let created = service
@@ -98,14 +91,15 @@ async fn sandbox_service_calls_sandbox_manager() {
     loop {
         let inspect_req = InspectSandboxRequest {
             id: sandbox_id.clone(),
+            ..Default::default()
         };
         let inspect_payload = inspect_req.encode_to_vec();
         let info = service.inspect(&inspect_payload).expect("inspect failed");
 
-        if info.state() == SandboxState::Ready {
+        if info.state == SandboxState::Ready {
             break;
         }
-        if info.state() == SandboxState::Failed {
+        if info.state == SandboxState::Failed {
             cleanup_sandbox(&service, &sandbox_id).await;
             panic!("sandbox entered failed state: {}", info.error);
         }
@@ -131,13 +125,8 @@ async fn sandbox_service_calls_sandbox_manager() {
             "-lc".to_string(),
             "echo sandbox-service-manager".to_string(),
         ],
-        env: HashMap::new(),
-        working_dir: String::new(),
-        user: String::new(),
-        tty: false,
-        tty_size: None,
         timeout_seconds: 30,
-        stdin: false,
+        ..Default::default()
     }
     .encode_to_vec();
     let started = service
@@ -150,6 +139,7 @@ async fn sandbox_service_calls_sandbox_manager() {
         sandbox_id: sandbox_id.clone(),
         execution_id: started.id.clone(),
         timeout_seconds: 30,
+        ..Default::default()
     }
     .encode_to_vec();
     let finished = service
@@ -158,6 +148,7 @@ async fn sandbox_service_calls_sandbox_manager() {
         .expect("wait_execution failed");
     let status = finished
         .exit_status
+        .into_option()
         .and_then(|s| s.status)
         .expect("execution should report an exit status");
     assert_eq!(
@@ -173,6 +164,7 @@ async fn sandbox_service_calls_sandbox_manager() {
     let stop_payload = StopSandboxRequest {
         id: sandbox_id.clone(),
         timeout_seconds: 20,
+        ..Default::default()
     }
     .encode_to_vec();
     service.stop(&stop_payload).await.expect("stop failed");
@@ -180,6 +172,7 @@ async fn sandbox_service_calls_sandbox_manager() {
     let remove_payload = RemoveSandboxRequest {
         id: sandbox_id,
         force: true,
+        ..Default::default()
     }
     .encode_to_vec();
     service
