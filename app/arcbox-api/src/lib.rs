@@ -1,21 +1,11 @@
 //! # arcbox-api
 //!
-//! gRPC service implementations for `ArcBox`.
-//!
-//! This crate hosts service implementations consumed by the `arcbox-daemon`
-//! binary. It provides machine, sandbox, migration, and system gRPC services.
+//! The daemon's API service implementations, served over Connect (one set
+//! of handlers answers Connect, gRPC, and gRPC-Web): machine, sandbox,
+//! migration, kubernetes, stats, and system services.
 
 pub mod connect;
 pub mod error;
-
-// Re-export gRPC service types from arcbox-grpc for convenience.
-pub use arcbox_grpc::v1::{
-    kubernetes_service_client, kubernetes_service_server, machine_service_client,
-    machine_service_server, migration_service_client, migration_service_server,
-    stats_service_client, stats_service_server,
-};
-#[cfg(target_os = "macos")]
-pub use arcbox_grpc::v1::{macos_service_client, macos_service_server};
 
 pub use arcbox_connect::v1::setup_status::Phase as SetupPhase;
 #[cfg(target_os = "macos")]
