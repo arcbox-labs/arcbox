@@ -1,12 +1,12 @@
 //! Host-side runtime migration manager.
 
 use crate::error::{CoreError, Result};
+use arcbox_connect::v1::{
+    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+};
 use arcbox_migration::{
     DockerCliRunner, MigrationError, MigrationExecutor, MigrationExecutorOptions, MigrationPlanner,
     MigrationProgress, SourceConfig, SourceKind, resolve_source,
-};
-use arcbox_protocol::v1::{
-    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -93,6 +93,7 @@ impl MigrationManager {
             // are surfaced via `warnings`.
             replacements_required: !plan.replacements.is_empty(),
             warnings,
+            ..Default::default()
         })
     }
 
@@ -217,6 +218,7 @@ fn progress_to_event(
         total: progress.total.unwrap_or(0),
         done,
         success,
+        ..Default::default()
     }
 }
 
@@ -285,6 +287,7 @@ mod tests {
             .run_migration(RunMigrationRequest {
                 plan_id: plan_id.clone(),
                 allow_replacements: false,
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -331,6 +334,7 @@ mod tests {
             .run_migration(RunMigrationRequest {
                 plan_id: plan_id.clone(),
                 allow_replacements: true,
+                ..Default::default()
             })
             .await
             .unwrap();

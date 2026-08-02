@@ -16,13 +16,11 @@
 //! time (CORE-68): [`icon`], [`kubernetes`], [`machine`], [`migration`],
 //! [`stats`], [`system`].
 //!
-//! Request and response types are buffa-generated (`arcbox-connect`)
-//! because that is what `connectrpc` binds to, while the host↔guest vsock
-//! payloads stay prost (`arcbox-protocol`); [`bridge`] is the crossing, and
-//! its module docs explain why it is a decode rather than a conversion
-//! table.
+//! Request and response types are buffa-generated (`arcbox-connect`) — the
+//! one Rust representation of the ArcBox protos since CORE-73. The same
+//! types ride the host↔guest vsock wire, so handlers hand messages between
+//! the two surfaces without any twin-codegen re-decode.
 
-pub(crate) mod bridge;
 mod control;
 mod filesystem;
 mod icon;
