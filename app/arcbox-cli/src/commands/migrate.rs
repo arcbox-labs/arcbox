@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use arcbox_connect::v1 as pb;
 use arcbox_connect::v1::MigrationServiceClient;
-use arcbox_protocol::v1::{
+use arcbox_connect::v1::{
     PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
 use clap::{Args, Subcommand};
@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use crate::connect::{self, StreamItemExt as _, UnaryExt as _};
+use crate::connect;
 
 /// Runtime migration commands.
 #[derive(Subcommand)]
@@ -101,17 +101,16 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
     println!("Preparing migration from {}...", source_kind.display_name());
 
     let client = migration_client();
-    let prepare = client
-        .prepare_migration(connect::request::<pb::PrepareMigrationRequest, _>(
-            &PrepareMigrationRequest {
-                source_kind: source_kind.as_str().to_string(),
-                source_socket_path: source_socket.to_string_lossy().into_owned(),
-                allow_replacements: true,
-            },
-        )?)
+    let prepare: PrepareMigrationResponse = client
+        .prepare_migration(PrepareMigrationRequest {
+            source_kind: source_kind.as_str().to_string(),
+            source_socket_path: source_socket.to_string_lossy().into_owned(),
+            allow_replacements: true,
+            ..Default::default()
+        })
         .await
         .context("Failed to prepare migration")?
-        .prost::<PrepareMigrationResponse>()?;
+        .into_owned();
 
     if prepare.plan_id.is_empty() {
         bail!("Migration prepare response did not include a plan ID");
@@ -132,15 +131,14 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
     println!("Running migration...");
 
     let mut stream = client
-        .run_migration(connect::request::<pb::RunMigrationRequest, _>(
-            &RunMigrationRequest {
-                plan_id: prepare.plan_id.clone(),
-                // We only reach this point after the user has explicitly confirmed
-                // (either via interactive prompt or --yes), so allow both
-                // replacements and stopping blocker containers.
-                allow_replacements: true,
-            },
-        )?)
+        .run_migration(RunMigrationRequest {
+            plan_id: prepare.plan_id.clone(),
+            // We only reach this point after the user has explicitly confirmed
+            // (either via interactive prompt or --yes), so allow both
+            // replacements and stopping blocker containers.
+            allow_replacements: true,
+            ..Default::default()
+        })
         .await
         .context("Failed to start migration")?;
 
@@ -150,7 +148,7 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
         .await
         .context("Failed to read migration progress")?
     {
-        let event: RunMigrationEvent = item.prost()?;
+        let event: RunMigrationEvent = item.to_owned_message();
         print_progress_event(&event);
         if event.done {
             final_status = Some(event.success);
