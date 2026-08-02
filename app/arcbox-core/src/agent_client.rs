@@ -2,15 +2,11 @@
 //!
 //! Provides RPC communication with the arcbox-agent running inside guest VMs.
 //!
-//! Message types come from two codegens during the CORE-73 convergence, and
-//! they encode identical bytes, so the wire cannot tell them apart:
-//!
-//! * buffa (`arcbox_connect::v1`) for RPCs whose types stay inside
-//!   `arcbox-core` — the target state.
-//! * prost (`arcbox_protocol`) for the surface whose types still cross into
-//!   `arcbox-api` handlers as prost values (kubernetes). Phase B3 moves
-//!   those handlers and retires the prost half — see
-//!   [`AgentClient::unary_rpc_prost`].
+//! Message types are buffa-generated (`arcbox_connect`), the one Rust
+//! representation of the ArcBox protos since CORE-73. buffa encodes the
+//! same bytes prost did, so this daemon interoperates with both old
+//! (prost) and new (buffa) guest agents: same length-prefixed
+//! `MessageType` frames, same `AGENT_PROTOCOL_VERSION`, no wire change.
 
 mod transport;
 mod wire;
@@ -36,21 +32,18 @@ use arcbox_connect::v1::{
     WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 use arcbox_connect::v1::{
-    SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SandboxPortForwardResponse,
-};
-use arcbox_constants::ports::AGENT_PORT;
-use arcbox_constants::wire::MessageType;
-use arcbox_protocol::agent::{
     KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
     KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
     KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse,
+    KubernetesStopResponse, SandboxPortForwardRemoveRequest, SandboxPortForwardRequest,
+    SandboxPortForwardResponse,
 };
+use arcbox_constants::ports::AGENT_PORT;
+use arcbox_constants::wire::MessageType;
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
 use buffa::Message;
 use bytes::Bytes;
-use prost::Message as ProstMessage;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -294,14 +287,6 @@ impl AgentClient {
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 
-    /// Prost twin of [`Self::decode_response`], for the RPC surface whose
-    /// message types still cross into `arcbox-api` handlers as prost values.
-    /// CORE-73 Phase B3 retires it together with [`Self::unary_rpc_prost`].
-    fn decode_response_prost<T: ProstMessage + Default>(payload: &[u8]) -> Result<T> {
-        T::decode(payload)
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
-    }
-
     fn expect_response_type(resp_type: u32, expected: MessageType) -> Result<()> {
         if resp_type == expected as u32 {
             Ok(())
@@ -331,24 +316,6 @@ impl AgentClient {
         let (resp_type, resp_payload) = self.rpc_call(request_type, payload).await?;
         Self::expect_response_type(resp_type, response_type)?;
         Self::decode_response(&resp_payload)
-    }
-
-    /// [`Self::unary_rpc`] for responses still decoded as prost types.
-    ///
-    /// The kubernetes surface keeps its prost signatures because
-    /// `arcbox-api` handlers pass and forward those exact types
-    /// (`wire_request`/`wire_response` bound on `prost::Message`). Both
-    /// codegens decode the same bytes, so this is only a type-level split;
-    /// CORE-73 Phase B3 removes it.
-    async fn unary_rpc_prost<T: ProstMessage + Default>(
-        &mut self,
-        request_type: MessageType,
-        payload: &[u8],
-        response_type: MessageType,
-    ) -> Result<T> {
-        let (resp_type, resp_payload) = self.rpc_call(request_type, payload).await?;
-        Self::expect_response_type(resp_type, response_type)?;
-        Self::decode_response_prost(&resp_payload)
     }
 
     fn unary_rpc_blocking<T: Message>(
@@ -844,8 +811,8 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn start_kubernetes(&mut self) -> Result<KubernetesStartResponse> {
-        let payload = KubernetesStartRequest {}.encode_to_vec();
-        self.unary_rpc_prost(
+        let payload = KubernetesStartRequest::default().encode_to_vec();
+        self.unary_rpc(
             MessageType::KubernetesStartRequest,
             &payload,
             MessageType::KubernetesStartResponse,
@@ -859,8 +826,8 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn stop_kubernetes(&mut self) -> Result<KubernetesStopResponse> {
-        let payload = KubernetesStopRequest {}.encode_to_vec();
-        self.unary_rpc_prost(
+        let payload = KubernetesStopRequest::default().encode_to_vec();
+        self.unary_rpc(
             MessageType::KubernetesStopRequest,
             &payload,
             MessageType::KubernetesStopResponse,
@@ -874,8 +841,8 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn delete_kubernetes(&mut self) -> Result<KubernetesDeleteResponse> {
-        let payload = KubernetesDeleteRequest {}.encode_to_vec();
-        self.unary_rpc_prost(
+        let payload = KubernetesDeleteRequest::default().encode_to_vec();
+        self.unary_rpc(
             MessageType::KubernetesDeleteRequest,
             &payload,
             MessageType::KubernetesDeleteResponse,
@@ -889,8 +856,8 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn get_kubernetes_status(&mut self) -> Result<KubernetesStatusResponse> {
-        let payload = KubernetesStatusRequest {}.encode_to_vec();
-        self.unary_rpc_prost(
+        let payload = KubernetesStatusRequest::default().encode_to_vec();
+        self.unary_rpc(
             MessageType::KubernetesStatusRequest,
             &payload,
             MessageType::KubernetesStatusResponse,
@@ -904,8 +871,8 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn get_kubeconfig(&mut self) -> Result<KubernetesKubeconfigResponse> {
-        let payload = KubernetesKubeconfigRequest {}.encode_to_vec();
-        self.unary_rpc_prost(
+        let payload = KubernetesKubeconfigRequest::default().encode_to_vec();
+        self.unary_rpc(
             MessageType::KubernetesKubeconfigRequest,
             &payload,
             MessageType::KubernetesKubeconfigResponse,

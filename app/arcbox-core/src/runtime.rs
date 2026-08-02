@@ -21,19 +21,16 @@ use crate::vm::VmManager;
 use crate::vm_lifecycle::{
     DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager, VmLifecycleState,
 };
-use arcbox_connect::v1::{ContainerFsPathsResponse, ImageFsPathsResponse};
+use arcbox_connect::v1::{
+    ContainerFsPathsResponse, ImageFsPathsResponse, KubernetesDeleteResponse,
+    KubernetesKubeconfigResponse, KubernetesStartResponse, KubernetesStatusResponse,
+    KubernetesStopResponse, ServiceStatus,
+};
 use arcbox_net::NetworkManager;
 #[cfg(target_os = "macos")]
 use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
 #[cfg(not(target_os = "macos"))]
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
-// The kubernetes responses stay on the prost side of the CORE-73 split:
-// `arcbox-api` forwards them through `wire_response`, which is bound on
-// `prost::Message` (Phase B3 worklist).
-use arcbox_protocol::agent::{
-    KubernetesDeleteResponse, KubernetesKubeconfigResponse, KubernetesStartResponse,
-    KubernetesStatusResponse, KubernetesStopResponse, ServiceStatus,
-};
 use assets::ensure_guest_binaries;
 use kubeconfig::{KUBERNETES_HOST_ENDPOINT, rewrite_kubeconfig_server};
 use std::collections::HashMap;
@@ -647,6 +644,7 @@ impl Runtime {
             return Ok(KubernetesStopResponse {
                 stopped: true,
                 detail: "k3s already stopped".to_string(),
+                ..Default::default()
             });
         }
 
@@ -685,7 +683,9 @@ impl Runtime {
                     name: "k3s".to_string(),
                     status: "not_ready".to_string(),
                     detail: "default vm not running".to_string(),
+                    ..Default::default()
                 }],
+                ..Default::default()
             });
         }
 
