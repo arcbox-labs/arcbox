@@ -17,7 +17,7 @@
 use std::process::Stdio;
 
 use anyhow::Context;
-use prost::Message;
+use buffa::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
 
@@ -32,7 +32,7 @@ pub(super) async fn handle_machine_exec<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let req = arcbox_protocol::MachineExecRequest::decode(payload)
+    let req = arcbox_connect::v1::MachineExecRequest::decode_from_slice(payload)
         .context("failed to decode MachineExecRequest")?;
 
     if req.cmd.is_empty() {
@@ -137,7 +137,7 @@ where
     }
 
     let status = child.wait().await.context("failed to wait for child")?;
-    let final_out = arcbox_protocol::MachineExecOutput {
+    let final_out = arcbox_connect::v1::MachineExecOutput {
         done: true,
         exit_code: status.code().unwrap_or(-1),
         ..Default::default()
@@ -162,7 +162,7 @@ async fn write_output<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let out = arcbox_protocol::MachineExecOutput {
+    let out = arcbox_connect::v1::MachineExecOutput {
         stream: name.to_string(),
         data: data.to_vec(),
         ..Default::default()
@@ -187,7 +187,7 @@ where
 async fn tty_session<S>(
     stream: &mut S,
     trace_id: &str,
-    req: &arcbox_protocol::MachineExecRequest,
+    req: &arcbox_connect::v1::MachineExecRequest,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -208,7 +208,7 @@ where
         }
     };
 
-    let size = req.tty_size.as_ref().map(|s| arcbox_pty::WinSize {
+    let size = req.tty_size.as_option().map(|s| arcbox_pty::WinSize {
         cols: u16::try_from(s.width).unwrap_or(80),
         rows: u16::try_from(s.height).unwrap_or(24),
     });
@@ -288,7 +288,7 @@ where
         tokio::select! {
             chunk = out_rx.recv() => match chunk {
                 Some(data) => {
-                    let out = arcbox_protocol::MachineExecOutput {
+                    let out = arcbox_connect::v1::MachineExecOutput {
                         stream: "stdout".to_string(),
                         data,
                         ..Default::default()
@@ -322,7 +322,7 @@ where
                     }
                 }
                 Ok((MessageType::MachineExecResize, _, payload)) => {
-                    if let Ok(ts) = arcbox_protocol::v1::TerminalSize::decode(&payload[..]) {
+                    if let Ok(ts) = arcbox_connect::v1::TerminalSize::decode_from_slice(&payload) {
                         let _ = arcbox_pty::resize(
                             &master_resize,
                             arcbox_pty::WinSize {
@@ -365,7 +365,7 @@ where
     let _ = reader.await;
 
     if !host_gone {
-        let final_out = arcbox_protocol::MachineExecOutput {
+        let final_out = arcbox_connect::v1::MachineExecOutput {
             done: true,
             exit_code,
             ..Default::default()

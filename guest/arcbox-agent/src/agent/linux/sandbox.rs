@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use prost::Message as _;
+use buffa::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
@@ -26,9 +26,9 @@ fn port_forwards() -> &'static Mutex<PortForwardManager> {
 ///
 /// This is the vsock payload's own enum, not the published sandbox
 /// contract's — the two are deliberately separate (CORE-57).
-fn wire_protocol(protocol: arcbox_protocol::v1::SandboxPortProtocol) -> Protocol {
+fn wire_protocol(protocol: arcbox_connect::v1::SandboxPortProtocol) -> Protocol {
     match protocol {
-        arcbox_protocol::v1::SandboxPortProtocol::Udp => Protocol::Udp,
+        arcbox_connect::v1::SandboxPortProtocol::Udp => Protocol::Udp,
         _ => Protocol::Tcp,
     }
 }
@@ -71,7 +71,7 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
 /// Stop/Remove, TTL expiry, and boot failures — without threading cleanup
 /// hooks through each of them.
 fn spawn_port_forward_cleanup(svc: &Arc<SandboxService>) {
-    use arcbox_protocol::sandbox_v1::{SandboxEvent, SandboxEventKind, SandboxEventsRequest};
+    use arcbox_connect::sandbox_v1::{SandboxEvent, SandboxEventKind, SandboxEventsRequest};
 
     let payload = SandboxEventsRequest::default().encode_to_vec();
     let mut rx = match svc.subscribe_events(&payload) {
@@ -83,12 +83,16 @@ fn spawn_port_forward_cleanup(svc: &Arc<SandboxService>) {
     };
     tokio::spawn(async move {
         while let Some(encoded) = rx.recv().await {
-            let Ok(event) = SandboxEvent::decode(encoded.as_slice()) else {
+            let Ok(event) = SandboxEvent::decode_from_slice(&encoded) else {
                 continue;
             };
             if matches!(
-                event.kind(),
-                SandboxEventKind::Stopped | SandboxEventKind::Removed | SandboxEventKind::Failed
+                event.kind.as_known(),
+                Some(
+                    SandboxEventKind::Stopped
+                        | SandboxEventKind::Removed
+                        | SandboxEventKind::Failed
+                )
             ) {
                 port_forwards()
                     .lock()
@@ -129,7 +133,6 @@ where
         // -----------------------------------------------------------------
         MessageType::SandboxCreateRequest => match svc.create(payload).await {
             Ok(resp) => {
-                use prost::Message as _;
                 write_message(
                     stream,
                     MessageType::SandboxCreateResponse,
@@ -160,7 +163,6 @@ where
         },
         MessageType::SandboxInspectRequest => match svc.inspect(payload) {
             Ok(resp) => {
-                use prost::Message as _;
                 write_message(
                     stream,
                     MessageType::SandboxInspectResponse,
@@ -175,7 +177,6 @@ where
         },
         MessageType::SandboxListRequest => match svc.list(payload) {
             Ok(resp) => {
-                use prost::Message as _;
                 write_message(
                     stream,
                     MessageType::SandboxListResponse,
@@ -307,7 +308,6 @@ where
         // -----------------------------------------------------------------
         MessageType::SandboxCheckpointRequest => match svc.checkpoint(payload).await {
             Ok(resp) => {
-                use prost::Message as _;
                 write_message(
                     stream,
                     MessageType::SandboxCheckpointResponse,
@@ -322,7 +322,6 @@ where
         },
         MessageType::SandboxRestoreRequest => match svc.restore(payload).await {
             Ok(resp) => {
-                use prost::Message as _;
                 write_message(
                     stream,
                     MessageType::SandboxRestoreResponse,
@@ -337,7 +336,6 @@ where
         },
         MessageType::SandboxListSnapshotsRequest => match svc.list_snapshots(payload) {
             Ok(resp) => {
-                use prost::Message as _;
                 write_message(
                     stream,
                     MessageType::SandboxListSnapshotsResponse,
@@ -396,16 +394,16 @@ async fn handle_port_forward<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    use arcbox_protocol::v1::{SandboxPortForwardRequest, SandboxPortForwardResponse};
+    use arcbox_connect::v1::{SandboxPortForwardRequest, SandboxPortForwardResponse};
 
-    let (req, sandbox_port, protocol) = match SandboxPortForwardRequest::decode(payload)
+    let (req, sandbox_port, protocol) = match SandboxPortForwardRequest::decode_from_slice(payload)
         .map_err(|e| format!("decode error: {e}"))
         .and_then(|req| {
             let port = u16::try_from(req.sandbox_port)
                 .ok()
                 .filter(|p| *p != 0)
                 .ok_or_else(|| format!("invalid sandbox port {}", req.sandbox_port))?;
-            let proto = wire_protocol(req.protocol());
+            let proto = wire_protocol(req.protocol.as_known().unwrap_or_default());
             Ok((req, port, proto))
         }) {
         Ok(parsed) => parsed,
@@ -434,6 +432,7 @@ where
         Ok(guest_port) => {
             let resp = SandboxPortForwardResponse {
                 guest_port: u32::from(guest_port),
+                ..Default::default()
             };
             write_message(
                 stream,
@@ -460,25 +459,26 @@ async fn handle_port_forward_remove<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    use arcbox_protocol::v1::SandboxPortForwardRemoveRequest;
+    use arcbox_connect::v1::SandboxPortForwardRemoveRequest;
 
-    let (req, sandbox_port, protocol) = match SandboxPortForwardRemoveRequest::decode(payload)
-        .map_err(|e| format!("decode error: {e}"))
-        .and_then(|req| {
-            let port = u16::try_from(req.sandbox_port)
-                .ok()
-                .filter(|p| *p != 0)
-                .ok_or_else(|| format!("invalid sandbox port {}", req.sandbox_port))?;
-            let proto = wire_protocol(req.protocol());
-            Ok((req, port, proto))
-        }) {
-        Ok(parsed) => parsed,
-        Err(msg) => {
-            let err = ErrorResponse::new(400, msg);
-            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-            return Ok(());
-        }
-    };
+    let (req, sandbox_port, protocol) =
+        match SandboxPortForwardRemoveRequest::decode_from_slice(payload)
+            .map_err(|e| format!("decode error: {e}"))
+            .and_then(|req| {
+                let port = u16::try_from(req.sandbox_port)
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| format!("invalid sandbox port {}", req.sandbox_port))?;
+                let proto = wire_protocol(req.protocol.as_known().unwrap_or_default());
+                Ok((req, port, proto))
+            }) {
+            Ok(parsed) => parsed,
+            Err(msg) => {
+                let err = ErrorResponse::new(400, msg);
+                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+                return Ok(());
+            }
+        };
 
     match port_forwards()
         .lock()

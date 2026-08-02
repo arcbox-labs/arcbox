@@ -1,12 +1,12 @@
 //! Conversions between `arcbox-vm` native types and `sandbox.v1` protos,
 //! plus the shared id-ordered pagination helper.
 
-use arcbox_protocol::pbjson_types::Timestamp;
-use arcbox_protocol::sandbox_v1;
+use arcbox_connect::sandbox_v1;
 use arcbox_vm::{
     CheckpointInfo, CheckpointSummary, ExecutionChannel, ExecutionSnapshot, ExitStatus,
     SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxState, SandboxSummary, StdinState,
 };
+use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
 
 /// Server default when a list request leaves `page_size` at 0.
@@ -19,6 +19,7 @@ pub(super) fn timestamp(dt: DateTime<Utc>) -> Timestamp {
         seconds: dt.timestamp(),
         // Sub-second nanos are < 2e9 even on leap seconds; i32 holds them.
         nanos: i32::try_from(dt.timestamp_subsec_nanos()).unwrap_or(0),
+        ..Default::default()
     }
 }
 
@@ -33,6 +34,7 @@ pub(super) fn timestamp_from_unix_nanos(ns: i64) -> Timestamp {
         seconds: ns.div_euclid(1_000_000_000),
         // rem_euclid of 1e9 is always in [0, 1e9), which fits i32.
         nanos: i32::try_from(ns.rem_euclid(1_000_000_000)).expect("nanos below 1e9"),
+        ..Default::default()
     }
 }
 
@@ -43,6 +45,7 @@ pub(super) fn exit_status_to_proto(status: ExitStatus) -> sandbox_v1::ExitStatus
     };
     sandbox_v1::ExitStatus {
         status: Some(status),
+        ..Default::default()
     }
 }
 
@@ -50,6 +53,7 @@ pub(super) fn stdin_to_proto(state: StdinState) -> sandbox_v1::StdinStatus {
     sandbox_v1::StdinStatus {
         bytes_written: state.bytes_written,
         closed: state.closed,
+        ..Default::default()
     }
 }
 
@@ -64,13 +68,14 @@ pub(super) fn execution_to_proto(snap: &ExecutionSnapshot) -> sandbox_v1::Execut
         sandbox_id: snap.sandbox_id.clone(),
         state: state.into(),
         tty: snap.tty,
-        started_at: Some(timestamp(snap.started_at)),
-        exited_at: snap.exited_at.map(timestamp),
-        exit_status: snap.exit_status.map(exit_status_to_proto),
+        started_at: timestamp(snap.started_at).into(),
+        exited_at: snap.exited_at.map(timestamp).into(),
+        exit_status: snap.exit_status.map(exit_status_to_proto).into(),
         error: snap.error.clone().unwrap_or_default(),
         stdout_len: snap.stdout_len,
         stderr_len: snap.stderr_len,
-        stdin: Some(stdin_to_proto(snap.stdin)),
+        stdin: stdin_to_proto(snap.stdin).into(),
+        ..Default::default()
     }
 }
 
@@ -128,8 +133,9 @@ pub(super) fn vm_event_to_proto(e: VmSandboxEvent) -> sandbox_v1::SandboxEvent {
     sandbox_v1::SandboxEvent {
         sandbox_id: e.sandbox_id,
         kind: event_kind(&e.action).into(),
-        time: Some(timestamp_from_unix_nanos(e.timestamp_ns)),
-        attributes: e.attributes,
+        time: timestamp_from_unix_nanos(e.timestamp_ns).into(),
+        attributes: e.attributes.into_iter().collect(),
+        ..Default::default()
     }
 }
 
@@ -139,21 +145,25 @@ pub(super) fn info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
     let network = info.network.map(|n| sandbox_v1::SandboxNetwork {
         ip_address: n.ip_address,
         gateway: n.gateway,
+        ..Default::default()
     });
     sandbox_v1::SandboxInfo {
         id: info.id,
         state: state_to_proto(info.state).into(),
-        labels: info.labels,
-        limits: Some(sandbox_v1::ResourceLimits {
+        labels: info.labels.into_iter().collect(),
+        limits: sandbox_v1::ResourceLimits {
             vcpus: info.vcpus,
             memory_mib: info.memory_mib,
-        }),
-        network,
-        created_at: Some(timestamp(info.created_at)),
-        ready_at: info.ready_at.map(timestamp),
-        last_exited_at: info.last_exited_at.map(timestamp),
-        last_exit_status: info.last_exit_status.map(exit_status_to_proto),
+            ..Default::default()
+        }
+        .into(),
+        network: network.into(),
+        created_at: timestamp(info.created_at).into(),
+        ready_at: info.ready_at.map(timestamp).into(),
+        last_exited_at: info.last_exited_at.map(timestamp).into(),
+        last_exit_status: info.last_exit_status.map(exit_status_to_proto).into(),
         error: info.error.unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -161,9 +171,10 @@ pub(super) fn summary_to_proto(s: SandboxSummary) -> sandbox_v1::SandboxSummary 
     sandbox_v1::SandboxSummary {
         id: s.id,
         state: state_to_proto(s.state).into(),
-        labels: s.labels,
+        labels: s.labels.into_iter().collect(),
         ip_address: s.ip_address,
-        created_at: Some(timestamp(s.created_at)),
+        created_at: timestamp(s.created_at).into(),
+        ..Default::default()
     }
 }
 
@@ -173,7 +184,8 @@ pub(super) fn summary_to_proto(s: SandboxSummary) -> sandbox_v1::SandboxSummary 
 pub(super) fn checkpoint_to_proto(info: CheckpointInfo) -> sandbox_v1::CheckpointResponse {
     sandbox_v1::CheckpointResponse {
         snapshot_id: info.snapshot_id,
-        created_at: timestamp_from_rfc3339(&info.created_at),
+        created_at: timestamp_from_rfc3339(&info.created_at).into(),
+        ..Default::default()
     }
 }
 
@@ -182,8 +194,9 @@ pub(super) fn checkpoint_summary_to_proto(s: CheckpointSummary) -> sandbox_v1::S
         id: s.id,
         sandbox_id: s.sandbox_id,
         name: s.name,
-        labels: s.labels,
-        created_at: timestamp_from_rfc3339(&s.created_at),
+        labels: s.labels.into_iter().collect(),
+        created_at: timestamp_from_rfc3339(&s.created_at).into(),
+        ..Default::default()
     }
 }
 

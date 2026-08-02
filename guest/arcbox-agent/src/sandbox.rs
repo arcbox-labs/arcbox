@@ -14,9 +14,9 @@ mod template;
 
 use std::sync::Arc;
 
-use arcbox_protocol::sandbox_v1;
+use arcbox_connect::sandbox_v1;
 use arcbox_vm::{SandboxManager, SandboxMountSpec, SandboxNetworkSpec, SandboxSpec, VmmConfig};
-use prost::Message;
+use buffa::Message;
 
 use crate::error::SandboxError;
 
@@ -76,7 +76,7 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
-        let req = sandbox_v1::CreateSandboxRequest::decode(payload)
+        let req = sandbox_v1::CreateSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let template = template::Template::parse(&req.template)?;
         let mut spec = proto_to_spec(req);
@@ -110,6 +110,7 @@ impl SandboxService {
             id,
             ip_address,
             state: sandbox_v1::SandboxState::Starting.into(),
+            ..Default::default()
         })
     }
 
@@ -147,7 +148,7 @@ impl SandboxService {
 
     /// Stop a sandbox.
     pub async fn stop(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::StopSandboxRequest::decode(payload)
+        let req = sandbox_v1::StopSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         self.manager
             .stop_sandbox(&req.id, req.timeout_seconds)
@@ -159,7 +160,7 @@ impl SandboxService {
 
     /// Remove a sandbox.
     pub async fn remove(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::RemoveSandboxRequest::decode(payload)
+        let req = sandbox_v1::RemoveSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         self.manager
             .remove_sandbox(&req.id, req.force)
@@ -171,7 +172,7 @@ impl SandboxService {
 
     /// Inspect a sandbox.
     pub fn inspect(&self, payload: &[u8]) -> Result<sandbox_v1::SandboxInfo, SandboxError> {
-        let req = sandbox_v1::InspectSandboxRequest::decode(payload)
+        let req = sandbox_v1::InspectSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let info = self
             .manager
@@ -182,15 +183,17 @@ impl SandboxService {
 
     /// List sandboxes (id-ordered, paginated).
     pub fn list(&self, payload: &[u8]) -> Result<sandbox_v1::ListSandboxesResponse, SandboxError> {
-        let req = sandbox_v1::ListSandboxesRequest::decode(payload)
+        let req = sandbox_v1::ListSandboxesRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let state_filter = convert::state_filter(req.state());
-        let summaries = self.manager.list_sandboxes(state_filter, &req.labels);
+        let state_filter = convert::state_filter(req.state.as_known().unwrap_or_default());
+        let labels: std::collections::HashMap<String, String> = req.labels.into_iter().collect();
+        let summaries = self.manager.list_sandboxes(state_filter, &labels);
         let (page, next_page_token) =
             convert::paginate(summaries, |s| &s.id, req.page_size, &req.page_token);
         Ok(sandbox_v1::ListSandboxesResponse {
             sandboxes: page.into_iter().map(convert::summary_to_proto).collect(),
             next_page_token,
+            ..Default::default()
         })
     }
 
@@ -230,8 +233,10 @@ fn deregister_sandbox_dns(id: &str) {
 
 /// Convert a `CreateSandboxRequest` proto to a [`SandboxSpec`].
 fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
-    let limits = req.limits.unwrap_or_default();
-    let mode = match req.network.map(|n| n.mode()).unwrap_or_default() {
+    // An unset `limits`/`network` field derefs to the default instance, and
+    // an unknown wire value falls back to UNSPECIFIED — the proto3 defaults.
+    let (vcpus, memory_mib) = (req.limits.vcpus, req.limits.memory_mib);
+    let mode = match req.network.mode.as_known().unwrap_or_default() {
         sandbox_v1::NetworkMode::None => "none",
         // UNSPECIFIED defaults to a networked sandbox.
         sandbox_v1::NetworkMode::Enabled | sandbox_v1::NetworkMode::Unspecified => "tap",
@@ -242,16 +247,16 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
         } else {
             Some(req.id)
         },
-        labels: req.labels,
+        labels: req.labels.into_iter().collect(),
         // Boot recipe fields are resolved from the template, never from the
         // request (CORE-54); the manager fills kernel/boot_args defaults.
         kernel: String::new(),
         rootfs: String::new(),
         boot_args: String::new(),
-        vcpus: limits.vcpus,
-        memory_mib: limits.memory_mib,
+        vcpus,
+        memory_mib,
         cmd: req.cmd,
-        env: req.env,
+        env: req.env.into_iter().collect(),
         working_dir: req.working_dir,
         user: req.user,
         mounts: req
