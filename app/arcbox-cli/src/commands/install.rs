@@ -253,8 +253,9 @@ fn register_daemon_service() -> Result<()> {
     <true/>
     <!--
       ExitTimeOut: seconds launchd waits after SIGTERM before sending SIGKILL.
-      Default is 20s, but daemon shutdown needs ~35s (5s service drain + 30s VM
-      graceful stop). Set to 45s to avoid SIGKILL mid-shutdown.
+      Daemon shutdown can use all 45s (two 5s NFS unmount attempts + 5s service
+      drain + 30s VM graceful stop). This preserves the full VM stop budget;
+      only final best-effort cleanup may run up against the deadline.
     -->
     <key>ExitTimeOut</key>
     <integer>45</integer>
