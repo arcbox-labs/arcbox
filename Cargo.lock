@@ -384,6 +384,7 @@ name = "arcbox-core"
 version = "0.5.5"
 dependencies = [
  "arcbox-boot",
+ "arcbox-connect",
  "arcbox-constants",
  "arcbox-dns",
  "arcbox-error",
@@ -400,6 +401,7 @@ dependencies = [
  "arcbox-vz",
  "async-trait",
  "base64",
+ "buffa",
  "bytes",
  "chrono",
  "dirs",
@@ -546,6 +548,7 @@ name = "arcbox-e2e"
 version = "0.5.5"
 dependencies = [
  "anyhow",
+ "arcbox-connect",
  "arcbox-constants",
  "arcbox-core",
  "arcbox-grpc",

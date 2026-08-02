@@ -21,15 +21,18 @@ use crate::vm::VmManager;
 use crate::vm_lifecycle::{
     DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager, VmLifecycleState,
 };
+use arcbox_connect::v1::{ContainerFsPathsResponse, ImageFsPathsResponse};
 use arcbox_net::NetworkManager;
 #[cfg(target_os = "macos")]
 use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
 #[cfg(not(target_os = "macos"))]
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
+// The kubernetes responses stay on the prost side of the CORE-73 split:
+// `arcbox-api` forwards them through `wire_response`, which is bound on
+// `prost::Message` (Phase B3 worklist).
 use arcbox_protocol::agent::{
-    ContainerFsPathsResponse, ImageFsPathsResponse, KubernetesDeleteResponse,
-    KubernetesKubeconfigResponse, KubernetesStartResponse, KubernetesStatusResponse,
-    KubernetesStopResponse, ServiceStatus,
+    KubernetesDeleteResponse, KubernetesKubeconfigResponse, KubernetesStartResponse,
+    KubernetesStatusResponse, KubernetesStopResponse, ServiceStatus,
 };
 use assets::ensure_guest_binaries;
 use kubeconfig::{KUBERNETES_HOST_ENDPOINT, rewrite_kubeconfig_server};

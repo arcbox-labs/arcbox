@@ -470,12 +470,15 @@ impl VmManager {
     fn send_shutdown_rpc(&self, id: &VmId, timeout_seconds: u32) -> Result<()> {
         use arcbox_constants::ports::AGENT_PORT;
         use arcbox_constants::wire::MessageType;
-        use prost::Message;
+        use buffa::Message;
 
         let fd = self.connect_vsock(id, AGENT_PORT)?;
 
         // Build the shutdown request wire frame.
-        let req = arcbox_protocol::ShutdownRequest { timeout_seconds };
+        let req = arcbox_connect::v1::ShutdownRequest {
+            timeout_seconds,
+            ..Default::default()
+        };
         let payload = req.encode_to_vec();
         let frame = crate::AgentClient::build_message(MessageType::ShutdownRequest, "", &payload);
 

@@ -15,8 +15,11 @@
 //! * The **guest agent** encodes its vsock frames with these types too —
 //!   the crate compiles for `aarch64-unknown-linux-musl` (base `connectrpc`
 //!   is transport-free) and must stay musl-clean.
-//! * The **host side of the vsock wire** still uses the prost twins in
-//!   `arcbox-protocol` until the remaining CORE-73 phases land.
+//! * The **host side of the vsock wire** (`arcbox-core`'s `AgentClient`)
+//!   uses these types too, except for the RPCs whose messages still cross
+//!   into `arcbox-api` handlers as prost twins (sandbox, machine exec,
+//!   kubernetes, machine stats) — the remaining CORE-73 phase moves those
+//!   handlers and retires the prost half.
 //!
 //! buffa and prost encode identical protobuf bytes, so mixed-codec peers
 //! interoperate; both representations are generated from the same `.proto`
