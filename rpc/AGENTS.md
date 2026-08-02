@@ -31,10 +31,11 @@ This file is only the non-obvious operational knowledge.
   - `connectrpc` is bound to `buffa::Message`, and since CORE-73 the buffa
     types in `arcbox-connect` are the ONE runtime representation: daemon
     handlers, `abctl`, and both ends of the vsock wire. The prost twins in
-    `arcbox-protocol` are still generated, but only the tonic test clients
-    and the reflection descriptor set consume them — the two codegens emit
-    identical bytes, which is what lets a prost test client prove the buffa
-    server's wire format.
+    `arcbox-protocol` are still generated for the tonic test clients, the
+    reflection descriptor set, and one production consumer: the fleet agent
+    (`fleet/arcbox-fleet-agent/src/vm.rs`) drives the daemon's gRPC endpoint
+    with them, deliberately kept on tonic. The two codegens emit identical
+    bytes, which is what lets a prost peer talk to the buffa server.
   - Reflection is served by `connectrpc-reflection` from the whole daemon's
     descriptor set. It answers `501` over HTTP/1.1 Connect because
     `ServerReflectionInfo` is bidi-streaming and Connect carries bidi only
@@ -98,10 +99,12 @@ This file is only the non-obvious operational knowledge.
 
 **Add/change a daemon gRPC message or service:**
 1. Edit the `.proto`.
-2. If it's a *new* `.proto` file, add it to **both** proto arrays:
-   `arcbox-protocol/build.rs` (prost, messages) **and**
-   `arcbox-grpc/build.rs` (tonic, services). Miss one → missing message types
-   or missing service stubs with a confusing compile error.
+2. If it's a *new* `.proto` file, add it to all **three** proto arrays:
+   `arcbox-protocol/build.rs` (prost, messages), `arcbox-grpc/build.rs`
+   (tonic, services), **and** `arcbox-connect/build.rs` (buffa messages plus
+   the Connect service traits the daemon actually implements). Miss one →
+   missing message types or service stubs with a confusing compile error;
+   miss the last and step 5 has no trait to register.
 3. Rebuild (regenerates + rustfmts `src/generated/*.rs`) and commit the result.
 4. Add a hand-written re-export in `arcbox-protocol/src/lib.rs` (the flat
    `pub use v1::{...}` block and the per-module `pub mod`) — nothing generates
@@ -124,9 +127,12 @@ This file is only the non-obvious operational knowledge.
    missing there is a 404 on every format — the
    `migrated_daemon_services_are_registered_on_the_connect_router` test in
    `control_plane.rs` is where that surfaces.
-4. Nothing else changes: the guest agent, `AgentClient`, and the vsock frames
-   use the same `arcbox-connect` buffa types, so a new message is available
-   to them the moment it is generated.
+4. No codec step remains: the guest agent, `AgentClient`, and the vsock
+   frames use the same `arcbox-connect` buffa types, so a new message is
+   *available* to them the moment it is generated. Available is not wired:
+   a message that must actually cross the vsock channel still needs the
+   host↔guest checklist below (`MessageType`, guest dispatcher arm,
+   `AgentClient` method).
 
 **Add a host↔guest agent RPC (NOT a tonic method):**
 1. Define the proto *message* in `agent.proto`.
