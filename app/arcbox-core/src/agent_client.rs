@@ -8,8 +8,8 @@
 //! * buffa (`arcbox_connect::v1`) for RPCs whose types stay inside
 //!   `arcbox-core` — the target state.
 //! * prost (`arcbox_protocol`) for the surface whose types still cross into
-//!   `arcbox-api` handlers as prost values (sandbox, machine exec,
-//!   kubernetes, machine stats). Phase B3 moves those handlers and retires
+//!   `arcbox-api` handlers as prost values (machine exec, kubernetes,
+//!   machine stats). Phase B3 moves those handlers and retires
 //!   the prost half — see [`AgentClient::unary_rpc_prost`].
 
 mod transport;
@@ -17,23 +17,7 @@ mod wire;
 
 use self::transport::{AgentTransport, BLOCKING_RPC_TIMEOUT};
 use crate::error::{CoreError, Result};
-use arcbox_connect::v1::{
-    AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
-    ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse, EnsureNfsExportRequest,
-    EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse, MemoryPressureEvent,
-    MmapReadFileRequest, MmapReadFileResponse, ReadinessEvent, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
-    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
-};
-use arcbox_constants::ports::AGENT_PORT;
-use arcbox_constants::wire::MessageType;
-use arcbox_protocol::agent::{
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, MachineStats,
-};
-use arcbox_protocol::sandbox_v1::{
+use arcbox_connect::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CheckpointResponse, CreateSandboxRequest,
     CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk,
     GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
@@ -42,8 +26,24 @@ use arcbox_protocol::sandbox_v1::{
     SandboxInfo, SignalExecutionRequest, StartExecutionRequest, StdinStatus, StopSandboxRequest,
     WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
 };
-use arcbox_protocol::v1::{
+use arcbox_connect::v1::{
+    AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
+    ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse, EnsureNfsExportRequest,
+    EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse, MemoryPressureEvent,
+    MmapReadFileRequest, MmapReadFileResponse, ReadinessEvent, RuntimeEnsureRequest,
+    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
+    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+};
+use arcbox_connect::v1::{
     SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SandboxPortForwardResponse,
+};
+use arcbox_constants::ports::AGENT_PORT;
+use arcbox_constants::wire::MessageType;
+use arcbox_protocol::agent::{
+    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+    KubernetesStopResponse, MachineStats,
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
@@ -334,7 +334,7 @@ impl AgentClient {
 
     /// [`Self::unary_rpc`] for responses still decoded as prost types.
     ///
-    /// The kubernetes, sandbox, machine-exec, and machine-stats surfaces
+    /// The kubernetes, machine-exec, and machine-stats surfaces
     /// keep their prost signatures because `arcbox-api` handlers pass and
     /// forward those exact types (`wire_request`/`wire_response` bound on
     /// `prost::Message`). Both codegens decode the same bytes, so this is
@@ -1062,7 +1062,7 @@ impl AgentClient {
         req: CreateSandboxRequest,
     ) -> Result<CreateSandboxResponse> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxCreateRequest,
             &payload,
             MessageType::SandboxCreateResponse,
@@ -1080,7 +1080,7 @@ impl AgentClient {
         req: SandboxPortForwardRequest,
     ) -> Result<SandboxPortForwardResponse> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxPortForwardRequest,
             &payload,
             MessageType::SandboxPortForwardResponse,
@@ -1137,7 +1137,7 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn sandbox_inspect(&mut self, req: InspectSandboxRequest) -> Result<SandboxInfo> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxInspectRequest,
             &payload,
             MessageType::SandboxInspectResponse,
@@ -1155,7 +1155,7 @@ impl AgentClient {
         req: ListSandboxesRequest,
     ) -> Result<ListSandboxesResponse> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxListRequest,
             &payload,
             MessageType::SandboxListResponse,
@@ -1219,7 +1219,7 @@ impl AgentClient {
                         .await;
                     break;
                 }
-                match FileChunk::decode(&resp_payload[..]) {
+                match FileChunk::decode_from_slice(&resp_payload) {
                     Ok(chunk) => {
                         let done = chunk.done;
                         if tx.send(Ok(chunk)).await.is_err() || done {
@@ -1276,7 +1276,11 @@ impl AgentClient {
                     ));
                 }
             };
-            let chunk = FileChunk { data, done: false };
+            let chunk = FileChunk {
+                data,
+                done: false,
+                ..Default::default()
+            };
             let frame =
                 wire::build_message(MessageType::SandboxFileChunk, "", &chunk.encode_to_vec());
             self.transport
@@ -1287,6 +1291,7 @@ impl AgentClient {
         let done = FileChunk {
             data: Vec::new(),
             done: true,
+            ..Default::default()
         };
         let frame = wire::build_message(MessageType::SandboxFileChunk, "", &done.encode_to_vec());
         self.transport
@@ -1533,7 +1538,7 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn sandbox_exec_start(&mut self, req: StartExecutionRequest) -> Result<Execution> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxExecStartRequest,
             &payload,
             MessageType::SandboxExecStartResponse,
@@ -1549,7 +1554,7 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn sandbox_stdin_write(&mut self, req: WriteStdinRequest) -> Result<StdinStatus> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxStdinWriteRequest,
             &payload,
             MessageType::SandboxStdinStatus,
@@ -1567,7 +1572,7 @@ impl AgentClient {
         req: GetStdinStatusRequest,
     ) -> Result<StdinStatus> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxStdinStatusRequest,
             &payload,
             MessageType::SandboxStdinStatus,
@@ -1609,7 +1614,7 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn sandbox_exec_wait(&mut self, req: WaitExecutionRequest) -> Result<Execution> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxExecWaitRequest,
             &payload,
             MessageType::SandboxExecWaitResponse,
@@ -1679,7 +1684,7 @@ impl AgentClient {
                     break;
                 }
 
-                match ExecutionEvent::decode(&resp_payload[..]) {
+                match ExecutionEvent::decode_from_slice(&resp_payload) {
                     Ok(event) => {
                         let done = matches!(event.event, Some(execution_event::Event::Exited(_)));
                         // Stop reading if the consumer dropped, so a spewing
@@ -1761,7 +1766,7 @@ impl AgentClient {
                     break;
                 }
 
-                match SandboxEvent::decode(&resp_payload[..]) {
+                match SandboxEvent::decode_from_slice(&resp_payload) {
                     Ok(event) => {
                         // Stop when the subscriber drops instead of draining the
                         // event stream forever.
@@ -1792,7 +1797,7 @@ impl AgentClient {
         req: CheckpointRequest,
     ) -> Result<CheckpointResponse> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxCheckpointRequest,
             &payload,
             MessageType::SandboxCheckpointResponse,
@@ -1807,7 +1812,7 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn sandbox_restore(&mut self, req: RestoreRequest) -> Result<RestoreResponse> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxRestoreRequest,
             &payload,
             MessageType::SandboxRestoreResponse,
@@ -1825,7 +1830,7 @@ impl AgentClient {
         req: ListSnapshotsRequest,
     ) -> Result<ListSnapshotsResponse> {
         let payload = req.encode_to_vec();
-        self.unary_rpc_prost(
+        self.unary_rpc(
             MessageType::SandboxListSnapshotsRequest,
             &payload,
             MessageType::SandboxListSnapshotsResponse,
