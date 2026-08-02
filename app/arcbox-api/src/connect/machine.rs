@@ -1,11 +1,12 @@
 //! Machine service gRPC implementation.
 
 use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::machine_exec_input;
 use arcbox_core::ExecSessionInput;
 use arcbox_core::machine_image;
 use arcbox_protocol::v1::{
     CreateMachineResponse, Empty, ListMachinesResponse, MachineEvent, MachineInfo, MachineNetwork,
-    MachinePingResponse, MachineSummary, MachineSystemInfo, machine_exec_input,
+    MachinePingResponse, MachineSummary, MachineSystemInfo,
 };
 use connectrpc::{
     ConnectError, InboundStream, PreEncoded, RequestContext, Response, ServiceRequest,
@@ -16,7 +17,7 @@ use tokio_stream::StreamExt as _;
 use super::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
-use super::bridge::{wire_request, wire_response, wire_stream_item};
+use super::bridge::{wire_request, wire_response};
 
 /// The NAT gateway every machine's primary interface routes through; it also
 /// serves DNS (same literal the guest agent's DHCP path documents).
@@ -440,8 +441,8 @@ impl pb::MachineService for MachineServiceImpl {
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::MachineExecRequest>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::MachineExecOutput>>> {
-        let req = wire_request::<arcbox_protocol::v1::MachineExecRequest, _>(&request)?;
+    ) -> ServiceResult<ServiceStream<pb::MachineExecOutput>> {
+        let req = request.to_owned_message();
         let agent = self
             .runtime
             .ready()?
@@ -458,7 +459,7 @@ impl pb::MachineService for MachineServiceImpl {
                 match item {
                     Ok(output) => {
                         let done = output.done;
-                        yield Ok(wire_response::<pb::MachineExecOutput, _>(&output));
+                        yield Ok(output);
                         if done {
                             break;
                         }
@@ -493,15 +494,14 @@ impl pb::MachineService for MachineServiceImpl {
         &self,
         _ctx: RequestContext,
         requests: InboundStream<pb::MachineExecInput>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::MachineExecOutput>>> {
+    ) -> ServiceResult<ServiceStream<pb::MachineExecOutput>> {
         let mut stream = requests;
 
         let first = stream.next().await.ok_or_else(|| {
             ConnectError::invalid_argument("exec session: stream closed before Init message")
         })??;
-        let first: arcbox_protocol::v1::MachineExecInput = wire_stream_item(&first)?;
-        let exec_req = match first.payload {
-            Some(machine_exec_input::Payload::Init(req)) => req,
+        let exec_req = match first.to_owned_message().payload {
+            Some(machine_exec_input::Payload::Init(req)) => *req,
             _ => {
                 return Err(ConnectError::invalid_argument(
                     "exec session: first message must be Init",
@@ -520,15 +520,7 @@ impl pb::MachineService for MachineServiceImpl {
         let (in_tx, in_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             while let Some(Ok(item)) = stream.next().await {
-                // A decode failure can only mean the two generated
-                // representations disagree — a build fault. Fail toward the
-                // EOF sentinel below, ending the session cleanly, rather
-                // than dropping a frame out of an interactive input stream.
-                let Ok(input) = wire_stream_item::<arcbox_protocol::v1::MachineExecInput, _>(&item)
-                else {
-                    break;
-                };
-                let msg = match input.payload {
+                let msg = match item.to_owned_message().payload {
                     Some(machine_exec_input::Payload::Stdin(data)) => ExecSessionInput::Stdin(data),
                     Some(machine_exec_input::Payload::Resize(size)) => ExecSessionInput::Resize {
                         width: u16::try_from(size.width).unwrap_or(u16::MAX),
@@ -553,7 +545,7 @@ impl pb::MachineService for MachineServiceImpl {
                 match item {
                     Ok(output) => {
                         let done = output.done;
-                        yield Ok(wire_response::<pb::MachineExecOutput, _>(&output));
+                        yield Ok(output);
                         if done {
                             break;
                         }

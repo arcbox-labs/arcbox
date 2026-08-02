@@ -41,27 +41,6 @@ where
     })
 }
 
-/// Decodes one inbound client-stream item as its prost twin.
-///
-/// Same contract as [`wire_request`]; the item retains the bytes it was
-/// decoded from, so this is a decode and not a re-encode.
-///
-/// # Errors
-///
-/// Returns `invalid_argument` if the bytes do not decode as `P`.
-pub fn wire_stream_item<P, B>(item: &connectrpc::StreamMessage<B>) -> Result<P, ConnectError>
-where
-    P: prost::Message + Default,
-    B: buffa::Message + connectrpc::HasMessageView,
-{
-    P::decode(item.bytes().clone()).map_err(|e| {
-        ConnectError::invalid_argument(format!(
-            "stream item did not decode as {}: {e}",
-            std::any::type_name::<P>()
-        ))
-    })
-}
-
 /// Wraps a prost message as the response body for its buffa twin `B`.
 ///
 /// The bytes are produced once here and handed to the codec as-is for

@@ -275,7 +275,7 @@ impl Runtime {
     #[must_use]
     pub fn subscribe_machine_stats(
         &self,
-    ) -> tokio::sync::broadcast::Receiver<arcbox_protocol::agent::MachineStats> {
+    ) -> tokio::sync::broadcast::Receiver<arcbox_connect::v1::MachineStats> {
         self.stats_hub.subscribe()
     }
 
@@ -284,7 +284,7 @@ impl Runtime {
     pub async fn subscribe_machine_stats_for(
         &self,
         name: &str,
-    ) -> tokio::sync::broadcast::Receiver<arcbox_protocol::agent::MachineStats> {
+    ) -> tokio::sync::broadcast::Receiver<arcbox_connect::v1::MachineStats> {
         if name == DEFAULT_MACHINE_NAME {
             return self.stats_hub.subscribe();
         }

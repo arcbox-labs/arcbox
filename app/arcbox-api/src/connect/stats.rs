@@ -7,22 +7,19 @@
 
 use arcbox_connect::v1 as pb;
 use arcbox_core::{DEFAULT_MACHINE_NAME, Runtime};
-use arcbox_protocol::v1::MachineStats;
 use connectrpc::{
-    ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
-    ServiceStream,
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
 
 use super::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
-use super::bridge::{wire_request, wire_response};
 
 /// Fills each container's display name from the runtime's registry,
 /// leaving the ID-only entries untouched when no name is known (the
 /// consumer falls back to the short ID). Skips the registry read entirely
 /// when the frame carries no containers.
-async fn enrich_container_names(runtime: &Runtime, sample: &mut MachineStats) {
+async fn enrich_container_names(runtime: &Runtime, sample: &mut pb::MachineStats) {
     if sample.containers.is_empty() {
         return;
     }
@@ -58,8 +55,8 @@ impl pb::StatsService for StatsServiceImpl {
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::StatsWatchRequest>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::MachineStats>>> {
-        let req: arcbox_protocol::v1::StatsWatchRequest = wire_request(&request)?;
+    ) -> ServiceResult<ServiceStream<pb::MachineStats>> {
+        let req = request.to_owned_message();
         let machine_id = if req.machine_id.is_empty() {
             DEFAULT_MACHINE_NAME.to_string()
         } else {
@@ -75,7 +72,7 @@ impl pb::StatsService for StatsServiceImpl {
                 match rx.recv().await {
                     Ok(mut sample) => {
                         enrich_container_names(&runtime, &mut sample).await;
-                        yield Ok(wire_response::<pb::MachineStats, _>(&sample));
+                        yield Ok(sample);
                     }
                     // This subscriber lagged; newer samples follow, which
                     // is exactly what a live monitor wants.
