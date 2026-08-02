@@ -12,8 +12,8 @@
 //! - [`filesystem`] — file transfer (data plane)
 //! - [`snapshot`] — checkpoint / restore
 //!
-//! The rest are the daemon's own services, migrating off tonic one at a
-//! time (CORE-68): [`icon`], [`kubernetes`], [`machine`], [`migration`],
+//! The rest are the daemon's own services, all migrated off tonic
+//! (CORE-68): [`icon`], [`kubernetes`], [`machine`], [`migration`],
 //! [`stats`], [`system`].
 //!
 //! Request and response types are buffa-generated (`arcbox-connect`) — the

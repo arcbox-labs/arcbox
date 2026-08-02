@@ -3,11 +3,9 @@
 //! Generates buffa message types plus ConnectRPC service traits and clients
 //! for every ArcBox-owned proto (`arcbox.v1` and `arcbox.sandbox.v1`).
 //! These types serve the daemon's client-facing Connect surface and both
-//! ends of the host↔guest vsock wire (CORE-73); the host `AgentClient`
-//! still decodes the surfaces that cross into `arcbox-api` handlers as
-//! prost twins (sandbox, machine exec, kubernetes, machine stats) until
-//! the remaining convergence phases land — safe because buffa and prost
-//! emit identical protobuf bytes.
+//! ends of the host↔guest vsock wire (CORE-73). Remaining prost consumers
+//! of the same protos interoperate byte-for-byte: buffa and prost emit
+//! identical protobuf bytes from the same `.proto` sources.
 
 fn main() {
     let proto_dir = "../arcbox-protocol/proto";
