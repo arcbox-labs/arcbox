@@ -159,12 +159,8 @@ impl ContextExt for RequestContext {
 
 /// Map the public port protocol onto the host-side exposure key
 /// (`UNSPECIFIED` defaults to TCP).
-///
-/// Takes the prost enum: handler bodies work in the internal representation
-/// from [`bridge::wire_request`] onwards, so the public buffa twin never
-/// reaches this far.
-fn protocol_key(protocol: arcbox_protocol::sandbox_v1::PortProtocol) -> &'static str {
-    use arcbox_protocol::sandbox_v1::PortProtocol;
+fn protocol_key(protocol: arcbox_connect::sandbox_v1::PortProtocol) -> &'static str {
+    use arcbox_connect::sandbox_v1::PortProtocol;
     match protocol {
         PortProtocol::Udp => "udp",
         _ => "tcp",
@@ -176,12 +172,12 @@ fn protocol_key(protocol: arcbox_protocol::sandbox_v1::PortProtocol) -> &'static
 /// The vsock payloads carry their own protocol enum so the published
 /// contract is never imported by the internal wire (CORE-57).
 fn wire_protocol(
-    protocol: arcbox_protocol::sandbox_v1::PortProtocol,
-) -> arcbox_protocol::v1::SandboxPortProtocol {
-    use arcbox_protocol::sandbox_v1::PortProtocol;
+    protocol: arcbox_connect::sandbox_v1::PortProtocol,
+) -> arcbox_connect::v1::SandboxPortProtocol {
+    use arcbox_connect::sandbox_v1::PortProtocol;
     match protocol {
-        PortProtocol::Udp => arcbox_protocol::v1::SandboxPortProtocol::Udp,
-        _ => arcbox_protocol::v1::SandboxPortProtocol::Tcp,
+        PortProtocol::Udp => arcbox_connect::v1::SandboxPortProtocol::Udp,
+        _ => arcbox_connect::v1::SandboxPortProtocol::Tcp,
     }
 }
 

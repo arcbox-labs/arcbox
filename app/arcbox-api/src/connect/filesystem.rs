@@ -1,11 +1,11 @@
 //! Sandbox filesystem service — data plane.
 
 use arcbox_connect::sandbox_v1 as pb;
-use arcbox_protocol::sandbox_v1::{FileChunk, write_file_request};
+use arcbox_connect::sandbox_v1::{FileChunk, write_file_request};
 use buffa_types::google::protobuf::Empty;
 use connectrpc::{
-    ConnectError, InboundStream, PreEncoded, RequestContext, Response, ServiceRequest,
-    ServiceResult, ServiceStream,
+    ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult,
+    ServiceStream,
 };
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
@@ -15,7 +15,6 @@ use arcbox_core::WriteFileChunk;
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::bridge::{wire_request, wire_response, wire_stream_item};
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 
 /// Filesystem service implementation.
@@ -45,7 +44,7 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::ReadFileRequest>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::FileChunk>>> {
+    ) -> ServiceResult<ServiceStream<FileChunk>> {
         let machine = ctx.machine_id()?;
         let agent = self
             .runtime
@@ -53,17 +52,13 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let rx = agent
-            .sandbox_read_file(wire_request(&request)?)
+            .sandbox_read_file(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
         let stream =
             ReceiverStream::new(rx).map(|r| r.map_err(|e| ConnectError::from(ApiError::from(e))));
         // Keepalives are empty non-final chunks, as documented in the proto.
-        let stream = with_keepalive(stream, || FileChunk {
-            data: Vec::new(),
-            done: false,
-        });
-        let stream = stream.map(|item| item.map(|chunk| wire_response::<pb::FileChunk, _>(&chunk)));
+        let stream = with_keepalive(stream, FileChunk::default);
         Response::ok(Box::pin(stream))
     }
 
@@ -83,9 +78,8 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
         let first = requests.next().await.ok_or_else(|| {
             ConnectError::invalid_argument("write_file: stream closed before Open message")
         })??;
-        let first: arcbox_protocol::sandbox_v1::WriteFileRequest = wire_stream_item(&first)?;
-        let open = match first.payload {
-            Some(write_file_request::Payload::Open(open)) => open,
+        let open = match first.to_owned_message().payload {
+            Some(write_file_request::Payload::Open(open)) => *open,
             _ => {
                 return Err(ConnectError::invalid_argument(
                     "write_file: first message must be Open",
@@ -102,14 +96,9 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
             loop {
                 match requests.next().await {
                     Some(Ok(item)) => {
-                        let Ok(msg) = wire_stream_item::<
-                            arcbox_protocol::sandbox_v1::WriteFileRequest,
-                            _,
-                        >(&item) else {
-                            let _ = tx.send(WriteFileChunk::Abort).await;
-                            return;
-                        };
-                        if let Some(write_file_request::Payload::Chunk(chunk)) = msg.payload {
+                        if let Some(write_file_request::Payload::Chunk(chunk)) =
+                            item.to_owned_message().payload
+                        {
                             let done = chunk.done;
                             if !chunk.data.is_empty()
                                 && tx.send(WriteFileChunk::Data(chunk.data)).await.is_err()

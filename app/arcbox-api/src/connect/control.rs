@@ -1,12 +1,11 @@
 //! Sandbox lifecycle service — control plane.
 
 use arcbox_connect::sandbox_v1 as pb;
-use arcbox_protocol::sandbox_v1::{KeepAlive, WatchEventsResponse, watch_events_response};
-use arcbox_protocol::v1::{SandboxPortForwardRemoveRequest, SandboxPortForwardRequest};
+use arcbox_connect::sandbox_v1::{KeepAlive, WatchEventsResponse, watch_events_response};
+use arcbox_connect::v1::{SandboxPortForwardRemoveRequest, SandboxPortForwardRequest};
 use buffa_types::google::protobuf::Empty;
 use connectrpc::{
-    ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
-    ServiceStream,
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
@@ -16,7 +15,6 @@ use arcbox_core::SandboxPortExposure;
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::bridge::{wire_request, wire_response};
 use super::{ConnectRuntimeExt as _, ContextExt as _, protocol_key, wire_protocol, with_keepalive};
 
 /// Sandbox lifecycle service implementation.
@@ -48,7 +46,7 @@ impl pb::SandboxService for SandboxServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::CreateSandboxRequest>,
-    ) -> ServiceResult<PreEncoded<pb::CreateSandboxResponse>> {
+    ) -> ServiceResult<pb::CreateSandboxResponse> {
         let machine = ctx.machine_id()?;
         let mut agent = self
             .runtime
@@ -56,7 +54,7 @@ impl pb::SandboxService for SandboxServiceImpl {
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let resp = agent
-            .sandbox_create(wire_request(&request)?)
+            .sandbox_create(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
 
@@ -68,7 +66,7 @@ impl pb::SandboxService for SandboxServiceImpl {
                 .await;
         }
 
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn stop(
@@ -77,7 +75,7 @@ impl pb::SandboxService for SandboxServiceImpl {
         request: ServiceRequest<'_, pb::StopSandboxRequest>,
     ) -> ServiceResult<Empty> {
         let machine = ctx.machine_id()?;
-        let req: arcbox_protocol::sandbox_v1::StopSandboxRequest = wire_request(&request)?;
+        let req = request.to_owned_message();
         let sandbox_id = req.id.clone();
         let mut agent = self
             .runtime
@@ -99,7 +97,7 @@ impl pb::SandboxService for SandboxServiceImpl {
         request: ServiceRequest<'_, pb::RemoveSandboxRequest>,
     ) -> ServiceResult<Empty> {
         let machine = ctx.machine_id()?;
-        let req: arcbox_protocol::sandbox_v1::RemoveSandboxRequest = wire_request(&request)?;
+        let req = request.to_owned_message();
         let sandbox_id = req.id.clone();
         let mut agent = self
             .runtime
@@ -119,7 +117,7 @@ impl pb::SandboxService for SandboxServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::InspectSandboxRequest>,
-    ) -> ServiceResult<PreEncoded<pb::SandboxInfo>> {
+    ) -> ServiceResult<pb::SandboxInfo> {
         let machine = ctx.machine_id()?;
         let mut agent = self
             .runtime
@@ -127,17 +125,17 @@ impl pb::SandboxService for SandboxServiceImpl {
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let info = agent
-            .sandbox_inspect(wire_request(&request)?)
+            .sandbox_inspect(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&info))
+        Response::ok(info)
     }
 
     async fn list(
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::ListSandboxesRequest>,
-    ) -> ServiceResult<PreEncoded<pb::ListSandboxesResponse>> {
+    ) -> ServiceResult<pb::ListSandboxesResponse> {
         let machine = ctx.machine_id()?;
         let mut agent = self
             .runtime
@@ -145,27 +143,28 @@ impl pb::SandboxService for SandboxServiceImpl {
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let resp = agent
-            .sandbox_list(wire_request(&request)?)
+            .sandbox_list(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn expose_port(
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::ExposePortRequest>,
-    ) -> ServiceResult<PreEncoded<pb::ExposePortResponse>> {
+    ) -> ServiceResult<pb::ExposePortResponse> {
         let machine = ctx.machine_id()?;
-        let req: arcbox_protocol::sandbox_v1::ExposePortRequest = wire_request(&request)?;
+        let req = request.to_owned_message();
         let sandbox_port = u16::try_from(req.sandbox_port)
             .ok()
             .filter(|p| *p != 0)
             .ok_or_else(|| ConnectError::invalid_argument("sandbox_port must be 1-65535"))?;
         let host_port = u16::try_from(req.host_port)
             .map_err(|_| ConnectError::invalid_argument("host_port must be 0-65535"))?;
-        let protocol = protocol_key(req.protocol()).to_owned();
-        let wire = wire_protocol(req.protocol());
+        let requested = req.protocol.as_known().unwrap_or_default();
+        let protocol = protocol_key(requested).to_owned();
+        let wire = wire_protocol(requested);
 
         // Guest half: allocate the reserved relay port and install the DNAT.
         let mut agent = self
@@ -178,6 +177,7 @@ impl pb::SandboxService for SandboxServiceImpl {
                 id: req.id.clone(),
                 sandbox_port: u32::from(sandbox_port),
                 protocol: wire.into(),
+                ..Default::default()
             })
             .await
             .map_err(ApiError::from)?;
@@ -215,16 +215,18 @@ impl pb::SandboxService for SandboxServiceImpl {
                     id: req.id,
                     sandbox_port: u32::from(sandbox_port),
                     protocol: wire.into(),
+                    ..Default::default()
                 })
                 .await;
             return Err(ApiError::from(e).into());
         }
 
-        let resp = arcbox_protocol::sandbox_v1::ExposePortResponse {
+        let resp = pb::ExposePortResponse {
             host_port: u32::from(host_port),
             guest_port: u32::from(guest_port),
+            ..Default::default()
         };
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn unexpose_port(
@@ -233,13 +235,14 @@ impl pb::SandboxService for SandboxServiceImpl {
         request: ServiceRequest<'_, pb::UnexposePortRequest>,
     ) -> ServiceResult<Empty> {
         let machine = ctx.machine_id()?;
-        let req: arcbox_protocol::sandbox_v1::UnexposePortRequest = wire_request(&request)?;
+        let req = request.to_owned_message();
         let sandbox_port = u16::try_from(req.sandbox_port)
             .ok()
             .filter(|p| *p != 0)
             .ok_or_else(|| ConnectError::invalid_argument("sandbox_port must be 1-65535"))?;
-        let protocol = protocol_key(req.protocol());
-        let wire = wire_protocol(req.protocol());
+        let requested = req.protocol.as_known().unwrap_or_default();
+        let protocol = protocol_key(requested);
+        let wire = wire_protocol(requested);
 
         let mut agent = self
             .runtime
@@ -251,6 +254,7 @@ impl pb::SandboxService for SandboxServiceImpl {
                 id: req.id.clone(),
                 sandbox_port: u32::from(sandbox_port),
                 protocol: wire.into(),
+                ..Default::default()
             })
             .await
             .map_err(ApiError::from)?;
@@ -267,7 +271,7 @@ impl pb::SandboxService for SandboxServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::SandboxEventsRequest>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::WatchEventsResponse>>> {
+    ) -> ServiceResult<ServiceStream<WatchEventsResponse>> {
         let machine = ctx.machine_id()?;
         let agent = self
             .runtime
@@ -275,20 +279,20 @@ impl pb::SandboxService for SandboxServiceImpl {
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let rx = agent
-            .sandbox_events(wire_request(&request)?)
+            .sandbox_events(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
         let stream = ReceiverStream::new(rx).map(|r| {
             r.map(|event| WatchEventsResponse {
-                payload: Some(watch_events_response::Payload::Event(event)),
+                payload: Some(watch_events_response::Payload::from(event)),
+                ..Default::default()
             })
             .map_err(|e| ConnectError::from(ApiError::from(e)))
         });
         let stream = with_keepalive(stream, || WatchEventsResponse {
-            payload: Some(watch_events_response::Payload::KeepAlive(KeepAlive {})),
+            payload: Some(watch_events_response::Payload::from(KeepAlive::default())),
+            ..Default::default()
         });
-        let stream =
-            stream.map(|item| item.map(|resp| wire_response::<pb::WatchEventsResponse, _>(&resp)));
         Response::ok(Box::pin(stream))
     }
 }
