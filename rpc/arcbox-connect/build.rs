@@ -17,24 +17,54 @@ fn main() {
         // the services move onto Connect one at a time. `common.proto` must be
         // listed explicitly: it defines this package's hand-rolled `Timestamp`
         // and `Mount`, which are NOT the well-known types.
-        "../arcbox-protocol/proto/common.proto",
-        "../arcbox-protocol/proto/machine.proto",
-        "../arcbox-protocol/proto/macos.proto",
-        "../arcbox-protocol/proto/container.proto",
-        "../arcbox-protocol/proto/image.proto",
-        "../arcbox-protocol/proto/agent.proto",
-        "../arcbox-protocol/proto/api.proto",
-        "../arcbox-protocol/proto/kubernetes.proto",
-        "../arcbox-protocol/proto/stats.proto",
-        "../arcbox-protocol/proto/arcbox/sandbox/v1/sandbox.proto",
-        "../arcbox-protocol/proto/arcbox/sandbox/v1/process.proto",
-        "../arcbox-protocol/proto/arcbox/sandbox/v1/filesystem.proto",
-        "../arcbox-protocol/proto/arcbox/sandbox/v1/snapshot.proto",
+        "common.proto",
+        "machine.proto",
+        "macos.proto",
+        "container.proto",
+        "image.proto",
+        "agent.proto",
+        "api.proto",
+        "kubernetes.proto",
+        "stats.proto",
+        "arcbox/sandbox/v1/sandbox.proto",
+        "arcbox/sandbox/v1/process.proto",
+        "arcbox/sandbox/v1/filesystem.proto",
+        "arcbox/sandbox/v1/snapshot.proto",
     ];
+
+    // Run protoc ourselves and hand connectrpc-build the descriptor set:
+    // its own protoc invocation cannot pass extra flags, and the older
+    // protoc still found on some CI runners requires
+    // --experimental_allow_proto3_optional (newer versions ignore it) —
+    // the same compatibility stance as arcbox-protocol/build.rs. Binary
+    // discovery mirrors connectrpc-build: $PROTOC, else PATH.
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR unset"));
+    let descriptor = out_dir.join("arcbox_connect.protoset");
+    let protoc = std::env::var("PROTOC").unwrap_or_else(|_| "protoc".to_string());
+    let status = std::process::Command::new(&protoc)
+        .arg("--experimental_allow_proto3_optional")
+        .arg("--include_imports")
+        .arg("--include_source_info")
+        .arg(format!("--descriptor_set_out={}", descriptor.display()))
+        .arg(format!("--proto_path={proto_dir}"))
+        .args(protos)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to invoke {protoc}: {e}"));
+    assert!(
+        status.success(),
+        "protoc failed building the Connect descriptor set"
+    );
+
+    // Precompiled mode emits no rerun directives for the sources; declare
+    // them so a proto edit regenerates.
+    for proto in protos {
+        println!("cargo:rerun-if-changed={proto_dir}/{proto}");
+    }
 
     connectrpc_build::Config::new()
         .files(&protos)
-        .includes(&[proto_dir])
+        .descriptor_set(&descriptor)
+        .emit_rerun_directives(false)
         .include_file("_connectrpc.rs")
         .generate_json(true)
         // `arcbox.v1` files sit at the proto root rather than in `arcbox/v1/`
