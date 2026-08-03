@@ -609,6 +609,11 @@ impl LifecycleShared {
                         match agent.ping_blocking() {
                             Ok(resp) => {
                                 crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
+                                // Record the handshake result so later
+                                // connect_agent clients carry it (the
+                                // sandbox gate reads it) — the System VM
+                                // never runs wait_for_machine_ready.
+                                mm.record_agent_protocol(&machine_name, resp.protocol_version)?;
                             }
                             Err(e) => {
                                 tracing::debug!("agent not answering ping yet: {e}");
@@ -684,6 +689,10 @@ impl LifecycleShared {
                     match tokio::time::timeout(remaining, agent.ping()).await {
                         Ok(Ok(resp)) => {
                             crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
+                            // Mirror the blocking arm: record the handshake
+                            // result for the sandbox gate.
+                            self.machine_manager
+                                .record_agent_protocol(&self.machine_name, resp.protocol_version)?;
                         }
                         Ok(Err(e)) => {
                             tracing::debug!("agent not answering ping yet: {e}");

@@ -21,8 +21,20 @@ pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 /// are rejected at boot with an actionable error instead of silently
 /// misbehaving under field skew. Note the sandbox surface assumes the
 /// post-redesign payloads: a pre-0.6.0 agent boots fine but must not be
-/// driven through the sandbox API.
+/// driven through the sandbox API — the daemon enforces that with
+/// [`SANDBOX_MIN_AGENT_PROTOCOL`].
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 1;
+
+/// Minimum agent protocol required for the sandbox RPC surface.
+///
+/// The execution redesign (CORE-55/56) re-typed the payloads of surviving
+/// sandbox `MessageType`s in place, so a pre-0.6.0 agent (reports protocol
+/// `1`) decodes them under silent proto3 field skew. Per the burned-version
+/// note on [`AGENT_PROTOCOL_VERSION`], `2` means "speaks the redesigned
+/// sandbox payloads": the daemon refuses sandbox operations against any
+/// agent reporting less, while non-sandbox surfaces keep working. This
+/// stays `2` even after future bumps (which must jump to `3`).
+pub const SANDBOX_MIN_AGENT_PROTOCOL: u32 = 2;
 
 /// Number of bytes in the fixed RPC frame header (`length` + `type`).
 pub const FRAME_HEADER_SIZE: usize = 8;
@@ -98,7 +110,7 @@ pub enum MessageType {
     // Sandbox workload request types.
     // 0x0030 (SandboxRunRequest), 0x0031 (SandboxExecRequest),
     // 0x0033 (SandboxExecInput), and 0x0034 (SandboxExecResize) were
-    // retired by the execution redesign (protocol v2); do not reuse.
+    // retired by the execution redesign (CORE-55/56); do not reuse.
     SandboxEventsRequest = 0x0032,
     /// Read a file from a sandbox (payload: `arcbox.sandbox.v1.ReadFileRequest`).
     /// The agent answers with a stream of [`Self::SandboxFileData`] frames.
@@ -117,7 +129,8 @@ pub enum MessageType {
     SandboxListSnapshotsRequest = 0x0042,
     SandboxDeleteSnapshotRequest = 0x0043,
 
-    // Sandbox execution request types (0x0060 - 0x0066), protocol v2.
+    // Sandbox execution request types (0x0060 - 0x0066), from the
+    // execution redesign (CORE-55/56).
     /// Start an addressable execution (payload:
     /// `arcbox.sandbox.v1.StartExecutionRequest`). Answered with
     /// [`Self::SandboxExecStartResponse`].
@@ -210,7 +223,7 @@ pub enum MessageType {
 
     // Sandbox workload response types (streaming).
     // 0x1035 (SandboxRunOutput) and 0x1036 (SandboxExecOutput) were
-    // retired by the execution redesign (protocol v2); do not reuse.
+    // retired by the execution redesign (CORE-55/56); do not reuse.
     /// One lifecycle event answering [`Self::SandboxEventsRequest`]
     /// (payload: `arcbox.sandbox.v1.SandboxEvent`).
     SandboxEvent = 0x1037,
@@ -226,7 +239,8 @@ pub enum MessageType {
     SandboxListSnapshotsResponse = 0x1042,
     SandboxDeleteSnapshotResponse = 0x1043,
 
-    // Sandbox execution response types (0x1060 - 0x1066), protocol v2.
+    // Sandbox execution response types (0x1060 - 0x1066), from the
+    // execution redesign (CORE-55/56).
     /// Answers [`Self::SandboxExecStartRequest`] (payload:
     /// `arcbox.sandbox.v1.Execution`).
     SandboxExecStartResponse = 0x1060,
@@ -296,7 +310,7 @@ impl MessageType {
             0x0041 => Some(Self::SandboxRestoreRequest),
             0x0042 => Some(Self::SandboxListSnapshotsRequest),
             0x0043 => Some(Self::SandboxDeleteSnapshotRequest),
-            // Sandbox execution requests (protocol v2).
+            // Sandbox execution requests (execution redesign, CORE-55/56).
             0x0060 => Some(Self::SandboxExecStartRequest),
             0x0061 => Some(Self::SandboxExecAttachRequest),
             0x0062 => Some(Self::SandboxStdinWriteRequest),
@@ -347,7 +361,7 @@ impl MessageType {
             0x1041 => Some(Self::SandboxRestoreResponse),
             0x1042 => Some(Self::SandboxListSnapshotsResponse),
             0x1043 => Some(Self::SandboxDeleteSnapshotResponse),
-            // Sandbox execution responses (protocol v2).
+            // Sandbox execution responses (execution redesign, CORE-55/56).
             0x1060 => Some(Self::SandboxExecStartResponse),
             0x1061 => Some(Self::SandboxExecEvent),
             0x1062 => Some(Self::SandboxStdinStatus),
@@ -407,7 +421,29 @@ impl MessageType {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageType;
+    use super::{
+        AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION, MessageType, SANDBOX_MIN_AGENT_PROTOCOL,
+    };
+
+    #[test]
+    fn protocol_version_2_is_burned() {
+        // `2` is burned: 0.6.0 daemons in the wild interpret it as "speaks
+        // the redesigned sandbox payloads" (see the AGENT_PROTOCOL_VERSION
+        // doc). A future mechanical +1 bump must fail here and jump to 3.
+        let version = AGENT_PROTOCOL_VERSION;
+        assert!(
+            version == 1 || version >= 3,
+            "AGENT_PROTOCOL_VERSION must never be 2 — it is burned; bump to 3"
+        );
+        let min = MIN_AGENT_PROTOCOL_VERSION;
+        assert!(
+            min == 1 || min >= 3,
+            "MIN_AGENT_PROTOCOL_VERSION must never be 2 — it is burned; bump to 3"
+        );
+        // The sandbox gate is the one legitimate meaning of `2` and must
+        // keep it: it names what 0.6.0 daemons shipped.
+        assert_eq!(SANDBOX_MIN_AGENT_PROTOCOL, 2);
+    }
 
     #[test]
     fn message_type_roundtrip_known_values() {
@@ -477,7 +513,7 @@ mod tests {
             (0x1037, MessageType::SandboxEvent),
             (0x1038, MessageType::SandboxFileData),
             (0x1039, MessageType::SandboxFileWriteResponse),
-            // Sandbox executions (protocol v2).
+            // Sandbox executions (execution redesign, CORE-55/56).
             (0x0060, MessageType::SandboxExecStartRequest),
             (0x0061, MessageType::SandboxExecAttachRequest),
             (0x0062, MessageType::SandboxStdinWriteRequest),
@@ -534,7 +570,7 @@ mod tests {
 
     #[test]
     fn retired_sandbox_values_stay_unknown() {
-        // Retired by the execution redesign (protocol v2); the values must
+        // Retired by the execution redesign (CORE-55/56); the values must
         // not be resurrected or reused.
         for retired in [0x0030, 0x0031, 0x0033, 0x0034, 0x1035, 0x1036] {
             assert_eq!(MessageType::from_u32(retired), None, "0x{retired:04x}");

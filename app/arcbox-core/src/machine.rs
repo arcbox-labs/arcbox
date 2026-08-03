@@ -66,6 +66,11 @@ pub struct MachineInfo {
     pub ssh_key_path: Option<PathBuf>,
     /// Guest IP address (reported by agent via vsock).
     pub ip_address: Option<String>,
+    /// Agent protocol version the readiness handshake reported (set where
+    /// `check_agent_protocol` runs: the ready probe for distro machines,
+    /// the `vm_lifecycle` boot arms for the System VM). `connect_agent`
+    /// stamps it onto every client it hands out; the sandbox gate reads it.
+    pub agent_protocol: Option<u32>,
     /// macOS hypervisor backend this machine boots on.
     pub backend: arcbox_vmm::VmBackend,
     /// Creation time.
@@ -351,6 +356,7 @@ impl MachineManager {
                     disk_path: persisted.disk_path.clone().map(PathBuf::from),
                     ssh_key_path: persisted.ssh_key_path.clone().map(PathBuf::from),
                     ip_address: persisted.ip_address.clone(),
+                    agent_protocol: None,
                     backend: persisted.backend,
                     created_at: persisted.created_at,
                     started_at: persisted.started_at,
@@ -546,6 +552,7 @@ impl MachineManager {
             disk_path,
             ssh_key_path: None,
             ip_address: None,
+            agent_protocol: None,
             backend: config.backend,
             created_at: Utc::now(),
             started_at: None,
@@ -599,6 +606,7 @@ impl MachineManager {
                 machine.state = MachineState::Running;
                 machine.cid = Some(cid);
                 machine.ip_address = None;
+                machine.agent_protocol = None;
                 machine.started_at = Some(started_at);
 
                 tracing::info!("Machine '{}' started with CID {}", name, cid);
@@ -656,7 +664,7 @@ impl MachineManager {
         let mut delay_ms = INITIAL_DELAY_MS;
         let mut attempt: u32 = 0;
 
-        let ip = loop {
+        let (ip, agent_protocol) = loop {
             attempt += 1;
 
             let probed = match self.connect_agent(name) {
@@ -669,8 +677,8 @@ impl MachineManager {
                     None
                 }
             };
-            if let Some(ip) = probed {
-                break ip;
+            if let Some(probed) = probed {
+                break probed;
             }
 
             if std::time::Instant::now() >= deadline {
@@ -688,12 +696,30 @@ impl MachineManager {
             let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
             if let Some(machine) = machines.get_mut(name) {
                 machine.ip_address = Some(ip.clone());
+                machine.agent_protocol = Some(agent_protocol);
             }
         }
         if let Err(e) = self.persistence.update_ip(name, Some(&ip)) {
             tracing::warn!("Failed to persist IP for machine '{}': {}", name, e);
         }
         tracing::info!("Machine '{}' ready with IP {}", name, ip);
+        Ok(())
+    }
+
+    /// Records the agent protocol version a successful ping handshake
+    /// reported, so later [`Self::connect_agent`] clients carry it (the
+    /// sandbox gate reads it). Called by the `vm_lifecycle` boot arms for
+    /// the System VM, whose readiness bypasses [`Self::wait_for_machine_ready`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the machine does not exist.
+    pub fn record_agent_protocol(&self, name: &str, version: u32) -> Result<()> {
+        let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+        let machine = machines
+            .get_mut(name)
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+        machine.agent_protocol = Some(version);
         Ok(())
     }
 
@@ -779,12 +805,15 @@ impl MachineManager {
         let cid = self
             .get_cid(name)
             .ok_or_else(|| CoreError::invalid_state("CID not assigned"))?;
-        let backend = {
+        let (backend, agent_protocol) = {
             let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
             let machine = machines
                 .get(name)
                 .ok_or_else(|| CoreError::not_found(name.to_string()))?;
-            self.vm_manager.backend(&machine.vm_id)?
+            (
+                self.vm_manager.backend(&machine.vm_id)?,
+                machine.agent_protocol,
+            )
         };
         let fd = self.connect_vsock_port(name, AGENT_PORT)?;
         // The transport must follow the backend, not the fd's socket domain:
@@ -792,10 +821,12 @@ impl MachineManager {
         // socketpair needs the blocking transport (tokio/kqueue stalls on
         // rapid connect/teardown cycles), and only the async transport
         // supports the streaming sandbox RPCs VZ clients rely on.
-        match backend {
+        let mut client = match backend {
             arcbox_vmm::VmBackend::Hv => AgentClient::from_fd_blocking(cid, fd),
             arcbox_vmm::VmBackend::Vz => AgentClient::from_fd_async(cid, fd),
-        }
+        }?;
+        client.set_agent_protocol(agent_protocol);
+        Ok(client)
     }
 
     /// Connects to a vsock port on a running machine (macOS).
@@ -841,7 +872,9 @@ impl MachineManager {
             .ok_or_else(|| CoreError::invalid_state("CID not assigned"))?;
 
         // On Linux, AgentClient connects directly via AF_VSOCK
-        Ok(AgentClient::new(cid))
+        let mut client = AgentClient::new(cid);
+        client.set_agent_protocol(machine.agent_protocol);
+        Ok(client)
     }
 
     /// Connects to a vsock port on a running machine (Linux).
@@ -1293,6 +1326,7 @@ impl MachineManager {
             disk_path: None,
             ssh_key_path: None,
             ip_address: None,
+            agent_protocol: None,
             backend: arcbox_vmm::VmBackend::default(),
             created_at: Utc::now(),
             started_at: None,
@@ -1306,14 +1340,16 @@ impl MachineManager {
 }
 
 /// One readiness attempt over the blocking (HV) transport: ping, protocol
-/// check, then IP discovery. `Ok(None)` means "not ready yet, retry";
-/// a protocol mismatch is fatal so stale agents fail machine start loudly
-/// instead of misbehaving under proto field skew.
+/// check, then IP discovery. `Ok(None)` means "not ready yet, retry"; on
+/// success it yields the routable IP plus the agent protocol the handshake
+/// reported (recorded so the sandbox gate can read it later). A protocol
+/// mismatch is fatal so stale agents fail machine start loudly instead of
+/// misbehaving under proto field skew.
 fn probe_ip_blocking(
     mut agent: crate::agent_client::AgentClient,
     name: &str,
     attempt: u32,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, u32)>> {
     let resp = match agent.ping_blocking() {
         Ok(resp) => resp,
         Err(e) => {
@@ -1329,7 +1365,9 @@ fn probe_ip_blocking(
         attempt,
     );
     match agent.get_system_info_blocking() {
-        Ok(info) => Ok(select_routable_ip(&info.ip_addresses)),
+        Ok(info) => {
+            Ok(select_routable_ip(&info.ip_addresses).map(|ip| (ip, resp.protocol_version)))
+        }
         Err(e) => {
             tracing::trace!(
                 "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
@@ -1346,7 +1384,7 @@ async fn probe_ip_async(
     mut agent: crate::agent_client::AgentClient,
     name: &str,
     attempt: u32,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, u32)>> {
     let resp = match agent.ping().await {
         Ok(resp) => resp,
         Err(e) => {
@@ -1362,7 +1400,9 @@ async fn probe_ip_async(
         attempt,
     );
     match agent.get_system_info().await {
-        Ok(info) => Ok(select_routable_ip(&info.ip_addresses)),
+        Ok(info) => {
+            Ok(select_routable_ip(&info.ip_addresses).map(|ip| (ip, resp.protocol_version)))
+        }
         Err(e) => {
             tracing::trace!(
                 "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
