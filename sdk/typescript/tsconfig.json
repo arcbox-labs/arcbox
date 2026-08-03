@@ -10,6 +10,7 @@
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
+    "types": ["node"],
     "noEmit": true
   },
   "include": ["src", "test", "vitest.config.ts", "eslint.config.js"]
