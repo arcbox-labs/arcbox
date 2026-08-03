@@ -1,0 +1,19 @@
+# Codegen for the sandbox API (`npm run generate`).
+#
+# Input is the repo's proto tree; only the public `arcbox.sandbox.v1`
+# package is generated (it is self-contained: imports only well-known
+# types, which protoc-gen-es maps to @bufbuild/protobuf/wkt). Output in
+# src/gen/ is committed, never exported from the package entry point —
+# public shapes are hand-written and mapped at the transport boundary.
+version: v2
+inputs:
+  - directory: ../../rpc/arcbox-protocol/proto
+    paths:
+      - ../../rpc/arcbox-protocol/proto/arcbox/sandbox/v1
+plugins:
+  - local: protoc-gen-es
+    out: src/gen
+    opt:
+      - target=ts
+      - import_extension=js
+clean: true
