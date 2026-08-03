@@ -8,12 +8,12 @@ in :mod:`arcbox.errors`.
 """
 
 from arcbox._async._client import AsyncConnectClient
-from arcbox._async.commands import AsyncCommandHandle, AsyncCommands
+from arcbox._async.commands import AsyncCommandHandle, AsyncCommands, AsyncOutputStream
 from arcbox._async.files import AsyncFiles
 from arcbox._async.sandbox import AsyncArcBox, AsyncSandbox
 from arcbox._connection import Connection
 from arcbox._sync._client import ConnectClient
-from arcbox._sync.commands import CommandHandle, Commands
+from arcbox._sync.commands import CommandHandle, Commands, OutputStream
 from arcbox._sync.files import Files
 from arcbox._sync.sandbox import ArcBox, Sandbox
 from arcbox._types import (
@@ -36,6 +36,7 @@ __all__ = [
     "AsyncCommands",
     "AsyncConnectClient",
     "AsyncFiles",
+    "AsyncOutputStream",
     "AsyncSandbox",
     "CommandHandle",
     "CommandResult",
@@ -46,6 +47,7 @@ __all__ = [
     "IdlePolicy",
     "OutputChannel",
     "OutputChunk",
+    "OutputStream",
     "Sandbox",
     "SandboxInfo",
     "SandboxState",

@@ -25,11 +25,13 @@ from arcbox import (
     AsyncCommands,
     AsyncConnectClient,
     AsyncFiles,
+    AsyncOutputStream,
     AsyncSandbox,
     CommandHandle,
     Commands,
     ConnectClient,
     Files,
+    OutputStream,
     Sandbox,
 )
 
@@ -40,6 +42,7 @@ PAIRS = [
     (AsyncSandbox, Sandbox),
     (AsyncCommands, Commands),
     (AsyncCommandHandle, CommandHandle),
+    (AsyncOutputStream, OutputStream),
     (AsyncFiles, Files),
     (AsyncConnectClient, ConnectClient),
 ]
