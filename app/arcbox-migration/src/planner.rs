@@ -46,9 +46,10 @@ impl MigrationPlanner {
         let source_volumes = source_runner.list_volumes().await?;
         let source_networks = source_runner.list_networks().await?;
         // Drop migration's own scaffolding before anything derives from it, so
-        // it cannot leak into volume usage, blockers, or the container plan.
-        // `ensure_helper_image` leaves its image behind on both daemons, and a
-        // crashed run can strand helper containers.
+        // it cannot leak into volume usage, blockers, or the container plan: a
+        // crashed run can strand helper containers. The filter keys on the
+        // UUID-bearing prefix, so it excludes only this probe's containers and
+        // not everything in the `arcbox-migration-` namespace.
         let source_containers: Vec<_> = source_runner
             .list_containers()
             .await?
@@ -201,7 +202,10 @@ fn normalize_images(
 
     for image in images {
         let tags = meaningful_tags(&image.repo_tags);
-        if tags.iter().any(|tag| is_helper_object(tag)) {
+        // Matched exactly, not by prefix: migration creates one helper image and
+        // knows its full reference, so a prefix test would only add a way to
+        // drop somebody else's image from the plan.
+        if tags.iter().any(|tag| tag == helper_image_reference()) {
             continue;
         }
         if !tags.is_empty() {
@@ -688,6 +692,30 @@ mod tests {
             .flat_map(|plan| plan.export_references.clone())
             .collect();
         assert_eq!(refs, vec!["postgres:16".to_string()]);
+    }
+
+    #[test]
+    fn only_the_exact_helper_image_is_excluded() {
+        // The `arcbox-migration-` namespace is ours to use elsewhere; matching
+        // it by prefix would drop an internal service's image from the plan.
+        let images = [
+            image_inspect("sha256:neighbour", &["arcbox-migration-tools:latest"]),
+            image_inspect("sha256:helper-ish", &["arcbox-migration-helper:v2"]),
+        ];
+        let plans = normalize_images(&images, &[], &BTreeSet::new());
+
+        let mut refs: Vec<_> = plans
+            .iter()
+            .flat_map(|plan| plan.export_references.clone())
+            .collect();
+        refs.sort();
+        assert_eq!(
+            refs,
+            vec![
+                "arcbox-migration-helper:v2".to_string(),
+                "arcbox-migration-tools:latest".to_string(),
+            ]
+        );
     }
 
     #[test]
