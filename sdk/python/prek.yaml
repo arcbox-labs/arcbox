@@ -1,0 +1,35 @@
+# Hooks for the Python SDK only (run with prek, the Rust pre-commit
+# runner — https://github.com/j178/prek — or classic pre-commit).
+#
+# Install from the repo root:
+#   prek install -c sdk/python/prek.yaml
+#
+# Scoped to sdk/python paths; deliberately no Rust-side hooks — the
+# repo's cargo fmt/clippy discipline stays where it is.
+repos:
+  - repo: local
+    hooks:
+      - id: sdk-python-ruff
+        name: sdk/python ruff (lint + format)
+        language: system
+        files: ^sdk/python/
+        pass_filenames: false
+        entry: bash -c 'cd sdk/python && uv run ruff check . && uv run ruff format --check .'
+      - id: sdk-python-pyright
+        name: sdk/python pyright (strict)
+        language: system
+        files: ^sdk/python/
+        pass_filenames: false
+        entry: bash -c 'cd sdk/python && uv run pyright'
+      - id: sdk-python-sync-lockstep
+        name: sdk/python sync-tree lockstep
+        language: system
+        files: ^sdk/python/(src/arcbox/(_async|_sync)/|scripts/gen_sync\.py)
+        pass_filenames: false
+        entry: bash -c 'cd sdk/python && uv run python scripts/gen_sync.py --check'
+      - id: sdk-python-pytest
+        name: sdk/python pytest
+        language: system
+        files: ^sdk/python/
+        pass_filenames: false
+        entry: bash -c 'cd sdk/python && uv run pytest -q'
