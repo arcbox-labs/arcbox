@@ -181,8 +181,8 @@ message KeepAlive {}
 
 // Request to create a sandbox.
 message CreateSandboxRequest {
-    // Caller-supplied unique ID for idempotent creation.
-    // If empty the daemon generates a UUID.
+    // Caller-supplied unique ID for durable retry idempotency.
+    // If empty the daemon generates a fresh UUID for every attempt.
     string id = 1;
 
     // Arbitrary key-value metadata (used for filtering in List / Events).

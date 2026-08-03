@@ -1,6 +1,12 @@
 use super::*;
+use serde::{Deserialize, Serialize};
 
 pub type SandboxId = String;
+
+pub(super) struct SandboxBootTask {
+    pub(super) resource_handoff: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub(super) handle: tokio::task::JoinHandle<()>,
+}
 
 // State
 
@@ -37,14 +43,14 @@ impl std::fmt::Display for SandboxState {
 // Spec types (input to SandboxManager methods)
 
 /// Network configuration supplied at sandbox creation time.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxNetworkSpec {
     /// `"tap"` (default) or `"none"`.
     pub mode: String,
 }
 
 /// A single bind-mount into the sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxMountSpec {
     pub source: String,
     pub target: String,
@@ -58,7 +64,8 @@ pub struct SandboxMountSpec {
 /// once the sandbox is ready, through the same path as `Run`.
 /// `mounts`, `image`, and `ssh_public_key` are validated at the service
 /// boundary (see the guest agent's `SandboxService::create`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SandboxSpec {
     /// Caller-supplied ID; auto-generated (UUID) when `None` or empty.
     pub id: Option<String>,
@@ -113,12 +120,18 @@ pub struct RestoreSandboxSpec {
 pub struct SandboxInstance {
     /// Unique identifier.
     pub id: SandboxId,
+    /// Durable lifecycle record generation.
+    pub(super) record_generation: Option<Uuid>,
     /// User-supplied labels.
     pub labels: HashMap<String, String>,
     /// Original creation spec.
     pub spec: SandboxSpec,
     /// Current lifecycle state.
     pub state: SandboxState,
+    /// Serializes Stop/Remove and failure cleanup for this generation.
+    pub(super) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
+    /// In-flight boot, retained until Remove can cancel and join it.
+    pub(super) boot_task: Option<SandboxBootTask>,
     /// Handle to the Firecracker process.
     pub process: Option<fc_sdk::FirecrackerProcess>,
     /// Post-boot API handle (present once the VM has booted).
@@ -142,10 +155,6 @@ pub struct SandboxInstance {
     pub error: Option<String>,
     /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
     pub cow_handle: Option<CowHandle>,
-    /// For restored sandboxes only: the original sandbox's vm_dir, recreated
-    /// so the vmstate-recorded `rootfs.link` symlink (and FC vsock socket)
-    /// resolve correctly.  Removed alongside the sandbox.
-    pub restore_origin_dir: Option<PathBuf>,
 }
 
 impl SandboxInstance {
@@ -155,11 +164,34 @@ impl SandboxInstance {
         network: Option<NetworkAllocation>,
         vm_dir: PathBuf,
     ) -> Self {
+        Self::new_inner(id, spec, network, vm_dir, None)
+    }
+
+    pub(super) fn new_with_generation(
+        id: SandboxId,
+        spec: SandboxSpec,
+        network: Option<NetworkAllocation>,
+        vm_dir: PathBuf,
+        generation: Uuid,
+    ) -> Self {
+        Self::new_inner(id, spec, network, vm_dir, Some(generation))
+    }
+
+    fn new_inner(
+        id: SandboxId,
+        spec: SandboxSpec,
+        network: Option<NetworkAllocation>,
+        vm_dir: PathBuf,
+        record_generation: Option<Uuid>,
+    ) -> Self {
         Self {
             id,
+            record_generation,
             labels: spec.labels.clone(),
             spec,
             state: SandboxState::Starting,
+            cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            boot_task: None,
             process: None,
             vm: None,
             network,
@@ -171,7 +203,6 @@ impl SandboxInstance {
             last_exit_status: None,
             error: None,
             cow_handle: None,
-            restore_origin_dir: None,
         }
     }
 

@@ -1,4 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -81,6 +83,37 @@ const MEM_FILE: &str = "mem";
 /// The leading dot keeps it out of the catalog's `{snapshot_id}` namespace:
 /// snapshot IDs are UUIDs, so no published entry can collide with one.
 const STAGING_SUFFIX: &str = ".partial";
+
+fn secure_dir(path: &Path) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(VmmError::Io)
+}
+
+fn sync_private_file(path: &Path) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(VmmError::Io)?;
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(VmmError::Io)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(VmmError::Io)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(VmmError::Io)?;
+    file.write_all(bytes).map_err(VmmError::Io)?;
+    file.sync_all().map_err(VmmError::Io)
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(VmmError::Io)
+}
 
 /// True when `path` is a published snapshot directory.
 ///
@@ -167,10 +200,23 @@ impl PendingSnapshot<'_> {
             rootfs_path: draft.rootfs_path,
         };
 
-        let json = serde_json::to_string_pretty(&meta)?;
-        std::fs::write(SnapshotCatalog::meta_path(&staging), json).map_err(VmmError::Io)?;
+        sync_private_file(&staging.join(VMSTATE_FILE))?;
+        if has_mem {
+            sync_private_file(&staging.join(MEM_FILE))?;
+        }
+        let json = serde_json::to_vec_pretty(&meta)?;
+        write_private_file(&SnapshotCatalog::meta_path(&staging), &json)?;
+        secure_dir(&staging)?;
+        sync_dir(&staging)?;
         std::fs::rename(&staging, &published).map_err(VmmError::Io)?;
         self.published = true;
+        let owner = published.parent().expect("snapshot directory has an owner");
+        sync_dir(owner).map_err(|error| {
+            VmmError::Unavailable(format!(
+                "snapshot {} is visible, but publish durability is unconfirmed: {error}",
+                meta.id
+            ))
+        })?;
 
         info!(snapshot_id = %meta.id, vm_id = %meta.vm_id, "snapshot registered");
         Ok(meta)
@@ -234,6 +280,14 @@ impl SnapshotCatalog {
             published: false,
         };
         std::fs::create_dir_all(pending.dir()).map_err(VmmError::Io)?;
+        secure_dir(&self.root)?;
+        secure_dir(&self.vm_dir(vm_id))?;
+        secure_dir(&pending.dir())?;
+        sync_dir(&self.vm_dir(vm_id))?;
+        sync_dir(&self.root)?;
+        if let Some(data_dir) = self.root.parent() {
+            sync_dir(data_dir)?;
+        }
         Ok(pending)
     }
 
@@ -268,6 +322,7 @@ impl SnapshotCatalog {
             )));
         }
         std::fs::remove_dir_all(&path).map_err(VmmError::Io)?;
+        sync_dir(&self.vm_dir(vm_id))?;
         info!(snapshot_id, vm_id, "snapshot deleted");
         Ok(())
     }
@@ -458,6 +513,20 @@ mod tests {
         assert_eq!(meta.vmstate_path, published.join(VMSTATE_FILE));
         assert_eq!(meta.mem_path, Some(published.join(MEM_FILE)));
         assert_eq!(catalog.list("vm-1").unwrap().len(), 1);
+        assert_eq!(
+            std::fs::metadata(&published).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for file in [VMSTATE_FILE, MEM_FILE, "meta.json"] {
+            assert_eq!(
+                std::fs::metadata(published.join(file))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

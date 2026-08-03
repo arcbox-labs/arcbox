@@ -42,10 +42,12 @@ message (`/dev/kvm` is absent in the guest).
 ## Connection
 
 - Socket: `~/.arcbox/run/arcbox.sock` (Unix domain socket, HTTP/2).
-- No routing metadata is required. Local clients MAY set the `x-machine`
-  header to target a named VM; absent (or empty) it resolves to the
-  System VM. The header is local transport metadata, not part of the
-  product contract — a cloud client never sends one.
+- Sandbox V1 runs only in the System VM. An absent, empty, or explicit
+  `x-machine: default` header targets it; every other value returns
+  `INVALID_ARGUMENT`. Supporting sandboxes in multiple VMs later requires
+  extending host listener and DNS ownership with a machine identity first.
+  The header remains local transport metadata, not part of the product
+  contract — a cloud client never sends one.
 - **Transport & auth posture (V1)**: UDS only — there is no TCP listener,
   and no authentication beyond the socket's file permissions. This is a
   single-user local API; remote access requires your own proxy in front of
@@ -103,7 +105,7 @@ Key fields:
 
 | Field | Semantics |
 |---|---|
-| `id` | caller-supplied for idempotency; empty → UUID |
+| `id` | caller-supplied for durable retry idempotency; empty → a fresh UUID on every attempt |
 | `limits.vcpus` / `limits.memory_mib` | 0 → daemon defaults (1 vCPU, 512 MiB) |
 | `template` | opaque reference to what boots — see **Templates** below |
 | `cmd`, `env`, `working_dir`, `user` | initial workload launched automatically once ready; exit returns the sandbox to `READY` with an `IDLE` event |
@@ -242,9 +244,11 @@ mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
 | `Restore{snapshot_id, id, network_override, ttl_seconds}` | new sandbox in `READY` state with near-zero boot; set `network_override` for a fresh TAP/IP when restoring concurrently |
 | `ListSnapshots` / `DeleteSnapshot` | catalog management; `ListSnapshots` paginates like `List` |
 
-Direct-mode (non-jailer) restores of the same snapshot cannot run
-concurrently with each other or the origin sandbox (the vmstate pins the
-origin vsock path); jailer-mode restores have no such constraint.
+Restore requires jailer mode. Direct-mode vmstate pins origin sandbox paths
+and is rejected rather than risking mutation of the origin or path collisions.
+Restore retries are durably replayed only when `id` is caller-supplied. An
+empty `id` creates a fresh UUID on every attempt, so retry-capable clients must
+generate and retain the ID before the first call.
 
 `network_override` (a fresh TAP/IP for the restored sandbox) uses
 Firecracker's `network_overrides` snapshot-load field (Firecracker ≥ 1.12;

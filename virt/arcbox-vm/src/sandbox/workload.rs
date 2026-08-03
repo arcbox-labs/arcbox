@@ -47,9 +47,8 @@ pub(super) fn release_running(id: &SandboxId, instances: &InstanceMap) {
 /// Record a workload's exit and return the sandbox to `Ready`.
 ///
 /// Runs when the `exit` chunk is observed. The `Ready` flip happens only from
-/// an active state (`Running` during a normal workload, `Stopping` while a
-/// `stop` drains — where the flip is the drain's completion signal); a sandbox
-/// already driven to `Stopped` is never resurrected.
+/// `Running`. A concurrent `Stop` owns the `Stopping` state; workload exit
+/// timestamps signal its drain without reopening the sandbox to new work.
 pub(super) fn finish_workload(
     id: &SandboxId,
     status: ExitStatus,
@@ -62,7 +61,7 @@ pub(super) fn finish_workload(
         let mut inst = arc.lock().unwrap();
         inst.last_exit_status = Some(status);
         inst.last_exited_at = Some(Utc::now());
-        if matches!(inst.state, SandboxState::Running | SandboxState::Stopping) {
+        if inst.state == SandboxState::Running {
             inst.state = SandboxState::Ready;
         }
     }
@@ -229,6 +228,23 @@ mod tests {
         instances.read().unwrap()["s"].lock().unwrap().state = SandboxState::Stopping;
         release_running(&"s".to_owned(), &instances);
         assert_eq!(state_of("s", &instances), SandboxState::Stopping);
+    }
+
+    #[test]
+    fn workload_exit_does_not_reopen_a_stopping_sandbox() {
+        let instances = instance_map("s", SandboxState::Stopping);
+        let (events_tx, _) = broadcast::channel(4);
+
+        finish_workload(&"s".to_owned(), ExitStatus::Code(0), &instances, &events_tx);
+
+        assert_eq!(state_of("s", &instances), SandboxState::Stopping);
+        assert!(
+            instances.read().unwrap()["s"]
+                .lock()
+                .unwrap()
+                .last_exited_at
+                .is_some()
+        );
     }
 
     #[tokio::test]

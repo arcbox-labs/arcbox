@@ -45,7 +45,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::StartExecutionRequest>,
     ) -> ServiceResult<pb::Execution> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
@@ -63,7 +63,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::AttachExecutionRequest>,
     ) -> ServiceResult<ServiceStream<ExecutionEvent>> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let agent = self
             .runtime
             .ready()?
@@ -87,7 +87,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::WriteStdinRequest>,
     ) -> ServiceResult<pb::StdinStatus> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
@@ -105,7 +105,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         mut requests: InboundStream<pb::WriteStdinRequest>,
     ) -> ServiceResult<pb::StdinStatus> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
 
         let mut last = None;
         while let Some(item) = requests.next().await {
@@ -135,7 +135,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::GetStdinStatusRequest>,
     ) -> ServiceResult<pb::StdinStatus> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
@@ -153,7 +153,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::SignalExecutionRequest>,
     ) -> ServiceResult<Empty> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
@@ -171,7 +171,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::ResizeExecutionTtyRequest>,
     ) -> ServiceResult<Empty> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
@@ -189,7 +189,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::WaitExecutionRequest>,
     ) -> ServiceResult<pb::Execution> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?

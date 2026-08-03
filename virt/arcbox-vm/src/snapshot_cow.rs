@@ -10,14 +10,27 @@
 //! guest does not have a meaningful one.
 
 use std::collections::HashMap;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use crate::error::{Result, VmmError};
+
+mod persistence;
+
+use persistence::{
+    SetupOrphan, clear_owner_marker, loop_backs_path, loop_devices_for_backing_sync,
+    remove_file_durable,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -47,6 +60,8 @@ const DM_NAME_MAX_LEN: usize = 127;
 /// startup we use these to identify *our* attached read-only loops
 /// rather than every read-only loop on the system.
 const TEMPLATE_LOOP_DIR: &str = ".template-loops";
+const TEMPLATE_PENDING_PREFIX: &str = "pending-";
+const TEMPLATE_MARKER_TEMP_PREFIX: &str = ".tmp-";
 
 /// Validate that `sandbox_id` can be used as the suffix of a dm-name.
 ///
@@ -107,9 +122,44 @@ pub struct CowHandle {
     pub template_path: PathBuf,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CowTestProbe {
+    setups: AtomicUsize,
+    teardowns: Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl CowTestProbe {
+    fn setup(&self, sandbox_id: &str, rootfs_path: &str, cow_dir: &Path) -> CowHandle {
+        self.setups.fetch_add(1, Ordering::SeqCst);
+        let dm_name = format!("{DM_NAME_PREFIX}{sandbox_id}");
+        CowHandle {
+            dm_device: format!("/dev/mapper/{dm_name}"),
+            cow_loop: format!("/dev/loop-test-{sandbox_id}"),
+            cow_file: cow_dir.join(format!("arcbox-cow-{sandbox_id}.img")),
+            template_path: PathBuf::from(rootfs_path),
+            dm_name,
+        }
+    }
+
+    fn teardown(&self, handle: &CowHandle) {
+        self.teardowns.lock().unwrap().push(handle.dm_name.clone());
+    }
+
+    pub(crate) fn setup_count(&self) -> usize {
+        self.setups.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn teardown_count(&self) -> usize {
+        self.teardowns.lock().unwrap().len()
+    }
+}
+
 /// Manages template loop devices and per-sandbox dm-snapshot lifecycle.
 pub struct CowManager {
     templates: Mutex<HashMap<PathBuf, TemplateEntry>>,
+    setup_orphans: Mutex<HashMap<String, SetupOrphan>>,
     /// Serializes the cache-miss attach+insert window so two concurrent
     /// first-time setups for the same template converge on a single
     /// `TemplateEntry` instead of each attaching its own loop device and
@@ -118,6 +168,8 @@ pub struct CowManager {
     losetup_lock: AsyncMutex<()>,
     cow_dir: PathBuf,
     dmsetup_bin: Option<String>,
+    #[cfg(test)]
+    test_probe: Option<Arc<CowTestProbe>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,9 +180,17 @@ impl CowManager {
     /// Create a new manager.  `data_dir` is the Firecracker data directory
     /// (e.g. `/var/lib/firecracker-vmm`); COW files are stored under
     /// `{data_dir}/cow/`.
-    pub fn new(data_dir: &str) -> std::io::Result<Self> {
-        let cow_dir = PathBuf::from(data_dir).join("cow");
-        std::fs::create_dir_all(&cow_dir)?;
+    pub fn new(data_dir: &str) -> Result<Self> {
+        let data_dir = PathBuf::from(data_dir);
+        let cow_dir = data_dir.join("cow");
+        let marker_dir = cow_dir.join(TEMPLATE_LOOP_DIR);
+        std::fs::create_dir_all(&marker_dir)?;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&cow_dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&marker_dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::File::open(&marker_dir)?.sync_all()?;
+        std::fs::File::open(&cow_dir)?.sync_all()?;
+        std::fs::File::open(&data_dir)?.sync_all()?;
 
         let dmsetup_bin = DMSETUP_CANDIDATES
             .iter()
@@ -141,17 +201,22 @@ impl CowManager {
             warn!("dmsetup not found; dm-snapshot CoW will be unavailable");
         }
 
-        let mgr = Self {
+        Ok(Self {
             templates: Mutex::new(HashMap::new()),
+            setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir,
             dmsetup_bin,
-        };
+            #[cfg(test)]
+            test_probe: None,
+        })
+    }
 
-        // Clean up orphaned dm devices and COW files from a previous crash.
-        mgr.cleanup_stale_sync();
-
-        Ok(mgr)
+    #[cfg(test)]
+    pub(crate) fn new_with_test_probe(data_dir: &str, probe: Arc<CowTestProbe>) -> Result<Self> {
+        let mut manager = Self::new(data_dir)?;
+        manager.test_probe = Some(probe);
+        Ok(manager)
     }
 
     /// Create a dm-snapshot for `sandbox_id` using `rootfs_path` as template.
@@ -160,6 +225,15 @@ impl CowManager {
     /// Firecracker as the rootfs block device.
     pub async fn setup(&self, sandbox_id: &str, rootfs_path: &str) -> Result<CowHandle> {
         validate_dm_name_suffix(sandbox_id)?;
+        #[cfg(test)]
+        if let Some(probe) = &self.test_probe {
+            return Ok(probe.setup(sandbox_id, rootfs_path, &self.cow_dir));
+        }
+        if self.setup_orphans.lock().unwrap().contains_key(sandbox_id) {
+            return Err(VmmError::Unavailable(format!(
+                "sandbox {sandbox_id} still owns resources from an incomplete CoW setup"
+            )));
+        }
 
         let dmsetup = self
             .dmsetup_bin
@@ -178,7 +252,14 @@ impl CowManager {
             // Fast path under the sync mutex.
             if let Some(cached) = {
                 let mut templates = self.templates.lock().unwrap();
-                templates.get_mut(&template).map(|entry| {
+                let entry = templates.get_mut(&template);
+                if entry.as_ref().is_some_and(|entry| entry.refcount == 0) {
+                    return Err(VmmError::Unavailable(format!(
+                        "template {} still owns resources from an incomplete CoW setup",
+                        template.display()
+                    )));
+                }
+                entry.map(|entry| {
                     entry.refcount += 1;
                     debug!(
                         template = %rootfs_path,
@@ -200,7 +281,14 @@ impl CowManager {
             // we were waiting for the lock.
             if let Some(cached) = {
                 let mut templates = self.templates.lock().unwrap();
-                templates.get_mut(&template).map(|entry| {
+                let entry = templates.get_mut(&template);
+                if entry.as_ref().is_some_and(|entry| entry.refcount == 0) {
+                    return Err(VmmError::Unavailable(format!(
+                        "template {} still owns resources from an incomplete CoW setup",
+                        template.display()
+                    )));
+                }
+                entry.map(|entry| {
                     entry.refcount += 1;
                     debug!(
                         template = %rootfs_path,
@@ -216,17 +304,54 @@ impl CowManager {
 
             // Genuinely first to attach — do the work and publish the entry
             // before releasing the lock.
-            let loop_dev = losetup_attach(BUSYBOX, Path::new(rootfs_path), true).await?;
-            let sectors = blockdev_getsz(BUSYBOX, &loop_dev).await.inspect_err(|_| {
-                let ld = loop_dev.clone();
-                tokio::spawn(async move {
-                    let _ = losetup_detach(BUSYBOX, &ld).await;
-                });
-            })?;
-            // Persist a marker so cleanup_stale_sync can identify this loop
-            // as ours on a future restart.  Best-effort: a failure here only
-            // means a leak after crash, not a runtime failure.
-            self.write_template_marker(&loop_dev, &template);
+            let pending = self.write_template_pending(sandbox_id, &template)?;
+            let loop_dev = match losetup_attach(BUSYBOX, Path::new(rootfs_path), true).await {
+                Ok(loop_dev) => loop_dev,
+                Err(error) => {
+                    return Err(self
+                        .abort_template_acquisition(sandbox_id, &pending, None, &template, error)
+                        .await);
+                }
+            };
+            // Persist ownership before publishing the loop. If the marker
+            // cannot be made durable, detach immediately rather than creating
+            // a resource that restart reconciliation cannot identify.
+            if let Err(error) = self.write_template_marker(&loop_dev, &template) {
+                return Err(self
+                    .abort_template_acquisition(
+                        sandbox_id,
+                        &pending,
+                        Some(&loop_dev),
+                        &template,
+                        error,
+                    )
+                    .await);
+            }
+            let sectors = match blockdev_getsz(BUSYBOX, &loop_dev).await {
+                Ok(sectors) => sectors,
+                Err(error) => {
+                    return Err(self
+                        .abort_template_acquisition(
+                            sandbox_id,
+                            &pending,
+                            Some(&loop_dev),
+                            &template,
+                            error,
+                        )
+                        .await);
+                }
+            };
+            if let Err(error) = clear_owner_marker(&pending) {
+                return Err(self
+                    .abort_template_acquisition(
+                        sandbox_id,
+                        &pending,
+                        Some(&loop_dev),
+                        &template,
+                        error,
+                    )
+                    .await);
+            }
             debug!(
                 template = %rootfs_path,
                 loop_dev = %loop_dev,
@@ -250,9 +375,17 @@ impl CowManager {
         // --- 2. Create sparse COW file (O(1), no actual I/O) ---------------
         let cow_file = self.cow_dir.join(format!("arcbox-cow-{sandbox_id}.img"));
         let cow_size = sectors * 512;
-        if let Err(e) = create_sparse_file(&cow_file, cow_size).await {
-            self.release_template(&template);
-            return Err(e);
+        if let Err((e, owns_file)) = create_sparse_file(&cow_file, cow_size).await {
+            return Err(self
+                .rollback_setup(
+                    sandbox_id,
+                    &template,
+                    None,
+                    None,
+                    owns_file.then_some(cow_file.as_path()),
+                    e,
+                )
+                .await);
         }
 
         // --- 3. Attach COW file as a loop device ----------------------------
@@ -265,9 +398,9 @@ impl CowManager {
         let cow_loop = match cow_loop_result {
             Ok(dev) => dev,
             Err(e) => {
-                let _ = std::fs::remove_file(&cow_file);
-                self.release_template(&template);
-                return Err(e);
+                return Err(self
+                    .rollback_setup(sandbox_id, &template, None, None, Some(&cow_file), e)
+                    .await);
             }
         };
 
@@ -277,10 +410,16 @@ impl CowManager {
             format!("0 {sectors} snapshot {template_loop} {cow_loop} P {SNAPSHOT_CHUNK_SECTORS}");
 
         if let Err(e) = dmsetup_create(dmsetup, &dm_name, &table).await {
-            let _ = losetup_detach(BUSYBOX, &cow_loop).await;
-            let _ = std::fs::remove_file(&cow_file);
-            self.release_template(&template);
-            return Err(e);
+            return Err(self
+                .rollback_setup(
+                    sandbox_id,
+                    &template,
+                    Some(&dm_name),
+                    Some(&cow_loop),
+                    Some(&cow_file),
+                    e,
+                )
+                .await);
         }
 
         let dm_device = format!("/dev/mapper/{dm_name}");
@@ -300,215 +439,90 @@ impl CowManager {
         })
     }
 
-    /// Tear down a dm-snapshot.  Best-effort: each step logs errors but
-    /// continues to the next so resources are not leaked.  The return type
-    /// is intentionally `()` — callers cannot do anything more useful than
-    /// log on individual step failures, which this function already does.
+    /// Tear down a dm-snapshot, logging any incomplete cleanup.
     pub async fn teardown(&self, handle: &CowHandle) {
-        let dmsetup = self.dmsetup_bin.as_deref().unwrap_or("dmsetup");
+        if let Err(error) = self.teardown_checked(handle).await {
+            warn!(dm = %handle.dm_name, error = %error, "dm-snapshot teardown incomplete");
+        }
+    }
+
+    /// Tear down a dm-snapshot and report whether every owned resource was
+    /// released. Crash reconciliation and durable Remove use this result to
+    /// avoid declaring cleanup complete when a retry is still required.
+    pub async fn teardown_checked(&self, handle: &CowHandle) -> Result<()> {
+        #[cfg(test)]
+        if let Some(probe) = &self.test_probe {
+            probe.teardown(handle);
+            return Ok(());
+        }
+        let dmsetup = self
+            .dmsetup_bin
+            .as_deref()
+            .ok_or_else(|| VmmError::DeviceMapper("dmsetup binary not found".into()))?;
+        let mut failures = Vec::new();
 
         // 1. Remove dm device.
-        let dm_removed = dmsetup_remove(dmsetup, &handle.dm_name).await.is_ok();
-        if !dm_removed {
-            warn!(dm = %handle.dm_name, "failed to remove dm device");
-        }
+        let dm_removed = if !Path::new(&handle.dm_device).exists() {
+            true
+        } else {
+            match dmsetup_remove(dmsetup, &handle.dm_name).await {
+                Ok(()) => true,
+                Err(error) => {
+                    failures.push(format!("remove {}: {error}", handle.dm_name));
+                    false
+                }
+            }
+        };
 
         // 2. Detach COW loop device.
-        let loop_detached = losetup_detach(BUSYBOX, &handle.cow_loop).await.is_ok();
-        if !loop_detached {
-            warn!(loop_dev = %handle.cow_loop, "failed to detach cow loop");
-        }
+        let loop_detached = if loop_backs_path(&handle.cow_loop, &handle.cow_file)? {
+            match losetup_detach(BUSYBOX, &handle.cow_loop).await {
+                Ok(()) => true,
+                Err(error) => {
+                    failures.push(format!("detach {}: {error}", handle.cow_loop));
+                    false
+                }
+            }
+        } else {
+            match loop_devices_for_backing_sync(&handle.cow_file) {
+                Ok(devices) if devices.is_empty() => true,
+                Ok(devices) => {
+                    failures.push(format!(
+                        "{} is still attached through {} after {} changed ownership",
+                        handle.cow_file.display(),
+                        devices.join(", "),
+                        handle.cow_loop
+                    ));
+                    false
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "verify loop ownership for {}: {error}",
+                        handle.cow_file.display()
+                    ));
+                    false
+                }
+            }
+        };
 
         // 3. Delete COW sparse file only after both dm and loop are released.
         //    Unlinking while still referenced would delay space reclamation
         //    until the last kernel reference drops.
         if dm_removed && loop_detached {
-            if let Err(e) = std::fs::remove_file(&handle.cow_file) {
-                warn!(file = %handle.cow_file.display(), error = %e, "failed to remove cow file");
+            if let Err(error) = remove_file_durable(&handle.cow_file) {
+                failures.push(format!("remove {}: {error}", handle.cow_file.display()));
             }
+        }
+
+        if failures.is_empty() {
+            // Release the shared template exactly once, after every per-sandbox
+            // resource is gone. A failed teardown keeps the handle for retry.
+            self.release_template_ref(&handle.template_path, true)
+                .await?;
+            info!(sandbox = %handle.dm_name, "dm-snapshot teardown complete");
+            Ok(())
         } else {
-            warn!(
-                file = %handle.cow_file.display(),
-                "skipping cow file removal — backing resources not fully released"
-            );
-        }
-
-        // 4. Release template refcount.
-        self.release_template(&handle.template_path);
-
-        info!(sandbox = %handle.dm_name, "dm-snapshot teardown complete");
-    }
-
-    /// Remove orphaned dm-snapshot devices, COW files, and template loop
-    /// devices left over from a previous crash.  Called once at startup
-    /// before a tokio runtime is guaranteed to exist, so this is
-    /// intentionally synchronous.
-    fn cleanup_stale_sync(&self) {
-        let dmsetup = match self.dmsetup_bin.as_deref() {
-            Some(bin) => bin,
-            None => return,
-        };
-
-        // 1. Remove stale dm devices first — they pin the loop devices
-        //    underneath, so the loop detach below would fail otherwise.
-        if let Ok(output) = Command::new(dmsetup)
-            .args(["ls", "--target", "snapshot"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(name) = line.split_whitespace().next()
-                    && name.starts_with(DM_NAME_PREFIX)
-                {
-                    debug!(dm = %name, "removing stale dm-snapshot");
-                    let _ = Command::new(dmsetup).args(["remove", name]).output();
-                }
-            }
-        }
-
-        // 2. Detach loops backing stale COW files, then unlink the files.
-        if let Ok(entries) = std::fs::read_dir(&self.cow_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("arcbox-cow-"))
-                {
-                    if let Ok(output) = Command::new(BUSYBOX)
-                        .args(["losetup", "-j", path.to_str().unwrap_or("")])
-                        .output()
-                    {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        for line in stdout.lines() {
-                            if let Some(dev) = line.split(':').next() {
-                                let _ = Command::new(BUSYBOX)
-                                    .args(["losetup", "-d", dev.trim()])
-                                    .output();
-                            }
-                        }
-                    }
-                    debug!(file = %path.display(), "removing stale cow file");
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-
-        // 3. Detach orphaned template loop devices.
-        //
-        // Template attaches are tracked only in the in-memory `templates`
-        // HashMap, which is empty at startup — without this pass, every
-        // crash+restart cycle would permanently leak one read-only loop
-        // device per unique rootfs template, eventually exhausting the
-        // 256-entry loop namespace.
-        //
-        // We use marker files written at attach time (under
-        // `{cow_dir}/.template-loops/`) rather than a system-wide "any
-        // RO loop" scan, so we never touch loops attached by other
-        // services in the guest (containerd snapshotter, squashfs mounts).
-        self.cleanup_stale_template_markers();
-    }
-
-    /// Marker path for the template loop `loop_dev` (e.g.
-    /// `{cow_dir}/.template-loops/loop0`).  Returns `None` for a
-    /// malformed device path.
-    fn template_marker_path(&self, loop_dev: &str) -> Option<PathBuf> {
-        let basename = Path::new(loop_dev).file_name()?;
-        Some(self.cow_dir.join(TEMPLATE_LOOP_DIR).join(basename))
-    }
-
-    fn write_template_marker(&self, loop_dev: &str, template_path: &Path) {
-        let Some(marker) = self.template_marker_path(loop_dev) else {
-            warn!(
-                loop_dev,
-                "skipping template marker: unparseable loop device"
-            );
-            return;
-        };
-        if let Some(parent) = marker.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            warn!(error = %e, "failed to create template-loops dir");
-            return;
-        }
-        if let Err(e) = std::fs::write(&marker, template_path.to_string_lossy().as_bytes()) {
-            warn!(loop_dev, error = %e, "failed to write template-loop marker");
-        }
-    }
-
-    fn cleanup_stale_template_markers(&self) {
-        let dir = self.cow_dir.join(TEMPLATE_LOOP_DIR);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let marker_path = entry.path();
-            let Some(loop_basename) = marker_path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let dev = format!("/dev/{loop_basename}");
-            let expected_backing = std::fs::read_to_string(&marker_path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-
-            // Verify the loop is still attached AND still backs the
-            // expected template, so we never detach a /dev/loopN that
-            // was reused by another process after our crash.
-            let actual_backing =
-                std::fs::read_to_string(format!("/sys/block/{loop_basename}/loop/backing_file"))
-                    .ok()
-                    .map(|s| s.trim().to_string());
-
-            if !expected_backing.is_empty()
-                && actual_backing.as_deref() == Some(expected_backing.as_str())
-            {
-                debug!(dev = %dev, "detaching stale template loop");
-                let _ = Command::new(BUSYBOX).args(["losetup", "-d", &dev]).output();
-            } else {
-                debug!(
-                    dev = %dev,
-                    expected = %expected_backing,
-                    actual = ?actual_backing,
-                    "skipping stale template loop: backing mismatch"
-                );
-            }
-
-            let _ = std::fs::remove_file(&marker_path);
-        }
-    }
-
-    /// Decrement the refcount for a template; detach its loop device when
-    /// the count reaches zero.
-    fn release_template(&self, template_path: &Path) {
-        let mut templates = self.templates.lock().unwrap();
-        let should_detach = if let Some(entry) = templates.get_mut(template_path) {
-            entry.refcount = entry.refcount.saturating_sub(1);
-            if entry.refcount == 0 {
-                Some(entry.loop_device.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(loop_dev) = should_detach {
-            templates.remove(template_path);
-            drop(templates);
-            // Fire-and-forget detach (we are under a sync Mutex, cannot await).
-            // The marker is removed only after a successful detach so a crash
-            // mid-detach still leaves a recoverable record on disk.
-            let marker = self.template_marker_path(&loop_dev);
-            tokio::spawn(async move {
-                if let Err(e) = losetup_detach(BUSYBOX, &loop_dev).await {
-                    warn!(loop_dev = %loop_dev, error = %e, "failed to detach template loop");
-                    return;
-                }
-                if let Some(marker) = marker {
-                    let _ = std::fs::remove_file(&marker);
-                }
-            });
+            Err(VmmError::DeviceMapper(failures.join("; ")))
         }
     }
 }
@@ -634,17 +648,58 @@ async fn dmsetup_remove(bin: &str, name: &str) -> Result<()> {
 }
 
 /// Create a sparse file of the given size in bytes.
-async fn create_sparse_file(path: &Path, size: u64) -> Result<()> {
+async fn create_sparse_file(path: &Path, size: u64) -> std::result::Result<(), (VmmError, bool)> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::create(&path)
-            .map_err(|e| VmmError::DeviceMapper(format!("create cow file: {e}")))?;
-        file.set_len(size)
-            .map_err(|e| VmmError::DeviceMapper(format!("truncate cow file: {e}")))?;
+    tokio::task::spawn_blocking(move || -> std::result::Result<(), (VmmError, bool)> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| {
+                (
+                    VmmError::DeviceMapper(format!("create cow file: {e}")),
+                    false,
+                )
+            })?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                (
+                    VmmError::DeviceMapper(format!("secure cow file: {e}")),
+                    true,
+                )
+            })?;
+        file.set_len(size).map_err(|e| {
+            (
+                VmmError::DeviceMapper(format!("truncate cow file: {e}")),
+                true,
+            )
+        })?;
+        file.sync_all()
+            .map_err(|e| (VmmError::DeviceMapper(format!("sync cow file: {e}")), true))?;
+        let parent = path.parent().ok_or_else(|| {
+            (
+                VmmError::DeviceMapper("cow file has no parent".into()),
+                true,
+            )
+        })?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| {
+                (
+                    VmmError::DeviceMapper(format!("sync cow directory: {e}")),
+                    true,
+                )
+            })?;
         Ok(())
     })
     .await
-    .map_err(|e| VmmError::DeviceMapper(format!("spawn_blocking join: {e}")))?
+    .map_err(|e| {
+        (
+            VmmError::DeviceMapper(format!("spawn_blocking join: {e}")),
+            false,
+        )
+    })?
 }
 
 /// Get the `(major, minor)` device numbers for a block device.
@@ -750,27 +805,131 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = CowManager {
             templates: Mutex::new(HashMap::new()),
+            setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
             dmsetup_bin: None,
+            test_probe: None,
         };
 
         let template = PathBuf::from("/var/lib/arcbox/rootfs.ext4");
-        mgr.write_template_marker("/dev/loop7", &template);
+        mgr.write_template_marker("/dev/loop7", &template).unwrap();
         let marker = mgr.template_marker_path("/dev/loop7").unwrap();
         assert_eq!(marker.file_name().unwrap(), "loop7");
         assert!(marker.exists());
         let content = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(content, template.to_string_lossy());
+
+        let pending = mgr.write_template_pending("box", &template).unwrap();
+        assert!(pending.exists());
+        clear_owner_marker(&pending).unwrap();
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn stale_marker_temp_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_dir = tmp.path().join(TEMPLATE_LOOP_DIR);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let temporary = marker_dir.join(format!("{TEMPLATE_MARKER_TEMP_PREFIX}loop7"));
+        std::fs::write(&temporary, b"/partial").unwrap();
+        let mgr = CowManager {
+            templates: Mutex::new(HashMap::new()),
+            setup_orphans: Mutex::new(HashMap::new()),
+            losetup_lock: AsyncMutex::new(()),
+            cow_dir: tmp.path().to_path_buf(),
+            dmsetup_bin: None,
+            test_probe: None,
+        };
+
+        mgr.cleanup_stale_template_markers().unwrap();
+
+        assert!(!temporary.exists());
+    }
+
+    #[tokio::test]
+    async fn sparse_cow_creation_never_overwrites_an_owned_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cow.img");
+        create_sparse_file(&path, 4096).await.unwrap();
+
+        let (_, owns_file) = create_sparse_file(&path, 8192).await.unwrap_err();
+        assert!(!owns_file);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn rollback_never_removes_an_unowned_cow_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cow_file = tmp.path().join("existing.img");
+        std::fs::write(&cow_file, b"owned by another setup").unwrap();
+        let mgr = CowManager {
+            templates: Mutex::new(HashMap::new()),
+            setup_orphans: Mutex::new(HashMap::new()),
+            losetup_lock: AsyncMutex::new(()),
+            cow_dir: tmp.path().to_path_buf(),
+            dmsetup_bin: None,
+            test_probe: None,
+        };
+
+        let _ = mgr
+            .rollback_setup(
+                "box",
+                Path::new("/template"),
+                None,
+                None,
+                None,
+                VmmError::DeviceMapper("create failed".into()),
+            )
+            .await;
+
+        assert_eq!(std::fs::read(&cow_file).unwrap(), b"owned by another setup");
+    }
+
+    #[tokio::test]
+    async fn zero_ref_template_is_not_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let template = PathBuf::from("/template");
+        let mgr = CowManager {
+            templates: Mutex::new(HashMap::from([(
+                template.clone(),
+                TemplateEntry {
+                    loop_device: "/dev/loop7".into(),
+                    sectors: 1024,
+                    refcount: 0,
+                },
+            )])),
+            setup_orphans: Mutex::new(HashMap::new()),
+            losetup_lock: AsyncMutex::new(()),
+            cow_dir: tmp.path().to_path_buf(),
+            dmsetup_bin: Some("/not-used".into()),
+            test_probe: None,
+        };
+
+        assert!(matches!(
+            mgr.setup("box", template.to_str().unwrap()).await,
+            Err(VmmError::Unavailable(_))
+        ));
+        assert_eq!(
+            mgr.templates
+                .lock()
+                .unwrap()
+                .get(&template)
+                .unwrap()
+                .refcount,
+            0
+        );
     }
 
     #[tokio::test]
     async fn test_release_template_refcount() {
         let mgr = CowManager {
             templates: Mutex::new(HashMap::new()),
+            setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir: PathBuf::from("/tmp"),
             dmsetup_bin: None,
+            test_probe: None,
         };
 
         let path = PathBuf::from("/tmp/template.ext4");
@@ -787,19 +946,10 @@ mod tests {
         }
 
         // First release: refcount 2 → 1, entry stays.
-        mgr.release_template(&path);
+        mgr.release_template_ref(&path, true).await.unwrap();
         {
             let t = mgr.templates.lock().unwrap();
             assert_eq!(t.get(&path).unwrap().refcount, 1);
-        }
-
-        // Second release: refcount 1 → 0, entry removed.
-        // (losetup_detach is spawned but won't run in sync test — that's fine,
-        // we just verify the map entry is removed.)
-        mgr.release_template(&path);
-        {
-            let t = mgr.templates.lock().unwrap();
-            assert!(!t.contains_key(&path));
         }
     }
 }

@@ -310,7 +310,8 @@ pub struct FirecrackerConfig {
     /// MMDS in-memory store size limit in bytes.
     #[serde(default)]
     pub mmds_size_limit: Option<usize>,
-    /// Seconds to wait for the Firecracker socket to become available (default: 5).
+    /// Seconds to wait for the Firecracker socket to become available.
+    /// `None` uses the five-second default.
     #[serde(default)]
     pub socket_timeout_secs: Option<u64>,
 }

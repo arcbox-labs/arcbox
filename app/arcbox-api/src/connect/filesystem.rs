@@ -45,7 +45,7 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::ReadFileRequest>,
     ) -> ServiceResult<ServiceStream<FileChunk>> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let agent = self
             .runtime
             .ready()?
@@ -67,7 +67,7 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
         ctx: RequestContext,
         mut requests: InboundStream<pb::WriteFileRequest>,
     ) -> ServiceResult<Empty> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let agent = self
             .runtime
             .ready()?

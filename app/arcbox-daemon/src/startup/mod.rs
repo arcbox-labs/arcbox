@@ -272,9 +272,20 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
         runtime.network_manager().set_dns_domain(&ctx.dns_domain);
     }
 
+    let sandbox_cleanup_supported = if runtime.config().vm.autostart {
+        arcbox_api::initialize_sandbox_cleanup(&runtime)
+            .await
+            .context("Failed to initialize sandbox cleanup")?
+    } else {
+        false
+    };
+
     ctx.shared_runtime
         .set(Arc::clone(&runtime))
         .map_err(|_| anyhow::anyhow!("init_runtime called twice"))?;
+    if sandbox_cleanup_supported {
+        arcbox_api::spawn_sandbox_cleanup(Arc::clone(&runtime));
+    }
     Ok(runtime)
 }
 

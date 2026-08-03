@@ -26,6 +26,8 @@ pub enum SandboxError {
     StdinGap(String),
     /// The host / guest lacks a prerequisite (e.g. nested virtualization).
     Unsupported(String),
+    /// A retryable runtime condition, including an unconfirmed durable write.
+    Unavailable(String),
     /// A runtime or business-logic error.
     Internal(String),
 }
@@ -40,6 +42,7 @@ impl fmt::Display for SandboxError {
             | Self::WrongState(msg)
             | Self::StdinGap(msg)
             | Self::Unsupported(msg)
+            | Self::Unavailable(msg)
             | Self::Internal(msg) => f.write_str(msg),
         }
     }
@@ -58,6 +61,7 @@ impl SandboxError {
             Self::AlreadyExists(_) => 409,
             Self::WrongState(_) | Self::Unsupported(_) => 412,
             Self::StdinGap(_) => 416,
+            Self::Unavailable(_) => 503,
             Self::Internal(_) => 500,
         }
     }
@@ -71,6 +75,7 @@ impl From<arcbox_vm::VmmError> for SandboxError {
             VmmError::AlreadyExists(_) => Self::AlreadyExists(e.to_string()),
             VmmError::WrongState { .. } => Self::WrongState(e.to_string()),
             VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
+            VmmError::Unavailable(_) => Self::Unavailable(e.to_string()),
             // Invalid caller input (e.g. a rejected sandbox id) is a 400, not a
             // 500 — otherwise a bad request surfaces as INTERNAL to the client.
             VmmError::Config(_) => Self::InvalidArgument(e.to_string()),
@@ -104,5 +109,14 @@ mod tests {
         });
         assert!(matches!(err, SandboxError::StdinGap(_)));
         assert_eq!(err.status_code(), 416);
+    }
+
+    #[test]
+    fn durability_uncertainty_maps_to_503() {
+        let err = SandboxError::from(arcbox_vm::VmmError::Unavailable(
+            "record fsync failed".into(),
+        ));
+        assert!(matches!(err, SandboxError::Unavailable(_)));
+        assert_eq!(err.status_code(), 503);
     }
 }

@@ -59,13 +59,11 @@ message CheckpointResponse {
 
 // Request to restore a sandbox from a snapshot.
 //
-// Direct-mode (non-jailer) limitation: the snapshot's vmstate records the
-// origin sandbox's absolute vsock socket path, so concurrent restores from
-// the same snapshot — or restoring while the origin sandbox is still
-// running — fail with FAILED_PRECONDITION on the vsock conflict. Jailer
-// mode restores into per-sandbox chroots and has no such constraint.
+// Restore requires jailer mode. Direct-mode vmstate records origin sandbox
+// paths and cannot be safely relocated to a new sandbox ID.
 message RestoreRequest {
-    // Caller-supplied ID for the new sandbox (empty = auto-generated).
+    // Caller-supplied ID for durable retry idempotency. Empty asks the daemon
+    // to generate a fresh UUID for every attempt.
     string id = 1;
     // Source snapshot ID.
     string snapshot_id = 2;

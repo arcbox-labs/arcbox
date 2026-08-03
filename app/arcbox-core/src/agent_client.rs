@@ -31,9 +31,10 @@ use arcbox_connect::v1::{
     KubernetesStatusResponse, KubernetesStopRequest, KubernetesStopResponse, MachineExecOutput,
     MachineExecRequest, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
     MmapReadFileResponse, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
-    RuntimeStatusRequest, RuntimeStatusResponse, SandboxPortForwardRemoveRequest,
-    SandboxPortForwardRequest, SandboxPortForwardResponse, SystemInfo, TerminalSize,
-    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+    RuntimeStatusRequest, RuntimeStatusResponse, SandboxCleanupResponse, SandboxCleanupTicket,
+    SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SandboxPortForwardResponse,
+    SystemInfo, TerminalSize, WatchMemoryPressureRequest, WatchReadinessRequest,
+    WatchSandboxCleanupRequest, WatchStatsRequest,
 };
 use arcbox_constants::ports::AGENT_PORT;
 use arcbox_constants::wire::MessageType;
@@ -1071,12 +1072,17 @@ impl AgentClient {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn sandbox_stop(&mut self, req: StopSandboxRequest) -> Result<()> {
+    pub async fn sandbox_stop(
+        &mut self,
+        req: StopSandboxRequest,
+    ) -> Result<SandboxCleanupResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, _) = self
-            .rpc_call(MessageType::SandboxStopRequest, &payload)
-            .await?;
-        Self::expect_ack_response_type(resp_type, MessageType::SandboxStopResponse)
+        self.unary_rpc(
+            MessageType::SandboxStopRequest,
+            &payload,
+            MessageType::SandboxStopResponse,
+        )
+        .await
     }
 
     /// Removes a sandbox from the guest VM.
@@ -1084,12 +1090,39 @@ impl AgentClient {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn sandbox_remove(&mut self, req: RemoveSandboxRequest) -> Result<()> {
+    pub async fn sandbox_remove(
+        &mut self,
+        req: RemoveSandboxRequest,
+    ) -> Result<SandboxCleanupResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, _) = self
-            .rpc_call(MessageType::SandboxRemoveRequest, &payload)
+        self.unary_rpc(
+            MessageType::SandboxRemoveRequest,
+            &payload,
+            MessageType::SandboxRemoveResponse,
+        )
+        .await
+    }
+
+    /// Validate one exact cleanup generation before host listeners are removed.
+    pub async fn sandbox_cleanup_prepare(&mut self, ticket: &SandboxCleanupTicket) -> Result<()> {
+        let (response_type, _) = self
+            .rpc_call(
+                MessageType::SandboxCleanupPrepareRequest,
+                &ticket.encode_to_vec(),
+            )
             .await?;
-        Self::expect_ack_response_type(resp_type, MessageType::SandboxRemoveResponse)
+        Self::expect_ack_response_type(response_type, MessageType::SandboxCleanupPrepareResponse)
+    }
+
+    /// Finalize one exact cleanup generation after host listeners are gone.
+    pub async fn sandbox_cleanup_finalize(&mut self, ticket: &SandboxCleanupTicket) -> Result<()> {
+        let (response_type, _) = self
+            .rpc_call(
+                MessageType::SandboxCleanupFinalizeRequest,
+                &ticket.encode_to_vec(),
+            )
+            .await?;
+        Self::expect_ack_response_type(response_type, MessageType::SandboxCleanupFinalizeResponse)
     }
 
     /// Inspects a sandbox in the guest VM.
@@ -1747,6 +1780,80 @@ impl AgentClient {
             }
         });
 
+        Ok(rx)
+    }
+
+    /// Stream durable sandbox cleanup tickets. Reconnecting replays every
+    /// generation that has not finalized.
+    pub async fn sandbox_cleanup_events(
+        mut self,
+    ) -> Result<mpsc::Receiver<Result<SandboxCleanupTicket>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let request = WatchSandboxCleanupRequest::default();
+        let buffer = wire::build_message(
+            MessageType::WatchSandboxCleanupRequest,
+            "",
+            &request.encode_to_vec(),
+        );
+        self.transport.async_send(buffer).await.map_err(|error| {
+            CoreError::Machine(format!("failed to send sandbox cleanup watch: {error}"))
+        })?;
+
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            loop {
+                let raw = match self.transport.async_recv().await {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!(
+                                "sandbox cleanup watch receive failed: {error}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                };
+                let (response_type, _, payload) = match wire::parse_response(&raw) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        break;
+                    }
+                };
+                if response_type == MessageType::Error as u32 {
+                    let (code, message) = wire::parse_error_response(&payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_owned()));
+                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    break;
+                }
+                if response_type != MessageType::SandboxCleanupEvent as u32 {
+                    let _ = tx
+                        .send(Err(CoreError::Machine(format!(
+                            "unexpected sandbox cleanup response: 0x{response_type:04x}"
+                        ))))
+                        .await;
+                    break;
+                }
+                match SandboxCleanupTicket::decode_from_slice(&payload) {
+                    Ok(ticket) => {
+                        if tx.send(Ok(ticket)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!(
+                                "sandbox cleanup ticket decode failed: {error}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
         Ok(rx)
     }
 

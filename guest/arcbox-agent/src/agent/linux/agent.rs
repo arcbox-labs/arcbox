@@ -33,11 +33,6 @@ impl Agent {
         // rather than on the first sandbox request.
         let _ = sandbox_service();
 
-        // Flush sandbox DNAT rules left over from a previous agent process: the
-        // in-memory forward table starts empty, so any tagged rule still in the
-        // kernel is an orphan whose sandbox the crash-recovery sweep destroyed.
-        super::port_forward::flush_orphan_rules().await;
-
         // Drop half-written rootfs build artifacts from a previous crash.
         crate::rootfs_builder::sweep_stale_tmp().await;
 

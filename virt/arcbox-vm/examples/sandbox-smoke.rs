@@ -88,7 +88,9 @@ async fn main() -> anyhow::Result<()> {
         info.network.as_ref().map_or("-", |n| n.ip_address.as_str()),
     );
 
-    let list = manager.list_sandboxes(None, &HashMap::new());
+    let list = manager
+        .list_sandboxes(None, &HashMap::new())
+        .context("list sandboxes")?;
     println!("  [list]    {} sandbox(es):", list.len());
     for s in &list {
         println!(

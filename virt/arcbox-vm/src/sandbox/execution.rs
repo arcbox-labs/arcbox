@@ -593,7 +593,7 @@ fn abort_workload(
     if let Some(arc) = arc {
         let mut inst = arc.lock().unwrap();
         inst.last_exited_at = Some(Utc::now());
-        if matches!(inst.state, SandboxState::Running | SandboxState::Stopping) {
+        if inst.state == SandboxState::Running {
             inst.state = SandboxState::Ready;
         }
     }

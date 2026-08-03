@@ -11,6 +11,7 @@ use buffa::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
+use super::btrfs::{ensure_data_mount, ensure_no_legacy_live_sandboxes};
 use super::port_forward::{PortForwardManager, Protocol};
 use crate::rpc::{ErrorResponse, MessageType, write_message};
 use crate::sandbox::SandboxService;
@@ -36,10 +37,11 @@ fn wire_protocol(protocol: arcbox_connect::v1::SandboxPortProtocol) -> Protocol 
 /// Returns the global [`SandboxService`] singleton.
 ///
 /// The service is initialised lazily on the first call. The nested-virt
-/// prerequisite is probed first: without `/dev/kvm` every sandbox RPC is
-/// rejected with 412 (mapped to `FAILED_PRECONDITION` on the host) and an
-/// actionable reason. Initialisation failures store a 503 so sandbox
-/// operations degrade instead of crashing the agent.
+/// prerequisite is probed first, then the persistent Btrfs data volume is
+/// mounted before the manager can create state. Without `/dev/kvm` every
+/// sandbox RPC is rejected with 412 (mapped to `FAILED_PRECONDITION` on the
+/// host) and an actionable reason. Initialisation failures store a 503 so
+/// sandbox operations degrade instead of crashing the agent.
 pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static (i32, String)> {
     static SERVICE: OnceLock<Result<Arc<SandboxService>, (i32, String)>> = OnceLock::new();
     SERVICE
@@ -48,12 +50,20 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
                 tracing::warn!(reason, "sandbox prerequisite missing");
                 return Err((412, reason));
             }
+            if let Err(reason) = ensure_data_mount() {
+                tracing::warn!(reason, "sandbox data volume unavailable");
+                return Err((503, format!("sandbox data volume unavailable: {reason}")));
+            }
+            if let Err(reason) = ensure_no_legacy_live_sandboxes() {
+                tracing::warn!(reason, "legacy sandbox runtime requires guest restart");
+                return Err((503, reason));
+            }
             let config = crate::config::load();
             match SandboxService::new(config) {
                 Ok(svc) => {
                     tracing::info!("sandbox service initialised");
                     let svc = Arc::new(svc);
-                    spawn_sandbox_cleanup(&svc);
+                    spawn_create_registry_cleanup(&svc);
                     Ok(svc)
                 }
                 Err(e) => {
@@ -65,20 +75,15 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
         .as_ref()
 }
 
-/// Reconcile process-local state when a sandbox stops.
-///
-/// Subscribing to lifecycle events covers all teardown paths — explicit
-/// Stop/Remove, TTL expiry, and boot failures — without threading cleanup
-/// hooks through each of them. Terminal sandboxes also release their retained
-/// idempotent Create response.
-fn spawn_sandbox_cleanup(svc: &Arc<SandboxService>) {
+/// Release process-local Create responses after their sandbox becomes terminal.
+fn spawn_create_registry_cleanup(svc: &Arc<SandboxService>) {
     use arcbox_connect::sandbox_v1::{SandboxEvent, SandboxEventKind, SandboxEventsRequest};
 
     let payload = SandboxEventsRequest::default().encode_to_vec();
     let mut rx = match svc.subscribe_events(&payload) {
         Ok(rx) => rx,
         Err(e) => {
-            tracing::warn!(error = %e, "sandbox cleanup subscription failed");
+            tracing::warn!(error = %e, "create-registry cleanup subscription failed");
             return;
         }
     };
@@ -97,11 +102,6 @@ fn spawn_sandbox_cleanup(svc: &Arc<SandboxService>) {
                 )
             ) {
                 svc.clear_stale_completed_create(&event.sandbox_id);
-                port_forwards()
-                    .lock()
-                    .await
-                    .remove_all_for(&event.sandbox_id)
-                    .await;
             }
         }
     });
@@ -148,22 +148,164 @@ where
                 send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
             }
         },
-        MessageType::SandboxStopRequest => match svc.stop(payload).await {
-            Ok(()) => {
-                write_message(stream, MessageType::SandboxStopResponse, trace_id, &[]).await?;
+        MessageType::SandboxStopRequest => {
+            use arcbox_connect::sandbox_v1::StopSandboxRequest;
+            use arcbox_connect::v1::SandboxCleanupResponse;
+            let req = match StopSandboxRequest::decode_from_slice(payload) {
+                Ok(req) => req,
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, 400, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let sandbox_id = req.id.clone();
+            let _operation = svc.lock_operation(&req.id).await;
+            match svc.stop_request(req).await {
+                Ok(()) => match svc.pending_cleanup_ticket(&sandbox_id).await {
+                    Ok(ticket) => {
+                        let response = SandboxCleanupResponse {
+                            ticket: ticket.into(),
+                            ..Default::default()
+                        };
+                        write_message(
+                            stream,
+                            MessageType::SandboxStopResponse,
+                            trace_id,
+                            &response.encode_to_vec(),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        send_sandbox_error(
+                            stream,
+                            trace_id,
+                            error.status_code(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                    }
+                },
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+                }
             }
-            Err(e) => {
-                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+        }
+        MessageType::SandboxRemoveRequest => {
+            use arcbox_connect::sandbox_v1::RemoveSandboxRequest;
+            use arcbox_connect::v1::SandboxCleanupResponse;
+            let req = match RemoveSandboxRequest::decode_from_slice(payload) {
+                Ok(req) => req,
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, 400, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let sandbox_id = req.id.clone();
+            let _operation = svc.lock_operation(&req.id).await;
+            match svc.remove_request(req).await {
+                Ok(()) => match svc.pending_cleanup_ticket(&sandbox_id).await {
+                    Ok(ticket) => {
+                        let response = SandboxCleanupResponse {
+                            ticket: ticket.into(),
+                            ..Default::default()
+                        };
+                        write_message(
+                            stream,
+                            MessageType::SandboxRemoveResponse,
+                            trace_id,
+                            &response.encode_to_vec(),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        send_sandbox_error(
+                            stream,
+                            trace_id,
+                            error.status_code(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                    }
+                },
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+                }
             }
-        },
-        MessageType::SandboxRemoveRequest => match svc.remove(payload).await {
-            Ok(()) => {
-                write_message(stream, MessageType::SandboxRemoveResponse, trace_id, &[]).await?;
+        }
+        MessageType::SandboxCleanupPrepareRequest => {
+            use arcbox_connect::v1::SandboxCleanupTicket;
+
+            let ticket = match SandboxCleanupTicket::decode_from_slice(payload) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, 400, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let _operation = svc.lock_operation(&ticket.id).await;
+            match svc.prepare_cleanup(&ticket).await {
+                Ok(_) => {
+                    write_message(
+                        stream,
+                        MessageType::SandboxCleanupPrepareResponse,
+                        trace_id,
+                        &[],
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, error.status_code(), &error.to_string())
+                        .await?;
+                }
             }
-            Err(e) => {
-                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+        }
+        MessageType::SandboxCleanupFinalizeRequest => {
+            use arcbox_connect::v1::SandboxCleanupTicket;
+
+            let ticket = match SandboxCleanupTicket::decode_from_slice(payload) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, 400, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let _operation = svc.lock_operation(&ticket.id).await;
+            let result = async {
+                let sandbox_ip = svc.prepare_cleanup(&ticket).await?;
+                if ticket.startup {
+                    super::port_forward::remove_legacy_orphan_rules()
+                        .await
+                        .map_err(|error| crate::error::SandboxError::Internal(error.to_string()))?;
+                    return svc.finalize_cleanup(&ticket).await;
+                }
+                port_forwards()
+                    .lock()
+                    .await
+                    .remove_all_for(&ticket.id, &ticket.token)
+                    .await
+                    .map_err(|error| crate::error::SandboxError::Internal(error.to_string()))?;
+                super::port_forward::remove_orphan_rules_for(sandbox_ip, &ticket.token)
+                    .await
+                    .map_err(|error| crate::error::SandboxError::Internal(error.to_string()))?;
+                svc.finalize_cleanup(&ticket).await
             }
-        },
+            .await;
+            match result {
+                Ok(()) => {
+                    write_message(
+                        stream,
+                        MessageType::SandboxCleanupFinalizeResponse,
+                        trace_id,
+                        &[],
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, error.status_code(), &error.to_string())
+                        .await?;
+                }
+            }
+        }
         MessageType::SandboxInspectRequest => match svc.inspect(payload) {
             Ok(resp) => {
                 write_message(
@@ -288,6 +430,9 @@ where
         MessageType::SandboxEventsRequest => {
             svc.handle_events(stream, trace_id, payload).await?;
         }
+        MessageType::WatchSandboxCleanupRequest => {
+            svc.handle_cleanup_events(stream, trace_id, payload).await?;
+        }
         // -----------------------------------------------------------------
         // File I/O
         // -----------------------------------------------------------------
@@ -304,7 +449,7 @@ where
             handle_port_forward(stream, &svc, trace_id, payload).await?;
         }
         MessageType::SandboxPortForwardRemoveRequest => {
-            handle_port_forward_remove(stream, trace_id, payload).await?;
+            handle_port_forward_remove(stream, &svc, trace_id, payload).await?;
         }
         // -----------------------------------------------------------------
         // Snapshots
@@ -416,9 +561,11 @@ where
             return Ok(());
         }
     };
+    svc.wait_startup_cleanup_complete().await;
+    let _operation = svc.lock_operation(&req.id).await;
 
-    let ip = match svc.sandbox_ip(&req.id) {
-        Ok(ip) => ip,
+    let (ip, cleanup_token) = match svc.sandbox_network_identity(&req.id) {
+        Ok(identity) => identity,
         Err(e) => {
             let err = ErrorResponse::new(e.status_code(), e.to_string());
             write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
@@ -429,7 +576,7 @@ where
     match port_forwards()
         .lock()
         .await
-        .forward(&req.id, ip, sandbox_port, protocol)
+        .forward(&req.id, ip, &cleanup_token, sandbox_port, protocol)
         .await
     {
         Ok(guest_port) => {
@@ -456,6 +603,7 @@ where
 /// Remove a DNAT mapping (idempotent) and acknowledge.
 async fn handle_port_forward_remove<S>(
     stream: &mut S,
+    svc: &SandboxService,
     trace_id: &str,
     payload: &[u8],
 ) -> anyhow::Result<()>
@@ -482,11 +630,21 @@ where
                 return Ok(());
             }
         };
+    svc.wait_startup_cleanup_complete().await;
+    let _operation = svc.lock_operation(&req.id).await;
+    let (_, cleanup_token) = match svc.sandbox_network_identity(&req.id) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let response = ErrorResponse::new(error.status_code(), error.to_string());
+            write_message(stream, MessageType::Error, trace_id, &response.encode()).await?;
+            return Ok(());
+        }
+    };
 
     match port_forwards()
         .lock()
         .await
-        .remove(&req.id, sandbox_port, protocol)
+        .remove(&req.id, &cleanup_token, sandbox_port, protocol)
         .await
     {
         Ok(()) => {

@@ -13,20 +13,17 @@
 /// this was rolled back — **`2` is burned**: 0.6.0 daemons in the wild
 /// read it as "speaks the redesigned sandbox payloads", so the next real
 /// bump must go to `3`, never reuse `2` for a different meaning.
-pub const AGENT_PROTOCOL_VERSION: u32 = 1;
+///
+/// v3: sandbox Stop/Remove responses carry a durable cleanup generation,
+/// completed through Prepare/Finalize after host listeners are gone.
+pub const AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest agent protocol version this host still accepts.
 ///
-/// Agents reporting less (`0` — agents that predate the handshake field)
-/// are rejected at boot with an actionable error instead of silently
-/// misbehaving under field skew. A pre-0.6.0 agent boots and works on
-/// every released surface. Driving the (unreleased) sandbox surface from
-/// such an agent is undefined behavior by decision: with the version
-/// signal retired back to `1`, old and new agents are indistinguishable
-/// on the wire, so there is nothing to gate on. The only exposure is a
-/// stale dev-tree binary, fixed by rebuilding
-/// (`cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl`).
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 1;
+/// Agents reporting less (including `0` — agents that predate the
+/// handshake field) are rejected at boot with an actionable error
+/// instead of silently misbehaving under field skew.
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Number of bytes in the fixed RPC frame header (`length` + `type`).
 pub const FRAME_HEADER_SIZE: usize = 8;
@@ -98,6 +95,16 @@ pub enum MessageType {
     /// Remove a sandbox DNAT mapping (payload:
     /// `arcbox.v1.SandboxPortForwardRemoveRequest`).
     SandboxPortForwardRemoveRequest = 0x0026,
+    /// Validate one exact durable cleanup generation before the host removes
+    /// listeners (payload: `arcbox.v1.SandboxCleanupTicket`).
+    SandboxCleanupPrepareRequest = 0x0027,
+    /// Confirm host cleanup, delete the matching guest DNAT generation, and
+    /// recycle its quarantined network allocation (payload:
+    /// `arcbox.v1.SandboxCleanupTicket`).
+    SandboxCleanupFinalizeRequest = 0x0028,
+    /// Opens the internal durable cleanup ticket stream (payload:
+    /// `arcbox.v1.WatchSandboxCleanupRequest`).
+    WatchSandboxCleanupRequest = 0x0029,
 
     // Sandbox workload request types.
     // 0x0030 (SandboxRunRequest), 0x0031 (SandboxExecRequest),
@@ -212,6 +219,12 @@ pub enum MessageType {
     SandboxPortForwardResponse = 0x1025,
     /// Acknowledges [`Self::SandboxPortForwardRemoveRequest`] (empty payload).
     SandboxPortForwardRemoveResponse = 0x1026,
+    /// Acknowledges [`Self::SandboxCleanupPrepareRequest`].
+    SandboxCleanupPrepareResponse = 0x1027,
+    /// Acknowledges [`Self::SandboxCleanupFinalizeRequest`].
+    SandboxCleanupFinalizeResponse = 0x1028,
+    /// One durable cleanup ticket answering [`Self::WatchSandboxCleanupRequest`].
+    SandboxCleanupEvent = 0x1029,
 
     // Sandbox workload response types (streaming).
     // 0x1035 (SandboxRunOutput) and 0x1036 (SandboxExecOutput) were
@@ -292,6 +305,9 @@ impl MessageType {
             0x0024 => Some(Self::SandboxListRequest),
             0x0025 => Some(Self::SandboxPortForwardRequest),
             0x0026 => Some(Self::SandboxPortForwardRemoveRequest),
+            0x0027 => Some(Self::SandboxCleanupPrepareRequest),
+            0x0028 => Some(Self::SandboxCleanupFinalizeRequest),
+            0x0029 => Some(Self::WatchSandboxCleanupRequest),
             // Sandbox workload requests.
             0x0032 => Some(Self::SandboxEventsRequest),
             0x0035 => Some(Self::SandboxFileReadRequest),
@@ -344,6 +360,9 @@ impl MessageType {
             0x1024 => Some(Self::SandboxListResponse),
             0x1025 => Some(Self::SandboxPortForwardResponse),
             0x1026 => Some(Self::SandboxPortForwardRemoveResponse),
+            0x1027 => Some(Self::SandboxCleanupPrepareResponse),
+            0x1028 => Some(Self::SandboxCleanupFinalizeResponse),
+            0x1029 => Some(Self::SandboxCleanupEvent),
             // Sandbox workload responses (streaming).
             0x1037 => Some(Self::SandboxEvent),
             0x1038 => Some(Self::SandboxFileData),
@@ -383,6 +402,9 @@ impl MessageType {
                 | Self::SandboxFileWriteRequest
                 | Self::SandboxPortForwardRequest
                 | Self::SandboxPortForwardRemoveRequest
+                | Self::SandboxCleanupPrepareRequest
+                | Self::SandboxCleanupFinalizeRequest
+                | Self::WatchSandboxCleanupRequest
                 | Self::SandboxCheckpointRequest
                 | Self::SandboxRestoreRequest
                 | Self::SandboxListSnapshotsRequest
@@ -490,8 +512,14 @@ mod tests {
             (0x1024, MessageType::SandboxListResponse),
             (0x0025, MessageType::SandboxPortForwardRequest),
             (0x0026, MessageType::SandboxPortForwardRemoveRequest),
+            (0x0027, MessageType::SandboxCleanupPrepareRequest),
+            (0x0028, MessageType::SandboxCleanupFinalizeRequest),
+            (0x0029, MessageType::WatchSandboxCleanupRequest),
             (0x1025, MessageType::SandboxPortForwardResponse),
             (0x1026, MessageType::SandboxPortForwardRemoveResponse),
+            (0x1027, MessageType::SandboxCleanupPrepareResponse),
+            (0x1028, MessageType::SandboxCleanupFinalizeResponse),
+            (0x1029, MessageType::SandboxCleanupEvent),
             // Sandbox workload.
             (0x0032, MessageType::SandboxEventsRequest),
             (0x0035, MessageType::SandboxFileReadRequest),
