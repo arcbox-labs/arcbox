@@ -133,6 +133,7 @@ Key fields:
 | `limits.vcpus` / `limits.memory_mib` | 0 → daemon defaults (1 vCPU, 512 MiB) |
 | `template` | opaque reference to what boots — see **Templates** below |
 | `cmd`, `env`, `working_dir`, `user` | initial workload launched automatically once ready; exit returns the sandbox to `READY` with an `IDLE` event |
+| `no_default_cmd`, `no_default_env` | explicit-empty overrides of a catalog template's default cmd/env — proto3 repeated/map fields cannot distinguish omitted from empty (CORE-21, contract-only today) |
 | `network.mode` | `NETWORK_MODE_ENABLED` (default, IP from 172.20.0.0/16) or `NETWORK_MODE_NONE` |
 | `ttl_seconds` | hard maximum lifetime from creation (not reset by activity; re-armable via `SetLifecycle`); always destroys |
 | `idle_timeout_seconds`, `on_idle` | idle reaping: `KILL` (default) or `PAUSE` after inactivity (CORE-21, contract-only today) |
@@ -153,6 +154,14 @@ Anything else is rejected with `INVALID_ARGUMENT` — a bare
 `name[:version]` addresses the template catalog (`TemplateService`,
 CORE-21; contract-only today), so it is never guessed at as an image
 reference.
+
+Catalog templates carry defaults (`limits`, `cmd`, `env`,
+`exposed_ports`, `ready_probe`). A create request overrides them
+field-wise: a set `limits` replaces the default limits, a non-empty
+`cmd` replaces the default cmd, and `env` merges per key with the
+request winning. `no_default_cmd` / `no_default_env` express the
+explicitly-empty case that proto3 repeated/map shape cannot
+(`exposed_ports` and `ready_probe` have no per-create counterpart).
 
 A `docker:` template is resolved **inside the VM**: the guest exports the
 image from its own dockerd, converts it to ext4, and caches the result

@@ -64,19 +64,37 @@ pub struct CreateSandboxRequest {
     pub labels:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// --- Resources ---
+    /// Unset = the template's default limits, if any, else daemon
+    /// defaults. Set = replaces the template default wholesale.
     #[prost(message, optional, tag = "6")]
     pub limits: ::core::option::Option<ResourceLimits>,
     /// --- Initial workload (optional) ---
     /// Initial command launched automatically after boot.
-    /// Empty = sandbox enters READY without running anything.
+    /// Empty = inherit the template's default cmd, if any; otherwise the
+    /// sandbox enters READY without running anything. Non-empty =
+    /// replaces the template default.
     /// When this process exits the sandbox transitions back to READY
     /// (NOT destroyed) and continues accepting executions.
     #[prost(string, repeated, tag = "8")]
     pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Environment variables for the initial command.
+    /// Suppress the template's default cmd: enter READY without running
+    /// anything even when the template defines one. proto3 repeated
+    /// fields cannot express "explicitly empty", so this flag carries the
+    /// presence `cmd` cannot. Rejected with INVALID_ARGUMENT alongside a
+    /// non-empty `cmd`.
+    #[prost(bool, tag = "20")]
+    pub no_default_cmd: bool,
+    /// Environment variables for the initial command, merged over the
+    /// template's default env (per key, this request wins).
     #[prost(map = "string, string", tag = "9")]
     pub env:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Start the initial command from exactly `env`, discarding the
+    /// template's default env instead of merging over it (the map
+    /// counterpart of `no_default_cmd`; to unset a single default key,
+    /// set this and supply the full desired map).
+    #[prost(bool, tag = "21")]
+    pub no_default_env: bool,
     /// Working directory for the initial command.
     #[prost(string, tag = "10")]
     pub working_dir: ::prost::alloc::string::String,
@@ -114,7 +132,7 @@ pub struct CreateSandboxRequest {
     ///    "name\[:version\]" — a template from the catalog (`template.proto`,
     ///                       CORE-21); a bare name resolves to the newest
     ///                       published version. Template defaults apply
-    ///                       unless overridden by the fields above.
+    ///                       per the override rules on the fields above.
     /// Cloud mode resolves names against the tenant's template registry.
     /// Anything else is rejected with INVALID_ARGUMENT.
     #[prost(string, tag = "17")]
@@ -1488,7 +1506,11 @@ pub struct Template {
     pub size_bytes: u64,
 }
 /// Default configuration a template applies to sandboxes created from it.
-/// Every field can be overridden per sandbox in CreateSandboxRequest.
+/// `limits`, `cmd`, and `env` can be overridden per sandbox — the
+/// override/merge rules, including the `no_default_cmd`/`no_default_env`
+/// explicit-empty flags, live on the CreateSandboxRequest fields.
+/// `exposed_ports` and `ready_probe` have no per-create counterpart and
+/// apply as-is.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TemplateDefaults {
     /// Default resource limits.

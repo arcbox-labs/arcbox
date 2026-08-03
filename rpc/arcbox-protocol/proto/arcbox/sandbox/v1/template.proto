@@ -77,7 +77,11 @@ message Template {
 }
 
 // Default configuration a template applies to sandboxes created from it.
-// Every field can be overridden per sandbox in CreateSandboxRequest.
+// `limits`, `cmd`, and `env` can be overridden per sandbox — the
+// override/merge rules, including the `no_default_cmd`/`no_default_env`
+// explicit-empty flags, live on the CreateSandboxRequest fields.
+// `exposed_ports` and `ready_probe` have no per-create counterpart and
+// apply as-is.
 message TemplateDefaults {
     // Default resource limits.
     ResourceLimits limits = 1;
