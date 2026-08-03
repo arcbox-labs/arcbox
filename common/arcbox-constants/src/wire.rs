@@ -14,8 +14,11 @@
 /// read it as "speaks the redesigned sandbox payloads", so the next real
 /// bump must go to `3`, never reuse `2` for a different meaning.
 ///
-/// v3: sandbox Stop/Remove responses carry a durable cleanup generation,
-/// completed through Prepare/Finalize after host listeners are gone.
+/// v3: runtime startup requires the host-provided
+/// `arcbox.runtime_generation` kernel parameter and materializes runtime
+/// assets onto the guest Btrfs data disk before execution. Sandbox
+/// Stop/Remove responses also carry a durable cleanup generation, completed
+/// through Prepare/Finalize after host listeners are gone.
 pub const AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest agent protocol version this host still accepts.

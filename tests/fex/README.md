@@ -55,24 +55,27 @@ Exit status: `0` no FAIL, `1` any FAIL, `2` only INFRA (nothing validated).
 
 ABX-375 provisions FEX like the other guest runtime binaries (dockerd,
 containerd, runc): a single aarch64 static-PIE `FEX` binary ships in the
-boot-asset runtime bin set at `/arcbox/runtime/bin/FEX` (sibling `boot-assets`
-repo + `assets.lock`; this is a coordinated two-repo change, not a local edit).
+boot-asset runtime bin set. `/arcbox/runtime` is a read-only VirtioFS source;
+the guest agent verifies the current architecture's manifest checksums, copies
+the generation onto the Btrfs data disk, and publishes
+`/run/arcbox/runtime/bin/FEX` (sibling `boot-assets` repo + `assets.lock`; this
+is a coordinated two-repo change, not a local edit).
 ArcBox's FEX carries a small patch making it **binfmt-only**: it drops the
 FEXServer requirement, so nothing else needs to be running in the guest — no
-daemon to reach across container mount namespaces. On boot, the rootfs
-`/sbin/init` trampoline mounts the `arcbox` VirtioFS share, checks for
-`/arcbox/runtime/bin/FEX`, and — if present — registers the x86_64 ELF handler
-in `binfmt_misc` with `POCF` flags. The `F` (fix-binary) flag loads the
-interpreter at registration time so containers inherit it across mount
-namespaces. (This registration lives in the `boot-assets` rootfs init, not the
-ArcBox guest agent.)
+daemon to reach across container mount namespaces. Before Docker, Kubernetes,
+or Sandbox startup, the guest agent materializes the runtime and registers the
+local FEX path as the x86_64 ELF handler in `binfmt_misc` with `POCF` flags.
+The `F` (fix-binary) flag loads the Btrfs-backed interpreter at registration
+time so containers inherit it across mount namespaces. A repaired generation
+is unregistered and registered again so the pinned interpreter inode cannot
+refer to superseded content.
 
 Manual guest-side confirmation (until `abctl exec` diag is wired):
 
 ```bash
 # inside the HV guest:
 cat /proc/sys/fs/binfmt_misc/FEX-x86_64     # handler present + enabled
-/arcbox/runtime/bin/FEX --version           # FEX version
+/run/arcbox/runtime/bin/FEX --version       # FEX version
 # direct x86_64 exec (no Docker):
 ./some-x86_64-binary                         # runs via FEX
 ```
@@ -105,6 +108,7 @@ This directory provides the **reproducible procedure and pass/fail contract**.
 The live gate execution requires Apple Silicon hardware and a signed, bootable
 daemon. The ArcBox-side routing change (amd64 → HV/FEX, fail-closed) is
 implemented and unit/compile-tested in this repo; the FEX binary provisioning
-and the rootfs `/sbin/init` binfmt registration live in the sibling
-`boot-assets` repo. The FEX binary provisioning (boot-assets) and the live
-A/B/C runs are the remaining hardware/sibling-repo steps.
+and manifest live in the sibling `boot-assets` repo. Runtime materialization
+and Btrfs-backed binfmt registration live in this repo's guest agent. The FEX
+binary provisioning (boot-assets) and the live A/B/C runs are the remaining
+hardware/sibling-repo steps.

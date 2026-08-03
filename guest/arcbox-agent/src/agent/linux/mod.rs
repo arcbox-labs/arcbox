@@ -16,6 +16,7 @@ mod probe;
 mod proxy;
 mod rpc;
 mod runtime;
+mod runtime_cache;
 mod sandbox;
 mod stats;
 mod system_info;

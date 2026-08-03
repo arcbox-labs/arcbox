@@ -330,10 +330,10 @@ impl AgentClient {
     /// Verifies the agent's protocol version from a ping response.
     ///
     /// Rejects agents older than
-    /// [`arcbox_constants::wire::MIN_AGENT_PROTOCOL_VERSION`] — including
-    /// pre-handshake agents that report `0` — so a stale staged agent
-    /// fails the boot with an actionable error instead of silently
-    /// misdecoding newer requests (proto3 defaults unknown fields).
+    /// [`arcbox_constants::wire::MIN_AGENT_PROTOCOL_VERSION`]. Protocol `0`
+    /// means no compatible handshake completed and may carry a boot-contract
+    /// rejection from a current agent; positive older versions identify a
+    /// stale staged agent.
     /// A *newer* agent than the host only warns: protocol evolution is
     /// additive, so newer agents understand older hosts.
     ///
@@ -344,13 +344,20 @@ impl AgentClient {
     pub fn check_agent_protocol(resp: &PingResponse) -> Result<()> {
         use arcbox_constants::wire::{AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION};
 
+        if resp.protocol_version == 0 {
+            return Err(CoreError::Machine(format!(
+                "guest agent did not complete a compatible handshake \
+                 (agent version {}, response {:?}); fix the reported guest boot contract",
+                resp.version, resp.message,
+            )));
+        }
         if resp.protocol_version < MIN_AGENT_PROTOCOL_VERSION {
             return Err(CoreError::Machine(format!(
                 "guest agent is incompatible with this daemon: agent protocol {} \
-                 (agent version {}), daemon requires >= {}. The staged agent \
+                 (agent version {}, response {:?}), daemon requires >= {}. The staged agent \
                  binary is stale — reinstall or update ArcBox so the bundled \
                  agent is staged again",
-                resp.protocol_version, resp.version, MIN_AGENT_PROTOCOL_VERSION,
+                resp.protocol_version, resp.version, resp.message, MIN_AGENT_PROTOCOL_VERSION,
             )));
         }
         if resp.protocol_version > AGENT_PROTOCOL_VERSION {
@@ -1967,12 +1974,24 @@ mod tests {
     }
 
     #[test]
-    fn pre_handshake_agent_is_rejected() {
-        // Agents older than the handshake never set the field → proto3
-        // default 0 → must be rejected, not silently accepted.
-        let err = AgentClient::check_agent_protocol(&ping_response(0))
-            .expect_err("protocol 0 must be rejected");
+    fn boot_contract_rejection_is_not_reported_as_a_stale_agent() {
+        let mut response = ping_response(0);
+        response.message =
+            "incompatible host boot contract: missing arcbox.runtime_generation".to_string();
+        let err =
+            AgentClient::check_agent_protocol(&response).expect_err("protocol 0 must be rejected");
         assert!(err.to_string().contains("incompatible"));
+        assert!(err.to_string().contains("arcbox.runtime_generation"));
+        assert!(!err.to_string().contains("stale"));
+    }
+
+    #[test]
+    fn previous_protocol_is_rejected() {
+        let previous = arcbox_constants::wire::AGENT_PROTOCOL_VERSION - 1;
+        let err = AgentClient::check_agent_protocol(&ping_response(previous))
+            .expect_err("previous protocol must be rejected");
+        assert!(err.to_string().contains("incompatible"));
+        assert!(err.to_string().contains("stale"));
     }
 
     #[test]

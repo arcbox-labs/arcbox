@@ -30,7 +30,7 @@ const BTRFS_TOTAL_BYTES_OFFSET: u64 = 0x10070;
 ///
 /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
 /// while EROFS root is read-only and cannot host dynamic mountpoints.
-const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
+pub(super) const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
 const LEGACY_SANDBOX_RUNTIME_DIR: &str = "/var/lib/arcbox/sandboxes";
 
 const DATA_SUBVOLUME_MOUNTS: [(&str, &str); 6] = [
@@ -45,9 +45,10 @@ const DATA_SUBVOLUME_MOUNTS: [(&str, &str); 6] = [
 static DATA_MOUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn data_mounts_ready(mut is_mounted: impl FnMut(&str) -> bool) -> bool {
-    DATA_SUBVOLUME_MOUNTS
-        .iter()
-        .all(|(_, target)| is_mounted(target))
+    is_mounted(BTRFS_TEMP_MOUNT)
+        && DATA_SUBVOLUME_MOUNTS
+            .iter()
+            .all(|(_, target)| is_mounted(target))
 }
 
 fn has_btrfs_superblock(device: &str) -> bool {

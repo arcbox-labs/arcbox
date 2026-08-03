@@ -524,6 +524,14 @@ fn handle_mmap_read_file(req: arcbox_connect::v1::MmapReadFileRequest) -> RpcRes
 /// Handles a Ping request.
 fn handle_ping(req: arcbox_connect::v1::AgentPingRequest) -> RpcResponse {
     tracing::debug!("Ping request: {:?}", req.message);
+    if let Err(reason) = super::cmdline::validate_runtime_boot_contract() {
+        return RpcResponse::Ping(PingResponse {
+            message: format!("incompatible host boot contract: {reason}"),
+            version: AGENT_VERSION.to_string(),
+            protocol_version: 0,
+            ..Default::default()
+        });
+    }
     sync_clock_from_host(req.timestamp_secs);
     RpcResponse::Ping(PingResponse {
         message: if req.message.is_empty() {

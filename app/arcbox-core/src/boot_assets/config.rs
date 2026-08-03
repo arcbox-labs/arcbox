@@ -15,6 +15,8 @@ pub struct BootAssetConfig {
     pub cache_dir: PathBuf,
     /// Custom kernel path (skip download).
     pub custom_kernel: Option<PathBuf>,
+    /// Allow a locally built development manifest to differ from `assets.lock`.
+    pub allow_unpinned_manifest: bool,
 }
 
 impl Default for BootAssetConfig {
@@ -38,6 +40,7 @@ impl Default for BootAssetConfig {
                 .join(".arcbox")
                 .join("boot"),
             custom_kernel: None,
+            allow_unpinned_manifest: false,
         }
     }
 }
@@ -55,6 +58,14 @@ impl BootAssetConfig {
     /// Override asset version.
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = version.into();
+        self
+    }
+
+    /// Allow local development boot assets whose manifest is generated after
+    /// the daemon was compiled.
+    #[must_use]
+    pub const fn with_unpinned_manifest_allowed(mut self, allowed: bool) -> Self {
+        self.allow_unpinned_manifest = allowed;
         self
     }
 

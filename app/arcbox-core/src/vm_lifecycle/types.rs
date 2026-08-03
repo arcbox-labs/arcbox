@@ -98,6 +98,8 @@ pub struct VmLifecycleConfig {
     pub skip_vm_check: bool,
     /// Guest docker API vsock port propagated via kernel cmdline.
     pub guest_docker_vsock_port: Option<u32>,
+    /// Allow locally generated boot manifests in the development profile.
+    pub allow_unpinned_boot_manifest: bool,
     /// macOS hypervisor backend this lifecycle's machine will use.
     ///
     /// Defaults to the System VM default ([`arcbox_vmm::VmBackend::default`],
@@ -117,6 +119,7 @@ impl Default for VmLifecycleConfig {
             default_vm: DefaultVmConfig::default(),
             skip_vm_check: false,
             guest_docker_vsock_port: None,
+            allow_unpinned_boot_manifest: false,
             backend: arcbox_vmm::VmBackend::default(),
         }
     }
@@ -164,9 +167,6 @@ pub(super) struct DesiredBoot {
     pub(super) cmdline: String,
     /// EROFS rootfs image path (read-only vda).
     pub(super) rootfs_image: PathBuf,
-    /// Read-only image of the guest container-runtime binaries, when the
-    /// pinned boot release ships one (ABX-498).
-    pub(super) runtime_image: Option<PathBuf>,
 }
 
 /// Returns the first daemon-overridable field that differs between a persisted
@@ -181,22 +181,22 @@ pub(super) struct DesiredBoot {
 pub(super) fn machine_drift_reason(
     persisted: &MachineInfo,
     want: &DefaultVmConfig,
-    boot: &DesiredBoot,
+    boot: Option<&DesiredBoot>,
 ) -> Option<&'static str> {
     if persisted.cpus != want.cpus {
         Some("cpus")
     } else if persisted.memory_mb != want.memory_mb {
         Some("memory_mb")
-    } else if persisted.kernel.as_deref() != Some(boot.kernel.as_str()) {
-        Some("kernel")
-    } else if persisted.cmdline.as_deref() != Some(boot.cmdline.as_str()) {
-        Some("cmdline")
-    } else if persisted.block_devices.len() != boot.expected_disk_count() {
-        // A machine persisted before a disk was added (the ext4 metadata
-        // volume, or the runtime image) carries fewer disks; recreating
+    } else if persisted.block_devices.len() != BASE_MACHINE_DISK_COUNT {
+        // A machine persisted before or after the current disk layout
+        // carries a different disk count; recreating
         // rewrites the machine record — image files are untouched — so the
-        // guest receives the new device.
+        // guest receives exactly the current device set.
         Some("block_devices")
+    } else if boot.is_some_and(|boot| persisted.kernel.as_deref() != Some(boot.kernel.as_str())) {
+        Some("kernel")
+    } else if boot.is_some_and(|boot| persisted.cmdline.as_deref() != Some(boot.cmdline.as_str())) {
+        Some("cmdline")
     } else {
         None
     }
@@ -205,15 +205,6 @@ pub(super) fn machine_drift_reason(
 /// Block devices `create_default_machine` always attaches: EROFS rootfs
 /// (vda), btrfs data image (vdb), ext4 metadata image (vdc).
 const BASE_MACHINE_DISK_COUNT: usize = 3;
-
-impl DesiredBoot {
-    /// Number of block devices a machine created from these boot params
-    /// carries: the always-present three, plus the read-only runtime image
-    /// when the pinned boot release ships one.
-    pub(super) fn expected_disk_count(&self) -> usize {
-        BASE_MACHINE_DISK_COUNT + usize::from(self.runtime_image.is_some())
-    }
-}
 
 /// Derives the metadata-volume image filename paired with a data image:
 /// `docker.img` → `docker-meta.img`, `docker-rosetta.img` →

@@ -76,6 +76,54 @@ fn test_is_cached_requires_all_assets() {
     assert!(provider.is_cached());
 }
 
+#[test]
+fn only_development_config_accepts_a_locally_generated_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let version = "1.0.0";
+    let version_dir = temp.path().join(version);
+    std::fs::create_dir_all(&version_dir).unwrap();
+    std::fs::write(
+        version_dir.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "asset_version": version,
+            "built_at": "now",
+            "targets": {},
+            "binaries": [{
+                "name": "FEX",
+                "version": "1",
+                "targets": {
+                    "arm64": {
+                        "path": "FEX",
+                        "sha256": "0".repeat(64)
+                    }
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let production = BootAssetProvider::with_config(BootAssetConfig {
+        version: version.to_string(),
+        cache_dir: temp.path().to_path_buf(),
+        arch: "arm64".to_string(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(production.cached_manifest_has_binary("FEX").is_err());
+
+    let development = BootAssetProvider::with_config(BootAssetConfig {
+        version: version.to_string(),
+        cache_dir: temp.path().to_path_buf(),
+        arch: "arm64".to_string(),
+        allow_unpinned_manifest: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(development.cached_manifest_has_binary("FEX").unwrap());
+}
+
 fn restore_env(original: Option<String>) {
     // SAFETY: Test code running under ENV_LOCK mutex.
     unsafe {
