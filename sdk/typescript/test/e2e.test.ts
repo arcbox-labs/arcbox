@@ -18,7 +18,7 @@ const enabled = process.env.ARCBOX_SDK_E2E === "1";
 describe.skipIf(!enabled)("hello world against a live daemon", () => {
   it("creates a sandbox, moves files, runs commands, and cleans up", async () => {
     // Built-in minimal template (busybox) — no image pull involved.
-    const sandbox = await Sandbox.create("", { ttlMs: 300_000 });
+    const sandbox = await Sandbox.create("", { ttlMs: 300000 });
     try {
       // files: write then read back.
       await sandbox.files.writeText("/tmp/hello.txt", "hello from arcbox\n");
@@ -48,7 +48,7 @@ describe.skipIf(!enabled)("hello world against a live daemon", () => {
         }
       }
       expect(streamed).toContain("line3");
-      const exited = await bg.waitForExit(30_000);
+      const exited = await bg.waitForExit(30000);
       expect(exited.exitCode).toBe(0);
 
       // kill() delivers a signal to the whole process group.
@@ -56,7 +56,7 @@ describe.skipIf(!enabled)("hello world against a live daemon", () => {
         background: true,
       });
       await sleeper.kill("SIGKILL");
-      const killed = await sleeper.waitForExit(30_000);
+      const killed = await sleeper.waitForExit(30000);
       expect(killed.signal).toBe("SIGKILL");
       expect(killed.exitCode).toBe(137);
 
@@ -66,5 +66,5 @@ describe.skipIf(!enabled)("hello world against a live daemon", () => {
     } finally {
       await sandbox.kill();
     }
-  }, 300_000);
+  }, 300000);
 });

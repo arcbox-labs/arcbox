@@ -63,9 +63,9 @@ function createUdsOrTcpTransport(conn: ResolvedConnection): Transport {
     httpVersion: "1.1",
     baseUrl: conn.baseUrl,
     interceptors,
-    ...(conn.socketPath === undefined
-      ? {}
-      : { nodeOptions: { socketPath: conn.socketPath } }),
+    ...(!(conn.socketPath === undefined) && {
+      nodeOptions: { socketPath: conn.socketPath },
+    }),
   });
 }
 
