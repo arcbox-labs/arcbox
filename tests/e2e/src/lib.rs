@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod net_fixtures;
 pub mod sandbox;
 pub mod scenario;
+pub mod sdk_py;
 pub mod sdk_ts;
 pub mod signing;
 pub mod virtio_debug;
