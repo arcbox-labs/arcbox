@@ -8,6 +8,8 @@ mod rpc;
 #[cfg(target_os = "linux")]
 pub mod config;
 pub mod containerd;
+#[cfg(any(target_os = "linux", test))]
+mod create_registry;
 pub mod dns;
 pub mod dns_server;
 #[cfg(target_os = "linux")]
