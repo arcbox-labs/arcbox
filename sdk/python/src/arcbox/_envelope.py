@@ -87,9 +87,16 @@ class ConnectErrorDetail(msgspec.Struct):
 
 
 class ConnectWireError(msgspec.Struct):
-    """The JSON `error` object of the Connect protocol."""
+    """The JSON `error` object of the Connect protocol.
 
-    code: str = "unknown"
+    ``code`` is deliberately required (the spec always sends it): its
+    presence is what distinguishes Connect error JSON from an arbitrary
+    JSON body something in front of the daemon may return — a reverse
+    proxy's ``{"error": "Bad Gateway"}`` must route to the HTTP-status
+    fallback, not decode as an empty Connect error.
+    """
+
+    code: str
     message: str = ""
     details: list[ConnectErrorDetail] = msgspec.field(default_factory=list[ConnectErrorDetail])
 
