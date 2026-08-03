@@ -71,9 +71,7 @@ def main() -> int:
         (GEN_DIR / "__init__.py").write_text(GEN_INIT)
 
         for generated in sorted((Path(tmp) / PROTO_PACKAGE_DIR).iterdir()):
-            (GEN_DIR / generated.name).write_text(
-                rewrite_imports(generated.read_text())
-            )
+            (GEN_DIR / generated.name).write_text(rewrite_imports(generated.read_text()))
 
     print(f"regenerated {GEN_DIR}")
     return 0
