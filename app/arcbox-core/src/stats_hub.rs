@@ -14,7 +14,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arcbox_protocol::agent::{MachineStats, WatchStatsRequest};
+use arcbox_connect::v1::{MachineStats, WatchStatsRequest};
 use tokio::sync::broadcast;
 
 use crate::error::Result;
@@ -175,6 +175,7 @@ impl StatsSource for AgentStatsSource {
             .watch_stats(WatchStatsRequest {
                 timeout_ms: u32::try_from(WATCH_WINDOW.as_millis()).unwrap_or(u32::MAX),
                 interval_ms: u32::try_from(SAMPLE_INTERVAL.as_millis()).unwrap_or(u32::MAX),
+                ..Default::default()
             })
             .await?;
         Ok(AgentStatsStream { agent })

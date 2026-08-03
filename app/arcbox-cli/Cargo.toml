@@ -23,7 +23,6 @@ path = "src/bin/arcbox_placeholder.rs"
 [dependencies]
 arcbox-core = { workspace = true }
 arcbox-docker = { workspace = true }
-arcbox-protocol = { workspace = true }
 arcbox-constants = { workspace = true }
 arcbox-docker-tools = { workspace = true }
 arcbox-asset = { workspace = true }
@@ -50,8 +49,8 @@ uuid = { workspace = true, features = ["v4"] }
 arcbox-connect.workspace = true
 connectrpc = { version = "0.8.1", features = ["client"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
 buffa = { version = "0.9.1", features = ["json"] }
-prost.workspace = true
 tower.workspace = true
+buffa-types = { version = "0.9.1", features = ["json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }

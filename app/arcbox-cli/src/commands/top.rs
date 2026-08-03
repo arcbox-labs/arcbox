@@ -11,11 +11,11 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result, bail};
 use arcbox_connect::v1 as pb;
 use arcbox_connect::v1::StatsServiceClient;
-use arcbox_protocol::v1::{ContainerStats, MachineStats};
+use arcbox_connect::v1::{ContainerStats, MachineStats};
 use clap::Args;
 
 use super::OutputFormat;
-use crate::connect::{self, StreamItemExt as _};
+use crate::connect;
 
 /// Arguments for `abctl top`.
 #[derive(Debug, Args)]
@@ -40,7 +40,7 @@ pub async fn execute(args: TopArgs, format: OutputFormat) -> Result<()> {
     let mut previous: Option<MachineStats> = None;
     loop {
         let sample: MachineStats = match stream.message::<pb::MachineStats>().await? {
-            Some(item) => item.prost()?,
+            Some(item) => item.to_owned_message(),
             None => bail!("stats stream ended (daemon shutting down?)"),
         };
         // Compute against the prior sample (if any) before it becomes the
@@ -310,6 +310,7 @@ mod tests {
             net_rx_bytes: 3000,
             net_tx_bytes: 4000,
             containers: vec![],
+            ..Default::default()
         }
     }
 
@@ -325,6 +326,7 @@ mod tests {
             pids: 3,
             net_rx_bytes: 0,
             net_tx_bytes: 0,
+            ..Default::default()
         }
     }
 

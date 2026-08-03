@@ -9,21 +9,15 @@
 use std::sync::Arc;
 
 use arcbox_connect::v1 as pb;
-use arcbox_protocol::v1::{
-    ResolveContainerFsResponse, ResolveImageFsResponse, SetupStatus, SystemVmBackend,
-    SystemVmBackendInfo, VcpuDebug, VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug,
-    setup_status,
-};
+use arcbox_connect::v1::{SetupStatus, SystemVmBackend, setup_status};
 use connectrpc::{
-    ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
-    ServiceStream,
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
 use tokio::sync::{broadcast, watch};
 
 use super::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
-use super::bridge::{wire_request, wire_response};
 
 /// Buffered updates per streaming client. Startup publishes on the order of a
 /// dozen; the margin covers a client that stalls briefly mid-boot without
@@ -54,13 +48,8 @@ impl SetupState {
     pub fn new() -> Self {
         let initial = SetupStatus {
             phase: setup_status::Phase::Initializing.into(),
-            dns_resolver_installed: false,
-            docker_socket_linked: false,
-            route_installed: false,
-            vm_running: false,
             message: "Daemon starting...".to_string(),
-            docker_tools_installed: false,
-            error: String::new(),
+            ..Default::default()
         };
         let (tx, _) = watch::channel(initial);
         Self {
@@ -192,8 +181,8 @@ fn backend_to_proto(backend: arcbox_core::VmBackend) -> SystemVmBackend {
 
 /// Maps a core virtio device snapshot to the wire message. (A `From`
 /// impl is impossible here — both types are foreign to this crate.)
-fn device_debug_to_proto(device: arcbox_core::DeviceDebug) -> VirtioDeviceDebug {
-    VirtioDeviceDebug {
+fn device_debug_to_proto(device: arcbox_core::DeviceDebug) -> pb::VirtioDeviceDebug {
+    pb::VirtioDeviceDebug {
         id: device.id,
         device_type: device.device_type,
         name: device.name,
@@ -204,7 +193,7 @@ fn device_debug_to_proto(device: arcbox_core::DeviceDebug) -> VirtioDeviceDebug 
         queues: device
             .queues
             .into_iter()
-            .map(|queue| VirtioQueueDebug {
+            .map(|queue| pb::VirtioQueueDebug {
                 index: u32::from(queue.index),
                 size: u32::from(queue.size),
                 ready: queue.ready,
@@ -215,8 +204,10 @@ fn device_debug_to_proto(device: arcbox_core::DeviceDebug) -> VirtioDeviceDebug 
                 used_flags: queue.used_flags.map(u32::from),
                 used_event: queue.used_event.map(u32::from),
                 avail_event: queue.avail_event.map(u32::from),
+                ..Default::default()
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -231,7 +222,7 @@ impl pb::SystemService for SystemServiceImpl {
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::GetInfoRequest>,
-    ) -> ServiceResult<PreEncoded<pb::GetInfoResponse>> {
+    ) -> ServiceResult<pb::GetInfoResponse> {
         // TODO: Populate from runtime.
         Err(ConnectError::unimplemented("get_info not yet implemented"))
     }
@@ -240,33 +231,34 @@ impl pb::SystemService for SystemServiceImpl {
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::GetVersionRequest>,
-    ) -> ServiceResult<PreEncoded<pb::GetVersionResponse>> {
-        let resp = arcbox_protocol::v1::GetVersionResponse {
+    ) -> ServiceResult<pb::GetVersionResponse> {
+        let resp = pb::GetVersionResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             api_version: "1.0".to_string(),
             min_api_version: "1.0".to_string(),
             ..Default::default()
         };
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn ping(
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::SystemPingRequest>,
-    ) -> ServiceResult<PreEncoded<pb::SystemPingResponse>> {
-        let resp = arcbox_protocol::v1::SystemPingResponse {
+    ) -> ServiceResult<pb::SystemPingResponse> {
+        let resp = pb::SystemPingResponse {
             api_version: "1.0".to_string(),
             build_version: env!("CARGO_PKG_VERSION").to_string(),
+            ..Default::default()
         };
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn events(
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::EventsRequest>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::Event>>> {
+    ) -> ServiceResult<ServiceStream<pb::Event>> {
         // TODO: Implement event streaming.
         Err(ConnectError::unimplemented("events not yet implemented"))
     }
@@ -275,7 +267,7 @@ impl pb::SystemService for SystemServiceImpl {
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::PruneRequest>,
-    ) -> ServiceResult<PreEncoded<pb::PruneResponse>> {
+    ) -> ServiceResult<pb::PruneResponse> {
         // TODO: Implement resource pruning.
         Err(ConnectError::unimplemented("prune not yet implemented"))
     }
@@ -284,22 +276,22 @@ impl pb::SystemService for SystemServiceImpl {
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::Empty>,
-    ) -> ServiceResult<PreEncoded<pb::SetupStatus>> {
-        Response::ok(wire_response(&self.setup_state.current()))
+    ) -> ServiceResult<pb::SetupStatus> {
+        Response::ok(self.setup_state.current())
     }
 
     async fn watch_setup_status(
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::Empty>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::SetupStatus>>> {
+    ) -> ServiceResult<ServiceStream<pb::SetupStatus>> {
         let (initial, mut updates) = self.setup_state.subscribe();
         let stream = async_stream::stream! {
             // Send current state immediately, then every update after it.
-            yield Ok(wire_response::<pb::SetupStatus, _>(&initial));
+            yield Ok(initial);
             loop {
                 match updates.recv().await {
-                    Ok(status) => yield Ok(wire_response::<pb::SetupStatus, _>(&status)),
+                    Ok(status) => yield Ok(status),
                     // Too slow to keep up: the next recv resumes from the
                     // oldest retained update, so the client stays live and
                     // converges — it has only missed intermediate phases.
@@ -317,26 +309,27 @@ impl pb::SystemService for SystemServiceImpl {
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::Empty>,
-    ) -> ServiceResult<PreEncoded<pb::SystemVmBackendInfo>> {
+    ) -> ServiceResult<pb::SystemVmBackendInfo> {
         let runtime = self.runtime.ready()?;
-        let info = SystemVmBackendInfo {
-            backend: backend_to_proto(runtime.system_vm_backend()) as i32,
+        let info = pb::SystemVmBackendInfo {
+            backend: backend_to_proto(runtime.system_vm_backend()).into(),
+            ..Default::default()
         };
-        Response::ok(wire_response(&info))
+        Response::ok(info)
     }
 
     async fn get_virtio_debug(
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::Empty>,
-    ) -> ServiceResult<PreEncoded<pb::VirtioDebugInfo>> {
+    ) -> ServiceResult<pb::VirtioDebugInfo> {
         // The early handle exists as soon as the runtime is constructed —
         // a boot that never reaches READY is this RPC's main use case.
         let runtime = self.early_runtime.ready()?;
         let snapshot = runtime
             .system_vm_debug_snapshot()
             .map_err(|e| ConnectError::failed_precondition(e.to_string()))?;
-        let info = VirtioDebugInfo {
+        let info = pb::VirtioDebugInfo {
             devices: snapshot
                 .devices
                 .into_iter()
@@ -345,7 +338,7 @@ impl pb::SystemService for SystemServiceImpl {
             vcpus: snapshot
                 .vcpus
                 .into_iter()
-                .map(|v| VcpuDebug {
+                .map(|v| pb::VcpuDebug {
                     vcpu: v.vcpu,
                     mmio_reads: v.mmio_reads,
                     mmio_writes: v.mmio_writes,
@@ -356,21 +349,23 @@ impl pb::SystemService for SystemServiceImpl {
                     kicks_received: v.kicks_received,
                     sysreg: v.sysreg,
                     other: v.other,
+                    ..Default::default()
                 })
                 .collect(),
             kick_broadcasts: snapshot.kick_broadcasts,
             unpark_broadcasts: snapshot.unpark_broadcasts,
+            ..Default::default()
         };
-        Response::ok(wire_response(&info))
+        Response::ok(info)
     }
 
     async fn resolve_container_fs(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::ResolveContainerFsRequest>,
-    ) -> ServiceResult<PreEncoded<pb::ResolveContainerFsResponse>> {
+    ) -> ServiceResult<pb::ResolveContainerFsResponse> {
         let runtime = self.runtime.ready()?;
-        let req: arcbox_protocol::v1::ResolveContainerFsRequest = wire_request(&request)?;
+        let req = request.to_owned_message();
         if req.container_id.is_empty() {
             return Err(ConnectError::invalid_argument(
                 "container_id must not be empty",
@@ -380,20 +375,21 @@ impl pb::SystemService for SystemServiceImpl {
             .container_fs_paths(&req.container_id)
             .await
             .map_err(|e| ConnectError::failed_precondition(e.to_string()))?;
-        let resp = ResolveContainerFsResponse {
+        let resp = pb::ResolveContainerFsResponse {
             upper_dir: paths.upper_dir,
             lower_dirs: paths.lower_dirs,
+            ..Default::default()
         };
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn resolve_image_fs(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::ResolveImageFsRequest>,
-    ) -> ServiceResult<PreEncoded<pb::ResolveImageFsResponse>> {
+    ) -> ServiceResult<pb::ResolveImageFsResponse> {
         let runtime = self.runtime.ready()?;
-        let req: arcbox_protocol::v1::ResolveImageFsRequest = wire_request(&request)?;
+        let req = request.to_owned_message();
         if req.top_chain_id.is_empty() {
             return Err(ConnectError::invalid_argument(
                 "top_chain_id must not be empty",
@@ -403,29 +399,31 @@ impl pb::SystemService for SystemServiceImpl {
             .image_fs_paths(&req.top_chain_id)
             .await
             .map_err(|e| ConnectError::failed_precondition(e.to_string()))?;
-        let resp = ResolveImageFsResponse {
+        let resp = pb::ResolveImageFsResponse {
             lower_dirs: paths.lower_dirs,
+            ..Default::default()
         };
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn set_system_vm_backend(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::SetSystemVmBackendRequest>,
-    ) -> ServiceResult<PreEncoded<pb::SystemVmBackendInfo>> {
-        let req: arcbox_protocol::v1::SetSystemVmBackendRequest = wire_request(&request)?;
-        let backend = backend_from_proto(req.backend())
+    ) -> ServiceResult<pb::SystemVmBackendInfo> {
+        let req = request.to_owned_message();
+        let backend = backend_from_proto(req.backend.as_known().unwrap_or_default())
             .ok_or_else(|| ConnectError::invalid_argument("backend must be HV or VZ"))?;
         let runtime = self.runtime.ready()?;
         runtime
             .switch_system_vm_backend(backend)
             .await
             .map_err(|e| ConnectError::internal(e.to_string()))?;
-        let info = SystemVmBackendInfo {
-            backend: backend_to_proto(runtime.system_vm_backend()) as i32,
+        let info = pb::SystemVmBackendInfo {
+            backend: backend_to_proto(runtime.system_vm_backend()).into(),
+            ..Default::default()
         };
-        Response::ok(wire_response(&info))
+        Response::ok(info)
     }
 }
 
@@ -436,7 +434,7 @@ mod tests {
     /// Every update currently buffered for `updates`, as phases.
     fn drain(updates: &mut broadcast::Receiver<SetupStatus>) -> Vec<setup_status::Phase> {
         std::iter::from_fn(|| updates.try_recv().ok())
-            .map(|status| status.phase())
+            .map(|status| status.phase.as_known().unwrap_or_default())
             .collect()
     }
 
@@ -471,7 +469,7 @@ mod tests {
 
         let (snapshot, mut updates) = state.subscribe();
 
-        assert_eq!(snapshot.phase(), setup_status::Phase::AssetsReady);
+        assert_eq!(snapshot.phase, setup_status::Phase::AssetsReady);
         assert!(drain(&mut updates).is_empty());
     }
 

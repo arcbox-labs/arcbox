@@ -10,21 +10,14 @@ use std::sync::Arc;
 
 use arcbox_connect::v1 as pb;
 use arcbox_core::{MacImage, PullStage, RemoteLocation, RemoteSource};
-use arcbox_protocol::v1::{
-    Empty, MacosImageListResponse, MacosImagePullEvent, MacosImageResolveResponse,
-    MacosImageSummary, MacosMachineInfo, MacosMachineListResponse, MacosMachineSummary,
-};
 use connectrpc::{
-    ConnectError, PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult,
-    ServiceStream,
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
-use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
-use super::bridge::{wire_request, wire_response};
 use super::run_macos_blocking;
 
 /// Wire name of a pull stage.
@@ -54,8 +47,8 @@ fn parse_source(reference: &str, manifest_url: &str) -> Result<RemoteSource, Con
 
 /// Wire summary of a registered image. Shared by `ImageList` and
 /// `ImagePull`'s terminal event.
-fn image_summary(image: MacImage) -> MacosImageSummary {
-    MacosImageSummary {
+fn image_summary(image: MacImage) -> pb::MacosImageSummary {
+    pb::MacosImageSummary {
         name: image.meta.name,
         minimum_cpu_count: image.meta.minimum_cpu_count,
         minimum_memory_mib: image.meta.minimum_memory_mib,
@@ -64,6 +57,7 @@ fn image_summary(image: MacImage) -> MacosImageSummary {
         source: image.meta.source.unwrap_or_default(),
         version: image.meta.version.unwrap_or_default(),
         os_version: image.meta.os_version.unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -91,8 +85,8 @@ impl pb::MacosService for MacosServiceImpl {
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::CreateMacosMachineRequest>,
-    ) -> ServiceResult<PreEncoded<pb::Empty>> {
-        let req = wire_request::<arcbox_protocol::v1::CreateMacosMachineRequest, _>(&request)?;
+    ) -> ServiceResult<pb::Empty> {
+        let req = request.to_owned_message();
         self.runtime
             .ready()?
             .mac_machine_manager()
@@ -103,81 +97,84 @@ impl pb::MacosService for MacosServiceImpl {
                 memory_mib: req.memory_mib,
             })
             .map_err(|e| ConnectError::internal(e.to_string()))?;
-        Response::ok(wire_response(&Empty {}))
+        Response::ok(pb::Empty::default())
     }
 
     async fn start(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::StartMacosMachineRequest>,
-    ) -> ServiceResult<PreEncoded<pb::Empty>> {
-        let name = wire_request::<arcbox_protocol::v1::StartMacosMachineRequest, _>(&request)?.name;
+    ) -> ServiceResult<pb::Empty> {
+        let name = request.to_owned_message().name;
         let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
         run_macos_blocking(move || async move { mgr.start(&name).await }).await?;
-        Response::ok(wire_response(&Empty {}))
+        Response::ok(pb::Empty::default())
     }
 
     async fn stop(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::StopMacosMachineRequest>,
-    ) -> ServiceResult<PreEncoded<pb::Empty>> {
-        let name = wire_request::<arcbox_protocol::v1::StopMacosMachineRequest, _>(&request)?.name;
+    ) -> ServiceResult<pb::Empty> {
+        let name = request.to_owned_message().name;
         let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
         run_macos_blocking(move || async move { mgr.stop(&name).await }).await?;
-        Response::ok(wire_response(&Empty {}))
+        Response::ok(pb::Empty::default())
     }
 
     async fn remove(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::RemoveMacosMachineRequest>,
-    ) -> ServiceResult<PreEncoded<pb::Empty>> {
-        let req = wire_request::<arcbox_protocol::v1::RemoveMacosMachineRequest, _>(&request)?;
+    ) -> ServiceResult<pb::Empty> {
+        let req = request.to_owned_message();
         let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
         let name = req.name;
         let force = req.force;
         run_macos_blocking(move || async move { mgr.remove(&name, force).await }).await?;
-        Response::ok(wire_response(&Empty {}))
+        Response::ok(pb::Empty::default())
     }
 
     async fn list(
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::Empty>,
-    ) -> ServiceResult<PreEncoded<pb::MacosMachineListResponse>> {
+    ) -> ServiceResult<pb::MacosMachineListResponse> {
         let machines = self
             .runtime
             .ready()?
             .mac_machine_manager()
             .list()
             .into_iter()
-            .map(|m| MacosMachineSummary {
+            .map(|m| pb::MacosMachineSummary {
                 name: m.name,
                 state: format!("{:?}", m.state).to_lowercase(),
                 cpus: m.cpus,
                 memory_mib: m.memory_mib,
                 image: m.image,
                 created: m.created_at.timestamp(),
+                ..Default::default()
             })
             .collect();
-        Response::ok(wire_response(&MacosMachineListResponse { machines }))
+        Response::ok(pb::MacosMachineListResponse {
+            machines,
+            ..Default::default()
+        })
     }
 
     async fn inspect(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::InspectMacosMachineRequest>,
-    ) -> ServiceResult<PreEncoded<pb::MacosMachineInfo>> {
-        let name =
-            wire_request::<arcbox_protocol::v1::InspectMacosMachineRequest, _>(&request)?.name;
+    ) -> ServiceResult<pb::MacosMachineInfo> {
+        let name = request.to_owned_message().name;
         let machine = self
             .runtime
             .ready()?
             .mac_machine_manager()
             .get(&name)
             .ok_or_else(|| ConnectError::not_found("macOS guest not found"))?;
-        let resp = MacosMachineInfo {
+        let resp = pb::MacosMachineInfo {
             name: machine.name,
             state: format!("{:?}", machine.state).to_lowercase(),
             cpus: machine.cpus,
@@ -186,16 +183,17 @@ impl pb::MacosService for MacosServiceImpl {
             created: machine.created_at.timestamp(),
             mac_address: machine.mac_address.unwrap_or_default(),
             ip_address: machine.ip_address.unwrap_or_default(),
+            ..Default::default()
         };
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn image_pull(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::MacosImagePullRequest>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::MacosImagePullEvent>>> {
-        let req = wire_request::<arcbox_protocol::v1::MacosImagePullRequest, _>(&request)?;
+    ) -> ServiceResult<ServiceStream<pb::MacosImagePullEvent>> {
+        let req = request.to_owned_message();
         let source = parse_source(&req.reference, &req.manifest_url)?;
 
         let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
@@ -214,10 +212,10 @@ impl pb::MacosService for MacosServiceImpl {
                 let percent = (fraction * 100.0) as u32;
                 if last != (stage, percent) {
                     last = (stage, percent);
-                    let _ = progress.send(Ok(MacosImagePullEvent {
+                    let _ = progress.send(Ok(pb::MacosImagePullEvent {
                         stage: stage_name(stage).to_string(),
                         fraction,
-                        image: None,
+                        ..Default::default()
                     }));
                 }
             });
@@ -229,10 +227,11 @@ impl pb::MacosService for MacosServiceImpl {
                     // present), so the caller learns the concrete version a
                     // floating reference resolved to.
                     Ok(image) => {
-                        let _ = tx.send(Ok(MacosImagePullEvent {
+                        let _ = tx.send(Ok(pb::MacosImagePullEvent {
                             stage: "done".to_string(),
                             fraction: 1.0,
-                            image: Some(image_summary(image)),
+                            image: image_summary(image).into(),
+                            ..Default::default()
                         }));
                     }
                     Err(e) => {
@@ -244,8 +243,7 @@ impl pb::MacosService for MacosServiceImpl {
                 }
             }
         });
-        let stream = UnboundedReceiverStream::new(rx)
-            .map(|item| item.map(|event| wire_response::<pb::MacosImagePullEvent, _>(&event)));
+        let stream = UnboundedReceiverStream::new(rx);
         Response::ok(Box::pin(stream))
     }
 
@@ -253,8 +251,8 @@ impl pb::MacosService for MacosServiceImpl {
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::MacosImageResolveRequest>,
-    ) -> ServiceResult<PreEncoded<pb::MacosImageResolveResponse>> {
-        let req = wire_request::<arcbox_protocol::v1::MacosImageResolveRequest, _>(&request)?;
+    ) -> ServiceResult<pb::MacosImageResolveResponse> {
+        let req = request.to_owned_message();
         let source = parse_source(&req.reference, &req.manifest_url)?;
         let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
         let resolved = mgr
@@ -262,7 +260,7 @@ impl pb::MacosService for MacosServiceImpl {
             .resolve_remote(&source)
             .await
             .map_err(|e| ConnectError::internal(e.to_string()))?;
-        let resp = MacosImageResolveResponse {
+        let resp = pb::MacosImageResolveResponse {
             name: resolved.name,
             version: resolved.version,
             os_version: resolved.os_version,
@@ -270,15 +268,16 @@ impl pb::MacosService for MacosServiceImpl {
             minimum_memory_mib: resolved.minimum_memory_mib,
             disk_gb: resolved.disk_gb,
             installed_version: resolved.installed_version.unwrap_or_default(),
+            ..Default::default()
         };
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn image_list(
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::Empty>,
-    ) -> ServiceResult<PreEncoded<pb::MacosImageListResponse>> {
+    ) -> ServiceResult<pb::MacosImageListResponse> {
         let images = self
             .runtime
             .ready()?
@@ -288,21 +287,24 @@ impl pb::MacosService for MacosServiceImpl {
             .into_iter()
             .map(image_summary)
             .collect();
-        Response::ok(wire_response(&MacosImageListResponse { images }))
+        Response::ok(pb::MacosImageListResponse {
+            images,
+            ..Default::default()
+        })
     }
 
     async fn image_remove(
         &self,
         _ctx: RequestContext,
         request: ServiceRequest<'_, pb::MacosImageRemoveRequest>,
-    ) -> ServiceResult<PreEncoded<pb::Empty>> {
-        let name = wire_request::<arcbox_protocol::v1::MacosImageRemoveRequest, _>(&request)?.name;
+    ) -> ServiceResult<pb::Empty> {
+        let name = request.to_owned_message().name;
         self.runtime
             .ready()?
             .mac_machine_manager()
             .images()
             .remove(&name)
             .map_err(|e| ConnectError::internal(e.to_string()))?;
-        Response::ok(wire_response(&Empty {}))
+        Response::ok(pb::Empty::default())
     }
 }

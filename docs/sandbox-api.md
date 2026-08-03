@@ -15,9 +15,11 @@ seam (CORE-57):
 | File | Service | Plane |
 |---|---|---|
 | `sandbox.proto` | `SandboxService` | control — lifecycle, events, published ports |
+| `template.proto` | `TemplateService` | control — the template catalog (CORE-21, contract-only) |
 | `process.proto` | `SandboxProcessService` | data — executions |
-| `filesystem.proto` | `SandboxFilesystemService` | data — file transfer |
+| `filesystem.proto` | `SandboxFilesystemService` | data — file transfer + path verbs |
 | `snapshot.proto` | `SandboxSnapshotService` | checkpoint / restore |
+| `errors.proto` | — | the `ErrorCode` registry / `ErrorInfo` detail |
 
 The split is what lets a deployment put the two planes in different places:
 control-plane calls address a fleet and can be served by a multi-tenant
@@ -42,10 +44,12 @@ message (`/dev/kvm` is absent in the guest).
 ## Connection
 
 - Socket: `~/.arcbox/run/arcbox.sock` (Unix domain socket, HTTP/2).
-- No routing metadata is required. Local clients MAY set the `x-machine`
-  header to target a named VM; absent (or empty) it resolves to the
-  System VM. The header is local transport metadata, not part of the
-  product contract — a cloud client never sends one.
+- Sandbox V1 runs only in the System VM. An absent, empty, or explicit
+  `x-machine: default` header targets it; every other value returns
+  `INVALID_ARGUMENT`. Supporting sandboxes in multiple VMs later requires
+  extending host listener and DNS ownership with a machine identity first.
+  The header remains local transport metadata, not part of the product
+  contract — a cloud client never sends one.
 - **Transport & auth posture (V1)**: UDS only — there is no TCP listener,
   and no authentication beyond the socket's file permissions. This is a
   single-user local API; remote access requires your own proxy in front of
@@ -71,14 +75,30 @@ Sandbox V1" (`image`, `mounts`, `ssh_public_key`) are rejected with
 `FAILED_PRECONDITION` rather than silently ignored, and will gain
 behavior in later releases without a wire break.
 
+**Contract-only additions (CORE-58 phase 1).** The SDK-prerequisite
+surface is on the wire ahead of its implementation; these RPCs answer
+`UNIMPLEMENTED` today, each naming its follow-up issue:
+
+- `TemplateService` (`template.proto`) — the template catalog (CORE-21;
+  Build additionally gated on CORE-5/CORE-16).
+- `SandboxService.Pause/Resume` (CORE-21), `SetLifecycle` (CORE-60 /
+  CORE-21), `GetCapabilities` (CORE-13).
+- `SandboxProcessService.ListExecutions/WaitForPort` (CORE-58 phase 2).
+- The `SandboxFilesystemService` path verbs — `Stat`, `ListDir`,
+  `MakeDir`, `Remove`, `Move`, `WatchDir` (CORE-62).
+- `errors.proto` — the `ErrorCode` registry; handlers attach `ErrorInfo`
+  as a Connect error detail in a follow-up phase (CORE-58).
+
 ## Sandbox state machine
 
 ```
 STARTING ──► READY ──► RUNNING ──► READY   (execution exited; IDLE event)
                │          │
-               └──────────┴──► STOPPING ──► STOPPED
-                                    │
-                                 FAILED
+               ├──────────┴──► STOPPING ──► STOPPED
+               │          │
+               ├──────────┴──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
+               │          │
+               └──────────┴──► FAILED   (error + failed_at set)
 ```
 
 States are the `SandboxState` enum (`SANDBOX_STATE_*`); events carry the
@@ -86,9 +106,15 @@ States are the `SandboxState` enum (`SANDBOX_STATE_*`); events carry the
 
 - A sandbox is **not destroyed** when its execution exits — it returns to
   `READY` and accepts further `StartExecution` calls.
-- Destruction happens via `Stop`/`Remove` or `ttl_seconds` expiry.
+- Destruction happens via `Stop`/`Remove`, `ttl_seconds` (hard maximum
+  lifetime) expiry, or `idle_timeout_seconds` expiry with the default
+  `KILL` policy; `on_idle: PAUSE` checkpoints instead (CORE-21,
+  contract-only today).
 - `stopped` sandboxes have released their TAP/IP, CoW device, and chroot;
   only the inspectable record and logs remain until `Remove`.
+- `paused` sandboxes keep their record **and** an on-disk checkpoint
+  (`storage_bytes`) under the same ID; data-plane calls resume them
+  transparently, `Inspect`/`List` never do.
 
 ## SandboxService
 
@@ -103,12 +129,14 @@ Key fields:
 
 | Field | Semantics |
 |---|---|
-| `id` | caller-supplied for idempotency; empty → UUID |
+| `id` | caller-supplied for durable retry idempotency; empty → a fresh UUID on every attempt |
 | `limits.vcpus` / `limits.memory_mib` | 0 → daemon defaults (1 vCPU, 512 MiB) |
 | `template` | opaque reference to what boots — see **Templates** below |
 | `cmd`, `env`, `working_dir`, `user` | initial workload launched automatically once ready; exit returns the sandbox to `READY` with an `IDLE` event |
+| `no_default_cmd`, `no_default_env` | explicit-empty overrides of a catalog template's default cmd/env — proto3 repeated/map fields cannot distinguish omitted from empty (CORE-21, contract-only today) |
 | `network.mode` | `NETWORK_MODE_ENABLED` (default, IP from 172.20.0.0/16) or `NETWORK_MODE_NONE` |
-| `ttl_seconds` | auto-destroy timer from creation (not reset by activity) |
+| `ttl_seconds` | hard maximum lifetime from creation (not reset by activity; re-armable via `SetLifecycle`); always destroys |
+| `idle_timeout_seconds`, `on_idle` | idle reaping: `KILL` (default) or `PAUSE` after inactivity (CORE-21, contract-only today) |
 | `mounts`, `ssh_public_key` | **rejected in V1** with `FAILED_PRECONDITION` (see Proto stability) |
 
 ### Templates
@@ -122,9 +150,21 @@ crosses the API (CORE-54). Local mode accepts:
 | `""` | the built-in minimal image (busybox + init), built on first use |
 | `"docker:<ref>"` | a Docker image in the guest's own image store |
 
-Anything else is rejected with `INVALID_ARGUMENT` — a bare name is
-reserved for the cloud template registry (CORE-21), so it is never
-guessed at as an image reference.
+Anything else is rejected with `INVALID_ARGUMENT` — a bare
+`name[:version]` addresses the template catalog (`TemplateService`,
+CORE-21; contract-only today), so it is never guessed at as an image
+reference.
+
+Catalog templates carry defaults (`limits`, `cmd`, `env`,
+`exposed_ports`, `ready_probe`). A create request overrides them
+field-wise: a set `limits` replaces the default limits wholesale, a
+non-empty `cmd` replaces the default cmd, and `env` merges per key with
+the request winning. Inside a set `limits`, a zero `vcpus` or
+`memory_mib` means the *daemon* default for that resource — never a
+per-field fall-through to the template, since the scalars have no
+presence. `no_default_cmd` / `no_default_env` express the
+explicitly-empty case that proto3 repeated/map shape cannot
+(`exposed_ports` and `ready_probe` have no per-create counterpart).
 
 A `docker:` template is resolved **inside the VM**: the guest exports the
 image from its own dockerd, converts it to ext4, and caches the result
@@ -242,9 +282,11 @@ mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
 | `Restore{snapshot_id, id, network_override, ttl_seconds}` | new sandbox in `READY` state with near-zero boot; set `network_override` for a fresh TAP/IP when restoring concurrently |
 | `ListSnapshots` / `DeleteSnapshot` | catalog management; `ListSnapshots` paginates like `List` |
 
-Direct-mode (non-jailer) restores of the same snapshot cannot run
-concurrently with each other or the origin sandbox (the vmstate pins the
-origin vsock path); jailer-mode restores have no such constraint.
+Restore requires jailer mode. Direct-mode vmstate pins origin sandbox paths
+and is rejected rather than risking mutation of the origin or path collisions.
+Restore retries are durably replayed only when `id` is caller-supplied. An
+empty `id` creates a fresh UUID on every attempt, so retry-capable clients must
+generate and retain the ID before the first call.
 
 `network_override` (a fresh TAP/IP for the restored sandbox) uses
 Firecracker's `network_overrides` snapshot-load field (Firecracker ≥ 1.12;

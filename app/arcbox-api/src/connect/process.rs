@@ -1,11 +1,11 @@
 //! Sandbox process (execution) service — data plane.
 
 use arcbox_connect::sandbox_v1 as pb;
-use arcbox_protocol::sandbox_v1::{ExecutionEvent, KeepAlive, execution_event};
+use arcbox_connect::sandbox_v1::{ExecutionEvent, KeepAlive, execution_event};
 use buffa_types::google::protobuf::Empty;
 use connectrpc::{
-    ConnectError, InboundStream, PreEncoded, RequestContext, Response, ServiceRequest,
-    ServiceResult, ServiceStream,
+    ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult,
+    ServiceStream,
 };
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
@@ -13,7 +13,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::bridge::{wire_request, wire_response, wire_stream_item};
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 
 /// Execution service implementation.
@@ -45,42 +44,41 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::StartExecutionRequest>,
-    ) -> ServiceResult<PreEncoded<pb::Execution>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<pb::Execution> {
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let execution = agent
-            .sandbox_exec_start(wire_request(&request)?)
+            .sandbox_exec_start(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&execution))
+        Response::ok(execution)
     }
 
     async fn attach_execution(
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::AttachExecutionRequest>,
-    ) -> ServiceResult<ServiceStream<PreEncoded<pb::ExecutionEvent>>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<ServiceStream<ExecutionEvent>> {
+        let machine = ctx.sandbox_machine_id()?;
         let agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let rx = agent
-            .sandbox_exec_attach(wire_request(&request)?)
+            .sandbox_exec_attach(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
         let stream =
             ReceiverStream::new(rx).map(|r| r.map_err(|e| ConnectError::from(ApiError::from(e))));
         let stream = with_keepalive(stream, || ExecutionEvent {
-            event: Some(execution_event::Event::KeepAlive(KeepAlive {})),
+            event: Some(execution_event::Event::from(KeepAlive::default())),
+            ..Default::default()
         });
-        let stream =
-            stream.map(|item| item.map(|event| wire_response::<pb::ExecutionEvent, _>(&event)));
         Response::ok(Box::pin(stream))
     }
 
@@ -88,33 +86,33 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::WriteStdinRequest>,
-    ) -> ServiceResult<PreEncoded<pb::StdinStatus>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<pb::StdinStatus> {
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let status = agent
-            .sandbox_stdin_write(wire_request(&request)?)
+            .sandbox_stdin_write(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&status))
+        Response::ok(status)
     }
 
     async fn stream_stdin(
         &self,
         ctx: RequestContext,
         mut requests: InboundStream<pb::WriteStdinRequest>,
-    ) -> ServiceResult<PreEncoded<pb::StdinStatus>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<pb::StdinStatus> {
+        let machine = ctx.sandbox_machine_id()?;
 
         let mut last = None;
         while let Some(item) = requests.next().await {
             // `Some(Err(..))` is an abnormal end (decode failure or a
             // truncated body), so it must fail the RPC rather than be read
             // as a clean finish — only `None` means the client is done.
-            let req = wire_stream_item(&item?)?;
+            let req = item?.to_owned_message();
             let mut agent = self
                 .runtime
                 .ready()?
@@ -129,25 +127,25 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         }
         let last = last
             .ok_or_else(|| ConnectError::invalid_argument("stream_stdin: empty request stream"))?;
-        Response::ok(wire_response(&last))
+        Response::ok(last)
     }
 
     async fn get_stdin_status(
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::GetStdinStatusRequest>,
-    ) -> ServiceResult<PreEncoded<pb::StdinStatus>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<pb::StdinStatus> {
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let status = agent
-            .sandbox_stdin_status(wire_request(&request)?)
+            .sandbox_stdin_status(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&status))
+        Response::ok(status)
     }
 
     async fn signal_execution(
@@ -155,14 +153,14 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::SignalExecutionRequest>,
     ) -> ServiceResult<Empty> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         agent
-            .sandbox_exec_signal(wire_request(&request)?)
+            .sandbox_exec_signal(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
         Response::ok(Empty::default())
@@ -173,14 +171,14 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::ResizeExecutionTtyRequest>,
     ) -> ServiceResult<Empty> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         agent
-            .sandbox_exec_resize(wire_request(&request)?)
+            .sandbox_exec_resize(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
         Response::ok(Empty::default())
@@ -190,17 +188,41 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::WaitExecutionRequest>,
-    ) -> ServiceResult<PreEncoded<pb::Execution>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<pb::Execution> {
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let execution = agent
-            .sandbox_exec_wait(wire_request(&request)?)
+            .sandbox_exec_wait(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&execution))
+        Response::ok(execution)
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): execution discovery lands
+    /// with CORE-58 phase 2 (guest-agent enumeration).
+    async fn list_executions(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ListExecutionsRequest>,
+    ) -> ServiceResult<pb::ListExecutionsResponse> {
+        Err(ConnectError::unimplemented(
+            "execution listing is not implemented yet (CORE-58 phase 2)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the guest-agent listen-table
+    /// watch lands with CORE-58 phase 2.
+    async fn wait_for_port(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::WaitForPortRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "port readiness waits are not implemented yet (CORE-58 phase 2)",
+        ))
     }
 }

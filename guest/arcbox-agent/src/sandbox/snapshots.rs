@@ -1,8 +1,8 @@
 //! Sandbox checkpoint / restore handlers.
 
-use arcbox_protocol::sandbox_v1;
-use arcbox_vm::RestoreSandboxSpec;
-use prost::Message;
+use arcbox_connect::sandbox_v1;
+use arcbox_vm::{RestoreSandboxSpec, SandboxState};
+use buffa::Message;
 
 use super::{SandboxService, convert, register_sandbox_dns};
 use crate::error::SandboxError;
@@ -13,11 +13,12 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::CheckpointResponse, SandboxError> {
-        let req = sandbox_v1::CheckpointRequest::decode(payload)
+        let req = sandbox_v1::CheckpointRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let _operation = self.operations.lock(&req.sandbox_id).await;
         let info = self
             .manager
-            .checkpoint_sandbox(&req.sandbox_id, req.name, req.labels)
+            .checkpoint_sandbox(&req.sandbox_id, req.name, req.labels.into_iter().collect())
             .await
             .map_err(SandboxError::from)?;
         Ok(convert::checkpoint_to_proto(info))
@@ -28,8 +29,14 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::RestoreResponse, SandboxError> {
-        let req = sandbox_v1::RestoreRequest::decode(payload)
+        let req = sandbox_v1::RestoreRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        self.manager.wait_startup_cleanup_complete().await;
+        let _operation = self.operations.lock(&req.id).await;
+        let restore_key = crate::create_key::restore_key(&req);
+        if !req.id.is_empty() {
+            self.clear_stale_completed_create(&req.id);
+        }
         let spec = RestoreSandboxSpec {
             id: if req.id.is_empty() {
                 None
@@ -37,17 +44,31 @@ impl SandboxService {
                 Some(req.id)
             },
             snapshot_id: req.snapshot_id,
-            labels: req.labels,
+            labels: req.labels.into_iter().collect(),
             network_override: req.network_override,
             ttl_seconds: req.ttl_seconds,
         };
         let (id, ip_address) = self
             .manager
-            .restore_sandbox(spec)
+            .restore_sandbox_keyed(spec, &restore_key)
             .await
             .map_err(SandboxError::from)?;
-        register_sandbox_dns(&id, &ip_address);
-        Ok(sandbox_v1::RestoreResponse { id, ip_address })
+        let live = self.manager.inspect_sandbox(&id).is_ok_and(|info| {
+            matches!(
+                info.state,
+                SandboxState::Starting | SandboxState::Ready | SandboxState::Running
+            ) && info
+                .network
+                .is_some_and(|network| network.ip_address == ip_address)
+        });
+        if live {
+            register_sandbox_dns(&id, &ip_address);
+        }
+        Ok(sandbox_v1::RestoreResponse {
+            id,
+            ip_address,
+            ..Default::default()
+        })
     }
 
     /// List snapshots (id-ordered, paginated).
@@ -55,7 +76,7 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::ListSnapshotsResponse, SandboxError> {
-        let req = sandbox_v1::ListSnapshotsRequest::decode(payload)
+        let req = sandbox_v1::ListSnapshotsRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let filter = if req.sandbox_id.is_empty() {
             None
@@ -84,12 +105,13 @@ impl SandboxService {
                 .map(convert::checkpoint_summary_to_proto)
                 .collect(),
             next_page_token,
+            ..Default::default()
         })
     }
 
     /// Delete a snapshot.
     pub fn delete_snapshot(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::DeleteSnapshotRequest::decode(payload)
+        let req = sandbox_v1::DeleteSnapshotRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         self.manager
             .delete_checkpoint(&req.snapshot_id)

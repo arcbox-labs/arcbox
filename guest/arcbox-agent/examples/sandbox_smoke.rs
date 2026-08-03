@@ -5,20 +5,19 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::HashMap;
     use std::time::Duration;
 
     use anyhow::{Context, Result, bail};
-    use arcbox_constants::ports::AGENT_PORT;
-    use arcbox_constants::wire::MessageType;
-    use arcbox_protocol::sandbox_v1::{
+    use arcbox_connect::sandbox_v1::{
         AttachExecutionRequest, CreateSandboxRequest, CreateSandboxResponse, Execution,
         ExecutionEvent, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
         RemoveSandboxRequest, SandboxState, StartExecutionRequest, StopSandboxRequest,
         execution_event, exit_status,
     };
+    use arcbox_constants::ports::AGENT_PORT;
+    use arcbox_constants::wire::MessageType;
+    use buffa::Message;
     use bytes::{Buf, BufMut, BytesMut};
-    use prost::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Instant, sleep};
     use tokio_vsock::{VMADDR_CID_LOCAL, VsockAddr, VsockStream};
@@ -28,20 +27,10 @@ mod linux {
     pub async fn run() -> Result<()> {
         let mut stream = connect_with_retry().await?;
 
+        // Empty template = the built-in busybox image.
         let create = CreateSandboxRequest {
-            id: String::new(),
-            labels: HashMap::from([("suite".to_string(), "agent-smoke".to_string())]),
-            // Empty template = the built-in busybox image.
-            template: String::new(),
-            limits: None,
-            cmd: Vec::new(),
-            env: HashMap::new(),
-            working_dir: String::new(),
-            user: String::new(),
-            mounts: Vec::new(),
-            network: None,
-            ttl_seconds: 0,
-            ssh_public_key: None,
+            labels: std::iter::once(("suite".to_string(), "agent-smoke".to_string())).collect(),
+            ..Default::default()
         };
 
         let created: CreateSandboxResponse = rpc_unary(
@@ -84,13 +73,8 @@ mod linux {
                 "-lc".to_string(),
                 "echo arcbox-agent-smoke".to_string(),
             ],
-            env: HashMap::new(),
-            working_dir: String::new(),
-            user: String::new(),
-            tty: false,
-            tty_size: None,
             timeout_seconds: 30,
-            stdin: false,
+            ..Default::default()
         };
         execute_and_assert_success(&mut stream, start_req).await?;
 
@@ -101,6 +85,7 @@ mod linux {
             &StopSandboxRequest {
                 id: sandbox_id.clone(),
                 timeout_seconds: 20,
+                ..Default::default()
             },
         )
         .await
@@ -113,6 +98,7 @@ mod linux {
             &RemoveSandboxRequest {
                 id: sandbox_id.clone(),
                 force: true,
+                ..Default::default()
             },
         )
         .await
@@ -160,18 +146,21 @@ mod linux {
     async fn wait_until_ready(stream: &mut VsockStream, id: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            let info: arcbox_protocol::sandbox_v1::SandboxInfo = rpc_unary(
+            let info: arcbox_connect::sandbox_v1::SandboxInfo = rpc_unary(
                 stream,
                 MessageType::SandboxInspectRequest,
                 MessageType::SandboxInspectResponse,
-                &InspectSandboxRequest { id: id.to_string() },
+                &InspectSandboxRequest {
+                    id: id.to_string(),
+                    ..Default::default()
+                },
             )
             .await?;
 
-            if info.state() == SandboxState::Ready {
+            if info.state == SandboxState::Ready {
                 return Ok(());
             }
-            if info.state() == SandboxState::Failed {
+            if info.state == SandboxState::Failed {
                 bail!("sandbox transitioned to failed state: {}", info.error);
             }
             if Instant::now() >= deadline {
@@ -198,8 +187,7 @@ mod linux {
         let attach = AttachExecutionRequest {
             sandbox_id: req.sandbox_id.clone(),
             execution_id: started.id.clone(),
-            stdout_offset: 0,
-            stderr_offset: 0,
+            ..Default::default()
         };
         write_message(
             stream,
@@ -220,7 +208,7 @@ mod linux {
                 bail!("unexpected response while attached: 0x{resp_type_raw:04x}");
             }
 
-            let event = ExecutionEvent::decode(resp_payload.as_slice())
+            let event = ExecutionEvent::decode_from_slice(&resp_payload)
                 .context("decode ExecutionEvent payload failed")?;
             match event.event {
                 Some(execution_event::Event::Output(output)) => {
@@ -229,7 +217,8 @@ mod linux {
                 Some(execution_event::Event::Exited(exited)) => {
                     let status = exited
                         .execution
-                        .and_then(|e| e.exit_status)
+                        .into_option()
+                        .and_then(|e| e.exit_status.into_option())
                         .and_then(|s| s.status);
                     match status {
                         Some(exit_status::Status::Code(0)) => return Ok(()),
@@ -267,7 +256,7 @@ mod linux {
             );
         }
 
-        TResp::decode(resp_payload.as_slice()).context("decode unary response failed")
+        TResp::decode_from_slice(&resp_payload).context("decode unary response failed")
     }
 
     async fn rpc_unary_empty<TReq>(

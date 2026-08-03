@@ -28,13 +28,15 @@ This file is only the non-obvious operational knowledge.
   and used by e2e and the daemon's own tests as the standing proof that the
   gRPC format still answers at the same endpoint. (The CLI has none: `abctl`
   speaks Connect only, and `tonic` is absent from its dependency tree.)
-  - `connectrpc` is bound to `buffa::Message` and has no prost interop, so
-    every served proto package is generated **twice**: buffa types for the
-    public boundary, prost types for the internal and vsock payloads. Both
-    encode standard protobuf bytes, so the two are wire-identical and the
-    guest agent stays on prost. `app/arcbox-api/src/connect/bridge.rs` is
-    the crossing — a decode of the bytes already in hand, never a conversion
-    table.
+  - `connectrpc` is bound to `buffa::Message`, and since CORE-73 the buffa
+    types in `arcbox-connect` are the ONE runtime representation: daemon
+    handlers, `abctl`, the fleet agent's daemon client, reflection's
+    descriptor set, and both ends of the vsock wire. The prost twins in
+    `arcbox-protocol` are still generated, but ONLY test support consumes
+    them: the tonic test clients (daemon/e2e wire-format proofs) and the
+    fleet agent's tonic mock daemon. The two codegens emit identical
+    bytes, which is what lets a prost test peer prove the buffa server's
+    wire format.
   - Reflection is served by `connectrpc-reflection` from the whole daemon's
     descriptor set. It answers `501` over HTTP/1.1 Connect because
     `ServerReflectionInfo` is bidi-streaming and Connect carries bidi only
@@ -56,10 +58,15 @@ This file is only the non-obvious operational knowledge.
   and rustfmt'd by `build.rs` (writes into `src/`, not `OUT_DIR`) — a `.proto`
   edit without a rebuild+commit ships a stale/unformatted file that fails
   `cargo fmt --check` only in CI.
-- **Every message derives serde `Serialize/Deserialize` in `camelCase`**
-  (`arcbox-protocol/build.rs`: `type_attribute(".", ...)`) — proto types double
-  as JSON DTOs (debug snapshots, config), so a proto field rename also breaks
-  JSON consumers, which `buf breaking` (protobuf-wire only) will NOT catch.
+- **Generated types carry NO serde impls — persisted/user-facing JSON must
+  come from hand-written DTOs, never from codegen shapes.** WHY: it keeps the
+  message-layer codec swappable without silently rewriting on-disk or
+  scripted formats (`buf breaking` checks protobuf wire only and would never
+  catch such a rewrite). The one existing DTO is the `virtio-debug.json`
+  mirror (`tests/e2e/src/virtio_debug.rs`, shape pinned by test); `abctl
+  --json` output is likewise hand-mapped (`serde_json::json!` payloads in
+  `app/arcbox-cli/src/commands/`). Do not reintroduce blanket
+  `type_attribute` serde derives in `arcbox-protocol/build.rs`.
 - **`protocol_version` (enforced) ≠ `version` (debug-only).**
   `AgentPingResponse.protocol_version` is gated against
   `MIN_AGENT_PROTOCOL_VERSION`; `.version` is informational log text only
@@ -84,48 +91,64 @@ This file is only the non-obvious operational knowledge.
 - **Well-known types map to `pbjson-types`, not `prost-types`**
   (`extern_path(".google.protobuf", "::pbjson_types")` in BOTH
   `arcbox-protocol/build.rs` and `arcbox-grpc/build.rs` — keep them in
-  lockstep). WHY: every message derives serde (see above) and
-  `prost_types::Timestamp` has no serde impls; `pbjson_types` serializes
-  WKTs per the canonical protobuf JSON mapping (Timestamp → RFC3339).
+  lockstep). Historically forced by the blanket serde derives; kept after
+  their removal so public field types (`pbjson_types::Timestamp` etc.) stay
+  stable for every consumer — reverting to `prost-types` would churn all of
+  them for zero benefit.
 
 ## Extending checklists (change every path together)
 
 **Add/change a daemon gRPC message or service:**
 1. Edit the `.proto`.
-2. If it's a *new* `.proto` file, add it to **both** proto arrays:
-   `arcbox-protocol/build.rs` (prost, messages) **and**
-   `arcbox-grpc/build.rs` (tonic, services). Miss one → missing message types
-   or missing service stubs with a confusing compile error.
+2. If it's a *new* `.proto` file, add it to all **three** proto arrays:
+   `arcbox-protocol/build.rs` (prost, messages), `arcbox-grpc/build.rs`
+   (tonic, services), **and** `arcbox-connect/build.rs` (buffa messages plus
+   the Connect service traits the daemon actually implements). Miss one →
+   missing message types or service stubs with a confusing compile error;
+   miss the last and step 5 has no trait to register.
 3. Rebuild (regenerates + rustfmts `src/generated/*.rs`) and commit the result.
 4. Add a hand-written re-export in `arcbox-protocol/src/lib.rs` (the flat
    `pub use v1::{...}` block and the per-module `pub mod`) — nothing generates
    or checks these; a new message is invisible downstream until listed.
-5. If it's a new gRPC service the daemon must serve, `add_service()` it in
-   `app/arcbox-daemon/src/services.rs`.
+5. If it's a new service the daemon must serve, register it on
+   `arcbox_api::connect::router` with `.add_service(...)` — the daemon
+   serves only that router (see the sandbox checklist below). What died
+   with tonic is the daemon's `Server::builder().add_service()` chain in
+   `app/arcbox-daemon/src/services.rs`, not the connectrpc router builder
+   method of the same name.
 
 **Add/change something under `arcbox.sandbox.v1` (the Connect surface):**
-1. Edit the `.proto`, then add a *new* file to `arcbox-connect/build.rs` as
-   well as the two arrays above — the sandbox package is compiled by three
-   build scripts, and connectrpc codegen is the one that emits the service
+1. Edit the `.proto`; a *new* file goes into all three build-script arrays
+   listed in step 2 above (`arcbox-connect`, `arcbox-protocol`,
+   `arcbox-grpc`) — connectrpc codegen is the one that emits the service
    traits the daemon implements.
 2. Implement the method in `app/arcbox-api/src/connect/` against the
-   connectrpc trait, not a tonic one. Cross to the prost twin with
-   `bridge::wire_request` / `wire_response`; do not hand-map fields.
+   connectrpc trait, not a tonic one, working in the buffa types directly
+   (`request.to_owned_message()` in, owned messages out — the blanket
+   `Encodable` impl covers them). There is no bridge to cross.
 3. A new *service* goes on `arcbox_api::connect::router` (or
    `router_with_system`). The daemon serves only that router, so a service
    missing there is a 404 on every format — the
    `migrated_daemon_services_are_registered_on_the_connect_router` test in
    `control_plane.rs` is where that surfaces.
-4. Nothing else changes: the guest agent, `AgentClient`, and the vsock frames
-   keep using the prost types, and the two encodings are identical bytes.
+4. No codec step remains: the guest agent, `AgentClient`, and the vsock
+   frames use the same `arcbox-connect` buffa types, so a new message is
+   *available* to them the moment it is generated. Available is not wired:
+   a message that must actually cross the vsock channel still needs the
+   host↔guest checklist below (`MessageType`, guest dispatcher arm,
+   `AgentClient` method).
 
 **Add a host↔guest agent RPC (NOT a tonic method):**
 1. Define the proto *message* in `agent.proto`.
 2. Add a `MessageType` enum variant **and** its `from_u32` arm in
    `common/arcbox-constants/src/wire.rs` (and a roundtrip test case).
-3. Handle it in the guest dispatcher `guest/arcbox-agent/src/rpc.rs`.
+3. Wire the guest side in BOTH files: the frame codec arms in
+   `guest/arcbox-agent/src/rpc.rs` (`parse_request`, `message_type`,
+   `encode_payload`) and the `handle_request` dispatch in
+   `guest/arcbox-agent/src/agent/linux/rpc.rs` — `guest/AGENTS.md`'s
+   extending checklist is authoritative for this half.
 4. Add a method on `AgentClient` (`app/arcbox-core/src/agent_client.rs`) that
-   prost-encodes and frames the message via `rpc_call`.
+   buffa-encodes and frames the message via `rpc_call`.
 
 **Change the wire contract / add a meaning-bearing field:**
 - Bump `AGENT_PROTOCOL_VERSION` (and `MIN_AGENT_PROTOCOL_VERSION` if dropping
@@ -160,9 +183,11 @@ This file is only the non-obvious operational knowledge.
   rpc/arcbox-protocol/src/generated/` → cause: you edited a `.proto` without
   rebuilding (or rebuilt without rustfmt), shipping stale/unformatted
   generated code.
-- **JSON consumer breaks though `buf breaking` passed.** You renamed a proto
-  field; the serde/`camelCase` view changed and buf only checks protobuf wire
-  compat.
+- **A forensic/`--json` field is missing though the proto has it.** The
+  hand-written DTO mirror was not extended with the proto change (e.g. a new
+  `VirtioQueueDebug` field never added to `tests/e2e/src/virtio_debug.rs`).
+  Codegen no longer feeds these surfaces, so proto edits reach them only by
+  hand — update the mirror and its shape-pinning test together.
 
 ## Validation ladder (cheapest first)
 

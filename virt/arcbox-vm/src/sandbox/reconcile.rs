@@ -7,19 +7,26 @@
 //! boot/restore persists a small `state.json` next to the sandbox's runtime
 //! files, and a new manager sweeps those records: orphaned Firecracker
 //! processes are killed and every held resource is torn down. Sandboxes are
-//! ephemeral by design, so reconciliation destroys rather than re-adopts.
+//! not live-reconciled yet: startup destroys orphaned runtime resources, then
+//! normalizes durable lifecycle records for replay and inspection.
 
+use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
+use super::persistence::{SandboxPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
+use super::{SandboxInstance, SandboxState};
 use crate::config::VmmConfig;
+use crate::error::Result;
 use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot_cow::{CowHandle, CowManager};
 
 /// File name of the per-sandbox crash-recovery record.
 const STATE_FILE: &str = "state.json";
+const AGENT_RESTART_ERROR: &str = "sandbox runtime was cleaned after agent restart";
 
 /// Plain serializable mirror of [`CowHandle`].
 ///
@@ -106,24 +113,50 @@ impl SandboxStateRecord {
     }
 }
 
-/// Persist the crash-recovery record into the sandbox's runtime directory.
-///
-/// Best-effort: a failed write only degrades crash recovery, never a boot.
-pub(super) fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) {
-    let path = vm_dir.join(STATE_FILE);
-    match serde_json::to_vec_pretty(record) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, bytes) {
-                warn!(sandbox_id = %record.id, error = %e, "failed to persist sandbox state");
-            }
-        }
-        Err(e) => warn!(sandbox_id = %record.id, error = %e, "failed to encode sandbox state"),
-    }
+/// Atomically persist crash-recovery metadata before resources are exposed.
+pub(super) fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(record)?;
+    super::persistence::atomic_write(&vm_dir.join(STATE_FILE), &bytes)?;
+    Ok(())
+}
+
+/// Creates a runtime directory and durably links it from its parent.
+pub(super) fn create_runtime_dir(vm_dir: &Path) -> Result<()> {
+    let parent = vm_dir.parent().ok_or_else(|| {
+        crate::error::VmmError::Config(format!(
+            "sandbox runtime directory has no parent: {}",
+            vm_dir.display()
+        ))
+    })?;
+    let data_dir = parent.parent().ok_or_else(|| {
+        crate::error::VmmError::Config(format!(
+            "sandbox runtime parent has no parent: {}",
+            parent.display()
+        ))
+    })?;
+    std::fs::create_dir_all(vm_dir)?;
+    std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(vm_dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    std::fs::File::open(data_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Remove the crash-recovery record (resources have been released).
-pub(super) fn clear_state_record(vm_dir: &Path) {
-    let _ = std::fs::remove_file(vm_dir.join(STATE_FILE));
+pub(super) fn clear_state_record(vm_dir: &Path) -> Result<()> {
+    match std::fs::remove_file(vm_dir.join(STATE_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::File::open(vm_dir)?.sync_all()?;
+    Ok(())
+}
+
+pub(super) struct OrphanSweep {
+    pub ids: HashSet<String>,
+    runtime_dirs: Vec<PathBuf>,
 }
 
 /// Sweep `<data_dir>/sandboxes/*/state.json` and tear down every leftover,
@@ -137,43 +170,64 @@ pub(super) async fn sweep_orphans(
     network: &NetworkManager,
     cow_manager: &CowManager,
     snapshots: &crate::snapshot::SnapshotCatalog,
-) {
+) -> Result<OrphanSweep> {
     // Snapshots staged by a checkpoint that died mid-flight: unfinished by
     // definition, and each can hold a full memory dump.
     snapshots.sweep_incomplete();
 
     let sandboxes_dir = PathBuf::from(&config.firecracker.data_dir).join("sandboxes");
-    let Ok(entries) = std::fs::read_dir(&sandboxes_dir) else {
-        return;
+    let entries = match std::fs::read_dir(&sandboxes_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OrphanSweep {
+                ids: HashSet::new(),
+                runtime_dirs: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error.into()),
     };
-
-    for entry in entries.flatten() {
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
         let dir = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let state_path = dir.join(STATE_FILE);
         let record: SandboxStateRecord = match std::fs::read(&state_path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(path = %state_path.display(), error = %e, "unreadable sandbox record");
-                    continue;
-                }
-            },
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
             // No record: either never booted or cleanly stopped.
-            Err(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         };
+        validate_state_record(config, &sandboxes_dir, &dir, &record)?;
+        records.push((dir, record));
+    }
 
+    // Firecracker pins dm devices, so every owned process must be dead before
+    // the global CoW sweep can report meaningful cleanup failures.
+    for (_, record) in &records {
+        let mut pids = discover_firecracker_pids(config, record)?;
+        if let Some(pid) = record.pid {
+            pids.insert(pid);
+        }
+        for pid in pids {
+            kill_orphaned_firecracker(pid).await?;
+        }
+    }
+    cow_manager.reconcile_stale()?;
+
+    let mut swept = HashSet::new();
+    let mut runtime_dirs = Vec::new();
+    for (dir, record) in records {
         info!(sandbox_id = %record.id, "reconciling orphaned sandbox");
 
-        if let Some(pid) = record.pid {
-            kill_orphaned_firecracker(pid).await;
-        }
-
         if let Some(cow) = record.cow {
-            cow_manager.teardown(&cow.into_handle()).await;
+            cow_manager.teardown_checked(&cow.into_handle()).await?;
         }
 
         if let Some(alloc) = &record.network {
-            network.release(alloc);
+            network.quarantine_checked(&record.id, alloc)?;
         }
 
         if record.jailer
@@ -182,18 +236,94 @@ pub(super) async fn sweep_orphans(
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
             let chroot = super::boot::chroot_root(&config.firecracker.binary, base, &record.id);
             if let Some(parent) = chroot.parent() {
-                let _ = tokio::fs::remove_dir_all(parent).await;
+                remove_dir_if_present(parent).await?;
             }
         }
 
-        if let Some(origin) = &record.restore_origin_dir {
-            let _ = tokio::fs::remove_dir_all(origin).await;
-        }
+        runtime_dirs.push(dir);
+        swept.insert(record.id);
+    }
 
-        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-            warn!(sandbox_id = %record.id, error = %e, "failed to remove orphaned sandbox dir");
+    Ok(OrphanSweep {
+        ids: swept,
+        runtime_dirs,
+    })
+}
+
+/// Deletes cleanup journals only after durable lifecycle normalization commits.
+pub(super) async fn finalize_sweep(sweep: OrphanSweep) -> Result<()> {
+    for dir in sweep.runtime_dirs {
+        remove_dir_if_present(&dir).await?;
+    }
+    Ok(())
+}
+
+/// Normalizes durable records after orphan resources have been swept.
+///
+/// Interrupted live phases become inspectable failures; already inactive
+/// sandboxes are reconstructed without runtime handles. A create intent stays
+/// resumable, while an interrupted removal finishes as a durable tombstone.
+pub(super) fn normalize_durable_records(
+    store: &SandboxRecordStore,
+    data_dir: &Path,
+    swept: Option<&HashSet<String>>,
+) -> Result<Vec<SandboxInstance>> {
+    let mut inactive = Vec::new();
+
+    for record in store.load_all()? {
+        match record.phase {
+            SandboxPhase::Creating => {}
+            SandboxPhase::Starting | SandboxPhase::Ready | SandboxPhase::Stopping => {
+                if swept.is_some_and(|ids| !ids.contains(&record.id)) {
+                    return Err(crate::error::VmmError::Unavailable(format!(
+                        "sandbox {} is {} but has no cleanup journal",
+                        record.id,
+                        record.phase.as_str()
+                    )));
+                }
+                let record = store
+                    .transition(
+                        &record.id,
+                        record.generation,
+                        SandboxTransition::Failed(AGENT_RESTART_ERROR.into()),
+                    )?
+                    .confirmed("sandbox restart normalization")?;
+                inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
+            }
+            SandboxPhase::Stopped => {
+                inactive.push(inactive_instance(record, SandboxState::Stopped, data_dir));
+            }
+            SandboxPhase::Failed => {
+                inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
+            }
+            SandboxPhase::Removing => {
+                store
+                    .finish_remove(&record.id, record.generation)?
+                    .confirmed("sandbox removal recovery")?;
+            }
         }
     }
+
+    Ok(inactive)
+}
+
+fn inactive_instance(
+    record: SandboxRecord,
+    state: SandboxState,
+    data_dir: &Path,
+) -> SandboxInstance {
+    let vm_dir = data_dir.join("sandboxes").join(&record.id);
+    let mut instance = SandboxInstance::new_with_generation(
+        record.id,
+        record.effective_spec,
+        None,
+        vm_dir,
+        record.generation,
+    );
+    instance.state = state;
+    instance.created_at = record.created_at;
+    instance.error = record.error;
+    instance
 }
 
 /// SIGKILL an orphaned Firecracker process and wait for it to disappear.
@@ -202,23 +332,93 @@ pub(super) async fn sweep_orphans(
 /// process is killed only when its command name still looks like
 /// Firecracker (Linux `/proc/<pid>/comm`; on other targets the check
 /// degrades to "process exists").
-async fn kill_orphaned_firecracker(pid: i32) {
+async fn kill_orphaned_firecracker(pid: i32) -> Result<()> {
     if !process_is_firecracker(pid) {
-        return;
+        return Ok(());
     }
-    let _ = nix::sys::signal::kill(
+    match nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
         nix::sys::signal::Signal::SIGKILL,
-    );
+    ) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => {
+            return Err(crate::error::VmmError::Process(format!(
+                "kill orphaned firecracker {pid}: {error}"
+            )));
+        }
+    }
     // The orphan was reparented to init, which reaps it; poll until the PID
     // vanishes so dm teardown doesn't hit EBUSY on the open block device.
     for _ in 0..50 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
-            return;
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    warn!(pid, "orphaned firecracker did not exit after SIGKILL");
+    Err(crate::error::VmmError::Process(format!(
+        "orphaned firecracker {pid} did not exit after SIGKILL"
+    )))
+}
+
+async fn remove_dir_if_present(path: &Path) -> Result<()> {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_state_record(
+    config: &VmmConfig,
+    sandboxes_dir: &Path,
+    directory: &Path,
+    record: &SandboxStateRecord,
+) -> Result<()> {
+    super::validate_id("sandbox id", &record.id)?;
+    if directory.file_name().and_then(|name| name.to_str()) != Some(record.id.as_str()) {
+        return Err(crate::error::VmmError::Config(format!(
+            "sandbox cleanup record id {} does not match directory {}",
+            record.id,
+            directory.display()
+        )));
+    }
+    if let Some(network) = &record.network {
+        let octets = network.ip_address.octets();
+        let expected = format!("vmtap{}-{}", octets[2], octets[3]);
+        if network.tap_name != expected {
+            return Err(crate::error::VmmError::Config(format!(
+                "sandbox {} cleanup record has unexpected TAP {}",
+                record.id, network.tap_name
+            )));
+        }
+    }
+    if let Some(cow) = &record.cow {
+        let expected_name = format!("arcbox-snap-{}", record.id);
+        let expected_file = Path::new(&config.firecracker.data_dir)
+            .join("cow")
+            .join(format!("arcbox-cow-{}.img", record.id));
+        if cow.dm_name != expected_name
+            || cow.dm_device != format!("/dev/mapper/{expected_name}")
+            || cow.cow_file != expected_file
+        {
+            return Err(crate::error::VmmError::Config(format!(
+                "sandbox {} cleanup record has invalid CoW resources",
+                record.id
+            )));
+        }
+    }
+    if let Some(origin) = &record.restore_origin_dir {
+        let origin_id = origin.file_name().and_then(|name| name.to_str());
+        if origin.parent() != Some(sandboxes_dir) || origin_id.is_none() {
+            return Err(crate::error::VmmError::Config(format!(
+                "sandbox {} restore origin escapes {}",
+                record.id,
+                sandboxes_dir.display()
+            )));
+        }
+        super::validate_id("restore origin sandbox id", origin_id.unwrap())?;
+    }
+    Ok(())
 }
 
 /// True when `pid` is alive and (on Linux) named like a Firecracker binary.
@@ -239,9 +439,151 @@ fn process_is_firecracker(pid: i32) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn discover_firecracker_pids(
+    config: &VmmConfig,
+    record: &SandboxStateRecord,
+) -> Result<HashSet<i32>> {
+    let mut matches = HashSet::new();
+    let direct_socket = Path::new(&config.firecracker.data_dir)
+        .join("sandboxes")
+        .join(&record.id)
+        .join("firecracker.sock");
+    let jailer_root = config.firecracker.jailer.as_ref().map(|jailer| {
+        let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+        super::boot::chroot_root(&config.firecracker.binary, base, &record.id)
+    });
+
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if !process_is_firecracker(pid) {
+            continue;
+        }
+        let proc_dir = entry.path();
+        let direct_match = std::fs::read(proc_dir.join("cmdline"))
+            .ok()
+            .is_some_and(|bytes| cmdline_matches(&bytes, &record.id, &direct_socket));
+        let jailer_match = jailer_root.as_ref().is_some_and(|expected| {
+            std::fs::read_link(proc_dir.join("root"))
+                .ok()
+                .is_some_and(|root| root == *expected)
+        });
+        if direct_match || jailer_match {
+            matches.insert(pid);
+        }
+    }
+    Ok(matches)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Linux process discovery reads /proc and is fallible"
+)]
+fn discover_firecracker_pids(
+    _config: &VmmConfig,
+    _record: &SandboxStateRecord,
+) -> Result<HashSet<i32>> {
+    Ok(HashSet::new())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cmdline_matches(bytes: &[u8], id: &str, socket: &Path) -> bool {
+    let args: Vec<_> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect();
+    args.windows(2).any(|pair| {
+        (pair[0] == b"--id" && pair[1] == id.as_bytes())
+            || (pair[0] == b"--api-sock" && pair[1] == socket.as_os_str().as_encoded_bytes())
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use super::super::SandboxSpec;
+    use super::super::persistence::{ProvisionIntent, SandboxProvisionOutcome};
     use super::*;
+
+    fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: SandboxPhase) -> SandboxRecord {
+        let spec = SandboxSpec {
+            id: Some(id.into()),
+            ..SandboxSpec::default()
+        };
+        let record = match store.provision_intent(id, "create-key", spec).unwrap() {
+            ProvisionIntent::Created(record) => record,
+            other => panic!("expected a new record, got {other:?}"),
+        };
+        let generation = record.generation;
+
+        match phase {
+            SandboxPhase::Creating => return record,
+            SandboxPhase::Failed => {
+                store
+                    .transition(
+                        id,
+                        generation,
+                        SandboxTransition::Failed("original failure".into()),
+                    )
+                    .unwrap();
+            }
+            SandboxPhase::Removing => {
+                store
+                    .transition(
+                        id,
+                        generation,
+                        SandboxTransition::Starting(SandboxProvisionOutcome {
+                            ip_address: "192.0.2.2".into(),
+                        }),
+                    )
+                    .unwrap();
+                store
+                    .transition(id, generation, SandboxTransition::Removing)
+                    .unwrap();
+            }
+            phase => {
+                store
+                    .transition(
+                        id,
+                        generation,
+                        SandboxTransition::Starting(SandboxProvisionOutcome {
+                            ip_address: "192.0.2.2".into(),
+                        }),
+                    )
+                    .unwrap();
+                match phase {
+                    SandboxPhase::Starting => {}
+                    SandboxPhase::Ready => {
+                        store
+                            .transition(id, generation, SandboxTransition::Ready)
+                            .unwrap();
+                    }
+                    SandboxPhase::Stopping | SandboxPhase::Stopped => {
+                        store
+                            .transition(id, generation, SandboxTransition::Stopping)
+                            .unwrap();
+                        if phase == SandboxPhase::Stopped {
+                            store
+                                .transition(id, generation, SandboxTransition::Stopped)
+                                .unwrap();
+                        }
+                    }
+                    _ => unreachable!("phase handled above"),
+                }
+            }
+        }
+
+        store.load(id).unwrap().unwrap()
+    }
 
     #[test]
     fn state_record_roundtrips_through_json() {
@@ -269,9 +611,103 @@ mod tests {
     }
 
     #[test]
+    fn clearing_state_record_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(STATE_FILE), b"journal").unwrap();
+
+        clear_state_record(tmp.path()).unwrap();
+        clear_state_record(tmp.path()).unwrap();
+
+        assert!(!tmp.path().join(STATE_FILE).exists());
+    }
+
+    #[test]
     fn dead_pid_is_not_firecracker() {
         // PID 0 targets "the calling process group" for kill(2); use an
         // implausibly high PID instead.
         assert!(!process_is_firecracker(i32::MAX - 1));
+    }
+
+    #[test]
+    fn firecracker_command_line_matches_only_the_owned_id_or_socket() {
+        let socket = Path::new("/var/lib/arcbox/sandbox/sandboxes/box/firecracker.sock");
+        assert!(cmdline_matches(
+            b"firecracker\0--api-sock\0/var/lib/arcbox/sandbox/sandboxes/box/firecracker.sock\0",
+            "box",
+            socket
+        ));
+        assert!(cmdline_matches(b"firecracker\0--id\0box\0", "box", socket));
+        assert!(!cmdline_matches(
+            b"firecracker\0--id\0other\0",
+            "box",
+            socket
+        ));
+    }
+
+    #[test]
+    fn startup_normalizes_crash_phases_and_restores_inactive_records() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        for (id, phase) in [
+            ("creating", SandboxPhase::Creating),
+            ("starting", SandboxPhase::Starting),
+            ("ready", SandboxPhase::Ready),
+            ("stopping", SandboxPhase::Stopping),
+            ("stopped", SandboxPhase::Stopped),
+            ("failed", SandboxPhase::Failed),
+            ("removing", SandboxPhase::Removing),
+        ] {
+            record_in_phase(&store, id, phase);
+        }
+
+        let inactive = normalize_durable_records(&store, data_dir.path(), None).unwrap();
+        let inactive: HashMap<_, _> = inactive
+            .into_iter()
+            .map(|instance| (instance.id.clone(), instance))
+            .collect();
+
+        assert_eq!(inactive.len(), 5);
+        for id in ["starting", "ready", "stopping"] {
+            let record = store.load(id).unwrap().unwrap();
+            assert_eq!(record.phase, SandboxPhase::Failed);
+            assert_eq!(record.error.as_deref(), Some(AGENT_RESTART_ERROR));
+
+            let instance = &inactive[id];
+            assert_eq!(instance.state, SandboxState::Failed);
+            assert_eq!(instance.error.as_deref(), Some(AGENT_RESTART_ERROR));
+            assert_eq!(instance.record_generation, Some(record.generation));
+            assert!(instance.process.is_none());
+            assert!(instance.vm.is_none());
+            assert!(instance.network.is_none());
+        }
+
+        assert_eq!(inactive["stopped"].state, SandboxState::Stopped);
+        assert_eq!(inactive["failed"].state, SandboxState::Failed);
+        assert_eq!(
+            inactive["failed"].error.as_deref(),
+            Some("original failure")
+        );
+        assert_eq!(
+            store.load("creating").unwrap().unwrap().phase,
+            SandboxPhase::Creating
+        );
+        assert!(store.load("removing").unwrap().is_none());
+        assert!(!inactive.contains_key("removing"));
+    }
+
+    #[test]
+    fn active_record_without_cleanup_journal_blocks_normalization() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, "starting", SandboxPhase::Starting);
+
+        assert!(matches!(
+            normalize_durable_records(&store, data_dir.path(), Some(&HashSet::new())),
+            Err(crate::error::VmmError::Unavailable(_))
+        ));
+        assert_eq!(
+            store.load("starting").unwrap().unwrap().phase,
+            SandboxPhase::Starting
+        );
     }
 }

@@ -306,7 +306,8 @@ impl DaemonHandle {
                 anyhow::Ok(client.get_virtio_debug(Empty {}).await?.into_inner())
             })?;
         let path = self.data_dir.join("virtio-debug.json");
-        std::fs::write(&path, serde_json::to_vec_pretty(&info)?)
+        let snapshot = crate::virtio_debug::Snapshot::from(info);
+        std::fs::write(&path, serde_json::to_vec_pretty(&snapshot)?)
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }

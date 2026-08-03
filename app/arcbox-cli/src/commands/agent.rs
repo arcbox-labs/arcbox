@@ -12,16 +12,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use arcbox_connect::sandbox_v1 as pb;
 use arcbox_connect::sandbox_v1::SandboxServiceClient;
-use arcbox_protocol::sandbox_v1::{
+use arcbox_connect::sandbox_v1::{
     CreateSandboxRequest, InspectSandboxRequest, RemoveSandboxRequest, ResourceLimits, SandboxInfo,
     SandboxState, StartExecutionRequest,
 };
 use clap::Args;
 
 use super::sandbox::{current_tty_size, exec_session, sandbox_channel};
-use crate::connect::UnaryExt as _;
 
 /// How long to wait for a freshly created sandbox to become ready.
 ///
@@ -123,6 +121,12 @@ enum Action {
     Refuse,
 }
 
+/// The sandbox's state with prost-getter semantics: an unknown wire value
+/// reads as `Unspecified`.
+fn state_of(info: &SandboxInfo) -> SandboxState {
+    info.state.as_known().unwrap_or_default()
+}
+
 /// Decide how to reach a usable sandbox from its current state.
 fn plan_action(state: Option<SandboxState>) -> Action {
     match state {
@@ -185,11 +189,13 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     let client = SandboxServiceClient::new(transport.clone(), config.clone());
 
     let existing = inspect(&client, &id).await?;
-    match plan_action(existing.as_ref().map(SandboxInfo::state)) {
+    match plan_action(existing.as_ref().map(state_of)) {
         Action::Attach => {}
         Action::WaitReady => wait_ready(&client, &id).await?,
         Action::Refuse => {
-            let state = existing.map_or("unknown", |info| super::sandbox::state_name(info.state()));
+            let state = existing.map_or("unknown", |info| {
+                super::sandbox::state_name(state_of(&info))
+            });
             bail!(
                 "sandbox '{id}' is {state} — a session may already be active. \
                  Use --id <name> for a second one, or remove it with \
@@ -216,11 +222,11 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     let start = StartExecutionRequest {
         sandbox_id: id.clone(),
         cmd,
-        env,
+        env: env.into_iter().collect(),
         working_dir: def.workdir.to_string(),
         user: def.user.to_string(),
         tty: true,
-        tty_size: current_tty_size(true),
+        tty_size: current_tty_size(true).into(),
         stdin: true,
         ..Default::default()
     };
@@ -245,12 +251,12 @@ async fn inspect(
     client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
     id: &str,
 ) -> Result<Option<SandboxInfo>> {
-    let request =
-        crate::connect::request::<pb::InspectSandboxRequest, _>(&InspectSandboxRequest {
-            id: id.to_string(),
-        })?;
+    let request = InspectSandboxRequest {
+        id: id.to_string(),
+        ..Default::default()
+    };
     match client.inspect(request).await {
-        Ok(response) => Ok(Some(response.prost()?)),
+        Ok(response) => Ok(Some(response.into_owned())),
         Err(status) if status.code == connectrpc::ErrorCode::NotFound => Ok(None),
         Err(status) => Err(status).context("Failed to inspect sandbox")?,
     }
@@ -261,12 +267,12 @@ async fn remove(
     client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
     id: &str,
 ) -> Result<()> {
-    let request = crate::connect::request::<pb::RemoveSandboxRequest, _>(&RemoveSandboxRequest {
-        id: id.to_string(),
-        force: true,
-    })?;
     client
-        .remove(request)
+        .remove(RemoveSandboxRequest {
+            id: id.to_string(),
+            force: true,
+            ..Default::default()
+        })
         .await
         .context("Failed to remove the previous sandbox")?;
     Ok(())
@@ -282,17 +288,21 @@ async fn create(
 ) -> Result<()> {
     let template = super::sandbox::resolve_template(def.template).await?;
 
-    let request = crate::connect::request::<pb::CreateSandboxRequest, _>(&CreateSandboxRequest {
-        id: id.to_string(),
-        labels: HashMap::from([("arcbox.agent".to_string(), def.name.to_string())]),
-        template,
-        limits: Some(ResourceLimits { vcpus, memory_mib }),
-        // No TTL: expiry would take /workspace with it mid-session.
-        ttl_seconds: 0,
-        ..Default::default()
-    })?;
     client
-        .create(request)
+        .create(CreateSandboxRequest {
+            id: id.to_string(),
+            labels: std::iter::once(("arcbox.agent".to_string(), def.name.to_string())).collect(),
+            template,
+            limits: ResourceLimits {
+                vcpus,
+                memory_mib,
+                ..Default::default()
+            }
+            .into(),
+            // No TTL: expiry would take /workspace with it mid-session.
+            ttl_seconds: 0,
+            ..Default::default()
+        })
         .await
         .context("Failed to create the agent sandbox")?;
     Ok(())
@@ -306,8 +316,8 @@ async fn wait_ready(
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         match inspect(client, id).await? {
-            Some(info) if info.state() == SandboxState::Ready => return Ok(()),
-            Some(info) if info.state() == SandboxState::Failed => {
+            Some(info) if info.state == SandboxState::Ready => return Ok(()),
+            Some(info) if info.state == SandboxState::Failed => {
                 let detail = if info.error.is_empty() {
                     "no reason reported".to_string()
                 } else {

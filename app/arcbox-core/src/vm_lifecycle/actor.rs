@@ -245,12 +245,13 @@ impl BalloonDeps for RealBalloonDeps {
 
         let mut agent = self.connect_agent()?;
         agent
-            .watch_memory_pressure(arcbox_protocol::agent::WatchMemoryPressureRequest {
+            .watch_memory_pressure(arcbox_connect::v1::WatchMemoryPressureRequest {
                 timeout_ms: u32::try_from(WATCH_WINDOW.as_millis()).unwrap_or(u32::MAX),
                 min_available_bytes: PRESSURE_MIN_AVAILABLE,
                 max_refault_rate: PRESSURE_MAX_REFAULT_RATE,
                 keepalive_ms: u32::try_from(WATCH_KEEPALIVE.as_millis()).unwrap_or(u32::MAX),
                 psi_full_stall_us: PRESSURE_PSI_FULL_STALL_US,
+                ..Default::default()
             })
             .await?;
         let mut watch = AgentPressureWatch { agent };
@@ -269,14 +270,17 @@ pub(super) struct AgentPressureWatch {
 
 impl PressureWatch for AgentPressureWatch {
     async fn next_frame(&mut self, max_wait: Duration) -> Result<WatchFrame> {
-        use arcbox_protocol::agent::memory_pressure_event::Reason;
+        use arcbox_connect::v1::memory_pressure_event::Reason;
 
         let event = self.agent.next_memory_pressure_event(max_wait).await?;
-        Ok(match event.reason() {
-            Reason::Keepalive => WatchFrame::Keepalive,
-            Reason::LowAvailable | Reason::RefaultSpike => WatchFrame::Pressure,
-            Reason::Settled => WatchFrame::Settled,
-            Reason::WindowElapsed => WatchFrame::WindowElapsed,
+        Ok(match event.reason.as_known() {
+            Some(Reason::LowAvailable | Reason::RefaultSpike) => WatchFrame::Pressure,
+            Some(Reason::Settled) => WatchFrame::Settled,
+            Some(Reason::WindowElapsed) => WatchFrame::WindowElapsed,
+            // KEEPALIVE, plus any reason newer than this host: the proto
+            // pins unknown reasons to decode as KEEPALIVE, so `None` must
+            // fold the same way and never read as pressure.
+            Some(Reason::Keepalive) | None => WatchFrame::Keepalive,
         })
     }
 }

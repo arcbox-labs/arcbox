@@ -1,7 +1,7 @@
 //! Sandbox file I/O streaming handlers.
 
-use arcbox_protocol::sandbox_v1;
-use prost::Message;
+use arcbox_connect::sandbox_v1;
+use buffa::Message;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::SandboxService;
@@ -22,7 +22,7 @@ impl SandboxService {
     where
         S: AsyncWrite + Unpin,
     {
-        let req = match sandbox_v1::ReadFileRequest::decode(payload) {
+        let req = match sandbox_v1::ReadFileRequest::decode_from_slice(payload) {
             Ok(r) => r,
             Err(e) => {
                 let err = ErrorResponse::new(400, format!("decode error: {e}"));
@@ -45,7 +45,7 @@ impl SandboxService {
         for chunk in data.chunks(CHUNK_SIZE) {
             let msg = sandbox_v1::FileChunk {
                 data: chunk.to_vec(),
-                done: false,
+                ..Default::default()
             };
             write_message(
                 stream,
@@ -56,8 +56,8 @@ impl SandboxService {
             .await?;
         }
         let done = sandbox_v1::FileChunk {
-            data: Vec::new(),
             done: true,
+            ..Default::default()
         };
         write_message(
             stream,
@@ -83,7 +83,7 @@ impl SandboxService {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let open = match sandbox_v1::WriteFileOpen::decode(payload) {
+        let open = match sandbox_v1::WriteFileOpen::decode_from_slice(payload) {
             Ok(o) => o,
             Err(e) => {
                 let err = ErrorResponse::new(400, format!("decode error: {e}"));
@@ -97,7 +97,7 @@ impl SandboxService {
         loop {
             match read_message(stream).await {
                 Ok((MessageType::SandboxFileChunk, _, frame)) => {
-                    let chunk = match sandbox_v1::FileChunk::decode(frame.as_slice()) {
+                    let chunk = match sandbox_v1::FileChunk::decode_from_slice(&frame) {
                         Ok(c) => c,
                         Err(e) => {
                             let err = ErrorResponse::new(400, format!("decode error: {e}"));

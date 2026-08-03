@@ -7,13 +7,18 @@
 /// don't need a bump. Unknown `MessageType`s already fail cleanly; this
 /// version catches the silent proto3 field-skew class instead.
 ///
-/// v2: the sandbox execution redesign (CORE-55/56) retired the Run/Exec
-/// streaming types and re-typed the surviving sandbox payloads (enums,
-/// timestamps, exit-status oneof).
+/// "Existing" means *released*: the sandbox execution redesign
+/// (CORE-55/56) re-typed payloads that no release had ever shipped, so it
+/// did not warrant a bump. 0.6.0 briefly shipped `2`/`2` for it before
+/// this was rolled back — **`2` is burned**: 0.6.0 daemons in the wild
+/// read it as "speaks the redesigned sandbox payloads", so the next real
+/// bump must go to `3`, never reuse `2` for a different meaning.
 ///
 /// v3: runtime startup requires the host-provided
 /// `arcbox.runtime_generation` kernel parameter and materializes runtime
-/// assets onto the guest Btrfs data disk before execution.
+/// assets onto the guest Btrfs data disk before execution. Sandbox
+/// Stop/Remove responses also carry a durable cleanup generation, completed
+/// through Prepare/Finalize after host listeners are gone.
 pub const AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest agent protocol version this host still accepts.
@@ -93,11 +98,21 @@ pub enum MessageType {
     /// Remove a sandbox DNAT mapping (payload:
     /// `arcbox.v1.SandboxPortForwardRemoveRequest`).
     SandboxPortForwardRemoveRequest = 0x0026,
+    /// Validate one exact durable cleanup generation before the host removes
+    /// listeners (payload: `arcbox.v1.SandboxCleanupTicket`).
+    SandboxCleanupPrepareRequest = 0x0027,
+    /// Confirm host cleanup, delete the matching guest DNAT generation, and
+    /// recycle its quarantined network allocation (payload:
+    /// `arcbox.v1.SandboxCleanupTicket`).
+    SandboxCleanupFinalizeRequest = 0x0028,
+    /// Opens the internal durable cleanup ticket stream (payload:
+    /// `arcbox.v1.WatchSandboxCleanupRequest`).
+    WatchSandboxCleanupRequest = 0x0029,
 
     // Sandbox workload request types.
     // 0x0030 (SandboxRunRequest), 0x0031 (SandboxExecRequest),
     // 0x0033 (SandboxExecInput), and 0x0034 (SandboxExecResize) were
-    // retired by the execution redesign (protocol v2); do not reuse.
+    // retired by the execution redesign (CORE-55/56); do not reuse.
     SandboxEventsRequest = 0x0032,
     /// Read a file from a sandbox (payload: `arcbox.sandbox.v1.ReadFileRequest`).
     /// The agent answers with a stream of [`Self::SandboxFileData`] frames.
@@ -116,7 +131,8 @@ pub enum MessageType {
     SandboxListSnapshotsRequest = 0x0042,
     SandboxDeleteSnapshotRequest = 0x0043,
 
-    // Sandbox execution request types (0x0060 - 0x0066), protocol v2.
+    // Sandbox execution request types (0x0060 - 0x0066), from the
+    // execution redesign (CORE-55/56).
     /// Start an addressable execution (payload:
     /// `arcbox.sandbox.v1.StartExecutionRequest`). Answered with
     /// [`Self::SandboxExecStartResponse`].
@@ -206,10 +222,16 @@ pub enum MessageType {
     SandboxPortForwardResponse = 0x1025,
     /// Acknowledges [`Self::SandboxPortForwardRemoveRequest`] (empty payload).
     SandboxPortForwardRemoveResponse = 0x1026,
+    /// Acknowledges [`Self::SandboxCleanupPrepareRequest`].
+    SandboxCleanupPrepareResponse = 0x1027,
+    /// Acknowledges [`Self::SandboxCleanupFinalizeRequest`].
+    SandboxCleanupFinalizeResponse = 0x1028,
+    /// One durable cleanup ticket answering [`Self::WatchSandboxCleanupRequest`].
+    SandboxCleanupEvent = 0x1029,
 
     // Sandbox workload response types (streaming).
     // 0x1035 (SandboxRunOutput) and 0x1036 (SandboxExecOutput) were
-    // retired by the execution redesign (protocol v2); do not reuse.
+    // retired by the execution redesign (CORE-55/56); do not reuse.
     /// One lifecycle event answering [`Self::SandboxEventsRequest`]
     /// (payload: `arcbox.sandbox.v1.SandboxEvent`).
     SandboxEvent = 0x1037,
@@ -225,7 +247,8 @@ pub enum MessageType {
     SandboxListSnapshotsResponse = 0x1042,
     SandboxDeleteSnapshotResponse = 0x1043,
 
-    // Sandbox execution response types (0x1060 - 0x1066), protocol v2.
+    // Sandbox execution response types (0x1060 - 0x1066), from the
+    // execution redesign (CORE-55/56).
     /// Answers [`Self::SandboxExecStartRequest`] (payload:
     /// `arcbox.sandbox.v1.Execution`).
     SandboxExecStartResponse = 0x1060,
@@ -285,6 +308,9 @@ impl MessageType {
             0x0024 => Some(Self::SandboxListRequest),
             0x0025 => Some(Self::SandboxPortForwardRequest),
             0x0026 => Some(Self::SandboxPortForwardRemoveRequest),
+            0x0027 => Some(Self::SandboxCleanupPrepareRequest),
+            0x0028 => Some(Self::SandboxCleanupFinalizeRequest),
+            0x0029 => Some(Self::WatchSandboxCleanupRequest),
             // Sandbox workload requests.
             0x0032 => Some(Self::SandboxEventsRequest),
             0x0035 => Some(Self::SandboxFileReadRequest),
@@ -295,7 +321,7 @@ impl MessageType {
             0x0041 => Some(Self::SandboxRestoreRequest),
             0x0042 => Some(Self::SandboxListSnapshotsRequest),
             0x0043 => Some(Self::SandboxDeleteSnapshotRequest),
-            // Sandbox execution requests (protocol v2).
+            // Sandbox execution requests (execution redesign, CORE-55/56).
             0x0060 => Some(Self::SandboxExecStartRequest),
             0x0061 => Some(Self::SandboxExecAttachRequest),
             0x0062 => Some(Self::SandboxStdinWriteRequest),
@@ -337,6 +363,9 @@ impl MessageType {
             0x1024 => Some(Self::SandboxListResponse),
             0x1025 => Some(Self::SandboxPortForwardResponse),
             0x1026 => Some(Self::SandboxPortForwardRemoveResponse),
+            0x1027 => Some(Self::SandboxCleanupPrepareResponse),
+            0x1028 => Some(Self::SandboxCleanupFinalizeResponse),
+            0x1029 => Some(Self::SandboxCleanupEvent),
             // Sandbox workload responses (streaming).
             0x1037 => Some(Self::SandboxEvent),
             0x1038 => Some(Self::SandboxFileData),
@@ -346,7 +375,7 @@ impl MessageType {
             0x1041 => Some(Self::SandboxRestoreResponse),
             0x1042 => Some(Self::SandboxListSnapshotsResponse),
             0x1043 => Some(Self::SandboxDeleteSnapshotResponse),
-            // Sandbox execution responses (protocol v2).
+            // Sandbox execution responses (execution redesign, CORE-55/56).
             0x1060 => Some(Self::SandboxExecStartResponse),
             0x1061 => Some(Self::SandboxExecEvent),
             0x1062 => Some(Self::SandboxStdinStatus),
@@ -376,6 +405,9 @@ impl MessageType {
                 | Self::SandboxFileWriteRequest
                 | Self::SandboxPortForwardRequest
                 | Self::SandboxPortForwardRemoveRequest
+                | Self::SandboxCleanupPrepareRequest
+                | Self::SandboxCleanupFinalizeRequest
+                | Self::WatchSandboxCleanupRequest
                 | Self::SandboxCheckpointRequest
                 | Self::SandboxRestoreRequest
                 | Self::SandboxListSnapshotsRequest
@@ -406,7 +438,24 @@ impl MessageType {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageType;
+    use super::{AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION, MessageType};
+
+    #[test]
+    fn protocol_version_2_is_burned() {
+        // `2` is burned: 0.6.0 daemons in the wild interpret it as "speaks
+        // the redesigned sandbox payloads" (see the AGENT_PROTOCOL_VERSION
+        // doc). A future mechanical +1 bump must fail here and jump to 3.
+        let version = AGENT_PROTOCOL_VERSION;
+        assert!(
+            version == 1 || version >= 3,
+            "AGENT_PROTOCOL_VERSION must never be 2 — it is burned; bump to 3"
+        );
+        let min = MIN_AGENT_PROTOCOL_VERSION;
+        assert!(
+            min == 1 || min >= 3,
+            "MIN_AGENT_PROTOCOL_VERSION must never be 2 — it is burned; bump to 3"
+        );
+    }
 
     #[test]
     fn message_type_roundtrip_known_values() {
@@ -466,8 +515,14 @@ mod tests {
             (0x1024, MessageType::SandboxListResponse),
             (0x0025, MessageType::SandboxPortForwardRequest),
             (0x0026, MessageType::SandboxPortForwardRemoveRequest),
+            (0x0027, MessageType::SandboxCleanupPrepareRequest),
+            (0x0028, MessageType::SandboxCleanupFinalizeRequest),
+            (0x0029, MessageType::WatchSandboxCleanupRequest),
             (0x1025, MessageType::SandboxPortForwardResponse),
             (0x1026, MessageType::SandboxPortForwardRemoveResponse),
+            (0x1027, MessageType::SandboxCleanupPrepareResponse),
+            (0x1028, MessageType::SandboxCleanupFinalizeResponse),
+            (0x1029, MessageType::SandboxCleanupEvent),
             // Sandbox workload.
             (0x0032, MessageType::SandboxEventsRequest),
             (0x0035, MessageType::SandboxFileReadRequest),
@@ -476,7 +531,7 @@ mod tests {
             (0x1037, MessageType::SandboxEvent),
             (0x1038, MessageType::SandboxFileData),
             (0x1039, MessageType::SandboxFileWriteResponse),
-            // Sandbox executions (protocol v2).
+            // Sandbox executions (execution redesign, CORE-55/56).
             (0x0060, MessageType::SandboxExecStartRequest),
             (0x0061, MessageType::SandboxExecAttachRequest),
             (0x0062, MessageType::SandboxStdinWriteRequest),
@@ -533,7 +588,7 @@ mod tests {
 
     #[test]
     fn retired_sandbox_values_stay_unknown() {
-        // Retired by the execution redesign (protocol v2); the values must
+        // Retired by the execution redesign (CORE-55/56); the values must
         // not be resurrected or reused.
         for retired in [0x0030, 0x0031, 0x0033, 0x0034, 0x1035, 0x1036] {
             assert_eq!(MessageType::from_u32(retired), None, "0x{retired:04x}");

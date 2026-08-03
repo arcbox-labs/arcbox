@@ -95,8 +95,15 @@ pub fn bind(socket_path: &std::path::Path) -> Result<UnixListener> {
 /// calls are unaffected, which is why `curl --unix-socket` still works for
 /// the services themselves.
 ///
-/// The descriptor set is standard protobuf wire bytes, so the same one
-/// `arcbox-grpc` emits for its prost build describes every service here.
+/// The descriptor set is `arcbox-connect`'s own — emitted by the same
+/// build script that generates the served types, so it tracks the
+/// GENERATED surface exactly. That is deliberately a superset of the
+/// served one — reflection advertises every service the protos declare:
+/// the schema-only `AgentService`, the never-implemented Container,
+/// Image, Network, and Volume services, and (off macOS) the cfg-gated
+/// `MacosService`. A reflected service 404ing on every format is one of
+/// these, not a router bug. The prost-built set advertised the same
+/// superset.
 ///
 /// # Errors
 ///
@@ -107,7 +114,7 @@ pub fn connect_router(
     system: arcbox_api::SystemServiceImpl,
 ) -> Result<connectrpc::Router> {
     let reflector = connectrpc_reflection::Reflector::from_descriptor_set_bytes(
-        arcbox_grpc::FILE_DESCRIPTOR_SET,
+        arcbox_connect::FILE_DESCRIPTOR_SET,
     )
     .context("parsing the embedded file descriptor set for reflection")?;
     Ok(connectrpc_reflection::install(
@@ -339,6 +346,9 @@ mod tests {
             "arcbox.v1.KubernetesService/Status",
             "arcbox.v1.MigrationService/RunMigration",
             "arcbox.v1.MachineService/ExecSession",
+            // Post-migration additions live under the same guarantee: a
+            // service missing from the router 404s and fails nowhere else.
+            "arcbox.sandbox.v1.TemplateService/Get",
             #[cfg(target_os = "macos")]
             "arcbox.v1.MacosService/List",
         ] {

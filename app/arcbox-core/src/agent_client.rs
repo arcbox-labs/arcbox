@@ -1,26 +1,19 @@
 //! Agent client for communicating with the guest VM.
 //!
 //! Provides RPC communication with the arcbox-agent running inside guest VMs.
+//!
+//! Message types are buffa-generated (`arcbox_connect`), the one Rust
+//! representation of the ArcBox protos since CORE-73. buffa encodes the
+//! same bytes prost did, so this daemon interoperates with both old
+//! (prost) and new (buffa) guest agents: same length-prefixed
+//! `MessageType` frames, same `AGENT_PROTOCOL_VERSION`, no wire change.
 
 mod transport;
 mod wire;
 
 use self::transport::{AgentTransport, BLOCKING_RPC_TIMEOUT};
 use crate::error::{CoreError, Result};
-use arcbox_constants::ports::AGENT_PORT;
-use arcbox_constants::wire::MessageType;
-use arcbox_protocol::agent::{
-    ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
-    EnsureNfsExportRequest, EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse,
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
-    MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
-    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
-};
-use arcbox_protocol::sandbox_v1::{
+use arcbox_connect::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CheckpointResponse, CreateSandboxRequest,
     CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk,
     GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
@@ -29,13 +22,26 @@ use arcbox_protocol::sandbox_v1::{
     SandboxInfo, SignalExecutionRequest, StartExecutionRequest, StdinStatus, StopSandboxRequest,
     WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
 };
-use arcbox_protocol::v1::{
+use arcbox_connect::v1::{
+    AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
+    ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse, EnsureNfsExportRequest,
+    EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse, KubernetesDeleteRequest,
+    KubernetesDeleteResponse, KubernetesKubeconfigRequest, KubernetesKubeconfigResponse,
+    KubernetesStartRequest, KubernetesStartResponse, KubernetesStatusRequest,
+    KubernetesStatusResponse, KubernetesStopRequest, KubernetesStopResponse, MachineExecOutput,
+    MachineExecRequest, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
+    MmapReadFileResponse, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
+    RuntimeStatusRequest, RuntimeStatusResponse, SandboxCleanupResponse, SandboxCleanupTicket,
     SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SandboxPortForwardResponse,
+    SystemInfo, TerminalSize, WatchMemoryPressureRequest, WatchReadinessRequest,
+    WatchSandboxCleanupRequest, WatchStatsRequest,
 };
+use arcbox_constants::ports::AGENT_PORT;
+use arcbox_constants::wire::MessageType;
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
+use buffa::Message;
 use bytes::Bytes;
-use prost::Message;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -274,8 +280,8 @@ impl AgentClient {
         Ok((resp_type, payload))
     }
 
-    fn decode_response<T: Message + Default>(payload: &[u8]) -> Result<T> {
-        T::decode(payload)
+    fn decode_response<T: Message>(payload: &[u8]) -> Result<T> {
+        T::decode_from_slice(payload)
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 
@@ -299,7 +305,7 @@ impl AgentClient {
         }
     }
 
-    async fn unary_rpc<T: Message + Default>(
+    async fn unary_rpc<T: Message>(
         &mut self,
         request_type: MessageType,
         payload: &[u8],
@@ -310,7 +316,7 @@ impl AgentClient {
         Self::decode_response(&resp_payload)
     }
 
-    fn unary_rpc_blocking<T: Message + Default>(
+    fn unary_rpc_blocking<T: Message>(
         &mut self,
         request_type: MessageType,
         payload: &[u8],
@@ -367,6 +373,7 @@ impl AgentClient {
             timestamp_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
+            ..Default::default()
         };
         let payload = req.encode_to_vec();
         self.unary_rpc_blocking(
@@ -405,6 +412,7 @@ impl AgentClient {
             timestamp_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
+            ..Default::default()
         };
         let payload = req.encode_to_vec();
         self.unary_rpc(
@@ -457,6 +465,7 @@ impl AgentClient {
             path: path.to_string(),
             offset,
             length,
+            ..Default::default()
         };
         let payload = req.encode_to_vec();
         self.unary_rpc_blocking(
@@ -472,7 +481,10 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn ensure_runtime(&mut self, start_if_needed: bool) -> Result<RuntimeEnsureResponse> {
-        let req = RuntimeEnsureRequest { start_if_needed };
+        let req = RuntimeEnsureRequest {
+            start_if_needed,
+            ..Default::default()
+        };
         let payload = req.encode_to_vec();
         self.unary_rpc(
             MessageType::EnsureRuntimeRequest,
@@ -492,7 +504,10 @@ impl AgentClient {
         &mut self,
         start_if_needed: bool,
     ) -> Result<RuntimeEnsureResponse> {
-        let req = RuntimeEnsureRequest { start_if_needed };
+        let req = RuntimeEnsureRequest {
+            start_if_needed,
+            ..Default::default()
+        };
         let payload = req.encode_to_vec();
         let (resp_type, resp_payload) =
             self.rpc_call_blocking(MessageType::EnsureRuntimeRequest, &payload)?;
@@ -501,7 +516,7 @@ impl AgentClient {
                 "unexpected response type: {resp_type}"
             )));
         }
-        RuntimeEnsureResponse::decode(&resp_payload[..])
+        RuntimeEnsureResponse::decode_from_slice(&resp_payload)
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 
@@ -511,7 +526,7 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn get_runtime_status(&mut self) -> Result<RuntimeStatusResponse> {
-        let req = RuntimeStatusRequest {};
+        let req = RuntimeStatusRequest::default();
         let payload = req.encode_to_vec();
         self.unary_rpc(
             MessageType::RuntimeStatusRequest,
@@ -539,6 +554,7 @@ impl AgentClient {
         let req = WatchReadinessRequest {
             start_runtime_if_needed,
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+            ..Default::default()
         };
         let payload = req.encode_to_vec();
         let buf = Self::build_message(MessageType::WatchReadinessRequest, trace_id, &payload);
@@ -607,6 +623,7 @@ impl AgentClient {
         let req = WatchReadinessRequest {
             start_runtime_if_needed,
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+            ..Default::default()
         };
         let payload = req.encode_to_vec();
         let buf = Self::build_message(MessageType::WatchReadinessRequest, trace_id, &payload);
@@ -752,7 +769,7 @@ impl AgentClient {
                 "unexpected stats response type: 0x{resp_type:04x}"
             )));
         }
-        MachineStats::decode(&resp_payload[..])
+        MachineStats::decode_from_slice(&resp_payload)
             .map_err(|e| CoreError::Machine(format!("failed to decode machine stats: {e}")))
     }
 
@@ -767,7 +784,7 @@ impl AgentClient {
                 "unexpected memory pressure response type: 0x{resp_type:04x}"
             )));
         }
-        MemoryPressureEvent::decode(&resp_payload[..])
+        MemoryPressureEvent::decode_from_slice(&resp_payload)
             .map_err(|e| CoreError::Machine(format!("failed to decode memory pressure event: {e}")))
     }
 
@@ -782,7 +799,7 @@ impl AgentClient {
                 "unexpected readiness response type: 0x{resp_type:04x}"
             )));
         }
-        ReadinessEvent::decode(&resp_payload[..])
+        ReadinessEvent::decode_from_slice(&resp_payload)
             .map_err(|e| CoreError::Machine(format!("failed to decode readiness event: {e}")))
     }
 
@@ -792,7 +809,7 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn start_kubernetes(&mut self) -> Result<KubernetesStartResponse> {
-        let payload = KubernetesStartRequest {}.encode_to_vec();
+        let payload = KubernetesStartRequest::default().encode_to_vec();
         self.unary_rpc(
             MessageType::KubernetesStartRequest,
             &payload,
@@ -807,7 +824,7 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn stop_kubernetes(&mut self) -> Result<KubernetesStopResponse> {
-        let payload = KubernetesStopRequest {}.encode_to_vec();
+        let payload = KubernetesStopRequest::default().encode_to_vec();
         self.unary_rpc(
             MessageType::KubernetesStopRequest,
             &payload,
@@ -822,7 +839,7 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn delete_kubernetes(&mut self) -> Result<KubernetesDeleteResponse> {
-        let payload = KubernetesDeleteRequest {}.encode_to_vec();
+        let payload = KubernetesDeleteRequest::default().encode_to_vec();
         self.unary_rpc(
             MessageType::KubernetesDeleteRequest,
             &payload,
@@ -837,7 +854,7 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn get_kubernetes_status(&mut self) -> Result<KubernetesStatusResponse> {
-        let payload = KubernetesStatusRequest {}.encode_to_vec();
+        let payload = KubernetesStatusRequest::default().encode_to_vec();
         self.unary_rpc(
             MessageType::KubernetesStatusRequest,
             &payload,
@@ -852,7 +869,7 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn get_kubeconfig(&mut self) -> Result<KubernetesKubeconfigResponse> {
-        let payload = KubernetesKubeconfigRequest {}.encode_to_vec();
+        let payload = KubernetesKubeconfigRequest::default().encode_to_vec();
         self.unary_rpc(
             MessageType::KubernetesKubeconfigRequest,
             &payload,
@@ -874,6 +891,7 @@ impl AgentClient {
     ) -> Result<ContainerFsPathsResponse> {
         let payload = ContainerFsPathsRequest {
             container_id: container_id.to_string(),
+            ..Default::default()
         }
         .encode_to_vec();
         self.unary_rpc(
@@ -897,6 +915,7 @@ impl AgentClient {
     ) -> Result<ContainerFsPathsResponse> {
         let payload = ContainerFsPathsRequest {
             container_id: container_id.to_string(),
+            ..Default::default()
         }
         .encode_to_vec();
         self.unary_rpc_blocking(
@@ -916,6 +935,7 @@ impl AgentClient {
     pub async fn image_fs_paths(&mut self, top_chain_id: &str) -> Result<ImageFsPathsResponse> {
         let payload = ImageFsPathsRequest {
             top_chain_id: top_chain_id.to_string(),
+            ..Default::default()
         }
         .encode_to_vec();
         self.unary_rpc(
@@ -936,6 +956,7 @@ impl AgentClient {
     pub fn image_fs_paths_blocking(&mut self, top_chain_id: &str) -> Result<ImageFsPathsResponse> {
         let payload = ImageFsPathsRequest {
             top_chain_id: top_chain_id.to_string(),
+            ..Default::default()
         }
         .encode_to_vec();
         self.unary_rpc_blocking(
@@ -954,7 +975,7 @@ impl AgentClient {
     /// Returns an error if the request fails or the guest could not establish
     /// the export.
     pub async fn ensure_nfs_export(&mut self) -> Result<EnsureNfsExportResponse> {
-        let payload = EnsureNfsExportRequest {}.encode_to_vec();
+        let payload = EnsureNfsExportRequest::default().encode_to_vec();
         self.unary_rpc(
             MessageType::EnsureNfsExportRequest,
             &payload,
@@ -971,7 +992,7 @@ impl AgentClient {
     /// Returns an error if the request fails or the guest could not establish
     /// the export.
     pub fn ensure_nfs_export_blocking(&mut self) -> Result<EnsureNfsExportResponse> {
-        let payload = EnsureNfsExportRequest {}.encode_to_vec();
+        let payload = EnsureNfsExportRequest::default().encode_to_vec();
         self.unary_rpc_blocking(
             MessageType::EnsureNfsExportRequest,
             &payload,
@@ -985,7 +1006,7 @@ impl AgentClient {
     ///
     /// Returns an error if the request fails.
     pub async fn disk_trim(&mut self) -> Result<DiskTrimResponse> {
-        let payload = DiskTrimRequest {}.encode_to_vec();
+        let payload = DiskTrimRequest::default().encode_to_vec();
         self.unary_rpc(
             MessageType::DiskTrimRequest,
             &payload,
@@ -1051,12 +1072,17 @@ impl AgentClient {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn sandbox_stop(&mut self, req: StopSandboxRequest) -> Result<()> {
+    pub async fn sandbox_stop(
+        &mut self,
+        req: StopSandboxRequest,
+    ) -> Result<SandboxCleanupResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, _) = self
-            .rpc_call(MessageType::SandboxStopRequest, &payload)
-            .await?;
-        Self::expect_ack_response_type(resp_type, MessageType::SandboxStopResponse)
+        self.unary_rpc(
+            MessageType::SandboxStopRequest,
+            &payload,
+            MessageType::SandboxStopResponse,
+        )
+        .await
     }
 
     /// Removes a sandbox from the guest VM.
@@ -1064,12 +1090,39 @@ impl AgentClient {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn sandbox_remove(&mut self, req: RemoveSandboxRequest) -> Result<()> {
+    pub async fn sandbox_remove(
+        &mut self,
+        req: RemoveSandboxRequest,
+    ) -> Result<SandboxCleanupResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, _) = self
-            .rpc_call(MessageType::SandboxRemoveRequest, &payload)
+        self.unary_rpc(
+            MessageType::SandboxRemoveRequest,
+            &payload,
+            MessageType::SandboxRemoveResponse,
+        )
+        .await
+    }
+
+    /// Validate one exact cleanup generation before host listeners are removed.
+    pub async fn sandbox_cleanup_prepare(&mut self, ticket: &SandboxCleanupTicket) -> Result<()> {
+        let (response_type, _) = self
+            .rpc_call(
+                MessageType::SandboxCleanupPrepareRequest,
+                &ticket.encode_to_vec(),
+            )
             .await?;
-        Self::expect_ack_response_type(resp_type, MessageType::SandboxRemoveResponse)
+        Self::expect_ack_response_type(response_type, MessageType::SandboxCleanupPrepareResponse)
+    }
+
+    /// Finalize one exact cleanup generation after host listeners are gone.
+    pub async fn sandbox_cleanup_finalize(&mut self, ticket: &SandboxCleanupTicket) -> Result<()> {
+        let (response_type, _) = self
+            .rpc_call(
+                MessageType::SandboxCleanupFinalizeRequest,
+                &ticket.encode_to_vec(),
+            )
+            .await?;
+        Self::expect_ack_response_type(response_type, MessageType::SandboxCleanupFinalizeResponse)
     }
 
     /// Inspects a sandbox in the guest VM.
@@ -1161,7 +1214,7 @@ impl AgentClient {
                         .await;
                     break;
                 }
-                match FileChunk::decode(&resp_payload[..]) {
+                match FileChunk::decode_from_slice(&resp_payload) {
                     Ok(chunk) => {
                         let done = chunk.done;
                         if tx.send(Ok(chunk)).await.is_err() || done {
@@ -1218,7 +1271,11 @@ impl AgentClient {
                     ));
                 }
             };
-            let chunk = FileChunk { data, done: false };
+            let chunk = FileChunk {
+                data,
+                done: false,
+                ..Default::default()
+            };
             let frame =
                 wire::build_message(MessageType::SandboxFileChunk, "", &chunk.encode_to_vec());
             self.transport
@@ -1229,6 +1286,7 @@ impl AgentClient {
         let done = FileChunk {
             data: Vec::new(),
             done: true,
+            ..Default::default()
         };
         let frame = wire::build_message(MessageType::SandboxFileChunk, "", &done.encode_to_vec());
         self.transport
@@ -1266,8 +1324,8 @@ impl AgentClient {
     /// Returns an error if the initial send fails.
     pub async fn machine_exec(
         mut self,
-        req: arcbox_protocol::v1::MachineExecRequest,
-    ) -> Result<mpsc::Receiver<Result<arcbox_protocol::v1::MachineExecOutput>>> {
+        req: MachineExecRequest,
+    ) -> Result<mpsc::Receiver<Result<MachineExecOutput>>> {
         if !self.connected {
             self.connect().await?;
         }
@@ -1317,7 +1375,7 @@ impl AgentClient {
                     break;
                 }
 
-                match arcbox_protocol::v1::MachineExecOutput::decode(&resp_payload[..]) {
+                match MachineExecOutput::decode_from_slice(&resp_payload) {
                     Ok(output) => {
                         let done = output.done;
                         // Stop reading if the consumer dropped, so a spewing
@@ -1344,7 +1402,7 @@ impl AgentClient {
     /// Consumes the client because the stream task requires exclusive
     /// transport access. The caller supplies a receiver of
     /// [`ExecSessionInput`]s (stdin bytes, TTY resizes, or EOF) and gets an
-    /// output receiver of [`arcbox_protocol::v1::MachineExecOutput`] frames
+    /// output receiver of [`MachineExecOutput`] frames
     /// (stdout/stderr merged by the PTY; final frame carries the exit code).
     ///
     /// # Errors
@@ -1352,9 +1410,9 @@ impl AgentClient {
     /// Returns an error if the initial send fails.
     pub async fn machine_exec_session(
         mut self,
-        req: arcbox_protocol::v1::MachineExecRequest,
+        req: MachineExecRequest,
         mut input_rx: mpsc::Receiver<ExecSessionInput>,
-    ) -> Result<mpsc::Receiver<Result<arcbox_protocol::v1::MachineExecOutput>>> {
+    ) -> Result<mpsc::Receiver<Result<MachineExecOutput>>> {
         if !self.connected {
             self.connect().await?;
         }
@@ -1385,9 +1443,10 @@ impl AgentClient {
                         }
                     }
                     Some(ExecSessionInput::Resize { width, height }) => {
-                        let size = arcbox_protocol::v1::TerminalSize {
+                        let size = TerminalSize {
                             width: u32::from(width),
                             height: u32::from(height),
+                            ..Default::default()
                         };
                         let frame = wire::build_message(
                             MessageType::MachineExecResize,
@@ -1447,7 +1506,7 @@ impl AgentClient {
                     break;
                 }
 
-                match arcbox_protocol::v1::MachineExecOutput::decode(&resp_payload[..]) {
+                match MachineExecOutput::decode_from_slice(&resp_payload) {
                     Ok(output) => {
                         let done = output.done;
                         if out_tx.send(Ok(output)).await.is_err() || done {
@@ -1621,7 +1680,7 @@ impl AgentClient {
                     break;
                 }
 
-                match ExecutionEvent::decode(&resp_payload[..]) {
+                match ExecutionEvent::decode_from_slice(&resp_payload) {
                     Ok(event) => {
                         let done = matches!(event.event, Some(execution_event::Event::Exited(_)));
                         // Stop reading if the consumer dropped, so a spewing
@@ -1703,7 +1762,7 @@ impl AgentClient {
                     break;
                 }
 
-                match SandboxEvent::decode(&resp_payload[..]) {
+                match SandboxEvent::decode_from_slice(&resp_payload) {
                     Ok(event) => {
                         // Stop when the subscriber drops instead of draining the
                         // event stream forever.
@@ -1721,6 +1780,80 @@ impl AgentClient {
             }
         });
 
+        Ok(rx)
+    }
+
+    /// Stream durable sandbox cleanup tickets. Reconnecting replays every
+    /// generation that has not finalized.
+    pub async fn sandbox_cleanup_events(
+        mut self,
+    ) -> Result<mpsc::Receiver<Result<SandboxCleanupTicket>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let request = WatchSandboxCleanupRequest::default();
+        let buffer = wire::build_message(
+            MessageType::WatchSandboxCleanupRequest,
+            "",
+            &request.encode_to_vec(),
+        );
+        self.transport.async_send(buffer).await.map_err(|error| {
+            CoreError::Machine(format!("failed to send sandbox cleanup watch: {error}"))
+        })?;
+
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            loop {
+                let raw = match self.transport.async_recv().await {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!(
+                                "sandbox cleanup watch receive failed: {error}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                };
+                let (response_type, _, payload) = match wire::parse_response(&raw) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        break;
+                    }
+                };
+                if response_type == MessageType::Error as u32 {
+                    let (code, message) = wire::parse_error_response(&payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_owned()));
+                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    break;
+                }
+                if response_type != MessageType::SandboxCleanupEvent as u32 {
+                    let _ = tx
+                        .send(Err(CoreError::Machine(format!(
+                            "unexpected sandbox cleanup response: 0x{response_type:04x}"
+                        ))))
+                        .await;
+                    break;
+                }
+                match SandboxCleanupTicket::decode_from_slice(&payload) {
+                    Ok(ticket) => {
+                        if tx.send(Ok(ticket)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!(
+                                "sandbox cleanup ticket decode failed: {error}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
         Ok(rx)
     }
 
@@ -1790,11 +1923,11 @@ impl AgentClient {
 }
 
 fn readiness_event_is_terminal(event: &ReadinessEvent) -> bool {
-    use arcbox_protocol::agent::readiness_event::Kind;
+    use arcbox_connect::v1::readiness_event::Kind;
 
     matches!(
-        Kind::try_from(event.kind),
-        Ok(Kind::RuntimeReady | Kind::RuntimeFailed)
+        event.kind.as_known(),
+        Some(Kind::RuntimeReady | Kind::RuntimeFailed)
     )
 }
 #[cfg(test)]
@@ -1829,6 +1962,7 @@ mod tests {
             message: "pong".to_string(),
             version: "0.4.16".to_string(),
             protocol_version,
+            ..Default::default()
         }
     }
 

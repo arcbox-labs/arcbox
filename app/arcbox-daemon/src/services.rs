@@ -69,7 +69,7 @@ pub async fn start_services(
         .await
         .context("Failed to start DNS service")?;
 
-    register_host_dns(runtime);
+    register_host_dns(runtime).await;
 
     let dns_shutdown = ctx.shutdown.clone();
     let dns = tokio::spawn(async move {
@@ -448,7 +448,7 @@ fn should_log_route_failure(consecutive_failures: u32) -> bool {
     consecutive_failures == 1 || consecutive_failures.is_multiple_of(30)
 }
 
-fn register_host_dns(runtime: &Arc<Runtime>) {
+async fn register_host_dns(runtime: &Arc<Runtime>) {
     let network_cfg = &runtime.config().network;
     let gateway_ip = network_cfg
         .gateway
@@ -457,14 +457,16 @@ fn register_host_dns(runtime: &Arc<Runtime>) {
         .or_else(|| first_address_in_subnet(&network_cfg.subnet))
         .unwrap_or(Ipv4Addr::new(10, 0, 2, 1));
     let ip = IpAddr::V4(gateway_ip);
-    runtime.network_manager().register_dns("host", ip);
-    // Docker compatibility: containers use these to reach host services.
     runtime
-        .network_manager()
-        .register_dns("host.docker.internal", ip);
-    runtime
-        .network_manager()
-        .register_dns("gateway.docker.internal", ip);
+        .register_host_dns(
+            &[
+                "host".into(),
+                "host.docker.internal".into(),
+                "gateway.docker.internal".into(),
+            ],
+            ip,
+        )
+        .await;
 }
 
 fn first_address_in_subnet(subnet: &str) -> Option<Ipv4Addr> {

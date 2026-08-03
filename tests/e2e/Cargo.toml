@@ -11,6 +11,7 @@ description = "End-to-end integration tests for the ArcBox container and VM runt
 
 [dependencies]
 anyhow.workspace = true
+arcbox-connect.workspace = true
 arcbox-constants.workspace = true
 arcbox-core.workspace = true
 arcbox-grpc.workspace = true

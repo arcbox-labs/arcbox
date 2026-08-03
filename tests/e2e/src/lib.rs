@@ -8,6 +8,7 @@ pub mod net_fixtures;
 pub mod sandbox;
 pub mod scenario;
 pub mod signing;
+pub mod virtio_debug;
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

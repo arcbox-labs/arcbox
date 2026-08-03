@@ -15,18 +15,18 @@ use anyhow::Result;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use arcbox_connect::v1::{
+    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+    KubernetesStopResponse,
+};
 use arcbox_constants::paths::{
     ARCBOX_RUNTIME_BIN_DIR, CNI_DATA_MOUNT_POINT, CONTAINERD_SOCKET, K3S_DATA_MOUNT_POINT,
     K3S_KUBECONFIG_PATH, KUBELET_DATA_MOUNT_POINT,
 };
 use arcbox_constants::ports::KUBERNETES_API_GUEST_PORT;
 use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
-use arcbox_protocol::agent::{
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse,
-};
 
 use super::probe::{probe_first_ready_socket, probe_tcp};
 use super::runtime::{
@@ -114,6 +114,7 @@ pub(super) async fn handle_kubernetes_kubeconfig(_req: KubernetesKubeconfigReque
             kubeconfig,
             context_name: "arcbox".to_string(),
             endpoint: KUBERNETES_HOST_ENDPOINT.to_string(),
+            ..Default::default()
         }),
         Err(e) => RpcResponse::Error(ErrorResponse::new(
             404,
@@ -133,6 +134,7 @@ async fn do_start_kubernetes() -> KubernetesStartResponse {
                 api_ready: false,
                 endpoint: KUBERNETES_HOST_ENDPOINT.to_string(),
                 detail: format!("local runtime setup failed: {error}"),
+                ..Default::default()
             };
         }
     }
@@ -148,6 +150,7 @@ async fn do_start_kubernetes() -> KubernetesStartResponse {
                 ARCBOX_RUNTIME_BIN_DIR,
                 missing.join(", ")
             ),
+            ..Default::default()
         };
     }
     ensure_shared_runtime_dirs(&mut notes);
@@ -158,6 +161,7 @@ async fn do_start_kubernetes() -> KubernetesStartResponse {
             api_ready: false,
             endpoint: KUBERNETES_HOST_ENDPOINT.to_string(),
             detail: notes.join("; "),
+            ..Default::default()
         };
     }
 
@@ -209,6 +213,7 @@ async fn do_start_kubernetes() -> KubernetesStartResponse {
         api_ready: status.api_ready,
         endpoint: status.endpoint,
         detail: status.detail,
+        ..Default::default()
     }
 }
 
@@ -222,6 +227,7 @@ async fn do_stop_kubernetes_locked() -> KubernetesStopResponse {
         return KubernetesStopResponse {
             stopped: true,
             detail: "k3s already stopped".to_string(),
+            ..Default::default()
         };
     };
 
@@ -233,6 +239,7 @@ async fn do_stop_kubernetes_locked() -> KubernetesStopResponse {
             return KubernetesStopResponse {
                 stopped: true,
                 detail: "k3s stopped".to_string(),
+                ..Default::default()
             };
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -243,6 +250,7 @@ async fn do_stop_kubernetes_locked() -> KubernetesStopResponse {
     KubernetesStopResponse {
         stopped: true,
         detail: "k3s force-stopped".to_string(),
+        ..Default::default()
     }
 }
 
@@ -264,6 +272,7 @@ async fn do_delete_kubernetes() -> KubernetesDeleteResponse {
 
     KubernetesDeleteResponse {
         detail: notes.join("; "),
+        ..Default::default()
     }
 }
 
@@ -317,7 +326,7 @@ fn clear_directory_contents(path: &Path) -> Result<()> {
 }
 
 async fn collect_kubernetes_status() -> KubernetesStatusResponse {
-    use arcbox_protocol::agent::ServiceStatus;
+    use arcbox_connect::v1::ServiceStatus;
 
     let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
     let running = k3s_pid().is_some();
@@ -336,6 +345,7 @@ async fn collect_kubernetes_status() -> KubernetesStatusResponse {
         } else {
             "containerd socket not reachable".to_string()
         },
+        ..Default::default()
     });
     services.push(ServiceStatus {
         name: "k3s".to_string(),
@@ -353,6 +363,7 @@ async fn collect_kubernetes_status() -> KubernetesStatusResponse {
         } else {
             "k3s process not running".to_string()
         },
+        ..Default::default()
     });
 
     let detail = if api_ready {
@@ -369,6 +380,7 @@ async fn collect_kubernetes_status() -> KubernetesStatusResponse {
         endpoint: KUBERNETES_HOST_ENDPOINT.to_string(),
         detail,
         services,
+        ..Default::default()
     }
 }
 

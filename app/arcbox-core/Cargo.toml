@@ -14,7 +14,6 @@ arcbox-vmm = { workspace = true }
 arcbox-virtio = { workspace = true }
 arcbox-fs = { workspace = true }
 arcbox-net = { workspace = true }
-arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
 arcbox-constants = { workspace = true }
 arcbox-error = { workspace = true }
@@ -22,7 +21,6 @@ arcbox-boot = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-prost = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
@@ -44,6 +42,8 @@ tempfile = "3"
 statig = "0.4.1"
 zstd = "0.13.3"
 base64 = "0.22.1"
+arcbox-connect.workspace = true
+buffa = "0.9.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-route.workspace = true

@@ -32,6 +32,8 @@ fn main() {
         "proto/arcbox/sandbox/v1/process.proto",
         "proto/arcbox/sandbox/v1/filesystem.proto",
         "proto/arcbox/sandbox/v1/snapshot.proto",
+        "proto/arcbox/sandbox/v1/template.proto",
+        "proto/arcbox/sandbox/v1/errors.proto",
         "proto/stats.proto",
     ];
 
@@ -44,14 +46,15 @@ fn main() {
     // Newer protoc versions simply ignore this switch.
     config.protoc_arg("--experimental_allow_proto3_optional");
 
-    // Generate serde derives for all messages.
-    config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
-    config.type_attribute(".", "#[serde(rename_all = \"camelCase\")]");
+    // No serde derives on generated types: persisted/user-facing JSON must
+    // come from hand-written DTOs, never from codegen shapes, so that the
+    // message-layer codec can change without silently rewriting on-disk or
+    // scripted formats. (The derives that used to live here made proto
+    // types double as JSON DTOs — retired with the DTO decoupling.)
 
-    // Well-known types (Timestamp, Empty) map to pbjson-types, whose types
-    // carry serde impls following the canonical protobuf JSON mapping —
-    // prost-types has no serde support, which would break the blanket
-    // serde derives above. compile_well_known_types() drops prost-build's
+    // Well-known types (Timestamp, Empty) map to pbjson-types; kept (rather
+    // than reverting to prost-types) so public field types stay stable for
+    // every consumer. compile_well_known_types() drops prost-build's
     // implicit prost-types mapping so the extern_path below can take over.
     config.compile_well_known_types();
     config.extern_path(".google.protobuf", "::pbjson_types");

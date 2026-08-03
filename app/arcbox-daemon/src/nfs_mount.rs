@@ -33,6 +33,9 @@ use crate::context::DaemonContext;
 
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 const MOUNT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Shutdown may make two attempts; their 10s total is part of launchd's
+/// 45s budget.
+const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pause before retrying a failed incarnation, so a guest that is up but not
 /// yet able to serve the export is retried without spinning.
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -65,7 +68,7 @@ pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
 }
 
 /// Unmounts `~/ArcBox` on shutdown, but only the mount this daemon created.
-pub fn cleanup(ctx: &DaemonContext) {
+pub async fn cleanup(ctx: &DaemonContext) {
     if !ctx.mount_nfs {
         return;
     }
@@ -78,7 +81,7 @@ pub fn cleanup(ctx: &DaemonContext) {
 
     // Re-check the shape in case the user replaced the mount since.
     match current_mount_info(mount_path) {
-        Some(info) if is_arcbox_nfs_mount(&info) => match unmount(mount_path) {
+        Some(info) if is_arcbox_nfs_mount(&info) => match unmount(mount_path).await {
             Ok(()) => info!(path = %mount_path.display(), "unmounted ~/ArcBox host NFS mount"),
             Err(e) => warn!(path = %mount_path.display(), error = %e, "failed to unmount ~/ArcBox"),
         },
@@ -162,7 +165,7 @@ async fn establish(
 ) -> Result<()> {
     if occupancy == MountPoint::Stale {
         info!(path = %mount_path.display(), "replacing stale ~/ArcBox NFS mount");
-        unmount(mount_path)?;
+        unmount(mount_path).await?;
     }
     std::fs::create_dir_all(mount_path)?;
 
@@ -577,8 +580,12 @@ fn parse_mount_line(line: &str) -> Option<(&str, MountInfo)> {
     ))
 }
 
-fn unmount(path: &Path) -> Result<()> {
-    let status = Command::new("/sbin/umount").arg(path).status()?;
+async fn unmount(path: &Path) -> Result<()> {
+    let mut command = tokio::process::Command::new("/sbin/umount");
+    command.arg(path).kill_on_drop(true);
+    let status = tokio::time::timeout(UNMOUNT_TIMEOUT, command.status())
+        .await
+        .context("umount timed out")??;
     if status.success() {
         Ok(())
     } else {

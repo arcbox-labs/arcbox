@@ -2,24 +2,31 @@
 
 use arcbox_connect::sandbox_v1 as pb;
 use buffa_types::google::protobuf::Empty;
-use connectrpc::{PreEncoded, RequestContext, Response, ServiceRequest, ServiceResult};
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
+
+use std::sync::Arc;
 
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::bridge::{wire_request, wire_response};
+use super::sandbox_cleanup;
+use super::sandbox_locks::SandboxOperationLocks;
 use super::{ConnectRuntimeExt as _, ContextExt as _};
 
 /// Sandbox snapshot service implementation.
 pub struct SandboxSnapshotServiceImpl {
     runtime: SharedRuntime,
+    operations: Arc<SandboxOperationLocks>,
 }
 
 impl SandboxSnapshotServiceImpl {
     /// Creates a new sandbox snapshot service with a deferred runtime.
     #[must_use]
-    pub fn new(runtime: SharedRuntime) -> Self {
-        Self { runtime }
+    pub(super) fn new(runtime: SharedRuntime, operations: Arc<SandboxOperationLocks>) -> Self {
+        Self {
+            runtime,
+            operations,
+        }
     }
 }
 
@@ -34,63 +41,63 @@ impl pb::SandboxSnapshotService for SandboxSnapshotServiceImpl {
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::CheckpointRequest>,
-    ) -> ServiceResult<PreEncoded<pb::CheckpointResponse>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<pb::CheckpointResponse> {
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let _operation = self.operations.lock(&machine, &req.sandbox_id).await;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let resp = agent
-            .sandbox_checkpoint(wire_request(&request)?)
+            .sandbox_checkpoint(req)
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn restore(
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::RestoreRequest>,
-    ) -> ServiceResult<PreEncoded<pb::RestoreResponse>> {
-        let machine = ctx.machine_id()?;
-        let mut agent = self
-            .runtime
-            .ready()?
-            .get_agent(&machine)
-            .map_err(ApiError::from)?;
-        let resp = agent
-            .sandbox_restore(wire_request(&request)?)
-            .await
-            .map_err(ApiError::from)?;
+    ) -> ServiceResult<pb::RestoreResponse> {
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let _operation = self.operations.lock(&machine, &req.id).await;
+        let runtime = self.runtime.ready()?;
+        let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
+        let resp = agent.sandbox_restore(req).await.map_err(ApiError::from)?;
+        let _host_state = runtime.lock_sandbox_host_state().await;
 
         // Register restored sandbox DNS.
-        if let Ok(ip) = resp.ip_address.parse() {
-            self.runtime
-                .ready()?
-                .register_dns(&resp.id, std::slice::from_ref(&resp.id), ip)
-                .await;
+        // Replays retain the original result even after Stop, so always
+        // confirm that the exact sandbox and IP are still live.
+        if let Ok(ip) = resp.ip_address.parse()
+            && sandbox_cleanup::live_sandbox_matches(runtime, &machine, &resp.id, ip).await
+        {
+            runtime.register_sandbox_dns(&resp.id, ip).await;
         }
 
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn list_snapshots(
         &self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::ListSnapshotsRequest>,
-    ) -> ServiceResult<PreEncoded<pb::ListSnapshotsResponse>> {
-        let machine = ctx.machine_id()?;
+    ) -> ServiceResult<pb::ListSnapshotsResponse> {
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         let resp = agent
-            .sandbox_list_snapshots(wire_request(&request)?)
+            .sandbox_list_snapshots(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
-        Response::ok(wire_response(&resp))
+        Response::ok(resp)
     }
 
     async fn delete_snapshot(
@@ -98,14 +105,14 @@ impl pb::SandboxSnapshotService for SandboxSnapshotServiceImpl {
         ctx: RequestContext,
         request: ServiceRequest<'_, pb::DeleteSnapshotRequest>,
     ) -> ServiceResult<Empty> {
-        let machine = ctx.machine_id()?;
+        let machine = ctx.sandbox_machine_id()?;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
         agent
-            .sandbox_delete_snapshot(wire_request(&request)?)
+            .sandbox_delete_snapshot(request.to_owned_message())
             .await
             .map_err(ApiError::from)?;
         Response::ok(Empty::default())

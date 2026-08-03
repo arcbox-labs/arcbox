@@ -1,12 +1,11 @@
 //! Machine management commands.
 
-use crate::connect::{StreamItemExt as _, UnaryExt as _};
 use anyhow::{Context, Result};
 use arcbox_cli::terminal::{RawModeGuard, TerminalSize};
 use arcbox_connect::v1 as pb;
 use arcbox_connect::v1::MachineServiceClient;
-use arcbox_protocol::v1::TerminalSize as ProtoTerminalSize;
-use arcbox_protocol::v1::{
+use arcbox_connect::v1::TerminalSize as ProtoTerminalSize;
+use arcbox_connect::v1::{
     CreateMachineRequest, DirectoryMount, InspectMachineRequest, ListMachinesRequest,
     MachineAgentRequest, MachineExecInput, MachineExecRequest, RemoveMachineRequest,
     StartMachineRequest, StopMachineRequest, machine_exec_input,
@@ -25,17 +24,16 @@ pub fn machine_client() -> MachineServiceClient<connectrpc::client::SharedHttp2C
 /// Returns the number of machines visible through the daemon gRPC API.
 pub async fn machine_count() -> Result<usize> {
     let client = machine_client();
-    let response = client
-        .list(crate::connect::request::<pb::ListMachinesRequest, _>(
-            &ListMachinesRequest { all: true },
-        )?)
+    let response: pb::ListMachinesResponse = client
+        .list(ListMachinesRequest {
+            all: true,
+            ..Default::default()
+        })
         .await
-        .context("Failed to list machines")?;
+        .context("Failed to list machines")?
+        .into_owned();
 
-    Ok(response
-        .prost::<arcbox_protocol::v1::ListMachinesResponse>()?
-        .machines
-        .len())
+    Ok(response.machines.len())
 }
 
 fn parse_mount(mount: &str) -> Result<DirectoryMount> {
@@ -51,6 +49,7 @@ fn parse_mount(mount: &str) -> Result<DirectoryMount> {
         host_path: host.to_string(),
         guest_path: guest.to_string(),
         readonly: false,
+        ..Default::default()
     })
 }
 
@@ -223,22 +222,21 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     client
-        .create(crate::connect::request::<pb::CreateMachineRequest, _>(
-            &CreateMachineRequest {
-                name: args.name.clone(),
-                // 0 = let the daemon apply its default (host core count).
-                cpus: args.cpus.unwrap_or(0),
-                memory: args.memory.saturating_mul(1024_u64 * 1024),
-                disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
-                distro: args.distro.clone().unwrap_or_default(),
-                version: args.distro_version.clone().unwrap_or_default(),
-                arch: std::env::consts::ARCH.to_string(),
-                mounts,
-                ssh_public_key: String::new(),
-                kernel: args.kernel.clone().unwrap_or_default(),
-                cmdline: args.cmdline.clone().unwrap_or_default(),
-            },
-        )?)
+        .create(CreateMachineRequest {
+            name: args.name.clone(),
+            // 0 = let the daemon apply its default (host core count).
+            cpus: args.cpus.unwrap_or(0),
+            memory: args.memory.saturating_mul(1024_u64 * 1024),
+            disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
+            distro: args.distro.clone().unwrap_or_default(),
+            version: args.distro_version.clone().unwrap_or_default(),
+            arch: std::env::consts::ARCH.to_string(),
+            mounts,
+            ssh_public_key: String::new(),
+            kernel: args.kernel.clone().unwrap_or_default(),
+            cmdline: args.cmdline.clone().unwrap_or_default(),
+            ..Default::default()
+        })
         .await
         .context("Failed to create machine")?;
 
@@ -262,11 +260,10 @@ async fn execute_start(args: StartArgs) -> Result<()> {
     println!("Starting machine '{}'...", args.name);
 
     client
-        .start(crate::connect::request::<pb::StartMachineRequest, _>(
-            &StartMachineRequest {
-                id: args.name.clone(),
-            },
-        )?)
+        .start(StartMachineRequest {
+            id: args.name.clone(),
+            ..Default::default()
+        })
         .await
         .context("Failed to start machine")?;
 
@@ -274,11 +271,10 @@ async fn execute_start(args: StartArgs) -> Result<()> {
     let mut delay = std::time::Duration::from_millis(200);
     for attempt in 1..=MAX_AGENT_WAIT_ATTEMPTS {
         match client
-            .ping(crate::connect::request::<pb::MachineAgentRequest, _>(
-                &MachineAgentRequest {
-                    id: args.name.clone(),
-                },
-            )?)
+            .ping(MachineAgentRequest {
+                id: args.name.clone(),
+                ..Default::default()
+            })
             .await
         {
             Ok(_) => break,
@@ -295,17 +291,17 @@ async fn execute_start(args: StartArgs) -> Result<()> {
 
     println!("Machine '{}' started", args.name);
     if let Ok(resp) = client
-        .inspect(crate::connect::request::<pb::InspectMachineRequest, _>(
-            &InspectMachineRequest {
-                id: args.name.clone(),
-            },
-        )?)
+        .inspect(InspectMachineRequest {
+            id: args.name.clone(),
+            ..Default::default()
+        })
         .await
     {
-        if let Some(network) = resp.prost::<arcbox_protocol::v1::MachineInfo>()?.network {
-            if !network.ip_address.is_empty() {
-                println!("IP:      {}", network.ip_address);
-            }
+        let info: pb::MachineInfo = resp.into_owned();
+        // An unset `network` derefs to the default instance (empty IP), so
+        // the "no IP" case needs no separate branch.
+        if !info.network.ip_address.is_empty() {
+            println!("IP:      {}", info.network.ip_address);
         }
     }
 
@@ -318,12 +314,11 @@ async fn execute_stop(args: StopArgs) -> Result<()> {
     println!("Stopping machine '{}'...", args.name);
 
     client
-        .stop(crate::connect::request::<pb::StopMachineRequest, _>(
-            &StopMachineRequest {
-                id: args.name.clone(),
-                force: args.force,
-            },
-        )?)
+        .stop(StopMachineRequest {
+            id: args.name.clone(),
+            force: args.force,
+            ..Default::default()
+        })
         .await
         .context("Failed to stop machine")?;
 
@@ -336,15 +331,14 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
     let client = machine_client();
 
     client
-        .remove(crate::connect::request::<pb::RemoveMachineRequest, _>(
-            &RemoveMachineRequest {
-                id: args.name.clone(),
-                force: args.force,
-                // Removal always deletes the machine directory; the wire field
-                // is retained for compatibility only.
-                volumes: false,
-            },
-        )?)
+        .remove(RemoveMachineRequest {
+            id: args.name.clone(),
+            force: args.force,
+            // Removal always deletes the machine directory; the wire field
+            // is retained for compatibility only.
+            volumes: false,
+            ..Default::default()
+        })
         .await
         .context("Failed to remove machine")?;
 
@@ -356,12 +350,13 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
 async fn execute_list(args: ListArgs) -> Result<()> {
     let client = machine_client();
     let machines = client
-        .list(crate::connect::request::<pb::ListMachinesRequest, _>(
-            &ListMachinesRequest { all: args.all },
-        )?)
+        .list(ListMachinesRequest {
+            all: args.all,
+            ..Default::default()
+        })
         .await
         .context("Failed to list machines")?
-        .prost::<arcbox_protocol::v1::ListMachinesResponse>()?
+        .into_owned()
         .machines;
 
     if args.quiet {
@@ -410,29 +405,21 @@ async fn execute_list(args: ListArgs) -> Result<()> {
 
 async fn execute_status(args: StatusArgs) -> Result<()> {
     let client = machine_client();
-    let machine = client
-        .inspect(crate::connect::request::<pb::InspectMachineRequest, _>(
-            &InspectMachineRequest {
-                id: args.name.clone(),
-            },
-        )?)
+    let machine: pb::MachineInfo = client
+        .inspect(InspectMachineRequest {
+            id: args.name.clone(),
+            ..Default::default()
+        })
         .await
         .context("Failed to get machine status")?
-        .prost::<arcbox_protocol::v1::MachineInfo>()?;
+        .into_owned();
 
-    let cpus = machine.hardware.as_ref().map_or(0, |h| h.cpus);
-    let memory_mb = machine
-        .hardware
-        .as_ref()
-        .map_or(0, |h| h.memory / (1024 * 1024));
-    let disk_gb = machine
-        .storage
-        .as_ref()
-        .map_or(0, |s| s.disk_size / (1024 * 1024 * 1024));
-    let ip_address = machine
-        .network
-        .as_ref()
-        .map(|n| n.ip_address.as_str())
+    // Unset sub-messages deref to their default instances, which carry the
+    // same zero/empty values the old Option-based fallbacks produced.
+    let cpus = machine.hardware.cpus;
+    let memory_mb = machine.hardware.memory / (1024 * 1024);
+    let disk_gb = machine.storage.disk_size / (1024 * 1024 * 1024);
+    let ip_address = Some(machine.network.ip_address.as_str())
         .filter(|ip| !ip.is_empty())
         .unwrap_or("-");
 
@@ -449,27 +436,29 @@ async fn execute_status(args: StatusArgs) -> Result<()> {
 
 async fn execute_inspect(args: InspectArgs) -> Result<()> {
     let client = machine_client();
-    let machine = client
-        .inspect(crate::connect::request::<pb::InspectMachineRequest, _>(
-            &InspectMachineRequest {
-                id: args.name.clone(),
-            },
-        )?)
+    let machine: pb::MachineInfo = client
+        .inspect(InspectMachineRequest {
+            id: args.name.clone(),
+            ..Default::default()
+        })
         .await
         .context("Failed to inspect machine")?
-        .prost::<arcbox_protocol::v1::MachineInfo>()?;
+        .into_owned();
 
+    // Sub-message derefs fall back to default instances (zero/empty), which
+    // matches the old Option-based fallbacks — the JSON shape is unchanged,
+    // including `ip_address: null` when the machine has no address.
     let payload = serde_json::json!({
         "id": machine.id,
         "name": machine.name,
         "state": machine.state,
-        "cpus": machine.hardware.as_ref().map_or(0, |h| h.cpus),
-        "memory_mb": machine.hardware.as_ref().map_or(0, |h| h.memory / (1024 * 1024)),
-        "disk_gb": machine.storage.as_ref().map_or(0, |s| s.disk_size / (1024 * 1024 * 1024)),
-        "ip_address": machine.network.as_ref().map(|n| n.ip_address.clone()).filter(|ip| !ip.is_empty()),
-        "kernel": machine.os.as_ref().map_or(String::new(), |os| os.kernel.clone()),
-        "distro": machine.os.as_ref().map_or(String::new(), |os| os.distro.clone()),
-        "distro_version": machine.os.as_ref().map_or(String::new(), |os| os.version.clone()),
+        "cpus": machine.hardware.cpus,
+        "memory_mb": machine.hardware.memory / (1024 * 1024),
+        "disk_gb": machine.storage.disk_size / (1024 * 1024 * 1024),
+        "ip_address": Some(machine.network.ip_address.clone()).filter(|ip| !ip.is_empty()),
+        "kernel": machine.os.kernel.clone(),
+        "distro": machine.os.distro.clone(),
+        "distro_version": machine.os.version.clone(),
     });
 
     println!(
@@ -483,15 +472,14 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
 async fn execute_ping(args: PingArgs) -> Result<()> {
     let client = machine_client();
     let started = std::time::Instant::now();
-    let response = client
-        .ping(crate::connect::request::<pb::MachineAgentRequest, _>(
-            &MachineAgentRequest {
-                id: args.name.clone(),
-            },
-        )?)
+    let response: pb::MachinePingResponse = client
+        .ping(MachineAgentRequest {
+            id: args.name.clone(),
+            ..Default::default()
+        })
         .await
         .context("Failed to ping agent")?
-        .prost::<arcbox_protocol::v1::MachinePingResponse>()?;
+        .into_owned();
     let elapsed = started.elapsed();
 
     println!(
@@ -505,15 +493,14 @@ async fn execute_ping(args: PingArgs) -> Result<()> {
 
 async fn execute_info(args: InfoArgs) -> Result<()> {
     let client = machine_client();
-    let info = client
-        .get_system_info(crate::connect::request::<pb::MachineAgentRequest, _>(
-            &MachineAgentRequest {
-                id: args.name.clone(),
-            },
-        )?)
+    let info: pb::MachineSystemInfo = client
+        .get_system_info(MachineAgentRequest {
+            id: args.name.clone(),
+            ..Default::default()
+        })
         .await
         .context("Failed to get system info")?
-        .prost::<arcbox_protocol::v1::MachineSystemInfo>()?;
+        .into_owned();
 
     let total_mb = info.total_memory / 1024 / 1024;
     let available_mb = info.available_memory / 1024 / 1024;
@@ -552,18 +539,21 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
     let tty_size = TerminalSize::current().ok().map(|s| ProtoTerminalSize {
         width: u32::from(s.cols),
         height: u32::from(s.rows),
+        ..Default::default()
     });
 
     // The first message in the stream must be the Init payload.
     msg_tx
         .send(MachineExecInput {
-            payload: Some(machine_exec_input::Payload::Init(MachineExecRequest {
+            payload: MachineExecRequest {
                 id: name.to_string(),
                 cmd,
                 tty: true,
-                tty_size,
+                tty_size: tty_size.into(),
                 ..Default::default()
-            })),
+            }
+            .into(),
+            ..Default::default()
         })
         .await
         .context("Failed to send exec session init")?;
@@ -577,10 +567,13 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
             tokio::spawn(async move {
                 while let Some(size) = watcher.recv().await {
                     let msg = MachineExecInput {
-                        payload: Some(machine_exec_input::Payload::Resize(ProtoTerminalSize {
+                        payload: ProtoTerminalSize {
                             width: u32::from(size.cols),
                             height: u32::from(size.rows),
-                        })),
+                            ..Default::default()
+                        }
+                        .into(),
+                        ..Default::default()
                     };
                     if resize_tx.send(msg).await.is_err() {
                         break;
@@ -603,6 +596,7 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
                     if stdin_tx
                         .send(MachineExecInput {
                             payload: Some(machine_exec_input::Payload::Stdin(buf[..n].to_vec())),
+                            ..Default::default()
                         })
                         .await
                         .is_err()
@@ -624,20 +618,13 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
         .context("Failed to open machine exec session")?;
     let (mut send, mut recv) = stream.into_split();
 
-    // Forwarder: prost inputs from the pumps → wire. When every pump has
-    // dropped its sender the channel drains, and closing the send half ends
-    // the request body cleanly; the session keeps running until the server
+    // Forwarder: inputs from the pumps → wire. When every pump has dropped
+    // its sender the channel drains, and closing the send half ends the
+    // request body cleanly; the session keeps running until the server
     // finishes the response side.
     tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
-            let req = match crate::connect::request::<pb::MachineExecInput, _>(&msg) {
-                Ok(req) => req,
-                Err(e) => {
-                    tracing::error!(error = %e, "dropping exec session input");
-                    break;
-                }
-            };
-            if send.send(req).await.is_err() {
+            if send.send(msg).await.is_err() {
                 break;
             }
         }
@@ -651,7 +638,7 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
         .await
         .context("Failed to read session output")?
     {
-        let output: arcbox_protocol::v1::MachineExecOutput = item.prost()?;
+        let output = item.to_owned_message();
         if !output.data.is_empty() {
             // The PTY merges stdout/stderr into one stream.
             std::io::stdout()
@@ -690,17 +677,15 @@ async fn exec_via_grpc(
 ) -> Result<()> {
     let client = machine_client();
     let mut stream = client
-        .exec(crate::connect::request::<pb::MachineExecRequest, _>(
-            &MachineExecRequest {
-                id: name.to_string(),
-                cmd,
-                working_dir: String::new(),
-                user: String::new(),
-                env,
-                tty,
-                tty_size: None,
-            },
-        )?)
+        .exec(MachineExecRequest {
+            id: name.to_string(),
+            cmd,
+            working_dir: String::new(),
+            user: String::new(),
+            env: env.into_iter().collect(),
+            tty,
+            ..Default::default()
+        })
         .await
         .context("Failed to execute command in machine")?;
 
@@ -710,7 +695,7 @@ async fn exec_via_grpc(
         .await
         .context("Failed to read exec output")?
     {
-        let output: arcbox_protocol::v1::MachineExecOutput = item.prost()?;
+        let output = item.to_owned_message();
         if !output.data.is_empty() {
             match output.stream.as_str() {
                 "stderr" => {
