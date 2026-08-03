@@ -1,6 +1,7 @@
 import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
 import { noop } from "foxts/noop";
+import { wait } from "foxts/wait";
 
 import { Commands } from "./commands.js";
 import type { ConnectionOptions } from "./connection.js";
@@ -76,6 +77,12 @@ export interface ListSandboxesOptions {
 }
 
 type SandboxClient = Client<typeof SandboxService>;
+
+/**
+ * How often {@link ArcBox.connect} re-inspects a PAUSING sandbox. No
+ * lifecycle event marks the PAUSING→PAUSED edge, so it is polled out.
+ */
+const PAUSE_SETTLE_POLL_MS = 500;
 
 /**
  * Client entry point. Holds one resolved connection; every handle it
@@ -167,13 +174,23 @@ export class ArcBox {
 
   /**
    * Attach to an existing sandbox. A PAUSED sandbox is resumed (resume
-   * completes once it is READY again); a STARTING one is waited for. A
-   * terminal state is a typed error carrying the observed state.
-   * Connecting never touches the sandbox's lifecycle deadlines.
+   * completes once it is READY again); a PAUSING one settles to PAUSED
+   * first, then resumes; a STARTING one is waited for. A terminal state
+   * is a typed error carrying the observed state. Connecting never
+   * touches the sandbox's lifecycle deadlines.
    */
   async connect(id: string): Promise<Sandbox> {
     try {
-      const info = await this.#client.inspect({ id }, unaryOptions(this.#ctx));
+      let info = await this.#client.inspect({ id }, unaryOptions(this.#ctx));
+      // A pausing sandbox's next stop is PAUSED — never READY — so
+      // waiting on readiness events would park forever. Poll the
+      // checkpoint out, then route on whatever state it settled in.
+      while (info.state === SandboxStateProto.PAUSING) {
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: each re-inspect waits out the poll interval
+        await wait(PAUSE_SETTLE_POLL_MS);
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: the settled state decides the route
+        info = await this.#client.inspect({ id }, unaryOptions(this.#ctx));
+      }
       switch (info.state) {
         case SandboxStateProto.READY:
         case SandboxStateProto.RUNNING:
@@ -183,8 +200,7 @@ export class ArcBox {
           // takes as long as it takes, and the RPC returns once READY.
           await this.#client.resume({ id });
           return new Sandbox(this.#ctx, id);
-        case SandboxStateProto.STARTING:
-        case SandboxStateProto.PAUSING: {
+        case SandboxStateProto.STARTING: {
           const abort = new AbortController();
           try {
             const stream = this.#client.events(
