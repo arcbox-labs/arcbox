@@ -77,6 +77,12 @@ export class CommandResult {
     readonly stdout: string,
     /** Stderr content — warnings land here too; it is not "errors". */
     readonly stderr: string,
+    /**
+     * True when the daemon's output retention (8 MiB per channel)
+     * dropped bytes before they were collected — {@link stdout} /
+     * {@link stderr} then hold only the newest retained output.
+     */
+    readonly truncated = false,
   ) {
     if (signal !== undefined) {
       this.signal = signal;
@@ -117,6 +123,7 @@ export function commandResultFromExecution(
   execution: Execution,
   stdout: string,
   stderr: string,
+  truncated = false,
 ): CommandResult {
   if (execution.error !== "") {
     throw new SandboxDiedError(
@@ -129,13 +136,20 @@ export function commandResultFromExecution(
   const status = execution.exitStatus?.status;
   switch (status?.case) {
     case "code":
-      return new CommandResult(status.value, undefined, stdout, stderr);
+      return new CommandResult(
+        status.value,
+        undefined,
+        stdout,
+        stderr,
+        truncated,
+      );
     case "signal":
       return new CommandResult(
         128 + status.value,
         signalName(status.value),
         stdout,
         stderr,
+        truncated,
       );
     default:
       throw new ArcBoxError("execution exited without an exit status", {
@@ -152,19 +166,28 @@ type ProcessClient = Client<typeof SandboxProcessService>;
  */
 export class CommandHandle {
   readonly commandId: string;
+  readonly #ctx: ClientContext;
   readonly #client: ProcessClient;
   readonly #sandboxId: string;
 
-  constructor(client: ProcessClient, sandboxId: string, commandId: string) {
+  constructor(
+    ctx: ClientContext,
+    client: ProcessClient,
+    sandboxId: string,
+    commandId: string,
+  ) {
+    this.#ctx = ctx;
     this.#client = client;
     this.#sandboxId = sandboxId;
     this.commandId = commandId;
   }
 
   /**
-   * Stream the command's output from the beginning. Buffered output
-   * replays first, then live output follows; the stream ends when the
-   * process exits (deterministic termination — never silence).
+   * Stream the command's output from the beginning — or from the
+   * earliest byte the daemon still retains (8 MiB per channel); replayed
+   * buffered output comes first, then live output follows; the stream
+   * ends when the process exits (deterministic termination — never
+   * silence).
    */
   get output(): AsyncIterable<CommandOutput> {
     return this.#streamOutput();
@@ -245,11 +268,14 @@ export class CommandHandle {
   /** Deliver a signal to the whole process group (default SIGTERM). */
   async kill(signal: SignalName = "SIGTERM"): Promise<void> {
     try {
-      await this.#client.signalExecution({
-        sandboxId: this.#sandboxId,
-        executionId: this.commandId,
-        signal: SIGNAL_VALUES[signal],
-      });
+      await this.#client.signalExecution(
+        {
+          sandboxId: this.#sandboxId,
+          executionId: this.commandId,
+          signal: SIGNAL_VALUES[signal],
+        },
+        unaryOptions(this.#ctx),
+      );
     } catch (error) {
       throw toArcBoxError(error, "commands.kill");
     }
@@ -267,17 +293,33 @@ export class CommandHandle {
   /**
    * Assemble the result of an exited execution. Output is re-read from
    * offset 0 — the daemon retains and replays it, so the result is
-   * complete even when nobody consumed the live stream.
+   * complete even when nobody consumed the live stream, UNLESS the
+   * command outgrew the daemon's per-channel retention (8 MiB): chunk
+   * offsets expose the dropped head, reported as `truncated`.
    */
   async #collectResult(execution: Execution): Promise<CommandResult> {
     const stdout: Uint8Array[] = [];
     const stderr: Uint8Array[] = [];
+    let nextStdout = 0n;
+    let nextStderr = 0n;
+    let truncated = false;
     for await (const event of this.#attach()) {
       if (event.event.case === "output") {
         const chunk = event.event.value;
-        (chunk.channel === StdioChannel.STDERR ? stderr : stdout).push(
-          chunk.data,
-        );
+        const isStderr = chunk.channel === StdioChannel.STDERR;
+        // A chunk landing past the expected offset means retention
+        // already dropped bytes we asked for.
+        if (chunk.offset > (isStderr ? nextStderr : nextStdout)) {
+          truncated = true;
+        }
+        const after = chunk.offset + BigInt(chunk.data.byteLength);
+        if (isStderr) {
+          nextStderr = after;
+          stderr.push(chunk.data);
+        } else {
+          nextStdout = after;
+          stdout.push(chunk.data);
+        }
       } else if (event.event.case === "exited") {
         break;
       }
@@ -286,6 +328,7 @@ export class CommandHandle {
       execution,
       decode(stdout),
       decode(stderr),
+      truncated,
     );
   }
 }
@@ -348,7 +391,12 @@ export class Commands {
         },
         unaryOptions(this.#ctx),
       );
-      return new CommandHandle(this.#client, this.#sandboxId, execution.id);
+      return new CommandHandle(
+        this.#ctx,
+        this.#client,
+        this.#sandboxId,
+        execution.id,
+      );
     } catch (error) {
       throw toArcBoxError(error, "commands.run");
     }
