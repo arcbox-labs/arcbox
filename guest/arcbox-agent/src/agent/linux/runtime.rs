@@ -748,6 +748,13 @@ async fn try_start_bundled_runtime() -> Result<String, String> {
     let _guard = runtime_start_lock().lock().await;
     let mut notes = Vec::new();
 
+    // Prepare /run and the other mounts needed by runtime materialization.
+    let prereq_notes = ensure_runtime_prerequisites();
+    if !prereq_notes.is_empty() {
+        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
+    }
+    notes.extend(prereq_notes);
+
     match ensure_local_runtime().await {
         Ok(note) => notes.push(note),
         Err(error) => return Err(format!("local runtime setup failed: {error}")),
@@ -756,13 +763,6 @@ async fn try_start_bundled_runtime() -> Result<String, String> {
         notes.push("docker socket already ready".to_string());
         return Ok(notes.join("; "));
     }
-
-    // Ensure kernel/filesystem prerequisites before spawning daemons.
-    let prereq_notes = ensure_runtime_prerequisites();
-    if !prereq_notes.is_empty() {
-        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
-    }
-    notes.extend(prereq_notes);
 
     let runtime_bin_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
     let missing = missing_runtime_binaries_at(&runtime_bin_dir);

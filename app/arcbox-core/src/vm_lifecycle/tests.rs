@@ -193,33 +193,39 @@ fn machine_drift_detects_each_overridable_field() {
     let current = sample_machine(want.cpus, want.memory_mb, &boot.kernel, &boot.cmdline);
 
     // Matching machine: no drift.
-    assert_eq!(machine_drift_reason(&current, &want, &boot), None);
+    assert_eq!(machine_drift_reason(&current, &want, Some(&boot)), None);
 
     // Each overridable field, changed independently, is detected.
     let mut m = current.clone();
     m.cpus = want.cpus + 1;
-    assert_eq!(machine_drift_reason(&m, &want, &boot), Some("cpus"));
+    assert_eq!(machine_drift_reason(&m, &want, Some(&boot)), Some("cpus"));
 
     let mut m = current.clone();
     m.memory_mb = want.memory_mb + 1;
-    assert_eq!(machine_drift_reason(&m, &want, &boot), Some("memory_mb"));
+    assert_eq!(
+        machine_drift_reason(&m, &want, Some(&boot)),
+        Some("memory_mb")
+    );
 
     let mut m = current.clone();
     m.kernel = Some("/other-kernel".to_string());
-    assert_eq!(machine_drift_reason(&m, &want, &boot), Some("kernel"));
+    assert_eq!(machine_drift_reason(&m, &want, Some(&boot)), Some("kernel"));
 
     // The cmdline gap that previously slipped through (e.g. arm64.nosve
     // added/removed without bumping the boot-asset version).
     let mut m = current.clone();
     m.cmdline = Some("console=hvc0 earlycon arm64.nosve".to_string());
-    assert_eq!(machine_drift_reason(&m, &want, &boot), Some("cmdline"));
+    assert_eq!(
+        machine_drift_reason(&m, &want, Some(&boot)),
+        Some("cmdline")
+    );
 
     // A machine persisted before the ext4 metadata volume (two disks) must
     // be recreated so the guest receives vdc.
     let mut m = current.clone();
     m.block_devices.pop();
     assert_eq!(
-        machine_drift_reason(&m, &want, &boot),
+        machine_drift_reason(&m, &want, Some(&boot)),
         Some("block_devices")
     );
 
@@ -231,9 +237,10 @@ fn machine_drift_detects_each_overridable_field() {
         read_only: true,
     });
     assert_eq!(
-        machine_drift_reason(&m, &want, &boot),
+        machine_drift_reason(&m, &want, Some(&boot)),
         Some("block_devices")
     );
+    assert_eq!(machine_drift_reason(&m, &want, None), Some("block_devices"));
 }
 
 #[test]

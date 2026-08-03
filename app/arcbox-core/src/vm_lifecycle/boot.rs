@@ -153,14 +153,13 @@ impl LifecycleShared {
         let desired_boot = match self.resolve_desired_boot().await {
             Ok(boot) => Some(boot),
             Err(e) => {
-                tracing::warn!(error = %e, "could not resolve desired boot params; skipping drift check");
+                tracing::warn!(error = %e, "could not resolve desired boot params; skipping boot-dependent drift fields");
                 None
             }
         };
-        let drift_reason = match (existing_machine.as_ref(), desired_boot.as_ref()) {
-            (Some(m), Some(boot)) => machine_drift_reason(m, &self.config.default_vm, boot),
-            _ => None,
-        };
+        let drift_reason = existing_machine.as_ref().and_then(|machine| {
+            machine_drift_reason(machine, &self.config.default_vm, desired_boot.as_ref())
+        });
         if let Some(field) = drift_reason {
             let m = existing_machine.as_ref().unwrap();
             tracing::warn!(

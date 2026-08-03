@@ -181,22 +181,22 @@ pub(super) struct DesiredBoot {
 pub(super) fn machine_drift_reason(
     persisted: &MachineInfo,
     want: &DefaultVmConfig,
-    boot: &DesiredBoot,
+    boot: Option<&DesiredBoot>,
 ) -> Option<&'static str> {
     if persisted.cpus != want.cpus {
         Some("cpus")
     } else if persisted.memory_mb != want.memory_mb {
         Some("memory_mb")
-    } else if persisted.kernel.as_deref() != Some(boot.kernel.as_str()) {
-        Some("kernel")
-    } else if persisted.cmdline.as_deref() != Some(boot.cmdline.as_str()) {
-        Some("cmdline")
     } else if persisted.block_devices.len() != BASE_MACHINE_DISK_COUNT {
         // A machine persisted before or after the current disk layout
         // carries a different disk count; recreating
         // rewrites the machine record — image files are untouched — so the
         // guest receives exactly the current device set.
         Some("block_devices")
+    } else if boot.is_some_and(|boot| persisted.kernel.as_deref() != Some(boot.kernel.as_str())) {
+        Some("kernel")
+    } else if boot.is_some_and(|boot| persisted.cmdline.as_deref() != Some(boot.cmdline.as_str())) {
+        Some("cmdline")
     } else {
         None
     }

@@ -69,6 +69,7 @@ struct PlannedAsset {
     source: PathBuf,
     destination: PathBuf,
     sha256: String,
+    expected_len: Option<u64>,
 }
 
 /// Copies the manifest's current-architecture assets to Btrfs and atomically
@@ -151,8 +152,12 @@ fn plan_assets(
         if !destinations.insert(relative.clone()) {
             bail!("duplicate runtime asset destination {}", relative.display());
         }
+        let source = source_root.join(&relative);
         assets.push(PlannedAsset {
-            source: source_root.join(&relative),
+            expected_len: fs::symlink_metadata(&source)
+                .ok()
+                .and_then(|metadata| metadata.file_type().is_file().then_some(metadata.len())),
+            source,
             destination: relative,
             sha256: target.sha256.to_ascii_lowercase(),
         });
@@ -289,26 +294,11 @@ fn generation_complete(
             fs::symlink_metadata(&path).is_ok_and(|metadata| {
                 metadata.file_type().is_file()
                     && metadata.permissions().mode() & 0o111 != 0
-                    && sha256_file(&path).is_ok_and(|digest| digest == asset.sha256)
+                    && asset
+                        .expected_len
+                        .is_none_or(|expected_len| metadata.len() == expected_len)
             })
         })
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file =
-        File::open(path).with_context(|| format!("open runtime asset {}", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("read runtime asset {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn publish_generation(temporary_root: &Path, generation_root: &Path) -> Result<()> {

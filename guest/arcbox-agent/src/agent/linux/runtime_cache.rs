@@ -38,7 +38,6 @@ fn ensure_local_runtime_blocking() -> Result<String> {
         return Ok(note.clone());
     }
 
-    unregister_fex()?;
     let data_note = ensure_data_mount().map_err(anyhow::Error::msg)?;
     let generation = runtime_generation().map_err(anyhow::Error::msg)?;
     let arch = manifest_arch()?;
@@ -55,6 +54,7 @@ fn ensure_local_runtime_blocking() -> Result<String> {
         generation: &generation,
         arch,
     })?;
+    unregister_fex()?;
     let fex_note = register_local_fex(Path::new(ARCBOX_RUNTIME_BIN_DIR))?;
     let action = if runtime.reused {
         "reused"
@@ -128,7 +128,7 @@ fn register_local_fex(runtime_bin_dir: &Path) -> Result<String> {
 fn unregister_fex() -> Result<()> {
     if cfg!(target_arch = "aarch64") && Path::new(FEX_BINFMT_ENTRY).exists() {
         // `F` pins the interpreter inode, so remove the legacy VirtioFS entry
-        // before materialization can fail.
+        // immediately before registering the materialized interpreter.
         std::fs::write(FEX_BINFMT_ENTRY, b"-1\n")
             .context("remove stale FEX binfmt registration")?;
     }
