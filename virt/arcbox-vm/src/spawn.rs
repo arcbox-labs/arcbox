@@ -8,6 +8,7 @@ use fc_sdk::process::{FirecrackerProcessBuilder, JailerProcessBuilder};
 use crate::config::{FirecrackerConfig, JailerConfig};
 use crate::error::{Result, VmmError};
 
+// Match fc-sdk 0.2.3 while keeping ArcBox's boot handoff bound stable across upgrades.
 const DEFAULT_SOCKET_TIMEOUT_SECS: u64 = 5;
 
 /// Configure and spawn a Firecracker process via the Jailer.
