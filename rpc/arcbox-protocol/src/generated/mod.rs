@@ -28,6 +28,7 @@ pub mod arcbox_v1;
 /// - `process.proto` - data plane: the execution (exec) family
 /// - `filesystem.proto` - data plane: file transfer and path verbs
 /// - `snapshot.proto` - checkpoint / restore
+/// - `template.proto` - the template catalog (CORE-21)
 /// - `errors.proto` - the error-code registry (`ErrorInfo` detail)
 #[path = "arcbox.sandbox.v1.rs"]
 pub mod arcbox_sandbox_v1;

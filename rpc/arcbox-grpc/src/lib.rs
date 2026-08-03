@@ -62,6 +62,7 @@ pub mod v1 {
 /// deployment can serve the control plane from a multi-tenant front door
 /// and the data plane from whatever is co-located with the sandbox:
 /// - SandboxService - control plane: lifecycle, events, published ports
+/// - TemplateService - control plane: the template catalog (CORE-21)
 /// - SandboxProcessService - data plane: executions (exec family)
 /// - SandboxFilesystemService - data plane: file transfer
 /// - SandboxSnapshotService - checkpoint and restore
@@ -76,6 +77,7 @@ pub use sandbox_v1::sandbox_filesystem_service_client::SandboxFilesystemServiceC
 pub use sandbox_v1::sandbox_process_service_client::SandboxProcessServiceClient;
 pub use sandbox_v1::sandbox_service_client::SandboxServiceClient;
 pub use sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
+pub use sandbox_v1::template_service_client::TemplateServiceClient;
 pub use v1::agent_service_client::AgentServiceClient;
 pub use v1::icon_service_client::IconServiceClient;
 pub use v1::machine_service_client::MachineServiceClient;
@@ -94,6 +96,7 @@ pub use sandbox_v1::sandbox_service_server::{SandboxService, SandboxServiceServe
 pub use sandbox_v1::sandbox_snapshot_service_server::{
     SandboxSnapshotService, SandboxSnapshotServiceServer,
 };
+pub use sandbox_v1::template_service_server::{TemplateService, TemplateServiceServer};
 pub use v1::agent_service_server::{AgentService, AgentServiceServer};
 pub use v1::icon_service_server::{IconService, IconServiceServer};
 pub use v1::machine_service_server::{MachineService, MachineServiceServer};

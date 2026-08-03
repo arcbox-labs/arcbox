@@ -230,13 +230,16 @@ message CreateSandboxRequest {
 
     reserved 16;
 
-    // Opaque reference to what boots inside the sandbox. Local mode accepts:
-    //   ""             — the built-in minimal template (busybox + init)
-    //   "docker:<ref>" — a local Docker image reference, resolved and
-    //                    converted inside the VM
-    // Cloud mode resolves names against the tenant's template registry;
-    // first-class templates are designed in CORE-21. Anything else is
-    // rejected with INVALID_ARGUMENT.
+    // Reference to what boots inside the sandbox:
+    //   ""               — the built-in minimal template (busybox + init)
+    //   "docker:<ref>"   — a local Docker image reference, resolved and
+    //                      converted inside the VM
+    //   "name[:version]" — a template from the catalog (`template.proto`,
+    //                      CORE-21); a bare name resolves to the newest
+    //                      published version. Template defaults apply
+    //                      unless overridden by the fields above.
+    // Cloud mode resolves names against the tenant's template registry.
+    // Anything else is rejected with INVALID_ARGUMENT.
     string template = 17;
 }
 
