@@ -47,6 +47,11 @@ _STREAM_HEADERS = {
 class _UseDefault:
     """Sentinel: apply the connection's ``request_timeout``."""
 
+    def __repr__(self) -> str:
+        # Stable across the async and sync trees so signatures compare
+        # equal in the parity test (and read cleanly in help()).
+        return "USE_DEFAULT"
+
 
 _USE_DEFAULT = _UseDefault()
 
