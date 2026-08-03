@@ -1,0 +1,141 @@
+name: SDK Python Release
+
+# Publishes arcbox (the Python SDK) to PyPI on its own cadence,
+# independent of the main arcbox release train — mirrors
+# release-sdk-typescript.yml. The tag is minted by release-please when
+# the sdk-python component's release PR merges (see
+# release-please-config.json).
+#
+# Publishing uses PyPI trusted publishing (OIDC): no token — the job's
+# id-token permission lets uv mint a workflow-scoped credential. Unlike
+# npm, PyPI supports PENDING trusted publishers, so the publisher is
+# registered before the first upload and CI performs the first publish —
+# no local bootstrap: see sdk/python/README.md "Releasing".
+
+on:
+  push:
+    tags:
+      - 'sdk-python-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. sdk-python-v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish arcbox to PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Required for PyPI trusted publishing: lets the job mint the OIDC
+      # token PyPI exchanges for a publish credential.
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdk/python
+
+    steps:
+      - name: Determine tag
+        id: tag
+        working-directory: .
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            sdk-python-v*) ;;
+            *)
+              echo "::error::tag '$TAG' does not match sdk-python-v*"
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#sdk-python-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG (PyPI version $VERSION)"
+
+      # Check out the tag being released, not the dispatching ref — a
+      # workflow_dispatch from master must still publish the tag's tree,
+      # or the published distribution would not match the release.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # uv pinned to the same range as pyproject.toml's uv_build
+      # requirement; uv sync provisions the interpreter pinned by
+      # sdk/python/.python-version.
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          version: '>=0.12.1,<0.13'
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
+
+      - name: Verify tag matches pyproject.toml
+        run: |
+          PKG_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$PKG_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "::error::pyproject.toml version ($PKG_VERSION) != tag version (${{ steps.tag.outputs.version }})"
+            exit 1
+          fi
+
+      # Idempotency: a re-dispatch (or a re-delivered tag event) must not
+      # fail on an already-published release — PyPI rejects re-uploading
+      # a version, so skip cleanly instead (same lesson as the npm and
+      # crates.io publish paths).
+      - name: Check PyPI for existing version
+        id: registry
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/arcbox/${{ steps.tag.outputs.version }}/json")
+          if [ "$STATUS" = "200" ]; then
+            echo "::notice::arcbox ${{ steps.tag.outputs.version }} already on PyPI; skipping publish"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.registry.outputs.published != 'true'
+        run: uv sync --locked
+
+      - name: Lint
+        if: steps.registry.outputs.published != 'true'
+        run: uv run ruff check .
+
+      - name: Format check
+        if: steps.registry.outputs.published != 'true'
+        run: uv run ruff format --check .
+
+      - name: Typecheck
+        if: steps.registry.outputs.published != 'true'
+        run: uv run pyright
+
+      - name: Sync-tree lockstep check
+        if: steps.registry.outputs.published != 'true'
+        run: uv run python scripts/gen_sync.py --check
+
+      - name: Test
+        if: steps.registry.outputs.published != 'true'
+        run: uv run pytest
+
+      - name: Build
+        if: steps.registry.outputs.published != 'true'
+        run: uv build
+
+      # uv auto-detects trusted publishing in GitHub Actions (its GitHub
+      # integration guide runs a bare `uv publish`); `always` makes the
+      # OIDC exchange mandatory so a broken exchange fails loudly instead
+      # of falling back to hunting for ambient credentials.
+      - name: Publish to PyPI
+        if: steps.registry.outputs.published != 'true'
+        run: uv publish --trusted-publishing always
