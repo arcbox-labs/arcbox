@@ -1,22 +1,31 @@
-import type { Client } from '@connectrpc/connect';
-import { createClient } from '@connectrpc/connect';
+import type { Client } from "@connectrpc/connect";
+import { createClient } from "@connectrpc/connect";
 
-import { Commands } from './commands.js';
-import type { ConnectionOptions } from './connection.js';
-import { ArcBoxError, SandboxNotFoundError, SandboxStateError, toArcBoxError } from './errors.js';
-import { Files } from './files.js';
-import type { WatchEventsResponse } from './gen/arcbox/sandbox/v1/sandbox_pb.js';
+import { Commands } from "./commands.js";
+import type { ConnectionOptions } from "./connection.js";
+import {
+  ArcBoxError,
+  SandboxNotFoundError,
+  SandboxStateError,
+  toArcBoxError,
+} from "./errors.js";
+import { Files } from "./files.js";
+import type { WatchEventsResponse } from "./gen/arcbox/sandbox/v1/sandbox_pb.js";
 import {
   IdleAction,
   NetworkMode,
   SandboxEventKind,
   SandboxService,
   SandboxState as SandboxStateProto,
-} from './gen/arcbox/sandbox/v1/sandbox_pb.js';
-import type { ClientContext } from './transport.js';
-import { createClientContext, unaryOptions } from './transport.js';
-import type { SandboxInfo, SandboxState, SandboxSummary } from './types.js';
-import { sandboxInfoFromProto, sandboxStateToProto, sandboxSummaryFromProto } from './types.js';
+} from "./gen/arcbox/sandbox/v1/sandbox_pb.js";
+import type { ClientContext } from "./transport.js";
+import { createClientContext, unaryOptions } from "./transport.js";
+import type { SandboxInfo, SandboxState, SandboxSummary } from "./types.js";
+import {
+  sandboxInfoFromProto,
+  sandboxStateToProto,
+  sandboxSummaryFromProto,
+} from "./types.js";
 
 /** Options for {@link Sandbox.create}. */
 export interface CreateSandboxOptions {
@@ -32,7 +41,7 @@ export interface CreateSandboxOptions {
    */
   idleTimeoutMs?: number;
   /** What the daemon does when the idle timeout expires (default: kill). */
-  onIdle?: 'kill' | 'pause';
+  onIdle?: "kill" | "pause";
   /** vCPU count (default: template, else daemon default). */
   vcpus?: number;
   /** Memory in MiB (default: template, else daemon default). */
@@ -89,7 +98,10 @@ export class ArcBox {
    * transition is missed (the CORE-67 rule) — and so retries stay
    * idempotent.
    */
-  async create(template = '', opts: CreateSandboxOptions = {}): Promise<Sandbox> {
+  async create(
+    template = "",
+    opts: CreateSandboxOptions = {},
+  ): Promise<Sandbox> {
     const id = crypto.randomUUID();
     const abort = new AbortController();
     try {
@@ -113,19 +125,24 @@ export class ArcBox {
           ...(opts.vcpus === undefined && opts.memoryMib === undefined
             ? {}
             : {
-                limits: { vcpus: opts.vcpus ?? 0, memoryMib: BigInt(opts.memoryMib ?? 0) },
+                limits: {
+                  vcpus: opts.vcpus ?? 0,
+                  memoryMib: BigInt(opts.memoryMib ?? 0),
+                },
               }),
           ...(opts.network === undefined
             ? {}
             : {
-                network: { mode: opts.network ? NetworkMode.ENABLED : NetworkMode.NONE },
+                network: {
+                  mode: opts.network ? NetworkMode.ENABLED : NetworkMode.NONE,
+                },
               }),
           ttlSeconds: secondsFromMs(opts.ttlMs),
           idleTimeoutSeconds: secondsFromMs(opts.idleTimeoutMs),
           onIdle:
             opts.onIdle === undefined
               ? IdleAction.UNSPECIFIED
-              : opts.onIdle === 'kill'
+              : opts.onIdle === "kill"
                 ? IdleAction.KILL
                 : IdleAction.PAUSE,
         },
@@ -136,7 +153,7 @@ export class ArcBox {
       }
       return new Sandbox(this.#ctx, id);
     } catch (reason) {
-      throw toArcBoxError(reason, 'sandbox.create');
+      throw toArcBoxError(reason, "sandbox.create");
     } finally {
       abort.abort();
     }
@@ -179,23 +196,28 @@ export class ArcBox {
           throw new SandboxStateError(
             `sandbox ${id} is ${sandboxInfoFromProto(info).state} and cannot be connected to`,
             {
-              context: { id, state: sandboxInfoFromProto(info).state, error: info.error },
+              context: {
+                id,
+                state: sandboxInfoFromProto(info).state,
+                error: info.error,
+              },
             },
           );
       }
     } catch (reason) {
-      throw toArcBoxError(reason, 'sandbox.connect');
+      throw toArcBoxError(reason, "sandbox.connect");
     }
   }
 
   /** List sandboxes, auto-paginating server-side pages. */
   async *list(opts: ListSandboxesOptions = {}): AsyncIterable<SandboxSummary> {
     try {
-      let pageToken = '';
+      let pageToken = "";
       do {
         const page = await this.#client.list(
           {
-            state: opts.state === undefined ? 0 : sandboxStateToProto(opts.state),
+            state:
+              opts.state === undefined ? 0 : sandboxStateToProto(opts.state),
             labels: opts.labels ?? {},
             pageToken,
           },
@@ -205,9 +227,9 @@ export class ArcBox {
           yield sandboxSummaryFromProto(summary);
         }
         pageToken = page.nextPageToken;
-      } while (pageToken !== '');
+      } while (pageToken !== "");
     } catch (reason) {
-      throw toArcBoxError(reason, 'sandbox.list');
+      throw toArcBoxError(reason, "sandbox.list");
     }
   }
 
@@ -229,19 +251,28 @@ export class ArcBox {
         case SandboxStateProto.RUNNING:
           return true;
         case SandboxStateProto.FAILED:
-          throw new SandboxStateError(`sandbox ${id} failed to start: ${error}`, {
-            context: { id, state: 'failed', error },
-          });
+          throw new SandboxStateError(
+            `sandbox ${id} failed to start: ${error}`,
+            {
+              context: { id, state: "failed", error },
+            },
+          );
         case SandboxStateProto.STOPPING:
         case SandboxStateProto.STOPPED:
-          throw new SandboxStateError(`sandbox ${id} stopped before becoming ready`, {
-            context: { id, state: 'stopped' },
-          });
+          throw new SandboxStateError(
+            `sandbox ${id} stopped before becoming ready`,
+            {
+              context: { id, state: "stopped" },
+            },
+          );
         default:
           return false;
       }
     };
-    const inspected = await this.#client.inspect({ id }, unaryOptions(this.#ctx));
+    const inspected = await this.#client.inspect(
+      { id },
+      unaryOptions(this.#ctx),
+    );
     if (check(inspected.state, inspected.error)) {
       return;
     }
@@ -249,12 +280,15 @@ export class ArcBox {
     for (;;) {
       const frame = await next;
       if (frame.done === true) {
-        throw new ArcBoxError(`the event stream ended before sandbox ${id} became ready`, {
-          context: { id },
-        });
+        throw new ArcBoxError(
+          `the event stream ended before sandbox ${id} became ready`,
+          {
+            context: { id },
+          },
+        );
       }
       const payload = frame.value.payload;
-      if (payload.case === 'event') {
+      if (payload.case === "event") {
         const event = payload.value;
         switch (event.kind) {
           case SandboxEventKind.READY:
@@ -263,20 +297,32 @@ export class ArcBox {
             return;
           case SandboxEventKind.FAILED:
             throw new SandboxStateError(
-              `sandbox ${id} failed to start: ${event.attributes.error ?? ''}`,
-              { context: { id, state: 'failed', error: event.attributes.error ?? '' } },
+              `sandbox ${id} failed to start: ${event.attributes.error ?? ""}`,
+              {
+                context: {
+                  id,
+                  state: "failed",
+                  error: event.attributes.error ?? "",
+                },
+              },
             );
           case SandboxEventKind.STOPPING:
           case SandboxEventKind.STOPPED:
           case SandboxEventKind.REMOVED:
-            throw new SandboxStateError(`sandbox ${id} stopped before becoming ready`, {
-              context: { id, state: 'stopped' },
-            });
+            throw new SandboxStateError(
+              `sandbox ${id} stopped before becoming ready`,
+              {
+                context: { id, state: "stopped" },
+              },
+            );
           default:
             break;
         }
-      } else if (payload.case === 'keepAlive') {
-        const info = await this.#client.inspect({ id }, unaryOptions(this.#ctx));
+      } else if (payload.case === "keepAlive") {
+        const info = await this.#client.inspect(
+          { id },
+          unaryOptions(this.#ctx),
+        );
         if (check(info.state, info.error)) {
           return;
         }
@@ -310,12 +356,18 @@ export class Sandbox {
   }
 
   /** Create a sandbox against the default (or given) connection. */
-  static create(template = '', opts: CreateSandboxOptions = {}): Promise<Sandbox> {
+  static create(
+    template = "",
+    opts: CreateSandboxOptions = {},
+  ): Promise<Sandbox> {
     return new ArcBox(opts.connection).create(template, opts);
   }
 
   /** Attach to an existing sandbox by id. */
-  static connect(id: string, opts: ConnectSandboxOptions = {}): Promise<Sandbox> {
+  static connect(
+    id: string,
+    opts: ConnectSandboxOptions = {},
+  ): Promise<Sandbox> {
     return new ArcBox(opts.connection).connect(id);
   }
 
@@ -331,16 +383,19 @@ export class Sandbox {
         await this.#client.inspect({ id: this.id }, unaryOptions(this.#ctx)),
       );
     } catch (reason) {
-      throw toArcBoxError(reason, 'sandbox.info');
+      throw toArcBoxError(reason, "sandbox.info");
     }
   }
 
   /** Destroy the sandbox and release all its resources immediately. */
   async kill(): Promise<void> {
     try {
-      await this.#client.remove({ id: this.id, force: true }, unaryOptions(this.#ctx));
+      await this.#client.remove(
+        { id: this.id, force: true },
+        unaryOptions(this.#ctx),
+      );
     } catch (reason) {
-      throw toArcBoxError(reason, 'sandbox.kill');
+      throw toArcBoxError(reason, "sandbox.kill");
     }
   }
 
@@ -355,7 +410,7 @@ export class Sandbox {
       // No per-request deadline: checkpointing takes as long as it takes.
       await this.#client.pause({ id: this.id });
     } catch (reason) {
-      throw toArcBoxError(reason, 'sandbox.pause');
+      throw toArcBoxError(reason, "sandbox.pause");
     }
   }
 

@@ -1,11 +1,11 @@
-import type { Client } from '@connectrpc/connect';
-import { createClient } from '@connectrpc/connect';
-import type { MessageInitShape } from '@bufbuild/protobuf';
+import type { Client } from "@connectrpc/connect";
+import { createClient } from "@connectrpc/connect";
+import type { MessageInitShape } from "@bufbuild/protobuf";
 
-import { FileTooLargeError, toArcBoxError } from './errors.js';
-import type { WriteFileRequestSchema } from './gen/arcbox/sandbox/v1/filesystem_pb.js';
-import { SandboxFilesystemService } from './gen/arcbox/sandbox/v1/filesystem_pb.js';
-import type { ClientContext } from './transport.js';
+import { FileTooLargeError, toArcBoxError } from "./errors.js";
+import type { WriteFileRequestSchema } from "./gen/arcbox/sandbox/v1/filesystem_pb.js";
+import { SandboxFilesystemService } from "./gen/arcbox/sandbox/v1/filesystem_pb.js";
+import type { ClientContext } from "./transport.js";
 
 /** Per-file transfer cap enforced by the daemon (`filesystem.proto`). */
 export const MAX_FILE_BYTES = 256 * 1024 * 1024;
@@ -40,7 +40,10 @@ export class Files {
     try {
       const chunks: Uint8Array[] = [];
       let total = 0;
-      for await (const chunk of this.#client.readFile({ id: this.#sandboxId, path })) {
+      for await (const chunk of this.#client.readFile({
+        id: this.#sandboxId,
+        path,
+      })) {
         if (chunk.data.byteLength > 0) {
           chunks.push(chunk.data);
           total += chunk.data.byteLength;
@@ -57,7 +60,7 @@ export class Files {
       }
       return out;
     } catch (reason) {
-      throw toArcBoxError(reason, 'files.readBytes');
+      throw toArcBoxError(reason, "files.readBytes");
     }
   }
 
@@ -67,26 +70,43 @@ export class Files {
   }
 
   /** Write raw bytes to a file, creating or truncating it. */
-  async writeBytes(path: string, data: Uint8Array, opts: WriteOptions = {}): Promise<void> {
+  async writeBytes(
+    path: string,
+    data: Uint8Array,
+    opts: WriteOptions = {},
+  ): Promise<void> {
     if (data.byteLength > MAX_FILE_BYTES) {
       throw new FileTooLargeError(
         `file of ${String(data.byteLength)} bytes exceeds the ${String(MAX_FILE_BYTES)}-byte per-file cap`,
         {
-          operation: 'files.writeBytes',
-          context: { path, limit: String(MAX_FILE_BYTES), size: String(data.byteLength) },
+          operation: "files.writeBytes",
+          context: {
+            path,
+            limit: String(MAX_FILE_BYTES),
+            size: String(data.byteLength),
+          },
         },
       );
     }
     const id = this.#sandboxId;
     // eslint-disable-next-line @typescript-eslint/require-await -- connect-es client streaming takes an AsyncIterable
-    async function* requests(): AsyncGenerator<MessageInitShape<typeof WriteFileRequestSchema>> {
-      yield { payload: { case: 'open', value: { id, path, mode: opts.mode ?? 0 } } };
+    async function* requests(): AsyncGenerator<
+      MessageInitShape<typeof WriteFileRequestSchema>
+    > {
+      yield {
+        payload: { case: "open", value: { id, path, mode: opts.mode ?? 0 } },
+      };
       // Always send at least one chunk so `done` is observed, even for
       // an empty file.
       for (let offset = 0; ; offset += WRITE_CHUNK_BYTES) {
         const end = Math.min(offset + WRITE_CHUNK_BYTES, data.byteLength);
         const done = end === data.byteLength;
-        yield { payload: { case: 'chunk', value: { data: data.subarray(offset, end), done } } };
+        yield {
+          payload: {
+            case: "chunk",
+            value: { data: data.subarray(offset, end), done },
+          },
+        };
         if (done) {
           return;
         }
@@ -95,12 +115,16 @@ export class Files {
     try {
       await this.#client.writeFile(requests());
     } catch (reason) {
-      throw toArcBoxError(reason, 'files.writeBytes');
+      throw toArcBoxError(reason, "files.writeBytes");
     }
   }
 
   /** Write text to a file as UTF-8. */
-  async writeText(path: string, text: string, opts: WriteOptions = {}): Promise<void> {
+  async writeText(
+    path: string,
+    text: string,
+    opts: WriteOptions = {},
+  ): Promise<void> {
     await this.writeBytes(path, new TextEncoder().encode(text), opts);
   }
 }

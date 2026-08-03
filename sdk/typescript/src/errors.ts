@@ -1,6 +1,9 @@
-import { Code, ConnectError } from '@connectrpc/connect';
+import { Code, ConnectError } from "@connectrpc/connect";
 
-import { ErrorCode, ErrorInfoSchema } from './gen/arcbox/sandbox/v1/errors_pb.js';
+import {
+  ErrorCode,
+  ErrorInfoSchema,
+} from "./gen/arcbox/sandbox/v1/errors_pb.js";
 
 /**
  * Options carried by every ArcBox error.
@@ -33,7 +36,10 @@ export class ArcBoxError extends Error {
   operation?: string;
 
   constructor(message: string, options: ArcBoxErrorOptions = {}) {
-    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    super(
+      message,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
     this.name = new.target.name;
     if (options.code !== undefined) {
       this.code = options.code;
@@ -116,7 +122,8 @@ export class CommandFailedError extends ArcBoxError {
   }
 }
 
-const DAEMON_START_SUGGESTION = 'run `abctl daemon start` (or launch the ArcBox app)';
+const DAEMON_START_SUGGESTION =
+  "run `abctl daemon start` (or launch the ArcBox app)";
 
 /**
  * Map one daemon/transport failure to the typed hierarchy. The single
@@ -134,7 +141,7 @@ export function toArcBoxError(reason: unknown, operation: string): ArcBoxError {
     return reason;
   }
   if (isConnectionRefused(reason)) {
-    return new ConnectionFailedError('the ArcBox daemon is not reachable', {
+    return new ConnectionFailedError("the ArcBox daemon is not reachable", {
       suggestion: DAEMON_START_SUGGESTION,
       operation,
       cause: reason,
@@ -146,7 +153,7 @@ export function toArcBoxError(reason: unknown, operation: string): ArcBoxError {
   let ctor: new (message: string, options?: ArcBoxErrorOptions) => ArcBoxError;
   if (info !== undefined) {
     options.code = errorCodeName(info.code);
-    if (info.suggestion !== '') {
+    if (info.suggestion !== "") {
       options.suggestion = info.suggestion;
     }
     options.context = info.context;
@@ -160,13 +167,19 @@ export function toArcBoxError(reason: unknown, operation: string): ArcBoxError {
 /** `ErrorCode` numeric value → its registry name (e.g. "SANDBOX_NOT_FOUND"). */
 function errorCodeName(code: ErrorCode): string {
   const name: unknown = ErrorCode[code];
-  return typeof name === 'string' ? name : `ERROR_CODE_${String(code)}`;
+  return typeof name === "string" ? name : `ERROR_CODE_${String(code)}`;
 }
 
-type ErrorClass = new (message: string, options?: ArcBoxErrorOptions) => ArcBoxError;
+type ErrorClass = new (
+  message: string,
+  options?: ArcBoxErrorOptions,
+) => ArcBoxError;
 
 /** The registry-driven mapping (`errors.proto` → class), applied when the daemon attached `ErrorInfo`. */
-const REGISTRY_CLASSES: ReadonlyMap<ErrorCode, ErrorClass> = new Map<ErrorCode, ErrorClass>([
+const REGISTRY_CLASSES: ReadonlyMap<ErrorCode, ErrorClass> = new Map<
+  ErrorCode,
+  ErrorClass
+>([
   [ErrorCode.SANDBOX_NOT_FOUND, SandboxNotFoundError],
   [ErrorCode.TEMPLATE_NOT_FOUND, TemplateNotFoundError],
   [ErrorCode.EXECUTION_NOT_FOUND, CommandNotFoundError],
@@ -188,7 +201,10 @@ const REGISTRY_CLASSES: ReadonlyMap<ErrorCode, ErrorClass> = new Map<ErrorCode, 
 ]);
 
 /** Fallback routing on the coarse Connect code when no `ErrorInfo` detail rode along. */
-function classForConnectCode(code: Code, options: ArcBoxErrorOptions): ErrorClass {
+function classForConnectCode(
+  code: Code,
+  options: ArcBoxErrorOptions,
+): ErrorClass {
   options.code ??= Code[code];
   switch (code) {
     case Code.NotFound:
@@ -198,7 +214,7 @@ function classForConnectCode(code: Code, options: ArcBoxErrorOptions): ErrorClas
     case Code.FailedPrecondition:
       return SandboxStateError;
     case Code.DeadlineExceeded:
-      options.suggestion ??= 'increase connection.requestTimeoutMs';
+      options.suggestion ??= "increase connection.requestTimeoutMs";
       return RequestTimeoutError;
     case Code.Unavailable:
       options.suggestion ??= DAEMON_START_SUGGESTION;
@@ -217,9 +233,9 @@ function classForConnectCode(code: Code, options: ArcBoxErrorOptions): ErrorClas
  * so both are detected here directly.
  */
 function isConnectionRefused(reason: unknown): boolean {
-  for (let cursor = reason; typeof cursor === 'object' && cursor !== null;) {
+  for (let cursor = reason; typeof cursor === "object" && cursor !== null; ) {
     const code = (cursor as { code?: unknown }).code;
-    if (code === 'ENOENT' || code === 'ECONNREFUSED' || code === 'ENOTSOCK') {
+    if (code === "ENOENT" || code === "ECONNREFUSED" || code === "ENOTSOCK") {
       return true;
     }
     cursor = (cursor as { cause?: unknown }).cause;

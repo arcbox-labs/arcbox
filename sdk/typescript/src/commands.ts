@@ -1,5 +1,5 @@
-import type { Client } from '@connectrpc/connect';
-import { createClient } from '@connectrpc/connect';
+import type { Client } from "@connectrpc/connect";
+import { createClient } from "@connectrpc/connect";
 
 import {
   ArcBoxError,
@@ -7,19 +7,24 @@ import {
   SandboxDiedError,
   TimeoutError,
   toArcBoxError,
-} from './errors.js';
-import type { Execution } from './gen/arcbox/sandbox/v1/process_pb.js';
+} from "./errors.js";
+import type { Execution } from "./gen/arcbox/sandbox/v1/process_pb.js";
 import {
   ExecutionState,
   SandboxProcessService,
   Signal,
   StdioChannel,
-} from './gen/arcbox/sandbox/v1/process_pb.js';
-import type { ClientContext } from './transport.js';
-import { unaryOptions } from './transport.js';
+} from "./gen/arcbox/sandbox/v1/process_pb.js";
+import type { ClientContext } from "./transport.js";
+import { unaryOptions } from "./transport.js";
 
 /** Signals deliverable to a command's process group. */
-export type SignalName = 'SIGTERM' | 'SIGKILL' | 'SIGINT' | 'SIGHUP' | 'SIGQUIT';
+export type SignalName =
+  | "SIGTERM"
+  | "SIGKILL"
+  | "SIGINT"
+  | "SIGHUP"
+  | "SIGQUIT";
 
 const SIGNAL_VALUES: Record<SignalName, Signal> = {
   SIGHUP: Signal.SIGHUP,
@@ -48,7 +53,7 @@ export interface RunOptions {
 
 /** One chunk of command output. */
 export interface CommandOutput {
-  channel: 'stdout' | 'stderr' | 'pty';
+  channel: "stdout" | "stderr" | "pty";
   data: Uint8Array;
 }
 
@@ -68,7 +73,12 @@ export class CommandResult {
   /** Stderr content — warnings land here too; it is not "errors". */
   readonly stderr: string;
 
-  constructor(exitCode: number, signal: string | undefined, stdout: string, stderr: string) {
+  constructor(
+    exitCode: number,
+    signal: string | undefined,
+    stdout: string,
+    stderr: string,
+  ) {
     this.exitCode = exitCode;
     if (signal !== undefined) {
       this.signal = signal;
@@ -91,13 +101,15 @@ export class CommandResult {
  * directly with no shell involved.
  */
 export function normalizeCmd(cmd: string | string[]): string[] {
-  return typeof cmd === 'string' ? ['/bin/sh', '-lc', cmd] : cmd;
+  return typeof cmd === "string" ? ["/bin/sh", "-lc", cmd] : cmd;
 }
 
 /** Map a POSIX signal number to its conventional name. */
 function signalName(value: number): string {
   const name: unknown = Signal[value];
-  return typeof name === 'string' && name !== 'UNSPECIFIED' ? name : `SIG${String(value)}`;
+  return typeof name === "string" && name !== "UNSPECIFIED"
+    ? name
+    : `SIG${String(value)}`;
 }
 
 /**
@@ -110,19 +122,27 @@ export function commandResultFromExecution(
   stdout: string,
   stderr: string,
 ): CommandResult {
-  if (execution.error !== '') {
-    throw new SandboxDiedError(`command ended without an exit: ${execution.error}`, {
-      context: { executionId: execution.id, error: execution.error },
-    });
+  if (execution.error !== "") {
+    throw new SandboxDiedError(
+      `command ended without an exit: ${execution.error}`,
+      {
+        context: { executionId: execution.id, error: execution.error },
+      },
+    );
   }
   const status = execution.exitStatus?.status;
   switch (status?.case) {
-    case 'code':
+    case "code":
       return new CommandResult(status.value, undefined, stdout, stderr);
-    case 'signal':
-      return new CommandResult(128 + status.value, signalName(status.value), stdout, stderr);
+    case "signal":
+      return new CommandResult(
+        128 + status.value,
+        signalName(status.value),
+        stdout,
+        stderr,
+      );
     default:
-      throw new ArcBoxError('execution exited without an exit status', {
+      throw new ArcBoxError("execution exited without an exit status", {
         context: { executionId: execution.id },
       });
   }
@@ -150,14 +170,26 @@ export class Commands {
    * (`background: true`): resolves as soon as the process is started,
    * with a {@link CommandHandle} for streaming and waiting.
    */
-  run(cmd: string | string[], opts?: RunOptions & { background?: false }): Promise<CommandResult>;
-  run(cmd: string | string[], opts: RunOptions & { background: true }): Promise<CommandHandle>;
-  async run(cmd: string | string[], opts: RunOptions = {}): Promise<CommandResult | CommandHandle> {
+  run(
+    cmd: string | string[],
+    opts?: RunOptions & { background?: false },
+  ): Promise<CommandResult>;
+  run(
+    cmd: string | string[],
+    opts: RunOptions & { background: true },
+  ): Promise<CommandHandle>;
+  async run(
+    cmd: string | string[],
+    opts: RunOptions = {},
+  ): Promise<CommandResult | CommandHandle> {
     const handle = await this.#start(cmd, opts);
     return opts.background === true ? handle : handle.waitForExit();
   }
 
-  async #start(cmd: string | string[], opts: RunOptions): Promise<CommandHandle> {
+  async #start(
+    cmd: string | string[],
+    opts: RunOptions,
+  ): Promise<CommandHandle> {
     try {
       // The execution id is minted client-side: a lost response leaves an
       // addressable execution, and retries are idempotent by contract.
@@ -168,16 +200,17 @@ export class Commands {
           executionId,
           cmd: normalizeCmd(cmd),
           env: opts.env ?? {},
-          workingDir: opts.cwd ?? '',
-          user: opts.user ?? '',
-          timeoutSeconds: opts.timeoutMs === undefined ? 0 : Math.ceil(opts.timeoutMs / 1000),
+          workingDir: opts.cwd ?? "",
+          user: opts.user ?? "",
+          timeoutSeconds:
+            opts.timeoutMs === undefined ? 0 : Math.ceil(opts.timeoutMs / 1000),
           stdin: false,
         },
         unaryOptions(this.#ctx),
       );
       return new CommandHandle(this.#client, this.#sandboxId, execution.id);
     } catch (reason) {
-      throw toArcBoxError(reason, 'commands.run');
+      throw toArcBoxError(reason, "commands.run");
     }
   }
 }
@@ -209,18 +242,21 @@ export class CommandHandle {
   async *#streamOutput(): AsyncGenerator<CommandOutput> {
     try {
       for await (const event of this.#attach()) {
-        if (event.event.case === 'output') {
+        if (event.event.case === "output") {
           const chunk = event.event.value;
           yield {
-            channel: chunk.channel === StdioChannel.STDERR ? 'stderr' : channelName(chunk.channel),
+            channel:
+              chunk.channel === StdioChannel.STDERR
+                ? "stderr"
+                : channelName(chunk.channel),
             data: chunk.data,
           };
-        } else if (event.event.case === 'exited') {
+        } else if (event.event.case === "exited") {
           return;
         }
       }
     } catch (reason) {
-      throw toArcBoxError(reason, 'commands.output');
+      throw toArcBoxError(reason, "commands.output");
     }
   }
 
@@ -231,22 +267,34 @@ export class CommandHandle {
    * running.
    */
   async waitForExit(timeoutMs?: number): Promise<CommandResult> {
-    const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    const deadline =
+      timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
     try {
       for (;;) {
-        const remaining = deadline === undefined ? undefined : deadline - Date.now();
+        const remaining =
+          deadline === undefined ? undefined : deadline - Date.now();
         if (remaining !== undefined && remaining <= 0) {
-          throw new TimeoutError('waitForExit(timeoutMs) elapsed before the command exited', {
-            suggestion: 'increase the waitForExit timeoutMs argument, or kill() the command',
-            context: { commandId: this.commandId },
-          });
+          throw new TimeoutError(
+            "waitForExit(timeoutMs) elapsed before the command exited",
+            {
+              suggestion:
+                "increase the waitForExit timeoutMs argument, or kill() the command",
+              context: { commandId: this.commandId },
+            },
+          );
         }
         // Long-poll in bounded slices so a dropped daemon surfaces as an
         // error instead of an infinite silent wait.
         const sliceSeconds =
-          remaining === undefined ? 30 : Math.min(30, Math.max(1, Math.ceil(remaining / 1000)));
+          remaining === undefined
+            ? 30
+            : Math.min(30, Math.max(1, Math.ceil(remaining / 1000)));
         const execution = await this.#client.waitExecution(
-          { sandboxId: this.#sandboxId, executionId: this.commandId, timeoutSeconds: sliceSeconds },
+          {
+            sandboxId: this.#sandboxId,
+            executionId: this.commandId,
+            timeoutSeconds: sliceSeconds,
+          },
           // Exempt from requestTimeoutMs: this unary deliberately parks
           // server-side for sliceSeconds; grant it that long plus grace.
           { timeoutMs: (sliceSeconds + 5) * 1000 },
@@ -256,12 +304,12 @@ export class CommandHandle {
         }
       }
     } catch (reason) {
-      throw toArcBoxError(reason, 'commands.waitForExit');
+      throw toArcBoxError(reason, "commands.waitForExit");
     }
   }
 
   /** Deliver a signal to the whole process group (default SIGTERM). */
-  async kill(signal: SignalName = 'SIGTERM'): Promise<void> {
+  async kill(signal: SignalName = "SIGTERM"): Promise<void> {
     try {
       await this.#client.signalExecution({
         sandboxId: this.#sandboxId,
@@ -269,7 +317,7 @@ export class CommandHandle {
         signal: SIGNAL_VALUES[signal],
       });
     } catch (reason) {
-      throw toArcBoxError(reason, 'commands.kill');
+      throw toArcBoxError(reason, "commands.kill");
     }
   }
 
@@ -291,24 +339,30 @@ export class CommandHandle {
     const stdout: Uint8Array[] = [];
     const stderr: Uint8Array[] = [];
     for await (const event of this.#attach()) {
-      if (event.event.case === 'output') {
+      if (event.event.case === "output") {
         const chunk = event.event.value;
-        (chunk.channel === StdioChannel.STDERR ? stderr : stdout).push(chunk.data);
-      } else if (event.event.case === 'exited') {
+        (chunk.channel === StdioChannel.STDERR ? stderr : stdout).push(
+          chunk.data,
+        );
+      } else if (event.event.case === "exited") {
         break;
       }
     }
-    return commandResultFromExecution(execution, decode(stdout), decode(stderr));
+    return commandResultFromExecution(
+      execution,
+      decode(stdout),
+      decode(stderr),
+    );
   }
 }
 
-function channelName(channel: StdioChannel): 'stdout' | 'pty' {
-  return channel === StdioChannel.PTY ? 'pty' : 'stdout';
+function channelName(channel: StdioChannel): "stdout" | "pty" {
+  return channel === StdioChannel.PTY ? "pty" : "stdout";
 }
 
 function decode(chunks: Uint8Array[]): string {
   const decoder = new TextDecoder();
-  let out = '';
+  let out = "";
   for (const chunk of chunks) {
     out += decoder.decode(chunk, { stream: true });
   }

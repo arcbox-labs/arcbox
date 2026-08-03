@@ -1,8 +1,8 @@
-import type { Interceptor, Transport } from '@connectrpc/connect';
-import { createConnectTransport } from '@connectrpc/connect-node';
+import type { Interceptor, Transport } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
 
-import type { ConnectionOptions, ResolvedConnection } from './connection.js';
-import { resolveConnection } from './connection.js';
+import type { ConnectionOptions, ResolvedConnection } from "./connection.js";
+import { resolveConnection } from "./connection.js";
 
 /**
  * A resolved transport plus the per-unary deadline call sites apply.
@@ -38,24 +38,34 @@ export interface ClientContext {
  * request bodies, unlike fetch over h1). Only bidi streaming would
  * require HTTP/2, and the surface has none.
  */
-export function createClientContext(options: ConnectionOptions = {}): ClientContext {
+export function createClientContext(
+  options: ConnectionOptions = {},
+): ClientContext {
   if (options.transport !== undefined) {
-    return { transport: options.transport, requestTimeoutMs: options.requestTimeoutMs };
+    return {
+      transport: options.transport,
+      requestTimeoutMs: options.requestTimeoutMs,
+    };
   }
   const conn = resolveConnection(options);
-  return { transport: createUdsOrTcpTransport(conn), requestTimeoutMs: conn.requestTimeoutMs };
+  return {
+    transport: createUdsOrTcpTransport(conn),
+    requestTimeoutMs: conn.requestTimeoutMs,
+  };
 }
 
 function createUdsOrTcpTransport(conn: ResolvedConnection): Transport {
   const interceptors: Interceptor[] = [];
-  if (conn.apiKey !== undefined && conn.apiKey !== '') {
+  if (conn.apiKey !== undefined && conn.apiKey !== "") {
     interceptors.push(bearerAuth(conn.apiKey));
   }
   return createConnectTransport({
-    httpVersion: '1.1',
+    httpVersion: "1.1",
     baseUrl: conn.baseUrl,
     interceptors,
-    ...(conn.socketPath === undefined ? {} : { nodeOptions: { socketPath: conn.socketPath } }),
+    ...(conn.socketPath === undefined
+      ? {}
+      : { nodeOptions: { socketPath: conn.socketPath } }),
   });
 }
 
@@ -64,13 +74,15 @@ function createUdsOrTcpTransport(conn: ResolvedConnection): Transport {
  * is configured. Streams and long-polls never receive it.
  */
 export function unaryOptions(ctx: ClientContext): { timeoutMs?: number } {
-  return ctx.requestTimeoutMs === undefined ? {} : { timeoutMs: ctx.requestTimeoutMs };
+  return ctx.requestTimeoutMs === undefined
+    ? {}
+    : { timeoutMs: ctx.requestTimeoutMs };
 }
 
 /** Attach the API key as a bearer credential (remote tier; ignored by the local daemon). */
 function bearerAuth(apiKey: string): Interceptor {
   return (next) => (req) => {
-    req.header.set('Authorization', `Bearer ${apiKey}`);
+    req.header.set("Authorization", `Bearer ${apiKey}`);
     return next(req);
   };
 }
