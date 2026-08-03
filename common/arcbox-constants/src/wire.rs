@@ -7,17 +7,22 @@
 /// don't need a bump. Unknown `MessageType`s already fail cleanly; this
 /// version catches the silent proto3 field-skew class instead.
 ///
-/// v2: the sandbox execution redesign (CORE-55/56) retired the Run/Exec
-/// streaming types and re-typed the surviving sandbox payloads (enums,
-/// timestamps, exit-status oneof).
-pub const AGENT_PROTOCOL_VERSION: u32 = 2;
+/// "Existing" means *released*: the sandbox execution redesign
+/// (CORE-55/56) re-typed payloads that no release had ever shipped, so it
+/// did not warrant a bump. 0.6.0 briefly shipped `2`/`2` for it before
+/// this was rolled back — **`2` is burned**: 0.6.0 daemons in the wild
+/// read it as "speaks the redesigned sandbox payloads", so the next real
+/// bump must go to `3`, never reuse `2` for a different meaning.
+pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 
 /// Oldest agent protocol version this host still accepts.
 ///
-/// Agents reporting less (including `0` — agents that predate the
-/// handshake field) are rejected at boot with an actionable error
-/// instead of silently misbehaving under field skew.
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 2;
+/// Agents reporting less (`0` — agents that predate the handshake field)
+/// are rejected at boot with an actionable error instead of silently
+/// misbehaving under field skew. Note the sandbox surface assumes the
+/// post-redesign payloads: a pre-0.6.0 agent boots fine but must not be
+/// driven through the sandbox API.
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 1;
 
 /// Number of bytes in the fixed RPC frame header (`length` + `type`).
 pub const FRAME_HEADER_SIZE: usize = 8;
