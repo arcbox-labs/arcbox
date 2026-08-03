@@ -136,7 +136,10 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
         .into_inner();
 
     if args.dry_run {
-        return report_dry_run(source_kind, &prepare, args.json);
+        // `--no-start` never reaches the daemon on this path, so the preview has
+        // to apply it locally or it would advertise the opposite of what the
+        // same flags would actually do.
+        return report_dry_run(source_kind, &prepare, args.json, args.no_start);
     }
 
     print_prepare_summary(source_kind, &prepare);
@@ -261,16 +264,20 @@ fn report_dry_run(
     source_kind: MigrationSourceKind,
     prepare: &PrepareMigrationResponse,
     as_json: bool,
+    skip_start: bool,
 ) -> Result<()> {
     if as_json {
         // The daemon already serialized the plan; reprinting it verbatim keeps
         // the CLI from becoming a second, drifting view of the same model.
+        // `--no-start` is deliberately not folded in here: the plan is the
+        // daemon's model, and a consumer combining the two flags reads
+        // `--no-start` from its own invocation.
         println!("{}", prepare.plan_json);
         return Ok(());
     }
 
     print_prepare_summary(source_kind, prepare);
-    print_plan_details(&prepare.plan_json)?;
+    print_plan_details(&prepare.plan_json, skip_start)?;
     print_blocking_issues(prepare);
 
     println!();
@@ -296,7 +303,10 @@ fn print_blocking_issues(prepare: &PrepareMigrationResponse) {
 }
 
 /// Prints the per-resource breakdown of the plan.
-fn print_plan_details(plan_json: &str) -> Result<()> {
+///
+/// `skip_start` mirrors `--no-start` so container rows describe the run the same
+/// flags would produce.
+fn print_plan_details(plan_json: &str, skip_start: bool) -> Result<()> {
     if plan_json.is_empty() {
         return Ok(());
     }
@@ -321,16 +331,24 @@ fn print_plan_details(plan_json: &str) -> Result<()> {
         format!(
             "{} [{}] image={} network={}",
             container.name,
-            if container.was_running {
-                "will start"
-            } else {
-                "stopped"
-            },
+            describe_start_state(container.was_running, skip_start),
             container.image_reference,
             describe_network_mode(&container.spec.network_mode),
         )
     });
     Ok(())
+}
+
+/// Describes what will happen to a container after it is created.
+///
+/// A source-running container is started unless `--no-start` was passed, in
+/// which case every container arrives stopped.
+fn describe_start_state(was_running: bool, skip_start: bool) -> &'static str {
+    match (was_running, skip_start) {
+        (true, false) => "will start",
+        (true, true) => "stopped (--no-start)",
+        (false, _) => "stopped",
+    }
 }
 
 /// Renders a network mode as a short label.
