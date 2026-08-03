@@ -2,31 +2,31 @@ import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
 import { noop } from "foxts/noop";
 
-import { Commands } from "./commands.js";
-import type { ConnectionOptions } from "./connection.js";
+import { Commands } from "./commands";
+import type { ConnectionOptions } from "./connection";
 import {
   ArcBoxError,
   NotFoundError,
   SandboxStateError,
   toArcBoxError,
-} from "./errors.js";
-import { Files } from "./files.js";
-import type { WatchEventsResponse } from "./gen/arcbox/sandbox/v1/sandbox_pb.js";
+} from "./errors";
+import { Files } from "./files";
+import type { WatchEventsResponse } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import {
   IdleAction,
   NetworkMode,
   SandboxEventKind,
   SandboxService,
   SandboxState as SandboxStateProto,
-} from "./gen/arcbox/sandbox/v1/sandbox_pb.js";
-import type { ClientContext } from "./transport.js";
-import { createClientContext, unaryOptions } from "./transport.js";
-import type { SandboxInfo, SandboxState, SandboxSummary } from "./types.js";
+} from "./gen/arcbox/sandbox/v1/sandbox_pb";
+import type { ClientContext } from "./transport";
+import { createClientContext, unaryOptions } from "./transport";
+import type { SandboxInfo, SandboxState, SandboxSummary } from "./types";
 import {
   sandboxInfoFromProto,
   sandboxStateToProto,
   sandboxSummaryFromProto,
-} from "./types.js";
+} from "./types";
 
 /** Options for {@link Sandbox.create}. */
 export interface CreateSandboxOptions {

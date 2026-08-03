@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import type { Transport } from "@connectrpc/connect";
 
-import { InvalidArgumentError } from "./errors.js";
+import { InvalidArgumentError } from "./errors";
 
 /**
  * Connection configuration for reaching an ArcBox daemon.

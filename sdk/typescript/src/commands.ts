@@ -9,16 +9,16 @@ import {
   SandboxDiedError,
   TimeoutError,
   toArcBoxError,
-} from "./errors.js";
-import type { Execution } from "./gen/arcbox/sandbox/v1/process_pb.js";
+} from "./errors";
+import type { Execution } from "./gen/arcbox/sandbox/v1/process_pb";
 import {
   ExecutionState,
   SandboxProcessService,
   Signal,
   StdioChannel,
-} from "./gen/arcbox/sandbox/v1/process_pb.js";
-import type { ClientContext } from "./transport.js";
-import { unaryOptions } from "./transport.js";
+} from "./gen/arcbox/sandbox/v1/process_pb";
+import type { ClientContext } from "./transport";
+import { unaryOptions } from "./transport";
 
 /** Signals deliverable to a command's process group. */
 export type SignalName =

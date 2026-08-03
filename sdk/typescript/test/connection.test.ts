@@ -3,8 +3,8 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { resolveConnection, UDS_BASE_URL } from "../src/connection.js";
-import { InvalidArgumentError } from "../src/errors.js";
+import { resolveConnection, UDS_BASE_URL } from "../src/connection";
+import { InvalidArgumentError } from "../src/errors";
 
 describe("resolveConnection", () => {
   it("defaults to <home>/.arcbox/run/arcbox.sock", () => {

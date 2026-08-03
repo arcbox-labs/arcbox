@@ -1,8 +1,8 @@
 import type { Interceptor, Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 
-import type { ConnectionOptions, ResolvedConnection } from "./connection.js";
-import { resolveConnection } from "./connection.js";
+import type { ConnectionOptions, ResolvedConnection } from "./connection";
+import { resolveConnection } from "./connection";
 
 /**
  * A resolved transport plus the per-unary deadline call sites apply.

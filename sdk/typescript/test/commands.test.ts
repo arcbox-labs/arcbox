@@ -6,19 +6,19 @@ import {
   CommandHandle,
   commandResultFromExecution,
   normalizeCmd,
-} from "../src/commands.js";
+} from "../src/commands";
 import {
   ArcBoxError,
   CommandFailedError,
   SandboxDiedError,
-} from "../src/errors.js";
-import type { ExecutionEvent } from "../src/gen/arcbox/sandbox/v1/process_pb.js";
+} from "../src/errors";
+import type { ExecutionEvent } from "../src/gen/arcbox/sandbox/v1/process_pb";
 import {
   ExecutionEventSchema,
   ExecutionSchema,
   ExecutionState,
   StdioChannel,
-} from "../src/gen/arcbox/sandbox/v1/process_pb.js";
+} from "../src/gen/arcbox/sandbox/v1/process_pb";
 
 describe("normalizeCmd", () => {
   it("passes argv through untouched", () => {

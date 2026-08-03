@@ -7,27 +7,27 @@
  * and mapped at the transport boundary.
  */
 
-export { ArcBox, Sandbox } from "./sandbox.js";
+export { ArcBox, Sandbox } from "./sandbox";
 export type {
   ConnectSandboxOptions,
   CreateSandboxOptions,
   ListSandboxesOptions,
-} from "./sandbox.js";
+} from "./sandbox";
 
-export { CommandHandle, CommandResult, Commands } from "./commands.js";
-export type { CommandOutput, RunOptions, SignalName } from "./commands.js";
+export { CommandHandle, CommandResult, Commands } from "./commands";
+export type { CommandOutput, RunOptions, SignalName } from "./commands";
 
-export { Files, MAX_FILE_BYTES } from "./files.js";
-export type { WriteOptions } from "./files.js";
+export { Files, MAX_FILE_BYTES } from "./files";
+export type { WriteOptions } from "./files";
 
-export type { ConnectionOptions } from "./connection.js";
+export type { ConnectionOptions } from "./connection";
 
 export type {
   IdlePolicy,
   SandboxInfo,
   SandboxState,
   SandboxSummary,
-} from "./types.js";
+} from "./types";
 
 export {
   ArcBoxError,
@@ -49,5 +49,5 @@ export {
   SandboxTtlError,
   TemplateNotFoundError,
   TimeoutError,
-} from "./errors.js";
-export type { ArcBoxErrorOptions, CommandFailure } from "./errors.js";
+} from "./errors";
+export type { ArcBoxErrorOptions, CommandFailure } from "./errors";

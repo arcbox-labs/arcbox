@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   ErrorCode,
   ErrorInfoSchema,
-} from "../src/gen/arcbox/sandbox/v1/errors_pb.js";
+} from "../src/gen/arcbox/sandbox/v1/errors_pb";
 import {
   ArcBoxError,
   CapabilityError,
@@ -18,7 +18,7 @@ import {
   SandboxNotFoundError,
   SandboxStateError,
   toArcBoxError,
-} from "../src/errors.js";
+} from "../src/errors";
 
 function daemonError(
   code: ErrorCode,
