@@ -3,7 +3,6 @@
 //! Constructs `sockaddr_in` (IPv4 destination/netmask) and `sockaddr_dl`
 //! (link-layer interface gateway) for use in PF_ROUTE messages.
 
-use std::io;
 use std::net::Ipv4Addr;
 
 use crate::Ipv4Net;
@@ -27,38 +26,12 @@ fn make_sin(addr: Ipv4Addr) -> libc::sockaddr_in {
     sin
 }
 
-/// Constructs a `sockaddr_dl` for an interface-based route.
-///
-/// Resolves the interface name (e.g. `"bridge100"`) to its kernel index
-/// via `if_nametoindex`. The interface name is also stored in `sdl_data`
-/// for kernel diagnostics.
-pub fn make_gateway_dl(iface: &str) -> io::Result<libc::sockaddr_dl> {
-    let c_name = std::ffi::CString::new(iface)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-    // Safety: if_nametoindex is safe with a valid C string.
-    let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if idx == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(build_sdl(iface, idx))
-}
-
 /// Constructs a `sockaddr_dl` with an explicit interface index.
-///
-/// Used in tests where the interface may not exist on the host.
-#[cfg(test)]
-pub fn make_gateway_dl_with_index(iface: &str, index: u32) -> libc::sockaddr_dl {
-    build_sdl(iface, index)
-}
-
-/// Shared `sockaddr_dl` builder — single source of truth.
-fn build_sdl(iface: &str, index: u32) -> libc::sockaddr_dl {
+pub fn make_gateway_dl(iface: &str, index: u16) -> libc::sockaddr_dl {
     let mut sdl: libc::sockaddr_dl = unsafe { std::mem::zeroed() };
     sdl.sdl_len = std::mem::size_of::<libc::sockaddr_dl>() as u8;
     sdl.sdl_family = libc::AF_LINK as u8;
-    sdl.sdl_index = index as u16;
+    sdl.sdl_index = index;
 
     let name_bytes = iface.as_bytes();
     let copy_len = name_bytes.len().min(sdl.sdl_data.len());
@@ -147,7 +120,7 @@ mod tests {
 
     #[test]
     fn gateway_dl_with_index_sets_fields() {
-        let sdl = make_gateway_dl_with_index("bridge100", 42);
+        let sdl = make_gateway_dl("bridge100", 42);
         assert_eq!(sdl.sdl_family, libc::AF_LINK as u8);
         assert_eq!(sdl.sdl_index, 42);
         assert_eq!(sdl.sdl_nlen, 9); // "bridge100".len()

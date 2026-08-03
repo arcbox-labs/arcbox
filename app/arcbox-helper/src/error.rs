@@ -69,6 +69,16 @@ pub enum HelperError {
     /// An exact route already exists and was left untouched.
     #[error("route conflict for {subnet}")]
     RouteConflict { subnet: String },
+
+    /// The interface name no longer identifies the caller's expected index.
+    #[error(
+        "route interface {iface} changed (expected index {expected_ifindex}, actual {actual_ifindex:?})"
+    )]
+    RouteInterfaceChanged {
+        iface: String,
+        expected_ifindex: u16,
+        actual_ifindex: Option<u16>,
+    },
 }
 
 impl HelperError {
@@ -138,6 +148,7 @@ impl HelperError {
             Self::Other(_) => "other",
             Self::DockerSocketOccupied { .. } => "docker_socket_occupied",
             Self::RouteConflict { .. } => "route_conflict",
+            Self::RouteInterfaceChanged { .. } => "route_interface_changed",
         }
     }
 }

@@ -12,6 +12,18 @@ async fn route_add_valid_input() {
 }
 
 #[tokio::test]
+async fn route_add_for_interface_rejects_zero_index() {
+    let (client, _dir) = common::setup().await;
+    let err = client
+        .route_add_for_interface("10.0.0.0/8", "bridge100", 0)
+        .await;
+    assert!(matches!(
+        err,
+        Err(ClientError::Helper(HelperError::Validation(_)))
+    ));
+}
+
+#[tokio::test]
 async fn route_add_rejects_public_subnet() {
     let (client, _dir) = common::setup().await;
     let err = client.route_add("8.8.8.0/24", "bridge100").await;

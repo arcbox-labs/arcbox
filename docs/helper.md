@@ -7,19 +7,19 @@ perform: `/usr/local/bin` CLI symlinks, `/var/run/docker.sock`, `/etc/resolver`,
 ## Independent version
 
 `arcbox-helper` owns its **own** Cargo package version
-(`app/arcbox-helper/Cargo.toml`), currently `1.0.2`. It is **not** tied to
+(`app/arcbox-helper/Cargo.toml`), currently `1.0.3`. It is **not** tied to
 `workspace.package.version`.
 
 | Pin | Location |
 |-----|----------|
-| Helper package version | `app/arcbox-helper/Cargo.toml` → `version = "1.0.2"` |
-| Workspace path-dep | root `Cargo.toml` → `arcbox-helper = { version = "1.0.2", path = ... }` (**no** `x-release-please-version`) |
+| Helper package version | `app/arcbox-helper/Cargo.toml` → `version = "1.0.3"` |
+| Workspace path-dep | root `Cargo.toml` → `arcbox-helper = { version = "1.0.3", path = ... }` (**no** `x-release-please-version`) |
 | Daemon/CLI floor | `arcbox_constants::helper::MIN_HELPER_VERSION` |
 
 `arcbox-helper --version` and the tarpc `version` RPC both print:
 
 ```text
-arcbox-helper 1.0.2
+arcbox-helper 1.0.3
 ```
 
 Desktop and daemon parse that line with
@@ -82,6 +82,7 @@ Rejected peers are dropped before any tarpc dispatch; logs include
 | `socket_link` / `socket_unlink` | Target must parse as `SocketTarget` (`~/.arcbox` / `~/.arcbox-dev`); replace only ArcBox-owned symlink | Only ArcBox-owned symlink; never real sockets |
 | `dns_install` / `dns_uninstall` | Writes marker `# managed by arcbox-helper`; refuses to overwrite foreign resolvers | Only files carrying the marker |
 | `hosts_alias_*` | Fixed `127.0.0.1 ArcBox # managed by arcbox-helper` line only | Lines carrying the marker only |
+| `route_add_for_interface` | Bridge name must still resolve to the daemon-provided kernel interface index | N/A |
 
 `is_arcbox_owned` (shared with `CliTarget`) rejects relative paths, `..`, and
 anything outside `/Applications/` or `/Users/` without a

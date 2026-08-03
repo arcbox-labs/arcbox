@@ -77,6 +77,23 @@ impl HelperService for HelperServer {
         mutations::hosts::status()
     }
 
+    async fn route_add_for_interface(
+        self,
+        _: tarpc::context::Context,
+        subnet: String,
+        iface: String,
+        expected_ifindex: u16,
+    ) -> Result<(), HelperError> {
+        let subnet: Subnet = subnet.parse().map_err(HelperError::validation)?;
+        let iface: BridgeIface = iface.parse().map_err(HelperError::validation)?;
+        if expected_ifindex == 0 {
+            return Err(HelperError::validation(
+                "expected interface index must be non-zero",
+            ));
+        }
+        mutations::route::add_for_interface(&subnet, &iface, expected_ifindex)
+    }
+
     async fn socket_link(
         self,
         _: tarpc::context::Context,

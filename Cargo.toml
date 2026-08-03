@@ -261,7 +261,7 @@ arcbox-fleet-control-proto = { version = "0.6.3", path = "fleet/arcbox-fleet-con
 arcbox-docker = { version = "0.6.3", path = "app/arcbox-docker" } # x-release-please-version
 # Pinned to app/arcbox-helper's own version (not workspace.package). Do not
 # attach x-release-please-version — helper releases are manual.
-arcbox-helper = { version = "1.0.2", path = "app/arcbox-helper" }
+arcbox-helper = { version = "1.0.3", path = "app/arcbox-helper" }
 arcbox-core = { version = "0.6.3", path = "app/arcbox-core" } # x-release-please-version
 arcbox-api = { version = "0.6.3", path = "app/arcbox-api" } # x-release-please-version
 arcbox-migration = { version = "0.6.3", path = "app/arcbox-migration" } # x-release-please-version

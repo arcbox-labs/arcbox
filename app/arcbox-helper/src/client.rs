@@ -87,6 +87,24 @@ impl Client {
             .await??)
     }
 
+    /// Adds a host route only if `iface` still has `expected_ifindex`.
+    pub async fn route_add_for_interface(
+        &self,
+        subnet: &str,
+        iface: &str,
+        expected_ifindex: u16,
+    ) -> Result<(), ClientError> {
+        Ok(self
+            .inner
+            .route_add_for_interface(
+                tarpc::context::current(),
+                subnet.into(),
+                iface.into(),
+                expected_ifindex,
+            )
+            .await??)
+    }
+
     /// Removes the host route for `subnet`.
     pub async fn route_remove(&self, subnet: &str) -> Result<(), ClientError> {
         Ok(self

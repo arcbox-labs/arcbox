@@ -79,6 +79,23 @@ impl HelperService for MockHelperServer {
         Ok(false)
     }
 
+    async fn route_add_for_interface(
+        self,
+        _: tarpc::context::Context,
+        subnet: String,
+        iface: String,
+        expected_ifindex: u16,
+    ) -> Result<(), HelperError> {
+        validate::validate_subnet(&subnet).map_err(HelperError::validation)?;
+        validate::validate_iface(&iface).map_err(HelperError::validation)?;
+        if expected_ifindex == 0 {
+            return Err(HelperError::validation(
+                "expected interface index must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+
     async fn socket_link(
         self,
         _: tarpc::context::Context,

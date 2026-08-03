@@ -379,7 +379,7 @@ mod tests {
     fn build_msg_add_with_gateway() {
         let net: Ipv4Net = "172.16.0.0/12".parse().unwrap();
         let dst = sockaddr::make_dst(net);
-        let gw = sockaddr::make_gateway_dl_with_index("bridge100", 42);
+        let gw = sockaddr::make_gateway_dl("bridge100", 42);
         let mask = sockaddr::make_netmask(net);
 
         let buf = build_msg(MsgType::Add, &dst, Some(&gw), &mask).unwrap();
@@ -419,7 +419,7 @@ mod tests {
     fn build_msg_sockaddr_order() {
         let net: Ipv4Net = "192.168.0.0/16".parse().unwrap();
         let dst = sockaddr::make_dst(net);
-        let gw = sockaddr::make_gateway_dl_with_index("bridge100", 5);
+        let gw = sockaddr::make_gateway_dl("bridge100", 5);
         let mask = sockaddr::make_netmask(net);
 
         let buf = build_msg(MsgType::Add, &dst, Some(&gw), &mask).unwrap();

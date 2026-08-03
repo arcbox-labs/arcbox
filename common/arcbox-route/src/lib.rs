@@ -254,10 +254,23 @@ impl AsRawFd for RouteWatcher {
 ///
 /// Returns an error string if the kernel rejects the route operation.
 pub fn add(net: Ipv4Net, iface: &str) -> Result<AddOutcome, String> {
+    let ifindex = interface_index(iface)
+        .map_err(|e| format!("RTM_ADD {net} via {iface}: failed to resolve interface: {e}"))?;
+    add_by_index(net, iface, ifindex)
+}
+
+/// Adds a subnet route using a caller-verified kernel interface identity.
+///
+/// `iface` is retained in the link-layer gateway for diagnostics; `ifindex`
+/// selects the interface.
+///
+/// # Errors
+///
+/// Returns an error string if the kernel rejects the route operation.
+pub fn add_by_index(net: Ipv4Net, iface: &str, ifindex: u16) -> Result<AddOutcome, String> {
     let dst = sockaddr::make_dst(net);
     let mask = sockaddr::make_netmask(net);
-    let gw = sockaddr::make_gateway_dl(iface)
-        .map_err(|e| format!("RTM_ADD {net} via {iface}: failed to resolve interface: {e}"))?;
+    let gw = sockaddr::make_gateway_dl(iface, ifindex);
 
     let add_msg = msg::build_msg(msg::MsgType::Add, &dst, Some(&gw), &mask)
         .map_err(|e| format!("RTM_ADD {net} via {iface}: failed to build message: {e}"))?;

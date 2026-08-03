@@ -102,6 +102,13 @@ pub trait HelperService {
 
     /// Checks whether the ArcBox `/etc/hosts` alias is installed.
     async fn hosts_alias_status() -> Result<bool, HelperError>;
+
+    /// Adds a host route only if `iface` still has `expected_ifindex`.
+    async fn route_add_for_interface(
+        subnet: String,
+        iface: String,
+        expected_ifindex: u16,
+    ) -> Result<(), HelperError>;
 }
 
 /// Low-level connect — use [`client::Client::connect()`] instead.
