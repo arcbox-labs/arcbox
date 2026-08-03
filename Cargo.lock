@@ -277,9 +277,9 @@ dependencies = [
 
 [[package]]
 name = "arcbox-boot"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2925f99fcc4097b1b8eeb12bd1364f858aeefd9426ee57e8c94229a3b6b002d5"
+checksum = "239431ac6f459a9fd12f63e14d4492af7997046984b492c5b30be56a025068e8"
 dependencies = [
  "camino",
  "dirs",
