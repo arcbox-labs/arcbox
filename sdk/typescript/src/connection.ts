@@ -1,9 +1,9 @@
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { homedir } from "node:os";
+import { join } from "node:path";
 
-import type { Transport } from '@connectrpc/connect';
+import type { Transport } from "@connectrpc/connect";
 
-import { InvalidArgumentError } from './errors.js';
+import { InvalidArgumentError } from "./errors.js";
 
 /**
  * Connection configuration for reaching an ArcBox daemon.
@@ -54,14 +54,14 @@ export interface ResolvedConnection {
  * takes the connection target from `socketPath` and uses the URL only for
  * the Host header and path, so any stable name works here.
  */
-export const UDS_BASE_URL = 'http://arcbox';
+export const UDS_BASE_URL = "http://arcbox";
 
 /** Default socket location relative to the daemon data dir: `run/arcbox.sock`. */
 function defaultSocketPath(env: NodeJS.ProcessEnv): string {
   // Mirrors arcbox-constants paths.rs: `<data_dir>/run/arcbox.sock`, data
   // dir from ARCBOX_DATA_DIR, default `~/.arcbox`.
-  const dataDir = env.ARCBOX_DATA_DIR ?? join(homedir(), '.arcbox');
-  return join(dataDir, 'run', 'arcbox.sock');
+  const dataDir = env.ARCBOX_DATA_DIR ?? join(homedir(), ".arcbox");
+  return join(dataDir, "run", "arcbox.sock");
 }
 
 /**
@@ -77,8 +77,8 @@ export function resolveConnection(
 ): ResolvedConnection {
   if (options.socketPath !== undefined && options.apiUrl !== undefined) {
     throw new InvalidArgumentError(
-      'connection.socketPath and connection.apiUrl are mutually exclusive: ' +
-        'a connection dials either the local Unix socket or a remote URL',
+      "connection.socketPath and connection.apiUrl are mutually exclusive: " +
+        "a connection dials either the local Unix socket or a remote URL",
     );
   }
 
@@ -92,11 +92,11 @@ export function resolveConnection(
   if (options.apiUrl !== undefined) {
     return { baseUrl: options.apiUrl, ...common };
   }
-  if (env.ARCBOX_API_URL !== undefined && env.ARCBOX_API_URL !== '') {
+  if (env.ARCBOX_API_URL !== undefined && env.ARCBOX_API_URL !== "") {
     return { baseUrl: env.ARCBOX_API_URL, ...common };
   }
   const socketPath =
-    env.ARCBOX_SOCKET !== undefined && env.ARCBOX_SOCKET !== ''
+    env.ARCBOX_SOCKET !== undefined && env.ARCBOX_SOCKET !== ""
       ? env.ARCBOX_SOCKET
       : defaultSocketPath(env);
   return { baseUrl: UDS_BASE_URL, socketPath, ...common };
