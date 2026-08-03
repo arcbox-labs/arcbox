@@ -186,8 +186,18 @@ impl pb::SandboxService for SandboxServiceImpl {
             .map_err(ApiError::from)?;
         let guest_port = u16::try_from(forwarded.guest_port)
             .map_err(|_| ConnectError::internal("agent returned an invalid guest port"))?;
+        let rollback_request = || SandboxPortForwardRemoveRequest {
+            id: req.id.clone(),
+            sandbox_port: u32::from(sandbox_port),
+            protocol: wire.into(),
+            ..Default::default()
+        };
         let host_state = runtime.lock_sandbox_host_state().await;
         if *host_state != host_generation {
+            agent
+                .sandbox_port_forward_remove(rollback_request())
+                .await
+                .map_err(ApiError::from)?;
             return Err(ConnectError::unavailable(
                 "sandbox host cleanup raced port exposure; retry to confirm the result",
             ));
@@ -209,15 +219,10 @@ impl pb::SandboxService for SandboxServiceImpl {
         };
         if let Err(e) = runtime.expose_sandbox_port(&machine, &exposure).await {
             // Roll back the guest DNAT so a failed bind leaves no half rule.
-            let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
-            let _ = agent
-                .sandbox_port_forward_remove(SandboxPortForwardRemoveRequest {
-                    id: req.id,
-                    sandbox_port: u32::from(sandbox_port),
-                    protocol: wire.into(),
-                    ..Default::default()
-                })
-                .await;
+            agent
+                .sandbox_port_forward_remove(rollback_request())
+                .await
+                .map_err(ApiError::from)?;
             return Err(ApiError::from(e).into());
         }
 

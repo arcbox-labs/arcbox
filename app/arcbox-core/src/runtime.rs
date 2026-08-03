@@ -1303,16 +1303,22 @@ impl Runtime {
         format!("sandbox:{sandbox_id}:{sandbox_port}/{protocol}")
     }
 
+    fn sandbox_port_key_owner(key: &str) -> Option<&str> {
+        let (sandbox_id, binding) = key.strip_prefix("sandbox:")?.rsplit_once(':')?;
+        let (port, protocol) = binding.split_once('/')?;
+        (!sandbox_id.is_empty() && port.parse::<u16>().is_ok() && !protocol.is_empty())
+            .then_some(sandbox_id)
+    }
+
     fn sandbox_dns_owner(sandbox_id: &str) -> String {
         format!("sandbox:{sandbox_id}")
     }
 
     async fn sandbox_authority_keys(&self, sandbox_id: &str) -> Vec<String> {
-        let prefix = format!("sandbox:{sandbox_id}:");
         self.all_sandbox_authority_keys()
             .await
             .into_iter()
-            .filter(|key| key.starts_with(&prefix))
+            .filter(|key| Self::sandbox_port_key_owner(key) == Some(sandbox_id))
             .collect()
     }
 
@@ -1323,7 +1329,7 @@ impl Runtime {
                 .read()
                 .await
                 .keys()
-                .filter(|key| key.starts_with("sandbox:"))
+                .filter(|key| Self::sandbox_port_key_owner(key).is_some())
                 .cloned()
                 .collect()
         }
@@ -1333,7 +1339,7 @@ impl Runtime {
                 .read()
                 .await
                 .keys()
-                .filter(|key| key.starts_with("sandbox:"))
+                .filter(|key| Self::sandbox_port_key_owner(key).is_some())
                 .cloned()
                 .collect()
         }

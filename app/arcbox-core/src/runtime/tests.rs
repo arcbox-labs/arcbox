@@ -275,6 +275,41 @@ async fn sandbox_cleanup_discovers_authority_without_secondary_indexes() {
     );
 }
 
+#[tokio::test]
+async fn sandbox_cleanup_matches_the_exact_authority_owner() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let owned = Runtime::sandbox_port_key("a", 80, "tcp");
+    let other = Runtime::sandbox_port_key("a:other", 80, "tcp");
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut rules = runtime.inbound_rules.write().await;
+        rules.insert(owned.clone(), ("missing-machine".into(), Vec::new()));
+        rules.insert(other.clone(), ("missing-machine".into(), Vec::new()));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut forwarders = runtime.port_forwarders.write().await;
+        forwarders.insert(owned.clone(), super::PortForwarder::new());
+        forwarders.insert(other.clone(), super::PortForwarder::new());
+    }
+
+    runtime.remove_sandbox_ports("a").await;
+
+    #[cfg(target_os = "macos")]
+    {
+        let rules = runtime.inbound_rules.read().await;
+        assert!(!rules.contains_key(&owned));
+        assert!(rules.contains_key(&other));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let forwarders = runtime.port_forwarders.read().await;
+        assert!(!forwarders.contains_key(&owned));
+        assert!(forwarders.contains_key(&other));
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn conflicting_sandbox_cleanup_does_not_remove_the_existing_listener() {

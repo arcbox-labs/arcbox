@@ -83,7 +83,7 @@ fn begin_removal(
             actual: inst.state.to_string(),
         });
     }
-    if inst.state == SandboxState::Starting {
+    if !force && inst.state == SandboxState::Starting {
         return Err(VmmError::WrongState {
             id: id.to_owned(),
             expected: "a sandbox whose boot attempt has completed".into(),
@@ -146,15 +146,9 @@ pub(super) async fn expire_sandbox(
     cow_manager: &Arc<CowManager>,
     records: &Arc<SandboxRecordStore>,
 ) {
-    let expected = loop {
-        let current = instances.read().unwrap().get(id).cloned();
-        let Some(expected) = armed_instance(generation, armed_for, current.as_ref()) else {
-            return;
-        };
-        if expected.lock().unwrap().state != SandboxState::Starting {
-            break expected;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let current = instances.read().unwrap().get(id).cloned();
+    let Some(expected) = armed_instance(generation, armed_for, current.as_ref()) else {
+        return;
     };
     if let Err(error) = remove_sandbox_impl(
         id,
@@ -337,6 +331,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_and_ttl_remove_a_wedged_starting_sandbox() {
+        for via_ttl in [false, true] {
+            let data_dir = tempfile::tempdir().unwrap();
+            let vm_dir = data_dir.path().join("sandboxes/job");
+            std::fs::create_dir_all(&vm_dir).unwrap();
+            let spec = SandboxSpec {
+                id: Some("job".into()),
+                ..Default::default()
+            };
+            let records = Arc::new(SandboxRecordStore::new(data_dir.path()).unwrap());
+            let record = match records
+                .provision_intent("job", "create-key", spec.clone())
+                .unwrap()
+            {
+                ProvisionIntent::Created(record) => record,
+                other => panic!("unexpected create intent: {other:?}"),
+            };
+            records
+                .transition(
+                    "job",
+                    record.generation,
+                    SandboxTransition::Starting(SandboxProvisionOutcome {
+                        ip_address: String::new(),
+                    }),
+                )
+                .unwrap();
+            let expected = Arc::new(Mutex::new(SandboxInstance::new_with_generation(
+                "job".into(),
+                spec,
+                None,
+                vm_dir.clone(),
+                record.generation,
+            )));
+            let instances: InstanceMap = Arc::new(RwLock::new(HashMap::from([(
+                "job".into(),
+                Arc::clone(&expected),
+            )])));
+            let mut config = VmmConfig::default();
+            config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+            let config = Arc::new(config);
+            let network = Arc::new(
+                NetworkManager::new(
+                    &config.network.cidr,
+                    &config.network.gateway,
+                    config.network.dns.clone(),
+                )
+                .unwrap(),
+            );
+            let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+            let (events_tx, _) = broadcast::channel(1);
+            let armed_for = Arc::downgrade(&expected);
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                if via_ttl {
+                    expire_sandbox(
+                        "job",
+                        Some(record.generation),
+                        &armed_for,
+                        &instances,
+                        &network,
+                        &events_tx,
+                        &config,
+                        &cow_manager,
+                        &records,
+                    )
+                    .await;
+                    Ok(())
+                } else {
+                    remove_sandbox_impl(
+                        "job",
+                        true,
+                        &expected,
+                        &instances,
+                        &network,
+                        &events_tx,
+                        &config,
+                        &cow_manager,
+                        &records,
+                    )
+                    .await
+                }
+            })
+            .await
+            .expect("forced removal must not wait for boot to finish")
+            .unwrap();
+
+            assert!(!instances.read().unwrap().contains_key("job"));
+            assert!(records.load("job").unwrap().is_none());
+            assert!(!vm_dir.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn stale_removal_does_not_touch_a_recreated_sandbox() {
         let data_dir = tempfile::tempdir().unwrap();
         let vm_dir = data_dir.path().join("sandboxes/job");
@@ -429,7 +516,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            begin_removal("job", true, &expected, &records),
+            begin_removal("job", false, &expected, &records),
             Err(VmmError::WrongState { .. })
         ));
         records
