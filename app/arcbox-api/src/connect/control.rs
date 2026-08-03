@@ -194,13 +194,17 @@ impl pb::SandboxService for SandboxServiceImpl {
         };
         let host_state = runtime.lock_sandbox_host_state().await;
         if *host_state != host_generation {
-            agent
-                .sandbox_port_forward_remove(rollback_request())
-                .await
-                .map_err(ApiError::from)?;
-            return Err(ConnectError::unavailable(
+            let primary = ConnectError::unavailable(
                 "sandbox host cleanup raced port exposure; retry to confirm the result",
-            ));
+            );
+            if let Err(rollback) = agent.sandbox_port_forward_remove(rollback_request()).await {
+                tracing::warn!(
+                    sandbox_id = %req.id,
+                    error = %rollback,
+                    "failed to roll back guest DNAT after host cleanup race"
+                );
+            }
+            return Err(primary);
         }
 
         // Host half: bind the listener; default the host port to the relay
@@ -219,11 +223,15 @@ impl pb::SandboxService for SandboxServiceImpl {
         };
         if let Err(e) = runtime.expose_sandbox_port(&machine, &exposure).await {
             // Roll back the guest DNAT so a failed bind leaves no half rule.
-            agent
-                .sandbox_port_forward_remove(rollback_request())
-                .await
-                .map_err(ApiError::from)?;
-            return Err(ApiError::from(e).into());
+            let primary = ConnectError::from(ApiError::from(e));
+            if let Err(rollback) = agent.sandbox_port_forward_remove(rollback_request()).await {
+                tracing::warn!(
+                    sandbox_id = %req.id,
+                    error = %rollback,
+                    "failed to roll back guest DNAT after host bind failure"
+                );
+            }
+            return Err(primary);
         }
 
         let resp = pb::ExposePortResponse {
