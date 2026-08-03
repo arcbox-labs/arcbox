@@ -99,11 +99,17 @@ class CommandHandle:
                         ),
                         context={"command_id": self.command_id},
                     )
-                slice_seconds = (
-                    _WAIT_SLICE_SECONDS
-                    if remaining is None
-                    else min(_WAIT_SLICE_SECONDS, max(1, math.ceil(remaining)))
-                )
+                if remaining is None:
+                    slice_seconds = _WAIT_SLICE_SECONDS
+                elif remaining < 1:
+                    # The wire's wait granularity is whole seconds:
+                    # sleep out the sub-second remainder, then ask for
+                    # the current state (0 = return immediately) so the
+                    # documented timeout bound holds.
+                    time.sleep(remaining)
+                    slice_seconds = 0
+                else:
+                    slice_seconds = min(_WAIT_SLICE_SECONDS, int(remaining))
                 execution = self._client.unary(
                     _PROCESS + "WaitExecution",
                     process_pb2.WaitExecutionRequest(

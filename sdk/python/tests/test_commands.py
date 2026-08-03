@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -19,6 +20,7 @@ from arcbox.errors import (
     CommandFailedError,
     InvalidArgumentError,
     SandboxDiedError,
+    TimeoutError,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +89,9 @@ class MockDaemon:
         self.exit_code = exit_code
         self.started: list[process_pb2.StartExecutionRequest] = []
         self.signals: list[process_pb2.SignalExecutionRequest] = []
+        self.waits: list[process_pb2.WaitExecutionRequest] = []
+        #: states served by successive WaitExecution calls before EXITED.
+        self.wait_states: list[process_pb2.ExecutionState] = []
         #: (channel, offset, data) triples replayed by AttachExecution.
         self.chunks: list[tuple[process_pb2.StdioChannel, int, bytes]] = [
             (process_pb2.STDIO_CHANNEL_STDOUT, 0, b"hello "),
@@ -100,6 +105,9 @@ class MockDaemon:
             self.started.append(process_pb2.StartExecutionRequest.FromString(request.content))
             return proto_response(execution(process_pb2.EXECUTION_STATE_RUNNING))
         if path.endswith("/WaitExecution"):
+            self.waits.append(process_pb2.WaitExecutionRequest.FromString(request.content))
+            if self.wait_states:
+                return proto_response(execution(self.wait_states.pop(0)))
             return proto_response(
                 execution(process_pb2.EXECUTION_STATE_EXITED, exit_code=self.exit_code)
             )
@@ -177,6 +185,27 @@ def test_background_streams_output_then_waits() -> None:
     assert result.exit_code == 0
     handle.kill("SIGKILL")
     assert daemon.signals[0].signal == process_pb2.SIGNAL_SIGKILL
+
+
+def test_wait_slices_are_capped_and_floored_to_the_wire_granularity() -> None:
+    daemon = MockDaemon(exit_code=0)
+    handle = sync_sandbox(daemon).commands.run("spin", background=True)
+    handle.wait_for_exit(45)
+    assert daemon.waits[-1].timeout_seconds == 30
+
+
+def test_sub_second_wait_honors_its_deadline() -> None:
+    daemon = MockDaemon(exit_code=0)
+    daemon.wait_states = [process_pb2.EXECUTION_STATE_RUNNING]
+    handle = sync_sandbox(daemon).commands.run("spin", background=True)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        handle.wait_for_exit(0.2)
+    elapsed = time.monotonic() - started
+    # One immediate poll (timeout_seconds=0) after sleeping out the
+    # remainder — not the old 1 s minimum server slice.
+    assert [w.timeout_seconds for w in daemon.waits] == [0]
+    assert 0.2 <= elapsed < 1.0
 
 
 def test_retention_gap_reports_truncation() -> None:

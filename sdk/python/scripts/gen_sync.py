@@ -49,6 +49,10 @@ EXTRA_REPLACEMENTS = {
     "AbstractAsyncContextManager": "AbstractContextManager",
     "aclosing": "closing",
     "anext": "next",
+    # The event-loop sleep becomes a thread sleep (`asyncio.sleep` ->
+    # `time.sleep`; the duplicate `import time` is deduplicated by the
+    # ruff pass below).
+    "asyncio": "time",
 }
 
 
