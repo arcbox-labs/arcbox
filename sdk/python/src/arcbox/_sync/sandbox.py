@@ -8,6 +8,7 @@ cached; ``info()`` always fetches fresh.
 from __future__ import annotations
 
 import math
+import time
 import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING
@@ -53,6 +54,10 @@ _GONE_EVENTS = (
     sandbox_pb2.SANDBOX_EVENT_KIND_STOPPED,
     sandbox_pb2.SANDBOX_EVENT_KIND_REMOVED,
 )
+
+#: How often ``connect`` re-inspects a PAUSING sandbox. No lifecycle
+#: event marks the PAUSING→PAUSED edge, so it is polled out.
+_PAUSE_SETTLE_POLL_SECONDS = 0.5
 
 
 def _seconds_to_wire(seconds: float | None) -> int:
@@ -166,12 +171,18 @@ class ArcBox:
 
     def connect(self, sandbox_id: str) -> Sandbox:
         """Attach to an existing sandbox. A PAUSED sandbox is resumed
-        (resume completes once it is READY again); a STARTING one is
-        waited for. A terminal state is a typed error carrying the
-        observed state. Connecting never touches the sandbox's lifecycle
-        deadlines."""
+        (resume completes once it is READY again); a PAUSING one settles
+        to PAUSED first, then resumes; a STARTING one is waited for. A
+        terminal state is a typed error carrying the observed state.
+        Connecting never touches the sandbox's lifecycle deadlines."""
         with wrap_errors("sandbox.connect"):
             info = self._inspect(sandbox_id)
+            # A pausing sandbox's next stop is PAUSED — never READY — so
+            # waiting on readiness events would park forever. Poll the
+            # checkpoint out, then route on whatever state it settled in.
+            while info.state == sandbox_pb2.SANDBOX_STATE_PAUSING:
+                time.sleep(_PAUSE_SETTLE_POLL_SECONDS)
+                info = self._inspect(sandbox_id)
             if info.state in _READY_STATES:
                 return Sandbox(self._client, sandbox_id)
             if info.state == sandbox_pb2.SANDBOX_STATE_PAUSED:
@@ -185,10 +196,7 @@ class ArcBox:
                     timeout=None,
                 )
                 return Sandbox(self._client, sandbox_id)
-            if info.state in (
-                sandbox_pb2.SANDBOX_STATE_STARTING,
-                sandbox_pb2.SANDBOX_STATE_PAUSING,
-            ):
+            if info.state == sandbox_pb2.SANDBOX_STATE_STARTING:
                 with self._client.stream(
                     _SANDBOX + "Events",
                     sandbox_pb2.SandboxEventsRequest(sandbox_id=sandbox_id),
