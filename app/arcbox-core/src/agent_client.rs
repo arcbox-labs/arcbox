@@ -84,20 +84,6 @@ pub struct AgentClient {
     transport: AgentTransport,
     /// Whether connected.
     connected: bool,
-    /// Agent protocol version the machine's readiness handshake reported,
-    /// or `None` when it was never learned.
-    ///
-    /// This client never pings for it itself: every sandbox call constructs
-    /// a fresh client (`Runtime::get_agent` → `MachineManager::connect_agent`),
-    /// so the version must come from per-machine state. `connect_agent`
-    /// stamps it from `MachineInfo::agent_protocol`, which is recorded at
-    /// the sites that run [`Self::check_agent_protocol`]: the machine ready
-    /// probe (`machine.rs::probe_ip_*`) and both boot arms
-    /// (`vm_lifecycle/boot.rs::wait_for_agent`). The sandbox gate
-    /// ([`Self::ensure_sandbox_protocol`]) reads it and fails closed on
-    /// `None`, so a client built outside `connect_agent` cannot silently
-    /// drive sandbox payloads at an unverified agent.
-    agent_protocol: Option<u32>,
 }
 
 impl AgentClient {
@@ -109,50 +95,6 @@ impl AgentClient {
             cid,
             transport: AgentTransport::Async(VsockTransport::new(addr)),
             connected: false,
-            agent_protocol: None,
-        }
-    }
-
-    /// Stamps the agent protocol version learned for this machine (see the
-    /// `agent_protocol` field docs). `MachineManager::connect_agent` calls
-    /// this on every client it hands out.
-    pub fn set_agent_protocol(&mut self, version: Option<u32>) {
-        self.agent_protocol = version;
-    }
-
-    /// Refuses to drive a sandbox request at an agent that predates the
-    /// execution redesign (CORE-55/56).
-    ///
-    /// The redesign re-typed surviving sandbox `MessageType` payloads in
-    /// place, so a pre-0.6.0 agent (protocol < 2) would misdecode them under
-    /// silent proto3 field skew rather than erroring. Non-sandbox requests
-    /// pass untouched. Called on every path that emits a request frame:
-    /// [`Self::rpc_call_traced`], [`Self::rpc_call_blocking`], and the
-    /// sandbox streaming senders — a new streaming sandbox RPC must call it
-    /// before its first send (unary RPCs are covered automatically).
-    fn ensure_sandbox_protocol(&self, msg_type: MessageType) -> Result<()> {
-        use arcbox_constants::wire::SANDBOX_MIN_AGENT_PROTOCOL;
-
-        if !msg_type.is_sandbox_request() {
-            return Ok(());
-        }
-        match self.agent_protocol {
-            Some(version) if version >= SANDBOX_MIN_AGENT_PROTOCOL => Ok(()),
-            Some(version) => Err(CoreError::Machine(format!(
-                "sandbox operations require agent protocol >= \
-                 {SANDBOX_MIN_AGENT_PROTOCOL}, but this machine's agent \
-                 reported protocol {version}: it predates the sandbox \
-                 execution redesign and would misinterpret sandbox requests. \
-                 Restart the machine (or update ArcBox) so the bundled agent \
-                 is staged again"
-            ))),
-            None => Err(CoreError::Machine(format!(
-                "sandbox operations require agent protocol >= \
-                 {SANDBOX_MIN_AGENT_PROTOCOL}, but this machine's agent \
-                 protocol is unknown (no readiness handshake recorded). \
-                 Restart the machine (or update ArcBox) so the bundled agent \
-                 is staged again"
-            ))),
         }
     }
 
@@ -171,7 +113,6 @@ impl AgentClient {
             cid,
             transport: AgentTransport::Blocking(transport),
             connected: true,
-            agent_protocol: None,
         })
     }
 
@@ -193,7 +134,6 @@ impl AgentClient {
             cid,
             transport: AgentTransport::Async(transport),
             connected: true,
-            agent_protocol: None,
         })
     }
 
@@ -264,7 +204,6 @@ impl AgentClient {
         trace_id: &str,
         payload: &[u8],
     ) -> Result<(u32, Vec<u8>)> {
-        self.ensure_sandbox_protocol(msg_type)?;
         if !self.connected {
             self.connect().await?;
         }
@@ -314,7 +253,6 @@ impl AgentClient {
         msg_type: MessageType,
         payload: &[u8],
     ) -> Result<(u32, Vec<u8>)> {
-        self.ensure_sandbox_protocol(msg_type)?;
         let trace_id = "";
         let buf = wire::build_message(msg_type, trace_id, payload);
 
@@ -1199,7 +1137,6 @@ impl AgentClient {
         mut self,
         req: ReadFileRequest,
     ) -> Result<mpsc::Receiver<Result<FileChunk>>> {
-        self.ensure_sandbox_protocol(MessageType::SandboxFileReadRequest)?;
         if !self.connected {
             self.connect().await?;
         }
@@ -1277,7 +1214,6 @@ impl AgentClient {
         open: WriteFileOpen,
         mut data_rx: mpsc::Receiver<WriteFileChunk>,
     ) -> Result<()> {
-        self.ensure_sandbox_protocol(MessageType::SandboxFileWriteRequest)?;
         if !self.connected {
             self.connect().await?;
         }
@@ -1662,7 +1598,6 @@ impl AgentClient {
         mut self,
         req: AttachExecutionRequest,
     ) -> Result<mpsc::Receiver<Result<ExecutionEvent>>> {
-        self.ensure_sandbox_protocol(MessageType::SandboxExecAttachRequest)?;
         if !self.connected {
             self.connect().await?;
         }
@@ -1745,7 +1680,6 @@ impl AgentClient {
         mut self,
         req: SandboxEventsRequest,
     ) -> Result<mpsc::Receiver<Result<SandboxEvent>>> {
-        self.ensure_sandbox_protocol(MessageType::SandboxEventsRequest)?;
         if !self.connected {
             self.connect().await?;
         }
@@ -1945,61 +1879,5 @@ mod tests {
         // Additive evolution: a newer agent understands an older host.
         let resp = ping_response(arcbox_constants::wire::AGENT_PROTOCOL_VERSION + 1);
         AgentClient::check_agent_protocol(&resp).expect("newer protocol must pass");
-    }
-
-    /// A pre-redesign agent (protocol 1) must be refused on the real sandbox
-    /// call path with the actionable error. The guard fires before any
-    /// transport I/O, so the unconnected client errors deterministically.
-    #[tokio::test]
-    async fn sandbox_call_against_protocol_1_agent_is_refused() {
-        let mut client = AgentClient::new(3);
-        client.set_agent_protocol(Some(1));
-        let err = client
-            .sandbox_create(CreateSandboxRequest::default())
-            .await
-            .expect_err("protocol 1 must be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("reported protocol 1"), "got: {msg}");
-        assert!(msg.contains("Restart the machine"), "got: {msg}");
-    }
-
-    /// A client whose machine never recorded a handshake fails closed on the
-    /// sandbox path — it must not silently drive sandbox payloads.
-    #[tokio::test]
-    async fn sandbox_call_with_unknown_protocol_is_refused() {
-        let mut client = AgentClient::new(3);
-        let err = client
-            .sandbox_create(CreateSandboxRequest::default())
-            .await
-            .expect_err("unknown protocol must be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("protocol is unknown"), "got: {msg}");
-        assert!(msg.contains("Restart the machine"), "got: {msg}");
-    }
-
-    #[test]
-    fn sandbox_guard_passes_a_redesign_agent_and_skips_non_sandbox_types() {
-        use arcbox_constants::wire::SANDBOX_MIN_AGENT_PROTOCOL;
-
-        let mut client = AgentClient::new(3);
-
-        // A redesign-era agent passes the guard for sandbox requests.
-        client.set_agent_protocol(Some(SANDBOX_MIN_AGENT_PROTOCOL));
-        client
-            .ensure_sandbox_protocol(MessageType::SandboxCreateRequest)
-            .expect("protocol 2 must pass the sandbox gate");
-        client
-            .ensure_sandbox_protocol(MessageType::SandboxExecStartRequest)
-            .expect("protocol 2 must pass the sandbox gate");
-
-        // Non-sandbox requests are never gated, whatever the version.
-        client.set_agent_protocol(Some(1));
-        client
-            .ensure_sandbox_protocol(MessageType::PingRequest)
-            .expect("ping must not be gated");
-        client.set_agent_protocol(None);
-        client
-            .ensure_sandbox_protocol(MessageType::MachineExecRequest)
-            .expect("machine exec must not be gated");
     }
 }

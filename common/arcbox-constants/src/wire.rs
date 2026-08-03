@@ -19,22 +19,14 @@ pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 ///
 /// Agents reporting less (`0` — agents that predate the handshake field)
 /// are rejected at boot with an actionable error instead of silently
-/// misbehaving under field skew. Note the sandbox surface assumes the
-/// post-redesign payloads: a pre-0.6.0 agent boots fine but must not be
-/// driven through the sandbox API — the daemon enforces that with
-/// [`SANDBOX_MIN_AGENT_PROTOCOL`].
+/// misbehaving under field skew. A pre-0.6.0 agent boots and works on
+/// every released surface. Driving the (unreleased) sandbox surface from
+/// such an agent is undefined behavior by decision: with the version
+/// signal retired back to `1`, old and new agents are indistinguishable
+/// on the wire, so there is nothing to gate on. The only exposure is a
+/// stale dev-tree binary, fixed by rebuilding
+/// (`cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl`).
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 1;
-
-/// Minimum agent protocol required for the sandbox RPC surface.
-///
-/// The execution redesign (CORE-55/56) re-typed the payloads of surviving
-/// sandbox `MessageType`s in place, so a pre-0.6.0 agent (reports protocol
-/// `1`) decodes them under silent proto3 field skew. Per the burned-version
-/// note on [`AGENT_PROTOCOL_VERSION`], `2` means "speaks the redesigned
-/// sandbox payloads": the daemon refuses sandbox operations against any
-/// agent reporting less, while non-sandbox surfaces keep working. This
-/// stays `2` even after future bumps (which must jump to `3`).
-pub const SANDBOX_MIN_AGENT_PROTOCOL: u32 = 2;
 
 /// Number of bytes in the fixed RPC frame header (`length` + `type`).
 pub const FRAME_HEADER_SIZE: usize = 8;
@@ -421,9 +413,7 @@ impl MessageType {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION, MessageType, SANDBOX_MIN_AGENT_PROTOCOL,
-    };
+    use super::{AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION, MessageType};
 
     #[test]
     fn protocol_version_2_is_burned() {
@@ -440,9 +430,6 @@ mod tests {
             min == 1 || min >= 3,
             "MIN_AGENT_PROTOCOL_VERSION must never be 2 — it is burned; bump to 3"
         );
-        // The sandbox gate is the one legitimate meaning of `2` and must
-        // keep it: it names what 0.6.0 daemons shipped.
-        assert_eq!(SANDBOX_MIN_AGENT_PROTOCOL, 2);
     }
 
     #[test]
