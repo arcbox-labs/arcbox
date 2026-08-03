@@ -201,4 +201,28 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             .map_err(ApiError::from)?;
         Response::ok(execution)
     }
+
+    /// Contract-only stub (CORE-58 phase 1): execution discovery lands
+    /// with CORE-58 phase 2 (guest-agent enumeration).
+    async fn list_executions(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ListExecutionsRequest>,
+    ) -> ServiceResult<pb::ListExecutionsResponse> {
+        Err(ConnectError::unimplemented(
+            "execution listing is not implemented yet (CORE-58 phase 2)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the guest-agent listen-table
+    /// watch lands with CORE-58 phase 2.
+    async fn wait_for_port(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::WaitForPortRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "port readiness waits are not implemented yet (CORE-58 phase 2)",
+        ))
+    }
 }

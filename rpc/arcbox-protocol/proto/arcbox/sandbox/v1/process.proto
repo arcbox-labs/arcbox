@@ -61,6 +61,18 @@ service SandboxProcessService {
     // state (a zero timeout polls). The exit status distinguishes a normal
     // exit code from death by signal.
     rpc WaitExecution(WaitExecutionRequest) returns (Execution);
+
+    // List a sandbox's executions, running and exited, so a client can
+    // rediscover processes it no longer holds handles to — after losing
+    // its connection, or across an auto-pause/resume cycle. Executions
+    // are retained for the life of their sandbox.
+    rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
+
+    // Wait until something inside the sandbox listens on the given TCP
+    // port, or fail with DEADLINE_EXCEEDED when the timeout elapses. The
+    // guest agent watches the listen table directly — clients never
+    // poll with shelled-out probes.
+    rpc WaitForPort(WaitForPortRequest) returns (google.protobuf.Empty);
 }
 
 // ---------------------------------------------------------------------------
@@ -268,5 +280,28 @@ message WaitExecutionRequest {
     string execution_id = 2;
     // Give up after this many seconds and return the current state
     // (0 = return immediately — a poll).
+    uint32 timeout_seconds = 3;
+}
+
+// Request to list a sandbox's executions.
+message ListExecutionsRequest {
+    // Sandbox whose executions to list.
+    string sandbox_id = 1;
+}
+
+// Response to ListExecutions.
+message ListExecutionsResponse {
+    // Every retained execution, running and exited.
+    repeated Execution executions = 1;
+}
+
+// Request to wait for a listening TCP port inside a sandbox.
+message WaitForPortRequest {
+    // Sandbox to watch.
+    string sandbox_id = 1;
+    // TCP port a workload is expected to listen on.
+    uint32 port = 2;
+    // Give up after this many seconds with DEADLINE_EXCEEDED
+    // (0 = daemon default of 30 s).
     uint32 timeout_seconds = 3;
 }
