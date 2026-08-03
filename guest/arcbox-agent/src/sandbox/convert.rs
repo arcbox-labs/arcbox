@@ -111,6 +111,10 @@ pub(super) fn state_filter(state: sandbox_v1::SandboxState) -> Option<&'static s
         sandbox_v1::SandboxState::Stopping => Some("stopping"),
         sandbox_v1::SandboxState::Stopped => Some("stopped"),
         sandbox_v1::SandboxState::Failed => Some("failed"),
+        // Pause states (CORE-21): the manager cannot produce them yet, so
+        // the filter matches nothing until pause lands guest-side.
+        sandbox_v1::SandboxState::Pausing => Some("pausing"),
+        sandbox_v1::SandboxState::Paused => Some("paused"),
     }
 }
 

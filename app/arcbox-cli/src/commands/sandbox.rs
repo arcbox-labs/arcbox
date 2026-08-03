@@ -349,6 +349,8 @@ pub(super) fn state_name(state: SandboxState) -> &'static str {
         SandboxState::Stopping => "stopping",
         SandboxState::Stopped => "stopped",
         SandboxState::Failed => "failed",
+        SandboxState::Pausing => "pausing",
+        SandboxState::Paused => "paused",
     }
 }
 
@@ -361,8 +363,11 @@ fn parse_state(value: &str) -> Result<SandboxState> {
         "stopping" => SandboxState::Stopping,
         "stopped" => SandboxState::Stopped,
         "failed" => SandboxState::Failed,
+        "pausing" => SandboxState::Pausing,
+        "paused" => SandboxState::Paused,
         other => anyhow::bail!(
-            "unknown state '{other}' (expected starting/ready/running/stopping/stopped/failed)"
+            "unknown state '{other}' (expected starting/ready/running/stopping/\
+             stopped/failed/pausing/paused)"
         ),
     })
 }
@@ -378,9 +383,13 @@ fn parse_event_kind(value: &str) -> Result<SandboxEventKind> {
         "stopped" => SandboxEventKind::Stopped,
         "failed" => SandboxEventKind::Failed,
         "removed" => SandboxEventKind::Removed,
+        "pausing" => SandboxEventKind::Pausing,
+        "paused" => SandboxEventKind::Paused,
+        "resumed" => SandboxEventKind::Resumed,
         other => anyhow::bail!(
             "unknown event kind '{other}' (expected \
-             created/ready/running/idle/stopping/stopped/failed/removed)"
+             created/ready/running/idle/stopping/stopped/failed/removed/\
+             pausing/paused/resumed)"
         ),
     })
 }
@@ -397,6 +406,9 @@ fn event_kind_name(kind: SandboxEventKind) -> &'static str {
         SandboxEventKind::Stopped => "stopped",
         SandboxEventKind::Failed => "failed",
         SandboxEventKind::Removed => "removed",
+        SandboxEventKind::Pausing => "pausing",
+        SandboxEventKind::Paused => "paused",
+        SandboxEventKind::Resumed => "resumed",
     }
 }
 
