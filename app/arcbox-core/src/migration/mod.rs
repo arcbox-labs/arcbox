@@ -1,5 +1,7 @@
 //! Host-side runtime migration manager.
 
+mod dto;
+
 use crate::error::{CoreError, Result};
 use arcbox_migration::{
     DockerCliRunner, MigrationError, MigrationExecutor, MigrationExecutorOptions, MigrationPlanner,
@@ -8,6 +10,7 @@ use arcbox_migration::{
 use arcbox_protocol::v1::{
     PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
+use dto::ToWire;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
@@ -104,11 +107,7 @@ impl MigrationManager {
             // Only for an explicit dry run: the plan embeds each container's
             // environment verbatim, so it is not worth shipping on a prepare
             // whose caller is about to run the migration anyway.
-            plan_json: if request.dry_run {
-                serde_json::to_string(&plan).unwrap_or_default()
-            } else {
-                String::new()
-            },
+            plan: request.dry_run.then(|| plan.to_wire()),
             unsupported_resources: plan.unsupported_resources.clone(),
         })
     }
@@ -473,7 +472,11 @@ exit 0
         let response = response.unwrap();
 
         assert!(response.plan_id.is_empty(), "a dry run issues no plan id");
-        assert!(!response.plan_json.is_empty());
+        let plan = response.plan.expect("a dry run ships the plan");
+        assert!(
+            plan.source.is_some(),
+            "the plan's source is always projected"
+        );
         assert!(
             manager.prepared.read().await.is_empty(),
             "a dry run must not accumulate plans in the daemon"
@@ -501,7 +504,7 @@ exit 0
         // The plan embeds container environments; it ships only when a caller
         // explicitly asked to inspect it.
         assert!(
-            response.plan_json.is_empty(),
+            response.plan.is_none(),
             "a runnable prepare must not ship the plan payload"
         );
     }

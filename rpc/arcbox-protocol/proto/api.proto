@@ -650,14 +650,300 @@ message PrepareMigrationResponse {
     // blockers that will require stopping running source containers, or bind
     // mount sources that do not exist on this host).
     repeated string warnings = 9;
-    // The full migration plan serialized as JSON, populated only when the
-    // request set `dry_run`. The plan carries each container's environment
-    // verbatim, so it is sent only when a caller explicitly asked to inspect
-    // it rather than on every prepare.
-    string plan_json = 10;
+    // The full migration plan, populated only when the request set `dry_run`.
+    // The plan carries each container's environment verbatim, so it is sent
+    // only when a caller explicitly asked to inspect it rather than on every
+    // prepare.
+    MigrationPlan plan = 10;
     // Source resources this migration cannot reproduce. Unlike warnings these
     // are blocking: RunMigration refuses to execute a plan that has any.
     repeated string unsupported_resources = 11;
+}
+
+// A fully resolved migration plan.
+//
+// This is the wire projection of the daemon's internal plan, not the plan
+// itself: the daemon's own model makes invalid states unrepresentable (a mount
+// is one of three shapes, a container always has a spec), which protobuf
+// cannot express. Fields here are therefore flatter and more permissive, and
+// the notes on each say which combinations the daemon actually emits.
+message MigrationPlan {
+    // Identity of the source runtime the plan was built from.
+    MigrationSourceInfo source = 1;
+    // Helper image reference used for temporary volume-mount containers.
+    string helper_image = 2;
+    // Images that will be imported into ArcBox.
+    repeated MigrationImagePlan images = 3;
+    // Volumes that will be imported into ArcBox.
+    repeated MigrationVolumePlan volumes = 4;
+    // Networks that will be recreated in ArcBox.
+    repeated MigrationNetworkPlan networks = 5;
+    // Containers that will be recreated in ArcBox, in creation order.
+    repeated MigrationContainerPlan containers = 6;
+    // Resources that are out of scope. Blocking: execution refuses to start
+    // while any are present. Mirrors PrepareMigrationResponse.
+    repeated string unsupported_resources = 7;
+    // Advisory problems that do not block execution.
+    repeated string warnings = 8;
+    // Replace actions that require confirmation.
+    MigrationReplacementSummary replacements = 9;
+    // Source volumes attached to running containers, which must be stopped.
+    repeated MigrationRunningVolumeBlocker blockers = 10;
+}
+
+// Identity of a migration source runtime.
+message MigrationSourceInfo {
+    // Stable source runtime identifier ("docker-desktop" or "orbstack").
+    string kind = 1;
+    // Resolved source Docker Engine socket path.
+    string socket_path = 2;
+    // Docker daemon name reported by the source.
+    string daemon_name = 3;
+    // Server version reported by the source.
+    string server_version = 4;
+    // Operating system reported by the source.
+    string operating_system = 5;
+    // Architecture reported by the source.
+    string architecture = 6;
+}
+
+// One image transfer.
+message MigrationImagePlan {
+    // Source image identifier.
+    string image_id = 1;
+    // Every reference passed to `docker save`. All tags are listed because
+    // `docker save` preserves an image's other tags only when the argument
+    // omits a tag, so exporting one repo:tag would drop the rest. Empty for an
+    // untagged image, which is exported by ID instead.
+    repeated string export_references = 2;
+    // Repo tags recorded by the source daemon.
+    repeated string repo_tags = 3;
+    // Subset of repo_tags that already exist on the target and will be
+    // overwritten.
+    repeated string replace_tags = 4;
+}
+
+// One volume transfer.
+message MigrationVolumePlan {
+    // Source volume name.
+    string name = 1;
+    // Volume driver. Only "local" is supported; anything else is reported as
+    // an unsupported resource.
+    string driver = 2;
+    // Volume labels preserved on recreate.
+    map<string, string> labels = 3;
+    // Driver options preserved on recreate.
+    map<string, string> options = 4;
+    // Whether an existing target volume will be replaced.
+    bool replace_existing = 5;
+    // Source containers referencing this volume.
+    repeated string attached_containers = 6;
+}
+
+// One network recreation.
+message MigrationNetworkPlan {
+    // Source network name.
+    string name = 1;
+    // Source network identifier.
+    string id = 2;
+    // Docker network driver. Only "bridge" is supported; anything else is
+    // reported as an unsupported resource.
+    string driver = 3;
+    // Whether the network is internal.
+    bool internal = 4;
+    // Whether IPv6 is enabled.
+    bool enable_ipv6 = 5;
+    // Whether the network is attachable.
+    bool attachable = 6;
+    // Network labels preserved on recreate.
+    map<string, string> labels = 7;
+    // Network options preserved on recreate.
+    map<string, string> options = 8;
+    // IPAM configuration preserved on recreate.
+    repeated MigrationNetworkIpam ipam = 9;
+    // Whether an existing target network will be replaced.
+    bool replace_existing = 10;
+}
+
+// One IPAM subnet configuration. Unset entries are empty strings.
+message MigrationNetworkIpam {
+    // Subnet CIDR.
+    string subnet = 1;
+    // Gateway address.
+    string gateway = 2;
+    // Allocation range.
+    string ip_range = 3;
+}
+
+// One container recreation.
+message MigrationContainerPlan {
+    // Source container name, without the leading slash.
+    string name = 1;
+    // Source container identifier.
+    string id = 2;
+    // Image reference used when recreating. For an untagged image this is the
+    // source image ID, which the daemon rewrites to the ID the target assigns
+    // on import.
+    string image_reference = 3;
+    // Normalized creation spec. Always set by the daemon.
+    MigrationContainerSpec spec = 4;
+    // Networks joined after create, beyond spec.network_mode. Always empty when
+    // network_mode is HOST, which Docker forbids combining with any attachment.
+    repeated MigrationContainerNetworkAttachment extra_networks = 5;
+    // Whether an existing target container will be replaced.
+    bool replace_existing = 6;
+    // Whether the container was running on the source. Such containers are
+    // started after the migration unless RunMigrationRequest.skip_start is set.
+    bool was_running = 7;
+    // Source creation timestamp, RFC 3339. Containers are ordered by it so the
+    // originals' creation order is reproduced.
+    string created = 8;
+}
+
+// A container creation spec translated from source inspect output.
+//
+// Optional scalars use the empty string or 0 to mean "not set", matching how
+// Docker reports them; the daemon omits the corresponding flag in that case.
+message MigrationContainerSpec {
+    // Hostname; empty when unset.
+    string hostname = 1;
+    // Domain name; empty when unset.
+    string domainname = 2;
+    // User; empty when unset.
+    string user = 3;
+    // Environment variables, verbatim from the source, as KEY=VALUE.
+    repeated string env = 4;
+    // Labels.
+    map<string, string> labels = 5;
+    // Exposed ports, as "port/proto".
+    repeated string exposed_ports = 6;
+    // Whether a TTY is allocated.
+    bool tty = 7;
+    // Whether stdin stays open.
+    bool open_stdin = 8;
+    // Working directory; empty when unset.
+    string working_dir = 9;
+    // Entrypoint argv; empty to inherit the image's.
+    repeated string entrypoint = 10;
+    // Command argv; empty to inherit the image's.
+    repeated string cmd = 11;
+    // Mounts.
+    repeated MigrationContainerMount mounts = 12;
+    // Host port publish rules.
+    repeated MigrationPortPublish publishes = 13;
+    // Restart policy; unset when the source had none.
+    MigrationRestartPolicy restart_policy = 14;
+    // Whether the container is privileged.
+    bool privileged = 15;
+    // Whether the root filesystem is read-only.
+    bool read_only_rootfs = 16;
+    // Extra /etc/hosts entries, as "host:ip".
+    repeated string extra_hosts = 17;
+    // Whether the container is removed on exit.
+    bool auto_remove = 18;
+    // Memory limit in bytes; 0 when unset.
+    int64 memory = 19;
+    // CPU quota in units of 10^-9 CPUs; 0 when unset.
+    int64 nano_cpus = 20;
+    // Added Linux capabilities.
+    repeated string cap_add = 21;
+    // Network joined at create time.
+    MigrationNetworkMode network_mode = 22;
+    // The network joined when network_mode is NAMED; unset for every other
+    // mode. The daemon only emits a network that is part of this migration.
+    MigrationContainerNetworkAttachment named_network = 23;
+}
+
+// The network a container joins at create time.
+//
+// `container:<name|id>` has no member: sharing another container's namespace is
+// rejected during planning rather than reproduced, and appears in
+// unsupported_resources instead.
+enum MigrationNetworkMode {
+    // The default bridge; no network is selected explicitly.
+    MIGRATION_NETWORK_MODE_DEFAULT = 0;
+    // Host networking.
+    MIGRATION_NETWORK_MODE_HOST = 1;
+    // No networking.
+    MIGRATION_NETWORK_MODE_NONE = 2;
+    // A user-defined network, named by
+    // MigrationContainerSpec.named_network.
+    MIGRATION_NETWORK_MODE_NAMED = 3;
+}
+
+// What a mount carries.
+enum MigrationMountType {
+    // Unset; never emitted by the daemon.
+    MIGRATION_MOUNT_TYPE_UNSPECIFIED = 0;
+    // A named volume, migrated with the plan.
+    MIGRATION_MOUNT_TYPE_VOLUME = 1;
+    // A host path, which must already exist on this host.
+    MIGRATION_MOUNT_TYPE_BIND = 2;
+    // A tmpfs.
+    MIGRATION_MOUNT_TYPE_TMPFS = 3;
+}
+
+// One mount. Which fields are meaningful depends on `type`; the daemon leaves
+// the rest at their zero values.
+message MigrationContainerMount {
+    // Mount kind, which selects the meaningful fields below.
+    MigrationMountType type = 1;
+    // Volume name for VOLUME, host path for BIND, empty for TMPFS.
+    string source = 2;
+    // Destination path inside the container. Always set.
+    string target = 3;
+    // Whether the mount is writable. VOLUME and BIND only.
+    bool rw = 4;
+    // Mount options string. TMPFS only, empty when it had none.
+    string options = 5;
+}
+
+// One host port publish rule.
+message MigrationPortPublish {
+    // Port and protocol inside the container, as "port/proto".
+    string container_port = 1;
+    // Host IP to bind; empty to bind every interface.
+    string host_ip = 2;
+    // Host port; empty to let Docker assign one.
+    string host_port = 3;
+}
+
+// A container restart policy.
+message MigrationRestartPolicy {
+    // Policy name, as Docker reports it ("always", "on-failure", ...).
+    string name = 1;
+    // Retry cap for "on-failure"; 0 when unset.
+    int64 maximum_retry_count = 2;
+}
+
+// A network a container joins, with its network-scoped aliases.
+message MigrationContainerNetworkAttachment {
+    // Network name.
+    string network = 1;
+    // Aliases resolvable on that network. The container's own name is excluded,
+    // since Docker registers it automatically.
+    repeated string aliases = 2;
+}
+
+// Existing target resources a plan would replace, all requiring confirmation
+// via RunMigrationRequest.allow_replacements.
+message MigrationReplacementSummary {
+    // Container names that will be removed and recreated.
+    repeated string containers = 1;
+    // Volume names that will be removed and recreated.
+    repeated string volumes = 2;
+    // Network names that will be removed and recreated.
+    repeated string networks = 3;
+    // Image tags that will be overwritten.
+    repeated string image_tags = 4;
+}
+
+// A source volume held open by running containers.
+message MigrationRunningVolumeBlocker {
+    // Source volume name.
+    string volume_name = 1;
+    // Running source containers using it, which the migration stops first.
+    repeated string containers = 2;
 }
 
 // Request to run a prepared migration.

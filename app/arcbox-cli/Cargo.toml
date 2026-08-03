@@ -51,7 +51,6 @@ arcbox-helper.workspace = true
 chrono.workspace = true
 tar = "0.4.46"
 tempfile = { workspace = true }
-arcbox-migration = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }

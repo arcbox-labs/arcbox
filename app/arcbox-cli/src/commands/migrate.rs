@@ -5,9 +5,9 @@
 
 use anyhow::{Context, Result, bail};
 use arcbox_grpc::v1::migration_service_client::MigrationServiceClient;
-use arcbox_migration::{MigrationPlan, NetworkModeSpec};
 use arcbox_protocol::v1::{
-    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+    MigrationContainerSpec, MigrationNetworkMode, MigrationPlan, PrepareMigrationRequest,
+    PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
 use clap::{Args, Subcommand};
 use std::fmt::Write as _;
@@ -266,18 +266,26 @@ fn report_dry_run(
     as_json: bool,
     skip_start: bool,
 ) -> Result<()> {
+    // The daemon populates the plan for every dry run, so its absence is a
+    // broken contract rather than a state to render around.
+    let plan = prepare
+        .plan
+        .as_ref()
+        .context("Daemon returned no plan for a dry run")?;
+
     if as_json {
-        // The daemon already serialized the plan; reprinting it verbatim keeps
-        // the CLI from becoming a second, drifting view of the same model.
-        // `--no-start` is deliberately not folded in here: the plan is the
-        // daemon's model, and a consumer combining the two flags reads
-        // `--no-start` from its own invocation.
-        println!("{}", prepare.plan_json);
+        // Serialized from the wire message, so the JSON a consumer sees is the
+        // documented `MigrationPlan` schema. `--no-start` is deliberately not
+        // folded in: the plan describes the migration, and a consumer combining
+        // the two flags reads `--no-start` from its own invocation.
+        let rendered = serde_json::to_string_pretty(plan)
+            .context("Failed to render migration plan as JSON")?;
+        println!("{rendered}");
         return Ok(());
     }
 
     print_prepare_summary(source_kind, prepare);
-    print_plan_details(&prepare.plan_json, skip_start)?;
+    print_plan_details(plan, skip_start);
     print_blocking_issues(prepare);
 
     println!();
@@ -306,16 +314,7 @@ fn print_blocking_issues(prepare: &PrepareMigrationResponse) {
 ///
 /// `skip_start` mirrors `--no-start` so container rows describe the run the same
 /// flags would produce.
-fn print_plan_details(plan_json: &str, skip_start: bool) -> Result<()> {
-    if plan_json.is_empty() {
-        return Ok(());
-    }
-    // Deserialized into the daemon's own plan type rather than picked apart as
-    // untyped JSON: `abctl` and `arcbox-daemon` build and ship together, so the
-    // type is the contract and a field rename is a compile error here.
-    let plan: MigrationPlan =
-        serde_json::from_str(plan_json).context("Failed to parse migration plan")?;
-
+fn print_plan_details(plan: &MigrationPlan, skip_start: bool) {
     print_section("Images", &plan.images, |image| {
         image.export_references.join(", ")
     });
@@ -333,10 +332,12 @@ fn print_plan_details(plan_json: &str, skip_start: bool) -> Result<()> {
             container.name,
             describe_start_state(container.was_running, skip_start),
             container.image_reference,
-            describe_network_mode(&container.spec.network_mode),
+            container
+                .spec
+                .as_ref()
+                .map_or_else(|| "?".to_string(), describe_network_mode),
         )
     });
-    Ok(())
 }
 
 /// Describes what will happen to a container after it is created.
@@ -351,13 +352,19 @@ fn describe_start_state(was_running: bool, skip_start: bool) -> &'static str {
     }
 }
 
-/// Renders a network mode as a short label.
-fn describe_network_mode(mode: &NetworkModeSpec) -> String {
-    match mode {
-        NetworkModeSpec::Default => "default".to_string(),
-        NetworkModeSpec::Host => "host".to_string(),
-        NetworkModeSpec::None => "none".to_string(),
-        NetworkModeSpec::Named(attachment) => attachment.network.clone(),
+/// Renders a container's network mode as a short label.
+///
+/// `NAMED` reads its network from the companion `named_network` field, which the
+/// wire format keeps separate from the mode; an unset one leaves nothing to name.
+fn describe_network_mode(spec: &MigrationContainerSpec) -> String {
+    match spec.network_mode() {
+        MigrationNetworkMode::Default => "default".to_string(),
+        MigrationNetworkMode::Host => "host".to_string(),
+        MigrationNetworkMode::None => "none".to_string(),
+        MigrationNetworkMode::Named => spec
+            .named_network
+            .as_ref()
+            .map_or_else(|| "named".to_string(), |network| network.network.clone()),
     }
 }
 
@@ -439,7 +446,18 @@ fn print_progress_event(event: &RunMigrationEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MigrationSourceKind, NetworkModeSpec, describe_network_mode, is_confirmation_yes};
+    use super::{
+        MigrationContainerSpec, MigrationNetworkMode, MigrationSourceKind, describe_network_mode,
+        is_confirmation_yes,
+    };
+    use arcbox_protocol::v1::MigrationContainerNetworkAttachment;
+
+    fn spec_with(mode: MigrationNetworkMode) -> MigrationContainerSpec {
+        MigrationContainerSpec {
+            network_mode: mode as i32,
+            ..MigrationContainerSpec::default()
+        }
+    }
 
     #[test]
     fn docker_desktop_default_socket_ends_with_expected_path() {
@@ -461,16 +479,33 @@ mod tests {
 
     #[test]
     fn network_modes_render_as_short_labels() {
-        assert_eq!(describe_network_mode(&NetworkModeSpec::Host), "host");
-        assert_eq!(describe_network_mode(&NetworkModeSpec::Default), "default");
         assert_eq!(
-            describe_network_mode(&NetworkModeSpec::Named(
-                arcbox_migration::ContainerNetworkAttachment {
+            describe_network_mode(&spec_with(MigrationNetworkMode::Host)),
+            "host"
+        );
+        assert_eq!(
+            describe_network_mode(&spec_with(MigrationNetworkMode::Default)),
+            "default"
+        );
+        assert_eq!(
+            describe_network_mode(&MigrationContainerSpec {
+                named_network: Some(MigrationContainerNetworkAttachment {
                     network: "usernet".into(),
                     aliases: vec!["api".into()],
-                }
-            )),
+                }),
+                ..spec_with(MigrationNetworkMode::Named)
+            }),
             "usernet"
+        );
+    }
+
+    #[test]
+    fn a_named_mode_without_its_network_still_renders() {
+        // The wire format lets the two fields disagree even though the daemon
+        // never emits that, so the renderer must not depend on the pairing.
+        assert_eq!(
+            describe_network_mode(&spec_with(MigrationNetworkMode::Named)),
+            "named"
         );
     }
 

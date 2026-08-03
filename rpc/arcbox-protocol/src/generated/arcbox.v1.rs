@@ -831,7 +831,7 @@ pub struct PrepareMigrationRequest {
 /// Prepared migration summary.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrepareMigrationResponse {
     /// Opaque identifier for the prepared plan.
     #[prost(string, tag = "1")]
@@ -864,16 +864,394 @@ pub struct PrepareMigrationResponse {
     /// mount sources that do not exist on this host).
     #[prost(string, repeated, tag = "9")]
     pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// The full migration plan serialized as JSON, populated only when the
-    /// request set `dry_run`. The plan carries each container's environment
-    /// verbatim, so it is sent only when a caller explicitly asked to inspect
-    /// it rather than on every prepare.
-    #[prost(string, tag = "10")]
-    pub plan_json: ::prost::alloc::string::String,
+    /// The full migration plan, populated only when the request set `dry_run`.
+    /// The plan carries each container's environment verbatim, so it is sent
+    /// only when a caller explicitly asked to inspect it rather than on every
+    /// prepare.
+    #[prost(message, optional, tag = "10")]
+    pub plan: ::core::option::Option<MigrationPlan>,
     /// Source resources this migration cannot reproduce. Unlike warnings these
     /// are blocking: RunMigration refuses to execute a plan that has any.
     #[prost(string, repeated, tag = "11")]
     pub unsupported_resources: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// A fully resolved migration plan.
+///
+/// This is the wire projection of the daemon's internal plan, not the plan
+/// itself: the daemon's own model makes invalid states unrepresentable (a mount
+/// is one of three shapes, a container always has a spec), which protobuf
+/// cannot express. Fields here are therefore flatter and more permissive, and
+/// the notes on each say which combinations the daemon actually emits.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MigrationPlan {
+    /// Identity of the source runtime the plan was built from.
+    #[prost(message, optional, tag = "1")]
+    pub source: ::core::option::Option<MigrationSourceInfo>,
+    /// Helper image reference used for temporary volume-mount containers.
+    #[prost(string, tag = "2")]
+    pub helper_image: ::prost::alloc::string::String,
+    /// Images that will be imported into ArcBox.
+    #[prost(message, repeated, tag = "3")]
+    pub images: ::prost::alloc::vec::Vec<MigrationImagePlan>,
+    /// Volumes that will be imported into ArcBox.
+    #[prost(message, repeated, tag = "4")]
+    pub volumes: ::prost::alloc::vec::Vec<MigrationVolumePlan>,
+    /// Networks that will be recreated in ArcBox.
+    #[prost(message, repeated, tag = "5")]
+    pub networks: ::prost::alloc::vec::Vec<MigrationNetworkPlan>,
+    /// Containers that will be recreated in ArcBox, in creation order.
+    #[prost(message, repeated, tag = "6")]
+    pub containers: ::prost::alloc::vec::Vec<MigrationContainerPlan>,
+    /// Resources that are out of scope. Blocking: execution refuses to start
+    /// while any are present. Mirrors PrepareMigrationResponse.
+    #[prost(string, repeated, tag = "7")]
+    pub unsupported_resources: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Advisory problems that do not block execution.
+    #[prost(string, repeated, tag = "8")]
+    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Replace actions that require confirmation.
+    #[prost(message, optional, tag = "9")]
+    pub replacements: ::core::option::Option<MigrationReplacementSummary>,
+    /// Source volumes attached to running containers, which must be stopped.
+    #[prost(message, repeated, tag = "10")]
+    pub blockers: ::prost::alloc::vec::Vec<MigrationRunningVolumeBlocker>,
+}
+/// Identity of a migration source runtime.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationSourceInfo {
+    /// Stable source runtime identifier ("docker-desktop" or "orbstack").
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    /// Resolved source Docker Engine socket path.
+    #[prost(string, tag = "2")]
+    pub socket_path: ::prost::alloc::string::String,
+    /// Docker daemon name reported by the source.
+    #[prost(string, tag = "3")]
+    pub daemon_name: ::prost::alloc::string::String,
+    /// Server version reported by the source.
+    #[prost(string, tag = "4")]
+    pub server_version: ::prost::alloc::string::String,
+    /// Operating system reported by the source.
+    #[prost(string, tag = "5")]
+    pub operating_system: ::prost::alloc::string::String,
+    /// Architecture reported by the source.
+    #[prost(string, tag = "6")]
+    pub architecture: ::prost::alloc::string::String,
+}
+/// One image transfer.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationImagePlan {
+    /// Source image identifier.
+    #[prost(string, tag = "1")]
+    pub image_id: ::prost::alloc::string::String,
+    /// Every reference passed to `docker save`. All tags are listed because
+    /// `docker save` preserves an image's other tags only when the argument
+    /// omits a tag, so exporting one repo:tag would drop the rest. Empty for an
+    /// untagged image, which is exported by ID instead.
+    #[prost(string, repeated, tag = "2")]
+    pub export_references: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Repo tags recorded by the source daemon.
+    #[prost(string, repeated, tag = "3")]
+    pub repo_tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Subset of repo_tags that already exist on the target and will be
+    /// overwritten.
+    #[prost(string, repeated, tag = "4")]
+    pub replace_tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// One volume transfer.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MigrationVolumePlan {
+    /// Source volume name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Volume driver. Only "local" is supported; anything else is reported as
+    /// an unsupported resource.
+    #[prost(string, tag = "2")]
+    pub driver: ::prost::alloc::string::String,
+    /// Volume labels preserved on recreate.
+    #[prost(map = "string, string", tag = "3")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Driver options preserved on recreate.
+    #[prost(map = "string, string", tag = "4")]
+    pub options:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Whether an existing target volume will be replaced.
+    #[prost(bool, tag = "5")]
+    pub replace_existing: bool,
+    /// Source containers referencing this volume.
+    #[prost(string, repeated, tag = "6")]
+    pub attached_containers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// One network recreation.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MigrationNetworkPlan {
+    /// Source network name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Source network identifier.
+    #[prost(string, tag = "2")]
+    pub id: ::prost::alloc::string::String,
+    /// Docker network driver. Only "bridge" is supported; anything else is
+    /// reported as an unsupported resource.
+    #[prost(string, tag = "3")]
+    pub driver: ::prost::alloc::string::String,
+    /// Whether the network is internal.
+    #[prost(bool, tag = "4")]
+    pub internal: bool,
+    /// Whether IPv6 is enabled.
+    #[prost(bool, tag = "5")]
+    pub enable_ipv6: bool,
+    /// Whether the network is attachable.
+    #[prost(bool, tag = "6")]
+    pub attachable: bool,
+    /// Network labels preserved on recreate.
+    #[prost(map = "string, string", tag = "7")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Network options preserved on recreate.
+    #[prost(map = "string, string", tag = "8")]
+    pub options:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// IPAM configuration preserved on recreate.
+    #[prost(message, repeated, tag = "9")]
+    pub ipam: ::prost::alloc::vec::Vec<MigrationNetworkIpam>,
+    /// Whether an existing target network will be replaced.
+    #[prost(bool, tag = "10")]
+    pub replace_existing: bool,
+}
+/// One IPAM subnet configuration. Unset entries are empty strings.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationNetworkIpam {
+    /// Subnet CIDR.
+    #[prost(string, tag = "1")]
+    pub subnet: ::prost::alloc::string::String,
+    /// Gateway address.
+    #[prost(string, tag = "2")]
+    pub gateway: ::prost::alloc::string::String,
+    /// Allocation range.
+    #[prost(string, tag = "3")]
+    pub ip_range: ::prost::alloc::string::String,
+}
+/// One container recreation.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MigrationContainerPlan {
+    /// Source container name, without the leading slash.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Source container identifier.
+    #[prost(string, tag = "2")]
+    pub id: ::prost::alloc::string::String,
+    /// Image reference used when recreating. For an untagged image this is the
+    /// source image ID, which the daemon rewrites to the ID the target assigns
+    /// on import.
+    #[prost(string, tag = "3")]
+    pub image_reference: ::prost::alloc::string::String,
+    /// Normalized creation spec. Always set by the daemon.
+    #[prost(message, optional, tag = "4")]
+    pub spec: ::core::option::Option<MigrationContainerSpec>,
+    /// Networks joined after create, beyond spec.network_mode. Always empty when
+    /// network_mode is HOST, which Docker forbids combining with any attachment.
+    #[prost(message, repeated, tag = "5")]
+    pub extra_networks: ::prost::alloc::vec::Vec<MigrationContainerNetworkAttachment>,
+    /// Whether an existing target container will be replaced.
+    #[prost(bool, tag = "6")]
+    pub replace_existing: bool,
+    /// Whether the container was running on the source. Such containers are
+    /// started after the migration unless RunMigrationRequest.skip_start is set.
+    #[prost(bool, tag = "7")]
+    pub was_running: bool,
+    /// Source creation timestamp, RFC 3339. Containers are ordered by it so the
+    /// originals' creation order is reproduced.
+    #[prost(string, tag = "8")]
+    pub created: ::prost::alloc::string::String,
+}
+/// A container creation spec translated from source inspect output.
+///
+/// Optional scalars use the empty string or 0 to mean "not set", matching how
+/// Docker reports them; the daemon omits the corresponding flag in that case.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MigrationContainerSpec {
+    /// Hostname; empty when unset.
+    #[prost(string, tag = "1")]
+    pub hostname: ::prost::alloc::string::String,
+    /// Domain name; empty when unset.
+    #[prost(string, tag = "2")]
+    pub domainname: ::prost::alloc::string::String,
+    /// User; empty when unset.
+    #[prost(string, tag = "3")]
+    pub user: ::prost::alloc::string::String,
+    /// Environment variables, verbatim from the source, as KEY=VALUE.
+    #[prost(string, repeated, tag = "4")]
+    pub env: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Labels.
+    #[prost(map = "string, string", tag = "5")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Exposed ports, as "port/proto".
+    #[prost(string, repeated, tag = "6")]
+    pub exposed_ports: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Whether a TTY is allocated.
+    #[prost(bool, tag = "7")]
+    pub tty: bool,
+    /// Whether stdin stays open.
+    #[prost(bool, tag = "8")]
+    pub open_stdin: bool,
+    /// Working directory; empty when unset.
+    #[prost(string, tag = "9")]
+    pub working_dir: ::prost::alloc::string::String,
+    /// Entrypoint argv; empty to inherit the image's.
+    #[prost(string, repeated, tag = "10")]
+    pub entrypoint: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Command argv; empty to inherit the image's.
+    #[prost(string, repeated, tag = "11")]
+    pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Mounts.
+    #[prost(message, repeated, tag = "12")]
+    pub mounts: ::prost::alloc::vec::Vec<MigrationContainerMount>,
+    /// Host port publish rules.
+    #[prost(message, repeated, tag = "13")]
+    pub publishes: ::prost::alloc::vec::Vec<MigrationPortPublish>,
+    /// Restart policy; unset when the source had none.
+    #[prost(message, optional, tag = "14")]
+    pub restart_policy: ::core::option::Option<MigrationRestartPolicy>,
+    /// Whether the container is privileged.
+    #[prost(bool, tag = "15")]
+    pub privileged: bool,
+    /// Whether the root filesystem is read-only.
+    #[prost(bool, tag = "16")]
+    pub read_only_rootfs: bool,
+    /// Extra /etc/hosts entries, as "host:ip".
+    #[prost(string, repeated, tag = "17")]
+    pub extra_hosts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Whether the container is removed on exit.
+    #[prost(bool, tag = "18")]
+    pub auto_remove: bool,
+    /// Memory limit in bytes; 0 when unset.
+    #[prost(int64, tag = "19")]
+    pub memory: i64,
+    /// CPU quota in units of 10^-9 CPUs; 0 when unset.
+    #[prost(int64, tag = "20")]
+    pub nano_cpus: i64,
+    /// Added Linux capabilities.
+    #[prost(string, repeated, tag = "21")]
+    pub cap_add: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Network joined at create time.
+    #[prost(enumeration = "MigrationNetworkMode", tag = "22")]
+    pub network_mode: i32,
+    /// The network joined when network_mode is NAMED; unset for every other
+    /// mode. The daemon only emits a network that is part of this migration.
+    #[prost(message, optional, tag = "23")]
+    pub named_network: ::core::option::Option<MigrationContainerNetworkAttachment>,
+}
+/// One mount. Which fields are meaningful depends on `type`; the daemon leaves
+/// the rest at their zero values.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationContainerMount {
+    /// Mount kind, which selects the meaningful fields below.
+    #[prost(enumeration = "MigrationMountType", tag = "1")]
+    pub r#type: i32,
+    /// Volume name for VOLUME, host path for BIND, empty for TMPFS.
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    /// Destination path inside the container. Always set.
+    #[prost(string, tag = "3")]
+    pub target: ::prost::alloc::string::String,
+    /// Whether the mount is writable. VOLUME and BIND only.
+    #[prost(bool, tag = "4")]
+    pub rw: bool,
+    /// Mount options string. TMPFS only, empty when it had none.
+    #[prost(string, tag = "5")]
+    pub options: ::prost::alloc::string::String,
+}
+/// One host port publish rule.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationPortPublish {
+    /// Port and protocol inside the container, as "port/proto".
+    #[prost(string, tag = "1")]
+    pub container_port: ::prost::alloc::string::String,
+    /// Host IP to bind; empty to bind every interface.
+    #[prost(string, tag = "2")]
+    pub host_ip: ::prost::alloc::string::String,
+    /// Host port; empty to let Docker assign one.
+    #[prost(string, tag = "3")]
+    pub host_port: ::prost::alloc::string::String,
+}
+/// A container restart policy.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationRestartPolicy {
+    /// Policy name, as Docker reports it ("always", "on-failure", ...).
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Retry cap for "on-failure"; 0 when unset.
+    #[prost(int64, tag = "2")]
+    pub maximum_retry_count: i64,
+}
+/// A network a container joins, with its network-scoped aliases.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationContainerNetworkAttachment {
+    /// Network name.
+    #[prost(string, tag = "1")]
+    pub network: ::prost::alloc::string::String,
+    /// Aliases resolvable on that network. The container's own name is excluded,
+    /// since Docker registers it automatically.
+    #[prost(string, repeated, tag = "2")]
+    pub aliases: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Existing target resources a plan would replace, all requiring confirmation
+/// via RunMigrationRequest.allow_replacements.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationReplacementSummary {
+    /// Container names that will be removed and recreated.
+    #[prost(string, repeated, tag = "1")]
+    pub containers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Volume names that will be removed and recreated.
+    #[prost(string, repeated, tag = "2")]
+    pub volumes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Network names that will be removed and recreated.
+    #[prost(string, repeated, tag = "3")]
+    pub networks: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Image tags that will be overwritten.
+    #[prost(string, repeated, tag = "4")]
+    pub image_tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// A source volume held open by running containers.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MigrationRunningVolumeBlocker {
+    /// Source volume name.
+    #[prost(string, tag = "1")]
+    pub volume_name: ::prost::alloc::string::String,
+    /// Running source containers using it, which the migration stops first.
+    #[prost(string, repeated, tag = "2")]
+    pub containers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Request to run a prepared migration.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1092,6 +1470,89 @@ impl SystemVmBackend {
             "SYSTEM_VM_BACKEND_UNSPECIFIED" => Some(Self::Unspecified),
             "SYSTEM_VM_BACKEND_HV" => Some(Self::Hv),
             "SYSTEM_VM_BACKEND_VZ" => Some(Self::Vz),
+            _ => None,
+        }
+    }
+}
+/// The network a container joins at create time.
+///
+/// `container:<name|id>` has no member: sharing another container's namespace is
+/// rejected during planning rather than reproduced, and appears in
+/// unsupported_resources instead.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MigrationNetworkMode {
+    /// The default bridge; no network is selected explicitly.
+    Default = 0,
+    /// Host networking.
+    Host = 1,
+    /// No networking.
+    None = 2,
+    /// A user-defined network, named by
+    /// MigrationContainerSpec.named_network.
+    Named = 3,
+}
+impl MigrationNetworkMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Default => "MIGRATION_NETWORK_MODE_DEFAULT",
+            Self::Host => "MIGRATION_NETWORK_MODE_HOST",
+            Self::None => "MIGRATION_NETWORK_MODE_NONE",
+            Self::Named => "MIGRATION_NETWORK_MODE_NAMED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MIGRATION_NETWORK_MODE_DEFAULT" => Some(Self::Default),
+            "MIGRATION_NETWORK_MODE_HOST" => Some(Self::Host),
+            "MIGRATION_NETWORK_MODE_NONE" => Some(Self::None),
+            "MIGRATION_NETWORK_MODE_NAMED" => Some(Self::Named),
+            _ => None,
+        }
+    }
+}
+/// What a mount carries.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MigrationMountType {
+    /// Unset; never emitted by the daemon.
+    Unspecified = 0,
+    /// A named volume, migrated with the plan.
+    Volume = 1,
+    /// A host path, which must already exist on this host.
+    Bind = 2,
+    /// A tmpfs.
+    Tmpfs = 3,
+}
+impl MigrationMountType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MIGRATION_MOUNT_TYPE_UNSPECIFIED",
+            Self::Volume => "MIGRATION_MOUNT_TYPE_VOLUME",
+            Self::Bind => "MIGRATION_MOUNT_TYPE_BIND",
+            Self::Tmpfs => "MIGRATION_MOUNT_TYPE_TMPFS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MIGRATION_MOUNT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MIGRATION_MOUNT_TYPE_VOLUME" => Some(Self::Volume),
+            "MIGRATION_MOUNT_TYPE_BIND" => Some(Self::Bind),
+            "MIGRATION_MOUNT_TYPE_TMPFS" => Some(Self::Tmpfs),
             _ => None,
         }
     }
