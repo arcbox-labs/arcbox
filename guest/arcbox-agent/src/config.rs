@@ -10,6 +10,9 @@
 use arcbox_vm::VmmConfig;
 use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
 
+/// Persistent Btrfs mount that owns sandbox images, snapshots, and VM state.
+pub const SANDBOX_DATA_DIR: &str = "/var/lib/arcbox/sandbox";
+
 /// Guest-specific VMM configuration defaults.
 ///
 /// These differ from [`VmmConfig::default()`] which targets the host-side
@@ -37,7 +40,7 @@ fn guest_defaults() -> VmmConfig {
                 parent_cgroup: None,
                 resource_limits: vec![],
             }),
-            data_dir: "/var/lib/arcbox".into(),
+            data_dir: SANDBOX_DATA_DIR.into(),
             log_level: None,
             no_seccomp: false,
             seccomp_filter: None,
@@ -58,7 +61,7 @@ fn guest_defaults() -> VmmConfig {
             vcpus: 1,
             memory_mib: 512,
             kernel: "/arcbox/runtime/kernel/vmlinux".into(),
-            rootfs: "/var/lib/arcbox/sandbox/rootfs.ext4".into(),
+            rootfs: format!("{SANDBOX_DATA_DIR}/rootfs.ext4"),
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/vm-agent".into(),
         },
     }
@@ -104,4 +107,17 @@ pub fn load() -> VmmConfig {
     // 3. Built-in guest defaults.
     tracing::debug!("using built-in guest VMM config defaults");
     guest_defaults()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SANDBOX_DATA_DIR, guest_defaults};
+
+    #[test]
+    fn defaults_keep_sandbox_state_on_its_data_mount() {
+        let config = guest_defaults();
+
+        assert_eq!(config.firecracker.data_dir, SANDBOX_DATA_DIR);
+        assert!(std::path::Path::new(&config.defaults.rootfs).starts_with(SANDBOX_DATA_DIR));
+    }
 }

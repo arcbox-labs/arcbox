@@ -3,25 +3,26 @@
 //! The two representations are deliberately not the same type. `arcbox_migration`
 //! parses source inspect output into a model where invalid states are
 //! unrepresentable — a mount is exactly one of three shapes, a container always
-//! has a spec, a network mode either names a network or does not. Protobuf can
-//! express none of that: every message field arrives as an `Option`, every enum
-//! admits an unknown value, and a `oneof` still decodes to `None`. Letting the
-//! generated types serve as the internal model would push that permissiveness
-//! into the planner and executor, which is precisely what parsing at the
-//! boundary is meant to prevent.
+//! has a spec, a network mode either names a network or does not. The wire types
+//! can express none of that: a message field is a `MessageField` that may be
+//! absent, an enum field is an `EnumValue` that may hold a number no variant
+//! covers, and every message carries unknown fields from a future peer. Letting
+//! the generated types serve as the internal model would push all of that
+//! permissiveness into the planner and executor, which is precisely what parsing
+//! at the boundary is meant to prevent.
 //!
 //! So the flow is one-way. The planner produces the parsed model; this module
 //! projects it outward for callers to read. Nothing converts a DTO back into the
 //! model — `RunMigration` names a plan the daemon already holds by ID rather
 //! than accepting one over the wire, so no code path has to reconstruct
-//! invariants from optional fields.
+//! invariants from absent fields or unknown enum values.
 
+use arcbox_connect::v1 as wire;
 use arcbox_migration::{
     ContainerMount, ContainerNetworkAttachment, ContainerPlan, ContainerSpec, ImagePlan,
     MigrationPlan, NetworkModeSpec, NetworkPlan, PortPublish, ReplacementSummary,
     RestartPolicySpec, RunningVolumeBlocker, SourceInfo, VolumePlan,
 };
-use arcbox_protocol::v1 as wire;
 
 /// Projects an internal migration type onto the wire message that carries it.
 ///
@@ -42,7 +43,7 @@ impl ToWire for MigrationPlan {
 
     fn to_wire(&self) -> Self::Wire {
         wire::MigrationPlan {
-            source: Some(self.source.to_wire()),
+            source: self.source.to_wire().into(),
             helper_image: self.helper_image.clone(),
             images: self.images.to_wire(),
             volumes: self.volumes.to_wire(),
@@ -50,8 +51,9 @@ impl ToWire for MigrationPlan {
             containers: self.containers.to_wire(),
             unsupported_resources: self.unsupported_resources.clone(),
             warnings: self.warnings.clone(),
-            replacements: Some(self.replacements.to_wire()),
+            replacements: self.replacements.to_wire().into(),
             blockers: self.blockers.to_wire(),
+            ..Default::default()
         }
     }
 }
@@ -67,6 +69,7 @@ impl ToWire for SourceInfo {
             server_version: self.server_version.clone(),
             operating_system: self.operating_system.clone(),
             architecture: self.architecture.clone(),
+            ..Default::default()
         }
     }
 }
@@ -80,6 +83,7 @@ impl ToWire for ImagePlan {
             export_references: self.export_references.clone(),
             repo_tags: self.repo_tags.clone(),
             replace_tags: self.replace_tags.clone(),
+            ..Default::default()
         }
     }
 }
@@ -91,10 +95,11 @@ impl ToWire for VolumePlan {
         wire::MigrationVolumePlan {
             name: self.name.clone(),
             driver: self.driver.clone(),
-            labels: self.labels.clone(),
-            options: self.options.clone(),
+            labels: self.labels.clone().into_iter().collect(),
+            options: self.options.clone().into_iter().collect(),
             replace_existing: self.replace_existing,
             attached_containers: self.attached_containers.clone(),
+            ..Default::default()
         }
     }
 }
@@ -110,8 +115,8 @@ impl ToWire for NetworkPlan {
             internal: self.internal,
             enable_ipv6: self.enable_ipv6,
             attachable: self.attachable,
-            labels: self.labels.clone(),
-            options: self.options.clone(),
+            labels: self.labels.clone().into_iter().collect(),
+            options: self.options.clone().into_iter().collect(),
             ipam: self
                 .ipam
                 .iter()
@@ -119,9 +124,11 @@ impl ToWire for NetworkPlan {
                     subnet: entry.subnet.clone(),
                     gateway: entry.gateway.clone(),
                     ip_range: entry.ip_range.clone(),
+                    ..Default::default()
                 })
                 .collect(),
             replace_existing: self.replace_existing,
+            ..Default::default()
         }
     }
 }
@@ -134,11 +141,12 @@ impl ToWire for ContainerPlan {
             name: self.name.clone(),
             id: self.id.clone(),
             image_reference: self.image_reference.clone(),
-            spec: Some(self.spec.to_wire()),
+            spec: self.spec.to_wire().into(),
             extra_networks: self.extra_networks.to_wire(),
             replace_existing: self.replace_existing,
             was_running: self.was_running,
             created: self.created.clone(),
+            ..Default::default()
         }
     }
 }
@@ -147,19 +155,22 @@ impl ToWire for ContainerSpec {
     type Wire = wire::MigrationContainerSpec;
 
     fn to_wire(&self) -> Self::Wire {
-        // `network_mode` splits into an enum plus an optional attachment: the
+        // `network_mode` splits into an enum plus a separate attachment: the
         // model's `Named` variant carries its network inline, which protobuf
-        // cannot do without a oneof that decodes back to `None` anyway.
+        // cannot express without a oneof that decodes back to absent anyway.
+        // Every other mode leaves the attachment absent, not present-and-empty.
         let named_network = match &self.network_mode {
-            NetworkModeSpec::Named(attachment) => Some(attachment.to_wire()),
-            NetworkModeSpec::Default | NetworkModeSpec::Host | NetworkModeSpec::None => None,
+            NetworkModeSpec::Named(attachment) => attachment.to_wire().into(),
+            NetworkModeSpec::Default | NetworkModeSpec::Host | NetworkModeSpec::None => {
+                Default::default()
+            }
         };
         wire::MigrationContainerSpec {
             hostname: self.hostname.clone().unwrap_or_default(),
             domainname: self.domainname.clone().unwrap_or_default(),
             user: self.user.clone().unwrap_or_default(),
             env: self.env.clone(),
-            labels: self.labels.clone(),
+            labels: self.labels.clone().into_iter().collect(),
             exposed_ports: self.exposed_ports.clone(),
             tty: self.tty,
             open_stdin: self.open_stdin,
@@ -168,7 +179,10 @@ impl ToWire for ContainerSpec {
             cmd: self.cmd.clone(),
             mounts: self.mounts.to_wire(),
             publishes: self.publishes.to_wire(),
-            restart_policy: self.restart_policy.as_ref().map(ToWire::to_wire),
+            restart_policy: self
+                .restart_policy
+                .as_ref()
+                .map_or_else(Default::default, |policy| policy.to_wire().into()),
             privileged: self.privileged,
             read_only_rootfs: self.read_only_rootfs,
             extra_hosts: self.extra_hosts.clone(),
@@ -176,8 +190,9 @@ impl ToWire for ContainerSpec {
             memory: self.memory.unwrap_or_default(),
             nano_cpus: self.nano_cpus.unwrap_or_default(),
             cap_add: self.cap_add.clone(),
-            network_mode: self.network_mode.to_wire() as i32,
+            network_mode: self.network_mode.to_wire().into(),
             named_network,
+            ..Default::default()
         }
     }
 }
@@ -204,25 +219,28 @@ impl ToWire for ContainerMount {
         // do not apply to a variant stay at their zero value.
         match self {
             Self::Volume { source, target, rw } => wire::MigrationContainerMount {
-                r#type: wire::MigrationMountType::Volume as i32,
+                r#type: wire::MigrationMountType::Volume.into(),
                 source: source.clone(),
                 target: target.clone(),
                 rw: *rw,
                 options: String::new(),
+                ..Default::default()
             },
             Self::Bind { source, target, rw } => wire::MigrationContainerMount {
-                r#type: wire::MigrationMountType::Bind as i32,
+                r#type: wire::MigrationMountType::Bind.into(),
                 source: source.clone(),
                 target: target.clone(),
                 rw: *rw,
                 options: String::new(),
+                ..Default::default()
             },
             Self::Tmpfs { target, options } => wire::MigrationContainerMount {
-                r#type: wire::MigrationMountType::Tmpfs as i32,
+                r#type: wire::MigrationMountType::Tmpfs.into(),
                 source: String::new(),
                 target: target.clone(),
                 rw: false,
                 options: options.clone().unwrap_or_default(),
+                ..Default::default()
             },
         }
     }
@@ -236,6 +254,7 @@ impl ToWire for PortPublish {
             container_port: self.container_port.clone(),
             host_ip: self.host_ip.clone().unwrap_or_default(),
             host_port: self.host_port.clone().unwrap_or_default(),
+            ..Default::default()
         }
     }
 }
@@ -247,6 +266,7 @@ impl ToWire for RestartPolicySpec {
         wire::MigrationRestartPolicy {
             name: self.name.clone(),
             maximum_retry_count: self.maximum_retry_count.unwrap_or_default(),
+            ..Default::default()
         }
     }
 }
@@ -258,6 +278,7 @@ impl ToWire for ContainerNetworkAttachment {
         wire::MigrationContainerNetworkAttachment {
             network: self.network.clone(),
             aliases: self.aliases.clone(),
+            ..Default::default()
         }
     }
 }
@@ -271,6 +292,7 @@ impl ToWire for ReplacementSummary {
             volumes: self.volumes.clone(),
             networks: self.networks.clone(),
             image_tags: self.image_tags.clone(),
+            ..Default::default()
         }
     }
 }
@@ -282,6 +304,7 @@ impl ToWire for RunningVolumeBlocker {
         wire::MigrationRunningVolumeBlocker {
             volume_name: self.volume_name.clone(),
             containers: self.containers.clone(),
+            ..Default::default()
         }
     }
 }
@@ -297,10 +320,10 @@ impl<T: ToWire> ToWire for Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::ToWire;
+    use arcbox_connect::v1 as wire;
     use arcbox_migration::{
         ContainerMount, ContainerNetworkAttachment, ContainerPlan, ContainerSpec, NetworkModeSpec,
     };
-    use arcbox_protocol::v1 as wire;
 
     fn plan_with(spec: ContainerSpec) -> wire::MigrationContainerPlan {
         ContainerPlan {
@@ -316,9 +339,13 @@ mod tests {
         .to_wire()
     }
 
+    fn spec_of(plan: &wire::MigrationContainerPlan) -> &wire::MigrationContainerSpec {
+        plan.spec.as_option().expect("spec is always projected")
+    }
+
     #[test]
     fn a_named_network_mode_splits_into_enum_and_attachment() {
-        let wire = plan_with(ContainerSpec {
+        let plan = plan_with(ContainerSpec {
             network_mode: NetworkModeSpec::Named(ContainerNetworkAttachment {
                 network: "app-net".to_string(),
                 aliases: vec!["db".to_string()],
@@ -326,33 +353,35 @@ mod tests {
             ..ContainerSpec::default()
         });
 
-        let spec = wire.spec.expect("spec is always projected");
+        let spec = spec_of(&plan);
         assert_eq!(
-            spec.network_mode,
-            wire::MigrationNetworkMode::Named as i32,
+            spec.network_mode.as_known(),
+            Some(wire::MigrationNetworkMode::Named),
             "mode must name the NAMED member"
         );
         let attachment = spec
             .named_network
+            .as_option()
             .expect("NAMED carries the attachment it was built from");
         assert_eq!(attachment.network, "app-net");
         assert_eq!(attachment.aliases, vec!["db".to_string()]);
     }
 
     #[test]
-    fn modes_without_a_network_leave_the_attachment_unset() {
+    fn modes_without_a_network_leave_the_attachment_absent() {
+        // Absent, not present-and-empty: a consumer distinguishes the two, and
+        // an empty attachment would read as "a network with no name".
         for mode in [
             NetworkModeSpec::Default,
             NetworkModeSpec::Host,
             NetworkModeSpec::None,
         ] {
-            let wire = plan_with(ContainerSpec {
+            let plan = plan_with(ContainerSpec {
                 network_mode: mode.clone(),
                 ..ContainerSpec::default()
             });
-            let spec = wire.spec.expect("spec is always projected");
             assert!(
-                spec.named_network.is_none(),
+                spec_of(&plan).named_network.is_unset(),
                 "{mode:?} must not carry an attachment"
             );
         }
@@ -360,7 +389,7 @@ mod tests {
 
     #[test]
     fn mount_variants_flatten_onto_the_fields_they_use() {
-        let wire = plan_with(ContainerSpec {
+        let plan = plan_with(ContainerSpec {
             mounts: vec![
                 ContainerMount::Volume {
                     source: "pgdata".to_string(),
@@ -379,18 +408,27 @@ mod tests {
             ],
             ..ContainerSpec::default()
         });
-        let mounts = wire.spec.expect("spec is always projected").mounts;
+        let mounts = &spec_of(&plan).mounts;
 
-        assert_eq!(mounts[0].r#type, wire::MigrationMountType::Volume as i32);
+        assert_eq!(
+            mounts[0].r#type.as_known(),
+            Some(wire::MigrationMountType::Volume)
+        );
         assert_eq!(mounts[0].source, "pgdata");
         assert!(mounts[0].rw);
         assert!(mounts[0].options.is_empty(), "volumes carry no options");
 
-        assert_eq!(mounts[1].r#type, wire::MigrationMountType::Bind as i32);
+        assert_eq!(
+            mounts[1].r#type.as_known(),
+            Some(wire::MigrationMountType::Bind)
+        );
         assert_eq!(mounts[1].source, "/host/src");
         assert!(!mounts[1].rw);
 
-        assert_eq!(mounts[2].r#type, wire::MigrationMountType::Tmpfs as i32);
+        assert_eq!(
+            mounts[2].r#type.as_known(),
+            Some(wire::MigrationMountType::Tmpfs)
+        );
         assert!(mounts[2].source.is_empty(), "tmpfs has no source");
         assert_eq!(mounts[2].options, "size=64m");
     }
@@ -399,13 +437,13 @@ mod tests {
     fn unset_optionals_project_to_zero_values() {
         // The proto documents empty/0 as "not set", so a `None` must not become
         // a literal "None" or a sentinel a consumer would read as a real value.
-        let wire = plan_with(ContainerSpec::default());
-        let spec = wire.spec.expect("spec is always projected");
+        let plan = plan_with(ContainerSpec::default());
+        let spec = spec_of(&plan);
 
         assert!(spec.hostname.is_empty());
         assert!(spec.working_dir.is_empty());
         assert_eq!(spec.memory, 0);
         assert_eq!(spec.nano_cpus, 0);
-        assert!(spec.restart_policy.is_none());
+        assert!(spec.restart_policy.is_unset());
     }
 }

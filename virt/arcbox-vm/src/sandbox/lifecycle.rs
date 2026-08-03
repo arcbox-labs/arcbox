@@ -1,12 +1,36 @@
 use super::boot::boot_sandbox;
 use super::cleanup::{inst_to_info, remove_sandbox_impl};
+use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
+use super::types::{SandboxBootTask, action};
 use super::*;
 
 impl SandboxManager {
-    pub async fn create_sandbox(&self, mut spec: SandboxSpec) -> Result<(SandboxId, String)> {
+    /// Replay a durable Create outcome without resolving its template again.
+    pub async fn replay_sandbox_create(
+        &self,
+        id: &str,
+        request_key: &str,
+    ) -> Result<Option<(SandboxId, String)>> {
+        self.await_reconcile().await?;
+        self.records
+            .replay_provision(id, request_key)
+            .map(|outcome| outcome.map(|outcome| (id.to_owned(), outcome.ip_address)))
+    }
+
+    pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<(SandboxId, String)> {
+        self.create_sandbox_keyed(spec, &Uuid::new_v4().to_string())
+            .await
+    }
+
+    /// Create a sandbox with a stable key for durable request replay.
+    pub async fn create_sandbox_keyed(
+        &self,
+        mut spec: SandboxSpec,
+        request_key: &str,
+    ) -> Result<(SandboxId, String)> {
         // Do not allocate any per-id resources until the startup orphan sweep
         // has run — otherwise a re-created same-id sandbox races it.
-        self.await_reconcile().await;
+        self.await_reconcile().await?;
 
         // Apply daemon defaults for fields not supplied by the caller.
         let defaults = &self.config.defaults;
@@ -38,65 +62,148 @@ impl SandboxManager {
         // Restrict caller-supplied ids to a safe charset (path components,
         // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
         super::validate_id("sandbox id", &id)?;
+        spec.id = Some(id.clone());
 
         let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
             .join("sandboxes")
             .join(&id);
 
-        // Reserve the id atomically BEFORE allocating any per-id resource, so
-        // two concurrent creates of the same id can't both pass a uniqueness
-        // check and race — the loser fails with AlreadyExists instead of
-        // overwriting the map entry and leaking the winner's TAP/instance
-        // (mirrors restore; unwound on any early return via Drop).
+        // Create and Restore claim the in-memory namespace in the same order,
+        // before either consults durable ownership.
         let reservation = super::reserve_id(
             &self.instances,
             &id,
             SandboxInstance::new(id.clone(), spec.clone(), None, vm_dir.clone()),
         )?;
 
-        // Allocate network resources (point-to-point TAP). The id is claimed,
-        // so a concurrent create already failed at reserve_id above.
-        let net_alloc = if spec.network.mode == "none" {
-            None
-        } else {
-            Some(self.network.allocate(&id)?)
+        // This durable boundary still precedes every external side effect.
+        let record = match self.records.provision_intent(&id, request_key, spec)? {
+            ProvisionIntent::Created(record) | ProvisionIntent::Resume(record) => record,
+            ProvisionIntent::Replay(record) => {
+                let outcome = record
+                    .provision_outcome
+                    .ok_or_else(|| VmmError::WrongState {
+                        id: id.clone(),
+                        expected: "a persisted create outcome".into(),
+                        actual: "none".into(),
+                    })?;
+                return Ok((id, outcome.ip_address));
+            }
+            ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(id)),
+        };
+        let generation = record.generation;
+        let spec = record.effective_spec;
+        let arc = reservation.instance();
+        let mut creating_instance = arc.lock().unwrap();
+        creating_instance.record_generation = Some(generation);
+        creating_instance.labels.clone_from(&spec.labels);
+        creating_instance.spec.clone_from(&spec);
+
+        // Reserve the IP without touching the host, durably journal it, then
+        // materialize the TAP. No external resource exists before its cleanup
+        // metadata does.
+        let mut net_alloc = None;
+        let setup = (|| -> Result<(String, Option<String>)> {
+            if spec.network.mode != "none" {
+                net_alloc = Some(self.network.reserve(&id)?);
+            }
+            let ip_address = net_alloc
+                .as_ref()
+                .map(|net| net.ip_address.to_string())
+                .unwrap_or_default();
+
+            super::reconcile::create_runtime_dir(&vm_dir)?;
+            let cleanup_record = super::reconcile::SandboxStateRecord::new(
+                &id,
+                None,
+                net_alloc.as_ref(),
+                None,
+                self.config.firecracker.jailer.is_some(),
+                None,
+            );
+            super::reconcile::write_state_record(&vm_dir, &cleanup_record)?;
+            if let Some(net) = &net_alloc {
+                self.network.activate(net)?;
+            }
+
+            let outcome = SandboxProvisionOutcome {
+                ip_address: ip_address.clone(),
+            };
+            let commit =
+                self.records
+                    .transition(&id, generation, SandboxTransition::Starting(outcome))?;
+            Ok((ip_address, commit.durability_error))
+        })();
+
+        let (ip_address, starting_durability_error) = match setup {
+            Ok(result) => result,
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                let mut network_cleanup_failed = false;
+                if let Some(net) = &net_alloc
+                    && let Err(release_error) = self.network.release_checked(net)
+                {
+                    network_cleanup_failed = true;
+                    rollback_errors.push(format!("network: {release_error}"));
+                }
+                if !network_cleanup_failed
+                    && let Err(remove_error) = std::fs::remove_dir_all(&vm_dir)
+                    && remove_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    rollback_errors.push(format!("directory {}: {remove_error}", vm_dir.display()));
+                }
+                if !rollback_errors.is_empty() {
+                    creating_instance.network.clone_from(&net_alloc);
+                    creating_instance.state = SandboxState::Failed;
+                    creating_instance.error = Some(error.to_string());
+                    let record_error = self
+                        .records
+                        .transition(
+                            &id,
+                            generation,
+                            SandboxTransition::Failed(error.to_string()),
+                        )
+                        .err()
+                        .map(|record_error| format!("record: {record_error}"));
+                    if let Some(record_error) = record_error {
+                        rollback_errors.push(record_error);
+                    }
+                    drop(creating_instance);
+                    reservation.commit();
+                    return Err(VmmError::Other(format!(
+                        "{error}; sandbox rollback is incomplete: {}",
+                        rollback_errors.join("; ")
+                    )));
+                }
+                let abort = self.records.abort_provision(&id, generation)?;
+                if let Some(durability_error) = abort.durability_error {
+                    return Err(VmmError::Unavailable(format!(
+                        "{error}; create rollback is visible, but durability is unconfirmed: {durability_error}"
+                    )));
+                }
+                return Err(error);
+            }
         };
 
-        let ip_address = net_alloc
-            .as_ref()
-            .map(|n| n.ip_address.to_string())
-            .unwrap_or_default();
-
-        // Create the VM working directory; release the TAP if this fails (the
-        // reservation itself unwinds the placeholder on the early return).
-        if let Err(e) = std::fs::create_dir_all(&vm_dir) {
-            if let Some(net) = &net_alloc {
-                self.network.release(net);
-            }
-            return Err(VmmError::Io(e));
-        }
-
-        // Populate the reserved instance and commit it. Keep a Weak to identify
-        // this exact generation when its TTL timer fires (see expire_sandbox).
-        let arc = reservation.instance();
-        arc.lock().unwrap().network.clone_from(&net_alloc);
+        // Populate the reserved instance. Keep a Weak to identify this exact
+        // generation when its TTL timer fires (see expire_sandbox).
+        creating_instance.network.clone_from(&net_alloc);
         let ttl_armed_for = Arc::downgrade(&arc);
-        reservation.commit();
 
-        // Broadcast "created" event.
-        let _ = self.events_tx.send(SandboxEvent::new(&id, "created"));
-
-        // Spawn background boot task.
+        // Retain the boot task so force/TTL removal can cancel and join it
+        // before deleting the crash-recovery journal.
         {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
             let config = Arc::clone(&self.config);
             let events_tx = self.events_tx.clone();
             let cow_manager = Arc::clone(&self.cow_manager);
+            let records = Arc::clone(&self.records);
             let id_clone = id.clone();
             let spec_clone = spec.clone();
             let net_alloc_clone = net_alloc;
-            tokio::spawn(async move {
+            let (resource_handoff_tx, resource_handoff) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
                 boot_sandbox(
                     id_clone,
                     spec_clone,
@@ -107,10 +214,22 @@ impl SandboxManager {
                     config,
                     events_tx,
                     cow_manager,
+                    records,
+                    generation,
+                    resource_handoff_tx,
                 )
                 .await;
             });
+            creating_instance.boot_task = Some(SandboxBootTask {
+                resource_handoff: Some(resource_handoff),
+                handle,
+            });
         }
+        drop(creating_instance);
+        reservation.commit();
+
+        // Publish only after removal can observe and join the boot task.
+        let _ = self.events_tx.send(SandboxEvent::new(&id, action::CREATED));
 
         // Spawn TTL expiry task if requested.
         if spec.ttl_seconds > 0 {
@@ -119,19 +238,33 @@ impl SandboxManager {
             let events_tx = self.events_tx.clone();
             let config2 = Arc::clone(&self.config);
             let cow2 = Arc::clone(&self.cow_manager);
+            let records = Arc::clone(&self.records);
             let id2 = id.clone();
             let ttl = spec.ttl_seconds;
             let armed_for = ttl_armed_for;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
                 super::cleanup::expire_sandbox(
-                    &id2, &armed_for, &instances, &network, &events_tx, &config2, &cow2,
+                    &id2,
+                    Some(generation),
+                    &armed_for,
+                    &instances,
+                    &network,
+                    &events_tx,
+                    &config2,
+                    &cow2,
+                    &records,
                 )
                 .await;
             });
         }
 
         info!(sandbox_id = %id, "sandbox create requested (async boot started)");
+        if let Some(error) = starting_durability_error {
+            return Err(VmmError::Unavailable(format!(
+                "sandbox {id} was created, but ACK durability is unconfirmed: {error}"
+            )));
+        }
         Ok((id, ip_address))
     }
 
@@ -144,6 +277,7 @@ impl SandboxManager {
     /// dm-snapshot CoW, jailer chroot) are released on `Stopped`; only the
     /// inspectable record and the log directory survive until `Remove`.
     pub async fn stop_sandbox(&self, id: &SandboxId, timeout_seconds: u32) -> Result<()> {
+        self.await_reconcile().await?;
         let budget = Duration::from_secs(u64::from(if timeout_seconds > 0 {
             timeout_seconds
         } else {
@@ -151,39 +285,71 @@ impl SandboxManager {
         }));
         let deadline = tokio::time::Instant::now() + budget;
 
-        let (was_running, vm_handle) = {
-            let instance = self.get_instance(id)?;
+        let instance = self.get_instance(id)?;
+        let cleanup_lock = instance.lock().unwrap().cleanup_lock.clone();
+        let _cleanup_guard = cleanup_lock.lock().await;
+        super::ensure_current_instance(&self.instances, id, &instance)?;
+        let already_stopped = {
+            let inst = instance.lock().unwrap();
+            (inst.state == SandboxState::Stopped)
+                .then(|| (inst.record_generation, inst.vm_dir.clone()))
+        };
+        if let Some((generation, vm_dir)) = already_stopped {
+            if let Some(generation) = generation {
+                self.records
+                    .transition(id, generation, SandboxTransition::Stopped)?
+                    .confirmed("sandbox stop retry")?;
+            }
+            super::reconcile::clear_state_record(&vm_dir)?;
+            return Ok(());
+        }
+        let (was_running, vm_handle, record_generation, last_exited_at) = {
             let mut inst = instance.lock().unwrap();
             match inst.state {
-                SandboxState::Ready | SandboxState::Running => {}
+                SandboxState::Ready | SandboxState::Running | SandboxState::Stopping => {}
                 s => {
                     return Err(VmmError::WrongState {
                         id: id.clone(),
-                        expected: "Ready or Running".into(),
+                        expected: "Ready, Running, or Stopping".into(),
                         actual: s.to_string(),
                     });
                 }
             }
             let was_running = inst.state == SandboxState::Running;
+            let captured = (
+                was_running,
+                inst.vm.as_ref().map(Arc::clone),
+                inst.record_generation,
+                inst.last_exited_at,
+            );
+            if let Some(generation) = inst.record_generation {
+                let commit =
+                    self.records
+                        .transition(id, generation, SandboxTransition::Stopping)?;
+                if let Some(error) = commit.durability_error {
+                    warn!(
+                        sandbox_id = %id,
+                        error,
+                        "stopping transition is visible but durability is unconfirmed"
+                    );
+                }
+            }
             inst.state = SandboxState::Stopping;
-            (was_running, inst.vm.as_ref().map(Arc::clone))
+            captured
         };
 
-        let _ = self.events_tx.send(SandboxEvent::new(id, "stopping"));
+        let _ = self.events_tx.send(SandboxEvent::new(id, action::STOPPING));
 
         // Drain: give an active workload the budget to finish. The run/exec
-        // watcher flips the state to Ready (over our Stopping) when the exit
-        // chunk arrives, so poll for that transition.
+        // watcher records last_exited_at when the exit chunk arrives, so poll
+        // for that signal without relinquishing the Stopping state.
         if was_running {
             while tokio::time::Instant::now() < deadline {
-                let state = self.get_instance(id)?.lock().unwrap().state;
-                if state != SandboxState::Stopping {
+                if instance.lock().unwrap().last_exited_at != last_exited_at {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            // Re-assert Stopping for observers regardless of drain outcome.
-            self.get_instance(id)?.lock().unwrap().state = SandboxState::Stopping;
         }
 
         // Ask the guest to shut down. Ctrl+Alt+Del triggers a guest reboot,
@@ -195,22 +361,33 @@ impl SandboxManager {
 
         // Wait for Firecracker to exit within the remaining budget; SIGKILL
         // as a fallback, then reap.
-        let fc_process = self.get_instance(id)?.lock().unwrap().process.take();
+        let fc_process = instance.lock().unwrap().process.take();
         if let Some(mut proc) = fc_process {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::from_secs(1))
                 .max(Duration::from_secs(1));
-            if tokio::time::timeout(remaining, proc.wait()).await.is_err() {
-                warn!(sandbox_id = %id, "guest did not shut down in time; killing firecracker");
-                super::boot::kill_and_reap_fc(&mut proc).await;
+            match tokio::time::timeout(remaining, proc.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    instance.lock().unwrap().process = Some(proc);
+                    return Err(VmmError::Process(format!(
+                        "wait for sandbox {id} firecracker: {error}"
+                    )));
+                }
+                Err(_) => {
+                    warn!(sandbox_id = %id, "guest did not shut down in time; killing firecracker");
+                    if let Err(error) = super::boot::kill_and_reap_fc_checked(&mut proc).await {
+                        instance.lock().unwrap().process = Some(proc);
+                        return Err(error);
+                    }
+                }
             }
         }
 
         // Release TAP/IP, CoW device, and chroot now that FC is gone; the
         // record itself stays inspectable until Remove.
-        {
-            let instance = self.get_instance(id)?;
+        let stop_commit = {
             super::cleanup::release_runtime_resources(
                 id,
                 &instance,
@@ -218,44 +395,84 @@ impl SandboxManager {
                 &self.config,
                 &self.cow_manager,
             )
-            .await;
+            .await?;
+            let commit = record_generation
+                .map(|generation| {
+                    self.records
+                        .transition(id, generation, SandboxTransition::Stopped)
+                })
+                .transpose()?;
             let mut inst = instance.lock().unwrap();
             inst.state = SandboxState::Stopped;
-            // Every reconcilable resource is gone; drop the crash record.
-            super::reconcile::clear_state_record(&inst.vm_dir);
-        }
+            if commit
+                .as_ref()
+                .is_none_or(|commit| commit.durability_error.is_none())
+            {
+                // Every reconcilable resource is gone and Stopped is durable.
+                super::reconcile::clear_state_record(&inst.vm_dir)?;
+            }
+            commit
+        };
 
-        let _ = self.events_tx.send(SandboxEvent::new(id, "stopped"));
+        let _ = self.events_tx.send(SandboxEvent::new(id, action::STOPPED));
         info!(sandbox_id = %id, "sandbox stopped");
+        stop_commit
+            .map(|commit| commit.confirmed("sandbox stop"))
+            .transpose()?;
         Ok(())
     }
 
     /// Forcibly destroy a sandbox and release all resources immediately.
     pub async fn remove_sandbox(&self, id: &SandboxId, force: bool) -> Result<()> {
-        // Verify the sandbox exists.
-        let state = {
-            let instance = self.get_instance(id)?;
-            instance.lock().unwrap().state
+        self.await_reconcile().await?;
+        let expected = match self.get_instance(id) {
+            Ok(expected) => expected,
+            Err(VmmError::NotFound(_)) => {
+                let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
+                    .join("sandboxes")
+                    .join(id);
+                match super::reserve_id(
+                    &self.instances,
+                    id,
+                    SandboxInstance::new(
+                        id.clone(),
+                        SandboxSpec {
+                            id: Some(id.clone()),
+                            ..Default::default()
+                        },
+                        None,
+                        vm_dir,
+                    ),
+                ) {
+                    Ok(_reservation) => {
+                        let commit = self.records.cancel_pending_or_missing(id)?;
+                        if let Some(error) = commit.durability_error {
+                            return Err(VmmError::Unavailable(format!(
+                                "sandbox {id} removal is visible, but durability is unconfirmed: {error}"
+                            )));
+                        }
+                        info!(sandbox_id = %id, "sandbox already removed");
+                        return Ok(());
+                    }
+                    Err(VmmError::AlreadyExists(_)) => self.get_instance(id)?,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
         };
-
-        if !force && state == SandboxState::Running {
-            return Err(VmmError::WrongState {
-                id: id.clone(),
-                expected: "non-running (pass force=true to override)".into(),
-                actual: state.to_string(),
-            });
-        }
 
         remove_sandbox_impl(
             id,
             force,
+            &expected,
             &self.instances,
             &self.network,
             &self.events_tx,
             &self.config,
             &self.cow_manager,
+            &self.records,
         )
-        .await;
+        .await?;
         info!(sandbox_id = %id, "sandbox removed");
         Ok(())
     }
@@ -272,14 +489,15 @@ impl SandboxManager {
         &self,
         state_filter: Option<&str>,
         label_filter: &HashMap<String, String>,
-    ) -> Vec<SandboxSummary> {
+    ) -> Result<Vec<SandboxSummary>> {
+        self.check_reconcile()?;
         // Snapshot the Arcs under the map read guard, then release it before
         // locking any instance. The manager's discipline is "never hold the
         // instances map lock while holding an instance lock"; taking both here
         // (as before) is the one place that could deadlock a future writer that
         // locks in the opposite order.
         let instances: Vec<_> = self.instances.read().unwrap().values().cloned().collect();
-        instances
+        Ok(instances
             .iter()
             .filter_map(|arc| {
                 let inst = arc.lock().unwrap();
@@ -308,7 +526,7 @@ impl SandboxManager {
                     created_at: inst.created_at,
                 })
             })
-            .collect()
+            .collect())
     }
 
     /// Subscribe to sandbox lifecycle events.
@@ -317,6 +535,7 @@ impl SandboxManager {
     }
 
     pub(super) fn get_instance(&self, id: &SandboxId) -> Result<Arc<Mutex<SandboxInstance>>> {
+        self.check_reconcile()?;
         self.instances
             .read()
             .unwrap()

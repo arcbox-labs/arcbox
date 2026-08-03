@@ -12,22 +12,24 @@ authors.workspace = true
 arcbox-constants = { workspace = true }
 chrono = { workspace = true }
 arcbox-core = { workspace = true }
-arcbox-protocol = { workspace = true }
-arcbox-grpc = { workspace = true }
 arcbox-docker = { workspace = true }
 arcbox-error = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 dimicon = { version = "0.2.0", features = ["devicon", "simpleicon"] }
+bytes.workspace = true
+arcbox-connect.workspace = true
+connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.1" }
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
 
 [dev-dependencies]
+http = "1.5.0"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

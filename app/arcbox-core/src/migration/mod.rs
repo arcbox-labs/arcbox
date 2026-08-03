@@ -3,12 +3,12 @@
 mod dto;
 
 use crate::error::{CoreError, Result};
+use arcbox_connect::v1::{
+    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+};
 use arcbox_migration::{
     DockerCliRunner, MigrationError, MigrationExecutor, MigrationExecutorOptions, MigrationPlanner,
     MigrationProgress, SourceConfig, SourceKind, resolve_source,
-};
-use arcbox_protocol::v1::{
-    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
 use dto::ToWire;
 use std::collections::HashMap;
@@ -107,8 +107,12 @@ impl MigrationManager {
             // Only for an explicit dry run: the plan embeds each container's
             // environment verbatim, so it is not worth shipping on a prepare
             // whose caller is about to run the migration anyway.
-            plan: request.dry_run.then(|| plan.to_wire()),
+            plan: request
+                .dry_run
+                .then(|| plan.to_wire())
+                .map_or_else(Default::default, Into::into),
             unsupported_resources: plan.unsupported_resources.clone(),
+            ..Default::default()
         })
     }
 
@@ -246,6 +250,7 @@ fn progress_to_event(
         success,
         // Only the terminal event carries warnings; the caller fills them in.
         warnings: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -324,6 +329,7 @@ exit 0
             source_socket_path: socket.to_string_lossy().into_owned(),
             allow_replacements: true,
             dry_run,
+            ..Default::default()
         }
     }
 
@@ -372,6 +378,7 @@ exit 0
                 plan_id: plan_id.clone(),
                 allow_replacements: false,
                 skip_start: false,
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -406,6 +413,7 @@ exit 0
                 plan_id: plan_id.clone(),
                 allow_replacements: true,
                 skip_start: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -443,6 +451,7 @@ exit 0
                 plan_id,
                 allow_replacements: true,
                 skip_start: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -474,7 +483,7 @@ exit 0
         assert!(response.plan_id.is_empty(), "a dry run issues no plan id");
         let plan = response.plan.expect("a dry run ships the plan");
         assert!(
-            plan.source.is_some(),
+            plan.source.is_set(),
             "the plan's source is always projected"
         );
         assert!(
@@ -504,7 +513,7 @@ exit 0
         // The plan embeds container environments; it ships only when a caller
         // explicitly asked to inspect it.
         assert!(
-            response.plan.is_none(),
+            response.plan.is_unset(),
             "a runnable prepare must not ship the plan payload"
         );
     }

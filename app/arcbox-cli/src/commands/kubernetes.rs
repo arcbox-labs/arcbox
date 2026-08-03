@@ -3,18 +3,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::KubernetesServiceClient;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_docker_tools::{HostToolManager, ToolGroup, parse_tools_for_group};
-use arcbox_grpc::v1::kubernetes_service_client::KubernetesServiceClient;
-use arcbox_protocol::v1::{
-    KubernetesDeleteRequest, KubernetesKubeconfigRequest, KubernetesStartRequest,
-    KubernetesStatusRequest, KubernetesStopRequest,
-};
 use clap::Subcommand;
-use tonic::Request;
-use tonic::transport::{Channel, Endpoint};
 
-use super::machine::UnixConnector;
+use crate::connect;
 
 /// Embedded `assets.lock` (same copy used by Docker/Kubernetes host tools).
 const LOCK_TOML: &str = include_str!("../../../../assets.lock");
@@ -58,19 +53,9 @@ pub async fn execute(cmd: KubernetesCommands) -> Result<()> {
     }
 }
 
-async fn kubernetes_client() -> Result<KubernetesServiceClient<Channel>> {
-    let socket_path = super::resolve_grpc_socket_path();
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-
-    Ok(KubernetesServiceClient::new(channel))
+fn kubernetes_client() -> KubernetesServiceClient<connectrpc::client::SharedHttp2Connection> {
+    let (transport, config) = connect::daemon(&super::resolve_grpc_socket_path());
+    KubernetesServiceClient::new(transport, config)
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -288,12 +273,12 @@ async fn delete_context_entries(home: &Path) -> Result<()> {
 }
 
 async fn refresh_managed_kubeconfig(home: &Path) -> Result<()> {
-    let mut client = kubernetes_client().await?;
-    let response = client
-        .get_kubeconfig(Request::new(KubernetesKubeconfigRequest {}))
+    let client = kubernetes_client();
+    let response: pb::KubernetesKubeconfigResponse = client
+        .get_kubeconfig(pb::KubernetesKubeconfigRequest::default())
         .await
         .context("failed to get ArcBox kubeconfig; run 'abctl k8s start' first")?
-        .into_inner();
+        .into_owned();
 
     let managed = managed_kubeconfig_path(home);
     if let Some(parent) = managed.parent() {
@@ -316,12 +301,12 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
 }
 
 async fn execute_start() -> Result<()> {
-    let mut client = kubernetes_client().await?;
-    let response = client
-        .start(Request::new(KubernetesStartRequest {}))
+    let client = kubernetes_client();
+    let response: pb::KubernetesStartResponse = client
+        .start(pb::KubernetesStartRequest::default())
         .await
         .context("failed to start Kubernetes")?
-        .into_inner();
+        .into_owned();
 
     println!(
         "Kubernetes: {}",
@@ -342,12 +327,12 @@ async fn execute_start() -> Result<()> {
 }
 
 async fn execute_stop() -> Result<()> {
-    let mut client = kubernetes_client().await?;
-    let response = client
-        .stop(Request::new(KubernetesStopRequest {}))
+    let client = kubernetes_client();
+    let response: pb::KubernetesStopResponse = client
+        .stop(pb::KubernetesStopRequest::default())
         .await
         .context("failed to stop Kubernetes")?
-        .into_inner();
+        .into_owned();
 
     println!("Kubernetes stopped: {}", response.stopped);
     if !response.detail.is_empty() {
@@ -362,12 +347,12 @@ async fn execute_restart() -> Result<()> {
 }
 
 async fn execute_delete() -> Result<()> {
-    let mut client = kubernetes_client().await?;
-    let response = client
-        .delete(Request::new(KubernetesDeleteRequest {}))
+    let client = kubernetes_client();
+    let response: pb::KubernetesDeleteResponse = client
+        .delete(pb::KubernetesDeleteRequest::default())
         .await
         .context("failed to delete Kubernetes")?
-        .into_inner();
+        .into_owned();
 
     println!("Kubernetes cluster deleted.");
     if !response.detail.is_empty() {
@@ -381,12 +366,12 @@ async fn execute_status() -> Result<()> {
     let state = load_state(&home).await?;
     let kubectl_installed = kubectl_bin(&home).exists();
 
-    let mut client = kubernetes_client().await?;
-    let status = client
-        .status(Request::new(KubernetesStatusRequest {}))
+    let client = kubernetes_client();
+    let status: pb::KubernetesStatusResponse = client
+        .status(pb::KubernetesStatusRequest::default())
         .await
         .context("failed to get Kubernetes status")?
-        .into_inner();
+        .into_owned();
 
     println!(
         "Cluster:      {}",
@@ -472,12 +457,12 @@ async fn execute_disable() -> Result<()> {
 }
 
 async fn execute_kubeconfig() -> Result<()> {
-    let mut client = kubernetes_client().await?;
-    let response = client
-        .get_kubeconfig(Request::new(KubernetesKubeconfigRequest {}))
+    let client = kubernetes_client();
+    let response: pb::KubernetesKubeconfigResponse = client
+        .get_kubeconfig(pb::KubernetesKubeconfigRequest::default())
         .await
         .context("failed to get kubeconfig")?
-        .into_inner();
+        .into_owned();
     print!("{}", response.kubeconfig);
     Ok(())
 }

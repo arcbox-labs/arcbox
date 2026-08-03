@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail};
-use arcbox_grpc::v1::stats_service_client::StatsServiceClient;
-use arcbox_protocol::v1::{ContainerStats, MachineStats, StatsWatchRequest};
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::StatsServiceClient;
+use arcbox_connect::v1::{ContainerStats, MachineStats};
 use clap::Args;
-use tonic::transport::Endpoint;
 
 use super::OutputFormat;
-use super::machine::UnixConnector;
+use crate::connect;
 
 /// Arguments for `abctl top`.
 #[derive(Debug, Args)]
@@ -26,30 +26,21 @@ pub struct TopArgs {
 }
 
 pub async fn execute(args: TopArgs, format: OutputFormat) -> Result<()> {
-    let socket_path = super::resolve_grpc_socket_path();
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-    let mut client = StatsServiceClient::new(channel);
+    let (transport, config) = connect::daemon(&super::resolve_grpc_socket_path());
+    let client = StatsServiceClient::new(transport, config);
     let mut stream = client
-        .watch(StatsWatchRequest {
+        .watch(pb::StatsWatchRequest {
             machine_id: String::new(),
+            ..Default::default()
         })
         .await
-        .context("subscribing to machine stats")?
-        .into_inner();
+        .context("subscribing to machine stats")?;
 
     let once = args.once || matches!(format, OutputFormat::Json | OutputFormat::Quiet);
     let mut previous: Option<MachineStats> = None;
     loop {
-        let sample = match stream.message().await? {
-            Some(sample) => sample,
+        let sample: MachineStats = match stream.message::<pb::MachineStats>().await? {
+            Some(item) => item.to_owned_message(),
             None => bail!("stats stream ended (daemon shutting down?)"),
         };
         // Compute against the prior sample (if any) before it becomes the
@@ -319,6 +310,7 @@ mod tests {
             net_rx_bytes: 3000,
             net_tx_bytes: 4000,
             containers: vec![],
+            ..Default::default()
         }
     }
 
@@ -334,6 +326,7 @@ mod tests {
             pids: 3,
             net_rx_bytes: 0,
             net_tx_bytes: 0,
+            ..Default::default()
         }
     }
 

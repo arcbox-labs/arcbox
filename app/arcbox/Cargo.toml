@@ -13,7 +13,6 @@ categories = ["virtualization", "development-tools"]
 [dependencies]
 arcbox-hypervisor = { workspace = true }
 arcbox-virtio = { workspace = true }
-arcbox-protocol = { workspace = true }
 arcbox-vmm = { workspace = true }
 arcbox-container = { workspace = true }
 arcbox-fs = { workspace = true }

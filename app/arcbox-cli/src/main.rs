@@ -5,6 +5,7 @@ use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
+mod connect;
 
 use commands::{Cli, Commands};
 

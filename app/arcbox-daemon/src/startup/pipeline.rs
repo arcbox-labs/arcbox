@@ -149,6 +149,17 @@ impl RuntimeBooted {
             Ok(handles)
         })
         .await?;
+        // DNS and, with a Linux VM, the Docker API are bound: both bind before
+        // `start_services` returns, so a failure on either arrives as an `Err`
+        // here and becomes FAILED instead of this phase (`--no-linux-vm` skips
+        // the Docker API and reaches this phase with DNS alone). The
+        // Kubernetes proxy is the exception — a taken 16443 is tolerated by
+        // design, so it is started but not promised. What recovery spawned
+        // (route reconcile, self-setup) reports through the SetupStatus flags
+        // instead.
+        self.ctx
+            .setup_state
+            .set_phase(SetupPhase::NetworkReady, "Network services ready");
         Ok(RuntimeServicesStarted {
             ctx: self.ctx,
             handles,

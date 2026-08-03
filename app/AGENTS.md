@@ -41,6 +41,63 @@ must name `abctl`.
   restarts install the route outside the cold-start path that sets the flag
   directly, so without the bridge the flag goes stale until the next daemon
   restart.
+- **A `SetupStatus.Phase` value that nothing publishes is invisible as a
+  gap** — it simply never arrives, so a client waits forever or reports a
+  plausible zero. Declaring a phase in `api.proto` therefore obliges you to
+  publish it; the happy-path progression and which phases are conditional
+  live in the enum's own doc comment (`api.proto`) and
+  `docs/daemon-lifecycle.md`, and must be updated with any change. This
+  was CORE-67: `VM_STARTING`/`VM_READY`/`NETWORK_READY` sat declared and
+  unpublished, leaving the slowest stretch of startup silent.
+- **The VM phases are reported from inside `Runtime::init`, not derived
+  from pipeline order** (`InitProgress` → `SetupPhase` in
+  `startup/mod.rs::init_runtime`). WHY: `boot_runtime` is one stage that
+  stages guest binaries, boots the VM, waits for the agent, then waits for
+  dockerd. Publishing at the stage boundaries would bill the binary
+  download to `VM_STARTING` and make `VM_READY` mean "dockerd answered" —
+  the span ABX-309 budgets would measure the wrong thing. `init` reports
+  `SystemVmStarting` after the binaries are staged and `SystemVmReady` when
+  `vm_lifecycle.ensure_ready` returns (readiness level 2 below); the
+  dockerd wait lands in the `VM_READY → NETWORK_READY` window. `init`
+  reports nothing under `--no-linux-vm`, which is what keeps the VM pair
+  off the wire when no guest boots.
+- **`SetupState` streams every update, not the newest snapshot**
+  (`arcbox-api/src/system.rs`: a `watch` for `GetSetupStatus`, a `broadcast`
+  for `WatchSetupStatus`). WHY: `NETWORK_READY` and `READY` are published
+  ~300 µs apart with no await point between them, so a snapshot channel
+  hands a subscriber only `READY` whenever it does not get scheduled in
+  that window — indistinguishable from a phase that was never published,
+  and the exact bug CORE-67 set out to remove. The two halves are kept
+  atomic by opposite sides of one lock: `publish` broadcasts from inside
+  `send_modify`, holding the write lock, and `subscribe` takes the snapshot
+  and the receiver together under the read lock that write lock excludes.
+  Split either pair and you drop an update or replay one already folded
+  into the snapshot, walking a client's phase backwards. Regressions:
+  `back_to_back_phases_are_all_delivered`,
+  `the_snapshot_is_not_replayed_as_an_update`.
+- **A listener the phase promises is bound before `start_services` returns,
+  never inside its spawned task** (`DnsService::bind`, then
+  `DockerApiServer::bind` + `serve` — CORE-71). WHY: a task that binds and
+  only logs its error cannot fail startup, so the pipeline publishes
+  `NETWORK_READY` and `READY` for a daemon whose primary API no client can
+  reach. `NETWORK_READY` therefore covers whichever services this daemon
+  runs — `--no-linux-vm` reaches it with DNS alone — and the Kubernetes
+  proxy is the deliberate exception: a taken 16443 is tolerated, so it is
+  started here but not promised. Adding a listener means deciding which of
+  those two it is.
+- **`SetupStatus.vm_running` is owned by `services::vm_running_loop`**, which
+  mirrors `VmLifecycleState::is_ready` (readiness level 2 below) off
+  `Runtime::subscribe_system_vm_state`. WHY: it used to be set once by
+  cold-start recovery on a successful guest query and never cleared, so it
+  read `true` for the rest of the daemon's life after any stop (CORE-70). A
+  second writer re-introduces that class of drift — the loop owns both
+  edges. It is armed from `init_runtime` *before* `Runtime::init`, not from
+  `start_services`: the VM goes ready partway through `init`, so a later
+  start would report it down for the whole dockerd wait. And it is only as
+  good as the lifecycle state — an unmanaged guest crash leaves that
+  `Running` (ABX-414: no `HealthMonitor` loop), so the flag says "the daemon
+  believes the VM is up", not "the VM answered just now". Regression:
+  `vm_running_loop_follows_the_lifecycle_both_ways`.
 - Startup-cancellation invariant: the flock (`daemon_lock`) and
   `early_runtime` are held in `StartupHandles`, not only in pipeline-local
   context (`context.rs`, `main::run` keeps a clone). WHY: a signal can drop

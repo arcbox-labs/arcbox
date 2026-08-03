@@ -4,8 +4,9 @@
 //! gRPC service for importing local Docker Desktop and OrbStack workloads.
 
 use anyhow::{Context, Result, bail};
-use arcbox_grpc::v1::migration_service_client::MigrationServiceClient;
-use arcbox_protocol::v1::{
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::MigrationServiceClient;
+use arcbox_connect::v1::{
     MigrationContainerSpec, MigrationNetworkMode, MigrationPlan, PrepareMigrationRequest,
     PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
 };
@@ -13,9 +14,8 @@ use clap::{Args, Subcommand};
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use tonic::transport::{Channel, Endpoint};
 
-use super::machine::UnixConnector;
+use crate::connect;
 
 /// Runtime migration commands.
 #[derive(Subcommand)]
@@ -84,20 +84,9 @@ impl MigrationSourceKind {
     }
 }
 
-async fn migration_client() -> Result<MigrationServiceClient<Channel>> {
-    let socket_path = super::resolve_grpc_socket_path();
-
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-
-    Ok(MigrationServiceClient::new(channel))
+fn migration_client() -> MigrationServiceClient<connectrpc::client::SharedHttp2Connection> {
+    let (transport, config) = connect::daemon(&super::resolve_grpc_socket_path());
+    MigrationServiceClient::new(transport, config)
 }
 
 /// Executes a runtime migration subcommand.
@@ -123,17 +112,18 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
         println!("Preparing migration from {}...", source_kind.display_name());
     }
 
-    let mut client = migration_client().await?;
-    let prepare = client
-        .prepare_migration(tonic::Request::new(PrepareMigrationRequest {
+    let client = migration_client();
+    let prepare: PrepareMigrationResponse = client
+        .prepare_migration(PrepareMigrationRequest {
             source_kind: source_kind.as_str().to_string(),
             source_socket_path: source_socket.to_string_lossy().into_owned(),
             allow_replacements: true,
             dry_run: args.dry_run,
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to prepare migration")?
-        .into_inner();
+        .into_owned();
 
     if args.dry_run {
         // `--no-start` never reaches the daemon on this path, so the preview has
@@ -169,24 +159,25 @@ async fn execute_source(source_kind: MigrationSourceKind, args: MigrateSourceArg
     println!("Running migration...");
 
     let mut stream = client
-        .run_migration(tonic::Request::new(RunMigrationRequest {
+        .run_migration(RunMigrationRequest {
             plan_id: prepare.plan_id.clone(),
             // We only reach this point after the user has explicitly confirmed
             // (either via interactive prompt or --yes), so allow both
             // replacements and stopping blocker containers.
             allow_replacements: true,
             skip_start: args.no_start,
-        }))
+            ..Default::default()
+        })
         .await
-        .context("Failed to start migration")?
-        .into_inner();
+        .context("Failed to start migration")?;
 
     let mut terminal = None;
-    while let Some(event) = stream
-        .message()
+    while let Some(item) = stream
+        .message::<pb::RunMigrationEvent>()
         .await
         .context("Failed to read migration progress")?
     {
+        let event: RunMigrationEvent = item.to_owned_message();
         print_progress_event(&event);
         if event.done {
             terminal = Some(event);
@@ -270,7 +261,7 @@ fn report_dry_run(
     // broken contract rather than a state to render around.
     let plan = prepare
         .plan
-        .as_ref()
+        .as_option()
         .context("Daemon returned no plan for a dry run")?;
 
     if as_json {
@@ -334,7 +325,7 @@ fn print_plan_details(plan: &MigrationPlan, skip_start: bool) {
             container.image_reference,
             container
                 .spec
-                .as_ref()
+                .as_option()
                 .map_or_else(|| "?".to_string(), describe_network_mode),
         )
     });
@@ -356,15 +347,19 @@ fn describe_start_state(was_running: bool, skip_start: bool) -> &'static str {
 ///
 /// `NAMED` reads its network from the companion `named_network` field, which the
 /// wire format keeps separate from the mode; an unset one leaves nothing to name.
+/// A mode this build has no variant for is printed as its wire number rather
+/// than folded into a neighbouring label, so a newer daemon reads as unknown
+/// instead of quietly as `default`.
 fn describe_network_mode(spec: &MigrationContainerSpec) -> String {
-    match spec.network_mode() {
-        MigrationNetworkMode::Default => "default".to_string(),
-        MigrationNetworkMode::Host => "host".to_string(),
-        MigrationNetworkMode::None => "none".to_string(),
-        MigrationNetworkMode::Named => spec
+    match spec.network_mode.as_known() {
+        Some(MigrationNetworkMode::Default) => "default".to_string(),
+        Some(MigrationNetworkMode::Host) => "host".to_string(),
+        Some(MigrationNetworkMode::None) => "none".to_string(),
+        Some(MigrationNetworkMode::Named) => spec
             .named_network
-            .as_ref()
+            .as_option()
             .map_or_else(|| "named".to_string(), |network| network.network.clone()),
+        None => format!("unknown({})", spec.network_mode.to_i32()),
     }
 }
 
@@ -450,11 +445,11 @@ mod tests {
         MigrationContainerSpec, MigrationNetworkMode, MigrationSourceKind, describe_network_mode,
         describe_start_state, is_confirmation_yes,
     };
-    use arcbox_protocol::v1::MigrationContainerNetworkAttachment;
+    use arcbox_connect::v1::MigrationContainerNetworkAttachment;
 
     fn spec_with(mode: MigrationNetworkMode) -> MigrationContainerSpec {
         MigrationContainerSpec {
-            network_mode: mode as i32,
+            network_mode: mode.into(),
             ..MigrationContainerSpec::default()
         }
     }
@@ -489,10 +484,12 @@ mod tests {
         );
         assert_eq!(
             describe_network_mode(&MigrationContainerSpec {
-                named_network: Some(MigrationContainerNetworkAttachment {
+                named_network: MigrationContainerNetworkAttachment {
                     network: "usernet".into(),
                     aliases: vec!["api".into()],
-                }),
+                    ..Default::default()
+                }
+                .into(),
                 ..spec_with(MigrationNetworkMode::Named)
             }),
             "usernet"

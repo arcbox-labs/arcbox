@@ -88,6 +88,17 @@ fn no_tap() -> SandboxSpec {
     }
 }
 
+/// Complete the startup cleanup handshake for a manager backed by a fresh
+/// test directory, where no stale host resources exist.
+async fn finalize_startup_cleanup(mgr: &SandboxManager) {
+    let token = mgr
+        .startup_cleanup_token()
+        .await
+        .unwrap()
+        .expect("a new sandbox manager should require startup cleanup");
+    mgr.finalize_startup_cleanup(&token).await.unwrap();
+}
+
 /// Drain the broadcast channel until the specified `action` arrives for `id`,
 /// or until a `"failed"` event for `id` is received, or a 30-second timeout
 /// expires.  Returns `true` on success.
@@ -198,6 +209,7 @@ async fn e2e_two_sandboxes_distinct_ips() {
     };
 
     let mgr = SandboxManager::new(cfg).unwrap();
+    finalize_startup_cleanup(&mgr).await;
 
     // Subscribe twice so that waiting for id1 does not consume id2's events.
     let mut ev1 = mgr.subscribe_events();
@@ -240,6 +252,7 @@ async fn e2e_sandbox_with_tap_network() {
     };
 
     let mgr = SandboxManager::new(cfg).unwrap();
+    finalize_startup_cleanup(&mgr).await;
     let mut events = mgr.subscribe_events();
 
     let (id, ip) = mgr.create_sandbox(Default::default()).await.unwrap();
@@ -310,10 +323,12 @@ async fn e2e_run_command() {
     let mut exit_code: i32 = -1;
     while let Some(result) = rx.recv().await {
         let chunk = result.unwrap();
-        match chunk.stream.as_str() {
-            "stdout" => stdout.push_str(&String::from_utf8_lossy(&chunk.data)),
-            "exit" => exit_code = chunk.exit_code,
-            _ => {}
+        match chunk {
+            arcbox_vm::OutputChunk::Stdout(data) => {
+                stdout.push_str(&String::from_utf8_lossy(&data));
+            }
+            arcbox_vm::OutputChunk::Exit(status) => exit_code = status.conventional_code(),
+            arcbox_vm::OutputChunk::Stderr(_) => {}
         }
     }
 

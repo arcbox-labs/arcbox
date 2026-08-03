@@ -1,32 +1,29 @@
 //! Machine service gRPC implementation.
 
-use std::pin::Pin;
-
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::machine_exec_input;
 use arcbox_core::ExecSessionInput;
 use arcbox_core::machine_image;
-use arcbox_grpc::v1::machine_service_server;
-use arcbox_protocol::v1::{
-    CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
-    ListMachinesResponse, MachineAgentRequest, MachineEvent, MachineEventsRequest,
-    MachineExecInput, MachineExecOutput, MachineExecRequest, MachineInfo, MachineNetwork,
-    MachinePingResponse, MachineSummary, MachineSystemInfo, RemoveMachineRequest,
-    StartMachineRequest, StopMachineRequest, machine_exec_input,
+use connectrpc::{
+    ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult,
+    ServiceStream,
 };
-use tokio_stream::Stream;
 use tokio_stream::StreamExt as _;
-use tonic::{Request, Response, Status};
 
-use super::{SharedRuntime, SharedRuntimeExt};
+use super::SharedRuntime;
+
+use super::ConnectRuntimeExt as _;
 
 /// The NAT gateway every machine's primary interface routes through; it also
 /// serves DNS (same literal the guest agent's DHCP path documents).
 const NAT_GATEWAY: &str = "10.0.2.1";
 
 /// Converts a chrono timestamp to the wire `Timestamp`.
-fn timestamp(t: chrono::DateTime<chrono::Utc>) -> arcbox_protocol::v1::Timestamp {
-    arcbox_protocol::v1::Timestamp {
+fn timestamp(t: chrono::DateTime<chrono::Utc>) -> pb::Timestamp {
+    pb::Timestamp {
         seconds: t.timestamp(),
         nanos: i32::try_from(t.timestamp_subsec_nanos()).unwrap_or(0),
+        ..Default::default()
     }
 }
 
@@ -43,13 +40,19 @@ impl MachineServiceImpl {
     }
 }
 
-#[tonic::async_trait]
-impl machine_service_server::MachineService for MachineServiceImpl {
+#[allow(
+    refining_impl_trait,
+    reason = "the trait returns `impl Encodable<M>`; naming the concrete body \
+              type is strictly more informative and these impls are registered on a \
+              Router rather than named by callers"
+)]
+impl pb::MachineService for MachineServiceImpl {
     async fn create(
         &self,
-        request: Request<CreateMachineRequest>,
-    ) -> Result<Response<CreateMachineResponse>, Status> {
-        let req = request.into_inner();
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::CreateMachineRequest>,
+    ) -> ServiceResult<pb::CreateMachineResponse> {
+        let req = request.to_owned_message();
         let runtime = self.runtime.ready()?;
 
         // Convert bytes to MB for internal config.
@@ -79,9 +82,9 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 .await
                 .map_err(|e| match &e {
                     arcbox_core::error::CoreError::Common(c) if c.is_not_found() => {
-                        Status::not_found(e.to_string())
+                        ConnectError::not_found(e.to_string())
                     }
-                    _ => Status::internal(e.to_string()),
+                    _ => ConnectError::internal(e.to_string()),
                 })?;
             tracing::info!(
                 machine = %req.name,
@@ -103,7 +106,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 })
             }
             .await
-            .map_err(|e| Status::internal(format!("resolve boot shim: {e}")))?;
+            .map_err(|e| ConnectError::internal(format!("resolve boot shim: {e}")))?;
 
             Some(arcbox_core::machine::MachineRootfs {
                 path: image.rootfs_path(),
@@ -161,29 +164,37 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .machine_manager()
             .create(config)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
-        Ok(Response::new(CreateMachineResponse { id: req.name }))
+        Response::ok(pb::CreateMachineResponse {
+            id: req.name,
+            ..Default::default()
+        })
     }
 
     async fn start(
         &self,
-        request: Request<StartMachineRequest>,
-    ) -> Result<Response<Empty>, Status> {
-        let id = request.into_inner().id;
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::StartMachineRequest>,
+    ) -> ServiceResult<pb::Empty> {
+        let id = request.to_owned_message().id;
         let runtime = self.runtime.ready()?;
 
         runtime
             .machine_manager()
             .start(&id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
-        Ok(Response::new(Empty {}))
+        Response::ok(pb::Empty::default())
     }
 
-    async fn stop(&self, request: Request<StopMachineRequest>) -> Result<Response<Empty>, Status> {
-        let req = request.into_inner();
+    async fn stop(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::StopMachineRequest>,
+    ) -> ServiceResult<pb::Empty> {
+        let req = request.to_owned_message();
         let runtime = self.runtime.ready()?;
         let manager = std::sync::Arc::clone(runtime.machine_manager());
 
@@ -212,38 +223,40 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             }
         })
         .await
-        .map_err(|e| Status::internal(format!("stop task panicked: {e}")))?
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(|e| ConnectError::internal(format!("stop task panicked: {e}")))?
+        .map_err(|e| ConnectError::internal(e.to_string()))?;
 
-        Ok(Response::new(Empty {}))
+        Response::ok(pb::Empty::default())
     }
 
     async fn remove(
         &self,
-        request: Request<RemoveMachineRequest>,
-    ) -> Result<Response<Empty>, Status> {
-        let req = request.into_inner();
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::RemoveMachineRequest>,
+    ) -> ServiceResult<pb::Empty> {
+        let req = request.to_owned_message();
         let runtime = self.runtime.ready()?;
 
         runtime
             .machine_manager()
             .remove(&req.id, req.force)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
-        Ok(Response::new(Empty {}))
+        Response::ok(pb::Empty::default())
     }
 
     async fn list(
         &self,
-        _request: Request<ListMachinesRequest>,
-    ) -> Result<Response<ListMachinesResponse>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ListMachinesRequest>,
+    ) -> ServiceResult<pb::ListMachinesResponse> {
         let runtime = self.runtime.ready()?;
 
-        let summaries: Vec<MachineSummary> = runtime
+        let summaries: Vec<pb::MachineSummary> = runtime
             .machine_manager()
             .list()
             .into_iter()
-            .map(|m| MachineSummary {
+            .map(|m| pb::MachineSummary {
                 id: m.name.clone(),
                 name: m.name,
                 state: format!("{:?}", m.state).to_lowercase(),
@@ -254,36 +267,41 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 created: m.created_at.timestamp(),
                 distro: m.distro.unwrap_or_default(),
                 distro_version: m.distro_version.unwrap_or_default(),
+                ..Default::default()
             })
             .collect();
 
-        Ok(Response::new(ListMachinesResponse {
+        Response::ok(pb::ListMachinesResponse {
             machines: summaries,
-        }))
+            ..Default::default()
+        })
     }
 
     async fn inspect(
         &self,
-        request: Request<InspectMachineRequest>,
-    ) -> Result<Response<MachineInfo>, Status> {
-        let id = request.into_inner().id;
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::InspectMachineRequest>,
+    ) -> ServiceResult<pb::MachineInfo> {
+        let id = request.to_owned_message().id;
         let runtime = self.runtime.ready()?;
 
         let machine = runtime
             .machine_manager()
             .get(&id)
-            .ok_or_else(|| Status::not_found("machine not found"))?;
+            .ok_or_else(|| ConnectError::not_found("machine not found"))?;
 
-        Ok(Response::new(MachineInfo {
+        let resp = pb::MachineInfo {
             id: machine.name.clone(),
             name: machine.name,
             state: format!("{:?}", machine.state).to_lowercase(),
-            hardware: Some(arcbox_protocol::v1::MachineHardware {
+            hardware: pb::MachineHardware {
                 cpus: machine.cpus,
                 memory: machine.memory_mb * 1024 * 1024,
                 arch: std::env::consts::ARCH.to_string(),
-            }),
-            network: Some(MachineNetwork {
+                ..Default::default()
+            }
+            .into(),
+            network: pb::MachineNetwork {
                 // Gateway/DNS only exist once the guest has an address; both
                 // are the NAT gateway (which also serves DNS — the same
                 // topology the agent's DHCP path configures).
@@ -300,8 +318,10 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 ip_address: machine.ip_address.clone().unwrap_or_default(),
                 mac_address: String::new(),
                 bridge_mac_address: arcbox_core::vm::bridge_nic_mac_for_vm_id(&machine.vm_id),
-            }),
-            storage: Some(arcbox_protocol::v1::MachineStorage {
+                ..Default::default()
+            }
+            .into(),
+            storage: pb::MachineStorage {
                 disk_size: machine.disk_gb * 1024 * 1024 * 1024,
                 disk_format: "raw".to_string(),
                 disk_path: machine
@@ -309,68 +329,78 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
-            }),
-            os: Some(arcbox_protocol::v1::MachineOs {
+                ..Default::default()
+            }
+            .into(),
+            os: pb::MachineOS {
                 distro: machine
                     .distro
                     .clone()
                     .unwrap_or_else(|| "linux".to_string()),
                 version: machine.distro_version.clone().unwrap_or_default(),
                 kernel: machine.kernel.unwrap_or_default(),
-            }),
-            created: Some(timestamp(machine.created_at)),
-            started_at: machine.started_at.map(timestamp),
+                ..Default::default()
+            }
+            .into(),
+            created: timestamp(machine.created_at).into(),
+            started_at: machine.started_at.map(timestamp).into(),
             mounts: machine
                 .mounts
                 .iter()
-                .map(|m| arcbox_protocol::v1::DirectoryMount {
+                .map(|m| pb::DirectoryMount {
                     host_path: m.host_path.clone(),
                     guest_path: m.guest_path.clone(),
                     readonly: m.read_only,
+                    ..Default::default()
                 })
                 .collect(),
-        }))
+            ..Default::default()
+        };
+        Response::ok(resp)
     }
 
     async fn ping(
         &self,
-        request: Request<MachineAgentRequest>,
-    ) -> Result<Response<MachinePingResponse>, Status> {
-        let id = request.into_inner().id;
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::MachineAgentRequest>,
+    ) -> ServiceResult<pb::MachinePingResponse> {
+        let id = request.to_owned_message().id;
 
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
         let response = agent
             .ping()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
-        Ok(Response::new(MachinePingResponse {
+        Response::ok(pb::MachinePingResponse {
             message: response.message,
             version: response.version,
-        }))
+            ..Default::default()
+        })
     }
 
     async fn get_system_info(
         &self,
-        request: Request<MachineAgentRequest>,
-    ) -> Result<Response<MachineSystemInfo>, Status> {
-        let id = request.into_inner().id;
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::MachineAgentRequest>,
+    ) -> ServiceResult<pb::MachineSystemInfo> {
+        let id = request.to_owned_message().id;
 
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
         let info = agent
             .get_system_info()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
-        Ok(Response::new(MachineSystemInfo {
+        Response::ok(pb::MachineSystemInfo {
             kernel_version: info.kernel_version,
             os_name: info.os_name,
             os_version: info.os_version,
@@ -382,14 +412,16 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             hostname: info.hostname,
             uptime: info.uptime,
             ip_addresses: info.ip_addresses,
-        }))
+            ..Default::default()
+        })
     }
 
     async fn compact_disk(
         &self,
-        request: Request<MachineAgentRequest>,
-    ) -> Result<Response<Empty>, Status> {
-        let id = request.into_inner().id;
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::MachineAgentRequest>,
+    ) -> ServiceResult<pb::Empty> {
+        let id = request.to_owned_message().id;
 
         // Trigger an immediate fstrim in the guest. The discards flow through
         // virtio-blk, which punches holes in the host data image, shrinking its
@@ -402,18 +434,15 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .runtime
             .ready()?
             .get_agent(&id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
         let resp = agent
             .disk_trim()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
         tracing::debug!(machine = %id, result = %resp.result, "disk compact: fstrim done");
 
-        Ok(Response::new(Empty {}))
+        Response::ok(pb::Empty::default())
     }
-
-    type ExecStream =
-        Pin<Box<dyn Stream<Item = Result<MachineExecOutput, Status>> + Send + 'static>>;
 
     /// Runs a command in the machine root via the guest agent, streaming
     /// stdout/stderr frames and a final exit-code frame.
@@ -423,19 +452,20 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     /// the HV blocking transport shares the sandbox-streaming limitation.
     async fn exec(
         &self,
-        request: Request<MachineExecRequest>,
-    ) -> Result<Response<Self::ExecStream>, Status> {
-        let req = request.into_inner();
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::MachineExecRequest>,
+    ) -> ServiceResult<ServiceStream<pb::MachineExecOutput>> {
+        let req = request.to_owned_message();
         let agent = self
             .runtime
             .ready()?
             .get_agent(&req.id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
         let mut rx = agent
             .machine_exec(req)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
         let stream = async_stream::stream! {
             while let Some(item) = rx.recv().await {
@@ -448,46 +478,45 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                         }
                     }
                     Err(arcbox_core::error::CoreError::Agent { code: 400, message }) => {
-                        yield Err(Status::invalid_argument(message));
+                        yield Err(ConnectError::invalid_argument(message));
                         break;
                     }
                     Err(e) => {
-                        yield Err(Status::internal(e.to_string()));
+                        yield Err(ConnectError::internal(e.to_string()));
                         break;
                     }
                 }
             }
         };
-        Ok(Response::new(Box::pin(stream)))
+        Response::ok(Box::pin(stream))
     }
 
     async fn ssh_info(
         &self,
-        _request: Request<arcbox_protocol::v1::SshInfoRequest>,
-    ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::SSHInfoRequest>,
+    ) -> ServiceResult<pb::SSHInfoResponse> {
         // TODO: Implement SSH info.
-        Err(Status::unimplemented("ssh_info not implemented"))
+        Err(ConnectError::unimplemented("ssh_info not implemented"))
     }
-
-    type ExecSessionStream =
-        Pin<Box<dyn Stream<Item = Result<MachineExecOutput, Status>> + Send + 'static>>;
 
     /// Interactive machine exec: a bidi PTY session bridged to the agent's
     /// machine-exec frames. The first client message must carry Init; stdin
     /// and resize messages follow on the same stream.
     async fn exec_session(
         &self,
-        request: Request<tonic::Streaming<MachineExecInput>>,
-    ) -> Result<Response<Self::ExecSessionStream>, Status> {
-        let mut stream = request.into_inner();
+        _ctx: RequestContext,
+        requests: InboundStream<pb::MachineExecInput>,
+    ) -> ServiceResult<ServiceStream<pb::MachineExecOutput>> {
+        let mut stream = requests;
 
         let first = stream.next().await.ok_or_else(|| {
-            Status::invalid_argument("exec session: stream closed before Init message")
+            ConnectError::invalid_argument("exec session: stream closed before Init message")
         })??;
-        let exec_req = match first.payload {
-            Some(machine_exec_input::Payload::Init(req)) => req,
+        let exec_req = match first.to_owned_message().payload {
+            Some(machine_exec_input::Payload::Init(req)) => *req,
             _ => {
-                return Err(Status::invalid_argument(
+                return Err(ConnectError::invalid_argument(
                     "exec session: first message must be Init",
                 ));
             }
@@ -497,14 +526,14 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .runtime
             .ready()?
             .get_agent(&exec_req.id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
         // Feed remaining gRPC input (stdin + TTY resizes) into a channel for
         // the core layer. Stream end sends the empty-stdin EOF sentinel.
         let (in_tx, in_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            while let Some(Ok(input)) = stream.next().await {
-                let msg = match input.payload {
+            while let Some(Ok(item)) = stream.next().await {
+                let msg = match item.to_owned_message().payload {
                     Some(machine_exec_input::Payload::Stdin(data)) => ExecSessionInput::Stdin(data),
                     Some(machine_exec_input::Payload::Resize(size)) => ExecSessionInput::Resize {
                         width: u16::try_from(size.width).unwrap_or(u16::MAX),
@@ -522,7 +551,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         let mut out_rx = agent
             .machine_exec_session(exec_req, in_rx)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| ConnectError::internal(e.to_string()))?;
 
         let out_stream = async_stream::stream! {
             while let Some(item) = out_rx.recv().await {
@@ -535,28 +564,27 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                         }
                     }
                     Err(arcbox_core::error::CoreError::Agent { code: 400, message }) => {
-                        yield Err(Status::invalid_argument(message));
+                        yield Err(ConnectError::invalid_argument(message));
                         break;
                     }
                     Err(e) => {
-                        yield Err(Status::internal(e.to_string()));
+                        yield Err(ConnectError::internal(e.to_string()));
                         break;
                     }
                 }
             }
         };
-        Ok(Response::new(Box::pin(out_stream)))
+        Response::ok(Box::pin(out_stream))
     }
-
-    type EventsStream = Pin<Box<dyn Stream<Item = Result<MachineEvent, Status>> + Send + 'static>>;
 
     async fn events(
         &self,
-        request: Request<MachineEventsRequest>,
-    ) -> Result<Response<Self::EventsStream>, Status> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::MachineEventsRequest>,
+    ) -> ServiceResult<ServiceStream<pb::MachineEvent>> {
         use tokio::sync::broadcast::error::RecvError;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
         let mut rx = self.runtime.ready()?.event_bus().subscribe();
 
         let stream = async_stream::stream! {
@@ -586,7 +614,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             }
         };
 
-        Ok(Response::new(Box::pin(stream)))
+        Response::ok(Box::pin(stream))
     }
 }
 
@@ -599,7 +627,7 @@ fn now_unix_nanos() -> i64 {
 
 /// Maps a system event to its machine-lifecycle wire form, or `None` for
 /// events that are not machine lifecycle transitions.
-fn to_machine_event(event: &arcbox_core::event::Event) -> Option<MachineEvent> {
+fn to_machine_event(event: &arcbox_core::event::Event) -> Option<pb::MachineEvent> {
     use arcbox_core::event::Event;
 
     let (name, action) = match event {
@@ -610,22 +638,22 @@ fn to_machine_event(event: &arcbox_core::event::Event) -> Option<MachineEvent> {
         Event::MachineRemoved { name } => (name, "removed"),
         _ => return None,
     };
-    Some(MachineEvent {
+    Some(pb::MachineEvent {
         name: name.clone(),
         action: action.to_owned(),
         timestamp: now_unix_nanos(),
-        attributes: std::collections::HashMap::new(),
+        ..Default::default()
     })
 }
 
 /// A filter-independent signal that the client should re-list because events
 /// were dropped. Carries no machine name and the reserved `resync` action.
-fn resync_event() -> MachineEvent {
-    MachineEvent {
+fn resync_event() -> pb::MachineEvent {
+    pb::MachineEvent {
         name: String::new(),
         action: "resync".to_owned(),
         timestamp: now_unix_nanos(),
-        attributes: std::collections::HashMap::new(),
+        ..Default::default()
     }
 }
 

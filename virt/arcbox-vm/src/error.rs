@@ -55,6 +55,20 @@ pub enum VmmError {
     #[error("vsock error: {0}")]
     Vsock(String),
 
+    /// A retryable operation whose durable result could not be confirmed.
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
+
+    /// A stdin write starts past the accepted byte count — the caller must
+    /// resume from `accepted` (its offsets have a gap).
+    #[error("stdin offset {offset} is past the {accepted} accepted bytes")]
+    StdinGap {
+        /// Bytes accepted so far — the offset the next write must start at.
+        accepted: u64,
+        /// The rejected write's offset.
+        offset: u64,
+    },
+
     /// Generic catch-all error.
     #[error("{0}")]
     Other(String),

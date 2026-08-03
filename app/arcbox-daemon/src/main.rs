@@ -1,6 +1,7 @@
 //! ArcBox daemon — orchestrates VM, networking, and API services.
 
 mod context;
+mod control_plane;
 mod dns_service;
 mod kubernetes_proxy;
 mod nfs_mount;
