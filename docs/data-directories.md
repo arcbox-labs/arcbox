@@ -73,16 +73,19 @@ Assets are version-keyed. The daemon downloads them on first launch if not
 already cached. When running inside the Desktop app bundle, they are seeded
 from `Contents/Resources/assets/{version}/` to avoid a network round-trip.
 
-### 1.5 `runtime/` — Guest Runtime Binaries
+### 1.5 `runtime/` — Runtime Binaries
 
 | Path | Purpose | Creator |
 |------|---------|---------|
-| `runtime/bin/` | dockerd, containerd, runc, etc. | daemon (bundle seed) |
+| `runtime/bin/` | Host Docker CLI tools | daemon (bundle seed) |
+| `runtime/{version}/bin/` | Guest dockerd, containerd, runc, etc. | daemon (bundle seed) |
+| `runtime/{version}/kernel/` | Sandbox guest kernel | daemon (bundle seed) |
 
 Seeded from `Contents/Resources/runtime/` when running inside the app bundle.
-Exposed to the guest VM via VirtioFS at `/arcbox/runtime/` as a transport
-source. The agent verifies each manifest entry and materializes it onto the
-guest Btrfs data disk before execution.
+Each guest generation is exposed via VirtioFS at
+`/arcbox/runtime/{version}/` as a transport source. The agent verifies each
+manifest entry and materializes it onto the guest Btrfs data disk before
+execution.
 
 ### 1.6 `bin/` — User Executables
 
@@ -237,7 +240,7 @@ These paths exist inside the Linux VM, not on the macOS host. Defined in
 |------------|----------------|--------------|---------|
 | `/arcbox` | `~/.arcbox/` | `arcbox` | ArcBox data sharing |
 | `/arcbox/log/` | `~/.arcbox/log/` | — | Guest logs visible from host |
-| `/arcbox/runtime/` | `~/.arcbox/runtime/` | — | Runtime transport source (never executed directly) |
+| `/arcbox/runtime/{version}/` | `~/.arcbox/runtime/{version}/` | — | Runtime transport source (never executed directly) |
 | `/Users` | `/Users` | `users` | macOS home directory passthrough |
 
 Tags defined in `common/arcbox-constants/src/virtiofs.rs`.

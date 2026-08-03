@@ -96,6 +96,8 @@ pub fn find_bundle_contents() -> Option<PathBuf> {
 /// ```text
 /// Contents/Resources/assets/{version}/  → ~/.arcbox/boot/{version}/
 /// Contents/Resources/runtime/           → ~/.arcbox/runtime/
+///   bin/                                → host Docker CLI tools
+///   {version}/{bin,kernel}/             → guest runtime transport source
 /// Contents/Resources/bin/arcbox-agent   → ~/.arcbox/bin/arcbox-agent
 /// Contents/Resources/bin/vm-agent      → ~/.arcbox/bin/vm-agent
 /// ```

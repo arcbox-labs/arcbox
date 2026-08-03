@@ -382,7 +382,10 @@ async fn prefetch_json(
     }
 
     // Runtime binaries.
-    let runtime_bin_dir = root_data_dir.join("runtime/bin");
+    let runtime_bin_dir = root_data_dir
+        .join("runtime")
+        .join(&provider.config().version)
+        .join("bin");
     tokio::fs::create_dir_all(&runtime_bin_dir).await?;
 
     if let Err(e) = provider
@@ -463,7 +466,10 @@ async fn prefetch_table(
     println!("\n  Boot assets ready");
 
     // 2. Runtime binaries.
-    let runtime_bin_dir = root_data_dir.join("runtime/bin");
+    let runtime_bin_dir = root_data_dir
+        .join("runtime")
+        .join(&provider.config().version)
+        .join("bin");
     tokio::fs::create_dir_all(&runtime_bin_dir).await?;
 
     provider

@@ -541,11 +541,11 @@ impl Runtime {
     /// - **VZ** uses Apple Rosetta — requires Apple Silicon *and* the System
     ///   VM actually wiring the Rosetta share (`default_vm.rosetta`). If Rosetta
     ///   is disabled the VZ guest has no x86 `binfmt` handler.
-    /// - **HV** uses FEX, which requires the interpreter provisioned as a
-    ///   runtime binary at `<data_dir>/runtime/bin/FEX` (the same `runtime/bin`
-    ///   set as `dockerd`/`containerd`, transported to the guest over the
-    ///   `arcbox` VirtioFS share). The guest agent registers the `binfmt_misc`
-    ///   handler after verifying and materializing FEX onto Btrfs.
+    /// - **HV** uses FEX, which requires the interpreter provisioned in the
+    ///   active boot generation's runtime assets and transported to the guest
+    ///   over the `arcbox` VirtioFS share. The guest agent registers the
+    ///   `binfmt_misc` handler after verifying and materializing FEX onto
+    ///   Btrfs.
     ///
     /// Fail-closed (ABX-375): when the active backend's translator is
     /// unavailable, amd64 requests must return a clear error rather than
@@ -558,14 +558,15 @@ impl Runtime {
                     && self.vm_lifecycle.config().default_vm.rosetta
             }
             arcbox_vmm::VmBackend::Hv => {
-                self.vm_lifecycle
-                    .boot_assets()
+                let boot_assets = self.vm_lifecycle.boot_assets();
+                boot_assets
                     .cached_manifest_has_binary("FEX")
                     .unwrap_or(false)
                     && self
                         .config
                         .data_dir
                         .join("runtime")
+                        .join(&boot_assets.config().version)
                         .join("bin")
                         .join("FEX")
                         .is_file()
@@ -783,7 +784,13 @@ impl Runtime {
         // dockerd, containerd, containerd-shim-runc-v2, runc, docker-init, k3s,
         // and the optional FEX x86_64 interpreter for linux/amd64. ArcBox's
         // FEX carries a small patch making it binfmt-only — no FEXServer.
-        let runtime_bin_dir = self.config.data_dir.join("runtime/bin");
+        let generation = self.vm_lifecycle.boot_assets().config().version.clone();
+        let runtime_bin_dir = self
+            .config
+            .data_dir
+            .join("runtime")
+            .join(&generation)
+            .join("bin");
         tokio::fs::create_dir_all(&runtime_bin_dir).await?;
         self.vm_lifecycle
             .boot_assets()
@@ -791,7 +798,7 @@ impl Runtime {
             .await?;
 
         // Validate all guest binaries are present and executable (boot-blocking).
-        ensure_guest_binaries(&self.config.data_dir)?;
+        ensure_guest_binaries(&self.config.data_dir, &generation)?;
 
         // Boot the VM through the lifecycle manager first so the agent
         // handshake is observable on its own: `ensure_vm_ready` below covers

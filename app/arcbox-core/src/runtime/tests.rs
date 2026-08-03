@@ -8,18 +8,19 @@ use std::path::PathBuf;
 fn test_ensure_guest_binaries_ok() {
     let temp_dir = tempfile::tempdir().unwrap();
     let data_dir = temp_dir.path();
+    let generation = "0.6.13";
 
     std::fs::create_dir_all(data_dir.join("bin")).unwrap();
-    std::fs::create_dir_all(data_dir.join("runtime/bin")).unwrap();
+    std::fs::create_dir_all(data_dir.join("runtime").join(generation).join("bin")).unwrap();
 
     for name in [
         "bin/arcbox-agent",
-        "runtime/bin/dockerd",
-        "runtime/bin/containerd",
-        "runtime/bin/containerd-shim-runc-v2",
-        "runtime/bin/runc",
-        "runtime/bin/docker-init",
-        "runtime/bin/k3s",
+        "runtime/0.6.13/bin/dockerd",
+        "runtime/0.6.13/bin/containerd",
+        "runtime/0.6.13/bin/containerd-shim-runc-v2",
+        "runtime/0.6.13/bin/runc",
+        "runtime/0.6.13/bin/docker-init",
+        "runtime/0.6.13/bin/k3s",
     ] {
         let path = data_dir.join(name);
         std::fs::write(&path, b"binary").unwrap();
@@ -30,14 +31,14 @@ fn test_ensure_guest_binaries_ok() {
         }
     }
 
-    let result = ensure_guest_binaries(data_dir);
+    let result = ensure_guest_binaries(data_dir, generation);
     assert!(result.is_ok(), "expected success, got {result:?}");
 }
 
 #[test]
 fn test_ensure_guest_binaries_missing_agent() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let err = ensure_guest_binaries(temp_dir.path()).unwrap_err();
+    let err = ensure_guest_binaries(temp_dir.path(), "0.6.13").unwrap_err();
     assert!(
         err.to_string().contains("agent binary not found"),
         "got: {err}"
@@ -58,7 +59,7 @@ fn test_ensure_guest_binaries_missing_runtime() {
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let err = ensure_guest_binaries(data_dir).unwrap_err();
+    let err = ensure_guest_binaries(data_dir, "0.6.13").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("runtime binary"), "got: {msg}");
 }

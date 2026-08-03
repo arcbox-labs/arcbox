@@ -45,10 +45,11 @@ fn ensure_local_runtime_blocking() -> Result<String> {
     let manifest_path = Path::new(BOOT_SOURCE_ROOT)
         .join(&generation)
         .join("manifest.json");
+    let source_root = Path::new(RUNTIME_SOURCE_ROOT).join(&generation);
 
     let runtime = materialize_runtime(&MaterializeRequest {
         manifest_path: &manifest_path,
-        source_root: Path::new(RUNTIME_SOURCE_ROOT),
+        source_root: &source_root,
         data_root: Path::new(BTRFS_TEMP_MOUNT),
         stable_root: Path::new(ARCBOX_RUNTIME_DIR),
         generation: &generation,
