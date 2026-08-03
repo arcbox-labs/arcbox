@@ -39,7 +39,7 @@ IdlePolicy = Literal["kill", "pause"]
 #: Signals deliverable to a command's process group.
 SignalName = Literal["SIGTERM", "SIGKILL", "SIGINT", "SIGHUP", "SIGQUIT"]
 
-SIGNAL_VALUES: dict[SignalName, int] = {
+SIGNAL_VALUES: dict[SignalName, process_pb2.Signal] = {
     "SIGHUP": process_pb2.SIGNAL_SIGHUP,
     "SIGINT": process_pb2.SIGNAL_SIGINT,
     "SIGQUIT": process_pb2.SIGNAL_SIGQUIT,
@@ -49,6 +49,9 @@ SIGNAL_VALUES: dict[SignalName, int] = {
 
 #: One chunk of command output.
 OutputChannel = Literal["stdout", "stderr", "pty"]
+
+#: Per-file transfer cap enforced by the daemon (`filesystem.proto`).
+MAX_FILE_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -129,20 +132,20 @@ class SandboxSummary:
     storage_bytes: int = 0
 
 
-_STATE_NAMES: dict[int, SandboxState] = {
-    sandbox_pb2.SANDBOX_STATE_STARTING: "starting",
-    sandbox_pb2.SANDBOX_STATE_READY: "ready",
-    sandbox_pb2.SANDBOX_STATE_RUNNING: "running",
-    sandbox_pb2.SANDBOX_STATE_STOPPING: "stopping",
-    sandbox_pb2.SANDBOX_STATE_STOPPED: "stopped",
-    sandbox_pb2.SANDBOX_STATE_FAILED: "failed",
-    sandbox_pb2.SANDBOX_STATE_PAUSING: "pausing",
-    sandbox_pb2.SANDBOX_STATE_PAUSED: "paused",
+_STATE_VALUES: dict[SandboxState, sandbox_pb2.SandboxState] = {
+    "unknown": sandbox_pb2.SANDBOX_STATE_UNSPECIFIED,
+    "starting": sandbox_pb2.SANDBOX_STATE_STARTING,
+    "ready": sandbox_pb2.SANDBOX_STATE_READY,
+    "running": sandbox_pb2.SANDBOX_STATE_RUNNING,
+    "stopping": sandbox_pb2.SANDBOX_STATE_STOPPING,
+    "stopped": sandbox_pb2.SANDBOX_STATE_STOPPED,
+    "failed": sandbox_pb2.SANDBOX_STATE_FAILED,
+    "pausing": sandbox_pb2.SANDBOX_STATE_PAUSING,
+    "paused": sandbox_pb2.SANDBOX_STATE_PAUSED,
 }
 
-_STATE_VALUES: dict[SandboxState, int] = {
-    "unknown": sandbox_pb2.SANDBOX_STATE_UNSPECIFIED,
-    **{name: value for value, name in _STATE_NAMES.items()},
+_STATE_NAMES: dict[int, SandboxState] = {
+    value: name for name, value in _STATE_VALUES.items() if name != "unknown"
 }
 
 
@@ -151,7 +154,7 @@ def sandbox_state_from_proto(state: int) -> SandboxState:
     return _STATE_NAMES.get(state, "unknown")
 
 
-def sandbox_state_to_proto(state: SandboxState) -> int:
+def sandbox_state_to_proto(state: SandboxState) -> sandbox_pb2.SandboxState:
     """Public state filter -> wire state."""
     return _STATE_VALUES[state]
 
