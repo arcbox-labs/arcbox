@@ -8,7 +8,7 @@ use crate::model::{
 };
 use crate::progress::{MigrationProgress, MigrationStage};
 use crate::runner::{CreateNetworkOptions, DockerCliRunner};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Execution options approved by the caller.
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,8 +44,14 @@ impl MigrationExecutor {
 
     /// Executes a migration plan, returning any non-fatal problems.
     ///
-    /// A returned outcome means the migration itself succeeded; its warnings
-    /// describe things the caller should surface alongside that result.
+    /// A returned outcome means the migration ran to completion; its warnings
+    /// describe what the caller must surface alongside that result. Completion
+    /// is not "everything arrived": failures scoped to one container — it could
+    /// not be created, could not join every network, or did not start — are
+    /// reported per container and the run continues, because the alternative
+    /// abandons an otherwise migrated environment partway through. Only a
+    /// failure that invalidates the whole plan (a rejected precondition, or an
+    /// image, volume or network that every later step depends on) returns `Err`.
     pub async fn execute<F>(
         &self,
         source: SourceConfig,
@@ -85,12 +91,11 @@ impl MigrationExecutor {
             import_images(&source_runner, &self.target, plan, &mut progress).await?;
         import_volumes(&source_runner, &self.target, plan, &mut progress).await?;
         recreate_networks(&self.target, plan, &mut progress).await?;
-        recreate_containers(&self.target, plan, &image_rewrites, &mut progress).await?;
-        let warnings = if options.start_containers {
-            start_containers(&self.target, plan, &mut progress).await
-        } else {
-            Vec::new()
-        };
+        let (created, mut warnings) =
+            recreate_containers(&self.target, plan, &image_rewrites, &mut progress).await;
+        if options.start_containers {
+            warnings.extend(start_containers(&self.target, plan, &created, &mut progress).await);
+        }
 
         // No completion event here: returning `Ok` is the signal. Only the
         // caller knows whether the run as a whole succeeded, so it owns the
@@ -350,35 +355,88 @@ where
     Ok(())
 }
 
+/// Recreates every planned container, reporting the ones that could not be
+/// created instead of abandoning the run.
+///
+/// A single container's failure is not the migration's failure. The dominant
+/// cause is a bind mount whose host path the target daemon cannot see — ArcBox
+/// shares some host directories into the guest and not others, so a source
+/// container bound to an unshared path (`/tmp`, `/opt`, ...) is rejected at
+/// create time even though the path exists on this host and planning found
+/// nothing wrong with it. Propagating that aborted the whole run partway:
+/// images, volumes and networks were already created, every later container was
+/// never attempted, the source container stayed stopped, and the retry then
+/// demanded replacement confirmation for the resources the first attempt left
+/// behind. Reporting per container keeps the rest of the environment.
+///
+/// Returns the names that were created, so the start pass skips the ones that
+/// never existed rather than reporting each of them a second time.
 async fn recreate_containers<F>(
     target: &DockerCliRunner,
     plan: &MigrationPlan,
     image_rewrites: &HashMap<String, String>,
     progress: &mut F,
-) -> Result<()>
+) -> (BTreeSet<String>, Vec<String>)
 where
     F: FnMut(MigrationProgress),
 {
+    let mut created = BTreeSet::new();
+    let mut warnings = Vec::new();
     let total = u32::try_from(plan.containers.len()).unwrap_or(0);
     for (index, container) in plan.containers.iter().enumerate() {
+        let current = Some(u32::try_from(index + 1).unwrap_or(total));
+        let create_args = build_create_args(container, resolve_image(container, image_rewrites));
+        let detail = match target.create_container(create_args).await {
+            Ok(container_id) => {
+                created.insert(container.name.clone());
+                match attach_extra_networks(target, container, &container_id).await {
+                    Ok(()) => format!("recreated container '{}'", container.name),
+                    Err(error) => {
+                        // The container exists; only an extra attachment failed,
+                        // so it is still worth starting on a reduced network set.
+                        let warning = format!(
+                            "container '{}' was migrated but could not join every network: {error}",
+                            container.name
+                        );
+                        warnings.push(warning.clone());
+                        warning
+                    }
+                }
+            }
+            Err(error) => {
+                let warning = format!(
+                    "container '{}' could not be recreated: {error}",
+                    container.name
+                );
+                warnings.push(warning.clone());
+                warning
+            }
+        };
         progress(MigrationProgress {
             stage: MigrationStage::RecreateContainers,
-            detail: format!("recreating container '{}'", container.name),
+            detail,
             resource_type: Some("container".to_string()),
             resource_name: Some(container.name.clone()),
-            current: Some(u32::try_from(index + 1).unwrap_or(total)),
+            current,
             total: Some(total),
         });
-        let create_args = build_create_args(container, resolve_image(container, image_rewrites));
-        let container_id = target.create_container(create_args).await?;
-        if container.spec.network_mode.forbids_extra_networks() {
-            continue;
-        }
-        for attachment in &container.extra_networks {
-            target
-                .connect_network(&attachment.network, &container_id, &attachment.aliases)
-                .await?;
-        }
+    }
+    (created, warnings)
+}
+
+/// Joins the networks a container needs beyond the one it was created on.
+async fn attach_extra_networks(
+    target: &DockerCliRunner,
+    container: &ContainerPlan,
+    container_id: &str,
+) -> Result<()> {
+    if container.spec.network_mode.forbids_extra_networks() {
+        return Ok(());
+    }
+    for attachment in &container.extra_networks {
+        target
+            .connect_network(&attachment.network, container_id, &attachment.aliases)
+            .await?;
     }
     Ok(())
 }
@@ -397,16 +455,13 @@ where
 async fn start_containers<F>(
     target: &DockerCliRunner,
     plan: &MigrationPlan,
+    created: &BTreeSet<String>,
     progress: &mut F,
 ) -> Vec<String>
 where
     F: FnMut(MigrationProgress),
 {
-    let running: Vec<_> = plan
-        .containers
-        .iter()
-        .filter(|container| container.was_running)
-        .collect();
+    let running = containers_to_start(plan, created);
 
     let mut warnings = Vec::new();
     let total = u32::try_from(running.len()).unwrap_or(0);
@@ -433,6 +488,22 @@ where
         });
     }
     warnings
+}
+
+/// Selects the containers the start pass should attempt.
+///
+/// A container that was running on the source but could not be recreated is
+/// omitted: `recreate_containers` already reported why it is missing, and
+/// starting a name that does not exist would report the same container twice
+/// with a less useful error the second time.
+fn containers_to_start<'a>(
+    plan: &'a MigrationPlan,
+    created: &BTreeSet<String>,
+) -> Vec<&'a ContainerPlan> {
+    plan.containers
+        .iter()
+        .filter(|container| container.was_running && created.contains(&container.name))
+        .collect()
 }
 
 /// Returns the reference that resolves on the target for this container.
@@ -635,7 +706,9 @@ fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ContainerNetworkAttachment, RestartPolicySpec};
+    use crate::model::{
+        ContainerNetworkAttachment, ReplacementSummary, RestartPolicySpec, SourceInfo, SourceKind,
+    };
 
     fn args_for(spec: &ContainerSpec) -> Vec<String> {
         let mut args = Vec::new();
@@ -810,5 +883,57 @@ mod tests {
         assert!(NetworkModeSpec::Host.forbids_extra_networks());
         assert!(!NetworkModeSpec::None.forbids_extra_networks());
         assert!(!NetworkModeSpec::Default.forbids_extra_networks());
+    }
+
+    fn named_container(name: &str, was_running: bool) -> ContainerPlan {
+        ContainerPlan {
+            name: name.into(),
+            was_running,
+            ..container_on("alpine:3.21")
+        }
+    }
+
+    fn plan_of(containers: Vec<ContainerPlan>) -> MigrationPlan {
+        MigrationPlan {
+            source: SourceInfo {
+                kind: SourceKind::OrbStack,
+                socket_path: std::path::PathBuf::new(),
+                daemon_name: String::new(),
+                server_version: String::new(),
+                operating_system: String::new(),
+                architecture: String::new(),
+            },
+            helper_image: String::new(),
+            images: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            containers,
+            unsupported_resources: Vec::new(),
+            warnings: Vec::new(),
+            replacements: ReplacementSummary::default(),
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_container_that_failed_to_recreate_is_not_started() {
+        // Its absence was already reported once; starting a name that does not
+        // exist would report the same container again with a worse error.
+        let plan = plan_of(vec![
+            named_container("survived", true),
+            named_container("failed-create", true),
+            named_container("was-stopped", false),
+        ]);
+        let created = BTreeSet::from(["survived".to_string(), "was-stopped".to_string()]);
+
+        let names: Vec<_> = containers_to_start(&plan, &created)
+            .iter()
+            .map(|container| container.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["survived"],
+            "only a container that was both running on the source and recreated here"
+        );
     }
 }
