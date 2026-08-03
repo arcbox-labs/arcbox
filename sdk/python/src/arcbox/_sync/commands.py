@@ -133,32 +133,38 @@ class CommandHandle:
                         context={"command_id": self.command_id},
                     )
                 if remaining is None:
-                    slice_seconds = _WAIT_SLICE_SECONDS
-                elif remaining < 1:
-                    # The wire's wait granularity is whole seconds:
-                    # sleep out the sub-second remainder, then ask for
-                    # the current state (0 = return immediately) so the
-                    # documented timeout bound holds.
-                    time.sleep(remaining)
-                    slice_seconds = 0
+                    execution = self._wait_slice(_WAIT_SLICE_SECONDS)
+                elif remaining >= 1:
+                    execution = self._wait_slice(min(_WAIT_SLICE_SECONDS, int(remaining)))
                 else:
-                    slice_seconds = min(_WAIT_SLICE_SECONDS, int(remaining))
-                execution = self._client.unary(
-                    _PROCESS + "WaitExecution",
-                    process_pb2.WaitExecutionRequest(
-                        sandbox_id=self._sandbox_id,
-                        execution_id=self.command_id,
-                        timeout_seconds=slice_seconds,
-                    ),
-                    process_pb2.Execution,
-                    # Exempt from request_timeout: this unary deliberately
-                    # parks server-side for the slice; grant it that long
-                    # plus grace.
-                    timeout=float(slice_seconds + 5),
-                )
+                    # The wire's wait granularity is whole seconds. Poll
+                    # immediately (an already-exited command returns at
+                    # once); only if it is still running, sleep out the
+                    # remainder and take one final poll so an exit inside
+                    # the budget is still caught — past it, the deadline
+                    # check above raises.
+                    execution = self._wait_slice(0)
+                    if execution.state != process_pb2.EXECUTION_STATE_EXITED:
+                        time.sleep(remaining)
+                        execution = self._wait_slice(0)
                 if execution.state == process_pb2.EXECUTION_STATE_EXITED:
                     break
             return self._collect_result(execution)
+
+    def _wait_slice(self, slice_seconds: int) -> process_pb2.Execution:
+        """One WaitExecution long-poll (0 = an immediate state poll)."""
+        return self._client.unary(
+            _PROCESS + "WaitExecution",
+            process_pb2.WaitExecutionRequest(
+                sandbox_id=self._sandbox_id,
+                execution_id=self.command_id,
+                timeout_seconds=slice_seconds,
+            ),
+            process_pb2.Execution,
+            # Exempt from request_timeout: this unary deliberately parks
+            # server-side for the slice; grant it that long plus grace.
+            timeout=float(slice_seconds + 5),
+        )
 
     def kill(self, signal: SignalName = "SIGTERM") -> None:
         """Deliver a signal to the whole process group (default SIGTERM)."""

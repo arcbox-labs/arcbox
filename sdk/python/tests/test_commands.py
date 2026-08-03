@@ -196,16 +196,38 @@ def test_wait_slices_are_capped_and_floored_to_the_wire_granularity() -> None:
 
 def test_sub_second_wait_honors_its_deadline() -> None:
     daemon = MockDaemon(exit_code=0)
-    daemon.wait_states = [process_pb2.EXECUTION_STATE_RUNNING]
+    daemon.wait_states = [process_pb2.EXECUTION_STATE_RUNNING] * 2
     handle = sync_sandbox(daemon).commands.run("spin", background=True)
     started = time.monotonic()
     with pytest.raises(TimeoutError):
         handle.wait_for_exit(0.2)
     elapsed = time.monotonic() - started
-    # One immediate poll (timeout_seconds=0) after sleeping out the
+    # Two immediate polls (timeout_seconds=0) bracketing the slept-out
     # remainder — not the old 1 s minimum server slice.
-    assert [w.timeout_seconds for w in daemon.waits] == [0]
+    assert [w.timeout_seconds for w in daemon.waits] == [0, 0]
     assert 0.2 <= elapsed < 1.0
+
+
+def test_sub_second_wait_returns_a_finished_command_without_sleeping() -> None:
+    daemon = MockDaemon(exit_code=0)
+    handle = sync_sandbox(daemon).commands.run("spin", background=True)
+    started = time.monotonic()
+    result = handle.wait_for_exit(0.5)
+    # The immediate poll came back EXITED: no sleep, no second poll.
+    assert result.exit_code == 0
+    assert [w.timeout_seconds for w in daemon.waits] == [0]
+    assert time.monotonic() - started < 0.2
+
+
+def test_sub_second_wait_catches_an_exit_inside_the_budget() -> None:
+    daemon = MockDaemon(exit_code=0)
+    daemon.wait_states = [process_pb2.EXECUTION_STATE_RUNNING]
+    handle = sync_sandbox(daemon).commands.run("spin", background=True)
+    # First poll sees RUNNING; the exit lands during the slept-out
+    # remainder and the final poll reports it — a result, not a timeout.
+    result = handle.wait_for_exit(0.2)
+    assert result.exit_code == 0
+    assert [w.timeout_seconds for w in daemon.waits] == [0, 0]
 
 
 def test_retention_gap_reports_truncation() -> None:
