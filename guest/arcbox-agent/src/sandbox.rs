@@ -128,7 +128,9 @@ impl SandboxService {
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
         let request = sandbox_v1::CreateSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        self.manager.wait_startup_cleanup_complete().await;
+        if create_uses_network(&request) {
+            self.manager.wait_startup_cleanup_complete().await;
+        }
         let _operation = self.operations.lock(&request.id).await;
         let create_key = crate::create_key::create_key(&request);
         if request.id.is_empty() {
@@ -520,9 +522,31 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
     }
 }
 
+fn create_uses_network(request: &sandbox_v1::CreateSandboxRequest) -> bool {
+    !matches!(
+        request.network.mode.as_known().unwrap_or_default(),
+        sandbox_v1::NetworkMode::None
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_networked_create_waits_for_startup_cleanup() {
+        assert!(create_uses_network(
+            &sandbox_v1::CreateSandboxRequest::default()
+        ));
+        assert!(!create_uses_network(&sandbox_v1::CreateSandboxRequest {
+            network: sandbox_v1::NetworkSpec {
+                mode: sandbox_v1::NetworkMode::None.into(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        }));
+    }
 
     #[test]
     fn completed_create_is_stale_only_after_terminal_or_removed_state() {
