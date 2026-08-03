@@ -65,7 +65,11 @@ pub struct CreateSandboxRequest {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// --- Resources ---
     /// Unset = the template's default limits, if any, else daemon
-    /// defaults. Set = replaces the template default wholesale.
+    /// defaults. Set = replaces the template default wholesale: a zero
+    /// subfield (vcpus, memory_mib) inside a set message means the DAEMON
+    /// default for that resource — the template's value does not shine
+    /// through per-field. Precision costs message presence, which the
+    /// subfields (plain proto3 scalars) do not have.
     #[prost(message, optional, tag = "6")]
     pub limits: ::core::option::Option<ResourceLimits>,
     /// --- Initial workload (optional) ---

@@ -258,7 +258,11 @@ message CreateSandboxRequest {
 
     // --- Resources ---
     // Unset = the template's default limits, if any, else daemon
-    // defaults. Set = replaces the template default wholesale.
+    // defaults. Set = replaces the template default wholesale: a zero
+    // subfield (vcpus, memory_mib) inside a set message means the DAEMON
+    // default for that resource — the template's value does not shine
+    // through per-field. Precision costs message presence, which the
+    // subfields (plain proto3 scalars) do not have.
     ResourceLimits limits = 6;
 
     // --- Initial workload (optional) ---
