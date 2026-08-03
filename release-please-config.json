@@ -27,7 +27,7 @@
         }
       ],
       "changelog-path": "CHANGELOG.md",
-      "exclude-paths": ["fleet", "sdk/typescript"]
+      "exclude-paths": ["fleet", "sdk/typescript", "sdk/python"]
     },
     "fleet": {
       "component": "fleet-agent",
@@ -43,6 +43,12 @@
     "sdk/typescript": {
       "release-type": "node",
       "component": "sdk-typescript",
+      "include-component-in-tag": true,
+      "changelog-path": "CHANGELOG.md"
+    },
+    "sdk/python": {
+      "release-type": "python",
+      "component": "sdk-python",
       "include-component-in-tag": true,
       "changelog-path": "CHANGELOG.md"
     }

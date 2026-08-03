@@ -116,9 +116,9 @@ ARCBOX_SDK_E2E=1 uv run pytest tests/test_e2e.py
 ## Toolchain notes
 
 - **uv** is the package/project manager (`uv_build` backend, `uv.lock`
-  committed). Publishing: `uv build && uv publish` (credentials via
-  `UV_PUBLISH_TOKEN`; TestPyPI first via a `[[tool.uv.index]]` entry if
-  desired).
+  committed). Publishing is CI-only: `uv build && uv publish` under
+  PyPI trusted publishing (OIDC) — see [Releasing](#releasing); no
+  `UV_PUBLISH_TOKEN` anywhere.
 - **ruff** is both linter and formatter (`E,F,W,I,UP,B,SIM,RUF`).
 - **pyright** (strict) is the authoritative type checker. Evaluated
   alternatives (2026-08): **ty** 0.0.65 reports 16 false positives here
@@ -140,6 +140,43 @@ ARCBOX_SDK_E2E=1 uv run pytest tests/test_e2e.py
 TODO(CI): wire the gates above into `.github/workflows` as an
 `sdk-python` job (follow-up; workflow changes are intentionally not part
 of this branch).
+
+## Releasing
+
+The SDK is a release-please component (`sdk-python` in
+`release-please-config.json`), released on its own cadence, independent
+of the main arcbox release train:
+
+1. Conventional commits touching `sdk/python` accumulate on `master`.
+2. release-please maintains a dedicated release PR for the component
+   (separate from the root, fleet-agent, and sdk-typescript PRs) that
+   bumps the `pyproject.toml` version and updates `CHANGELOG.md`.
+3. Merging that PR creates the GitHub release and the tag
+   `sdk-python-vX.Y.Z` (same convention as `sdk-typescript-vX.Y.Z`).
+4. The tag triggers the PyPI publish workflow
+   (`release-sdk-python.yml`), which checks out the tag's tree, re-runs
+   the full gate suite (`ruff check`, `ruff format --check`, `pyright`,
+   `pytest`, `gen_sync.py --check`), builds with `uv build`, and
+   publishes with `uv publish` via [trusted
+   publishing](https://docs.pypi.org/trusted-publishers/) (OIDC) —
+   tokenless: the job's `id-token: write` permission is exchanged for a
+   short-lived PyPI credential. The job skips cleanly if the version is
+   already on PyPI, so a re-dispatch never fails on an
+   already-published release.
+
+One-time bootstrap — unlike npm, PyPI supports [pending
+publishers](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/):
+the trusted publisher is registered *before* the first upload and CI
+does the first publish, so there is no local bootstrap publish and no
+API token at any point:
+
+1. On pypi.org → account → Publishing → "Add a new pending publisher"
+   (GitHub): PyPI project name `arcbox`, owner `arcboxlabs`, repository
+   `arcbox`, workflow filename `release-sdk-python.yml`, environment
+   left empty.
+2. The first tag-triggered run then creates the `arcbox` project on
+   PyPI as it publishes, and the pending publisher becomes the
+   project's regular trusted publisher. Nothing else to configure.
 
 ## Status
 
