@@ -38,6 +38,7 @@ use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(target_os = "macos"))]
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard, RwLock as TokioRwLock};
@@ -45,6 +46,7 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard, RwLock as 
 /// Default guest VM IP address in NAT network (used by PortForwarder fallback).
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
+const HOST_DNS_OWNER: &str = "system:host";
 
 /// Resolve a host-IP binding string for a forwarded port.
 ///
@@ -72,6 +74,12 @@ type InboundRulesMap =
 /// Per-machine inbound listener managers, keyed by machine name.
 #[cfg(target_os = "macos")]
 type InboundListenerMap = Arc<TokioRwLock<HashMap<String, InboundListenerManager>>>;
+
+struct DnsRegistration {
+    hostnames: Vec<String>,
+    ip: IpAddr,
+    revision: u64,
+}
 
 pub struct Runtime {
     /// Configuration.
@@ -120,8 +128,9 @@ pub struct Runtime {
     /// Generation fence for cleanup racing RPC-created host state.
     /// ponytail: keep one fence until unrelated cleanup retries are measurable.
     sandbox_host_state: TokioMutex<u64>,
-    /// Tracks DNS registrations: canonical container ID → hostnames.
-    dns_entries: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
+    /// Tracks DNS owner → registered hostnames and IP.
+    dns_entries: Arc<TokioRwLock<HashMap<String, DnsRegistration>>>,
+    dns_revision: AtomicU64,
     /// Maps a container's unique name to its canonical ID, so teardown can
     /// resolve the name/short-ID a client used without a guest inspect
     /// round-trip. Populated at registration, updated on rename, cleared with
@@ -268,6 +277,7 @@ impl Runtime {
             sandbox_dns_ids: Arc::new(TokioRwLock::new(HashSet::new())),
             sandbox_host_state: TokioMutex::new(0),
             dns_entries: Arc::new(TokioRwLock::new(HashMap::new())),
+            dns_revision: AtomicU64::new(0),
             container_aliases: Arc::new(TokioRwLock::new(HashMap::new())),
             stats_hub,
             machine_stats_hubs: Arc::new(TokioRwLock::new(HashMap::new())),
@@ -1259,6 +1269,12 @@ impl Runtime {
             .insert(sandbox_id.to_owned());
     }
 
+    /// Register stable host aliases through the same ownership table as
+    /// containers and sandboxes.
+    pub async fn register_host_dns(&self, hostnames: &[String], ip: IpAddr) {
+        self.register_dns(HOST_DNS_OWNER, hostnames, ip).await;
+    }
+
     /// Remove one sandbox's host DNS state.
     pub async fn deregister_sandbox_dns(&self, sandbox_id: &str) {
         self.deregister_dns_by_id(&Self::sandbox_dns_owner(sandbox_id))
@@ -1351,21 +1367,52 @@ impl Runtime {
     /// container by name. Also tracks the `container_id → hostnames` mapping
     /// for cleanup.
     pub async fn register_dns(&self, container_id: &str, hostnames: &[String], ip: IpAddr) {
-        self.dns_entries
-            .write()
-            .await
-            .insert(container_id.to_string(), hostnames.to_vec());
+        let hostnames: Vec<_> = hostnames
+            .iter()
+            .map(|hostname| hostname.to_ascii_lowercase())
+            .collect();
+        let mut entries = self.dns_entries.write().await;
+        let previous = entries.insert(
+            container_id.to_string(),
+            DnsRegistration {
+                hostnames: hostnames.clone(),
+                ip,
+                revision: self.dns_revision.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+        if let Some(previous) = previous {
+            for hostname in previous
+                .hostnames
+                .iter()
+                .filter(|hostname| !hostnames.contains(hostname))
+            {
+                self.restore_dns_hostname(&entries, hostname);
+            }
+        }
         // Ownership is authoritative before the synchronous DNS mutation, so
         // cancellation can never leave an unenumerable hostname.
-        for hostname in hostnames {
+        for hostname in &hostnames {
             self.network_manager.register_dns(hostname, ip);
         }
+        drop(entries);
         tracing::info!(
             container_id,
             ?hostnames,
             %ip,
             "DNS entries registered",
         );
+    }
+
+    fn restore_dns_hostname(&self, entries: &HashMap<String, DnsRegistration>, hostname: &str) {
+        if let Some(owner) = entries
+            .values()
+            .filter(|entry| entry.hostnames.iter().any(|name| name == hostname))
+            .max_by_key(|entry| entry.revision)
+        {
+            self.network_manager.register_dns(hostname, owner.ip);
+        } else {
+            self.network_manager.deregister_dns(hostname);
+        }
     }
 
     /// Maps canonical container ID → display name, inverting the registered
@@ -1404,27 +1451,26 @@ impl Runtime {
     /// teardown never leaks alias mappings.
     ///
     /// Shared DNS hostnames (e.g. compose service-level names used by multiple
-    /// replicas) are only removed from the network manager when no other
-    /// container still references them.
+    /// replicas) are restored to another owner's IP when one owner leaves.
     pub async fn deregister_dns_by_id(&self, container_id: &str) {
         self.container_aliases
             .write()
             .await
             .retain(|_, id| id != container_id);
         let mut entries = self.dns_entries.write().await;
-        let Some(hostnames) = entries.remove(container_id) else {
+        let Some(registration) = entries.remove(container_id) else {
             return;
         };
 
-        // Only deregister hostnames not referenced by any remaining container.
-        for hostname in &hostnames {
-            let still_in_use = entries.values().any(|names| names.contains(hostname));
-            if !still_in_use {
-                self.network_manager.deregister_dns(hostname);
-            }
+        for hostname in &registration.hostnames {
+            self.restore_dns_hostname(&entries, hostname);
         }
         drop(entries);
-        tracing::info!(container_id, ?hostnames, "DNS entries deregistered");
+        tracing::info!(
+            container_id,
+            hostnames = ?registration.hostnames,
+            "DNS entries deregistered"
+        );
     }
 
     /// Returns the set of container IDs that currently hold host-side
@@ -1437,13 +1483,33 @@ impl Runtime {
     /// none`) are included so the reconciler reclaims their alias entries too;
     /// otherwise every ephemeral `--rm` run would leak one alias forever.
     pub async fn registered_container_ids(&self) -> std::collections::HashSet<String> {
-        let mut ids: std::collections::HashSet<String> =
-            self.dns_entries.read().await.keys().cloned().collect();
+        let mut ids: std::collections::HashSet<String> = self
+            .dns_entries
+            .read()
+            .await
+            .keys()
+            .filter(|owner| !owner.starts_with("sandbox:") && !owner.starts_with("system:"))
+            .cloned()
+            .collect();
         ids.extend(self.container_aliases.read().await.values().cloned());
         #[cfg(target_os = "macos")]
-        ids.extend(self.inbound_rules.read().await.keys().cloned());
+        ids.extend(
+            self.inbound_rules
+                .read()
+                .await
+                .keys()
+                .filter(|key| Self::sandbox_port_key_owner(key).is_none())
+                .cloned(),
+        );
         #[cfg(not(target_os = "macos"))]
-        ids.extend(self.port_forwarders.read().await.keys().cloned());
+        ids.extend(
+            self.port_forwarders
+                .read()
+                .await
+                .keys()
+                .filter(|key| Self::sandbox_port_key_owner(key).is_none())
+                .cloned(),
+        );
         ids
     }
 

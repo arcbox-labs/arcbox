@@ -222,23 +222,86 @@ async fn deregister_dns_clears_aliases_even_without_dns_entry() {
 }
 
 #[tokio::test]
-async fn sandbox_dns_owner_does_not_overwrite_same_named_container() {
+async fn sandbox_dns_cleanup_restores_same_named_container() {
     let (runtime, _tmp) = networking_test_runtime();
-    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let container_ip = "172.17.0.2".parse().unwrap();
+    let sandbox_ip = "172.31.0.2".parse().unwrap();
     runtime
-        .register_dns("same", &["container.local".into()], ip)
+        .register_dns("container", &["same".into()], container_ip)
         .await;
-    runtime.register_sandbox_dns("same", ip).await;
+    runtime.register_sandbox_dns("SAME", sandbox_ip).await;
 
     let entries = runtime.dns_entries.read().await;
-    assert!(entries.contains_key("same"));
-    assert!(entries.contains_key("sandbox:same"));
+    assert!(entries.contains_key("container"));
+    assert!(entries.contains_key("sandbox:SAME"));
     drop(entries);
+    assert_eq!(
+        runtime.registered_container_ids().await,
+        std::collections::HashSet::from(["container".to_string()])
+    );
+    let hosts = runtime.network_manager.local_hosts_table();
+    assert_eq!(hosts.read().unwrap().get("same"), Some(&sandbox_ip));
+    assert_eq!(
+        hosts.read().unwrap().get("same.arcbox.local"),
+        Some(&sandbox_ip)
+    );
 
-    runtime.deregister_sandbox_dns("same").await;
+    runtime.deregister_sandbox_dns("SAME").await;
     let entries = runtime.dns_entries.read().await;
-    assert!(entries.contains_key("same"));
-    assert!(!entries.contains_key("sandbox:same"));
+    assert!(entries.contains_key("container"));
+    assert!(!entries.contains_key("sandbox:SAME"));
+    drop(entries);
+    assert_eq!(hosts.read().unwrap().get("same"), Some(&container_ip));
+    assert_eq!(
+        hosts.read().unwrap().get("same.arcbox.local"),
+        Some(&container_ip)
+    );
+}
+
+#[tokio::test]
+async fn sandbox_dns_cleanup_restores_host_alias() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let host_ip = "10.0.2.1".parse().unwrap();
+    let sandbox_ip = "172.31.0.2".parse().unwrap();
+    runtime.register_host_dns(&["host".into()], host_ip).await;
+    runtime.register_sandbox_dns("host", sandbox_ip).await;
+
+    assert!(runtime.registered_container_ids().await.is_empty());
+    runtime.deregister_sandbox_dns("host").await;
+
+    let hosts = runtime.network_manager.local_hosts_table();
+    assert_eq!(hosts.read().unwrap().get("host"), Some(&host_ip));
+}
+
+#[tokio::test]
+async fn shared_dns_restores_the_latest_live_owner_and_drops_old_aliases() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let first_ip = "172.17.0.2".parse().unwrap();
+    let second_ip = "172.17.0.3".parse().unwrap();
+    let latest_ip = "172.17.0.4".parse().unwrap();
+    runtime
+        .register_dns("first", &["shared".into(), "old".into()], first_ip)
+        .await;
+    runtime
+        .register_dns("second", &["shared".into()], second_ip)
+        .await;
+    runtime
+        .register_dns("latest", &["shared".into()], latest_ip)
+        .await;
+    let hosts = runtime.network_manager.local_hosts_table();
+
+    runtime.deregister_dns_by_id("first").await;
+    assert_eq!(hosts.read().unwrap().get("shared"), Some(&latest_ip));
+    assert!(!hosts.read().unwrap().contains_key("old"));
+
+    runtime.deregister_dns_by_id("latest").await;
+    assert_eq!(hosts.read().unwrap().get("shared"), Some(&second_ip));
+
+    runtime
+        .register_dns("second", &["replacement".into()], second_ip)
+        .await;
+    assert!(!hosts.read().unwrap().contains_key("shared"));
+    assert_eq!(hosts.read().unwrap().get("replacement"), Some(&second_ip));
 }
 
 #[cfg(target_os = "macos")]
@@ -257,11 +320,14 @@ async fn sandbox_cleanup_discovers_authority_without_secondary_indexes() {
             )],
         ),
     );
-    runtime
-        .dns_entries
-        .write()
-        .await
-        .insert("sandbox:orphan".into(), vec!["orphan".into()]);
+    runtime.dns_entries.write().await.insert(
+        "sandbox:orphan".into(),
+        super::DnsRegistration {
+            hostnames: vec!["orphan".into()],
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            revision: 0,
+        },
+    );
 
     runtime.clear_sandbox_host_state().await;
 
@@ -293,6 +359,7 @@ async fn sandbox_cleanup_matches_the_exact_authority_owner() {
         forwarders.insert(owned.clone(), super::PortForwarder::new());
         forwarders.insert(other.clone(), super::PortForwarder::new());
     }
+    assert!(runtime.registered_container_ids().await.is_empty());
 
     runtime.remove_sandbox_ports("a").await;
 
