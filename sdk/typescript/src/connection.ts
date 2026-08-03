@@ -58,10 +58,28 @@ export const UDS_BASE_URL = "http://arcbox";
 
 /** Default socket location relative to the daemon data dir: `run/arcbox.sock`. */
 function defaultSocketPath(env: NodeJS.ProcessEnv): string {
-  // Mirrors arcbox-constants paths.rs: `<data_dir>/run/arcbox.sock`, data
-  // dir from ARCBOX_DATA_DIR, default `~/.arcbox`.
-  const dataDir = env.ARCBOX_DATA_DIR ?? join(homedir(), ".arcbox");
+  // Mirrors arcbox-constants paths.rs (HostLayout::resolve_for_profile_from_env):
+  // `<data_dir>/run/arcbox.sock`, data dir from a non-empty ARCBOX_DATA_DIR,
+  // else the ARCBOX_PROFILE default — `~/.arcbox`, or `~/.arcbox-dev` for the
+  // development profile.
+  const dataDir =
+    env.ARCBOX_DATA_DIR !== undefined && env.ARCBOX_DATA_DIR !== ""
+      ? env.ARCBOX_DATA_DIR
+      : join(homedir(), profileDataDirName(env.ARCBOX_PROFILE));
   return join(dataDir, "run", "arcbox.sock");
+}
+
+/**
+ * `ARCBOX_PROFILE` → default data dir name. Parsing mirrors the daemon's
+ * `ArcboxProfile::from_str` (trimmed, case-insensitive, `development`/`dev`)
+ * with unknown values falling back to production, exactly like
+ * `from_env_or_default`.
+ */
+function profileDataDirName(profile: string | undefined): string {
+  const parsed = profile?.trim().toLowerCase();
+  return parsed === "development" || parsed === "dev"
+    ? ".arcbox-dev"
+    : ".arcbox";
 }
 
 /**
