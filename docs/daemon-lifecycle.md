@@ -66,18 +66,18 @@ startup failure.
   `READY = 6`). Clients must match on the value, never compare ordinals.
   New phases are appended with the next free number regardless of where
   they sit in the progression — values are additive-only.
-- Phases mark the transitions; the boolean `SetupStatus` fields
-  (`vm_running`, `route_installed`, `dns_resolver_installed`, …) carry the
-  state that outlives startup, including work `recovery::run` spawns in
-  the background and anything `route_status_loop` reconciles afterwards.
-  A client wanting "is the route up *now*" reads the flag, not a phase.
-  `vm_running` and `route_installed` both track the VM across restarts —
-  `services::vm_running_loop` mirrors `VmLifecycleState::is_ready`, and
-  `route_status_loop` mirrors the route events — so both fall on a
-  lifecycle-managed stop and rise again on the next boot rather than
-  reporting one cold-start observation forever. Neither is a liveness probe:
-  a guest that dies without the lifecycle noticing leaves `vm_running` true,
-  because crash detection is unimplemented (ABX-414).
+- Phases mark transitions; `SetupStatus` fields carry state that outlives
+  startup. `services::vm_running_loop` exclusively mirrors
+  `VmLifecycleState::is_ready`. The container route controller exclusively
+  publishes `route_installed` from the reconciled kernel route. It caches the
+  bridge name and interface index for one System VM generation, so FDB expiry
+  cannot change route identity; the privileged helper validates that identity
+  again immediately before mutation. Both states fall on a lifecycle-managed
+  stop and rise on the next boot rather than preserving a cold-start
+  observation forever.
+- `vm_running` is not a liveness probe: a guest that dies without lifecycle
+  detection leaves it true because crash detection is unimplemented
+  (ABX-414).
 
 ### Why gRPC starts before resource cleanup
 
@@ -196,7 +196,7 @@ When the daemon is killed without graceful shutdown:
 | `arcbox.sock` | **stale** | `start_grpc` removes before bind |
 | disk images | **possibly held by XPC helpers** | `wait_for_resources` waits up to 10 s |
 | VM | non-graceful termination | Virtualization.framework cleans up |
-| Route | **stale** | `recovery::run()` rebuilds |
+| Route | **stale** | container route controller reconciles |
 
 All residual state is handled automatically on next startup. No manual
 intervention needed.

@@ -36,11 +36,11 @@ must name `abctl`.
   e2e) may use — never log-grep or sleep. Fatal startup failures MUST call
   `SetupState::set_failed` before exit (200ms flush grace, `main.rs`) so
   clients see the cause instead of a bare disconnect. Route-install state is
-  mirrored into `SetupState.route_installed` by `services::route_status_loop`
-  (`ContainerRouteInstalled` sets, `MachineStopped` clears) — WHY: VM
-  restarts install the route outside the cold-start path that sets the flag
-  directly, so without the bridge the flag goes stale until the next daemon
-  restart.
+  exclusively owned by the `container_route` controller. It follows System
+  VM lifecycle and kernel route changes, caches bridge `{name, ifindex}` by VM
+  generation, and publishes the result through `SetupState.route_installed`.
+  Never add a second writer — WHY: competing lifecycle and polling paths can
+  publish stale state after the VM or bridge identity changes.
 - **A `SetupStatus.Phase` value that nothing publishes is invisible as a
   gap** — it simply never arrives, so a client waits forever or reports a
   plausible zero. Declaring a phase in `api.proto` therefore obliges you to

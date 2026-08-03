@@ -19,8 +19,6 @@ pub enum Event {
     MachineStopped { name: String },
     /// Machine removed (record and disks deleted).
     MachineRemoved { name: String },
-    /// Container subnet route installed on the host for a machine's bridge NIC.
-    ContainerRouteInstalled { name: String },
 }
 
 /// Event bus for system-wide event distribution.

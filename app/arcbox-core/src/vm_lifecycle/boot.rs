@@ -123,10 +123,6 @@ impl LifecycleShared {
         tokio::task::spawn_blocking(move || mm.reboot(&name))
             .await
             .map_err(|e| CoreError::Vm(format!("reboot task panicked: {e}")))??;
-        // The teardown dropped the bridge along with the VMM; the fresh boot
-        // created a new one, so the host container-subnet route must be
-        // reinstalled exactly like after a normal start.
-        self.spawn_route_reconciler();
         self.wait_for_agent(timeout).await?;
         self.sync_guest_clock().await;
         Ok(())
@@ -248,7 +244,6 @@ impl LifecycleShared {
             match self.machine_manager.start(&self.machine_name).await {
                 Ok(()) => {
                     tracing::info!("Default VM started successfully");
-                    self.spawn_route_reconciler();
                     return Ok(());
                 }
                 Err(e) => {
@@ -291,53 +286,6 @@ impl LifecycleShared {
             }
         }
     }
-
-    /// Installs the host route for container subnets via the bridge NIC.
-    ///
-    /// Non-blocking: retries transient failures (helper not ready, bridge FDB
-    /// not populated) but does not gate VM readiness.
-    #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    fn spawn_route_reconciler(&self) {
-        if let Some(bridge) = self.machine_manager.vmnet_bridge_name(&self.machine_name) {
-            // vmnet path: bridge name is known instantly, only need
-            // helper retry (1-2 attempts for XPC readiness).
-            let event_bus = self.event_bus.clone();
-            let name = self.machine_name.clone();
-            drop(tokio::spawn(async move {
-                match crate::route_reconciler::ensure_route_for_bridge(&bridge).await {
-                    Ok(()) => {
-                        event_bus.publish(Event::ContainerRouteInstalled { name });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to install container route (vmnet)");
-                    }
-                }
-            }));
-        }
-    }
-
-    /// See the vmnet variant; this path discovers the bridge by scanning the
-    /// kernel FDB (retries up to ~10s for FDB learning).
-    #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
-    fn spawn_route_reconciler(&self) {
-        if let Some(mac) = self.machine_manager.bridge_mac(&self.machine_name) {
-            let event_bus = self.event_bus.clone();
-            let name = self.machine_name.clone();
-            drop(tokio::spawn(async move {
-                match crate::route_reconciler::ensure_route_with_retry(&mac).await {
-                    Ok(()) => {
-                        event_bus.publish(Event::ContainerRouteInstalled { name });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to install container route");
-                    }
-                }
-            }));
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn spawn_route_reconciler(&self) {}
 
     /// Creates the default machine with EROFS rootfs and no initramfs.
     ///

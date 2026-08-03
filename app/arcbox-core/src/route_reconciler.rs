@@ -7,13 +7,11 @@
 //! `arcbox-helper` is a pure mutation executor — the daemon tells it
 //! exactly which interface to add/remove a route for via tarpc RPC.
 
-use std::time::Duration;
-
 use arcbox_helper::client::{Client, ClientError};
 use arcbox_helper::error::HelperError;
 use arcbox_route::{Ipv4Net, RouteInfo};
 
-use crate::bridge_discovery;
+use crate::bridge_discovery::BridgeTarget;
 
 /// Preferred route covering the complete container address range.
 pub const CONTAINER_SUBNET: &str = "172.16.0.0/12";
@@ -21,21 +19,13 @@ pub const CONTAINER_SUBNET: &str = "172.16.0.0/12";
 /// More-specific routes used when another network service owns the exact `/12`.
 pub const CONTAINER_SPLIT_SUBNETS: [&str; 2] = ["172.16.0.0/13", "172.24.0.0/13"];
 
-/// Maximum retry attempts for transient route installation failures.
-const MAX_ROUTE_ATTEMPTS: u32 = 5;
-
-/// Delay between retry attempts.
-const ROUTE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-
 /// Errors from route installation.
 ///
-/// All variants are retryable — the caller decides whether to retry via
-/// [`ensure_route_with_retry`].
+/// All variants are retryable — the route controller owns the retry cadence.
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
-    /// Bridge MAC not found in kernel FDB. Retryable — the bridge/FDB may
-    /// not have stabilized yet (VM just started, vmenet member not learned).
-    #[error("bridge not found in kernel FDB")]
+    /// The expected bridge identity is not currently available.
+    #[error("bridge identity is not ready")]
     BridgeNotReady,
     /// Helper daemon not reachable. Retryable.
     #[error("helper unavailable: {0}")]
@@ -58,6 +48,7 @@ impl From<ClientError> for RouteError {
             | ClientError::Rpc(_)
             | ClientError::UnrecognizedVersion(_)
             | ClientError::IncompatibleVersion { .. } => Self::HelperUnavailable(e.to_string()),
+            ClientError::Helper(HelperError::RouteInterfaceChanged { .. }) => Self::BridgeNotReady,
             ClientError::Helper(err) => Self::RouteFailed(err.to_string()),
         }
     }
@@ -170,9 +161,15 @@ fn classify_route(route: Option<&RouteInfo>, bridge_ifindex: u16) -> ExactRouteS
     }
 }
 
-fn inspect_routes_sync(bridge_name: &str) -> Result<RouteSnapshot, RouteError> {
+fn inspect_routes_sync(
+    bridge_name: &str,
+    expected_ifindex: Option<u16>,
+) -> Result<RouteSnapshot, RouteError> {
     let bridge_ifindex =
         arcbox_route::interface_index(bridge_name).map_err(|_| RouteError::BridgeNotReady)?;
+    if expected_ifindex.is_some_and(|expected| expected != bridge_ifindex) {
+        return Err(RouteError::BridgeNotReady);
+    }
     let preferred = parse_network(CONTAINER_SUBNET)?;
     let split = [
         parse_network(CONTAINER_SPLIT_SUBNETS[0])?,
@@ -189,15 +186,25 @@ fn inspect_routes_sync(bridge_name: &str) -> Result<RouteSnapshot, RouteError> {
     })
 }
 
-async fn inspect_routes(bridge_name: &str) -> Result<RouteSnapshot, RouteError> {
+async fn inspect_routes(
+    bridge_name: &str,
+    expected_ifindex: Option<u16>,
+) -> Result<RouteSnapshot, RouteError> {
     let bridge_name = bridge_name.to_string();
-    tokio::task::spawn_blocking(move || inspect_routes_sync(&bridge_name))
+    tokio::task::spawn_blocking(move || inspect_routes_sync(&bridge_name, expected_ifindex))
         .await
         .map_err(|error| RouteError::RouteFailed(format!("route check task failed: {error}")))?
 }
 
-async fn add_route(client: &Client, subnet: &str, bridge_name: &str) -> Result<bool, RouteError> {
-    match client.route_add(subnet, bridge_name).await {
+async fn add_route(
+    client: &Client,
+    subnet: &str,
+    target: &BridgeTarget,
+) -> Result<bool, RouteError> {
+    match client
+        .route_add_for_interface(subnet, &target.name, target.ifindex)
+        .await
+    {
         Ok(()) => Ok(true),
         Err(ClientError::Helper(HelperError::RouteConflict { .. })) => Ok(false),
         Err(error) => Err(error.into()),
@@ -205,7 +212,7 @@ async fn add_route(client: &Client, subnet: &str, bridge_name: &str) -> Result<b
 }
 
 async fn ensure_split_routes(
-    bridge_name: &str,
+    target: &BridgeTarget,
     mut snapshot: RouteSnapshot,
 ) -> Result<(), RouteError> {
     if let Some(index) = snapshot
@@ -230,12 +237,12 @@ async fn ensure_split_routes(
         if snapshot.split[index] == ExactRouteState::Owned {
             continue;
         }
-        if add_route(&client, subnet, bridge_name).await? {
+        if add_route(&client, subnet, target).await? {
             snapshot.split[index] = ExactRouteState::Owned;
             continue;
         }
 
-        snapshot = inspect_routes(bridge_name).await?;
+        snapshot = inspect_routes(&target.name, Some(target.ifindex)).await?;
         if snapshot.split[index] != ExactRouteState::Owned {
             return Err(RouteError::RouteConflict {
                 subnet: (*subnet).to_string(),
@@ -246,7 +253,7 @@ async fn ensure_split_routes(
 }
 
 async fn reconcile_with_snapshot(
-    bridge_name: &str,
+    target: &BridgeTarget,
     mode: RouteMode,
     mut snapshot: RouteSnapshot,
 ) -> Result<RouteMode, RouteError> {
@@ -260,152 +267,51 @@ async fn reconcile_with_snapshot(
         ReconcileAction::EnsureSplit => {}
         ReconcileAction::AddPreferred => {
             let client = Client::connect().await?;
-            if add_route(&client, CONTAINER_SUBNET, bridge_name).await? {
+            if add_route(&client, CONTAINER_SUBNET, target).await? {
                 return Ok(RouteMode::Preferred);
             }
             // Another service won the add race. Re-query before deciding: an
             // ArcBox route added by a concurrent reconciler is already good.
-            snapshot = inspect_routes(bridge_name).await?;
+            snapshot = inspect_routes(&target.name, Some(target.ifindex)).await?;
             if snapshot.preferred == ExactRouteState::Owned {
                 return Ok(RouteMode::Preferred);
             }
         }
     }
 
-    ensure_split_routes(bridge_name, snapshot).await?;
+    ensure_split_routes(target, snapshot).await?;
     tracing::info!(
         preferred = CONTAINER_SUBNET,
         lower = CONTAINER_SPLIT_SUBNETS[0],
         upper = CONTAINER_SPLIT_SUBNETS[1],
-        bridge = bridge_name,
+        bridge = target.name,
         "external container route detected; switched to sticky split fallback"
     );
     Ok(RouteMode::SplitFallback)
 }
 
-/// Reconciles the container routes while preserving a sticky lifecycle mode.
-pub async fn reconcile_route_for_bridge(
-    bridge_name: &str,
+/// Reconciles the container routes for a bridge identity while preserving its mode.
+pub async fn reconcile_route_for_target(
+    target: &BridgeTarget,
     mode: RouteMode,
 ) -> Result<RouteMode, RouteError> {
-    let snapshot = inspect_routes(bridge_name).await?;
-    reconcile_with_snapshot(bridge_name, mode, snapshot).await
+    let snapshot = inspect_routes(&target.name, Some(target.ifindex)).await?;
+    reconcile_with_snapshot(target, mode, snapshot).await
 }
 
-/// Detects the route shape left by this VM lifecycle and reconciles it.
-pub async fn initialize_route_for_bridge(bridge_name: &str) -> Result<RouteMode, RouteError> {
-    let snapshot = inspect_routes(bridge_name).await?;
-    reconcile_with_snapshot(bridge_name, snapshot.initial_mode(), snapshot).await
-}
-
-/// Checks whether the container subnet is an interface route through `bridge_name`.
-///
-/// The routing query is unprivileged but blocking, so it runs outside the async
-/// executor. A route through the expected interface still fails the check when
-/// `RTF_GATEWAY` remains set, which is the invalid state produced when a VPN's
-/// gateway route is changed in place.
-pub async fn container_route_matches_bridge(bridge_name: &str) -> Result<bool, RouteError> {
-    Ok(container_route_mode(bridge_name).await?.is_some())
+/// Detects and reconciles the route shape for a newly attached bridge identity.
+pub async fn initialize_route_for_target(target: &BridgeTarget) -> Result<RouteMode, RouteError> {
+    let snapshot = inspect_routes(&target.name, Some(target.ifindex)).await?;
+    reconcile_with_snapshot(target, snapshot.initial_mode(), snapshot).await
 }
 
 /// Returns the healthy route shape currently installed through `bridge_name`.
 pub async fn container_route_mode(bridge_name: &str) -> Result<Option<RouteMode>, RouteError> {
-    let snapshot = inspect_routes(bridge_name).await?;
+    let snapshot = inspect_routes(bridge_name, None).await?;
     if !snapshot.is_healthy() {
         return Ok(None);
     }
     Ok(Some(snapshot.initial_mode()))
-}
-
-/// Performs one route installation attempt through a known bridge interface.
-///
-/// Callers that need retries own the retry cadence. Keeping this operation
-/// single-shot prevents a continuous route guard from blocking inside a nested
-/// retry loop when another network service replaces the route.
-pub async fn repair_route_for_bridge(bridge_name: &str) -> Result<(), RouteError> {
-    initialize_route_for_bridge(bridge_name).await.map(|_| ())
-}
-
-/// Ensures the container subnet route points to the correct bridge.
-///
-/// 1. Resolves bridge MAC → bridge interface via kernel FDB (`ifbridge`)
-/// 2. Calls helper via tarpc to add the route
-///
-/// Called on: VM ready, VM recovery, daemon cold-start reconcile.
-async fn ensure_route(bridge_mac: &str) -> Result<(), RouteError> {
-    // Step 1: Resolve MAC → bridge via kernel FDB (typed API, no text parsing).
-    let mac = bridge_mac.to_string();
-    let bridge = tokio::task::spawn_blocking(move || bridge_discovery::resolve_bridge_by_mac(&mac))
-        .await
-        .unwrap_or(None)
-        .ok_or(RouteError::BridgeNotReady)?;
-
-    // Step 2: Tell helper to add the route.
-    repair_route_for_bridge(&bridge.name).await?;
-
-    tracing::info!(
-        bridge = %bridge.name,
-        %bridge_mac,
-        "container route ensured"
-    );
-    Ok(())
-}
-
-/// Ensures the container subnet route with automatic retry on transient failures.
-///
-/// All [`RouteError`] variants are treated as retryable. Retries up to 5 times
-/// with 2-second intervals (~10s total). This covers:
-/// - Bridge FDB not yet populated after VM start (~1-2s to learn MAC)
-/// - Helper daemon not yet started by launchd (first connection)
-pub async fn ensure_route_with_retry(bridge_mac: &str) -> Result<(), RouteError> {
-    for attempt in 1..=MAX_ROUTE_ATTEMPTS {
-        match ensure_route(bridge_mac).await {
-            Ok(()) => return Ok(()),
-            Err(ref e) if attempt < MAX_ROUTE_ATTEMPTS => {
-                tracing::debug!(
-                    attempt,
-                    max_attempts = MAX_ROUTE_ATTEMPTS,
-                    error = %e,
-                    "route install failed, retrying"
-                );
-                tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    attempt,
-                    error = %e,
-                    "route install failed after all attempts"
-                );
-                return Err(e);
-            }
-        }
-    }
-    unreachable!()
-}
-
-/// Ensures the container subnet route using a known bridge interface name.
-///
-/// When vmnet.framework creates the bridge, we know the interface immediately —
-/// no need to scan the kernel FDB. Only retries for helper readiness.
-#[cfg(all(feature = "vmnet", target_os = "macos"))]
-pub async fn ensure_route_for_bridge(bridge_name: &str) -> Result<(), RouteError> {
-    for attempt in 1..=2 {
-        match repair_route_for_bridge(bridge_name).await {
-            Ok(()) => {
-                tracing::info!(
-                    bridge = bridge_name,
-                    "container route ensured (vmnet direct)"
-                );
-                return Ok(());
-            }
-            Err(ref e) if attempt < 2 => {
-                tracing::debug!(attempt, error = %e, "vmnet route install retry");
-                tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!()
 }
 
 #[cfg(test)]

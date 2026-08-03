@@ -23,6 +23,8 @@ struct VmEntry {
     info: VmInfo,
     config: VmConfig,
     vmm: Option<Vmm>,
+    #[cfg(all(target_os = "macos", feature = "vmnet"))]
+    bridge_target: Option<crate::bridge_discovery::BridgeTarget>,
 }
 
 /// VM manager.
@@ -59,6 +61,8 @@ impl VmManager {
             info,
             config,
             vmm: None,
+            #[cfg(all(target_os = "macos", feature = "vmnet"))]
+            bridge_target: None,
         };
 
         self.vms
@@ -225,6 +229,10 @@ impl VmManager {
         }
 
         entry.info.state = MachineState::Starting;
+        #[cfg(all(target_os = "macos", feature = "vmnet"))]
+        {
+            entry.bridge_target = None;
+        }
 
         let vmm_config = Self::build_vmm_config(entry);
 
@@ -287,6 +295,10 @@ impl VmManager {
         }
 
         entry.vmm = None;
+        #[cfg(all(target_os = "macos", feature = "vmnet"))]
+        {
+            entry.bridge_target = None;
+        }
         entry.info.state = MachineState::Stopped;
 
         tracing::info!("Stopped VM {}", id);
@@ -323,6 +335,10 @@ impl VmManager {
         let entry = vms
             .get_mut(id)
             .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+        #[cfg(all(target_os = "macos", feature = "vmnet"))]
+        {
+            entry.bridge_target = None;
+        }
         let vmm = entry
             .vmm
             .as_mut()
@@ -396,6 +412,10 @@ impl VmManager {
             }
 
             entry.info.state = MachineState::Stopping;
+            #[cfg(all(target_os = "macos", feature = "vmnet"))]
+            {
+                entry.bridge_target = None;
+            }
             entry
                 .vmm
                 .take()
@@ -565,6 +585,10 @@ impl VmManager {
             #[cfg(target_os = "macos")]
             vmm.set_skip_hypervisor_stop();
             drop(vmm);
+        }
+        #[cfg(all(target_os = "macos", feature = "vmnet"))]
+        {
+            entry.bridge_target = None;
         }
 
         entry.info.state = MachineState::Stopped;
@@ -1032,21 +1056,30 @@ impl VmManager {
         entry.vmm.as_mut()?.take_inbound_listener_manager()
     }
 
-    /// Returns the vmnet bridge interface name for a running VM.
+    /// Returns the vmnet bridge identity for a running VM.
     ///
-    /// After vmnet creates the shared interface, the system also creates a
-    /// bridge with a vmnet member. We resolve it via the MAC that vmnet
-    /// reported. Since vmnet has already started, the bridge is immediately
-    /// present — no retry needed.
+    /// FDB discovery attaches the bridge identity to this VMM incarnation.
+    /// The name and interface index remain cached while that kernel identity
+    /// exists, independent of later FDB expiry.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    pub fn vmnet_bridge_name(&self, id: &VmId) -> Option<String> {
-        let vms = self.vms.read().ok()?;
-        let entry = vms.get(id)?;
+    pub fn vmnet_bridge_target(&self, id: &VmId) -> Option<crate::bridge_discovery::BridgeTarget> {
+        let mut vms = self.vms.write().ok()?;
+        let entry = vms.get_mut(id)?;
+        if entry
+            .bridge_target
+            .as_ref()
+            .is_some_and(crate::bridge_discovery::BridgeTarget::is_current)
+        {
+            return entry.bridge_target.clone();
+        }
+        entry.bridge_target = None;
+
         let vmm = entry.vmm.as_ref()?;
         let info = vmm.vmnet_interface_info()?;
         let mac_str = arcbox_net::darwin::format_mac(&info.mac);
         let bridge = crate::bridge_discovery::resolve_bridge_by_mac(&mac_str)?;
-        Some(bridge.name)
+        entry.bridge_target = Some(bridge.clone());
+        Some(bridge)
     }
 
     #[cfg(test)]

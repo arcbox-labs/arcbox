@@ -52,9 +52,8 @@ libproc = { workspace = true }
 # `vmnet` is on by default: the bridge NIC (NIC2) for host→container L3
 # routing only compiles behind it, and no build pipeline passes
 # `--features` — without it release daemons ship without container
-# routing, `route_installed` stays false, and the desktop app falls back
-# to localhost instead of *.arcbox.local domains. Failure to create the
-# vmnet interface at runtime (e.g. unsigned dev builds) is non-fatal.
+# routing and Desktop links fall back to published host ports. Failure to
+# create the vmnet interface at runtime (e.g. unsigned dev builds) is non-fatal.
 default = ["gic", "vmnet"]
 vmnet = ["arcbox-core/vmnet"]
 gic = ["arcbox-core/gic"]

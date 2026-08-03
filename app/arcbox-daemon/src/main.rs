@@ -1,5 +1,7 @@
 //! ArcBox daemon — orchestrates VM, networking, and API services.
 
+#[cfg(target_os = "macos")]
+mod container_route;
 mod context;
 mod control_plane;
 mod dns_service;

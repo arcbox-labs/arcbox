@@ -6,12 +6,20 @@
 use std::ffi::CString;
 
 /// Information about a bridge interface suitable for container routing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeTarget {
     /// Interface name (e.g. "bridge104").
     pub name: String,
     /// Interface index (from `if_nametoindex`).
-    pub ifindex: u32,
+    pub ifindex: u16,
+}
+
+impl BridgeTarget {
+    /// Returns whether this name still identifies the same kernel interface.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        if_nametoindex(&self.name) == Some(self.ifindex)
+    }
 }
 
 /// Resolve a VM bridge MAC to a bridge interface.
@@ -50,11 +58,15 @@ pub fn find_bridge_with_vmenet() -> Option<(String, String)> {
     None
 }
 
-fn if_nametoindex(name: &str) -> Option<u32> {
+fn if_nametoindex(name: &str) -> Option<u16> {
     let cname = CString::new(name).ok()?;
     // SAFETY: if_nametoindex is a standard POSIX function with a valid C string.
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    if idx == 0 { None } else { Some(idx) }
+    if idx == 0 {
+        None
+    } else {
+        u16::try_from(idx).ok()
+    }
 }
 
 #[cfg(test)]

@@ -681,7 +681,6 @@ mod tests {
     #[test]
     fn ignores_non_machine_events() {
         assert!(to_machine_event(&Event::VmStarted { id: "vm".into() }).is_none());
-        assert!(to_machine_event(&Event::ContainerRouteInstalled { name: "m".into() }).is_none());
     }
 
     #[test]
