@@ -26,14 +26,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use arcbox_grpc::MacosServiceClient;
-use arcbox_protocol::v1::{
-    CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImageSummary,
-    RemoveMacosMachineRequest, StartMacosMachineRequest,
+use arcbox_connect::v1::{
+    CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImagePullRequest,
+    MacosImageSummary, MacosServiceClient, RemoveMacosMachineRequest, StartMacosMachineRequest,
 };
+use connectrpc::Protocol;
+use connectrpc::client::{ClientConfig, Http2Connection, SharedHttp2Connection};
 use russh::client::{Config as SshConfig, Handle as SshHandle};
 use russh::{ChannelMsg, Disconnect};
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 use crate::host;
@@ -44,6 +44,17 @@ const GUEST_SSH_USER: &str = "admin";
 const GUEST_SSH_PASSWORD: &str = "admin";
 const GUEST_RUNNER_SCRIPT: &str = "/Users/admin/actions-runner/run.sh";
 const SSH_PORT: u16 = 22;
+
+/// Concurrent in-flight requests the daemon transport will buffer — a
+/// couple of unary calls plus one progress stream never queue.
+const TRANSPORT_BUFFER: usize = 32;
+
+/// Progress stream from `MacosService.ImagePull`, concretized for the
+/// daemon transport below.
+pub type PullStream = connectrpc::client::ServerStream<
+    hyper::body::Incoming,
+    arcbox_connect::v1::__buffa::view::MacosImagePullEventView<'static>,
+>;
 
 /// Budget for a freshly started guest to acquire its DHCP lease and answer
 /// SSH. First boots take minutes; the DHCP lease appears well before
@@ -78,7 +89,7 @@ fn stream_name(reference: &str) -> &str {
 /// Runs darwin jobs in disposable macOS guests via the local arcbox-daemon.
 #[derive(Clone)]
 pub struct VmRunner {
-    client: MacosServiceClient<Channel>,
+    client: MacosServiceClient<SharedHttp2Connection>,
 }
 
 impl VmRunner {
@@ -114,10 +125,17 @@ impl VmRunner {
     /// what that pull is about to fix, so demanding the full readiness
     /// probe first would be circular.
     pub async fn connect(daemon_socket: &Path) -> Result<Self> {
-        let channel = crate::control::client::connect(daemon_socket).await?;
-        let mut client = MacosServiceClient::new(channel);
+        // Speak the gRPC protocol: the daemon's Connect router answers it,
+        // and so does the tonic mock daemon in tests — which thereby stays
+        // an independent-implementation interop check.
+        let authority = "http://localhost".parse().expect("static authority parses");
+        let transport =
+            Http2Connection::lazy_unix(daemon_socket, authority).shared(TRANSPORT_BUFFER);
+        let config = ClientConfig::new("http://localhost".parse().expect("static base URI parses"))
+            .with_protocol(Protocol::Grpc);
+        let client = MacosServiceClient::new(transport, config);
         client
-            .image_list(Empty {})
+            .image_list(Empty::default())
             .await
             .context("daemon does not serve macOS guests (MacosService.ImageList failed)")?;
         Ok(Self { client })
@@ -127,9 +145,9 @@ impl VmRunner {
     /// names (the control socket is a per-host singleton), so anything
     /// matching is an orphan from a previous process.
     async fn sweep_leftovers(&self) {
-        let mut client = self.client.clone();
-        let machines = match client.list(Empty {}).await {
-            Ok(response) => response.into_inner().machines,
+        let client = self.client.clone();
+        let machines = match client.list(Empty::default()).await {
+            Ok(response) => response.into_owned().machines,
             Err(e) => {
                 warn!(error = %e, "listing leftover fleet guests failed");
                 return;
@@ -138,7 +156,7 @@ impl VmRunner {
         for machine in machines {
             if machine.name.starts_with("fleet-") {
                 warn!(name = %machine.name, "removing leftover fleet guest");
-                remove_vm(&mut client, &machine.name).await;
+                remove_vm(&client, &machine.name).await;
             }
         }
     }
@@ -147,8 +165,8 @@ impl VmRunner {
     /// idempotent. Remove-before-bind ahead of a create, and the cleanup
     /// when cancellation interrupts [`start`](Self::start) mid-flight.
     pub async fn remove_job_vm(&self, job_id: &str) {
-        let mut client = self.client.clone();
-        remove_vm(&mut client, &machine_name(job_id)).await;
+        let client = self.client.clone();
+        remove_vm(&client, &machine_name(job_id)).await;
     }
 
     /// Pull `reference` through the daemon, returning its progress stream
@@ -156,19 +174,17 @@ impl VmRunner {
     /// this to converge `macos_runner_image` onto its target; a pull the
     /// daemon already has registered completes immediately, so
     /// re-preparation is cheap when nothing changed.
-    pub async fn pull(
-        &self,
-        reference: &str,
-    ) -> Result<tonic::Streaming<arcbox_protocol::v1::MacosImagePullEvent>> {
-        let mut client = self.client.clone();
-        let stream = client
-            .image_pull(arcbox_protocol::v1::MacosImagePullRequest {
+    pub async fn pull(&self, reference: &str) -> Result<PullStream> {
+        let stream = self
+            .client
+            .image_pull(MacosImagePullRequest {
                 reference: reference.to_owned(),
                 manifest_url: String::new(),
+                ..Default::default()
             })
             .await
             .with_context(|| format!("pulling macOS image '{reference}' through the daemon"))?;
-        Ok(stream.into_inner())
+        Ok(stream)
     }
 
     /// Provision a guest for `spec` and start the runner in it, returning a
@@ -196,11 +212,11 @@ impl VmRunner {
     /// provision→ssh→exec→destroy cycle without a real runner invocation.
     async fn start_with_command(&self, spec: &RunSpec<'_>, command: &str) -> Result<RunningVm> {
         let name = machine_name(spec.job_id);
-        let mut client = self.client.clone();
+        let client = self.client.clone();
 
         // The name is deterministic per job, so a redelivery after a crash
         // that left an orphan would otherwise collide on create.
-        remove_vm(&mut client, &name).await;
+        remove_vm(&client, &name).await;
 
         let image = self.installed_image(spec.runner_image).await?;
         let (cpus, memory_mib) = guest_size(&image, host::cpu_cores(), host::mem_mib());
@@ -210,6 +226,7 @@ impl VmRunner {
                 image: image.name.clone(),
                 cpus,
                 memory_mib,
+                ..Default::default()
             })
             .await
             .context("creating macOS guest")?;
@@ -217,7 +234,10 @@ impl VmRunner {
         // Everything from here on owns a guest; tear it down on any error.
         let provisioned = async {
             client
-                .start(StartMacosMachineRequest { name: name.clone() })
+                .start(StartMacosMachineRequest {
+                    name: name.clone(),
+                    ..Default::default()
+                })
                 .await
                 .context("starting macOS guest (a two-guest license-cap refusal lands here)")?;
 
@@ -245,7 +265,7 @@ impl VmRunner {
         .await;
 
         if provisioned.is_err() {
-            remove_vm(&mut client, &name).await;
+            remove_vm(&client, &name).await;
         }
         provisioned
     }
@@ -254,12 +274,12 @@ impl VmRunner {
     /// minimums. Not being installed is a per-job failure (reject), not a
     /// backend fault: the image may have been removed since the probe.
     async fn installed_image(&self, reference: &str) -> Result<MacosImageSummary> {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         let images = client
-            .image_list(Empty {})
+            .image_list(Empty::default())
             .await
             .context("listing daemon macOS images")?
-            .into_inner()
+            .into_owned()
             .images;
         images
             .into_iter()
@@ -269,15 +289,16 @@ impl VmRunner {
 
     /// Poll `Inspect` until the guest reports its DHCP-lease address.
     async fn await_ip(&self, name: &str, deadline: tokio::time::Instant) -> Result<String> {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         loop {
             let info = client
                 .inspect(InspectMacosMachineRequest {
                     name: name.to_owned(),
+                    ..Default::default()
                 })
                 .await
                 .context("inspecting macOS guest")?
-                .into_inner();
+                .into_owned();
             if !info.ip_address.is_empty() {
                 return Ok(info.ip_address);
             }
@@ -367,7 +388,7 @@ impl russh::client::Handler for SshClient {
 /// caller's bookkeeping settles only after the guest is actually gone. The
 /// embedded [`VmGuard`] is a panic safety net, not the teardown path.
 pub struct RunningVm {
-    client: MacosServiceClient<Channel>,
+    client: MacosServiceClient<SharedHttp2Connection>,
     guard: VmGuard,
     name: String,
     ssh: SshHandle<SshClient>,
@@ -400,7 +421,7 @@ impl RunningVm {
     /// failed loudly in the log.
     pub async fn destroy(self) {
         let Self {
-            mut client,
+            client,
             guard,
             name,
             ssh,
@@ -409,24 +430,30 @@ impl RunningVm {
         guard.defuse();
         drop(channel);
         let _ = ssh.disconnect(Disconnect::ByApplication, "", "en").await;
-        remove_vm(&mut client, &name).await;
+        remove_vm(&client, &name).await;
     }
 }
 
 /// Force-remove a guest, awaited and idempotent: "not found" is the normal
 /// no-leftover case, anything else is logged — the job itself already
 /// concluded, so removal failures must not fail the caller.
-async fn remove_vm(client: &mut MacosServiceClient<Channel>, name: &str) {
+async fn remove_vm(client: &MacosServiceClient<SharedHttp2Connection>, name: &str) {
     let request = RemoveMacosMachineRequest {
         name: name.to_owned(),
         force: true,
+        ..Default::default()
     };
     match client.remove(request).await {
         Ok(_) => {}
-        Err(status) if status.code() == tonic::Code::NotFound => {}
+        Err(status) if status.code == connectrpc::ErrorCode::NotFound => {}
         // The daemon maps not-found to Internal today; match on message
         // until it grows structured codes.
-        Err(status) if status.message().contains("not found") => {}
+        Err(status)
+            if status
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not found") => {}
         Err(status) => warn!(guest = name, error = %status, "failed to remove macOS guest"),
     }
 }
@@ -438,13 +465,13 @@ async fn remove_vm(client: &mut MacosServiceClient<Channel>, name: &str) {
 /// cannot await); it must never be the path a correctness guarantee rides
 /// on.
 struct VmGuard {
-    client: MacosServiceClient<Channel>,
+    client: MacosServiceClient<SharedHttp2Connection>,
     name: String,
     defused: bool,
 }
 
 impl VmGuard {
-    fn new(client: MacosServiceClient<Channel>, name: String) -> Self {
+    fn new(client: MacosServiceClient<SharedHttp2Connection>, name: String) -> Self {
         Self {
             client,
             name,
@@ -463,10 +490,10 @@ impl Drop for VmGuard {
         if self.defused {
             return;
         }
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         let name = std::mem::take(&mut self.name);
         tokio::spawn(async move {
-            remove_vm(&mut client, &name).await;
+            remove_vm(&client, &name).await;
         });
     }
 }

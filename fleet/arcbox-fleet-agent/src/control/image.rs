@@ -196,6 +196,7 @@ impl FleetImageServiceTrait for ImageService {
                                         ))
                                     })?;
                                     let Some(progress) = progress else { break };
+                                    let progress = progress.to_owned_message();
                                     yield event(kind, &progress.stage, "pulling", progress.fraction);
                                 }
                                 // A pull through a direct dial leaves a daemon that

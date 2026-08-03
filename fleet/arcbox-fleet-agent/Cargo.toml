@@ -38,8 +38,6 @@ command-group = { version = "5.0.1", features = ["with-tokio"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 bollard = "0.21.0"
 hyper-util = "0.1"
-arcbox-grpc.workspace = true
-arcbox-protocol.workspace = true
 arcbox-constants.workspace = true
 russh = { version = "0.62.1", default-features = false, features = ["aws-lc-rs", "flate2"] }
 thiserror.workspace = true
@@ -48,6 +46,9 @@ libc.workspace = true
 sha2.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 uuid = { workspace = true }
+arcbox-connect = { version = "0.6.0", path = "../../rpc/arcbox-connect" }
+connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.1", features = ["client"] }
+hyper.workspace = true
 
 [lints]
 workspace = true
@@ -56,5 +57,7 @@ workspace = true
 keyring = "4"
 
 [dev-dependencies]
+arcbox-grpc.workspace = true
+arcbox-protocol.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
