@@ -157,9 +157,11 @@ reference.
 
 Catalog templates carry defaults (`limits`, `cmd`, `env`,
 `exposed_ports`, `ready_probe`). A create request overrides them
-field-wise: a set `limits` replaces the default limits, a non-empty
-`cmd` replaces the default cmd, and `env` merges per key with the
-request winning. `no_default_cmd` / `no_default_env` express the
+field-wise: a set `limits` replaces the default limits wholesale — a
+zero `vcpus`/`memory_mib` inside it means the *daemon* default for that
+resource, never a per-field fall-through to the template (the scalars
+have no presence) — a non-empty `cmd` replaces the default cmd, and
+`env` merges per key with the request winning. `no_default_cmd` / `no_default_env` express the
 explicitly-empty case that proto3 repeated/map shape cannot
 (`exposed_ports` and `ready_probe` have no per-create counterpart).
 
