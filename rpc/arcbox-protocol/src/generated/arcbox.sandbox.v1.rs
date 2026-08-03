@@ -1017,3 +1017,131 @@ pub struct DeleteSnapshotRequest {
     #[prost(string, tag = "1")]
     pub snapshot_id: ::prost::alloc::string::String,
 }
+/// Structured detail attached to sandbox API errors.
+///
+/// Carried as a Connect error detail; the transport status code stays the
+/// coarse routing signal while this message carries the precise cause.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ErrorInfo {
+    /// Machine-readable cause.
+    #[prost(enumeration = "ErrorCode", tag = "1")]
+    pub code: i32,
+    /// Actionable fix, phrased for direct display ("run `abctl daemon
+    /// start`"). Agent frameworks surface this to the LLM verbatim.
+    #[prost(string, tag = "2")]
+    pub suggestion: ::prost::alloc::string::String,
+    /// Structured facts about the failure: which timeout knob fired, the
+    /// limit that was exceeded, the state that was observed, and so on.
+    #[prost(map = "string, string", tag = "3")]
+    pub context:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Machine-readable cause of a sandbox API error.
+///
+/// Values are append-only: SDKs map unknown codes to their base error
+/// class, so retiring or renumbering a value silently reclassifies errors
+/// for older clients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ErrorCode {
+    Unspecified = 0,
+    /// The addressed sandbox does not exist.
+    SandboxNotFound = 1,
+    /// The addressed template does not exist.
+    TemplateNotFound = 2,
+    /// The addressed execution does not exist.
+    ExecutionNotFound = 3,
+    /// The addressed path does not exist inside the sandbox.
+    FileNotFound = 4,
+    /// The sandbox is PAUSED and this call did not resume it. Data-plane
+    /// calls resume a paused sandbox transparently (CORE-21), so this
+    /// surfaces only where resume does not apply: on control-plane calls,
+    /// or when the caller opted out of transparent resume (the reserved
+    /// `x-arcbox-no-auto-resume` header — see sandbox.proto `Resume`).
+    SandboxPaused = 5,
+    /// The sandbox exists but is not READY for this operation
+    /// (e.g. still STARTING).
+    SandboxNotReady = 6,
+    /// The sandbox is in FAILED state; context carries the failure reason.
+    SandboxFailed = 7,
+    /// The sandbox's hard maximum lifetime (`ttl_seconds`) expired and the
+    /// daemon destroyed it.
+    TtlExpired = 8,
+    /// A per-command timeout fired and the process group was killed.
+    CommandTimeout = 9,
+    /// This host cannot run sandboxes (no nested virtualization).
+    /// See SandboxService.GetCapabilities (CORE-13 fail-fast).
+    NestedVirtUnsupported = 10,
+    /// The template reference could not be resolved or is malformed.
+    TemplateInvalid = 11,
+    /// A file transfer exceeded the per-file size cap; context carries
+    /// the limit.
+    FileTooLarge = 12,
+    /// Stdin was already closed for this execution.
+    StdinClosed = 13,
+    /// The operation requires a TTY execution (e.g. terminal resize).
+    TtyRequired = 14,
+    /// The requested host port is already bound.
+    PortInUse = 15,
+    /// Authentication is required. Reserved for the remote tier (CORE-63).
+    AuthRequired = 16,
+    /// The client and daemon protocol levels are incompatible; the
+    /// suggestion names which side to upgrade.
+    ProtocolMismatch = 17,
+    /// The host is out of a resource (memory, disk, sandbox slots).
+    ResourceExhaustedHost = 18,
+}
+impl ErrorCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ERROR_CODE_UNSPECIFIED",
+            Self::SandboxNotFound => "ERROR_CODE_SANDBOX_NOT_FOUND",
+            Self::TemplateNotFound => "ERROR_CODE_TEMPLATE_NOT_FOUND",
+            Self::ExecutionNotFound => "ERROR_CODE_EXECUTION_NOT_FOUND",
+            Self::FileNotFound => "ERROR_CODE_FILE_NOT_FOUND",
+            Self::SandboxPaused => "ERROR_CODE_SANDBOX_PAUSED",
+            Self::SandboxNotReady => "ERROR_CODE_SANDBOX_NOT_READY",
+            Self::SandboxFailed => "ERROR_CODE_SANDBOX_FAILED",
+            Self::TtlExpired => "ERROR_CODE_TTL_EXPIRED",
+            Self::CommandTimeout => "ERROR_CODE_COMMAND_TIMEOUT",
+            Self::NestedVirtUnsupported => "ERROR_CODE_NESTED_VIRT_UNSUPPORTED",
+            Self::TemplateInvalid => "ERROR_CODE_TEMPLATE_INVALID",
+            Self::FileTooLarge => "ERROR_CODE_FILE_TOO_LARGE",
+            Self::StdinClosed => "ERROR_CODE_STDIN_CLOSED",
+            Self::TtyRequired => "ERROR_CODE_TTY_REQUIRED",
+            Self::PortInUse => "ERROR_CODE_PORT_IN_USE",
+            Self::AuthRequired => "ERROR_CODE_AUTH_REQUIRED",
+            Self::ProtocolMismatch => "ERROR_CODE_PROTOCOL_MISMATCH",
+            Self::ResourceExhaustedHost => "ERROR_CODE_RESOURCE_EXHAUSTED_HOST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ERROR_CODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ERROR_CODE_SANDBOX_NOT_FOUND" => Some(Self::SandboxNotFound),
+            "ERROR_CODE_TEMPLATE_NOT_FOUND" => Some(Self::TemplateNotFound),
+            "ERROR_CODE_EXECUTION_NOT_FOUND" => Some(Self::ExecutionNotFound),
+            "ERROR_CODE_FILE_NOT_FOUND" => Some(Self::FileNotFound),
+            "ERROR_CODE_SANDBOX_PAUSED" => Some(Self::SandboxPaused),
+            "ERROR_CODE_SANDBOX_NOT_READY" => Some(Self::SandboxNotReady),
+            "ERROR_CODE_SANDBOX_FAILED" => Some(Self::SandboxFailed),
+            "ERROR_CODE_TTL_EXPIRED" => Some(Self::TtlExpired),
+            "ERROR_CODE_COMMAND_TIMEOUT" => Some(Self::CommandTimeout),
+            "ERROR_CODE_NESTED_VIRT_UNSUPPORTED" => Some(Self::NestedVirtUnsupported),
+            "ERROR_CODE_TEMPLATE_INVALID" => Some(Self::TemplateInvalid),
+            "ERROR_CODE_FILE_TOO_LARGE" => Some(Self::FileTooLarge),
+            "ERROR_CODE_STDIN_CLOSED" => Some(Self::StdinClosed),
+            "ERROR_CODE_TTY_REQUIRED" => Some(Self::TtyRequired),
+            "ERROR_CODE_PORT_IN_USE" => Some(Self::PortInUse),
+            "ERROR_CODE_AUTH_REQUIRED" => Some(Self::AuthRequired),
+            "ERROR_CODE_PROTOCOL_MISMATCH" => Some(Self::ProtocolMismatch),
+            "ERROR_CODE_RESOURCE_EXHAUSTED_HOST" => Some(Self::ResourceExhaustedHost),
+            _ => None,
+        }
+    }
+}

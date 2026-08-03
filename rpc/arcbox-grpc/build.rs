@@ -22,6 +22,7 @@ fn main() {
         "../arcbox-protocol/proto/arcbox/sandbox/v1/process.proto",
         "../arcbox-protocol/proto/arcbox/sandbox/v1/filesystem.proto",
         "../arcbox-protocol/proto/arcbox/sandbox/v1/snapshot.proto",
+        "../arcbox-protocol/proto/arcbox/sandbox/v1/errors.proto",
         "../arcbox-protocol/proto/stats.proto",
     ];
 

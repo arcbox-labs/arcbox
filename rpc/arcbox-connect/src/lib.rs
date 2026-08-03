@@ -35,8 +35,9 @@ pub use arcbox::sandbox::v1 as sandbox_v1;
 pub use arcbox::v1;
 
 /// The compiled `FileDescriptorSet` covering every ArcBox-owned proto
-/// (all thirteen files plus their imports, with source info), produced by
-/// this crate's build script. The daemon feeds it to reflection, so the
-/// reflected surface is exactly the surface this crate generates.
+/// (every file in the build script's list plus imports, with source
+/// info), produced by this crate's build script. The daemon feeds it to
+/// reflection, so the reflected surface is exactly the surface this
+/// crate generates.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/arcbox_connect.protoset"));

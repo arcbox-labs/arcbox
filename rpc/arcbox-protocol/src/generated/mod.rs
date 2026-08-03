@@ -22,11 +22,12 @@ pub mod arcbox_v1;
 
 /// All protocol buffer types from the `arcbox.sandbox.v1` package.
 ///
-/// prost emits one module per package, so the four proto files that make up
+/// prost emits one module per package, so the proto files that make up
 /// the sandbox API land here together:
 /// - `sandbox.proto` - control plane: lifecycle, events, published ports
 /// - `process.proto` - data plane: the execution (exec) family
-/// - `filesystem.proto` - data plane: file transfer
+/// - `filesystem.proto` - data plane: file transfer and path verbs
 /// - `snapshot.proto` - checkpoint / restore
+/// - `errors.proto` - the error-code registry (`ErrorInfo` detail)
 #[path = "arcbox.sandbox.v1.rs"]
 pub mod arcbox_sandbox_v1;
