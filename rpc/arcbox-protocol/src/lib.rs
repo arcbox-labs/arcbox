@@ -153,7 +153,12 @@ pub mod api {
 
     // Migration service types
     pub use super::v1::{
-        PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+        MigrationContainerMount, MigrationContainerNetworkAttachment, MigrationContainerPlan,
+        MigrationContainerSpec, MigrationImagePlan, MigrationMountType, MigrationNetworkIpam,
+        MigrationNetworkMode, MigrationNetworkPlan, MigrationPlan, MigrationPortPublish,
+        MigrationReplacementSummary, MigrationRestartPolicy, MigrationRunningVolumeBlocker,
+        MigrationSourceInfo, MigrationVolumePlan, PrepareMigrationRequest,
+        PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
     };
 
     // Shell/interactive session types
@@ -225,7 +230,12 @@ pub use v1::{
 
 // API types - Migration
 pub use v1::{
-    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+    MigrationContainerMount, MigrationContainerNetworkAttachment, MigrationContainerPlan,
+    MigrationContainerSpec, MigrationImagePlan, MigrationMountType, MigrationNetworkIpam,
+    MigrationNetworkMode, MigrationNetworkPlan, MigrationPlan, MigrationPortPublish,
+    MigrationReplacementSummary, MigrationRestartPolicy, MigrationRunningVolumeBlocker,
+    MigrationSourceInfo, MigrationVolumePlan, PrepareMigrationRequest, PrepareMigrationResponse,
+    RunMigrationEvent, RunMigrationRequest,
 };
 
 // API types - Shell

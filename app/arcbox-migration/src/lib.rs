@@ -14,13 +14,13 @@ pub mod runner;
 pub mod source;
 
 pub use error::{MigrationError, Result};
-pub use executor::{MigrationExecutor, MigrationExecutorOptions};
+pub use executor::{MigrationExecutor, MigrationExecutorOptions, MigrationOutcome};
 pub use model::{
     ContainerMount, ContainerNetworkAttachment, ContainerPlan, ContainerSpec, ImagePlan,
-    MigrationPlan, NetworkPlan, PortPublish, ReplacementSummary, RestartPolicySpec,
-    RunningVolumeBlocker, SourceConfig, SourceInfo, SourceKind, VolumePlan,
+    MigrationPlan, NetworkModeSpec, NetworkPlan, PortPublish, ReplacementSummary,
+    RestartPolicySpec, RunningVolumeBlocker, SourceConfig, SourceInfo, SourceKind, VolumePlan,
 };
 pub use planner::MigrationPlanner;
 pub use progress::{MigrationProgress, MigrationStage};
-pub use runner::DockerCliRunner;
+pub use runner::{DockerCliRunner, ImageTransfer};
 pub use source::{DockerDesktopSource, MigrationSource, OrbStackSource, resolve_source};

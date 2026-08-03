@@ -25,8 +25,11 @@ abctl machine list
 abctl machine stop myvm
 
 # Runtime migration
+abctl migrate from orbstack --dry-run          # inspect the plan, change nothing
+abctl migrate from orbstack --dry-run --json   # same plan, machine-readable
 abctl migrate from docker-desktop
 abctl migrate from orbstack --source-socket ~/.orbstack/run/docker.sock --yes
+abctl migrate from orbstack --no-start         # recreate but leave stopped
 
 # Daemon management
 abctl daemon start              # Start daemon in background

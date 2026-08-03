@@ -15,6 +15,8 @@ pub enum MigrationStage {
     RecreateNetworks,
     /// Recreating containers.
     RecreateContainers,
+    /// Starting containers that were running on the source.
+    StartContainers,
     /// Cleaning up temporary resources.
     Cleanup,
     /// Migration completed.
@@ -32,6 +34,7 @@ impl MigrationStage {
             Self::ImportVolumes => "import-volumes",
             Self::RecreateNetworks => "recreate-networks",
             Self::RecreateContainers => "recreate-containers",
+            Self::StartContainers => "start-containers",
             Self::Cleanup => "cleanup",
             Self::Complete => "complete",
         }
