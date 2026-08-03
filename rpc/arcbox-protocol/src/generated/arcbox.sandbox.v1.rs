@@ -1119,6 +1119,223 @@ pub mod write_file_request {
         Chunk(super::FileChunk),
     }
 }
+/// Metadata of one filesystem entry.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FileStat {
+    /// Base name of the entry (the final path component).
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Kind of entry (symlinks are reported as SYMLINK, not followed).
+    #[prost(enumeration = "FileKind", tag = "2")]
+    pub kind: i32,
+    /// Size in bytes (regular files; 0 otherwise).
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    /// Unix permission bits (the low 12 bits of st_mode).
+    #[prost(uint32, tag = "4")]
+    pub mode: u32,
+    /// Last modification time.
+    #[prost(message, optional, tag = "5")]
+    pub modified_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// Owning user ID.
+    #[prost(uint32, tag = "6")]
+    pub uid: u32,
+    /// Owning group ID.
+    #[prost(uint32, tag = "7")]
+    pub gid: u32,
+    /// Symlink target (set only when kind == SYMLINK).
+    #[prost(string, tag = "8")]
+    pub symlink_target: ::prost::alloc::string::String,
+}
+/// Request to stat a path.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StatFileRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute path inside the sandbox rootfs.
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+}
+/// Request to list a directory.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListDirRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute directory path inside the sandbox rootfs.
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+}
+/// Response to ListDir.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDirResponse {
+    /// Directory entries, each with full metadata.
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<FileStat>,
+}
+/// Request to create a directory.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MakeDirRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute directory path to create (missing parents are created).
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// Unix permission bits for created directories (0 = 0755).
+    #[prost(uint32, tag = "3")]
+    pub mode: u32,
+}
+/// Request to remove a filesystem entry.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveEntryRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute path to remove.
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// Remove directories and their contents recursively. Without it a
+    /// non-empty directory fails with FAILED_PRECONDITION.
+    #[prost(bool, tag = "3")]
+    pub recursive: bool,
+}
+/// Request to rename / move a filesystem entry.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MoveEntryRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute source path.
+    #[prost(string, tag = "2")]
+    pub from_path: ::prost::alloc::string::String,
+    /// Absolute destination path.
+    #[prost(string, tag = "3")]
+    pub to_path: ::prost::alloc::string::String,
+}
+/// Request to watch a path for filesystem events.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchDirRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute path to watch (a directory).
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// Also watch subdirectories.
+    #[prost(bool, tag = "3")]
+    pub recursive: bool,
+}
+/// One filesystem event.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FsEvent {
+    /// What happened.
+    #[prost(enumeration = "FsEventKind", tag = "1")]
+    pub kind: i32,
+    /// Absolute path of the affected entry (the old path for RENAMED).
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// New absolute path (set only for RENAMED).
+    #[prost(string, tag = "3")]
+    pub renamed_to: ::prost::alloc::string::String,
+}
+/// One frame of a WatchDir stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchDirResponse {
+    #[prost(oneof = "watch_dir_response::Payload", tags = "1, 2")]
+    pub payload: ::core::option::Option<watch_dir_response::Payload>,
+}
+/// Nested message and enum types in `WatchDirResponse`.
+pub mod watch_dir_response {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Payload {
+        /// A filesystem event.
+        #[prost(message, tag = "1")]
+        Event(super::FsEvent),
+        /// Idle-stream keepalive; carries no data.
+        #[prost(message, tag = "2")]
+        KeepAlive(super::KeepAlive),
+    }
+}
+/// What kind of filesystem object a path is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FileKind {
+    Unspecified = 0,
+    /// Regular file.
+    File = 1,
+    Directory = 2,
+    Symlink = 3,
+    /// Device node, FIFO, or socket.
+    Other = 4,
+}
+impl FileKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FILE_KIND_UNSPECIFIED",
+            Self::File => "FILE_KIND_FILE",
+            Self::Directory => "FILE_KIND_DIRECTORY",
+            Self::Symlink => "FILE_KIND_SYMLINK",
+            Self::Other => "FILE_KIND_OTHER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FILE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "FILE_KIND_FILE" => Some(Self::File),
+            "FILE_KIND_DIRECTORY" => Some(Self::Directory),
+            "FILE_KIND_SYMLINK" => Some(Self::Symlink),
+            "FILE_KIND_OTHER" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+/// Kind of a filesystem event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FsEventKind {
+    Unspecified = 0,
+    /// An entry was created.
+    Created = 1,
+    /// An entry's content or metadata changed.
+    Modified = 2,
+    /// An entry was removed.
+    Removed = 3,
+    /// An entry was renamed within the watched tree.
+    Renamed = 4,
+}
+impl FsEventKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FS_EVENT_KIND_UNSPECIFIED",
+            Self::Created => "FS_EVENT_KIND_CREATED",
+            Self::Modified => "FS_EVENT_KIND_MODIFIED",
+            Self::Removed => "FS_EVENT_KIND_REMOVED",
+            Self::Renamed => "FS_EVENT_KIND_RENAMED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FS_EVENT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "FS_EVENT_KIND_CREATED" => Some(Self::Created),
+            "FS_EVENT_KIND_MODIFIED" => Some(Self::Modified),
+            "FS_EVENT_KIND_REMOVED" => Some(Self::Removed),
+            "FS_EVENT_KIND_RENAMED" => Some(Self::Renamed),
+            _ => None,
+        }
+    }
+}
 /// Request to checkpoint a sandbox.
 /// The sandbox must be in READY state (no active execution).
 #[derive(Clone, PartialEq, ::prost::Message)]
