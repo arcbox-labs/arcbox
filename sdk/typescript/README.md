@@ -86,7 +86,10 @@ TODO(CI): wire `npm run lint`, `npm run format:check`, `npm test`, and
 ## Status
 
 Phase 1 of CORE-58 — the hello-world closed loop: `Sandbox`
-create/connect/list, `kill`/`pause`/`info`, `commands.run` (foreground
+create/connect/list, `kill`/`pause`/`info` (`pause` and the
+paused-sandbox reconnect path are wire-complete but reject with
+Unimplemented until the daemon's CORE-21 lands — the daemon serves
+Pause/Resume as contract-only stubs today), `commands.run` (foreground
 result + background handle with streamed output, `waitForExit`, `kill`),
 and whole-file `files` read/write. Deferred: PTY, `ports`,
 `waitForPort`/`waitForLog`, filesystem path verbs (stat/list/mkdir/…),
