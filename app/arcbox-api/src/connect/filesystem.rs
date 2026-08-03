@@ -125,4 +125,76 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
             .map_err(ApiError::from)?;
         Response::ok(Empty::default())
     }
+
+    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
+    /// CORE-62 (guest-agent implementation).
+    async fn stat(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::StatFileRequest>,
+    ) -> ServiceResult<pb::FileStat> {
+        Err(ConnectError::unimplemented(
+            "stat is not implemented yet (CORE-62)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
+    /// CORE-62 (guest-agent implementation).
+    async fn list_dir(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ListDirRequest>,
+    ) -> ServiceResult<pb::ListDirResponse> {
+        Err(ConnectError::unimplemented(
+            "list_dir is not implemented yet (CORE-62)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
+    /// CORE-62 (guest-agent implementation).
+    async fn make_dir(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::MakeDirRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "make_dir is not implemented yet (CORE-62)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
+    /// CORE-62 (guest-agent implementation).
+    async fn remove(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::RemoveEntryRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "remove is not implemented yet (CORE-62)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
+    /// CORE-62 (guest-agent implementation).
+    async fn r#move(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::MoveEntryRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "move is not implemented yet (CORE-62)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
+    /// CORE-62 (guest-agent implementation).
+    async fn watch_dir(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::WatchDirRequest>,
+    ) -> ServiceResult<ServiceStream<pb::WatchDirResponse>> {
+        Err(ConnectError::unimplemented(
+            "watch_dir is not implemented yet (CORE-62)",
+        ))
+    }
 }
