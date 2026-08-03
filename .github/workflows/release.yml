@@ -10,6 +10,11 @@ on:
         description: 'Tag to build (e.g. v0.1.5)'
         required: true
         type: string
+      publish_crates:
+        description: 'Publish missing workspace crates to crates.io'
+        required: false
+        default: false
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,18 +57,21 @@ jobs:
   # green by the CI build job, so the per-crate verify build is redundant safety
   # here, not new coverage. cargo still resolves the dependency graph and uploads
   # in dependency order via a local temp registry, so unpublished inter-deps
-  # resolve. arcbox-hv has its own release cadence and may already exist at
-  # its pinned version, so exclude it from the coordinated workspace publish.
-  # Platform-agnostic (no compilation happens), so it runs on ubuntu. Skipped on
-  # workflow_dispatch (manual binary rebuilds must not republish).
+  # resolve. arcbox-hv and arcbox-helper have their own release cadences and may
+  # already exist at their pinned versions, so exclude them from the coordinated
+  # workspace publish. Platform-agnostic (no compilation happens), so it runs on
+  # ubuntu. Manual binary rebuilds only republish when explicitly requested.
   publish-crates:
     name: Publish crates to crates.io
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.publish_crates
+    needs: version
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.version }}
 
       - name: Setup Rust
         # @stable resolves to the latest stable at run time; coordinated
@@ -87,29 +95,53 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_TERM_COLOR: never
         # One coordinated publish of the whole workspace: cargo packages every
         # member, resolves inter-deps via a local temp registry, then uploads in
         # dependency order, waiting for the index between uploads. --no-verify:
         # see the note above (crates that embed out-of-tree workspace files).
         #
         # crates.io rate-limits bulk updates to existing crates (HTTP 429 after
-        # a burst), and the workspace has ~50 members — a single pass never gets
-        # through. Retry with backoff: cargo skips crates already published at
-        # this version, so each pass uploads whatever the refill allows until
-        # the whole workspace is up. Only a persistent non-rate-limit failure
-        # exhausts the attempts and fails the job.
+        # a burst), and the workspace has ~50 members. Cargo does not skip versions
+        # already uploaded by a partial pass, so add each one to the exclusion
+        # list before resuming. Only rate limits are retried; other errors fail
+        # immediately.
         run: |
-          attempts=20
-          for i in $(seq 1 "$attempts"); do
-            if cargo publish --workspace --exclude arcbox-hv --no-verify --locked; then
-              echo "crates.io publish complete after $i attempt(s)"
+          excludes=(--exclude arcbox-hv --exclude arcbox-helper)
+          rate_limit_attempts=0
+
+          while true; do
+            set +e
+            output=$(cargo publish --workspace "${excludes[@]}" --no-verify --locked 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+
+            if (( status == 0 )); then
+              echo "crates.io publish complete"
               exit 0
             fi
-            echo "::notice::crates.io publish attempt $i/$attempts incomplete (likely rate-limited); backing off 60s"
+
+            if [[ $output =~ crate[[:space:]]+([^@[:space:]]+)@[^[:space:]]+[[:space:]]+already[[:space:]]+exists[[:space:]]+on[[:space:]]+crates\.io[[:space:]]+index ]]; then
+              crate=${BASH_REMATCH[1]}
+              excludes+=(--exclude "$crate")
+              echo "::notice::$crate is already published; resuming with remaining workspace crates"
+              continue
+            fi
+
+            if [[ $output != *"429"* ]]; then
+              echo "::error::crates.io publish failed with a non-rate-limit error"
+              exit "$status"
+            fi
+
+            ((rate_limit_attempts += 1))
+            if (( rate_limit_attempts >= 20 )); then
+              echo "::error::crates.io publish did not complete after $rate_limit_attempts rate-limit retries"
+              exit 1
+            fi
+            echo "::notice::crates.io rate-limited; retrying in 60s ($rate_limit_attempts/20)"
             sleep 60
           done
-          echo "::error::crates.io publish did not complete after $attempts attempts"
-          exit 1
 
   # ==========================================================================
   # Build + sign macOS ARM64 host binaries
