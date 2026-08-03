@@ -1,4 +1,4 @@
-//! Execution RPC handlers (protocol v2, CORE-55).
+//! Execution RPC handlers (the execution redesign, CORE-55/56).
 //!
 //! Executions are addressable: start returns an identity, attach streams
 //! offset-addressed output, stdin writes are offset-idempotent, and signal /

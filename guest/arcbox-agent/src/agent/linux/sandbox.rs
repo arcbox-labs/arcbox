@@ -190,7 +190,7 @@ where
             }
         },
         // -----------------------------------------------------------------
-        // Executions (protocol v2)
+        // Executions (execution redesign, CORE-55/56)
         // -----------------------------------------------------------------
         MessageType::SandboxExecStartRequest => match svc.start_execution(payload).await {
             Ok(resp) => {
