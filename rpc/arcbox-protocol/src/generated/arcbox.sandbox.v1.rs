@@ -92,9 +92,14 @@ pub struct CreateSandboxRequest {
     #[prost(message, optional, tag = "13")]
     pub network: ::core::option::Option<NetworkSpec>,
     /// --- Lifecycle ---
-    /// Sandbox auto-destruction timeout in seconds (0 = no limit).
-    /// The timer starts from the moment the sandbox is created and is not
-    /// reset by workload activity.
+    /// Two independent lifecycle knobs exist; never conflate them:
+    /// `ttl_seconds` is the hard maximum lifetime, `idle_timeout_seconds`
+    /// reacts to inactivity.
+    ///
+    /// Hard maximum lifetime in seconds (0 = no limit). On expiry the
+    /// sandbox is always destroyed — pausing does not apply. The deadline
+    /// starts at creation and is not reset by workload activity;
+    /// SetLifecycle replaces it with a fresh deadline from now (CORE-60).
     #[prost(uint32, tag = "14")]
     pub ttl_seconds: u32,
     /// --- Provisioning ---
@@ -114,6 +119,16 @@ pub struct CreateSandboxRequest {
     /// Anything else is rejected with INVALID_ARGUMENT.
     #[prost(string, tag = "17")]
     pub template: ::prost::alloc::string::String,
+    /// Apply `on_idle` after this many seconds without a running
+    /// execution (0 = no idle detection). Re-armed every time the
+    /// workload goes idle; distinct from `ttl_seconds`, which caps total
+    /// lifetime regardless of activity (CORE-21).
+    #[prost(uint32, tag = "18")]
+    pub idle_timeout_seconds: u32,
+    /// What to do when the idle timeout expires (UNSPECIFIED = the
+    /// daemon default, currently KILL).
+    #[prost(enumeration = "IdleAction", tag = "19")]
+    pub on_idle: i32,
 }
 /// Response to CreateSandbox.
 /// Returned immediately; the sandbox may still be booting (state STARTING).
@@ -150,6 +165,73 @@ pub struct RemoveSandboxRequest {
     /// Force removal even if the sandbox is in RUNNING state.
     #[prost(bool, tag = "2")]
     pub force: bool,
+}
+/// Request to pause a sandbox.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PauseSandboxRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+}
+/// Request to resume a paused sandbox.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResumeSandboxRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+}
+/// Request to replace a sandbox's lifecycle deadlines. Absent fields are
+/// left unchanged, so each knob can be adjusted independently.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetLifecycleRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Replace the hard maximum lifetime: expire this many seconds from
+    /// now (0 = remove the limit).
+    #[prost(uint32, optional, tag = "2")]
+    pub ttl_seconds: ::core::option::Option<u32>,
+    /// Replace the idle timeout (0 = disable idle detection).
+    #[prost(uint32, optional, tag = "3")]
+    pub idle_timeout_seconds: ::core::option::Option<u32>,
+    /// Replace the idle policy (UNSPECIFIED = leave unchanged).
+    #[prost(enumeration = "IdleAction", tag = "4")]
+    pub on_idle: i32,
+}
+/// Request for the daemon's sandbox capabilities.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetCapabilitiesRequest {}
+/// What this daemon can do. SDKs fetch it lazily once per process and
+/// fail fast with an actionable error instead of probing per call.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetCapabilitiesResponse {
+    /// Daemon version string (informational).
+    #[prost(string, tag = "1")]
+    pub daemon_version: ::prost::alloc::string::String,
+    /// Sandbox API protocol level. SDKs compare it against their floor
+    /// and raise a mismatch error with an upgrade suggestion
+    /// (PROTOCOL_MISMATCH in `errors.proto`) instead of sprinkling
+    /// version checks at call sites.
+    #[prost(uint32, tag = "2")]
+    pub protocol: u32,
+    /// Named feature flags for capabilities that postdate `protocol`.
+    #[prost(string, repeated, tag = "3")]
+    pub features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Whether this host can run sandboxes at all (CORE-13).
+    #[prost(message, optional, tag = "4")]
+    pub nested_virt: ::core::option::Option<NestedVirtCapability>,
+}
+/// Nested-virtualization support on this host.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NestedVirtCapability {
+    /// True when sandboxes can run (M3+ hardware, VZ backend).
+    #[prost(bool, tag = "1")]
+    pub supported: bool,
+    /// Why not, when unsupported — the daemon's authoritative reason
+    /// (chip generation vs backend), surfaced verbatim in
+    /// NESTED_VIRT_UNSUPPORTED errors.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
 }
 /// Request to inspect a sandbox.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -193,6 +275,31 @@ pub struct SandboxInfo {
     /// Human-readable error message (only set when state == FAILED).
     #[prost(string, tag = "10")]
     pub error: ::prost::alloc::string::String,
+    /// Template reference the sandbox was created from (as passed to
+    /// Create; empty = the built-in minimal template).
+    #[prost(string, tag = "11")]
+    pub template: ::prost::alloc::string::String,
+    /// When the hard maximum lifetime fires (unset = no limit). Replaced
+    /// by SetLifecycle.
+    #[prost(message, optional, tag = "12")]
+    pub ttl_deadline: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// Idle timeout in seconds (0 = no idle detection).
+    #[prost(uint32, tag = "13")]
+    pub idle_timeout_seconds: u32,
+    /// Action applied when the idle timeout expires.
+    #[prost(enumeration = "IdleAction", tag = "14")]
+    pub on_idle: i32,
+    /// When the sandbox reached PAUSED (unset unless paused).
+    #[prost(message, optional, tag = "15")]
+    pub paused_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// When the sandbox reached FAILED (unset otherwise; `error` carries
+    /// the reason).
+    #[prost(message, optional, tag = "16")]
+    pub failed_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// On-disk footprint of the sandbox's retained state (checkpoint +
+    /// disk overlay). Paused sandboxes keep paying this until removed.
+    #[prost(uint64, tag = "17")]
+    pub storage_bytes: u64,
 }
 /// Network details of a sandbox.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -231,6 +338,9 @@ pub struct ListSandboxesResponse {
     pub next_page_token: ::prost::alloc::string::String,
 }
 /// Lightweight sandbox summary for List.
+///
+/// Carries the state timestamps and retention cost so a listing shows
+/// lifecycle truth without an Inspect per row.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SandboxSummary {
     /// Sandbox ID.
@@ -249,6 +359,18 @@ pub struct SandboxSummary {
     /// Creation time.
     #[prost(message, optional, tag = "5")]
     pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// When the sandbox first became READY (unset if not yet).
+    #[prost(message, optional, tag = "6")]
+    pub ready_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// When the sandbox reached PAUSED (unset unless paused).
+    #[prost(message, optional, tag = "7")]
+    pub paused_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// When the sandbox reached FAILED (unset otherwise).
+    #[prost(message, optional, tag = "8")]
+    pub failed_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// On-disk footprint of retained state; nonzero for paused sandboxes.
+    #[prost(uint64, tag = "9")]
+    pub storage_bytes: u64,
 }
 /// Request to subscribe to sandbox lifecycle events.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -341,9 +463,11 @@ pub struct UnexposePortRequest {
 ///
 ///    STARTING ──► READY ──► RUNNING ──► READY  (execution exited, sandbox alive)
 ///                   │          │
-///                   └──────────┴──► STOPPING ──► STOPPED
-///                                        │
-///                                     FAILED
+///                   ├──────────┴──► STOPPING ──► STOPPED
+///                   │          │
+///                   ├──────────┴──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
+///                   │          │
+///                   └──────────┴──► FAILED  (error reason set)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SandboxState {
@@ -360,6 +484,11 @@ pub enum SandboxState {
     Stopped = 5,
     /// Unrecoverable error occurred.
     Failed = 6,
+    /// Pause in progress: checkpointing state, then releasing the VM.
+    Pausing = 7,
+    /// Checkpointed to disk; runtime resources released. The record and
+    /// snapshot survive under the same ID until Resume or Remove.
+    Paused = 8,
 }
 impl SandboxState {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -375,6 +504,8 @@ impl SandboxState {
             Self::Stopping => "SANDBOX_STATE_STOPPING",
             Self::Stopped => "SANDBOX_STATE_STOPPED",
             Self::Failed => "SANDBOX_STATE_FAILED",
+            Self::Pausing => "SANDBOX_STATE_PAUSING",
+            Self::Paused => "SANDBOX_STATE_PAUSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -387,6 +518,8 @@ impl SandboxState {
             "SANDBOX_STATE_STOPPING" => Some(Self::Stopping),
             "SANDBOX_STATE_STOPPED" => Some(Self::Stopped),
             "SANDBOX_STATE_FAILED" => Some(Self::Failed),
+            "SANDBOX_STATE_PAUSING" => Some(Self::Pausing),
+            "SANDBOX_STATE_PAUSED" => Some(Self::Paused),
             _ => None,
         }
     }
@@ -414,6 +547,17 @@ pub enum SandboxEventKind {
     Failed = 7,
     /// Sandbox deleted.
     Removed = 8,
+    /// Pause started — whether client-driven (Pause) or automated (idle
+    /// timeout with a PAUSE policy); automation must be visible, so the
+    /// idle detector emits the same events. Attributes carry "reason"
+    /// ("pause" or "idle_timeout").
+    Pausing = 9,
+    /// Checkpoint complete; runtime resources released.
+    Paused = 10,
+    /// Resume completed — explicit or transparent (a data-plane call to a
+    /// paused sandbox); sandbox READY again under the same ID. Attributes
+    /// carry "reason" ("resume" or "auto_resume").
+    Resumed = 11,
 }
 impl SandboxEventKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -431,6 +575,9 @@ impl SandboxEventKind {
             Self::Stopped => "SANDBOX_EVENT_KIND_STOPPED",
             Self::Failed => "SANDBOX_EVENT_KIND_FAILED",
             Self::Removed => "SANDBOX_EVENT_KIND_REMOVED",
+            Self::Pausing => "SANDBOX_EVENT_KIND_PAUSING",
+            Self::Paused => "SANDBOX_EVENT_KIND_PAUSED",
+            Self::Resumed => "SANDBOX_EVENT_KIND_RESUMED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -445,6 +592,44 @@ impl SandboxEventKind {
             "SANDBOX_EVENT_KIND_STOPPED" => Some(Self::Stopped),
             "SANDBOX_EVENT_KIND_FAILED" => Some(Self::Failed),
             "SANDBOX_EVENT_KIND_REMOVED" => Some(Self::Removed),
+            "SANDBOX_EVENT_KIND_PAUSING" => Some(Self::Pausing),
+            "SANDBOX_EVENT_KIND_PAUSED" => Some(Self::Paused),
+            "SANDBOX_EVENT_KIND_RESUMED" => Some(Self::Resumed),
+            _ => None,
+        }
+    }
+}
+/// What the daemon does when a sandbox's idle timeout expires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum IdleAction {
+    /// Daemon default (currently KILL; auto-pause is opt-in).
+    Unspecified = 0,
+    /// Destroy the sandbox and release all resources (Remove semantics).
+    Kill = 1,
+    /// Pause: checkpoint to disk under the same ID and release the VM.
+    /// Trades RAM for disk — the sandbox reports `storage_bytes` until
+    /// resumed or removed.
+    Pause = 2,
+}
+impl IdleAction {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "IDLE_ACTION_UNSPECIFIED",
+            Self::Kill => "IDLE_ACTION_KILL",
+            Self::Pause => "IDLE_ACTION_PAUSE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "IDLE_ACTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "IDLE_ACTION_KILL" => Some(Self::Kill),
+            "IDLE_ACTION_PAUSE" => Some(Self::Pause),
             _ => None,
         }
     }

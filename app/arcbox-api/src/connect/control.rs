@@ -117,6 +117,54 @@ impl pb::SandboxService for SandboxServiceImpl {
         Response::ok(Empty::default())
     }
 
+    /// Contract-only stub (CORE-58 phase 1): pause/auto-pause lands with
+    /// CORE-21.
+    async fn pause(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::PauseSandboxRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "sandbox pause is not implemented yet (CORE-21)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): resume lands with CORE-21.
+    async fn resume(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ResumeSandboxRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "sandbox resume is not implemented yet (CORE-21)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): the TTL wire-up lands with
+    /// CORE-60 (the daemon-side mechanism already exists), the idle
+    /// knobs with CORE-21.
+    async fn set_lifecycle(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::SetLifecycleRequest>,
+    ) -> ServiceResult<Empty> {
+        Err(ConnectError::unimplemented(
+            "sandbox lifecycle updates are not implemented yet (CORE-60/CORE-21)",
+        ))
+    }
+
+    /// Contract-only stub (CORE-58 phase 1): served for real with
+    /// CORE-13 (nested-virt fail-fast).
+    async fn get_capabilities(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetCapabilitiesRequest>,
+    ) -> ServiceResult<pb::GetCapabilitiesResponse> {
+        Err(ConnectError::unimplemented(
+            "capability reporting is not implemented yet (CORE-13)",
+        ))
+    }
+
     async fn inspect(
         &self,
         ctx: RequestContext,
