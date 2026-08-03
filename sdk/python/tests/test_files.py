@@ -10,7 +10,7 @@ from arcbox import Connection, Sandbox
 from arcbox._envelope import FLAG_END_STREAM, EnvelopeDecoder, encode_envelope
 from arcbox._gen import filesystem_pb2
 from arcbox._sync._client import ConnectClient
-from arcbox.errors import FileTooLargeError
+from arcbox.errors import ArcBoxError, FileTooLargeError
 
 
 class MockFilesystem:
@@ -18,6 +18,9 @@ class MockFilesystem:
         self.writes: list[list[filesystem_pb2.WriteFileRequest]] = []
         #: chunks replayed by ReadFile.
         self.read_chunks: list[tuple[bytes, bool]] = [(b"hello ", False), (b"world", True)]
+        #: Drop the terminal EndStream frame from WriteFile responses,
+        #: simulating a connection cut after the response message.
+        self.truncate_write_response = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -27,9 +30,9 @@ class MockFilesystem:
                 for _flags, payload in EnvelopeDecoder().feed(request.content)
             ]
             self.writes.append(decoded)
-            body = encode_envelope(0, empty_pb2.Empty().SerializeToString()) + encode_envelope(
-                FLAG_END_STREAM, b"{}"
-            )
+            body = encode_envelope(0, empty_pb2.Empty().SerializeToString())
+            if not self.truncate_write_response:
+                body += encode_envelope(FLAG_END_STREAM, b"{}")
             return httpx.Response(
                 200, content=body, headers={"content-type": "application/connect+proto"}
             )
@@ -92,6 +95,13 @@ def test_oversized_writes_fail_before_any_request() -> None:
         sandbox.files.write_bytes("/huge", bytes(256 * 1024 * 1024 + 1))
     assert exc_info.value.context["limit"] == str(256 * 1024 * 1024)
     assert daemon.writes == []
+
+
+def test_write_without_the_terminal_frame_is_an_error_not_success() -> None:
+    daemon = MockFilesystem()
+    daemon.truncate_write_response = True
+    with pytest.raises(ArcBoxError, match="without an EndStreamResponse"):
+        sandbox_for(daemon).files.write_bytes("/x", b"data")
 
 
 def test_read_bytes_assembles_chunks_until_done() -> None:
