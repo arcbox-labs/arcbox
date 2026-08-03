@@ -448,7 +448,7 @@ fn print_progress_event(event: &RunMigrationEvent) {
 mod tests {
     use super::{
         MigrationContainerSpec, MigrationNetworkMode, MigrationSourceKind, describe_network_mode,
-        is_confirmation_yes,
+        describe_start_state, is_confirmation_yes,
     };
     use arcbox_protocol::v1::MigrationContainerNetworkAttachment;
 
@@ -507,6 +507,17 @@ mod tests {
             describe_network_mode(&spec_with(MigrationNetworkMode::Named)),
             "named"
         );
+    }
+
+    #[test]
+    fn the_preview_matches_what_the_run_would_do() {
+        // Mirrors `start_containers: !skip_start` on the daemon side: only a
+        // source-running container with --no-start absent is started, so that is
+        // the one row allowed to say so.
+        assert_eq!(describe_start_state(true, false), "will start");
+        assert_eq!(describe_start_state(true, true), "stopped (--no-start)");
+        assert_eq!(describe_start_state(false, false), "stopped");
+        assert_eq!(describe_start_state(false, true), "stopped");
     }
 
     #[test]

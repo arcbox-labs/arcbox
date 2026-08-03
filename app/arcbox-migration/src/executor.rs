@@ -266,6 +266,11 @@ where
         let target_helper_name =
             format!("{HELPER_OBJECT_PREFIX}dst-{}", sanitize_name(&volume.name));
 
+        // Clear strays before creating: an interrupted run leaves its helper
+        // holding this exact name, and create refuses a duplicate.
+        source.remove_stale_helper(&source_helper_name).await?;
+        target.remove_stale_helper(&target_helper_name).await?;
+
         let source_helper = source
             .create_helper_container(&source_helper_name, &volume.name)
             .await?;

@@ -154,6 +154,37 @@ impl DockerCliRunner {
             .await
     }
 
+    /// Clears a helper container left behind by an interrupted run.
+    ///
+    /// A run whose daemon died mid-copy strands its helper, and
+    /// `docker create --name` refuses a duplicate — which would wedge the retry
+    /// the user is certain to attempt, since a failed migration leaves them no
+    /// other way to get their data across. Clearing the name first makes the
+    /// volume copy idempotent.
+    ///
+    /// Existence is checked rather than the removal being forced blindly, so a
+    /// genuine removal failure still surfaces instead of being swallowed as
+    /// "nothing was there". `remove_container` passes `--volumes`, which reaps
+    /// only *anonymous* volumes, so the named volume being migrated is never at
+    /// risk.
+    pub async fn remove_stale_helper(&self, name: &str) -> Result<()> {
+        if !self.container_exists(name).await {
+            return Ok(());
+        }
+        self.remove_container(name).await
+    }
+
+    /// Whether a container with this name exists, running or not.
+    async fn container_exists(&self, name: &str) -> bool {
+        self.command()
+            .args(["container", "inspect", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    }
+
     /// Removes a volume.
     pub async fn remove_volume(&self, name: &str) -> Result<()> {
         self.status(["volume", "rm", "--force", name]).await
