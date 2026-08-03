@@ -137,6 +137,7 @@ class AsyncConnectClient:
             raise unary_error(response.status_code, response.content)
         decoder = EnvelopeDecoder()
         message: M | None = None
+        ended = False
         for flags, payload in decoder.feed(response.content):
             if flags & FLAG_COMPRESSED:
                 raise ArcBoxError("received a compressed frame without negotiating compression")
@@ -144,10 +145,16 @@ class AsyncConnectClient:
                 error = end_stream_error(payload)
                 if error is not None:
                     raise error
+                ended = True
             else:
                 decoded = response_type()
                 decoded.ParseFromString(payload)
                 message = decoded
+        if not ended:
+            # Without the terminal frame a truncated body is
+            # indistinguishable from success — never report one as
+            # completed (WriteFile rides this path).
+            raise ArcBoxError("the stream ended without an EndStreamResponse")
         if message is None:
             raise ArcBoxError("the stream ended without a response message")
         return message
