@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+
 import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
 import type { MessageInitShape } from "@bufbuild/protobuf";
@@ -52,15 +54,10 @@ export class Files {
           break;
         }
       }
-      const out = new Uint8Array(total);
-      let offset = 0;
-      for (const chunk of chunks) {
-        out.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      return out;
-    } catch (reason) {
-      throw toArcBoxError(reason, "files.readBytes");
+      // Buffer IS a Uint8Array; concat is the native single-copy assembly.
+      return Buffer.concat(chunks, total);
+    } catch (error) {
+      throw toArcBoxError(error, "files.readBytes");
     }
   }
 
@@ -114,8 +111,8 @@ export class Files {
     }
     try {
       await this.#client.writeFile(requests());
-    } catch (reason) {
-      throw toArcBoxError(reason, "files.writeBytes");
+    } catch (error) {
+      throw toArcBoxError(error, "files.writeBytes");
     }
   }
 

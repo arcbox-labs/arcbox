@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+
 import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
 
@@ -62,29 +64,23 @@ export interface CommandOutput {
  * {@link expect} is the opt-in throw.
  */
 export class CommandResult {
-  /**
-   * Process exit code. When the process was killed by a signal this is
-   * `128 + signal` (shell convention) and {@link signal} is set.
-   */
-  readonly exitCode: number;
   /** Signal name when killed by a signal (e.g. "SIGKILL"). */
   readonly signal?: string;
-  readonly stdout: string;
-  /** Stderr content — warnings land here too; it is not "errors". */
-  readonly stderr: string;
 
   constructor(
-    exitCode: number,
+    /**
+     * Process exit code. When the process was killed by a signal this is
+     * `128 + signal` (shell convention) and {@link signal} is set.
+     */
+    readonly exitCode: number,
     signal: string | undefined,
-    stdout: string,
-    stderr: string,
+    readonly stdout: string,
+    /** Stderr content — warnings land here too; it is not "errors". */
+    readonly stderr: string,
   ) {
-    this.exitCode = exitCode;
     if (signal !== undefined) {
       this.signal = signal;
     }
-    this.stdout = stdout;
-    this.stderr = stderr;
   }
 
   /** Throw {@link CommandFailedError} when the exit code is non-zero; otherwise return this. */
@@ -151,6 +147,150 @@ export function commandResultFromExecution(
 type ProcessClient = Client<typeof SandboxProcessService>;
 
 /**
+ * A handle to a running (or finished) command. The process is decoupled
+ * from this object: dropping the handle never kills the process.
+ */
+export class CommandHandle {
+  readonly commandId: string;
+  readonly #client: ProcessClient;
+  readonly #sandboxId: string;
+
+  constructor(client: ProcessClient, sandboxId: string, commandId: string) {
+    this.#client = client;
+    this.#sandboxId = sandboxId;
+    this.commandId = commandId;
+  }
+
+  /**
+   * Stream the command's output from the beginning. Buffered output
+   * replays first, then live output follows; the stream ends when the
+   * process exits (deterministic termination — never silence).
+   */
+  get output(): AsyncIterable<CommandOutput> {
+    return this.#streamOutput();
+  }
+
+  async *#streamOutput(): AsyncGenerator<CommandOutput> {
+    try {
+      for await (const event of this.#attach()) {
+        if (event.event.case === "output") {
+          const chunk = event.event.value;
+          yield {
+            channel:
+              chunk.channel === StdioChannel.STDERR
+                ? "stderr"
+                : channelName(chunk.channel),
+            data: chunk.data,
+          };
+        } else if (event.event.case === "exited") {
+          return;
+        }
+      }
+    } catch (error) {
+      throw toArcBoxError(error, "commands.output");
+    }
+  }
+
+  /**
+   * Wait until the command exits and return its result (long-poll; no
+   * client-side spinning). `timeoutMs` bounds the WAIT, not the process:
+   * on expiry a {@link TimeoutError} is thrown and the process keeps
+   * running.
+   */
+  async waitForExit(timeoutMs?: number): Promise<CommandResult> {
+    const deadline =
+      timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    try {
+      let execution: Execution;
+      for (;;) {
+        const remaining =
+          deadline === undefined ? undefined : deadline - Date.now();
+        if (remaining !== undefined && remaining <= 0) {
+          throw new TimeoutError(
+            "waitForExit(timeoutMs) elapsed before the command exited",
+            {
+              suggestion:
+                "increase the waitForExit timeoutMs argument, or kill() the command",
+              context: { commandId: this.commandId },
+            },
+          );
+        }
+        // Long-poll in bounded slices so a dropped daemon surfaces as an
+        // error instead of an infinite silent wait.
+        const sliceSeconds =
+          remaining === undefined
+            ? 30
+            : Math.min(30, Math.max(1, Math.ceil(remaining / 1000)));
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: each long-poll slice must finish before the next
+        execution = await this.#client.waitExecution(
+          {
+            sandboxId: this.#sandboxId,
+            executionId: this.commandId,
+            timeoutSeconds: sliceSeconds,
+          },
+          // Exempt from requestTimeoutMs: this unary deliberately parks
+          // server-side for sliceSeconds; grant it that long plus grace.
+          { timeoutMs: (sliceSeconds + 5) * 1000 },
+        );
+        if (execution.state === ExecutionState.EXITED) {
+          break;
+        }
+      }
+      return await this.#collectResult(execution);
+    } catch (error) {
+      throw toArcBoxError(error, "commands.waitForExit");
+    }
+  }
+
+  /** Deliver a signal to the whole process group (default SIGTERM). */
+  async kill(signal: SignalName = "SIGTERM"): Promise<void> {
+    try {
+      await this.#client.signalExecution({
+        sandboxId: this.#sandboxId,
+        executionId: this.commandId,
+        signal: SIGNAL_VALUES[signal],
+      });
+    } catch (error) {
+      throw toArcBoxError(error, "commands.kill");
+    }
+  }
+
+  #attach() {
+    return this.#client.attachExecution({
+      sandboxId: this.#sandboxId,
+      executionId: this.commandId,
+      stdoutOffset: 0n,
+      stderrOffset: 0n,
+    });
+  }
+
+  /**
+   * Assemble the result of an exited execution. Output is re-read from
+   * offset 0 — the daemon retains and replays it, so the result is
+   * complete even when nobody consumed the live stream.
+   */
+  async #collectResult(execution: Execution): Promise<CommandResult> {
+    const stdout: Uint8Array[] = [];
+    const stderr: Uint8Array[] = [];
+    for await (const event of this.#attach()) {
+      if (event.event.case === "output") {
+        const chunk = event.event.value;
+        (chunk.channel === StdioChannel.STDERR ? stderr : stdout).push(
+          chunk.data,
+        );
+      } else if (event.event.case === "exited") {
+        break;
+      }
+    }
+    return commandResultFromExecution(
+      execution,
+      decode(stdout),
+      decode(stderr),
+    );
+  }
+}
+
+/**
  * The `sandbox.commands` namespace: run processes inside one sandbox.
  */
 export class Commands {
@@ -209,150 +349,9 @@ export class Commands {
         unaryOptions(this.#ctx),
       );
       return new CommandHandle(this.#client, this.#sandboxId, execution.id);
-    } catch (reason) {
-      throw toArcBoxError(reason, "commands.run");
+    } catch (error) {
+      throw toArcBoxError(error, "commands.run");
     }
-  }
-}
-
-/**
- * A handle to a running (or finished) command. The process is decoupled
- * from this object: dropping the handle never kills the process.
- */
-export class CommandHandle {
-  readonly commandId: string;
-  readonly #client: ProcessClient;
-  readonly #sandboxId: string;
-
-  constructor(client: ProcessClient, sandboxId: string, commandId: string) {
-    this.#client = client;
-    this.#sandboxId = sandboxId;
-    this.commandId = commandId;
-  }
-
-  /**
-   * Stream the command's output from the beginning. Buffered output
-   * replays first, then live output follows; the stream ends when the
-   * process exits (deterministic termination — never silence).
-   */
-  get output(): AsyncIterable<CommandOutput> {
-    return this.#streamOutput();
-  }
-
-  async *#streamOutput(): AsyncGenerator<CommandOutput> {
-    try {
-      for await (const event of this.#attach()) {
-        if (event.event.case === "output") {
-          const chunk = event.event.value;
-          yield {
-            channel:
-              chunk.channel === StdioChannel.STDERR
-                ? "stderr"
-                : channelName(chunk.channel),
-            data: chunk.data,
-          };
-        } else if (event.event.case === "exited") {
-          return;
-        }
-      }
-    } catch (reason) {
-      throw toArcBoxError(reason, "commands.output");
-    }
-  }
-
-  /**
-   * Wait until the command exits and return its result (long-poll; no
-   * client-side spinning). `timeoutMs` bounds the WAIT, not the process:
-   * on expiry a {@link TimeoutError} is thrown and the process keeps
-   * running.
-   */
-  async waitForExit(timeoutMs?: number): Promise<CommandResult> {
-    const deadline =
-      timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
-    try {
-      for (;;) {
-        const remaining =
-          deadline === undefined ? undefined : deadline - Date.now();
-        if (remaining !== undefined && remaining <= 0) {
-          throw new TimeoutError(
-            "waitForExit(timeoutMs) elapsed before the command exited",
-            {
-              suggestion:
-                "increase the waitForExit timeoutMs argument, or kill() the command",
-              context: { commandId: this.commandId },
-            },
-          );
-        }
-        // Long-poll in bounded slices so a dropped daemon surfaces as an
-        // error instead of an infinite silent wait.
-        const sliceSeconds =
-          remaining === undefined
-            ? 30
-            : Math.min(30, Math.max(1, Math.ceil(remaining / 1000)));
-        const execution = await this.#client.waitExecution(
-          {
-            sandboxId: this.#sandboxId,
-            executionId: this.commandId,
-            timeoutSeconds: sliceSeconds,
-          },
-          // Exempt from requestTimeoutMs: this unary deliberately parks
-          // server-side for sliceSeconds; grant it that long plus grace.
-          { timeoutMs: (sliceSeconds + 5) * 1000 },
-        );
-        if (execution.state === ExecutionState.EXITED) {
-          return await this.#collectResult(execution);
-        }
-      }
-    } catch (reason) {
-      throw toArcBoxError(reason, "commands.waitForExit");
-    }
-  }
-
-  /** Deliver a signal to the whole process group (default SIGTERM). */
-  async kill(signal: SignalName = "SIGTERM"): Promise<void> {
-    try {
-      await this.#client.signalExecution({
-        sandboxId: this.#sandboxId,
-        executionId: this.commandId,
-        signal: SIGNAL_VALUES[signal],
-      });
-    } catch (reason) {
-      throw toArcBoxError(reason, "commands.kill");
-    }
-  }
-
-  #attach() {
-    return this.#client.attachExecution({
-      sandboxId: this.#sandboxId,
-      executionId: this.commandId,
-      stdoutOffset: 0n,
-      stderrOffset: 0n,
-    });
-  }
-
-  /**
-   * Assemble the result of an exited execution. Output is re-read from
-   * offset 0 — the daemon retains and replays it, so the result is
-   * complete even when nobody consumed the live stream.
-   */
-  async #collectResult(execution: Execution): Promise<CommandResult> {
-    const stdout: Uint8Array[] = [];
-    const stderr: Uint8Array[] = [];
-    for await (const event of this.#attach()) {
-      if (event.event.case === "output") {
-        const chunk = event.event.value;
-        (chunk.channel === StdioChannel.STDERR ? stderr : stdout).push(
-          chunk.data,
-        );
-      } else if (event.event.case === "exited") {
-        break;
-      }
-    }
-    return commandResultFromExecution(
-      execution,
-      decode(stdout),
-      decode(stderr),
-    );
   }
 }
 
@@ -361,10 +360,5 @@ function channelName(channel: StdioChannel): "stdout" | "pty" {
 }
 
 function decode(chunks: Uint8Array[]): string {
-  const decoder = new TextDecoder();
-  let out = "";
-  for (const chunk of chunks) {
-    out += decoder.decode(chunk, { stream: true });
-  }
-  return out + decoder.decode();
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }

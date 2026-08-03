@@ -1,5 +1,6 @@
 import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
+import { noop } from "foxts/noop";
 
 import { Commands } from "./commands.js";
 import type { ConnectionOptions } from "./connection.js";
@@ -108,12 +109,14 @@ export class ArcBox {
       let firstEvent: Promise<IteratorResult<WatchEventsResponse>> | undefined;
       let events: AsyncIterator<WatchEventsResponse> | undefined;
       if (opts.waitUntilReady !== false) {
-        events = this.#client
-          .events({ sandboxId: id }, { signal: abort.signal })
-          [Symbol.asyncIterator]();
+        const stream = this.#client.events(
+          { sandboxId: id },
+          { signal: abort.signal },
+        );
+        events = stream[Symbol.asyncIterator]();
         // Starting the first read is what sends the subscription request.
         firstEvent = events.next();
-        firstEvent.catch(() => undefined); // pre-handled: cancellation on the fast path is fine
+        firstEvent.catch(noop); // pre-handled: cancellation on the fast path is fine
       }
       await this.#client.create(
         {
@@ -122,21 +125,17 @@ export class ArcBox {
           labels: opts.labels ?? {},
           cmd: opts.cmd ?? [],
           env: opts.env ?? {},
-          ...(opts.vcpus === undefined && opts.memoryMib === undefined
-            ? {}
-            : {
-                limits: {
-                  vcpus: opts.vcpus ?? 0,
-                  memoryMib: BigInt(opts.memoryMib ?? 0),
-                },
-              }),
-          ...(opts.network === undefined
-            ? {}
-            : {
-                network: {
-                  mode: opts.network ? NetworkMode.ENABLED : NetworkMode.NONE,
-                },
-              }),
+          ...((opts.vcpus !== undefined || opts.memoryMib !== undefined) && {
+            limits: {
+              vcpus: opts.vcpus ?? 0,
+              memoryMib: BigInt(opts.memoryMib ?? 0),
+            },
+          }),
+          ...(!(opts.network === undefined) && {
+            network: {
+              mode: opts.network ? NetworkMode.ENABLED : NetworkMode.NONE,
+            },
+          }),
           ttlSeconds: secondsFromMs(opts.ttlMs),
           idleTimeoutSeconds: secondsFromMs(opts.idleTimeoutMs),
           onIdle:
@@ -152,8 +151,8 @@ export class ArcBox {
         await this.#waitReady(id, events, firstEvent);
       }
       return new Sandbox(this.#ctx, id);
-    } catch (reason) {
-      throw toArcBoxError(reason, "sandbox.create");
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.create");
     } finally {
       abort.abort();
     }
@@ -181,11 +180,13 @@ export class ArcBox {
         case SandboxStateProto.PAUSING: {
           const abort = new AbortController();
           try {
-            const events = this.#client
-              .events({ sandboxId: id }, { signal: abort.signal })
-              [Symbol.asyncIterator]();
+            const stream = this.#client.events(
+              { sandboxId: id },
+              { signal: abort.signal },
+            );
+            const events = stream[Symbol.asyncIterator]();
             const first = events.next();
-            first.catch(() => undefined);
+            first.catch(noop);
             await this.#waitReady(id, events, first);
           } finally {
             abort.abort();
@@ -204,8 +205,8 @@ export class ArcBox {
             },
           );
       }
-    } catch (reason) {
-      throw toArcBoxError(reason, "sandbox.connect");
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.connect");
     }
   }
 
@@ -214,6 +215,7 @@ export class ArcBox {
     try {
       let pageToken = "";
       do {
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: each request needs the previous page's token
         const page = await this.#client.list(
           {
             state:
@@ -223,13 +225,11 @@ export class ArcBox {
           },
           unaryOptions(this.#ctx),
         );
-        for (const summary of page.sandboxes) {
-          yield sandboxSummaryFromProto(summary);
-        }
+        yield* page.sandboxes.map(sandboxSummaryFromProto);
         pageToken = page.nextPageToken;
       } while (pageToken !== "");
-    } catch (reason) {
-      throw toArcBoxError(reason, "sandbox.list");
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.list");
     }
   }
 
@@ -278,6 +278,7 @@ export class ArcBox {
     }
     let next = firstEvent;
     for (;;) {
+      // eslint-disable-next-line no-await-in-loop -- sequential by design: lifecycle events must be consumed in order
       const frame = await next;
       if (frame.done === true) {
         throw new ArcBoxError(
@@ -319,6 +320,7 @@ export class ArcBox {
             break;
         }
       } else if (payload.case === "keepAlive") {
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: the re-inspect must resolve before reading further events
         const info = await this.#client.inspect(
           { id },
           unaryOptions(this.#ctx),
@@ -328,7 +330,7 @@ export class ArcBox {
         }
       }
       next = events.next();
-      next.catch(() => undefined);
+      next.catch(noop);
     }
   }
 }
@@ -357,6 +359,7 @@ export class Sandbox {
 
   /** Create a sandbox against the default (or given) connection. */
   static create(
+    this: void,
     template = "",
     opts: CreateSandboxOptions = {},
   ): Promise<Sandbox> {
@@ -365,6 +368,7 @@ export class Sandbox {
 
   /** Attach to an existing sandbox by id. */
   static connect(
+    this: void,
     id: string,
     opts: ConnectSandboxOptions = {},
   ): Promise<Sandbox> {
@@ -372,7 +376,10 @@ export class Sandbox {
   }
 
   /** List sandboxes (auto-paginating). */
-  static list(opts: ListSandboxesOptions = {}): AsyncIterable<SandboxSummary> {
+  static list(
+    this: void,
+    opts: ListSandboxesOptions = {},
+  ): AsyncIterable<SandboxSummary> {
     return new ArcBox(opts.connection).list(opts);
   }
 
@@ -382,8 +389,8 @@ export class Sandbox {
       return sandboxInfoFromProto(
         await this.#client.inspect({ id: this.id }, unaryOptions(this.#ctx)),
       );
-    } catch (reason) {
-      throw toArcBoxError(reason, "sandbox.info");
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.info");
     }
   }
 
@@ -394,8 +401,8 @@ export class Sandbox {
         { id: this.id, force: true },
         unaryOptions(this.#ctx),
       );
-    } catch (reason) {
-      throw toArcBoxError(reason, "sandbox.kill");
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.kill");
     }
   }
 
@@ -409,8 +416,8 @@ export class Sandbox {
     try {
       // No per-request deadline: checkpointing takes as long as it takes.
       await this.#client.pause({ id: this.id });
-    } catch (reason) {
-      throw toArcBoxError(reason, "sandbox.pause");
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.pause");
     }
   }
 
@@ -421,9 +428,9 @@ export class Sandbox {
   async [Symbol.asyncDispose](): Promise<void> {
     try {
       await this.kill();
-    } catch (reason) {
-      if (!(reason instanceof SandboxNotFoundError)) {
-        throw reason;
+    } catch (error) {
+      if (!(error instanceof SandboxNotFoundError)) {
+        throw error;
       }
     }
   }
