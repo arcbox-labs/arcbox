@@ -107,7 +107,7 @@ pub fn connect_router(
     system: arcbox_api::SystemServiceImpl,
 ) -> Result<connectrpc::Router> {
     let reflector = connectrpc_reflection::Reflector::from_descriptor_set_bytes(
-        arcbox_grpc::FILE_DESCRIPTOR_SET,
+        arcbox_connect::FILE_DESCRIPTOR_SET,
     )
     .context("parsing the embedded file descriptor set for reflection")?;
     Ok(connectrpc_reflection::install(
