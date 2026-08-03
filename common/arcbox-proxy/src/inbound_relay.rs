@@ -349,8 +349,11 @@ impl InboundListenerManager {
         protocol: InboundProtocol,
     ) -> std::io::Result<u16> {
         let key = (host_ip, host_port, protocol);
-        if let Some((_, _, bound)) = self.listeners.get(&key) {
-            return Ok(*bound); // Already listening.
+        if self.listeners.contains_key(&key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("inbound listener already exists on {host_ip}:{host_port}"),
+            ));
         }
 
         let cancel = CancellationToken::new();
@@ -396,12 +399,19 @@ impl InboundListenerManager {
         Ok(bound_port)
     }
 
-    /// Removes a forwarding rule and stops its listener.
-    pub fn remove_rule(&mut self, host_ip: Ipv4Addr, host_port: u16, protocol: InboundProtocol) {
+    /// Removes a forwarding rule and waits until its listener has dropped the
+    /// bound socket.
+    pub async fn remove_rule(
+        &mut self,
+        host_ip: Ipv4Addr,
+        host_port: u16,
+        protocol: InboundProtocol,
+    ) {
         let key = (host_ip, host_port, protocol);
         if let Some((handle, cancel, bound)) = self.listeners.remove(&key) {
             cancel.cancel();
             handle.abort();
+            let _ = handle.await;
             tracing::debug!(
                 "Inbound listener removed: {:?} {}:{}",
                 protocol,
@@ -412,11 +422,10 @@ impl InboundListenerManager {
     }
 
     /// Stops all listeners.
-    pub fn stop_all(&mut self) {
-        for ((ip, _, proto), (handle, cancel, bound)) in self.listeners.drain() {
-            cancel.cancel();
-            handle.abort();
-            tracing::debug!("Inbound listener stopped: {:?} {}:{}", proto, ip, bound);
+    pub async fn stop_all(&mut self) {
+        let keys: Vec<_> = self.listeners.keys().copied().collect();
+        for (ip, port, protocol) in keys {
+            self.remove_rule(ip, port, protocol).await;
         }
     }
 }
@@ -676,7 +685,9 @@ mod tests {
             .expect("should bind to port 0 (OS-assigned)");
 
         // Remove it.
-        manager.remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp);
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp)
+            .await;
 
         // The cmd_rx channel should still be valid (no panic).
         assert!(cmd_rx.try_recv().is_err(), "no commands expected yet");
@@ -751,10 +762,11 @@ mod tests {
 
         // Keyed by the port that was *requested*, hence 0 rather than the
         // bound port — see the `listeners` field comment.
-        manager.remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp);
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp)
+            .await;
 
-        // Cancellation is cooperative: the listener task observes the token
-        // and drops its socket, so retry briefly rather than racing it.
+        // `remove_rule` waits for the listener task to drop its socket.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             match tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).await {
@@ -781,7 +793,7 @@ mod tests {
             .await
             .unwrap();
 
-        manager.stop_all();
+        manager.stop_all().await;
         // After stop_all, the internal map should be empty. Since we can't
         // inspect it directly, adding the same rule again should succeed (no
         // duplicate key).
@@ -789,6 +801,44 @@ mod tests {
             .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_manager_rejects_duplicate_host_endpoint() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+
+        let error = manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 81, InboundProtocol::Tcp)
+            .await
+            .expect_err("the existing listener must not be reused for another destination");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(manager.listeners.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn listener_remove_waits_until_socket_is_reusable() {
+        let reservation = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, port, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, port, InboundProtocol::Tcp)
+            .await;
+
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .expect("remove_rule must release the socket before returning");
     }
 
     #[tokio::test]
@@ -807,7 +857,9 @@ mod tests {
             .unwrap();
 
         // Remove only the localhost rule; re-adding it should succeed (not a dup).
-        manager.remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp);
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp)
+            .await;
         manager
             .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
             .await

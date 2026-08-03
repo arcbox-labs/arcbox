@@ -33,14 +33,14 @@ use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol}
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
 use assets::ensure_guest_binaries;
 use kubeconfig::{KUBERNETES_HOST_ENDPOINT, rewrite_kubeconfig_server};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(target_os = "macos"))]
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::watch;
+use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard, RwLock as TokioRwLock};
 
 /// Default guest VM IP address in NAT network (used by PortForwarder fallback).
 #[cfg(not(target_os = "macos"))]
@@ -114,6 +114,12 @@ pub struct Runtime {
     /// Host listener keys of exposed sandbox ports, keyed by sandbox ID, so
     /// Stop/Remove can tear down every listener a sandbox owns.
     sandbox_port_keys: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
+    /// Sandbox DNS owners, kept separate from container DNS so an agent
+    /// restart can clear only sandbox host state before relay reuse.
+    sandbox_dns_ids: Arc<TokioRwLock<HashSet<String>>>,
+    /// Generation fence for cleanup racing RPC-created host state.
+    /// ponytail: keep one fence until unrelated cleanup retries are measurable.
+    sandbox_host_state: TokioMutex<u64>,
     /// Tracks DNS registrations: canonical container ID → hostnames.
     dns_entries: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
     /// Maps a container's unique name to its canonical ID, so teardown can
@@ -259,11 +265,23 @@ impl Runtime {
             #[cfg(not(target_os = "macos"))]
             port_forwarders: Arc::new(TokioRwLock::new(HashMap::new())),
             sandbox_port_keys: Arc::new(TokioRwLock::new(HashMap::new())),
+            sandbox_dns_ids: Arc::new(TokioRwLock::new(HashSet::new())),
+            sandbox_host_state: TokioMutex::new(0),
             dns_entries: Arc::new(TokioRwLock::new(HashMap::new())),
             container_aliases: Arc::new(TokioRwLock::new(HashMap::new())),
             stats_hub,
             machine_stats_hubs: Arc::new(TokioRwLock::new(HashMap::new())),
         })
+    }
+
+    /// Snapshot the host cleanup generation before a guest RPC.
+    pub async fn sandbox_host_state_generation(&self) -> u64 {
+        *self.sandbox_host_state.lock().await
+    }
+
+    /// Fence a cleanup or host-side sandbox state mutation.
+    pub async fn lock_sandbox_host_state(&self) -> TokioMutexGuard<'_, u64> {
+        self.sandbox_host_state.lock().await
     }
 
     /// Subscribes to live System VM machine stats (see
@@ -994,28 +1012,14 @@ impl Runtime {
         // routes to the machine the rules were originally bound to —
         // which may differ from the requested machine if the container
         // was previously on a different role.
-        let previous = {
-            let mut rules = self.inbound_rules.write().await;
-            rules.remove(container_id)
-        };
-        if let Some((prev_machine, previous_rules)) = previous {
-            let mut guard = self.inbound_listeners.write().await;
-            if let Some(manager) = guard.get_mut(&prev_machine) {
-                for (host_ip, host_port, proto) in previous_rules {
-                    manager.remove_rule(host_ip, host_port, proto);
-                }
-            }
-        }
+        self.stop_port_forwarding_by_id(container_id).await;
 
-        let mut added_rules = Vec::new();
-        let mut bind_errors: Vec<String> = Vec::new();
-
+        let mut planned_rules = Vec::new();
         for (host_ip_str, host_port, container_port, protocol) in bindings {
             let proto = match protocol.to_lowercase().as_str() {
                 "udp" => InboundProtocol::Udp,
                 _ => InboundProtocol::Tcp,
             };
-
             let Some(host_ip) = resolve_bind_ip(host_ip_str) else {
                 tracing::warn!(
                     "Skipping inbound rule: invalid HostIp '{}' for port {}:{}",
@@ -1025,45 +1029,51 @@ impl Runtime {
                 );
                 continue;
             };
-
-            let mut guard = self.inbound_listeners.write().await;
-            let manager = guard
+            planned_rules.push((host_ip, *host_port, *container_port, proto));
+        }
+        let mut added_count = 0usize;
+        let mut bind_errors: Vec<String> = Vec::new();
+        for (host_ip, host_port, container_port, protocol) in planned_rules {
+            // Hold the ownership map before the listener map. Once add_rule
+            // returns there is no await before recording ownership, so
+            // cancellation cannot leave a live listener undiscoverable.
+            let mut rules_guard = self.inbound_rules.write().await;
+            let mut listeners_guard = self.inbound_listeners.write().await;
+            let manager = listeners_guard
                 .get_mut(machine_name)
                 .expect("checked machine_name presence above");
             if let Err(e) = manager
-                .add_rule(host_ip, *host_port, *container_port, proto)
+                .add_rule(host_ip, host_port, container_port, protocol)
                 .await
             {
                 tracing::warn!(
-                    "Failed to bind inbound port {}:{}:{}: {}",
-                    host_ip_str,
+                    "Failed to bind inbound port {}:{}:{:?}: {}",
+                    host_ip,
                     host_port,
                     protocol,
                     e,
                 );
-                bind_errors.push(format!("{host_ip_str}:{host_port}/{protocol}: {e}"));
+                bind_errors.push(format!("{host_ip}:{host_port}/{protocol:?}: {e}"));
                 continue;
             }
-            added_rules.push((host_ip, *host_port, proto));
+            let authority = rules_guard
+                .entry(container_id.to_owned())
+                .or_insert_with(|| (machine_name.to_owned(), Vec::new()));
+            debug_assert_eq!(authority.0, machine_name);
+            authority.1.push((host_ip, host_port, protocol));
+            added_count += 1;
         }
 
         // Surface a total bind failure instead of reporting success. A sandbox
         // expose is a single binding, so a swallowed port conflict would claim
         // "exposed on localhost" while nothing is actually listening. Docker
         // multi-port publish stays best-effort as long as one port binds.
-        if added_rules.is_empty() && !bindings.is_empty() {
+        if added_count == 0 && !bindings.is_empty() {
+            self.stop_port_forwarding_by_id(container_id).await;
             return Err(CoreError::Machine(format!(
                 "no requested port could be bound: {}",
                 bind_errors.join("; ")
             )));
-        }
-
-        if !added_rules.is_empty() {
-            let mut rules = self.inbound_rules.write().await;
-            rules.insert(
-                container_id.to_string(),
-                (machine_name.to_string(), added_rules),
-            );
         }
 
         Ok(())
@@ -1077,6 +1087,7 @@ impl Runtime {
         container_id: &str,
         bindings: &[(String, u16, u16, String)],
     ) -> Result<()> {
+        self.stop_port_forwarding_by_id(container_id).await;
         let guest_ip = self.guest_ip_for_machine(machine_name);
         let mut forwarder = PortForwarder::new();
 
@@ -1108,10 +1119,20 @@ impl Runtime {
             );
         }
 
-        forwarder.start().await?;
-
         let mut forwarders = self.port_forwarders.write().await;
         forwarders.insert(container_id.to_string(), forwarder);
+        let result = forwarders
+            .get_mut(container_id)
+            .expect("forwarder was just inserted")
+            .start()
+            .await;
+        if let Err(error) = result {
+            if let Some(forwarder) = forwarders.get_mut(container_id) {
+                forwarder.stop().await;
+            }
+            forwarders.remove(container_id);
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -1120,16 +1141,20 @@ impl Runtime {
     pub async fn stop_port_forwarding_by_id(&self, container_id: &str) {
         #[cfg(target_os = "macos")]
         {
-            let rules = {
-                let mut guard = self.inbound_rules.write().await;
-                guard.remove(container_id)
-            };
-            if let Some((machine_name, rules)) = rules {
+            let authority = self.inbound_rules.read().await.get(container_id).cloned();
+            if let Some((machine_name, rules)) = authority.as_ref() {
                 let mut guard = self.inbound_listeners.write().await;
-                if let Some(manager) = guard.get_mut(&machine_name) {
-                    for (host_ip, host_port, proto) in rules {
-                        manager.remove_rule(host_ip, host_port, proto);
+                if let Some(manager) = guard.get_mut(machine_name) {
+                    for (host_ip, host_port, proto) in rules.iter().copied() {
+                        manager.remove_rule(host_ip, host_port, proto).await;
                     }
+                }
+                drop(guard);
+                let mut rules_guard = self.inbound_rules.write().await;
+                if rules_guard.get(container_id) == authority.as_ref() {
+                    // The authoritative owner remains visible through every
+                    // await and a concurrent replacement is never removed.
+                    rules_guard.remove(container_id);
                 }
                 tracing::debug!(
                     machine = %machine_name,
@@ -1142,8 +1167,11 @@ impl Runtime {
         #[cfg(not(target_os = "macos"))]
         {
             let mut forwarders = self.port_forwarders.write().await;
-            if let Some(mut forwarder) = forwarders.remove(container_id) {
+            if let Some(forwarder) = forwarders.get_mut(container_id) {
                 forwarder.stop().await;
+                // Cancellation during stop leaves the forwarder discoverable
+                // for the next cleanup pass.
+                forwarders.remove(container_id);
                 tracing::debug!("Stopped port forwarding for container {}", container_id);
             }
         }
@@ -1200,14 +1228,115 @@ impl Runtime {
 
     /// Removes every host listener a sandbox owns (Stop/Remove teardown).
     pub async fn remove_sandbox_ports(&self, sandbox_id: &str) {
-        let keys = self.sandbox_port_keys.write().await.remove(sandbox_id);
-        for key in keys.unwrap_or_default() {
+        let mut keys: HashSet<String> = self
+            .sandbox_port_keys
+            .read()
+            .await
+            .get(sandbox_id)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        keys.extend(self.sandbox_authority_keys(sandbox_id).await);
+        for key in keys {
             self.stop_port_forwarding_by_id(&key).await;
         }
+        self.sandbox_port_keys.write().await.remove(sandbox_id);
+    }
+
+    /// Register a sandbox hostname and remember its ownership independently
+    /// from Docker container DNS state.
+    pub async fn register_sandbox_dns(&self, sandbox_id: &str, ip: IpAddr) {
+        self.register_dns(
+            &Self::sandbox_dns_owner(sandbox_id),
+            &[sandbox_id.to_owned()],
+            ip,
+        )
+        .await;
+        self.sandbox_dns_ids
+            .write()
+            .await
+            .insert(sandbox_id.to_owned());
+    }
+
+    /// Remove one sandbox's host DNS state.
+    pub async fn deregister_sandbox_dns(&self, sandbox_id: &str) {
+        self.deregister_dns_by_id(&Self::sandbox_dns_owner(sandbox_id))
+            .await;
+        self.sandbox_dns_ids.write().await.remove(sandbox_id);
+    }
+
+    /// Remove every host listener and DNS entry owned by sandboxes.
+    ///
+    /// Called during the agent startup handshake before the guest relay
+    /// allocator is allowed to serve new exposures.
+    pub async fn clear_sandbox_host_state(&self) {
+        let mut port_keys = self.all_sandbox_authority_keys().await;
+        port_keys.extend(
+            self.sandbox_port_keys
+                .read()
+                .await
+                .values()
+                .flatten()
+                .cloned(),
+        );
+        for key in port_keys {
+            self.stop_port_forwarding_by_id(&key).await;
+        }
+
+        let dns_owners: Vec<_> = self
+            .dns_entries
+            .read()
+            .await
+            .keys()
+            .filter(|owner| owner.starts_with("sandbox:"))
+            .cloned()
+            .collect();
+        for owner in dns_owners {
+            self.deregister_dns_by_id(&owner).await;
+        }
+        self.sandbox_port_keys.write().await.clear();
+        self.sandbox_dns_ids.write().await.clear();
     }
 
     fn sandbox_port_key(sandbox_id: &str, sandbox_port: u16, protocol: &str) -> String {
         format!("sandbox:{sandbox_id}:{sandbox_port}/{protocol}")
+    }
+
+    fn sandbox_dns_owner(sandbox_id: &str) -> String {
+        format!("sandbox:{sandbox_id}")
+    }
+
+    async fn sandbox_authority_keys(&self, sandbox_id: &str) -> Vec<String> {
+        let prefix = format!("sandbox:{sandbox_id}:");
+        self.all_sandbox_authority_keys()
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(&prefix))
+            .collect()
+    }
+
+    async fn all_sandbox_authority_keys(&self) -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inbound_rules
+                .read()
+                .await
+                .keys()
+                .filter(|key| key.starts_with("sandbox:"))
+                .cloned()
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.port_forwarders
+                .read()
+                .await
+                .keys()
+                .filter(|key| key.starts_with("sandbox:"))
+                .cloned()
+                .collect()
+        }
     }
 
     /// Registers DNS entries for a container.
@@ -1216,13 +1345,15 @@ impl Runtime {
     /// container by name. Also tracks the `container_id → hostnames` mapping
     /// for cleanup.
     pub async fn register_dns(&self, container_id: &str, hostnames: &[String], ip: IpAddr) {
-        for hostname in hostnames {
-            self.network_manager.register_dns(hostname, ip);
-        }
         self.dns_entries
             .write()
             .await
             .insert(container_id.to_string(), hostnames.to_vec());
+        // Ownership is authoritative before the synchronous DNS mutation, so
+        // cancellation can never leave an unenumerable hostname.
+        for hostname in hostnames {
+            self.network_manager.register_dns(hostname, ip);
+        }
         tracing::info!(
             container_id,
             ?hostnames,
@@ -1342,20 +1473,25 @@ impl Runtime {
         #[cfg(target_os = "macos")]
         {
             let mut guard = self.inbound_listeners.write().await;
-            // Drain so the next start_port_forwarding_macos() call fetches
-            // fresh managers from the VMM (with live cmd_tx values).
-            for (_, mut manager) in guard.drain() {
-                manager.stop_all();
+            for manager in guard.values_mut() {
+                manager.stop_all().await;
             }
+            // Clear only after every listener task has terminated.
+            guard.clear();
+            drop(guard);
             self.inbound_rules.write().await.clear();
         }
 
         #[cfg(not(target_os = "macos"))]
         {
             let mut forwarders = self.port_forwarders.write().await;
-            for (container_id, mut forwarder) in forwarders.drain() {
+            let ids: Vec<_> = forwarders.keys().cloned().collect();
+            for container_id in ids {
                 tracing::debug!("Stopping port forwarder for container {}", container_id);
-                forwarder.stop().await;
+                if let Some(forwarder) = forwarders.get_mut(&container_id) {
+                    forwarder.stop().await;
+                }
+                forwarders.remove(&container_id);
             }
         }
     }

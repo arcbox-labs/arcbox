@@ -9,6 +9,8 @@ mod rpc;
 pub mod config;
 pub mod containerd;
 #[cfg(any(target_os = "linux", test))]
+mod create_key;
+#[cfg(any(target_os = "linux", test))]
 mod create_registry;
 pub mod dns;
 pub mod dns_server;
@@ -19,5 +21,7 @@ pub mod metadata_migrate;
 pub mod rootfs_builder;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+#[cfg(any(target_os = "linux", test))]
+mod sandbox_cleanup_watch;
 pub mod stats;
 pub mod volume_icon;

@@ -30,6 +30,8 @@ mod machine;
 mod macos;
 mod migration;
 mod process;
+mod sandbox_cleanup;
+mod sandbox_locks;
 mod snapshot;
 mod stats;
 mod system;
@@ -53,6 +55,9 @@ pub use machine::MachineServiceImpl;
 pub use macos::MacosServiceImpl;
 pub use migration::MigrationServiceImpl;
 pub use process::SandboxProcessServiceImpl;
+pub use sandbox_cleanup::{
+    initialize as initialize_sandbox_cleanup, spawn as spawn_sandbox_cleanup,
+};
 pub use snapshot::SandboxSnapshotServiceImpl;
 pub use stats::StatsServiceImpl;
 pub use system::{SetupState, SystemServiceImpl};
@@ -132,6 +137,9 @@ impl ConnectRuntimeExt for SharedRuntime {
 pub(crate) trait ContextExt {
     /// Returns the target machine name, defaulting to the System VM.
     fn machine_id(&self) -> Result<String, ConnectError>;
+
+    /// Returns the System VM for Sandbox V1, rejecting every other machine.
+    fn sandbox_machine_id(&self) -> Result<String, ConnectError>;
 }
 
 impl ContextExt for RequestContext {
@@ -152,6 +160,16 @@ impl ContextExt for RequestContext {
                 )),
             },
         }
+    }
+
+    fn sandbox_machine_id(&self) -> Result<String, ConnectError> {
+        let machine = self.machine_id()?;
+        if machine != DEFAULT_MACHINE_NAME {
+            return Err(ConnectError::invalid_argument(
+                "Sandbox V1 is available only on the System VM",
+            ));
+        }
+        Ok(machine)
     }
 }
 
@@ -188,11 +206,18 @@ fn wire_protocol(
 #[must_use]
 pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
     let clone = || Arc::clone(&runtime);
+    let sandbox_operations = Arc::new(sandbox_locks::SandboxOperationLocks::default());
     let router = connectrpc::Router::new()
-        .add_service(Arc::new(SandboxServiceImpl::new(clone())))
+        .add_service(Arc::new(SandboxServiceImpl::new(
+            clone(),
+            Arc::clone(&sandbox_operations),
+        )))
         .add_service(Arc::new(SandboxProcessServiceImpl::new(clone())))
         .add_service(Arc::new(SandboxFilesystemServiceImpl::new(clone())))
-        .add_service(Arc::new(SandboxSnapshotServiceImpl::new(clone())))
+        .add_service(Arc::new(SandboxSnapshotServiceImpl::new(
+            clone(),
+            Arc::clone(&sandbox_operations),
+        )))
         // The daemon's own services, all on Connect since CORE-68.
         .add_service(Arc::new(IconServiceImpl::new()))
         .add_service(Arc::new(StatsServiceImpl::new(clone())))
@@ -247,5 +272,22 @@ mod tests {
                 .expect("explicit header is valid"),
             "other-vm"
         );
+    }
+
+    #[test]
+    fn sandbox_machine_id_accepts_only_the_system_vm() {
+        assert_eq!(DEFAULT_MACHINE_NAME, "default");
+        for header in [None, Some(""), Some(DEFAULT_MACHINE_NAME)] {
+            assert_eq!(
+                ctx_with(header)
+                    .sandbox_machine_id()
+                    .expect("System VM routing should be accepted"),
+                DEFAULT_MACHINE_NAME
+            );
+        }
+        let error = ctx_with(Some("other-vm"))
+            .sandbox_machine_id()
+            .expect_err("other machines must be rejected");
+        assert_eq!(error.code, connectrpc::ErrorCode::InvalidArgument);
     }
 }

@@ -221,6 +221,103 @@ async fn deregister_dns_clears_aliases_even_without_dns_entry() {
     );
 }
 
+#[tokio::test]
+async fn sandbox_dns_owner_does_not_overwrite_same_named_container() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    runtime
+        .register_dns("same", &["container.local".into()], ip)
+        .await;
+    runtime.register_sandbox_dns("same", ip).await;
+
+    let entries = runtime.dns_entries.read().await;
+    assert!(entries.contains_key("same"));
+    assert!(entries.contains_key("sandbox:same"));
+    drop(entries);
+
+    runtime.deregister_sandbox_dns("same").await;
+    let entries = runtime.dns_entries.read().await;
+    assert!(entries.contains_key("same"));
+    assert!(!entries.contains_key("sandbox:same"));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_cleanup_discovers_authority_without_secondary_indexes() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let key = "sandbox:orphan:80/tcp".to_owned();
+    runtime.inbound_rules.write().await.insert(
+        key.clone(),
+        (
+            "missing-machine".into(),
+            vec![(
+                std::net::Ipv4Addr::LOCALHOST,
+                45_678,
+                super::InboundProtocol::Tcp,
+            )],
+        ),
+    );
+    runtime
+        .dns_entries
+        .write()
+        .await
+        .insert("sandbox:orphan".into(), vec!["orphan".into()]);
+
+    runtime.clear_sandbox_host_state().await;
+
+    assert!(!runtime.inbound_rules.read().await.contains_key(&key));
+    assert!(
+        !runtime
+            .dns_entries
+            .read()
+            .await
+            .contains_key("sandbox:orphan")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn conflicting_sandbox_cleanup_does_not_remove_the_existing_listener() {
+    use arcbox_net::darwin::inbound_relay::{InboundCommand, InboundListenerManager};
+
+    let (runtime, _tmp) = networking_test_runtime();
+    let reservation = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let host_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(4);
+    runtime.inbound_listeners.write().await.insert(
+        "test-machine".into(),
+        InboundListenerManager::new(command_tx),
+    );
+    let first = [("127.0.0.1".to_owned(), host_port, 80, "tcp".to_owned())];
+    runtime
+        .start_port_forwarding_for("test-machine", "sandbox:first", &first)
+        .await
+        .unwrap();
+
+    let conflicting = [("127.0.0.1".to_owned(), host_port, 81, "tcp".to_owned())];
+    runtime
+        .start_port_forwarding_for("test-machine", "sandbox:second", &conflicting)
+        .await
+        .expect_err("a second owner must not reuse the first owner's listener");
+    runtime.stop_port_forwarding_by_id("sandbox:second").await;
+
+    let _connection = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, host_port))
+        .await
+        .expect("the first owner's listener must remain bound");
+    let command = tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+        .await
+        .expect("the listener should accept the connection")
+        .expect("the listener command channel should remain open");
+    match command {
+        InboundCommand::TcpAccepted { container_port, .. } => assert_eq!(container_port, 80),
+        InboundCommand::UdpReceived { .. } => panic!("expected a TCP listener"),
+    }
+
+    runtime.stop_port_forwarding_by_id("sandbox:first").await;
+}
+
 #[test]
 fn test_runtime_new_propagates_config_vm_defaults() {
     let temp_dir = tempfile::tempdir().unwrap();

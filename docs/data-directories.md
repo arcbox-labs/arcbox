@@ -250,7 +250,11 @@ Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
 | `/run/containerd/containerd.sock` | containerd gRPC socket | agent (containerd) |
 | `/run/arcbox/data` | Btrfs temporary mount point | agent |
 | `/run/arcbox/vmm.sock` | Guest VMM gRPC socket | agent |
-| `/var/lib/arcbox/sandboxes` | Firecracker sandbox data | agent |
+| `/var/lib/arcbox/sandbox` | Persistent Btrfs `@sandboxes` subvolume | agent |
+| `/var/lib/arcbox/sandbox/sandboxes` | Firecracker runtime files and crash-cleanup journals | agent |
+| `/var/lib/arcbox/sandbox/sandbox-records` | Durable Sandbox lifecycle records | agent |
+| `/var/lib/arcbox/sandbox/snapshots` | Sandbox checkpoint catalog and data | agent |
+| `/var/lib/arcbox/sandbox/cow` | Sandbox dm-snapshot CoW files | agent |
 | `/var/lib/arcbox/sandbox/rootfs.ext4` | Default sandbox rootfs (busybox + vm-agent, auto-built) | agent |
 | `/var/lib/arcbox/sandbox/rootfs-<layer>-<agent>.ext4` | Converted image rootfs cache, keyed on the source layer and the injected `vm-agent`; superseded entries are swept on the next conversion unless a snapshot still needs them as its dm-snapshot origin | agent |
 | `/var/lib/arcbox/jailer` | Firecracker jailer chroots | agent |
@@ -258,6 +262,25 @@ Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
 | `/arcbox/runtime/kernel/vmlinux` | Sandbox guest kernel (boot manifest, via VirtioFS) | host daemon |
 | `/arcbox/bin/vm-agent` | Sandbox init binary, staged next to `arcbox-agent` (via VirtioFS) | host daemon |
 | `/etc/arcbox/vmm.toml` | Optional guest VMM config override (not shipped; built-in defaults apply) | admin (manual) |
+
+Sandbox lifecycle metadata survives an `arcbox-agent` restart. Live
+Firecracker processes are not re-adopted yet: startup first tears down their
+runtime resources, then exposes the affected Sandbox as `Failed`. Create and
+Restore share the same durable lifecycle and request-replay model; TTL timers
+remain process-local in this first persistence phase. Restore requires jailer
+isolation; direct mode is rejected because Firecracker snapshots embed shared
+origin paths that cannot safely support concurrent clones.
+
+Create and Restore retries are durable only when the caller supplies `id`.
+An empty ID asks the agent to generate a fresh UUID and is intentionally not
+retry-idempotent; clients that may retry must generate and retain the ID before
+the first call. Remove is intentionally different in this phase: a request
+deletes whichever generation owns the ID when it executes, because the public
+Remove API does not yet carry an expected generation or idempotency key.
+
+An in-place agent upgrade that still has legacy
+`/var/lib/arcbox/sandboxes/*` runtime directories is rejected until the guest restarts,
+so the new persistent namespace cannot collide with an old live runtime.
 
 ---
 

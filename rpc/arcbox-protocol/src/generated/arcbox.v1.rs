@@ -3082,6 +3082,30 @@ pub struct SandboxPortForwardRemoveRequest {
     #[prost(enumeration = "SandboxPortProtocol", tag = "3")]
     pub protocol: i32,
 }
+/// Durable ticket identifying one sandbox generation whose host and guest
+/// forwarding state must be removed before its IP/relay ports can be reused.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxCleanupTicket {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub token: ::prost::alloc::string::String,
+    /// True for the process-generation startup barrier. The host must clear
+    /// all stale sandbox listeners before acknowledging this ticket.
+    #[prost(bool, tag = "3")]
+    pub startup: bool,
+}
+/// Stop/Remove response. Network-disabled sandboxes have no cleanup ticket;
+/// a present ticket always names a durable quarantine marker.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxCleanupResponse {
+    #[prost(message, optional, tag = "1")]
+    pub ticket: ::core::option::Option<SandboxCleanupTicket>,
+}
+/// Opens the internal stream of pending sandbox cleanup tickets. The guest
+/// first replays its durable snapshot, then streams new terminal generations.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchSandboxCleanupRequest {}
 /// Transport protocol of a forwarded sandbox port.
 ///
 /// Deliberately separate from `arcbox.sandbox.v1.PortProtocol`: the public

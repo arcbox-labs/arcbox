@@ -529,3 +529,23 @@ message SandboxPortForwardRemoveRequest {
     // Transport protocol (UNSPECIFIED = TCP).
     SandboxPortProtocol protocol = 3;
 }
+
+// Durable ticket identifying one sandbox generation whose host and guest
+// forwarding state must be removed before its IP/relay ports can be reused.
+message SandboxCleanupTicket {
+    string id = 1;
+    string token = 2;
+    // True for the process-generation startup barrier. The host must clear
+    // all stale sandbox listeners before acknowledging this ticket.
+    bool startup = 3;
+}
+
+// Stop/Remove response. Network-disabled sandboxes have no cleanup ticket;
+// a present ticket always names a durable quarantine marker.
+message SandboxCleanupResponse {
+    SandboxCleanupTicket ticket = 1;
+}
+
+// Opens the internal stream of pending sandbox cleanup tickets. The guest
+// first replays its durable snapshot, then streams new terminal generations.
+message WatchSandboxCleanupRequest {}

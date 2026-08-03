@@ -1,7 +1,7 @@
 //! Sandbox checkpoint / restore handlers.
 
 use arcbox_connect::sandbox_v1;
-use arcbox_vm::RestoreSandboxSpec;
+use arcbox_vm::{RestoreSandboxSpec, SandboxState};
 use buffa::Message;
 
 use super::{SandboxService, convert, register_sandbox_dns};
@@ -15,6 +15,7 @@ impl SandboxService {
     ) -> Result<sandbox_v1::CheckpointResponse, SandboxError> {
         let req = sandbox_v1::CheckpointRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let _operation = self.operations.lock(&req.sandbox_id).await;
         let info = self
             .manager
             .checkpoint_sandbox(&req.sandbox_id, req.name, req.labels.into_iter().collect())
@@ -30,6 +31,9 @@ impl SandboxService {
     ) -> Result<sandbox_v1::RestoreResponse, SandboxError> {
         let req = sandbox_v1::RestoreRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        self.manager.wait_startup_cleanup_complete().await;
+        let _operation = self.operations.lock(&req.id).await;
+        let restore_key = crate::create_key::restore_key(&req);
         if !req.id.is_empty() {
             self.clear_stale_completed_create(&req.id);
         }
@@ -46,10 +50,20 @@ impl SandboxService {
         };
         let (id, ip_address) = self
             .manager
-            .restore_sandbox(spec)
+            .restore_sandbox_keyed(spec, &restore_key)
             .await
             .map_err(SandboxError::from)?;
-        register_sandbox_dns(&id, &ip_address);
+        let live = self.manager.inspect_sandbox(&id).is_ok_and(|info| {
+            matches!(
+                info.state,
+                SandboxState::Starting | SandboxState::Ready | SandboxState::Running
+            ) && info
+                .network
+                .is_some_and(|network| network.ip_address == ip_address)
+        });
+        if live {
+            register_sandbox_dns(&id, &ip_address);
+        }
         Ok(sandbox_v1::RestoreResponse {
             id,
             ip_address,

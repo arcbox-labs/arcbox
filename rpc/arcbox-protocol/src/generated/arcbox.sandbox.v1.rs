@@ -55,8 +55,8 @@ pub struct KeepAlive {}
 /// Request to create a sandbox.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateSandboxRequest {
-    /// Caller-supplied unique ID for idempotent creation.
-    /// If empty the daemon generates a UUID.
+    /// Caller-supplied unique ID for durable retry idempotency.
+    /// If empty the daemon generates a fresh UUID for every attempt.
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
     /// Arbitrary key-value metadata (used for filtering in List / Events).
@@ -930,14 +930,12 @@ pub struct CheckpointResponse {
 }
 /// Request to restore a sandbox from a snapshot.
 ///
-/// Direct-mode (non-jailer) limitation: the snapshot's vmstate records the
-/// origin sandbox's absolute vsock socket path, so concurrent restores from
-/// the same snapshot — or restoring while the origin sandbox is still
-/// running — fail with FAILED_PRECONDITION on the vsock conflict. Jailer
-/// mode restores into per-sandbox chroots and has no such constraint.
+/// Restore requires jailer mode. Direct-mode vmstate records origin sandbox
+/// paths and cannot be safely relocated to a new sandbox ID.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RestoreRequest {
-    /// Caller-supplied ID for the new sandbox (empty = auto-generated).
+    /// Caller-supplied ID for durable retry idempotency. Empty asks the daemon
+    /// to generate a fresh UUID for every attempt.
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
     /// Source snapshot ID.
