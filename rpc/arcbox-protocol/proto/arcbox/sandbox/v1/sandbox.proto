@@ -257,16 +257,32 @@ message CreateSandboxRequest {
     reserved "kernel", "rootfs", "boot_args", "image";
 
     // --- Resources ---
+    // Unset = the template's default limits, if any, else daemon
+    // defaults. Set = replaces the template default wholesale.
     ResourceLimits limits = 6;
 
     // --- Initial workload (optional) ---
     // Initial command launched automatically after boot.
-    // Empty = sandbox enters READY without running anything.
+    // Empty = inherit the template's default cmd, if any; otherwise the
+    // sandbox enters READY without running anything. Non-empty =
+    // replaces the template default.
     // When this process exits the sandbox transitions back to READY
     // (NOT destroyed) and continues accepting executions.
     repeated string cmd = 8;
-    // Environment variables for the initial command.
+    // Suppress the template's default cmd: enter READY without running
+    // anything even when the template defines one. proto3 repeated
+    // fields cannot express "explicitly empty", so this flag carries the
+    // presence `cmd` cannot. Rejected with INVALID_ARGUMENT alongside a
+    // non-empty `cmd`.
+    bool no_default_cmd = 20;
+    // Environment variables for the initial command, merged over the
+    // template's default env (per key, this request wins).
     map<string, string> env = 9;
+    // Start the initial command from exactly `env`, discarding the
+    // template's default env instead of merging over it (the map
+    // counterpart of `no_default_cmd`; to unset a single default key,
+    // set this and supply the full desired map).
+    bool no_default_env = 21;
     // Working directory for the initial command.
     string working_dir = 10;
     // User to run the initial command as.
@@ -305,7 +321,7 @@ message CreateSandboxRequest {
     //   "name[:version]" — a template from the catalog (`template.proto`,
     //                      CORE-21); a bare name resolves to the newest
     //                      published version. Template defaults apply
-    //                      unless overridden by the fields above.
+    //                      per the override rules on the fields above.
     // Cloud mode resolves names against the tenant's template registry.
     // Anything else is rejected with INVALID_ARGUMENT.
     string template = 17;
