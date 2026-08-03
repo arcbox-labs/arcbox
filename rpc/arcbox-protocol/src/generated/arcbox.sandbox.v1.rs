@@ -194,9 +194,10 @@ pub struct SetLifecycleRequest {
     /// Replace the idle timeout (0 = disable idle detection).
     #[prost(uint32, optional, tag = "3")]
     pub idle_timeout_seconds: ::core::option::Option<u32>,
-    /// Replace the idle policy (UNSPECIFIED = leave unchanged).
-    #[prost(enumeration = "IdleAction", tag = "4")]
-    pub on_idle: i32,
+    /// Replace the idle policy (absent = leave unchanged; UNSPECIFIED =
+    /// restore the daemon default).
+    #[prost(enumeration = "IdleAction", optional, tag = "4")]
+    pub on_idle: ::core::option::Option<i32>,
 }
 /// Request for the daemon's sandbox capabilities.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

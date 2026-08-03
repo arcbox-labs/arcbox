@@ -380,8 +380,9 @@ message SetLifecycleRequest {
     optional uint32 ttl_seconds = 2;
     // Replace the idle timeout (0 = disable idle detection).
     optional uint32 idle_timeout_seconds = 3;
-    // Replace the idle policy (UNSPECIFIED = leave unchanged).
-    IdleAction on_idle = 4;
+    // Replace the idle policy (absent = leave unchanged; UNSPECIFIED =
+    // restore the daemon default).
+    optional IdleAction on_idle = 4;
 }
 
 // ---------------------------------------------------------------------------
