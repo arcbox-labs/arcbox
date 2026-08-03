@@ -98,10 +98,12 @@ pub fn bind(socket_path: &std::path::Path) -> Result<UnixListener> {
 /// The descriptor set is `arcbox-connect`'s own — emitted by the same
 /// build script that generates the served types, so it tracks the
 /// GENERATED surface exactly. That is deliberately a superset of the
-/// served one: reflection also advertises the schema-only `AgentService`,
-/// the unregistered Container/Image services, and (off macOS) the
-/// cfg-gated `MacosService` — the same superset the prost-built set
-/// always advertised.
+/// served one — reflection advertises every service the protos declare:
+/// the schema-only `AgentService`, the never-implemented Container,
+/// Image, Network, and Volume services, and (off macOS) the cfg-gated
+/// `MacosService`. A reflected service 404ing on every format is one of
+/// these, not a router bug. The prost-built set advertised the same
+/// superset.
 ///
 /// # Errors
 ///
