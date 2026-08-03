@@ -929,6 +929,34 @@ pub struct WaitExecutionRequest {
     #[prost(uint32, tag = "3")]
     pub timeout_seconds: u32,
 }
+/// Request to list a sandbox's executions.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListExecutionsRequest {
+    /// Sandbox whose executions to list.
+    #[prost(string, tag = "1")]
+    pub sandbox_id: ::prost::alloc::string::String,
+}
+/// Response to ListExecutions.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExecutionsResponse {
+    /// Every retained execution, running and exited.
+    #[prost(message, repeated, tag = "1")]
+    pub executions: ::prost::alloc::vec::Vec<Execution>,
+}
+/// Request to wait for a listening TCP port inside a sandbox.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WaitForPortRequest {
+    /// Sandbox to watch.
+    #[prost(string, tag = "1")]
+    pub sandbox_id: ::prost::alloc::string::String,
+    /// TCP port a workload is expected to listen on.
+    #[prost(uint32, tag = "2")]
+    pub port: u32,
+    /// Give up after this many seconds with DEADLINE_EXCEEDED
+    /// (0 = daemon default of 30 s).
+    #[prost(uint32, tag = "3")]
+    pub timeout_seconds: u32,
+}
 /// Lifecycle state of an execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
