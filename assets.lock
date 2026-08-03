@@ -21,16 +21,16 @@ manifest_sha256 = "7bff7252fa38a74fd1a513baffeceb80eaddb556b11eec55438503ac7e9ec
 [[tools]]
 name = "docker"
 group = "docker"
-version = "29.6.2"
-arch.arm64.sha256 = "86f86ad4b2119ec55aa50224f15ceb4c94a198f8ae153bb32318d7da589749da"
-arch.x86_64.sha256 = "9a72a1c1a331885aadf7948e3da8e3c5c88c5e813474bb82dce7cc72450487bf"
+version = "29.7.1"
+arch.arm64.sha256 = "231bc78e848661427925aea1081950ba1bebd1a6f7d4581dc6929ddef7fa7d9d"
+arch.x86_64.sha256 = "f7aa447d9b02fc1798df31c73a1f2797d4b23336ff11bce0972b778582ee6526"
 
 [[tools]]
 name = "docker-buildx"
 group = "docker"
-version = "0.35.0"
-arch.arm64.sha256 = "fedbcbd488dcdb46414c6119920d8186d406531a1157ceede4e857e25af77ff1"
-arch.x86_64.sha256 = "7d53fd11deca2d4caebc5436c9eebece5c81c8bbc6d4b539cf30be5c133c38c7"
+version = "0.36.0"
+arch.arm64.sha256 = "82c6a3d9df37790c5bdb0d7ca88986d1d17622fc2b88ebe34b275c6c47acd7a6"
+arch.x86_64.sha256 = "8a75be22ecf40f633fe0a0199be48fa304c0446a0d7fa8a53d7c71b1d0093028"
 
 [[tools]]
 name = "docker-compose"
