@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3](https://github.com/arcboxlabs/arcbox/compare/v0.6.2...v0.6.3) (2026-08-03)
+
+
+### Features
+
+* **rpc:** add the sandbox error registry (errors.proto) ([b3103c5](https://github.com/arcboxlabs/arcbox/commit/b3103c540e2ef64cff4b0bbd9186998092ff5dde))
+* **rpc:** execution discovery and port readiness on the process plane ([3c8dec6](https://github.com/arcboxlabs/arcbox/commit/3c8dec63081f927368f19ab15e97d4382fde594e))
+* **rpc:** filesystem path verbs (CORE-62) ([5f14b73](https://github.com/arcboxlabs/arcbox/commit/5f14b73207a41d14bb0c1f1b4364a4a563646e19))
+* **rpc:** first-class template catalog (template.proto, CORE-21) ([7505f3b](https://github.com/arcboxlabs/arcbox/commit/7505f3ba225fdedcf42e1100d7de3d04d1f3ccd2))
+* **rpc:** sandbox lifecycle — pause/resume, dual-knob timeouts, capabilities ([b081e99](https://github.com/arcboxlabs/arcbox/commit/b081e99e1c6c96b94e3fc7b88be03e8f92dd02ac))
+* **sdk:** ArcBox entry point and Sandbox handle ([fbf6ce4](https://github.com/arcboxlabs/arcbox/commit/fbf6ce4ecd99b5bd7082c0317e5526a8f98a6410))
+* **sdk:** commands and files data-plane namespaces ([038b674](https://github.com/arcboxlabs/arcbox/commit/038b6741e501940435a69210fc33cb91f09e9c74))
+* **sdk:** generate sandbox_v1 wire types via buf + protoc-gen-es ([2ec52ee](https://github.com/arcboxlabs/arcbox/commit/2ec52eed2fb47c6d1ba5507f6a34a0e512d0c149))
+* **sdk:** hello-world e2e gate and README ([e85bf73](https://github.com/arcboxlabs/arcbox/commit/e85bf73023830c18da9b0d7a78eb23c9d94c72e2))
+* **sdk:** scaffold @arcbox/sandbox package tooling ([5aa3134](https://github.com/arcboxlabs/arcbox/commit/5aa3134bd21d2e447e5ff1478f6c956e33bcf1b1))
+* **sdk:** UDS Connect transport and typed error mapping ([9241860](https://github.com/arcboxlabs/arcbox/commit/9241860d1e8f2cfeb5fc02f25d6d5e3f852e2e30))
+
+
+### Bug Fixes
+
+* **migration:** make a migrated dev environment actually run, add --dry-run ([#520](https://github.com/arcboxlabs/arcbox/issues/520)) ([02d5692](https://github.com/arcboxlabs/arcbox/commit/02d569265286c923106410f124bb4178c78250ee))
+* **rpc:** give SetLifecycle.on_idle explicit presence ([2e50089](https://github.com/arcboxlabs/arcbox/commit/2e50089744b5f0fdc552a31e885484107a1dd22b))
+* **rpc:** make template default cmd/env suppressible in Create ([2a438f9](https://github.com/arcboxlabs/arcbox/commit/2a438f9ce17c4583ee2a3959e8b9fc2307a42ce0))
+* **sdk:** clean up on failed create and widen the dispose not-found gate ([8aae4de](https://github.com/arcboxlabs/arcbox/commit/8aae4ded91afae0536ed96741f1b1931851afe50))
+* **sdk:** honor ARCBOX_PROFILE when resolving the default socket ([31cf8e5](https://github.com/arcboxlabs/arcbox/commit/31cf8e5626cdc6cbdc723cf3a02e7de83bf151b0))
+* **sdk:** include node types explicitly so the build config compiles ([18798cb](https://github.com/arcboxlabs/arcbox/commit/18798cba124759bc6c6da7423e072a4ba09806be))
+* **sdk:** report retained-output truncation and deadline the signal RPC ([b0d05cf](https://github.com/arcboxlabs/arcbox/commit/b0d05cfae622ee22437355ff36df912ad49c4136))
+* **sdk:** resolve the writeBytes default mode SDK-side ([2ca4c8c](https://github.com/arcboxlabs/arcbox/commit/2ca4c8c2a4b31fc4e394473e1219aeb8c1f8fa21))
+
+
+### Code Refactoring
+
+* **sdk:** resolve the sukka lint findings in handwritten code ([1611b15](https://github.com/arcboxlabs/arcbox/commit/1611b156622036045a2e97a10bc18712be41273a))
+
+
+### Tests
+
+* **e2e:** harness hook for SDK e2e ([1fcbf27](https://github.com/arcboxlabs/arcbox/commit/1fcbf27a5d18f4fb46c9d025c135099f19dd4a8f))
+
+
+### Documentation
+
+* **rpc:** pin the limits override contract's zero-subfield semantics ([dc92556](https://github.com/arcboxlabs/arcbox/commit/dc9255664415f54a0c17ba77afde85c68a3fe06d))
+* **sandbox:** carry the limits zero-subfield semantics into the API doc ([a94d9ab](https://github.com/arcboxlabs/arcbox/commit/a94d9ab922028d1a15e024ff6234dfd4699b4e2e))
+* **sandbox:** reflect the CORE-58 phase 1 contract additions ([34b4477](https://github.com/arcboxlabs/arcbox/commit/34b4477e8313d3c57654b6ac10c25cc96501205d))
+* **sandbox:** untangle the limits aside from the override enumeration ([b8d4057](https://github.com/arcboxlabs/arcbox/commit/b8d4057eab4c78fe98cdc5dd22057d6f049a8575))
+
+
+### Styles
+
+* **sdk:** apply the biome formatter ([6c2aff2](https://github.com/arcboxlabs/arcbox/commit/6c2aff2dbde4b39ccbe3157c290a5160d4dd84bd))
+
+
+### Miscellaneous Chores
+
+* **sdk:** build with bunchee instead of tsc ([4a6fae7](https://github.com/arcboxlabs/arcbox/commit/4a6fae7fb0c64c3b2a46cbe516bce7af3adfb3af))
+* **sdk:** swap prettier and typescript-eslint for biome and sukka ([4aab59f](https://github.com/arcboxlabs/arcbox/commit/4aab59f571c93be2a5c1fc5e477dd7f8de433d42))
+
 ## [0.6.2](https://github.com/arcboxlabs/arcbox/compare/v0.6.1...v0.6.2) (2026-08-03)
 
 
