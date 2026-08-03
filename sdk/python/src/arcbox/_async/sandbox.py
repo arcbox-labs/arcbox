@@ -426,7 +426,11 @@ class AsyncSandbox:
         connection: Connection | None = None,
     ) -> AsyncIterator[SandboxSummary]:
         """List sandboxes (auto-paginating). The hidden entry point's
-        HTTP client is closed when iteration finishes."""
+        HTTP client closes when iteration completes or the iterator is
+        closed; abandoning it mid-iteration defers that to generator
+        finalization, so callers that may stop early should hold an
+        ArcBox entry point instead (or close the iterator explicitly,
+        e.g. ``contextlib.aclosing`` in the async flavor)."""
         async with AsyncArcBox(connection) as box:
             async for summary in box.list(state=state, labels=labels):
                 yield summary
