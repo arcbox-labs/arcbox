@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **rpc:** filesystem path verbs (CORE-62) ([5f14b73](https://github.com/arcboxlabs/arcbox/commit/5f14b73207a41d14bb0c1f1b4364a4a563646e19))
 * **rpc:** first-class template catalog (template.proto, CORE-21) ([7505f3b](https://github.com/arcboxlabs/arcbox/commit/7505f3ba225fdedcf42e1100d7de3d04d1f3ccd2))
 * **rpc:** sandbox lifecycle — pause/resume, dual-knob timeouts, capabilities ([b081e99](https://github.com/arcboxlabs/arcbox/commit/b081e99e1c6c96b94e3fc7b88be03e8f92dd02ac))
+* **runtime:** materialize guest runtime on Btrfs ([#529](https://github.com/arcboxlabs/arcbox/issues/529)) ([9315eb8](https://github.com/arcboxlabs/arcbox/commit/9315eb87554b8afa2884bdd0f165332a027d505b))
 * **sdk:** ArcBox entry point and Sandbox handle ([fbf6ce4](https://github.com/arcboxlabs/arcbox/commit/fbf6ce4ecd99b5bd7082c0317e5526a8f98a6410))
 * **sdk:** commands and files data-plane namespaces ([038b674](https://github.com/arcboxlabs/arcbox/commit/038b6741e501940435a69210fc33cb91f09e9c74))
 * **sdk:** generate sandbox_v1 wire types via buf + protoc-gen-es ([2ec52ee](https://github.com/arcboxlabs/arcbox/commit/2ec52eed2fb47c6d1ba5507f6a34a0e512d0c149))
