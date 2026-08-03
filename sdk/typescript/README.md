@@ -60,11 +60,12 @@ Inside the arcbox repo (`sdk/typescript`):
 
 ```sh
 npm install
-npm run generate   # regenerate src/gen from ../../rpc/arcbox-protocol/proto (buf + protoc-gen-es)
-npm run lint       # eslint + prettier --check
-npm test           # vitest unit tests (no daemon needed)
-npm run typecheck  # tsc --noEmit
-npm run build      # emit dist/
+npm run generate      # regenerate src/gen from ../../rpc/arcbox-protocol/proto (buf + protoc-gen-es)
+npm run lint          # eslint (eslint-config-sukka)
+npm run format:check  # biome formatter check (biome format --write . fixes)
+npm test              # vitest unit tests (no daemon needed)
+npm run typecheck     # tsc --noEmit
+npm run build         # bunchee → dist/
 ```
 
 Generated code under `src/gen/` is committed and is **never** exported
@@ -78,9 +79,9 @@ opt-in:
 ARCBOX_SDK_E2E=1 npm test -- test/e2e.test.ts
 ```
 
-TODO(CI): wire `npm run lint`, `npm test`, and `npm run typecheck` into
-`.github/workflows` as an `sdk-typescript` job (follow-up; workflow
-changes are intentionally not part of this branch).
+TODO(CI): wire `npm run lint`, `npm run format:check`, `npm test`, and
+`npm run typecheck` into `.github/workflows` as an `sdk-typescript` job
+(follow-up; workflow changes are intentionally not part of this branch).
 
 ## Status
 
