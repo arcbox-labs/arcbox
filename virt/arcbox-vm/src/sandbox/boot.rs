@@ -2,12 +2,7 @@ use super::persistence::{SandboxRecordStore, SandboxTransition};
 use super::types::action;
 use super::*;
 
-type BootOutput = (
-    fc_sdk::FirecrackerProcess,
-    Arc<fc_sdk::Vm>,
-    PathBuf,
-    Option<CowHandle>,
-);
+type BootOutput = (Arc<fc_sdk::Vm>, PathBuf);
 
 struct BootFailure {
     error: VmmError,
@@ -31,6 +26,7 @@ pub(super) async fn boot_sandbox(
     cow_manager: Arc<CowManager>,
     records: Arc<SandboxRecordStore>,
     generation: Uuid,
+    resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) {
     match do_boot(
         &id,
@@ -39,60 +35,35 @@ pub(super) async fn boot_sandbox(
         &vm_dir,
         &config,
         &cow_manager,
+        &instances,
+        generation,
+        resource_handoff,
     )
     .await
     {
-        Ok((process, vm, vsock_uds_path, cow_handle)) => {
+        Ok((vm, vsock_uds_path)) => {
             let ready_at = Utc::now();
-            let mut process = Some(process);
-            let mut cow_handle = cow_handle;
 
             let current = instances.read().unwrap().get(&id).cloned();
             let is_current_generation = current
                 .as_ref()
                 .is_some_and(|arc| arc.lock().unwrap().record_generation == Some(generation));
             if !is_current_generation {
-                info!(sandbox_id = %id, "stale sandbox boot completed; tearing down resources");
-                if let Err(error) = tear_down_orphaned_boot(
-                    process.take().unwrap(),
-                    cow_handle.take(),
-                    &cow_manager,
-                )
-                .await
-                {
-                    error!(sandbox_id = %id, error = %error, "stale boot cleanup incomplete");
-                }
+                info!(sandbox_id = %id, "stale sandbox boot completed");
                 return;
             }
 
-            // Persist cleanup metadata before making Ready durable. A crash
-            // after the lifecycle commit can then still sweep every resource.
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "Firecracker pid fits platform pid_t"
-            )]
-            let state_record = super::reconcile::SandboxStateRecord::new(
-                &id,
-                process
-                    .as_ref()
-                    .and_then(|process| process.pid())
-                    .map(|p| p as i32),
-                net_alloc.as_ref(),
-                cow_handle.as_ref(),
-                config.firecracker.jailer.is_some(),
-                None,
-            );
-            let durable_ready = super::reconcile::write_state_record(&vm_dir, &state_record)
-                .and_then(|()| {
-                    let commit =
-                        records.transition(&id, generation, SandboxTransition::Ready)?;
-                    match commit.durability_error {
+            // do_boot persisted every cleanup resource before completing the
+            // handoff, so only the lifecycle phase remains to make Ready.
+            let durable_ready =
+                records
+                    .transition(&id, generation, SandboxTransition::Ready)
+                    .and_then(|commit| match commit.durability_error {
                         Some(error) => Err(VmmError::Unavailable(format!(
                             "sandbox {id} ready state is visible, but durability is unconfirmed: {error}"
                         ))),
                         None => Ok(()),
-                    }
-            });
+                    });
             if let Err(record_error) = durable_ready {
                 let message = format!("failed to persist ready state: {record_error}");
                 let value = instances.read().unwrap().get(&id).cloned();
@@ -113,8 +84,6 @@ pub(super) async fn boot_sandbox(
                             persist_boot_failure(&records, &id, generation, &message);
                         inst.state = SandboxState::Failed;
                         inst.error = Some(message.clone());
-                        inst.process = process.take();
-                        inst.cow_handle = cow_handle.take();
                         updated_current = true;
                     }
                 }
@@ -135,19 +104,7 @@ pub(super) async fn boot_sandbox(
                         }
                     }
                 } else {
-                    match tear_down_orphaned_boot(
-                        process.take().unwrap(),
-                        cow_handle.take(),
-                        &cow_manager,
-                    )
-                    .await
-                    {
-                        Ok(()) => true,
-                        Err(error) => {
-                            error!(sandbox_id = %id, error = %error, "boot failure runtime cleanup incomplete");
-                            false
-                        }
-                    }
+                    false
                 };
                 if failure_record_visible && cleanup_complete {
                     if let Err(error) = super::reconcile::clear_state_record(&vm_dir) {
@@ -165,12 +122,8 @@ pub(super) async fn boot_sandbox(
                 return;
             }
 
-            // Hand the booted resources to the instance while holding the map
-            // read guard, so a concurrent force-remove/TTL (which needs the
-            // write guard to drop the entry) cannot slip between the presence
-            // check and the handoff. If the instance is gone or already
-            // stopping, tear the resources down instead of dropping them — a
-            // dropped CowHandle leaks the dm device + loop + sparse COW file.
+            // Hand the post-boot API objects to the instance. Every cleanup
+            // resource was transferred before configuration could be aborted.
             let mut vm = Some(vm);
             let accepted = {
                 let map = instances.read().unwrap();
@@ -182,10 +135,8 @@ pub(super) async fn boot_sandbox(
                         {
                             false
                         } else {
-                            inst.process = process.take();
                             inst.vm = vm.take();
                             inst.vsock_uds_path = Some(vsock_uds_path.clone());
-                            inst.cow_handle = cow_handle.take();
                             inst.state = SandboxState::Ready;
                             inst.ready_at = Some(ready_at);
                             true
@@ -196,18 +147,7 @@ pub(super) async fn boot_sandbox(
             };
 
             if !accepted {
-                info!(sandbox_id = %id, "sandbox removed/stopped during boot; tearing down booted resources");
-                if let Some(process) = process.take() {
-                    if let Err(error) =
-                        tear_down_orphaned_boot(process, cow_handle.take(), &cow_manager).await
-                    {
-                        error!(sandbox_id = %id, error = %error, "rejected boot cleanup incomplete");
-                        return;
-                    }
-                }
-                if let Err(error) = super::reconcile::clear_state_record(&vm_dir) {
-                    error!(sandbox_id = %id, error = %error, "rejected boot journal cleanup is not durable");
-                }
+                info!(sandbox_id = %id, "sandbox removed/stopped during boot");
                 return;
             }
 
@@ -242,8 +182,12 @@ pub(super) async fn boot_sandbox(
                         persist_boot_failure(&records, &id, generation, &message);
                     inst.state = SandboxState::Failed;
                     inst.error = Some(message.clone());
-                    inst.process = failure.process.take();
-                    inst.cow_handle = failure.cow_handle.take();
+                    if let Some(process) = failure.process.take() {
+                        inst.process = Some(process);
+                    }
+                    if let Some(cow_handle) = failure.cow_handle.take() {
+                        inst.cow_handle = Some(cow_handle);
+                    }
                     updated_current = true;
                 }
             }
@@ -511,14 +455,11 @@ pub(super) async fn kill_and_reap_fc_checked(
     }
 }
 
-/// Tear down the resources of a boot that finished after its sandbox was
-/// force-removed (or TTL-expired) mid-boot.
+/// Tear down resources that could not be handed to their sandbox generation.
 ///
-/// The instance entry is gone (or stopping), so these resources were never
-/// handed off. Without an explicit teardown the CoW dm device + loop + sparse
-/// COW file leak (`CowHandle` has no `Drop`) and Firecracker is left holding
-/// the block device. The TAP/IP and jailer chroot are owned by the racing
-/// remove/stop path and are intentionally not touched here.
+/// The resource-handoff channel closes without its explicit signal in this
+/// case, so Remove joins this cleanup instead of aborting it. TAP/IP and the
+/// jailer chroot remain managed by lifecycle cleanup or restart reconciliation.
 async fn tear_down_orphaned_boot(
     mut process: fc_sdk::FirecrackerProcess,
     cow_handle: Option<CowHandle>,
@@ -535,10 +476,13 @@ async fn tear_down_orphaned_boot(
 
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
 ///
-/// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path, Option<CowHandle>)`
-/// on success.  The `CowHandle` is `Some` whenever dm-snapshot CoW is
-/// active — both direct mode and jailer mode (when the snapshot device
-/// node is successfully created inside the chroot).
+/// The spawned process is transferred to its [`SandboxInstance`] immediately.
+/// Cleanup is allowed to abort this task only after the paths/CoW phase has
+/// finished and every live `CowHandle` has also been transferred.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "boot owns one exact sandbox generation and its handoff signal"
+)]
 async fn do_boot(
     id: &str,
     spec: &SandboxSpec,
@@ -546,7 +490,11 @@ async fn do_boot(
     vm_dir: &Path,
     config: &VmmConfig,
     cow_manager: &CowManager,
+    instances: &super::InstanceMap,
+    generation: Uuid,
+    resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) -> std::result::Result<BootOutput, BootFailure> {
+    let mut resource_handoff = Some(resource_handoff);
     let log_path = vm_dir.join("firecracker.log");
     let metrics_path = vm_dir.join("firecracker.metrics");
     // socket_path is used only for the direct (non-jailer) mode spawn.
@@ -569,6 +517,7 @@ async fn do_boot(
         Ok(())
     })();
     if let Err(error) = prepare_files {
+        complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
             error,
             process: None,
@@ -585,6 +534,7 @@ async fn do_boot(
     let process = match process_result {
         Ok(process) => process,
         Err(error) => {
+            complete_resource_handoff(&mut resource_handoff);
             return Err(BootFailure {
                 error,
                 process: None,
@@ -597,18 +547,63 @@ async fn do_boot(
         clippy::cast_possible_wrap,
         reason = "Firecracker pid fits platform pid_t"
     )]
+    let process_pid = process.pid().map(|pid| pid as i32);
+    let process_socket = process.socket_path().to_owned();
     let spawned_record = super::reconcile::SandboxStateRecord::new(
         id,
-        process.pid().map(|pid| pid as i32),
+        process_pid,
         net_alloc,
         None,
         fc_cfg.jailer.is_some(),
         None,
     );
-    if let Err(error) = super::reconcile::write_state_record(vm_dir, &spawned_record) {
+    let journal_error = super::reconcile::write_state_record(vm_dir, &spawned_record).err();
+
+    // Once spawn returns, make the process immediately owned by the instance.
+    // Cleanup still waits for the paths/CoW phase before it may abort boot.
+    let mut process = Some(process);
+    let state = {
+        let map = instances.read().unwrap();
+        map.get(id).and_then(|instance| {
+            let mut instance = instance.lock().unwrap();
+            (instance.record_generation == Some(generation)).then(|| {
+                instance.process = process.take();
+                instance.state
+            })
+        })
+    };
+
+    let Some(state) = state else {
+        // Closing the channel without the explicit signal makes cleanup join
+        // this task instead of aborting it, so the outer failure path can tear
+        // down these unhanded resources.
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "the current sandbox generation".into(),
+                actual: "replaced or removed".into(),
+            },
+            process,
+            cow_handle: None,
+        });
+    };
+    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+        complete_resource_handoff(&mut resource_handoff);
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "a sandbox still booting".into(),
+                actual: state.to_string(),
+            },
+            process: None,
+            cow_handle: None,
+        });
+    }
+    if let Some(error) = journal_error {
+        complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
             error,
-            process: Some(process),
+            process: None,
             cow_handle: None,
         });
     }
@@ -632,13 +627,9 @@ async fn do_boot(
             let r = match cow_manager.setup(id, &spec.rootfs).await {
                 Ok(handle) => {
                     cow_handle = Some(handle);
-                    #[allow(
-                        clippy::cast_possible_wrap,
-                        reason = "Firecracker pid fits platform pid_t"
-                    )]
                     let record = super::reconcile::SandboxStateRecord::new(
                         id,
-                        process.pid().map(|pid| pid as i32),
+                        process_pid,
                         net_alloc,
                         cow_handle.as_ref(),
                         true,
@@ -664,13 +655,9 @@ async fn do_boot(
                                 .teardown_checked(cow_handle.as_ref().unwrap())
                                 .await?;
                             cow_handle = None;
-                            #[allow(
-                                clippy::cast_possible_wrap,
-                                reason = "Firecracker pid fits platform pid_t"
-                            )]
                             let record = super::reconcile::SandboxStateRecord::new(
                                 id,
-                                process.pid().map(|pid| pid as i32),
+                                process_pid,
                                 net_alloc,
                                 None,
                                 true,
@@ -706,13 +693,9 @@ async fn do_boot(
             let rootfs = match cow_manager.setup(id, &spec.rootfs).await {
                 Ok(handle) => {
                     cow_handle = Some(handle);
-                    #[allow(
-                        clippy::cast_possible_wrap,
-                        reason = "Firecracker pid fits platform pid_t"
-                    )]
                     let record = super::reconcile::SandboxStateRecord::new(
                         id,
-                        process.pid().map(|pid| pid as i32),
+                        process_pid,
                         net_alloc,
                         cow_handle.as_ref(),
                         false,
@@ -743,16 +726,52 @@ async fn do_boot(
         }
     }
     .await;
-    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path) = match paths {
-        Ok(paths) => paths,
-        Err(error) => {
-            return Err(BootFailure {
-                error,
-                process: Some(process),
-                cow_handle,
-            });
-        }
+
+    // No await may occur between transferring a successful CoW handle and
+    // completing this signal. Once signalled, Remove is allowed to abort us.
+    let state = {
+        let map = instances.read().unwrap();
+        map.get(id).and_then(|instance| {
+            let mut instance = instance.lock().unwrap();
+            (instance.record_generation == Some(generation)).then(|| {
+                if cow_handle.is_some() {
+                    debug_assert!(instance.cow_handle.is_none());
+                    instance.cow_handle = cow_handle.take();
+                }
+                instance.state
+            })
+        })
     };
+    let Some(state) = state else {
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "the current sandbox generation".into(),
+                actual: "replaced or removed during boot setup".into(),
+            },
+            process: None,
+            cow_handle,
+        });
+    };
+    complete_resource_handoff(&mut resource_handoff);
+
+    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path) =
+        paths.map_err(|error| BootFailure {
+            error,
+            process: None,
+            cow_handle: None,
+        })?;
+    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "a sandbox still booting".into(),
+                actual: state.to_string(),
+            },
+            process: None,
+            cow_handle: None,
+        });
+    }
 
     // Configure and boot the VM.
     let vcpu_count =
@@ -776,7 +795,7 @@ async fn do_boot(
         spec.boot_args.clone()
     };
 
-    let mut builder = VmBuilder::new(process.socket_path())
+    let mut builder = VmBuilder::new(process_socket)
         .boot_source(BootSource {
             kernel_image_path: kernel_path,
             boot_args: Some(boot_args),
@@ -833,12 +852,18 @@ async fn do_boot(
         Err(e) => {
             return Err(BootFailure {
                 error: VmmError::from(e),
-                process: Some(process),
-                cow_handle,
+                process: None,
+                cow_handle: None,
             });
         }
     };
-    Ok((process, vm, vsock_host_path, cow_handle))
+    Ok((vm, vsock_host_path))
+}
+
+fn complete_resource_handoff(signal: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(signal) = signal.take() {
+        let _ = signal.send(());
+    }
 }
 
 #[cfg(test)]

@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 
 pub type SandboxId = String;
 
+pub(super) struct SandboxBootTask {
+    pub(super) resource_handoff: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub(super) handle: tokio::task::JoinHandle<()>,
+}
+
 // State
 
 /// Lifecycle state of a sandbox.
@@ -125,6 +130,8 @@ pub struct SandboxInstance {
     pub state: SandboxState,
     /// Serializes Stop/Remove and failure cleanup for this generation.
     pub(super) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
+    /// In-flight boot, retained until Remove can cancel and join it.
+    pub(super) boot_task: Option<SandboxBootTask>,
     /// Handle to the Firecracker process.
     pub process: Option<fc_sdk::FirecrackerProcess>,
     /// Post-boot API handle (present once the VM has booted).
@@ -184,6 +191,7 @@ impl SandboxInstance {
             spec,
             state: SandboxState::Starting,
             cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            boot_task: None,
             process: None,
             vm: None,
             network,

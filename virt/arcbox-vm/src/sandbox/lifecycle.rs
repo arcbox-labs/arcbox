@@ -1,7 +1,7 @@
 use super::boot::boot_sandbox;
 use super::cleanup::{inst_to_info, remove_sandbox_impl};
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
-use super::types::action;
+use super::types::{SandboxBootTask, action};
 use super::*;
 
 impl SandboxManager {
@@ -185,17 +185,13 @@ impl SandboxManager {
             }
         };
 
-        // Populate the reserved instance and commit it. Keep a Weak to identify
-        // this exact generation when its TTL timer fires (see expire_sandbox).
+        // Populate the reserved instance. Keep a Weak to identify this exact
+        // generation when its TTL timer fires (see expire_sandbox).
         creating_instance.network.clone_from(&net_alloc);
-        drop(creating_instance);
         let ttl_armed_for = Arc::downgrade(&arc);
-        reservation.commit();
 
-        // Broadcast "created" event.
-        let _ = self.events_tx.send(SandboxEvent::new(&id, action::CREATED));
-
-        // Spawn background boot task.
+        // Retain the boot task so force/TTL removal can cancel and join it
+        // before deleting the crash-recovery journal.
         {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
@@ -206,7 +202,8 @@ impl SandboxManager {
             let id_clone = id.clone();
             let spec_clone = spec.clone();
             let net_alloc_clone = net_alloc;
-            tokio::spawn(async move {
+            let (resource_handoff_tx, resource_handoff) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
                 boot_sandbox(
                     id_clone,
                     spec_clone,
@@ -219,10 +216,20 @@ impl SandboxManager {
                     cow_manager,
                     records,
                     generation,
+                    resource_handoff_tx,
                 )
                 .await;
             });
+            creating_instance.boot_task = Some(SandboxBootTask {
+                resource_handoff: Some(resource_handoff),
+                handle,
+            });
         }
+        drop(creating_instance);
+        reservation.commit();
+
+        // Publish only after removal can observe and join the boot task.
+        let _ = self.events_tx.send(SandboxEvent::new(&id, action::CREATED));
 
         // Spawn TTL expiry task if requested.
         if spec.ttl_seconds > 0 {

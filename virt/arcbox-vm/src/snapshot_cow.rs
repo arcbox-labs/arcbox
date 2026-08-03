@@ -14,6 +14,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
@@ -117,6 +122,40 @@ pub struct CowHandle {
     pub template_path: PathBuf,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CowTestProbe {
+    setups: AtomicUsize,
+    teardowns: Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl CowTestProbe {
+    fn setup(&self, sandbox_id: &str, rootfs_path: &str, cow_dir: &Path) -> CowHandle {
+        self.setups.fetch_add(1, Ordering::SeqCst);
+        let dm_name = format!("{DM_NAME_PREFIX}{sandbox_id}");
+        CowHandle {
+            dm_device: format!("/dev/mapper/{dm_name}"),
+            cow_loop: format!("/dev/loop-test-{sandbox_id}"),
+            cow_file: cow_dir.join(format!("arcbox-cow-{sandbox_id}.img")),
+            template_path: PathBuf::from(rootfs_path),
+            dm_name,
+        }
+    }
+
+    fn teardown(&self, handle: &CowHandle) {
+        self.teardowns.lock().unwrap().push(handle.dm_name.clone());
+    }
+
+    pub(crate) fn setup_count(&self) -> usize {
+        self.setups.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn teardown_count(&self) -> usize {
+        self.teardowns.lock().unwrap().len()
+    }
+}
+
 /// Manages template loop devices and per-sandbox dm-snapshot lifecycle.
 pub struct CowManager {
     templates: Mutex<HashMap<PathBuf, TemplateEntry>>,
@@ -129,6 +168,8 @@ pub struct CowManager {
     losetup_lock: AsyncMutex<()>,
     cow_dir: PathBuf,
     dmsetup_bin: Option<String>,
+    #[cfg(test)]
+    test_probe: Option<Arc<CowTestProbe>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +207,16 @@ impl CowManager {
             losetup_lock: AsyncMutex::new(()),
             cow_dir,
             dmsetup_bin,
+            #[cfg(test)]
+            test_probe: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_probe(data_dir: &str, probe: Arc<CowTestProbe>) -> Result<Self> {
+        let mut manager = Self::new(data_dir)?;
+        manager.test_probe = Some(probe);
+        Ok(manager)
     }
 
     /// Create a dm-snapshot for `sandbox_id` using `rootfs_path` as template.
@@ -175,6 +225,10 @@ impl CowManager {
     /// Firecracker as the rootfs block device.
     pub async fn setup(&self, sandbox_id: &str, rootfs_path: &str) -> Result<CowHandle> {
         validate_dm_name_suffix(sandbox_id)?;
+        #[cfg(test)]
+        if let Some(probe) = &self.test_probe {
+            return Ok(probe.setup(sandbox_id, rootfs_path, &self.cow_dir));
+        }
         if self.setup_orphans.lock().unwrap().contains_key(sandbox_id) {
             return Err(VmmError::Unavailable(format!(
                 "sandbox {sandbox_id} still owns resources from an incomplete CoW setup"
@@ -396,6 +450,11 @@ impl CowManager {
     /// released. Crash reconciliation and durable Remove use this result to
     /// avoid declaring cleanup complete when a retry is still required.
     pub async fn teardown_checked(&self, handle: &CowHandle) -> Result<()> {
+        #[cfg(test)]
+        if let Some(probe) = &self.test_probe {
+            probe.teardown(handle);
+            return Ok(());
+        }
         let dmsetup = self
             .dmsetup_bin
             .as_deref()
@@ -750,6 +809,7 @@ mod tests {
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
             dmsetup_bin: None,
+            test_probe: None,
         };
 
         let template = PathBuf::from("/var/lib/arcbox/rootfs.ext4");
@@ -779,6 +839,7 @@ mod tests {
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
             dmsetup_bin: None,
+            test_probe: None,
         };
 
         mgr.cleanup_stale_template_markers().unwrap();
@@ -808,6 +869,7 @@ mod tests {
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
             dmsetup_bin: None,
+            test_probe: None,
         };
 
         let _ = mgr
@@ -841,6 +903,7 @@ mod tests {
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
             dmsetup_bin: Some("/not-used".into()),
+            test_probe: None,
         };
 
         assert!(matches!(
@@ -866,6 +929,7 @@ mod tests {
             losetup_lock: AsyncMutex::new(()),
             cow_dir: PathBuf::from("/tmp"),
             dmsetup_bin: None,
+            test_probe: None,
         };
 
         let path = PathBuf::from("/tmp/template.ext4");
