@@ -46,7 +46,7 @@ Resolution order: explicit option > environment > default.
 
 | Environment      | Meaning                                                                                       |
 | ---------------- | --------------------------------------------------------------------------------------------- |
-| `ARCBOX_SOCKET`  | daemon Unix socket (default `$ARCBOX_DATA_DIR/run/arcbox.sock`, data dir default `~/.arcbox`) |
+| `ARCBOX_SOCKET`  | daemon Unix socket (default `$ARCBOX_DATA_DIR/run/arcbox.sock`; data dir default `~/.arcbox`, or `~/.arcbox-dev` under `ARCBOX_PROFILE=development`) |
 | `ARCBOX_API_URL` | remote daemon / cloud front door; setting it selects the remote tier (reserved, CORE-63)      |
 | `ARCBOX_API_KEY` | bearer credential, attached as `Authorization` when set; unused by the local daemon           |
 

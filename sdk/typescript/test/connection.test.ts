@@ -21,6 +21,36 @@ describe("resolveConnection", () => {
     expect(conn.socketPath).toBe(join("/tmp/abx", "run", "arcbox.sock"));
   });
 
+  it.each(["development", "dev", " Development "])(
+    "ARCBOX_PROFILE=%j selects ~/.arcbox-dev, like the daemon",
+    (profile) => {
+      const conn = resolveConnection({}, { ARCBOX_PROFILE: profile });
+      expect(conn.socketPath).toBe(
+        join(homedir(), ".arcbox-dev", "run", "arcbox.sock"),
+      );
+    },
+  );
+
+  it("unknown profiles fall back to production, like from_env_or_default", () => {
+    const conn = resolveConnection({}, { ARCBOX_PROFILE: "staging" });
+    expect(conn.socketPath).toBe(
+      join(homedir(), ".arcbox", "run", "arcbox.sock"),
+    );
+  });
+
+  it("a non-empty ARCBOX_DATA_DIR beats the profile; an empty one is unset", () => {
+    expect(
+      resolveConnection(
+        {},
+        { ARCBOX_DATA_DIR: "/tmp/abx", ARCBOX_PROFILE: "dev" },
+      ).socketPath,
+    ).toBe(join("/tmp/abx", "run", "arcbox.sock"));
+    expect(
+      resolveConnection({}, { ARCBOX_DATA_DIR: "", ARCBOX_PROFILE: "dev" })
+        .socketPath,
+    ).toBe(join(homedir(), ".arcbox-dev", "run", "arcbox.sock"));
+  });
+
   it("ARCBOX_SOCKET overrides the data-dir default", () => {
     const conn = resolveConnection(
       {},
