@@ -21,7 +21,8 @@ from arcbox._types import (
 from arcbox.errors import InvalidArgumentError, TimeoutError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+    from types import TracebackType
 
     from arcbox._types import OutputChannel, SignalName
 
@@ -52,6 +53,37 @@ def _decode_output(chunks: list[bytes]) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
+class AsyncOutputStream:
+    """A command's output, iterable chunk by chunk.
+
+    Consuming it to the end releases the underlying HTTP stream
+    deterministically. When exiting early (``break``), iterate inside
+    the context-manager form — ``async with handle.output as stream`` in
+    the async flavor, ``with`` in the sync one — so the stream closes at
+    the break instead of whenever the generator finalizer runs."""
+
+    def __init__(self, chunks: AsyncGenerator[OutputChunk]) -> None:
+        self._chunks = chunks
+
+    def __aiter__(self) -> AsyncIterator[OutputChunk]:
+        return self._chunks
+
+    async def aclose(self) -> None:
+        """Release the underlying HTTP stream without consuming the rest."""
+        await self._chunks.aclose()
+
+    async def __aenter__(self) -> AsyncOutputStream:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+
 class AsyncCommandHandle:
     """A handle to a running (or finished) command. The process is
     decoupled from this object: dropping the handle never kills the
@@ -64,15 +96,16 @@ class AsyncCommandHandle:
         self.command_id = command_id
 
     @property
-    def output(self) -> AsyncIterator[OutputChunk]:
+    def output(self) -> AsyncOutputStream:
         """Stream the command's output from the beginning — or from the
         earliest byte the daemon still retains (8 MiB per channel);
         replayed buffered output comes first, then live output follows;
         the stream ends when the process exits (deterministic
-        termination — never silence)."""
-        return self._stream_output()
+        termination — never silence). When breaking out early, iterate
+        via the context-manager form (see :class:`AsyncOutputStream`)."""
+        return AsyncOutputStream(self._stream_output())
 
-    async def _stream_output(self) -> AsyncIterator[OutputChunk]:
+    async def _stream_output(self) -> AsyncGenerator[OutputChunk]:
         with wrap_errors("commands.output"):
             async with self._attach() as stream:
                 async for event in stream:

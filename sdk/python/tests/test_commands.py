@@ -217,6 +217,31 @@ def test_retention_gap_reports_truncation() -> None:
     assert result.stdout == "tail"
 
 
+def test_output_context_closes_the_stream_on_early_exit() -> None:
+    daemon = MockDaemon(exit_code=0)
+    handle = sync_sandbox(daemon).commands.run("emit", background=True)
+    with handle.output as stream:
+        for _chunk in stream:
+            break
+    # The underlying generator was closed at scope exit, releasing the
+    # HTTP stream; resuming it yields nothing.
+    with pytest.raises(StopIteration):
+        next(iter(stream))
+
+
+@pytest.mark.anyio
+async def test_async_output_context_closes_the_stream_on_early_exit() -> None:
+    daemon = MockDaemon(exit_code=0)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(daemon), base_url="http://arcbox")
+    sandbox = AsyncSandbox(AsyncConnectClient(Connection(http_client=http)), "sb-1")
+    handle = await sandbox.commands.run("emit", background=True)
+    async with handle.output as stream:
+        async for _chunk in stream:
+            break
+    with pytest.raises(StopAsyncIteration):
+        await anext(aiter(stream))
+
+
 @pytest.mark.anyio
 async def test_async_tree_runs_the_same_loop() -> None:
     daemon = MockDaemon(exit_code=0)
