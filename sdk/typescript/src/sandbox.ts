@@ -6,7 +6,7 @@ import { Commands } from "./commands.js";
 import type { ConnectionOptions } from "./connection.js";
 import {
   ArcBoxError,
-  SandboxNotFoundError,
+  NotFoundError,
   SandboxStateError,
   toArcBoxError,
 } from "./errors.js";
@@ -152,6 +152,13 @@ export class ArcBox {
       }
       return new Sandbox(this.#ctx, id);
     } catch (error) {
+      // The sandbox may exist even though create() failed (readiness
+      // failed, response lost) and ttlMs is optional, so a leaked VM
+      // could run forever. Best-effort removal; a failure here (e.g.
+      // nothing was created) must not mask the original error.
+      await this.#client
+        .remove({ id, force: true }, unaryOptions(this.#ctx))
+        .catch(noop);
       throw toArcBoxError(error, "sandbox.create");
     } finally {
       abort.abort();
@@ -411,6 +418,10 @@ export class Sandbox {
    * runtime resources. Resume happens on the next {@link Sandbox.connect}
    * (or transparently, daemon-side, on the next data-plane call). Trades
    * RAM for disk: a paused sandbox keeps paying `storageBytes`.
+   *
+   * Requires daemon-side CORE-21: the current local daemon serves
+   * Pause/Resume as contract-only stubs, so this rejects with an
+   * Unimplemented {@link ArcBoxError} until that lands.
    */
   async pause(): Promise<void> {
     try {
@@ -423,13 +434,15 @@ export class Sandbox {
 
   /**
    * `await using` disposal: kill the sandbox, so a leaked handle never
-   * leaks a VM. Swallows only "already gone".
+   * leaks a VM. Swallows only "already gone" — the whole NotFoundError
+   * family, because the daemon does not attach `ErrorInfo` details yet
+   * and a coarse NotFound on this id can only mean the sandbox.
    */
   async [Symbol.asyncDispose](): Promise<void> {
     try {
       await this.kill();
     } catch (error) {
-      if (!(error instanceof SandboxNotFoundError)) {
+      if (!(error instanceof NotFoundError)) {
         throw error;
       }
     }
