@@ -102,13 +102,16 @@ pub struct CreateSandboxRequest {
     /// FAILED_PRECONDITION. Use executions for interactive access.
     #[prost(string, optional, tag = "15")]
     pub ssh_public_key: ::core::option::Option<::prost::alloc::string::String>,
-    /// Opaque reference to what boots inside the sandbox. Local mode accepts:
-    ///    ""             — the built-in minimal template (busybox + init)
-    ///    "docker:<ref>" — a local Docker image reference, resolved and
-    ///                     converted inside the VM
-    /// Cloud mode resolves names against the tenant's template registry;
-    /// first-class templates are designed in CORE-21. Anything else is
-    /// rejected with INVALID_ARGUMENT.
+    /// Reference to what boots inside the sandbox:
+    ///    ""               — the built-in minimal template (busybox + init)
+    ///    "docker:<ref>"   — a local Docker image reference, resolved and
+    ///                       converted inside the VM
+    ///    "name\[:version\]" — a template from the catalog (`template.proto`,
+    ///                       CORE-21); a bare name resolves to the newest
+    ///                       published version. Template defaults apply
+    ///                       unless overridden by the fields above.
+    /// Cloud mode resolves names against the tenant's template registry.
+    /// Anything else is rejected with INVALID_ARGUMENT.
     #[prost(string, tag = "17")]
     pub template: ::prost::alloc::string::String,
 }
@@ -1016,6 +1019,188 @@ pub struct DeleteSnapshotRequest {
     /// Snapshot ID.
     #[prost(string, tag = "1")]
     pub snapshot_id: ::prost::alloc::string::String,
+}
+/// A template: named, versioned, reproducible sandbox base.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Template {
+    /// Template name, unique in the catalog.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Published version this record describes (empty = unpublished draft).
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// Content digest pinning this version's artifacts.
+    #[prost(string, tag = "3")]
+    pub digest: ::prost::alloc::string::String,
+    /// Reference to the built rootfs image in the rootfs cache.
+    #[prost(string, tag = "4")]
+    pub rootfs_ref: ::prost::alloc::string::String,
+    /// Pre-warmed boot-to-ready snapshot (empty = cold boot from
+    /// `rootfs_ref`). Not a oneof with `rootfs_ref`: a built rootfs and
+    /// its pre-warmed snapshot compose — creating from this template
+    /// restores the snapshot for sub-second READY (CORE-16).
+    #[prost(string, tag = "5")]
+    pub warm_snapshot_id: ::prost::alloc::string::String,
+    /// Defaults applied to sandboxes created from this template.
+    #[prost(message, optional, tag = "6")]
+    pub defaults: ::core::option::Option<TemplateDefaults>,
+    /// Creation time of this version.
+    #[prost(message, optional, tag = "7")]
+    pub created_at: ::core::option::Option<::pbjson_types::Timestamp>,
+    /// Arbitrary key-value metadata (filterable in List).
+    #[prost(map = "string, string", tag = "8")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// On-disk footprint of this version's artifacts (rootfs + warm
+    /// snapshot).
+    #[prost(uint64, tag = "9")]
+    pub size_bytes: u64,
+}
+/// Default configuration a template applies to sandboxes created from it.
+/// Every field can be overridden per sandbox in CreateSandboxRequest.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TemplateDefaults {
+    /// Default resource limits.
+    #[prost(message, optional, tag = "1")]
+    pub limits: ::core::option::Option<ResourceLimits>,
+    /// Default initial command (see CreateSandboxRequest.cmd).
+    #[prost(string, repeated, tag = "2")]
+    pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Default environment for the initial command.
+    #[prost(map = "string, string", tag = "3")]
+    pub env:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Ports the workload is expected to listen on; clients may expose
+    /// them without knowing the workload.
+    #[prost(uint32, repeated, tag = "4")]
+    pub exposed_ports: ::prost::alloc::vec::Vec<u32>,
+    /// How to decide the sandbox is ready for use (unset = READY as soon
+    /// as the VM accepts executions).
+    #[prost(message, optional, tag = "5")]
+    pub ready_probe: ::core::option::Option<ReadyProbe>,
+}
+/// Readiness probe run inside a sandbox after boot.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadyProbe {
+    /// Give up after this many seconds and mark the sandbox FAILED
+    /// (0 = daemon default).
+    #[prost(uint32, tag = "3")]
+    pub timeout_seconds: u32,
+    #[prost(oneof = "ready_probe::Probe", tags = "1, 2")]
+    pub probe: ::core::option::Option<ready_probe::Probe>,
+}
+/// Nested message and enum types in `ReadyProbe`.
+pub mod ready_probe {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Probe {
+        /// Ready when something inside the sandbox listens on this TCP
+        /// port.
+        #[prost(uint32, tag = "1")]
+        Port(u32),
+        /// Ready when this command exits 0.
+        #[prost(message, tag = "2")]
+        Command(super::CommandProbe),
+    }
+}
+/// Command form of a ReadyProbe.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CommandProbe {
+    /// Command and arguments to run inside the sandbox.
+    #[prost(string, repeated, tag = "1")]
+    pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to build a template.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuildTemplateRequest {
+    /// Template name to register the result under.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Defaults for sandboxes created from this template.
+    #[prost(message, optional, tag = "5")]
+    pub defaults: ::core::option::Option<TemplateDefaults>,
+    /// Labels for the template.
+    #[prost(map = "string, string", tag = "6")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Also boot the built rootfs once and checkpoint it at READY, so the
+    /// template carries a warm snapshot (requires CORE-16; ignored for
+    /// `snapshot_id` sources, which are warm by construction).
+    #[prost(bool, tag = "7")]
+    pub prewarm: bool,
+    /// What to build the rootfs from.
+    #[prost(oneof = "build_template_request::Source", tags = "2, 3, 4")]
+    pub source: ::core::option::Option<build_template_request::Source>,
+}
+/// Nested message and enum types in `BuildTemplateRequest`.
+pub mod build_template_request {
+    /// What to build the rootfs from.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Source {
+        /// A local Docker image reference, converted to a rootfs via the
+        /// in-guest OCI pipeline (CORE-5).
+        #[prost(string, tag = "2")]
+        DockerRef(::prost::alloc::string::String),
+        /// Inline Dockerfile content, built in-guest then converted
+        /// (CORE-5).
+        #[prost(string, tag = "3")]
+        Dockerfile(::prost::alloc::string::String),
+        /// Promote an existing checkpoint (snapshot.proto) into a
+        /// template: no build runs, and the checkpoint becomes the
+        /// template's warm snapshot.
+        #[prost(string, tag = "4")]
+        SnapshotId(::prost::alloc::string::String),
+    }
+}
+/// Request to publish a template version.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PublishTemplateRequest {
+    /// Template name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Version to freeze the current draft content as (e.g. "1.2.0").
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+}
+/// Request to resolve a template reference.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetTemplateRequest {
+    /// `name` or `name:version`. A bare name resolves to the newest
+    /// published version, or the draft when nothing is published.
+    #[prost(string, tag = "1")]
+    pub reference: ::prost::alloc::string::String,
+}
+/// Request to list templates.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListTemplatesRequest {
+    /// Filter by labels (all key-value pairs must match).
+    #[prost(map = "string, string", tag = "1")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Maximum entries per page (0 = server default of 100; capped at
+    /// 1000).
+    #[prost(uint32, tag = "2")]
+    pub page_size: u32,
+    /// Continuation token from a previous response (empty = first page).
+    #[prost(string, tag = "3")]
+    pub page_token: ::prost::alloc::string::String,
+}
+/// Response to ListTemplates.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListTemplatesResponse {
+    /// One entry per template version (drafts included).
+    #[prost(message, repeated, tag = "1")]
+    pub templates: ::prost::alloc::vec::Vec<Template>,
+    /// Token for the next page; empty when this is the last page.
+    #[prost(string, tag = "2")]
+    pub next_page_token: ::prost::alloc::string::String,
+}
+/// Request to delete a template.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteTemplateRequest {
+    /// `name` (delete the template and all its versions) or
+    /// `name:version` (delete one version).
+    #[prost(string, tag = "1")]
+    pub reference: ::prost::alloc::string::String,
 }
 /// Structured detail attached to sandbox API errors.
 ///

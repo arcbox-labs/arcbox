@@ -8,6 +8,7 @@
 //! processes:
 //!
 //! - [`control`] — sandbox lifecycle, events, published ports
+//! - [`template`] — the template catalog (control plane, CORE-21)
 //! - [`process`] — executions (data plane)
 //! - [`filesystem`] — file transfer (data plane)
 //! - [`snapshot`] — checkpoint / restore
@@ -35,6 +36,7 @@ mod sandbox_locks;
 mod snapshot;
 mod stats;
 mod system;
+mod template;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +63,7 @@ pub use sandbox_cleanup::{
 pub use snapshot::SandboxSnapshotServiceImpl;
 pub use stats::StatsServiceImpl;
 pub use system::{SetupState, SystemServiceImpl};
+pub use template::TemplateServiceImpl;
 
 /// Shared handle to a runtime that may not be initialized yet.
 ///
@@ -218,6 +221,7 @@ pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
             clone(),
             Arc::clone(&sandbox_operations),
         )))
+        .add_service(Arc::new(TemplateServiceImpl::new()))
         // The daemon's own services, all on Connect since CORE-68.
         .add_service(Arc::new(IconServiceImpl::new()))
         .add_service(Arc::new(StatsServiceImpl::new(clone())))

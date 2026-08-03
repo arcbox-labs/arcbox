@@ -346,6 +346,9 @@ mod tests {
             "arcbox.v1.KubernetesService/Status",
             "arcbox.v1.MigrationService/RunMigration",
             "arcbox.v1.MachineService/ExecSession",
+            // Post-migration additions live under the same guarantee: a
+            // service missing from the router 404s and fails nowhere else.
+            "arcbox.sandbox.v1.TemplateService/Get",
             #[cfg(target_os = "macos")]
             "arcbox.v1.MacosService/List",
         ] {

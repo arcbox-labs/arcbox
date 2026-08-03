@@ -32,6 +32,7 @@ fn main() {
         "proto/arcbox/sandbox/v1/process.proto",
         "proto/arcbox/sandbox/v1/filesystem.proto",
         "proto/arcbox/sandbox/v1/snapshot.proto",
+        "proto/arcbox/sandbox/v1/template.proto",
         "proto/arcbox/sandbox/v1/errors.proto",
         "proto/stats.proto",
     ];
