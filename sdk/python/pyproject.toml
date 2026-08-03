@@ -32,6 +32,16 @@ include = ["src", "tests", "scripts"]
 exclude = ["src/arcbox/_gen", ".venv"]
 typeCheckingMode = "strict"
 
+# The codegen scripts drive tools that ship no type information
+# (grpcio-tools' protoc entry point, unasync); only the unknown-type
+# diagnostics that follow from those imports are relaxed there.
+[[tool.pyright.executionEnvironments]]
+root = "scripts"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
