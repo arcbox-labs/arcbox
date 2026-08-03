@@ -1,13 +1,24 @@
 import { create } from "@bufbuild/protobuf";
+import { EmptySchema } from "@bufbuild/protobuf/wkt";
 import { describe, expect, it } from "vitest";
 
-import { commandResultFromExecution, normalizeCmd } from "../src/commands.js";
+import {
+  CommandHandle,
+  commandResultFromExecution,
+  normalizeCmd,
+} from "../src/commands.js";
 import {
   ArcBoxError,
   CommandFailedError,
   SandboxDiedError,
 } from "../src/errors.js";
-import { ExecutionSchema } from "../src/gen/arcbox/sandbox/v1/process_pb.js";
+import type { ExecutionEvent } from "../src/gen/arcbox/sandbox/v1/process_pb.js";
+import {
+  ExecutionEventSchema,
+  ExecutionSchema,
+  ExecutionState,
+  StdioChannel,
+} from "../src/gen/arcbox/sandbox/v1/process_pb.js";
 
 describe("normalizeCmd", () => {
   it("passes argv through untouched", () => {
@@ -75,5 +86,86 @@ describe("commandResultFromExecution", () => {
     expect(() => commandResultFromExecution(execution, "", "")).toThrow(
       ArcBoxError,
     );
+  });
+});
+
+describe("CommandHandle output collection", () => {
+  type HandleCtx = ConstructorParameters<typeof CommandHandle>[0];
+  type HandleClient = ConstructorParameters<typeof CommandHandle>[1];
+
+  const exited = create(ExecutionSchema, {
+    id: "cmd",
+    state: ExecutionState.EXITED,
+    exitStatus: { status: { case: "code", value: 0 } },
+  });
+
+  function output(channel: StdioChannel, offset: bigint, text: string) {
+    return create(ExecutionEventSchema, {
+      event: {
+        case: "output",
+        value: { channel, offset, data: new TextEncoder().encode(text) },
+      },
+    });
+  }
+
+  /** Only the methods the code under test calls are stubbed. */
+  function stubClient(overrides: Partial<HandleClient>): HandleClient {
+    return overrides as HandleClient;
+  }
+
+  function handleWith(events: ExecutionEvent[]): CommandHandle {
+    const client = stubClient({
+      waitExecution: () => Promise.resolve(exited),
+      // eslint-disable-next-line @typescript-eslint/require-await -- mirrors the AsyncIterable contract of the generated client
+      async *attachExecution() {
+        yield* events;
+        yield create(ExecutionEventSchema, {
+          event: { case: "exited", value: { execution: exited } },
+        });
+      },
+    });
+    return new CommandHandle(
+      { transport: {} } as HandleCtx,
+      client,
+      "sb",
+      "cmd",
+    );
+  }
+
+  it("assembles contiguous replayed chunks as complete, untruncated output", async () => {
+    const result = await handleWith([
+      output(StdioChannel.STDOUT, 0n, "hel"),
+      output(StdioChannel.STDOUT, 3n, "lo"),
+      output(StdioChannel.STDERR, 0n, "warn"),
+    ]).waitForExit();
+    expect(result.stdout).toBe("hello");
+    expect(result.stderr).toBe("warn");
+    expect(result.truncated).toBe(false);
+  });
+
+  it("flags truncation when retention dropped the head of a channel", async () => {
+    const result = await handleWith([
+      output(StdioChannel.STDOUT, 4096n, "tail"),
+    ]).waitForExit();
+    expect(result.stdout).toBe("tail");
+    expect(result.truncated).toBe(true);
+  });
+
+  it("kill() applies the configured per-unary deadline", async () => {
+    let seen: unknown;
+    const client = stubClient({
+      signalExecution(_req, opts) {
+        seen = opts;
+        return Promise.resolve(create(EmptySchema));
+      },
+    });
+    const handle = new CommandHandle(
+      { transport: {}, requestTimeoutMs: 1234 } as HandleCtx,
+      client,
+      "sb",
+      "cmd",
+    );
+    await handle.kill();
+    expect(seen).toEqual({ timeoutMs: 1234 });
   });
 });
