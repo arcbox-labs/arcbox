@@ -66,6 +66,14 @@ Every entry point takes a `connection=Connection(...)` slot
 `http_client` for mocking — pass an `httpx.Client` to the sync surface,
 an `httpx.AsyncClient` to the async one).
 
+The `Sandbox` / `AsyncSandbox` classmethods resolve a hidden connection
+per call, and the returned handle closes its HTTP client on context
+exit. Long-lived programs should hold an `ArcBox` / `AsyncArcBox`
+instead: it is a context manager (or call `.close()` / `.aclose()`),
+and every handle it creates shares its client. An injected
+`http_client` always belongs to the caller and is never closed by the
+SDK.
+
 ## Development
 
 Inside the arcbox repo (`sdk/python`):

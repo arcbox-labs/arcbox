@@ -69,6 +69,9 @@ class AsyncConnectClient:
         #: and long-polls never receive it.
         self.request_timeout = resolved.request_timeout
         injected = connection.http_client if connection is not None else None
+        #: Whether this client constructed (and must eventually close)
+        #: its HTTP client; an injected one belongs to the caller.
+        self._owns_http = injected is None
         if injected is not None:
             required = httpx.AsyncClient
             if not isinstance(injected, required):
@@ -89,6 +92,12 @@ class AsyncConnectClient:
             headers=headers,
             timeout=None,
         )
+
+    async def aclose(self) -> None:
+        """Release the HTTP client's pooled connections. A no-op when the
+        client was injected — it belongs to the caller."""
+        if self._owns_http:
+            await self._http.aclose()
 
     async def unary(
         self,

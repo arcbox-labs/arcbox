@@ -73,7 +73,10 @@ def generate(target_dir: Path) -> None:
     # passes the repo gates verbatim. --config pins the project config
     # even when generating into a scratch dir (the --check path).
     config = str(SDK_ROOT / "pyproject.toml")
-    for args in (["check", "--fix", "--quiet"], ["format", "--quiet"]):
+    # --ignore UP028 mirrors the pyproject per-file-ignore for the sync
+    # tree (this invocation lints nothing else): the --check scratch dir
+    # sits outside the project root, where that pattern cannot anchor.
+    for args in (["check", "--fix", "--quiet", "--ignore", "UP028"], ["format", "--quiet"]):
         subprocess.run(
             ["ruff", *args, "--config", config, "--no-cache", str(target_dir)],
             check=True,
