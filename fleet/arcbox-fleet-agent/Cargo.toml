@@ -46,9 +46,8 @@ libc.workspace = true
 sha2.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 uuid = { workspace = true }
-arcbox-connect = { version = "0.6.0", path = "../../rpc/arcbox-connect" }
+arcbox-connect.workspace = true
 connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.1", features = ["client"] }
-hyper.workspace = true
 
 [lints]
 workspace = true

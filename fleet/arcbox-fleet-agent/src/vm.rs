@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use arcbox_connect::v1::{
-    CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImagePullRequest,
-    MacosImageSummary, MacosServiceClient, RemoveMacosMachineRequest, StartMacosMachineRequest,
+    CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImagePullEvent,
+    MacosImagePullRequest, MacosImageSummary, MacosServiceClient, RemoveMacosMachineRequest,
+    StartMacosMachineRequest,
 };
 use connectrpc::Protocol;
 use connectrpc::client::{ClientConfig, Http2Connection, SharedHttp2Connection};
@@ -50,10 +51,10 @@ const SSH_PORT: u16 = 22;
 const TRANSPORT_BUFFER: usize = 32;
 
 /// Progress stream from `MacosService.ImagePull`, concretized for the
-/// daemon transport below.
+/// daemon transport below via the public associated types.
 pub type PullStream = connectrpc::client::ServerStream<
-    hyper::body::Incoming,
-    arcbox_connect::v1::__buffa::view::MacosImagePullEventView<'static>,
+    <SharedHttp2Connection as connectrpc::client::ClientTransport>::ResponseBody,
+    <MacosImagePullEvent as connectrpc::HasMessageView>::View<'static>,
 >;
 
 /// Budget for a freshly started guest to acquire its DHCP lease and answer

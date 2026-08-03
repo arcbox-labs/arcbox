@@ -95,8 +95,9 @@ pub fn bind(socket_path: &std::path::Path) -> Result<UnixListener> {
 /// calls are unaffected, which is why `curl --unix-socket` still works for
 /// the services themselves.
 ///
-/// The descriptor set is standard protobuf wire bytes, so the same one
-/// `arcbox-grpc` emits for its prost build describes every service here.
+/// The descriptor set is `arcbox-connect`'s own — emitted by the same
+/// build script that generates the served types, so the reflected surface
+/// cannot drift from the implemented one.
 ///
 /// # Errors
 ///
