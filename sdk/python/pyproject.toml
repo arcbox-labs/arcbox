@@ -27,6 +27,13 @@ extend-exclude = ["src/arcbox/_gen"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.per-file-ignores]
+# The sync tree is a mechanical unasync mirror: `async for … yield` has
+# no `yield from` form, so its transform cannot satisfy UP028.
+# gen_sync.py mirrors this ignore for its scratch directory, which sits
+# outside the project root where this pattern cannot anchor.
+"src/arcbox/_sync/*" = ["UP028"]
+
 [tool.pyright]
 include = ["src", "tests", "scripts"]
 exclude = ["src/arcbox/_gen", ".venv"]

@@ -68,7 +68,11 @@ def _normalize(signature: inspect.Signature) -> str:
 
 
 def _normalize_name(name: str) -> str:
-    return name.replace("__aenter__", "__enter__").replace("__aexit__", "__exit__")
+    return (
+        name.replace("__aenter__", "__enter__")
+        .replace("__aexit__", "__exit__")
+        .replace("aclose", "close")
+    )
 
 
 @pytest.mark.parametrize(("async_cls", "sync_cls"), PAIRS, ids=lambda cls: cls.__name__)

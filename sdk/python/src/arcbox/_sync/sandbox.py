@@ -62,10 +62,29 @@ def _seconds_to_wire(seconds: float | None) -> int:
 class ArcBox:
     """Client entry point. Holds one resolved connection; every handle it
     creates shares it. The :class:`AsyncSandbox` classmethods are sugar
-    over a throwaway instance resolved from options/environment."""
+    over a throwaway instance resolved from options/environment.
+
+    Usable as a context manager: exiting the scope closes the SDK-owned
+    HTTP client (handles created from this instance stop working); an
+    injected ``Connection.http_client`` is left to its owner."""
 
     def __init__(self, connection: Connection | None = None) -> None:
         self._client = ConnectClient(connection)
+
+    def close(self) -> None:
+        """Close the SDK-owned HTTP client (no-op for an injected one)."""
+        self._client.close()
+
+    def __enter__(self) -> ArcBox:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def create(
         self,
@@ -322,6 +341,11 @@ class Sandbox:
 
     def __init__(self, client: ConnectClient, sandbox_id: str) -> None:
         self._client = client
+        # Flipped by the classmethod sugar, whose hidden entry point has
+        # no other referent: the handle then closes the client on
+        # context exit. Handles minted by a caller-held entry point
+        # share its client and never close it.
+        self._owns_client = False
         #: Sandbox id.
         self.id = sandbox_id
         #: Run processes inside the sandbox.
@@ -346,25 +370,43 @@ class Sandbox:
         wait_until_ready: bool = True,
         connection: Connection | None = None,
     ) -> Sandbox:
-        """Create a sandbox against the default (or given) connection."""
-        return ArcBox(connection).create(
-            template,
-            ttl=ttl,
-            idle_timeout=idle_timeout,
-            on_idle=on_idle,
-            vcpus=vcpus,
-            memory_mib=memory_mib,
-            cmd=cmd,
-            env=env,
-            labels=labels,
-            network=network,
-            wait_until_ready=wait_until_ready,
-        )
+        """Create a sandbox against the default (or given) connection.
+        The handle owns the hidden entry point's HTTP client and closes
+        it on context exit; without the context manager, hold an
+        :class:`AsyncArcBox` instead for deterministic cleanup."""
+        box = ArcBox(connection)
+        try:
+            sandbox = box.create(
+                template,
+                ttl=ttl,
+                idle_timeout=idle_timeout,
+                on_idle=on_idle,
+                vcpus=vcpus,
+                memory_mib=memory_mib,
+                cmd=cmd,
+                env=env,
+                labels=labels,
+                network=network,
+                wait_until_ready=wait_until_ready,
+            )
+        except BaseException:
+            box.close()
+            raise
+        sandbox._owns_client = True
+        return sandbox
 
     @classmethod
     def connect(cls, sandbox_id: str, *, connection: Connection | None = None) -> Sandbox:
-        """Attach to an existing sandbox by id."""
-        return ArcBox(connection).connect(sandbox_id)
+        """Attach to an existing sandbox by id. Client ownership works as
+        in :meth:`create`."""
+        box = ArcBox(connection)
+        try:
+            sandbox = box.connect(sandbox_id)
+        except BaseException:
+            box.close()
+            raise
+        sandbox._owns_client = True
+        return sandbox
 
     @classmethod
     def list(
@@ -374,8 +416,11 @@ class Sandbox:
         labels: Mapping[str, str] | None = None,
         connection: Connection | None = None,
     ) -> Iterator[SandboxSummary]:
-        """List sandboxes (auto-paginating)."""
-        return ArcBox(connection).list(state=state, labels=labels)
+        """List sandboxes (auto-paginating). The hidden entry point's
+        HTTP client is closed when iteration finishes."""
+        with ArcBox(connection) as box:
+            for summary in box.list(state=state, labels=labels):
+                yield summary
 
     def info(self) -> SandboxInfo:
         """Fetch the sandbox's current state — always fresh, never cached."""
@@ -431,5 +476,9 @@ class Sandbox:
         # NotFoundError family, because the daemon does not attach
         # ErrorInfo details yet and a coarse NotFound on this id can only
         # mean the sandbox.
-        with suppress(NotFoundError):
-            self.kill()
+        try:
+            with suppress(NotFoundError):
+                self.kill()
+        finally:
+            if self._owns_client:
+                self._client.close()
