@@ -11,7 +11,7 @@
 // waitForExit instead of a port probe.
 import { describe, expect, it } from "vitest";
 
-import { Sandbox } from "../src/index.js";
+import { Sandbox } from "../src/index";
 
 const enabled = process.env.ARCBOX_SDK_E2E === "1";
 

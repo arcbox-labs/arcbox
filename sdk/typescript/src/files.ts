@@ -4,10 +4,10 @@ import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 
-import { FileTooLargeError, toArcBoxError } from "./errors.js";
-import type { WriteFileRequestSchema } from "./gen/arcbox/sandbox/v1/filesystem_pb.js";
-import { SandboxFilesystemService } from "./gen/arcbox/sandbox/v1/filesystem_pb.js";
-import type { ClientContext } from "./transport.js";
+import { FileTooLargeError, toArcBoxError } from "./errors";
+import type { WriteFileRequestSchema } from "./gen/arcbox/sandbox/v1/filesystem_pb";
+import { SandboxFilesystemService } from "./gen/arcbox/sandbox/v1/filesystem_pb";
+import type { ClientContext } from "./transport";
 
 /** Per-file transfer cap enforced by the daemon (`filesystem.proto`). */
 export const MAX_FILE_BYTES = 256 * 1024 * 1024;

@@ -1,9 +1,6 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 
-import {
-  ErrorCode,
-  ErrorInfoSchema,
-} from "./gen/arcbox/sandbox/v1/errors_pb.js";
+import { ErrorCode, ErrorInfoSchema } from "./gen/arcbox/sandbox/v1/errors_pb";
 
 /**
  * Options carried by every ArcBox error.

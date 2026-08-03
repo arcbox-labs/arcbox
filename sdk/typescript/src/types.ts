@@ -3,11 +3,11 @@ import { timestampDate } from "@bufbuild/protobuf/wkt";
 import type {
   SandboxInfo as SandboxInfoProto,
   SandboxSummary as SandboxSummaryProto,
-} from "./gen/arcbox/sandbox/v1/sandbox_pb.js";
+} from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import {
   IdleAction,
   SandboxState as SandboxStateProto,
-} from "./gen/arcbox/sandbox/v1/sandbox_pb.js";
+} from "./gen/arcbox/sandbox/v1/sandbox_pb";
 
 /** Lifecycle state of a sandbox. See `sandbox.proto` for the state machine. */
 export type SandboxState =
