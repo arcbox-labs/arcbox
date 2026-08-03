@@ -13,14 +13,14 @@
 //! `aarch64-unknown-linux-musl` (base `connectrpc` is transport-free) and
 //! must stay musl-clean for the guest agent's sake.
 //!
-//! The prost twins in `arcbox-protocol` remain as test support — the
-//! daemon/e2e tonic clients that prove the gRPC wire format still answers,
-//! and the reflection FILE_DESCRIPTOR_SET — plus one production consumer:
-//! the fleet agent (`fleet/arcbox-fleet-agent/src/vm.rs`) drives the
-//! daemon's gRPC endpoint with them, deliberately kept on tonic. buffa and
-//! prost encode identical protobuf bytes, so those mixed-codec peers
-//! interoperate; both representations are generated from the same `.proto`
-//! sources and therefore cannot drift.
+//! The fleet agent's daemon client and reflection's descriptor set (see
+//! [`FILE_DESCRIPTOR_SET`]) use these types too. The prost twins in
+//! `arcbox-protocol` remain ONLY as test support: the daemon/e2e tonic
+//! clients that prove the gRPC wire format still answers, and the fleet
+//! agent's tonic mock daemon. buffa and prost encode identical protobuf
+//! bytes, so those mixed-codec test peers interoperate; both
+//! representations are generated from the same `.proto` sources and
+//! therefore cannot drift.
 
 connectrpc::include_generated!();
 
@@ -33,3 +33,10 @@ pub use arcbox::sandbox::v1 as sandbox_v1;
 /// The daemon's own package, under the same short alias `arcbox-protocol`
 /// uses for its prost twin (CORE-68).
 pub use arcbox::v1;
+
+/// The compiled `FileDescriptorSet` covering every ArcBox-owned proto
+/// (all thirteen files plus their imports, with source info), produced by
+/// this crate's build script. The daemon feeds it to reflection, so the
+/// reflected surface is exactly the surface this crate generates.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/arcbox_connect.protoset"));

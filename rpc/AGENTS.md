@@ -30,12 +30,13 @@ This file is only the non-obvious operational knowledge.
   speaks Connect only, and `tonic` is absent from its dependency tree.)
   - `connectrpc` is bound to `buffa::Message`, and since CORE-73 the buffa
     types in `arcbox-connect` are the ONE runtime representation: daemon
-    handlers, `abctl`, and both ends of the vsock wire. The prost twins in
-    `arcbox-protocol` are still generated for the tonic test clients, the
-    reflection descriptor set, and one production consumer: the fleet agent
-    (`fleet/arcbox-fleet-agent/src/vm.rs`) drives the daemon's gRPC endpoint
-    with them, deliberately kept on tonic. The two codegens emit identical
-    bytes, which is what lets a prost peer talk to the buffa server.
+    handlers, `abctl`, the fleet agent's daemon client, reflection's
+    descriptor set, and both ends of the vsock wire. The prost twins in
+    `arcbox-protocol` are still generated, but ONLY test support consumes
+    them: the tonic test clients (daemon/e2e wire-format proofs) and the
+    fleet agent's tonic mock daemon. The two codegens emit identical
+    bytes, which is what lets a prost test peer prove the buffa server's
+    wire format.
   - Reflection is served by `connectrpc-reflection` from the whole daemon's
     descriptor set. It answers `501` over HTTP/1.1 Connect because
     `ServerReflectionInfo` is bidi-streaming and Connect carries bidi only
