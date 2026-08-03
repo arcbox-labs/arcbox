@@ -96,8 +96,12 @@ pub fn bind(socket_path: &std::path::Path) -> Result<UnixListener> {
 /// the services themselves.
 ///
 /// The descriptor set is `arcbox-connect`'s own — emitted by the same
-/// build script that generates the served types, so the reflected surface
-/// cannot drift from the implemented one.
+/// build script that generates the served types, so it tracks the
+/// GENERATED surface exactly. That is deliberately a superset of the
+/// served one: reflection also advertises the schema-only `AgentService`,
+/// the unregistered Container/Image services, and (off macOS) the
+/// cfg-gated `MacosService` — the same superset the prost-built set
+/// always advertised.
 ///
 /// # Errors
 ///
