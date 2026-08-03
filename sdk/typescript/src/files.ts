@@ -15,9 +15,16 @@ export const MAX_FILE_BYTES = 256 * 1024 * 1024;
 /** Chunk size for streamed writes. */
 const WRITE_CHUNK_BYTES = 256 * 1024;
 
+/** Default permission bits for created files (mirrors the daemon's default). */
+const DEFAULT_WRITE_MODE = 0o644;
+
 /** Options for file writes. */
 export interface WriteOptions {
-  /** Unix permission bits for the created file (default 0o644). */
+  /**
+   * Unix permission bits for the created file (default 0o644). The wire
+   * protocol reserves 0 as "use the default" (`filesystem.proto`), so a
+   * literal mode of 0 is not expressible — it also yields 0o644.
+   */
   mode?: number;
 }
 
@@ -91,7 +98,10 @@ export class Files {
       MessageInitShape<typeof WriteFileRequestSchema>
     > {
       yield {
-        payload: { case: "open", value: { id, path, mode: opts.mode ?? 0 } },
+        payload: {
+          case: "open",
+          value: { id, path, mode: opts.mode ?? DEFAULT_WRITE_MODE },
+        },
       };
       // Always send at least one chunk so `done` is observed, even for
       // an empty file.
