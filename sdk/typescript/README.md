@@ -83,6 +83,38 @@ TODO(CI): wire `npm run lint`, `npm run format:check`, `npm test`, and
 `npm run typecheck` into `.github/workflows` as an `sdk-typescript` job
 (follow-up; workflow changes are intentionally not part of this branch).
 
+## Releasing
+
+The SDK is a release-please component (`sdk-typescript` in
+`release-please-config.json`), released on its own cadence, independent
+of the main arcbox release train:
+
+1. Conventional commits touching `sdk/typescript` accumulate on
+   `master`.
+2. release-please maintains a dedicated release PR for the component
+   (separate from the root and fleet-agent PRs) that bumps
+   `package.json` and updates `CHANGELOG.md`.
+3. Merging that PR creates the GitHub release and the tag
+   `sdk-typescript-vX.Y.Z` (same convention as `fleet-agent-vX.Y.Z`).
+4. The tag triggers the npm publish workflow, which re-runs the full
+   gate suite (`lint`, `format:check`, `test`, `typecheck`), builds
+   with `npm run build:publish`, and publishes to npm via [trusted
+   publishing](https://docs.npmjs.com/trusted-publishers) (OIDC) —
+   tokenless, with provenance attestations generated automatically.
+   The job skips cleanly if the version is already on the registry, so
+   a re-dispatch never fails on an already-published release.
+
+One-time bootstrap (trusted publishing can only be configured for a
+package that already exists on the registry):
+
+1. First publish is manual, from `sdk/typescript`, logged in to an npm
+   account with publish rights on the `@arcbox` scope:
+   `npm run build:publish && npm publish --access public`.
+2. On npmjs.com → package settings → Trusted Publisher: select GitHub
+   Actions, repository `arcboxlabs/arcbox`, workflow filename
+   `release-sdk-typescript.yml`. From then on the tag-triggered
+   workflow publishes without any token.
+
 ## Status
 
 Phase 1 of CORE-58 — the hello-world closed loop: `Sandbox`

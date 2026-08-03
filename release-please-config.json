@@ -27,7 +27,7 @@
         }
       ],
       "changelog-path": "CHANGELOG.md",
-      "exclude-paths": ["fleet"]
+      "exclude-paths": ["fleet", "sdk/typescript"]
     },
     "fleet": {
       "component": "fleet-agent",
@@ -38,6 +38,12 @@
           "path": "arcbox-fleet-agent/Cargo.toml"
         }
       ],
+      "changelog-path": "CHANGELOG.md"
+    },
+    "sdk/typescript": {
+      "release-type": "node",
+      "component": "sdk-typescript",
+      "include-component-in-tag": true,
       "changelog-path": "CHANGELOG.md"
     }
   }
