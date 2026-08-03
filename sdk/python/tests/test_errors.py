@@ -14,6 +14,7 @@ from arcbox._envelope import unary_error
 from arcbox._gen import errors_pb2
 from arcbox.errors import (
     ArcBoxError,
+    AuthenticationError,
     CapabilityError,
     CommandTimeoutError,
     ConnectionFailedError,
@@ -116,6 +117,17 @@ def test_non_json_bodies_fall_back_to_the_http_status_table() -> None:
     unknown = unary_error(500, b"?")
     assert type(unknown) is ArcBoxError
     assert unknown.code == "unknown"
+
+
+def test_valid_json_without_a_connect_code_also_falls_back() -> None:
+    # JSON, but not Connect error JSON: something in front of the daemon
+    # answered. The HTTP status is the only signal there is.
+    gateway = unary_error(401, b'{"detail": "token expired"}')
+    assert isinstance(gateway, AuthenticationError)
+    assert gateway.code == "unauthenticated"
+    proxy = unary_error(502, b'{"error": "Bad Gateway"}')
+    assert isinstance(proxy, ConnectionFailedError)
+    assert proxy.code == "unavailable"
 
 
 def test_wrap_errors_maps_connection_failures_with_a_suggestion() -> None:
