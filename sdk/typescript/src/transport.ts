@@ -59,6 +59,14 @@ function createUdsOrTcpTransport(conn: ResolvedConnection): Transport {
   });
 }
 
+/**
+ * Call options for a plain unary RPC: the per-request deadline, when one
+ * is configured. Streams and long-polls never receive it.
+ */
+export function unaryOptions(ctx: ClientContext): { timeoutMs?: number } {
+  return ctx.requestTimeoutMs === undefined ? {} : { timeoutMs: ctx.requestTimeoutMs };
+}
+
 /** Attach the API key as a bearer credential (remote tier; ignored by the local daemon). */
 function bearerAuth(apiKey: string): Interceptor {
   return (next) => (req) => {
