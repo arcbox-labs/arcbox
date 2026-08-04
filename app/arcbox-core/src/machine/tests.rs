@@ -439,7 +439,7 @@ async fn test_create_with_mounts_extends_cmdline_and_persists() {
 /// machine is usable.
 #[test]
 fn readiness_waits_for_the_distro_init_to_settle() {
-    let info = arcbox_protocol::agent::SystemInfo {
+    let info = arcbox_connect::v1::SystemInfo {
         ip_addresses: vec!["10.0.2.2".to_owned()],
         distro_init_pending: true,
         ..Default::default()
@@ -449,7 +449,7 @@ fn readiness_waits_for_the_distro_init_to_settle() {
 
 #[test]
 fn readiness_reports_the_address_once_the_distro_init_has_settled() {
-    let info = arcbox_protocol::agent::SystemInfo {
+    let info = arcbox_connect::v1::SystemInfo {
         ip_addresses: vec!["10.0.2.2".to_owned()],
         distro_init_pending: false,
         ..Default::default()
@@ -463,10 +463,10 @@ fn readiness_reports_the_address_once_the_distro_init_has_settled() {
 /// signal that agent will never send.
 #[test]
 fn an_agent_without_the_field_is_not_treated_as_pending() {
-    let decoded = arcbox_protocol::agent::SystemInfo::default();
+    let decoded = arcbox_connect::v1::SystemInfo::default();
     assert!(!decoded.distro_init_pending);
 
-    let info = arcbox_protocol::agent::SystemInfo {
+    let info = arcbox_connect::v1::SystemInfo {
         ip_addresses: vec!["10.0.2.2".to_owned()],
         ..Default::default()
     };
@@ -477,7 +477,7 @@ fn an_agent_without_the_field_is_not_treated_as_pending() {
 /// gate is additive, it does not replace the address requirement.
 #[test]
 fn a_settled_init_without_a_usable_address_is_still_not_ready() {
-    let info = arcbox_protocol::agent::SystemInfo {
+    let info = arcbox_connect::v1::SystemInfo {
         ip_addresses: vec!["127.0.0.1".to_owned()],
         distro_init_pending: false,
         ..Default::default()

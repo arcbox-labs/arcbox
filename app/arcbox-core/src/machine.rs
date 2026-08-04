@@ -1316,11 +1316,7 @@ impl MachineManager {
 /// would otherwise have returned. Waiting for the guest's init to settle is
 /// what makes readiness mean "usable" rather than "the agent is alive"
 /// (CORE-66).
-fn readiness_ip(
-    info: &arcbox_protocol::agent::SystemInfo,
-    name: &str,
-    attempt: u32,
-) -> Option<String> {
+fn readiness_ip(info: &arcbox_connect::v1::SystemInfo, name: &str, attempt: u32) -> Option<String> {
     if info.distro_init_pending {
         tracing::trace!(
             "Machine '{name}' distro init still starting (attempt {attempt}); not ready",
