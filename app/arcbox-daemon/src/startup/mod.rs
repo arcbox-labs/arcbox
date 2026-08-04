@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arcbox_api::SetupPhase;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
-use arcbox_core::{Config, Runtime};
+use arcbox_core::{Config, InitProgress, Runtime};
 use macos_resolver::to_env_prefix;
 use tracing::{info, warn};
 
@@ -207,7 +207,8 @@ async fn prepare_assets(ctx: &DaemonContext) -> Result<assets::PreparedAssets> {
 /// Phase 2: seed/download boot assets, build runtime, start VM.
 ///
 /// Called after gRPC SystemService is already listening so clients
-/// can observe DOWNLOADING_ASSETS → ASSETS_READY progression.
+/// can observe DOWNLOADING_ASSETS → ASSETS_READY progression, and
+/// publishes VM_STARTING → VM_READY around the guest boot itself.
 /// Returns the initialized runtime.
 async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     let mut config = Config::load_for_profile(ctx.profile).unwrap_or_else(|err| {
@@ -241,8 +242,24 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     ctx.early_runtime
         .set(Arc::clone(&runtime))
         .map_err(|_| anyhow::anyhow!("init_runtime called twice"))?;
+    // Armed before `init` for the same reason `early_runtime` is published
+    // here: the VM reaches its ready state partway through the call below, so
+    // a mirror started after it returns would report the VM down across the
+    // whole window between the agent answering and dockerd coming up.
+    crate::services::spawn_vm_running_mirror(ctx, &runtime);
+    // The guest boot is the longest stretch of startup and the only one a
+    // client cannot infer from anything else, so the runtime reports its
+    // milestones from inside and they are published as they arrive.
     runtime
-        .init()
+        .init(|milestone| match milestone {
+            InitProgress::SystemVmStarting => ctx
+                .setup_state
+                .set_phase(SetupPhase::VmStarting, "Starting the Linux VM…"),
+            InitProgress::SystemVmReady => ctx.setup_state.set_phase(
+                SetupPhase::VmReady,
+                "Linux VM ready; waiting for the container runtime…",
+            ),
+        })
         .await
         .context("Failed to initialize runtime")?;
     info!(
@@ -255,9 +272,20 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
         runtime.network_manager().set_dns_domain(&ctx.dns_domain);
     }
 
+    let sandbox_cleanup_supported = if runtime.config().vm.autostart {
+        arcbox_api::initialize_sandbox_cleanup(&runtime)
+            .await
+            .context("Failed to initialize sandbox cleanup")?
+    } else {
+        false
+    };
+
     ctx.shared_runtime
         .set(Arc::clone(&runtime))
         .map_err(|_| anyhow::anyhow!("init_runtime called twice"))?;
+    if sandbox_cleanup_supported {
+        arcbox_api::spawn_sandbox_cleanup(Arc::clone(&runtime));
+    }
     Ok(runtime)
 }
 

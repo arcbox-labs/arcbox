@@ -21,7 +21,6 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
-tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
@@ -31,16 +30,18 @@ dirs = { workspace = true }
 libc = { workspace = true }
 arcbox-constants = { workspace = true }
 arcbox-net = { workspace = true }
-serde_json.workspace = true
 axum.workspace = true
 bytes.workspace = true
 http-body-util = "0.1"
 tokio-util = "0.7"
 arcbox-docker-tools.workspace = true
 filetime = "0.2.29"
-arcbox-grpc.workspace = true
-tonic-reflection = "0.14"
 arcbox-transport.workspace = true
+connectrpc = { version = "0.8.1", features = ["axum"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
+hyper-util = { version = "0.1.20", features = ["server", "server-auto", "server-graceful", "tokio", "http1", "http2", "service"] }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
+connectrpc-reflection = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.0" }
+arcbox-connect.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-route.workspace = true
@@ -62,4 +63,11 @@ gic = ["arcbox-core/gic"]
 workspace = true
 
 [dev-dependencies]
+arcbox-grpc.workspace = true
+arcbox-protocol.workspace = true
+connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", features = ["client"] }
+serde_json.workspace = true
 tempfile.workspace = true
+tonic.workspace = true
+tonic-reflection = "0.14"
+tower.workspace = true

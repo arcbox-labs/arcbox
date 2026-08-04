@@ -17,10 +17,6 @@ pub enum ApiError {
     #[error("core error: {0}")]
     Core(#[from] arcbox_core::CoreError),
 
-    /// gRPC error.
-    #[error("gRPC error: {0}")]
-    Grpc(#[from] tonic::transport::Error),
-
     /// Server error.
     #[error("server error: {0}")]
     Server(String),
@@ -37,31 +33,39 @@ impl From<std::io::Error> for ApiError {
     }
 }
 
-impl From<ApiError> for tonic::Status {
+/// Every service answers over Connect, so `ApiError` classifies straight
+/// into a Connect error code. The assignments predate the tonic retirement
+/// (CORE-68/73): clients see the same codes the gRPC services always
+/// answered.
+impl From<ApiError> for connectrpc::ConnectError {
     fn from(err: ApiError) -> Self {
+        use connectrpc::ErrorCode;
+
         let message = err.to_string();
-        match &err {
+        let code = match &err {
             ApiError::Common(common) => match common {
-                CommonError::Config(_) => Self::invalid_argument(message),
-                CommonError::NotFound(_) => Self::not_found(message),
-                CommonError::AlreadyExists(_) => Self::already_exists(message),
-                CommonError::InvalidState(_) => Self::failed_precondition(message),
-                CommonError::Timeout(_) => Self::deadline_exceeded(message),
-                CommonError::PermissionDenied(_) => Self::permission_denied(message),
-                _ => Self::internal(message),
+                CommonError::Config(_) => ErrorCode::InvalidArgument,
+                CommonError::NotFound(_) => ErrorCode::NotFound,
+                CommonError::AlreadyExists(_) => ErrorCode::AlreadyExists,
+                CommonError::InvalidState(_) => ErrorCode::FailedPrecondition,
+                CommonError::Timeout(_) => ErrorCode::DeadlineExceeded,
+                CommonError::PermissionDenied(_) => ErrorCode::PermissionDenied,
+                _ => ErrorCode::Internal,
             },
             // Agent-reported errors carry an HTTP-style code over the wire.
             ApiError::Core(arcbox_core::CoreError::Agent { code, .. }) => match code {
-                400 => Self::invalid_argument(message),
-                404 => Self::not_found(message),
-                409 => Self::already_exists(message),
-                412 => Self::failed_precondition(message),
-                503 => Self::unavailable(message),
-                _ => Self::internal(message),
+                400 => ErrorCode::InvalidArgument,
+                404 => ErrorCode::NotFound,
+                409 => ErrorCode::AlreadyExists,
+                412 => ErrorCode::FailedPrecondition,
+                // Stdin offset gap: the client resyncs via GetStdinStatus.
+                416 => ErrorCode::OutOfRange,
+                503 => ErrorCode::Unavailable,
+                _ => ErrorCode::Internal,
             },
-            ApiError::Grpc(_) => Self::unavailable(message),
-            _ => Self::internal(message),
-        }
+            _ => ErrorCode::Internal,
+        };
+        Self::new(code, message)
     }
 }
 

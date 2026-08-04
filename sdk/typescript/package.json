@@ -1,0 +1,56 @@
+{
+  "name": "@arcbox/sandbox",
+  "version": "0.1.0",
+  "description": "ArcBox Sandbox SDK for TypeScript — run isolated microVM sandboxes on your Mac",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arcboxlabs/arcbox.git",
+    "directory": "sdk/typescript"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "!dist/**/*.tsbuildinfo"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "bunchee",
+    "build:publish": "rm -rf dist && bunchee",
+    "prepublishOnly": "npm run build:publish && vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint --format=sukka .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "test": "vitest run",
+    "generate": "buf generate"
+  },
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.13.0",
+    "@connectrpc/connect": "^2.1.2",
+    "@connectrpc/connect-node": "^2.1.2"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.6",
+    "@bufbuild/buf": "^1.72.0",
+    "@bufbuild/protoc-gen-es": "^2.13.0",
+    "@types/node": "^26.1.2",
+    "bunchee": "^7.0.0",
+    "eslint": "^10.8.0",
+    "eslint-config-sukka": "^8.14.2",
+    "eslint-formatter-sukka": "^8.14.2",
+    "eslint-import-resolver-typescript": "^4.4.5",
+    "foxts": "^5.8.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

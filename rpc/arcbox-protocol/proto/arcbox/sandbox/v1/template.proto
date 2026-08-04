@@ -1,0 +1,188 @@
+// Sandbox template catalog (CORE-21).
+//
+// A template is a named, versioned, reproducible base for sandboxes: a
+// built rootfs plus a default-config bundle (resources, startup command,
+// env, exposed ports, ready probe), optionally paired with a pre-warmed
+// boot-to-ready snapshot for sub-second starts. Templates are what users
+// author and share ("code-interpreter", "web-scraper", ...);
+// `CreateSandboxRequest.template` resolves `name[:version]` references
+// against this catalog.
+//
+// Control plane: the catalog addresses the fleet, not one sandbox.
+// Checkpoint/restore of a *live* sandbox stays in `snapshot.proto`;
+// promoting a checkpoint into a reusable template goes through
+// `Build` with a `snapshot_id` source.
+
+syntax = "proto3";
+
+package arcbox.sandbox.v1;
+
+import "arcbox/sandbox/v1/sandbox.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// TemplateService manages the template catalog. Control plane.
+//
+// Contract-only in CORE-58 phase 1: the daemon answers UNIMPLEMENTED
+// until the catalog lands with CORE-21. Build additionally depends on the
+// rootfs pipeline (CORE-5) and, for pre-warmed snapshots, FC 1.16
+// network overrides (CORE-16).
+service TemplateService {
+    // Build a template from a source and register it in the catalog.
+    // Blocks until the build completes; a streaming progress variant can
+    // be added additively later. The result is an unpublished draft
+    // addressed as `name` until Publish freezes a version.
+    rpc Build(BuildTemplateRequest) returns (Template);
+
+    // Freeze the template's current content as an immutable version.
+    // Bare-name references then resolve to the newest published version.
+    rpc Publish(PublishTemplateRequest) returns (Template);
+
+    // Resolve a `name[:version]` reference to its template.
+    rpc Get(GetTemplateRequest) returns (Template);
+
+    // List templates, optionally filtered by labels. Paginated.
+    rpc List(ListTemplatesRequest) returns (ListTemplatesResponse);
+
+    // Delete a template version — or, for a bare-name reference, the
+    // template with all its versions — and its on-disk artifacts.
+    // Sandboxes already created from it are unaffected.
+    rpc Delete(DeleteTemplateRequest) returns (google.protobuf.Empty);
+}
+
+// A template: named, versioned, reproducible sandbox base.
+message Template {
+    // Template name, unique in the catalog.
+    string name = 1;
+    // Published version this record describes (empty = unpublished draft).
+    string version = 2;
+    // Content digest pinning this version's artifacts.
+    string digest = 3;
+    // Reference to the built rootfs image in the rootfs cache.
+    string rootfs_ref = 4;
+    // Pre-warmed boot-to-ready snapshot (empty = cold boot from
+    // `rootfs_ref`). Not a oneof with `rootfs_ref`: a built rootfs and
+    // its pre-warmed snapshot compose — creating from this template
+    // restores the snapshot for sub-second READY (CORE-16).
+    string warm_snapshot_id = 5;
+    // Defaults applied to sandboxes created from this template.
+    TemplateDefaults defaults = 6;
+    // Creation time of this version.
+    google.protobuf.Timestamp created_at = 7;
+    // Arbitrary key-value metadata (filterable in List).
+    map<string, string> labels = 8;
+    // On-disk footprint of this version's artifacts (rootfs + warm
+    // snapshot).
+    uint64 size_bytes = 9;
+}
+
+// Default configuration a template applies to sandboxes created from it.
+// `limits`, `cmd`, and `env` can be overridden per sandbox — the
+// override/merge rules, including the `no_default_cmd`/`no_default_env`
+// explicit-empty flags, live on the CreateSandboxRequest fields.
+// `exposed_ports` and `ready_probe` have no per-create counterpart and
+// apply as-is.
+message TemplateDefaults {
+    // Default resource limits.
+    ResourceLimits limits = 1;
+    // Default initial command (see CreateSandboxRequest.cmd).
+    repeated string cmd = 2;
+    // Default environment for the initial command.
+    map<string, string> env = 3;
+    // Ports the workload is expected to listen on; clients may expose
+    // them without knowing the workload.
+    repeated uint32 exposed_ports = 4;
+    // How to decide the sandbox is ready for use (unset = READY as soon
+    // as the VM accepts executions).
+    ReadyProbe ready_probe = 5;
+}
+
+// Readiness probe run inside a sandbox after boot.
+message ReadyProbe {
+    oneof probe {
+        // Ready when something inside the sandbox listens on this TCP
+        // port.
+        uint32 port = 1;
+        // Ready when this command exits 0.
+        CommandProbe command = 2;
+    }
+    // Give up after this many seconds and mark the sandbox FAILED
+    // (0 = daemon default).
+    uint32 timeout_seconds = 3;
+}
+
+// Command form of a ReadyProbe.
+message CommandProbe {
+    // Command and arguments to run inside the sandbox.
+    repeated string cmd = 1;
+}
+
+// Request to build a template.
+message BuildTemplateRequest {
+    // Template name to register the result under.
+    string name = 1;
+
+    // What to build the rootfs from.
+    oneof source {
+        // A local Docker image reference, converted to a rootfs via the
+        // in-guest OCI pipeline (CORE-5).
+        string docker_ref = 2;
+        // Inline Dockerfile content, built in-guest then converted
+        // (CORE-5).
+        string dockerfile = 3;
+        // Promote an existing checkpoint (snapshot.proto) into a
+        // template: no build runs, and the checkpoint becomes the
+        // template's warm snapshot.
+        string snapshot_id = 4;
+    }
+
+    // Defaults for sandboxes created from this template.
+    TemplateDefaults defaults = 5;
+    // Labels for the template.
+    map<string, string> labels = 6;
+    // Also boot the built rootfs once and checkpoint it at READY, so the
+    // template carries a warm snapshot (requires CORE-16; ignored for
+    // `snapshot_id` sources, which are warm by construction).
+    bool prewarm = 7;
+}
+
+// Request to publish a template version.
+message PublishTemplateRequest {
+    // Template name.
+    string name = 1;
+    // Version to freeze the current draft content as (e.g. "1.2.0").
+    string version = 2;
+}
+
+// Request to resolve a template reference.
+message GetTemplateRequest {
+    // `name` or `name:version`. A bare name resolves to the newest
+    // published version, or the draft when nothing is published.
+    string reference = 1;
+}
+
+// Request to list templates.
+message ListTemplatesRequest {
+    // Filter by labels (all key-value pairs must match).
+    map<string, string> labels = 1;
+    // Maximum entries per page (0 = server default of 100; capped at
+    // 1000).
+    uint32 page_size = 2;
+    // Continuation token from a previous response (empty = first page).
+    string page_token = 3;
+}
+
+// Response to ListTemplates.
+message ListTemplatesResponse {
+    // One entry per template version (drafts included).
+    repeated Template templates = 1;
+    // Token for the next page; empty when this is the last page.
+    string next_page_token = 2;
+}
+
+// Request to delete a template.
+message DeleteTemplateRequest {
+    // `name` (delete the template and all its versions) or
+    // `name:version` (delete one version).
+    string reference = 1;
+}

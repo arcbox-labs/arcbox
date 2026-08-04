@@ -16,6 +16,8 @@ mod agent;
 // logic stays unit-testable on hosts.
 mod boot_done;
 mod init;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod runtime_materialize;
 mod supervisor;
 
 // Consumed by the Linux agent's WatchMemoryPressure handler; the library
@@ -32,6 +34,10 @@ mod stats;
 #[cfg(target_os = "linux")]
 mod metadata_migrate;
 
+#[cfg(target_os = "linux")]
+mod create_key;
+#[cfg(target_os = "linux")]
+mod create_registry;
 #[cfg(target_os = "linux")]
 mod error;
 
@@ -61,6 +67,8 @@ mod config;
 mod rootfs_builder;
 #[cfg(target_os = "linux")]
 mod sandbox;
+#[cfg(target_os = "linux")]
+mod sandbox_cleanup_watch;
 
 // DNS: legacy /etc/hosts management (being replaced by dns_server).
 mod dns;

@@ -1,6 +1,12 @@
 use super::*;
+use serde::{Deserialize, Serialize};
 
 pub type SandboxId = String;
+
+pub(super) struct SandboxBootTask {
+    pub(super) resource_handoff: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub(super) handle: tokio::task::JoinHandle<()>,
+}
 
 // State
 
@@ -37,14 +43,14 @@ impl std::fmt::Display for SandboxState {
 // Spec types (input to SandboxManager methods)
 
 /// Network configuration supplied at sandbox creation time.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxNetworkSpec {
     /// `"tap"` (default) or `"none"`.
     pub mode: String,
 }
 
 /// A single bind-mount into the sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxMountSpec {
     pub source: String,
     pub target: String,
@@ -58,7 +64,8 @@ pub struct SandboxMountSpec {
 /// once the sandbox is ready, through the same path as `Run`.
 /// `mounts`, `image`, and `ssh_public_key` are validated at the service
 /// boundary (see the guest agent's `SandboxService::create`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SandboxSpec {
     /// Caller-supplied ID; auto-generated (UUID) when `None` or empty.
     pub id: Option<String>,
@@ -74,8 +81,6 @@ pub struct SandboxSpec {
     pub vcpus: u32,
     /// Memory in MiB (0 = daemon default).
     pub memory_mib: u64,
-    /// OCI image reference (empty = use rootfs directly; reserved for future use).
-    pub image: String,
     /// Initial command launched automatically after boot (empty = none).
     pub cmd: Vec<String>,
     /// Environment variables for the initial command.
@@ -115,12 +120,18 @@ pub struct RestoreSandboxSpec {
 pub struct SandboxInstance {
     /// Unique identifier.
     pub id: SandboxId,
+    /// Durable lifecycle record generation.
+    pub(super) record_generation: Option<Uuid>,
     /// User-supplied labels.
     pub labels: HashMap<String, String>,
     /// Original creation spec.
     pub spec: SandboxSpec,
     /// Current lifecycle state.
     pub state: SandboxState,
+    /// Serializes Stop/Remove and failure cleanup for this generation.
+    pub(super) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
+    /// In-flight boot, retained until Remove can cancel and join it.
+    pub(super) boot_task: Option<SandboxBootTask>,
     /// Handle to the Firecracker process.
     pub process: Option<fc_sdk::FirecrackerProcess>,
     /// Post-boot API handle (present once the VM has booted).
@@ -138,16 +149,12 @@ pub struct SandboxInstance {
     pub ready_at: Option<DateTime<Utc>>,
     /// When the last workload exited.
     pub last_exited_at: Option<DateTime<Utc>>,
-    /// Exit code of the last workload.
-    pub last_exit_code: Option<i32>,
+    /// How the last workload terminated.
+    pub last_exit_status: Option<ExitStatus>,
     /// Human-readable error (only set when state == `Failed`).
     pub error: Option<String>,
     /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
     pub cow_handle: Option<CowHandle>,
-    /// For restored sandboxes only: the original sandbox's vm_dir, recreated
-    /// so the vmstate-recorded `rootfs.link` symlink (and FC vsock socket)
-    /// resolve correctly.  Removed alongside the sandbox.
-    pub restore_origin_dir: Option<PathBuf>,
 }
 
 impl SandboxInstance {
@@ -157,11 +164,34 @@ impl SandboxInstance {
         network: Option<NetworkAllocation>,
         vm_dir: PathBuf,
     ) -> Self {
+        Self::new_inner(id, spec, network, vm_dir, None)
+    }
+
+    pub(super) fn new_with_generation(
+        id: SandboxId,
+        spec: SandboxSpec,
+        network: Option<NetworkAllocation>,
+        vm_dir: PathBuf,
+        generation: Uuid,
+    ) -> Self {
+        Self::new_inner(id, spec, network, vm_dir, Some(generation))
+    }
+
+    fn new_inner(
+        id: SandboxId,
+        spec: SandboxSpec,
+        network: Option<NetworkAllocation>,
+        vm_dir: PathBuf,
+        record_generation: Option<Uuid>,
+    ) -> Self {
         Self {
             id,
+            record_generation,
             labels: spec.labels.clone(),
             spec,
             state: SandboxState::Starting,
+            cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            boot_task: None,
             process: None,
             vm: None,
             network,
@@ -170,10 +200,9 @@ impl SandboxInstance {
             created_at: Utc::now(),
             ready_at: None,
             last_exited_at: None,
-            last_exit_code: None,
+            last_exit_status: None,
             error: None,
             cow_handle: None,
-            restore_origin_dir: None,
         }
     }
 
@@ -206,7 +235,7 @@ pub struct SandboxInfo {
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub last_exited_at: Option<DateTime<Utc>>,
-    pub last_exit_code: Option<i32>,
+    pub last_exit_status: Option<ExitStatus>,
     pub error: Option<String>,
 }
 
@@ -219,12 +248,28 @@ pub struct SandboxNetworkInfo {
 
 // Events
 
+/// The `action` values a [`SandboxEvent`] carries, in lifecycle order.
+///
+/// `action` stays a `String` on the event (it crosses the API as one), but
+/// every emit site and match in this crate goes through these constants, so
+/// renaming or adding an action is a change here — not a grep for string
+/// literals whose miss surfaces as silently skipped teardown handling.
+pub mod action {
+    pub const CREATED: &str = "created";
+    pub const READY: &str = "ready";
+    pub const RUNNING: &str = "running";
+    pub const IDLE: &str = "idle";
+    pub const STOPPING: &str = "stopping";
+    pub const STOPPED: &str = "stopped";
+    pub const FAILED: &str = "failed";
+    pub const REMOVED: &str = "removed";
+}
+
 /// A sandbox lifecycle event broadcast to subscribers.
 #[derive(Debug, Clone)]
 pub struct SandboxEvent {
     pub sandbox_id: SandboxId,
-    /// Action: `"created"` | `"ready"` | `"running"` | `"idle"` |
-    ///         `"stopping"` | `"stopped"` | `"failed"` | `"removed"`
+    /// One of the [`action`] constants.
     pub action: String,
     /// Unix nanoseconds.
     pub timestamp_ns: i64,
@@ -245,6 +290,17 @@ impl SandboxEvent {
     pub(super) fn with_attr(mut self, key: &str, value: &str) -> Self {
         self.attributes.insert(key.to_owned(), value.to_owned());
         self
+    }
+
+    /// Whether this event marks the sandbox's teardown — nothing can run in
+    /// it afterwards. A new terminal action must be added here, or torn-down
+    /// sandboxes silently stop purging their executions.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.action.as_str(),
+            action::STOPPED | action::FAILED | action::REMOVED
+        )
     }
 }
 

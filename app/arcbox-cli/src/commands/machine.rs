@@ -2,81 +2,38 @@
 
 use anyhow::{Context, Result};
 use arcbox_cli::terminal::{RawModeGuard, TerminalSize};
-use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
-use arcbox_protocol::v1::TerminalSize as ProtoTerminalSize;
-use arcbox_protocol::v1::{
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::MachineServiceClient;
+use arcbox_connect::v1::TerminalSize as ProtoTerminalSize;
+use arcbox_connect::v1::{
     CreateMachineRequest, DirectoryMount, InspectMachineRequest, ListMachinesRequest,
     MachineAgentRequest, MachineExecInput, MachineExecRequest, RemoveMachineRequest,
     StartMachineRequest, StopMachineRequest, machine_exec_input,
 };
 use clap::{Args, Subcommand};
 use humantime::format_duration;
-use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
-use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 use tokio::io::AsyncReadExt as _;
-use tokio::net::UnixStream;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::codegen::{Service, http::Uri};
-use tonic::transport::{Channel, Endpoint};
 
-pub async fn machine_client() -> Result<MachineServiceClient<Channel>> {
-    let socket_path = super::resolve_grpc_socket_path();
-
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-
-    Ok(MachineServiceClient::new(channel))
-}
-
-pub struct UnixConnector {
-    socket_path: PathBuf,
-}
-
-impl UnixConnector {
-    pub(crate) fn new(socket_path: PathBuf) -> Self {
-        Self { socket_path }
-    }
-}
-
-impl Service<Uri> for UnixConnector {
-    type Response = TokioIo<UnixStream>;
-    type Error = std::io::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: Uri) -> Self::Future {
-        let socket_path = self.socket_path.clone();
-        Box::pin(async move {
-            let stream = UnixStream::connect(socket_path).await?;
-            Ok(TokioIo::new(stream))
-        })
-    }
+pub fn machine_client() -> MachineServiceClient<connectrpc::client::SharedHttp2Connection> {
+    let (transport, config) = crate::connect::daemon(&super::resolve_grpc_socket_path());
+    MachineServiceClient::new(transport, config)
 }
 
 /// Returns the number of machines visible through the daemon gRPC API.
 pub async fn machine_count() -> Result<usize> {
-    let mut client = machine_client().await?;
-    let response = client
-        .list(tonic::Request::new(ListMachinesRequest { all: true }))
+    let client = machine_client();
+    let response: pb::ListMachinesResponse = client
+        .list(ListMachinesRequest {
+            all: true,
+            ..Default::default()
+        })
         .await
-        .context("Failed to list machines")?;
+        .context("Failed to list machines")?
+        .into_owned();
 
-    Ok(response.into_inner().machines.len())
+    Ok(response.machines.len())
 }
 
 fn parse_mount(mount: &str) -> Result<DirectoryMount> {
@@ -92,6 +49,7 @@ fn parse_mount(mount: &str) -> Result<DirectoryMount> {
         host_path: host.to_string(),
         guest_path: guest.to_string(),
         readonly: false,
+        ..Default::default()
     })
 }
 
@@ -256,7 +214,7 @@ pub async fn execute(cmd: MachineCommands) -> Result<()> {
 }
 
 async fn execute_create(args: CreateArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let mounts = args
         .mount
         .iter()
@@ -264,7 +222,7 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     client
-        .create(tonic::Request::new(CreateMachineRequest {
+        .create(CreateMachineRequest {
             name: args.name.clone(),
             // 0 = let the daemon apply its default (host core count).
             cpus: args.cpus.unwrap_or(0),
@@ -277,7 +235,8 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
             ssh_public_key: String::new(),
             kernel: args.kernel.clone().unwrap_or_default(),
             cmdline: args.cmdline.clone().unwrap_or_default(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to create machine")?;
 
@@ -296,14 +255,15 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
 }
 
 async fn execute_start(args: StartArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
 
     println!("Starting machine '{}'...", args.name);
 
     client
-        .start(tonic::Request::new(StartMachineRequest {
+        .start(StartMachineRequest {
             id: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to start machine")?;
 
@@ -311,9 +271,10 @@ async fn execute_start(args: StartArgs) -> Result<()> {
     let mut delay = std::time::Duration::from_millis(200);
     for attempt in 1..=MAX_AGENT_WAIT_ATTEMPTS {
         match client
-            .ping(tonic::Request::new(MachineAgentRequest {
+            .ping(MachineAgentRequest {
                 id: args.name.clone(),
-            }))
+                ..Default::default()
+            })
             .await
         {
             Ok(_) => break,
@@ -330,15 +291,17 @@ async fn execute_start(args: StartArgs) -> Result<()> {
 
     println!("Machine '{}' started", args.name);
     if let Ok(resp) = client
-        .inspect(tonic::Request::new(InspectMachineRequest {
+        .inspect(InspectMachineRequest {
             id: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
     {
-        if let Some(network) = resp.into_inner().network {
-            if !network.ip_address.is_empty() {
-                println!("IP:      {}", network.ip_address);
-            }
+        let info: pb::MachineInfo = resp.into_owned();
+        // An unset `network` derefs to the default instance (empty IP), so
+        // the "no IP" case needs no separate branch.
+        if !info.network.ip_address.is_empty() {
+            println!("IP:      {}", info.network.ip_address);
         }
     }
 
@@ -346,15 +309,16 @@ async fn execute_start(args: StartArgs) -> Result<()> {
 }
 
 async fn execute_stop(args: StopArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
 
     println!("Stopping machine '{}'...", args.name);
 
     client
-        .stop(tonic::Request::new(StopMachineRequest {
+        .stop(StopMachineRequest {
             id: args.name.clone(),
             force: args.force,
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to stop machine")?;
 
@@ -364,16 +328,17 @@ async fn execute_stop(args: StopArgs) -> Result<()> {
 }
 
 async fn execute_remove(args: RemoveArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
 
     client
-        .remove(tonic::Request::new(RemoveMachineRequest {
+        .remove(RemoveMachineRequest {
             id: args.name.clone(),
             force: args.force,
             // Removal always deletes the machine directory; the wire field
             // is retained for compatibility only.
             volumes: false,
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to remove machine")?;
 
@@ -383,12 +348,15 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
 }
 
 async fn execute_list(args: ListArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let machines = client
-        .list(tonic::Request::new(ListMachinesRequest { all: args.all }))
+        .list(ListMachinesRequest {
+            all: args.all,
+            ..Default::default()
+        })
         .await
         .context("Failed to list machines")?
-        .into_inner()
+        .into_owned()
         .machines;
 
     if args.quiet {
@@ -436,28 +404,22 @@ async fn execute_list(args: ListArgs) -> Result<()> {
 }
 
 async fn execute_status(args: StatusArgs) -> Result<()> {
-    let mut client = machine_client().await?;
-    let machine = client
-        .inspect(tonic::Request::new(InspectMachineRequest {
+    let client = machine_client();
+    let machine: pb::MachineInfo = client
+        .inspect(InspectMachineRequest {
             id: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to get machine status")?
-        .into_inner();
+        .into_owned();
 
-    let cpus = machine.hardware.as_ref().map_or(0, |h| h.cpus);
-    let memory_mb = machine
-        .hardware
-        .as_ref()
-        .map_or(0, |h| h.memory / (1024 * 1024));
-    let disk_gb = machine
-        .storage
-        .as_ref()
-        .map_or(0, |s| s.disk_size / (1024 * 1024 * 1024));
-    let ip_address = machine
-        .network
-        .as_ref()
-        .map(|n| n.ip_address.as_str())
+    // Unset sub-messages deref to their default instances, which carry the
+    // same zero/empty values the old Option-based fallbacks produced.
+    let cpus = machine.hardware.cpus;
+    let memory_mb = machine.hardware.memory / (1024 * 1024);
+    let disk_gb = machine.storage.disk_size / (1024 * 1024 * 1024);
+    let ip_address = Some(machine.network.ip_address.as_str())
         .filter(|ip| !ip.is_empty())
         .unwrap_or("-");
 
@@ -473,26 +435,30 @@ async fn execute_status(args: StatusArgs) -> Result<()> {
 }
 
 async fn execute_inspect(args: InspectArgs) -> Result<()> {
-    let mut client = machine_client().await?;
-    let machine = client
-        .inspect(tonic::Request::new(InspectMachineRequest {
+    let client = machine_client();
+    let machine: pb::MachineInfo = client
+        .inspect(InspectMachineRequest {
             id: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to inspect machine")?
-        .into_inner();
+        .into_owned();
 
+    // Sub-message derefs fall back to default instances (zero/empty), which
+    // matches the old Option-based fallbacks — the JSON shape is unchanged,
+    // including `ip_address: null` when the machine has no address.
     let payload = serde_json::json!({
         "id": machine.id,
         "name": machine.name,
         "state": machine.state,
-        "cpus": machine.hardware.as_ref().map_or(0, |h| h.cpus),
-        "memory_mb": machine.hardware.as_ref().map_or(0, |h| h.memory / (1024 * 1024)),
-        "disk_gb": machine.storage.as_ref().map_or(0, |s| s.disk_size / (1024 * 1024 * 1024)),
-        "ip_address": machine.network.as_ref().map(|n| n.ip_address.clone()).filter(|ip| !ip.is_empty()),
-        "kernel": machine.os.as_ref().map_or(String::new(), |os| os.kernel.clone()),
-        "distro": machine.os.as_ref().map_or(String::new(), |os| os.distro.clone()),
-        "distro_version": machine.os.as_ref().map_or(String::new(), |os| os.version.clone()),
+        "cpus": machine.hardware.cpus,
+        "memory_mb": machine.hardware.memory / (1024 * 1024),
+        "disk_gb": machine.storage.disk_size / (1024 * 1024 * 1024),
+        "ip_address": Some(machine.network.ip_address.clone()).filter(|ip| !ip.is_empty()),
+        "kernel": machine.os.kernel.clone(),
+        "distro": machine.os.distro.clone(),
+        "distro_version": machine.os.version.clone(),
     });
 
     println!(
@@ -504,15 +470,16 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
 }
 
 async fn execute_ping(args: PingArgs) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let started = std::time::Instant::now();
-    let response = client
-        .ping(tonic::Request::new(MachineAgentRequest {
+    let response: pb::MachinePingResponse = client
+        .ping(MachineAgentRequest {
             id: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to ping agent")?
-        .into_inner();
+        .into_owned();
     let elapsed = started.elapsed();
 
     println!(
@@ -525,14 +492,15 @@ async fn execute_ping(args: PingArgs) -> Result<()> {
 }
 
 async fn execute_info(args: InfoArgs) -> Result<()> {
-    let mut client = machine_client().await?;
-    let info = client
-        .get_system_info(tonic::Request::new(MachineAgentRequest {
+    let client = machine_client();
+    let info: pb::MachineSystemInfo = client
+        .get_system_info(MachineAgentRequest {
             id: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to get system info")?
-        .into_inner();
+        .into_owned();
 
     let total_mb = info.total_memory / 1024 / 1024;
     let available_mb = info.available_memory / 1024 / 1024;
@@ -566,25 +534,26 @@ async fn execute_ssh(args: SshArgs) -> Result<()> {
 /// Runs an interactive PTY session in a machine: local terminal in raw mode,
 /// stdin and SIGWINCH resizes pumped up, merged PTY output written to stdout.
 async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
-    let mut client = machine_client().await?;
-
-    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<MachineExecInput>(16);
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<MachineExecInput>(16);
 
     let tty_size = TerminalSize::current().ok().map(|s| ProtoTerminalSize {
         width: u32::from(s.cols),
         height: u32::from(s.rows),
+        ..Default::default()
     });
 
     // The first message in the stream must be the Init payload.
     msg_tx
         .send(MachineExecInput {
-            payload: Some(machine_exec_input::Payload::Init(MachineExecRequest {
+            payload: MachineExecRequest {
                 id: name.to_string(),
                 cmd,
                 tty: true,
-                tty_size,
+                tty_size: tty_size.into(),
                 ..Default::default()
-            })),
+            }
+            .into(),
+            ..Default::default()
         })
         .await
         .context("Failed to send exec session init")?;
@@ -598,10 +567,13 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
             tokio::spawn(async move {
                 while let Some(size) = watcher.recv().await {
                     let msg = MachineExecInput {
-                        payload: Some(machine_exec_input::Payload::Resize(ProtoTerminalSize {
+                        payload: ProtoTerminalSize {
                             width: u32::from(size.cols),
                             height: u32::from(size.rows),
-                        })),
+                            ..Default::default()
+                        }
+                        .into(),
+                        ..Default::default()
                     };
                     if resize_tx.send(msg).await.is_err() {
                         break;
@@ -624,6 +596,7 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
                     if stdin_tx
                         .send(MachineExecInput {
                             payload: Some(machine_exec_input::Payload::Stdin(buf[..n].to_vec())),
+                            ..Default::default()
                         })
                         .await
                         .is_err()
@@ -635,19 +608,37 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
         }
     });
 
-    let mut stream = client
-        .exec_session(tonic::Request::new(ReceiverStream::new(msg_rx)))
+    // An interactive PTY drives both directions at once, so split the bidi
+    // stream into independently owned halves: the send half moves into a
+    // forwarder task, the receive half stays here.
+    let client = machine_client();
+    let stream = client
+        .exec_session()
         .await
-        .context("Failed to open machine exec session")?
-        .into_inner();
+        .context("Failed to open machine exec session")?;
+    let (mut send, mut recv) = stream.into_split();
+
+    // Forwarder: inputs from the pumps → wire. When every pump has dropped
+    // its sender the channel drains, and closing the send half ends the
+    // request body cleanly; the session keeps running until the server
+    // finishes the response side.
+    tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            if send.send(msg).await.is_err() {
+                break;
+            }
+        }
+        send.close_send();
+    });
 
     let mut exit_code = 0i32;
     let mut received_done = false;
-    while let Some(output) = stream
-        .message()
+    while let Some(item) = recv
+        .message::<pb::MachineExecOutput>()
         .await
         .context("Failed to read session output")?
     {
+        let output = item.to_owned_message();
         if !output.data.is_empty() {
             // The PTY merges stdout/stderr into one stream.
             std::io::stdout()
@@ -684,27 +675,27 @@ async fn exec_via_grpc(
     env: HashMap<String, String>,
     tty: bool,
 ) -> Result<()> {
-    let mut client = machine_client().await?;
+    let client = machine_client();
     let mut stream = client
-        .exec(tonic::Request::new(MachineExecRequest {
+        .exec(MachineExecRequest {
             id: name.to_string(),
             cmd,
             working_dir: String::new(),
             user: String::new(),
-            env,
+            env: env.into_iter().collect(),
             tty,
-            tty_size: None,
-        }))
+            ..Default::default()
+        })
         .await
-        .context("Failed to execute command in machine")?
-        .into_inner();
+        .context("Failed to execute command in machine")?;
 
     let mut exit_code = 0i32;
-    while let Some(output) = stream
-        .message()
+    while let Some(item) = stream
+        .message::<pb::MachineExecOutput>()
         .await
         .context("Failed to read exec output")?
     {
+        let output = item.to_owned_message();
         if !output.data.is_empty() {
             match output.stream.as_str() {
                 "stderr" => {

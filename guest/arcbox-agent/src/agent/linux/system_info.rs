@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 
-use arcbox_protocol::agent::SystemInfo;
+use arcbox_connect::v1::SystemInfo;
 
 use crate::rpc::RpcResponse;
 

@@ -1,4 +1,14 @@
+use super::persistence::{SandboxRecordStore, SandboxTransition};
+use super::types::action;
 use super::*;
+
+type BootOutput = (Arc<fc_sdk::Vm>, PathBuf);
+
+struct BootFailure {
+    error: VmmError,
+    process: Option<fc_sdk::FirecrackerProcess>,
+    cow_handle: Option<CowHandle>,
+}
 
 #[allow(
     clippy::too_many_arguments,
@@ -14,6 +24,9 @@ pub(super) async fn boot_sandbox(
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
+    records: Arc<SandboxRecordStore>,
+    generation: Uuid,
+    resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) {
     match do_boot(
         &id,
@@ -22,49 +35,108 @@ pub(super) async fn boot_sandbox(
         &vm_dir,
         &config,
         &cow_manager,
+        &instances,
+        generation,
+        resource_handoff,
     )
     .await
     {
-        Ok((process, vm, vsock_uds_path, cow_handle)) => {
+        Ok((vm, vsock_uds_path)) => {
             let ready_at = Utc::now();
 
-            // Persist the crash-recovery record before handing resources to
-            // the instance, so an agent restart can reconcile them.
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "Firecracker pid fits platform pid_t"
-            )]
-            let record = super::reconcile::SandboxStateRecord::new(
-                &id,
-                process.pid().map(|p| p as i32),
-                net_alloc.as_ref(),
-                cow_handle.as_ref(),
-                config.firecracker.jailer.is_some(),
-                None,
-            );
-            super::reconcile::write_state_record(&vm_dir, &record);
+            let current = instances.read().unwrap().get(&id).cloned();
+            let is_current_generation = current
+                .as_ref()
+                .is_some_and(|arc| arc.lock().unwrap().record_generation == Some(generation));
+            if !is_current_generation {
+                info!(sandbox_id = %id, "stale sandbox boot completed");
+                return;
+            }
 
-            // Hand the booted resources to the instance while holding the map
-            // read guard, so a concurrent force-remove/TTL (which needs the
-            // write guard to drop the entry) cannot slip between the presence
-            // check and the handoff. If the instance is gone or already
-            // stopping, tear the resources down instead of dropping them — a
-            // dropped CowHandle leaks the dm device + loop + sparse COW file.
-            let mut process = Some(process);
+            // do_boot persisted every cleanup resource before completing the
+            // handoff, so only the lifecycle phase remains to make Ready.
+            let durable_ready =
+                records
+                    .transition(&id, generation, SandboxTransition::Ready)
+                    .and_then(|commit| match commit.durability_error {
+                        Some(error) => Err(VmmError::Unavailable(format!(
+                            "sandbox {id} ready state is visible, but durability is unconfirmed: {error}"
+                        ))),
+                        None => Ok(()),
+                    });
+            if let Err(record_error) = durable_ready {
+                let message = format!("failed to persist ready state: {record_error}");
+                let value = instances.read().unwrap().get(&id).cloned();
+                let cleanup_lock = value
+                    .as_ref()
+                    .map(|arc| arc.lock().unwrap().cleanup_lock.clone());
+                let _cleanup_guard = match cleanup_lock.as_ref() {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                };
+                let mut updated_current = false;
+                let mut failure_record_error = None;
+                let mut failure_record_visible = false;
+                if let Some(ref arc) = value {
+                    let mut inst = arc.lock().unwrap();
+                    if can_mark_boot_failed(&inst, generation) {
+                        (failure_record_visible, failure_record_error) =
+                            persist_boot_failure(&records, &id, generation, &message);
+                        inst.state = SandboxState::Failed;
+                        inst.error = Some(message.clone());
+                        updated_current = true;
+                    }
+                }
+                let cleanup_complete = if updated_current {
+                    match super::cleanup::release_runtime_resources(
+                        &id,
+                        value.as_ref().unwrap(),
+                        &network,
+                        &config,
+                        &cow_manager,
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            error!(sandbox_id = %id, error = %error, "boot failure cleanup incomplete");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if failure_record_visible && cleanup_complete {
+                    if let Err(error) = super::reconcile::clear_state_record(&vm_dir) {
+                        error!(sandbox_id = %id, error = %error, "boot failure journal cleanup is not durable");
+                    }
+                }
+                if updated_current {
+                    let _ = events_tx
+                        .send(SandboxEvent::new(&id, action::FAILED).with_attr("error", &message));
+                }
+                if let Some(error) = failure_record_error {
+                    error!(sandbox_id = %id, error, "failed to persist sandbox boot failure");
+                }
+                error!(sandbox_id = %id, error = %record_error, "sandbox ready state was not durable");
+                return;
+            }
+
+            // Hand the post-boot API objects to the instance. Every cleanup
+            // resource was transferred before configuration could be aborted.
             let mut vm = Some(vm);
-            let mut cow_handle = cow_handle;
             let accepted = {
                 let map = instances.read().unwrap();
                 match map.get(&id) {
                     Some(arc) => {
                         let mut inst = arc.lock().unwrap();
-                        if matches!(inst.state, SandboxState::Stopping | SandboxState::Stopped) {
+                        if inst.record_generation != Some(generation)
+                            || matches!(inst.state, SandboxState::Stopping | SandboxState::Stopped)
+                        {
                             false
                         } else {
-                            inst.process = process.take();
                             inst.vm = vm.take();
                             inst.vsock_uds_path = Some(vsock_uds_path.clone());
-                            inst.cow_handle = cow_handle.take();
                             inst.state = SandboxState::Ready;
                             inst.ready_at = Some(ready_at);
                             true
@@ -75,14 +147,11 @@ pub(super) async fn boot_sandbox(
             };
 
             if !accepted {
-                info!(sandbox_id = %id, "sandbox removed/stopped during boot; tearing down booted resources");
-                if let Some(process) = process.take() {
-                    tear_down_orphaned_boot(process, cow_handle.take(), &cow_manager).await;
-                }
+                info!(sandbox_id = %id, "sandbox removed/stopped during boot");
                 return;
             }
 
-            let _ = events_tx.send(SandboxEvent::new(&id, "ready"));
+            let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
             info!(sandbox_id = %id, "sandbox booted and ready");
 
             // Launch the initial workload, if the spec carries one. The
@@ -93,21 +162,114 @@ pub(super) async fn boot_sandbox(
                 run_initial_cmd(&id, spec, &vsock_uds_path, &instances, &events_tx).await;
             }
         }
-        Err(e) => {
+        Err(mut failure) => {
+            let message = failure.error.to_string();
             let value = instances.read().unwrap().get(&id).cloned();
-            if let Some(arc) = value {
+            let cleanup_lock = value
+                .as_ref()
+                .map(|arc| arc.lock().unwrap().cleanup_lock.clone());
+            let _cleanup_guard = match cleanup_lock.as_ref() {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let mut updated_current = false;
+            let mut record_error = None;
+            let mut failure_record_visible = false;
+            if let Some(ref arc) = value {
                 let mut inst = arc.lock().unwrap();
-                inst.state = SandboxState::Failed;
-                inst.error = Some(e.to_string());
+                if can_mark_boot_failed(&inst, generation) {
+                    (failure_record_visible, record_error) =
+                        persist_boot_failure(&records, &id, generation, &message);
+                    inst.state = SandboxState::Failed;
+                    inst.error = Some(message.clone());
+                    if let Some(process) = failure.process.take() {
+                        inst.process = Some(process);
+                    }
+                    if let Some(cow_handle) = failure.cow_handle.take() {
+                        inst.cow_handle = Some(cow_handle);
+                    }
+                    updated_current = true;
+                }
             }
-            // Release network on boot failure.
-            if let Some(ref net) = net_alloc {
-                network.release(net);
+            let cleanup_complete = if updated_current {
+                match super::cleanup::release_runtime_resources(
+                    &id,
+                    value.as_ref().unwrap(),
+                    &network,
+                    &config,
+                    &cow_manager,
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        error!(sandbox_id = %id, error = %error, "boot failure cleanup incomplete");
+                        false
+                    }
+                }
+            } else if let Some(process) = failure.process.take() {
+                match tear_down_orphaned_boot(process, failure.cow_handle.take(), &cow_manager)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        error!(sandbox_id = %id, error = %error, "stale boot failure cleanup incomplete");
+                        false
+                    }
+                }
+            } else if let Some(handle) = failure.cow_handle.take() {
+                match cow_manager.teardown_checked(&handle).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        error!(sandbox_id = %id, error = %error, "stale boot CoW cleanup incomplete");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if failure_record_visible && cleanup_complete {
+                if let Err(error) = super::reconcile::clear_state_record(&vm_dir) {
+                    error!(sandbox_id = %id, error = %error, "stale boot journal cleanup is not durable");
+                }
             }
-            let _ =
-                events_tx.send(SandboxEvent::new(&id, "failed").with_attr("error", &e.to_string()));
-            error!(sandbox_id = %id, error = %e, "sandbox boot failed");
+            if updated_current {
+                let _ = events_tx
+                    .send(SandboxEvent::new(&id, action::FAILED).with_attr("error", &message));
+            }
+            if let Some(record_error) = record_error {
+                error!(
+                    sandbox_id = %id,
+                    error = %record_error,
+                    "failed to persist sandbox boot failure"
+                );
+            }
+            error!(sandbox_id = %id, error = %failure.error, "sandbox boot failed");
         }
+    }
+}
+
+fn can_mark_boot_failed(inst: &SandboxInstance, generation: Uuid) -> bool {
+    inst.record_generation == Some(generation)
+        && !matches!(inst.state, SandboxState::Stopping | SandboxState::Stopped)
+}
+
+fn persist_boot_failure(
+    records: &SandboxRecordStore,
+    id: &str,
+    generation: Uuid,
+    message: &str,
+) -> (bool, Option<String>) {
+    match records.transition(
+        id,
+        generation,
+        SandboxTransition::Failed(message.to_owned()),
+    ) {
+        Ok(commit) => match commit.durability_error {
+            Some(error) => (false, Some(error)),
+            None => (true, None),
+        },
+        Err(error) => (false, Some(error.to_string())),
     }
 }
 
@@ -264,88 +426,62 @@ pub(super) fn create_rootfs_symlink(vm_dir: &Path, dm_device: &str) -> Result<St
         .ok_or_else(|| VmmError::Config(format!("non-UTF-8 path: {}", link_path.display())))
 }
 
-/// Release the resources a partial restore has acquired: dm-snapshot CoW, the
-/// TAP/IP allocation, and the recreated origin directory.
-///
-/// None of these have a `Drop` that frees them (`CowHandle` and
-/// `NetworkAllocation` are plain records), so dropping them on a `?` would leak
-/// the dm device + loop + COW file and the TAP + IP. This must be called on
-/// every error path between resource acquisition and the point where they are
-/// handed off to the `SandboxInstance`.
-pub(super) async fn cleanup_pending_restore(
-    cow_manager: &CowManager,
-    network: &NetworkManager,
-    cow: Option<CowHandle>,
-    net_alloc: Option<&NetworkAllocation>,
-    origin_dir: Option<&Path>,
-) {
-    if let Some(handle) = cow {
-        cow_manager.teardown(&handle).await;
-    }
-    if let Some(net) = net_alloc {
-        network.release(net);
-    }
-    if let Some(dir) = origin_dir
-        && let Err(e) = tokio::fs::remove_dir_all(dir).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(dir = %dir.display(), err = %e, "failed to clean up restore origin dir");
-    }
-}
-
-/// SIGKILL Firecracker and wait for it to exit (bounded timeout).
-///
-/// Required before `cow_manager.teardown` on any failure path where FC may
-/// have opened the dm-snapshot block device: `dmsetup remove` returns EBUSY
-/// while a process still holds the device, leaking the dm device + loop +
-/// sparse COW file.  `FirecrackerProcess::drop` sends SIGKILL but never
-/// reaps, so by the time teardown runs FC may still be alive.
-pub(super) async fn kill_and_reap_fc(process: &mut fc_sdk::FirecrackerProcess) {
+pub(super) async fn kill_and_reap_fc_checked(
+    process: &mut fc_sdk::FirecrackerProcess,
+) -> Result<()> {
     if let Some(pid) = process.pid()
         && pid > 0
     {
-        let _ = nix::sys::signal::kill(
+        match nix::sys::signal::kill(
             #[allow(
                 clippy::cast_possible_wrap,
                 reason = "Firecracker pid fits platform pid_t"
             )]
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
-        );
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => {
+                return Err(VmmError::Process(format!(
+                    "kill firecracker {pid}: {error}"
+                )));
+            }
+        }
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), process.wait()).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), process.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(VmmError::Process(format!("reap firecracker: {error}"))),
+        Err(_) => Err(VmmError::Process("timed out reaping firecracker".into())),
+    }
 }
 
-/// Tear down the resources of a boot that finished after its sandbox was
-/// force-removed (or TTL-expired) mid-boot.
+/// Tear down resources that could not be handed to their sandbox generation.
 ///
-/// The instance entry is gone (or stopping), so these resources were never
-/// handed off. Without an explicit teardown the CoW dm device + loop + sparse
-/// COW file leak (`CowHandle` has no `Drop`) and Firecracker is left holding
-/// the block device. The TAP/IP and jailer chroot are owned by the racing
-/// remove/stop path and are intentionally not touched here.
+/// The resource-handoff channel closes without its explicit signal in this
+/// case, so Remove joins this cleanup instead of aborting it. TAP/IP and the
+/// jailer chroot remain managed by lifecycle cleanup or restart reconciliation.
 async fn tear_down_orphaned_boot(
     mut process: fc_sdk::FirecrackerProcess,
     cow_handle: Option<CowHandle>,
     cow_manager: &CowManager,
-) {
+) -> Result<()> {
     // Kill + reap FC before the dm teardown so `dmsetup remove` doesn't hit
     // EBUSY on the still-open block device.
-    kill_and_reap_fc(&mut process).await;
+    kill_and_reap_fc_checked(&mut process).await?;
     if let Some(handle) = cow_handle {
-        cow_manager.teardown(&handle).await;
+        cow_manager.teardown_checked(&handle).await?;
     }
+    Ok(())
 }
 
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
 ///
-/// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path, Option<CowHandle>)`
-/// on success.  The `CowHandle` is `Some` whenever dm-snapshot CoW is
-/// active — both direct mode and jailer mode (when the snapshot device
-/// node is successfully created inside the chroot).
+/// The spawned process is transferred to its [`SandboxInstance`] immediately.
+/// Cleanup is allowed to abort this task only after the paths/CoW phase has
+/// finished and every live `CowHandle` has also been transferred.
 #[allow(
-    clippy::type_complexity,
-    reason = "boot returns coupled Firecracker resources"
+    clippy::too_many_arguments,
+    reason = "boot owns one exact sandbox generation and its handoff signal"
 )]
 async fn do_boot(
     id: &str,
@@ -354,12 +490,11 @@ async fn do_boot(
     vm_dir: &Path,
     config: &VmmConfig,
     cow_manager: &CowManager,
-) -> Result<(
-    fc_sdk::FirecrackerProcess,
-    Arc<fc_sdk::Vm>,
-    PathBuf,
-    Option<CowHandle>,
-)> {
+    instances: &super::InstanceMap,
+    generation: Uuid,
+    resource_handoff: tokio::sync::oneshot::Sender<()>,
+) -> std::result::Result<BootOutput, BootFailure> {
+    let mut resource_handoff = Some(resource_handoff);
     let log_path = vm_dir.join("firecracker.log");
     let metrics_path = vm_dir.join("firecracker.metrics");
     // socket_path is used only for the direct (non-jailer) mode spawn.
@@ -370,27 +505,116 @@ async fn do_boot(
     // Some Firecracker builds expect log/metrics targets to pre-exist when
     // --log-path/--metrics-path are provided. Pre-create both files to avoid
     // startup failures with ENOENT across version variants.
-    if fc_cfg.jailer.is_none() {
+    let prepare_files = (|| -> Result<()> {
+        if fc_cfg.jailer.is_some() {
+            return Ok(());
+        }
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent).map_err(VmmError::Io)?;
         }
         std::fs::File::create(&log_path).map_err(VmmError::Io)?;
         std::fs::File::create(&metrics_path).map_err(VmmError::Io)?;
+        Ok(())
+    })();
+    if let Err(error) = prepare_files {
+        complete_resource_handoff(&mut resource_handoff);
+        return Err(BootFailure {
+            error,
+            process: None,
+            cow_handle: None,
+        });
     }
 
     // Spawn the Firecracker process (direct or via Jailer).
-    let mut process = if let Some(ref jc) = fc_cfg.jailer {
-        spawn_jailer(jc, fc_cfg, id).await?
+    let process_result = if let Some(ref jc) = fc_cfg.jailer {
+        spawn_jailer(jc, fc_cfg, id).await
     } else {
-        spawn_direct(fc_cfg, id, &socket_path, &log_path, &metrics_path).await?
+        spawn_direct(fc_cfg, id, &socket_path, &log_path, &metrics_path).await
     };
+    let process = match process_result {
+        Ok(process) => process,
+        Err(error) => {
+            complete_resource_handoff(&mut resource_handoff);
+            return Err(BootFailure {
+                error,
+                process: None,
+                cow_handle: None,
+            });
+        }
+    };
+
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "Firecracker pid fits platform pid_t"
+    )]
+    let process_pid = process.pid().map(|pid| pid as i32);
+    let process_socket = process.socket_path().to_owned();
+    let spawned_record = super::reconcile::SandboxStateRecord::new(
+        id,
+        process_pid,
+        net_alloc,
+        None,
+        fc_cfg.jailer.is_some(),
+        None,
+    );
+    let journal_error = super::reconcile::write_state_record(vm_dir, &spawned_record).err();
+
+    // Once spawn returns, make the process immediately owned by the instance.
+    // Cleanup still waits for the paths/CoW phase before it may abort boot.
+    let mut process = Some(process);
+    let state = {
+        let map = instances.read().unwrap();
+        map.get(id).and_then(|instance| {
+            let mut instance = instance.lock().unwrap();
+            (instance.record_generation == Some(generation)).then(|| {
+                instance.process = process.take();
+                instance.state
+            })
+        })
+    };
+
+    let Some(state) = state else {
+        // Closing the channel without the explicit signal makes cleanup join
+        // this task instead of aborting it, so the outer failure path can tear
+        // down these unhanded resources.
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "the current sandbox generation".into(),
+                actual: "replaced or removed".into(),
+            },
+            process,
+            cow_handle: None,
+        });
+    };
+    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+        complete_resource_handoff(&mut resource_handoff);
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "a sandbox still booting".into(),
+                actual: state.to_string(),
+            },
+            process: None,
+            cow_handle: None,
+        });
+    }
+    if let Some(error) = journal_error {
+        complete_resource_handoff(&mut resource_handoff);
+        return Err(BootFailure {
+            error,
+            process: None,
+            cow_handle: None,
+        });
+    }
 
     // Determine kernel, rootfs, and vsock paths.
     //
     // In jailer mode the files must exist inside the chroot, and paths passed
     // to the FC API are relative to the chroot root.  In direct mode the
     // host-absolute paths from the spec are used as-is.
-    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path, cow_handle) =
+    let mut cow_handle = None;
+    let paths: Result<(String, String, String, PathBuf)> = async {
         if let Some(ref jc) = fc_cfg.jailer {
             // Jailer mode: stage kernel + rootfs into chroot.
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
@@ -400,40 +624,65 @@ async fn do_boot(
             let k = stage_kernel_for_jailer(&cr, &spec.kernel, jc.uid, jc.gid).await?;
 
             // Rootfs: try dm-snapshot + mknod, fall back to full copy.
-            let (r, cow) = match cow_manager.setup(id, &spec.rootfs).await {
+            let r = match cow_manager.setup(id, &spec.rootfs).await {
                 Ok(handle) => {
-                    match stage_rootfs_device_for_jailer(&cr, &handle.dm_device, jc.uid, jc.gid)
-                        .await
+                    cow_handle = Some(handle);
+                    let record = super::reconcile::SandboxStateRecord::new(
+                        id,
+                        process_pid,
+                        net_alloc,
+                        cow_handle.as_ref(),
+                        true,
+                        None,
+                    );
+                    super::reconcile::write_state_record(vm_dir, &record)?;
+                    match stage_rootfs_device_for_jailer(
+                        &cr,
+                        &cow_handle.as_ref().unwrap().dm_device,
+                        jc.uid,
+                        jc.gid,
+                    )
+                    .await
                     {
-                        Ok(path) => (path, Some(handle)),
+                        Ok(path) => path,
                         Err(e) => {
                             debug!(
                                 sandbox_id = %id,
                                 error = %e,
                                 "mknod failed, falling back to rootfs copy"
                             );
-                            cow_manager.teardown(&handle).await;
-                            let path =
-                                stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid)
-                                    .await?;
-                            (path, None)
+                            cow_manager
+                                .teardown_checked(cow_handle.as_ref().unwrap())
+                                .await?;
+                            cow_handle = None;
+                            let record = super::reconcile::SandboxStateRecord::new(
+                                id,
+                                process_pid,
+                                net_alloc,
+                                None,
+                                true,
+                                None,
+                            );
+                            super::reconcile::write_state_record(vm_dir, &record)?;
+                            stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid).await?
                         }
                     }
                 }
                 Err(e) => {
+                    if matches!(e, VmmError::Unavailable(_)) {
+                        return Err(e);
+                    }
                     debug!(
                         sandbox_id = %id,
                         error = %e,
                         "dm-snapshot unavailable, copying rootfs into chroot"
                     );
-                    let path =
-                        stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid).await?;
-                    (path, None)
+                    stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid).await?
                 }
             };
 
             let vsock_host = cr.join("run/firecracker.vsock");
-            (k, r, "/run/firecracker.vsock".to_string(), vsock_host, cow)
+            Ok((k, r, "/run/firecracker.vsock".to_string(), vsock_host))
         } else {
             // Direct mode: try dm-snapshot CoW, fall back to using rootfs directly.
             // When CoW is active, create a stable `{vm_dir}/rootfs.link` symlink
@@ -441,36 +690,92 @@ async fn do_boot(
             // (not the ephemeral dm device name) in the vmstate, so a restored
             // sandbox can recreate a new dm-snapshot and retarget the symlink
             // transparently.
-            let (rootfs, cow) = match cow_manager.setup(id, &spec.rootfs).await {
-                Ok(handle) => match create_rootfs_symlink(vm_dir, &handle.dm_device) {
-                    Ok(link) => (link, Some(handle)),
-                    Err(e) => {
-                        cow_manager.teardown(&handle).await;
+            let rootfs = match cow_manager.setup(id, &spec.rootfs).await {
+                Ok(handle) => {
+                    cow_handle = Some(handle);
+                    let record = super::reconcile::SandboxStateRecord::new(
+                        id,
+                        process_pid,
+                        net_alloc,
+                        cow_handle.as_ref(),
+                        false,
+                        None,
+                    );
+                    super::reconcile::write_state_record(vm_dir, &record)?;
+                    create_rootfs_symlink(vm_dir, &cow_handle.as_ref().unwrap().dm_device)?
+                }
+                Err(e) => {
+                    if matches!(e, VmmError::Unavailable(_)) {
                         return Err(e);
                     }
-                },
-                Err(e) => {
                     debug!(
                         sandbox_id = %id,
                         error = %e,
                         "dm-snapshot unavailable, using rootfs directly"
                     );
-                    (spec.rootfs.clone(), None)
+                    spec.rootfs.clone()
                 }
             };
             let vsock_path = vm_dir.join("firecracker.vsock");
-            (
+            Ok((
                 spec.kernel.clone(),
                 rootfs,
                 vsock_path.to_str().unwrap().to_owned(),
                 vsock_path,
-                cow,
-            )
-        };
+            ))
+        }
+    }
+    .await;
+
+    // No await may occur between transferring a successful CoW handle and
+    // completing this signal. Once signalled, Remove is allowed to abort us.
+    let state = {
+        let map = instances.read().unwrap();
+        map.get(id).and_then(|instance| {
+            let mut instance = instance.lock().unwrap();
+            (instance.record_generation == Some(generation)).then(|| {
+                if cow_handle.is_some() {
+                    debug_assert!(instance.cow_handle.is_none());
+                    instance.cow_handle = cow_handle.take();
+                }
+                instance.state
+            })
+        })
+    };
+    let Some(state) = state else {
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "the current sandbox generation".into(),
+                actual: "replaced or removed during boot setup".into(),
+            },
+            process: None,
+            cow_handle,
+        });
+    };
+    complete_resource_handoff(&mut resource_handoff);
+
+    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path) =
+        paths.map_err(|error| BootFailure {
+            error,
+            process: None,
+            cow_handle: None,
+        })?;
+    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+        return Err(BootFailure {
+            error: VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "a sandbox still booting".into(),
+                actual: state.to_string(),
+            },
+            process: None,
+            cow_handle: None,
+        });
+    }
 
     // Configure and boot the VM.
-    let vcpu_count = NonZeroU64::new(spec.vcpus.max(1) as u64)
-        .ok_or_else(|| VmmError::Config("vcpus must be > 0".into()))?;
+    let vcpu_count =
+        NonZeroU64::new(spec.vcpus.max(1) as u64).expect("max(1) guarantees a non-zero vCPU count");
 
     // Append static IP configuration to boot args so the kernel configures
     // eth0 before init runs.  The guest-side vm-agent parses this back via
@@ -490,7 +795,7 @@ async fn do_boot(
         spec.boot_args.clone()
     };
 
-    let mut builder = VmBuilder::new(process.socket_path())
+    let mut builder = VmBuilder::new(process_socket)
         .boot_source(BootSource {
             kernel_image_path: kernel_path,
             boot_args: Some(boot_args),
@@ -545,23 +850,42 @@ async fn do_boot(
     let vm = match builder.start().await {
         Ok(v) => Arc::new(v),
         Err(e) => {
-            // Clean up dm-snapshot if boot fails after setup.
-            if let Some(ref handle) = cow_handle {
-                // FC has likely opened the dm-snapshot block device by this
-                // point.  Kill and wait before teardown so `dmsetup remove`
-                // doesn't hit EBUSY and leak the dm/loop/COW resources.
-                kill_and_reap_fc(&mut process).await;
-                cow_manager.teardown(handle).await;
-                // The rootfs.link symlink now points at a torn-down device.
-                // Remove it so subsequent retries see a clean slate.  Only
-                // applies to direct mode — jailer mode uses a chroot-internal
-                // device node which is removed when the chroot is destroyed.
-                if fc_cfg.jailer.is_none() {
-                    let _ = std::fs::remove_file(vm_dir.join("rootfs.link"));
-                }
-            }
-            return Err(VmmError::from(e));
+            return Err(BootFailure {
+                error: VmmError::from(e),
+                process: None,
+                cow_handle: None,
+            });
         }
     };
-    Ok((process, vm, vsock_host_path, cow_handle))
+    Ok((vm, vsock_host_path))
+}
+
+fn complete_resource_handoff(signal: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(signal) = signal.take() {
+        let _ = signal.send(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_failure_cannot_overwrite_shutdown() {
+        let generation = Uuid::new_v4();
+        let mut instance = SandboxInstance::new_with_generation(
+            "box".into(),
+            SandboxSpec::default(),
+            None,
+            PathBuf::from("/tmp/box"),
+            generation,
+        );
+
+        assert!(can_mark_boot_failed(&instance, generation));
+        instance.state = SandboxState::Stopping;
+        assert!(!can_mark_boot_failed(&instance, generation));
+        instance.state = SandboxState::Stopped;
+        assert!(!can_mark_boot_failed(&instance, generation));
+        assert!(!can_mark_boot_failed(&instance, Uuid::new_v4()));
+    }
 }

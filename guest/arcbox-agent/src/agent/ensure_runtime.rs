@@ -27,12 +27,12 @@ use std::sync::OnceLock;
 // STATUS_STARTED is still a valid terminal status the start task can report
 // internally (persisted via `RuntimeState::Ready`'s message); callers see
 // STATUS_REUSED once state is settled.
+use arcbox_connect::v1::RuntimeEnsureResponse;
 #[allow(unused_imports)]
 pub use arcbox_constants::status::{
     RUNTIME_FAILED as STATUS_FAILED, RUNTIME_REUSED as STATUS_REUSED,
     RUNTIME_STARTED as STATUS_STARTED, RUNTIME_STARTING as STATUS_STARTING,
 };
-use arcbox_protocol::agent::RuntimeEnsureResponse;
 use futures::FutureExt;
 use tokio::sync::Mutex;
 
@@ -121,6 +121,7 @@ where
                 endpoint: endpoint.clone(),
                 message: message.clone(),
                 status: STATUS_REUSED.to_string(),
+                ..Default::default()
             };
         }
     }
@@ -140,6 +141,7 @@ where
                     endpoint: endpoint.clone(),
                     message: message.clone(),
                     status: STATUS_REUSED.to_string(),
+                    ..Default::default()
                 };
             }
             RuntimeState::Starting => false,
@@ -171,6 +173,7 @@ where
                         endpoint: String::new(),
                         message: format!("runtime start panicked: {message}"),
                         status: STATUS_FAILED.to_string(),
+                        ..Default::default()
                     }
                 }
             };
@@ -195,6 +198,7 @@ where
         endpoint: String::new(),
         message: "runtime start in progress".to_string(),
         status: STATUS_STARTING.to_string(),
+        ..Default::default()
     }
 }
 
@@ -221,6 +225,7 @@ mod tests {
             endpoint: "vsock:2375".to_string(),
             message: "docker socket ready".to_string(),
             status: STATUS_STARTED.to_string(),
+            ..Default::default()
         }
     }
 
@@ -230,6 +235,7 @@ mod tests {
             endpoint: String::new(),
             message: "docker socket missing".to_string(),
             status: STATUS_FAILED.to_string(),
+            ..Default::default()
         }
     }
 

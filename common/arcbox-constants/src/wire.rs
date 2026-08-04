@@ -6,14 +6,27 @@
 /// fields, behavioral contracts) — purely additive, ignorable changes
 /// don't need a bump. Unknown `MessageType`s already fail cleanly; this
 /// version catches the silent proto3 field-skew class instead.
-pub const AGENT_PROTOCOL_VERSION: u32 = 1;
+///
+/// "Existing" means *released*: the sandbox execution redesign
+/// (CORE-55/56) re-typed payloads that no release had ever shipped, so it
+/// did not warrant a bump. 0.6.0 briefly shipped `2`/`2` for it before
+/// this was rolled back — **`2` is burned**: 0.6.0 daemons in the wild
+/// read it as "speaks the redesigned sandbox payloads", so the next real
+/// bump must go to `3`, never reuse `2` for a different meaning.
+///
+/// v3: runtime startup requires the host-provided
+/// `arcbox.runtime_generation` kernel parameter and materializes runtime
+/// assets onto the guest Btrfs data disk before execution. Sandbox
+/// Stop/Remove responses also carry a durable cleanup generation, completed
+/// through Prepare/Finalize after host listeners are gone.
+pub const AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest agent protocol version this host still accepts.
 ///
 /// Agents reporting less (including `0` — agents that predate the
 /// handshake field) are rejected at boot with an actionable error
 /// instead of silently misbehaving under field skew.
-pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 1;
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 3;
 
 /// Number of bytes in the fixed RPC frame header (`length` + `type`).
 pub const FRAME_HEADER_SIZE: usize = 8;
@@ -80,31 +93,36 @@ pub enum MessageType {
     SandboxInspectRequest = 0x0023,
     SandboxListRequest = 0x0024,
     /// DNAT a reserved guest port to a sandbox port (payload:
-    /// `sandbox.v1.SandboxPortForwardRequest`).
+    /// `arcbox.v1.SandboxPortForwardRequest`).
     SandboxPortForwardRequest = 0x0025,
     /// Remove a sandbox DNAT mapping (payload:
-    /// `sandbox.v1.SandboxPortForwardRemoveRequest`).
+    /// `arcbox.v1.SandboxPortForwardRemoveRequest`).
     SandboxPortForwardRemoveRequest = 0x0026,
+    /// Validate one exact durable cleanup generation before the host removes
+    /// listeners (payload: `arcbox.v1.SandboxCleanupTicket`).
+    SandboxCleanupPrepareRequest = 0x0027,
+    /// Confirm host cleanup, delete the matching guest DNAT generation, and
+    /// recycle its quarantined network allocation (payload:
+    /// `arcbox.v1.SandboxCleanupTicket`).
+    SandboxCleanupFinalizeRequest = 0x0028,
+    /// Opens the internal durable cleanup ticket stream (payload:
+    /// `arcbox.v1.WatchSandboxCleanupRequest`).
+    WatchSandboxCleanupRequest = 0x0029,
 
-    // Sandbox workload request types (0x0030 - 0x0034).
-    SandboxRunRequest = 0x0030,
-    SandboxExecRequest = 0x0031,
+    // Sandbox workload request types.
+    // 0x0030 (SandboxRunRequest), 0x0031 (SandboxExecRequest),
+    // 0x0033 (SandboxExecInput), and 0x0034 (SandboxExecResize) were
+    // retired by the execution redesign (CORE-55/56); do not reuse.
     SandboxEventsRequest = 0x0032,
-    /// Streaming stdin frame sent by the host after [`SandboxExecRequest`]
-    /// to forward user input to the running process.
-    SandboxExecInput = 0x0033,
-    /// TTY resize frame sent by the host during an exec session. Payload is
-    /// a prost-encoded `sandbox.v1.TerminalSize`.
-    SandboxExecResize = 0x0034,
-    /// Read a file from a sandbox (payload: `sandbox.v1.ReadFileRequest`).
+    /// Read a file from a sandbox (payload: `arcbox.sandbox.v1.ReadFileRequest`).
     /// The agent answers with a stream of [`Self::SandboxFileData`] frames.
     SandboxFileReadRequest = 0x0035,
     /// Open a file-write stream into a sandbox (payload:
-    /// `sandbox.v1.WriteFileOpen`), followed by [`Self::SandboxFileChunk`]
+    /// `arcbox.sandbox.v1.WriteFileOpen`), followed by [`Self::SandboxFileChunk`]
     /// frames and answered with [`Self::SandboxFileWriteResponse`].
     SandboxFileWriteRequest = 0x0036,
     /// One chunk of file content during a write stream (payload:
-    /// `sandbox.v1.FileChunk`; `done == true` on the last chunk).
+    /// `arcbox.sandbox.v1.FileChunk`; `done == true` on the last chunk).
     SandboxFileChunk = 0x0037,
 
     // Sandbox snapshot request types (0x0040 - 0x0043).
@@ -112,6 +130,38 @@ pub enum MessageType {
     SandboxRestoreRequest = 0x0041,
     SandboxListSnapshotsRequest = 0x0042,
     SandboxDeleteSnapshotRequest = 0x0043,
+
+    // Sandbox execution request types (0x0060 - 0x0066), from the
+    // execution redesign (CORE-55/56).
+    /// Start an addressable execution (payload:
+    /// `arcbox.sandbox.v1.StartExecutionRequest`). Answered with
+    /// [`Self::SandboxExecStartResponse`].
+    SandboxExecStartRequest = 0x0060,
+    /// Attach to an execution's output from per-channel offsets (payload:
+    /// `arcbox.sandbox.v1.AttachExecutionRequest`). The agent answers with a
+    /// stream of [`Self::SandboxExecEvent`] frames ending in an `exited`
+    /// event.
+    SandboxExecAttachRequest = 0x0061,
+    /// Offset-idempotent stdin write (payload:
+    /// `arcbox.sandbox.v1.WriteStdinRequest`). Answered with
+    /// [`Self::SandboxStdinStatus`].
+    SandboxStdinWriteRequest = 0x0062,
+    /// Query stdin acceptance state (payload:
+    /// `arcbox.sandbox.v1.GetStdinStatusRequest`). Answered with
+    /// [`Self::SandboxStdinStatus`].
+    SandboxStdinStatusRequest = 0x0063,
+    /// Signal an execution's process group (payload:
+    /// `arcbox.sandbox.v1.SignalExecutionRequest`). Answered with
+    /// [`Self::SandboxExecSignalResponse`].
+    SandboxExecSignalRequest = 0x0064,
+    /// Resize a TTY execution's terminal (payload:
+    /// `arcbox.sandbox.v1.ResizeExecutionTtyRequest`). Answered with
+    /// [`Self::SandboxExecResizeResponse`].
+    SandboxExecResizeRequest = 0x0065,
+    /// Wait for an execution to exit (payload:
+    /// `arcbox.sandbox.v1.WaitExecutionRequest`). Answered with
+    /// [`Self::SandboxExecWaitResponse`].
+    SandboxExecWaitRequest = 0x0066,
 
     /// Starts a machine-level exec: runs a command in the machine root (the
     /// agent's own mount namespace), streamed back as
@@ -168,17 +218,25 @@ pub enum MessageType {
     SandboxInspectResponse = 0x1023,
     SandboxListResponse = 0x1024,
     /// Answers [`Self::SandboxPortForwardRequest`] (payload:
-    /// `sandbox.v1.SandboxPortForwardResponse`).
+    /// `arcbox.v1.SandboxPortForwardResponse`).
     SandboxPortForwardResponse = 0x1025,
     /// Acknowledges [`Self::SandboxPortForwardRemoveRequest`] (empty payload).
     SandboxPortForwardRemoveResponse = 0x1026,
+    /// Acknowledges [`Self::SandboxCleanupPrepareRequest`].
+    SandboxCleanupPrepareResponse = 0x1027,
+    /// Acknowledges [`Self::SandboxCleanupFinalizeRequest`].
+    SandboxCleanupFinalizeResponse = 0x1028,
+    /// One durable cleanup ticket answering [`Self::WatchSandboxCleanupRequest`].
+    SandboxCleanupEvent = 0x1029,
 
     // Sandbox workload response types (streaming).
-    SandboxRunOutput = 0x1035,
-    SandboxExecOutput = 0x1036,
+    // 0x1035 (SandboxRunOutput) and 0x1036 (SandboxExecOutput) were
+    // retired by the execution redesign (CORE-55/56); do not reuse.
+    /// One lifecycle event answering [`Self::SandboxEventsRequest`]
+    /// (payload: `arcbox.sandbox.v1.SandboxEvent`).
     SandboxEvent = 0x1037,
     /// One chunk of file content answering [`Self::SandboxFileReadRequest`]
-    /// (payload: `sandbox.v1.FileChunk`; `done == true` on the last chunk).
+    /// (payload: `arcbox.sandbox.v1.FileChunk`; `done == true` on the last chunk).
     SandboxFileData = 0x1038,
     /// Acknowledges a completed file-write stream (empty payload).
     SandboxFileWriteResponse = 0x1039,
@@ -188,6 +246,26 @@ pub enum MessageType {
     SandboxRestoreResponse = 0x1041,
     SandboxListSnapshotsResponse = 0x1042,
     SandboxDeleteSnapshotResponse = 0x1043,
+
+    // Sandbox execution response types (0x1060 - 0x1066), from the
+    // execution redesign (CORE-55/56).
+    /// Answers [`Self::SandboxExecStartRequest`] (payload:
+    /// `arcbox.sandbox.v1.Execution`).
+    SandboxExecStartResponse = 0x1060,
+    /// One frame of an execution attach stream (payload:
+    /// `arcbox.sandbox.v1.ExecutionEvent`; the `exited` event is terminal).
+    SandboxExecEvent = 0x1061,
+    /// Answers [`Self::SandboxStdinWriteRequest`] and
+    /// [`Self::SandboxStdinStatusRequest`] (payload:
+    /// `arcbox.sandbox.v1.StdinStatus`).
+    SandboxStdinStatus = 0x1062,
+    /// Acknowledges [`Self::SandboxExecSignalRequest`] (empty payload).
+    SandboxExecSignalResponse = 0x1064,
+    /// Acknowledges [`Self::SandboxExecResizeRequest`] (empty payload).
+    SandboxExecResizeResponse = 0x1065,
+    /// Answers [`Self::SandboxExecWaitRequest`] (payload:
+    /// `arcbox.sandbox.v1.Execution`).
+    SandboxExecWaitResponse = 0x1066,
 
     /// One machine exec output frame (payload: `arcbox.v1.MachineExecOutput`;
     /// `done == true` on the final frame carrying the exit code).
@@ -230,12 +308,11 @@ impl MessageType {
             0x0024 => Some(Self::SandboxListRequest),
             0x0025 => Some(Self::SandboxPortForwardRequest),
             0x0026 => Some(Self::SandboxPortForwardRemoveRequest),
+            0x0027 => Some(Self::SandboxCleanupPrepareRequest),
+            0x0028 => Some(Self::SandboxCleanupFinalizeRequest),
+            0x0029 => Some(Self::WatchSandboxCleanupRequest),
             // Sandbox workload requests.
-            0x0030 => Some(Self::SandboxRunRequest),
-            0x0031 => Some(Self::SandboxExecRequest),
             0x0032 => Some(Self::SandboxEventsRequest),
-            0x0033 => Some(Self::SandboxExecInput),
-            0x0034 => Some(Self::SandboxExecResize),
             0x0035 => Some(Self::SandboxFileReadRequest),
             0x0036 => Some(Self::SandboxFileWriteRequest),
             0x0037 => Some(Self::SandboxFileChunk),
@@ -244,6 +321,14 @@ impl MessageType {
             0x0041 => Some(Self::SandboxRestoreRequest),
             0x0042 => Some(Self::SandboxListSnapshotsRequest),
             0x0043 => Some(Self::SandboxDeleteSnapshotRequest),
+            // Sandbox execution requests (execution redesign, CORE-55/56).
+            0x0060 => Some(Self::SandboxExecStartRequest),
+            0x0061 => Some(Self::SandboxExecAttachRequest),
+            0x0062 => Some(Self::SandboxStdinWriteRequest),
+            0x0063 => Some(Self::SandboxStdinStatusRequest),
+            0x0064 => Some(Self::SandboxExecSignalRequest),
+            0x0065 => Some(Self::SandboxExecResizeRequest),
+            0x0066 => Some(Self::SandboxExecWaitRequest),
             // Machine-level exec.
             0x0050 => Some(Self::MachineExecRequest),
             0x0051 => Some(Self::MachineExecInput),
@@ -278,9 +363,10 @@ impl MessageType {
             0x1024 => Some(Self::SandboxListResponse),
             0x1025 => Some(Self::SandboxPortForwardResponse),
             0x1026 => Some(Self::SandboxPortForwardRemoveResponse),
+            0x1027 => Some(Self::SandboxCleanupPrepareResponse),
+            0x1028 => Some(Self::SandboxCleanupFinalizeResponse),
+            0x1029 => Some(Self::SandboxCleanupEvent),
             // Sandbox workload responses (streaming).
-            0x1035 => Some(Self::SandboxRunOutput),
-            0x1036 => Some(Self::SandboxExecOutput),
             0x1037 => Some(Self::SandboxEvent),
             0x1038 => Some(Self::SandboxFileData),
             0x1039 => Some(Self::SandboxFileWriteResponse),
@@ -289,6 +375,13 @@ impl MessageType {
             0x1041 => Some(Self::SandboxRestoreResponse),
             0x1042 => Some(Self::SandboxListSnapshotsResponse),
             0x1043 => Some(Self::SandboxDeleteSnapshotResponse),
+            // Sandbox execution responses (execution redesign, CORE-55/56).
+            0x1060 => Some(Self::SandboxExecStartResponse),
+            0x1061 => Some(Self::SandboxExecEvent),
+            0x1062 => Some(Self::SandboxStdinStatus),
+            0x1064 => Some(Self::SandboxExecSignalResponse),
+            0x1065 => Some(Self::SandboxExecResizeResponse),
+            0x1066 => Some(Self::SandboxExecWaitResponse),
             0x1050 => Some(Self::MachineExecOutput),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
@@ -307,17 +400,25 @@ impl MessageType {
                 | Self::SandboxRemoveRequest
                 | Self::SandboxInspectRequest
                 | Self::SandboxListRequest
-                | Self::SandboxRunRequest
-                | Self::SandboxExecRequest
                 | Self::SandboxEventsRequest
                 | Self::SandboxFileReadRequest
                 | Self::SandboxFileWriteRequest
                 | Self::SandboxPortForwardRequest
                 | Self::SandboxPortForwardRemoveRequest
+                | Self::SandboxCleanupPrepareRequest
+                | Self::SandboxCleanupFinalizeRequest
+                | Self::WatchSandboxCleanupRequest
                 | Self::SandboxCheckpointRequest
                 | Self::SandboxRestoreRequest
                 | Self::SandboxListSnapshotsRequest
                 | Self::SandboxDeleteSnapshotRequest
+                | Self::SandboxExecStartRequest
+                | Self::SandboxExecAttachRequest
+                | Self::SandboxStdinWriteRequest
+                | Self::SandboxStdinStatusRequest
+                | Self::SandboxExecSignalRequest
+                | Self::SandboxExecResizeRequest
+                | Self::SandboxExecWaitRequest
         )
     }
 
@@ -337,7 +438,24 @@ impl MessageType {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageType;
+    use super::{AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION, MessageType};
+
+    #[test]
+    fn protocol_version_2_is_burned() {
+        // `2` is burned: 0.6.0 daemons in the wild interpret it as "speaks
+        // the redesigned sandbox payloads" (see the AGENT_PROTOCOL_VERSION
+        // doc). A future mechanical +1 bump must fail here and jump to 3.
+        let version = AGENT_PROTOCOL_VERSION;
+        assert!(
+            version == 1 || version >= 3,
+            "AGENT_PROTOCOL_VERSION must never be 2 — it is burned; bump to 3"
+        );
+        let min = MIN_AGENT_PROTOCOL_VERSION;
+        assert!(
+            min == 1 || min >= 3,
+            "MIN_AGENT_PROTOCOL_VERSION must never be 2 — it is burned; bump to 3"
+        );
+    }
 
     #[test]
     fn message_type_roundtrip_known_values() {
@@ -397,22 +515,36 @@ mod tests {
             (0x1024, MessageType::SandboxListResponse),
             (0x0025, MessageType::SandboxPortForwardRequest),
             (0x0026, MessageType::SandboxPortForwardRemoveRequest),
+            (0x0027, MessageType::SandboxCleanupPrepareRequest),
+            (0x0028, MessageType::SandboxCleanupFinalizeRequest),
+            (0x0029, MessageType::WatchSandboxCleanupRequest),
             (0x1025, MessageType::SandboxPortForwardResponse),
             (0x1026, MessageType::SandboxPortForwardRemoveResponse),
+            (0x1027, MessageType::SandboxCleanupPrepareResponse),
+            (0x1028, MessageType::SandboxCleanupFinalizeResponse),
+            (0x1029, MessageType::SandboxCleanupEvent),
             // Sandbox workload.
-            (0x0030, MessageType::SandboxRunRequest),
-            (0x0031, MessageType::SandboxExecRequest),
             (0x0032, MessageType::SandboxEventsRequest),
-            (0x0033, MessageType::SandboxExecInput),
-            (0x0034, MessageType::SandboxExecResize),
             (0x0035, MessageType::SandboxFileReadRequest),
             (0x0036, MessageType::SandboxFileWriteRequest),
             (0x0037, MessageType::SandboxFileChunk),
-            (0x1035, MessageType::SandboxRunOutput),
-            (0x1036, MessageType::SandboxExecOutput),
             (0x1037, MessageType::SandboxEvent),
             (0x1038, MessageType::SandboxFileData),
             (0x1039, MessageType::SandboxFileWriteResponse),
+            // Sandbox executions (execution redesign, CORE-55/56).
+            (0x0060, MessageType::SandboxExecStartRequest),
+            (0x0061, MessageType::SandboxExecAttachRequest),
+            (0x0062, MessageType::SandboxStdinWriteRequest),
+            (0x0063, MessageType::SandboxStdinStatusRequest),
+            (0x0064, MessageType::SandboxExecSignalRequest),
+            (0x0065, MessageType::SandboxExecResizeRequest),
+            (0x0066, MessageType::SandboxExecWaitRequest),
+            (0x1060, MessageType::SandboxExecStartResponse),
+            (0x1061, MessageType::SandboxExecEvent),
+            (0x1062, MessageType::SandboxStdinStatus),
+            (0x1064, MessageType::SandboxExecSignalResponse),
+            (0x1065, MessageType::SandboxExecResizeResponse),
+            (0x1066, MessageType::SandboxExecWaitResponse),
             // Sandbox snapshots.
             (0x0040, MessageType::SandboxCheckpointRequest),
             (0x0041, MessageType::SandboxRestoreRequest),
@@ -443,12 +575,24 @@ mod tests {
     #[test]
     fn is_sandbox_request_classifies_correctly() {
         assert!(MessageType::SandboxCreateRequest.is_sandbox_request());
-        assert!(MessageType::SandboxRunRequest.is_sandbox_request());
+        assert!(MessageType::SandboxExecStartRequest.is_sandbox_request());
+        assert!(MessageType::SandboxExecAttachRequest.is_sandbox_request());
+        assert!(MessageType::SandboxStdinWriteRequest.is_sandbox_request());
+        assert!(MessageType::SandboxExecWaitRequest.is_sandbox_request());
         assert!(MessageType::SandboxFileReadRequest.is_sandbox_request());
         assert!(MessageType::SandboxFileWriteRequest.is_sandbox_request());
         assert!(MessageType::SandboxCheckpointRequest.is_sandbox_request());
         assert!(!MessageType::PingRequest.is_sandbox_request());
         assert!(!MessageType::SandboxCreateResponse.is_sandbox_request());
+    }
+
+    #[test]
+    fn retired_sandbox_values_stay_unknown() {
+        // Retired by the execution redesign (CORE-55/56); the values must
+        // not be resurrected or reused.
+        for retired in [0x0030, 0x0031, 0x0033, 0x0034, 0x1035, 0x1036] {
+            assert_eq!(MessageType::from_u32(retired), None, "0x{retired:04x}");
+        }
     }
 
     #[test]

@@ -8,20 +8,10 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arcbox_api::{
-    IconServiceImpl, IconServiceServer, KubernetesServiceImpl, MachineServiceImpl,
-    MigrationServiceImpl, MigrationServiceServer, SandboxServiceImpl, SandboxServiceServer,
-    SandboxSnapshotServiceImpl, SandboxSnapshotServiceServer, SharedRuntime, StatsServiceImpl,
-    SystemServiceImpl, SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
-    machine_service_server::MachineServiceServer, stats_service_server::StatsServiceServer,
-};
-#[cfg(target_os = "macos")]
-use arcbox_api::{MacosServiceImpl, macos_service_server::MacosServiceServer};
-use arcbox_core::Runtime;
+use arcbox_api::{SharedRuntime, SystemServiceImpl};
+use arcbox_core::{Runtime, VmLifecycleState};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
-use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
-use tonic::transport::Server;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::context::{DaemonContext, ServiceHandles};
@@ -42,73 +32,26 @@ pub async fn start_grpc(
     shared_runtime: SharedRuntime,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let socket_path = &ctx.layout.grpc_socket;
-    let _ = std::fs::remove_file(socket_path);
+    let listener = crate::control_plane::bind(socket_path)?;
 
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create socket directory")?;
-    }
+    info!(socket = %socket_path.display(), "control plane listening (Connect + gRPC + gRPC-Web)");
 
-    let listener = UnixListener::bind(socket_path).context(format!(
-        "Failed to bind gRPC socket: {}",
-        socket_path.display()
-    ))?;
-    let incoming = UnixListenerStream::new(listener);
-
-    info!(socket = %socket_path.display(), "gRPC server listening");
-
-    let machine_service = MachineServiceImpl::new(Arc::clone(&shared_runtime));
-    #[cfg(target_os = "macos")]
-    let macos_service = MacosServiceImpl::new(Arc::clone(&shared_runtime));
-    let kubernetes_service = KubernetesServiceImpl::new(Arc::clone(&shared_runtime));
-    let migration_service = MigrationServiceImpl::new(Arc::clone(&shared_runtime));
-    let sandbox_service = SandboxServiceImpl::new(Arc::clone(&shared_runtime));
-    let sandbox_snapshot_service = SandboxSnapshotServiceImpl::new(Arc::clone(&shared_runtime));
     let system_service = SystemServiceImpl::new(
         Arc::clone(&ctx.setup_state),
         Arc::clone(&shared_runtime),
         Arc::clone(&ctx.early_runtime),
     );
-    let stats_service = StatsServiceImpl::new(Arc::clone(&shared_runtime));
-    let icon_service = IconServiceImpl::new();
-
-    // Server reflection lets SDK authors and grpcurl discover the API
-    // without vendoring the protos (both v1 and the legacy v1alpha are
-    // served — grpcurl still speaks v1alpha by default).
-    let reflection_v1 = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .context("building gRPC reflection service")?;
-    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
-        .build_v1alpha()
-        .context("building gRPC reflection service (v1alpha)")?;
+    // Every service is served over Connect (CORE-53, CORE-68). The sandbox
+    // control/data-plane split (CORE-57) is preserved inside it, so a cloud
+    // deployment can still host those halves in different processes.
+    // Reflection rides along and answers over all three wire formats.
+    let app = crate::control_plane::into_app(crate::control_plane::connect_router(
+        Arc::clone(&shared_runtime),
+        system_service,
+    )?);
 
     let shutdown = ctx.shutdown.clone();
-    let handle = tokio::spawn(async move {
-        let router = Server::builder()
-            .add_service(MachineServiceServer::new(machine_service))
-            .add_service(KubernetesServiceServer::new(kubernetes_service))
-            .add_service(MigrationServiceServer::new(migration_service))
-            .add_service(SandboxServiceServer::new(sandbox_service))
-            .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
-            .add_service(SystemServiceServer::new(system_service))
-            .add_service(StatsServiceServer::new(stats_service))
-            .add_service(IconServiceServer::new(icon_service));
-        // macOS guests are served only on Apple Silicon hosts; on other
-        // platforms the service is simply absent (the CLI `macos` noun is
-        // likewise macOS-only).
-        #[cfg(target_os = "macos")]
-        let router = router.add_service(MacosServiceServer::new(macos_service));
-        let result = router
-            .add_service(reflection_v1)
-            .add_service(reflection_v1alpha)
-            .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
-            .await;
-
-        if let Err(e) = result {
-            tracing::error!("gRPC server error: {}", e);
-        }
-    });
+    let handle = tokio::spawn(crate::control_plane::serve(listener, app, shutdown));
 
     Ok(handle)
 }
@@ -126,7 +69,7 @@ pub async fn start_services(
         .await
         .context("Failed to start DNS service")?;
 
-    register_host_dns(runtime);
+    register_host_dns(runtime).await;
 
     let dns_shutdown = ctx.shutdown.clone();
     let dns = tokio::spawn(async move {
@@ -140,21 +83,33 @@ pub async fn start_services(
     // is not booted.
     let linux_vm = runtime.config().vm.autostart;
 
-    // Docker API server.
-    let docker = linux_vm.then(|| {
+    // Docker API server. Bound here rather than inside the spawned task so a
+    // bind failure fails startup: the Docker socket is the daemon's primary
+    // API, and a task that only logs the error would leave the pipeline
+    // publishing READY for a daemon no client can reach (CORE-71). DNS above
+    // already works this way.
+    let docker = if linux_vm {
         let docker_server = DockerApiServer::new(
             ServerConfig {
                 socket_path: ctx.layout.docker_socket.clone(),
             },
             Arc::clone(runtime),
         );
+        let listener = docker_server.bind().with_context(|| {
+            format!(
+                "Failed to bind the Docker API socket: {}",
+                ctx.layout.docker_socket.display()
+            )
+        })?;
         let docker_shutdown = ctx.shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = docker_server.run(docker_shutdown).await {
+        Some(tokio::spawn(async move {
+            if let Err(e) = docker_server.serve(listener, docker_shutdown).await {
                 tracing::error!("Docker API server error: {}", e);
             }
-        })
-    });
+        }))
+    } else {
+        None
+    };
 
     // Docker CLI integration (optional).
     if linux_vm && ctx.docker_integration {
@@ -217,6 +172,50 @@ pub async fn start_services(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Starts the `vm_running` mirror for the System VM.
+///
+/// Spawned from `init_runtime`, not from [`start_services`]: the VM reaches
+/// `VmLifecycleState::Running` partway through `Runtime::init` — that is what
+/// publishes `VM_READY` — and `init` then waits for the guest container
+/// runtime. A mirror started once `boot_runtime` has returned would report
+/// `vm_running = false` across that whole window while the agent is already
+/// answering, which is exactly what the field promises it is not.
+pub fn spawn_vm_running_mirror(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
+    let state = runtime.subscribe_system_vm_state();
+    let setup_state = Arc::clone(&ctx.setup_state);
+    let shutdown = ctx.shutdown.clone();
+    drop(tokio::spawn(async move {
+        vm_running_loop(state, setup_state, shutdown).await;
+    }));
+}
+
+/// Mirrors the System VM's lifecycle state into `SetupState.vm_running`.
+///
+/// The flag reports readiness level 2 — `VmLifecycleState::is_ready`, the
+/// agent has answered a ping — which is the level that matches what a client
+/// reads the field to mean. Level 1 (`MachineState::Running`) counts a VM
+/// whose agent is not up, so RPCs against it fail; level 3 (guest dockerd)
+/// is narrower than "the VM is running" and already has its own signal.
+///
+/// Driven from the lifecycle watch rather than set once on a successful guest
+/// query, so it tracks both edges: idle stop, backend switch, and crash
+/// recovery all move it without anything else having to remember to.
+async fn vm_running_loop(
+    mut state: watch::Receiver<VmLifecycleState>,
+    setup_state: Arc<arcbox_api::SetupState>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        setup_state.set_vm_running(state.borrow_and_update().is_ready());
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            // The sender lives as long as the runtime; an error means it is
+            // gone, so there is nothing left to mirror.
+            changed = state.changed() => if changed.is_err() { break },
+        }
+    }
+}
 
 /// Mirrors VM lifecycle events into `SetupState.route_installed`.
 ///
@@ -449,7 +448,7 @@ fn should_log_route_failure(consecutive_failures: u32) -> bool {
     consecutive_failures == 1 || consecutive_failures.is_multiple_of(30)
 }
 
-fn register_host_dns(runtime: &Arc<Runtime>) {
+async fn register_host_dns(runtime: &Arc<Runtime>) {
     let network_cfg = &runtime.config().network;
     let gateway_ip = network_cfg
         .gateway
@@ -458,14 +457,16 @@ fn register_host_dns(runtime: &Arc<Runtime>) {
         .or_else(|| first_address_in_subnet(&network_cfg.subnet))
         .unwrap_or(Ipv4Addr::new(10, 0, 2, 1));
     let ip = IpAddr::V4(gateway_ip);
-    runtime.network_manager().register_dns("host", ip);
-    // Docker compatibility: containers use these to reach host services.
     runtime
-        .network_manager()
-        .register_dns("host.docker.internal", ip);
-    runtime
-        .network_manager()
-        .register_dns("gateway.docker.internal", ip);
+        .register_host_dns(
+            &[
+                "host".into(),
+                "host.docker.internal".into(),
+                "gateway.docker.internal".into(),
+            ],
+            ip,
+        )
+        .await;
 }
 
 fn first_address_in_subnet(subnet: &str) -> Option<Ipv4Addr> {
@@ -504,6 +505,53 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         false
+    }
+
+    /// Polls until `vm_running` matches `want` or times out.
+    async fn wait_for_vm_running(state: &SetupState, want: bool) -> bool {
+        for _ in 0..200 {
+            if state.current().vm_running == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// The flag has to fall as well as rise. Its predecessor was set once by
+    /// cold-start recovery and never cleared, so a client saw `vm_running`
+    /// stay true for the rest of the daemon's life after any VM stop.
+    #[tokio::test]
+    async fn vm_running_loop_follows_the_lifecycle_both_ways() {
+        let (lifecycle, rx) = watch::channel(VmLifecycleState::Stopped);
+        let setup_state = Arc::new(SetupState::new());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        let task = tokio::spawn(vm_running_loop(
+            rx,
+            Arc::clone(&setup_state),
+            shutdown.clone(),
+        ));
+
+        assert!(wait_for_vm_running(&setup_state, false).await);
+
+        lifecycle.send(VmLifecycleState::Running).expect("receiver");
+        assert!(wait_for_vm_running(&setup_state, true).await);
+
+        // Idle still counts as running: the VM is up, just quiet.
+        lifecycle.send(VmLifecycleState::Idle).expect("receiver");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(setup_state.current().vm_running);
+
+        // The regression this test exists for.
+        lifecycle.send(VmLifecycleState::Stopped).expect("receiver");
+        assert!(wait_for_vm_running(&setup_state, false).await);
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("loop exits on shutdown")
+            .expect("loop task panicked");
     }
 
     #[tokio::test]

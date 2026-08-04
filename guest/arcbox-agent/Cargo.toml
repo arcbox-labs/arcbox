@@ -13,7 +13,6 @@ name = "arcbox-agent"
 path = "src/main.rs"
 
 [dependencies]
-arcbox-protocol = { workspace = true }
 arcbox-constants = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -44,6 +43,12 @@ wait-timeout = "0.2.1"
 oci2rootfs = { version = "0.2.1", default-features = false }
 arcbox-ext4 = "0.1.2"
 arcbox-logging.workspace = true
+hyper = { workspace = true, features = ["http1", "client"] }
+http-body-util = "0.1.4"
+sha2.workspace = true
+arcbox-connect.workspace = true
+buffa = "0.9.1"
+buffa-types = "0.9.1"
 
 # vsock and arcbox-vm are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]

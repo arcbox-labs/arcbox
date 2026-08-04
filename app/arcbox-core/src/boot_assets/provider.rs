@@ -17,12 +17,6 @@ pub struct BootAssets {
     pub kernel: PathBuf,
     /// Path to EROFS rootfs image (attached as /dev/vda, read-only).
     pub rootfs_image: PathBuf,
-    /// Path to the read-only EROFS image of the guest container-runtime
-    /// binaries, when the pinned boot release ships one. Attached as an
-    /// extra read-only disk so the guest execs the runtime from
-    /// block-backed storage instead of over VirtioFS (ABX-498); `None` on
-    /// releases predating it, where the guest keeps using the share.
-    pub runtime_image: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: String,
     /// Asset version.
@@ -104,7 +98,6 @@ impl BootAssetProvider {
         Ok(BootAssets {
             kernel: prepared.kernel,
             rootfs_image: prepared.rootfs,
-            runtime_image: prepared.runtime_image,
             cmdline: prepared.kernel_cmdline,
             version: prepared.version,
             manifest: prepared.manifest,
@@ -152,6 +145,13 @@ impl BootAssetProvider {
     /// warns — dev workflows drop the pin deliberately to boot locally
     /// built assets.
     fn verify_manifest_pin(&self) -> Result<()> {
+        if self.config.allow_unpinned_manifest {
+            tracing::warn!(
+                "development profile allows a locally built boot manifest to bypass the \
+                 production assets.lock pin"
+            );
+            return Ok(());
+        }
         let Some(expected) = boot_asset_manifest_sha256() else {
             tracing::warn!(
                 "assets.lock carries no boot manifest_sha256 pin; skipping manifest \
@@ -171,43 +171,13 @@ impl BootAssetProvider {
         }
     }
 
-    /// Returns true if the current version's boot assets are fully cached
-    /// (manifest + kernel + rootfs, plus the runtime image on releases that
-    /// ship one).
-    ///
-    /// Callers use this to skip the progress-reported download phase, so a
-    /// release whose runtime image is still missing must report `false` —
-    /// otherwise that download happens silently mid-boot instead.
+    /// Returns true if the current version's boot assets are fully cached.
     #[must_use]
     pub fn is_cached(&self) -> bool {
         let dir = self.config.version_cache_dir();
-        if !(dir.join("manifest.json").exists()
+        dir.join("manifest.json").exists()
             && dir.join("kernel").exists()
-            && dir.join("rootfs.erofs").exists())
-        {
-            return false;
-        }
-        !self.cached_manifest_ships_runtime_image() || dir.join("runtime.erofs").exists()
-    }
-
-    /// Whether the cached manifest declares a runtime image for this arch.
-    /// An unreadable or unparsable manifest answers `false`: `prepare` is the
-    /// authority and re-fetches it, so guessing `true` here would only force
-    /// a pointless re-download.
-    fn cached_manifest_ships_runtime_image(&self) -> bool {
-        let path = self.config.version_cache_dir().join("manifest.json");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return false;
-        };
-        serde_json::from_slice::<BootAssetManifest>(&bytes)
-            .ok()
-            .and_then(|manifest| {
-                manifest
-                    .targets
-                    .get(&self.manager.config().arch)
-                    .map(|target| target.runtime.is_some())
-            })
-            .unwrap_or(false)
+            && dir.join("rootfs.erofs").exists()
     }
 
     /// Prefetches boot assets (downloads if not cached).
@@ -235,6 +205,20 @@ impl BootAssetProvider {
             .map_err(|e| CoreError::config(format!("failed to read manifest: {e}")))?;
         serde_json::from_slice(&bytes)
             .map_err(|e| CoreError::config(format!("failed to parse manifest: {e}")))
+    }
+
+    pub(crate) fn cached_manifest_has_binary(&self, name: &str) -> Result<bool> {
+        self.verify_manifest_pin()?;
+        let path = self.cached_manifest_path();
+        let bytes = std::fs::read(&path)
+            .map_err(|e| CoreError::config(format!("failed to read {}: {e}", path.display())))?;
+        let manifest: BootAssetManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| CoreError::config(format!("failed to parse {}: {e}", path.display())))?;
+        Ok(manifest_has_binary(
+            &manifest,
+            &self.manager.config().arch,
+            name,
+        ))
     }
 
     /// Lists all cached version directories.
@@ -297,5 +281,42 @@ impl BootAssetProvider {
         self.manager = AssetManager::new(inner_config)
             .map_err(|e| CoreError::config(format!("invalid boot asset config: {e}")))?;
         Ok(())
+    }
+}
+
+fn manifest_has_binary(manifest: &BootAssetManifest, arch: &str, name: &str) -> bool {
+    manifest
+        .binaries
+        .iter()
+        .any(|binary| binary.name == name && binary.targets.contains_key(arch))
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::{BootAssetManifest, manifest_has_binary};
+
+    #[test]
+    fn binary_capability_is_scoped_to_the_current_architecture() {
+        let manifest: BootAssetManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 0,
+            "asset_version": "0.6.13",
+            "built_at": "now",
+            "targets": {},
+            "binaries": [{
+                "name": "FEX",
+                "version": "1",
+                "targets": {
+                    "arm64": {
+                        "path": "FEX",
+                        "sha256": "0".repeat(64)
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+
+        assert!(manifest_has_binary(&manifest, "arm64", "FEX"));
+        assert!(!manifest_has_binary(&manifest, "x86_64", "FEX"));
+        assert!(!manifest_has_binary(&manifest, "arm64", "dockerd"));
     }
 }

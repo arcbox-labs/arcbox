@@ -12,15 +12,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use arcbox_grpc::SandboxServiceClient;
-use arcbox_protocol::sandbox_v1::{
-    CreateSandboxRequest, ExecRequest, InspectSandboxRequest, RemoveSandboxRequest, ResourceLimits,
-    SandboxInfo,
+use arcbox_connect::sandbox_v1::SandboxServiceClient;
+use arcbox_connect::sandbox_v1::{
+    CreateSandboxRequest, InspectSandboxRequest, RemoveSandboxRequest, ResourceLimits, SandboxInfo,
+    SandboxState, StartExecutionRequest,
 };
 use clap::Args;
-use tonic::transport::Channel;
 
-use super::sandbox::{attach_machine, current_tty_size, exec_session, sandbox_channel};
+use super::sandbox::{current_tty_size, exec_session, sandbox_channel};
 
 /// How long to wait for a freshly created sandbox to become ready.
 ///
@@ -122,16 +121,22 @@ enum Action {
     Refuse,
 }
 
+/// The sandbox's state with prost-getter semantics: an unknown wire value
+/// reads as `Unspecified`.
+fn state_of(info: &SandboxInfo) -> SandboxState {
+    info.state.as_known().unwrap_or_default()
+}
+
 /// Decide how to reach a usable sandbox from its current state.
-fn plan_action(state: Option<&str>) -> Action {
+fn plan_action(state: Option<SandboxState>) -> Action {
     match state {
         None => Action::Create,
-        Some("ready") => Action::Attach,
-        Some("starting") => Action::WaitReady,
+        Some(SandboxState::Ready) => Action::Attach,
+        Some(SandboxState::Starting) => Action::WaitReady,
         // `Stop` tears down the CoW overlay, so a stopped sandbox has lost
         // everything under /workspace and is only a name.
-        Some("stopped" | "failed") => Action::Recreate,
-        // "running" means a workload already holds the sandbox; anything else
+        Some(SandboxState::Stopped | SandboxState::Failed) => Action::Recreate,
+        // RUNNING means a workload already holds the sandbox; anything else
         // is a state this build does not know about.
         Some(_) => Action::Refuse,
     }
@@ -180,15 +185,17 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     // Fail before any image work if the credentials are not there.
     let env = collect_env(def, std::env::vars())?;
 
-    let channel = sandbox_channel().await?;
-    let mut client = SandboxServiceClient::new(channel);
+    let (transport, config) = sandbox_channel();
+    let client = SandboxServiceClient::new(transport.clone(), config.clone());
 
-    let existing = inspect(&mut client, &id).await?;
-    match plan_action(existing.as_ref().map(|info| info.state.as_str())) {
+    let existing = inspect(&client, &id).await?;
+    match plan_action(existing.as_ref().map(state_of)) {
         Action::Attach => {}
-        Action::WaitReady => wait_ready(&mut client, &id).await?,
+        Action::WaitReady => wait_ready(&client, &id).await?,
         Action::Refuse => {
-            let state = existing.map(|info| info.state).unwrap_or_default();
+            let state = existing.map_or("unknown", |info| {
+                super::sandbox::state_name(state_of(&info))
+            });
             bail!(
                 "sandbox '{id}' is {state} — a session may already be active. \
                  Use --id <name> for a second one, or remove it with \
@@ -196,13 +203,13 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
             );
         }
         Action::Recreate => {
-            remove(&mut client, &id).await?;
-            create(&mut client, def, &id, args.cpus, args.memory).await?;
-            wait_ready(&mut client, &id).await?;
+            remove(&client, &id).await?;
+            create(&client, def, &id, args.cpus, args.memory).await?;
+            wait_ready(&client, &id).await?;
         }
         Action::Create => {
-            create(&mut client, def, &id, args.cpus, args.memory).await?;
-            wait_ready(&mut client, &id).await?;
+            create(&client, def, &id, args.cpus, args.memory).await?;
+            wait_ready(&client, &id).await?;
         }
     }
 
@@ -212,18 +219,19 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
     }
     cmd.extend(args.args);
 
-    let init = ExecRequest {
-        id: id.clone(),
+    let start = StartExecutionRequest {
+        sandbox_id: id.clone(),
         cmd,
-        env,
+        env: env.into_iter().collect(),
         working_dir: def.workdir.to_string(),
         user: def.user.to_string(),
         tty: true,
-        tty_size: current_tty_size(true),
+        tty_size: current_tty_size(true).into(),
+        stdin: true,
         ..Default::default()
     };
 
-    let exit_code = exec_session(&mut client, init).await?;
+    let exit_code = exec_session(transport, config, start).await?;
 
     eprintln!(
         "\nSandbox '{id}' is still running: reopen with `abctl {}`, copy work out with \
@@ -240,27 +248,31 @@ pub async fn execute(def: &AgentDef, args: AgentArgs) -> Result<()> {
 
 /// Fetch a sandbox, or `None` when it does not exist.
 async fn inspect(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
     id: &str,
 ) -> Result<Option<SandboxInfo>> {
-    let request = attach_machine(tonic::Request::new(InspectSandboxRequest {
+    let request = InspectSandboxRequest {
         id: id.to_string(),
-    }));
+        ..Default::default()
+    };
     match client.inspect(request).await {
-        Ok(response) => Ok(Some(response.into_inner())),
-        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+        Ok(response) => Ok(Some(response.into_owned())),
+        Err(status) if status.code == connectrpc::ErrorCode::NotFound => Ok(None),
         Err(status) => Err(status).context("Failed to inspect sandbox")?,
     }
 }
 
 /// Remove a sandbox that cannot be reused.
-async fn remove(client: &mut SandboxServiceClient<Channel>, id: &str) -> Result<()> {
-    let request = attach_machine(tonic::Request::new(RemoveSandboxRequest {
-        id: id.to_string(),
-        force: true,
-    }));
+async fn remove(
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
+    id: &str,
+) -> Result<()> {
     client
-        .remove(request)
+        .remove(RemoveSandboxRequest {
+            id: id.to_string(),
+            force: true,
+            ..Default::default()
+        })
         .await
         .context("Failed to remove the previous sandbox")?;
     Ok(())
@@ -268,37 +280,44 @@ async fn remove(client: &mut SandboxServiceClient<Channel>, id: &str) -> Result<
 
 /// Build the agent image if needed and create the sandbox.
 async fn create(
-    client: &mut SandboxServiceClient<Channel>,
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
     def: &AgentDef,
     id: &str,
     vcpus: u32,
     memory_mib: u64,
 ) -> Result<()> {
-    let rootfs = super::sandbox::resolve_template_rootfs(def.template).await?;
+    let template = super::sandbox::resolve_template(def.template).await?;
 
-    let request = attach_machine(tonic::Request::new(CreateSandboxRequest {
-        id: id.to_string(),
-        labels: HashMap::from([("arcbox.agent".to_string(), def.name.to_string())]),
-        rootfs,
-        limits: Some(ResourceLimits { vcpus, memory_mib }),
-        // No TTL: expiry would take /workspace with it mid-session.
-        ttl_seconds: 0,
-        ..Default::default()
-    }));
     client
-        .create(request)
+        .create(CreateSandboxRequest {
+            id: id.to_string(),
+            labels: std::iter::once(("arcbox.agent".to_string(), def.name.to_string())).collect(),
+            template,
+            limits: ResourceLimits {
+                vcpus,
+                memory_mib,
+                ..Default::default()
+            }
+            .into(),
+            // No TTL: expiry would take /workspace with it mid-session.
+            ttl_seconds: 0,
+            ..Default::default()
+        })
         .await
         .context("Failed to create the agent sandbox")?;
     Ok(())
 }
 
 /// Block until the sandbox reports `ready`.
-async fn wait_ready(client: &mut SandboxServiceClient<Channel>, id: &str) -> Result<()> {
+async fn wait_ready(
+    client: &SandboxServiceClient<connectrpc::client::SharedHttp2Connection>,
+    id: &str,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         match inspect(client, id).await? {
-            Some(info) if info.state == "ready" => return Ok(()),
-            Some(info) if info.state == "failed" => {
+            Some(info) if info.state == SandboxState::Ready => return Ok(()),
+            Some(info) if info.state == SandboxState::Failed => {
                 let detail = if info.error.is_empty() {
                     "no reason reported".to_string()
                 } else {
@@ -379,13 +398,13 @@ mod tests {
     #[test]
     fn plan_action_maps_every_sandbox_state() {
         assert_eq!(plan_action(None), Action::Create);
-        assert_eq!(plan_action(Some("ready")), Action::Attach);
-        assert_eq!(plan_action(Some("starting")), Action::WaitReady);
-        assert_eq!(plan_action(Some("stopped")), Action::Recreate);
-        assert_eq!(plan_action(Some("failed")), Action::Recreate);
+        assert_eq!(plan_action(Some(SandboxState::Ready)), Action::Attach);
+        assert_eq!(plan_action(Some(SandboxState::Starting)), Action::WaitReady);
+        assert_eq!(plan_action(Some(SandboxState::Stopped)), Action::Recreate);
+        assert_eq!(plan_action(Some(SandboxState::Failed)), Action::Recreate);
         // A live workload holds the sandbox; never destroy it from under one.
-        assert_eq!(plan_action(Some("running")), Action::Refuse);
-        assert_eq!(plan_action(Some("stopping")), Action::Refuse);
-        assert_eq!(plan_action(Some("something-new")), Action::Refuse);
+        assert_eq!(plan_action(Some(SandboxState::Running)), Action::Refuse);
+        assert_eq!(plan_action(Some(SandboxState::Stopping)), Action::Refuse);
+        assert_eq!(plan_action(Some(SandboxState::Unspecified)), Action::Refuse);
     }
 }

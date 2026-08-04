@@ -181,8 +181,11 @@ impl VmLifecycleManager {
         config: VmLifecycleConfig,
     ) -> Result<Self> {
         let boot_assets = Arc::new(
-            BootAssetProvider::new(data_dir.join("boot"))?
-                .with_kernel(config.default_vm.kernel.clone().unwrap_or_default())?,
+            BootAssetProvider::with_config(
+                crate::boot_assets::BootAssetConfig::with_cache_dir(data_dir.join("boot"))
+                    .with_unpinned_manifest_allowed(config.allow_unpinned_boot_manifest),
+            )?
+            .with_kernel(config.default_vm.kernel.clone().unwrap_or_default())?,
         );
 
         let health_monitor = Arc::new(HealthMonitor::new(

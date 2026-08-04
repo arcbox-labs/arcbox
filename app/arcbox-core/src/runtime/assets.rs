@@ -37,7 +37,7 @@ pub(super) fn check_executable(path: &Path, context: &str) -> Result<()> {
 /// These binaries are provisioned by `abctl boot prefetch` (release builds) or
 /// manually by developers (see `cargo xtask dev boot-assets`). This function
 /// only validates — it does not download or install anything.
-pub(super) fn ensure_guest_binaries(data_dir: &Path) -> Result<()> {
+pub(super) fn ensure_guest_binaries(data_dir: &Path, generation: &str) -> Result<()> {
     let agent_path = data_dir.join("bin/arcbox-agent");
     check_executable(
         &agent_path,
@@ -47,7 +47,7 @@ pub(super) fn ensure_guest_binaries(data_dir: &Path) -> Result<()> {
         ),
     )?;
 
-    let runtime_dir = data_dir.join("runtime/bin");
+    let runtime_dir = data_dir.join("runtime").join(generation).join("bin");
     for name in REQUIRED_RUNTIME_ASSETS {
         check_executable(
             &runtime_dir.join(name),
