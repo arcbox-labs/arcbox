@@ -13,8 +13,8 @@ use arcbox_migration::{
 use dto::ToWire;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::{Mutex, RwLock, watch};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -23,11 +23,75 @@ struct PreparedMigration {
     plan: arcbox_migration::MigrationPlan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MigrationRunOptions {
+    allow_replacements: bool,
+    skip_start: bool,
+}
+
+impl From<&RunMigrationRequest> for MigrationRunOptions {
+    fn from(request: &RunMigrationRequest) -> Self {
+        Self {
+            allow_replacements: request.allow_replacements,
+            skip_start: request.skip_start,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MigrationRun {
+    options: MigrationRunOptions,
+    events: watch::Sender<Option<RunMigrationEvent>>,
+}
+
+impl MigrationRun {
+    fn is_active(&self) -> bool {
+        self.events
+            .borrow()
+            .as_ref()
+            .is_none_or(|event| !event.done)
+    }
+
+    fn publish(&self, event: RunMigrationEvent) {
+        self.events.send_replace(Some(event));
+    }
+
+    fn subscribe(&self) -> UnboundedReceiver<Result<RunMigrationEvent>> {
+        let mut events = self.events.subscribe();
+        let (tx, rx) = unbounded_channel();
+
+        tokio::spawn(async move {
+            loop {
+                let latest = events.borrow_and_update().clone();
+                if let Some(event) = latest {
+                    let done = event.done;
+                    if tx.send(Ok(event)).is_err() || done {
+                        break;
+                    }
+                }
+
+                tokio::select! {
+                    () = tx.closed() => break,
+                    changed = events.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        rx
+    }
+}
+
 /// Host-side migration manager.
 #[derive(Debug)]
 pub struct MigrationManager {
     target_socket: PathBuf,
     prepared: RwLock<HashMap<String, PreparedMigration>>,
+    runs: RwLock<HashMap<String, MigrationRun>>,
+    run_start: Mutex<()>,
 }
 
 impl MigrationManager {
@@ -37,6 +101,8 @@ impl MigrationManager {
         Self {
             target_socket,
             prepared: RwLock::new(HashMap::new()),
+            runs: RwLock::new(HashMap::new()),
+            run_start: Mutex::new(()),
         }
     }
 
@@ -121,6 +187,26 @@ impl MigrationManager {
         &self,
         request: RunMigrationRequest,
     ) -> Result<UnboundedReceiver<Result<RunMigrationEvent>>> {
+        let _start = self.run_start.lock().await;
+        let run_options = MigrationRunOptions::from(&request);
+
+        let existing = self.runs.read().await.get(&request.plan_id).cloned();
+        if let Some(run) = existing {
+            if run.options != run_options {
+                return Err(CoreError::invalid_state(format!(
+                    "migration {} is already running with different options",
+                    request.plan_id
+                )));
+            }
+            return Ok(run.subscribe());
+        }
+
+        if self.runs.read().await.values().any(MigrationRun::is_active) {
+            return Err(CoreError::invalid_state(
+                "another migration is already running",
+            ));
+        }
+
         let prepared = self
             .prepared
             .read()
@@ -140,21 +226,33 @@ impl MigrationManager {
         let target_runner =
             DockerCliRunner::new(self.target_socket.clone()).map_err(map_migration_error)?;
         let executor = MigrationExecutor::new(target_runner);
-        let options = MigrationExecutorOptions {
+        let executor_options = MigrationExecutorOptions {
             confirm_replace: request.allow_replacements,
             confirm_stop_source_containers: request.allow_replacements,
             start_containers: !request.skip_start,
         };
         let plan_id = request.plan_id.clone();
-        let prepared = self
-            .prepared
-            .write()
-            .await
-            .remove(&request.plan_id)
-            .ok_or_else(|| CoreError::not_found(format!("migration plan {}", request.plan_id)))?;
+        // Consume the plan and publish its run without a cancellation point
+        // between the two state transitions.
+        let (prepared, run) = {
+            let (mut prepared_plans, mut runs) =
+                tokio::join!(self.prepared.write(), self.runs.write());
+            let prepared = prepared_plans.remove(&request.plan_id).ok_or_else(|| {
+                CoreError::not_found(format!("migration plan {}", request.plan_id))
+            })?;
+            let (events, _) = watch::channel(None);
+            let run = MigrationRun {
+                options: run_options,
+                events,
+            };
+            // ponytail: retain tiny terminal snapshots for the daemon lifetime;
+            // add bounded durable history if migration volume makes this material.
+            runs.insert(plan_id.clone(), run.clone());
+            (prepared, run)
+        };
         let source = prepared.source;
         let plan = prepared.plan;
-        let (tx, rx) = unbounded_channel();
+        let receiver = run.subscribe();
 
         tokio::spawn(async move {
             let mut emit = |progress: MigrationProgress| {
@@ -163,10 +261,13 @@ impl MigrationManager {
                 // misleading clients that check `success` without gating on
                 // `done`.
                 let event = progress_to_event(&plan_id, progress, false, true);
-                let _ = tx.send(Ok(event));
+                run.publish(event);
             };
 
-            match executor.execute(source, &plan, options, &mut emit).await {
+            match executor
+                .execute(source, &plan, executor_options, &mut emit)
+                .await
+            {
                 Ok(outcome) => {
                     let detail = if outcome.warnings.is_empty() {
                         "migration completed".to_string()
@@ -190,10 +291,10 @@ impl MigrationManager {
                         true,
                     );
                     event.warnings = outcome.warnings;
-                    let _ = tx.send(Ok(event));
+                    run.publish(event);
                 }
                 Err(error) => {
-                    let _ = tx.send(Ok(progress_to_event(
+                    run.publish(progress_to_event(
                         &plan_id,
                         MigrationProgress {
                             stage: arcbox_migration::MigrationStage::Complete,
@@ -205,12 +306,12 @@ impl MigrationManager {
                         },
                         true,
                         false,
-                    )));
+                    ));
                 }
             }
         });
 
-        Ok(rx)
+        Ok(receiver)
     }
 }
 
@@ -358,6 +459,18 @@ exit 0
         }
     }
 
+    async fn terminal_event(
+        events: &mut UnboundedReceiver<Result<RunMigrationEvent>>,
+    ) -> RunMigrationEvent {
+        while let Some(event) = events.recv().await {
+            let event = event.unwrap();
+            if event.done {
+                return event;
+            }
+        }
+        panic!("migration stream ended without a terminal event");
+    }
+
     #[tokio::test]
     async fn run_migration_keeps_plan_when_confirmation_is_missing() {
         let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
@@ -424,7 +537,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn unsupported_resources_fail_the_run_rather_than_the_prepare() {
+    async fn terminal_result_survives_a_later_migration() {
         let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
         let plan_id = "test-plan".to_string();
         manager.prepared.write().await.insert(
@@ -446,22 +559,92 @@ exit 0
         let temp_dir = tempfile::tempdir().unwrap();
         let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
 
-        let mut events = manager
+        let request = RunMigrationRequest {
+            plan_id,
+            allow_replacements: true,
+            skip_start: false,
+            ..Default::default()
+        };
+        let mut events = manager.run_migration(request.clone()).await.unwrap();
+        let event = terminal_event(&mut events).await;
+
+        let next_plan_id = "next-plan".to_string();
+        manager.prepared.write().await.insert(
+            next_plan_id.clone(),
+            PreparedMigration {
+                source: SourceConfig {
+                    kind: SourceKind::DockerDesktop,
+                    socket_path: PathBuf::from("/tmp/docker.sock"),
+                },
+                plan: MigrationPlan {
+                    replacements: ReplacementSummary::default(),
+                    unsupported_resources: vec!["another unsupported resource".to_string()],
+                    ..sample_plan()
+                },
+            },
+        );
+        let mut next_events = manager
             .run_migration(RunMigrationRequest {
-                plan_id,
+                plan_id: next_plan_id,
                 allow_replacements: true,
                 skip_start: false,
                 ..Default::default()
             })
             .await
             .unwrap();
-        let event = events.recv().await.unwrap().unwrap();
+        terminal_event(&mut next_events).await;
+
+        let mut reattached = manager.run_migration(request).await.unwrap();
+        let replayed = terminal_event(&mut reattached).await;
 
         restore_path(previous_path);
 
         assert!(event.done);
         assert!(!event.success);
         assert!(event.message.contains("unsupported resources"));
+        assert_eq!(replayed, event);
+    }
+
+    #[tokio::test]
+    async fn concurrent_plan_is_rejected_without_being_consumed() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        let (events, _) = watch::channel(None);
+        manager.runs.write().await.insert(
+            "active-plan".to_string(),
+            MigrationRun {
+                options: MigrationRunOptions {
+                    allow_replacements: true,
+                    skip_start: false,
+                },
+                events,
+            },
+        );
+        manager.prepared.write().await.insert(
+            "next-plan".to_string(),
+            PreparedMigration {
+                source: SourceConfig {
+                    kind: SourceKind::DockerDesktop,
+                    socket_path: PathBuf::from("/tmp/docker.sock"),
+                },
+                plan: MigrationPlan {
+                    replacements: ReplacementSummary::default(),
+                    ..sample_plan()
+                },
+            },
+        );
+
+        let error = manager
+            .run_migration(RunMigrationRequest {
+                plan_id: "next-plan".to_string(),
+                allow_replacements: true,
+                skip_start: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("another migration"));
+        assert!(manager.prepared.read().await.contains_key("next-plan"));
     }
 
     #[tokio::test]
