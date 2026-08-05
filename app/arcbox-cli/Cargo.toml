@@ -16,10 +16,6 @@ path = "src/lib.rs"
 name = "abctl"
 path = "src/main.rs"
 
-[[bin]]
-name = "arcbox"
-path = "src/bin/arcbox_placeholder.rs"
-
 [dependencies]
 arcbox-core = { workspace = true }
 arcbox-docker = { workspace = true }

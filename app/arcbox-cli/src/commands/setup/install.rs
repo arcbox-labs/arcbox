@@ -19,15 +19,13 @@ pub(super) async fn install(format: OutputFormat) -> Result<()> {
     }
 
     let executable = std::env::current_exe().context("could not determine current executable")?;
-    let executable_dir = executable
-        .parent()
-        .context("current executable has no parent directory")?;
     let abctl_link = bin.join("abctl");
     create_or_update_symlink(&executable, &abctl_link).await?;
-    let placeholder = executable_dir.join("arcbox");
-    if placeholder.exists() {
-        create_or_update_symlink(&placeholder, &bin.join("arcbox")).await?;
-    }
+
+    // Older installs linked ~/.arcbox/bin/arcbox to the rename shim, which no
+    // longer ships — the link would dangle on PATH. Drop it here rather than in
+    // `uninstall`, so an upgrade heals without the user removing anything.
+    remove_stale_shim_link(&bin.join("arcbox")).await;
 
     let docker_tools = link_docker_tools(&executable, &bin).await;
     let (docker_plugins, plugin_error) = register_docker_plugins(&bin).await;
@@ -235,6 +233,19 @@ async fn valid_symlink(path: &Path) -> bool {
             .is_ok_and(|target| target.exists())
 }
 
+/// Remove the retired `arcbox` shim link left by an older `setup install`.
+///
+/// Only symlinks are touched: this directory holds nothing but links we
+/// created, so a regular file here is the user's and is left alone.
+async fn remove_stale_shim_link(link: &Path) {
+    let Ok(metadata) = tokio::fs::symlink_metadata(link).await else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        let _ = tokio::fs::remove_file(link).await;
+    }
+}
+
 async fn create_or_update_symlink(target: &Path, link: &Path) -> Result<()> {
     if tokio::fs::symlink_metadata(link).await.is_ok() {
         tokio::fs::remove_file(link)
@@ -254,7 +265,29 @@ async fn create_or_update_symlink(target: &Path, link: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_init_scripts;
+    use super::{remove_stale_shim_link, write_init_scripts};
+
+    #[tokio::test]
+    async fn stale_shim_link_is_removed_but_a_real_file_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A dangling link to the retired shim: the upgrade case.
+        let link = dir.path().join("arcbox");
+        tokio::fs::symlink(dir.path().join("gone"), &link)
+            .await
+            .unwrap();
+        remove_stale_shim_link(&link).await;
+        assert!(tokio::fs::symlink_metadata(&link).await.is_err());
+
+        // A regular file of the same name is not ours to delete.
+        let file = dir.path().join("arcbox-file");
+        tokio::fs::write(&file, b"user data").await.unwrap();
+        remove_stale_shim_link(&file).await;
+        assert_eq!(tokio::fs::read(&file).await.unwrap(), b"user data");
+
+        // Absent path is a no-op, not an error.
+        remove_stale_shim_link(&dir.path().join("absent")).await;
+    }
 
     #[tokio::test]
     async fn init_scripts_reference_the_selected_profile_root() {
