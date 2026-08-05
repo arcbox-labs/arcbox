@@ -111,8 +111,8 @@ async fn reconcile(
     // The trigger is the lifecycle *ready* edge, never the restart generation:
     // that counter is bumped when the VM stops, so acting on it would send the
     // request into the gap where no guest exists and burn the retry budget on a
-    // VM that is still booting — or, after a plain `abctl machine stop`, on one that is
-    // not coming back until the next on-demand start.
+    // VM that is still booting — or, after a plain `abctl machine stop`, on
+    // one that is not coming back until the next on-demand start.
     let mut state = runtime.subscribe_system_vm_state();
     let mut first = true;
 

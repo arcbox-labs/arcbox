@@ -6,9 +6,7 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 `docs/daemon-lifecycle.md` (lock/handoff, residual-state tables) and
 `docs/data-directories.md` (filesystem paths) — point there, don't restate.
 
-`arcbox-cli` ships two binaries: `abctl` (the real CLI) and `arcbox` (a
-deprecated shim that `exec`s `abctl`, pending removal). User-facing strings
-must name `abctl`.
+`arcbox-cli` ships one binary, `abctl`. User-facing strings must name it.
 
 ## Startup & readiness contract
 
