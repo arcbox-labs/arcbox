@@ -19,12 +19,12 @@ const SIMD_THRESHOLD: usize = 64;
 
 /// Calculates the ones' complement sum of 16-bit words.
 ///
-/// This is the core operation for IP/TCP/UDP checksums. Buffers of
-/// [`SIMD_THRESHOLD`] bytes or more use the architecture SIMD path when
-/// available (NEON / SSSE3); shorter buffers stay on the scalar loop.
+/// This is the core operation for IP/TCP/UDP checksums. Buffers longer than
+/// [`SIMD_THRESHOLD`] bytes use the architecture SIMD path when available
+/// (NEON / SSSE3); shorter buffers stay on the scalar loop.
 #[inline]
 pub fn checksum_add(data: &[u8]) -> u32 {
-    if data.len() >= SIMD_THRESHOLD {
+    if data.len() > SIMD_THRESHOLD {
         checksum_add_fast(data)
     } else {
         checksum_add_scalar(data)
@@ -177,10 +177,14 @@ pub fn udp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], udp_datagram: &[u8]) -> u1
 /// Ones' complement sum via the fastest available path for this host.
 #[inline]
 fn checksum_add_fast(data: &[u8]) -> u32 {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         // SAFETY: NEON is mandatory on AArch64.
         unsafe { checksum_add_neon(data) }
+    }
+    #[cfg(all(target_arch = "aarch64", target_endian = "big"))]
+    {
+        checksum_add_scalar(data)
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -200,26 +204,56 @@ fn checksum_add_fast(data: &[u8]) -> u32 {
 /// SIMD ones' complement sum for ARM64 NEON (16 bytes/iter, BE halfwords).
 ///
 /// # Safety
-/// Requires NEON (`#[target_feature(enable = "neon")]`). Always true on AArch64.
-#[cfg(target_arch = "aarch64")]
+/// Requires NEON (`#[target_feature(enable = "neon")]`) on little-endian
+/// AArch64.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 unsafe fn checksum_add_neon(data: &[u8]) -> u32 {
     use std::arch::aarch64::*;
 
     // SAFETY: NEON available; loads stay within `data`.
     unsafe {
-        let mut sum = vdupq_n_u32(0);
+        let zero = vdupq_n_u32(0);
+        let mut sum0 = zero;
+        let mut sum1 = zero;
+        let mut sum2 = zero;
+        let mut sum3 = zero;
         let (chunks, remainder) = data.as_chunks::<16>();
+        let (groups, group_remainder) = chunks.as_chunks::<4>();
 
-        for chunk in chunks {
-            let bytes = vld1q_u8(chunk.as_ptr());
+        for group in groups {
+            let bytes = vld1q_u8(group[0].as_ptr());
             // Network order is BE; swap adjacent bytes on LE host.
             let swapped = vrev16q_u8(bytes);
             let words = vreinterpretq_u16_u8(swapped);
-            sum = vpadalq_u16(sum, words);
+            sum0 = vpadalq_u16(sum0, words);
+
+            let bytes = vld1q_u8(group[1].as_ptr());
+            let swapped = vrev16q_u8(bytes);
+            let words = vreinterpretq_u16_u8(swapped);
+            sum1 = vpadalq_u16(sum1, words);
+
+            let bytes = vld1q_u8(group[2].as_ptr());
+            let swapped = vrev16q_u8(bytes);
+            let words = vreinterpretq_u16_u8(swapped);
+            sum2 = vpadalq_u16(sum2, words);
+
+            let bytes = vld1q_u8(group[3].as_ptr());
+            let swapped = vrev16q_u8(bytes);
+            let words = vreinterpretq_u16_u8(swapped);
+            sum3 = vpadalq_u16(sum3, words);
         }
 
-        let mut scalar_sum = vaddvq_u32(sum);
+        for chunk in group_remainder {
+            let bytes = vld1q_u8(chunk.as_ptr());
+            let swapped = vrev16q_u8(bytes);
+            let words = vreinterpretq_u16_u8(swapped);
+            sum0 = vpadalq_u16(sum0, words);
+        }
+
+        let sum01 = vaddq_u32(sum0, sum1);
+        let sum23 = vaddq_u32(sum2, sum3);
+        let mut scalar_sum = vaddvq_u32(vaddq_u32(sum01, sum23));
         let mut i = 0;
         while i + 1 < remainder.len() {
             let word = u16::from_be_bytes([remainder[i], remainder[i + 1]]);
@@ -285,18 +319,6 @@ unsafe fn checksum_add_ssse3(data: &[u8]) -> u32 {
 #[inline]
 pub fn checksum_simd(data: &[u8]) -> u16 {
     checksum_fold(checksum_add_fast(data))
-}
-
-/// Deprecated name kept for external callers that linked the old NEON entry.
-///
-/// Prefer [`checksum`] or [`checksum_simd`].
-#[cfg(target_arch = "aarch64")]
-#[deprecated(note = "use checksum() or checksum_simd() instead")]
-#[target_feature(enable = "neon")]
-#[inline]
-pub unsafe fn checksum_simd_neon(data: &[u8]) -> u16 {
-    // SAFETY: NEON mandatory on AArch64.
-    checksum_fold(unsafe { checksum_add_neon(data) })
 }
 
 #[cfg(test)]
@@ -404,14 +426,26 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_add_fast_matches_scalar_long() {
-        let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-        assert_eq!(checksum_add_scalar(&data), checksum_add_fast(&data));
-        assert_eq!(
-            checksum_fold(checksum_add_scalar(&data)),
-            checksum(&data),
-            "checksum() must match pure scalar on long buffers"
-        );
+    fn test_checksum_paths_match_scalar() {
+        for len in 0..=600 {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let expected = checksum_add_scalar(&data);
+            assert_eq!(
+                checksum_add(&data),
+                expected,
+                "dispatch mismatch at len={len}"
+            );
+            assert_eq!(
+                checksum_add_fast(&data),
+                expected,
+                "fast mismatch at len={len}"
+            );
+            assert_eq!(
+                checksum_simd(&data),
+                checksum_fold(expected),
+                "checksum mismatch at len={len}"
+            );
+        }
     }
 
     #[test]

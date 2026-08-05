@@ -1,4 +1,4 @@
-//! Microbench: scalar vs SIMD Internet checksum throughput.
+//! Microbench: dispatched, scalar, and SIMD Internet checksum throughput.
 //!
 //! ```text
 //! cargo run -p arcbox-packet --example checksum_bench --release
@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use arcbox_packet::checksum::{checksum_add_scalar, checksum_fold, checksum_simd};
+use arcbox_packet::checksum::{checksum, checksum_add_scalar, checksum_fold, checksum_simd};
 
 fn bench(label: &str, len: usize, iters: usize, f: impl Fn(&[u8]) -> u16) {
     let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
@@ -28,6 +28,10 @@ fn bench(label: &str, len: usize, iters: usize, f: impl Fn(&[u8]) -> u16) {
     );
 }
 
+fn checksum_scalar(data: &[u8]) -> u16 {
+    checksum_fold(checksum_add_scalar(data))
+}
+
 fn main() {
     println!(
         "# Internet checksum microbench (host = {})",
@@ -35,11 +39,10 @@ fn main() {
     );
     println!();
 
-    for &len in &[64usize, 1500, 9000, 16384, 65536] {
+    for &len in &[63usize, 64, 65, 1500, 9000, 16384, 65536] {
         let iters = (50_000_000 / len).max(2_000);
-        bench("scalar", len, iters, |d| {
-            checksum_fold(checksum_add_scalar(d))
-        });
+        bench("checksum", len, iters, checksum);
+        bench("scalar", len, iters, checksum_scalar);
         bench("simd", len, iters, checksum_simd);
         let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         assert_eq!(
