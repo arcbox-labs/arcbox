@@ -455,6 +455,9 @@ impl VmmManager {
             parent_id: None,
             kernel_path: None,
             rootfs_path: None,
+            // General VMs boot whatever network the caller configured; only
+            // sandbox checkpoints carry the invariant identity.
+            net_invariant: false,
         })?;
 
         if was_running {
