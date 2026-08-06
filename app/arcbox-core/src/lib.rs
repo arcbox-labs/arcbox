@@ -46,6 +46,7 @@ pub mod remote_image;
 #[cfg(target_os = "macos")]
 pub mod route_reconciler;
 pub mod runtime;
+pub mod sandbox_capability;
 pub mod stats_hub;
 pub mod trace;
 pub mod vm;
@@ -70,6 +71,7 @@ pub use macos::{
 pub use macos::{PullPhase, PullSource};
 pub use migration::MigrationManager;
 pub use runtime::{InitProgress, Runtime, SandboxPortExposure};
+pub use sandbox_capability::NestedVirtCapability;
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
 pub use vm_lifecycle::{
     ActivityScope, DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig,
