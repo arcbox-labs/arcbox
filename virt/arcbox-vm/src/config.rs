@@ -314,6 +314,9 @@ pub struct FirecrackerConfig {
     /// `None` uses the five-second default.
     #[serde(default)]
     pub socket_timeout_secs: Option<u64>,
+    /// Host-side translation mechanism for invariant sandbox TAPs (CORE-83).
+    #[serde(default)]
+    pub sandbox_datapath: SandboxDatapath,
     /// Spare pre-warmed restore slots kept per snapshot id (CORE-78).
     ///
     /// A slot pre-executes the fixed host-side restore setup — jailer
@@ -327,6 +330,23 @@ pub struct FirecrackerConfig {
 
 fn default_pool_size() -> usize {
     1
+}
+
+/// How the pool-IP <-> fixed-guest-IP translation of an invariant sandbox TAP
+/// (CORE-81) is applied host-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxDatapath {
+    /// Per-TAP TCX eBPF programs: two attach syscalls and one map update per
+    /// activation, stateless, O(1) per packet (CORE-83). Falls back to
+    /// [`Self::Iptables`] automatically when the BPF object cannot be loaded
+    /// or attached.
+    #[default]
+    Ebpf,
+    /// The CORE-81 iptables rule set (mark + DNAT/SNAT + fwmark fib rules);
+    /// conntrack-stateful and O(active sandboxes) per packet. Also the only
+    /// mechanism ever applied to legacy (non-invariant) TAPs.
+    Iptables,
 }
 
 /// Network IP-pool settings for sandbox TAP interfaces.
@@ -372,6 +392,7 @@ impl Default for VmmConfig {
                 http_api_max_payload_size: None,
                 mmds_size_limit: None,
                 socket_timeout_secs: None,
+                sandbox_datapath: SandboxDatapath::default(),
                 pool_size: default_pool_size(),
             },
             network: NetworkConfig {
@@ -573,6 +594,25 @@ mod tests {
             toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
                 .unwrap();
         assert_eq!(cfg.pool_size, 1);
+    }
+
+    #[test]
+    fn sandbox_datapath_defaults_to_ebpf_and_parses_the_fallback() {
+        assert_eq!(
+            VmmConfig::default().firecracker.sandbox_datapath,
+            SandboxDatapath::Ebpf
+        );
+        // A config written before the knob existed still loads with the default.
+        let cfg: FirecrackerConfig =
+            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
+                .unwrap();
+        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Ebpf);
+        // The fallback is reachable by config alone.
+        let cfg: FirecrackerConfig = toml::from_str(
+            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\nsandbox_datapath = \"iptables\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Iptables);
     }
 
     #[test]
