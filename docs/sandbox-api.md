@@ -81,13 +81,17 @@ surface is on the wire ahead of its implementation; these RPCs answer
 
 - `TemplateService` (`template.proto`) — the template catalog (CORE-21;
   Build additionally gated on CORE-5/CORE-16).
-- `SandboxService.Pause/Resume` (CORE-21), `SetLifecycle` (CORE-60 /
-  CORE-21), `GetCapabilities` (CORE-13).
+- `SetLifecycle` (CORE-60 / CORE-21 — the idle knobs land with the idle
+  detector), `GetCapabilities` (CORE-13).
 - `SandboxProcessService.ListExecutions/WaitForPort` (CORE-58 phase 2).
 - The `SandboxFilesystemService` path verbs — `Stat`, `ListDir`,
   `MakeDir`, `Remove`, `Move`, `WatchDir` (CORE-62).
 - `errors.proto` — the `ErrorCode` registry; handlers attach `ErrorInfo`
-  as a Connect error detail in a follow-up phase (CORE-58).
+  as a Connect error detail in a follow-up phase (CORE-58; `SANDBOX_PAUSED`
+  already ships it).
+
+`SandboxService.Pause/Resume` and daemon-side transparent auto-resume are
+implemented (CORE-21) — see **Pause / Resume** below.
 
 ## Sandbox state machine
 
@@ -95,8 +99,8 @@ surface is on the wire ahead of its implementation; these RPCs answer
 STARTING ──► READY ──► RUNNING ──► READY   (execution exited; IDLE event)
                │          │
                ├──────────┴──► STOPPING ──► STOPPED
-               │          │
-               ├──────────┴──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
+               │
+               ├──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
                │          │
                └──────────┴──► FAILED   (error + failed_at set)
 ```
@@ -115,9 +119,13 @@ States are the `SandboxState` enum (`SANDBOX_STATE_*`); events carry the
   contract-only today).
 - `stopped` sandboxes have released their TAP/IP, CoW device, and chroot;
   only the inspectable record and logs remain until `Remove`.
-- `paused` sandboxes keep their record **and** an on-disk checkpoint
-  (`storage_bytes`) under the same ID; data-plane calls resume them
-  transparently, `Inspect`/`List` never do.
+- `paused` sandboxes keep their record, an on-disk checkpoint, **and their
+  disk overlay** (`storage_bytes`, `paused_at`) under the same ID;
+  data-plane calls resume them transparently, `Inspect`/`List` never do.
+- `PAUSING` branches from `READY` only: a `RUNNING` sandbox has a live
+  execution whose session cannot survive the VM being checkpointed and
+  killed, so `Pause` on it answers `FAILED_PRECONDITION` — finish or stop
+  the execution first.
 
 ## SandboxService
 
@@ -257,13 +265,45 @@ host listener :H → inbound relay → guest :G (reserved 40000-49999)
 mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
 `abctl sandbox expose <id> <port>` / `unexpose`.
 
+### Pause / Resume (CORE-21)
+
+- `Pause{id}`: checkpoints the sandbox (memory + device state) and
+  releases its VM, TAP/IP, and chroot while **retaining the disk
+  overlay** — both memory and disk survive under the same ID. Requires
+  `READY`; `Pause` on a `PAUSED` sandbox is a no-op. The VM is not
+  resumed after the snapshot, so the checkpoint and disk can never
+  diverge. Port exposures are dropped with the released network.
+- `Resume{id}`: restores the checkpoint against the retained overlay in a
+  fresh microVM with a **fresh IP** (the `sandbox-id.arcbox.local` DNS
+  name follows it), then returns once `READY`. `Resume` on a
+  `READY`/`RUNNING` sandbox is a no-op; re-expose ports as needed. The
+  internal pause checkpoint is deleted on a successful resume.
+- **Transparent auto-resume**: data-plane RPCs (executions, files)
+  hitting a paused sandbox resume it first and then proceed — one shared
+  resume even under concurrent callers. Calls that address execution
+  *history* (attach, wait, stdin status, signal, resize) are served from
+  the retained records without waking the sandbox. Opt out per request
+  with the `x-arcbox-no-auto-resume: 1` header to receive the honest
+  `FAILED_PRECONDITION` carrying the `SANDBOX_PAUSED` `ErrorInfo` detail.
+- **Events**: `PAUSING` (attributes `reason: pause`, later
+  `idle_timeout`), `PAUSED`, and `RESUMED` (attributes `reason: resume`
+  or `auto_resume`) make every automated transition visible.
+- Paused sandboxes report `paused_at` and `storage_bytes` (checkpoint +
+  overlay footprint) in `Inspect`/`List`, survive daemon and VM restarts,
+  and still honor `ttl_seconds` — the hard cap destroys a paused sandbox
+  too. Idle-driven auto-pause (`idle_timeout_seconds` + `on_idle: PAUSE`)
+  is contract-only until the idle detector lands.
+
 ### Stop / Remove
 
 - `Stop{id, timeout_seconds}` (default 30 s): drains an active workload
   up to the budget, asks the guest to shut down, and force-kills only on
-  timeout. Releases network/CoW/chroot resources.
-- `Remove{id, force}`: destroys the sandbox and every remaining resource.
-  `force: true` removes even a `running` sandbox.
+  timeout. Releases network/CoW/chroot resources. A `paused` sandbox has
+  no VM to stop — `Stop` answers `FAILED_PRECONDITION`; use
+  `Resume`+`Stop` or `Remove`.
+- `Remove{id, force}`: destroys the sandbox and every remaining resource,
+  including a paused sandbox's checkpoint and disk overlay. `force: true`
+  removes even a `running` sandbox.
 
 ### Inspect / List / Events
 
@@ -315,6 +355,7 @@ map onto gRPC statuses:
 | unknown sandbox / snapshot | `NOT_FOUND` |
 | duplicate sandbox ID | `ALREADY_EXISTS` |
 | wrong state, missing nested virt, V1-unsupported field | `FAILED_PRECONDITION` |
+| paused sandbox, transparent resume not applied (opt-out header or control-plane call) | `FAILED_PRECONDITION` + `SANDBOX_PAUSED` `ErrorInfo` detail |
 | stdin write offset past the accepted count | `OUT_OF_RANGE` (resync via `GetStdinStatus`) |
 | sandbox service initialisation failure | `UNAVAILABLE` |
 | daemon still starting (runtime not ready) | `UNAVAILABLE` |
