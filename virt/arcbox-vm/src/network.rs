@@ -9,12 +9,15 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::config::SandboxDatapath;
 use crate::error::{Result, VmmError};
 
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "the datapath selection that consumes the loader lands with the NetworkManager wiring"
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "the loader is Linux-only; other platforms keep the pure map-value helpers for unit tests"
+    )
 )]
 mod ebpf;
 #[cfg_attr(
@@ -47,6 +50,27 @@ pub(crate) enum TapMode {
     /// snapshots (no `net_invariant` marker), whose guests are re-addressed
     /// over the reconfig RPC.
     LegacySnapshot,
+}
+
+/// The translation mechanism actually applied to an active invariant TAP.
+///
+/// Distinct from the configured [`SandboxDatapath`]: a TAP configured for
+/// eBPF lands on `Iptables` when the object cannot be loaded or this TAP's
+/// attach fails. Teardown and expose targeting must follow what was applied,
+/// not what was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only the Linux activation path constructs these; other platforms activate nothing"
+    )
+)]
+enum AppliedDatapath {
+    /// TCX programs + map entry + onlink gateway route.
+    Ebpf,
+    /// The CORE-81 iptables/fwmark rule set.
+    Iptables,
 }
 
 /// Default prefix length for backwards-compatible deserialization of records
@@ -119,6 +143,32 @@ pub struct NetworkManager {
     startup_host_cleaned: AtomicBool,
     /// Whether guest durable-state reconciliation has completed.
     startup_reconciled: AtomicBool,
+    /// Configured translation mechanism for invariant TAPs (CORE-83).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "consulted only by the Linux activation path; other platforms activate nothing"
+        )
+    )]
+    datapath: SandboxDatapath,
+    /// Mechanism actually applied per active invariant TAP, recorded at
+    /// activation. Keyed by TAP name; entries live exactly as long as the
+    /// TAP (activation inserts, teardown removes). A TAP absent here was
+    /// either activated by a previous agent process (its eBPF links died
+    /// with that process) or is legacy — both tear down via the tolerant
+    /// iptables removal.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "only the Linux activation path records translation state; other platforms activate nothing"
+        )
+    )]
+    applied: Mutex<HashMap<String, AppliedDatapath>>,
+    /// Lazily loaded eBPF datapath state (CORE-83).
+    #[cfg(target_os = "linux")]
+    ebpf: Mutex<ebpf::Engine>,
 }
 
 impl NetworkManager {
@@ -126,18 +176,19 @@ impl NetworkManager {
     ///
     /// `cidr` must be in `a.b.c.d/n` notation (e.g. `"172.20.0.0/16"`).
     pub fn new(cidr: &str, gateway: &str, dns: Vec<String>) -> Result<Self> {
-        Self::new_inner(cidr, gateway, dns, None)
+        Self::new_inner(cidr, gateway, dns, None, SandboxDatapath::default())
     }
 
     /// Create a manager that persists inactive allocations until host cleanup
-    /// is finalized.
+    /// is finalized, translating invariant TAPs via `datapath`.
     pub(crate) fn with_quarantine_dir(
         cidr: &str,
         gateway: &str,
         dns: Vec<String>,
         quarantine_dir: PathBuf,
+        datapath: SandboxDatapath,
     ) -> Result<Self> {
-        Self::new_inner(cidr, gateway, dns, Some(quarantine_dir))
+        Self::new_inner(cidr, gateway, dns, Some(quarantine_dir), datapath)
     }
 
     fn new_inner(
@@ -145,6 +196,7 @@ impl NetworkManager {
         gateway: &str,
         dns: Vec<String>,
         quarantine_dir: Option<PathBuf>,
+        datapath: SandboxDatapath,
     ) -> Result<Self> {
         let (base, prefix_len) = parse_cidr(cidr)?;
         if !(1..=30).contains(&prefix_len) {
@@ -190,6 +242,10 @@ impl NetworkManager {
             startup_token,
             startup_host_cleaned: AtomicBool::new(!startup_barrier),
             startup_reconciled: AtomicBool::new(!startup_barrier),
+            datapath,
+            applied: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            ebpf: Mutex::new(ebpf::Engine::Unloaded),
         })
     }
 
@@ -262,16 +318,97 @@ impl NetworkManager {
             };
             self.create_tap(&allocation.tap_name, local, allocation.ip_address)?;
             if mode == TapMode::Invariant
-                && let Err(error) = invariant::install(&allocation.tap_name, allocation.ip_address)
+                && let Err(error) = self.install_translation(allocation)
             {
                 // Unwind the partial translation and the TAP so a failed
                 // activation leaves no half-translated interface behind.
-                let _ = invariant::remove(&allocation.tap_name, allocation.ip_address);
+                let _ = self.deactivate_translation(allocation);
                 destroy_tap(&allocation.tap_name);
                 return Err(error);
             }
         }
         Ok(())
+    }
+
+    /// Apply the invariant pool-IP translation to an existing TAP, honoring
+    /// the configured [`SandboxDatapath`] and falling back to iptables when
+    /// the eBPF path is unavailable, then record what was applied.
+    #[cfg(target_os = "linux")]
+    fn install_translation(&self, allocation: &NetworkAllocation) -> Result<()> {
+        let applied = match self.datapath {
+            SandboxDatapath::Iptables => {
+                invariant::install(&allocation.tap_name, allocation.ip_address)?;
+                AppliedDatapath::Iptables
+            }
+            SandboxDatapath::Ebpf => match self.attach_ebpf(allocation) {
+                Ok(ebpf::Attach::Done) => AppliedDatapath::Ebpf,
+                // The load failure already warned once; stay quiet per TAP.
+                Ok(ebpf::Attach::EngineUnavailable) => {
+                    invariant::install(&allocation.tap_name, allocation.ip_address)?;
+                    AppliedDatapath::Iptables
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        tap = %allocation.tap_name,
+                        %error,
+                        "eBPF TAP attach failed; using iptables NAT for this TAP"
+                    );
+                    invariant::install(&allocation.tap_name, allocation.ip_address)?;
+                    AppliedDatapath::Iptables
+                }
+            },
+        };
+        self.applied
+            .lock()
+            .unwrap()
+            .insert(allocation.tap_name.clone(), applied);
+        Ok(())
+    }
+
+    /// TCX-attach both NAT programs, map the TAP's ifindex to its pool IP,
+    /// and swap the kernel peer route for the onlink gateway route that
+    /// steers the (still-untranslated) pool destination into this TAP.
+    #[cfg(target_os = "linux")]
+    fn attach_ebpf(&self, allocation: &NetworkAllocation) -> Result<ebpf::Attach> {
+        let mut engine = self.ebpf.lock().unwrap();
+        let pool = ebpf::PoolValues::new(self.base, self.prefix_len, self.gateway);
+        let Some(nat) = engine.ensure_loaded(pool) else {
+            return Ok(ebpf::Attach::EngineUnavailable);
+        };
+        let ifindex = invariant::tap_ifindex(&allocation.tap_name)?;
+        nat.attach(&allocation.tap_name, ifindex, allocation.ip_address)?;
+        if let Err(error) = rtnetlink::execute(
+            &rtnetlink::replace_gateway_route(allocation.ip_address, invariant::GUEST_IP, ifindex),
+            &[],
+        ) {
+            let _ = nat.detach(&allocation.tap_name);
+            return Err(error);
+        }
+        info!(
+            ifindex,
+            pool_ip = %allocation.ip_address,
+            "ebpf datapath attached"
+        );
+        Ok(ebpf::Attach::Done)
+    }
+
+    /// Remove whatever translation this process applied to the TAP.
+    ///
+    /// eBPF TAPs detach their links and drop their map entry (the gateway
+    /// route dies with the TAP). Everything else — iptables TAPs, legacy
+    /// TAPs, and TAPs activated by a previous agent process (whose eBPF
+    /// links died with it) — takes the tolerant iptables removal, exactly
+    /// as before CORE-83.
+    #[cfg(target_os = "linux")]
+    fn deactivate_translation(&self, alloc: &NetworkAllocation) -> Result<()> {
+        let applied = self.applied.lock().unwrap().remove(&alloc.tap_name);
+        if applied == Some(AppliedDatapath::Ebpf) {
+            if let Some(nat) = self.ebpf.lock().unwrap().loaded_mut() {
+                return nat.detach(&alloc.tap_name);
+            }
+            return Ok(());
+        }
+        invariant::remove(&alloc.tap_name, alloc.ip_address)
     }
 
     /// Release the TAP interface and guest IP associated with `vm_id`.
@@ -292,10 +429,10 @@ impl NetworkManager {
         reason = "Linux TAP cleanup is fallible; macOS test builds compile the no-op branch"
     )]
     pub(crate) fn release_checked(&self, alloc: &NetworkAllocation) -> Result<()> {
-        // Translation rules do not die with the device; remove them first
+        // Translation state does not die with the device; remove it first
         // (tolerant of absence, so legacy TAPs are a no-op).
         #[cfg(target_os = "linux")]
-        invariant::remove(&alloc.tap_name, alloc.ip_address)?;
+        self.deactivate_translation(alloc)?;
         #[cfg(target_os = "linux")]
         destroy_tap_checked(&alloc.tap_name)?;
 
@@ -831,6 +968,7 @@ mod tests {
                 "10.0.0.1",
                 vec![],
                 root.path().join("network-quarantine"),
+                SandboxDatapath::default(),
             )
             .unwrap(),
         );
@@ -863,6 +1001,7 @@ mod tests {
             "10.0.0.1",
             vec![],
             quarantine.clone(),
+            SandboxDatapath::default(),
         )
         .unwrap();
         manager.mark_reconciled();
@@ -872,9 +1011,14 @@ mod tests {
         quarantine::write_quarantine(&quarantine, "old", &allocation).unwrap();
         drop(manager);
 
-        let restarted =
-            NetworkManager::with_quarantine_dir("10.0.0.0/30", "10.0.0.1", vec![], quarantine)
-                .unwrap();
+        let restarted = NetworkManager::with_quarantine_dir(
+            "10.0.0.0/30",
+            "10.0.0.1",
+            vec![],
+            quarantine,
+            SandboxDatapath::default(),
+        )
+        .unwrap();
         restarted.mark_reconciled();
         assert!(restarted.reserve("new").is_err());
         assert!(restarted.validate_startup_cleanup(&first_startup).is_err());
@@ -931,8 +1075,14 @@ mod tests {
             mutate(&mut allocation);
             quarantine::write_quarantine(&quarantine, "box", &allocation).unwrap();
             assert!(
-                NetworkManager::with_quarantine_dir("10.0.0.0/30", "10.0.0.1", vec![], quarantine)
-                    .is_err()
+                NetworkManager::with_quarantine_dir(
+                    "10.0.0.0/30",
+                    "10.0.0.1",
+                    vec![],
+                    quarantine,
+                    SandboxDatapath::default(),
+                )
+                .is_err()
             );
         }
     }

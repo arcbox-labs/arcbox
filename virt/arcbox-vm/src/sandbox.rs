@@ -87,6 +87,7 @@ impl SandboxManager {
             &config.network.gateway,
             config.network.dns.clone(),
             Path::new(&config.firecracker.data_dir).join("sandbox-network-quarantine"),
+            config.firecracker.sandbox_datapath,
         )?);
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);

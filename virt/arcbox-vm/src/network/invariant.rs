@@ -244,8 +244,9 @@ fn write_tap_sysctl(tap: &str, key: &str, value: &str) -> Result<()> {
         .map_err(|e| crate::error::VmmError::Network(format!("write {path}: {e}")))
 }
 
+/// Resolve a TAP's interface index (also the eBPF datapath's map key).
 #[cfg(target_os = "linux")]
-fn tap_ifindex(tap: &str) -> Result<u32> {
+pub(super) fn tap_ifindex(tap: &str) -> Result<u32> {
     let name = std::ffi::CString::new(tap)
         .map_err(|_| crate::error::VmmError::Network(format!("TAP name {tap:?} contains NUL")))?;
     // SAFETY: name is a valid NUL-terminated string.
