@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::{Result, VmmError};
 
@@ -421,7 +421,12 @@ pub async fn exec(
 /// completes so the guest does not run with a stale timestamp from snapshot
 /// creation time.
 pub async fn sync_clock(uds_path: &Path) -> Result<()> {
+    // Split connect vs frame RTT: on a just-resumed guest these have very
+    // different causes (vsock handshake vs guest-side processing), and the
+    // CORE-75 settle-window investigation needs them attributable.
+    let started = std::time::Instant::now();
     let mut stream = connect_to_agent(uds_path).await?;
+    let connected = std::time::Instant::now();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -431,7 +436,13 @@ pub async fn sync_clock(uds_path: &Path) -> Result<()> {
         .map_err(|e| VmmError::Vsock(format!("unix timestamp overflow: {e}")))?;
     let nanos = now.subsec_nanos();
 
-    sync_clock_on_stream(&mut stream, secs, nanos).await
+    let result = sync_clock_on_stream(&mut stream, secs, nanos).await;
+    info!(
+        connect_ms = connected.duration_since(started).as_millis() as u64,
+        rpc_ms = connected.elapsed().as_millis() as u64,
+        "clock sync"
+    );
+    result
 }
 
 /// Send a clock-sync frame and validate the agent response.
@@ -486,8 +497,16 @@ pub async fn reconfigure_network(
     uds_path: &Path,
     cmd: &crate::boot_proto::NetReconfigCommand,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     let mut stream = connect_to_agent(uds_path).await?;
-    net_reconfig_on_stream(&mut stream, cmd).await
+    let connected = std::time::Instant::now();
+    let result = net_reconfig_on_stream(&mut stream, cmd).await;
+    info!(
+        connect_ms = connected.duration_since(started).as_millis() as u64,
+        rpc_ms = connected.elapsed().as_millis() as u64,
+        "net reconfig"
+    );
+    result
 }
 
 /// Send a net-reconfig frame and validate the agent response.
@@ -526,6 +545,22 @@ async fn net_reconfig_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWri
         return Err(VmmError::Vsock(format!(
             "net reconfig: agent returned exit code {code}"
         )));
+    }
+    // Newer agents append six u32 millis (four per-ioctl, resolv write,
+    // whole handler) after the [code][signal] header — CORE-75 latency
+    // attribution.
+    if payload.len() >= 32 {
+        let step =
+            |i: usize| u32::from_le_bytes(payload[8 + i * 4..12 + i * 4].try_into().unwrap());
+        info!(
+            addr_ms = step(0),
+            netmask_ms = step(1),
+            delrt_ms = step(2),
+            addrt_ms = step(3),
+            resolv_ms = step(4),
+            handler_ms = step(5),
+            "net reconfig guest split"
+        );
     }
     Ok(())
 }
