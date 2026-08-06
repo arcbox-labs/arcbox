@@ -248,6 +248,7 @@ dependencies = [
  "arcbox-docker",
  "arcbox-error",
  "async-stream",
+ "base64",
  "buffa",
  "buffa-types",
  "bytes",
