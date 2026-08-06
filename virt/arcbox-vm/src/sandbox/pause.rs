@@ -44,7 +44,7 @@ use super::*;
 pub(super) const PAUSE_SNAPSHOT_NAME: &str = "arcbox-pause";
 
 /// Where a copy-mode rootfs is parked inside `vm_dir` while paused.
-const PAUSED_ROOTFS_FILE: &str = "paused-rootfs.ext4";
+pub(super) const PAUSED_ROOTFS_FILE: &str = "paused-rootfs.ext4";
 
 /// Reason attribute values for pause/resume events.
 pub mod reason {
