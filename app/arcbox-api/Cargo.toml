@@ -29,6 +29,7 @@ buffa = { version = "0.9.1", features = ["json"] }
 buffa-types = { version = "0.9.1", features = ["json"] }
 
 [dev-dependencies]
+base64 = "0.22.1"
 http = "1.5.0"
 tokio = { workspace = true, features = ["test-util"] }
 
