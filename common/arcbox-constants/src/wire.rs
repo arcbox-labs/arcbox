@@ -131,6 +131,18 @@ pub enum MessageType {
     SandboxListSnapshotsRequest = 0x0042,
     SandboxDeleteSnapshotRequest = 0x0043,
 
+    // Sandbox pause/resume request types (0x0044 - 0x0045), CORE-21.
+    /// Pause a sandbox: checkpoint, then release its VM while keeping the
+    /// record and disk under the same id (payload:
+    /// `arcbox.sandbox.v1.PauseSandboxRequest`). Answered with
+    /// [`Self::SandboxPauseResponse`].
+    SandboxPauseRequest = 0x0044,
+    /// Resume a paused sandbox in place (payload:
+    /// `arcbox.v1.SandboxResumeCommand`, which carries the resume reason
+    /// the RESUMED event surfaces). Answered with
+    /// [`Self::SandboxResumeResponse`].
+    SandboxResumeRequest = 0x0045,
+
     // Sandbox execution request types (0x0060 - 0x0066), from the
     // execution redesign (CORE-55/56).
     /// Start an addressable execution (payload:
@@ -228,6 +240,13 @@ pub enum MessageType {
     SandboxCleanupFinalizeResponse = 0x1028,
     /// One durable cleanup ticket answering [`Self::WatchSandboxCleanupRequest`].
     SandboxCleanupEvent = 0x1029,
+    /// Answers [`Self::SandboxPauseRequest`] (payload:
+    /// `arcbox.v1.SandboxCleanupResponse` — pause quarantines the network
+    /// like Stop, so it hands back the same durable cleanup ticket).
+    SandboxPauseResponse = 0x1044,
+    /// Answers [`Self::SandboxResumeRequest`] (payload:
+    /// `arcbox.v1.SandboxResumeResponse` with the fresh IP).
+    SandboxResumeResponse = 0x1045,
 
     // Sandbox workload response types (streaming).
     // 0x1035 (SandboxRunOutput) and 0x1036 (SandboxExecOutput) were
@@ -321,6 +340,8 @@ impl MessageType {
             0x0041 => Some(Self::SandboxRestoreRequest),
             0x0042 => Some(Self::SandboxListSnapshotsRequest),
             0x0043 => Some(Self::SandboxDeleteSnapshotRequest),
+            0x0044 => Some(Self::SandboxPauseRequest),
+            0x0045 => Some(Self::SandboxResumeRequest),
             // Sandbox execution requests (execution redesign, CORE-55/56).
             0x0060 => Some(Self::SandboxExecStartRequest),
             0x0061 => Some(Self::SandboxExecAttachRequest),
@@ -366,6 +387,8 @@ impl MessageType {
             0x1027 => Some(Self::SandboxCleanupPrepareResponse),
             0x1028 => Some(Self::SandboxCleanupFinalizeResponse),
             0x1029 => Some(Self::SandboxCleanupEvent),
+            0x1044 => Some(Self::SandboxPauseResponse),
+            0x1045 => Some(Self::SandboxResumeResponse),
             // Sandbox workload responses (streaming).
             0x1037 => Some(Self::SandboxEvent),
             0x1038 => Some(Self::SandboxFileData),
@@ -412,6 +435,8 @@ impl MessageType {
                 | Self::SandboxRestoreRequest
                 | Self::SandboxListSnapshotsRequest
                 | Self::SandboxDeleteSnapshotRequest
+                | Self::SandboxPauseRequest
+                | Self::SandboxResumeRequest
                 | Self::SandboxExecStartRequest
                 | Self::SandboxExecAttachRequest
                 | Self::SandboxStdinWriteRequest
@@ -550,6 +575,10 @@ mod tests {
             (0x0041, MessageType::SandboxRestoreRequest),
             (0x0042, MessageType::SandboxListSnapshotsRequest),
             (0x0043, MessageType::SandboxDeleteSnapshotRequest),
+            (0x0044, MessageType::SandboxPauseRequest),
+            (0x0045, MessageType::SandboxResumeRequest),
+            (0x1044, MessageType::SandboxPauseResponse),
+            (0x1045, MessageType::SandboxResumeResponse),
             (0x1040, MessageType::SandboxCheckpointResponse),
             (0x1041, MessageType::SandboxRestoreResponse),
             (0x1042, MessageType::SandboxListSnapshotsResponse),
@@ -582,6 +611,8 @@ mod tests {
         assert!(MessageType::SandboxFileReadRequest.is_sandbox_request());
         assert!(MessageType::SandboxFileWriteRequest.is_sandbox_request());
         assert!(MessageType::SandboxCheckpointRequest.is_sandbox_request());
+        assert!(MessageType::SandboxPauseRequest.is_sandbox_request());
+        assert!(MessageType::SandboxResumeRequest.is_sandbox_request());
         assert!(!MessageType::PingRequest.is_sandbox_request());
         assert!(!MessageType::SandboxCreateResponse.is_sandbox_request());
     }

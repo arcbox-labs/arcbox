@@ -3560,6 +3560,31 @@ pub struct SandboxCleanupResponse {
 /// first replays its durable snapshot, then streams new terminal generations.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchSandboxCleanupRequest {}
+/// Ask the guest agent to resume a paused sandbox in place (CORE-21).
+///
+/// Internal wire message rather than the public ResumeSandboxRequest: the
+/// daemon decides *why* a resume runs (an explicit Resume call vs its own
+/// transparent auto-resume on a data-plane RPC), and the guest surfaces that
+/// verbatim as the RESUMED event's "reason" attribute — the visibility the
+/// contract promises for automation.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxResumeCommand {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// "resume" (explicit) or "auto_resume" (daemon-side transparent resume).
+    /// Empty is treated as "resume".
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// Guest agent's answer to a resume: the fresh network identity.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxResumeResponse {
+    /// IP address of the resumed sandbox's new allocation (empty when the
+    /// sandbox has no network). The daemon re-registers host DNS from it.
+    #[prost(string, tag = "1")]
+    pub ip_address: ::prost::alloc::string::String,
+}
 /// Transport protocol of a forwarded sandbox port.
 ///
 /// Deliberately separate from `arcbox.sandbox.v1.PortProtocol`: the public
