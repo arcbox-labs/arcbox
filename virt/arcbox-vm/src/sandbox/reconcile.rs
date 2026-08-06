@@ -28,6 +28,12 @@ use crate::snapshot_cow::{CowHandle, CowManager};
 const STATE_FILE: &str = "state.json";
 const AGENT_RESTART_ERROR: &str = "sandbox runtime was cleaned after agent restart";
 
+/// Id prefix of pre-warmed restore slots (CORE-78). A slot's chroot,
+/// dm/CoW names, and runtime dir are keyed by `pool-<uuid>`, so the
+/// startup sweep recognizes and reclaims orphaned slots like any other
+/// journaled sandbox.
+pub(super) const POOL_SLOT_PREFIX: &str = "pool-";
+
 /// Plain serializable mirror of [`CowHandle`].
 ///
 /// `CowHandle` itself is deliberately `!Clone`/`!Serialize` (it owns a
@@ -90,6 +96,10 @@ pub(super) struct SandboxStateRecord {
     /// For restored sandboxes: the recreated origin directory to remove.
     #[serde(default)]
     pub restore_origin_dir: Option<PathBuf>,
+    /// For sandboxes that adopted a pre-warmed pool slot (CORE-78): the
+    /// slot id the jailer chroot and dm/CoW names are keyed by.
+    #[serde(default)]
+    pub pool_slot_id: Option<String>,
 }
 
 impl SandboxStateRecord {
@@ -109,7 +119,22 @@ impl SandboxStateRecord {
             cow: cow.map(CowRecord::from_handle),
             jailer,
             restore_origin_dir: restore_origin_dir.map(Path::to_path_buf),
+            pool_slot_id: None,
         }
+    }
+
+    /// Key the record's chroot and dm/CoW resources by an adopted pool
+    /// slot id instead of the sandbox id.
+    pub fn with_pool_slot(mut self, slot_id: Option<&str>) -> Self {
+        self.pool_slot_id = slot_id.map(str::to_owned);
+        self
+    }
+
+    /// Id the per-sandbox host resources (chroot, dm/CoW names) are
+    /// actually named after: the adopted pool slot id when present, the
+    /// sandbox id otherwise.
+    pub fn resource_owner(&self) -> &str {
+        self.pool_slot_id.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -219,10 +244,10 @@ pub(super) async fn sweep_orphans(
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();
-    for (dir, record) in records {
+    for (dir, mut record) in records {
         info!(sandbox_id = %record.id, "reconciling orphaned sandbox");
 
-        if let Some(cow) = record.cow {
+        if let Some(cow) = record.cow.take() {
             cow_manager.teardown_checked(&cow.into_handle()).await?;
         }
 
@@ -234,7 +259,8 @@ pub(super) async fn sweep_orphans(
             && let Some(ref jc) = config.firecracker.jailer
         {
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            let chroot = super::boot::chroot_root(&config.firecracker.binary, base, &record.id);
+            let chroot =
+                super::boot::chroot_root(&config.firecracker.binary, base, record.resource_owner());
             if let Some(parent) = chroot.parent() {
                 remove_dir_if_present(parent).await?;
             }
@@ -392,11 +418,21 @@ fn validate_state_record(
             )));
         }
     }
+    if let Some(slot_id) = &record.pool_slot_id {
+        super::validate_id("pool slot id", slot_id)?;
+        if !slot_id.starts_with(POOL_SLOT_PREFIX) {
+            return Err(crate::error::VmmError::Config(format!(
+                "sandbox {} cleanup record has non-pool slot id {slot_id}",
+                record.id
+            )));
+        }
+    }
     if let Some(cow) = &record.cow {
-        let expected_name = format!("arcbox-snap-{}", record.id);
+        let owner = record.resource_owner();
+        let expected_name = format!("arcbox-snap-{owner}");
         let expected_file = Path::new(&config.firecracker.data_dir)
             .join("cow")
-            .join(format!("arcbox-cow-{}.img", record.id));
+            .join(format!("arcbox-cow-{owner}.img"));
         if cow.dm_name != expected_name
             || cow.dm_device != format!("/dev/mapper/{expected_name}")
             || cow.cow_file != expected_file
@@ -451,7 +487,7 @@ fn discover_firecracker_pids(
         .join("firecracker.sock");
     let jailer_root = config.firecracker.jailer.as_ref().map(|jailer| {
         let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        super::boot::chroot_root(&config.firecracker.binary, base, &record.id)
+        super::boot::chroot_root(&config.firecracker.binary, base, record.resource_owner())
     });
 
     for entry in std::fs::read_dir("/proc")? {
@@ -600,14 +636,73 @@ mod tests {
             }),
             jailer: true,
             restore_origin_dir: None,
+            pool_slot_id: Some("pool-1".into()),
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         let parsed: SandboxStateRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.id, "sb-1");
         assert_eq!(parsed.pid, Some(42));
         assert!(parsed.jailer);
+        assert_eq!(parsed.pool_slot_id.as_deref(), Some("pool-1"));
+        assert_eq!(parsed.resource_owner(), "pool-1");
         let handle = parsed.cow.unwrap().into_handle();
         assert_eq!(handle.dm_name, "arcbox-snap-sb-1");
+    }
+
+    #[test]
+    fn cleanup_record_validation_keys_cow_resources_by_the_pool_slot() {
+        let config = VmmConfig::default();
+        let sandboxes_dir = Path::new("/var/lib/firecracker-vmm/sandboxes");
+        let directory = sandboxes_dir.join("sb-1");
+        let cow_for = |owner: &str| CowRecord {
+            dm_name: format!("arcbox-snap-{owner}"),
+            dm_device: format!("/dev/mapper/arcbox-snap-{owner}"),
+            cow_loop: "/dev/loop7".into(),
+            cow_file: Path::new(&config.firecracker.data_dir)
+                .join("cow")
+                .join(format!("arcbox-cow-{owner}.img")),
+            template_path: "/var/lib/arcbox/sandbox/rootfs.ext4".into(),
+        };
+        let record = |slot: Option<&str>, cow_owner: &str| SandboxStateRecord {
+            id: "sb-1".into(),
+            pid: None,
+            network: None,
+            cow: Some(cow_for(cow_owner)),
+            jailer: true,
+            restore_origin_dir: None,
+            pool_slot_id: slot.map(str::to_owned),
+        };
+
+        // Slot-keyed resources validate against the slot id, not the sandbox id.
+        validate_state_record(
+            &config,
+            sandboxes_dir,
+            &directory,
+            &record(Some("pool-abc"), "pool-abc"),
+        )
+        .unwrap();
+        // A claimed record whose CoW is named after the sandbox id is corrupt.
+        assert!(
+            validate_state_record(
+                &config,
+                sandboxes_dir,
+                &directory,
+                &record(Some("pool-abc"), "sb-1"),
+            )
+            .is_err()
+        );
+        // A slot id outside the pool namespace is rejected.
+        assert!(
+            validate_state_record(
+                &config,
+                sandboxes_dir,
+                &directory,
+                &record(Some("other-abc"), "other-abc"),
+            )
+            .is_err()
+        );
+        // Without a slot the sandbox id keys the resources, as before.
+        validate_state_record(&config, sandboxes_dir, &directory, &record(None, "sb-1")).unwrap();
     }
 
     #[test]

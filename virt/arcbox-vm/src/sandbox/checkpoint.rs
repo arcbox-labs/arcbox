@@ -167,7 +167,10 @@ impl SandboxManager {
         cow_handle: Option<CowHandle>,
     ) -> VmmError {
         let arc = reservation.instance();
-        let vm_dir = arc.lock().unwrap().vm_dir.clone();
+        let (vm_dir, pool_slot_id) = {
+            let inst = arc.lock().unwrap();
+            (inst.vm_dir.clone(), inst.pool_slot_id.clone())
+        };
         #[allow(
             clippy::cast_possible_wrap,
             reason = "Firecracker pid fits platform pid_t"
@@ -182,7 +185,8 @@ impl SandboxManager {
             cow_handle.as_ref(),
             self.config.firecracker.jailer.is_some(),
             None,
-        );
+        )
+        .with_pool_slot(pool_slot_id.as_deref());
         let journal_error = super::reconcile::write_state_record(&vm_dir, &state_record).err();
         {
             let mut inst = arc.lock().unwrap();

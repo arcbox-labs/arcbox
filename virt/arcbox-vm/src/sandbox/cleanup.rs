@@ -326,10 +326,16 @@ pub(super) async fn release_runtime_resources(
         }
     }
 
-    // Clean up the jailer chroot directory if applicable.
+    // Clean up the jailer chroot directory if applicable. A sandbox that
+    // adopted a pre-warmed pool slot lives in the slot's chroot, so the
+    // removal is keyed by the owning id, not the sandbox id.
     if let Some(ref jc) = config.firecracker.jailer {
         let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        let chroot_dir = chroot_root(&config.firecracker.binary, base, id);
+        let chroot_owner = {
+            let inst = arc.lock().unwrap();
+            inst.pool_slot_id.clone().unwrap_or_else(|| id.to_owned())
+        };
+        let chroot_dir = chroot_root(&config.firecracker.binary, base, &chroot_owner);
         // Remove {base}/{exec_name}/{id}/ (parent of "root/").
         if let Some(parent) = chroot_dir.parent()
             && let Err(e) = tokio::fs::remove_dir_all(parent).await
@@ -740,6 +746,60 @@ mod tests {
         assert!(!vm_dir.exists());
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn release_removes_the_chroot_of_an_adopted_pool_slot() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let chroot_base = data_dir.path().join("jailer");
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+        config.firecracker.jailer = Some(crate::config::JailerConfig {
+            binary: "/usr/bin/jailer".into(),
+            uid: 0,
+            gid: 0,
+            chroot_base_dir: Some(chroot_base.to_string_lossy().into_owned()),
+            netns: None,
+            new_pid_ns: false,
+            cgroup_version: None,
+            parent_cgroup: None,
+            resource_limits: vec![],
+        });
+        let slot_chroot = chroot_root(
+            &config.firecracker.binary,
+            &chroot_base.to_string_lossy(),
+            "pool-slot",
+        );
+        let sandbox_chroot = chroot_root(
+            &config.firecracker.binary,
+            &chroot_base.to_string_lossy(),
+            "job",
+        );
+        std::fs::create_dir_all(&slot_chroot).unwrap();
+        std::fs::create_dir_all(&sandbox_chroot).unwrap();
+
+        let arc = instance("job");
+        arc.lock().unwrap().pool_slot_id = Some("pool-slot".into());
+        let config = Arc::new(config);
+        let network = Arc::new(
+            NetworkManager::new(
+                &config.network.cidr,
+                &config.network.gateway,
+                config.network.dns.clone(),
+            )
+            .unwrap(),
+        );
+        let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+
+        release_runtime_resources("job", &arc, &network, &config, &cow_manager)
+            .await
+            .unwrap();
+
+        assert!(!slot_chroot.parent().unwrap().exists());
+        assert!(
+            sandbox_chroot.exists(),
+            "the sandbox-id chroot belongs to nobody here and must not be touched"
+        );
     }
 
     #[tokio::test]
