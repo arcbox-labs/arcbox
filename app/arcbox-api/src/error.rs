@@ -60,6 +60,15 @@ impl From<ApiError> for connectrpc::ConnectError {
                 412 => ErrorCode::FailedPrecondition,
                 // Stdin offset gap: the client resyncs via GetStdinStatus.
                 416 => ErrorCode::OutOfRange,
+                // Paused sandbox surfaced without a transparent resume
+                // (control-plane call, or the caller opted out): a
+                // FAILED_PRECONDITION carrying the machine-readable
+                // SANDBOX_PAUSED detail (CORE-21).
+                423 => {
+                    let mut error = Self::new(ErrorCode::FailedPrecondition, message);
+                    error.details.push(sandbox_paused_detail());
+                    return error;
+                }
                 503 => ErrorCode::Unavailable,
                 _ => ErrorCode::Internal,
             },
@@ -67,6 +76,20 @@ impl From<ApiError> for connectrpc::ConnectError {
         };
         Self::new(code, message)
     }
+}
+
+/// The `SANDBOX_PAUSED` `ErrorInfo` Connect error detail (`errors.proto`).
+fn sandbox_paused_detail() -> connectrpc::ErrorDetail {
+    use arcbox_connect::sandbox_v1 as pb;
+
+    let info = pb::ErrorInfo {
+        code: pb::ErrorCode::SandboxPaused.into(),
+        suggestion: "resume the sandbox (`abctl sandbox resume <id>`), or retry \
+                     the data-plane call without `x-arcbox-no-auto-resume`"
+            .into(),
+        ..Default::default()
+    };
+    connectrpc::ErrorDetail::from_message("arcbox.sandbox.v1.ErrorInfo", &info)
 }
 
 impl ApiError {

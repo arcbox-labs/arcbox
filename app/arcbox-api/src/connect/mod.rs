@@ -33,6 +33,7 @@ mod migration;
 mod process;
 mod sandbox_cleanup;
 mod sandbox_locks;
+mod sandbox_resume;
 mod snapshot;
 mod stats;
 mod system;
@@ -215,8 +216,14 @@ pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
             clone(),
             Arc::clone(&sandbox_operations),
         )))
-        .add_service(Arc::new(SandboxProcessServiceImpl::new(clone())))
-        .add_service(Arc::new(SandboxFilesystemServiceImpl::new(clone())))
+        .add_service(Arc::new(SandboxProcessServiceImpl::new(
+            clone(),
+            Arc::clone(&sandbox_operations),
+        )))
+        .add_service(Arc::new(SandboxFilesystemServiceImpl::new(
+            clone(),
+            Arc::clone(&sandbox_operations),
+        )))
         .add_service(Arc::new(SandboxSnapshotServiceImpl::new(
             clone(),
             Arc::clone(&sandbox_operations),

@@ -1,5 +1,7 @@
 //! Sandbox filesystem service — data plane.
 
+use std::sync::Arc;
+
 use arcbox_connect::sandbox_v1 as pb;
 use arcbox_connect::sandbox_v1::{FileChunk, write_file_request};
 use buffa_types::google::protobuf::Empty;
@@ -15,21 +17,29 @@ use arcbox_core::WriteFileChunk;
 use super::SharedRuntime;
 use crate::ApiError;
 
+use super::sandbox_locks::SandboxOperationLocks;
+use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 
 /// Filesystem service implementation.
 ///
 /// Carries file bytes for one sandbox, so it belongs with the data plane
-/// rather than the control-plane front door.
+/// rather than the control-plane front door — and, like the rest of the
+/// data plane, it transparently resumes a paused sandbox (CORE-21) unless
+/// the caller set `x-arcbox-no-auto-resume`.
 pub struct SandboxFilesystemServiceImpl {
     runtime: SharedRuntime,
+    operations: Arc<SandboxOperationLocks>,
 }
 
 impl SandboxFilesystemServiceImpl {
     /// Creates a new filesystem service with a deferred runtime.
     #[must_use]
-    pub fn new(runtime: SharedRuntime) -> Self {
-        Self { runtime }
+    pub(super) fn new(runtime: SharedRuntime, operations: Arc<SandboxOperationLocks>) -> Self {
+        Self {
+            runtime,
+            operations,
+        }
     }
 }
 
@@ -46,17 +56,40 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
         request: ServiceRequest<'_, pb::ReadFileRequest>,
     ) -> ServiceResult<ServiceStream<FileChunk>> {
         let machine = ctx.sandbox_machine_id()?;
-        let agent = self
-            .runtime
-            .ready()?
-            .get_agent(&machine)
-            .map_err(ApiError::from)?;
-        let rx = agent
-            .sandbox_read_file(request.to_owned_message())
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+
+        // Optimistic first attempt. The guest's verdict arrives as the first
+        // stream frame, so peek it: a SANDBOX_PAUSED answer becomes one
+        // resume + one fresh read instead of an in-stream error.
+        let agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
+        let mut rx = agent
+            .sandbox_read_file(req.clone())
             .await
             .map_err(ApiError::from)?;
-        let stream =
-            ReceiverStream::new(rx).map(|r| r.map_err(|e| ConnectError::from(ApiError::from(e))));
+        let first = match rx.recv().await {
+            Some(Err(error)) if sandbox_resume::is_sandbox_paused(&error) => {
+                if sandbox_resume::auto_resume_opted_out(&ctx) {
+                    return Err(ConnectError::from(ApiError::from(error)));
+                }
+                sandbox_resume::resume(
+                    runtime,
+                    &self.operations,
+                    &machine,
+                    &req.id,
+                    sandbox_resume::REASON_AUTO_RESUME,
+                )
+                .await?;
+                let agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
+                rx = agent.sandbox_read_file(req).await.map_err(ApiError::from)?;
+                rx.recv().await
+            }
+            other => other,
+        };
+
+        let stream = tokio_stream::iter(first)
+            .chain(ReceiverStream::new(rx))
+            .map(|r| r.map_err(|e| ConnectError::from(ApiError::from(e))));
         // Keepalives are empty non-final chunks, as documented in the proto.
         let stream = with_keepalive(stream, FileChunk::default);
         Response::ok(Box::pin(stream))
@@ -68,11 +101,7 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
         mut requests: InboundStream<pb::WriteFileRequest>,
     ) -> ServiceResult<Empty> {
         let machine = ctx.sandbox_machine_id()?;
-        let agent = self
-            .runtime
-            .ready()?
-            .get_agent(&machine)
-            .map_err(ApiError::from)?;
+        let runtime = self.runtime.ready()?;
 
         // The first message in the stream must carry the Open payload.
         let first = requests.next().await.ok_or_else(|| {
@@ -86,6 +115,18 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
                 ));
             }
         };
+
+        // A paused sandbox must be handled before any chunk is consumed —
+        // the input stream cannot be replayed for a retry.
+        sandbox_resume::ensure_resumed_for_write(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &open.id,
+        )
+        .await?;
+        let agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
 
         // Bridge Connect chunks into the agent write stream. A clean end (the
         // client's `done` chunk) closes the channel, which triggers the
