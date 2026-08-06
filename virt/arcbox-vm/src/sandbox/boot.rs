@@ -104,25 +104,37 @@ pub(super) async fn boot_sandbox(
             }
 
             // The guest clock still needs setting on cold boot (no RTC — the
-            // guest wakes at the kernel default epoch), but it no longer
-            // gates readiness: warn and continue on any failure, mirroring
-            // the restore path's non-fatal treatment. Retires when guest-side
-            // ptp_kvm self-sync lands.
-            match tokio::time::timeout(CLOCK_SYNC_TIMEOUT, vsock::sync_clock(&vsock_uds_path)).await
+            // guest wakes at the kernel default epoch), but it must not delay
+            // readiness either: the agent is already accepting executions, so
+            // a slow or retrying sync holding the Ready publication back
+            // would recreate the latency this gate exists to remove. Fire it
+            // detached; any failure is a warn, mirroring the restore path.
+            // Retires when guest-side ptp_kvm self-sync lands.
             {
-                Ok(Ok(vsock::ClockSync::Synced)) => {}
-                Ok(Ok(vsock::ClockSync::AgentError(code))) => {
-                    warn!(
-                        sandbox_id = %id, code,
-                        "agent could not set the clock; continuing with a possibly skewed clock"
-                    );
-                }
-                Ok(Err(error)) => {
-                    warn!(sandbox_id = %id, %error, "cold-boot clock sync failed; continuing");
-                }
-                Err(_) => {
-                    warn!(sandbox_id = %id, "cold-boot clock sync timed out; continuing");
-                }
+                let id = id.clone();
+                let vsock_uds_path = vsock_uds_path.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        CLOCK_SYNC_TIMEOUT,
+                        vsock::sync_clock(&vsock_uds_path),
+                    )
+                    .await
+                    {
+                        Ok(Ok(vsock::ClockSync::Synced)) => {}
+                        Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                            warn!(
+                                sandbox_id = %id, code,
+                                "agent could not set the clock; continuing with a possibly skewed clock"
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            warn!(sandbox_id = %id, %error, "cold-boot clock sync failed; continuing");
+                        }
+                        Err(_) => {
+                            warn!(sandbox_id = %id, "cold-boot clock sync timed out; continuing");
+                        }
+                    }
+                });
             }
 
             let ready_at = Utc::now();

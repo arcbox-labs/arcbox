@@ -77,6 +77,14 @@ impl CowRecord {
 /// default) and an older agent read a newer one (unknown fields are ignored),
 /// so a schema change never silently disables reconciliation of a pre-upgrade
 /// sandbox — which would leak its resources.
+///
+/// One scoped exception: `pool_slot_id` changes the *interpretation* of `id`
+/// (resource names key on the slot, not the sandbox), so an agent from before
+/// CORE-78 reading a pool-adopted record computes the wrong expected CoW/chroot
+/// names, fails validation, and skips — not corrupts — that one sandbox's
+/// cleanup (a bounded leak until the next new-agent sweep). Accepted because
+/// the daemon stages the agent it shipped with, so an old agent only ever sees
+/// new records across a daemon downgrade.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct SandboxStateRecord {
     /// Sandbox ID (also the directory name).
