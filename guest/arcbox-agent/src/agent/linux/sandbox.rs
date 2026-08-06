@@ -513,7 +513,7 @@ where
                 send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
             }
         },
-        MessageType::SandboxDeleteSnapshotRequest => match svc.delete_snapshot(payload) {
+        MessageType::SandboxDeleteSnapshotRequest => match svc.delete_snapshot(payload).await {
             Ok(()) => {
                 write_message(
                     stream,

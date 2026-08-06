@@ -3,6 +3,7 @@ use super::boot::{
     stage_snapshot_files,
 };
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
+use super::pool::PreparedSlot;
 use super::types::action;
 use super::*;
 
@@ -377,120 +378,216 @@ impl SandboxManager {
         // On success, the CoW handle is moved onto the SandboxInstance.
         let mut pending_cow: Option<CowHandle> = None;
 
-        // Determine the actual host-side vsock UDS path FC will bind to on restore
-        // and ensure the socket path is clear before spawning.
-        //
-        // Each jailer restore owns a distinct chroot and vsock path.
-        let spawned: Result<(fc_sdk::FirecrackerProcess, PathBuf)> = async {
-            let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            let cr = chroot_root(&fc_cfg.binary, base, &new_id);
-            // Ensure the `run/` directory exists inside the new chroot so FC can
-            // create the vsock socket there on restore.
-            let run_dir = cr.join("run");
-            std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
-            let vsock_path = cr.join("run/firecracker.vsock");
-            let _ = std::fs::remove_file(&vsock_path);
-
-            let proc = spawn_jailer(jailer, fc_cfg, &new_id).await?;
-            Ok((proc, vsock_path))
-        }
-        .await;
-        let (process, actual_vsock_path) = match spawned {
-            Ok(spawned) => spawned,
-            Err(error) => {
-                return Err(self
-                    .rollback_restore(&new_id, reservation, error, None, net_alloc, None)
-                    .await);
-            }
-        };
-
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "Firecracker pid fits platform pid_t"
-        )]
-        let pid = process.pid().map(|pid| pid as i32);
-        let journal = |cow: Option<&CowHandle>| {
-            super::reconcile::write_state_record(
-                &vm_dir,
-                &super::reconcile::SandboxStateRecord::new(
+        // CORE-78: a pre-warmed slot has already executed the spawn and
+        // staging blocks below; claiming one leaves LoadSnapshot + guest
+        // reconfiguration as the only restore work. From the claim on, the
+        // slot's resources are owned by this restore and unwind through
+        // rollback_restore like freshly created ones.
+        let claimed = self.claim_restore_slot(&spec.snapshot_id);
+        let pool_hit = claimed.is_some();
+        let (process, actual_vsock_path, effective_vmstate, effective_mem, t_spawned, t_staged) =
+            if let Some(slot) = claimed {
+                // Record the adopting sandbox's slot id first: failure cleanup
+                // and crash reconciliation key the chroot and dm/CoW teardown
+                // on it (see release_runtime_resources / sweep_orphans).
+                reservation.instance().lock().unwrap().pool_slot_id = Some(slot.slot_id.clone());
+                #[allow(
+                    clippy::cast_possible_wrap,
+                    reason = "Firecracker pid fits platform pid_t"
+                )]
+                let adopted_record = super::reconcile::SandboxStateRecord::new(
                     &new_id,
-                    pid,
+                    slot.process.pid().map(|pid| pid as i32),
                     net_alloc.as_ref(),
-                    cow,
+                    slot.cow_handle.as_ref(),
                     true,
                     None,
-                ),
-            )
-        };
-        if let Err(error) = journal(None) {
-            return Err(self
-                .rollback_restore(&new_id, reservation, error, Some(process), net_alloc, None)
-                .await);
-        }
-
-        let t_spawned = std::time::Instant::now();
-
-        // In jailer mode the restored FC process also runs inside a chroot and
-        // cannot access the catalog's host-absolute paths.  Stage the snapshot
-        // files into the new sandbox's chroot and use chroot-relative paths.
-        let setup_result: Result<(String, Option<String>)> = async {
-            let jc = jailer;
-            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            let cr = chroot_root(&fc_cfg.binary, base, &new_id);
-
-            // Stage kernel (always hard-linked or copied, ~16MB).
-            if let Some(k) = snap_meta.kernel_path.as_deref() {
-                stage_kernel_for_jailer(&cr, k, jc.uid, jc.gid).await?;
-            }
-
-            // Stage rootfs: dm-snapshot + mknod with full-copy fallback,
-            // mirroring the boot path so restored sandboxes get the same CoW
-            // semantics (block-level template sharing, sparse COW).
-            if let Some(r) = snap_meta.rootfs_path.as_deref() {
-                match stage_rootfs_cow_or_copy(
-                    &self.cow_manager,
-                    &cr,
-                    &new_id,
-                    r,
-                    jc.uid,
-                    jc.gid,
-                    &journal,
                 )
-                .await
+                .with_pool_slot(Some(&slot.slot_id));
+                let handover = super::reconcile::write_state_record(&vm_dir, &adopted_record);
+                // The slot's own journal is superseded: the record above (or the
+                // rollback below) covers its resources under the sandbox id. The
+                // crash window where both journals exist is safe — the startup
+                // sweep is idempotent over already-released resources.
+                if let Err(error) = super::reconcile::clear_state_record(&slot.vm_dir) {
+                    warn!(
+                        sandbox_id = %new_id,
+                        slot_id = %slot.slot_id,
+                        error = %error,
+                        "claimed slot journal not cleared; the startup sweep will reconcile it"
+                    );
+                } else if let Err(error) = tokio::fs::remove_dir_all(&slot.vm_dir).await
+                    && error.kind() != std::io::ErrorKind::NotFound
                 {
-                    Ok(cow) => pending_cow = cow,
-                    Err(StageError { error, cow_handle }) => {
-                        pending_cow = cow_handle;
-                        return Err(error);
-                    }
+                    warn!(
+                        sandbox_id = %new_id,
+                        slot_id = %slot.slot_id,
+                        error = %error,
+                        "claimed slot runtime dir not removed"
+                    );
                 }
-            }
+                let PreparedSlot {
+                    process: slot_process,
+                    cow_handle,
+                    vmstate_path,
+                    mem_path,
+                    vsock_path,
+                    ..
+                } = slot;
+                pending_cow = cow_handle;
+                if let Err(error) = handover {
+                    return Err(self
+                        .rollback_restore(
+                            &new_id,
+                            reservation,
+                            error,
+                            Some(slot_process),
+                            net_alloc,
+                            pending_cow,
+                        )
+                        .await);
+                }
+                // Both phases were pre-executed by the slot; the timestamps
+                // collapse so the completion log reports them honestly as ~0.
+                let t_claimed = std::time::Instant::now();
+                (
+                    slot_process,
+                    vsock_path,
+                    vmstate_path,
+                    mem_path,
+                    t_claimed,
+                    t_claimed,
+                )
+            } else {
+                // Determine the actual host-side vsock UDS path FC will bind to
+                // on restore and ensure the socket path is clear before spawning.
+                //
+                // Each jailer restore owns a distinct chroot and vsock path.
+                let spawned: Result<(fc_sdk::FirecrackerProcess, PathBuf)> = async {
+                    let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+                    let cr = chroot_root(&fc_cfg.binary, base, &new_id);
+                    // Ensure the `run/` directory exists inside the new chroot so
+                    // FC can create the vsock socket there on restore.
+                    let run_dir = cr.join("run");
+                    std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
+                    let vsock_path = cr.join("run/firecracker.vsock");
+                    let _ = std::fs::remove_file(&vsock_path);
 
-            // Stage vmstate + mem into the chroot. Both are read-only to FC
-            // (mem is mapped MAP_PRIVATE on load), so the root jailer
-            // hard-links them instead of copying — the mem file is the
-            // sandbox's full memory size (CORE-75).
-            stage_snapshot_files(&cr, &snap_meta, jc.uid, jc.gid).await
-        }
-        .await;
+                    let proc = spawn_jailer(jailer, fc_cfg, &new_id).await?;
+                    Ok((proc, vsock_path))
+                }
+                .await;
+                let (spawned_process, vsock_path) = match spawned {
+                    Ok(spawned) => spawned,
+                    Err(error) => {
+                        return Err(self
+                            .rollback_restore(&new_id, reservation, error, None, net_alloc, None)
+                            .await);
+                    }
+                };
 
-        let (effective_vmstate, effective_mem) = match setup_result {
-            Ok(x) => x,
-            Err(error) => {
-                return Err(self
-                    .rollback_restore(
-                        &new_id,
-                        reservation,
-                        error,
-                        Some(process),
-                        net_alloc,
-                        pending_cow,
+                #[allow(
+                    clippy::cast_possible_wrap,
+                    reason = "Firecracker pid fits platform pid_t"
+                )]
+                let pid = spawned_process.pid().map(|pid| pid as i32);
+                let journal = |cow: Option<&CowHandle>| {
+                    super::reconcile::write_state_record(
+                        &vm_dir,
+                        &super::reconcile::SandboxStateRecord::new(
+                            &new_id,
+                            pid,
+                            net_alloc.as_ref(),
+                            cow,
+                            true,
+                            None,
+                        ),
                     )
-                    .await);
-            }
-        };
+                };
+                if let Err(error) = journal(None) {
+                    return Err(self
+                        .rollback_restore(
+                            &new_id,
+                            reservation,
+                            error,
+                            Some(spawned_process),
+                            net_alloc,
+                            None,
+                        )
+                        .await);
+                }
 
-        let t_staged = std::time::Instant::now();
+                let t_spawned = std::time::Instant::now();
+
+                // In jailer mode the restored FC process also runs inside a
+                // chroot and cannot access the catalog's host-absolute paths.
+                // Stage the snapshot files into the new sandbox's chroot and use
+                // chroot-relative paths.
+                let setup_result: Result<(String, Option<String>)> = async {
+                    let jc = jailer;
+                    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+                    let cr = chroot_root(&fc_cfg.binary, base, &new_id);
+
+                    // Stage kernel (always hard-linked or copied, ~16MB).
+                    if let Some(k) = snap_meta.kernel_path.as_deref() {
+                        stage_kernel_for_jailer(&cr, k, jc.uid, jc.gid).await?;
+                    }
+
+                    // Stage rootfs: dm-snapshot + mknod with full-copy fallback,
+                    // mirroring the boot path so restored sandboxes get the same
+                    // CoW semantics (block-level template sharing, sparse COW).
+                    if let Some(r) = snap_meta.rootfs_path.as_deref() {
+                        match stage_rootfs_cow_or_copy(
+                            &self.cow_manager,
+                            &cr,
+                            &new_id,
+                            r,
+                            jc.uid,
+                            jc.gid,
+                            &journal,
+                        )
+                        .await
+                        {
+                            Ok(cow) => pending_cow = cow,
+                            Err(StageError { error, cow_handle }) => {
+                                pending_cow = cow_handle;
+                                return Err(error);
+                            }
+                        }
+                    }
+
+                    // Stage vmstate + mem into the chroot. Both are read-only to
+                    // FC (mem is mapped MAP_PRIVATE on load), so the root jailer
+                    // hard-links them instead of copying — the mem file is the
+                    // sandbox's full memory size (CORE-75).
+                    stage_snapshot_files(&cr, &snap_meta, jc.uid, jc.gid).await
+                }
+                .await;
+
+                let (effective_vmstate, effective_mem) = match setup_result {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        return Err(self
+                            .rollback_restore(
+                                &new_id,
+                                reservation,
+                                error,
+                                Some(spawned_process),
+                                net_alloc,
+                                pending_cow,
+                            )
+                            .await);
+                    }
+                };
+                (
+                    spawned_process,
+                    vsock_path,
+                    effective_vmstate,
+                    effective_mem,
+                    t_spawned,
+                    std::time::Instant::now(),
+                )
+            };
 
         // Build the restore parameters.
         let mut load_params = fc_sdk::types::SnapshotLoadParams {
@@ -601,6 +698,7 @@ impl SandboxManager {
 
         // Persist cleanup metadata before handing runtime resources to the
         // instance. A failed durable write aborts and unwinds every resource.
+        let adopted_slot = reservation.instance().lock().unwrap().pool_slot_id.clone();
         #[allow(
             clippy::cast_possible_wrap,
             reason = "Firecracker pid fits platform pid_t"
@@ -612,7 +710,8 @@ impl SandboxManager {
             pending_cow.as_ref(),
             true,
             None,
-        );
+        )
+        .with_pool_slot(adopted_slot.as_deref());
         if let Err(error) = super::reconcile::write_state_record(&vm_dir, &state_record) {
             return Err(self
                 .rollback_restore(
@@ -700,10 +799,14 @@ impl SandboxManager {
             });
         }
 
+        // On a pool hit, spawn_ms covers records + network + the claim
+        // itself (the phases that still ran) and stage_ms is genuinely 0 —
+        // the log never fakes the pre-executed phases.
         let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         info!(
             sandbox_id = %new_id,
             snapshot_id = %spec.snapshot_id,
+            pool_hit,
             spawn_ms = ms(t_spawned.duration_since(restore_started)),
             stage_ms = ms(t_staged.duration_since(t_spawned)),
             load_ms = ms(t_loaded.duration_since(t_staged)),
@@ -711,6 +814,10 @@ impl SandboxManager {
             total_ms = ms(restore_started.elapsed()),
             "sandbox restored from checkpoint"
         );
+
+        // Populate/refill the pool for this snapshot in the background:
+        // the successful restore is what makes it eligible for pooling.
+        self.spawn_pool_refill(&spec.snapshot_id);
         if let Some(error) = ready_commit.durability_error {
             return Err(VmmError::Unavailable(format!(
                 "sandbox {new_id} was restored, but ACK durability is unconfirmed: {error}"
@@ -742,8 +849,10 @@ impl SandboxManager {
             .collect())
     }
 
-    /// Delete a checkpoint by its ID.
-    pub fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
+    /// Delete a checkpoint by its ID, tearing down any pre-warmed restore
+    /// slots staged from it first.
+    pub async fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
+        self.drain_pool(Some(snapshot_id)).await;
         self.snapshots.delete_by_id(snapshot_id)
     }
 }

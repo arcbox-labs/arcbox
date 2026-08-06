@@ -110,11 +110,12 @@ impl SandboxService {
     }
 
     /// Delete a snapshot.
-    pub fn delete_snapshot(&self, payload: &[u8]) -> Result<(), SandboxError> {
+    pub async fn delete_snapshot(&self, payload: &[u8]) -> Result<(), SandboxError> {
         let req = sandbox_v1::DeleteSnapshotRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         self.manager
             .delete_checkpoint(&req.snapshot_id)
+            .await
             .map_err(SandboxError::from)
     }
 }

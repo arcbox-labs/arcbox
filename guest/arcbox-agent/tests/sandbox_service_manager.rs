@@ -35,6 +35,9 @@ fn test_config() -> VmmConfig {
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: Some(15),
+            // Direct mode cannot restore (and so never pools); keep the
+            // test run free of background pre-warm spawns regardless.
+            pool_size: 0,
         },
         network: NetworkConfig {
             cidr: "172.31.0.0/16".to_string(),

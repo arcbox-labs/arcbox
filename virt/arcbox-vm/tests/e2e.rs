@@ -58,6 +58,9 @@ fn try_config(data_dir: &str) -> Option<VmmConfig> {
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: Some(15),
+            // Direct mode cannot restore (and so never pools); keep the
+            // e2e run free of background pre-warm spawns regardless.
+            pool_size: 0,
         },
         network: NetworkConfig {
             cidr: "172.99.0.0/24".into(),

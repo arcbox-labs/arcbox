@@ -314,6 +314,19 @@ pub struct FirecrackerConfig {
     /// `None` uses the five-second default.
     #[serde(default)]
     pub socket_timeout_secs: Option<u64>,
+    /// Spare pre-warmed restore slots kept per snapshot id (CORE-78).
+    ///
+    /// A slot pre-executes the fixed host-side restore setup — jailer
+    /// chroot, Firecracker spawn, kernel/vmstate/mem staging, dm-snapshot
+    /// — so a restore only claims it and issues LoadSnapshot. Only
+    /// snapshots that have been restored at least once are pooled, for at
+    /// most two distinct snapshot ids (LRU-evicted). `0` disables pooling.
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+}
+
+fn default_pool_size() -> usize {
+    1
 }
 
 /// Network IP-pool settings for sandbox TAP interfaces.
@@ -359,6 +372,7 @@ impl Default for VmmConfig {
                 http_api_max_payload_size: None,
                 mmds_size_limit: None,
                 socket_timeout_secs: None,
+                pool_size: default_pool_size(),
             },
             network: NetworkConfig {
                 cidr: "172.20.0.0/16".into(),
@@ -549,6 +563,16 @@ mod tests {
         assert!(cfg.defaults.boot_args.contains("console=ttyS0"));
         assert!(!cfg.network.cidr.is_empty());
         assert!(!cfg.firecracker.binary.is_empty());
+    }
+
+    #[test]
+    fn pool_size_defaults_to_one_spare_slot() {
+        assert_eq!(VmmConfig::default().firecracker.pool_size, 1);
+        // A config written before the knob existed still loads with the default.
+        let cfg: FirecrackerConfig =
+            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
+                .unwrap();
+        assert_eq!(cfg.pool_size, 1);
     }
 
     #[test]
