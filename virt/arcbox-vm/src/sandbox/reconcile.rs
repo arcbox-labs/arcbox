@@ -249,22 +249,29 @@ pub(super) async fn sweep_orphans(
             kill_orphaned_firecracker(pid).await?;
         }
     }
-    // Cleanly paused sandboxes (durably Paused, no cleanup journal) keep
-    // their detached COW overlay — it is retained disk state, not an orphan.
-    // A Paused record that still has a journal died mid-pause; its resources
-    // (overlay included) are swept and normalization degrades it to Failed.
-    let journaled: HashSet<String> = records.iter().map(|(_, r)| r.id.clone()).collect();
-    let keep_cow: HashSet<String> = store
+    // Durably Paused sandboxes keep their retained disk state (the detached
+    // COW overlay or parked rootfs): Paused is committed only after
+    // `release_for_pause` (or the resume unwind) released every runtime
+    // resource, so a cleanup journal found next to it is a leftover of the
+    // crash window between that commit and the journal clear — not evidence
+    // of a torn release. Those journals are dropped as stale; every other
+    // journaled sandbox is swept.
+    let paused: HashSet<String> = store
         .load_all()?
         .into_iter()
-        .filter(|record| record.phase == SandboxPhase::Paused && !journaled.contains(&record.id))
+        .filter(|record| record.phase == SandboxPhase::Paused)
         .map(|record| record.id)
         .collect();
-    cow_manager.reconcile_stale(&keep_cow)?;
+    cow_manager.reconcile_stale(&paused)?;
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();
     for (dir, mut record) in records {
+        if paused.contains(&record.id) {
+            info!(sandbox_id = %record.id, "dropping stale pause journal, keeping retained state");
+            clear_state_record(&dir)?;
+            continue;
+        }
         info!(sandbox_id = %record.id, "reconciling orphaned sandbox");
 
         if let Some(cow) = record.cow.take() {
@@ -352,23 +359,12 @@ pub(super) fn normalize_durable_records(
                     .confirmed("sandbox restart normalization")?;
                 inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
             }
+            // Paused commits only after every runtime resource was released,
+            // and the sweep preserves durably Paused retained state (clearing
+            // any stale journal), so a paused sandbox always survives a
+            // restart resumable.
             SandboxPhase::Paused => {
-                // A journal on a Paused record means the pause's release never
-                // finished cleanly and the sweep just destroyed the retained
-                // resources — degrade honestly rather than promise a resume
-                // that cannot work.
-                if swept.is_some_and(|ids| ids.contains(&record.id)) {
-                    let record = store
-                        .transition(
-                            &record.id,
-                            record.generation,
-                            SandboxTransition::Failed(AGENT_RESTART_ERROR.into()),
-                        )?
-                        .confirmed("sandbox restart normalization")?;
-                    inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
-                } else {
-                    inactive.push(inactive_instance(record, SandboxState::Paused, data_dir));
-                }
+                inactive.push(inactive_instance(record, SandboxState::Paused, data_dir));
             }
             SandboxPhase::Stopped => {
                 inactive.push(inactive_instance(record, SandboxState::Stopped, data_dir));
@@ -873,18 +869,15 @@ mod tests {
     }
 
     #[test]
-    fn paused_records_survive_restart_unless_their_release_was_interrupted() {
+    fn paused_records_survive_restart_while_interrupted_transitions_fail() {
         let data_dir = tempfile::tempdir().unwrap();
         let store = SandboxRecordStore::new(data_dir.path()).unwrap();
         record_in_phase(&store, "clean", SandboxPhase::Paused);
-        record_in_phase(&store, "torn", SandboxPhase::Paused);
         record_in_phase(&store, "mid-pause", SandboxPhase::Pausing);
         record_in_phase(&store, "mid-resume", SandboxPhase::Resuming);
 
-        // Only "torn" had a cleanup journal, i.e. the sweep destroyed its
-        // retained resources. The interrupted pause/resume fail regardless.
-        let swept = HashSet::from(["torn".to_owned()]);
-        let inactive = normalize_durable_records(&store, data_dir.path(), Some(&swept)).unwrap();
+        let inactive =
+            normalize_durable_records(&store, data_dir.path(), Some(&HashSet::new())).unwrap();
         let inactive: HashMap<_, _> = inactive
             .into_iter()
             .map(|instance| (instance.id.clone(), instance))
@@ -899,7 +892,9 @@ mod tests {
             SandboxPhase::Paused
         );
 
-        for id in ["torn", "mid-pause", "mid-resume"] {
+        // An interrupted pause/resume never reached a durable Paused commit;
+        // its resources were swept, so it degrades honestly.
+        for id in ["mid-pause", "mid-resume"] {
             assert_eq!(inactive[id].state, SandboxState::Failed, "{id}");
             assert_eq!(
                 store.load(id).unwrap().unwrap().phase,
@@ -907,6 +902,40 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// The crash window between the durable `Paused` commit and the journal
+    /// clear must not cost the sandbox its retained disk state: the restart
+    /// sweep drops the stale journal and keeps everything else.
+    #[tokio::test]
+    async fn stale_pause_journal_is_dropped_and_retained_state_survives() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, "napper", SandboxPhase::Paused);
+
+        let vm_dir = data_dir.path().join("sandboxes").join("napper");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(vm_dir.join(STATE_FILE), br#"{"id": "napper"}"#).unwrap();
+        let parked_rootfs = vm_dir.join(super::super::pause::PAUSED_ROOTFS_FILE);
+        std::fs::write(&parked_rootfs, b"disk").unwrap();
+        let cow_dir = data_dir.path().join("cow");
+        std::fs::create_dir_all(&cow_dir).unwrap();
+        let cow_file = cow_dir.join("arcbox-cow-napper.img");
+        std::fs::write(&cow_file, b"overlay").unwrap();
+        drop(store);
+
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+        let manager = super::super::SandboxManager::new(config).unwrap();
+        manager.await_reconcile().await.unwrap();
+
+        assert!(!vm_dir.join(STATE_FILE).exists());
+        assert!(parked_rootfs.exists());
+        assert!(cow_file.exists());
+        let instances = manager.instances.read().unwrap();
+        let inst = instances["napper"].lock().unwrap();
+        assert_eq!(inst.state, SandboxState::Paused);
+        assert_eq!(inst.pause_snapshot_id.as_deref(), Some("snap"));
     }
 
     #[test]
