@@ -73,6 +73,19 @@ enum AppliedDatapath {
     Iptables,
 }
 
+/// How host-side expose/port-forward DNAT must target a sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposeTarget {
+    /// DNAT straight to the pool IP, delivered by the main-table TAP route.
+    /// Legacy guests own that address; on the eBPF datapath the TAP's egress
+    /// program rewrites it after routing. No mangle companion either way.
+    PoolIp,
+    /// DNAT to the fixed invariant guest IP with a companion fwmark `MARK`
+    /// rule on the same match, so the rewritten destination routes out the
+    /// right TAP through the CORE-81 fwmark table (iptables datapath only).
+    GuestIpWithFwmark,
+}
+
 /// Default prefix length for backwards-compatible deserialization of records
 /// that predate the `prefix_len` field.
 const fn default_prefix_len() -> u8 {
@@ -157,14 +170,7 @@ pub struct NetworkManager {
     /// TAP (activation inserts, teardown removes). A TAP absent here was
     /// either activated by a previous agent process (its eBPF links died
     /// with that process) or is legacy — both tear down via the tolerant
-    /// iptables removal.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            dead_code,
-            reason = "only the Linux activation path records translation state; other platforms activate nothing"
-        )
-    )]
+    /// iptables removal and expose via the fwmark form.
     applied: Mutex<HashMap<String, AppliedDatapath>>,
     /// Lazily loaded eBPF datapath state (CORE-83).
     #[cfg(target_os = "linux")]
@@ -409,6 +415,23 @@ impl NetworkManager {
             return Ok(());
         }
         invariant::remove(&alloc.tap_name, alloc.ip_address)
+    }
+
+    /// How expose DNAT must target the sandbox behind `tap_name` (CORE-83).
+    ///
+    /// Follows the *applied* datapath, not the configured one: an eBPF TAP's
+    /// egress program translates pool-IP packets on the TAP itself, so the
+    /// plain pool-IP form suffices; everything else — iptables TAPs, legacy
+    /// guests, and TAPs whose activation record died with a previous agent
+    /// process — needs the CORE-81 guest-IP + fwmark form.
+    pub(crate) fn expose_target(&self, tap_name: &str, net_invariant: bool) -> ExposeTarget {
+        if !net_invariant {
+            return ExposeTarget::PoolIp;
+        }
+        match self.applied.lock().unwrap().get(tap_name) {
+            Some(AppliedDatapath::Ebpf) => ExposeTarget::PoolIp,
+            Some(AppliedDatapath::Iptables) | None => ExposeTarget::GuestIpWithFwmark,
+        }
     }
 
     /// Release the TAP interface and guest IP associated with `vm_id`.
@@ -957,6 +980,42 @@ mod tests {
 
         let ip2: Ipv4Addr = "10.0.255.1".parse().unwrap();
         assert_eq!(tap_name_from_ip(ip2), "vmtap255-1");
+    }
+
+    /// Expose targeting must follow the datapath actually applied to the
+    /// TAP, and default to the fwmark form when the record is gone (agent
+    /// restart) — the eBPF links died with that process, so only the
+    /// iptables machinery could still be translating.
+    #[test]
+    fn expose_target_follows_the_applied_datapath() {
+        let manager = NetworkManager::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
+        // Legacy guests own the pool IP outright.
+        assert_eq!(
+            manager.expose_target("vmtap0-2", false),
+            ExposeTarget::PoolIp
+        );
+        // Invariant TAP without an activation record.
+        assert_eq!(
+            manager.expose_target("vmtap0-2", true),
+            ExposeTarget::GuestIpWithFwmark
+        );
+        let record = |applied| {
+            manager
+                .applied
+                .lock()
+                .unwrap()
+                .insert("vmtap0-2".to_owned(), applied)
+        };
+        record(AppliedDatapath::Ebpf);
+        assert_eq!(
+            manager.expose_target("vmtap0-2", true),
+            ExposeTarget::PoolIp
+        );
+        record(AppliedDatapath::Iptables);
+        assert_eq!(
+            manager.expose_target("vmtap0-2", true),
+            ExposeTarget::GuestIpWithFwmark
+        );
     }
 
     #[tokio::test]

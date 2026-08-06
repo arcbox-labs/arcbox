@@ -50,7 +50,7 @@ pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
 };
 pub use error::{Result, VmmError};
-pub use network::{NetworkAllocation, NetworkManager};
+pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
 pub use sandbox::{
     CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
     SandboxManager, SandboxMountSpec, SandboxNetworkIdentity, SandboxNetworkInfo,

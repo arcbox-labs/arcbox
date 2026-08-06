@@ -48,6 +48,11 @@
 //! is tolerant of absence so the same teardown serves legacy TAPs, partial
 //! activations, and crash-recovery replays; rule specs derive entirely from
 //! the allocation, so cleanup needs no extra state.
+//!
+//! Since CORE-83 this rule set is the `SandboxDatapath::Iptables` mechanism
+//! and the automatic fallback; the default datapath applies the same
+//! translation with two TCX programs per TAP instead (`super::ebpf`),
+//! needing none of the mark/fwmark machinery.
 
 use std::net::Ipv4Addr;
 
