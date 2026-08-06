@@ -59,7 +59,12 @@ impl SandboxService {
         loop {
             tokio::select! {
                 event = lifecycle.recv() => match event {
-                    Ok(event) if event.is_terminal() => {
+                    // Terminal teardowns release the network, and a pause
+                    // quarantines it the same way (CORE-21) — emit the
+                    // ticket promptly in both cases so the host finalizes
+                    // before a resume needs the allocation back, instead of
+                    // waiting for the 1 s rescan below.
+                    Ok(event) if event.is_terminal() || event.action == "paused" => {
                         if let Some(ticket) = self
                             .pending_cleanup_ticket(&event.sandbox_id)
                             .await

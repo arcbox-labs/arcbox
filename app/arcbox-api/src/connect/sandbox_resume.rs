@@ -74,21 +74,48 @@ pub(super) async fn resume(
     let mut agent = runtime
         .get_agent(machine)
         .map_err(|e| ConnectError::from(ApiError::from(e)))?;
-    let resumed = agent
-        .sandbox_resume(SandboxResumeCommand {
-            id: sandbox_id.to_owned(),
-            reason: reason.to_owned(),
-            ..Default::default()
-        })
-        .await
-        // Same reason as create/stop/remove/pause: a failed lifecycle
-        // mutation must reach the daemon log on its own (CORE-82). It matters
-        // more here — an auto-resume has no caller expecting a Resume RPC, so
-        // the failure would otherwise surface only as the data-plane error.
-        .inspect_err(|error| {
-            tracing::warn!(machine, sandbox_id, reason, %error, "sandbox resume failed");
-        })
-        .map_err(|e| ConnectError::from(ApiError::from(e)))?;
+    // A resume can race the host finalization of the pause's network
+    // quarantine (guest-initiated pauses — the idle detector — publish
+    // their cleanup ticket through the async watch stream). The guest
+    // answers 503 for that transient, so retry within a bounded budget
+    // while the daemon's cleanup watcher completes the ticket; resume is
+    // idempotent, and the guest lock is released between attempts.
+    let resumed = {
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+        let deadline = tokio::time::Instant::now() + RETRY_BUDGET;
+        loop {
+            let attempt = agent
+                .sandbox_resume(SandboxResumeCommand {
+                    id: sandbox_id.to_owned(),
+                    reason: reason.to_owned(),
+                    ..Default::default()
+                })
+                .await;
+            match attempt {
+                Ok(resumed) => break resumed,
+                Err(CoreError::Agent { code: 503, message })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tracing::debug!(
+                        sandbox_id,
+                        message,
+                        "sandbox resume hit a retryable condition; retrying"
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    // Same reason as create/stop/remove/pause: a failed
+                    // lifecycle mutation must reach the daemon log on its own
+                    // (CORE-82). It matters more here — an auto-resume has no
+                    // caller expecting a Resume RPC, so the failure would
+                    // otherwise surface only as the data-plane error.
+                    tracing::warn!(machine, sandbox_id, reason, %error, "sandbox resume failed");
+                    return Err(ConnectError::from(ApiError::from(error)));
+                }
+            }
+        }
+    };
 
     let _host_state = runtime.lock_sandbox_host_state().await;
     if let Ok(ip) = resumed.ip_address.parse()
