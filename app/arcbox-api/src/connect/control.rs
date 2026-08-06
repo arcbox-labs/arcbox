@@ -19,6 +19,7 @@ use crate::ApiError;
 
 use super::sandbox_cleanup;
 use super::sandbox_locks::SandboxOperationLocks;
+use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, protocol_key, wire_protocol, with_keepalive};
 
 /// Sandbox lifecycle service implementation.
@@ -138,27 +139,58 @@ impl pb::SandboxService for SandboxServiceImpl {
         Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): pause/auto-pause lands with
-    /// CORE-21.
+    /// Pause: checkpoint in the guest, release the VM, then complete the
+    /// host half of the network release — the guest quarantines the TAP+IP
+    /// exactly like Stop and hands back the same durable cleanup ticket
+    /// (which also drops the sandbox's host DNS entry).
     async fn pause(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::PauseSandboxRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::PauseSandboxRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "sandbox pause is not implemented yet (CORE-21)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let sandbox_id = req.id.clone();
+        let _operation = self.operations.lock(&machine, &sandbox_id).await;
+        let runtime = self.runtime.ready()?;
+        let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
+        // Same reason as create/stop/remove: a failed lifecycle mutation must
+        // reach the daemon log on its own, not only the caller (CORE-82).
+        let response = agent
+            .sandbox_pause(req)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox pause failed");
+            })
+            .map_err(ApiError::from)?;
+        if let Some(ticket) = response.ticket.as_option() {
+            sandbox_cleanup::complete(runtime, &mut agent, ticket)
+                .await
+                .map_err(ApiError::from)?;
+        }
+
+        Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): resume lands with CORE-21.
+    /// Explicit resume; data-plane RPCs resume transparently through the
+    /// same routine (`sandbox_resume`), differing only in the event reason.
     async fn resume(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::ResumeSandboxRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ResumeSandboxRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "sandbox resume is not implemented yet (CORE-21)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        sandbox_resume::resume(
+            runtime,
+            &self.operations,
+            &machine,
+            &req.id,
+            sandbox_resume::REASON_RESUME,
+        )
+        .await?;
+        Response::ok(Empty::default())
     }
 
     /// Contract-only stub (CORE-58 phase 1): the TTL wire-up lands with

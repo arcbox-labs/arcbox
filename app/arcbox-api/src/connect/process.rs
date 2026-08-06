@@ -1,5 +1,7 @@
 //! Sandbox process (execution) service — data plane.
 
+use std::sync::Arc;
+
 use arcbox_connect::sandbox_v1 as pb;
 use arcbox_connect::sandbox_v1::{ExecutionEvent, KeepAlive, execution_event};
 use buffa_types::google::protobuf::Empty;
@@ -13,6 +15,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::SharedRuntime;
 use crate::ApiError;
 
+use super::sandbox_locks::SandboxOperationLocks;
+use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 
 /// Execution service implementation.
@@ -21,15 +25,25 @@ use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 /// stdio, so this is the half a cloud deployment serves from whatever is
 /// co-located with the sandbox rather than from the control-plane front
 /// door.
+///
+/// Data-plane calls transparently resume a paused sandbox (CORE-21): a
+/// guest answer of SANDBOX_PAUSED triggers one shared resume and one retry,
+/// unless the caller opted out via `x-arcbox-no-auto-resume`. Calls that
+/// address execution *history* (attach, wait, stdin status, signal, resize)
+/// are served from the guest's registry without waking the sandbox.
 pub struct SandboxProcessServiceImpl {
     runtime: SharedRuntime,
+    operations: Arc<SandboxOperationLocks>,
 }
 
 impl SandboxProcessServiceImpl {
     /// Creates a new execution service with a deferred runtime.
     #[must_use]
-    pub fn new(runtime: SharedRuntime) -> Self {
-        Self { runtime }
+    pub(super) fn new(runtime: SharedRuntime, operations: Arc<SandboxOperationLocks>) -> Self {
+        Self {
+            runtime,
+            operations,
+        }
     }
 }
 
@@ -46,15 +60,23 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         request: ServiceRequest<'_, pb::StartExecutionRequest>,
     ) -> ServiceResult<pb::Execution> {
         let machine = ctx.sandbox_machine_id()?;
-        let mut agent = self
-            .runtime
-            .ready()?
-            .get_agent(&machine)
-            .map_err(ApiError::from)?;
-        let execution = agent
-            .sandbox_exec_start(request.to_owned_message())
-            .await
-            .map_err(ApiError::from)?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        let execution = sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.sandbox_id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_exec_start(req).await
+                }
+            },
+        )
+        .await?;
         Response::ok(execution)
     }
 
@@ -88,15 +110,23 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         request: ServiceRequest<'_, pb::WriteStdinRequest>,
     ) -> ServiceResult<pb::StdinStatus> {
         let machine = ctx.sandbox_machine_id()?;
-        let mut agent = self
-            .runtime
-            .ready()?
-            .get_agent(&machine)
-            .map_err(ApiError::from)?;
-        let status = agent
-            .sandbox_stdin_write(request.to_owned_message())
-            .await
-            .map_err(ApiError::from)?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        let status = sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.sandbox_id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_stdin_write(req).await
+                }
+            },
+        )
+        .await?;
         Response::ok(status)
     }
 
@@ -113,17 +143,23 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             // truncated body), so it must fail the RPC rather than be read
             // as a clean finish — only `None` means the client is done.
             let req = item?.to_owned_message();
-            let mut agent = self
-                .runtime
-                .ready()?
-                .get_agent(&machine)
-                .map_err(ApiError::from)?;
-            last = Some(
-                agent
-                    .sandbox_stdin_write(req)
-                    .await
-                    .map_err(ApiError::from)?,
-            );
+            let runtime = self.runtime.ready()?;
+            let status = sandbox_resume::with_auto_resume(
+                runtime,
+                &self.operations,
+                &ctx,
+                &machine,
+                &req.sandbox_id,
+                || {
+                    let req = req.clone();
+                    async {
+                        let mut agent = runtime.get_agent(&machine)?;
+                        agent.sandbox_stdin_write(req).await
+                    }
+                },
+            )
+            .await?;
+            last = Some(status);
         }
         let last = last
             .ok_or_else(|| ConnectError::invalid_argument("stream_stdin: empty request stream"))?;
