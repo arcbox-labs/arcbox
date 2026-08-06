@@ -7,6 +7,7 @@ pub mod env;
 pub mod helper;
 pub mod paths;
 pub mod ports;
+pub mod sandbox;
 pub mod status;
 pub mod timeouts;
 pub mod virtiofs;

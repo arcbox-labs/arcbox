@@ -32,6 +32,7 @@ mod macos;
 mod migration;
 mod process;
 mod sandbox_cleanup;
+mod sandbox_errors;
 mod sandbox_locks;
 mod sandbox_resume;
 mod snapshot;

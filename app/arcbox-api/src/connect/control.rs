@@ -61,6 +61,12 @@ impl pb::SandboxService for SandboxServiceImpl {
         let sandbox_id = req.id.clone();
         let _operation = self.operations.lock(&machine, &sandbox_id).await;
         let runtime = self.runtime.ready()?;
+        // CORE-13 fail-fast: refuse before dialing the guest instead of a
+        // boot that wedges into FAILED with an opaque KVM error.
+        let capability = runtime.sandbox_nested_virt();
+        if !capability.supported {
+            return Err(super::sandbox_errors::nested_virt_unsupported(&capability));
+        }
         let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
         // The RPC error otherwise reaches only the caller; the daemon log
         // must record a failed lifecycle mutation on its own (CORE-82).
@@ -214,16 +220,33 @@ impl pb::SandboxService for SandboxServiceImpl {
         Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): served for real with
-    /// CORE-13 (nested-virt fail-fast).
+    /// Report what this daemon can do (CORE-13): version, sandbox protocol
+    /// level, feature flags, and whether nested virtualization is available
+    /// on the *current* backend and hardware — answered host-side without
+    /// touching the guest, so the SDK handshake works before any sandbox
+    /// exists.
     async fn get_capabilities(
         &self,
         _ctx: RequestContext,
         _request: ServiceRequest<'_, pb::GetCapabilitiesRequest>,
     ) -> ServiceResult<pb::GetCapabilitiesResponse> {
-        Err(ConnectError::unimplemented(
-            "capability reporting is not implemented yet (CORE-13)",
-        ))
+        let runtime = self.runtime.ready()?;
+        let nested = runtime.sandbox_nested_virt();
+        Response::ok(pb::GetCapabilitiesResponse {
+            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol: arcbox_constants::sandbox::SANDBOX_API_PROTOCOL,
+            features: arcbox_constants::sandbox::SANDBOX_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            nested_virt: pb::NestedVirtCapability {
+                supported: nested.supported,
+                reason: nested.reason,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        })
     }
 
     async fn inspect(

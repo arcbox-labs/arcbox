@@ -82,11 +82,30 @@ impl From<ApiError> for connectrpc::ConnectError {
 fn sandbox_paused_detail() -> connectrpc::ErrorDetail {
     use arcbox_connect::sandbox_v1 as pb;
 
-    let info = pb::ErrorInfo {
-        code: pb::ErrorCode::SandboxPaused.into(),
-        suggestion: "resume the sandbox (`abctl sandbox resume <id>`), or retry \
-                     the data-plane call without `x-arcbox-no-auto-resume`"
-            .into(),
+    error_info(
+        pb::ErrorCode::SandboxPaused,
+        "resume the sandbox (`abctl sandbox resume <id>`), or retry \
+         the data-plane call without `x-arcbox-no-auto-resume`",
+        &[],
+    )
+}
+
+/// Build the `arcbox.sandbox.v1.ErrorInfo` Connect error detail from a
+/// registry code + actionable suggestion + structured context (CORE-58).
+/// The single builder every attachment site uses, so the type URL and
+/// shape SDKs parse stay in one place.
+pub(crate) fn error_info(
+    code: arcbox_connect::sandbox_v1::ErrorCode,
+    suggestion: &str,
+    context: &[(&str, &str)],
+) -> connectrpc::ErrorDetail {
+    let info = arcbox_connect::sandbox_v1::ErrorInfo {
+        code: code.into(),
+        suggestion: suggestion.to_owned(),
+        context: context
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
         ..Default::default()
     };
     connectrpc::ErrorDetail::from_message("arcbox.sandbox.v1.ErrorInfo", &info)
