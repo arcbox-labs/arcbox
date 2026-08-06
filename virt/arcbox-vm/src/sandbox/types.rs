@@ -25,6 +25,12 @@ pub enum SandboxState {
     Stopped,
     /// Unrecoverable error occurred.
     Failed,
+    /// `Pause` called; checkpointing state, then releasing the VM.
+    Pausing,
+    /// Checkpointed to disk with runtime resources released; the record,
+    /// checkpoint, and disk overlay survive under the same id until
+    /// `Resume` or `Remove` (CORE-21).
+    Paused,
 }
 
 impl std::fmt::Display for SandboxState {
@@ -36,6 +42,8 @@ impl std::fmt::Display for SandboxState {
             Self::Stopping => write!(f, "stopping"),
             Self::Stopped => write!(f, "stopped"),
             Self::Failed => write!(f, "failed"),
+            Self::Pausing => write!(f, "pausing"),
+            Self::Paused => write!(f, "paused"),
         }
     }
 }
@@ -159,12 +167,20 @@ pub struct SandboxInstance {
     /// (CORE-78), the slot id (`pool-<uuid>`) its jailer chroot and dm/CoW
     /// names are keyed by. `None` for resources created under the
     /// sandbox's own id.
+    ///
+    /// Cleared by pause: releasing a paused sandbox renames its retained
+    /// overlay to the sandbox-id path and destroys the slot chroot, so a
+    /// resumed sandbox owns everything under its own id again.
     pub(super) pool_slot_id: Option<String>,
     /// Whether this guest runs the fixed invariant network identity
     /// (CORE-81). Set by the create path when the boot bakes the invariant
     /// `ip=` parameter, and inherited from [`crate::snapshot::SnapshotMeta`]
     /// on restore so chained checkpoints record the guest's actual addressing.
     pub(super) net_invariant: bool,
+    /// When the sandbox reached `Paused` (None otherwise).
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Catalog id of the internal pause checkpoint (state == `Paused` only).
+    pub pause_snapshot_id: Option<String>,
 }
 
 impl SandboxInstance {
@@ -215,6 +231,8 @@ impl SandboxInstance {
             cow_handle: None,
             pool_slot_id: None,
             net_invariant: false,
+            paused_at: None,
+            pause_snapshot_id: None,
         }
     }
 
@@ -234,6 +252,10 @@ pub struct SandboxSummary {
     /// Allocated IP address (empty when network mode is `"none"`).
     pub ip_address: String,
     pub created_at: DateTime<Utc>,
+    /// When the sandbox reached `Paused` (None otherwise).
+    pub paused_at: Option<DateTime<Utc>>,
+    /// On-disk footprint of retained pause state (checkpoint + overlay).
+    pub storage_bytes: u64,
 }
 
 /// Detailed sandbox state for `Inspect`.
@@ -249,6 +271,10 @@ pub struct SandboxInfo {
     pub last_exited_at: Option<DateTime<Utc>>,
     pub last_exit_status: Option<ExitStatus>,
     pub error: Option<String>,
+    /// When the sandbox reached `Paused` (None otherwise).
+    pub paused_at: Option<DateTime<Utc>>,
+    /// On-disk footprint of retained pause state (checkpoint + overlay).
+    pub storage_bytes: u64,
 }
 
 /// Network details within `SandboxInfo`.
@@ -275,6 +301,9 @@ pub mod action {
     pub const STOPPED: &str = "stopped";
     pub const FAILED: &str = "failed";
     pub const REMOVED: &str = "removed";
+    pub const PAUSING: &str = "pausing";
+    pub const PAUSED: &str = "paused";
+    pub const RESUMED: &str = "resumed";
 }
 
 /// A sandbox lifecycle event broadcast to subscribers.

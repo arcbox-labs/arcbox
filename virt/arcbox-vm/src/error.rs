@@ -19,6 +19,12 @@ pub enum VmmError {
         actual: String,
     },
 
+    /// The sandbox is paused. Distinct from [`Self::WrongState`] so callers
+    /// (the daemon's transparent auto-resume, CORE-21) can recognise
+    /// "paused" machine-readably instead of parsing state strings.
+    #[error("sandbox '{0}' is paused")]
+    Paused(String),
+
     /// I/O error (file system, sockets, etc.).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

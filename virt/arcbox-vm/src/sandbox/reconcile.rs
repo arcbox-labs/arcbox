@@ -203,6 +203,7 @@ pub(super) async fn sweep_orphans(
     network: &NetworkManager,
     cow_manager: &CowManager,
     snapshots: &crate::snapshot::SnapshotCatalog,
+    store: &SandboxRecordStore,
 ) -> Result<OrphanSweep> {
     // Snapshots staged by a checkpoint that died mid-flight: unfinished by
     // definition, and each can hold a full memory dump.
@@ -248,7 +249,18 @@ pub(super) async fn sweep_orphans(
             kill_orphaned_firecracker(pid).await?;
         }
     }
-    cow_manager.reconcile_stale()?;
+    // Cleanly paused sandboxes (durably Paused, no cleanup journal) keep
+    // their detached COW overlay — it is retained disk state, not an orphan.
+    // A Paused record that still has a journal died mid-pause; its resources
+    // (overlay included) are swept and normalization degrades it to Failed.
+    let journaled: HashSet<String> = records.iter().map(|(_, r)| r.id.clone()).collect();
+    let keep_cow: HashSet<String> = store
+        .load_all()?
+        .into_iter()
+        .filter(|record| record.phase == SandboxPhase::Paused && !journaled.contains(&record.id))
+        .map(|record| record.id)
+        .collect();
+    cow_manager.reconcile_stale(&keep_cow)?;
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();
@@ -324,6 +336,40 @@ pub(super) fn normalize_durable_records(
                     .confirmed("sandbox restart normalization")?;
                 inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
             }
+            // An interrupted pause/resume died between resource states; the
+            // sweep already tore down whatever its journal listed (including
+            // the disk overlay), so the sandbox is unrecoverable. Unlike the
+            // live phases above, a missing journal is normal here — Pausing
+            // clears it after releasing everything, just before the Paused
+            // commit.
+            SandboxPhase::Pausing | SandboxPhase::Resuming => {
+                let record = store
+                    .transition(
+                        &record.id,
+                        record.generation,
+                        SandboxTransition::Failed(AGENT_RESTART_ERROR.into()),
+                    )?
+                    .confirmed("sandbox restart normalization")?;
+                inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
+            }
+            SandboxPhase::Paused => {
+                // A journal on a Paused record means the pause's release never
+                // finished cleanly and the sweep just destroyed the retained
+                // resources — degrade honestly rather than promise a resume
+                // that cannot work.
+                if swept.is_some_and(|ids| ids.contains(&record.id)) {
+                    let record = store
+                        .transition(
+                            &record.id,
+                            record.generation,
+                            SandboxTransition::Failed(AGENT_RESTART_ERROR.into()),
+                        )?
+                        .confirmed("sandbox restart normalization")?;
+                    inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
+                } else {
+                    inactive.push(inactive_instance(record, SandboxState::Paused, data_dir));
+                }
+            }
             SandboxPhase::Stopped => {
                 inactive.push(inactive_instance(record, SandboxState::Stopped, data_dir));
             }
@@ -357,6 +403,10 @@ fn inactive_instance(
     instance.state = state;
     instance.created_at = record.created_at;
     instance.error = record.error;
+    if state == SandboxState::Paused {
+        instance.pause_snapshot_id = record.pause_snapshot_id;
+        instance.paused_at = record.paused_at;
+    }
     instance
 }
 
@@ -621,6 +671,30 @@ mod tests {
                                 .unwrap();
                         }
                     }
+                    SandboxPhase::Pausing | SandboxPhase::Paused | SandboxPhase::Resuming => {
+                        store
+                            .transition(id, generation, SandboxTransition::Ready)
+                            .unwrap();
+                        store
+                            .transition(id, generation, SandboxTransition::Pausing)
+                            .unwrap();
+                        if phase != SandboxPhase::Pausing {
+                            store
+                                .transition(
+                                    id,
+                                    generation,
+                                    SandboxTransition::Paused {
+                                        snapshot_id: "snap".into(),
+                                    },
+                                )
+                                .unwrap();
+                        }
+                        if phase == SandboxPhase::Resuming {
+                            store
+                                .transition(id, generation, SandboxTransition::Resuming)
+                                .unwrap();
+                        }
+                    }
                     _ => unreachable!("phase handled above"),
                 }
             }
@@ -796,6 +870,43 @@ mod tests {
         );
         assert!(store.load("removing").unwrap().is_none());
         assert!(!inactive.contains_key("removing"));
+    }
+
+    #[test]
+    fn paused_records_survive_restart_unless_their_release_was_interrupted() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, "clean", SandboxPhase::Paused);
+        record_in_phase(&store, "torn", SandboxPhase::Paused);
+        record_in_phase(&store, "mid-pause", SandboxPhase::Pausing);
+        record_in_phase(&store, "mid-resume", SandboxPhase::Resuming);
+
+        // Only "torn" had a cleanup journal, i.e. the sweep destroyed its
+        // retained resources. The interrupted pause/resume fail regardless.
+        let swept = HashSet::from(["torn".to_owned()]);
+        let inactive = normalize_durable_records(&store, data_dir.path(), Some(&swept)).unwrap();
+        let inactive: HashMap<_, _> = inactive
+            .into_iter()
+            .map(|instance| (instance.id.clone(), instance))
+            .collect();
+
+        let clean = &inactive["clean"];
+        assert_eq!(clean.state, SandboxState::Paused);
+        assert_eq!(clean.pause_snapshot_id.as_deref(), Some("snap"));
+        assert!(clean.paused_at.is_some());
+        assert_eq!(
+            store.load("clean").unwrap().unwrap().phase,
+            SandboxPhase::Paused
+        );
+
+        for id in ["torn", "mid-pause", "mid-resume"] {
+            assert_eq!(inactive[id].state, SandboxState::Failed, "{id}");
+            assert_eq!(
+                store.load(id).unwrap().unwrap().phase,
+                SandboxPhase::Failed,
+                "{id}"
+            );
+        }
     }
 
     #[test]

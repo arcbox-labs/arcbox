@@ -31,6 +31,7 @@ pub(super) async fn remove_sandbox_impl(
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
     records: &Arc<SandboxRecordStore>,
+    snapshots: &Arc<crate::snapshot::SnapshotCatalog>,
 ) -> Result<()> {
     let cleanup_lock = expected.lock().unwrap().cleanup_lock.clone();
     let _cleanup_guard = cleanup_lock.lock().await;
@@ -39,6 +40,12 @@ pub(super) async fn remove_sandbox_impl(
 
     cancel_and_join_boot(id, expected, boot_task).await?;
     release_runtime_resources(id, expected, network, config, cow_manager).await?;
+
+    // Pause artifacts survive Stop-style release by design (CORE-21); Remove
+    // is where they die: the retained disk overlay and the internal pause
+    // checkpoint(s), including any leaked by an interrupted pause.
+    cow_manager.remove_preserved_cow(id).await?;
+    super::pause::delete_pause_snapshots(snapshots, id)?;
 
     // Remove the sandbox working directory (sockets, logs, state journal).
     let vm_dir = PathBuf::from(&config.firecracker.data_dir)
@@ -203,6 +210,7 @@ pub(super) async fn expire_sandbox(
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
     records: &Arc<SandboxRecordStore>,
+    snapshots: &Arc<crate::snapshot::SnapshotCatalog>,
 ) {
     let mut retry_delay = TTL_REMOVE_RETRY_INITIAL;
     loop {
@@ -220,6 +228,7 @@ pub(super) async fn expire_sandbox(
             config,
             cow_manager,
             records,
+            snapshots,
         )
         .await
         {
@@ -256,6 +265,83 @@ pub(super) async fn release_runtime_resources(
     network: &Arc<NetworkManager>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
+) -> Result<()> {
+    kill_sandbox_process(id, arc).await?;
+
+    // Teardown dm-snapshot CoW device (must happen after FC process exits
+    // because Firecracker holds the block device open).
+    {
+        let cow_handle = arc.lock().unwrap().cow_handle.take();
+        if let Some(handle) = cow_handle
+            && let Err(error) = cow_manager.teardown_checked(&handle).await
+        {
+            arc.lock().unwrap().cow_handle = Some(handle);
+            return Err(error);
+        }
+    }
+    cow_manager.cleanup_setup_orphan(id).await?;
+
+    // Release network resources (destroys TAP via ioctl).
+    {
+        let mut inst = arc.lock().unwrap();
+        if let Some(net) = inst.network.take() {
+            drop(inst);
+            if let Err(error) = network.quarantine_checked(id, &net) {
+                arc.lock().unwrap().network = Some(net);
+                return Err(error);
+            }
+        }
+    }
+
+    // Clean up the jailer chroot directory if applicable. A sandbox that
+    // adopted a pre-warmed pool slot lives in the slot's chroot, so the
+    // removal is keyed by the owning id, not the sandbox id.
+    remove_jailer_chroot(id, arc, config).await
+}
+
+/// Remove the jailer chroot a sandbox actually lives in.
+///
+/// Keyed by the adopted pool slot id when the sandbox claimed a pre-warmed
+/// slot (CORE-78), by the sandbox id otherwise. Shared with the pause path,
+/// which releases the same chroot while keeping the disk.
+pub(super) async fn remove_jailer_chroot(
+    id: &str,
+    arc: &Arc<Mutex<SandboxInstance>>,
+    config: &Arc<VmmConfig>,
+) -> Result<()> {
+    let Some(ref jc) = config.firecracker.jailer else {
+        return Ok(());
+    };
+    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+    let chroot_owner = chroot_owner(id, arc);
+    let chroot_dir = chroot_root(&config.firecracker.binary, base, &chroot_owner);
+    // Remove {base}/{exec_name}/{id}/ (parent of "root/").
+    if let Some(parent) = chroot_dir.parent()
+        && let Err(e) = tokio::fs::remove_dir_all(parent).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VmmError::Io(e));
+    }
+    Ok(())
+}
+
+/// Id the sandbox's jailer chroot and dm/CoW resources are named after.
+pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> String {
+    arc.lock()
+        .unwrap()
+        .pool_slot_id
+        .clone()
+        .unwrap_or_else(|| id.to_owned())
+}
+
+/// SIGKILL the sandbox's Firecracker process and reap it with a bounded wait.
+///
+/// Extracted so the pause path (which keeps the disk overlay) shares the exact
+/// kill/reap discipline with full release. A failed reap restores the handle
+/// so a retry can finish the job. Idempotent — the process is `take()`n.
+pub(super) async fn kill_sandbox_process(
+    id: &str,
+    arc: &Arc<Mutex<SandboxInstance>>,
 ) -> Result<()> {
     let mut fc_process = {
         let mut inst = arc.lock().unwrap();
@@ -300,50 +386,6 @@ pub(super) async fn release_runtime_resources(
             }
         }
     }
-
-    // Teardown dm-snapshot CoW device (must happen after FC process exits
-    // because Firecracker holds the block device open).
-    {
-        let cow_handle = arc.lock().unwrap().cow_handle.take();
-        if let Some(handle) = cow_handle
-            && let Err(error) = cow_manager.teardown_checked(&handle).await
-        {
-            arc.lock().unwrap().cow_handle = Some(handle);
-            return Err(error);
-        }
-    }
-    cow_manager.cleanup_setup_orphan(id).await?;
-
-    // Release network resources (destroys TAP via ioctl).
-    {
-        let mut inst = arc.lock().unwrap();
-        if let Some(net) = inst.network.take() {
-            drop(inst);
-            if let Err(error) = network.quarantine_checked(id, &net) {
-                arc.lock().unwrap().network = Some(net);
-                return Err(error);
-            }
-        }
-    }
-
-    // Clean up the jailer chroot directory if applicable. A sandbox that
-    // adopted a pre-warmed pool slot lives in the slot's chroot, so the
-    // removal is keyed by the owning id, not the sandbox id.
-    if let Some(ref jc) = config.firecracker.jailer {
-        let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        let chroot_owner = {
-            let inst = arc.lock().unwrap();
-            inst.pool_slot_id.clone().unwrap_or_else(|| id.to_owned())
-        };
-        let chroot_dir = chroot_root(&config.firecracker.binary, base, &chroot_owner);
-        // Remove {base}/{exec_name}/{id}/ (parent of "root/").
-        if let Some(parent) = chroot_dir.parent()
-            && let Err(e) = tokio::fs::remove_dir_all(parent).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(VmmError::Io(e));
-        }
-    }
     Ok(())
 }
 
@@ -364,6 +406,9 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
         last_exited_at: inst.last_exited_at,
         last_exit_status: inst.last_exit_status,
         error: inst.error.clone(),
+        paused_at: inst.paused_at,
+        // Filled by the manager for paused sandboxes (it owns the paths).
+        storage_bytes: 0,
     }
 }
 
@@ -463,6 +508,9 @@ mod tests {
                 .unwrap(),
             );
             let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+            let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
+                &config.firecracker.data_dir,
+            ));
             let (events_tx, _) = broadcast::channel(1);
             let armed_for = Arc::downgrade(&expected);
 
@@ -478,6 +526,7 @@ mod tests {
                         &config,
                         &cow_manager,
                         &records,
+                        &snapshots,
                     )
                     .await;
                     Ok(())
@@ -492,6 +541,7 @@ mod tests {
                         &config,
                         &cow_manager,
                         &records,
+                        &snapshots,
                     )
                     .await
                 }
@@ -593,6 +643,9 @@ mod tests {
             .unwrap(),
         );
         let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+        let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
+            &config.firecracker.data_dir,
+        ));
         let (events_tx, _) = broadcast::channel(1);
         let armed_for = Arc::downgrade(&expected);
 
@@ -608,6 +661,7 @@ mod tests {
                 &config,
                 &cow_manager,
                 &records,
+                &snapshots,
             ),
         )
         .await
@@ -839,6 +893,9 @@ mod tests {
         );
         let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
         let records = Arc::new(SandboxRecordStore::new(data_dir.path()).unwrap());
+        let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
+            &config.firecracker.data_dir,
+        ));
         let (events_tx, _) = broadcast::channel(1);
 
         assert!(matches!(
@@ -852,6 +909,7 @@ mod tests {
                 &config,
                 &cow_manager,
                 &records,
+                &snapshots,
             )
             .await,
             Err(VmmError::WrongState { .. })

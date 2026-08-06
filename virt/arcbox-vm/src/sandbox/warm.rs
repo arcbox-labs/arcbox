@@ -326,8 +326,12 @@ async fn publish_warm_snapshot(
         &ticket.snapshots,
         config,
         sandbox_id,
-        name,
-        labels,
+        super::checkpoint::CheckpointRequest {
+            name,
+            labels,
+            expected_state: SandboxState::Ready,
+            resume_after: true,
+        },
     )
     .await?;
     ticket.cache.touch(&ticket.key);

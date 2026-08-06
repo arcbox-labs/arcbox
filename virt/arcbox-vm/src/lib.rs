@@ -51,6 +51,7 @@ pub use config::{
 };
 pub use error::{Result, VmmError};
 pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
+pub use sandbox::pause_reason;
 pub use sandbox::{
     CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
     SandboxManager, SandboxMountSpec, SandboxNetworkIdentity, SandboxNetworkInfo,

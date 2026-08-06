@@ -37,7 +37,16 @@ impl CowManager {
     /// devices left over from a previous crash. Called after orphaned
     /// Firecracker processes are dead; it is synchronous because every
     /// command is short and startup is already gated on reconciliation.
-    pub(crate) fn reconcile_stale(&self) -> Result<()> {
+    ///
+    /// `keep_cow_ids` names sandboxes whose COW file is *retained state*,
+    /// not an orphan: a paused sandbox keeps its (detached) overlay on disk
+    /// so Resume can re-assemble the dm-snapshot with every written block
+    /// intact (CORE-21). Deleting those files here would silently destroy a
+    /// paused sandbox's disk across an agent restart.
+    pub(crate) fn reconcile_stale(
+        &self,
+        keep_cow_ids: &std::collections::HashSet<String>,
+    ) -> Result<()> {
         let dmsetup = self.dmsetup_bin.as_deref();
 
         // 1. Remove stale dm devices first — they pin the loop devices
@@ -57,14 +66,19 @@ impl CowManager {
         }
 
         // 2. Detach loops backing stale COW files, then unlink the files.
+        //    Overlays retained by a paused sandbox are skipped wholesale.
         for entry in std::fs::read_dir(&self.cow_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("arcbox-cow-"))
-            {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some(rest) = name.strip_prefix("arcbox-cow-") {
+                let id = rest.strip_suffix(".img").unwrap_or(rest);
+                if keep_cow_ids.contains(id) {
+                    debug!(file = %path.display(), "keeping paused sandbox cow file");
+                    continue;
+                }
                 for loop_device in loop_devices_for_backing_sync(&path)? {
                     run_sync_checked(Command::new(BUSYBOX).args(["losetup", "-d", &loop_device]))?;
                 }
