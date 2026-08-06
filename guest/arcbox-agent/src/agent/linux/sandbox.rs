@@ -318,6 +318,31 @@ where
                 }
             }
         }
+        MessageType::SandboxSetLifecycleRequest => {
+            use arcbox_connect::sandbox_v1::SetLifecycleRequest;
+            let req = match SetLifecycleRequest::decode_from_slice(payload) {
+                Ok(req) => req,
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, 400, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let _operation = svc.lock_operation(&req.id).await;
+            match svc.set_lifecycle_request(req).await {
+                Ok(()) => {
+                    write_message(
+                        stream,
+                        MessageType::SandboxSetLifecycleResponse,
+                        trace_id,
+                        &[],
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+                }
+            }
+        }
         MessageType::SandboxCleanupPrepareRequest => {
             use arcbox_connect::v1::SandboxCleanupTicket;
 

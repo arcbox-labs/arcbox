@@ -19,8 +19,9 @@ use arcbox_connect::sandbox_v1::{
     GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, PauseSandboxRequest, ReadFileRequest,
     RemoveSandboxRequest, ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent,
-    SandboxEventsRequest, SandboxInfo, SignalExecutionRequest, StartExecutionRequest, StdinStatus,
-    StopSandboxRequest, WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
+    SandboxEventsRequest, SandboxInfo, SetLifecycleRequest, SignalExecutionRequest,
+    StartExecutionRequest, StdinStatus, StopSandboxRequest, WaitExecutionRequest, WriteFileOpen,
+    WriteStdinRequest, execution_event,
 };
 use arcbox_connect::v1::{
     AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
@@ -1140,6 +1141,23 @@ impl AgentClient {
             MessageType::SandboxResumeResponse,
         )
         .await
+    }
+
+    /// Replaces a sandbox's lifecycle deadlines in the guest VM (CORE-60):
+    /// TTL re-armed from now, idle timeout/policy replaced. Absent fields
+    /// are left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_set_lifecycle(&mut self, req: SetLifecycleRequest) -> Result<()> {
+        let (response_type, _) = self
+            .rpc_call(
+                MessageType::SandboxSetLifecycleRequest,
+                &req.encode_to_vec(),
+            )
+            .await?;
+        Self::expect_ack_response_type(response_type, MessageType::SandboxSetLifecycleResponse)
     }
 
     /// Removes a sandbox from the guest VM.

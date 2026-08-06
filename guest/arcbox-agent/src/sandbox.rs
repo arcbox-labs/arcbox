@@ -313,6 +313,26 @@ impl SandboxService {
         })
     }
 
+    /// Replace a sandbox's lifecycle deadlines (CORE-60): TTL re-armed from
+    /// now, idle timeout/policy replaced. Absent fields are unchanged; an
+    /// explicit `UNSPECIFIED` policy restores the daemon default (KILL).
+    pub(crate) async fn set_lifecycle_request(
+        &self,
+        req: sandbox_v1::SetLifecycleRequest,
+    ) -> Result<(), SandboxError> {
+        let update = arcbox_vm::LifecycleUpdate {
+            ttl_seconds: req.ttl_seconds,
+            idle_timeout_seconds: req.idle_timeout_seconds,
+            on_idle: req
+                .on_idle
+                .map(|value| idle_action_to_spec(value.as_known().unwrap_or_default())),
+        };
+        self.manager
+            .set_sandbox_lifecycle(&req.id, update)
+            .await
+            .map_err(SandboxError::from)
+    }
+
     /// Remove a sandbox.
     pub async fn remove(&self, payload: &[u8]) -> Result<(), SandboxError> {
         let req = sandbox_v1::RemoveSandboxRequest::decode_from_slice(payload)
