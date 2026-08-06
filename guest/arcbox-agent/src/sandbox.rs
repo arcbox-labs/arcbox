@@ -317,11 +317,12 @@ impl SandboxService {
         })
     }
 
-    /// Return the active generation's address and cleanup token.
+    /// Return the active generation's network identity (external pool IP,
+    /// cleanup token, and addressing mode).
     pub(crate) fn sandbox_network_identity(
         &self,
         sandbox_id: &str,
-    ) -> Result<(std::net::Ipv4Addr, String), SandboxError> {
+    ) -> Result<arcbox_vm::SandboxNetworkIdentity, SandboxError> {
         self.manager
             .sandbox_network_identity(sandbox_id)
             .map_err(SandboxError::from)

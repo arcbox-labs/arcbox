@@ -263,8 +263,11 @@ impl SandboxManager {
         self.network.finalize_startup_cleanup(token)
     }
 
-    /// Return the active generation's IP and opaque cleanup token.
-    pub fn sandbox_network_identity(&self, id: &str) -> Result<(std::net::Ipv4Addr, String)> {
+    /// Return the active generation's network identity: the external pool IP
+    /// (what DNS, expose, and the API report), its opaque cleanup token, and
+    /// whether the guest runs the invariant addressing — which decides how
+    /// expose DNAT must target the sandbox (CORE-81).
+    pub fn sandbox_network_identity(&self, id: &str) -> Result<SandboxNetworkIdentity> {
         self.ensure_startup_cleanup_complete()?;
         let instance = self.get_instance(&id.to_owned())?;
         let instance = instance.lock().unwrap();
@@ -276,8 +279,26 @@ impl SandboxManager {
                 expected: "sandbox with an active network allocation".into(),
                 actual: instance.state.to_string(),
             })?;
-        Ok((allocation.ip_address, allocation.cleanup_token.clone()))
+        Ok(SandboxNetworkIdentity {
+            ip: allocation.ip_address,
+            cleanup_token: allocation.cleanup_token.clone(),
+            net_invariant: instance.net_invariant,
+        })
     }
+}
+
+/// A sandbox's network identity as seen by forwarding and DNS consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxNetworkIdentity {
+    /// External pool IP — the address the rest of the system keeps using.
+    pub ip: std::net::Ipv4Addr,
+    /// Opaque generation token carried through host cleanup finalization.
+    pub cleanup_token: String,
+    /// Whether the guest runs the fixed invariant addressing (CORE-81).
+    /// When set, DNAT toward the sandbox must target
+    /// [`crate::network::invariant::GUEST_IP`] with a companion fwmark rule;
+    /// legacy guests own the pool IP directly.
+    pub net_invariant: bool,
 }
 
 /// Validate a caller-supplied sandbox or snapshot id.

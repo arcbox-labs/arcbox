@@ -684,9 +684,23 @@ exit 0
     /// The subnet is read from the VMM config (default `172.20.0.0/16`).
     /// Uses `-I` (insert at chain top) so rules take effect even when
     /// Docker sets the default FORWARD policy to DROP.
+    ///
+    /// Invariant-addressed sandboxes (CORE-81) traverse FORWARD with the
+    /// fixed guest IP on the sandbox side — DNAT to it happens in PREROUTING
+    /// (before the filter) and SNAT off it in POSTROUTING (after) — so that
+    /// address needs its own accept pair; the subnet rules keep covering
+    /// legacy sandboxes.
+    ///
+    /// The mangle pair makes the deliberate sandbox-to-sandbox isolation
+    /// explicit: traffic from any sandbox TAP toward the pool is dropped
+    /// before it can be marked or DNAT'd (the per-TAP invariant NAT would
+    /// otherwise misattribute it), except toward the pool gateway, which
+    /// legacy guests use for DNS. These run at System VM boot, so per-sandbox
+    /// rules appended later always sit below them.
     fn setup_sandbox_forwarding() {
         let config = crate::config::load();
         let subnet = &config.network.cidr;
+        let guest_ip = format!("{}/32", arcbox_vm::network::invariant::GUEST_IP);
 
         run_iptables(
             &["-I", "FORWARD", "-d", subnet, "-j", "ACCEPT"],
@@ -695,6 +709,47 @@ exit 0
         run_iptables(
             &["-I", "FORWARD", "-s", subnet, "-j", "ACCEPT"],
             "FORWARD accept from sandbox subnet",
+        );
+        run_iptables(
+            &["-I", "FORWARD", "-d", &guest_ip, "-j", "ACCEPT"],
+            "FORWARD accept to invariant sandbox address",
+        );
+        run_iptables(
+            &["-I", "FORWARD", "-s", &guest_ip, "-j", "ACCEPT"],
+            "FORWARD accept from invariant sandbox address",
+        );
+
+        // Insert DROP first so the gateway ACCEPT lands above it.
+        let gateway = format!("{}/32", config.network.gateway);
+        run_iptables(
+            &[
+                "-t",
+                "mangle",
+                "-I",
+                "PREROUTING",
+                "-i",
+                "vmtap+",
+                "-d",
+                subnet,
+                "-j",
+                "DROP",
+            ],
+            "isolate sandbox-to-sandbox pool traffic",
+        );
+        run_iptables(
+            &[
+                "-t",
+                "mangle",
+                "-I",
+                "PREROUTING",
+                "-i",
+                "vmtap+",
+                "-d",
+                &gateway,
+                "-j",
+                "ACCEPT",
+            ],
+            "allow sandbox traffic to the pool gateway",
         );
 
         tracing::info!(subnet, "sandbox forwarding rules installed");

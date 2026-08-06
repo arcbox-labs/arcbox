@@ -297,6 +297,13 @@ the bundle ships 1.16.1). With it, a clone restores and runs while the
 origin keeps its NIC. Restore without `network_override` reuses the
 recorded NIC, so the origin must be stopped first.
 
+Snapshots are network-agnostic: every sandbox guest boots the identical
+fixed link-local identity, and the pool IP reported as `ip_address` is a
+host-side property of the TAP (per-TAP 1:1 NAT in the System VM). An
+invariant-addressed restore therefore performs zero guest-side network
+work; snapshots taken before this scheme keep the guest reconfig path.
+`ip_address`, DNS records, and expose always carry the external pool IP.
+
 ## Error model
 
 Agent-reported failures carry HTTP-style codes over the internal wire and

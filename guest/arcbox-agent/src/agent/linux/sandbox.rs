@@ -581,7 +581,7 @@ where
     svc.wait_startup_cleanup_complete().await;
     let _operation = svc.lock_operation(&req.id).await;
 
-    let (ip, cleanup_token) = match svc.sandbox_network_identity(&req.id) {
+    let identity = match svc.sandbox_network_identity(&req.id) {
         Ok(identity) => identity,
         Err(e) => {
             let err = ErrorResponse::new(e.status_code(), e.to_string());
@@ -593,7 +593,7 @@ where
     match port_forwards()
         .lock()
         .await
-        .forward(&req.id, ip, &cleanup_token, sandbox_port, protocol)
+        .forward(&req.id, &identity, sandbox_port, protocol)
         .await
     {
         Ok(guest_port) => {
@@ -649,7 +649,7 @@ where
         };
     svc.wait_startup_cleanup_complete().await;
     let _operation = svc.lock_operation(&req.id).await;
-    let (_, cleanup_token) = match svc.sandbox_network_identity(&req.id) {
+    let identity = match svc.sandbox_network_identity(&req.id) {
         Ok(identity) => identity,
         Err(error) => {
             let response = ErrorResponse::new(error.status_code(), error.to_string());
@@ -661,7 +661,7 @@ where
     match port_forwards()
         .lock()
         .await
-        .remove(&req.id, &cleanup_token, sandbox_port, protocol)
+        .remove(&req.id, &identity.cleanup_token, sandbox_port, protocol)
         .await
     {
         Ok(()) => {

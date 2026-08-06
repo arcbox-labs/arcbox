@@ -51,8 +51,8 @@ pub use error::{Result, VmmError};
 pub use network::{NetworkAllocation, NetworkManager};
 pub use sandbox::{
     CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
-    SandboxManager, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec,
-    SandboxState, SandboxSummary,
+    SandboxManager, SandboxMountSpec, SandboxNetworkIdentity, SandboxNetworkInfo,
+    SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
 };
 pub use sandbox::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
