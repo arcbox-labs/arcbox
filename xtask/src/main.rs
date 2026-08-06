@@ -72,6 +72,9 @@ struct DevArgs {
 enum DevCommand {
     /// Prepare boot assets under boot-assets/dev for local tests and daemons.
     BootAssets(BootAssetsArgs),
+    /// Rebuild the committed sandbox NAT BPF object and its source-hash
+    /// sidecar (virt/arcbox-vm/bpf). Requires a clang with the BPF backend.
+    Bpf,
 }
 
 #[derive(Args)]
