@@ -433,8 +433,10 @@ async fn drive_sandboxes(
         bail!("fresh-network clone run output missing marker: {stdout:?}");
     }
 
-    // The vsock channel working proves nothing about the new TAP. Assert the
-    // guest actually re-addressed eth0 to the fresh allocation…
+    // The vsock channel working proves nothing about the new TAP. Under
+    // invariant addressing (CORE-81) every guest carries the fixed
+    // link-local identity and the pool IP lives host-side, so assert the
+    // guest kept the invariant address and never sees a pool IP…
     wait_ready(&mut sandboxes, "smoke3").await?;
     let addr = run_and_collect(
         &mut processes,
@@ -442,24 +444,20 @@ async fn drive_sandboxes(
         &["/bin/sh", "-c", "ip addr show eth0"],
     )
     .await?;
-    if !addr.contains(&cloned.ip_address) {
-        bail!(
-            "clone eth0 does not carry its allocated IP {} (got: {addr:?})",
-            cloned.ip_address
-        );
+    // Mirrors GUEST_IP in virt/arcbox-vm/src/network/invariant.rs.
+    if !addr.contains("169.254.100.2/") {
+        bail!("clone eth0 does not carry the invariant guest IP (got: {addr:?})");
     }
-    if addr.contains(&format!("{}/", created.ip_address)) {
-        bail!(
-            "clone eth0 still carries the origin's IP {} (got: {addr:?})",
-            created.ip_address
-        );
+    if addr.contains(&format!("{}/", created.ip_address))
+        || addr.contains(&format!("{}/", cloned.ip_address))
+    {
+        bail!("clone eth0 carries a pool IP; those must stay host-side (got: {addr:?})");
     }
 
     // …and that traffic flows through the new TAP: ping the gateway, which
     // is the local address of the clone's own TAP (sandboxes are isolated
     // point-to-point links, so peers are deliberately unreachable). Deriving
-    // the gateway from `ip route` also proves the reconfig re-installed the
-    // default route.
+    // the gateway from `ip route` also proves the restored default route.
     wait_ready(&mut sandboxes, "smoke3").await?;
     let ping = run_and_collect(
         &mut processes,
