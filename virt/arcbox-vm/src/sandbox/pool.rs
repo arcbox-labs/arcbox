@@ -511,3 +511,124 @@ impl SandboxManager {
         self.drain_pool(None).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Policy tests run against `SlotPool<u32>` — the slot type is opaque
+    // to the policy, so no Firecracker process is needed.
+
+    /// Refill `snapshot` to `target` and deliver every planned slot as
+    /// consecutive values starting at `base`.
+    fn fill_and_offer(pool: &SlotPool<u32>, snapshot: &str, target: usize, base: u32) {
+        let plan = pool.begin_fill(snapshot, target);
+        assert!(plan.evicted.is_empty(), "unexpected eviction while filling");
+        for offset in 0..plan.spawn {
+            assert!(
+                pool.offer(snapshot, base + u32::try_from(offset).unwrap())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn claims_are_keyed_by_snapshot_id() {
+        let pool = SlotPool::<u32>::default();
+        fill_and_offer(&pool, "a", 1, 10);
+
+        assert_eq!(pool.claim("other"), None);
+        assert_eq!(pool.claim("a"), Some(10));
+        assert_eq!(pool.claim("a"), None);
+    }
+
+    #[test]
+    fn refill_accounts_for_ready_and_in_flight_slots() {
+        let pool = SlotPool::<u32>::default();
+        let plan = pool.begin_fill("a", 2);
+        assert_eq!(plan.spawn, 2);
+
+        // Nothing delivered yet: a concurrent refill must not over-spawn.
+        assert_eq!(pool.begin_fill("a", 2).spawn, 0);
+        assert!(pool.offer("a", 10).is_none());
+        assert!(pool.offer("a", 11).is_none());
+        assert_eq!(pool.begin_fill("a", 2).spawn, 0);
+
+        // A claim frees one spare; the next refill replaces exactly it.
+        assert_eq!(pool.claim("a"), Some(11));
+        assert_eq!(pool.begin_fill("a", 2).spawn, 1);
+
+        // A failed fill releases its accounting for the next refill.
+        pool.abandon_fill("a");
+        assert_eq!(pool.begin_fill("a", 2).spawn, 1);
+    }
+
+    #[test]
+    fn pool_size_zero_disables_pooling() {
+        let pool = SlotPool::<u32>::default();
+        let plan = pool.begin_fill("a", 0);
+        assert_eq!(plan.spawn, 0);
+        assert!(plan.evicted.is_empty());
+        assert_eq!(pool.claim("a"), None);
+    }
+
+    #[test]
+    fn a_third_snapshot_evicts_the_least_recently_restored() {
+        let pool = SlotPool::<u32>::default();
+        fill_and_offer(&pool, "a", 1, 10);
+        fill_and_offer(&pool, "b", 1, 20);
+
+        let plan = pool.begin_fill("c", 1);
+        assert_eq!(plan.spawn, 1);
+        assert_eq!(plan.evicted, vec![10], "a's slot must be handed back");
+        assert_eq!(pool.claim("a"), None);
+        assert_eq!(pool.claim("b"), Some(20));
+    }
+
+    #[test]
+    fn claiming_refreshes_recency() {
+        let pool = SlotPool::<u32>::default();
+        fill_and_offer(&pool, "a", 2, 10);
+        fill_and_offer(&pool, "b", 1, 20);
+
+        // Restoring from `a` again makes `b` the eviction candidate.
+        assert_eq!(pool.claim("a"), Some(11));
+        let plan = pool.begin_fill("c", 1);
+        assert_eq!(plan.evicted, vec![20]);
+        assert_eq!(pool.claim("b"), None);
+        assert_eq!(pool.claim("a"), Some(10));
+    }
+
+    #[test]
+    fn late_offers_for_an_evicted_snapshot_are_rejected() {
+        let pool = SlotPool::<u32>::default();
+        let plan = pool.begin_fill("a", 1);
+        assert_eq!(plan.spawn, 1);
+        fill_and_offer(&pool, "b", 1, 20);
+        fill_and_offer(&pool, "c", 1, 30); // evicts "a" while its fill is in flight
+
+        assert_eq!(pool.offer("a", 10), Some(10), "must come back for teardown");
+        assert_eq!(pool.claim("a"), None);
+    }
+
+    #[test]
+    fn drain_scopes_to_one_snapshot_or_all() {
+        let pool = SlotPool::<u32>::default();
+        fill_and_offer(&pool, "a", 2, 10);
+        fill_and_offer(&pool, "b", 1, 20);
+
+        let mut drained = pool.drain(Some("a"));
+        drained.sort_unstable();
+        assert_eq!(drained, vec![10, 11]);
+        assert_eq!(pool.claim("a"), None);
+
+        // A fill in flight across the drain is rejected on delivery.
+        let plan = pool.begin_fill("a", 1);
+        assert_eq!(plan.spawn, 1);
+        assert!(pool.drain(Some("a")).is_empty());
+        assert_eq!(pool.offer("a", 12), Some(12));
+
+        assert_eq!(pool.drain(None), vec![20]);
+        assert_eq!(pool.claim("b"), None);
+    }
+}
