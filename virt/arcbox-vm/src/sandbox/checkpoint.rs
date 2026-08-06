@@ -41,8 +41,11 @@ impl SandboxManager {
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
-        // Verify state and capture the kernel/rootfs paths for jailer re-staging.
-        let (kernel_path, rootfs_path) = {
+        // Verify state and capture the kernel/rootfs paths for jailer
+        // re-staging, plus the id the sandbox's chroot is actually keyed by
+        // — a sandbox restored from a pre-warmed pool slot lives in the
+        // slot's chroot, and FC resolves snapshot paths inside it.
+        let (kernel_path, rootfs_path, chroot_owner) = {
             let instance = self.get_instance(sandbox_id)?;
             let inst = instance.lock().unwrap();
             if inst.state != SandboxState::Ready {
@@ -53,7 +56,13 @@ impl SandboxManager {
                 });
             }
             // Only needed for jailer mode; safe to capture regardless.
-            (inst.spec.kernel.clone(), inst.spec.rootfs.clone())
+            (
+                inst.spec.kernel.clone(),
+                inst.spec.rootfs.clone(),
+                inst.pool_slot_id
+                    .clone()
+                    .unwrap_or_else(|| sandbox_id.clone()),
+            )
         };
 
         let vm = self.get_vm_handle(sandbox_id)?;
@@ -81,7 +90,7 @@ impl SandboxManager {
             let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
                 if let Some(ref jc) = self.config.firecracker.jailer {
                     let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                    let cr = chroot_root(&self.config.firecracker.binary, base, sandbox_id);
+                    let cr = chroot_root(&self.config.firecracker.binary, base, &chroot_owner);
                     let chroot_snap = cr.join("snapshots").join(&snapshot_id);
                     std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
                     // Firecracker runs as jc.uid/jc.gid; chown the directory so
