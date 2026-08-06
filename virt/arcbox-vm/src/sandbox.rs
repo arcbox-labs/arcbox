@@ -40,6 +40,7 @@ mod pause;
 mod persistence;
 mod pool;
 mod reconcile;
+mod timers;
 mod types;
 mod warm;
 mod workload;
@@ -49,9 +50,9 @@ pub use execution::{
 };
 pub use pause::reason as pause_reason;
 pub use types::{
-    CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
-    SandboxInstance, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec,
-    SandboxState, SandboxSummary,
+    CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
+    SandboxEvent, SandboxId, SandboxInfo, SandboxInstance, SandboxMountSpec, SandboxNetworkInfo,
+    SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -78,6 +79,11 @@ pub struct SandboxManager {
     /// Publishes the startup reconciliation result. Lifecycle and read APIs
     /// gate on it so callers never observe partial recovered state.
     reconcile_done: tokio::sync::watch::Receiver<Option<ReconcileResult>>,
+    /// Per-sandbox TTL / idle expiry timers (CORE-21/60); see `timers.rs`.
+    timers: timers::LifecycleTimers,
+    /// Weak self-handle set by [`Self::into_shared`]; idle timers need it to
+    /// reach the pause/remove flows from a detached task.
+    self_handle: std::sync::OnceLock<std::sync::Weak<Self>>,
 }
 
 impl SandboxManager {
@@ -184,7 +190,25 @@ impl SandboxManager {
             warm: Arc::new(warm::WarmCache::default()),
             executions,
             reconcile_done,
+            timers: timers::LifecycleTimers::default(),
+            self_handle: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wrap the manager in an `Arc` and start the lifecycle monitor that
+    /// arms/cancels the idle and TTL timers off the event stream.
+    ///
+    /// Production embedders (the guest agent's `SandboxService`) must use
+    /// this; a plain [`Self::new`] manager never fires idle timers (unit
+    /// tests exercising unrelated surfaces rely on that inertness).
+    #[must_use]
+    pub fn into_shared(self) -> Arc<Self> {
+        let manager = Arc::new(self);
+        let _ = manager.self_handle.set(Arc::downgrade(&manager));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            timers::spawn_lifecycle_monitor(&manager);
+        }
+        manager
     }
 
     /// Wait until the startup orphan sweep has completed.

@@ -104,7 +104,11 @@ impl SandboxService {
     /// Create a new [`SandboxService`] from the given config.
     pub fn new(config: VmmConfig) -> anyhow::Result<Self> {
         let default_rootfs = config.defaults.rootfs.clone();
-        let manager = Arc::new(SandboxManager::new(config).map_err(|e| anyhow::anyhow!("{e}"))?);
+        // `into_shared` starts the lifecycle monitor driving the idle/TTL
+        // expiry timers (CORE-21/60).
+        let manager = SandboxManager::new(config)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_shared();
         let creates = Arc::new(CreateRegistry::default());
         Ok(Self {
             manager,
@@ -567,6 +571,19 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
         network: SandboxNetworkSpec { mode: mode.into() },
         ttl_seconds: req.ttl_seconds,
         ssh_public_key: req.ssh_public_key,
+        idle_timeout_seconds: req.idle_timeout_seconds,
+        on_idle: idle_action_to_spec(req.on_idle.as_known().unwrap_or_default()),
+    }
+}
+
+/// Map the wire idle policy onto the manager's; `UNSPECIFIED` (and unknown
+/// future values) resolve to the daemon default, KILL.
+fn idle_action_to_spec(action: sandbox_v1::IdleAction) -> arcbox_vm::IdleAction {
+    match action {
+        sandbox_v1::IdleAction::Pause => arcbox_vm::IdleAction::Pause,
+        sandbox_v1::IdleAction::Kill | sandbox_v1::IdleAction::Unspecified => {
+            arcbox_vm::IdleAction::Kill
+        }
     }
 }
 

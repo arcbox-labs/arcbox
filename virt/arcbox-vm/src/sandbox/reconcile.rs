@@ -399,6 +399,9 @@ fn inactive_instance(
     instance.state = state;
     instance.created_at = record.created_at;
     instance.error = record.error;
+    // The TTL cap survives restarts: a reloaded paused sandbox still
+    // expires (the lifecycle monitor re-arms the timer after reconcile).
+    instance.ttl_deadline = record.ttl_deadline;
     if state == SandboxState::Paused {
         instance.pause_snapshot_id = record.pause_snapshot_id;
         instance.paused_at = record.paused_at;

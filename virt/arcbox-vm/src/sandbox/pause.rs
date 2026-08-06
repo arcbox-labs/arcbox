@@ -50,6 +50,8 @@ pub(super) const PAUSED_ROOTFS_FILE: &str = "paused-rootfs.ext4";
 pub mod reason {
     /// Client-driven `Pause`.
     pub const PAUSE: &str = "pause";
+    /// Idle-detector pause (`on_idle: PAUSE`, CORE-21).
+    pub const IDLE_TIMEOUT: &str = "idle_timeout";
     /// Client-driven `Resume`.
     pub const RESUME: &str = "resume";
     /// Daemon-side transparent resume on a data-plane call.
@@ -102,14 +104,28 @@ impl SandboxManager {
     /// answers `WrongState` — an active execution must finish (or be
     /// stopped) first, matching the contract's "requires READY".
     pub async fn pause_sandbox(&self, id: &SandboxId) -> Result<()> {
+        self.pause_sandbox_with_reason(id, reason::PAUSE).await
+    }
+
+    /// [`Self::pause_sandbox`] with an explicit PAUSING-event reason —
+    /// the idle detector reports `idle_timeout` (see [`reason`]).
+    pub(super) async fn pause_sandbox_with_reason(
+        &self,
+        id: &SandboxId,
+        pause_reason: &str,
+    ) -> Result<()> {
         self.await_reconcile().await?;
         let instance = self.get_instance(id)?;
         let cleanup_lock = instance.lock().unwrap().cleanup_lock.clone();
         let _cleanup_guard = cleanup_lock.lock().await;
         super::ensure_current_instance(&self.instances, id, &instance)?;
 
+        // Claim `Ready → Pausing` atomically: setting the state in the same
+        // critical section as the check means a concurrent Run cannot slip
+        // its `Ready → Running` claim in between and end up checkpointed
+        // mid-execution.
         let (generation, vm) = {
-            let inst = instance.lock().unwrap();
+            let mut inst = instance.lock().unwrap();
             match inst.state {
                 SandboxState::Paused => return Ok(()),
                 SandboxState::Ready => {}
@@ -121,38 +137,56 @@ impl SandboxManager {
                     });
                 }
             }
-            (inst.record_generation, inst.vm.as_ref().map(Arc::clone))
-        };
-        // Resume restores into a fresh jailer chroot; direct-mode vmstate
-        // pins origin paths, so a direct-mode pause could never resume.
-        // Fail fast before touching anything.
-        let jailer = self.config.firecracker.jailer.as_ref().ok_or_else(|| {
-            VmmError::Config(
-                "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
-            )
-        })?;
-        let vm = vm.ok_or_else(|| VmmError::WrongState {
-            id: id.clone(),
-            expected: "a sandbox with a live VM handle".into(),
-            actual: "no VM handle".into(),
-        })?;
-
-        if let Some(generation) = generation {
-            let commit = self
-                .records
-                .transition(id, generation, SandboxTransition::Pausing)?;
-            if let Some(error) = commit.durability_error {
-                warn!(
-                    sandbox_id = %id,
-                    error,
-                    "pausing transition is visible but durability is unconfirmed"
-                );
+            // Resume restores into a fresh jailer chroot; direct-mode
+            // vmstate pins origin paths, so a direct-mode pause could never
+            // resume. Fail fast before claiming anything.
+            if self.config.firecracker.jailer.is_none() {
+                return Err(VmmError::Config(
+                    "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
+                ));
             }
+            let vm = inst
+                .vm
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or_else(|| VmmError::WrongState {
+                    id: id.clone(),
+                    expected: "a sandbox with a live VM handle".into(),
+                    actual: "no VM handle".into(),
+                })?;
+            inst.state = SandboxState::Pausing;
+            (inst.record_generation, vm)
+        };
+        let jailer = self
+            .config
+            .firecracker
+            .jailer
+            .as_ref()
+            .expect("checked in the claim above");
+
+        if let Some(generation) = generation
+            && let Err(error) = (|| -> Result<()> {
+                let commit = self
+                    .records
+                    .transition(id, generation, SandboxTransition::Pausing)?;
+                if let Some(error) = commit.durability_error {
+                    warn!(
+                        sandbox_id = %id,
+                        error,
+                        "pausing transition is visible but durability is unconfirmed"
+                    );
+                }
+                Ok(())
+            })()
+        {
+            // The durable claim failed: release the in-memory claim so the
+            // sandbox stays usable.
+            instance.lock().unwrap().state = SandboxState::Ready;
+            return Err(error);
         }
-        instance.lock().unwrap().state = SandboxState::Pausing;
         let _ = self
             .events_tx
-            .send(SandboxEvent::new(id, action::PAUSING).with_attr("reason", reason::PAUSE));
+            .send(SandboxEvent::new(id, action::PAUSING).with_attr("reason", pause_reason));
 
         // Checkpoint through the shared implementation — it owns the
         // chroot-owner (pool slot) and addressing-mode bookkeeping — but with
