@@ -21,6 +21,10 @@ pub enum SandboxError {
     AlreadyExists(String),
     /// The sandbox is not in a state that allows the operation.
     WrongState(String),
+    /// The sandbox is paused. Carried as its own wire code (423) so the
+    /// daemon can recognise "paused" machine-readably and resume the
+    /// sandbox transparently on data-plane calls (CORE-21).
+    SandboxPaused(String),
     /// A stdin write's offset is past the accepted byte count; the client
     /// must resync via `GetStdinStatus` and resume from the reported offset.
     StdinGap(String),
@@ -40,6 +44,7 @@ impl fmt::Display for SandboxError {
             | Self::NotFound(msg)
             | Self::AlreadyExists(msg)
             | Self::WrongState(msg)
+            | Self::SandboxPaused(msg)
             | Self::StdinGap(msg)
             | Self::Unsupported(msg)
             | Self::Unavailable(msg)
@@ -53,7 +58,10 @@ impl SandboxError {
     ///
     /// The host maps these onto gRPC statuses: 400 → `INVALID_ARGUMENT`,
     /// 404 → `NOT_FOUND`, 409 → `ALREADY_EXISTS`, 412 → `FAILED_PRECONDITION`,
-    /// 416 → `OUT_OF_RANGE`, 503 → `UNAVAILABLE`, anything else → `INTERNAL`.
+    /// 416 → `OUT_OF_RANGE`, 423 → `FAILED_PRECONDITION` (after the daemon's
+    /// transparent auto-resume declined — 423 is the machine-readable
+    /// "paused" signal it keys on, CORE-21), 503 → `UNAVAILABLE`, anything
+    /// else → `INTERNAL`.
     pub const fn status_code(&self) -> i32 {
         match self {
             Self::Decode(_) | Self::InvalidArgument(_) => 400,
@@ -61,6 +69,7 @@ impl SandboxError {
             Self::AlreadyExists(_) => 409,
             Self::WrongState(_) | Self::Unsupported(_) => 412,
             Self::StdinGap(_) => 416,
+            Self::SandboxPaused(_) => 423,
             Self::Unavailable(_) => 503,
             Self::Internal(_) => 500,
         }
@@ -74,6 +83,7 @@ impl From<arcbox_vm::VmmError> for SandboxError {
             VmmError::NotFound(_) => Self::NotFound(e.to_string()),
             VmmError::AlreadyExists(_) => Self::AlreadyExists(e.to_string()),
             VmmError::WrongState { .. } => Self::WrongState(e.to_string()),
+            VmmError::Paused(_) => Self::SandboxPaused(e.to_string()),
             VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
             VmmError::Unavailable(_) | VmmError::AckUnconfirmed { .. } => {
                 Self::Unavailable(e.to_string())
@@ -111,6 +121,13 @@ mod tests {
         });
         assert!(matches!(err, SandboxError::StdinGap(_)));
         assert_eq!(err.status_code(), 416);
+    }
+
+    #[test]
+    fn paused_maps_to_423_for_the_daemon_auto_resume() {
+        let err = SandboxError::from(arcbox_vm::VmmError::Paused("box".into()));
+        assert!(matches!(err, SandboxError::SandboxPaused(_)));
+        assert_eq!(err.status_code(), 423);
     }
 
     #[test]

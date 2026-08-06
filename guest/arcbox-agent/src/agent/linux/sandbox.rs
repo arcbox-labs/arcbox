@@ -248,6 +248,76 @@ where
                 }
             }
         }
+        MessageType::SandboxPauseRequest => {
+            use arcbox_connect::sandbox_v1::PauseSandboxRequest;
+            use arcbox_connect::v1::SandboxCleanupResponse;
+            let req = match PauseSandboxRequest::decode_from_slice(payload) {
+                Ok(req) => req,
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, 400, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let sandbox_id = req.id.clone();
+            let _operation = svc.lock_operation(&req.id).await;
+            match svc.pause_request(req).await {
+                // Pause quarantines the network exactly like Stop, so it
+                // answers with the same durable cleanup ticket for the
+                // daemon's host-side forwarding cleanup.
+                Ok(()) => match svc.pending_cleanup_ticket(&sandbox_id).await {
+                    Ok(ticket) => {
+                        let response = SandboxCleanupResponse {
+                            ticket: ticket.into(),
+                            ..Default::default()
+                        };
+                        write_message(
+                            stream,
+                            MessageType::SandboxPauseResponse,
+                            trace_id,
+                            &response.encode_to_vec(),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        send_sandbox_error(
+                            stream,
+                            trace_id,
+                            error.status_code(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                    }
+                },
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+                }
+            }
+        }
+        MessageType::SandboxResumeRequest => {
+            use arcbox_connect::v1::SandboxResumeCommand;
+            let req = match SandboxResumeCommand::decode_from_slice(payload) {
+                Ok(req) => req,
+                Err(error) => {
+                    send_sandbox_error(stream, trace_id, 400, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let _operation = svc.lock_operation(&req.id).await;
+            match svc.resume_request(req).await {
+                Ok(resp) => {
+                    write_message(
+                        stream,
+                        MessageType::SandboxResumeResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+                }
+            }
+        }
         MessageType::SandboxCleanupPrepareRequest => {
             use arcbox_connect::v1::SandboxCleanupTicket;
 
