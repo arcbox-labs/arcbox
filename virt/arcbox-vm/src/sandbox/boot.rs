@@ -6,8 +6,11 @@ type BootOutput = (Arc<fc_sdk::Vm>, PathBuf);
 
 /// How long the agent-readiness gate waits for vm-agent to answer over vsock
 /// before the boot is declared failed. Covers guest kernel boot plus agent
-/// startup; `sync_clock`'s internal connect retries share this budget.
-const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// startup. Deliberately wider than `sync_clock`'s internal connect deadline
+/// (`AGENT_READY_TIMEOUT`, 30 s) so that when the agent never appears the
+/// inner error — which names the socket and the elapsed budget — wins the
+/// race against this outer timeout's generic message.
+const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(35);
 
 struct BootFailure {
     error: VmmError,
@@ -61,19 +64,30 @@ pub(super) async fn boot_sandbox(
             // listening. Gate the transition on a completed agent round trip:
             // sync_clock doubles as the readiness probe and sets the guest
             // clock on cold boot the same way the restore path already does.
-            let agent_ready =
-                match tokio::time::timeout(AGENT_GATE_TIMEOUT, vsock::sync_clock(&vsock_uds_path))
-                    .await
-                {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => {
-                        Err(VmmError::Vsock(format!("agent readiness gate: {error}")))
-                    }
-                    Err(_) => Err(VmmError::Vsock(format!(
-                        "agent readiness gate: vm-agent did not answer within {}s",
-                        AGENT_GATE_TIMEOUT.as_secs()
-                    ))),
-                };
+            // Liveness is the gate, not the clock side effect: an agent that
+            // answered-but-failed (`ClockSync::AgentError`) proves the RPC
+            // path works, and tearing down a usable VM over a clock error
+            // would be strictly worse than a skewed clock.
+            let agent_ready = match tokio::time::timeout(
+                AGENT_GATE_TIMEOUT,
+                vsock::sync_clock(&vsock_uds_path),
+            )
+            .await
+            {
+                Ok(Ok(vsock::ClockSync::Synced)) => Ok(()),
+                Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                    warn!(
+                        sandbox_id = %id, code,
+                        "agent alive but clock sync failed; continuing with a possibly skewed clock"
+                    );
+                    Ok(())
+                }
+                Ok(Err(error)) => Err(VmmError::Vsock(format!("agent readiness gate: {error}"))),
+                Err(_) => Err(VmmError::Vsock(format!(
+                    "agent readiness gate: vm-agent did not answer within {}s",
+                    AGENT_GATE_TIMEOUT.as_secs()
+                ))),
+            };
             if let Err(gate_error) = agent_ready {
                 let message = gate_error.to_string();
                 fail_started_boot(
