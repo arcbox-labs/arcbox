@@ -321,7 +321,46 @@ pub(super) fn chroot_root(fc_binary: &str, chroot_base_dir: &str, id: &str) -> P
         .join("root")
 }
 
-/// Copy kernel into the jailer chroot and set ownership.
+/// Stage a read-only file into a jailer chroot: hard-link when possible,
+/// copy otherwise.
+///
+/// A hard link shares the inode with the source, so it is only safe for
+/// files FC never writes — the kernel image, a snapshot vmstate, and a
+/// snapshot mem file (mapped MAP_PRIVATE on load). Do NOT use it for the
+/// rootfs copy fallback: FC writes guest blocks into that file. Linking is
+/// also reserved for the root jailer (uid/gid 0), because chown on a link
+/// would mutate the shared source inode; a non-root jailer gets a private
+/// copy with its own ownership.
+pub(super) async fn link_or_copy_for_jailer(
+    src: &Path,
+    dst: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    // Remove a stale entry first: hard_link fails on an existing dst, and a
+    // leftover from a previous run must not survive by accident.
+    if let Err(e) = tokio::fs::remove_file(dst).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VmmError::Io(e));
+    }
+    if uid == 0 && gid == 0 {
+        match tokio::fs::hard_link(src, dst).await {
+            Ok(()) => return Ok(()),
+            // Cross-device (EXDEV) or filesystem quirk — fall through to copy.
+            Err(e) => {
+                debug!(src = %src.display(), dst = %dst.display(), error = %e,
+                    "hard link failed; falling back to copy");
+            }
+        }
+    }
+    tokio::fs::copy(src, dst).await.map_err(VmmError::Io)?;
+    chown(dst, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+        .map_err(|e| VmmError::Process(format!("chown {}: {e}", dst.display())))?;
+    Ok(())
+}
+
+/// Stage the kernel into the jailer chroot (link or copy).
 ///
 /// Returns the chroot-relative kernel path (e.g. `"/vmlinux"`).
 pub(super) async fn stage_kernel_for_jailer(
@@ -334,15 +373,7 @@ pub(super) async fn stage_kernel_for_jailer(
         .await
         .map_err(VmmError::Io)?;
     let kernel_dst = chroot_root.join("vmlinux");
-    tokio::fs::copy(kernel_src, &kernel_dst)
-        .await
-        .map_err(VmmError::Io)?;
-    chown(
-        &kernel_dst,
-        Some(Uid::from_raw(uid)),
-        Some(Gid::from_raw(gid)),
-    )
-    .map_err(|e| VmmError::Process(format!("chown kernel: {e}")))?;
+    link_or_copy_for_jailer(Path::new(kernel_src), &kernel_dst, uid, gid).await?;
     Ok("/vmlinux".to_string())
 }
 
