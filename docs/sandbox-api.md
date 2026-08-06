@@ -81,17 +81,16 @@ surface is on the wire ahead of its implementation; these RPCs answer
 
 - `TemplateService` (`template.proto`) — the template catalog (CORE-21;
   Build additionally gated on CORE-5/CORE-16).
-- `SetLifecycle` (CORE-60 / CORE-21 — the idle knobs land with the idle
-  detector), `GetCapabilities` (CORE-13).
 - `SandboxProcessService.ListExecutions/WaitForPort` (CORE-58 phase 2).
 - The `SandboxFilesystemService` path verbs — `Stat`, `ListDir`,
   `MakeDir`, `Remove`, `Move`, `WatchDir` (CORE-62).
-- `errors.proto` — the `ErrorCode` registry; handlers attach `ErrorInfo`
-  as a Connect error detail in a follow-up phase (CORE-58; `SANDBOX_PAUSED`
-  already ships it).
 
-`SandboxService.Pause/Resume` and daemon-side transparent auto-resume are
-implemented (CORE-21) — see **Pause / Resume** below.
+`SandboxService.Pause/Resume` with daemon-side transparent auto-resume
+(CORE-21), the idle detector (`idle_timeout_seconds` + `on_idle`),
+`SetLifecycle` (CORE-60), and `GetCapabilities` (CORE-13) are
+implemented — see their sections below. The `errors.proto` registry is
+attached as an `ErrorInfo` Connect error detail on the principal error
+paths (see **Error model**).
 
 ## Sandbox state machine
 
@@ -115,8 +114,9 @@ States are the `SandboxState` enum (`SANDBOX_STATE_*`); events carry the
   `READY` and accepts further `StartExecution` calls.
 - Destruction happens via `Stop`/`Remove`, `ttl_seconds` (hard maximum
   lifetime) expiry, or `idle_timeout_seconds` expiry with the default
-  `KILL` policy; `on_idle: PAUSE` checkpoints instead (CORE-21,
-  contract-only today).
+  `KILL` policy; `on_idle: PAUSE` checkpoints instead (CORE-21). Idle
+  means "no running execution": the timer arms on every `READY` edge and
+  cancels when an execution starts — file activity does **not** re-arm it.
 - `stopped` sandboxes have released their TAP/IP, CoW device, and chroot;
   only the inspectable record and logs remain until `Remove`.
 - `paused` sandboxes keep their record, an on-disk checkpoint, **and their
@@ -147,7 +147,7 @@ Key fields:
 | `no_default_cmd`, `no_default_env` | explicit-empty overrides of a catalog template's default cmd/env — proto3 repeated/map fields cannot distinguish omitted from empty (CORE-21, contract-only today) |
 | `network.mode` | `NETWORK_MODE_ENABLED` (default, IP from 172.20.0.0/16) or `NETWORK_MODE_NONE` |
 | `ttl_seconds` | hard maximum lifetime from creation (not reset by activity; re-armable via `SetLifecycle`); always destroys |
-| `idle_timeout_seconds`, `on_idle` | idle reaping: `KILL` (default) or `PAUSE` after inactivity (CORE-21, contract-only today) |
+| `idle_timeout_seconds`, `on_idle` | idle reaping after this many seconds without a running execution: `KILL` (default) destroys, `PAUSE` checkpoints (CORE-21); both knobs are replaceable via `SetLifecycle` |
 | `mounts`, `ssh_public_key` | **rejected in V1** with `FAILED_PRECONDITION` (see Proto stability) |
 
 ### Templates
@@ -292,7 +292,48 @@ mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
   overlay footprint) in `Inspect`/`List`, survive daemon and VM restarts,
   and still honor `ttl_seconds` — the hard cap destroys a paused sandbox
   too. Idle-driven auto-pause (`idle_timeout_seconds` + `on_idle: PAUSE`)
-  is contract-only until the idle detector lands.
+  rides the same flow: the `PAUSING` event carries
+  `reason: idle_timeout`, and the next data-plane call resumes the
+  sandbox transparently.
+
+### SetLifecycle (CORE-60)
+
+`rpc SetLifecycle(SetLifecycleRequest) returns (Empty)`
+
+Replaces a sandbox's lifecycle deadlines; absent fields are left
+unchanged, so each knob adjusts independently:
+
+- `ttl_seconds`: the hard cap expires this many seconds **from now** —
+  calling repeatedly keeps a busy sandbox alive indefinitely (E2B
+  timeout semantics); `0` removes the limit. `Inspect.ttl_deadline`
+  reports the resulting deadline.
+- `idle_timeout_seconds`: replaces the idle window, re-arming a live
+  timer; `0` disables idle detection.
+- `on_idle` (`optional`): absent = unchanged; an explicit
+  `IDLE_ACTION_UNSPECIFIED` restores the daemon default (`KILL`).
+
+Allowed in any non-terminal state — updating a `PAUSED` sandbox works
+(its TTL keeps applying while asleep; new idle knobs take effect on the
+next `READY`). `STOPPING`/`STOPPED`/`FAILED` answer
+`FAILED_PRECONDITION`.
+
+### GetCapabilities (CORE-13)
+
+`rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse)`
+
+The SDK handshake, answered host-side (no guest round-trip, works before
+any sandbox exists):
+
+- `daemon_version` — informational.
+- `protocol` — the sandbox API protocol level (currently `1`); SDKs
+  compare it against their floor and raise `PROTOCOL_MISMATCH`.
+- `features` — append-only named flags: `pause_resume`, `auto_resume`,
+  `idle_policy`, `set_lifecycle`.
+- `nested_virt` — `{supported, reason}` for the **current** backend and
+  hardware (VZ on Apple Silicon M3+/macOS 15+). When unsupported,
+  `Create` fails fast with `FAILED_PRECONDITION` carrying the
+  `NESTED_VIRT_UNSUPPORTED` `ErrorInfo` detail and the same `reason`,
+  instead of booting into an opaque KVM failure.
 
 ### Stop / Remove
 
@@ -360,6 +401,16 @@ map onto gRPC statuses:
 | sandbox service initialisation failure | `UNAVAILABLE` |
 | daemon still starting (runtime not ready) | `UNAVAILABLE` |
 | everything else | `INTERNAL` |
+
+The daemon additionally attaches the `errors.proto` registry as an
+`arcbox.sandbox.v1.ErrorInfo` Connect error detail (code + actionable
+suggestion + structured context) on the principal paths, which SDKs map
+to typed exceptions: `SANDBOX_NOT_FOUND` / `EXECUTION_NOT_FOUND` on
+not-found, `SANDBOX_NOT_READY` (context `state`) / `SANDBOX_FAILED` on
+wrong-state, `SANDBOX_PAUSED`, `TEMPLATE_INVALID`, and
+`NESTED_VIRT_UNSUPPORTED` (both the host fail-fast and the guest probe).
+`TTL_EXPIRED` is not yet attachable: TTL expiry removes the record, so a
+later call sees plain `SANDBOX_NOT_FOUND`.
 
 ## Typical client flow
 

@@ -22,12 +22,13 @@ use arcbox_grpc::sandbox_v1::sandbox_service_client::SandboxServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
 use arcbox_protocol::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, Execution, ExecutionEvent,
-    FileChunk, GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest,
-    PauseSandboxRequest, ReadFileRequest, RemoveSandboxRequest, ResourceLimits, RestoreRequest,
-    ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest, SandboxState, Signal,
-    SignalExecutionRequest, StartExecutionRequest, StdioChannel, StopSandboxRequest,
-    WaitExecutionRequest, WatchEventsResponse, WriteFileOpen, WriteFileRequest, WriteStdinRequest,
-    execution_event, exit_status, watch_events_response, write_file_request,
+    FileChunk, GetCapabilitiesRequest, GetStdinStatusRequest, IdleAction, InspectSandboxRequest,
+    ListSandboxesRequest, PauseSandboxRequest, ReadFileRequest, RemoveSandboxRequest,
+    ResourceLimits, RestoreRequest, ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest,
+    SandboxState, SetLifecycleRequest, Signal, SignalExecutionRequest, StartExecutionRequest,
+    StdioChannel, StopSandboxRequest, WaitExecutionRequest, WatchEventsResponse, WriteFileOpen,
+    WriteFileRequest, WriteStdinRequest, execution_event, exit_status, watch_events_response,
+    write_file_request,
 };
 use tonic::transport::Channel;
 use tracing::{info, warn};
@@ -397,6 +398,22 @@ async fn drive_sandboxes(
     metrics.record(
         "sandbox_pause_resume",
         pause_started.elapsed().as_secs_f64(),
+    );
+
+    // -- CORE-13: capability handshake -------------------------------------
+    let capabilities_started = Instant::now();
+    assert_capabilities(&mut sandboxes).await?;
+    metrics.record(
+        "sandbox_capabilities",
+        capabilities_started.elapsed().as_secs_f64(),
+    );
+
+    // -- CORE-21/60: idle auto-pause + SetLifecycle re-arm -----------------
+    let lifecycle_started = Instant::now();
+    idle_lifecycle_scenario(&mut sandboxes, &mut processes).await?;
+    metrics.record(
+        "sandbox_idle_lifecycle",
+        lifecycle_started.elapsed().as_secs_f64(),
     );
 
     // -- Checkpoint / Restore --------------------------------------------
@@ -903,6 +920,168 @@ async fn exec_signal_and_keepalive(
         other => bail!("expected a SIGKILL death, got {other:?}"),
     }
     info!("stream-free signal delivered and reported as a signal death");
+    Ok(())
+}
+
+/// CORE-13 acceptance: the capability handshake answers real data —
+/// version, protocol level, the lifecycle feature flags, and nested-virt
+/// support (which must hold on any host this smoke can run on).
+async fn assert_capabilities(sandboxes: &mut SandboxServiceClient<Channel>) -> Result<()> {
+    let caps = sandboxes
+        .get_capabilities(with_machine(GetCapabilitiesRequest {}))
+        .await
+        .context("GetCapabilities failed")?
+        .into_inner();
+    if caps.daemon_version.is_empty() {
+        bail!("GetCapabilities reported an empty daemon_version");
+    }
+    if caps.protocol < 1 {
+        bail!(
+            "GetCapabilities protocol must be >= 1, got {}",
+            caps.protocol
+        );
+    }
+    for feature in [
+        "pause_resume",
+        "auto_resume",
+        "idle_policy",
+        "set_lifecycle",
+    ] {
+        if !caps.features.iter().any(|f| f == feature) {
+            bail!("missing feature flag {feature:?} in {:?}", caps.features);
+        }
+    }
+    let nested = caps
+        .nested_virt
+        .ok_or_else(|| anyhow::anyhow!("GetCapabilities left nested_virt unset"))?;
+    if !nested.supported {
+        bail!(
+            "this smoke requires nested virtualization but the daemon reports: {}",
+            nested.reason
+        );
+    }
+    info!(
+        version = %caps.daemon_version,
+        protocol = caps.protocol,
+        "capabilities verified"
+    );
+    Ok(())
+}
+
+/// CORE-21/60 acceptance: a sandbox created with `idle_timeout_seconds: 2`
+/// and `on_idle: PAUSE` auto-pauses on the idle edge (visible as PAUSING
+/// with reason=idle_timeout), a data-plane exec transparently resumes it,
+/// and SetLifecycle then disarms the idle window (Some(0)) while re-arming
+/// the TTL hard cap from now — with the absent `on_idle` left unchanged.
+async fn idle_lifecycle_scenario(
+    sandboxes: &mut SandboxServiceClient<Channel>,
+    processes: &mut SandboxProcessServiceClient<Channel>,
+) -> Result<()> {
+    const ID: &str = "smoke-idle";
+
+    // Subscribe before creating so no transition is missed.
+    let mut events = sandboxes
+        .events(with_machine(SandboxEventsRequest {
+            sandbox_id: ID.into(),
+            ..Default::default()
+        }))
+        .await
+        .context("Events subscribe failed")?
+        .into_inner();
+
+    let created = sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: ID.into(),
+            limits: Some(ResourceLimits {
+                vcpus: 1,
+                memory_mib: 256,
+            }),
+            idle_timeout_seconds: 2,
+            on_idle: IdleAction::Pause as i32,
+            ..Default::default()
+        }))
+        .await
+        .context("Create smoke-idle failed")?
+        .into_inner();
+    info!(id = %created.id, "idle-policy sandbox created");
+    wait_for_state(sandboxes, ID, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
+
+    // No execution runs, so the 2 s idle window expires and auto-pauses.
+    next_event(&mut events, SandboxEventKind::Pausing, Some("idle_timeout")).await?;
+    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    let info = inspect(sandboxes, ID).await?;
+    if info.state() != SandboxState::Paused {
+        bail!("expected auto-paused sandbox, got {:?}", info.state());
+    }
+    if info.idle_timeout_seconds != 2 || info.on_idle() != IdleAction::Pause {
+        bail!(
+            "idle knobs not reported: timeout={} on_idle={:?}",
+            info.idle_timeout_seconds,
+            info.on_idle()
+        );
+    }
+    info!("idle detector auto-paused the sandbox");
+
+    // A data-plane exec transparently resumes it (latency blip, no error).
+    let stdout = run_and_collect(processes, ID, &["/bin/echo", "idle-wake"]).await?;
+    if !stdout.contains("idle-wake") {
+        bail!("post-auto-resume exec output missing marker: {stdout:?}");
+    }
+    next_event(&mut events, SandboxEventKind::Resumed, Some("auto_resume")).await?;
+
+    // Disarm the idle window and re-arm the TTL from now (CORE-60). This
+    // races the freshly re-armed 2 s idle timer and must land well inside
+    // it (one local unary call).
+    let rearm_epoch = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )?;
+    sandboxes
+        .set_lifecycle(with_machine(SetLifecycleRequest {
+            id: ID.into(),
+            ttl_seconds: Some(600),
+            idle_timeout_seconds: Some(0),
+            on_idle: None,
+        }))
+        .await
+        .context("SetLifecycle failed")?;
+
+    // Outlive the original window: with idle detection disarmed the
+    // sandbox must stay READY past the 2 s that previously paused it.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let info = inspect(sandboxes, ID).await?;
+    if info.state() != SandboxState::Ready {
+        bail!("idle window re-arm did not stick; state {:?}", info.state());
+    }
+    if info.idle_timeout_seconds != 0 {
+        bail!(
+            "idle_timeout_seconds not replaced: {}",
+            info.idle_timeout_seconds
+        );
+    }
+    if info.on_idle() != IdleAction::Pause {
+        bail!(
+            "absent on_idle must stay unchanged, got {:?}",
+            info.on_idle()
+        );
+    }
+    let deadline = info
+        .ttl_deadline
+        .ok_or_else(|| anyhow::anyhow!("ttl_deadline unset after SetLifecycle"))?;
+    let ahead = deadline.seconds - rearm_epoch;
+    if !(540..=660).contains(&ahead) {
+        bail!("ttl_deadline not re-armed from now: {ahead}s ahead");
+    }
+    info!("SetLifecycle re-armed the TTL and disarmed the idle window");
+
+    sandboxes
+        .remove(with_machine(RemoveSandboxRequest {
+            id: ID.into(),
+            force: true,
+        }))
+        .await
+        .context("Remove smoke-idle failed")?;
     Ok(())
 }
 
