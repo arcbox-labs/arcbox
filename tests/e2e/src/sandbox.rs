@@ -22,11 +22,12 @@ use arcbox_grpc::sandbox_v1::sandbox_service_client::SandboxServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
 use arcbox_protocol::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, Execution, ExecutionEvent,
-    FileChunk, GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ReadFileRequest,
-    RemoveSandboxRequest, ResourceLimits, RestoreRequest, SandboxState, Signal,
+    FileChunk, GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest,
+    PauseSandboxRequest, ReadFileRequest, RemoveSandboxRequest, ResourceLimits, RestoreRequest,
+    ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest, SandboxState, Signal,
     SignalExecutionRequest, StartExecutionRequest, StdioChannel, StopSandboxRequest,
-    WaitExecutionRequest, WriteFileOpen, WriteFileRequest, WriteStdinRequest, execution_event,
-    exit_status, write_file_request,
+    WaitExecutionRequest, WatchEventsResponse, WriteFileOpen, WriteFileRequest, WriteStdinRequest,
+    execution_event, exit_status, watch_events_response, write_file_request,
 };
 use tonic::transport::Channel;
 use tracing::{info, warn};
@@ -390,6 +391,14 @@ async fn drive_sandboxes(
     metrics.record("sandbox_file_io", file_started.elapsed().as_secs_f64());
     info!("file round-trip verified");
 
+    // -- Pause / transparent auto-resume / explicit Resume (CORE-21) -------
+    let pause_started = Instant::now();
+    let origin_ip = pause_resume_scenario(&mut sandboxes, &mut processes, &mut files).await?;
+    metrics.record(
+        "sandbox_pause_resume",
+        pause_started.elapsed().as_secs_f64(),
+    );
+
     // -- Checkpoint / Restore --------------------------------------------
     let checkpoint_started = Instant::now();
     let snapshot_id = snapshots
@@ -424,10 +433,11 @@ async fn drive_sandboxes(
         .context("Fresh-network restore failed")?
         .into_inner();
     info!(id = %cloned.id, ip = %cloned.ip_address, "sandbox restored with fresh network while origin runs");
-    if cloned.ip_address.is_empty() || cloned.ip_address == created.ip_address {
+    // The origin's IP changed across pause/resume; compare against its
+    // current allocation, which is also what the checkpoint recorded.
+    if cloned.ip_address.is_empty() || cloned.ip_address == origin_ip {
         bail!(
-            "fresh-network clone must get its own IP (origin {}, clone {:?})",
-            created.ip_address,
+            "fresh-network clone must get its own IP (origin {origin_ip}, clone {:?})",
             cloned.ip_address
         );
     }
@@ -451,7 +461,10 @@ async fn drive_sandboxes(
     if !addr.contains("169.254.100.2/") {
         bail!("clone eth0 does not carry the invariant guest IP (got: {addr:?})");
     }
+    // `origin_ip` is the origin's *post-resume* allocation, distinct from the
+    // one it was created with — both are pool IPs and neither may leak in.
     if addr.contains(&format!("{}/", created.ip_address))
+        || addr.contains(&format!("{origin_ip}/"))
         || addr.contains(&format!("{}/", cloned.ip_address))
     {
         bail!("clone eth0 carries a pool IP; those must stay host-side (got: {addr:?})");
@@ -864,6 +877,212 @@ async fn exec_signal_and_keepalive(
     }
     info!("stream-free signal delivered and reported as a signal death");
     Ok(())
+}
+
+/// CORE-21 acceptance: pause → paused honesty (state, paused_at,
+/// storage_bytes, opt-out header) → transparent auto-resume on a data-plane
+/// call → pause again → explicit Resume, with memory AND disk state proven
+/// to survive and every transition visible on the Events stream.
+///
+/// Returns the origin's post-resume IP for the later restore assertions.
+async fn pause_resume_scenario(
+    sandboxes: &mut SandboxServiceClient<Channel>,
+    processes: &mut SandboxProcessServiceClient<Channel>,
+    files: &mut SandboxFilesystemServiceClient<Channel>,
+) -> Result<String> {
+    // Disk marker on the ext4 rootfs — unlike /tmp (tmpfs, which rides the
+    // memory image) this proves the CoW overlay itself survives. The sync
+    // pushes it out of the page cache into the overlay.
+    let disk_marker: Vec<u8> = (0..64 * 1024).map(|i| (i % 199) as u8).collect();
+    write_file(files, "smoke1", "/pause-disk-marker.bin", &disk_marker).await?;
+    run_and_collect(processes, "smoke1", &["/bin/sh", "-c", "sync"]).await?;
+    wait_ready(sandboxes, "smoke1").await?;
+
+    // Subscribe before pausing so every transition is captured.
+    let mut events = sandboxes
+        .events(with_machine(SandboxEventsRequest {
+            sandbox_id: "smoke1".into(),
+            ..Default::default()
+        }))
+        .await
+        .context("Events subscribe failed")?
+        .into_inner();
+
+    // -- Pause ------------------------------------------------------------
+    sandboxes
+        .pause(with_machine(PauseSandboxRequest {
+            id: "smoke1".into(),
+        }))
+        .await
+        .context("Pause failed")?;
+    let info = inspect(sandboxes, "smoke1").await?;
+    if info.state() != SandboxState::Paused {
+        bail!("expected PAUSED after Pause, got {:?}", info.state());
+    }
+    if info.paused_at.is_none() {
+        bail!("paused sandbox must report paused_at");
+    }
+    if info.storage_bytes == 0 {
+        bail!("paused sandbox must report a nonzero storage_bytes");
+    }
+    next_event(&mut events, SandboxEventKind::Pausing, Some("pause")).await?;
+    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    info!(storage_bytes = info.storage_bytes, "sandbox paused");
+
+    // Pause is idempotent on a paused sandbox.
+    sandboxes
+        .pause(with_machine(PauseSandboxRequest {
+            id: "smoke1".into(),
+        }))
+        .await
+        .context("idempotent Pause failed")?;
+
+    // -- Opt-out header gets the honest FAILED_PRECONDITION ---------------
+    let mut opted_out = with_machine(StartExecutionRequest {
+        sandbox_id: "smoke1".into(),
+        cmd: vec!["/bin/true".into()],
+        stdin: false,
+        ..Default::default()
+    });
+    opted_out.metadata_mut().insert(
+        "x-arcbox-no-auto-resume",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    match processes.start_execution(opted_out).await {
+        Ok(_) => bail!("opted-out execution on a paused sandbox must fail"),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
+        Err(status) => bail!("opted-out execution: expected FAILED_PRECONDITION, got {status}"),
+    }
+    let info = inspect(sandboxes, "smoke1").await?;
+    if info.state() != SandboxState::Paused {
+        bail!(
+            "the opted-out call must not wake the sandbox (state: {:?})",
+            info.state()
+        );
+    }
+
+    // -- Transparent auto-resume on a data-plane call ---------------------
+    let stdout = run_and_collect(
+        processes,
+        "smoke1",
+        &["/bin/sh", "-c", "wc -c < /pause-disk-marker.bin"],
+    )
+    .await?;
+    if stdout.trim() != disk_marker.len().to_string() {
+        bail!("disk marker size after auto-resume: {stdout:?}");
+    }
+    next_event(&mut events, SandboxEventKind::Resumed, Some("auto_resume")).await?;
+    wait_ready(sandboxes, "smoke1").await?;
+    let back = read_file(files, "smoke1", "/pause-disk-marker.bin").await?;
+    if back != disk_marker {
+        bail!("disk overlay state lost across pause/auto-resume");
+    }
+    let tmp = read_file(files, "smoke1", "/tmp/smoke.bin").await?;
+    if tmp.len() != 1024 * 1024 {
+        bail!(
+            "tmpfs (memory) state lost across pause/auto-resume ({} bytes)",
+            tmp.len()
+        );
+    }
+    info!("transparent auto-resume verified (disk + memory intact)");
+
+    // -- Pause again, resume explicitly -----------------------------------
+    sandboxes
+        .pause(with_machine(PauseSandboxRequest {
+            id: "smoke1".into(),
+        }))
+        .await
+        .context("second Pause failed")?;
+    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    sandboxes
+        .resume(with_machine(ResumeSandboxRequest {
+            id: "smoke1".into(),
+        }))
+        .await
+        .context("Resume failed")?;
+    next_event(&mut events, SandboxEventKind::Resumed, Some("resume")).await?;
+    // Resume is idempotent on a live sandbox.
+    sandboxes
+        .resume(with_machine(ResumeSandboxRequest {
+            id: "smoke1".into(),
+        }))
+        .await
+        .context("idempotent Resume failed")?;
+    wait_ready(sandboxes, "smoke1").await?;
+
+    // Resume allocates a fresh TAP + IP, but under invariant addressing
+    // (CORE-81) that is a purely host-side change: the guest keeps the fixed
+    // link-local identity and the pool IP lives on the TAP. The pool IP
+    // itself may legitimately be recycled — pause released it and this is
+    // the only sandbox — so what is asserted is the addressing shape.
+    //
+    // Deliberately NOT a gateway ping here: probing the gateway leaves a
+    // REACHABLE neighbour entry for it in the guest, and the checkpoint the
+    // next phase takes of this very sandbox inherits that entry. The clone
+    // restores onto a *different* TAP, whose gateway MAC differs, so the
+    // inherited entry blackholes the clone until it ages out. The clone
+    // phase owns the datapath proof (it pings from a guest whose neighbour
+    // cache was not freshly warmed); duplicating it here breaks it.
+    let info = inspect(sandboxes, "smoke1").await?;
+    let resumed_ip = info
+        .network
+        .as_ref()
+        .map(|n| n.ip_address.clone())
+        .unwrap_or_default();
+    if resumed_ip.is_empty() {
+        bail!("resumed sandbox must report an IP");
+    }
+    let addr =
+        run_and_collect(processes, "smoke1", &["/bin/sh", "-c", "ip addr show eth0"]).await?;
+    // Mirrors GUEST_IP in virt/arcbox-vm/src/network/invariant.rs.
+    if !addr.contains("169.254.100.2/") {
+        bail!("resumed eth0 does not carry the invariant guest IP (got: {addr:?})");
+    }
+    if addr.contains(&format!("{resumed_ip}/")) {
+        bail!("resumed eth0 carries a pool IP; those must stay host-side (got: {addr:?})");
+    }
+    // The default route must survive the checkpoint/restore round trip.
+    if !run_and_collect(processes, "smoke1", &["/bin/sh", "-c", "ip route"])
+        .await?
+        .contains("default via 169.254.100.1")
+    {
+        bail!("resumed sandbox lost its default route");
+    }
+    info!(ip = %resumed_ip, "explicit resume verified");
+    Ok(resumed_ip)
+}
+
+/// Scans the events stream (skipping keepalives and unrelated kinds) until
+/// `kind` arrives, asserting its "reason" attribute when specified.
+async fn next_event(
+    stream: &mut tonic::Streaming<WatchEventsResponse>,
+    kind: SandboxEventKind,
+    reason: Option<&str>,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .with_context(|| format!("timed out waiting for {kind:?} event"))?;
+        let message = tokio::time::timeout(remaining, stream.message())
+            .await
+            .with_context(|| format!("timed out waiting for {kind:?} event"))?
+            .context("events stream error")?
+            .context("events stream ended")?;
+        let Some(watch_events_response::Payload::Event(event)) = message.payload else {
+            continue; // keepalive
+        };
+        if event.kind() != kind {
+            continue;
+        }
+        if let Some(reason) = reason {
+            let got = event.attributes.get("reason").map(String::as_str);
+            if got != Some(reason) {
+                bail!("{kind:?} event reason: expected {reason:?}, got {got:?}");
+            }
+        }
+        return Ok(());
+    }
 }
 
 async fn inspect(
