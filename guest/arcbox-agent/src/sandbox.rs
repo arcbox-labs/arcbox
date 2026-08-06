@@ -266,6 +266,49 @@ impl SandboxService {
         Ok(())
     }
 
+    /// Pause a sandbox: checkpoint, then release its VM while keeping the
+    /// record and disk under the same id (CORE-21). The sandbox's DNS entry
+    /// is dropped with its released IP; Resume re-registers the fresh one.
+    pub(crate) async fn pause_request(
+        &self,
+        req: sandbox_v1::PauseSandboxRequest,
+    ) -> Result<(), SandboxError> {
+        self.manager
+            .pause_sandbox(&req.id)
+            .await
+            .map_err(SandboxError::from)?;
+        deregister_sandbox_dns(&req.id);
+        Ok(())
+    }
+
+    /// Resume a paused sandbox in place and re-register its fresh IP.
+    ///
+    /// The wire reason is constrained to the two values the contract
+    /// documents; anything else (including empty) reads as an explicit
+    /// resume rather than injecting arbitrary event attributes.
+    pub(crate) async fn resume_request(
+        &self,
+        req: arcbox_connect::v1::SandboxResumeCommand,
+    ) -> Result<arcbox_connect::v1::SandboxResumeResponse, SandboxError> {
+        let reason = if req.reason == arcbox_vm::pause_reason::AUTO_RESUME {
+            arcbox_vm::pause_reason::AUTO_RESUME
+        } else {
+            arcbox_vm::pause_reason::RESUME
+        };
+        let ip_address = self
+            .manager
+            .resume_sandbox(&req.id, reason)
+            .await
+            .map_err(SandboxError::from)?;
+        if !ip_address.is_empty() {
+            register_sandbox_dns(&req.id, &ip_address);
+        }
+        Ok(arcbox_connect::v1::SandboxResumeResponse {
+            ip_address,
+            ..Default::default()
+        })
+    }
+
     /// Remove a sandbox.
     pub async fn remove(&self, payload: &[u8]) -> Result<(), SandboxError> {
         let req = sandbox_v1::RemoveSandboxRequest::decode_from_slice(payload)
@@ -450,11 +493,15 @@ impl SandboxService {
 fn completed_create_is_stale(state: Result<SandboxState, VmmError>) -> bool {
     match state {
         Ok(SandboxState::Stopped | SandboxState::Failed) | Err(VmmError::NotFound(_)) => true,
+        // A paused sandbox is logically alive: the same-id create replay
+        // must keep answering until it is actually removed.
         Ok(
             SandboxState::Starting
             | SandboxState::Ready
             | SandboxState::Running
-            | SandboxState::Stopping,
+            | SandboxState::Stopping
+            | SandboxState::Pausing
+            | SandboxState::Paused,
         )
         | Err(_) => false,
     }

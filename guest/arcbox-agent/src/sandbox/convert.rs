@@ -97,6 +97,8 @@ pub(super) fn state_to_proto(state: SandboxState) -> sandbox_v1::SandboxState {
         SandboxState::Stopping => sandbox_v1::SandboxState::Stopping,
         SandboxState::Stopped => sandbox_v1::SandboxState::Stopped,
         SandboxState::Failed => sandbox_v1::SandboxState::Failed,
+        SandboxState::Pausing => sandbox_v1::SandboxState::Pausing,
+        SandboxState::Paused => sandbox_v1::SandboxState::Paused,
     }
 }
 
@@ -111,8 +113,6 @@ pub(super) fn state_filter(state: sandbox_v1::SandboxState) -> Option<&'static s
         sandbox_v1::SandboxState::Stopping => Some("stopping"),
         sandbox_v1::SandboxState::Stopped => Some("stopped"),
         sandbox_v1::SandboxState::Failed => Some("failed"),
-        // Pause states (CORE-21): the manager cannot produce them yet, so
-        // the filter matches nothing until pause lands guest-side.
         sandbox_v1::SandboxState::Pausing => Some("pausing"),
         sandbox_v1::SandboxState::Paused => Some("paused"),
     }
@@ -129,6 +129,9 @@ pub(super) fn event_kind(action: &str) -> sandbox_v1::SandboxEventKind {
         "stopped" => sandbox_v1::SandboxEventKind::Stopped,
         "failed" => sandbox_v1::SandboxEventKind::Failed,
         "removed" => sandbox_v1::SandboxEventKind::Removed,
+        "pausing" => sandbox_v1::SandboxEventKind::Pausing,
+        "paused" => sandbox_v1::SandboxEventKind::Paused,
+        "resumed" => sandbox_v1::SandboxEventKind::Resumed,
         _ => sandbox_v1::SandboxEventKind::Unspecified,
     }
 }
@@ -167,6 +170,8 @@ pub(super) fn info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
         last_exited_at: info.last_exited_at.map(timestamp).into(),
         last_exit_status: info.last_exit_status.map(exit_status_to_proto).into(),
         error: info.error.unwrap_or_default(),
+        paused_at: info.paused_at.map(timestamp).into(),
+        storage_bytes: info.storage_bytes,
         ..Default::default()
     }
 }
@@ -178,6 +183,8 @@ pub(super) fn summary_to_proto(s: SandboxSummary) -> sandbox_v1::SandboxSummary 
         labels: s.labels.into_iter().collect(),
         ip_address: s.ip_address,
         created_at: timestamp(s.created_at).into(),
+        paused_at: s.paused_at.map(timestamp).into(),
+        storage_bytes: s.storage_bytes,
         ..Default::default()
     }
 }
