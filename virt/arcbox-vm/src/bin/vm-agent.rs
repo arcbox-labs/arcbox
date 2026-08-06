@@ -42,7 +42,7 @@ mod agent {
     use std::io::{Read, Write};
     use std::os::unix::io::RawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
     use std::thread;
 
     use serde::Deserialize;
@@ -606,6 +606,13 @@ mod agent {
         REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// Wakes the reaper out of its no-children park when a spawn registers a
+    /// child (paired with the [`reap_registry`] mutex).
+    fn reap_wakeup() -> &'static Condvar {
+        static WAKEUP: OnceLock<Condvar> = OnceLock::new();
+        WAKEUP.get_or_init(Condvar::new)
+    }
+
     /// Narrow a `std::process::Child::id()` (u32) to a `pid_t`. Linux pids are
     /// bounded well below `i32::MAX`, so this never wraps.
     #[allow(clippy::cast_possible_wrap, reason = "pids fit in pid_t")]
@@ -659,9 +666,21 @@ mod agent {
                 // SAFETY: waitpid with a valid status pointer; -1 waits on any child.
                 let pid = unsafe { libc::waitpid(-1, &raw mut status, 0) };
                 if pid <= 0 {
-                    // ECHILD (no children yet) or EINTR — back off briefly so we
-                    // don't spin while the guest is idle.
-                    thread::sleep(std::time::Duration::from_millis(50));
+                    // ECHILD (no children) or EINTR. Park until a spawn
+                    // registers a child instead of polling: the old 50 ms
+                    // backoff put a flat ~50 ms floor under every short
+                    // execution whose child spawned and exited inside one
+                    // sleep. ECHILD means zero children of any kind — an
+                    // orphan can only be reparented to us while we still have
+                    // children, and then waitpid blocks rather than failing —
+                    // so a registry insert is the only way a child appears.
+                    // The timeout is a belt-and-braces bound, not a poll.
+                    let guard = reap_registry().lock().unwrap();
+                    let _ = reap_wakeup()
+                        .wait_timeout_while(guard, std::time::Duration::from_millis(500), |r| {
+                            r.is_empty()
+                        })
+                        .unwrap();
                     continue;
                 }
                 let Some(outcome) = wait_status_to_outcome(status) else {
@@ -736,6 +755,7 @@ mod agent {
             match cmd.spawn() {
                 Ok(c) => {
                     registry.insert(as_pid(c.id()), exit_tx);
+                    reap_wakeup().notify_all();
                     c
                 }
                 Err(e) => {
@@ -992,6 +1012,7 @@ mod agent {
             Ok(ForkResult::Parent { child }) => {
                 let child_pid = child.as_raw();
                 registry.insert(child_pid, exit_tx);
+                reap_wakeup().notify_all();
                 drop(registry); // release before the (long-lived) session loop
 
                 if start.timeout_seconds > 0 {

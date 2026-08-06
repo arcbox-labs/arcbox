@@ -1,5 +1,5 @@
 use super::boot::{
-    chroot_root, stage_kernel_for_jailer, stage_rootfs_copy_for_jailer,
+    chroot_root, link_or_copy_for_jailer, stage_kernel_for_jailer, stage_rootfs_copy_for_jailer,
     stage_rootfs_device_for_jailer,
 };
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
@@ -254,6 +254,11 @@ impl SandboxManager {
         // `../` id would traverse out of the snapshots directory.
         super::validate_id("snapshot id", &spec.snapshot_id)?;
 
+        // Phase clocks for the completion log: restore latency is a product
+        // metric (CORE-75) and the breakdown is what makes a regression
+        // attributable.
+        let restore_started = std::time::Instant::now();
+
         if caller_supplied_id
             && let Some(outcome) = self.records.replay_provision(&new_id, restore_key)?
         {
@@ -413,8 +418,10 @@ impl SandboxManager {
                 .await);
         }
 
+        let t_spawned = std::time::Instant::now();
+
         // In jailer mode the restored FC process also runs inside a chroot and
-        // cannot access the catalog's host-absolute paths.  Copy the snapshot
+        // cannot access the catalog's host-absolute paths.  Stage the snapshot
         // files into the new sandbox's chroot and use chroot-relative paths.
         let setup_result: Result<(String, Option<String>)> = async {
             let jc = jailer;
@@ -502,21 +509,18 @@ impl SandboxManager {
                 }
             }
 
-            // Copy vmstate into chroot.
+            // Stage vmstate + mem into the chroot. Both are read-only to FC
+            // (mem is mapped MAP_PRIVATE on load), so the root jailer
+            // hard-links them instead of copying — the mem file is the
+            // sandbox's full memory size (CORE-75).
             let dst_vmstate = snap_in_chroot.join("vmstate");
-            tokio::fs::copy(&snap_meta.vmstate_path, &dst_vmstate)
-                .await
-                .map_err(VmmError::Io)?;
-            nix::unistd::chown(&dst_vmstate, Some(uid), Some(gid))
-                .map_err(|e| VmmError::Process(format!("chown vmstate: {e}")))?;
+            link_or_copy_for_jailer(&snap_meta.vmstate_path, &dst_vmstate, jc.uid, jc.gid).await?;
 
             let effective_mem = if let Some(ref mf) = snap_meta.mem_path
                 && mf.exists()
             {
                 let dst_mem = snap_in_chroot.join("mem");
-                tokio::fs::copy(mf, &dst_mem).await.map_err(VmmError::Io)?;
-                nix::unistd::chown(&dst_mem, Some(uid), Some(gid))
-                    .map_err(|e| VmmError::Process(format!("chown mem: {e}")))?;
+                link_or_copy_for_jailer(mf, &dst_mem, jc.uid, jc.gid).await?;
                 Some(format!("/snapshots/{}/mem", spec.snapshot_id))
             } else {
                 None
@@ -544,6 +548,8 @@ impl SandboxManager {
                     .await);
             }
         };
+
+        let t_staged = std::time::Instant::now();
 
         // Build the restore parameters.
         let mut load_params = fc_sdk::types::SnapshotLoadParams {
@@ -582,6 +588,8 @@ impl SandboxManager {
             }
         };
 
+        let t_loaded = std::time::Instant::now();
+
         // Synchronise the guest clock to the host after restore.  The sandbox
         // clock is frozen at snapshot creation time; correct it before any
         // workload runs.  A failure here is non-fatal — the sandbox is still
@@ -590,16 +598,18 @@ impl SandboxManager {
         // Use a short timeout so clock sync never dominates restore latency.
         // sync_clock itself has a 5s read timeout, but connect_to_agent can
         // retry for up to AGENT_READY_TIMEOUT (30s).  Cap the whole operation.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            vsock::sync_clock(&actual_vsock_path),
-        )
-        .await
-        {
-            Ok(Err(e)) => warn!(sandbox_id = %new_id, "clock sync after restore failed: {e}"),
-            Err(_) => warn!(sandbox_id = %new_id, "clock sync after restore timed out"),
-            Ok(Ok(())) => {}
-        }
+        let clock_sync = async {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                vsock::sync_clock(&actual_vsock_path),
+            )
+            .await
+            {
+                Ok(Err(e)) => warn!(sandbox_id = %new_id, "clock sync after restore failed: {e}"),
+                Err(_) => warn!(sandbox_id = %new_id, "clock sync after restore timed out"),
+                Ok(Ok(())) => {}
+            }
+        };
 
         // Re-address the guest to the fresh allocation. The restored kernel
         // still carries the origin's `ip=` boot configuration, so without
@@ -608,32 +618,42 @@ impl SandboxManager {
         // clock, a fresh-network restore without a working network is the
         // silent breakage `network_override` exists to prevent — fail the
         // restore rather than hand back a half-networked sandbox.
-        if let Some(ref net) = net_alloc {
+        let net_reconfig = async {
+            let Some(ref net) = net_alloc else {
+                return Ok(());
+            };
             let cmd = crate::boot_proto::NetReconfigCommand {
                 ip: net.ip_address,
                 netmask: net.netmask(),
                 gateway: net.gateway,
             };
-            let reconfig = tokio::time::timeout(
+            tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 vsock::reconfigure_network(&actual_vsock_path, &cmd),
             )
             .await
             .map_err(|_| VmmError::Vsock("net reconfig after restore timed out".into()))
-            .and_then(|r| r);
-            if let Err(error) = reconfig {
-                return Err(self
-                    .rollback_restore(
-                        &new_id,
-                        reservation,
-                        error,
-                        Some(process),
-                        net_alloc,
-                        pending_cow,
-                    )
-                    .await);
-            }
+            .and_then(|r| r)
+        };
+
+        // The two guest configs are independent operations on separate vsock
+        // connections; run them concurrently — serially they were half the
+        // restore latency (CORE-75).
+        let ((), reconfig) = tokio::join!(clock_sync, net_reconfig);
+        if let Err(error) = reconfig {
+            return Err(self
+                .rollback_restore(
+                    &new_id,
+                    reservation,
+                    error,
+                    Some(process),
+                    net_alloc,
+                    pending_cow,
+                )
+                .await);
         }
+
+        let t_guest_cfg = std::time::Instant::now();
 
         // Persist cleanup metadata before handing runtime resources to the
         // instance. A failed durable write aborts and unwinds every resource.
@@ -736,9 +756,15 @@ impl SandboxManager {
             });
         }
 
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         info!(
             sandbox_id = %new_id,
             snapshot_id = %spec.snapshot_id,
+            spawn_ms = ms(t_spawned.duration_since(restore_started)),
+            stage_ms = ms(t_staged.duration_since(t_spawned)),
+            load_ms = ms(t_loaded.duration_since(t_staged)),
+            guest_cfg_ms = ms(t_guest_cfg.duration_since(t_loaded)),
+            total_ms = ms(restore_started.elapsed()),
             "sandbox restored from checkpoint"
         );
         if let Some(error) = ready_commit.durability_error {
