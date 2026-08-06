@@ -1168,6 +1168,17 @@ mod agent {
                 libc::MS_NOSUID | libc::MS_NOEXEC,
                 "newinstance,ptmxmode=0666",
             ),
+            // /etc/resolv.conf is a symlink into /run so DNS rewrites (boot
+            // setup_dns, post-restore net reconfig) stay off the CoW block
+            // device — a first ext4 write costs a ~30 ms synchronous
+            // dm-snapshot exception through the nested I/O stack (CORE-75).
+            (
+                "/run",
+                "tmpfs",
+                "tmpfs",
+                libc::MS_NOSUID | libc::MS_NODEV,
+                "mode=0755",
+            ),
         ];
 
         for (target, source, fstype, flags, data) in mounts {
