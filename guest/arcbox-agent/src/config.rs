@@ -63,7 +63,10 @@ fn guest_defaults() -> VmmConfig {
             memory_mib: 512,
             kernel: runtime_root.join("kernel/vmlinux").to_string_lossy().into(),
             rootfs: format!("{SANDBOX_DATA_DIR}/rootfs.ext4"),
-            boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/vm-agent".into(),
+            // `quiet`: every boot printk is a serial MMIO exit, doubled by
+            // nesting — silencing the console measurably shortens the cold
+            // kernel boot (CORE-75/CORE-79).
+            boot_args: "console=ttyS0 quiet reboot=k panic=1 pci=off init=/sbin/vm-agent".into(),
         },
     }
 }
