@@ -142,6 +142,11 @@ pub enum MessageType {
     /// the RESUMED event surfaces). Answered with
     /// [`Self::SandboxResumeResponse`].
     SandboxResumeRequest = 0x0045,
+    /// Replace a sandbox's lifecycle deadlines — TTL re-armed from now,
+    /// idle timeout/policy replaced (payload:
+    /// `arcbox.sandbox.v1.SetLifecycleRequest`, CORE-60). Answered with
+    /// [`Self::SandboxSetLifecycleResponse`].
+    SandboxSetLifecycleRequest = 0x0046,
 
     // Sandbox execution request types (0x0060 - 0x0066), from the
     // execution redesign (CORE-55/56).
@@ -247,6 +252,8 @@ pub enum MessageType {
     /// Answers [`Self::SandboxResumeRequest`] (payload:
     /// `arcbox.v1.SandboxResumeResponse` with the fresh IP).
     SandboxResumeResponse = 0x1045,
+    /// Acknowledges [`Self::SandboxSetLifecycleRequest`] (empty payload).
+    SandboxSetLifecycleResponse = 0x1046,
 
     // Sandbox workload response types (streaming).
     // 0x1035 (SandboxRunOutput) and 0x1036 (SandboxExecOutput) were
@@ -342,6 +349,7 @@ impl MessageType {
             0x0043 => Some(Self::SandboxDeleteSnapshotRequest),
             0x0044 => Some(Self::SandboxPauseRequest),
             0x0045 => Some(Self::SandboxResumeRequest),
+            0x0046 => Some(Self::SandboxSetLifecycleRequest),
             // Sandbox execution requests (execution redesign, CORE-55/56).
             0x0060 => Some(Self::SandboxExecStartRequest),
             0x0061 => Some(Self::SandboxExecAttachRequest),
@@ -389,6 +397,7 @@ impl MessageType {
             0x1029 => Some(Self::SandboxCleanupEvent),
             0x1044 => Some(Self::SandboxPauseResponse),
             0x1045 => Some(Self::SandboxResumeResponse),
+            0x1046 => Some(Self::SandboxSetLifecycleResponse),
             // Sandbox workload responses (streaming).
             0x1037 => Some(Self::SandboxEvent),
             0x1038 => Some(Self::SandboxFileData),
@@ -437,6 +446,7 @@ impl MessageType {
                 | Self::SandboxDeleteSnapshotRequest
                 | Self::SandboxPauseRequest
                 | Self::SandboxResumeRequest
+                | Self::SandboxSetLifecycleRequest
                 | Self::SandboxExecStartRequest
                 | Self::SandboxExecAttachRequest
                 | Self::SandboxStdinWriteRequest
@@ -577,8 +587,10 @@ mod tests {
             (0x0043, MessageType::SandboxDeleteSnapshotRequest),
             (0x0044, MessageType::SandboxPauseRequest),
             (0x0045, MessageType::SandboxResumeRequest),
+            (0x0046, MessageType::SandboxSetLifecycleRequest),
             (0x1044, MessageType::SandboxPauseResponse),
             (0x1045, MessageType::SandboxResumeResponse),
+            (0x1046, MessageType::SandboxSetLifecycleResponse),
             (0x1040, MessageType::SandboxCheckpointResponse),
             (0x1041, MessageType::SandboxRestoreResponse),
             (0x1042, MessageType::SandboxListSnapshotsResponse),
@@ -613,6 +625,7 @@ mod tests {
         assert!(MessageType::SandboxCheckpointRequest.is_sandbox_request());
         assert!(MessageType::SandboxPauseRequest.is_sandbox_request());
         assert!(MessageType::SandboxResumeRequest.is_sandbox_request());
+        assert!(MessageType::SandboxSetLifecycleRequest.is_sandbox_request());
         assert!(!MessageType::PingRequest.is_sandbox_request());
         assert!(!MessageType::SandboxCreateResponse.is_sandbox_request());
     }

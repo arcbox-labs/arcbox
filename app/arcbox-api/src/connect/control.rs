@@ -193,17 +193,25 @@ impl pb::SandboxService for SandboxServiceImpl {
         Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the TTL wire-up lands with
-    /// CORE-60 (the daemon-side mechanism already exists), the idle
-    /// knobs with CORE-21.
+    /// Replace lifecycle deadlines: `ttl_seconds` re-arms the hard cap
+    /// from now (CORE-60), `idle_timeout_seconds`/`on_idle` replace the
+    /// idle knobs (CORE-21). Absent fields are unchanged; works on paused
+    /// sandboxes too (the TTL keeps applying to them).
     async fn set_lifecycle(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::SetLifecycleRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::SetLifecycleRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "sandbox lifecycle updates are not implemented yet (CORE-60/CORE-21)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let _operation = self.operations.lock(&machine, &req.id).await;
+        let runtime = self.runtime.ready()?;
+        let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
+        agent
+            .sandbox_set_lifecycle(req)
+            .await
+            .map_err(ApiError::from)?;
+        Response::ok(Empty::default())
     }
 
     /// Contract-only stub (CORE-58 phase 1): served for real with
