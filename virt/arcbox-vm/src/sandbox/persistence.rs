@@ -101,6 +101,14 @@ pub(super) enum SandboxPhase {
     Stopped,
     Failed,
     Removing,
+    /// Pause in progress: checkpoint taken or being taken, runtime
+    /// resources not yet fully released.
+    Pausing,
+    /// Checkpointed with resources released; `pause_snapshot_id` names the
+    /// catalog entry a Resume restores from (CORE-21).
+    Paused,
+    /// Resume in progress: runtime resources are being re-created.
+    Resuming,
 }
 
 /// The stable result returned once a provisioning request has been accepted.
@@ -121,6 +129,14 @@ pub(super) struct SandboxRecord {
     pub(super) provision_outcome: Option<SandboxProvisionOutcome>,
     pub(super) created_at: DateTime<Utc>,
     pub(super) error: Option<String>,
+    /// Catalog id of the internal pause checkpoint. Set while the record is
+    /// `Paused`/`Resuming` so a Resume after an agent restart still finds
+    /// its snapshot; cleared when the sandbox is `Ready` again.
+    #[serde(default)]
+    pub(super) pause_snapshot_id: Option<String>,
+    /// When the sandbox reached `Paused` (None otherwise).
+    #[serde(default)]
+    pub(super) paused_at: Option<DateTime<Utc>>,
 }
 
 /// Result of reserving a durable provisioning intent.
@@ -142,6 +158,9 @@ pub(super) enum SandboxTransition {
     Stopped,
     Failed(String),
     Removing,
+    Pausing,
+    Paused { snapshot_id: String },
+    Resuming,
 }
 
 impl SandboxTransition {
@@ -153,6 +172,9 @@ impl SandboxTransition {
             Self::Stopped => SandboxPhase::Stopped,
             Self::Failed(_) => SandboxPhase::Failed,
             Self::Removing => SandboxPhase::Removing,
+            Self::Pausing => SandboxPhase::Pausing,
+            Self::Paused { .. } => SandboxPhase::Paused,
+            Self::Resuming => SandboxPhase::Resuming,
         }
     }
 }
@@ -171,6 +193,8 @@ impl SandboxRecord {
             provision_outcome: None,
             created_at,
             error: None,
+            pause_snapshot_id: None,
+            paused_at: None,
         }
     }
 
@@ -219,6 +243,8 @@ impl SandboxRecord {
             SandboxTransition::Ready => {
                 self.phase = SandboxPhase::Ready;
                 self.error = None;
+                self.pause_snapshot_id = None;
+                self.paused_at = None;
                 self.redact_runtime_inputs();
             }
             SandboxTransition::Stopping => {
@@ -238,6 +264,20 @@ impl SandboxRecord {
             SandboxTransition::Removing => {
                 self.phase = SandboxPhase::Removing;
                 self.redact_runtime_inputs();
+            }
+            SandboxTransition::Pausing => {
+                self.phase = SandboxPhase::Pausing;
+                self.error = None;
+            }
+            SandboxTransition::Paused { snapshot_id } => {
+                self.phase = SandboxPhase::Paused;
+                self.pause_snapshot_id = Some(snapshot_id);
+                self.paused_at = Some(Utc::now());
+                self.error = None;
+            }
+            SandboxTransition::Resuming => {
+                self.phase = SandboxPhase::Resuming;
+                self.error = None;
             }
         }
         Ok(())
@@ -268,12 +308,21 @@ impl SandboxPhase {
                 ) | (
                     Self::Starting,
                     Self::Ready | Self::Stopping | Self::Failed | Self::Removing
-                ) | (Self::Ready, Self::Stopping | Self::Failed | Self::Removing)
+                ) | (
+                    Self::Ready,
+                    Self::Stopping | Self::Pausing | Self::Failed | Self::Removing
+                ) | (
+                    Self::Stopping,
+                    Self::Stopped | Self::Failed | Self::Removing
+                ) | (Self::Stopped | Self::Failed, Self::Removing)
+                    // A failed pause reverts to Ready and a completed one
+                    // parks at Paused; a resume mirrors that exactly (a
+                    // failed one unwinds back to Paused).
                     | (
-                        Self::Stopping,
-                        Self::Stopped | Self::Failed | Self::Removing
+                        Self::Pausing | Self::Resuming,
+                        Self::Paused | Self::Ready | Self::Failed | Self::Removing
                     )
-                    | (Self::Stopped | Self::Failed, Self::Removing)
+                    | (Self::Paused, Self::Resuming | Self::Failed | Self::Removing)
             )
     }
 
@@ -286,6 +335,9 @@ impl SandboxPhase {
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Removing => "removing",
+            Self::Pausing => "pausing",
+            Self::Paused => "paused",
+            Self::Resuming => "resuming",
         }
     }
 }
@@ -619,10 +671,15 @@ fn classify_existing_provision(
     Ok(match record.phase {
         SandboxPhase::Creating => ExistingProvision::Pending,
         SandboxPhase::Starting | SandboxPhase::Ready => ExistingProvision::Replay,
+        // A paused sandbox's provision outcome names a released IP, so a
+        // same-key create retry must not replay it as live.
         SandboxPhase::Stopping
         | SandboxPhase::Stopped
         | SandboxPhase::Failed
-        | SandboxPhase::Removing => ExistingProvision::Blocked,
+        | SandboxPhase::Removing
+        | SandboxPhase::Pausing
+        | SandboxPhase::Paused
+        | SandboxPhase::Resuming => ExistingProvision::Blocked,
     })
 }
 
@@ -661,10 +718,21 @@ fn validate_record(id: &str, record: &SandboxRecord) -> Result<()> {
             | SandboxPhase::Ready
             | SandboxPhase::Stopping
             | SandboxPhase::Stopped
+            | SandboxPhase::Pausing
+            | SandboxPhase::Paused
+            | SandboxPhase::Resuming
     ) && record.provision_outcome.is_none()
     {
         return Err(VmmError::Config(format!(
             "sandbox record has no provision outcome in phase {} for {id}",
+            record.phase.as_str()
+        )));
+    }
+    if matches!(record.phase, SandboxPhase::Paused | SandboxPhase::Resuming)
+        && record.pause_snapshot_id.is_none()
+    {
+        return Err(VmmError::Config(format!(
+            "sandbox record has no pause snapshot in phase {} for {id}",
             record.phase.as_str()
         )));
     }
@@ -955,6 +1023,138 @@ mod tests {
             store.replay_provision("failed", "key"),
             Err(VmmError::AlreadyExists(id)) if id == "failed"
         ));
+    }
+
+    #[test]
+    fn pause_resume_transitions_carry_the_snapshot_and_paused_at() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let record = created(store.provision_intent("box", "key", spec("box")).unwrap());
+        let generation = record.generation;
+        store
+            .transition(
+                "box",
+                generation,
+                SandboxTransition::Starting(SandboxProvisionOutcome {
+                    ip_address: "192.0.2.2".into(),
+                }),
+            )
+            .unwrap();
+        store
+            .transition("box", generation, SandboxTransition::Ready)
+            .unwrap();
+
+        // Pausing may not jump straight to Paused-from-Ready.
+        assert!(
+            store
+                .transition(
+                    "box",
+                    generation,
+                    SandboxTransition::Paused {
+                        snapshot_id: "snap".into()
+                    }
+                )
+                .is_err()
+        );
+        store
+            .transition("box", generation, SandboxTransition::Pausing)
+            .unwrap();
+        let paused = store
+            .transition(
+                "box",
+                generation,
+                SandboxTransition::Paused {
+                    snapshot_id: "snap".into(),
+                },
+            )
+            .unwrap()
+            .value;
+        assert_eq!(paused.phase, SandboxPhase::Paused);
+        assert_eq!(paused.pause_snapshot_id.as_deref(), Some("snap"));
+        assert!(paused.paused_at.is_some());
+
+        // A paused id must not replay its (released) provision outcome.
+        assert!(matches!(
+            store.replay_provision("box", "key"),
+            Err(VmmError::AlreadyExists(_))
+        ));
+
+        // Resume keeps the snapshot until Ready clears it.
+        let resuming = store
+            .transition("box", generation, SandboxTransition::Resuming)
+            .unwrap()
+            .value;
+        assert_eq!(resuming.pause_snapshot_id.as_deref(), Some("snap"));
+        // A failed resume unwinds back to Paused…
+        store
+            .transition(
+                "box",
+                generation,
+                SandboxTransition::Paused {
+                    snapshot_id: "snap".into(),
+                },
+            )
+            .unwrap();
+        // …and a successful one lands Ready with the pause state cleared.
+        store
+            .transition("box", generation, SandboxTransition::Resuming)
+            .unwrap();
+        let ready = store
+            .transition("box", generation, SandboxTransition::Ready)
+            .unwrap()
+            .value;
+        assert_eq!(ready.phase, SandboxPhase::Ready);
+        assert_eq!(ready.pause_snapshot_id, None);
+        assert_eq!(ready.paused_at, None);
+    }
+
+    #[test]
+    fn failed_pause_reverts_to_ready_and_paused_cannot_stop() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let record = created(store.provision_intent("box", "key", spec("box")).unwrap());
+        let generation = record.generation;
+        store
+            .transition(
+                "box",
+                generation,
+                SandboxTransition::Starting(SandboxProvisionOutcome {
+                    ip_address: String::new(),
+                }),
+            )
+            .unwrap();
+        store
+            .transition("box", generation, SandboxTransition::Ready)
+            .unwrap();
+        store
+            .transition("box", generation, SandboxTransition::Pausing)
+            .unwrap();
+        store
+            .transition("box", generation, SandboxTransition::Ready)
+            .unwrap();
+
+        store
+            .transition("box", generation, SandboxTransition::Pausing)
+            .unwrap();
+        store
+            .transition(
+                "box",
+                generation,
+                SandboxTransition::Paused {
+                    snapshot_id: "snap".into(),
+                },
+            )
+            .unwrap();
+        // Paused has no VM to drain: only Resume, Failed, or Removing apply.
+        assert!(
+            store
+                .transition("box", generation, SandboxTransition::Stopping)
+                .is_err()
+        );
+        store
+            .transition("box", generation, SandboxTransition::Removing)
+            .unwrap();
+        store.finish_remove("box", generation).unwrap();
     }
 
     #[test]

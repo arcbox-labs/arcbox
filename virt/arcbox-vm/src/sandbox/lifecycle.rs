@@ -349,6 +349,7 @@ impl SandboxManager {
             let config2 = Arc::clone(&self.config);
             let cow2 = Arc::clone(&self.cow_manager);
             let records = Arc::clone(&self.records);
+            let snapshots = Arc::clone(&self.snapshots);
             let id2 = id.clone();
             let ttl = spec.ttl_seconds;
             let armed_for = ttl_armed_for;
@@ -364,6 +365,7 @@ impl SandboxManager {
                     &config2,
                     &cow2,
                     &records,
+                    &snapshots,
                 )
                 .await;
             });
@@ -579,6 +581,7 @@ impl SandboxManager {
             &self.config,
             &self.cow_manager,
             &self.records,
+            &self.snapshots,
         )
         .await?;
         info!(sandbox_id = %id, "sandbox removed");
@@ -589,7 +592,11 @@ impl SandboxManager {
     pub fn inspect_sandbox(&self, id: &SandboxId) -> Result<SandboxInfo> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
-        Ok(inst_to_info(&inst))
+        let mut info = inst_to_info(&inst);
+        if inst.state == SandboxState::Paused {
+            info.storage_bytes = self.paused_storage_bytes(&inst);
+        }
+        Ok(info)
     }
 
     /// List sandboxes, optionally filtered by state string and/or labels.
@@ -632,6 +639,12 @@ impl SandboxManager {
                         .map(|n| n.ip_address.to_string())
                         .unwrap_or_default(),
                     created_at: inst.created_at,
+                    paused_at: inst.paused_at,
+                    storage_bytes: if inst.state == SandboxState::Paused {
+                        self.paused_storage_bytes(&inst)
+                    } else {
+                        0
+                    },
                 })
             })
             .collect())
@@ -653,11 +666,17 @@ impl SandboxManager {
     }
 
     /// Verify the sandbox is `Ready` and return its vsock UDS path.
+    ///
+    /// A paused sandbox answers [`VmmError::Paused`], not `WrongState`, so
+    /// the daemon can resume it transparently and retry (CORE-21).
     pub(super) fn require_ready_vsock(&self, id: &SandboxId) -> Result<PathBuf> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
             SandboxState::Ready => {}
+            SandboxState::Pausing | SandboxState::Paused => {
+                return Err(VmmError::Paused(id.clone()));
+            }
             s => {
                 return Err(VmmError::WrongState {
                     id: id.clone(),
@@ -674,11 +693,16 @@ impl SandboxManager {
     /// Verify the sandbox is alive (Ready or Running) and return its vsock
     /// UDS path. Unlike [`Self::require_ready_vsock`], an in-flight workload
     /// does not block the operation — file I/O works alongside Run/Exec.
+    /// Paused states map to [`VmmError::Paused`] for the daemon's
+    /// transparent resume, as above.
     pub(super) fn require_alive_vsock(&self, id: &SandboxId) -> Result<PathBuf> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
             SandboxState::Ready | SandboxState::Running => {}
+            SandboxState::Pausing | SandboxState::Paused => {
+                return Err(VmmError::Paused(id.clone()));
+            }
             s => {
                 return Err(VmmError::WrongState {
                     id: id.clone(),

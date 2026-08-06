@@ -12,7 +12,7 @@ use super::*;
 /// The jailer chroot is its own vfsmount (bind + pivot_root), so a plain
 /// `rename(2)` out of it fails with `EXDEV` regardless of the underlying
 /// filesystem; fall back to copy + remove in that case.
-async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(super) async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     match tokio::fs::rename(from, to).await {
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
             tokio::fs::copy(from, to).await?;
@@ -54,19 +54,45 @@ pub(super) enum RestoreOrigin {
     WarmCreate,
 }
 
-/// Pause a `Ready` sandbox, capture a full snapshot into the catalog, and
-/// resume it.
+/// What a single [`checkpoint_impl`] call should capture, and how it should
+/// leave the guest.
+pub(super) struct CheckpointRequest {
+    /// Catalog name recorded on the committed snapshot.
+    pub(super) name: String,
+    /// Catalog labels recorded on the committed snapshot.
+    pub(super) labels: HashMap<String, String>,
+    /// State the instance must be in. The Checkpoint RPC and the warm-create
+    /// publisher require `Ready`; pause has already claimed the instance and
+    /// moved it to `Pausing` (CORE-21).
+    pub(super) expected_state: SandboxState,
+    /// Resume the guest once the snapshot files are written.
+    ///
+    /// False only for pause, whose whole point is that the guest must never
+    /// run past the memory image — any progress after it would diverge from
+    /// the retained disk overlay. The caller then owns the resume-on-error.
+    pub(super) resume_after: bool,
+}
+
+/// Pause a sandbox, capture a full snapshot into the catalog, and (unless
+/// the request opts out) resume it.
 ///
 /// Free-standing (rather than a method) so the boot task can publish warm
-/// snapshots (CORE-77) through the exact code path the Checkpoint RPC uses.
+/// snapshots (CORE-77) through the exact code path the Checkpoint RPC uses,
+/// and so pause (CORE-21) inherits the same chroot-owner and addressing-mode
+/// handling instead of re-deriving it.
 pub(super) async fn checkpoint_impl(
     instances: &super::InstanceMap,
     snapshots: &SnapshotCatalog,
     config: &VmmConfig,
     sandbox_id: &SandboxId,
-    name: String,
-    labels: HashMap<String, String>,
+    request: CheckpointRequest,
 ) -> Result<CheckpointInfo> {
+    let CheckpointRequest {
+        name,
+        labels,
+        expected_state,
+        resume_after,
+    } = request;
     // Verify state and capture the kernel/rootfs paths for jailer
     // re-staging, the id the sandbox's chroot is actually keyed by
     // — a sandbox restored from a pre-warmed pool slot lives in the
@@ -80,10 +106,10 @@ pub(super) async fn checkpoint_impl(
             .cloned()
             .ok_or_else(|| VmmError::NotFound(sandbox_id.clone()))?;
         let inst = instance.lock().unwrap();
-        if inst.state != SandboxState::Ready {
+        if inst.state != expected_state {
             return Err(VmmError::WrongState {
                 id: sandbox_id.clone(),
-                expected: "Ready".into(),
+                expected: expected_state.to_string(),
                 actual: inst.state.to_string(),
             });
         }
@@ -93,7 +119,7 @@ pub(super) async fn checkpoint_impl(
             .map(Arc::clone)
             .ok_or_else(|| VmmError::WrongState {
                 id: sandbox_id.clone(),
-                expected: "Ready (VM handle available)".into(),
+                expected: format!("{expected_state} (VM handle available)"),
                 actual: inst.state.to_string(),
             })?;
         // Only needed for jailer mode; safe to capture regardless.
@@ -120,9 +146,9 @@ pub(super) async fn checkpoint_impl(
 
     // Everything between pause and resume is fallible (chroot dir setup,
     // chown, the snapshot RPC). Run it in a block whose result is handled
-    // only AFTER an unconditional resume — a bare `?` here previously left
-    // the guest paused forever, wedging every later RPC. Returns the chroot
-    // snapshot dir (jailer mode) to move afterward.
+    // only AFTER the resume — a bare `?` here previously left the guest
+    // paused forever, wedging every later RPC. Returns the chroot snapshot
+    // dir (jailer mode) to move afterward.
     //
     // In jailer mode FC runs inside a chroot and can only write to paths
     // within it, so the snapshot is written to a chroot-local dir and moved
@@ -159,12 +185,18 @@ pub(super) async fn checkpoint_impl(
     }
     .await;
 
-    // Always resume, regardless of how the paused section fared.
-    let _ = vm.resume().await;
+    // Always resume, regardless of how the paused section fared — unless the
+    // caller owns the resume decision (pause).
+    if resume_after {
+        let _ = vm.resume().await;
+    }
 
     let chroot_snap_dir_opt = paused?;
 
-    // If jailer mode, move snapshot files from the chroot into staging.
+    // If jailer mode, move snapshot files from the chroot into staging. The
+    // guest is either resumed (and the files complete, FC having flushed
+    // them before returning) or deliberately left paused, so in both cases
+    // nothing is still writing to them.
     if let Some(chroot_snap) = chroot_snap_dir_opt {
         move_file(&chroot_snap.join("vmstate"), &staging_dir.join("vmstate"))
             .await
@@ -222,6 +254,14 @@ impl SandboxManager {
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
         self.check_reconcile()?;
+        // The pause machinery owns this name: Remove deletes every snapshot
+        // carrying it, so a user checkpoint must not squat on it (CORE-21).
+        if name == super::pause::PAUSE_SNAPSHOT_NAME {
+            return Err(VmmError::Config(format!(
+                "checkpoint name {:?} is reserved for sandbox pause",
+                super::pause::PAUSE_SNAPSHOT_NAME
+            )));
+        }
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
@@ -230,8 +270,12 @@ impl SandboxManager {
             &self.snapshots,
             &self.config,
             sandbox_id,
-            name,
-            labels,
+            CheckpointRequest {
+                name,
+                labels,
+                expected_state: SandboxState::Ready,
+                resume_after: true,
+            },
         )
         .await
     }
@@ -291,6 +335,7 @@ impl SandboxManager {
             &self.config,
             &self.cow_manager,
             &self.records,
+            &self.snapshots,
         )
         .await
         .err();
@@ -386,6 +431,16 @@ impl SandboxManager {
         // Resolve read-only prerequisites before claiming durable ownership.
         // Once the intent exists, every failure goes through rollback.
         let snap_meta = self.snapshots.find_by_id(&request.snapshot_id)?;
+        // A pause checkpoint pairs with its sandbox's retained disk overlay;
+        // cloning it with a fresh overlay would silently discard that disk
+        // state. Resume is the only consumer (CORE-21).
+        if snap_meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
+            return Err(VmmError::WrongState {
+                id: request.snapshot_id.clone(),
+                expected: "a user checkpoint".into(),
+                actual: "the internal pause checkpoint of a paused sandbox".into(),
+            });
+        }
         let jailer = self.config.firecracker.jailer.as_ref().ok_or_else(|| {
             VmmError::Config(
                 "checkpoint restore requires jailer isolation; direct mode embeds shared origin paths"
@@ -933,6 +988,7 @@ impl SandboxManager {
             let config2 = Arc::clone(&self.config);
             let cow2 = Arc::clone(&self.cow_manager);
             let records = Arc::clone(&self.records);
+            let snapshots = Arc::clone(&self.snapshots);
             let id2 = new_id.clone();
             let ttl = request.spec.ttl_seconds;
             let armed_for = ttl_armed_for;
@@ -948,6 +1004,7 @@ impl SandboxManager {
                     &config2,
                     &cow2,
                     &records,
+                    &snapshots,
                 )
                 .await;
             });
@@ -1001,6 +1058,9 @@ impl SandboxManager {
     }
 
     /// List checkpoints, optionally filtered by origin sandbox ID.
+    ///
+    /// Internal pause checkpoints are hidden: they are lifecycle state, not
+    /// user-owned snapshots, and deleting one would strand a paused sandbox.
     pub fn list_checkpoints(&self, sandbox_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
         let infos = match sandbox_id {
             Some(sid) => self.snapshots.list(sid)?,
@@ -1008,6 +1068,7 @@ impl SandboxManager {
         };
         Ok(infos
             .into_iter()
+            .filter(|s| s.name.as_deref() != Some(super::pause::PAUSE_SNAPSHOT_NAME))
             .map(|s| CheckpointSummary {
                 id: s.id,
                 sandbox_id: s.vm_id,
@@ -1025,7 +1086,18 @@ impl SandboxManager {
 
     /// Delete a checkpoint by its ID, tearing down any pre-warmed restore
     /// slots staged from it first.
+    ///
+    /// Internal pause checkpoints are refused — deleting one would strand
+    /// its paused sandbox; they die with the sandbox via `Remove`.
     pub async fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
+        let meta = self.snapshots.find_by_id(snapshot_id)?;
+        if meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
+            return Err(VmmError::WrongState {
+                id: snapshot_id.to_owned(),
+                expected: "a user checkpoint".into(),
+                actual: "the internal pause checkpoint of a paused sandbox".into(),
+            });
+        }
         self.drain_pool(Some(snapshot_id)).await;
         self.snapshots.delete_by_id(snapshot_id)
     }

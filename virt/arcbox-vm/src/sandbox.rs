@@ -36,6 +36,7 @@ mod checkpoint;
 mod cleanup;
 mod execution;
 mod lifecycle;
+mod pause;
 mod persistence;
 mod pool;
 mod reconcile;
@@ -46,6 +47,7 @@ mod workload;
 pub use execution::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
+pub use pause::reason as pause_reason;
 pub use types::{
     CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
     SandboxInstance, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec,
@@ -122,9 +124,14 @@ impl SandboxManager {
             let instances = Arc::clone(&instances);
             tokio::spawn(async move {
                 let result = async {
-                    let swept =
-                        reconcile::sweep_orphans(&config, &network, &cow_manager, &snapshots)
-                            .await?;
+                    let swept = reconcile::sweep_orphans(
+                        &config,
+                        &network,
+                        &cow_manager,
+                        &snapshots,
+                        &records,
+                    )
+                    .await?;
                     let inactive = reconcile::normalize_durable_records(
                         &records,
                         Path::new(&config.firecracker.data_dir),

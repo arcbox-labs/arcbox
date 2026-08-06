@@ -224,6 +224,27 @@ impl CowManager {
     /// Returns a [`CowHandle`] whose `dm_device` field can be passed to
     /// Firecracker as the rootfs block device.
     pub async fn setup(&self, sandbox_id: &str, rootfs_path: &str) -> Result<CowHandle> {
+        self.assemble(sandbox_id, rootfs_path, false).await
+    }
+
+    /// Re-assemble the dm-snapshot for a paused sandbox from its preserved
+    /// COW file (CORE-21 resume).
+    ///
+    /// The snapshot table uses persistent mode (`P`), so the exception store
+    /// in the retained overlay carries every block the sandbox wrote before
+    /// it was paused. Unlike [`Self::setup`], the COW file must already
+    /// exist and match the template size, and no failure path deletes it —
+    /// the overlay is the sandbox's disk.
+    pub async fn reattach(&self, sandbox_id: &str, rootfs_path: &str) -> Result<CowHandle> {
+        self.assemble(sandbox_id, rootfs_path, true).await
+    }
+
+    async fn assemble(
+        &self,
+        sandbox_id: &str,
+        rootfs_path: &str,
+        reuse_existing_cow: bool,
+    ) -> Result<CowHandle> {
         validate_dm_name_suffix(sandbox_id)?;
         #[cfg(test)]
         if let Some(probe) = &self.test_probe {
@@ -372,10 +393,38 @@ impl CowManager {
             (loop_dev, sectors)
         };
 
-        // --- 2. Create sparse COW file (O(1), no actual I/O) ---------------
+        // --- 2. Create (or, on reattach, verify) the sparse COW file --------
+        //
+        // On reattach the overlay is the sandbox's retained disk, so every
+        // rollback below passes `cow_file: None` — a failed re-assembly must
+        // never delete it.
         let cow_file = self.cow_dir.join(format!("arcbox-cow-{sandbox_id}.img"));
         let cow_size = sectors * 512;
-        if let Err((e, owns_file)) = create_sparse_file(&cow_file, cow_size).await {
+        if reuse_existing_cow {
+            let verified = std::fs::metadata(&cow_file)
+                .map_err(|e| {
+                    VmmError::DeviceMapper(format!(
+                        "preserved cow file {}: {e}",
+                        cow_file.display()
+                    ))
+                })
+                .and_then(|metadata| {
+                    if metadata.len() == cow_size {
+                        Ok(())
+                    } else {
+                        Err(VmmError::DeviceMapper(format!(
+                            "preserved cow file {} is {} bytes but template needs {cow_size}",
+                            cow_file.display(),
+                            metadata.len()
+                        )))
+                    }
+                });
+            if let Err(e) = verified {
+                return Err(self
+                    .rollback_setup(sandbox_id, &template, None, None, None, e)
+                    .await);
+            }
+        } else if let Err((e, owns_file)) = create_sparse_file(&cow_file, cow_size).await {
             return Err(self
                 .rollback_setup(
                     sandbox_id,
@@ -387,6 +436,8 @@ impl CowManager {
                 )
                 .await);
         }
+        let rollback_cow_file = (!reuse_existing_cow).then_some(cow_file.clone());
+        let rollback_cow_file = rollback_cow_file.as_deref();
 
         // --- 3. Attach COW file as a loop device ----------------------------
         let cow_loop_result = {
@@ -399,7 +450,7 @@ impl CowManager {
             Ok(dev) => dev,
             Err(e) => {
                 return Err(self
-                    .rollback_setup(sandbox_id, &template, None, None, Some(&cow_file), e)
+                    .rollback_setup(sandbox_id, &template, None, None, rollback_cow_file, e)
                     .await);
             }
         };
@@ -416,7 +467,7 @@ impl CowManager {
                     &template,
                     Some(&dm_name),
                     Some(&cow_loop),
-                    Some(&cow_file),
+                    rollback_cow_file,
                     e,
                 )
                 .await);
@@ -524,6 +575,63 @@ impl CowManager {
         } else {
             Err(VmmError::DeviceMapper(failures.join("; ")))
         }
+    }
+
+    /// Tear down the dm device and COW loop but keep the COW file on disk.
+    ///
+    /// This is the pause half of CORE-21: the persistent (`P`) exception
+    /// store in the retained file preserves every written block, and
+    /// [`Self::reattach`] re-assembles the identical device on resume. A
+    /// failed step keeps the handle valid for retry, exactly like
+    /// [`Self::teardown_checked`].
+    pub async fn detach_keep_cow(&self, handle: &CowHandle) -> Result<()> {
+        #[cfg(test)]
+        if let Some(probe) = &self.test_probe {
+            probe.teardown(handle);
+            return Ok(());
+        }
+        let dmsetup = self
+            .dmsetup_bin
+            .as_deref()
+            .ok_or_else(|| VmmError::DeviceMapper("dmsetup binary not found".into()))?;
+        let mut failures = Vec::new();
+
+        if Path::new(&handle.dm_device).exists()
+            && let Err(error) = dmsetup_remove(dmsetup, &handle.dm_name).await
+        {
+            failures.push(format!("remove {}: {error}", handle.dm_name));
+        }
+        if failures.is_empty()
+            && loop_backs_path(&handle.cow_loop, &handle.cow_file)?
+            && let Err(error) = losetup_detach(BUSYBOX, &handle.cow_loop).await
+        {
+            failures.push(format!("detach {}: {error}", handle.cow_loop));
+        }
+
+        if failures.is_empty() {
+            self.release_template_ref(&handle.template_path, true)
+                .await?;
+            info!(sandbox = %handle.dm_name, "dm-snapshot detached, cow file retained");
+            Ok(())
+        } else {
+            Err(VmmError::DeviceMapper(failures.join("; ")))
+        }
+    }
+
+    /// Delete the COW file a pause left behind (sandbox Remove / TTL).
+    ///
+    /// Idempotent: a missing file is success. Any loop still backing the
+    /// file is detached first so the unlink actually frees the space.
+    pub async fn remove_preserved_cow(&self, sandbox_id: &str) -> Result<()> {
+        let cow_file = self.cow_dir.join(format!("arcbox-cow-{sandbox_id}.img"));
+        if !cow_file.exists() {
+            return Ok(());
+        }
+        for loop_device in loop_devices_for_backing_sync(&cow_file)? {
+            losetup_detach(BUSYBOX, &loop_device).await?;
+        }
+        remove_file_durable(&cow_file)?;
+        Ok(())
     }
 }
 
