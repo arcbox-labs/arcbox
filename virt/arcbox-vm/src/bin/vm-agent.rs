@@ -274,23 +274,44 @@ mod agent {
             }
         };
 
-        if let Err(e) = net_reconfig::apply(&cmd) {
-            eprintln!("agent: net reconfig failed: {e}");
-            let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
-            return;
-        }
+        let handler_started = std::time::Instant::now();
+        let steps = match net_reconfig::apply(&cmd) {
+            Ok(steps) => steps,
+            Err(e) => {
+                eprintln!("agent: net reconfig failed: {e}");
+                let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
+                return;
+            }
+        };
 
         // Repoint DNS at the new gateway, mirroring the boot-time setup_dns.
+        let resolv_started = std::time::Instant::now();
         let content = format!("nameserver {}\n", cmd.gateway);
         if let Err(e) = std::fs::write("/etc/resolv.conf", &content) {
             eprintln!("agent: net reconfig: failed to write /etc/resolv.conf: {e}");
         }
+        let clamp = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+        let resolv_ms = clamp(resolv_started.elapsed());
+        let handler_ms = clamp(handler_started.elapsed());
 
+        // Exit payload: [i32 code][i32 signal] plus six u32 millis (four
+        // per-ioctl, resolv write, whole handler) so the host can attribute
+        // reconfig latency. Hosts read the first 4 bytes only, so the
+        // extension is backward compatible.
+        let mut payload = [0u8; 32];
+        let timings = steps.iter().copied().chain([resolv_ms, handler_ms]);
+        for (slot, ms) in payload[8..].chunks_exact_mut(4).zip(timings) {
+            slot.copy_from_slice(&ms.to_le_bytes());
+        }
+        let _ = write_frame(&mut conn, MSG_EXIT, &payload);
+
+        // Console logging goes AFTER the response: /dev/console is the FC
+        // serial device, written byte-by-byte through nested MMIO exits —
+        // putting it before the reply held the restore RPC hostage to it.
         eprintln!(
             "agent: reconfigured eth0 to {}/{} via {}",
             cmd.ip, cmd.netmask, cmd.gateway
         );
-        let _ = write_frame(&mut conn, MSG_EXIT, &0i32.to_le_bytes());
     }
 
     /// eth0 re-addressing via raw `ioctl(2)`, self-contained so it works on
@@ -355,7 +376,17 @@ mod agent {
         }
 
         /// Set eth0's address + netmask and replace the default route.
-        pub fn apply(cmd: &NetReconfigCommand) -> Result<(), String> {
+        ///
+        /// Returns per-step millis `[addr, netmask, delrt, addrt]` so the
+        /// host can attribute reconfig latency (CORE-75 diagnostics).
+        pub fn apply(cmd: &NetReconfigCommand) -> Result<[u32; 4], String> {
+            let mut steps = [0u32; 4];
+            let mut mark = std::time::Instant::now();
+            let mut lap = |slot: &mut u32| {
+                *slot = u32::try_from(mark.elapsed().as_millis()).unwrap_or(u32::MAX);
+                mark = std::time::Instant::now();
+            };
+
             // SAFETY: plain socket(2) call; result checked below.
             let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
             if raw < 0 {
@@ -367,10 +398,12 @@ mod agent {
             let mut req = ifreq_with_addr(sockaddr_in(cmd.ip));
             ioctl(&fd, libc::SIOCSIFADDR, (&raw mut req).cast())
                 .map_err(|e| format!("SIOCSIFADDR: {e}"))?;
+            lap(&mut steps[0]);
 
             let mut req = ifreq_with_addr(sockaddr_in(cmd.netmask));
             ioctl(&fd, libc::SIOCSIFNETMASK, (&raw mut req).cast())
                 .map_err(|e| format!("SIOCSIFNETMASK: {e}"))?;
+            lap(&mut steps[1]);
 
             // The kernel flushes routes through the interface when its
             // primary address changes, but don't rely on that implicit
@@ -386,6 +419,7 @@ mod agent {
                     eprintln!("agent: net reconfig: SIOCDELRT stale default: {e}");
                 }
             }
+            lap(&mut steps[2]);
 
             // Add the default route via the new gateway.
             // SAFETY: rtentry is POD; fields set below, rest zeroed.
@@ -396,8 +430,9 @@ mod agent {
             route.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
             ioctl(&fd, libc::SIOCADDRT, (&raw mut route).cast())
                 .map_err(|e| format!("SIOCADDRT default via {}: {e}", cmd.gateway))?;
+            lap(&mut steps[3]);
 
-            Ok(())
+            Ok(steps)
         }
     }
 
