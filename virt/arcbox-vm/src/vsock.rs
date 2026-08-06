@@ -28,7 +28,7 @@
 //! | 0x07 | Host→Agent  | `[i32 LE signal]` — deliver to workload    |
 //! | 0x10 | Agent→Host  | raw stdout bytes                           |
 //! | 0x11 | Agent→Host  | raw stderr bytes                           |
-//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` (signal 0 = normal exit; old agents send only the 4-byte code) |
+//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` (signal 0 = normal exit; old agents send only the 4-byte code). Net-reconfig replies append six `u32 LE` micros — see [`ReconfigTimings`]. Readers key on payload length. |
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -546,23 +546,41 @@ async fn net_reconfig_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWri
             "net reconfig: agent returned exit code {code}"
         )));
     }
-    // Newer agents append six u32 millis (four per-ioctl, resolv write,
-    // whole handler) after the [code][signal] header — CORE-75 latency
-    // attribution.
-    if payload.len() >= 32 {
-        let step =
-            |i: usize| u32::from_le_bytes(payload[8 + i * 4..12 + i * 4].try_into().unwrap());
+    if let Some(t) = ReconfigTimings::parse(&payload) {
         info!(
-            addr_ms = step(0),
-            netmask_ms = step(1),
-            delrt_ms = step(2),
-            addrt_ms = step(3),
-            resolv_ms = step(4),
-            handler_ms = step(5),
+            addr_us = t.steps[0],
+            netmask_us = t.steps[1],
+            delrt_us = t.steps[2],
+            addrt_us = t.steps[3],
+            resolv_us = t.resolv,
+            handler_us = t.handler,
             "net reconfig guest split"
         );
     }
     Ok(())
+}
+
+/// Guest-side timing breakdown a net-reconfig `MSG_EXIT` reply may carry:
+/// six `u32 LE` microsecond values (four per-ioctl, resolv.conf write, whole
+/// handler) appended after the `[code][signal]` header — CORE-75 latency
+/// attribution. Absent from legacy agents; readers key on payload length.
+#[derive(Debug, PartialEq, Eq)]
+struct ReconfigTimings {
+    steps: [u32; 4],
+    resolv: u32,
+    handler: u32,
+}
+
+impl ReconfigTimings {
+    fn parse(payload: &[u8]) -> Option<Self> {
+        let extra = payload.get(8..32)?;
+        let at = |i: usize| u32::from_le_bytes(extra[i * 4..i * 4 + 4].try_into().unwrap());
+        Some(Self {
+            steps: [at(0), at(1), at(2), at(3)],
+            resolv: at(4),
+            handler: at(5),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -841,6 +859,43 @@ mod tests {
             msg.contains("agent returned exit code -1"),
             "unexpected error: {msg}"
         );
+        agent_handle.await.unwrap();
+    }
+
+    /// The extended 32-byte reply parses in the exact layout the agent
+    /// writes: `[code][signal]` then six u32 LE micros. A reply with an
+    /// extended payload must also still pass the success path end to end.
+    #[tokio::test]
+    async fn test_net_reconfig_timing_payload() {
+        // Layout mirror of vm-agent's handle_net_reconfig response builder.
+        let mut payload = [0u8; 32];
+        for (slot, us) in payload[8..]
+            .chunks_exact_mut(4)
+            .zip([1_u32, 2, 3, 4, 30_000, 40_000])
+        {
+            slot.copy_from_slice(&us.to_le_bytes());
+        }
+
+        assert_eq!(
+            ReconfigTimings::parse(&payload),
+            Some(ReconfigTimings {
+                steps: [1, 2, 3, 4],
+                resolv: 30_000,
+                handler: 40_000,
+            })
+        );
+        // Legacy shapes carry no timings.
+        assert_eq!(ReconfigTimings::parse(&0i32.to_le_bytes()), None);
+        assert_eq!(ReconfigTimings::parse(&[0u8; 8]), None);
+
+        let (mut agent, mut host) = tokio::io::duplex(1024);
+        let agent_handle = tokio::spawn(async move {
+            let _ = read_frame(&mut agent).await.unwrap();
+            write_frame(&mut agent, MSG_EXIT, &payload).await.unwrap();
+        });
+        net_reconfig_on_stream(&mut host, &reconfig_cmd())
+            .await
+            .expect("extended payload must still count as success");
         agent_handle.await.unwrap();
     }
 }
