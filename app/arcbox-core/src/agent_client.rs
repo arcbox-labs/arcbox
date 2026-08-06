@@ -17,10 +17,10 @@ use arcbox_connect::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CheckpointResponse, CreateSandboxRequest,
     CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk,
     GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, ReadFileRequest, RemoveSandboxRequest,
-    ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent, SandboxEventsRequest,
-    SandboxInfo, SignalExecutionRequest, StartExecutionRequest, StdinStatus, StopSandboxRequest,
-    WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
+    ListSnapshotsRequest, ListSnapshotsResponse, PauseSandboxRequest, ReadFileRequest,
+    RemoveSandboxRequest, ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent,
+    SandboxEventsRequest, SandboxInfo, SignalExecutionRequest, StartExecutionRequest, StdinStatus,
+    StopSandboxRequest, WaitExecutionRequest, WriteFileOpen, WriteStdinRequest, execution_event,
 };
 use arcbox_connect::v1::{
     AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
@@ -33,8 +33,9 @@ use arcbox_connect::v1::{
     MmapReadFileResponse, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
     RuntimeStatusRequest, RuntimeStatusResponse, SandboxCleanupResponse, SandboxCleanupTicket,
     SandboxPortForwardRemoveRequest, SandboxPortForwardRequest, SandboxPortForwardResponse,
-    SystemInfo, TerminalSize, WatchMemoryPressureRequest, WatchReadinessRequest,
-    WatchSandboxCleanupRequest, WatchStatsRequest,
+    SandboxResumeCommand, SandboxResumeResponse, SystemInfo, TerminalSize,
+    WatchMemoryPressureRequest, WatchReadinessRequest, WatchSandboxCleanupRequest,
+    WatchStatsRequest,
 };
 use arcbox_constants::ports::AGENT_PORT;
 use arcbox_constants::wire::MessageType;
@@ -1094,6 +1095,49 @@ impl AgentClient {
             MessageType::SandboxStopRequest,
             &payload,
             MessageType::SandboxStopResponse,
+        )
+        .await
+    }
+
+    /// Pauses a sandbox in the guest VM (checkpoint + release; CORE-21).
+    ///
+    /// Answers with the same durable network-cleanup ticket a Stop does —
+    /// pause quarantines the sandbox's TAP + IP for host-side cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_pause(
+        &mut self,
+        req: PauseSandboxRequest,
+    ) -> Result<SandboxCleanupResponse> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxPauseRequest,
+            &payload,
+            MessageType::SandboxPauseResponse,
+        )
+        .await
+    }
+
+    /// Resumes a paused sandbox in place (CORE-21).
+    ///
+    /// `req.reason` distinguishes an explicit Resume from the daemon's
+    /// transparent auto-resume; the guest surfaces it on the RESUMED event.
+    /// The response carries the fresh IP for host DNS re-registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_resume(
+        &mut self,
+        req: SandboxResumeCommand,
+    ) -> Result<SandboxResumeResponse> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxResumeRequest,
+            &payload,
+            MessageType::SandboxResumeResponse,
         )
         .await
     }
