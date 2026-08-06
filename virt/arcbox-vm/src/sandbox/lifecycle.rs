@@ -184,12 +184,16 @@ impl SandboxManager {
             ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(id)),
         };
         let generation = record.generation;
+        let ttl_deadline = record.ttl_deadline;
         let spec = record.effective_spec;
         let arc = reservation.instance();
         let mut creating_instance = arc.lock().unwrap();
         creating_instance.record_generation = Some(generation);
         creating_instance.labels.clone_from(&spec.labels);
         creating_instance.spec.clone_from(&spec);
+        // Computed by the durable record so a same-key create retry keeps
+        // the original cap instead of re-deriving it from a later "now".
+        creating_instance.ttl_deadline = ttl_deadline;
 
         // Reserve the IP without touching the host, durably journal it, then
         // materialize the TAP. No external resource exists before its cleanup
@@ -289,15 +293,13 @@ impl SandboxManager {
             }
         };
 
-        // Populate the reserved instance. Keep a Weak to identify this exact
-        // generation when its TTL timer fires (see expire_sandbox).
+        // Populate the reserved instance.
         creating_instance.network.clone_from(&net_alloc);
         // The boot bakes the invariant `ip=` identity unless the caller
         // supplied an explicit ip= (see do_boot); record which one this guest
         // runs so checkpoints carry the right restore contract.
         creating_instance.net_invariant =
             creating_instance.network.is_some() && !spec.boot_args.contains("ip=");
-        let ttl_armed_for = Arc::downgrade(&arc);
 
         // Retain the boot task so force/TTL removal can cancel and join it
         // before deleting the crash-recovery journal.
@@ -309,13 +311,12 @@ impl SandboxManager {
             let cow_manager = Arc::clone(&self.cow_manager);
             let records = Arc::clone(&self.records);
             let id_clone = id.clone();
-            let spec_clone = spec.clone();
             let net_alloc_clone = net_alloc;
             let (resource_handoff_tx, resource_handoff) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
                 boot_sandbox(
                     id_clone,
-                    spec_clone,
+                    spec,
                     net_alloc_clone,
                     vm_dir,
                     instances,
@@ -341,35 +342,9 @@ impl SandboxManager {
         // Publish only after removal can observe and join the boot task.
         let _ = self.events_tx.send(SandboxEvent::new(&id, action::CREATED));
 
-        // Spawn TTL expiry task if requested.
-        if spec.ttl_seconds > 0 {
-            let instances = Arc::clone(&self.instances);
-            let network = Arc::clone(&self.network);
-            let events_tx = self.events_tx.clone();
-            let config2 = Arc::clone(&self.config);
-            let cow2 = Arc::clone(&self.cow_manager);
-            let records = Arc::clone(&self.records);
-            let snapshots = Arc::clone(&self.snapshots);
-            let id2 = id.clone();
-            let ttl = spec.ttl_seconds;
-            let armed_for = ttl_armed_for;
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                super::cleanup::expire_sandbox(
-                    &id2,
-                    Some(generation),
-                    &armed_for,
-                    &instances,
-                    &network,
-                    &events_tx,
-                    &config2,
-                    &cow2,
-                    &records,
-                    &snapshots,
-                )
-                .await;
-            });
-        }
+        // Arm the TTL expiry timer if a deadline was set (re-armable via
+        // SetLifecycle, CORE-60).
+        self.arm_ttl_timer(&id);
 
         info!(sandbox_id = %id, "sandbox create requested (async boot started)");
         if let Some(error) = starting_durability_error {

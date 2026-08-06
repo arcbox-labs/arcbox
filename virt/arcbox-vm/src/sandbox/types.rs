@@ -50,6 +50,36 @@ impl std::fmt::Display for SandboxState {
 
 // Spec types (input to SandboxManager methods)
 
+/// What happens when a sandbox's idle timeout expires (CORE-21).
+///
+/// Mirrors `arcbox.sandbox.v1.IdleAction`; `UNSPECIFIED` resolves to the
+/// daemon default ([`IdleAction::Kill`]) at the service boundary, so this
+/// type only carries effective policies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleAction {
+    /// Destroy the sandbox and release all resources (Remove semantics).
+    #[default]
+    Kill,
+    /// Checkpoint to disk under the same id and release the VM.
+    Pause,
+}
+
+/// A partial lifecycle update applied by `SetLifecycle` (CORE-60).
+///
+/// `None` fields are left unchanged, so each knob can be adjusted
+/// independently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LifecycleUpdate {
+    /// Replace the hard maximum lifetime: expire this many seconds from
+    /// now (`Some(0)` removes the limit).
+    pub ttl_seconds: Option<u32>,
+    /// Replace the idle timeout (`Some(0)` disables idle detection).
+    pub idle_timeout_seconds: Option<u32>,
+    /// Replace the idle policy.
+    pub on_idle: Option<IdleAction>,
+}
+
 /// Network configuration supplied at sandbox creation time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxNetworkSpec {
@@ -105,6 +135,12 @@ pub struct SandboxSpec {
     pub ttl_seconds: u32,
     /// SSH public key injected via MMDS (None = no SSH setup).
     pub ssh_public_key: Option<String>,
+    /// Apply [`Self::on_idle`] after this many seconds without a running
+    /// execution (0 = no idle detection). Re-armed on every `Ready` edge;
+    /// file activity does NOT re-arm (CORE-21).
+    pub idle_timeout_seconds: u32,
+    /// What to do when the idle timeout expires.
+    pub on_idle: IdleAction,
 }
 
 /// Parameters to restore a sandbox from a checkpoint.
@@ -181,6 +217,10 @@ pub struct SandboxInstance {
     pub paused_at: Option<DateTime<Utc>>,
     /// Catalog id of the internal pause checkpoint (state == `Paused` only).
     pub pause_snapshot_id: Option<String>,
+    /// When the hard maximum lifetime fires (None = no limit). Seeded from
+    /// `spec.ttl_seconds` at creation; replaced from-now by `SetLifecycle`
+    /// (CORE-60).
+    pub ttl_deadline: Option<DateTime<Utc>>,
 }
 
 impl SandboxInstance {
@@ -233,6 +273,7 @@ impl SandboxInstance {
             net_invariant: false,
             paused_at: None,
             pause_snapshot_id: None,
+            ttl_deadline: None,
         }
     }
 
@@ -275,6 +316,12 @@ pub struct SandboxInfo {
     pub paused_at: Option<DateTime<Utc>>,
     /// On-disk footprint of retained pause state (checkpoint + overlay).
     pub storage_bytes: u64,
+    /// When the hard maximum lifetime fires (None = no limit).
+    pub ttl_deadline: Option<DateTime<Utc>>,
+    /// Idle timeout in seconds (0 = no idle detection).
+    pub idle_timeout_seconds: u32,
+    /// Action applied when the idle timeout expires.
+    pub on_idle: IdleAction,
 }
 
 /// Network details within `SandboxInfo`.

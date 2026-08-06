@@ -3,7 +3,7 @@
 
 use arcbox_connect::sandbox_v1;
 use arcbox_vm::{
-    CheckpointInfo, CheckpointSummary, ExecutionChannel, ExecutionSnapshot, ExitStatus,
+    CheckpointInfo, CheckpointSummary, ExecutionChannel, ExecutionSnapshot, ExitStatus, IdleAction,
     SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxState, SandboxSummary, StdinState,
 };
 use buffa_types::google::protobuf::Timestamp;
@@ -172,7 +172,18 @@ pub(super) fn info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
         error: info.error.unwrap_or_default(),
         paused_at: info.paused_at.map(timestamp).into(),
         storage_bytes: info.storage_bytes,
+        ttl_deadline: info.ttl_deadline.map(timestamp).into(),
+        idle_timeout_seconds: info.idle_timeout_seconds,
+        on_idle: idle_action_to_proto(info.on_idle).into(),
         ..Default::default()
+    }
+}
+
+/// Map the manager's effective idle policy onto the wire enum.
+pub(super) fn idle_action_to_proto(action: IdleAction) -> sandbox_v1::IdleAction {
+    match action {
+        IdleAction::Kill => sandbox_v1::IdleAction::Kill,
+        IdleAction::Pause => sandbox_v1::IdleAction::Pause,
     }
 }
 

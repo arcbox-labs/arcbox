@@ -185,20 +185,25 @@ fn armed_instance(
     }
 }
 
-/// TTL expiry: force-remove `id`, but only if the instance registered under it
+/// Deadline expiry: remove `id`, but only if the instance registered under it
 /// is still the one this timer was armed for.
 ///
 /// A sandbox that was removed and re-created under the same id (deterministic
 /// caller-supplied ids make this common) installs a fresh `Arc`. The captured
 /// `Weak` then points at a different — or dropped — instance, so the stale
 /// timer becomes a no-op instead of force-removing the unrelated new sandbox.
+///
+/// `force` distinguishes the two expiry classes: the TTL hard cap destroys
+/// regardless of activity (`true`), while the idle detector must never kill
+/// a sandbox that turned busy in the firing window — non-forced removal
+/// rejects `Running`/`Starting` (`false`). `cause` labels the logs.
 #[allow(
     clippy::type_complexity,
     reason = "manager storage type is shared here"
 )]
 #[allow(
     clippy::too_many_arguments,
-    reason = "detached TTL task captures the manager-owned resource set"
+    reason = "detached expiry task captures the manager-owned resource set"
 )]
 pub(super) async fn expire_sandbox(
     id: &str,
@@ -211,6 +216,8 @@ pub(super) async fn expire_sandbox(
     cow_manager: &Arc<CowManager>,
     records: &Arc<SandboxRecordStore>,
     snapshots: &Arc<crate::snapshot::SnapshotCatalog>,
+    force: bool,
+    cause: &str,
 ) {
     let mut retry_delay = TTL_REMOVE_RETRY_INITIAL;
     loop {
@@ -220,7 +227,7 @@ pub(super) async fn expire_sandbox(
         };
         match remove_sandbox_impl(
             id,
-            true,
+            force,
             &expected,
             instances,
             network,
@@ -237,14 +244,19 @@ pub(super) async fn expire_sandbox(
                 warn!(
                     sandbox_id = %id,
                     error,
+                    cause,
                     retry_millis = retry_delay.as_millis(),
-                    "TTL sandbox removal is not yet confirmed; retrying"
+                    "expired sandbox removal is not yet confirmed; retrying"
                 );
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = retry_delay.saturating_mul(2).min(TTL_REMOVE_RETRY_MAX);
             }
+            Err(VmmError::WrongState { .. }) if !force => {
+                debug!(sandbox_id = %id, cause, "sandbox became busy before expiry; skipping");
+                return;
+            }
             Err(error) => {
-                error!(sandbox_id = %id, error = %error, "TTL sandbox removal failed");
+                error!(sandbox_id = %id, error = %error, cause, "expired sandbox removal failed");
                 return;
             }
         }
@@ -409,6 +421,9 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
         paused_at: inst.paused_at,
         // Filled by the manager for paused sandboxes (it owns the paths).
         storage_bytes: 0,
+        ttl_deadline: inst.ttl_deadline,
+        idle_timeout_seconds: inst.spec.idle_timeout_seconds,
+        on_idle: inst.spec.on_idle,
     }
 }
 
@@ -527,6 +542,8 @@ mod tests {
                         &cow_manager,
                         &records,
                         &snapshots,
+                        true,
+                        "TTL",
                     )
                     .await;
                     Ok(())
@@ -662,6 +679,8 @@ mod tests {
                 &cow_manager,
                 &records,
                 &snapshots,
+                true,
+                "TTL",
             ),
         )
         .await

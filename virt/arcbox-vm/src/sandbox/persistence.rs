@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
+use super::types::IdleAction;
 use super::{SandboxId, SandboxSpec, validate_id};
 use crate::error::{Result, VmmError};
 
@@ -137,6 +138,12 @@ pub(super) struct SandboxRecord {
     /// When the sandbox reached `Paused` (None otherwise).
     #[serde(default)]
     pub(super) paused_at: Option<DateTime<Utc>>,
+    /// When the hard maximum lifetime fires (None = no limit). Seeded from
+    /// `effective_spec.ttl_seconds`; replaced by `SetLifecycle` (CORE-60).
+    /// Survives `redact_runtime_inputs` — unlike the seed seconds, the
+    /// deadline is durable lifecycle state, not a runtime input.
+    #[serde(default)]
+    pub(super) ttl_deadline: Option<DateTime<Utc>>,
 }
 
 /// Result of reserving a durable provisioning intent.
@@ -182,6 +189,8 @@ impl SandboxTransition {
 impl SandboxRecord {
     fn new(id: &str, request_key: &str, effective_spec: SandboxSpec) -> Self {
         let created_at = Utc::now();
+        let ttl_deadline = (effective_spec.ttl_seconds > 0)
+            .then(|| created_at + chrono::Duration::seconds(i64::from(effective_spec.ttl_seconds)));
 
         Self {
             version: RECORD_VERSION,
@@ -195,6 +204,7 @@ impl SandboxRecord {
             error: None,
             pause_snapshot_id: None,
             paused_at: None,
+            ttl_deadline,
         }
     }
 
@@ -514,6 +524,36 @@ impl SandboxRecordStore {
         let durability_error = self.save_unlocked(&record)?;
         Ok(DurableCommit {
             value: record,
+            durability_error,
+        })
+    }
+
+    /// Persists the resolved lifecycle knobs without changing the phase.
+    ///
+    /// Called by `SetLifecycle` (CORE-60) with the post-update values so a
+    /// paused sandbox reloaded after an agent restart keeps its (re-armed)
+    /// TTL deadline and idle policy.
+    pub(super) fn update_lifecycle(
+        &self,
+        id: &str,
+        generation: Uuid,
+        ttl_deadline: Option<DateTime<Utc>>,
+        idle_timeout_seconds: u32,
+        on_idle: IdleAction,
+    ) -> Result<DurableCommit<()>> {
+        let _guard = self.lock()?;
+        let mut record = self
+            .load_unlocked(id)?
+            .ok_or_else(|| VmmError::NotFound(id.to_owned()))?;
+        if record.generation != generation {
+            return Err(generation_mismatch(id, record.generation, generation));
+        }
+        record.ttl_deadline = ttl_deadline;
+        record.effective_spec.idle_timeout_seconds = idle_timeout_seconds;
+        record.effective_spec.on_idle = on_idle;
+        let durability_error = self.save_unlocked(&record)?;
+        Ok(DurableCommit {
+            value: (),
             durability_error,
         })
     }

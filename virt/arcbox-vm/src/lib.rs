@@ -53,9 +53,9 @@ pub use error::{Result, VmmError};
 pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
 pub use sandbox::pause_reason;
 pub use sandbox::{
-    CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
-    SandboxManager, SandboxMountSpec, SandboxNetworkIdentity, SandboxNetworkInfo,
-    SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
+    CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
+    SandboxEvent, SandboxId, SandboxInfo, SandboxManager, SandboxMountSpec, SandboxNetworkIdentity,
+    SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
 };
 pub use sandbox::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,

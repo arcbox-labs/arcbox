@@ -491,6 +491,7 @@ impl SandboxManager {
             instance.labels.clone_from(&record.effective_spec.labels);
             instance.spec = record.effective_spec;
             instance.created_at = record.created_at;
+            instance.ttl_deadline = record.ttl_deadline;
         }
 
         // Reserve network metadata, journal it, then materialize the TAP. This
@@ -965,7 +966,6 @@ impl SandboxManager {
             inst.ready_at = Some(Utc::now());
         }
         reservation.commit();
-        let ttl_armed_for = Arc::downgrade(&arc);
 
         let warm_create = matches!(request.origin, RestoreOrigin::WarmCreate);
         if warm_create {
@@ -979,36 +979,10 @@ impl SandboxManager {
             .events_tx
             .send(SandboxEvent::new(&new_id, action::READY));
 
-        // TTL expiry task — identity-guarded so a stale timer can't remove a
-        // same-id sandbox re-created after this one (see expire_sandbox).
-        if request.spec.ttl_seconds > 0 {
-            let instances = Arc::clone(&self.instances);
-            let network = Arc::clone(&self.network);
-            let events_tx = self.events_tx.clone();
-            let config2 = Arc::clone(&self.config);
-            let cow2 = Arc::clone(&self.cow_manager);
-            let records = Arc::clone(&self.records);
-            let snapshots = Arc::clone(&self.snapshots);
-            let id2 = new_id.clone();
-            let ttl = request.spec.ttl_seconds;
-            let armed_for = ttl_armed_for;
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                super::cleanup::expire_sandbox(
-                    &id2,
-                    Some(generation),
-                    &armed_for,
-                    &instances,
-                    &network,
-                    &events_tx,
-                    &config2,
-                    &cow2,
-                    &records,
-                    &snapshots,
-                )
-                .await;
-            });
-        }
+        // Arm the TTL expiry timer if a deadline was set — identity-guarded
+        // so a stale timer can't remove a same-id sandbox re-created after
+        // this one (see expire_sandbox), re-armable via SetLifecycle.
+        self.arm_ttl_timer(&new_id);
 
         // On a pool hit, spawn_ms covers records + network + the claim
         // itself (the phases that still ran) and stage_ms is genuinely 0 —
