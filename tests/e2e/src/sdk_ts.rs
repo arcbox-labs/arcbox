@@ -19,8 +19,10 @@ use crate::daemon::{DaemonConfig, DaemonHandle};
 use crate::metrics::RunMetrics;
 use crate::{env_flag, repo_root};
 
-/// Generous ceiling for daemon startup (asset staging + VM boot + agent).
-const READY_TIMEOUT: Duration = Duration::from_secs(180);
+/// Generous ceiling for daemon startup: asset staging + the cold
+/// ~255 MiB runtime-binary download into the isolated data dir + VM boot
+/// + agent (same budget as the sandbox smoke; measured 2026-08-06).
+const READY_TIMEOUT: Duration = Duration::from_secs(360);
 /// Ceiling for the whole vitest run: one sandbox boot (which may include
 /// the first in-guest rootfs build) plus a handful of executions. Vitest's
 /// own per-test timeout is 300s; this only catches a wedged runner.
