@@ -1,6 +1,6 @@
 use super::boot::{
-    chroot_root, link_or_copy_for_jailer, stage_kernel_for_jailer, stage_rootfs_copy_for_jailer,
-    stage_rootfs_device_for_jailer,
+    StageError, chroot_root, stage_kernel_for_jailer, stage_rootfs_cow_or_copy,
+    stage_snapshot_files,
 };
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::action;
@@ -408,15 +408,21 @@ impl SandboxManager {
             clippy::cast_possible_wrap,
             reason = "Firecracker pid fits platform pid_t"
         )]
-        let spawned_record = super::reconcile::SandboxStateRecord::new(
-            &new_id,
-            process.pid().map(|pid| pid as i32),
-            net_alloc.as_ref(),
-            None,
-            self.config.firecracker.jailer.is_some(),
-            None,
-        );
-        if let Err(error) = super::reconcile::write_state_record(&vm_dir, &spawned_record) {
+        let pid = process.pid().map(|pid| pid as i32);
+        let journal = |cow: Option<&CowHandle>| {
+            super::reconcile::write_state_record(
+                &vm_dir,
+                &super::reconcile::SandboxStateRecord::new(
+                    &new_id,
+                    pid,
+                    net_alloc.as_ref(),
+                    cow,
+                    true,
+                    None,
+                ),
+            )
+        };
+        if let Err(error) = journal(None) {
             return Err(self
                 .rollback_restore(&new_id, reservation, error, Some(process), net_alloc, None)
                 .await);
@@ -431,84 +437,31 @@ impl SandboxManager {
             let jc = jailer;
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
             let cr = chroot_root(&fc_cfg.binary, base, &new_id);
-            let snap_in_chroot = cr.join("snapshots").join(&spec.snapshot_id);
-            std::fs::create_dir_all(&snap_in_chroot).map_err(VmmError::Io)?;
-            let uid = nix::unistd::Uid::from_raw(jc.uid);
-            let gid = nix::unistd::Gid::from_raw(jc.gid);
-            nix::unistd::chown(&snap_in_chroot, Some(uid), Some(gid))
-                .map_err(|e| VmmError::Process(format!("chown snap dir: {e}")))?;
 
-            // Stage kernel (always copied, ~16MB).
+            // Stage kernel (always hard-linked or copied, ~16MB).
             if let Some(k) = snap_meta.kernel_path.as_deref() {
                 stage_kernel_for_jailer(&cr, k, jc.uid, jc.gid).await?;
             }
 
-            // Stage rootfs: try dm-snapshot + mknod, fall back to full copy.
-            // Mirrors the boot path so restored sandboxes get the same CoW
-            // semantics (block-level sharing of the template, sparse COW).
+            // Stage rootfs: dm-snapshot + mknod with full-copy fallback,
+            // mirroring the boot path so restored sandboxes get the same CoW
+            // semantics (block-level template sharing, sparse COW).
             if let Some(r) = snap_meta.rootfs_path.as_deref() {
-                match self.cow_manager.setup(&new_id, r).await {
-                    Ok(handle) => {
-                        pending_cow = Some(handle);
-                        #[allow(
-                            clippy::cast_possible_wrap,
-                            reason = "Firecracker pid fits platform pid_t"
-                        )]
-                        let record = super::reconcile::SandboxStateRecord::new(
-                            &new_id,
-                            process.pid().map(|pid| pid as i32),
-                            net_alloc.as_ref(),
-                            pending_cow.as_ref(),
-                            true,
-                            None,
-                        );
-                        super::reconcile::write_state_record(&vm_dir, &record)?;
-                        match stage_rootfs_device_for_jailer(
-                            &cr,
-                            &pending_cow.as_ref().unwrap().dm_device,
-                            jc.uid,
-                            jc.gid,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => {
-                                debug!(
-                                    sandbox_id = %new_id,
-                                    error = %e,
-                                    "mknod failed on restore, falling back to rootfs copy"
-                                );
-                                self.cow_manager
-                                    .teardown_checked(pending_cow.as_ref().unwrap())
-                                    .await?;
-                                pending_cow = None;
-                                #[allow(
-                                    clippy::cast_possible_wrap,
-                                    reason = "Firecracker pid fits platform pid_t"
-                                )]
-                                let record = super::reconcile::SandboxStateRecord::new(
-                                    &new_id,
-                                    process.pid().map(|pid| pid as i32),
-                                    net_alloc.as_ref(),
-                                    None,
-                                    true,
-                                    None,
-                                );
-                                super::reconcile::write_state_record(&vm_dir, &record)?;
-                                stage_rootfs_copy_for_jailer(&cr, r, jc.uid, jc.gid).await?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if matches!(e, VmmError::Unavailable(_)) {
-                            return Err(e);
-                        }
-                        debug!(
-                            sandbox_id = %new_id,
-                            error = %e,
-                            "dm-snapshot unavailable on restore, copying rootfs"
-                        );
-                        stage_rootfs_copy_for_jailer(&cr, r, jc.uid, jc.gid).await?;
+                match stage_rootfs_cow_or_copy(
+                    &self.cow_manager,
+                    &cr,
+                    &new_id,
+                    r,
+                    jc.uid,
+                    jc.gid,
+                    &journal,
+                )
+                .await
+                {
+                    Ok(cow) => pending_cow = cow,
+                    Err(StageError { error, cow_handle }) => {
+                        pending_cow = cow_handle;
+                        return Err(error);
                     }
                 }
             }
@@ -517,23 +470,7 @@ impl SandboxManager {
             // (mem is mapped MAP_PRIVATE on load), so the root jailer
             // hard-links them instead of copying — the mem file is the
             // sandbox's full memory size (CORE-75).
-            let dst_vmstate = snap_in_chroot.join("vmstate");
-            link_or_copy_for_jailer(&snap_meta.vmstate_path, &dst_vmstate, jc.uid, jc.gid).await?;
-
-            let effective_mem = if let Some(ref mf) = snap_meta.mem_path
-                && mf.exists()
-            {
-                let dst_mem = snap_in_chroot.join("mem");
-                link_or_copy_for_jailer(mf, &dst_mem, jc.uid, jc.gid).await?;
-                Some(format!("/snapshots/{}/mem", spec.snapshot_id))
-            } else {
-                None
-            };
-
-            Ok((
-                format!("/snapshots/{}/vmstate", spec.snapshot_id),
-                effective_mem,
-            ))
+            stage_snapshot_files(&cr, &snap_meta, jc.uid, jc.gid).await
         }
         .await;
 

@@ -553,6 +553,106 @@ pub(super) async fn stage_rootfs_device_for_jailer(
     Ok("/rootfs.ext4".to_string())
 }
 
+/// A failed restore-staging step, carrying whichever CoW resources were
+/// acquired before the failure so the caller can roll them back.
+pub(super) struct StageError {
+    pub error: VmmError,
+    pub cow_handle: Option<CowHandle>,
+}
+
+/// Stage a snapshot's rootfs into a jailer chroot: dm-snapshot + mknod
+/// when device-mapper is available, full copy otherwise.
+///
+/// `owner_id` keys the dm/CoW resource names (the sandbox id, or a pool
+/// slot id for pre-warmed slots). `journal` persists the caller's crash
+/// record whenever CoW resources appear or disappear, so reconciliation
+/// can always identify them. Returns the CoW handle when the dm path was
+/// taken; the staged rootfs is `/rootfs.ext4` inside the chroot either way.
+pub(super) async fn stage_rootfs_cow_or_copy(
+    cow_manager: &CowManager,
+    chroot: &Path,
+    owner_id: &str,
+    rootfs: &str,
+    uid: u32,
+    gid: u32,
+    journal: &(dyn Fn(Option<&CowHandle>) -> Result<()> + Sync),
+) -> std::result::Result<Option<CowHandle>, StageError> {
+    let fail = |error: VmmError, cow_handle: Option<CowHandle>| StageError { error, cow_handle };
+    match cow_manager.setup(owner_id, rootfs).await {
+        Ok(handle) => {
+            if let Err(error) = journal(Some(&handle)) {
+                return Err(fail(error, Some(handle)));
+            }
+            match stage_rootfs_device_for_jailer(chroot, &handle.dm_device, uid, gid).await {
+                Ok(_) => Ok(Some(handle)),
+                Err(e) => {
+                    debug!(
+                        owner_id,
+                        error = %e,
+                        "mknod failed, falling back to rootfs copy"
+                    );
+                    if let Err(error) = cow_manager.teardown_checked(&handle).await {
+                        return Err(fail(error, Some(handle)));
+                    }
+                    journal(None).map_err(|error| fail(error, None))?;
+                    stage_rootfs_copy_for_jailer(chroot, rootfs, uid, gid)
+                        .await
+                        .map_err(|error| fail(error, None))?;
+                    Ok(None)
+                }
+            }
+        }
+        Err(e) if matches!(e, VmmError::Unavailable(_)) => Err(fail(e, None)),
+        Err(e) => {
+            debug!(
+                owner_id,
+                error = %e,
+                "dm-snapshot unavailable, copying rootfs into chroot"
+            );
+            stage_rootfs_copy_for_jailer(chroot, rootfs, uid, gid)
+                .await
+                .map_err(|error| fail(error, None))?;
+            Ok(None)
+        }
+    }
+}
+
+/// Stage a snapshot's vmstate/mem into `{chroot}/snapshots/{snapshot_id}`
+/// via [`link_or_copy_for_jailer`] and return their chroot-relative paths
+/// `(vmstate, mem)` for `SnapshotLoadParams`.
+pub(super) async fn stage_snapshot_files(
+    chroot: &Path,
+    snapshot: &crate::snapshot::SnapshotMeta,
+    uid: u32,
+    gid: u32,
+) -> Result<(String, Option<String>)> {
+    let snap_in_chroot = chroot.join("snapshots").join(&snapshot.id);
+    std::fs::create_dir_all(&snap_in_chroot).map_err(VmmError::Io)?;
+    chown(
+        &snap_in_chroot,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )
+    .map_err(|e| VmmError::Process(format!("chown snap dir: {e}")))?;
+
+    link_or_copy_for_jailer(
+        &snapshot.vmstate_path,
+        &snap_in_chroot.join("vmstate"),
+        uid,
+        gid,
+    )
+    .await?;
+    let mem = if let Some(ref mf) = snapshot.mem_path
+        && mf.exists()
+    {
+        link_or_copy_for_jailer(mf, &snap_in_chroot.join("mem"), uid, gid).await?;
+        Some(format!("/snapshots/{}/mem", snapshot.id))
+    } else {
+        None
+    };
+    Ok((format!("/snapshots/{}/vmstate", snapshot.id), mem))
+}
+
 /// Create a stable `{vm_dir}/rootfs.link` symlink pointing at the dm-snapshot
 /// device.  Returns the symlink path as a string for Firecracker to use as the
 /// rootfs.  The vmstate records this path verbatim, so on restore we can
