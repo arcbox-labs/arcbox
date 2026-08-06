@@ -11,7 +11,37 @@ use uuid::Uuid;
 
 use crate::error::{Result, VmmError};
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "TAP translation executes only on Linux; other platforms keep the pure rule builders for unit tests"
+    )
+)]
+pub mod invariant;
 mod quarantine;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "the netlink send is Linux-gated; other platforms keep the encoders for unit tests"
+    )
+)]
+mod rtnetlink;
+
+/// Host-side addressing scheme applied when a sandbox TAP is materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TapMode {
+    /// Fixed guest identity + per-TAP 1:1 NAT (CORE-81): the TAP's local
+    /// address is [`invariant::GUEST_GATEWAY`] and the pool IP is translated
+    /// host-side. Every fresh boot and every invariant-snapshot restore.
+    Invariant,
+    /// The pre-invariant shape: the TAP's local address is the pool gateway
+    /// and the guest owns the pool IP directly. Only restores of legacy
+    /// snapshots (no `net_invariant` marker), whose guests are re-addressed
+    /// over the reconfig RPC.
+    LegacySnapshot,
+}
 
 /// Default prefix length for backwards-compatible deserialization of records
 /// that predate the `prefix_len` field.
@@ -162,9 +192,13 @@ impl NetworkManager {
     /// On Linux this creates a persistent TAP device with a point-to-point IP
     /// configuration (gateway ↔ sandbox IP). The call is best-effort on
     /// non-Linux platforms (tests / macOS CI).
+    ///
+    /// General (non-sandbox) VMs boot the pool identity directly, so this
+    /// keeps the legacy TAP shape; the sandbox lifecycle activates invariant
+    /// TAPs via [`Self::activate`].
     pub fn allocate(&self, vm_id: &str) -> Result<NetworkAllocation> {
         let allocation = self.reserve(vm_id)?;
-        if let Err(error) = self.activate(&allocation) {
+        if let Err(error) = self.activate(&allocation, TapMode::LegacySnapshot) {
             self.release(&allocation);
             return Err(error);
         }
@@ -197,18 +231,40 @@ impl NetworkManager {
     }
 
     /// Materializes a previously reserved network allocation.
+    ///
+    /// In [`TapMode::Invariant`] the TAP's local address is the fixed
+    /// [`invariant::GUEST_GATEWAY`] and the per-TAP 1:1 NAT (pool IP ↔ fixed
+    /// guest IP) is installed alongside; in [`TapMode::LegacySnapshot`] the
+    /// TAP carries the pool gateway and no translation, matching guests that
+    /// own the pool IP directly.
     #[allow(
         clippy::unnecessary_wraps,
         reason = "Linux TAP activation is fallible; macOS test builds compile the no-op branch"
     )]
-    pub(crate) fn activate(&self, allocation: &NetworkAllocation) -> Result<()> {
+    pub(crate) fn activate(&self, allocation: &NetworkAllocation, mode: TapMode) -> Result<()> {
         info!(
             tap = %allocation.tap_name,
             ip = %allocation.ip_address,
+            ?mode,
             "activating sandbox network"
         );
         #[cfg(target_os = "linux")]
-        self.create_tap(&allocation.tap_name, allocation.ip_address)?;
+        {
+            let local = match mode {
+                TapMode::Invariant => invariant::GUEST_GATEWAY,
+                TapMode::LegacySnapshot => self.gateway,
+            };
+            self.create_tap(&allocation.tap_name, local, allocation.ip_address)?;
+            if mode == TapMode::Invariant
+                && let Err(error) = invariant::install(&allocation.tap_name, allocation.ip_address)
+            {
+                // Unwind the partial translation and the TAP so a failed
+                // activation leaves no half-translated interface behind.
+                let _ = invariant::remove(&allocation.tap_name, allocation.ip_address);
+                destroy_tap(&allocation.tap_name);
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -230,6 +286,10 @@ impl NetworkManager {
         reason = "Linux TAP cleanup is fallible; macOS test builds compile the no-op branch"
     )]
     pub(crate) fn release_checked(&self, alloc: &NetworkAllocation) -> Result<()> {
+        // Translation rules do not die with the device; remove them first
+        // (tolerant of absence, so legacy TAPs are a no-op).
+        #[cfg(target_os = "linux")]
+        invariant::remove(&alloc.tap_name, alloc.ip_address)?;
         #[cfg(target_os = "linux")]
         destroy_tap_checked(&alloc.tap_name)?;
 
@@ -266,7 +326,7 @@ impl NetworkManager {
     }
 
     #[cfg(target_os = "linux")]
-    fn create_tap(&self, tap_name: &str, ip: Ipv4Addr) -> Result<()> {
+    fn create_tap(&self, tap_name: &str, local: Ipv4Addr, ip: Ipv4Addr) -> Result<()> {
         use std::os::fd::FromRawFd;
         use std::os::unix::io::AsRawFd;
 
@@ -341,9 +401,10 @@ impl NetworkManager {
             )));
         }
 
-        // 3. Configure point-to-point IP on TAP host end (gateway IP) so the
-        //    sandbox can use it as its default gateway. Each TAP is an isolated
-        //    link — sandboxes cannot see each other at L2.
+        // 3. Configure point-to-point IP on TAP host end (the gateway the
+        //    guest routes through) so the sandbox can use it as its default
+        //    gateway. Each TAP is an isolated link — sandboxes cannot see
+        //    each other at L2.
         //
         // Wrap in a closure so a failure in any set_ifaddr triggers TAP cleanup.
         if let Err(e) = (|| -> Result<()> {
@@ -352,7 +413,7 @@ impl NetworkManager {
                 &sock,
                 &ifr,
                 libc::SIOCSIFADDR,
-                self.gateway,
+                local,
                 tap_name,
                 "SIOCSIFADDR",
             )?;

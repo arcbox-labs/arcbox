@@ -371,7 +371,16 @@ impl SandboxManager {
             );
             super::reconcile::write_state_record(&vm_dir, &cleanup_record)?;
             if let Some(network) = &net_alloc {
-                self.network.activate(network)?;
+                // The restored guest keeps the addressing its snapshot baked:
+                // invariant snapshots pair with an invariant TAP (host-side
+                // NAT, no guest work); legacy snapshots keep the legacy TAP
+                // shape and are re-addressed over the reconfig RPC below.
+                let mode = if snap_meta.net_invariant {
+                    crate::network::TapMode::Invariant
+                } else {
+                    crate::network::TapMode::LegacySnapshot
+                };
+                self.network.activate(network, mode)?;
             }
             Ok(())
         })();

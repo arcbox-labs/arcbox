@@ -123,7 +123,8 @@ impl SandboxManager {
             );
             super::reconcile::write_state_record(&vm_dir, &cleanup_record)?;
             if let Some(net) = &net_alloc {
-                self.network.activate(net)?;
+                self.network
+                    .activate(net, crate::network::TapMode::Invariant)?;
             }
 
             let outcome = SandboxProvisionOutcome {
@@ -188,6 +189,11 @@ impl SandboxManager {
         // Populate the reserved instance. Keep a Weak to identify this exact
         // generation when its TTL timer fires (see expire_sandbox).
         creating_instance.network.clone_from(&net_alloc);
+        // The boot bakes the invariant `ip=` identity unless the caller
+        // supplied an explicit ip= (see do_boot); record which one this guest
+        // runs so checkpoints carry the right restore contract.
+        creating_instance.net_invariant =
+            creating_instance.network.is_some() && !spec.boot_args.contains("ip=");
         let ttl_armed_for = Arc::downgrade(&arc);
 
         // Retain the boot task so force/TTL removal can cancel and join it
