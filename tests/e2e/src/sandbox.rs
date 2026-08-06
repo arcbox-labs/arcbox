@@ -37,11 +37,12 @@ use crate::daemon::{DaemonConfig, DaemonHandle, connect_unix};
 use crate::metrics::RunMetrics;
 use crate::{env_flag, repo_root};
 
-/// Generous ceiling for daemon startup (asset staging + VM boot + agent).
-/// Sized for a cold CDN fetch of the runtime binaries: measured startups
-/// reach 150-180s when the CDN is slow, and the guest runtime
-/// materialization added to the budget in v0.8.
-const READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Generous ceiling for daemon startup: asset staging + the cold
+/// ~255 MiB runtime-binary download into the isolated data dir (dockerd,
+/// containerd, k3s, FEX, ...) + the guest runtime materialization added in
+/// v0.8 + VM boot + agent. Measured 2026-08-06: a constrained uplink put
+/// the download alone at ~180 s.
+const READY_TIMEOUT: Duration = Duration::from_secs(360);
 /// Ceiling for a sandbox to reach `ready` (includes the first default
 /// rootfs build inside the guest).
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);
