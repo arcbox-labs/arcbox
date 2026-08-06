@@ -11,6 +11,12 @@ use uuid::Uuid;
 
 use crate::error::{Result, VmmError};
 
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "the datapath selection that consumes the loader lands with the NetworkManager wiring"
+)]
+mod ebpf;
 #[cfg_attr(
     not(target_os = "linux"),
     allow(
