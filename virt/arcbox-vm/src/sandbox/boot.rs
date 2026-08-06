@@ -4,6 +4,11 @@ use super::*;
 
 type BootOutput = (Arc<fc_sdk::Vm>, PathBuf);
 
+/// How long the agent-readiness gate waits for vm-agent to answer over vsock
+/// before the boot is declared failed. Covers guest kernel boot plus agent
+/// startup; `sync_clock`'s internal connect retries share this budget.
+const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct BootFailure {
     error: VmmError,
     process: Option<fc_sdk::FirecrackerProcess>,
@@ -42,8 +47,6 @@ pub(super) async fn boot_sandbox(
     .await
     {
         Ok((vm, vsock_uds_path)) => {
-            let ready_at = Utc::now();
-
             let current = instances.read().unwrap().get(&id).cloned();
             let is_current_generation = current
                 .as_ref()
@@ -52,6 +55,45 @@ pub(super) async fn boot_sandbox(
                 info!(sandbox_id = %id, "stale sandbox boot completed");
                 return;
             }
+
+            // READY promises "accepting executions", but InstanceStart returns
+            // while the guest kernel is still booting and vm-agent is not yet
+            // listening. Gate the transition on a completed agent round trip:
+            // sync_clock doubles as the readiness probe and sets the guest
+            // clock on cold boot the same way the restore path already does.
+            let agent_ready =
+                match tokio::time::timeout(AGENT_GATE_TIMEOUT, vsock::sync_clock(&vsock_uds_path))
+                    .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => {
+                        Err(VmmError::Vsock(format!("agent readiness gate: {error}")))
+                    }
+                    Err(_) => Err(VmmError::Vsock(format!(
+                        "agent readiness gate: vm-agent did not answer within {}s",
+                        AGENT_GATE_TIMEOUT.as_secs()
+                    ))),
+                };
+            if let Err(gate_error) = agent_ready {
+                let message = gate_error.to_string();
+                fail_started_boot(
+                    &id,
+                    generation,
+                    &message,
+                    &vm_dir,
+                    &instances,
+                    &network,
+                    &config,
+                    &cow_manager,
+                    &records,
+                    &events_tx,
+                )
+                .await;
+                error!(sandbox_id = %id, error = %gate_error, "sandbox agent readiness gate failed");
+                return;
+            }
+
+            let ready_at = Utc::now();
 
             // do_boot persisted every cleanup resource before completing the
             // handoff, so only the lifecycle phase remains to make Ready.
@@ -66,58 +108,19 @@ pub(super) async fn boot_sandbox(
                     });
             if let Err(record_error) = durable_ready {
                 let message = format!("failed to persist ready state: {record_error}");
-                let value = instances.read().unwrap().get(&id).cloned();
-                let cleanup_lock = value
-                    .as_ref()
-                    .map(|arc| arc.lock().unwrap().cleanup_lock.clone());
-                let _cleanup_guard = match cleanup_lock.as_ref() {
-                    Some(lock) => Some(lock.lock().await),
-                    None => None,
-                };
-                let mut updated_current = false;
-                let mut failure_record_error = None;
-                let mut failure_record_visible = false;
-                if let Some(ref arc) = value {
-                    let mut inst = arc.lock().unwrap();
-                    if can_mark_boot_failed(&inst, generation) {
-                        (failure_record_visible, failure_record_error) =
-                            persist_boot_failure(&records, &id, generation, &message);
-                        inst.state = SandboxState::Failed;
-                        inst.error = Some(message.clone());
-                        updated_current = true;
-                    }
-                }
-                let cleanup_complete = if updated_current {
-                    match super::cleanup::release_runtime_resources(
-                        &id,
-                        value.as_ref().unwrap(),
-                        &network,
-                        &config,
-                        &cow_manager,
-                    )
-                    .await
-                    {
-                        Ok(()) => true,
-                        Err(error) => {
-                            error!(sandbox_id = %id, error = %error, "boot failure cleanup incomplete");
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                if failure_record_visible && cleanup_complete {
-                    if let Err(error) = super::reconcile::clear_state_record(&vm_dir) {
-                        error!(sandbox_id = %id, error = %error, "boot failure journal cleanup is not durable");
-                    }
-                }
-                if updated_current {
-                    let _ = events_tx
-                        .send(SandboxEvent::new(&id, action::FAILED).with_attr("error", &message));
-                }
-                if let Some(error) = failure_record_error {
-                    error!(sandbox_id = %id, error, "failed to persist sandbox boot failure");
-                }
+                fail_started_boot(
+                    &id,
+                    generation,
+                    &message,
+                    &vm_dir,
+                    &instances,
+                    &network,
+                    &config,
+                    &cow_manager,
+                    &records,
+                    &events_tx,
+                )
+                .await;
                 error!(sandbox_id = %id, error = %record_error, "sandbox ready state was not durable");
                 return;
             }
@@ -270,6 +273,80 @@ fn persist_boot_failure(
             None => (true, None),
         },
         Err(error) => (false, Some(error.to_string())),
+    }
+}
+
+/// Fail a boot whose VM process already started and whose cleanup resources
+/// were all transferred to the instance: persist the failure, flip the
+/// instance to `Failed`, release runtime resources, clear the boot journal,
+/// and broadcast the FAILED event. Shared by the agent-readiness gate and the
+/// durable-Ready persistence check; each caller logs its own context line.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "failure handling spans the boot task's captured manager state"
+)]
+async fn fail_started_boot(
+    id: &SandboxId,
+    generation: Uuid,
+    message: &str,
+    vm_dir: &Path,
+    instances: &super::InstanceMap,
+    network: &Arc<NetworkManager>,
+    config: &Arc<VmmConfig>,
+    cow_manager: &Arc<CowManager>,
+    records: &SandboxRecordStore,
+    events_tx: &broadcast::Sender<SandboxEvent>,
+) {
+    let value = instances.read().unwrap().get(id).cloned();
+    let cleanup_lock = value
+        .as_ref()
+        .map(|arc| arc.lock().unwrap().cleanup_lock.clone());
+    let _cleanup_guard = match cleanup_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    let mut updated_current = false;
+    let mut failure_record_error = None;
+    let mut failure_record_visible = false;
+    if let Some(ref arc) = value {
+        let mut inst = arc.lock().unwrap();
+        if can_mark_boot_failed(&inst, generation) {
+            (failure_record_visible, failure_record_error) =
+                persist_boot_failure(records, id, generation, message);
+            inst.state = SandboxState::Failed;
+            inst.error = Some(message.to_owned());
+            updated_current = true;
+        }
+    }
+    let cleanup_complete = if updated_current {
+        match super::cleanup::release_runtime_resources(
+            id,
+            value.as_ref().unwrap(),
+            network,
+            config,
+            cow_manager,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                error!(sandbox_id = %id, error = %error, "boot failure cleanup incomplete");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if failure_record_visible && cleanup_complete {
+        if let Err(error) = super::reconcile::clear_state_record(vm_dir) {
+            error!(sandbox_id = %id, error = %error, "boot failure journal cleanup is not durable");
+        }
+    }
+    if updated_current {
+        let _ = events_tx.send(SandboxEvent::new(id, action::FAILED).with_attr("error", message));
+    }
+    if let Some(error) = failure_record_error {
+        error!(sandbox_id = %id, error, "failed to persist sandbox boot failure");
     }
 }
 
