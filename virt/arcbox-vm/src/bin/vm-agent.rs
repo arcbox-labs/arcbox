@@ -26,7 +26,7 @@
 //! | 0x07 | Host→Agent  | `[i32 LE signal]` — signal the workload's process group |
 //! | 0x10 | Agent→Host  | raw stdout bytes                 |
 //! | 0x11 | Agent→Host  | raw stderr bytes                 |
-//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` — signal 0 = normal exit |
+//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` — signal 0 = normal exit. Net-reconfig replies append six `u32 LE` micros (addr/netmask/delrt/addrt ioctls, resolv write, whole handler); legacy agents send only the 4-byte code. Readers key on payload length. |
 //!
 //! This binary requires Linux — it uses AF_VSOCK, accept4, openpty, and fork,
 //! none of which are available on other platforms.  The workspace compiles the
@@ -290,16 +290,16 @@ mod agent {
         if let Err(e) = std::fs::write("/etc/resolv.conf", &content) {
             eprintln!("agent: net reconfig: failed to write /etc/resolv.conf: {e}");
         }
-        let clamp = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
-        let resolv_ms = clamp(resolv_started.elapsed());
-        let handler_ms = clamp(handler_started.elapsed());
+        let clamp = |d: std::time::Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX);
+        let resolv_us = clamp(resolv_started.elapsed());
+        let handler_us = clamp(handler_started.elapsed());
 
-        // Exit payload: [i32 code][i32 signal] plus six u32 millis (four
+        // Exit payload: [i32 code][i32 signal] plus six u32 micros (four
         // per-ioctl, resolv write, whole handler) so the host can attribute
         // reconfig latency. Hosts read the first 4 bytes only, so the
         // extension is backward compatible.
         let mut payload = [0u8; 32];
-        let timings = steps.iter().copied().chain([resolv_ms, handler_ms]);
+        let timings = steps.iter().copied().chain([resolv_us, handler_us]);
         for (slot, ms) in payload[8..].chunks_exact_mut(4).zip(timings) {
             slot.copy_from_slice(&ms.to_le_bytes());
         }
@@ -382,8 +382,10 @@ mod agent {
         pub fn apply(cmd: &NetReconfigCommand) -> Result<[u32; 4], String> {
             let mut steps = [0u32; 4];
             let mut mark = std::time::Instant::now();
+            // Microseconds: the ioctls land well under a millisecond each,
+            // and u32 micros still spans ~71 minutes.
             let mut lap = |slot: &mut u32| {
-                *slot = u32::try_from(mark.elapsed().as_millis()).unwrap_or(u32::MAX);
+                *slot = u32::try_from(mark.elapsed().as_micros()).unwrap_or(u32::MAX);
                 mark = std::time::Instant::now();
             };
 
@@ -648,6 +650,20 @@ mod agent {
         WAKEUP.get_or_init(Condvar::new)
     }
 
+    /// Register a spawned child for reaping AND wake the parked reaper.
+    ///
+    /// The single entry point for both spawn paths: an insert without the
+    /// wakeup would strand that child's exit for up to the reaper's park
+    /// timeout, so the two steps must never be separated.
+    fn register_child(
+        registry: &mut HashMap<libc::pid_t, mpsc::Sender<WaitOutcome>>,
+        pid: libc::pid_t,
+        exit_tx: mpsc::Sender<WaitOutcome>,
+    ) {
+        registry.insert(pid, exit_tx);
+        reap_wakeup().notify_all();
+    }
+
     /// Narrow a `std::process::Child::id()` (u32) to a `pid_t`. Linux pids are
     /// bounded well below `i32::MAX`, so this never wraps.
     #[allow(clippy::cast_possible_wrap, reason = "pids fit in pid_t")]
@@ -789,8 +805,7 @@ mod agent {
             let mut registry = reap_registry().lock().unwrap();
             match cmd.spawn() {
                 Ok(c) => {
-                    registry.insert(as_pid(c.id()), exit_tx);
-                    reap_wakeup().notify_all();
+                    register_child(&mut registry, as_pid(c.id()), exit_tx);
                     c
                 }
                 Err(e) => {
@@ -1046,8 +1061,7 @@ mod agent {
 
             Ok(ForkResult::Parent { child }) => {
                 let child_pid = child.as_raw();
-                registry.insert(child_pid, exit_tx);
-                reap_wakeup().notify_all();
+                register_child(&mut registry, child_pid, exit_tx);
                 drop(registry); // release before the (long-lived) session loop
 
                 if start.timeout_seconds > 0 {
