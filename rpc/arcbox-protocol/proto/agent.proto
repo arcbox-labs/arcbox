@@ -549,3 +549,25 @@ message SandboxCleanupResponse {
 // Opens the internal stream of pending sandbox cleanup tickets. The guest
 // first replays its durable snapshot, then streams new terminal generations.
 message WatchSandboxCleanupRequest {}
+
+// Ask the guest agent to resume a paused sandbox in place (CORE-21).
+//
+// Internal wire message rather than the public ResumeSandboxRequest: the
+// daemon decides *why* a resume runs (an explicit Resume call vs its own
+// transparent auto-resume on a data-plane RPC), and the guest surfaces that
+// verbatim as the RESUMED event's "reason" attribute — the visibility the
+// contract promises for automation.
+message SandboxResumeCommand {
+    // Sandbox ID.
+    string id = 1;
+    // "resume" (explicit) or "auto_resume" (daemon-side transparent resume).
+    // Empty is treated as "resume".
+    string reason = 2;
+}
+
+// Guest agent's answer to a resume: the fresh network identity.
+message SandboxResumeResponse {
+    // IP address of the resumed sandbox's new allocation (empty when the
+    // sandbox has no network). The daemon re-registers host DNS from it.
+    string ip_address = 1;
+}
