@@ -487,10 +487,16 @@ pub struct UnexposePortRequest {
 ///    STARTING ──► READY ──► RUNNING ──► READY  (execution exited, sandbox alive)
 ///                   │          │
 ///                   ├──────────┴──► STOPPING ──► STOPPED
-///                   │          │
-///                   ├──────────┴──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
+///                   │
+///                   ├──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
 ///                   │          │
 ///                   └──────────┴──► FAILED  (error reason set)
+///
+/// PAUSING branches from READY only: pausing means checkpointing a quiescent
+/// sandbox, and a RUNNING one has a live execution whose host-side session
+/// cannot survive the VM being checkpointed and killed — finish or stop the
+/// execution first (the idle detector pauses on the READY edge for the same
+/// reason). Every other non-terminal state can also reach FAILED.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SandboxState {

@@ -43,12 +43,14 @@ service SandboxService {
     rpc Remove(RemoveSandboxRequest) returns (google.protobuf.Empty);
 
     // Pause a sandbox: checkpoint it to disk under the same ID, then
-    // release its runtime resources (VM, network, CoW overlay). The
-    // record survives as PAUSED and Resume restores it in place — the
+    // release its runtime resources (VM, network) while retaining the
+    // checkpoint and the disk overlay — memory AND disk state survive.
+    // The record survives as PAUSED and Resume restores it in place — the
     // origin VM is gone by construction, which sidesteps the direct-mode
     // relocation constraint documented in `snapshot.proto` (CORE-21).
     // Returns once the sandbox reaches PAUSED; requires READY (no active
-    // execution). Trades RAM for disk: a paused sandbox keeps paying
+    // execution — see the state machine below for why RUNNING cannot
+    // pause). Trades RAM for disk: a paused sandbox keeps paying
     // `storage_bytes` until removed.
     rpc Pause(PauseSandboxRequest) returns (google.protobuf.Empty);
 
@@ -58,8 +60,12 @@ service SandboxService {
     // resume it transparently before proceeding, so clients see a
     // latency blip rather than an error. Callers that want the honest
     // state machine instead set the reserved `x-arcbox-no-auto-resume`
-    // request header (not yet honored) and receive SANDBOX_PAUSED
-    // (`errors.proto`). Inspect and List never resume.
+    // request header and receive SANDBOX_PAUSED (`errors.proto`).
+    // Inspect and List never resume.
+    //
+    // Resuming re-allocates networking: the sandbox comes back with a
+    // fresh IP (its DNS name follows), and port exposures dropped at
+    // pause time must be re-established with ExposePort.
     rpc Resume(ResumeSandboxRequest) returns (google.protobuf.Empty);
 
     // Replace a sandbox's lifecycle deadlines: the hard maximum lifetime
@@ -106,10 +112,16 @@ service SandboxService {
 //   STARTING ──► READY ──► RUNNING ──► READY  (execution exited, sandbox alive)
 //                  │          │
 //                  ├──────────┴──► STOPPING ──► STOPPED
-//                  │          │
-//                  ├──────────┴──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
+//                  │
+//                  ├──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
 //                  │          │
 //                  └──────────┴──► FAILED  (error reason set)
+//
+// PAUSING branches from READY only: pausing means checkpointing a quiescent
+// sandbox, and a RUNNING one has a live execution whose host-side session
+// cannot survive the VM being checkpointed and killed — finish or stop the
+// execution first (the idle detector pauses on the READY edge for the same
+// reason). Every other non-terminal state can also reach FAILED.
 enum SandboxState {
     SANDBOX_STATE_UNSPECIFIED = 0;
     // Firecracker process spawned; VM still booting.
