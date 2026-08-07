@@ -85,17 +85,42 @@ impl SandboxManager {
                             snapshot_id,
                             "warm create: restoring cached template snapshot"
                         );
-                        return self
+                        // The cache entry can die between this lookup and the
+                        // restore: a concurrent publish of another key evicts
+                        // by LRU and deletes the snapshot. That is a cache
+                        // miss arriving late, not a create failure — fall
+                        // through to the cold boot (which republishes) rather
+                        // than surfacing a snapshot-not-found to the caller.
+                        // The restore path unwinds its own claim on failure,
+                        // so the id is free again here.
+                        match self
                             .restore_from_snapshot(
                                 super::checkpoint::RestoreRequest {
-                                    snapshot_id,
+                                    snapshot_id: snapshot_id.clone(),
                                     network_override: true,
-                                    spec,
+                                    spec: spec.clone(),
                                     origin: super::checkpoint::RestoreOrigin::WarmCreate,
                                 },
                                 request_key,
                             )
-                            .await;
+                            .await
+                        {
+                            Ok(result) => return Ok(result),
+                            Err(error) => {
+                                warn!(
+                                    sandbox_id = %id,
+                                    snapshot_id,
+                                    %error,
+                                    "warm restore failed; cold-booting instead"
+                                );
+                                warm_publish = Some(super::warm::WarmPublishTicket {
+                                    key,
+                                    cache: Arc::clone(&self.warm),
+                                    snapshots: Arc::clone(&self.snapshots),
+                                    pool: Arc::clone(&self.pool),
+                                });
+                            }
+                        }
                     }
                     Ok(None) => {
                         warm_publish = Some(super::warm::WarmPublishTicket {
