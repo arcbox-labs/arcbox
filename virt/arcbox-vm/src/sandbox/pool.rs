@@ -382,6 +382,27 @@ async fn stage_slot(
     }
 }
 
+/// Drain and tear down every ready slot staged from one snapshot (or from
+/// all of them). Teardown failures are logged and left to the startup
+/// sweep — the slots' crash journals keep them reclaimable.
+pub(super) async fn drain_pool_slots(
+    pool: &SlotPool,
+    config: &VmmConfig,
+    cow_manager: &CowManager,
+    snapshot_id: Option<&str>,
+) {
+    for slot in pool.drain(snapshot_id) {
+        let slot_id = slot.slot_id.clone();
+        if let Err(error) = destroy_slot(config, cow_manager, slot).await {
+            warn!(
+                slot_id,
+                error = %error,
+                "pool slot teardown incomplete; the startup sweep will retry"
+            );
+        }
+    }
+}
+
 /// Tear down a slot completely: process, CoW resources, chroot, journal.
 ///
 /// On error the slot's crash journal is left in place so the startup
@@ -499,19 +520,9 @@ impl SandboxManager {
     }
 
     /// Tear down pooled slots: all of them, or those staged from one
-    /// snapshot. Teardown failures are logged and left to the startup
-    /// sweep — the slots' crash journals keep them reclaimable.
+    /// snapshot.
     pub(super) async fn drain_pool(&self, snapshot_id: Option<&str>) {
-        for slot in self.pool.drain(snapshot_id) {
-            let slot_id = slot.slot_id.clone();
-            if let Err(error) = destroy_slot(&self.config, &self.cow_manager, slot).await {
-                warn!(
-                    slot_id,
-                    error = %error,
-                    "pool slot teardown incomplete; the startup sweep will retry"
-                );
-            }
-        }
+        drain_pool_slots(&self.pool, &self.config, &self.cow_manager, snapshot_id).await;
     }
 
     /// Release manager-held background resources: tears down every

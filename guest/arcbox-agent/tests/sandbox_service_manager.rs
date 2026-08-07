@@ -36,9 +36,11 @@ fn test_config() -> VmmConfig {
             mmds_size_limit: None,
             socket_timeout_secs: Some(15),
             sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
-            // Direct mode cannot restore (and so never pools); keep the
-            // test run free of background pre-warm spawns regardless.
+            // Direct mode cannot restore (and so never pools or serves
+            // warm creates); keep the run free of background checkpoint
+            // and pre-warm work regardless.
             pool_size: 0,
+            warm_create: false,
         },
         network: NetworkConfig {
             cidr: "172.31.0.0/16".to_string(),

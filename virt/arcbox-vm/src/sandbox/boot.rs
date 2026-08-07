@@ -36,6 +36,7 @@ pub(super) async fn boot_sandbox(
     cow_manager: Arc<CowManager>,
     records: Arc<SandboxRecordStore>,
     generation: Uuid,
+    warm_publish: Option<super::warm::WarmPublishTicket>,
     resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) {
     match do_boot(
@@ -197,6 +198,22 @@ pub(super) async fn boot_sandbox(
             if !accepted {
                 info!(sandbox_id = %id, "sandbox removed/stopped during boot");
                 return;
+            }
+
+            // First eligible create of this boot shape (CORE-77): capture
+            // the warm snapshot while the guest is still idle, before the
+            // initial cmd dirties it. Synchronous on purpose — the cmd must
+            // not run before the checkpoint — and failures only warn: cache
+            // population never fails a healthy boot.
+            //
+            // This MUST precede the READY event: checkpointing pauses the
+            // guest for the duration, and a client that acts on READY the
+            // moment it arrives would hit that pause with an execution and
+            // hang. READY promises the sandbox accepts executions, so it
+            // cannot fire while the guest is about to stop answering.
+            if let Some(ticket) = &warm_publish {
+                super::warm::publish_after_boot(&id, ticket, &instances, &config, &cow_manager)
+                    .await;
             }
 
             let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
@@ -399,8 +416,10 @@ async fn fail_started_boot(
 ///
 /// Uses the same workload path as `Run` (`start_run_workload`), so state
 /// transitions and events are identical; the output itself has no consumer
-/// and is discarded chunk by chunk to keep the exit handler flowing.
-async fn run_initial_cmd(
+/// and is discarded chunk by chunk to keep the exit handler flowing. Also
+/// driven by the warm-create restore path (CORE-77), which owes a restored
+/// Create the same initial workload a cold boot runs.
+pub(super) async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
     vsock_uds_path: &Path,

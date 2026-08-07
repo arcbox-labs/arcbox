@@ -75,7 +75,9 @@ impl From<arcbox_vm::VmmError> for SandboxError {
             VmmError::AlreadyExists(_) => Self::AlreadyExists(e.to_string()),
             VmmError::WrongState { .. } => Self::WrongState(e.to_string()),
             VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
-            VmmError::Unavailable(_) => Self::Unavailable(e.to_string()),
+            VmmError::Unavailable(_) | VmmError::AckUnconfirmed { .. } => {
+                Self::Unavailable(e.to_string())
+            }
             // Invalid caller input (e.g. a rejected sandbox id) is a 400, not a
             // 500 — otherwise a bad request surfaces as INTERNAL to the client.
             VmmError::Config(_) => Self::InvalidArgument(e.to_string()),

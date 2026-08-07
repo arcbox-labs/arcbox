@@ -26,6 +26,185 @@ async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Parameters for the internal restore path
+/// ([`SandboxManager::restore_from_snapshot`]), shared by the Restore RPC
+/// and internal callers.
+pub(super) struct RestoreRequest {
+    /// Source checkpoint id.
+    pub(super) snapshot_id: String,
+    /// Assign a fresh TAP + IP to the restored sandbox.
+    pub(super) network_override: bool,
+    /// Spec journaled with the provision intent and installed on the
+    /// instance. Restore consumes its identity fields (`id`, `labels`,
+    /// `ttl_seconds`) — plus, on the warm-create origin, the initial
+    /// workload fields; the boot-recipe fields are ignored — the snapshot
+    /// carries the boot state.
+    pub(super) spec: SandboxSpec,
+    /// Which API surface this restore serves; decides the event contract.
+    pub(super) origin: RestoreOrigin,
+}
+
+/// Which caller a restore serves.
+pub(super) enum RestoreOrigin {
+    /// The Restore RPC: the sandbox announces itself with READY alone.
+    Restore,
+    /// The warm-create reroute (CORE-77): watchers must see the Create
+    /// contract — CREATED then READY — and the spec's initial `cmd` runs
+    /// after Ready exactly as a cold boot would run it.
+    WarmCreate,
+}
+
+/// Pause a `Ready` sandbox, capture a full snapshot into the catalog, and
+/// resume it.
+///
+/// Free-standing (rather than a method) so the boot task can publish warm
+/// snapshots (CORE-77) through the exact code path the Checkpoint RPC uses.
+pub(super) async fn checkpoint_impl(
+    instances: &super::InstanceMap,
+    snapshots: &SnapshotCatalog,
+    config: &VmmConfig,
+    sandbox_id: &SandboxId,
+    name: String,
+    labels: HashMap<String, String>,
+) -> Result<CheckpointInfo> {
+    // Verify state and capture the kernel/rootfs paths for jailer
+    // re-staging, the id the sandbox's chroot is actually keyed by
+    // — a sandbox restored from a pre-warmed pool slot lives in the
+    // slot's chroot, and FC resolves snapshot paths inside it — plus
+    // the guest's network addressing mode and the VM API handle.
+    let (kernel_path, rootfs_path, chroot_owner, net_invariant, vm) = {
+        let instance = instances
+            .read()
+            .unwrap()
+            .get(sandbox_id)
+            .cloned()
+            .ok_or_else(|| VmmError::NotFound(sandbox_id.clone()))?;
+        let inst = instance.lock().unwrap();
+        if inst.state != SandboxState::Ready {
+            return Err(VmmError::WrongState {
+                id: sandbox_id.clone(),
+                expected: "Ready".into(),
+                actual: inst.state.to_string(),
+            });
+        }
+        let vm = inst
+            .vm
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| VmmError::WrongState {
+                id: sandbox_id.clone(),
+                expected: "Ready (VM handle available)".into(),
+                actual: inst.state.to_string(),
+            })?;
+        // Only needed for jailer mode; safe to capture regardless.
+        (
+            inst.spec.kernel.clone(),
+            inst.spec.rootfs.clone(),
+            inst.pool_slot_id
+                .clone()
+                .unwrap_or_else(|| sandbox_id.clone()),
+            inst.net_invariant,
+            vm,
+        )
+    };
+
+    // Staging directory outside the catalog: the snapshot becomes visible
+    // only on commit, and dropping `pending` on any error below takes the
+    // directory and whatever partial vmstate/mem it holds with it.
+    let pending = snapshots.begin(sandbox_id)?;
+    let snapshot_id = pending.id().to_owned();
+    let staging_dir = pending.dir();
+
+    // Pause before snapshotting.
+    vm.pause().await.map_err(VmmError::from)?;
+
+    // Everything between pause and resume is fallible (chroot dir setup,
+    // chown, the snapshot RPC). Run it in a block whose result is handled
+    // only AFTER an unconditional resume — a bare `?` here previously left
+    // the guest paused forever, wedging every later RPC. Returns the chroot
+    // snapshot dir (jailer mode) to move afterward.
+    //
+    // In jailer mode FC runs inside a chroot and can only write to paths
+    // within it, so the snapshot is written to a chroot-local dir and moved
+    // into staging after resume.
+    let paused: Result<Option<PathBuf>> = async {
+        let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
+            if let Some(ref jc) = config.firecracker.jailer {
+                let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+                let cr = chroot_root(&config.firecracker.binary, base, &chroot_owner);
+                let chroot_snap = cr.join("snapshots").join(&snapshot_id);
+                std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
+                // Firecracker runs as jc.uid/jc.gid; chown the directory so
+                // it can create the snapshot files.
+                let uid = nix::unistd::Uid::from_raw(jc.uid);
+                let gid = nix::unistd::Gid::from_raw(jc.gid);
+                nix::unistd::chown(&chroot_snap, Some(uid), Some(gid))
+                    .map_err(|e| VmmError::Process(format!("chown snapshot dir: {e}")))?;
+                // Paths as seen by Firecracker inside the chroot.
+                let fc_vmstate = format!("/snapshots/{snapshot_id}/vmstate");
+                let fc_mem = format!("/snapshots/{snapshot_id}/mem");
+                (fc_vmstate, fc_mem, Some(chroot_snap))
+            } else {
+                (
+                    staging_dir.join("vmstate").to_str().unwrap().to_owned(),
+                    staging_dir.join("mem").to_str().unwrap().to_owned(),
+                    None,
+                )
+            };
+
+        vm.create_snapshot(&fc_vmstate_path, &fc_mem_path)
+            .await
+            .map_err(VmmError::from)?;
+        Ok(chroot_snap_dir_opt)
+    }
+    .await;
+
+    // Always resume, regardless of how the paused section fared.
+    let _ = vm.resume().await;
+
+    let chroot_snap_dir_opt = paused?;
+
+    // If jailer mode, move snapshot files from the chroot into staging.
+    if let Some(chroot_snap) = chroot_snap_dir_opt {
+        move_file(&chroot_snap.join("vmstate"), &staging_dir.join("vmstate"))
+            .await
+            .map_err(VmmError::Io)?;
+        if chroot_snap.join("mem").exists() {
+            move_file(&chroot_snap.join("mem"), &staging_dir.join("mem"))
+                .await
+                .map_err(VmmError::Io)?;
+        }
+        let _ = tokio::fs::remove_dir_all(&chroot_snap).await;
+    }
+
+    // Store kernel/rootfs template paths so restore can re-derive them.
+    // Jailer mode needs them for chroot staging; direct mode needs the
+    // rootfs path to set up a fresh dm-snapshot and retarget the
+    // vmstate-recorded symlink.
+    let meta = pending.commit(SnapshotDraft {
+        name: Some(name),
+        labels,
+        snapshot_type: crate::config::SnapshotType::Full,
+        parent_id: None,
+        kernel_path: Some(kernel_path),
+        rootfs_path: Some(rootfs_path),
+        net_invariant,
+    })?;
+
+    let snap_dir_path = meta
+        .vmstate_path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    info!(sandbox_id, snapshot_id = %meta.id, "sandbox checkpointed");
+    Ok(CheckpointInfo {
+        snapshot_id: meta.id,
+        snapshot_dir: snap_dir_path,
+        created_at: meta.created_at.to_rfc3339(),
+    })
+}
+
 impl SandboxManager {
     /// Rootfs images that existing snapshots need to stay restorable.
     ///
@@ -35,135 +214,26 @@ impl SandboxManager {
         self.snapshots.referenced_rootfs_paths()
     }
 
+    /// Checkpoint a `Ready` sandbox into the snapshot catalog.
     pub async fn checkpoint_sandbox(
         &self,
         sandbox_id: &SandboxId,
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
-        // Verify state and capture the kernel/rootfs paths for jailer
-        // re-staging, the id the sandbox's chroot is actually keyed by
-        // — a sandbox restored from a pre-warmed pool slot lives in the
-        // slot's chroot, and FC resolves snapshot paths inside it — plus
-        // the guest's network addressing mode.
-        let (kernel_path, rootfs_path, chroot_owner, net_invariant) = {
-            let instance = self.get_instance(sandbox_id)?;
-            let inst = instance.lock().unwrap();
-            if inst.state != SandboxState::Ready {
-                return Err(VmmError::WrongState {
-                    id: sandbox_id.clone(),
-                    expected: "Ready".into(),
-                    actual: inst.state.to_string(),
-                });
-            }
-            // Only needed for jailer mode; safe to capture regardless.
-            (
-                inst.spec.kernel.clone(),
-                inst.spec.rootfs.clone(),
-                inst.pool_slot_id
-                    .clone()
-                    .unwrap_or_else(|| sandbox_id.clone()),
-                inst.net_invariant,
-            )
-        };
-
-        let vm = self.get_vm_handle(sandbox_id)?;
-
-        // Staging directory outside the catalog: the snapshot becomes visible
-        // only on commit, and dropping `pending` on any error below takes the
-        // directory and whatever partial vmstate/mem it holds with it.
-        let pending = self.snapshots.begin(sandbox_id)?;
-        let snapshot_id = pending.id().to_owned();
-        let staging_dir = pending.dir();
-
-        // Pause before snapshotting.
-        vm.pause().await.map_err(VmmError::from)?;
-
-        // Everything between pause and resume is fallible (chroot dir setup,
-        // chown, the snapshot RPC). Run it in a block whose result is handled
-        // only AFTER an unconditional resume — a bare `?` here previously left
-        // the guest paused forever, wedging every later RPC. Returns the chroot
-        // snapshot dir (jailer mode) to move afterward.
-        //
-        // In jailer mode FC runs inside a chroot and can only write to paths
-        // within it, so the snapshot is written to a chroot-local dir and moved
-        // into staging after resume.
-        let paused: Result<Option<PathBuf>> = async {
-            let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
-                if let Some(ref jc) = self.config.firecracker.jailer {
-                    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                    let cr = chroot_root(&self.config.firecracker.binary, base, &chroot_owner);
-                    let chroot_snap = cr.join("snapshots").join(&snapshot_id);
-                    std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
-                    // Firecracker runs as jc.uid/jc.gid; chown the directory so
-                    // it can create the snapshot files.
-                    let uid = nix::unistd::Uid::from_raw(jc.uid);
-                    let gid = nix::unistd::Gid::from_raw(jc.gid);
-                    nix::unistd::chown(&chroot_snap, Some(uid), Some(gid))
-                        .map_err(|e| VmmError::Process(format!("chown snapshot dir: {e}")))?;
-                    // Paths as seen by Firecracker inside the chroot.
-                    let fc_vmstate = format!("/snapshots/{snapshot_id}/vmstate");
-                    let fc_mem = format!("/snapshots/{snapshot_id}/mem");
-                    (fc_vmstate, fc_mem, Some(chroot_snap))
-                } else {
-                    (
-                        staging_dir.join("vmstate").to_str().unwrap().to_owned(),
-                        staging_dir.join("mem").to_str().unwrap().to_owned(),
-                        None,
-                    )
-                };
-
-            vm.create_snapshot(&fc_vmstate_path, &fc_mem_path)
-                .await
-                .map_err(VmmError::from)?;
-            Ok(chroot_snap_dir_opt)
-        }
-        .await;
-
-        // Always resume, regardless of how the paused section fared.
-        let _ = vm.resume().await;
-
-        let chroot_snap_dir_opt = paused?;
-
-        // If jailer mode, move snapshot files from the chroot into staging.
-        if let Some(chroot_snap) = chroot_snap_dir_opt {
-            move_file(&chroot_snap.join("vmstate"), &staging_dir.join("vmstate"))
-                .await
-                .map_err(VmmError::Io)?;
-            if chroot_snap.join("mem").exists() {
-                move_file(&chroot_snap.join("mem"), &staging_dir.join("mem"))
-                    .await
-                    .map_err(VmmError::Io)?;
-            }
-            let _ = tokio::fs::remove_dir_all(&chroot_snap).await;
-        }
-
-        // Store kernel/rootfs template paths so restore can re-derive them.
-        // Jailer mode needs them for chroot staging; direct mode needs the
-        // rootfs path to set up a fresh dm-snapshot and retarget the
-        // vmstate-recorded symlink.
-        let meta = pending.commit(SnapshotDraft {
-            name: Some(name),
+        self.check_reconcile()?;
+        // The warm-create cache (CORE-77) trusts its label as the lookup
+        // key; a caller must not be able to plant one.
+        super::warm::reject_reserved_labels(&labels)?;
+        checkpoint_impl(
+            &self.instances,
+            &self.snapshots,
+            &self.config,
+            sandbox_id,
+            name,
             labels,
-            snapshot_type: crate::config::SnapshotType::Full,
-            parent_id: None,
-            kernel_path: Some(kernel_path),
-            rootfs_path: Some(rootfs_path),
-            net_invariant,
-        })?;
-
-        let snap_dir_path = meta
-            .vmstate_path
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        info!(sandbox_id, snapshot_id = %meta.id, "sandbox checkpointed");
-        Ok(CheckpointInfo {
-            snapshot_id: meta.id,
-            snapshot_dir: snap_dir_path,
-            created_at: meta.created_at.to_rfc3339(),
-        })
+        )
+        .await
     }
 
     #[allow(
@@ -254,12 +324,43 @@ impl SandboxManager {
         spec: RestoreSandboxSpec,
         restore_key: &str,
     ) -> Result<(SandboxId, String)> {
+        let RestoreSandboxSpec {
+            id,
+            snapshot_id,
+            labels,
+            network_override,
+            ttl_seconds,
+        } = spec;
+        self.restore_from_snapshot(
+            RestoreRequest {
+                snapshot_id,
+                network_override,
+                spec: SandboxSpec {
+                    id,
+                    labels,
+                    ttl_seconds,
+                    ..Default::default()
+                },
+                origin: RestoreOrigin::Restore,
+            },
+            restore_key,
+        )
+        .await
+    }
+
+    /// Internal restore path shared by the Restore RPC and internal callers.
+    pub(super) async fn restore_from_snapshot(
+        &self,
+        request: RestoreRequest,
+        restore_key: &str,
+    ) -> Result<(SandboxId, String)> {
         // Gate on the startup sweep before touching per-id resources (see
         // create_sandbox / await_reconcile).
         self.await_reconcile().await?;
 
-        let caller_supplied_id = spec.id.as_ref().is_some_and(|id| !id.is_empty());
-        let new_id = spec
+        let caller_supplied_id = request.spec.id.as_ref().is_some_and(|id| !id.is_empty());
+        let new_id = request
+            .spec
             .id
             .clone()
             .filter(|s| !s.is_empty())
@@ -269,7 +370,7 @@ impl SandboxManager {
         // The snapshot id is caller-supplied and flows into snapshot dir paths
         // (create_dir_all / copy / remove_dir_all) — validate it too, or a
         // `../` id would traverse out of the snapshots directory.
-        super::validate_id("snapshot id", &spec.snapshot_id)?;
+        super::validate_id("snapshot id", &request.snapshot_id)?;
 
         // Phase clocks for the completion log: restore latency is a product
         // metric (CORE-75) and the breakdown is what makes a regression
@@ -284,7 +385,7 @@ impl SandboxManager {
 
         // Resolve read-only prerequisites before claiming durable ownership.
         // Once the intent exists, every failure goes through rollback.
-        let snap_meta = self.snapshots.find_by_id(&spec.snapshot_id)?;
+        let snap_meta = self.snapshots.find_by_id(&request.snapshot_id)?;
         let jailer = self.config.firecracker.jailer.as_ref().ok_or_else(|| {
             VmmError::Config(
                 "checkpoint restore requires jailer isolation; direct mode embeds shared origin paths"
@@ -299,12 +400,8 @@ impl SandboxManager {
         let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
             .join("sandboxes")
             .join(&new_id);
-        let restore_spec = SandboxSpec {
-            id: Some(new_id.clone()),
-            labels: spec.labels.clone(),
-            ttl_seconds: spec.ttl_seconds,
-            ..Default::default()
-        };
+        let mut restore_spec = request.spec.clone();
+        restore_spec.id = Some(new_id.clone());
         let reservation = super::reserve_id(
             &self.instances,
             &new_id,
@@ -328,6 +425,10 @@ impl SandboxManager {
             ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(new_id)),
         };
         let generation = record.generation;
+        // Kept out of the instance for the warm-create origin's initial
+        // workload; the durable copy is redacted once the record leaves the
+        // provisioning phases.
+        let effective_spec = record.effective_spec.clone();
         {
             let arc = reservation.instance();
             let mut instance = arc.lock().unwrap();
@@ -339,7 +440,7 @@ impl SandboxManager {
 
         // Reserve network metadata, journal it, then materialize the TAP. This
         // mirrors Create so an agent crash never leaves an unowned interface.
-        let net_alloc = if spec.network_override {
+        let net_alloc = if request.network_override {
             match self.network.reserve(&new_id) {
                 Ok(allocation) => Some(allocation),
                 Err(error) => {
@@ -404,7 +505,7 @@ impl SandboxManager {
         // reconfiguration as the only restore work. From the claim on, the
         // slot's resources are owned by this restore and unwind through
         // rollback_restore like freshly created ones.
-        let claimed = self.claim_restore_slot(&spec.snapshot_id);
+        let claimed = self.claim_restore_slot(&request.snapshot_id);
         let pool_hit = claimed.is_some();
         let (process, actual_vsock_path, effective_vmstate, effective_mem, t_spawned, t_staged) =
             if let Some(slot) = claimed {
@@ -802,7 +903,7 @@ impl SandboxManager {
             inst.network.clone_from(&net_alloc);
             inst.process = Some(process);
             inst.vm = Some(vm);
-            inst.vsock_uds_path = Some(actual_vsock_path);
+            inst.vsock_uds_path = Some(actual_vsock_path.clone());
             inst.cow_handle = pending_cow.take();
             inst.net_invariant = snap_meta.net_invariant;
             inst.state = SandboxState::Ready;
@@ -811,13 +912,21 @@ impl SandboxManager {
         reservation.commit();
         let ttl_armed_for = Arc::downgrade(&arc);
 
+        let warm_create = matches!(request.origin, RestoreOrigin::WarmCreate);
+        if warm_create {
+            // The Create event contract: watchers see CREATED then READY for
+            // this id in that order, exactly as a cold boot emits them.
+            let _ = self
+                .events_tx
+                .send(SandboxEvent::new(&new_id, action::CREATED));
+        }
         let _ = self
             .events_tx
             .send(SandboxEvent::new(&new_id, action::READY));
 
         // TTL expiry task — identity-guarded so a stale timer can't remove a
         // same-id sandbox re-created after this one (see expire_sandbox).
-        if spec.ttl_seconds > 0 {
+        if request.spec.ttl_seconds > 0 {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
             let events_tx = self.events_tx.clone();
@@ -825,7 +934,7 @@ impl SandboxManager {
             let cow2 = Arc::clone(&self.cow_manager);
             let records = Arc::clone(&self.records);
             let id2 = new_id.clone();
-            let ttl = spec.ttl_seconds;
+            let ttl = request.spec.ttl_seconds;
             let armed_for = ttl_armed_for;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
@@ -853,8 +962,9 @@ impl SandboxManager {
         let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         info!(
             sandbox_id = %new_id,
-            snapshot_id = %spec.snapshot_id,
+            snapshot_id = %request.snapshot_id,
             pool_hit,
+            warm_create,
             spawn_ms = ms(t_spawned.duration_since(restore_started)),
             stage_ms = ms(t_staged.duration_since(t_spawned)),
             load_ms = ms(t_loaded.duration_since(t_staged)),
@@ -865,11 +975,27 @@ impl SandboxManager {
 
         // Populate/refill the pool for this snapshot in the background:
         // the successful restore is what makes it eligible for pooling.
-        self.spawn_pool_refill(&spec.snapshot_id);
+        self.spawn_pool_refill(&request.snapshot_id);
+
+        // A warm create still owes the Create contract's initial workload:
+        // run it through the same path as a cold boot, after Ready. Kept off
+        // the timing log above — the workload is the user's, not restore's.
+        if warm_create && !effective_spec.cmd.is_empty() {
+            super::boot::run_initial_cmd(
+                &new_id,
+                effective_spec,
+                &actual_vsock_path,
+                &self.instances,
+                &self.events_tx,
+            )
+            .await;
+        }
+
         if let Some(error) = ready_commit.durability_error {
-            return Err(VmmError::Unavailable(format!(
-                "sandbox {new_id} was restored, but ACK durability is unconfirmed: {error}"
-            )));
+            return Err(VmmError::AckUnconfirmed {
+                id: new_id,
+                detail: error,
+            });
         }
         Ok((new_id, ip_address))
     }

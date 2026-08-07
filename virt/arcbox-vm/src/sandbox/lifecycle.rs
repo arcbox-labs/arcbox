@@ -32,6 +32,10 @@ impl SandboxManager {
         // has run — otherwise a re-created same-id sandbox races it.
         self.await_reconcile().await?;
 
+        // Whether the caller pinned its own boot recipe. Captured before the
+        // defaults fill — a custom kernel or cmdline is never warm-created.
+        let caller_supplied_boot = !spec.kernel.is_empty() || !spec.boot_args.is_empty();
+
         // Apply daemon defaults for fields not supplied by the caller.
         let defaults = &self.config.defaults;
         if spec.kernel.is_empty() {
@@ -63,6 +67,94 @@ impl SandboxManager {
         // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
         super::validate_id("sandbox id", &id)?;
         spec.id = Some(id.clone());
+
+        // Warm create (CORE-77): a Create whose boot shape matches a cached
+        // template snapshot restores instead of cold-booting. Decided before
+        // any resource allocation — the restore path owns its own id
+        // reservation, durable intent, and fresh network identity
+        // (`network_override`, free with net-invariant snapshots). On a miss
+        // the boot task publishes the snapshot once the guest is Ready.
+        let mut warm_publish = None;
+        if super::warm::warm_eligible(&self.config, &spec, caller_supplied_boot) {
+            match super::warm::derive_warm_key(&spec) {
+                Ok(key) => match super::warm::find_warm_snapshot(&self.snapshots, &key) {
+                    Ok(Some(snapshot_id)) => {
+                        self.warm.touch(&key);
+                        info!(
+                            sandbox_id = %id,
+                            snapshot_id,
+                            "warm create: restoring cached template snapshot"
+                        );
+                        // The cache entry can die between this lookup and the
+                        // restore: a concurrent publish of another key evicts
+                        // by LRU and deletes the snapshot. That is a cache
+                        // miss arriving late, not a create failure — fall
+                        // through to the cold boot (which republishes) rather
+                        // than surfacing a snapshot-not-found to the caller.
+                        //
+                        // The failure class decides the fallback, carried
+                        // in the error itself: `AckUnconfirmed` is the one
+                        // post-commit failure — the sandbox is running and
+                        // READY under this id — so cold-booting there would
+                        // recreate a live (or, if the client already acted
+                        // on READY and deleted it, just-deleted) sandbox.
+                        // Every other failure unwound its claim pre-commit
+                        // and cold-boots safely. The restore is pinned to
+                        // this create's id so both outcomes concern the id
+                        // the caller asked for.
+                        let mut warm_spec = spec.clone();
+                        warm_spec.id = Some(id.clone());
+                        match self
+                            .restore_from_snapshot(
+                                super::checkpoint::RestoreRequest {
+                                    snapshot_id: snapshot_id.clone(),
+                                    network_override: true,
+                                    spec: warm_spec,
+                                    origin: super::checkpoint::RestoreOrigin::WarmCreate,
+                                },
+                                request_key,
+                            )
+                            .await
+                        {
+                            Ok(result) => return Ok(result),
+                            Err(error @ VmmError::AckUnconfirmed { .. }) => {
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                warn!(
+                                    sandbox_id = %id,
+                                    snapshot_id,
+                                    %error,
+                                    "warm restore failed; cold-booting instead"
+                                );
+                                warm_publish = Some(super::warm::WarmPublishTicket {
+                                    key,
+                                    cache: Arc::clone(&self.warm),
+                                    snapshots: Arc::clone(&self.snapshots),
+                                    pool: Arc::clone(&self.pool),
+                                });
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        warm_publish = Some(super::warm::WarmPublishTicket {
+                            key,
+                            cache: Arc::clone(&self.warm),
+                            snapshots: Arc::clone(&self.snapshots),
+                            pool: Arc::clone(&self.pool),
+                        });
+                    }
+                    Err(error) => {
+                        // The publish path would scan the same catalog, so a
+                        // failed lookup cold-boots without cache interaction.
+                        warn!(sandbox_id = %id, %error, "warm snapshot lookup failed; cold-booting");
+                    }
+                },
+                Err(error) => {
+                    debug!(sandbox_id = %id, %error, "rootfs fingerprint failed; skipping warm create");
+                }
+            }
+        }
 
         let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
             .join("sandboxes")
@@ -233,6 +325,7 @@ impl SandboxManager {
                     cow_manager,
                     records,
                     generation,
+                    warm_publish,
                     resource_handoff_tx,
                 )
                 .await;
@@ -278,9 +371,7 @@ impl SandboxManager {
 
         info!(sandbox_id = %id, "sandbox create requested (async boot started)");
         if let Some(error) = starting_durability_error {
-            return Err(VmmError::Unavailable(format!(
-                "sandbox {id} was created, but ACK durability is unconfirmed: {error}"
-            )));
+            return Err(VmmError::AckUnconfirmed { id, detail: error });
         }
         Ok((id, ip_address))
     }
@@ -617,18 +708,5 @@ impl SandboxManager {
     ) -> Result<()> {
         let uds = self.require_alive_vsock(id)?;
         crate::file_io::write_file(&uds, path, mode, data).await
-    }
-
-    pub(super) fn get_vm_handle(&self, id: &SandboxId) -> Result<Arc<fc_sdk::Vm>> {
-        let instance = self.get_instance(id)?;
-        let inst = instance.lock().unwrap();
-        inst.vm
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| VmmError::WrongState {
-                id: id.clone(),
-                expected: "Ready or Running (VM handle not yet available)".into(),
-                actual: inst.state.to_string(),
-            })
     }
 }
