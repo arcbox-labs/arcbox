@@ -40,6 +40,7 @@ mod persistence;
 mod pool;
 mod reconcile;
 mod types;
+mod warm;
 mod workload;
 
 pub use execution::{

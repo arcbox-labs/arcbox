@@ -326,10 +326,23 @@ pub struct FirecrackerConfig {
     /// most two distinct snapshot ids (LRU-evicted). `0` disables pooling.
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+    /// Serve eligible Creates from warm template snapshots (CORE-77).
+    ///
+    /// The first create of a template shape cold-boots and checkpoints the
+    /// idle guest; every later create of the same shape restores from that
+    /// snapshot instead of booting a kernel. Requires jailer isolation;
+    /// only networked creates without a custom boot recipe participate.
+    /// `false` restores plain cold boots for every create.
+    #[serde(default = "default_warm_create")]
+    pub warm_create: bool,
 }
 
 fn default_pool_size() -> usize {
     1
+}
+
+fn default_warm_create() -> bool {
+    true
 }
 
 /// How the pool-IP <-> fixed-guest-IP translation of an invariant sandbox TAP
@@ -394,6 +407,7 @@ impl Default for VmmConfig {
                 socket_timeout_secs: None,
                 sandbox_datapath: SandboxDatapath::default(),
                 pool_size: default_pool_size(),
+                warm_create: default_warm_create(),
             },
             network: NetworkConfig {
                 cidr: "172.20.0.0/16".into(),
@@ -594,6 +608,22 @@ mod tests {
             toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
                 .unwrap();
         assert_eq!(cfg.pool_size, 1);
+    }
+
+    #[test]
+    fn warm_create_defaults_on_and_parses_the_escape_hatch() {
+        assert!(VmmConfig::default().firecracker.warm_create);
+        // A config written before the knob existed still loads with the default.
+        let cfg: FirecrackerConfig =
+            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
+                .unwrap();
+        assert!(cfg.warm_create);
+        // The escape hatch is reachable by config alone.
+        let cfg: FirecrackerConfig = toml::from_str(
+            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\nwarm_create = false\n",
+        )
+        .unwrap();
+        assert!(!cfg.warm_create);
     }
 
     #[test]

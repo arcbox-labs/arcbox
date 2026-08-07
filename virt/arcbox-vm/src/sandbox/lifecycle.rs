@@ -32,6 +32,10 @@ impl SandboxManager {
         // has run — otherwise a re-created same-id sandbox races it.
         self.await_reconcile().await?;
 
+        // Whether the caller pinned its own boot recipe. Captured before the
+        // defaults fill — a custom kernel or cmdline is never warm-created.
+        let caller_supplied_boot = !spec.kernel.is_empty() || !spec.boot_args.is_empty();
+
         // Apply daemon defaults for fields not supplied by the caller.
         let defaults = &self.config.defaults;
         if spec.kernel.is_empty() {
@@ -63,6 +67,46 @@ impl SandboxManager {
         // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
         super::validate_id("sandbox id", &id)?;
         spec.id = Some(id.clone());
+
+        // Warm create (CORE-77): a Create whose boot shape matches a cached
+        // template snapshot restores instead of cold-booting. Decided before
+        // any resource allocation — the restore path owns its own id
+        // reservation, durable intent, and fresh network identity
+        // (`network_override`, free with net-invariant snapshots). On a miss
+        // the boot task publishes the snapshot once the guest is Ready.
+        if super::warm::warm_eligible(&self.config, &spec, caller_supplied_boot) {
+            match super::warm::derive_warm_key(&spec) {
+                Ok(key) => match super::warm::find_warm_snapshot(&self.snapshots, &key) {
+                    Ok(Some(snapshot_id)) => {
+                        info!(
+                            sandbox_id = %id,
+                            snapshot_id,
+                            "warm create: restoring cached template snapshot"
+                        );
+                        return self
+                            .restore_from_snapshot(
+                                super::checkpoint::RestoreRequest {
+                                    snapshot_id,
+                                    network_override: true,
+                                    spec,
+                                    origin: super::checkpoint::RestoreOrigin::WarmCreate,
+                                },
+                                request_key,
+                            )
+                            .await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // The publish path would scan the same catalog, so a
+                        // failed lookup cold-boots without cache interaction.
+                        warn!(sandbox_id = %id, %error, "warm snapshot lookup failed; cold-booting");
+                    }
+                },
+                Err(error) => {
+                    debug!(sandbox_id = %id, %error, "rootfs fingerprint failed; skipping warm create");
+                }
+            }
+        }
 
         let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
             .join("sandboxes")

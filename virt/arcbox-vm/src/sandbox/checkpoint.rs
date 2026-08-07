@@ -36,9 +36,22 @@ pub(super) struct RestoreRequest {
     pub(super) network_override: bool,
     /// Spec journaled with the provision intent and installed on the
     /// instance. Restore consumes its identity fields (`id`, `labels`,
-    /// `ttl_seconds`); the boot-recipe fields are ignored — the snapshot
+    /// `ttl_seconds`) — plus, on the warm-create origin, the initial
+    /// workload fields; the boot-recipe fields are ignored — the snapshot
     /// carries the boot state.
     pub(super) spec: SandboxSpec,
+    /// Which API surface this restore serves; decides the event contract.
+    pub(super) origin: RestoreOrigin,
+}
+
+/// Which caller a restore serves.
+pub(super) enum RestoreOrigin {
+    /// The Restore RPC: the sandbox announces itself with READY alone.
+    Restore,
+    /// The warm-create reroute (CORE-77): watchers must see the Create
+    /// contract — CREATED then READY — and the spec's initial `cmd` runs
+    /// after Ready exactly as a cold boot would run it.
+    WarmCreate,
 }
 
 /// Pause a `Ready` sandbox, capture a full snapshot into the catalog, and
@@ -209,6 +222,9 @@ impl SandboxManager {
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
         self.check_reconcile()?;
+        // The warm-create cache (CORE-77) trusts its label as the lookup
+        // key; a caller must not be able to plant one.
+        super::warm::reject_reserved_labels(&labels)?;
         checkpoint_impl(
             &self.instances,
             &self.snapshots,
@@ -325,6 +341,7 @@ impl SandboxManager {
                     ttl_seconds,
                     ..Default::default()
                 },
+                origin: RestoreOrigin::Restore,
             },
             restore_key,
         )
@@ -408,6 +425,10 @@ impl SandboxManager {
             ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(new_id)),
         };
         let generation = record.generation;
+        // Kept out of the instance for the warm-create origin's initial
+        // workload; the durable copy is redacted once the record leaves the
+        // provisioning phases.
+        let effective_spec = record.effective_spec.clone();
         {
             let arc = reservation.instance();
             let mut instance = arc.lock().unwrap();
@@ -882,7 +903,7 @@ impl SandboxManager {
             inst.network.clone_from(&net_alloc);
             inst.process = Some(process);
             inst.vm = Some(vm);
-            inst.vsock_uds_path = Some(actual_vsock_path);
+            inst.vsock_uds_path = Some(actual_vsock_path.clone());
             inst.cow_handle = pending_cow.take();
             inst.net_invariant = snap_meta.net_invariant;
             inst.state = SandboxState::Ready;
@@ -891,6 +912,14 @@ impl SandboxManager {
         reservation.commit();
         let ttl_armed_for = Arc::downgrade(&arc);
 
+        let warm_create = matches!(request.origin, RestoreOrigin::WarmCreate);
+        if warm_create {
+            // The Create event contract: watchers see CREATED then READY for
+            // this id in that order, exactly as a cold boot emits them.
+            let _ = self
+                .events_tx
+                .send(SandboxEvent::new(&new_id, action::CREATED));
+        }
         let _ = self
             .events_tx
             .send(SandboxEvent::new(&new_id, action::READY));
@@ -935,6 +964,7 @@ impl SandboxManager {
             sandbox_id = %new_id,
             snapshot_id = %request.snapshot_id,
             pool_hit,
+            warm_create,
             spawn_ms = ms(t_spawned.duration_since(restore_started)),
             stage_ms = ms(t_staged.duration_since(t_spawned)),
             load_ms = ms(t_loaded.duration_since(t_staged)),
@@ -946,6 +976,21 @@ impl SandboxManager {
         // Populate/refill the pool for this snapshot in the background:
         // the successful restore is what makes it eligible for pooling.
         self.spawn_pool_refill(&request.snapshot_id);
+
+        // A warm create still owes the Create contract's initial workload:
+        // run it through the same path as a cold boot, after Ready. Kept off
+        // the timing log above — the workload is the user's, not restore's.
+        if warm_create && !effective_spec.cmd.is_empty() {
+            super::boot::run_initial_cmd(
+                &new_id,
+                effective_spec,
+                &actual_vsock_path,
+                &self.instances,
+                &self.events_tx,
+            )
+            .await;
+        }
+
         if let Some(error) = ready_commit.durability_error {
             return Err(VmmError::Unavailable(format!(
                 "sandbox {new_id} was restored, but ACK durability is unconfirmed: {error}"

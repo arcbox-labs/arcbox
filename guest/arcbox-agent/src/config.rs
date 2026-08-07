@@ -50,6 +50,7 @@ fn guest_defaults() -> VmmConfig {
             socket_timeout_secs: None,
             sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
             pool_size: 1,
+            warm_create: true,
         },
         network: NetworkConfig {
             cidr: "172.20.0.0/16".into(),

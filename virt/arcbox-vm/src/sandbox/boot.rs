@@ -399,8 +399,10 @@ async fn fail_started_boot(
 ///
 /// Uses the same workload path as `Run` (`start_run_workload`), so state
 /// transitions and events are identical; the output itself has no consumer
-/// and is discarded chunk by chunk to keep the exit handler flowing.
-async fn run_initial_cmd(
+/// and is discarded chunk by chunk to keep the exit handler flowing. Also
+/// driven by the warm-create restore path (CORE-77), which owes a restored
+/// Create the same initial workload a cold boot runs.
+pub(super) async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
     vsock_uds_path: &Path,

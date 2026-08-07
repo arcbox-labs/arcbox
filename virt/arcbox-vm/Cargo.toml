@@ -24,13 +24,13 @@ nix            = { workspace = true, features = ["process", "term", "signal"] }
 libc.workspace         = true
 chrono.workspace       = true
 toml.workspace         = true
+sha2.workspace         = true
 
 [dev-dependencies]
 tokio              = { workspace = true, features = ["rt", "macros"] }
 anyhow.workspace   = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
-sha2.workspace = true
 
 [lints]
 workspace = true

@@ -62,6 +62,8 @@ fn try_config(data_dir: &str) -> Option<VmmConfig> {
             // Direct mode cannot restore (and so never pools); keep the
             // e2e run free of background pre-warm spawns regardless.
             pool_size: 0,
+            // Direct mode is warm-ineligible anyway; keep it explicit.
+            warm_create: false,
         },
         network: NetworkConfig {
             cidr: "172.99.0.0/24".into(),
