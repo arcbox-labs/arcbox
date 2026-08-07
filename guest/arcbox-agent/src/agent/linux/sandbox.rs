@@ -550,7 +550,11 @@ async fn send_sandbox_error<S>(
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    tracing::warn!(trace_id, code, message, "sandbox RPC failed");
+    // `message` is tracing's reserved field for the event message itself:
+    // passing it as a field renders the error text unlabelled, looking like
+    // a second message spliced onto the first. `error` matches this file's
+    // convention and renders quoted.
+    tracing::warn!(trace_id, code, error = message, "sandbox RPC failed");
     let err = ErrorResponse::new(code, message);
     write_message(stream, MessageType::Error, trace_id, &err.encode()).await
 }
