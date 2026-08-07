@@ -58,7 +58,8 @@ fn sandbox_coldstart() -> Result<()> {
         .with_test_writer()
         .try_init();
 
-    let iters = env_usize("ARCBOX_COLDSTART_ITERS", 10);
+    // Floor of 1: `report` assumes at least one sample per group.
+    let iters = env_usize("ARCBOX_COLDSTART_ITERS", 10).max(1);
     let vcpus = env_usize("ARCBOX_COLDSTART_VCPUS", 1) as u32;
     let memory_mib = env_usize("ARCBOX_COLDSTART_MEMORY_MIB", 512) as u64;
 
@@ -503,8 +504,19 @@ async fn run_and_collect(
         .context("AttachExecution failed")?
         .into_inner();
 
+    // Deadline the drain like wait_for_ready: a wedged exec must fail the
+    // probe (writing metrics + preserving the test dir), not hang it.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut stdout = String::new();
-    while let Some(event) = stream.message().await.context("attach stream error")? {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = tokio::time::timeout(remaining, stream.message())
+            .await
+            .with_context(|| format!("{id}: command {cmd:?} timed out"))?
+            .context("attach stream error")?;
+        let Some(event) = event else {
+            bail!("{id}: attach stream ended without an exit event");
+        };
         match event.event {
             Some(execution_event::Event::Output(output)) => {
                 if output.channel() != StdioChannel::Stderr {
@@ -521,7 +533,6 @@ async fn run_and_collect(
             _ => {}
         }
     }
-    bail!("{id}: attach stream ended without an exit event")
 }
 
 /// Consumes the shared event stream until `id` reports READY.

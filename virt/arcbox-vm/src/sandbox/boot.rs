@@ -347,9 +347,12 @@ pub(super) async fn link_or_copy_for_jailer(
     if uid == 0 && gid == 0 {
         match tokio::fs::hard_link(src, dst).await {
             Ok(()) => return Ok(()),
-            // Cross-device (EXDEV) or filesystem quirk — fall through to copy.
+            // Cross-device (EXDEV) or filesystem quirk. warn, not debug: the
+            // copy fallback silently forfeits the restore fast path, and at
+            // default log levels a misplaced chroot base would only ever be
+            // rediscovered by re-measuring.
             Err(e) => {
-                debug!(src = %src.display(), dst = %dst.display(), error = %e,
+                warn!(src = %src.display(), dst = %dst.display(), error = %e,
                     "hard link failed; falling back to copy");
             }
         }

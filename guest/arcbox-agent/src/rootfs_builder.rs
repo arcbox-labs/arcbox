@@ -449,6 +449,22 @@ fn build_default_rootfs(spec: &DefaultRootfsSpec, out: &Path) -> Result<()> {
     )
     .context("write /etc/group")?;
 
+    // resolv.conf lives on tmpfs (/run, mounted by vm-agent): DNS writes on
+    // the post-restore reconfig path must not touch the block device — the
+    // clone's first ext4 write pays a synchronous dm-snapshot CoW exception
+    // through the nested I/O stack, measured at ~30 ms (CORE-75).
+    fmt.create(
+        "/etc/resolv.conf",
+        LNK,
+        Some("../run/resolv.conf"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .context("symlink /etc/resolv.conf")?;
+
     fmt.close().context("failed to finalize ext4 image")?;
     Ok(())
 }
@@ -505,6 +521,21 @@ async fn inject_vm_agent(ext4_path: &str, req_id: &str) -> Result<()> {
             .args(["chmod", "755", &dest])
             .status()
             .await;
+    }
+
+    // Point resolv.conf at tmpfs, mirroring the default template: DNS
+    // rewrites must stay off the CoW block device (CORE-75). Rewriting is
+    // safe for Docker images — Docker itself never ships meaningful
+    // resolv.conf content (it bind-mounts one at run time).
+    if copy_result.is_ok() {
+        let etc = format!("{mount_dir}/etc");
+        if tokio::fs::create_dir_all(&etc).await.is_ok() {
+            let resolv = format!("{etc}/resolv.conf");
+            let _ = tokio::fs::remove_file(&resolv).await;
+            if let Err(e) = tokio::fs::symlink("../run/resolv.conf", &resolv).await {
+                tracing::warn!(error = %e, "resolv.conf symlink failed; DNS rewrites will hit the CoW device");
+            }
+        }
     }
 
     // Always unmount and cleanup, even on failure.
