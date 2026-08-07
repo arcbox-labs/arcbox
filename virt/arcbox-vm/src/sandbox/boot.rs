@@ -200,18 +200,24 @@ pub(super) async fn boot_sandbox(
                 return;
             }
 
-            let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
-            info!(sandbox_id = %id, "sandbox booted and ready");
-
             // First eligible create of this boot shape (CORE-77): capture
             // the warm snapshot while the guest is still idle, before the
             // initial cmd dirties it. Synchronous on purpose — the cmd must
             // not run before the checkpoint — and failures only warn: cache
             // population never fails a healthy boot.
+            //
+            // This MUST precede the READY event: checkpointing pauses the
+            // guest for the duration, and a client that acts on READY the
+            // moment it arrives would hit that pause with an execution and
+            // hang. READY promises the sandbox accepts executions, so it
+            // cannot fire while the guest is about to stop answering.
             if let Some(ticket) = &warm_publish {
                 super::warm::publish_after_boot(&id, ticket, &instances, &config, &cow_manager)
                     .await;
             }
+
+            let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
+            info!(sandbox_id = %id, "sandbox booted and ready");
 
             // Launch the initial workload, if the spec carries one. The
             // sandbox stays alive when it exits (Running → Ready + "idle"),
