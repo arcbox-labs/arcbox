@@ -45,6 +45,10 @@ impl NetworkManager {
                 .insert(u32::from(alloc.ip_address));
         }
 
+        // Translation rules do not die with the device; remove them first
+        // (tolerant of absence, so legacy TAPs are a no-op).
+        #[cfg(target_os = "linux")]
+        super::invariant::remove(&alloc.tap_name, alloc.ip_address)?;
         #[cfg(target_os = "linux")]
         destroy_tap_checked(&alloc.tap_name)?;
         debug!(

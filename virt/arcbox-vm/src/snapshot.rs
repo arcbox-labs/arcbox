@@ -41,6 +41,13 @@ pub struct SnapshotMeta {
     /// Host-absolute rootfs path (required for jailer-mode restore staging).
     #[serde(default)]
     pub rootfs_path: Option<String>,
+    /// Whether the origin guest ran the fixed invariant network identity
+    /// (CORE-81): eth0 on the constant link-local address with the constant
+    /// gateway, external identity applied host-side per TAP. A restore of such
+    /// a snapshot needs zero guest-side network work. `serde(default)` so
+    /// legacy snapshots read back `false` and keep the reconfig-RPC path.
+    #[serde(default)]
+    pub net_invariant: bool,
 }
 
 /// Info returned to callers / gRPC layer.
@@ -145,6 +152,8 @@ pub struct SnapshotDraft {
     /// Host-absolute rootfs path (required for restore to rebuild the
     /// dm-snapshot origin).
     pub rootfs_path: Option<String>,
+    /// Whether the origin guest ran the invariant network identity (CORE-81).
+    pub net_invariant: bool,
 }
 
 /// A snapshot being written, not yet part of the catalog.
@@ -198,6 +207,7 @@ impl PendingSnapshot<'_> {
             parent_id: draft.parent_id,
             kernel_path: draft.kernel_path,
             rootfs_path: draft.rootfs_path,
+            net_invariant: draft.net_invariant,
         };
 
         sync_private_file(&staging.join(VMSTATE_FILE))?;
@@ -486,6 +496,7 @@ mod tests {
             parent_id: None,
             kernel_path: None,
             rootfs_path: None,
+            net_invariant: false,
         }
     }
 
@@ -578,6 +589,24 @@ mod tests {
         let listed = catalog.list("vm-1").unwrap();
         assert_eq!(listed.len(), 1, "pre-labels snapshot must still load");
         assert!(listed[0].labels.is_empty());
+        // Field absent on disk → legacy addressing → the reconfig-RPC restore
+        // path must stay selected.
+        assert!(!catalog.get("vm-1", "old-snap").unwrap().net_invariant);
+    }
+
+    #[test]
+    fn net_invariant_survives_the_catalog_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = publish(
+            &catalog,
+            "vm-1",
+            SnapshotDraft {
+                net_invariant: true,
+                ..draft()
+            },
+        );
+        assert!(catalog.get("vm-1", &meta.id).unwrap().net_invariant);
     }
 
     #[test]

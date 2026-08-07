@@ -62,6 +62,7 @@ http = "1"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [dev-dependencies]
+arcbox-vm.workspace = true
 tempfile = "3"
 
 [features]

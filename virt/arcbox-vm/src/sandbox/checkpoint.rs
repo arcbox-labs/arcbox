@@ -42,10 +42,11 @@ impl SandboxManager {
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
         // Verify state and capture the kernel/rootfs paths for jailer
-        // re-staging, plus the id the sandbox's chroot is actually keyed by
+        // re-staging, the id the sandbox's chroot is actually keyed by
         // — a sandbox restored from a pre-warmed pool slot lives in the
-        // slot's chroot, and FC resolves snapshot paths inside it.
-        let (kernel_path, rootfs_path, chroot_owner) = {
+        // slot's chroot, and FC resolves snapshot paths inside it — plus
+        // the guest's network addressing mode.
+        let (kernel_path, rootfs_path, chroot_owner, net_invariant) = {
             let instance = self.get_instance(sandbox_id)?;
             let inst = instance.lock().unwrap();
             if inst.state != SandboxState::Ready {
@@ -62,6 +63,7 @@ impl SandboxManager {
                 inst.pool_slot_id
                     .clone()
                     .unwrap_or_else(|| sandbox_id.clone()),
+                inst.net_invariant,
             )
         };
 
@@ -147,6 +149,7 @@ impl SandboxManager {
             parent_id: None,
             kernel_path: Some(kernel_path),
             rootfs_path: Some(rootfs_path),
+            net_invariant,
         })?;
 
         let snap_dir_path = meta
@@ -368,7 +371,16 @@ impl SandboxManager {
             );
             super::reconcile::write_state_record(&vm_dir, &cleanup_record)?;
             if let Some(network) = &net_alloc {
-                self.network.activate(network)?;
+                // The restored guest keeps the addressing its snapshot baked:
+                // invariant snapshots pair with an invariant TAP (host-side
+                // NAT, no guest work); legacy snapshots keep the legacy TAP
+                // shape and are re-addressed over the reconfig RPC below.
+                let mode = if snap_meta.net_invariant {
+                    crate::network::TapMode::Invariant
+                } else {
+                    crate::network::TapMode::LegacySnapshot
+                };
+                self.network.activate(network, mode)?;
             }
             Ok(())
         })();
@@ -672,6 +684,14 @@ impl SandboxManager {
             let Some(ref net) = net_alloc else {
                 return Ok(());
             };
+            // Invariant-addressed snapshot: the guest already holds the fixed
+            // link-local identity and its resolv.conf already points at the
+            // fixed gateway; the fresh TAP carries the new pool IP host-side.
+            // Zero guest-side work (CORE-81). Legacy snapshots (flag absent /
+            // false) keep the reconfig RPC below.
+            if snap_meta.net_invariant {
+                return Ok(());
+            }
             let cmd = crate::boot_proto::NetReconfigCommand {
                 ip: net.ip_address,
                 netmask: net.netmask(),
@@ -769,6 +789,7 @@ impl SandboxManager {
             inst.vm = Some(vm);
             inst.vsock_uds_path = Some(actual_vsock_path);
             inst.cow_handle = pending_cow.take();
+            inst.net_invariant = snap_meta.net_invariant;
             inst.state = SandboxState::Ready;
             inst.ready_at = Some(Utc::now());
         }

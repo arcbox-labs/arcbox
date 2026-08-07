@@ -1057,14 +1057,18 @@ async fn do_boot(
     // Append static IP configuration to boot args so the kernel configures
     // eth0 before init runs.  The guest-side vm-agent parses this back via
     // `KernelIpParam::from_str` to derive the DNS nameserver.
-    let boot_args = if let Some(net) = net_alloc {
+    //
+    // Every sandbox boots the identical fixed identity (CORE-81): the pool
+    // IP stays a host-side property of the TAP, so snapshots taken from this
+    // guest are network-agnostic and restore with zero guest-side work.
+    let boot_args = if net_alloc.is_some() {
         if spec.boot_args.contains("ip=") {
             spec.boot_args.clone()
         } else {
             let ip_param = KernelIpParam {
-                client: net.ip_address,
-                gateway: net.gateway,
-                netmask: net.netmask(),
+                client: crate::network::invariant::GUEST_IP,
+                gateway: crate::network::invariant::GUEST_GATEWAY,
+                netmask: crate::network::invariant::GUEST_NETMASK,
             };
             format!("{} {ip_param}", spec.boot_args)
         }

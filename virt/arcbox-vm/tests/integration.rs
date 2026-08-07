@@ -28,6 +28,7 @@ fn snapshot_catalog_persists_across_instances() {
                 parent_id: None,
                 kernel_path: None,
                 rootfs_path: None,
+                net_invariant: false,
             })
             .unwrap()
             .id

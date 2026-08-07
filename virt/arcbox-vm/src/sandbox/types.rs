@@ -160,6 +160,11 @@ pub struct SandboxInstance {
     /// names are keyed by. `None` for resources created under the
     /// sandbox's own id.
     pub(super) pool_slot_id: Option<String>,
+    /// Whether this guest runs the fixed invariant network identity
+    /// (CORE-81). Set by the create path when the boot bakes the invariant
+    /// `ip=` parameter, and inherited from [`crate::snapshot::SnapshotMeta`]
+    /// on restore so chained checkpoints record the guest's actual addressing.
+    pub(super) net_invariant: bool,
 }
 
 impl SandboxInstance {
@@ -209,6 +214,7 @@ impl SandboxInstance {
             error: None,
             cow_handle: None,
             pool_slot_id: None,
+            net_invariant: false,
         }
     }
 

@@ -13,6 +13,13 @@
 //! request or when the host finalizes the sandbox's durable cleanup ticket.
 //! `FORWARD` traffic is already accepted by the blanket sandbox subnet rules
 //! installed at boot (`init.rs::setup_sandbox_forwarding`).
+//!
+//! Invariant-addressed sandboxes (CORE-81) do not own their pool IP — the
+//! guest sits on the fixed link-local identity and the pool IP is a host-side
+//! TAP property. Their DNAT targets the fixed guest IP directly, paired with
+//! a mangle `MARK` rule on the same match so the rewritten destination routes
+//! out the right TAP via the sandbox's fwmark table. Legacy sandboxes keep
+//! the pool-IP target.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -20,15 +27,18 @@ use std::net::Ipv4Addr;
 use std::process::Output;
 
 use anyhow::{Context, Result, bail};
+use arcbox_vm::SandboxNetworkIdentity;
+use arcbox_vm::network::invariant;
 use tokio::process::Command;
 
 /// First port of the reserved guest relay range.
 const PORT_RANGE_START: u16 = 40000;
 /// Last port of the reserved guest relay range (inclusive).
 const PORT_RANGE_END: u16 = 49999;
-/// iptables `--comment` tag stamped on every sandbox DNAT rule, so rules left
-/// behind by a crashed/restarted agent can be identified and flushed (they are
-/// otherwise untracked kernel state that would misroute after IP reuse).
+/// iptables `--comment` tag stamped on every sandbox forwarding rule, so
+/// rules left behind by a crashed/restarted agent can be identified and
+/// flushed (they are otherwise untracked kernel state that would misroute
+/// after IP reuse).
 const RULE_COMMENT_PREFIX: &str = "arcbox-sbx:";
 const LEGACY_RULE_COMMENT: &str = "arcbox-sbx";
 
@@ -48,16 +58,30 @@ impl Protocol {
     }
 }
 
-/// One installed DNAT mapping.
+/// One installed forwarding mapping.
 struct ForwardRule {
     guest_port: u16,
     sandbox_ip: Ipv4Addr,
     cleanup_token: String,
-    /// The exact iptables rule spec, so removal deletes precisely this rule.
+    /// The exact nat DNAT rule spec, so removal deletes precisely this rule.
     rule_args: Vec<String>,
+    /// Companion mangle `MARK` rule spec (invariant-addressed sandboxes only).
+    mangle_args: Option<Vec<String>>,
 }
 
-/// Manages the reserved-range DNAT mappings for all sandboxes.
+impl ForwardRule {
+    /// The `(table, spec)` halves this mapping installed, in install order.
+    fn halves(&self) -> Vec<(&'static str, Vec<String>)> {
+        let mut halves = Vec::with_capacity(2);
+        if let Some(ref mangle) = self.mangle_args {
+            halves.push(("mangle", mangle.clone()));
+        }
+        halves.push(("nat", self.rule_args.clone()));
+        halves
+    }
+}
+
+/// Manages the reserved-range forwarding mappings for all sandboxes.
 #[derive(Default)]
 pub struct PortForwardManager {
     /// `(sandbox_id, sandbox_port, protocol)` → installed rule.
@@ -67,67 +91,105 @@ pub struct PortForwardManager {
 }
 
 impl PortForwardManager {
-    /// Install (or return the existing) DNAT mapping for a sandbox port.
+    /// Install (or return the existing) forwarding mapping for a sandbox port.
     ///
     /// Returns the reserved-range guest port carrying the relay.
     pub async fn forward(
         &mut self,
         sandbox_id: &str,
-        sandbox_ip: Ipv4Addr,
-        cleanup_token: &str,
+        identity: &SandboxNetworkIdentity,
         sandbox_port: u16,
         protocol: Protocol,
     ) -> Result<u16> {
         let key = (sandbox_id.to_owned(), sandbox_port, protocol);
         if let Some(rule) = self.rules.get(&key) {
-            let guest_port = rule.guest_port;
-            let rule_args = rule.rule_args.clone();
-            if rule.sandbox_ip == sandbox_ip && rule.cleanup_token == cleanup_token {
-                if rule_is_installed(&rule_args).await? {
-                    return Ok(guest_port);
+            let same_ip = rule.sandbox_ip == identity.ip;
+            let same_generation = rule.cleanup_token == identity.cleanup_token;
+            if same_ip && same_generation {
+                let guest_port = rule.guest_port;
+                let halves = rule.halves();
+                let mut repaired = false;
+                for (table, spec) in halves {
+                    if rule_is_installed(&prepend_table(table, "-C", &spec)).await? {
+                        continue;
+                    }
+                    run_iptables(&prepend_table(table, "-I", &spec))
+                        .await
+                        .context("repairing missing forwarding rule")?;
+                    repaired = true;
                 }
-                run_iptables(&prepend(&["-t", "nat", "-I", "PREROUTING"], &rule_args))
-                    .await
-                    .context("repairing missing DNAT rule")?;
-                tracing::info!(
-                    sandbox_id,
-                    guest_port,
-                    sandbox_port,
-                    %sandbox_ip,
-                    "sandbox port forward repaired"
-                );
+                if repaired {
+                    tracing::info!(
+                        sandbox_id,
+                        guest_port,
+                        sandbox_port,
+                        sandbox_ip = %identity.ip,
+                        "sandbox port forward repaired"
+                    );
+                }
                 return Ok(guest_port);
             }
             self.remove_keys(vec![key.clone()]).await?;
         }
 
         let guest_port = self.allocate_port()?;
+        // Invariant guests own only the fixed guest IP: DNAT to it, and mark
+        // the packet on the same match so the rewritten destination routes
+        // out this sandbox's TAP (fwmark table). Legacy guests own the pool
+        // IP, which the main table routes directly.
+        let (target_ip, mangle_args) = if identity.net_invariant {
+            (
+                invariant::GUEST_IP,
+                Some(mark_rule_args(
+                    guest_port,
+                    identity.ip,
+                    &identity.cleanup_token,
+                    protocol,
+                )),
+            )
+        } else {
+            (identity.ip, None)
+        };
         let rule_args = dnat_rule_args(
             guest_port,
-            sandbox_ip,
-            cleanup_token,
+            target_ip,
+            &identity.cleanup_token,
             sandbox_port,
             protocol,
         );
 
-        run_iptables(&prepend(&["-t", "nat", "-I", "PREROUTING"], &rule_args))
+        if let Some(ref mangle) = mangle_args {
+            run_iptables(&prepend_table("mangle", "-I", mangle))
+                .await
+                .context("installing fwmark rule")?;
+        }
+        if let Err(error) = run_iptables(&prepend_table("nat", "-I", &rule_args))
             .await
-            .context("installing DNAT rule")?;
+            .context("installing DNAT rule")
+        {
+            // Roll the mangle half back so a failed install leaves no orphan.
+            if let Some(ref mangle) = mangle_args {
+                let _ = run_iptables(&prepend_table("mangle", "-D", mangle)).await;
+            }
+            return Err(error);
+        }
 
         tracing::info!(
             sandbox_id,
             guest_port,
             sandbox_port,
-            %sandbox_ip,
+            sandbox_ip = %identity.ip,
+            invariant = identity.net_invariant,
             "sandbox port forward installed"
         );
         self.rules.insert(
             key,
             ForwardRule {
                 guest_port,
-                sandbox_ip,
-                cleanup_token: cleanup_token.to_owned(),
+                sandbox_ip: identity.ip,
+                cleanup_token: identity.cleanup_token.clone(),
                 rule_args,
+                mangle_args,
             },
         );
         Ok(guest_port)
@@ -171,6 +233,9 @@ impl PortForwardManager {
         .await
     }
 
+    /// Both closures receive a full iptables argv (`-t <table> -C/-D
+    /// PREROUTING <spec>`); the indirection keeps the removal bookkeeping
+    /// testable without a kernel.
     async fn remove_keys_with<C, CFut, D, DFut>(
         &mut self,
         keys: Vec<(String, u16, Protocol)>,
@@ -188,17 +253,25 @@ impl PortForwardManager {
             let Some(rule) = self.rules.get(&key) else {
                 continue;
             };
-            let rule_args = rule.rule_args.clone();
-            let del_args = prepend(&["-t", "nat", "-D", "PREROUTING"], &rule.rule_args);
+            let halves = rule.halves();
             let guest_port = rule.guest_port;
 
-            // Delete the kernel rule BEFORE dropping the record. A failed
+            // Delete the kernel rules BEFORE dropping the record. A failed
             // record remains owned by this manager so a retry can remove it.
-            let result = match check(rule_args).await.context("checking DNAT rule") {
-                Ok(false) => Ok(()),
-                Ok(true) => delete(del_args).await.context("removing DNAT rule"),
-                Err(error) => Err(error),
-            };
+            let result = async {
+                for (table, spec) in halves {
+                    if check(prepend_table(table, "-C", &spec))
+                        .await
+                        .context("checking forwarding rule")?
+                    {
+                        delete(prepend_table(table, "-D", &spec))
+                            .await
+                            .context("removing forwarding rule")?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
             match result {
                 Ok(()) => {
                     self.rules.remove(&key);
@@ -249,7 +322,7 @@ impl PortForwardManager {
 /// The protocol/port/destination spec shared by install and delete.
 fn dnat_rule_args(
     guest_port: u16,
-    sandbox_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
     cleanup_token: &str,
     sandbox_port: u16,
     protocol: Protocol,
@@ -266,13 +339,45 @@ fn dnat_rule_args(
         "-j".into(),
         "DNAT".into(),
         "--to-destination".into(),
-        format!("{sandbox_ip}:{sandbox_port}"),
+        format!("{target_ip}:{sandbox_port}"),
+    ]
+}
+
+/// The mangle-side companion of an invariant DNAT: the same match, marking
+/// the packet with the sandbox's fwmark so the rewritten (fixed-guest)
+/// destination routes out this sandbox's TAP.
+fn mark_rule_args(
+    guest_port: u16,
+    pool_ip: Ipv4Addr,
+    cleanup_token: &str,
+    protocol: Protocol,
+) -> Vec<String> {
+    vec![
+        "-p".into(),
+        protocol.iptables_name().into(),
+        "--dport".into(),
+        guest_port.to_string(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        format!("{RULE_COMMENT_PREFIX}{cleanup_token}"),
+        "-j".into(),
+        "MARK".into(),
+        "--set-mark".into(),
+        format!("{:#x}", invariant::fwmark(pool_ip)),
     ]
 }
 
 /// If `line` belongs to the exact quarantined generation, return the argv
-/// that deletes it.
+/// that deletes it from `table`'s PREROUTING chain.
+///
+/// Tokenized rules are matched by their unique generation comment alone —
+/// their DNAT target differs by addressing mode (pool IP for legacy,
+/// the fixed guest IP for invariant sandboxes) and the mangle MARK half has
+/// no target at all. Pre-token rules carry only the bare legacy comment, so
+/// they are additionally gated on the pool-IP target.
 fn orphan_delete_args(
+    table: &'static str,
     line: &str,
     sandbox_ip: Ipv4Addr,
     cleanup_token: &str,
@@ -283,24 +388,20 @@ fn orphan_delete_args(
         .map(unquote_iptables_field)
         .collect();
     let comment = format!("{RULE_COMMENT_PREFIX}{cleanup_token}");
+    let exact = fields
+        .windows(2)
+        .any(|pair| pair[0] == "--comment" && pair[1] == comment);
+    let legacy = fields
+        .windows(2)
+        .any(|pair| pair[0] == "--comment" && pair[1] == LEGACY_RULE_COMMENT);
     let destination_prefix = format!("{sandbox_ip}:");
-    let tagged = fields.windows(2).any(|pair| {
-        pair[0] == "--comment" && (pair[1] == comment || pair[1] == LEGACY_RULE_COMMENT)
-    });
     let targets_ip = fields
         .windows(2)
         .any(|pair| pair[0] == "--to-destination" && pair[1].starts_with(&destination_prefix));
-    if !tagged || !targets_ip {
+    if !(exact || (legacy && targets_ip)) {
         return None;
     }
-    let mut args = vec![
-        "-t".to_owned(),
-        "nat".to_owned(),
-        "-D".to_owned(),
-        "PREROUTING".to_owned(),
-    ];
-    args.extend(fields);
-    Some(args)
+    Some(prepend_table(table, "-D", &fields))
 }
 
 fn unquote_iptables_field(field: &str) -> String {
@@ -323,39 +424,24 @@ fn legacy_orphan_delete_args(line: &str) -> Option<Vec<String>> {
     if !legacy {
         return None;
     }
-    let mut args = vec![
-        "-t".to_owned(),
-        "nat".to_owned(),
-        "-D".to_owned(),
-        "PREROUTING".to_owned(),
-    ];
-    args.extend(fields);
-    Some(args)
+    Some(prepend_table("nat", "-D", &fields))
 }
 
-/// Delete kernel DNAT state for one exact quarantined generation after the
-/// host has removed its listeners. This also covers agent restart, where the
-/// process-local rule registry is empty.
+/// Delete kernel forwarding state for one exact quarantined generation after
+/// the host has removed its listeners. This also covers agent restart, where
+/// the process-local rule registry is empty. Sweeps both the nat DNAT rules
+/// and the mangle MARK companions of invariant sandboxes.
 pub async fn remove_orphan_rules_for(sandbox_ip: Ipv4Addr, cleanup_token: &str) -> Result<()> {
-    let output = Command::new("/sbin/iptables")
-        .args(["-t", "nat", "-S", "PREROUTING"])
-        .output()
-        .await
-        .context("listing sandbox DNAT rules")?;
-    if !output.status.success() {
-        bail!(
-            "iptables -t nat -S PREROUTING failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let listing = String::from_utf8_lossy(&output.stdout);
     let mut removed = 0usize;
     let mut failures = Vec::new();
-    for line in listing.lines() {
-        if let Some(args) = orphan_delete_args(line, sandbox_ip, cleanup_token) {
-            match run_iptables(&args).await {
-                Ok(()) => removed += 1,
-                Err(error) => failures.push(error.to_string()),
+    for table in ["nat", "mangle"] {
+        let listing = list_prerouting(table).await?;
+        for line in listing.lines() {
+            if let Some(args) = orphan_delete_args(table, line, sandbox_ip, cleanup_token) {
+                match run_iptables(&args).await {
+                    Ok(()) => removed += 1,
+                    Err(error) => failures.push(error.to_string()),
+                }
             }
         }
     }
@@ -363,12 +449,12 @@ pub async fn remove_orphan_rules_for(sandbox_ip: Ipv4Addr, cleanup_token: &str) 
         tracing::info!(
             removed,
             %sandbox_ip,
-            "removed quarantined sandbox DNAT rules"
+            "removed quarantined sandbox forwarding rules"
         );
     }
     if !failures.is_empty() {
         bail!(
-            "failed to remove {} quarantined DNAT rule(s): {}",
+            "failed to remove {} quarantined forwarding rule(s): {}",
             failures.len(),
             failures.join("; ")
         );
@@ -378,19 +464,9 @@ pub async fn remove_orphan_rules_for(sandbox_ip: Ipv4Addr, cleanup_token: &str) 
 
 /// Remove only pre-token sandbox rules during the startup handshake. Tokenized
 /// generations remain quarantined until their individual tickets finalize.
+/// Pre-token rules predate the mangle companions, so only nat is swept.
 pub async fn remove_legacy_orphan_rules() -> Result<()> {
-    let output = Command::new("/sbin/iptables")
-        .args(["-t", "nat", "-S", "PREROUTING"])
-        .output()
-        .await
-        .context("listing legacy sandbox DNAT rules")?;
-    if !output.status.success() {
-        bail!(
-            "iptables -t nat -S PREROUTING failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let listing = String::from_utf8_lossy(&output.stdout);
+    let listing = list_prerouting("nat").await?;
     let mut failures = Vec::new();
     for args in listing.lines().filter_map(legacy_orphan_delete_args) {
         if let Err(error) = run_iptables(&args).await {
@@ -407,8 +483,24 @@ pub async fn remove_legacy_orphan_rules() -> Result<()> {
     Ok(())
 }
 
-fn prepend(head: &[&str], tail: &[String]) -> Vec<String> {
-    head.iter()
+async fn list_prerouting(table: &str) -> Result<String> {
+    let output = Command::new("/sbin/iptables")
+        .args(["-t", table, "-S", "PREROUTING"])
+        .output()
+        .await
+        .context("listing sandbox forwarding rules")?;
+    if !output.status.success() {
+        bail!(
+            "iptables -t {table} -S PREROUTING failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn prepend_table(table: &str, verb: &str, tail: &[String]) -> Vec<String> {
+    ["-t", table, verb, "PREROUTING"]
+        .iter()
         .map(|s| (*s).to_owned())
         .chain(tail.iter().cloned())
         .collect()
@@ -430,15 +522,14 @@ async fn run_iptables(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn rule_is_installed(rule_args: &[String]) -> Result<bool> {
-    let args = prepend(&["-t", "nat", "-C", "PREROUTING"], rule_args);
+async fn rule_is_installed(check_args: &[String]) -> Result<bool> {
     let output = Command::new("/sbin/iptables")
         .args(["-w", "2"])
-        .args(&args)
+        .args(check_args)
         .output()
         .await
         .context("failed to run iptables")?;
-    classify_rule_check(output, &args)
+    classify_rule_check(output, check_args)
 }
 
 fn classify_rule_check(output: Output, args: &[String]) -> Result<bool> {
@@ -490,37 +581,123 @@ mod tests {
     }
 
     #[test]
+    fn mark_spec_shares_the_dnat_match_and_carries_the_fwmark() {
+        let pool: Ipv4Addr = "172.20.0.2".parse().unwrap();
+        let args = mark_rule_args(40000, pool, "generation", Protocol::Tcp);
+        assert_eq!(
+            args,
+            [
+                "-p",
+                "tcp",
+                "--dport",
+                "40000",
+                "-m",
+                "comment",
+                "--comment",
+                "arcbox-sbx:generation",
+                "-j",
+                "MARK",
+                "--set-mark",
+                "0xac140002"
+            ]
+        );
+        // Same match prefix as the DNAT half — the two rules must classify
+        // the identical packets.
+        let dnat = dnat_rule_args(
+            40000,
+            invariant::GUEST_IP,
+            "generation",
+            8080,
+            Protocol::Tcp,
+        );
+        assert_eq!(args[..8], dnat[..8]);
+    }
+
+    #[test]
     fn orphan_delete_targets_only_tagged_prerouting_rules() {
         // A tagged arcbox rule (as `iptables -S` prints it, with the implicit
         // `-m tcp`) is converted from -A to a -D argv.
         let line = "-A PREROUTING -p tcp -m tcp --dport 40000 -m comment \
                     --comment \"arcbox-sbx:generation\" -j DNAT \
                     --to-destination 172.20.0.2:8080";
-        let args = orphan_delete_args(line, "172.20.0.2".parse().unwrap(), "generation")
+        let args = orphan_delete_args("nat", line, "172.20.0.2".parse().unwrap(), "generation")
             .expect("tagged rule should match");
         assert_eq!(args[..4], ["-t", "nat", "-D", "PREROUTING"]);
         assert_eq!(args.last().unwrap(), "172.20.0.2:8080");
         assert!(args.iter().any(|a| a == "arcbox-sbx:generation"));
         assert!(!args.iter().any(|a| a.contains('"')));
-        assert!(orphan_delete_args(line, "172.20.0.2".parse().unwrap(), "old").is_none());
-        assert!(orphan_delete_args(line, "172.20.0.3".parse().unwrap(), "generation").is_none());
+        assert!(orphan_delete_args("nat", line, "172.20.0.2".parse().unwrap(), "old").is_none());
+        // The exact generation token is unique, so it alone identifies the
+        // rule — a mismatched pool IP no longer shields a tokenized rule.
+        assert!(
+            orphan_delete_args("nat", line, "172.20.0.3".parse().unwrap(), "generation").is_some()
+        );
 
         // A foreign rule (e.g. Docker's) is left untouched.
         let docker = "-A PREROUTING -p tcp -m tcp --dport 8080 -j DNAT \
                       --to-destination 172.17.0.2:80";
-        assert!(orphan_delete_args(docker, "172.20.0.2".parse().unwrap(), "generation").is_none());
+        assert!(
+            orphan_delete_args("nat", docker, "172.20.0.2".parse().unwrap(), "generation")
+                .is_none()
+        );
 
         // A non-PREROUTING line is ignored.
         assert!(
-            orphan_delete_args("-N DOCKER", "172.20.0.2".parse().unwrap(), "generation").is_none()
+            orphan_delete_args(
+                "nat",
+                "-N DOCKER",
+                "172.20.0.2".parse().unwrap(),
+                "generation"
+            )
+            .is_none()
         );
 
         let legacy = "-A PREROUTING -p tcp --dport 40000 -m comment \
                       --comment \"arcbox-sbx\" -j DNAT \
                       --to-destination 172.20.0.2:8080";
-        assert!(orphan_delete_args(legacy, "172.20.0.2".parse().unwrap(), "generation").is_some());
+        assert!(
+            orphan_delete_args("nat", legacy, "172.20.0.2".parse().unwrap(), "generation")
+                .is_some()
+        );
+        // Pre-token rules stay gated on the pool-IP target.
+        assert!(
+            orphan_delete_args("nat", legacy, "172.20.0.3".parse().unwrap(), "generation")
+                .is_none()
+        );
         assert!(legacy_orphan_delete_args(legacy).is_some());
         assert!(legacy_orphan_delete_args(line).is_none());
+    }
+
+    #[test]
+    fn orphan_delete_matches_invariant_dnat_and_mark_rules() {
+        // Invariant DNAT targets the fixed guest IP; the token must still
+        // claim it for this generation's cleanup.
+        let dnat = "-A PREROUTING -p tcp -m tcp --dport 40000 -m comment \
+                    --comment \"arcbox-sbx:generation\" -j DNAT \
+                    --to-destination 169.254.100.2:8080";
+        assert!(
+            orphan_delete_args("nat", dnat, "172.20.0.2".parse().unwrap(), "generation").is_some()
+        );
+
+        // The mangle MARK companion has no --to-destination at all.
+        let mark = "-A PREROUTING -p tcp -m tcp --dport 40000 -m comment \
+                    --comment \"arcbox-sbx:generation\" -j MARK --set-xmark 0xac140002/0xffffffff";
+        let args = orphan_delete_args("mangle", mark, "172.20.0.2".parse().unwrap(), "generation")
+            .expect("tokenized mangle rule should match");
+        assert_eq!(args[..4], ["-t", "mangle", "-D", "PREROUTING"]);
+        assert!(
+            orphan_delete_args("mangle", mark, "172.20.0.2".parse().unwrap(), "other").is_none()
+        );
+    }
+
+    fn test_rule(port: u16, token: &str, mangle: bool) -> ForwardRule {
+        ForwardRule {
+            guest_port: PORT_RANGE_START + port,
+            sandbox_ip: "172.20.0.2".parse().unwrap(),
+            cleanup_token: token.into(),
+            rule_args: vec![port.to_string()],
+            mangle_args: mangle.then(|| vec![format!("mark-{port}")]),
+        }
     }
 
     #[test]
@@ -536,6 +713,7 @@ mod tests {
                 sandbox_ip: "172.20.0.2".parse().unwrap(),
                 cleanup_token: "generation".into(),
                 rule_args: vec![],
+                mangle_args: None,
             },
         );
         let second = mgr.allocate_port().unwrap();
@@ -546,18 +724,14 @@ mod tests {
     async fn bulk_remove_keeps_failed_rules_and_removes_the_rest() {
         let mut mgr = PortForwardManager::default();
         for (id, port) in [("target", 80), ("target", 81), ("other", 82)] {
+            let token = if id == "target" {
+                "generation"
+            } else {
+                "other-generation"
+            };
             mgr.rules.insert(
                 (id.into(), port, Protocol::Tcp),
-                ForwardRule {
-                    guest_port: PORT_RANGE_START + port,
-                    sandbox_ip: "172.20.0.2".parse().unwrap(),
-                    cleanup_token: if id == "target" {
-                        "generation".into()
-                    } else {
-                        "other-generation".into()
-                    },
-                    rule_args: vec![port.to_string()],
-                },
+                test_rule(port, token, false),
             );
         }
 
@@ -605,16 +779,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_remove_deletes_both_halves_of_an_invariant_mapping() {
+        let mut mgr = PortForwardManager::default();
+        mgr.rules.insert(
+            ("target".into(), 80, Protocol::Tcp),
+            test_rule(80, "generation", true),
+        );
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&deleted);
+        mgr.remove_keys_with(
+            vec![("target".into(), 80, Protocol::Tcp)],
+            |_| async { Ok(true) },
+            move |args| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(args);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let deleted = deleted.lock().unwrap();
+        assert_eq!(deleted.len(), 2, "both the mangle and nat halves");
+        assert_eq!(deleted[0][..4], ["-t", "mangle", "-D", "PREROUTING"]);
+        assert_eq!(deleted[1][..4], ["-t", "nat", "-D", "PREROUTING"]);
+        assert!(mgr.rules.is_empty());
+    }
+
+    #[tokio::test]
     async fn bulk_remove_drops_records_for_rules_already_absent() {
         let mut mgr = PortForwardManager::default();
         mgr.rules.insert(
             ("target".into(), 80, Protocol::Tcp),
-            ForwardRule {
-                guest_port: PORT_RANGE_START,
-                sandbox_ip: "172.20.0.2".parse().unwrap(),
-                cleanup_token: "generation".into(),
-                rule_args: vec!["rule".into()],
-            },
+            test_rule(80, "generation", false),
         );
         let keys = vec![("target".into(), 80, Protocol::Tcp)];
         mgr.remove_keys_with(
