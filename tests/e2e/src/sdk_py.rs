@@ -19,8 +19,11 @@ use crate::daemon::{DaemonConfig, DaemonHandle};
 use crate::metrics::RunMetrics;
 use crate::{env_flag, repo_root};
 
-/// Generous ceiling for daemon startup (asset staging + VM boot + agent).
-const READY_TIMEOUT: Duration = Duration::from_secs(180);
+/// Generous ceiling for daemon startup: asset staging, the cold
+/// ~255 MiB runtime-binary download into the isolated data dir, VM boot,
+/// and the agent — the same budget as the sandbox smoke (measured
+/// 2026-08-07, where the sibling sdk_ts harness reached READY in 214 s).
+const READY_TIMEOUT: Duration = Duration::from_secs(360);
 /// Ceiling for the whole pytest run: two sandbox boots (sync + async
 /// flavors) plus a handful of executions each. This only catches a
 /// wedged runner.
