@@ -109,7 +109,8 @@ pub(super) async fn boot_sandbox(
             // a slow or retrying sync holding the Ready publication back
             // would recreate the latency this gate exists to remove. Fire it
             // detached; any failure is a warn, mirroring the restore path.
-            // Retires when guest-side ptp_kvm self-sync lands.
+            // Belt-and-braces alongside vm-agent's ptp_kvm self-sync;
+            // retires once ptp is proven in production.
             {
                 let id = id.clone();
                 let vsock_uds_path = vsock_uds_path.clone();

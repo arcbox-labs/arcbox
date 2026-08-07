@@ -661,29 +661,33 @@ impl SandboxManager {
 
         let t_loaded = std::time::Instant::now();
 
-        // Synchronise the guest clock to the host after restore.  The sandbox
-        // clock is frozen at snapshot creation time; correct it before any
-        // workload runs.  A failure here is non-fatal — the sandbox is still
-        // usable, just with a potentially stale clock.
-        //
-        // Use a short timeout so clock sync never dominates restore latency.
-        // sync_clock itself has a 5s read timeout, but connect_to_agent can
-        // retry for up to AGENT_READY_TIMEOUT (30s).  Cap the whole operation.
-        let clock_sync = async {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                vsock::sync_clock(&actual_vsock_path),
-            )
-            .await
-            {
-                Ok(Err(e)) => warn!(sandbox_id = %new_id, "clock sync after restore failed: {e}"),
-                Err(_) => warn!(sandbox_id = %new_id, "clock sync after restore timed out"),
-                Ok(Ok(vsock::ClockSync::AgentError(code))) => {
-                    warn!(sandbox_id = %new_id, code, "agent could not set the clock after restore");
+        // Clock sync after restore is DETACHED, mirroring the cold-boot path
+        // (boot.rs): vm-agent re-syncs itself from ptp_kvm (/dev/ptp0) on
+        // every accepted exec connection, so correct wall time no longer
+        // depends on this RPC. It stays as belt-and-braces while ptp proves
+        // itself in production, with the same 10 s cap and warn-only
+        // semantics it always had — but awaiting it cost ~57 ms (mostly the
+        // post-resume vsock connect settle), the dominant remainder of the
+        // restore RPC (CORE-80).
+        {
+            let id = new_id.clone();
+            let vsock_path = actual_vsock_path.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    vsock::sync_clock(&vsock_path),
+                )
+                .await
+                {
+                    Ok(Ok(vsock::ClockSync::Synced)) => {}
+                    Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                        warn!(sandbox_id = %id, code, "agent could not set the clock after restore");
+                    }
+                    Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after restore failed: {e}"),
+                    Err(_) => warn!(sandbox_id = %id, "clock sync after restore timed out"),
                 }
-                Ok(Ok(vsock::ClockSync::Synced)) => {}
-            }
-        };
+            });
+        }
 
         // Re-address the guest to the fresh allocation. The restored kernel
         // still carries the origin's `ip=` boot configuration, so without
@@ -718,11 +722,10 @@ impl SandboxManager {
             .and_then(|r| r)
         };
 
-        // The two guest configs are independent operations on separate vsock
-        // connections; run them concurrently — serially they were half the
-        // restore latency (CORE-75).
-        let ((), reconfig) = tokio::join!(clock_sync, net_reconfig);
-        if let Err(error) = reconfig {
+        // The reconfig RPC is the only guest configuration still awaited —
+        // and only by legacy snapshots; invariant snapshots return
+        // immediately above.
+        if let Err(error) = net_reconfig.await {
             return Err(self
                 .rollback_restore(
                     &new_id,
@@ -843,7 +846,10 @@ impl SandboxManager {
 
         // On a pool hit, spawn_ms covers records + network + the claim
         // itself (the phases that still ran) and stage_ms is genuinely 0 —
-        // the log never fakes the pre-executed phases.
+        // the log never fakes the pre-executed phases. guest_cfg_ms bills
+        // only what stayed awaited (the legacy net-reconfig RPC): invariant
+        // snapshots await nothing and honestly read ~0, since the detached
+        // clock sync is not restore latency.
         let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         info!(
             sandbox_id = %new_id,
