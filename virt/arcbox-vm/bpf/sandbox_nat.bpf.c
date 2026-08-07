@@ -185,8 +185,13 @@ sandbox_nat_ingress(struct __sk_buff *skb)
     struct iphdr iph;
     if (bpf_skb_load_bytes(skb, ETH_HLEN, &iph, sizeof(iph)))
         return TC_ACT_OK;
+    /* This program only attaches to invariant TAPs, where the guest's one
+     * legitimate IPv4 source is the fixed address. Anything else is forged
+     * by construction — passing it through would skip both the map-miss
+     * drop and the pool isolation below, and with onlink steering a forged
+     * source could reach another sandbox's TAP. */
     if (iph.saddr != GUEST_IP_BE)
-        return TC_ACT_OK;
+        return TC_ACT_SHOT;
 
     __u32 ifindex = skb->ifindex;
     __u32 *pool_ip = bpf_map_lookup_elem(&SANDBOX_NAT, &ifindex);

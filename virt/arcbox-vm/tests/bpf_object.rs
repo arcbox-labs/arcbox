@@ -10,8 +10,12 @@ use sha2::{Digest, Sha256};
 const SOURCE: &str = include_str!("../bpf/sandbox_nat.bpf.c");
 const SOURCE_HASH: &str = include_str!("../bpf/sandbox_nat.bpf.c.sha256");
 const OBJECT: &[u8] = include_bytes!("../bpf/sandbox_nat.bpf.o");
+const OBJECT_HASH: &str = include_str!("../bpf/sandbox_nat.bpf.o.sha256");
 
-/// The committed object must have been rebuilt from the committed source.
+/// The committed object must have been rebuilt from the committed source:
+/// both sidecars are written by the same `cargo xtask dev bpf` run, so the
+/// source half catches an edited `.c` without a rebuild and the object half
+/// catches a rebuilt-but-not-recommitted (or hand-swapped) `.o`.
 #[test]
 fn bpf_object_matches_source() {
     let digest = format!("{:x}", Sha256::digest(SOURCE.as_bytes()));
@@ -20,6 +24,13 @@ fn bpf_object_matches_source() {
         SOURCE_HASH.trim(),
         "bpf/sandbox_nat.bpf.c changed but the committed object was not \
          rebuilt — run `cargo xtask dev bpf` and commit the result"
+    );
+    let object_digest = format!("{:x}", Sha256::digest(OBJECT));
+    assert_eq!(
+        object_digest,
+        OBJECT_HASH.trim(),
+        "bpf/sandbox_nat.bpf.o does not match its sidecar — run \
+         `cargo xtask dev bpf` and commit BOTH the object and the sidecars"
     );
 }
 

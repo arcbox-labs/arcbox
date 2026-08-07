@@ -41,10 +41,20 @@ fn rebuild_sandbox_bpf() -> Result<()> {
         format!("{digest}\n"),
     )
     .context("writing the BPF source hash sidecar")?;
+    // Both sidecars come from the same rebuild: source↔object pairing is
+    // what lets the freshness test prove the committed .o was actually
+    // rebuilt, not just that the source hash was refreshed.
+    let object_digest = sha256_file(&object)?;
+    fs::write(
+        bpf_dir.join("sandbox_nat.bpf.o.sha256"),
+        format!("{object_digest}\n"),
+    )
+    .context("writing the BPF object hash sidecar")?;
 
     let object_len = fs::metadata(&object)?.len();
     println!("[INFO] Rebuilt {} ({object_len} bytes)", object.display());
     println!("[INFO] Source sha256: {digest}");
+    println!("[INFO] Object sha256: {object_digest}");
     Ok(())
 }
 
