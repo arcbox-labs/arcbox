@@ -992,9 +992,10 @@ impl SandboxManager {
         }
 
         if let Some(error) = ready_commit.durability_error {
-            return Err(VmmError::Unavailable(format!(
-                "sandbox {new_id} was restored, but ACK durability is unconfirmed: {error}"
-            )));
+            return Err(VmmError::AckUnconfirmed {
+                id: new_id,
+                detail: error,
+            });
         }
         Ok((new_id, ip_address))
     }

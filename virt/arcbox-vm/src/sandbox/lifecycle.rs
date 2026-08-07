@@ -92,15 +92,16 @@ impl SandboxManager {
                         // through to the cold boot (which republishes) rather
                         // than surfacing a snapshot-not-found to the caller.
                         //
-                        // The restore is pinned to this create's id so the
-                        // instance registry can discriminate how it failed:
-                        // a pre-commit failure unwinds its claim (id absent,
-                        // safe to cold-boot), while a post-commit failure
-                        // (ACK durability) leaves the sandbox running and
-                        // READY under this id — falling through there would
-                        // boot a duplicate and then fail on the id
-                        // reservation, so it propagates exactly as on the
-                        // direct Restore path.
+                        // The failure class decides the fallback, carried
+                        // in the error itself: `AckUnconfirmed` is the one
+                        // post-commit failure — the sandbox is running and
+                        // READY under this id — so cold-booting there would
+                        // recreate a live (or, if the client already acted
+                        // on READY and deleted it, just-deleted) sandbox.
+                        // Every other failure unwound its claim pre-commit
+                        // and cold-boots safely. The restore is pinned to
+                        // this create's id so both outcomes concern the id
+                        // the caller asked for.
                         let mut warm_spec = spec.clone();
                         warm_spec.id = Some(id.clone());
                         match self
@@ -116,7 +117,7 @@ impl SandboxManager {
                             .await
                         {
                             Ok(result) => return Ok(result),
-                            Err(error) if self.instances.read().unwrap().contains_key(&id) => {
+                            Err(error @ VmmError::AckUnconfirmed { .. }) => {
                                 return Err(error);
                             }
                             Err(error) => {
@@ -370,9 +371,7 @@ impl SandboxManager {
 
         info!(sandbox_id = %id, "sandbox create requested (async boot started)");
         if let Some(error) = starting_durability_error {
-            return Err(VmmError::Unavailable(format!(
-                "sandbox {id} was created, but ACK durability is unconfirmed: {error}"
-            )));
+            return Err(VmmError::AckUnconfirmed { id, detail: error });
         }
         Ok((id, ip_address))
     }

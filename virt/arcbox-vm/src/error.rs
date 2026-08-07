@@ -59,6 +59,19 @@ pub enum VmmError {
     #[error("service unavailable: {0}")]
     Unavailable(String),
 
+    /// The operation's side effects committed — the sandbox exists and is
+    /// running — but the acknowledging record's durability is unconfirmed.
+    /// Distinct from [`VmmError::Unavailable`] so callers with a fallback
+    /// (warm create) can tell "nothing happened, retry freely" from "it
+    /// happened, do NOT re-execute".
+    #[error("sandbox {id} committed, but ACK durability is unconfirmed: {detail}")]
+    AckUnconfirmed {
+        /// The sandbox whose operation committed.
+        id: String,
+        /// The underlying durability failure.
+        detail: String,
+    },
+
     /// A stdin write starts past the accepted byte count — the caller must
     /// resume from `accepted` (its offsets have a gap).
     #[error("stdin offset {offset} is past the {accepted} accepted bytes")]
