@@ -104,6 +104,9 @@ STARTING ──► READY ──► RUNNING ──► READY   (execution exited; 
 States are the `SandboxState` enum (`SANDBOX_STATE_*`); events carry the
 `SandboxEventKind` enum. All timestamps are `google.protobuf.Timestamp`.
 
+- `READY` means the in-VM agent is accepting executions: on a cold boot
+  the transition (and its event) fires only after the guest has booted
+  and the agent answers over vsock, not when the VM process starts.
 - A sandbox is **not destroyed** when its execution exits — it returns to
   `READY` and accepts further `StartExecution` calls.
 - Destruction happens via `Stop`/`Remove`, `ttl_seconds` (hard maximum

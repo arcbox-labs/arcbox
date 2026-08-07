@@ -50,7 +50,8 @@ const MSG_START: u8 = 0x01;
 const MSG_STDIN: u8 = 0x02;
 const MSG_RESIZE: u8 = 0x03;
 const MSG_EOF: u8 = 0x04;
-/// Synchronise the guest clock to the host after snapshot restore.
+/// Synchronise the guest clock to the host (after snapshot restore, and as
+/// the cold-boot agent-readiness gate).
 /// Payload: `[i64 LE unix_seconds][u32 LE nanos]` (12 bytes).
 pub(crate) const MSG_CLOCK_SYNC: u8 = 0x05;
 /// Re-address the guest network after a fresh-network snapshot restore.
@@ -157,8 +158,16 @@ pub struct StartCommand {
 
 /// How long to wait for the guest agent to start accepting vsock connections.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Interval between vsock connection attempts while the guest is still booting.
-const AGENT_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// First retry delay of the vsock connect backoff; doubles per attempt.
+const AGENT_READY_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
+/// Ceiling for the vsock connect retry backoff.
+const AGENT_READY_MAX_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Next delay of the exponential connect backoff: double, capped at
+/// [`AGENT_READY_MAX_BACKOFF`].
+fn next_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(AGENT_READY_MAX_BACKOFF)
+}
 
 /// Open a host-initiated vsock connection to the guest agent (port 52).
 ///
@@ -177,6 +186,7 @@ async fn connect_to_agent(uds_path: &Path) -> Result<UnixStream> {
 /// port-forward modules which operate on different vsock ports.
 pub(crate) async fn connect_to_port(uds_path: &Path, port: u32) -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + AGENT_READY_TIMEOUT;
+    let mut backoff = AGENT_READY_INITIAL_BACKOFF;
     loop {
         match try_vsock_handshake(uds_path, port).await {
             Ok(stream) => return Ok(stream),
@@ -190,7 +200,8 @@ pub(crate) async fn connect_to_port(uds_path: &Path, port: u32) -> Result<UnixSt
                 AGENT_READY_TIMEOUT.as_secs(),
             )));
         }
-        tokio::time::sleep(AGENT_READY_POLL_INTERVAL).await;
+        tokio::time::sleep(backoff).await;
+        backoff = next_backoff(backoff);
     }
 }
 
@@ -414,13 +425,30 @@ pub async fn exec(
 // sync_clock() — synchronise guest clock after snapshot restore
 // =============================================================================
 
+/// Outcome of a completed clock-sync round trip.
+///
+/// Both variants prove liveness — the agent accepted the connection, parsed
+/// the frame, and replied — which is what the boot readiness gate needs.
+/// Only [`ClockSync::Synced`] means the guest wall clock was actually set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockSync {
+    /// The agent set the clock.
+    Synced,
+    /// The agent answered but could not set the clock (e.g. `clock_settime`
+    /// failed); it carries the agent-reported exit code.
+    AgentError(i32),
+}
+
 /// Synchronise the guest clock to the current host time.
 ///
 /// Sends [`MSG_CLOCK_SYNC`] to the exec channel (vsock port 52) and waits for
-/// `MSG_EXIT(0)`.  Should be called immediately after `restore_sandbox()`
-/// completes so the guest does not run with a stale timestamp from snapshot
-/// creation time.
-pub async fn sync_clock(uds_path: &Path) -> Result<()> {
+/// `MSG_EXIT`.  Called immediately after `restore_sandbox()` completes so
+/// the guest does not run with a stale timestamp from snapshot creation time,
+/// and by the cold-boot path as the agent-readiness gate. `Err` means the
+/// round trip itself failed (connect, transport, malformed reply); an agent
+/// that answered-but-failed is `Ok(ClockSync::AgentError)` so callers can
+/// separate liveness from the clock side effect.
+pub async fn sync_clock(uds_path: &Path) -> Result<ClockSync> {
     // Split connect vs frame RTT: on a just-resumed guest these have very
     // different causes (vsock handshake vs guest-side processing), and the
     // CORE-75 settle-window investigation needs them attributable.
@@ -453,7 +481,7 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
     stream: &mut S,
     secs: i64,
     nanos: u32,
-) -> Result<()> {
+) -> Result<ClockSync> {
     let mut payload = [0u8; 12];
     payload[..8].copy_from_slice(&secs.to_le_bytes());
     payload[8..].copy_from_slice(&nanos.to_le_bytes());
@@ -480,11 +508,9 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
     }
     let code = i32::from_le_bytes(payload[..4].try_into().unwrap());
     if code != 0 {
-        return Err(VmmError::Vsock(format!(
-            "clock sync: agent returned exit code {code}"
-        )));
+        return Ok(ClockSync::AgentError(code));
     }
-    Ok(())
+    Ok(ClockSync::Synced)
 }
 
 /// Re-address the guest network after a fresh-network snapshot restore.
@@ -594,6 +620,17 @@ mod tests {
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(payload);
         buf
+    }
+
+    #[test]
+    fn connect_backoff_doubles_up_to_the_cap() {
+        let mut delays = Vec::new();
+        let mut backoff = AGENT_READY_INITIAL_BACKOFF;
+        for _ in 0..10 {
+            delays.push(backoff.as_millis());
+            backoff = next_backoff(backoff);
+        }
+        assert_eq!(delays, [2, 4, 8, 16, 32, 64, 128, 200, 200, 200]);
     }
 
     #[tokio::test]
@@ -747,11 +784,12 @@ mod tests {
         });
 
         let result = sync_clock_on_stream(&mut host, 1_700_000_000, 123_456_789).await;
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ClockSync::Synced);
         agent_handle.await.unwrap();
     }
 
-    /// Agent returns a non-zero exit code.
+    /// Agent answers with a non-zero exit code: liveness proven, clock not
+    /// set — `Ok(AgentError)`, not `Err`, so the boot gate can pass on it.
     #[tokio::test]
     async fn test_sync_clock_agent_error() {
         let (mut agent, mut host) = tokio::io::duplex(256);
@@ -764,9 +802,7 @@ mod tests {
         });
 
         let result = sync_clock_on_stream(&mut host, 1_700_000_000, 0).await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("exit code -1"), "unexpected error: {msg}");
+        assert_eq!(result.unwrap(), ClockSync::AgentError(-1));
         agent_handle.await.unwrap();
     }
 

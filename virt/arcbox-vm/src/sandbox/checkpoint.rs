@@ -607,7 +607,10 @@ impl SandboxManager {
             {
                 Ok(Err(e)) => warn!(sandbox_id = %new_id, "clock sync after restore failed: {e}"),
                 Err(_) => warn!(sandbox_id = %new_id, "clock sync after restore timed out"),
-                Ok(Ok(())) => {}
+                Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                    warn!(sandbox_id = %new_id, code, "agent could not set the clock after restore");
+                }
+                Ok(Ok(vsock::ClockSync::Synced)) => {}
             }
         };
 
