@@ -1070,4 +1070,53 @@ mod tests {
         assert!(manager.snapshots.find_by_id(&pause_meta.id).is_err());
         assert!(manager.snapshots.find_by_id(&user_meta.id).is_ok());
     }
+
+    /// `List` and `Inspect` must agree on a paused sandbox's footprint.
+    /// They resolve the checkpoint differently — `Inspect` by `find_by_id`,
+    /// `List` by a linear scan of one `list_all()` so a multi-sandbox
+    /// response pays a single catalog read — so a drift in either id match
+    /// would silently report 0 on one surface while the other stayed right.
+    #[tokio::test]
+    async fn list_and_inspect_report_the_same_paused_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+
+        let pending = manager.snapshots.begin("napper").unwrap();
+        std::fs::write(pending.dir().join("vmstate"), vec![0u8; 128 * 1024]).unwrap();
+        std::fs::write(pending.dir().join("mem"), vec![0u8; 256 * 1024]).unwrap();
+        let meta = pending
+            .commit(SnapshotDraft {
+                name: Some(PAUSE_SNAPSHOT_NAME.to_owned()),
+                labels: HashMap::new(),
+                snapshot_type: crate::config::SnapshotType::Full,
+                parent_id: None,
+                kernel_path: None,
+                rootfs_path: None,
+                net_invariant: false,
+            })
+            .unwrap();
+
+        // The retained disk overlay, alongside the checkpoint.
+        let cow_dir = dir.path().join("cow");
+        std::fs::create_dir_all(&cow_dir).unwrap();
+        std::fs::write(cow_dir.join("arcbox-cow-napper.img"), vec![0u8; 64 * 1024]).unwrap();
+
+        let arc = insert_instance(&manager, "napper", SandboxState::Paused);
+        arc.lock().unwrap().pause_snapshot_id = Some(meta.id);
+        // A live sandbox reports nothing: the field is retained-state only.
+        insert_instance(&manager, "awake", SandboxState::Ready);
+
+        let inspected = manager.inspect_sandbox(&"napper".to_owned()).unwrap();
+        let listed = manager.list_sandboxes(None, &HashMap::new()).unwrap();
+        let paused = listed.iter().find(|s| s.id == "napper").unwrap();
+        let awake = listed.iter().find(|s| s.id == "awake").unwrap();
+
+        assert!(
+            inspected.storage_bytes >= (128 + 256 + 64) * 1024,
+            "inspect must count the checkpoint and the overlay, got {}",
+            inspected.storage_bytes
+        );
+        assert_eq!(paused.storage_bytes, inspected.storage_bytes);
+        assert_eq!(awake.storage_bytes, 0);
+    }
 }
