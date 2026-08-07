@@ -42,13 +42,17 @@ impl WarmKey {
     }
 }
 
-/// Content fingerprint of the rootfs file behind a resolved template path.
+/// Content fingerprint of a boot input behind a resolved template path.
 ///
-/// A memory snapshot is only valid against the exact rootfs bytes it booted
-/// from, and template paths are reused across rebuilds — the fingerprint is
-/// what invalidates the cache when the content changes underneath the path.
+/// A memory snapshot is only valid against the exact rootfs and kernel
+/// bytes it booted from, and both paths are reused across rebuilds (the
+/// bundle installer overwrites the kernel in place on a version bump) —
+/// the fingerprints invalidate the cache when content changes underneath a
+/// path. The kernel case is the more dangerous one: the snapshot *is* the
+/// old kernel's memory image, so a stale hit would silently keep
+/// resurrecting the pre-bump kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RootfsFingerprint {
+pub(super) struct FileFingerprint {
     dev: u64,
     ino: u64,
     mtime: i64,
@@ -56,7 +60,7 @@ pub(super) struct RootfsFingerprint {
     size: u64,
 }
 
-impl RootfsFingerprint {
+impl FileFingerprint {
     fn read(path: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path)?;
@@ -71,13 +75,14 @@ impl RootfsFingerprint {
 }
 
 /// Derive the warm key for an effective (defaults-applied) create spec,
-/// fingerprinting the rootfs file on disk.
+/// fingerprinting the kernel and rootfs files on disk.
 pub(super) fn derive_warm_key(spec: &SandboxSpec) -> std::io::Result<WarmKey> {
-    let fingerprint = RootfsFingerprint::read(Path::new(&spec.rootfs))?;
-    Ok(derive(spec, fingerprint))
+    let kernel = FileFingerprint::read(Path::new(&spec.kernel))?;
+    let rootfs = FileFingerprint::read(Path::new(&spec.rootfs))?;
+    Ok(derive(spec, kernel, rootfs))
 }
 
-fn derive(spec: &SandboxSpec, fingerprint: RootfsFingerprint) -> WarmKey {
+fn derive(spec: &SandboxSpec, kernel: FileFingerprint, rootfs: FileFingerprint) -> WarmKey {
     let mut hasher = Sha256::new();
     // vcpus and memory are part of the key on purpose: a memory snapshot
     // restores only onto identical geometry.
@@ -85,17 +90,18 @@ fn derive(spec: &SandboxSpec, fingerprint: RootfsFingerprint) -> WarmKey {
         hasher.update(text.as_bytes());
         hasher.update([0u8]);
     }
-    for number in [
-        u64::from(spec.vcpus),
-        spec.memory_mib,
-        fingerprint.dev,
-        fingerprint.ino,
-        fingerprint.size,
-    ] {
+    for number in [u64::from(spec.vcpus), spec.memory_mib] {
         hasher.update(number.to_le_bytes());
     }
-    for number in [fingerprint.mtime, fingerprint.mtime_nsec] {
-        hasher.update(number.to_le_bytes());
+    // Field order fixes each fingerprint's position in the digest, so the
+    // kernel and rootfs contributions cannot be confused for one another.
+    for fingerprint in [kernel, rootfs] {
+        for number in [fingerprint.dev, fingerprint.ino, fingerprint.size] {
+            hasher.update(number.to_le_bytes());
+        }
+        for number in [fingerprint.mtime, fingerprint.mtime_nsec] {
+            hasher.update(number.to_le_bytes());
+        }
     }
     WarmKey(format!("{:x}", hasher.finalize()))
 }
@@ -367,8 +373,18 @@ mod tests {
     use crate::config::JailerConfig;
     use crate::snapshot::SnapshotDraft;
 
-    fn base_fingerprint() -> RootfsFingerprint {
-        RootfsFingerprint {
+    fn kernel_fingerprint() -> FileFingerprint {
+        FileFingerprint {
+            dev: 5,
+            ino: 7,
+            mtime: 1_690_000_000,
+            mtime_nsec: 456,
+            size: 9 << 20,
+        }
+    }
+
+    fn base_fingerprint() -> FileFingerprint {
+        FileFingerprint {
             dev: 5,
             ino: 42,
             mtime: 1_700_000_000,
@@ -408,17 +424,17 @@ mod tests {
     #[test]
     fn key_is_stable_for_an_identical_shape() {
         assert_eq!(
-            derive(&base_spec(), base_fingerprint()),
-            derive(&base_spec(), base_fingerprint())
+            derive(&base_spec(), kernel_fingerprint(), base_fingerprint()),
+            derive(&base_spec(), kernel_fingerprint(), base_fingerprint())
         );
     }
 
     type SpecEdit = Box<dyn Fn(&mut SandboxSpec)>;
-    type FingerprintEdit = Box<dyn Fn(&mut RootfsFingerprint)>;
+    type FingerprintEdit = Box<dyn Fn(&mut FileFingerprint)>;
 
     #[test]
     fn key_tracks_every_boot_recipe_and_geometry_field() {
-        let base = derive(&base_spec(), base_fingerprint());
+        let base = derive(&base_spec(), kernel_fingerprint(), base_fingerprint());
         let variants: Vec<SpecEdit> = vec![
             Box::new(|s| s.kernel = "/run/kernel/vmlinux-new".into()),
             Box::new(|s| s.rootfs = "/data/rootfs-other.ext4".into()),
@@ -429,7 +445,11 @@ mod tests {
         for mutate in variants {
             let mut spec = base_spec();
             mutate(&mut spec);
-            assert_ne!(derive(&spec, base_fingerprint()), base, "{spec:?}");
+            assert_ne!(
+                derive(&spec, kernel_fingerprint(), base_fingerprint()),
+                base,
+                "{spec:?}"
+            );
         }
         // Fields outside the boot shape must NOT change the key: labels,
         // cmd, ttl are per-sandbox, not per-template.
@@ -437,12 +457,15 @@ mod tests {
         spec.labels.insert("team".into(), "x".into());
         spec.cmd = vec!["sleep".into()];
         spec.ttl_seconds = 60;
-        assert_eq!(derive(&spec, base_fingerprint()), base);
+        assert_eq!(
+            derive(&spec, kernel_fingerprint(), base_fingerprint()),
+            base
+        );
     }
 
     #[test]
-    fn key_tracks_every_fingerprint_field() {
-        let base = derive(&base_spec(), base_fingerprint());
+    fn key_tracks_every_fingerprint_field_of_both_files() {
+        let base = derive(&base_spec(), kernel_fingerprint(), base_fingerprint());
         let variants: Vec<FingerprintEdit> = vec![
             Box::new(|f| f.dev += 1),
             Box::new(|f| f.ino += 1),
@@ -450,30 +473,60 @@ mod tests {
             Box::new(|f| f.mtime_nsec += 1),
             Box::new(|f| f.size += 1),
         ];
-        for mutate in variants {
+        for mutate in &variants {
             let mut fingerprint = base_fingerprint();
             mutate(&mut fingerprint);
-            assert_ne!(derive(&base_spec(), fingerprint), base, "{fingerprint:?}");
+            assert_ne!(
+                derive(&base_spec(), kernel_fingerprint(), fingerprint),
+                base,
+                "rootfs {fingerprint:?}"
+            );
         }
+        for mutate in &variants {
+            let mut fingerprint = kernel_fingerprint();
+            mutate(&mut fingerprint);
+            assert_ne!(
+                derive(&base_spec(), fingerprint, base_fingerprint()),
+                base,
+                "kernel {fingerprint:?}"
+            );
+        }
+        // Swapping the two fingerprints must not collide: their positions
+        // in the digest are what tells them apart.
+        assert_ne!(
+            derive(&base_spec(), base_fingerprint(), kernel_fingerprint()),
+            base
+        );
     }
 
     #[test]
-    fn rebuilding_the_rootfs_in_place_changes_the_key() {
+    fn rebuilding_a_boot_input_in_place_changes_the_key() {
         let dir = tempfile::tempdir().unwrap();
+        let kernel = dir.path().join("vmlinux");
         let rootfs = dir.path().join("rootfs.ext4");
+        std::fs::write(&kernel, b"kernel v1").unwrap();
         std::fs::write(&rootfs, b"template v1").unwrap();
         let mut spec = base_spec();
+        spec.kernel = kernel.to_str().unwrap().to_owned();
         spec.rootfs = rootfs.to_str().unwrap().to_owned();
 
         let first = derive_warm_key(&spec).unwrap();
         assert_eq!(derive_warm_key(&spec).unwrap(), first, "stat is stable");
 
-        // The template builder's rebuild discipline: write a sibling, then
-        // rename over the fixed path — same path, new inode.
+        // The rebuild discipline for both inputs: write a sibling, then
+        // rename over the fixed path — same path, new inode. The kernel
+        // case is exactly what a bundle version bump does to
+        // runtime/kernel/vmlinux.
         let staging = dir.path().join(".rootfs.tmp");
         std::fs::write(&staging, b"template v2").unwrap();
         std::fs::rename(&staging, &rootfs).unwrap();
-        assert_ne!(derive_warm_key(&spec).unwrap(), first);
+        let second = derive_warm_key(&spec).unwrap();
+        assert_ne!(second, first);
+
+        let staging = dir.path().join(".vmlinux.tmp");
+        std::fs::write(&staging, b"kernel v2").unwrap();
+        std::fs::rename(&staging, &kernel).unwrap();
+        assert_ne!(derive_warm_key(&spec).unwrap(), second);
     }
 
     #[test]

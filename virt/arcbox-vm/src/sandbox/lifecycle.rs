@@ -91,14 +91,24 @@ impl SandboxManager {
                         // miss arriving late, not a create failure — fall
                         // through to the cold boot (which republishes) rather
                         // than surfacing a snapshot-not-found to the caller.
-                        // The restore path unwinds its own claim on failure,
-                        // so the id is free again here.
+                        //
+                        // The restore is pinned to this create's id so the
+                        // instance registry can discriminate how it failed:
+                        // a pre-commit failure unwinds its claim (id absent,
+                        // safe to cold-boot), while a post-commit failure
+                        // (ACK durability) leaves the sandbox running and
+                        // READY under this id — falling through there would
+                        // boot a duplicate and then fail on the id
+                        // reservation, so it propagates exactly as on the
+                        // direct Restore path.
+                        let mut warm_spec = spec.clone();
+                        warm_spec.id = Some(id.clone());
                         match self
                             .restore_from_snapshot(
                                 super::checkpoint::RestoreRequest {
                                     snapshot_id: snapshot_id.clone(),
                                     network_override: true,
-                                    spec: spec.clone(),
+                                    spec: warm_spec,
                                     origin: super::checkpoint::RestoreOrigin::WarmCreate,
                                 },
                                 request_key,
@@ -106,6 +116,9 @@ impl SandboxManager {
                             .await
                         {
                             Ok(result) => return Ok(result),
+                            Err(error) if self.instances.read().unwrap().contains_key(&id) => {
+                                return Err(error);
+                            }
                             Err(error) => {
                                 warn!(
                                     sandbox_id = %id,
