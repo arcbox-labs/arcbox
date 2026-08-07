@@ -113,10 +113,10 @@ fn classify_agent_error(code: i32, message: &str) -> Option<connectrpc::ErrorDet
             &[],
         )),
         // VmmError::WrongState → "VM '{id}' is in wrong state: expected
-        // {expected}, got {actual}". A FAILED sandbox is its own registry
-        // code; anything else is "exists but not ready for this call"
-        // (still STARTING, or busy RUNNING under the single-execution
-        // model).
+        // {expected}, got {actual}". FAILED and PAUSED are their own registry
+        // codes — both need an action, not a wait; anything else is "exists
+        // but not ready for this call" (still STARTING, busy RUNNING under
+        // the single-execution model, or mid-transition).
         412 if message.contains("is in wrong state") => {
             let observed = message.rsplit("got ").next().unwrap_or_default();
             match observed {
@@ -125,11 +125,22 @@ fn classify_agent_error(code: i32, message: &str) -> Option<connectrpc::ErrorDet
                     "inspect the sandbox for the failure reason, then remove it",
                     &[("state", observed)],
                 )),
-                "starting" | "running" | "stopping" | "stopped" | "pausing" => Some(error_info(
-                    pb::ErrorCode::SandboxNotReady,
-                    "wait for the sandbox to reach READY (watch `Events` or poll `Inspect`)",
+                // A control-plane call refused because the sandbox is paused
+                // — `Stop` is the reachable one, since PAUSED only leads to
+                // RESUMING, FAILED, or REMOVING. Waiting never clears it.
+                "paused" => Some(error_info(
+                    pb::ErrorCode::SandboxPaused,
+                    "resume the sandbox first (`SandboxService.Resume`), or remove it — \
+                     a paused sandbox has no VM to stop",
                     &[("state", observed)],
                 )),
+                "starting" | "running" | "stopping" | "stopped" | "pausing" | "resuming" => {
+                    Some(error_info(
+                        pb::ErrorCode::SandboxNotReady,
+                        "wait for the sandbox to reach READY (watch `Events` or poll `Inspect`)",
+                        &[("state", observed)],
+                    ))
+                }
                 // Other WrongState shapes (generation races, cleanup
                 // tickets) are precondition failures without a precise
                 // registry identity.
@@ -239,6 +250,24 @@ mod tests {
                 "VM 'box1' is in wrong state: expected Ready, got failed"
             ),
             Some(pb::ErrorCode::SandboxFailed)
+        );
+        // A control-plane refusal on a paused sandbox (Stop is the reachable
+        // one) carries the same code as the data-plane 423 — one condition,
+        // one registry identity — not "not ready", which never clears.
+        assert_eq!(
+            classified(
+                412,
+                "VM 'box1' is in wrong state: expected Ready | Running | Stopping, got paused"
+            ),
+            Some(pb::ErrorCode::SandboxPaused)
+        );
+        // Mid-transition states are a genuine wait.
+        assert_eq!(
+            classified(
+                412,
+                "VM 'box1' is in wrong state: expected Ready, got resuming"
+            ),
+            Some(pb::ErrorCode::SandboxNotReady)
         );
         assert_eq!(
             classified(

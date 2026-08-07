@@ -563,13 +563,36 @@ impl SandboxManager {
         Ok(())
     }
 
+    /// Files a checkpoint occupies on disk, for storage accounting.
+    ///
+    /// Empty when the id is unknown — a paused sandbox whose checkpoint went
+    /// missing reports the disk overlay alone rather than failing the read.
+    fn checkpoint_paths(&self, snapshot_id: &str) -> Vec<PathBuf> {
+        self.snapshots
+            .find_by_id(snapshot_id)
+            .map(|meta| {
+                std::iter::once(meta.vmstate_path)
+                    .chain(meta.mem_path)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Return the current state and metadata of a sandbox.
     pub fn inspect_sandbox(&self, id: &SandboxId) -> Result<SandboxInfo> {
         let instance = self.get_instance(id)?;
-        let inst = instance.lock().unwrap();
-        let mut info = inst_to_info(&inst);
-        if inst.state == SandboxState::Paused {
-            info.storage_bytes = self.paused_storage_bytes(&inst);
+        // Locate the retained artifacts under the lock; size them after it
+        // is dropped — the sizing stats files and scans the catalog, and
+        // holding the instance lock across that blocks every lifecycle
+        // transition on this sandbox.
+        let (mut info, artifacts) = {
+            let inst = instance.lock().unwrap();
+            let artifacts =
+                (inst.state == SandboxState::Paused).then(|| self.paused_artifacts(&inst));
+            (inst_to_info(&inst), artifacts)
+        };
+        if let Some(artifacts) = artifacts {
+            info.storage_bytes = artifacts.storage_bytes(|id| self.checkpoint_paths(id));
         }
         Ok(info)
     }
@@ -587,7 +610,13 @@ impl SandboxManager {
         // (as before) is the one place that could deadlock a future writer that
         // locks in the opposite order.
         let instances: Vec<_> = self.instances.read().unwrap().values().cloned().collect();
-        Ok(instances
+        // Two passes on purpose. Under the instance lock, only field reads:
+        // sizing a paused sandbox's retained state stats files and scans the
+        // snapshot catalog, so doing it here would put blocking I/O on the
+        // async executor while holding a lock every lifecycle transition
+        // needs. The second pass pays one catalog listing for the whole
+        // response instead of one per paused sandbox.
+        let mut summaries: Vec<(SandboxSummary, Option<super::pause::PausedArtifacts>)> = instances
             .iter()
             .filter_map(|arc| {
                 let inst = arc.lock().unwrap();
@@ -604,7 +633,7 @@ impl SandboxManager {
                         return None;
                     }
                 }
-                Some(SandboxSummary {
+                let summary = SandboxSummary {
                     id: inst.id.clone(),
                     state: inst.state,
                     labels: inst.labels.clone(),
@@ -615,14 +644,29 @@ impl SandboxManager {
                         .unwrap_or_default(),
                     created_at: inst.created_at,
                     paused_at: inst.paused_at,
-                    storage_bytes: if inst.state == SandboxState::Paused {
-                        self.paused_storage_bytes(&inst)
-                    } else {
-                        0
-                    },
-                })
+                    storage_bytes: 0,
+                };
+                let artifacts =
+                    (inst.state == SandboxState::Paused).then(|| self.paused_artifacts(&inst));
+                Some((summary, artifacts))
             })
-            .collect())
+            .collect();
+
+        if summaries.iter().any(|(_, artifacts)| artifacts.is_some()) {
+            let catalog = self.snapshots.list_all().unwrap_or_default();
+            for (summary, artifacts) in &mut summaries {
+                if let Some(artifacts) = artifacts {
+                    summary.storage_bytes = artifacts.storage_bytes(|id| {
+                        catalog
+                            .iter()
+                            .find(|info| info.id == id)
+                            .map(snapshot_files)
+                            .unwrap_or_default()
+                    });
+                }
+            }
+        }
+        Ok(summaries.into_iter().map(|(summary, _)| summary).collect())
     }
 
     /// Subscribe to sandbox lifecycle events.
@@ -708,4 +752,15 @@ impl SandboxManager {
         let uds = self.require_alive_vsock(id)?;
         crate::file_io::write_file(&uds, path, mode, data).await
     }
+}
+
+/// Files a listed checkpoint occupies on disk, for storage accounting.
+///
+/// The listing counterpart of [`SandboxManager::checkpoint_paths`]: it reads
+/// an already-loaded [`SnapshotInfo`] so a multi-sandbox response pays one
+/// catalog scan rather than one per paused sandbox.
+fn snapshot_files(info: &crate::snapshot::SnapshotInfo) -> Vec<PathBuf> {
+    std::iter::once(info.vmstate_path.clone())
+        .chain(info.mem_path.clone())
+        .collect()
 }

@@ -847,31 +847,58 @@ impl SandboxManager {
             .join(format!("arcbox-cow-{id}.img"))
     }
 
-    /// On-disk footprint of a paused sandbox's retained state: checkpoint
-    /// (vmstate + mem) plus the disk overlay (allocated blocks of the
-    /// sparse COW file, or the parked rootfs copy).
-    pub(super) fn paused_storage_bytes(&self, inst: &SandboxInstance) -> u64 {
+    /// Locate a paused sandbox's retained artifacts.
+    ///
+    /// Pure field reads — no filesystem access — so it is the only half of
+    /// the storage accounting that may run under the instance lock. The
+    /// sizing itself ([`PausedArtifacts::storage_bytes`]) stats files and,
+    /// for the checkpoint, needs a catalog lookup; doing that under the
+    /// lock would block every lifecycle transition on the sandbox behind
+    /// blocking I/O on the async executor.
+    pub(super) fn paused_artifacts(&self, inst: &SandboxInstance) -> PausedArtifacts {
+        PausedArtifacts {
+            pause_snapshot_id: inst.pause_snapshot_id.clone(),
+            preserved_cow: self.preserved_cow_file(&inst.id),
+            parked_rootfs: inst.vm_dir.join(PAUSED_ROOTFS_FILE),
+        }
+    }
+}
+
+/// Where a paused sandbox's retained state lives on disk.
+///
+/// Collected under the instance lock, sized outside it.
+pub(super) struct PausedArtifacts {
+    /// Catalog id of the internal pause checkpoint.
+    pause_snapshot_id: Option<String>,
+    /// Retained dm-snapshot overlay (absent in copy-mode).
+    preserved_cow: PathBuf,
+    /// Copy-mode fallback: the staged rootfs parked in `vm_dir`.
+    parked_rootfs: PathBuf,
+}
+
+impl PausedArtifacts {
+    /// On-disk footprint: the checkpoint (vmstate + mem) plus the disk
+    /// overlay — allocated blocks, so a sparse COW is counted at its real
+    /// cost.
+    ///
+    /// `checkpoint_paths` resolves a pause-checkpoint id to its files. A
+    /// caller sizing many sandboxes should close over one catalog listing
+    /// rather than paying a catalog scan per sandbox.
+    pub(super) fn storage_bytes(&self, checkpoint_paths: impl FnOnce(&str) -> Vec<PathBuf>) -> u64 {
         use std::os::unix::fs::MetadataExt as _;
 
-        let mut total = 0u64;
-        if let Some(snapshot_id) = inst.pause_snapshot_id.as_deref()
-            && let Ok(meta) = self.snapshots.find_by_id(snapshot_id)
-        {
-            for path in std::iter::once(&meta.vmstate_path).chain(meta.mem_path.iter()) {
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    total = total.saturating_add(metadata.blocks().saturating_mul(512));
-                }
-            }
-        }
-        for path in [
-            self.preserved_cow_file(&inst.id),
-            inst.vm_dir.join(PAUSED_ROOTFS_FILE),
-        ] {
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                total = total.saturating_add(metadata.blocks().saturating_mul(512));
-            }
-        }
-        total
+        let allocated = |path: &Path| {
+            std::fs::metadata(path).map_or(0, |metadata| metadata.blocks().saturating_mul(512))
+        };
+        let checkpoint = self
+            .pause_snapshot_id
+            .as_deref()
+            .map(checkpoint_paths)
+            .unwrap_or_default();
+        checkpoint
+            .iter()
+            .chain([&self.preserved_cow, &self.parked_rootfs])
+            .fold(0u64, |total, path| total.saturating_add(allocated(path)))
     }
 }
 

@@ -228,15 +228,34 @@ impl SandboxManager {
     /// The armed task holds only `Weak`s plus the resource set the expiry
     /// needs, so it never keeps the manager alive; a `SetLifecycle` re-arm
     /// replaces the slot and aborts the sleeping task.
+    ///
+    /// No-op without a shared handle ([`SandboxManager::into_shared`]), like
+    /// [`Self::arm_idle_timer`]: the fired task claims its timer slot through
+    /// the manager, and a task that cannot claim one must not act — reading
+    /// the two functions opposite ways on the same condition is how a stale
+    /// timer would slip past both staleness guards below.
     pub(super) fn arm_ttl_timer(&self, id: &SandboxId) {
+        let Some(self_handle) = self.self_handle.get().cloned() else {
+            return;
+        };
         let Ok(instance) = self.get_instance(id) else {
             self.timers.ttl.cancel(id);
             return;
         };
-        let (deadline, generation) = {
+        let (deadline, generation, state) = {
             let inst = instance.lock().unwrap();
-            (inst.ttl_deadline, inst.record_generation)
+            (inst.ttl_deadline, inst.record_generation, inst.state)
         };
+        // A terminal sandbox has nothing left to expire, and the live path
+        // cancels its TTL on the STOPPED/FAILED edge. Without this guard the
+        // restart resync re-arms one — `inactive_instance` restores
+        // `ttl_deadline` for every recovered record regardless of state — so
+        // whether a stopped sandbox's record gets reaped would depend on
+        // whether the agent happened to bounce.
+        if matches!(state, SandboxState::Stopped | SandboxState::Failed) {
+            self.timers.ttl.cancel(id);
+            return;
+        }
         let Some(deadline) = deadline else {
             self.timers.ttl.cancel(id);
             return;
@@ -244,7 +263,6 @@ impl SandboxManager {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let self_handle = self.self_handle.get().cloned();
         let armed_for = Arc::downgrade(&instance);
         let instances = Arc::clone(&self.instances);
         let network = Arc::clone(&self.network);
@@ -258,18 +276,22 @@ impl SandboxManager {
             tokio::spawn(async move {
                 sleep_until_utc(deadline).await;
                 // Claim the slot so a late cancel cannot abort mid-removal.
-                if let Some(manager) = self_handle.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if !manager.timers.ttl.try_claim(&id, epoch) {
-                        return;
-                    }
-                    // Re-armed deadlines replace the task; a moved deadline
-                    // observed here means the claim raced one — bail.
-                    let still_due = armed_for
-                        .upgrade()
-                        .is_some_and(|inst| inst.lock().unwrap().ttl_deadline == Some(deadline));
-                    if !still_due {
-                        return;
-                    }
+                // A gone manager means the whole sandbox layer is being torn
+                // down: there is nothing to claim the slot against and no one
+                // left to expire for, so bail rather than fall through.
+                let Some(manager) = self_handle.upgrade() else {
+                    return;
+                };
+                if !manager.timers.ttl.try_claim(&id, epoch) {
+                    return;
+                }
+                // Re-armed deadlines replace the task; a moved deadline
+                // observed here means the claim raced one — bail.
+                let still_due = armed_for
+                    .upgrade()
+                    .is_some_and(|inst| inst.lock().unwrap().ttl_deadline == Some(deadline));
+                if !still_due {
+                    return;
                 }
                 info!(sandbox_id = %id, "sandbox TTL expired; removing");
                 super::cleanup::expire_sandbox(
