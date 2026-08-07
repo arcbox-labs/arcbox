@@ -141,8 +141,7 @@ where
     let svc = match sandbox_service() {
         Ok(s) => Arc::clone(s),
         Err((code, reason)) => {
-            let err = ErrorResponse::new(*code, reason.as_str());
-            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            send_sandbox_error(stream, trace_id, *code, reason).await?;
             return Ok(());
         }
     };
@@ -536,6 +535,12 @@ where
 }
 
 /// Write a single `Error` frame back to the caller.
+///
+/// Also logs the failure: the frame is the only copy of the error, and the
+/// caller may have dropped the connection before reading it — without this
+/// line a failed sandbox RPC leaves the guest log silent (CORE-82). The
+/// request type is the `Received message type …` line just above on the same
+/// connection.
 async fn send_sandbox_error<S>(
     stream: &mut S,
     trace_id: &str,
@@ -545,6 +550,11 @@ async fn send_sandbox_error<S>(
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
+    // `message` is tracing's reserved field for the event message itself:
+    // passing it as a field renders the error text unlabelled, looking like
+    // a second message spliced onto the first. `error` matches this file's
+    // convention and renders quoted.
+    tracing::warn!(trace_id, code, error = message, "sandbox RPC failed");
     let err = ErrorResponse::new(code, message);
     write_message(stream, MessageType::Error, trace_id, &err.encode()).await
 }
@@ -573,8 +583,7 @@ where
         }) {
         Ok(parsed) => parsed,
         Err(msg) => {
-            let err = ErrorResponse::new(400, msg);
-            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            send_sandbox_error(stream, trace_id, 400, &msg).await?;
             return Ok(());
         }
     };
@@ -584,8 +593,7 @@ where
     let identity = match svc.sandbox_network_identity(&req.id) {
         Ok(identity) => identity,
         Err(e) => {
-            let err = ErrorResponse::new(e.status_code(), e.to_string());
-            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
             return Ok(());
         }
     };
@@ -610,8 +618,7 @@ where
             .await?;
         }
         Err(e) => {
-            let err = ErrorResponse::new(500, e.to_string());
-            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            send_sandbox_error(stream, trace_id, 500, &e.to_string()).await?;
         }
     }
     Ok(())
@@ -642,8 +649,7 @@ where
             }) {
             Ok(parsed) => parsed,
             Err(msg) => {
-                let err = ErrorResponse::new(400, msg);
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+                send_sandbox_error(stream, trace_id, 400, &msg).await?;
                 return Ok(());
             }
         };
@@ -652,8 +658,7 @@ where
     let identity = match svc.sandbox_network_identity(&req.id) {
         Ok(identity) => identity,
         Err(error) => {
-            let response = ErrorResponse::new(error.status_code(), error.to_string());
-            write_message(stream, MessageType::Error, trace_id, &response.encode()).await?;
+            send_sandbox_error(stream, trace_id, error.status_code(), &error.to_string()).await?;
             return Ok(());
         }
     };
@@ -674,8 +679,7 @@ where
             .await?;
         }
         Err(e) => {
-            let err = ErrorResponse::new(500, e.to_string());
-            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            send_sandbox_error(stream, trace_id, 500, &e.to_string()).await?;
         }
     }
     Ok(())

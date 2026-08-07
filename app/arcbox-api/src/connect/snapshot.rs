@@ -44,15 +44,21 @@ impl pb::SandboxSnapshotService for SandboxSnapshotServiceImpl {
     ) -> ServiceResult<pb::CheckpointResponse> {
         let machine = ctx.sandbox_machine_id()?;
         let req = request.to_owned_message();
-        let _operation = self.operations.lock(&machine, &req.sandbox_id).await;
+        let sandbox_id = req.sandbox_id.clone();
+        let _operation = self.operations.lock(&machine, &sandbox_id).await;
         let mut agent = self
             .runtime
             .ready()?
             .get_agent(&machine)
             .map_err(ApiError::from)?;
+        // The RPC error otherwise reaches only the caller; the daemon log
+        // must record a failed lifecycle mutation on its own (CORE-82).
         let resp = agent
             .sandbox_checkpoint(req)
             .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox checkpoint failed");
+            })
             .map_err(ApiError::from)?;
         Response::ok(resp)
     }
@@ -64,10 +70,17 @@ impl pb::SandboxSnapshotService for SandboxSnapshotServiceImpl {
     ) -> ServiceResult<pb::RestoreResponse> {
         let machine = ctx.sandbox_machine_id()?;
         let req = request.to_owned_message();
-        let _operation = self.operations.lock(&machine, &req.id).await;
+        let sandbox_id = req.id.clone();
+        let _operation = self.operations.lock(&machine, &sandbox_id).await;
         let runtime = self.runtime.ready()?;
         let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
-        let resp = agent.sandbox_restore(req).await.map_err(ApiError::from)?;
+        let resp = agent
+            .sandbox_restore(req)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox restore failed");
+            })
+            .map_err(ApiError::from)?;
         let _host_state = runtime.lock_sandbox_host_state().await;
 
         // Register restored sandbox DNS.

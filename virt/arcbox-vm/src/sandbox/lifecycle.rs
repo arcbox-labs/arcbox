@@ -139,6 +139,11 @@ impl SandboxManager {
         let (ip_address, starting_durability_error) = match setup {
             Ok(result) => result,
             Err(error) => {
+                // The reply frame carries the only other copy of this error;
+                // log it here so a create that dies between the network
+                // activation and the Starting journal commit is attributable
+                // from the guest log alone (CORE-82).
+                warn!(sandbox_id = %id, error = %error, "sandbox create setup failed; rolling back");
                 let mut rollback_errors = Vec::new();
                 let mut network_cleanup_failed = false;
                 if let Some(net) = &net_alloc
@@ -171,9 +176,15 @@ impl SandboxManager {
                     }
                     drop(creating_instance);
                     reservation.commit();
+                    let rollback = rollback_errors.join("; ");
+                    error!(
+                        sandbox_id = %id,
+                        error = %error,
+                        rollback = %rollback,
+                        "sandbox create rollback incomplete; instance left Failed"
+                    );
                     return Err(VmmError::Other(format!(
-                        "{error}; sandbox rollback is incomplete: {}",
-                        rollback_errors.join("; ")
+                        "{error}; sandbox rollback is incomplete: {rollback}"
                     )));
                 }
                 let abort = self.records.abort_provision(&id, generation)?;

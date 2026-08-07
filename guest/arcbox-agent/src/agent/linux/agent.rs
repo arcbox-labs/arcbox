@@ -72,10 +72,13 @@ impl Agent {
                             // surfaces as BrokenPipe / ConnectionReset /
                             // UnexpectedEof. Log at warn — the daemon will
                             // reopen on its next poll iteration.
+                            // `{:#}` prints the whole context chain — the
+                            // top context alone hides which message the
+                            // connection was carrying when it died.
                             if is_peer_closed_error(&e) {
-                                tracing::warn!("Connection closed by peer: {}", e);
+                                tracing::warn!("Connection closed by peer: {e:#}");
                             } else {
-                                tracing::error!("Connection error: {}", e);
+                                tracing::error!("Connection error: {e:#}");
                             }
                         }
                     });

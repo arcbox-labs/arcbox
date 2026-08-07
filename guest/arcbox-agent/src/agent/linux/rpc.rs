@@ -70,7 +70,12 @@ where
         if msg_type.is_sandbox_request() {
             if let Err(e) = handle_sandbox_message(&mut stream, msg_type, &trace_id, &payload).await
             {
-                tracing::warn!(trace_id = %trace_id, error = %e, "sandbox handler error");
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    request = ?msg_type,
+                    error = %format!("{e:#}"),
+                    "sandbox handler error"
+                );
             }
             continue;
         }

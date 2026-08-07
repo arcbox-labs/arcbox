@@ -278,11 +278,17 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     }
     buf.extend_from_slice(payload);
 
+    // Name the frame in the error: on a torn-down connection the resulting
+    // "Connection closed by peer" warn must say which response/stream write
+    // was lost, or the failure cannot be attributed (CORE-82).
     writer
         .write_all(&buf)
         .await
-        .context("failed to write message")?;
-    writer.flush().await.context("failed to flush")?;
+        .with_context(|| format!("failed to write {msg_type:?} message"))?;
+    writer
+        .flush()
+        .await
+        .with_context(|| format!("failed to flush {msg_type:?} message"))?;
 
     Ok(())
 }

@@ -715,7 +715,22 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
     }
 
     // Fallback: if the interface still exists, use ip link delete.
-    if std::path::Path::new(&format!("/sys/class/net/{tap_name}")).exists() {
+    //
+    // The existence check and the delete race the kernel: clearing
+    // TUNSETPERSIST above and dropping the fd removes a non-persistent TAP
+    // asynchronously, so the sysfs entry can outlive the decision to delete
+    // and vanish before `ip` runs. A delete that fails because the device
+    // is already gone has reached exactly the state this function exists to
+    // reach, so the post-check below — not the exit status — decides: the
+    // device being absent is success no matter why `ip` complained.
+    //
+    // Deliberately not a message match: the System VM ships busybox `ip`
+    // ("can't find device 'x'", exit 2) while a dev host has iproute2
+    // ("Cannot find device \"x\"", exit 1), so any wording test would pass
+    // CI and still fail in production.
+    let sysfs = format!("/sys/class/net/{tap_name}");
+    let mut delete_error = None;
+    if std::path::Path::new(&sysfs).exists() {
         let output = std::process::Command::new("/usr/sbin/ip")
             .args(["link", "delete", tap_name])
             .output()
@@ -723,16 +738,14 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
                 VmmError::Network(format!("run ip link delete {tap_name}: {error}"))
             })?;
         if !output.status.success() {
-            return Err(VmmError::Network(format!(
-                "ip link delete {tap_name}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+            delete_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
     }
-    if std::path::Path::new(&format!("/sys/class/net/{tap_name}")).exists() {
-        return Err(VmmError::Network(format!(
-            "TAP {tap_name} still exists after deletion"
-        )));
+    if std::path::Path::new(&sysfs).exists() {
+        return Err(VmmError::Network(match delete_error {
+            Some(stderr) => format!("ip link delete {tap_name}: {stderr}"),
+            None => format!("TAP {tap_name} still exists after deletion"),
+        }));
     }
     Ok(())
 }
