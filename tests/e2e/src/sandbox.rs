@@ -417,6 +417,33 @@ async fn drive_sandboxes(
     );
     info!(%snapshot_id, "checkpoint taken");
 
+    // Datapath proof for the *resumed origin*: the pause/resume phase asserts
+    // only its addressing (its `run_and_collect` calls ride vsock, which never
+    // crosses the TAP), because probing the gateway there would bake a
+    // REACHABLE neighbour entry into the checkpoint above — and the clone,
+    // restoring onto a TAP with a different gateway MAC, would inherit it and
+    // blackhole until it aged out. After the checkpoint that hazard is gone
+    // (no further snapshot of `smoke1` is taken; the reuse-NIC restore below
+    // replays this same one), so ping here: it proves `restore_paused`'s
+    // freshly activated invariant TAP actually moves packets, which is a
+    // different code path from the clone's `network_overrides` restore.
+    wait_ready(&mut sandboxes, "smoke1").await?;
+    let resumed_ping = run_and_collect(
+        &mut processes,
+        "smoke1",
+        &[
+            "/bin/sh",
+            "-c",
+            "gw=$(ip route | sed -n 's/^default via \\([0-9.]*\\).*/\\1/p' | head -1); \
+             echo \"gateway=$gw\"; ping -c 1 -W 2 \"$gw\"",
+        ],
+    )
+    .await?;
+    if !resumed_ping.contains(" 0% packet loss") {
+        bail!("resumed sandbox could not reach its gateway over its new TAP: {resumed_ping:?}");
+    }
+    info!("resumed origin reaches its gateway over the post-resume TAP");
+
     // -- Fresh-network restore (origin still running) ----------------------
     // `network_override: true` gives the clone a new TAP via FC's
     // `network_overrides` snapshot-load field (Firecracker >= 1.12), so the
@@ -1020,9 +1047,10 @@ async fn pause_resume_scenario(
     // REACHABLE neighbour entry for it in the guest, and the checkpoint the
     // next phase takes of this very sandbox inherits that entry. The clone
     // restores onto a *different* TAP, whose gateway MAC differs, so the
-    // inherited entry blackholes the clone until it ages out. The clone
-    // phase owns the datapath proof (it pings from a guest whose neighbour
-    // cache was not freshly warmed); duplicating it here breaks it.
+    // inherited entry blackholes the clone until it ages out. The proof for
+    // this sandbox's own post-resume TAP lives in the caller, just after the
+    // checkpoint is taken — past the point where a warmed neighbour entry
+    // could still be captured.
     let info = inspect(sandboxes, "smoke1").await?;
     let resumed_ip = info
         .network
