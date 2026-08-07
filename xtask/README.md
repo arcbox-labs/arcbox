@@ -27,7 +27,7 @@ devenv shell -- cargo xtask <command>
 - `cargo xtask dev boot-assets` — prepare `boot-assets/dev` from the user boot
   cache or a neighboring `arcbox-kernel` checkout.
 - `cargo xtask dev bpf` — rebuild the committed sandbox NAT BPF object and its
-  source-hash sidecar under `virt/arcbox-vm/bpf` (requires a clang with the
+  hash sidecars (source and object) under `virt/arcbox-vm/bpf` (requires a clang with the
   BPF backend).
 - `cargo xtask macos dev` — build, locally sign, and run `arcbox-daemon` for
   development.

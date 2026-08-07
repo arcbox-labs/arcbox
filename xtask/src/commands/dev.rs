@@ -14,9 +14,10 @@ pub fn run(args: DevArgs) -> Result<()> {
 }
 
 /// Recompile `virt/arcbox-vm/bpf/sandbox_nat.bpf.c` into the committed
-/// `.bpf.o` and refresh the `.c.sha256` sidecar that the arcbox-vm
-/// `bpf_object_matches_source` test checks, so a source edit without a
-/// rebuild fails loudly instead of shipping a stale object.
+/// `.bpf.o` and refresh both the `.c.sha256` and `.o.sha256` sidecars that
+/// the arcbox-vm `bpf_object_matches_source` test checks, so neither a
+/// source edit without a rebuild nor a stale committed object ships
+/// silently.
 fn rebuild_sandbox_bpf() -> Result<()> {
     let root = repo::root_from_xtask_manifest(env!("CARGO_MANIFEST_DIR"))?;
     let bpf_dir = root.join("virt/arcbox-vm/bpf");
