@@ -272,7 +272,12 @@ impl SandboxRecord {
             SandboxTransition::Paused { snapshot_id } => {
                 self.phase = SandboxPhase::Paused;
                 self.pause_snapshot_id = Some(snapshot_id);
-                self.paused_at = Some(Utc::now());
+                // Stamped once per pause, not once per transition: a failed
+                // resume parks the record back at `Paused`, and overwriting
+                // here would report the sandbox as freshly paused — and push
+                // the time forward again on every retry. `Ready` clears the
+                // stamp, so a genuine re-pause still gets a fresh one.
+                self.paused_at.get_or_insert_with(Utc::now);
                 self.error = None;
             }
             SandboxTransition::Resuming => {
@@ -1085,8 +1090,10 @@ mod tests {
             .unwrap()
             .value;
         assert_eq!(resuming.pause_snapshot_id.as_deref(), Some("snap"));
-        // A failed resume unwinds back to Paused…
-        store
+        // A failed resume unwinds back to Paused, keeping the ORIGINAL
+        // paused_at — the sandbox has been paused since the pause call, and
+        // a retry loop must not keep pushing the stamp forward.
+        let reverted = store
             .transition(
                 "box",
                 generation,
@@ -1094,7 +1101,9 @@ mod tests {
                     snapshot_id: "snap".into(),
                 },
             )
-            .unwrap();
+            .unwrap()
+            .value;
+        assert_eq!(reverted.paused_at, paused.paused_at);
         // …and a successful one lands Ready with the pause state cleared.
         store
             .transition("box", generation, SandboxTransition::Resuming)
@@ -1106,6 +1115,23 @@ mod tests {
         assert_eq!(ready.phase, SandboxPhase::Ready);
         assert_eq!(ready.pause_snapshot_id, None);
         assert_eq!(ready.paused_at, None);
+
+        // A genuine re-pause after Ready gets a fresh stamp.
+        store
+            .transition("box", generation, SandboxTransition::Pausing)
+            .unwrap();
+        let repaused = store
+            .transition(
+                "box",
+                generation,
+                SandboxTransition::Paused {
+                    snapshot_id: "snap2".into(),
+                },
+            )
+            .unwrap()
+            .value;
+        assert!(repaused.paused_at.is_some());
+        assert!(repaused.paused_at >= paused.paused_at);
     }
 
     #[test]
