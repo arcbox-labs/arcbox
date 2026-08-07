@@ -13,6 +13,13 @@
 //! dials out to host port 51 (`READY_PORT`) and writes one byte — the
 //! host's cold-boot readiness event.
 //!
+//! The agent also owns its wall clock: once at startup and again on every
+//! accepted exec connection (rate-limited to one attempt per second) it
+//! re-syncs `CLOCK_REALTIME` from the hypervisor via `ptp_kvm` (see
+//! [`ptp`]), so a restored snapshot regains correct time before any
+//! workload command runs, without waiting for the host's `MSG_CLOCK_SYNC`
+//! RPC (CORE-80).
+//!
 //! ## Frame format
 //!
 //! ```text
@@ -35,6 +42,339 @@
 //! This binary requires Linux — it uses AF_VSOCK, accept4, openpty, and fork,
 //! none of which are available on other platforms.  The workspace compiles the
 //! crate everywhere, but the implementation is gated on `target_os = "linux"`.
+
+/// Guest-clock self-sync from the hypervisor via the `ptp_kvm` PTP clock.
+///
+/// `/dev/ptp0` is the kernel's `ptp_kvm` device: reading it issues the SMCCC
+/// vendor-hyp `PTP_KVM` call, answered directly by the L1 KVM with the host
+/// `CLOCK_REALTIME` — no VMM device, no vsock round-trip, nesting-safe.
+/// `PTP_SYS_OFFSET` brackets each PHC read between two guest system-clock
+/// reads, so the tightest bracket bounds the measurement error.
+///
+/// Struct layouts and the ioctl encoding mirror `<linux/ptp_clock.h>`. The
+/// offset math is portable and unit-tested on every host; the ioctl half is
+/// Linux-only.
+#[cfg(any(target_os = "linux", test))]
+mod ptp {
+    /// `struct ptp_clock_time` (`<linux/ptp_clock.h>`).
+    #[derive(Debug, Clone, Copy)]
+    #[repr(C)]
+    pub struct PtpClockTime {
+        pub sec: i64,
+        pub nsec: u32,
+        #[allow(dead_code, reason = "kernel ABI reserved padding, never read")]
+        pub reserved: u32,
+    }
+
+    /// `PTP_MAX_SAMPLES` (`<linux/ptp_clock.h>`) — the kernel rejects
+    /// `n_samples` above it with `EINVAL`.
+    pub const PTP_MAX_SAMPLES: usize = 25;
+
+    /// `struct ptp_sys_offset` (`<linux/ptp_clock.h>`).
+    #[repr(C)]
+    pub struct PtpSysOffset {
+        pub n_samples: u32,
+        #[allow(dead_code, reason = "kernel ABI reserved padding, never read")]
+        pub rsv: [u32; 3],
+        pub ts: [PtpClockTime; 2 * PTP_MAX_SAMPLES + 1],
+    }
+
+    /// ABI pin: `PTP_SYS_OFFSET` encodes the struct size, so a layout drift
+    /// would silently turn it into a different (unknown) ioctl number.
+    const _: () = assert!(std::mem::size_of::<PtpSysOffset>() == 832);
+
+    /// `PTP_SYS_OFFSET` = `_IOW('=', 5, struct ptp_sys_offset)` in the
+    /// asm-generic ioctl encoding (which arm64 uses):
+    /// `dir(write = 1) << 30 | size << 16 | type << 8 | nr`. The kernel
+    /// copies the filled struct back despite the `_IOW` label — a historical
+    /// quirk of the PTP ABI.
+    pub const PTP_SYS_OFFSET: u32 =
+        (1 << 30) | ((std::mem::size_of::<PtpSysOffset>() as u32) << 16) | ((b'=' as u32) << 8) | 5;
+
+    /// Samples per `PTP_SYS_OFFSET` call: enough that one preempted bracket
+    /// never decides the offset, while the ioctl stays microseconds-cheap.
+    #[cfg(target_os = "linux")]
+    pub const N_SAMPLES: u32 = 5;
+
+    /// Step the clock only when the measured skew exceeds this (100 ms).
+    /// Restore skew is seconds to days; anything smaller is normal drift the
+    /// sync must not fight.
+    pub const STEP_THRESHOLD_NS: i128 = 100_000_000;
+
+    const NANOS_PER_SEC: i128 = 1_000_000_000;
+
+    fn ns(t: PtpClockTime) -> i128 {
+        i128::from(t.sec) * NANOS_PER_SEC + i128::from(t.nsec)
+    }
+
+    /// Whether a measured guest→host offset warrants stepping the clock.
+    pub fn should_step(offset_ns: i128) -> bool {
+        offset_ns.abs() > STEP_THRESHOLD_NS
+    }
+
+    /// The offset to add to the guest `CLOCK_REALTIME` to land on the host
+    /// clock, from a filled `PTP_SYS_OFFSET` sample array.
+    ///
+    /// The kernel fills `2 * n_samples + 1` entries — `sys, phc, sys, phc,
+    /// …, sys` — bracketing every PHC read (under `ptp_kvm`: the host
+    /// `CLOCK_REALTIME`) between two guest system-clock reads, adjacent
+    /// samples sharing a boundary. The sample with the tightest bracket
+    /// carries the least scheduling noise; its offset is measured against
+    /// the bracket midpoint. Brackets that run backwards (the guest clock
+    /// was stepped mid-call) are discarded. `None` when no usable sample
+    /// exists.
+    pub fn realtime_offset_ns(ts: &[PtpClockTime], n_samples: u32) -> Option<i128> {
+        let n = n_samples as usize;
+        let filled = ts.get(..n.checked_mul(2)?.checked_add(1)?)?;
+        (0..n)
+            .map(|i| {
+                let before = ns(filled[2 * i]);
+                let phc = ns(filled[2 * i + 1]);
+                let after = ns(filled[2 * i + 2]);
+                (after - before, phc - i128::midpoint(before, after))
+            })
+            .filter(|&(bracket, _)| bracket >= 0)
+            .min_by_key(|&(bracket, _)| bracket)
+            .map(|(_, offset)| offset)
+    }
+
+    /// Outcome of one successful `/dev/ptp0` sample.
+    #[cfg(target_os = "linux")]
+    pub enum SyncOutcome {
+        /// Skew exceeded the threshold; `CLOCK_REALTIME` was stepped.
+        Stepped { offset_ns: i128 },
+        /// Skew within the threshold; the clock was left alone.
+        InSync { offset_ns: i128 },
+    }
+
+    /// One self-sync: sample `/dev/ptp0` and step `CLOCK_REALTIME` when the
+    /// skew exceeds [`STEP_THRESHOLD_NS`].
+    ///
+    /// `ptp_kvm` is the microVM kernel's only PTP clock, so it is always
+    /// index 0; a missing `/dev/ptp0` (kernel without ptp_kvm) is an error
+    /// the caller logs and ignores — such a guest keeps exactly the
+    /// host-driven `MSG_CLOCK_SYNC` semantics it has today.
+    #[cfg(target_os = "linux")]
+    pub fn sync_clock_from_ptp() -> Result<SyncOutcome, String> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // SAFETY: plain open(2) on a static C string; result checked below.
+        let raw = unsafe { libc::open(c"/dev/ptp0".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if raw < 0 {
+            return Err(format!(
+                "open /dev/ptp0: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: raw is a freshly opened, owned fd.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // SAFETY: PtpSysOffset is POD; n_samples set below, rest zeroed.
+        let mut req: PtpSysOffset = unsafe { std::mem::zeroed() };
+        req.n_samples = N_SAMPLES;
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "the PTP_SYS_OFFSET request number fits musl's c_int ioctl request type"
+        )]
+        let request = PTP_SYS_OFFSET as libc::Ioctl;
+        // SAFETY: fd is a valid chardev fd; req is a properly sized, live
+        // ptp_sys_offset the kernel reads, fills, and copies back.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), request, &raw mut req) } < 0 {
+            return Err(format!(
+                "PTP_SYS_OFFSET: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let offset_ns = realtime_offset_ns(&req.ts, req.n_samples)
+            .ok_or_else(|| "PTP_SYS_OFFSET returned no usable sample".to_owned())?;
+        if !should_step(offset_ns) {
+            return Ok(SyncOutcome::InSync { offset_ns });
+        }
+
+        // Step relative to the CURRENT clock: both clocks tick at the same
+        // rate, so the microseconds elapsed since the ioctl cancel out.
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid out-pointer to a live timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut now) } != 0 {
+            return Err(format!(
+                "clock_gettime: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let target_ns =
+            i128::from(now.tv_sec) * NANOS_PER_SEC + i128::from(now.tv_nsec) + offset_ns;
+        let ts = libc::timespec {
+            // Inferred field type: naming libc::time_t is deprecated on musl.
+            tv_sec: target_ns
+                .div_euclid(NANOS_PER_SEC)
+                .try_into()
+                .map_err(|_| format!("target wall time out of range: {target_ns} ns"))?,
+            // rem_euclid of a positive modulus is in [0, 1e9): lossless.
+            tv_nsec: target_ns.rem_euclid(NANOS_PER_SEC) as libc::c_long,
+        };
+        // SAFETY: clock_settime requires CAP_SYS_TIME; vm-agent is guest
+        // root (the same contract MSG_CLOCK_SYNC's handler relies on). A
+        // negative target is rejected by the kernel with EINVAL.
+        if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts) } != 0 {
+            return Err(format!(
+                "clock_settime: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(SyncOutcome::Stepped { offset_ns })
+    }
+
+    /// Accept-path sync: at most one `/dev/ptp0` attempt per second.
+    ///
+    /// The first post-resume interaction with a restored guest is always an
+    /// accepted exec connection, so running this before the handler spawns
+    /// guarantees correct wall time before any workload command. The slot
+    /// is claimed by CAS before syncing so concurrent accepts never pile
+    /// onto the device — losers of the race skip. The timestamp is
+    /// `CLOCK_MONOTONIC`, which Firecracker restores across
+    /// snapshot/resume, so post-restore deltas stay sane.
+    ///
+    /// Within-threshold outcomes are deliberately NOT logged: /dev/console
+    /// is the FC serial device (byte-by-byte nested MMIO exits), and steady
+    /// exec traffic would otherwise pay for one line per second.
+    #[cfg(target_os = "linux")]
+    pub fn sync_rate_limited() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// Monotonic milliseconds of the last sync attempt. Zero reads as
+        /// "attempted at boot", which is accurate: `run()` performs an
+        /// unconditional startup sync.
+        static LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid out-pointer; CLOCK_MONOTONIC cannot fail on Linux.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+        let now_ms = u64::try_from(now.tv_sec).unwrap_or(0) * 1000
+            + u64::try_from(now.tv_nsec).unwrap_or(0) / 1_000_000;
+
+        let last = LAST_ATTEMPT_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 1000
+            || LAST_ATTEMPT_MS
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+
+        match sync_clock_from_ptp() {
+            Ok(SyncOutcome::Stepped { offset_ns }) => eprintln!(
+                "vm-agent: ptp clock sync: stepped CLOCK_REALTIME by {} ms",
+                offset_ns / 1_000_000
+            ),
+            Ok(SyncOutcome::InSync { .. }) => {}
+            Err(e) => eprintln!("vm-agent: ptp clock sync: {e}"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn t(sec: i64, nsec: u32) -> PtpClockTime {
+            PtpClockTime {
+                sec,
+                nsec,
+                reserved: 0,
+            }
+        }
+
+        #[test]
+        fn tightest_bracket_wins() {
+            // Sample 0: 10 ms bracket, says +5 s. Sample 1: 1.5 µs bracket,
+            // says ~+2 s — the tight bracket must decide.
+            let ts = [
+                t(100, 0),
+                t(105, 5_000_000),
+                t(100, 10_000_000),
+                t(102, 10_000_500),
+                t(100, 10_001_500),
+            ];
+            assert_eq!(realtime_offset_ns(&ts, 2), Some(1_999_999_750));
+        }
+
+        #[test]
+        fn guest_ahead_of_host_yields_a_negative_offset() {
+            // Guest at 200 s, host (PHC) at 100 s, 2 ns bracket.
+            let ts = [t(200, 0), t(100, 0), t(200, 2)];
+            assert_eq!(realtime_offset_ns(&ts, 1), Some(-100_000_000_001));
+        }
+
+        #[test]
+        fn backwards_bracket_is_discarded() {
+            // Sample 0's bracket runs backwards (clock stepped mid-call) and
+            // would win a naive min; sample 1 must be picked instead.
+            let ts = [t(500, 0), t(100, 0), t(10, 0), t(60, 0), t(10, 1000)];
+            assert_eq!(realtime_offset_ns(&ts, 2), Some(49_999_999_500));
+        }
+
+        #[test]
+        fn no_usable_sample_yields_none() {
+            // All brackets backwards.
+            assert_eq!(
+                realtime_offset_ns(&[t(500, 0), t(100, 0), t(10, 0)], 1),
+                None
+            );
+            // Kernel filled fewer entries than 2 * n + 1.
+            assert_eq!(realtime_offset_ns(&[t(1, 0); 5], 3), None);
+            // Zero samples.
+            assert_eq!(realtime_offset_ns(&[t(1, 0); 1], 0), None);
+            // Hostile sample count never indexes out of bounds.
+            assert_eq!(realtime_offset_ns(&[t(1, 0); 3], u32::MAX), None);
+        }
+
+        #[test]
+        fn extreme_timestamps_do_not_overflow() {
+            let edge = t(i64::MAX, 999_999_999);
+            assert_eq!(realtime_offset_ns(&[edge, edge, edge], 1), Some(0));
+        }
+
+        #[test]
+        fn threshold_is_exclusive_and_sign_agnostic() {
+            assert!(!should_step(0));
+            assert!(!should_step(STEP_THRESHOLD_NS));
+            assert!(!should_step(-STEP_THRESHOLD_NS));
+            assert!(should_step(STEP_THRESHOLD_NS + 1));
+            assert!(should_step(-(STEP_THRESHOLD_NS + 1)));
+        }
+
+        #[test]
+        fn offset_reads_through_the_full_abi_struct() {
+            // Mirrors the real call path: the kernel-filled struct's ts
+            // array and echoed n_samples feed the offset derivation.
+            let mut req = PtpSysOffset {
+                n_samples: 1,
+                rsv: [0; 3],
+                ts: [t(0, 0); 2 * PTP_MAX_SAMPLES + 1],
+            };
+            req.ts[0] = t(10, 0);
+            req.ts[1] = t(20, 0);
+            req.ts[2] = t(10, 2);
+            assert_eq!(
+                realtime_offset_ns(&req.ts, req.n_samples),
+                Some(9_999_999_999)
+            );
+        }
+
+        #[test]
+        fn ioctl_request_matches_the_kernel_abi() {
+            // _IOW('=', 5, struct ptp_sys_offset) with sizeof == 832 on
+            // asm-generic platforms (arm64 among them).
+            assert_eq!(PTP_SYS_OFFSET, 0x4340_3d05);
+        }
+    }
+}
 
 // =============================================================================
 // Linux implementation
@@ -1304,6 +1644,22 @@ mod agent {
     pub fn run() {
         mount_filesystems();
         setup_dns();
+        // Set the wall clock from the hypervisor before anything can care:
+        // /dev/ptp0 needs no host RPC, so a guest whose kernel lacks
+        // RTC_HCTOSYS still boots with correct time. Verbose on purpose —
+        // once per boot, and the offset line is the hardware-validation
+        // signal for the ptp path.
+        match crate::ptp::sync_clock_from_ptp() {
+            Ok(crate::ptp::SyncOutcome::Stepped { offset_ns }) => eprintln!(
+                "vm-agent: ptp clock sync: stepped CLOCK_REALTIME by {} ms at startup",
+                offset_ns / 1_000_000
+            ),
+            Ok(crate::ptp::SyncOutcome::InSync { offset_ns }) => eprintln!(
+                "vm-agent: ptp clock sync: in sync at startup (offset {} us)",
+                offset_ns / 1_000
+            ),
+            Err(e) => eprintln!("vm-agent: ptp clock sync at startup: {e}"),
+        }
         // This process is guest PID 1: start the reaper so exiting workloads and
         // reparented double-fork orphans are collected instead of zombifying.
         start_reaper();
@@ -1331,6 +1687,11 @@ mod agent {
         // Exec listener (main thread).
         loop {
             let conn_fd = accept_connection(exec_fd);
+            // A restored guest wakes with CLOCK_REALTIME still at its
+            // snapshot value, and the first post-resume interaction is
+            // always an accepted connection: re-check the clock before the
+            // handler can spawn a workload (rate-limited, µs when in sync).
+            crate::ptp::sync_rate_limited();
             spawn_bounded(&exec_active, "exec", conn_fd, handle_connection);
         }
     }
