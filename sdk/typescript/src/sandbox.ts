@@ -79,8 +79,11 @@ export interface ListSandboxesOptions {
 type SandboxClient = Client<typeof SandboxService>;
 
 /**
- * How often {@link ArcBox.connect} re-inspects a PAUSING sandbox. No
- * lifecycle event marks the PAUSING→PAUSED edge, so it is polled out.
+ * How often {@link ArcBox.connect} re-inspects a PAUSING sandbox.
+ * `SANDBOX_EVENT_KIND_PAUSED` names this edge in the proto, but the
+ * daemon does not emit it yet (Pause/Resume are CORE-21 stubs), so the
+ * checkpoint is polled out instead. Once it is emitted, this poll
+ * should become an event wait.
  */
 const PAUSE_SETTLE_POLL_MS = 500;
 
