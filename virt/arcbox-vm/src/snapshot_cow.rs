@@ -192,13 +192,24 @@ impl CowManager {
         std::fs::File::open(&cow_dir)?.sync_all()?;
         std::fs::File::open(&data_dir)?.sync_all()?;
 
+        // Existence is not usability: driving device-mapper needs
+        // /dev/mapper/control, i.e. root inside the VM. A process that cannot
+        // talk to the driver (unprivileged dev host, CI runner) can never have
+        // created dm snapshots either, so it degrades to the same copy-mode
+        // fallback as a missing binary instead of failing every dm command.
         let dmsetup_bin = DMSETUP_CANDIDATES
             .iter()
             .find(|p| Path::new(p).exists())
-            .map(|s| (*s).to_string());
+            .map(|s| (*s).to_string())
+            .filter(|bin| {
+                Command::new(bin)
+                    .arg("version")
+                    .output()
+                    .is_ok_and(|out| out.status.success())
+            });
 
         if dmsetup_bin.is_none() {
-            warn!("dmsetup not found; dm-snapshot CoW will be unavailable");
+            warn!("dmsetup not found or unusable; dm-snapshot CoW will be unavailable");
         }
 
         Ok(Self {
