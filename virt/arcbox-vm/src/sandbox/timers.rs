@@ -739,4 +739,31 @@ mod tests {
         }
         assert!(!manager.instances.read().unwrap().contains_key("box"));
     }
+
+    /// A terminal sandbox recovered by the restart sweep carries a
+    /// `ttl_deadline` (`inactive_instance` restores it unconditionally), but
+    /// the live path cancels TTL on the STOPPED/FAILED edge. Arming one
+    /// anyway would make reaping a stopped record depend on whether the
+    /// agent happened to bounce.
+    #[tokio::test(start_paused = true)]
+    async fn ttl_timer_is_not_armed_for_a_terminal_sandbox() {
+        for state in [SandboxState::Stopped, SandboxState::Failed] {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = shared_manager(dir.path()).await;
+            std::fs::create_dir_all(dir.path().join("sandboxes/box")).unwrap();
+            insert_instance(&manager, "box", state, SandboxSpec::default());
+            manager.instances.read().unwrap()["box"]
+                .lock()
+                .unwrap()
+                .ttl_deadline = Some(Utc::now() + chrono::Duration::seconds(2));
+
+            manager.arm_ttl_timer(&"box".to_owned());
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            assert!(
+                manager.instances.read().unwrap().contains_key("box"),
+                "a {state} sandbox must not be expired by a re-armed TTL"
+            );
+        }
+    }
 }
