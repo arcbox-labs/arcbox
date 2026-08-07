@@ -155,6 +155,11 @@ pub struct SandboxInstance {
     pub error: Option<String>,
     /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
     pub cow_handle: Option<CowHandle>,
+    /// When this sandbox adopted a pre-warmed restore slot's resources
+    /// (CORE-78), the slot id (`pool-<uuid>`) its jailer chroot and dm/CoW
+    /// names are keyed by. `None` for resources created under the
+    /// sandbox's own id.
+    pub(super) pool_slot_id: Option<String>,
 }
 
 impl SandboxInstance {
@@ -203,6 +208,7 @@ impl SandboxInstance {
             last_exit_status: None,
             error: None,
             cow_handle: None,
+            pool_slot_id: None,
         }
     }
 

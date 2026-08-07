@@ -37,6 +37,7 @@ mod cleanup;
 mod execution;
 mod lifecycle;
 mod persistence;
+mod pool;
 mod reconcile;
 mod types;
 mod workload;
@@ -65,6 +66,8 @@ pub struct SandboxManager {
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
+    /// Pre-warmed restore slots (CORE-78); see `pool.rs`.
+    pool: Arc<pool::SlotPool>,
     /// Addressable executions (CORE-55); see `execution.rs`.
     executions: Arc<execution::ExecutionRegistry>,
     /// Publishes the startup reconciliation result. Lifecycle and read APIs
@@ -166,6 +169,7 @@ impl SandboxManager {
             config,
             events_tx,
             cow_manager,
+            pool: Arc::new(pool::SlotPool::default()),
             executions,
             reconcile_done,
         })
