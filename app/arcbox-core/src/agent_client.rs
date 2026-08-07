@@ -211,16 +211,19 @@ impl AgentClient {
 
         let buf = wire::build_message(msg_type, trace_id, payload);
 
+        // Errors name the RPC: a per-call vsock connection failing surfaces
+        // far from its caller (a warn in some supervisor loop), and without
+        // the message type the log cannot say which RPC died (CORE-82).
         let response = match &mut self.transport {
             AgentTransport::Async(t) => {
                 // Send request.
                 t.send(buf)
                     .await
-                    .map_err(|e| CoreError::Machine(format!("failed to send request: {e}")))?;
+                    .map_err(|e| CoreError::Machine(format!("{msg_type:?} send failed: {e}")))?;
                 // Receive response.
-                t.recv()
-                    .await
-                    .map_err(|e| CoreError::Machine(format!("failed to receive response: {e}")))?
+                t.recv().await.map_err(|e| {
+                    CoreError::Machine(format!("{msg_type:?} response receive failed: {e}"))
+                })?
             }
             AgentTransport::Blocking(t) => {
                 // block_in_place tells the tokio multi-thread scheduler that
@@ -228,10 +231,12 @@ impl AgentClient {
                 // This prevents the 5s poll timeout from stalling other tasks.
                 tokio::task::block_in_place(|| {
                     let deadline = Instant::now() + BLOCKING_RPC_TIMEOUT;
-                    t.send(&buf, deadline)
-                        .map_err(|e| CoreError::Machine(format!("failed to send request: {e}")))?;
-                    t.recv(deadline)
-                        .map_err(|e| CoreError::Machine(format!("failed to receive response: {e}")))
+                    t.send(&buf, deadline).map_err(|e| {
+                        CoreError::Machine(format!("{msg_type:?} send failed: {e}"))
+                    })?;
+                    t.recv(deadline).map_err(|e| {
+                        CoreError::Machine(format!("{msg_type:?} response receive failed: {e}"))
+                    })
                 })?
             }
         };
@@ -261,9 +266,10 @@ impl AgentClient {
             AgentTransport::Blocking(t) => {
                 let deadline = Instant::now() + BLOCKING_RPC_TIMEOUT;
                 t.send(&buf, deadline)
-                    .map_err(|e| CoreError::Machine(format!("failed to send request: {e}")))?;
-                t.recv(deadline)
-                    .map_err(|e| CoreError::Machine(format!("failed to receive response: {e}")))?
+                    .map_err(|e| CoreError::Machine(format!("{msg_type:?} send failed: {e}")))?;
+                t.recv(deadline).map_err(|e| {
+                    CoreError::Machine(format!("{msg_type:?} response receive failed: {e}"))
+                })?
             }
             AgentTransport::Async(_) => {
                 return Err(CoreError::Machine(

@@ -57,10 +57,19 @@ impl pb::SandboxService for SandboxServiceImpl {
     ) -> ServiceResult<pb::CreateSandboxResponse> {
         let machine = ctx.sandbox_machine_id()?;
         let req = request.to_owned_message();
-        let _operation = self.operations.lock(&machine, &req.id).await;
+        let sandbox_id = req.id.clone();
+        let _operation = self.operations.lock(&machine, &sandbox_id).await;
         let runtime = self.runtime.ready()?;
         let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
-        let resp = agent.sandbox_create(req).await.map_err(ApiError::from)?;
+        // The RPC error otherwise reaches only the caller; the daemon log
+        // must record a failed lifecycle mutation on its own (CORE-82).
+        let resp = agent
+            .sandbox_create(req)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox create failed");
+            })
+            .map_err(ApiError::from)?;
         let _host_state = runtime.lock_sandbox_host_state().await;
 
         // Register sandbox DNS so the host can resolve sandbox-id.arcbox.local.
@@ -86,7 +95,13 @@ impl pb::SandboxService for SandboxServiceImpl {
         let _operation = self.operations.lock(&machine, &sandbox_id).await;
         let runtime = self.runtime.ready()?;
         let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
-        let response = agent.sandbox_stop(req).await.map_err(ApiError::from)?;
+        let response = agent
+            .sandbox_stop(req)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox stop failed");
+            })
+            .map_err(ApiError::from)?;
         if let Some(ticket) = response.ticket.as_option() {
             sandbox_cleanup::complete(runtime, &mut agent, ticket)
                 .await
@@ -107,7 +122,13 @@ impl pb::SandboxService for SandboxServiceImpl {
         let _operation = self.operations.lock(&machine, &sandbox_id).await;
         let runtime = self.runtime.ready()?;
         let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
-        let response = agent.sandbox_remove(req).await.map_err(ApiError::from)?;
+        let response = agent
+            .sandbox_remove(req)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox remove failed");
+            })
+            .map_err(ApiError::from)?;
         if let Some(ticket) = response.ticket.as_option() {
             sandbox_cleanup::complete(runtime, &mut agent, ticket)
                 .await
@@ -342,6 +363,9 @@ impl pb::SandboxService for SandboxServiceImpl {
         let rx = agent
             .sandbox_events(request.to_owned_message())
             .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, %error, "sandbox events subscribe failed");
+            })
             .map_err(ApiError::from)?;
         let stream = ReceiverStream::new(rx).map(|r| {
             r.map(|event| WatchEventsResponse {
