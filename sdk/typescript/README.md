@@ -96,13 +96,27 @@ of the main arcbox release train:
    `package.json` and updates `CHANGELOG.md`.
 3. Merging that PR creates the GitHub release and the tag
    `sdk-typescript-vX.Y.Z` (same convention as `fleet-agent-vX.Y.Z`).
-4. The tag triggers the npm publish workflow, which re-runs the full
-   gate suite (`lint`, `format:check`, `test`, `typecheck`), builds
-   with `npm run build:publish`, and publishes to npm via [trusted
-   publishing](https://docs.npmjs.com/trusted-publishers) (OIDC) —
-   tokenless, with provenance attestations generated automatically.
-   The job skips cleanly if the version is already on the registry, so
-   a re-dispatch never fails on an already-published release.
+4. The tag is what an npm publish workflow
+   (`.github/workflows/release-sdk-typescript.yml`) triggers on: it
+   re-runs the full gate suite (`lint`, `format:check`, `test`,
+   `typecheck`), builds with `npm run build:publish`, and publishes to
+   npm via [trusted publishing](https://docs.npmjs.com/trusted-publishers)
+   (OIDC) — tokenless, with provenance attestations generated
+   automatically. The job skips cleanly if the version is already on the
+   registry, so a re-dispatch never fails on an already-published
+   release.
+
+> **The publish workflow is not in the repo yet.** Registering the
+> component (this change) and adding the workflow are separate pushes —
+> a workflow file needs a token carrying the `workflow` scope. Until
+> `release-sdk-typescript.yml` lands, step 4 does not happen:
+> release-please still mints `sdk-typescript-vX.Y.Z` and the GitHub
+> release, but nothing publishes to npm, and adding the workflow later
+> does **not** replay the missed tag push. So a version tagged before
+> the workflow lands must be published by hand (step 1 of the bootstrap
+> below, which is a manual `npm publish` regardless), or the workflow
+> re-dispatched against the existing tag once it exists — it takes a tag
+> as a `workflow_dispatch` input for exactly this.
 
 One-time bootstrap (trusted publishing can only be configured for a
 package that already exists on the registry):
