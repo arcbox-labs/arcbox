@@ -426,47 +426,59 @@ impl SandboxManager {
                 )
                 .with_pool_slot(Some(&slot.slot_id));
                 let handover = super::reconcile::write_state_record(&vm_dir, &adopted_record);
-                // The slot's own journal is superseded: the record above (or the
-                // rollback below) covers its resources under the sandbox id. The
-                // crash window where both journals exist is safe — the startup
-                // sweep is idempotent over already-released resources.
-                if let Err(error) = super::reconcile::clear_state_record(&slot.vm_dir) {
-                    warn!(
-                        sandbox_id = %new_id,
-                        slot_id = %slot.slot_id,
-                        error = %error,
-                        "claimed slot journal not cleared; the startup sweep will reconcile it"
-                    );
-                } else if let Err(error) = tokio::fs::remove_dir_all(&slot.vm_dir).await
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(
-                        sandbox_id = %new_id,
-                        slot_id = %slot.slot_id,
-                        error = %error,
-                        "claimed slot runtime dir not removed"
-                    );
-                }
                 let PreparedSlot {
+                    slot_id,
                     process: slot_process,
                     cow_handle,
                     vmstate_path,
                     mem_path,
                     vsock_path,
-                    ..
+                    vm_dir: slot_vm_dir,
                 } = slot;
                 pending_cow = cow_handle;
-                if let Err(error) = handover {
-                    return Err(self
-                        .rollback_restore(
-                            &new_id,
-                            reservation,
-                            error,
-                            Some(slot_process),
-                            net_alloc,
-                            pending_cow,
-                        )
-                        .await);
+                match handover {
+                    Ok(()) => {
+                        // Only now is the slot's own journal superseded: the
+                        // adopted record is durable under the sandbox id. The
+                        // crash window where both journals exist is safe — the
+                        // startup sweep is idempotent over already-released
+                        // resources. Clearing BEFORE the adopted write is
+                        // confirmed would open the opposite window: a crash
+                        // with NEITHER journal, leaving the slot-keyed FC,
+                        // chroot, and CoW invisible to reconciliation.
+                        if let Err(error) = super::reconcile::clear_state_record(&slot_vm_dir) {
+                            warn!(
+                                sandbox_id = %new_id,
+                                slot_id = %slot_id,
+                                error = %error,
+                                "claimed slot journal not cleared; the startup sweep will reconcile it"
+                            );
+                        } else if let Err(error) = tokio::fs::remove_dir_all(&slot_vm_dir).await
+                            && error.kind() != std::io::ErrorKind::NotFound
+                        {
+                            warn!(
+                                sandbox_id = %new_id,
+                                slot_id = %slot_id,
+                                error = %error,
+                                "claimed slot runtime dir not removed"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // Keep the slot journal: it is the only durable record
+                        // of the slot-keyed resources if this rollback gets
+                        // interrupted.
+                        return Err(self
+                            .rollback_restore(
+                                &new_id,
+                                reservation,
+                                error,
+                                Some(slot_process),
+                                net_alloc,
+                                pending_cow,
+                            )
+                            .await);
+                    }
                 }
                 // Both phases were pre-executed by the slot; the timestamps
                 // collapse so the completion log reports them honestly as ~0.

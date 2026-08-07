@@ -383,7 +383,7 @@ mod agent {
 
         /// Set eth0's address + netmask and replace the default route.
         ///
-        /// Returns per-step millis `[addr, netmask, delrt, addrt]` so the
+        /// Returns per-step micros `[addr, netmask, delrt, addrt]` so the
         /// host can attribute reconfig latency (CORE-75 diagnostics).
         pub fn apply(cmd: &NetReconfigCommand) -> Result<[u32; 4], String> {
             let mut steps = [0u32; 4];

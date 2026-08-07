@@ -25,13 +25,17 @@ const NLM_F_CREATE: u16 = 0x400;
 // rtmsg / fib_rule_hdr field values.
 const AF_INET: u8 = 2;
 const RT_TABLE_UNSPEC: u8 = 0;
+const RT_TABLE_MAIN: u8 = 254;
 const RTPROT_BOOT: u8 = 3;
+const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
 const RTN_UNICAST: u8 = 1;
 const FR_ACT_TO_TBL: u8 = 1;
+const RTNH_F_ONLINK: u32 = 4;
 
 // Route attributes.
 const RTA_DST: u16 = 1;
+const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
 const RTA_TABLE: u16 = 15;
 
@@ -133,6 +137,30 @@ pub(super) fn replace_link_route(dst: Ipv4Addr, oif: u32, table: u32) -> Vec<u8>
     let mut msg = MessageBuilder::new(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, header);
     msg.attr_u32(RTA_TABLE, table);
     msg.attr(RTA_DST, &dst.octets());
+    msg.attr_u32(RTA_OIF, oif);
+    msg.finish()
+}
+
+/// `ip route replace <dst>/32 via <gateway> dev <oif> onlink` (main table).
+///
+/// The eBPF datapath's only routing need (CORE-83): it replaces the kernel's
+/// address-derived peer route (`dst dev oif`, next hop = `dst`), whose ARP
+/// for the pool IP no invariant guest would ever answer, with a route whose
+/// neighbor-resolution target is the fixed guest IP — which every invariant
+/// guest owns. `onlink` (`RTNH_F_ONLINK`) is required because no route covers
+/// the link-local gateway on the main table.
+pub(super) fn replace_gateway_route(dst: Ipv4Addr, gateway: Ipv4Addr, oif: u32) -> Vec<u8> {
+    let mut header = [0u8; 12];
+    header[0] = AF_INET;
+    header[1] = 32; // dst_len
+    header[4] = RT_TABLE_MAIN;
+    header[5] = RTPROT_BOOT;
+    header[6] = RT_SCOPE_UNIVERSE;
+    header[7] = RTN_UNICAST;
+    header[8..12].copy_from_slice(&RTNH_F_ONLINK.to_ne_bytes());
+    let mut msg = MessageBuilder::new(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, header);
+    msg.attr(RTA_DST, &dst.octets());
+    msg.attr(RTA_GATEWAY, &gateway.octets());
     msg.attr_u32(RTA_OIF, oif);
     msg.finish()
 }
@@ -283,6 +311,41 @@ mod tests {
             vec![
                 (RTA_TABLE, 0xAC14_0002u32.to_ne_bytes().to_vec()),
                 (RTA_DST, vec![169, 254, 100, 2]),
+                (RTA_OIF, 42u32.to_ne_bytes().to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_route_is_an_onlink_main_table_replace() {
+        let msg = replace_gateway_route(
+            Ipv4Addr::new(172, 20, 0, 2),
+            Ipv4Addr::new(169, 254, 100, 2),
+            42,
+        );
+        let (ty, flags) = msg_type_and_flags(&msg);
+        assert_eq!(ty, RTM_NEWROUTE);
+        assert_eq!(
+            flags,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+            "must replace the kernel's peer route for the same /32"
+        );
+        // rtmsg: /32 dst in the main table, universe scope (gateway route),
+        // and the onlink flag — the link-local gateway has no covering route.
+        assert_eq!(msg[NLMSG_HDR_LEN], AF_INET);
+        assert_eq!(msg[NLMSG_HDR_LEN + 1], 32);
+        assert_eq!(msg[NLMSG_HDR_LEN + 4], RT_TABLE_MAIN);
+        assert_eq!(msg[NLMSG_HDR_LEN + 6], RT_SCOPE_UNIVERSE);
+        assert_eq!(msg[NLMSG_HDR_LEN + 7], RTN_UNICAST);
+        assert_eq!(
+            msg[NLMSG_HDR_LEN + 8..NLMSG_HDR_LEN + 12],
+            RTNH_F_ONLINK.to_ne_bytes()
+        );
+        assert_eq!(
+            attrs(&msg),
+            vec![
+                (RTA_DST, vec![172, 20, 0, 2]),
+                (RTA_GATEWAY, vec![169, 254, 100, 2]),
                 (RTA_OIF, 42u32.to_ne_bytes().to_vec()),
             ]
         );

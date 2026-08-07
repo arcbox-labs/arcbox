@@ -48,6 +48,11 @@
 //! is tolerant of absence so the same teardown serves legacy TAPs, partial
 //! activations, and crash-recovery replays; rule specs derive entirely from
 //! the allocation, so cleanup needs no extra state.
+//!
+//! Since CORE-83 this rule set is the `SandboxDatapath::Iptables` mechanism
+//! and the automatic fallback; the default datapath applies the same
+//! translation with two TCX programs per TAP instead (`super::ebpf`),
+//! needing none of the mark/fwmark machinery.
 
 use std::net::Ipv4Addr;
 
@@ -85,6 +90,12 @@ const FIB_RULE_PRIORITY: u32 = 8000;
 /// teardown and crash-recovery replays need no extra state. Caveat: kube-proxy
 /// matches marks with masks 0x4000/0x8000; those bits sit in the third pool
 /// octet, so the first 16 382 addresses of a /16 pool are conflict-free.
+///
+/// INVARIANT consumers rely on: the table this mark selects holds exactly
+/// one route (`GUEST_IP/32` via the sandbox's TAP). Expose's mangle
+/// companions mark every packet on a relay port regardless of destination
+/// (`port_forward.rs`) — safe only while any other destination misses this
+/// table and falls through to `main`. Never add a second route.
 pub fn fwmark(pool_ip: Ipv4Addr) -> u32 {
     u32::from(pool_ip)
 }
@@ -244,8 +255,9 @@ fn write_tap_sysctl(tap: &str, key: &str, value: &str) -> Result<()> {
         .map_err(|e| crate::error::VmmError::Network(format!("write {path}: {e}")))
 }
 
+/// Resolve a TAP's interface index (also the eBPF datapath's map key).
 #[cfg(target_os = "linux")]
-fn tap_ifindex(tap: &str) -> Result<u32> {
+pub(super) fn tap_ifindex(tap: &str) -> Result<u32> {
     let name = std::ffi::CString::new(tap)
         .map_err(|_| crate::error::VmmError::Network(format!("TAP name {tap:?} contains NUL")))?;
     // SAFETY: name is a valid NUL-terminated string.

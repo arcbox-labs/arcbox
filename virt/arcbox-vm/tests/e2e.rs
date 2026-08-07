@@ -58,6 +58,7 @@ fn try_config(data_dir: &str) -> Option<VmmConfig> {
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: Some(15),
+            sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
             // Direct mode cannot restore (and so never pools); keep the
             // e2e run free of background pre-warm spawns regardless.
             pool_size: 0,

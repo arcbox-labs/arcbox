@@ -36,7 +36,10 @@ use crate::metrics::RunMetrics;
 use crate::{env_flag, repo_root};
 
 /// Generous ceiling for daemon startup (asset staging + VM boot + agent).
-const READY_TIMEOUT: Duration = Duration::from_secs(180);
+/// Sized for a cold CDN fetch of the runtime binaries: measured startups
+/// reach 150-180s when the CDN is slow, and the guest runtime
+/// materialization added to the budget in v0.8.
+const READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// Ceiling for a sandbox to reach `ready` (includes the first default
 /// rootfs build inside the guest).
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);

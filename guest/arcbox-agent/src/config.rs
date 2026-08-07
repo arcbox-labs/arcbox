@@ -48,6 +48,7 @@ fn guest_defaults() -> VmmConfig {
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: None,
+            sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
             pool_size: 1,
         },
         network: NetworkConfig {

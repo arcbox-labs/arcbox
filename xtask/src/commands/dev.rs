@@ -2,14 +2,61 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use toml_edit::DocumentMut;
-use xtask_kit::{fs::copy_file, repo};
+use xtask_kit::{fs::copy_file, hash::sha256_file, repo};
 
 use crate::{BootAssetSource, DevArgs, DevCommand};
 
 pub fn run(args: DevArgs) -> Result<()> {
     match args.command {
         DevCommand::BootAssets(args) => prepare_boot_assets(args),
+        DevCommand::Bpf => rebuild_sandbox_bpf(),
     }
+}
+
+/// Recompile `virt/arcbox-vm/bpf/sandbox_nat.bpf.c` into the committed
+/// `.bpf.o` and refresh both the `.c.sha256` and `.o.sha256` sidecars that
+/// the arcbox-vm `bpf_object_matches_source` test checks, so neither a
+/// source edit without a rebuild nor a stale committed object ships
+/// silently.
+fn rebuild_sandbox_bpf() -> Result<()> {
+    let root = repo::root_from_xtask_manifest(env!("CARGO_MANIFEST_DIR"))?;
+    let bpf_dir = root.join("virt/arcbox-vm/bpf");
+    let source = bpf_dir.join("sandbox_nat.bpf.c");
+    let object = bpf_dir.join("sandbox_nat.bpf.o");
+
+    let sh = xshell::Shell::new()?;
+    // nix's cc-wrapper injects host hardening and deployment-target flags the
+    // BPF target rejects; scrubbing them is a no-op for plain clang.
+    let _hardening = sh.push_env("NIX_HARDENING_ENABLE", "");
+    let _deployment = sh.push_env("MACOSX_DEPLOYMENT_TARGET", "");
+    xshell::cmd!(
+        sh,
+        "clang -O2 -g0 --target=bpfel -Wall -Wextra -Werror -Qunused-arguments -c {source} -o {object}"
+    )
+    .run()
+    .context("compiling the sandbox NAT BPF object (is clang with the BPF backend installed?)")?;
+
+    let digest = sha256_file(&source)?;
+    fs::write(
+        bpf_dir.join("sandbox_nat.bpf.c.sha256"),
+        format!("{digest}\n"),
+    )
+    .context("writing the BPF source hash sidecar")?;
+    // Both sidecars come from the same rebuild: source↔object pairing is
+    // what lets the freshness test prove the committed .o was actually
+    // rebuilt, not just that the source hash was refreshed.
+    let object_digest = sha256_file(&object)?;
+    fs::write(
+        bpf_dir.join("sandbox_nat.bpf.o.sha256"),
+        format!("{object_digest}\n"),
+    )
+    .context("writing the BPF object hash sidecar")?;
+
+    let object_len = fs::metadata(&object)?.len();
+    println!("[INFO] Rebuilt {} ({object_len} bytes)", object.display());
+    println!("[INFO] Source sha256: {digest}");
+    println!("[INFO] Object sha256: {object_digest}");
+    Ok(())
 }
 
 pub fn prepare_boot_assets(args: crate::BootAssetsArgs) -> Result<()> {

@@ -49,17 +49,28 @@ pub(super) struct PreparedSlot {
 
 impl PreparedSlot {
     /// Whether the pre-spawned Firecracker process is still alive.
+    ///
+    /// `kill(pid, 0)` alone is not enough: it succeeds for a zombie, and a
+    /// parked slot's child is never `wait()`ed while pooled, so an FC that
+    /// died mid-park stays a zombie until claim and would pass a signal
+    /// probe. Read the `/proc` state instead (this code runs in the Linux
+    /// guest) and treat zombie/dead as gone; the claim path then discards
+    /// the slot and its kill+reap teardown collects the corpse. An external
+    /// `waitpid` is NOT an option here — the pid is owned by the handle's
+    /// tokio `Child`, and reaping it out from under that handle races its
+    /// own `wait`.
     pub fn process_alive(&self) -> bool {
         self.process.pid().is_some_and(|pid| {
-            nix::sys::signal::kill(
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
-                nix::unistd::Pid::from_raw(pid as i32),
-                None,
-            )
-            .is_ok()
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                // The state letter is the field after the parenthesized comm;
+                // comm may itself contain spaces or parens, so split at the
+                // LAST ')'.
+                Ok(stat) => stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .is_some_and(|state| state != "Z" && state != "X"),
+                Err(_) => false,
+            }
         })
     }
 }

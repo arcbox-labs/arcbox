@@ -695,8 +695,11 @@ exit 0
     /// explicit: traffic from any sandbox TAP toward the pool is dropped
     /// before it can be marked or DNAT'd (the per-TAP invariant NAT would
     /// otherwise misattribute it), except toward the pool gateway, which
-    /// legacy guests use for DNS. These run at System VM boot, so per-sandbox
-    /// rules appended later always sit below them.
+    /// legacy guests use for DNS. These run at System VM boot, so the
+    /// per-TAP `invariant::translation_rules` (appended with `-A`) always
+    /// sit below them. Expose companions (`port_forward.rs`) instead
+    /// PREPEND above these — safe because `MARK` is non-terminating, so a
+    /// marked packet still falls through to the DROP.
     fn setup_sandbox_forwarding() {
         let config = crate::config::load();
         let subnet = &config.network.cidr;
