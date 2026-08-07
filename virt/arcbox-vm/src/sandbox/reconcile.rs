@@ -346,9 +346,9 @@ pub(super) fn normalize_durable_records(
             // An interrupted pause/resume died between resource states; the
             // sweep already tore down whatever its journal listed (including
             // the disk overlay), so the sandbox is unrecoverable. Unlike the
-            // live phases above, a missing journal is normal here — Pausing
-            // clears it after releasing everything, just before the Paused
-            // commit.
+            // live phases above, a missing journal is normal here — a resume
+            // starts from a Paused record whose journal was already cleared
+            // (after the Paused commit) and re-journals as it re-allocates.
             SandboxPhase::Pausing | SandboxPhase::Resuming => {
                 let record = store
                     .transition(

@@ -309,11 +309,25 @@ impl SandboxManager {
                 .records
                 .transition(id, generation, SandboxTransition::Resuming)?;
             if let Some(error) = commit.durability_error {
-                warn!(
-                    sandbox_id = %id,
-                    error,
-                    "resuming transition is visible but durability is unconfirmed"
-                );
+                // The restart sweep trusts the durable phase: were Resuming to
+                // stay unconfirmed on disk, a crash mid-restore would read as
+                // cleanly Paused and the restore's journaled TAP/IP/chroot
+                // would be dropped as a stale pause journal, never released.
+                // Park back at Paused and fail before allocating anything —
+                // the mirror of the pause path's durability-gated journal
+                // clear.
+                if let Err(revert) = self.records.transition(
+                    id,
+                    generation,
+                    SandboxTransition::Paused {
+                        snapshot_id: snapshot_id.clone(),
+                    },
+                ) {
+                    warn!(sandbox_id = %id, error = %revert, "resume durability revert failed");
+                }
+                return Err(VmmError::Unavailable(format!(
+                    "sandbox resume is visible but its durability is unconfirmed: {error}"
+                )));
             }
         }
         instance.lock().unwrap().state = SandboxState::Starting;
