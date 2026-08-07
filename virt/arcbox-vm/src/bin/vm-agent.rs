@@ -9,6 +9,10 @@
 //!    the process.
 //! 5. Sends a final `MSG_EXIT` frame when the process terminates.
 //!
+//! Once the exec (52) and file I/O (53) listeners are both bound, the agent
+//! dials out to host port 51 (`READY_PORT`) and writes one byte — the
+//! host's cold-boot readiness event.
+//!
 //! ## Frame format
 //!
 //! ```text
@@ -71,6 +75,8 @@ mod agent {
         FILE_ACK, FILE_DATA, FILE_DONE, FILE_ERR, FILE_PORT, FILE_READ_REQ, FILE_WRITE_REQ,
         MAX_FILE_SIZE,
     };
+    // Readiness dial-out port — shared with the host-side boot gate.
+    use arcbox_vm::vsock::READY_PORT;
 
     const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -1305,6 +1311,10 @@ mod agent {
         let exec_fd = create_vsock_listener(AGENT_PORT);
         let file_fd = create_vsock_listener(FILE_PORT);
 
+        // Both listeners are bound and mounts/DNS are done: tell the host.
+        // The dial-out is the cold-boot readiness event the host gates on.
+        signal_ready();
+
         // Shared counters for bounding active connection threads.
         let file_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let exec_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -1322,6 +1332,55 @@ mod agent {
         loop {
             let conn_fd = accept_connection(exec_fd);
             spawn_bounded(&exec_active, "exec", conn_fd, handle_connection);
+        }
+    }
+
+    /// Dial the host's readiness listener: connect `AF_VSOCK` to the host
+    /// (CID 2) on `READY_PORT`, write one byte, close. Firecracker forwards
+    /// the connect to the Unix socket the host pre-bound before starting
+    /// this VM — the accept there is the boot readiness event.
+    ///
+    /// Best-effort by design: under an OLD host without the listener,
+    /// Firecracker resets the connect (`ECONNRESET`-class error), and the
+    /// agent must keep serving — readiness detection then falls back to
+    /// that host's own connect polling.
+    fn signal_ready() {
+        // SAFETY: plain socket(2) call; result checked below.
+        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            eprintln!(
+                "vm-agent: ready dial-out: socket: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // SAFETY: fd is a freshly opened, owned socket fd.
+        let mut stream = unsafe { VsockStream::from_raw_fd(fd) };
+
+        let addr = libc::sockaddr_vm {
+            svm_family: libc::AF_VSOCK as libc::sa_family_t,
+            svm_reserved1: 0,
+            svm_port: READY_PORT,
+            svm_cid: libc::VMADDR_CID_HOST,
+            ..unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: addr is a fully initialized sockaddr_vm; fd is a live socket.
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                (&raw const addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            eprintln!(
+                "vm-agent: ready dial-out failed (old host without a listener?): {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        if let Err(e) = stream.write_all(&[0u8]) {
+            eprintln!("vm-agent: ready dial-out write: {e}");
         }
     }
 

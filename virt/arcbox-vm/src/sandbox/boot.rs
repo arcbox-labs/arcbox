@@ -2,15 +2,17 @@ use super::persistence::{SandboxRecordStore, SandboxTransition};
 use super::types::action;
 use super::*;
 
-type BootOutput = (Arc<fc_sdk::Vm>, PathBuf);
+type BootOutput = (Arc<fc_sdk::Vm>, PathBuf, vsock::ReadyListener);
 
-/// How long the agent-readiness gate waits for vm-agent to answer over vsock
-/// before the boot is declared failed. Covers guest kernel boot plus agent
-/// startup. Deliberately wider than `sync_clock`'s internal connect deadline
-/// (`AGENT_READY_TIMEOUT`, 30 s) so that when the agent never appears the
-/// inner error — which names the socket and the elapsed budget — wins the
-/// race against this outer timeout's generic message.
+/// How long the readiness gate waits for vm-agent's dial-out (the guest
+/// connect to [`vsock::READY_PORT`]) before the boot is declared failed.
+/// Covers guest kernel boot plus agent startup.
 const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Cap on the non-gating cold-boot clock sync: `sync_clock`'s internal
+/// connect loop can retry for up to 30 s, pointlessly long for an agent
+/// that has already dialed out. Mirrors the restore path's cap.
+const CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BootFailure {
     error: VmmError,
@@ -49,7 +51,7 @@ pub(super) async fn boot_sandbox(
     )
     .await
     {
-        Ok((vm, vsock_uds_path)) => {
+        Ok((vm, vsock_uds_path, ready_listener)) => {
             let current = instances.read().unwrap().get(&id).cloned();
             let is_current_generation = current
                 .as_ref()
@@ -61,33 +63,27 @@ pub(super) async fn boot_sandbox(
 
             // READY promises "accepting executions", but InstanceStart returns
             // while the guest kernel is still booting and vm-agent is not yet
-            // listening. Gate the transition on a completed agent round trip:
-            // sync_clock doubles as the readiness probe and sets the guest
-            // clock on cold boot the same way the restore path already does.
-            // Liveness is the gate, not the clock side effect: an agent that
-            // answered-but-failed (`ClockSync::AgentError`) proves the RPC
-            // path works, and tearing down a usable VM over a clock error
-            // would be strictly worse than a skewed clock.
-            let agent_ready = match tokio::time::timeout(
-                AGENT_GATE_TIMEOUT,
-                vsock::sync_clock(&vsock_uds_path),
-            )
-            .await
+            // listening. The gate is an event, not a poll: once its exec and
+            // file listeners are up, vm-agent dials host port READY_PORT, and
+            // the accept on the listener do_boot pre-bound IS the signal.
+            //
+            // Compat: an OLD vm-agent (no dial-out) under this host would sit
+            // out the full gate timeout — but the template freshness keys
+            // (the vm-agent binary among them) rebuild the default template
+            // and re-inject it into docker templates automatically, so a
+            // guest always carries the agent from the same build as its host.
+            let agent_ready = match tokio::time::timeout(AGENT_GATE_TIMEOUT, ready_listener.wait())
+                .await
             {
-                Ok(Ok(vsock::ClockSync::Synced)) => Ok(()),
-                Ok(Ok(vsock::ClockSync::AgentError(code))) => {
-                    warn!(
-                        sandbox_id = %id, code,
-                        "agent alive but clock sync failed; continuing with a possibly skewed clock"
-                    );
-                    Ok(())
-                }
+                Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(VmmError::Vsock(format!("agent readiness gate: {error}"))),
                 Err(_) => Err(VmmError::Vsock(format!(
-                    "agent readiness gate: vm-agent did not answer within {}s",
+                    "agent readiness gate: vm-agent did not dial the ready port within {}s",
                     AGENT_GATE_TIMEOUT.as_secs()
                 ))),
             };
+            // The socket file is per-boot; the gate has consumed its one event.
+            drop(ready_listener);
             if let Err(gate_error) = agent_ready {
                 let message = gate_error.to_string();
                 fail_started_boot(
@@ -105,6 +101,28 @@ pub(super) async fn boot_sandbox(
                 .await;
                 error!(sandbox_id = %id, error = %gate_error, "sandbox agent readiness gate failed");
                 return;
+            }
+
+            // The guest clock still needs setting on cold boot (no RTC — the
+            // guest wakes at the kernel default epoch), but it no longer
+            // gates readiness: warn and continue on any failure, mirroring
+            // the restore path's non-fatal treatment. Retires when guest-side
+            // ptp_kvm self-sync lands.
+            match tokio::time::timeout(CLOCK_SYNC_TIMEOUT, vsock::sync_clock(&vsock_uds_path)).await
+            {
+                Ok(Ok(vsock::ClockSync::Synced)) => {}
+                Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                    warn!(
+                        sandbox_id = %id, code,
+                        "agent could not set the clock; continuing with a possibly skewed clock"
+                    );
+                }
+                Ok(Err(error)) => {
+                    warn!(sandbox_id = %id, %error, "cold-boot clock sync failed; continuing");
+                }
+                Err(_) => {
+                    warn!(sandbox_id = %id, "cold-boot clock sync timed out; continuing");
+                }
             }
 
             let ready_at = Utc::now();
@@ -898,6 +916,40 @@ async fn do_boot(
         });
     }
 
+    // Bind the readiness listener BEFORE InstanceStart: vm-agent dials host
+    // port READY_PORT as soon as it is serving, and Firecracker forwards
+    // that guest-initiated connect to `{uds_path}_{READY_PORT}` only if
+    // someone is already listening there — otherwise the guest is reset and
+    // the one readiness event is lost.
+    let ready_listener = match vsock::ReadyListener::bind(&vsock_host_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            return Err(BootFailure {
+                error,
+                process: None,
+                cow_handle: None,
+            });
+        }
+    };
+    // In jailer mode Firecracker connect(2)s to the socket as the jailed
+    // uid/gid, and connecting requires write permission on the socket file.
+    if let Some(ref jc) = fc_cfg.jailer
+        && let Err(e) = chown(
+            ready_listener.path(),
+            Some(Uid::from_raw(jc.uid)),
+            Some(Gid::from_raw(jc.gid)),
+        )
+    {
+        return Err(BootFailure {
+            error: VmmError::Process(format!(
+                "chown ready socket {}: {e}",
+                ready_listener.path().display()
+            )),
+            process: None,
+            cow_handle: None,
+        });
+    }
+
     // Configure and boot the VM.
     let vcpu_count =
         NonZeroU64::new(spec.vcpus.max(1) as u64).expect("max(1) guarantees a non-zero vCPU count");
@@ -982,7 +1034,7 @@ async fn do_boot(
             });
         }
     };
-    Ok((vm, vsock_host_path))
+    Ok((vm, vsock_host_path, ready_listener))
 }
 
 fn complete_resource_handoff(signal: &mut Option<tokio::sync::oneshot::Sender<()>>) {
