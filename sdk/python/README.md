@@ -117,8 +117,9 @@ ARCBOX_SDK_E2E=1 uv run pytest tests/test_e2e.py
 
 - **uv** is the package/project manager (`uv_build` backend, `uv.lock`
   committed). Publishing is CI-only: `uv build && uv publish` under
-  PyPI trusted publishing (OIDC) — see [Releasing](#releasing); no
-  `UV_PUBLISH_TOKEN` anywhere.
+  PyPI trusted publishing (OIDC) — see [Releasing](#releasing), which
+  also covers the workflow still being absent; no `UV_PUBLISH_TOKEN`
+  anywhere.
 - **ruff** is both linter and formatter (`E,F,W,I,UP,B,SIM,RUF`).
 - **pyright** (strict) is the authoritative type checker. Evaluated
   alternatives (2026-08): **ty** 0.0.65 reports 16 false positives here
@@ -153,16 +154,29 @@ of the main arcbox release train:
    bumps the `pyproject.toml` version and updates `CHANGELOG.md`.
 3. Merging that PR creates the GitHub release and the tag
    `sdk-python-vX.Y.Z` (same convention as `sdk-typescript-vX.Y.Z`).
-4. The tag triggers the PyPI publish workflow
-   (`release-sdk-python.yml`), which checks out the tag's tree, re-runs
-   the full gate suite (`ruff check`, `ruff format --check`, `pyright`,
-   `pytest`, `gen_sync.py --check`), builds with `uv build`, and
-   publishes with `uv publish` via [trusted
+4. The tag is what a PyPI publish workflow
+   (`.github/workflows/release-sdk-python.yml`) triggers on: it checks
+   out the tag's tree, re-runs the full gate suite (`ruff check`, `ruff
+   format --check`, `pyright`, `pytest`, `gen_sync.py --check`), builds
+   with `uv build`, and publishes with `uv publish` via [trusted
    publishing](https://docs.pypi.org/trusted-publishers/) (OIDC) —
    tokenless: the job's `id-token: write` permission is exchanged for a
    short-lived PyPI credential. The job skips cleanly if the version is
    already on PyPI, so a re-dispatch never fails on an
    already-published release.
+
+> **The publish workflow is not in the repo yet.** Registering the
+> component (this change) and adding the workflow are separate pushes —
+> a workflow file needs a token carrying the `workflow` scope. Until
+> `release-sdk-python.yml` lands, step 4 does not happen: release-please
+> still mints `sdk-python-vX.Y.Z` and the GitHub release, but nothing
+> uploads to PyPI, and adding the workflow later does **not** replay the
+> missed tag push. So land the workflow before cutting the first
+> release: a hand publish would need an API token, which is the one
+> thing the pending-publisher bootstrap below exists to avoid. If a tag
+> does get minted early, the recovery is to re-dispatch the workflow
+> against that existing tag once it lands — it takes a tag as a
+> `workflow_dispatch` input for exactly this — not to publish by hand.
 
 One-time bootstrap — unlike npm, PyPI supports [pending
 publishers](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/):
@@ -173,10 +187,26 @@ API token at any point:
 1. On pypi.org → account → Publishing → "Add a new pending publisher"
    (GitHub): PyPI project name `arcbox`, owner `arcboxlabs`, repository
    `arcbox`, workflow filename `release-sdk-python.yml`, environment
-   left empty.
+   left empty. Empty is deliberate: PyPI calls the environment
+   ["optional but strongly
+   recommended"](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/),
+   but its value is the [protection
+   rules](https://docs.pypi.org/trusted-publishers/security-model/) an
+   environment can carry (required reviewers gating a publish), and
+   this repo configures none — naming one today would add a label, not
+   a gate. Add the environment and a matching `environment:` key in the
+   workflow together with the reviewer rule, not before.
 2. The first tag-triggered run then creates the `arcbox` project on
    PyPI as it publishes, and the pending publisher becomes the
-   project's regular trusted publisher. Nothing else to configure.
+   project's regular trusted publisher.
+
+A pending publisher does not hold the name: PyPI ["does not create a
+project or reserve a project's name until it is actually used to
+publish"](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/),
+and if someone else registers `arcbox` first the pending publisher is
+invalidated. `arcbox` is short, generic, and still unclaimed — do the
+first publish promptly after registering, and re-check the name is free
+if the bootstrap has been sitting for a while.
 
 ## Status
 
