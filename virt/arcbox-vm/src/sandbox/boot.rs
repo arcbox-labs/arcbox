@@ -36,6 +36,7 @@ pub(super) async fn boot_sandbox(
     cow_manager: Arc<CowManager>,
     records: Arc<SandboxRecordStore>,
     generation: Uuid,
+    warm_publish: Option<super::warm::WarmPublishTicket>,
     resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) {
     match do_boot(
@@ -201,6 +202,16 @@ pub(super) async fn boot_sandbox(
 
             let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
             info!(sandbox_id = %id, "sandbox booted and ready");
+
+            // First eligible create of this boot shape (CORE-77): capture
+            // the warm snapshot while the guest is still idle, before the
+            // initial cmd dirties it. Synchronous on purpose — the cmd must
+            // not run before the checkpoint — and failures only warn: cache
+            // population never fails a healthy boot.
+            if let Some(ticket) = &warm_publish {
+                super::warm::publish_after_boot(&id, ticket, &instances, &config, &cow_manager)
+                    .await;
+            }
 
             // Launch the initial workload, if the spec carries one. The
             // sandbox stays alive when it exits (Running → Ready + "idle"),

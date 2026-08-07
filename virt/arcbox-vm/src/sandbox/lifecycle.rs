@@ -74,10 +74,12 @@ impl SandboxManager {
         // reservation, durable intent, and fresh network identity
         // (`network_override`, free with net-invariant snapshots). On a miss
         // the boot task publishes the snapshot once the guest is Ready.
+        let mut warm_publish = None;
         if super::warm::warm_eligible(&self.config, &spec, caller_supplied_boot) {
             match super::warm::derive_warm_key(&spec) {
                 Ok(key) => match super::warm::find_warm_snapshot(&self.snapshots, &key) {
                     Ok(Some(snapshot_id)) => {
+                        self.warm.touch(&key);
                         info!(
                             sandbox_id = %id,
                             snapshot_id,
@@ -95,7 +97,14 @@ impl SandboxManager {
                             )
                             .await;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        warm_publish = Some(super::warm::WarmPublishTicket {
+                            key,
+                            cache: Arc::clone(&self.warm),
+                            snapshots: Arc::clone(&self.snapshots),
+                            pool: Arc::clone(&self.pool),
+                        });
+                    }
                     Err(error) => {
                         // The publish path would scan the same catalog, so a
                         // failed lookup cold-boots without cache interaction.
@@ -277,6 +286,7 @@ impl SandboxManager {
                     cow_manager,
                     records,
                     generation,
+                    warm_publish,
                     resource_handoff_tx,
                 )
                 .await;

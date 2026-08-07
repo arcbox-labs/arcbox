@@ -69,6 +69,8 @@ pub struct SandboxManager {
     cow_manager: Arc<CowManager>,
     /// Pre-warmed restore slots (CORE-78); see `pool.rs`.
     pool: Arc<pool::SlotPool>,
+    /// Warm template snapshot bookkeeping (CORE-77); see `warm.rs`.
+    warm: Arc<warm::WarmCache>,
     /// Addressable executions (CORE-55); see `execution.rs`.
     executions: Arc<execution::ExecutionRegistry>,
     /// Publishes the startup reconciliation result. Lifecycle and read APIs
@@ -172,6 +174,7 @@ impl SandboxManager {
             events_tx,
             cow_manager,
             pool: Arc::new(pool::SlotPool::default()),
+            warm: Arc::new(warm::WarmCache::default()),
             executions,
             reconcile_done,
         })

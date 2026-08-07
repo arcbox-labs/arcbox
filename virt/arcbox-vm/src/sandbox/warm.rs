@@ -13,12 +13,18 @@
 //! Lookup scans the catalog for the label; a miss cold-boots and publishes
 //! the snapshot from the freshly Ready guest (see `publish_after_boot`).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::snapshot::SnapshotCatalog;
+
+/// Most distinct warm keys cached at once, mirroring the restore pool's
+/// distinct-snapshot cap. Evicting a key deletes its snapshot (and drains
+/// any pool slots staged from it).
+const MAX_WARM_KEYS: usize = 2;
 
 /// Reserved snapshot label carrying the warm key. The Checkpoint RPC rejects
 /// caller-supplied labels with this name so no caller can plant a cache
@@ -164,6 +170,195 @@ pub(super) fn find_warm_snapshot(
         .filter(|entry| entry.key == key.hex())
         .max_by_key(|entry| entry.created_at)
         .map(|entry| entry.snapshot_id))
+}
+
+/// In-memory cache bookkeeping: key recency for LRU eviction and the
+/// per-key publish single-flight. The durable cache state is the catalog;
+/// this only orders and serializes operations on it, so losing it on
+/// restart costs nothing (untouched keys rank by snapshot age instead).
+#[derive(Default)]
+pub(super) struct WarmCache {
+    inner: Mutex<WarmCacheInner>,
+}
+
+#[derive(Default)]
+struct WarmCacheInner {
+    /// Keys by last use (lookup hit or publish), least recent first.
+    recency: Vec<String>,
+    /// Keys with a publish in flight.
+    publishing: HashSet<String>,
+}
+
+impl WarmCache {
+    /// Record a use of `key`, making it the most recently used.
+    pub(super) fn touch(&self, key: &WarmKey) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.recency.retain(|entry| entry != key.hex());
+        inner.recency.push(key.hex().to_owned());
+    }
+
+    /// Claim the single publish slot for `key`. `false` means another
+    /// first-create is already checkpointing this key — skip, its result
+    /// serves every later create.
+    pub(super) fn begin_publish(&self, key: &WarmKey) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .publishing
+            .insert(key.hex().to_owned())
+    }
+
+    /// Release the publish slot claimed by [`Self::begin_publish`].
+    pub(super) fn end_publish(&self, key: &WarmKey) {
+        self.inner.lock().unwrap().publishing.remove(key.hex());
+    }
+
+    /// Which keys to evict so at most [`MAX_WARM_KEYS`] remain, given every
+    /// distinct key in the catalog with its newest snapshot's creation
+    /// time. Keys never used in this process rank below every used key,
+    /// oldest snapshot first.
+    pub(super) fn plan_evictions(&self, catalog: &[(String, DateTime<Utc>)]) -> Vec<String> {
+        let mut inner = self.inner.lock().unwrap();
+        // Recency only matters for keys that still exist; pruning here also
+        // keeps the list from accumulating deleted keys.
+        inner
+            .recency
+            .retain(|entry| catalog.iter().any(|(key, _)| key == entry));
+        let Some(excess) = catalog.len().checked_sub(MAX_WARM_KEYS).filter(|n| *n > 0) else {
+            return Vec::new();
+        };
+        let mut ranked: Vec<&(String, DateTime<Utc>)> = catalog.iter().collect();
+        // Ascending eviction priority: untouched keys first (oldest
+        // snapshot first), then touched keys least recent first.
+        ranked.sort_by_key(|(key, created_at)| {
+            let recency = inner
+                .recency
+                .iter()
+                .position(|entry| entry == key)
+                .map_or(-1, |position| i64::try_from(position).unwrap_or(i64::MAX));
+            (recency, *created_at)
+        });
+        ranked
+            .into_iter()
+            .take(excess)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+}
+
+/// Everything the boot task needs to publish a warm snapshot once its
+/// sandbox reaches Ready (CORE-77).
+pub(super) struct WarmPublishTicket {
+    pub(super) key: WarmKey,
+    pub(super) cache: Arc<WarmCache>,
+    pub(super) snapshots: Arc<SnapshotCatalog>,
+    pub(super) pool: Arc<super::pool::SlotPool>,
+}
+
+/// Publish the warm snapshot for a freshly Ready, still-idle sandbox.
+///
+/// Single-flighted per key, and every failure is a warn — cache population
+/// must never fail a healthy boot.
+pub(super) async fn publish_after_boot(
+    sandbox_id: &SandboxId,
+    ticket: &WarmPublishTicket,
+    instances: &super::InstanceMap,
+    config: &VmmConfig,
+    cow_manager: &CowManager,
+) {
+    if !ticket.cache.begin_publish(&ticket.key) {
+        debug!(
+            sandbox_id,
+            "a warm snapshot publish for this key is already in flight"
+        );
+        return;
+    }
+    let started = std::time::Instant::now();
+    let published = publish_warm_snapshot(sandbox_id, ticket, instances, config, cow_manager).await;
+    ticket.cache.end_publish(&ticket.key);
+    match published {
+        Ok(Some(snapshot_id)) => {
+            let checkpoint_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            info!(
+                sandbox_id,
+                snapshot_id, checkpoint_ms, "warm template snapshot published"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                sandbox_id,
+                %error,
+                "warm snapshot publish failed; later creates keep cold-booting"
+            );
+        }
+    }
+}
+
+/// Checkpoint into the catalog under the warm label, then enforce the cache
+/// shape: one snapshot per key, at most [`MAX_WARM_KEYS`] distinct keys.
+/// Returns `None` when the key was already cached by a concurrent create.
+async fn publish_warm_snapshot(
+    sandbox_id: &SandboxId,
+    ticket: &WarmPublishTicket,
+    instances: &super::InstanceMap,
+    config: &VmmConfig,
+    cow_manager: &CowManager,
+) -> Result<Option<String>> {
+    // A concurrent first-create may have published while this guest booted.
+    if warm_entries(&ticket.snapshots)?
+        .iter()
+        .any(|entry| entry.key == ticket.key.hex())
+    {
+        return Ok(None);
+    }
+
+    let name = format!("warm-{}", &ticket.key.hex()[..12]);
+    let labels = HashMap::from([(WARM_KEY_LABEL.to_owned(), ticket.key.hex().to_owned())]);
+    let info = super::checkpoint::checkpoint_impl(
+        instances,
+        &ticket.snapshots,
+        config,
+        sandbox_id,
+        name,
+        labels,
+    )
+    .await?;
+    ticket.cache.touch(&ticket.key);
+
+    // Everything superseded is deleted, draining its pre-warmed pool slots
+    // first (mirrors delete_checkpoint): older snapshots of this key — a
+    // crash-window leftover — and every snapshot of an evicted key.
+    let entries = warm_entries(&ticket.snapshots)?;
+    let mut newest: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for entry in &entries {
+        newest
+            .entry(entry.key.clone())
+            .and_modify(|at| *at = (*at).max(entry.created_at))
+            .or_insert(entry.created_at);
+    }
+    let keys: Vec<(String, DateTime<Utc>)> = newest.into_iter().collect();
+    let evicted = ticket.cache.plan_evictions(&keys);
+    for entry in entries {
+        let replaced = entry.key == ticket.key.hex() && entry.snapshot_id != info.snapshot_id;
+        if replaced || evicted.contains(&entry.key) {
+            super::pool::drain_pool_slots(
+                &ticket.pool,
+                config,
+                cow_manager,
+                Some(&entry.snapshot_id),
+            )
+            .await;
+            if let Err(error) = ticket.snapshots.delete_by_id(&entry.snapshot_id) {
+                warn!(
+                    snapshot_id = %entry.snapshot_id,
+                    %error,
+                    "failed to delete a superseded warm snapshot"
+                );
+            }
+        }
+    }
+    Ok(Some(info.snapshot_id))
 }
 
 #[cfg(test)]
@@ -347,6 +542,62 @@ mod tests {
             })
             .unwrap()
             .id
+    }
+
+    #[test]
+    fn publish_is_single_flighted_per_key() {
+        let cache = WarmCache::default();
+        let key_a = WarmKey("aa".into());
+        let key_b = WarmKey("bb".into());
+
+        assert!(cache.begin_publish(&key_a));
+        assert!(!cache.begin_publish(&key_a), "second publisher must skip");
+        assert!(cache.begin_publish(&key_b), "keys single-flight separately");
+        cache.end_publish(&key_a);
+        assert!(cache.begin_publish(&key_a), "slot frees on end_publish");
+    }
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, 0).unwrap()
+    }
+
+    #[test]
+    fn evictions_keep_the_cap_and_respect_recency() {
+        let cache = WarmCache::default();
+        let catalog = vec![
+            ("a".to_owned(), at(100)),
+            ("b".to_owned(), at(200)),
+            ("c".to_owned(), at(300)),
+        ];
+
+        // Within the cap: nothing to evict.
+        assert!(cache.plan_evictions(&catalog[..2]).is_empty());
+
+        // No recency recorded: the oldest snapshot goes.
+        assert_eq!(cache.plan_evictions(&catalog), vec!["a".to_owned()]);
+
+        // Touching the oldest protects it; the untouched oldest goes.
+        cache.touch(&WarmKey("a".into()));
+        assert_eq!(cache.plan_evictions(&catalog), vec!["b".to_owned()]);
+
+        // Touched keys outrank untouched ones, least recently used first.
+        cache.touch(&WarmKey("b".into()));
+        cache.touch(&WarmKey("c".into()));
+        assert_eq!(cache.plan_evictions(&catalog), vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn evictions_ignore_recency_of_deleted_keys() {
+        let cache = WarmCache::default();
+        cache.touch(&WarmKey("gone".into()));
+        let catalog = vec![
+            ("a".to_owned(), at(100)),
+            ("b".to_owned(), at(200)),
+            ("c".to_owned(), at(300)),
+        ];
+        // "gone" is not in the catalog, so it neither protects anything nor
+        // shows up as a victim.
+        assert_eq!(cache.plan_evictions(&catalog), vec!["a".to_owned()]);
     }
 
     #[test]
