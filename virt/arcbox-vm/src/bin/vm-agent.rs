@@ -228,41 +228,38 @@ mod ptp {
         Ok(SyncOutcome::Stepped { offset_ns })
     }
 
-    /// Accept-path sync: at most one `/dev/ptp0` attempt per second.
+    /// Accept-path sync: measure the offset on every accepted connection.
     ///
-    /// The first post-resume interaction with a restored guest is always an
-    /// accepted exec connection, so running this before the handler spawns
-    /// guarantees correct wall time before any workload command. The slot
-    /// is claimed by CAS before syncing so concurrent accepts never pile
-    /// onto the device — losers of the race skip. The timestamp is
-    /// `CLOCK_MONOTONIC`, which Firecracker restores across
-    /// snapshot/resume, so post-restore deltas stay sane.
+    /// A restored guest wakes with `CLOCK_REALTIME` still at its snapshot
+    /// value, and its first post-resume interaction is an accepted
+    /// connection — exec or file — so running this before the handler
+    /// spawns guarantees correct wall time before any workload command or
+    /// file mtime. There is deliberately NO time-based rate limit: any
+    /// last-attempt timestamp survives inside the snapshot (Firecracker
+    /// resumes `CLOCK_MONOTONIC`), so a window-based skip can suppress
+    /// exactly the first post-restore accept that matters most. The
+    /// measurement is cheap enough to run per accept (one open + one
+    /// `PTP_SYS_OFFSET` ioctl, tens of µs nested) and is naturally bounded
+    /// by connection traffic.
     ///
-    /// Within-threshold outcomes are deliberately NOT logged: /dev/console
-    /// is the FC serial device (byte-by-byte nested MMIO exits), and steady
-    /// exec traffic would otherwise pay for one line per second.
+    /// Concurrency and failure are still bounded: a busy flag lets one
+    /// accept sync while racers skip, and the first error latches the
+    /// module off — a guest without `ptp_kvm` fails permanently
+    /// (`/dev/ptp0` never appears at runtime), and it keeps exactly the
+    /// host-driven `MSG_CLOCK_SYNC` semantics it has today, with one
+    /// diagnostic line instead of one per accept. Within-threshold
+    /// outcomes are deliberately NOT logged: /dev/console is the FC serial
+    /// device (byte-by-byte nested MMIO exits).
     #[cfg(target_os = "linux")]
-    pub fn sync_rate_limited() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    pub fn sync_on_accept() {
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-        /// Monotonic milliseconds of the last sync attempt. Zero reads as
-        /// "attempted at boot", which is accurate: `run()` performs an
-        /// unconditional startup sync.
-        static LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+        static DISABLED: AtomicBool = AtomicBool::new(false);
+        static BUSY: AtomicBool = AtomicBool::new(false);
 
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: valid out-pointer; CLOCK_MONOTONIC cannot fail on Linux.
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
-        let now_ms = u64::try_from(now.tv_sec).unwrap_or(0) * 1000
-            + u64::try_from(now.tv_nsec).unwrap_or(0) / 1_000_000;
-
-        let last = LAST_ATTEMPT_MS.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) < 1000
-            || LAST_ATTEMPT_MS
-                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        if DISABLED.load(Ordering::Relaxed)
+            || BUSY
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
         {
             return;
@@ -274,8 +271,12 @@ mod ptp {
                 offset_ns / 1_000_000
             ),
             Ok(SyncOutcome::InSync { .. }) => {}
-            Err(e) => eprintln!("vm-agent: ptp clock sync: {e}"),
+            Err(e) => {
+                DISABLED.store(true, Ordering::Relaxed);
+                eprintln!("vm-agent: ptp clock sync: {e}; disabling ptp sync");
+            }
         }
+        BUSY.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1675,11 +1676,15 @@ mod agent {
         let file_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let exec_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
-        // File I/O listener thread.
+        // File I/O listener thread. The clock re-check runs here too:
+        // staging files before running anything is the natural sandbox
+        // order, and without it a restored guest would stamp uploads with
+        // snapshot-era mtimes.
         let file_active_clone = Arc::clone(&file_active);
         thread::spawn(move || {
             loop {
                 let conn_fd = accept_connection(file_fd);
+                crate::ptp::sync_on_accept();
                 spawn_bounded(&file_active_clone, "file", conn_fd, handle_file_connection);
             }
         });
@@ -1690,8 +1695,8 @@ mod agent {
             // A restored guest wakes with CLOCK_REALTIME still at its
             // snapshot value, and the first post-resume interaction is
             // always an accepted connection: re-check the clock before the
-            // handler can spawn a workload (rate-limited, µs when in sync).
-            crate::ptp::sync_rate_limited();
+            // handler can spawn a workload (µs when in sync).
+            crate::ptp::sync_on_accept();
             spawn_bounded(&exec_active, "exec", conn_fd, handle_connection);
         }
     }
