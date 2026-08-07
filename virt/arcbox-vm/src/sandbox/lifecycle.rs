@@ -618,17 +618,4 @@ impl SandboxManager {
         let uds = self.require_alive_vsock(id)?;
         crate::file_io::write_file(&uds, path, mode, data).await
     }
-
-    pub(super) fn get_vm_handle(&self, id: &SandboxId) -> Result<Arc<fc_sdk::Vm>> {
-        let instance = self.get_instance(id)?;
-        let inst = instance.lock().unwrap();
-        inst.vm
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| VmmError::WrongState {
-                id: id.clone(),
-                expected: "Ready or Running (VM handle not yet available)".into(),
-                actual: inst.state.to_string(),
-            })
-    }
 }
