@@ -357,6 +357,15 @@ fn dnat_rule_args(
 /// The mangle-side companion of an invariant DNAT: the same match, marking
 /// the packet with the sandbox's fwmark so the rewritten (fixed-guest)
 /// destination routes out this sandbox's TAP.
+///
+/// Deliberately has no `-d` guard: relay ports accept traffic addressed to
+/// any of the System VM's local addresses (that is the feature), so there
+/// is no single destination to pin. The mark therefore lands on every
+/// packet hitting `guest_port` — safe ONLY because the per-sandbox fwmark
+/// table holds exactly one route (`GUEST_IP/32`, see
+/// `invariant::fib_table_routes`); any other destination misses it and
+/// falls through to `main`. Adding a second route to that table would
+/// silently widen this rule's blast radius — don't.
 fn mark_rule_args(
     guest_port: u16,
     pool_ip: Ipv4Addr,

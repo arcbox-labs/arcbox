@@ -90,6 +90,12 @@ const FIB_RULE_PRIORITY: u32 = 8000;
 /// teardown and crash-recovery replays need no extra state. Caveat: kube-proxy
 /// matches marks with masks 0x4000/0x8000; those bits sit in the third pool
 /// octet, so the first 16 382 addresses of a /16 pool are conflict-free.
+///
+/// INVARIANT consumers rely on: the table this mark selects holds exactly
+/// one route (`GUEST_IP/32` via the sandbox's TAP). Expose's mangle
+/// companions mark every packet on a relay port regardless of destination
+/// (`port_forward.rs`) — safe only while any other destination misses this
+/// table and falls through to `main`. Never add a second route.
 pub fn fwmark(pool_ip: Ipv4Addr) -> u32 {
     u32::from(pool_ip)
 }

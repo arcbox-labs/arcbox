@@ -453,16 +453,26 @@ impl NetworkManager {
     )]
     pub(crate) fn release_checked(&self, alloc: &NetworkAllocation) -> Result<()> {
         // Translation state does not die with the device; remove it first
-        // (tolerant of absence, so legacy TAPs are a no-op).
+        // (tolerant of absence, so legacy TAPs are a no-op). A failure here
+        // must NOT abort the teardown: propagating before the TAP destroy
+        // would strand the device and leak the pool address forever (the
+        // allocation is only returned to the pool below, and expire paths do
+        // not retry Network errors). Finish the teardown, then surface the
+        // first error.
         #[cfg(target_os = "linux")]
-        self.deactivate_translation(alloc)?;
+        let translation_result = self.deactivate_translation(alloc);
         #[cfg(target_os = "linux")]
-        destroy_tap_checked(&alloc.tap_name)?;
+        let tap_result = destroy_tap_checked(&alloc.tap_name);
 
         let ip_int = u32::from(alloc.ip_address);
         self.allocated.lock().unwrap().remove(&ip_int);
 
         debug!(tap = %alloc.tap_name, ip = %alloc.ip_address, "releasing network");
+        #[cfg(target_os = "linux")]
+        {
+            translation_result?;
+            tap_result?;
+        }
         Ok(())
     }
 
