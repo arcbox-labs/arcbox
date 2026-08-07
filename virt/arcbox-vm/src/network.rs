@@ -715,6 +715,13 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
     }
 
     // Fallback: if the interface still exists, use ip link delete.
+    //
+    // The existence check and the delete race the kernel: clearing
+    // TUNSETPERSIST above and dropping the fd removes a non-persistent TAP
+    // asynchronously, so the sysfs entry can outlive the decision to delete
+    // and vanish before `ip` runs. "Cannot find device" therefore means the
+    // teardown already happened, which is exactly the state this function
+    // exists to reach — treat it as success. Any other failure still errors.
     if std::path::Path::new(&format!("/sys/class/net/{tap_name}")).exists() {
         let output = std::process::Command::new("/usr/sbin/ip")
             .args(["link", "delete", tap_name])
@@ -723,10 +730,13 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
                 VmmError::Network(format!("run ip link delete {tap_name}: {error}"))
             })?;
         if !output.status.success() {
-            return Err(VmmError::Network(format!(
-                "ip link delete {tap_name}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("Cannot find device") {
+                return Err(VmmError::Network(format!(
+                    "ip link delete {tap_name}: {}",
+                    stderr.trim()
+                )));
+            }
         }
     }
     if std::path::Path::new(&format!("/sys/class/net/{tap_name}")).exists() {
