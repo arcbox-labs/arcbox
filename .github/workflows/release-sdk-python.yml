@@ -104,9 +104,16 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # --frozen, not --locked: release-please bumps the version in
+      # pyproject.toml but not the root entry uv.lock carries for the same
+      # package, so at a release tag the two legitimately disagree and
+      # --locked refuses to install ("the lockfile needs to be updated"),
+      # failing every release before it reaches the tests. --frozen installs
+      # the locked dependency set as-is; the root package still builds at
+      # the tag's pyproject version, which is what gets published.
       - name: Install dependencies
         if: steps.registry.outputs.published != 'true'
-        run: uv sync --locked
+        run: uv sync --frozen
 
       - name: Lint
         if: steps.registry.outputs.published != 'true'
