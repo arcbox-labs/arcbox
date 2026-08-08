@@ -44,9 +44,15 @@ jobs:
       - name: Determine tag
         id: tag
         working-directory: .
+        # The dispatch input arrives through the environment, never spliced
+        # into the script body: template expansion happens before bash runs,
+        # so a `case` guard on an already-interpolated string cannot protect
+        # the assignment itself. This job holds `id-token: write`.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
@@ -80,7 +86,7 @@ jobs:
       # Trusted publishing requires npm >= 11.5.1 (Node 22 bundles 10.x).
       - name: Update npm for trusted publishing
         run: |
-          npm install -g npm@latest
+          npm install -g npm@11.5.1
           npm --version
 
       - name: Verify tag matches package.json
@@ -133,6 +139,12 @@ jobs:
 
       # No --provenance: trusted publishing generates provenance
       # attestations by default. No NODE_AUTH_TOKEN: OIDC replaces it.
+      # --ignore-scripts so the tarball is the artifact the steps above
+      # built and tested. package.json's prepublishOnly re-runs
+      # `rm -rf dist && bunchee` plus the whole suite inside publish, which
+      # would discard the validated dist/ and ship a rebuild nothing
+      # checked — the gate-then-build-then-publish shape only means
+      # something if the published bytes are the gated bytes.
       - name: Publish to npm
         if: steps.registry.outputs.published != 'true'
-        run: npm publish --access public
+        run: npm publish --access public --ignore-scripts

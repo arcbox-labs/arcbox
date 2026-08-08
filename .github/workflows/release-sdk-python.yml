@@ -7,7 +7,8 @@ name: SDK Python Release
 # release-please-config.json).
 #
 # Publishing uses PyPI trusted publishing (OIDC): no token — the job's
-# id-token permission lets uv mint a workflow-scoped credential. Unlike
+# id-token permission mints a workflow-scoped credential, and the upload
+# carries PEP 740 attestations. Unlike
 # npm, PyPI supports PENDING trusted publishers, so the publisher is
 # registered before the first upload and CI performs the first publish —
 # no local bootstrap: see sdk/python/README.md "Releasing".
@@ -44,9 +45,15 @@ jobs:
       - name: Determine tag
         id: tag
         working-directory: .
+        # The dispatch input arrives through the environment, never spliced
+        # into the script body: template expansion happens before bash runs,
+        # so a `case` guard on an already-interpolated string cannot protect
+        # the assignment itself. This job holds `id-token: write`.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
@@ -104,16 +111,19 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # --frozen, not --locked: release-please bumps the version in
-      # pyproject.toml but not the root entry uv.lock carries for the same
-      # package, so at a release tag the two legitimately disagree and
-      # --locked refuses to install ("the lockfile needs to be updated"),
-      # failing every release before it reaches the tests. --frozen installs
-      # the locked dependency set as-is; the root package still builds at
-      # the tag's pyproject version, which is what gets published.
+      # --locked is load-bearing: it is the only check that the resolved
+      # dependency set the gates run against is the one the published wheel
+      # declares. release-please bumps pyproject.toml without touching the
+      # root entry in uv.lock, which would make this fail — so the release
+      # PR job refreshes uv.lock the same way it already refreshes
+      # Cargo.lock (`release-please.yml`, "Update lockfiles on release
+      # PRs"). Relaxing this to --frozen instead would let an unlocked
+      # dependency edit ship: gates green against the old resolution, wheel
+      # declaring the new constraint. The Rust half of this repo made that
+      # trade once and reverted it.
       - name: Install dependencies
         if: steps.registry.outputs.published != 'true'
-        run: uv sync --frozen
+        run: uv sync --locked
 
       - name: Lint
         if: steps.registry.outputs.published != 'true'
@@ -139,10 +149,16 @@ jobs:
         if: steps.registry.outputs.published != 'true'
         run: uv build
 
-      # uv auto-detects trusted publishing in GitHub Actions (its GitHub
-      # integration guide runs a bare `uv publish`); `always` makes the
-      # OIDC exchange mandatory so a broken exchange fails loudly instead
-      # of falling back to hunting for ambient credentials.
+      # pypa/gh-action-pypi-publish rather than `uv publish`: both publish
+      # through the same OIDC trusted-publisher exchange, but uv emits no
+      # PEP 740 attestations ("attestations must be created separately
+      # before publishing", astral-sh/uv#15618) while this action signs the
+      # distributions by default. Without it the two SDKs would ship
+      # materially different supply-chain guarantees — npm trusted
+      # publishing attaches provenance to @arcbox/sandbox automatically.
+      # Pinned by commit: it runs in the job that mints publish credentials.
       - name: Publish to PyPI
         if: steps.registry.outputs.published != 'true'
-        run: uv publish --trusted-publishing always
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: sdk/python/dist
