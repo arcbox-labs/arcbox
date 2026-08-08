@@ -106,17 +106,10 @@ of the main arcbox release train:
    registry, so a re-dispatch never fails on an already-published
    release.
 
-> **The publish workflow is not in the repo yet.** Registering the
-> component (this change) and adding the workflow are separate pushes —
-> a workflow file needs a token carrying the `workflow` scope. Until
-> `release-sdk-typescript.yml` lands, step 4 does not happen:
-> release-please still mints `sdk-typescript-vX.Y.Z` and the GitHub
-> release, but nothing publishes to npm, and adding the workflow later
-> does **not** replay the missed tag push. So a version tagged before
-> the workflow lands must be published by hand (step 1 of the bootstrap
-> below, which is a manual `npm publish` regardless), or the workflow
-> re-dispatched against the existing tag once it exists — it takes a tag
-> as a `workflow_dispatch` input for exactly this.
+> A tag minted while the publish workflow was absent (or a tag whose
+> run failed) is **not replayed** by a later push — re-dispatch the
+> workflow against the existing tag instead: it takes the tag as a
+> `workflow_dispatch` input for exactly this.
 
 One-time bootstrap (trusted publishing can only be configured for a
 package that already exists on the registry):

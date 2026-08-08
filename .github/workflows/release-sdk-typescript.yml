@@ -72,16 +72,19 @@ jobs:
       # workflow_dispatch from master must still publish the tag's tree,
       # or the published package would not match the release.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ steps.tag.outputs.tag }}
+          # This job mints a publish credential; never leave the repo token
+          # persisted on disk beside it.
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0  # zizmor: ignore[cache-poisoning] -- setup-node caching is opt-in via the cache input, which this step does not set
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
+          # No cache restore: a publish job must build from the lockfile
+          # alone, not from a cache another workflow could have poisoned.
 
       # Trusted publishing requires npm >= 11.5.1 (Node 22 bundles 10.x).
       - name: Update npm for trusted publishing

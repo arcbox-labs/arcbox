@@ -30,7 +30,7 @@ jobs:
 
       # uv, for the sdk/python lockfile refresh in the next step. Pinned so
       # the job that pushes to release branches fetches nothing mutable.
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.12.1"
 
