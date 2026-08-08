@@ -116,10 +116,10 @@ ARCBOX_SDK_E2E=1 uv run pytest tests/test_e2e.py
 ## Toolchain notes
 
 - **uv** is the package/project manager (`uv_build` backend, `uv.lock`
-  committed). Publishing is CI-only: `uv build && uv publish` under
-  PyPI trusted publishing (OIDC) — see [Releasing](#releasing), which
-  also covers the workflow still being absent; no `UV_PUBLISH_TOKEN`
-  anywhere.
+  committed). Publishing is CI-only: `uv build`, then upload via
+  `pypa/gh-action-pypi-publish` under PyPI trusted publishing (OIDC,
+  with PEP 740 attestations — `uv publish` emits none, astral-sh/uv#15618)
+  — see [Releasing](#releasing); no `UV_PUBLISH_TOKEN` anywhere.
 - **ruff** is both linter and formatter (`E,F,W,I,UP,B,SIM,RUF`).
 - **pyright** (strict) is the authoritative type checker. Evaluated
   alternatives (2026-08): **ty** 0.0.65 reports 16 false positives here
@@ -158,25 +158,20 @@ of the main arcbox release train:
    (`.github/workflows/release-sdk-python.yml`) triggers on: it checks
    out the tag's tree, re-runs the full gate suite (`ruff check`, `ruff
    format --check`, `pyright`, `pytest`, `gen_sync.py --check`), builds
-   with `uv build`, and publishes with `uv publish` via [trusted
-   publishing](https://docs.pypi.org/trusted-publishers/) (OIDC) —
+   with `uv build`, and publishes via `pypa/gh-action-pypi-publish` under
+   [trusted publishing](https://docs.pypi.org/trusted-publishers/) (OIDC,
+   PEP 740 attestations included) —
    tokenless: the job's `id-token: write` permission is exchanged for a
    short-lived PyPI credential. The job skips cleanly if the version is
    already on PyPI, so a re-dispatch never fails on an
    already-published release.
 
-> **The publish workflow is not in the repo yet.** Registering the
-> component (this change) and adding the workflow are separate pushes —
-> a workflow file needs a token carrying the `workflow` scope. Until
-> `release-sdk-python.yml` lands, step 4 does not happen: release-please
-> still mints `sdk-python-vX.Y.Z` and the GitHub release, but nothing
-> uploads to PyPI, and adding the workflow later does **not** replay the
-> missed tag push. So land the workflow before cutting the first
-> release: a hand publish would need an API token, which is the one
-> thing the pending-publisher bootstrap below exists to avoid. If a tag
-> does get minted early, the recovery is to re-dispatch the workflow
-> against that existing tag once it lands — it takes a tag as a
-> `workflow_dispatch` input for exactly this — not to publish by hand.
+> A tag minted while the publish workflow was absent (or a tag whose
+> run failed) is **not replayed** by a later push — re-dispatch the
+> workflow against the existing tag instead (it takes the tag as a
+> `workflow_dispatch` input), never publish by hand: a hand publish
+> would need an API token, which the pending-publisher bootstrap below
+> exists to avoid.
 
 One-time bootstrap — unlike npm, PyPI supports [pending
 publishers](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/):

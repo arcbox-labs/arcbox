@@ -73,19 +73,23 @@ jobs:
       # workflow_dispatch from master must still publish the tag's tree,
       # or the published distribution would not match the release.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ steps.tag.outputs.tag }}
+          # This job mints a publish credential; never leave the repo token
+          # persisted on disk beside it.
+          persist-credentials: false
 
       # uv pinned to the same range as pyproject.toml's uv_build
       # requirement; uv sync provisions the interpreter pinned by
       # sdk/python/.python-version.
       - name: Setup uv
-        uses: astral-sh/setup-uv@v9
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: '>=0.12.1,<0.13'
-          enable-cache: true
-          cache-dependency-glob: sdk/python/uv.lock
+          # No cache restore: a publish job must resolve from the lockfile
+          # alone, not from a cache another workflow could have poisoned.
+          enable-cache: false
 
       - name: Verify tag matches pyproject.toml
         run: |
