@@ -94,7 +94,12 @@ where
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let err = spawn_error(&req.cmd[0], e);
+            let err = spawn_error(
+                &req.cmd[0],
+                &req.working_dir,
+                req.env.get("PATH").map(String::as_str),
+                e,
+            );
             write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
             return Ok(());
         }
@@ -251,7 +256,12 @@ where
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let err = spawn_error(&req.cmd[0], e);
+            let err = spawn_error(
+                &req.cmd[0],
+                &req.working_dir,
+                req.env.get("PATH").map(String::as_str),
+                e,
+            );
             write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
             return Ok(());
         }
