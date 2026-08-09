@@ -201,6 +201,11 @@ class ServerStream(Generic[M]):
         self._response: httpx.Response | None = None
 
     def __enter__(self) -> ServerStream[M]:
+        # A per-phase cap, not wall-clock: httpx grants connect/read/
+        # write/pool this much each, so it bounds silence (a wedged
+        # peer), while a stream that keeps sending frames stays open —
+        # callers enforcing an overall deadline re-check their budget on
+        # every frame.
         cm = self._http.stream(
             "POST",
             self._path,

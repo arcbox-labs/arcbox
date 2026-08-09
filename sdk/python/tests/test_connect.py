@@ -14,6 +14,7 @@ from google.protobuf import empty_pb2
 from arcbox import ArcBox, Connection
 from arcbox._envelope import FLAG_END_STREAM, encode_envelope
 from arcbox._gen import sandbox_pb2
+from arcbox.errors import InvalidArgumentError
 from arcbox.errors import TimeoutError as ArcBoxTimeoutError
 
 
@@ -90,6 +91,13 @@ def test_connect_settles_a_pausing_sandbox_then_resumes() -> None:
     assert daemon.inspects == 2
     assert daemon.event_streams == 0
     assert daemon.resumes == 1
+
+
+def test_connect_rejects_a_non_positive_timeout_before_any_rpc() -> None:
+    daemon = MockLifecycle([sandbox_pb2.SANDBOX_STATE_READY])
+    with pytest.raises(InvalidArgumentError):
+        connect_against(daemon).connect("sb-1", timeout=-1)
+    assert daemon.inspects == 0
 
 
 def test_connect_bounds_a_never_settling_pausing_sandbox() -> None:

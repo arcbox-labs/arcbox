@@ -8,6 +8,7 @@ import { Commands } from "./commands";
 import type { ConnectionOptions } from "./connection";
 import {
   ArcBoxError,
+  InvalidArgumentError,
   NotFoundError,
   SandboxStateError,
   TimeoutError,
@@ -72,7 +73,8 @@ export interface ConnectSandboxOptions {
    * readiness wait all share it (default 60_000 — generous because a
    * checkpoint restore or cold boot legitimately takes a while). On
    * expiry a {@link TimeoutError} is thrown and the sandbox is left as
-   * it was. `Number.POSITIVE_INFINITY` disables the bound.
+   * it was. Fractional values round up; the valid range is 1..2^31 - 1,
+   * and `Number.POSITIVE_INFINITY` disables the bound.
    */
   timeoutMs?: number;
   /** Connection override for this entry point. */
@@ -101,6 +103,9 @@ const PAUSE_SETTLE_POLL_MS = 500;
 
 /** Default overall deadline for {@link ArcBox.connect} — see {@link ConnectSandboxOptions.timeoutMs}. */
 const CONNECT_TIMEOUT_MS = 60000;
+
+/** Node clamps timer delays past 2^31 - 1 to 1ms; reject rather than mislead. */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
 /** Merge the connect deadline signal into a call's options, when one is set. */
 function withSignal(
@@ -213,7 +218,26 @@ export class ArcBox {
     id: string,
     opts: ConnectSandboxOptions = {},
   ): Promise<Sandbox> {
-    const timeoutMs = opts.timeoutMs ?? CONNECT_TIMEOUT_MS;
+    // Fractional milliseconds round up; the rest of the range is
+    // validated here so a bad knob surfaces as the SDK's typed error:
+    // AbortSignal.timeout() throws a raw RangeError on non-integers and
+    // negatives, NaN and NEGATIVE_INFINITY would silently disable the
+    // bound, and Node clamps timer delays past 2^31 - 1 to 1ms.
+    const timeoutMs = Math.ceil(opts.timeoutMs ?? CONNECT_TIMEOUT_MS);
+    if (
+      Number.isNaN(timeoutMs) ||
+      timeoutMs <= 0 ||
+      (Number.isFinite(timeoutMs) && timeoutMs > MAX_TIMEOUT_MS)
+    ) {
+      throw new InvalidArgumentError(
+        "connect timeoutMs must be a positive number of milliseconds at " +
+          "most 2**31 - 1 (Number.POSITIVE_INFINITY disables the bound)",
+        {
+          context: { timeoutMs: String(opts.timeoutMs) },
+          operation: "sandbox.connect",
+        },
+      );
+    }
     const timeoutLabel = String(timeoutMs);
     // One deadline over every wait below — the settle poll, resume, and
     // the readiness wait; bounding only one of them would be arbitrary
