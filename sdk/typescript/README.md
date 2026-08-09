@@ -124,12 +124,19 @@ package that already exists on the registry):
 
 ## Status
 
-Phase 1 of CORE-58 — the hello-world closed loop: `Sandbox`
-create/connect/list, `kill`/`pause`/`info` (`pause` and the
-paused-sandbox reconnect path are wire-complete but reject with
-Unimplemented until the daemon's CORE-21 lands — the daemon serves
-Pause/Resume as contract-only stubs today), `commands.run` (foreground
-result + background handle with streamed output, `waitForExit`, `kill`),
-and whole-file `files` read/write. Deferred: PTY, `ports`,
-`waitForPort`/`waitForLog`, filesystem path verbs (stat/list/mkdir/…),
-`Template` statics, `events()`, `setLifecycle`, capabilities handshake.
+Phase 2a of CORE-58. Shipped:
+
+| Surface | Notes |
+| --- | --- |
+| `Sandbox` create/connect/list, `kill`/`pause`/`info` | pause/resume are live daemon-side (CORE-21); data-plane calls auto-resume a paused sandbox |
+| `commands.run` | foreground result + background handle; `stdin: string\|bytes` (write-then-close) or `stdin: true` (keep open); `pty: {cols, rows}` |
+| `CommandHandle` | streamed `output` with transparent offset-resume across stream death (bounded retries → `ConnectionLostError`), `waitForExit`, `kill`, `writeStdin`/`closeStdin`/`stdinStatus` (offset-idempotent), `resize` |
+| `commands.get(id)` | re-attach a handle by execution id (stdin cursor seeded from the daemon) |
+| `sandbox.events()` | typed lifecycle events, keepalives filtered; a mid-stream drop is `ConnectionLostError` |
+| `sandbox.setLifecycle()` | tri-state: omitted = unchanged, `null` = restore default, value = replace |
+| `arcbox.capabilities()` | daemon handshake (version/protocol/features/nested virt), cached per client |
+| `files` | whole-file read/write |
+
+Deferred to phase 2b (the daemon answers Unimplemented today):
+`commands.list()` (ListExecutions), `ports` + `waitForPort`, filesystem
+path verbs (stat/list/mkdir/…), `Template` statics.

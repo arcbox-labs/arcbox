@@ -206,14 +206,20 @@ if the bootstrap has been sitting for a while.
 
 ## Status
 
-Phase 1 of CORE-58 — the hello-world closed loop: `Sandbox` /
-`AsyncSandbox` create/connect/list, `kill`/`pause`/`info` (`pause` and
-the paused-sandbox reconnect path are wire-complete but reject with an
-unimplemented error until the daemon's CORE-21 lands), `commands.run`
-(foreground result + background handle with streamed output,
-`wait_for_exit`, `kill`), and whole-file `files` read/write. Deferred:
-PTY, `ports`, `wait_for_port`/`wait_for_log`, stdin, filesystem path
-verbs (stat/list/mkdir/...), `Template` statics, `events()`,
-`set_lifecycle`, the capabilities handshake, and the SDK-side default
-idle-reaping policy (design decision 4 — applied once the daemon
-enforces the lifecycle knobs).
+Phase 2a of CORE-58, on both the sync and async surfaces. Shipped:
+
+| Surface | Notes |
+| --- | --- |
+| `Sandbox` create/connect/list, `kill`/`pause`/`info` | pause/resume are live daemon-side (CORE-21); data-plane calls auto-resume a paused sandbox |
+| `commands.run` | foreground result + background handle; `stdin=str\|bytes` (write-then-close) or `stdin=True` (keep open); `pty=PtySize(cols, rows)` |
+| `CommandHandle` | streamed `output` with transparent offset-resume across stream death (bounded retries → `ConnectionLostError`), `wait_for_exit`, `kill`, `write_stdin`/`close_stdin`/`stdin_status` (offset-idempotent), `resize` |
+| `commands.get(id)` | re-attach a handle by execution id (stdin cursor seeded from the daemon) |
+| `sandbox.events()` | typed lifecycle events, keepalives filtered; sync reads genuinely block; a mid-stream drop is `ConnectionLostError` |
+| `sandbox.set_lifecycle()` | tri-state: omitted (`UNCHANGED`) = unchanged, `None` = restore default (as on `create`), value = replace |
+| `arcbox.capabilities()` | daemon handshake (version/protocol/features/nested virt), cached per client |
+| `files` | whole-file read/write |
+
+Deferred to phase 2b (the daemon answers Unimplemented today):
+`commands.list()` (ListExecutions), `ports` + `wait_for_port`,
+filesystem path verbs (stat/list/mkdir/...), `Template` statics, and the
+SDK-side default idle-reaping policy (design decision 4).
