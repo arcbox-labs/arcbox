@@ -138,9 +138,10 @@ ARCBOX_SDK_E2E=1 uv run pytest tests/test_e2e.py
   **maturin**/PyO3 extension crate in this repo's workspace; nothing in
   the current SDK needs it.
 
-TODO(CI): wire the gates above into `.github/workflows` as an
-`sdk-python` job (follow-up; workflow changes are intentionally not part
-of this branch).
+The development gates (ruff check + format, pyright, the
+`gen_sync.py --check` lockstep gate, pytest) run on every PR as the
+`sdk-python` job in `.github/workflows/ci.yml`, from a
+`uv sync --locked` environment.
 
 ## Releasing
 

@@ -79,9 +79,9 @@ opt-in:
 ARCBOX_SDK_E2E=1 npm test -- test/e2e.test.ts
 ```
 
-TODO(CI): wire `npm run lint`, `npm run format:check`, `npm test`, and
-`npm run typecheck` into `.github/workflows` as an `sdk-typescript` job
-(follow-up; workflow changes are intentionally not part of this branch).
+The gates above (lint, format check, tests, typecheck, build) run on
+every PR as the `sdk-typescript` job in `.github/workflows/ci.yml`, on
+Node 22 from a clean `npm ci`.
 
 ## Releasing
 
