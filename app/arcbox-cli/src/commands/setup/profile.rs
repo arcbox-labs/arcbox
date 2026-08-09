@@ -55,8 +55,7 @@ pub(super) async fn profile_path(shell: ShellKind) -> Result<PathBuf> {
     })
 }
 
-pub(super) async fn inject(shell: ShellKind) -> Result<PathBuf> {
-    let path = profile_path(shell).await?;
+pub(super) async fn inject(shell: ShellKind, path: PathBuf) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -70,8 +69,7 @@ pub(super) async fn inject(shell: ShellKind) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub(super) async fn remove(shell: ShellKind) -> Result<Option<PathBuf>> {
-    let path = profile_path(shell).await?;
+pub(super) async fn remove(shell: ShellKind, path: PathBuf) -> Result<Option<PathBuf>> {
     let Some(existing) = read(&path).await? else {
         return Ok(None);
     };

@@ -1,7 +1,7 @@
 //! End-to-end health checks for the paths users actually invoke.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -112,10 +112,20 @@ pub async fn execute(format: OutputFormat) -> Result<()> {
 }
 
 async fn inspect() -> DoctorReport {
-    let expected_socket = daemon_socket();
     let layout = arcbox_constants::paths::HostLayout::from_env_or_default();
-    let mut checks = vec![check_daemon(&layout, &expected_socket)];
-    checks.push(check_docker_context(&expected_socket).await);
+    let mut checks = Vec::new();
+    match arcbox_core::Config::load() {
+        Ok(config) => {
+            let expected_socket = super::resolve_docker_socket_path(&config);
+            checks.push(check_daemon(&layout, &expected_socket));
+            checks.push(check_docker_context(&expected_socket).await);
+        }
+        Err(error) => checks.push(HealthCheck::fail(
+            "Configuration",
+            format!("{error:#}"),
+            "Fix the active ArcBox configuration, then rerun doctor.",
+        )),
+    }
     checks.push(check_docker_cli().await);
 
     let shell = super::setup::shell_integration_status().await;
@@ -253,20 +263,15 @@ fn endpoint_matches_socket(endpoint: &str, expected: &Path) -> Result<bool, Stri
     if actual == expected {
         return Ok(true);
     }
-    match (
-        std::fs::canonicalize(actual),
-        std::fs::canonicalize(expected),
-    ) {
-        (Ok(actual), Ok(expected)) => Ok(actual == expected),
-        _ => Ok(false),
-    }
-}
-
-fn daemon_socket() -> PathBuf {
-    std::env::var_os("ARCBOX_SOCKET").map_or_else(
-        || arcbox_constants::paths::HostLayout::from_env_or_default().docker_socket,
-        PathBuf::from,
-    )
+    let actual = std::fs::canonicalize(actual)
+        .map_err(|error| format!("could not resolve Docker endpoint {endpoint}: {error}"))?;
+    let expected = std::fs::canonicalize(expected).map_err(|error| {
+        format!(
+            "could not resolve expected Docker socket {}: {error}",
+            expected.display()
+        )
+    })?;
+    Ok(actual == expected)
 }
 
 #[cfg(target_os = "macos")]
@@ -431,6 +436,14 @@ mod tests {
         assert_eq!(
             endpoint_matches_socket("tcp://127.0.0.1:2375", &socket),
             Err("Docker endpoint is not a Unix socket: tcp://127.0.0.1:2375".to_owned())
+        );
+        assert!(
+            endpoint_matches_socket(
+                &format!("unix://{}", directory.path().join("missing.sock").display()),
+                &socket
+            )
+            .unwrap_err()
+            .contains("could not resolve Docker endpoint")
         );
     }
 }

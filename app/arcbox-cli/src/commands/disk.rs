@@ -198,10 +198,7 @@ async fn execute_usage(format: OutputFormat) -> Result<()> {
         .exists()
         .then(|| read_disk_usage(&meta_path))
         .transpose()?;
-    let socket_path = std::env::var_os("ARCBOX_SOCKET").map_or_else(
-        || config.docker.socket_path.clone(),
-        std::path::PathBuf::from,
-    );
+    let socket_path = super::resolve_docker_socket_path(&config);
     let docker_reclaimable = arcbox_docker::query_reclaimable_space(&socket_path)
         .await
         .with_context(|| {

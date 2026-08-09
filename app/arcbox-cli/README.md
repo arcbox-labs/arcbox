@@ -61,9 +61,12 @@ Read-only JSON schemas are available for `doctor`, `top`, `disk usage`,
 `sandbox inspect`, and, on macOS, `dns status`.
 Disk and boot sizes use raw `*_bytes` fields. For read-only commands, quiet
 output is limited to `setup status`, which prints `installed` or `partial` and
-still exits nonzero for a partial setup. If Docker is unavailable, `disk usage`
-keeps host image facts, sets runtime reclaimable fields to `null`, reports the
-query error, and exits nonzero.
+still exits nonzero for a partial setup.
+
+Status exit codes are health contracts: `doctor`, `dns status`, `boot status`,
+and `setup status` exit nonzero when their report is unhealthy or incomplete.
+If Docker is unavailable, `disk usage` keeps host image facts, sets runtime
+reclaimable fields to `null`, reports the query error, and exits nonzero.
 
 ## Exit status
 

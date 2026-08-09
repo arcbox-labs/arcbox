@@ -6,6 +6,8 @@ use super::super::OutputFormat;
 use super::{bin_dir, completions, completions_dir, profile, shell_dir};
 
 pub(super) async fn install(format: OutputFormat) -> Result<()> {
+    let selected_shell = profile::detect_shell();
+    let profile_path = profile::profile_path(selected_shell).await?;
     let bin = bin_dir();
     let shell = shell_dir();
     let completions = completions_dir();
@@ -32,8 +34,7 @@ pub(super) async fn install(format: OutputFormat) -> Result<()> {
     write_init_scripts(&shell).await?;
     completions::generate_all(&completions)?;
 
-    let selected_shell = profile::detect_shell();
-    let profile_path = profile::inject(selected_shell).await?;
+    let profile_path = profile::inject(selected_shell, profile_path).await?;
 
     match format {
         OutputFormat::Json => println!(
@@ -84,6 +85,8 @@ pub(super) async fn install(format: OutputFormat) -> Result<()> {
 }
 
 pub(super) async fn uninstall(format: OutputFormat) -> Result<()> {
+    let selected_shell = profile::detect_shell();
+    let profile_path = profile::profile_path(selected_shell).await?;
     let bin = bin_dir();
     let (docker_plugins, plugin_error) = unregister_docker_plugins(&bin).await;
     for path in [bin, shell_dir(), completions_dir()] {
@@ -93,7 +96,7 @@ pub(super) async fn uninstall(format: OutputFormat) -> Result<()> {
                 .with_context(|| format!("failed to remove {}", path.display()))?;
         }
     }
-    let cleaned_profile = profile::remove(profile::detect_shell()).await?;
+    let cleaned_profile = profile::remove(selected_shell, profile_path).await?;
 
     match format {
         OutputFormat::Json => println!(

@@ -42,6 +42,12 @@ pub fn resolve_grpc_socket_path() -> PathBuf {
     arcbox_constants::paths::HostLayout::from_env_or_default().grpc_socket
 }
 
+/// Resolves the Docker socket from the CLI override or active configuration.
+pub fn resolve_docker_socket_path(config: &arcbox_core::Config) -> PathBuf {
+    std::env::var_os("ARCBOX_SOCKET")
+        .map_or_else(|| config.docker.socket_path.clone(), PathBuf::from)
+}
+
 pub mod agent;
 pub mod boot;
 pub mod cli_plugins;
