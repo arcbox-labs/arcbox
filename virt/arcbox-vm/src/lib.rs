@@ -33,6 +33,7 @@ pub mod boot_proto;
 pub mod config;
 pub mod error;
 pub mod file_io;
+pub mod file_watch;
 pub mod network;
 pub mod sandbox;
 pub mod snapshot;
