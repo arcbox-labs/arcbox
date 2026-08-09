@@ -12,17 +12,21 @@ from importlib.metadata import PackageNotFoundError, version
 from arcbox._async._client import AsyncConnectClient
 from arcbox._async.commands import AsyncCommandHandle, AsyncCommands, AsyncOutputStream
 from arcbox._async.files import AsyncFiles, AsyncFileWatch
+from arcbox._async.ports import AsyncPorts
 from arcbox._async.sandbox import AsyncArcBox, AsyncEventStream, AsyncSandbox
 from arcbox._connection import Connection
 from arcbox._sync._client import ConnectClient
 from arcbox._sync.commands import CommandHandle, Commands, OutputStream
 from arcbox._sync.files import Files, FileWatch
+from arcbox._sync.ports import Ports
 from arcbox._sync.sandbox import ArcBox, EventStream, Sandbox
 from arcbox._types import (
     MAX_FILE_BYTES,
     UNCHANGED,
     Capabilities,
+    CommandInfo,
     CommandResult,
+    CommandState,
     FileKind,
     FileStat,
     FsEvent,
@@ -61,10 +65,13 @@ __all__ = [
     "AsyncFileWatch",
     "AsyncFiles",
     "AsyncOutputStream",
+    "AsyncPorts",
     "AsyncSandbox",
     "Capabilities",
     "CommandHandle",
+    "CommandInfo",
     "CommandResult",
+    "CommandState",
     "Commands",
     "ConnectClient",
     "Connection",
@@ -80,6 +87,7 @@ __all__ = [
     "OutputChannel",
     "OutputChunk",
     "OutputStream",
+    "Ports",
     "PtySize",
     "Sandbox",
     "SandboxEvent",

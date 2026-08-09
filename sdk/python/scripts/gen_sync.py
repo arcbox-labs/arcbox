@@ -40,6 +40,7 @@ EXTRA_REPLACEMENTS = {
     "AsyncEventStream": "EventStream",
     "AsyncFileWatch": "FileWatch",
     "AsyncFiles": "Files",
+    "AsyncPorts": "Ports",
     "AsyncConnectClient": "ConnectClient",
     "AsyncServerStream": "ServerStream",
     # httpx sync flavors.

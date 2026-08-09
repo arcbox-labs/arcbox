@@ -171,6 +171,34 @@ class FileStat:
     symlink_target: str | None = None
 
 
+#: Lifecycle state of a command (execution).
+CommandState = Literal["running", "exited"]
+
+
+@dataclass(frozen=True)
+class CommandInfo:
+    """One row of a command listing — the summary ``commands.list()``
+    returns. Exit is data, mirroring :class:`CommandResult`: a signal
+    death reports ``128 + signal`` with :attr:`signal` set; an execution
+    that ended without an observed exit carries :attr:`error` instead."""
+
+    #: Execution id — feed it to ``commands.get()`` for a live handle.
+    command_id: str
+    #: Whether the process runs on a pseudo-TTY.
+    tty: bool
+    state: CommandState
+    #: When the process was dispatched.
+    started_at: datetime | None = None
+    #: When the process terminated (None while running).
+    exited_at: datetime | None = None
+    #: Exit code (``128 + signal`` for signal deaths), set on an observed exit.
+    exit_code: int | None = None
+    #: Signal name when killed by a signal (e.g. "SIGKILL").
+    signal: str | None = None
+    #: Set when the execution ended without an observed exit.
+    error: str | None = None
+
+
 #: Kind of a filesystem event. "unknown" covers kinds this SDK predates.
 FsEventKind = Literal["created", "modified", "removed", "renamed", "unknown"]
 
@@ -432,6 +460,29 @@ def signal_display_name(value: int) -> str:
     if name == "SIGNAL_UNSPECIFIED":
         return f"SIG{value}"
     return name.removeprefix("SIGNAL_")
+
+
+def command_info_from_proto(execution: process_pb2.Execution) -> CommandInfo:
+    """Map one Execution row to the public summary DTO."""
+    exit_code: int | None = None
+    signal: str | None = None
+    status = execution.exit_status.WhichOneof("status")
+    if status == "code":
+        exit_code = execution.exit_status.code
+    elif status == "signal":
+        value = execution.exit_status.signal
+        exit_code = 128 + value
+        signal = signal_display_name(value)
+    return CommandInfo(
+        command_id=execution.id,
+        tty=execution.tty,
+        state="exited" if execution.state == process_pb2.EXECUTION_STATE_EXITED else "running",
+        started_at=_optional_time(execution.started_at, execution.HasField("started_at")),
+        exited_at=_optional_time(execution.exited_at, execution.HasField("exited_at")),
+        exit_code=exit_code,
+        signal=signal,
+        error=execution.error or None,
+    )
 
 
 def command_result_from_execution(

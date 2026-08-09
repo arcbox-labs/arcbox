@@ -46,6 +46,7 @@ from arcbox.errors import (
 from ._client import AsyncConnectClient
 from .commands import AsyncCommands
 from .files import AsyncFiles
+from .ports import AsyncPorts
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
@@ -509,6 +510,8 @@ class AsyncSandbox:
         self.commands = AsyncCommands(client, sandbox_id)
         #: Move bytes in and out of the sandbox.
         self.files = AsyncFiles(client, sandbox_id)
+        #: Network readiness of the sandbox.
+        self.ports = AsyncPorts(client, sandbox_id)
 
     @classmethod
     async def create(
