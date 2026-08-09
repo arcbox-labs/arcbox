@@ -5,20 +5,25 @@ with sandbox support on this host). Skipped cleanly otherwise.
 Connection resolution applies, so ARCBOX_SOCKET / ARCBOX_DATA_DIR
 point the loop at a dev daemon.
 
-This is the design doc's 20-line hello world plus the phase 2a surface:
-PTY, stdin, re-attach, set_lifecycle, capabilities, and events. Still
-outside scope: ports.expose and wait_for_port (2b). The sync flavor
-exercises the generated tree end to end — including genuinely blocking
-event-stream reads.
+This is the design doc's 20-line hello world plus the phase 2a surface
+(PTY, stdin, re-attach, set_lifecycle, capabilities, events) and the
+phase 2b surface (filesystem path verbs, watch, wait_for_port,
+commands.list, wait_for_log). Still outside scope: Template statics.
+The sync flavor exercises the generated tree end to end — including
+genuinely blocking event-stream reads.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
 
-from arcbox import ArcBox, AsyncSandbox, PtySize, Sandbox
+from arcbox import ArcBox, AsyncSandbox, FsEvent, PtySize, Sandbox
+from arcbox.errors import ArcBoxError
+from arcbox.errors import FileNotFoundError as SandboxFileNotFoundError
+from arcbox.errors import TimeoutError as SandboxTimeoutError
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ARCBOX_SDK_E2E") != "1",
@@ -105,6 +110,95 @@ def test_sync_hello_world() -> None:
         assert sandbox.info().state in ("ready", "running")
     finally:
         sandbox.kill()
+
+
+def test_sync_phase_2b_surface() -> None:
+    # Path verbs, wait_for_port, commands.list, and wait_for_log on the
+    # genuinely blocking sync tree (the watch flavor is exercised async
+    # below, where a read can be raced against a timer).
+    sandbox = Sandbox.create("", ttl=300)
+    try:
+        # The listener below needs busybox `nc`.
+        assert sandbox.commands.run("command -v nc").exit_code == 0
+
+        # Path verbs roundtrip: mkdir -p -> write -> stat -> list ->
+        # move -> remove (with the non-recursive guard).
+        sandbox.files.mkdir("/tmp/verbs/nested")
+        sandbox.files.mkdir("/tmp/verbs/nested")  # mkdir -p: idempotent
+        sandbox.files.write_text("/tmp/verbs/nested/a.txt", "payload\n")
+        stat = sandbox.files.stat("/tmp/verbs/nested/a.txt")
+        assert stat.kind == "file"
+        assert stat.size == 8
+        assert stat.mode == 0o644
+        assert stat.name == "a.txt"
+        assert stat.modified_at is not None
+        assert [e.name for e in sandbox.files.list("/tmp/verbs/nested")] == ["a.txt"]
+        sandbox.files.move("/tmp/verbs/nested/a.txt", "/tmp/verbs/nested/b.txt")
+        assert sandbox.files.read_text("/tmp/verbs/nested/b.txt") == "payload\n"
+        with pytest.raises(SandboxFileNotFoundError):
+            sandbox.files.stat("/tmp/verbs/nested/a.txt")
+        # A non-empty directory refuses a non-recursive remove...
+        with pytest.raises(ArcBoxError):
+            sandbox.files.remove("/tmp/verbs")
+        # ...and a recursive one takes the tree out.
+        sandbox.files.remove("/tmp/verbs", recursive=True)
+        with pytest.raises(SandboxFileNotFoundError):
+            sandbox.files.stat("/tmp/verbs")
+
+        # wait_for_port: nothing listens yet — a 1 s budget times out
+        # with the knob-naming error...
+        with pytest.raises(SandboxTimeoutError):
+            sandbox.ports.wait_for_port(23456, timeout=1)
+        # ...then a background nc listener flips it.
+        listener = sandbox.commands.run(
+            ["/bin/sh", "-c", "exec nc -l -p 23456 >/dev/null"], background=True
+        )
+        sandbox.ports.wait_for_port(23456, timeout=30)
+
+        # commands.list rediscovers the running listener by id.
+        rows = sandbox.commands.list()
+        assert any(r.command_id == listener.command_id and r.state == "running" for r in rows)
+        listener.kill("SIGKILL")
+        listener.wait_for_exit(30)
+
+        # wait_for_log catches a delayed echo while the command keeps
+        # running (the wait ends on the match, not the exit).
+        delayed = sandbox.commands.run("sleep 2; echo the-marker-line; sleep 300", background=True)
+        assert delayed.wait_for_log("the-marker-line", timeout=30) == "the-marker-line"
+        delayed.kill("SIGKILL")
+        delayed.wait_for_exit(30)
+    finally:
+        sandbox.kill()
+
+
+@pytest.mark.anyio
+async def test_async_watch_observes_a_write() -> None:
+    sandbox = await AsyncSandbox.create("", ttl=300)
+    async with sandbox:
+        await sandbox.files.mkdir("/tmp/watched")
+
+        async def first_event() -> FsEvent | None:
+            async with sandbox.files.watch("/tmp/watched", recursive=True) as watch:
+                async for event in watch:
+                    return event
+            return None
+
+        # Registration is asynchronous, so write markers until the first
+        # event lands (each write is itself a fresh candidate event).
+        task = asyncio.ensure_future(first_event())
+        event: FsEvent | None = None
+        try:
+            for i in range(20):
+                await sandbox.files.write_text("/tmp/watched/marker.txt", f"ping {i}\n")
+                done, _pending = await asyncio.wait([task], timeout=1.0)
+                if done:
+                    event = task.result()
+                    break
+        finally:
+            task.cancel()
+        assert event is not None
+        assert event.path == "/tmp/watched/marker.txt"
+        assert event.kind in ("created", "modified")
 
 
 def test_events_observe_the_idle_auto_pause() -> None:
