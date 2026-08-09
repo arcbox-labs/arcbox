@@ -6,6 +6,7 @@ import { createClient } from "@connectrpc/connect";
 import {
   ArcBoxError,
   CommandFailedError,
+  InvalidArgumentError,
   SandboxDiedError,
   TimeoutError,
   toArcBoxError,
@@ -36,6 +37,25 @@ const SIGNAL_VALUES: Record<SignalName, Signal> = {
   SIGTERM: Signal.SIGTERM,
 };
 
+/** Terminal geometry for a PTY command. */
+export interface PtySize {
+  /** Terminal width in columns. */
+  cols: number;
+  /** Terminal height in rows. */
+  rows: number;
+}
+
+/** Stdin acceptance state of a command, as reported by the daemon. */
+export interface StdinStatus {
+  /**
+   * Bytes accepted and forwarded so far — the offset the next stdin
+   * write starts at.
+   */
+  bytesWritten: number;
+  /** Whether stdin has been closed. */
+  closed: boolean;
+}
+
 /** Options for {@link Commands.run}. */
 export interface RunOptions {
   /** Working directory (default: rootfs default). */
@@ -51,6 +71,23 @@ export interface RunOptions {
   timeoutMs?: number;
   /** Return a {@link CommandHandle} immediately instead of waiting for exit. */
   background?: boolean;
+  /**
+   * Allocate a pseudo-terminal of this size. Output then arrives merged
+   * on the `"pty"` channel — stdout and stderr are indistinguishable
+   * once a terminal is allocated — and stdin stays open: end input by
+   * writing Ctrl-D (`"\x04"`) via {@link CommandHandle.writeStdin};
+   * {@link CommandHandle.closeStdin} is rejected for PTY commands.
+   */
+  pty?: PtySize;
+  /**
+   * Feed the command's stdin. A string (UTF-8) or bytes is written and
+   * then closed before the run resolves (subprocess semantics). `true`
+   * keeps stdin open for manual {@link CommandHandle.writeStdin} /
+   * {@link CommandHandle.closeStdin} — background runs only, since a
+   * foreground run cannot write while it waits. Unset: the process
+   * starts with stdin already at EOF.
+   */
+  stdin?: string | Uint8Array | boolean;
 }
 
 /** One chunk of command output. */
@@ -169,17 +206,26 @@ export class CommandHandle {
   readonly #ctx: ClientContext;
   readonly #client: ProcessClient;
   readonly #sandboxId: string;
+  /**
+   * The next stdin write offset — advanced only on a successful write,
+   * so a retried write lands at the same offset and the daemon's
+   * deduplication makes it idempotent. `undefined` = unknown (a
+   * re-attached handle); resynced lazily via GetStdinStatus.
+   */
+  #stdinOffset: bigint | undefined;
 
   constructor(
     ctx: ClientContext,
     client: ProcessClient,
     sandboxId: string,
     commandId: string,
+    stdinOffset: bigint | undefined = 0n,
   ) {
     this.#ctx = ctx;
     this.#client = client;
     this.#sandboxId = sandboxId;
     this.commandId = commandId;
+    this.#stdinOffset = stdinOffset;
   }
 
   /**
@@ -263,6 +309,107 @@ export class CommandHandle {
     } catch (error) {
       throw toArcBoxError(error, "commands.waitForExit");
     }
+  }
+
+  /**
+   * Write bytes (or a UTF-8 string) to the command's stdin. Requires a
+   * run started with `stdin: true` or a PTY.
+   *
+   * Writes are offset-idempotent: the handle tracks the stdin cursor and
+   * advances it only on success, so retrying a failed or lost write
+   * *with the same data* is safe — the daemon deduplicates bytes below
+   * its accepted count and never double-feeds the process. Issue writes
+   * sequentially; the handle tracks a single cursor.
+   */
+  async writeStdin(data: string | Uint8Array): Promise<void> {
+    const bytes =
+      typeof data === "string" ? new TextEncoder().encode(data) : data;
+    try {
+      const offset = await this.#stdinCursor();
+      const status = await this.#client.writeStdin(
+        {
+          sandboxId: this.#sandboxId,
+          executionId: this.commandId,
+          offset,
+          data: bytes,
+          eof: false,
+        },
+        unaryOptions(this.#ctx),
+      );
+      this.#stdinOffset = status.bytesWritten;
+    } catch (error) {
+      throw toArcBoxError(error, "commands.writeStdin");
+    }
+  }
+
+  /**
+   * Close the command's stdin (EOF). Rejected for PTY commands — write
+   * Ctrl-D (`"\x04"`) instead.
+   */
+  async closeStdin(): Promise<void> {
+    try {
+      const offset = await this.#stdinCursor();
+      await this.#client.writeStdin(
+        {
+          sandboxId: this.#sandboxId,
+          executionId: this.commandId,
+          offset,
+          data: new Uint8Array(),
+          eof: true,
+        },
+        unaryOptions(this.#ctx),
+      );
+    } catch (error) {
+      throw toArcBoxError(error, "commands.closeStdin");
+    }
+  }
+
+  /**
+   * The daemon's stdin acceptance state — the recovery point after a
+   * lost write response. Also resyncs the handle's write cursor.
+   */
+  async stdinStatus(): Promise<StdinStatus> {
+    try {
+      const status = await this.#client.getStdinStatus(
+        { sandboxId: this.#sandboxId, executionId: this.commandId },
+        unaryOptions(this.#ctx),
+      );
+      this.#stdinOffset = status.bytesWritten;
+      return {
+        bytesWritten: Number(status.bytesWritten),
+        closed: status.closed,
+      };
+    } catch (error) {
+      throw toArcBoxError(error, "commands.stdinStatus");
+    }
+  }
+
+  /** Resize a PTY command's terminal. */
+  async resize(cols: number, rows: number): Promise<void> {
+    try {
+      await this.#client.resizeExecutionTty(
+        {
+          sandboxId: this.#sandboxId,
+          executionId: this.commandId,
+          size: { width: cols, height: rows },
+        },
+        unaryOptions(this.#ctx),
+      );
+    } catch (error) {
+      throw toArcBoxError(error, "commands.resize");
+    }
+  }
+
+  /** The tracked stdin cursor, resynced from the daemon when unknown. */
+  async #stdinCursor(): Promise<bigint> {
+    if (this.#stdinOffset === undefined) {
+      const status = await this.#client.getStdinStatus(
+        { sandboxId: this.#sandboxId, executionId: this.commandId },
+        unaryOptions(this.#ctx),
+      );
+      this.#stdinOffset = status.bytesWritten;
+    }
+    return this.#stdinOffset;
   }
 
   /** Deliver a signal to the whole process group (default SIGTERM). */
@@ -365,13 +512,65 @@ export class Commands {
     cmd: string | string[],
     opts: RunOptions = {},
   ): Promise<CommandResult | CommandHandle> {
-    const handle = await this.#start(cmd, opts);
+    const stdinData =
+      typeof opts.stdin === "string"
+        ? new TextEncoder().encode(opts.stdin)
+        : opts.stdin instanceof Uint8Array
+          ? opts.stdin
+          : undefined;
+    if (opts.stdin === true && opts.background !== true) {
+      throw new InvalidArgumentError(
+        "stdin: true keeps stdin open for the handle and requires " +
+          "background: true; pass a string or bytes to feed a foreground run",
+        { operation: "commands.run" },
+      );
+    }
+    if (stdinData !== undefined && opts.pty !== undefined) {
+      throw new InvalidArgumentError(
+        "a PTY's stdin cannot be closed after a one-shot write; use " +
+          "background: true with writeStdin, ending input with Ctrl-D (0x04)",
+        { operation: "commands.run" },
+      );
+    }
+    const handle = await this.#start(cmd, opts, stdinData !== undefined);
+    if (stdinData !== undefined) {
+      await this.#feedStdin(handle, stdinData);
+    }
     return opts.background === true ? handle : handle.waitForExit();
+  }
+
+  /**
+   * Re-attach to an execution by id — from another process, or after
+   * losing the handle. Verifies the execution exists (an unknown id is a
+   * typed not-found error) and seeds the handle's stdin cursor from the
+   * daemon's accepted count so later writes resume without a gap.
+   */
+  async get(commandId: string): Promise<CommandHandle> {
+    try {
+      const execution = await this.#client.waitExecution(
+        {
+          sandboxId: this.#sandboxId,
+          executionId: commandId,
+          timeoutSeconds: 0,
+        },
+        unaryOptions(this.#ctx),
+      );
+      return new CommandHandle(
+        this.#ctx,
+        this.#client,
+        this.#sandboxId,
+        execution.id,
+        execution.stdin?.bytesWritten,
+      );
+    } catch (error) {
+      throw toArcBoxError(error, "commands.get");
+    }
   }
 
   async #start(
     cmd: string | string[],
     opts: RunOptions,
+    feedsStdin: boolean,
   ): Promise<CommandHandle> {
     try {
       // The execution id is minted client-side: a lost response leaves an
@@ -387,7 +586,14 @@ export class Commands {
           user: opts.user ?? "",
           timeoutSeconds:
             opts.timeoutMs === undefined ? 0 : Math.ceil(opts.timeoutMs / 1000),
-          stdin: false,
+          // A PTY inherently keeps stdin open (EOF is not expressible on
+          // a terminal); otherwise stdin stays open exactly when the
+          // caller feeds or drives it.
+          stdin: opts.pty !== undefined || opts.stdin === true || feedsStdin,
+          tty: opts.pty !== undefined,
+          ...(opts.pty !== undefined && {
+            ttySize: { width: opts.pty.cols, height: opts.pty.rows },
+          }),
         },
         unaryOptions(this.#ctx),
       );
@@ -399,6 +605,38 @@ export class Commands {
       );
     } catch (error) {
       throw toArcBoxError(error, "commands.run");
+    }
+  }
+
+  /**
+   * Write-then-close the one-shot stdin payload. A process is free to
+   * exit without consuming its stdin (`subprocess` semantics): when the
+   * feed fails but the execution has already exited, the exit result is
+   * the truth and the failed feed is noise — the write merely raced the
+   * exit. Any other failure is real and surfaces.
+   */
+  async #feedStdin(handle: CommandHandle, data: Uint8Array): Promise<void> {
+    try {
+      await handle.writeStdin(data);
+      await handle.closeStdin();
+    } catch (error) {
+      const mapped = toArcBoxError(error, "commands.run");
+      let state: Execution | undefined;
+      try {
+        state = await this.#client.waitExecution(
+          {
+            sandboxId: this.#sandboxId,
+            executionId: handle.commandId,
+            timeoutSeconds: 0,
+          },
+          unaryOptions(this.#ctx),
+        );
+      } catch {
+        // The poll itself failed; the original feed error stands.
+      }
+      if (state?.state !== ExecutionState.EXITED) {
+        throw mapped;
+      }
     }
   }
 }

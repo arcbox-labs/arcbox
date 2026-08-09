@@ -15,7 +15,13 @@ export type {
 } from "./sandbox";
 
 export { CommandHandle, CommandResult, Commands } from "./commands";
-export type { CommandOutput, RunOptions, SignalName } from "./commands";
+export type {
+  CommandOutput,
+  PtySize,
+  RunOptions,
+  SignalName,
+  StdinStatus,
+} from "./commands";
 
 export { Files, MAX_FILE_BYTES } from "./files";
 export type { WriteOptions } from "./files";
