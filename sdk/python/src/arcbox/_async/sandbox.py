@@ -28,6 +28,7 @@ from arcbox._types import (
 )
 from arcbox.errors import (
     ArcBoxError,
+    InvalidArgumentError,
     NotFoundError,
     RequestTimeoutError,
     SandboxStateError,
@@ -214,14 +215,26 @@ class AsyncArcBox:
 
         ``timeout`` bounds the WHOLE call — the settle poll, a resume,
         and the readiness wait share one deadline (default 60s;
-        ``None`` disables it). On expiry :class:`TimeoutError` is raised
-        and the sandbox is left as it was."""
+        ``None`` or ``math.inf`` disables it). On expiry
+        :class:`TimeoutError` is raised and the sandbox is left as it
+        was."""
         with wrap_errors("sandbox.connect"):
+            # Validate at the boundary: NaN and non-positive values
+            # would otherwise corrupt or silently pre-expire the budget
+            # arithmetic below.
+            if timeout is not None and not timeout > 0:
+                raise InvalidArgumentError(
+                    "connect timeout must be a positive number of seconds "
+                    "(None disables the bound)",
+                    context={"timeout": str(timeout)},
+                )
             # One deadline over every wait below — the settle poll,
             # resume, and the readiness wait; bounding only one of them
             # would be arbitrary while the neighbouring waits stayed
             # unbounded.
-            deadline = None if timeout is None else time.monotonic() + timeout
+            deadline = (
+                None if timeout is None or math.isinf(timeout) else time.monotonic() + timeout
+            )
             try:
                 return await self._connect(sandbox_id, deadline)
             except (RequestTimeoutError, httpx.TimeoutException) as exc:
@@ -489,8 +502,10 @@ class AsyncSandbox:
         timeout: float | None = _CONNECT_TIMEOUT_SECONDS,
         connection: Connection | None = None,
     ) -> AsyncSandbox:
-        """Attach to an existing sandbox by id. Client ownership works as
-        in :meth:`create`."""
+        """Attach to an existing sandbox by id. ``timeout`` bounds the
+        whole call as in :meth:`AsyncArcBox.connect` (default 60s;
+        ``None`` disables it; expiry raises :class:`TimeoutError`).
+        Client ownership works as in :meth:`create`."""
         box = AsyncArcBox(connection)
         try:
             sandbox = await box.connect(sandbox_id, timeout=timeout)

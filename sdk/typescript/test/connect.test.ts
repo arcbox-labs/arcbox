@@ -12,7 +12,7 @@ import { createRouterTransport } from "@connectrpc/connect";
 import { noop } from "foxts/noop";
 import { describe, expect, it } from "vitest";
 
-import { TimeoutError } from "../src/errors.js";
+import { InvalidArgumentError, TimeoutError } from "../src/errors.js";
 import {
   KeepAliveSchema,
   SandboxInfoSchema,
@@ -115,6 +115,15 @@ describe("ArcBox.connect lifecycle routing", () => {
     await expect(attempt).rejects.toThrow("connect(timeoutMs) elapsed");
     expect(daemon.eventStreams).toBe(0);
     expect(daemon.resumes).toBe(0);
+  });
+
+  it("rejects an out-of-range timeoutMs before any RPC", async () => {
+    // AbortSignal.timeout would throw a raw RangeError (or Node would
+    // clamp a huge delay to 1ms); the boundary check types the failure.
+    const daemon = new MockLifecycle([SandboxStateProto.READY]);
+    const attempt = connectAgainst(daemon).connect("sb-1", { timeoutMs: -5 });
+    await expect(attempt).rejects.toBeInstanceOf(InvalidArgumentError);
+    expect(daemon.inspects).toBe(0);
   });
 
   it("bounds a hung checkpoint resume with the same deadline", async () => {
