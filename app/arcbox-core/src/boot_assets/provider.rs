@@ -177,9 +177,12 @@ impl BootAssetProvider {
     #[must_use]
     pub fn is_cached(&self) -> bool {
         let dir = self.config.version_cache_dir();
-        dir.join("manifest.json").exists()
-            && dir.join("kernel").exists()
-            && dir.join("rootfs.erofs").exists()
+        let kernel_ready = self
+            .config
+            .custom_kernel
+            .as_ref()
+            .map_or_else(|| dir.join("kernel").is_file(), |kernel| kernel.is_file());
+        dir.join("manifest.json").is_file() && kernel_ready && dir.join("rootfs.erofs").is_file()
     }
 
     /// Prefetches boot assets (downloads if not cached).
@@ -356,5 +359,25 @@ mod manifest_tests {
         let error = provider.read_cached_manifest_required().await.unwrap_err();
 
         assert!(error.to_string().contains("manifest SHA256 mismatch"));
+    }
+
+    #[test]
+    fn cache_accepts_a_configured_custom_kernel() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_custom_kernel(Some(directory.path().join("custom-kernel")));
+        std::fs::create_dir_all(config.version_cache_dir()).unwrap();
+        std::fs::write(
+            config.version_cache_dir().join("manifest.json"),
+            b"manifest",
+        )
+        .unwrap();
+        std::fs::write(config.version_cache_dir().join("rootfs.erofs"), b"rootfs").unwrap();
+        std::fs::write(config.custom_kernel.as_ref().unwrap(), b"kernel").unwrap();
+        let provider = BootAssetProvider::with_config(config.clone()).unwrap();
+
+        assert!(provider.is_cached());
+        std::fs::remove_file(config.custom_kernel.unwrap()).unwrap();
+        assert!(!provider.is_cached());
     }
 }

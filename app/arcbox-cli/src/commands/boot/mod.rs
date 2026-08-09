@@ -1,7 +1,5 @@
 //! Boot asset cache commands.
 
-use arcbox_constants::paths::ArcboxProfile;
-use arcbox_core::boot_assets::BootAssetConfig;
 use clap::{Args, Subcommand};
 
 use super::OutputFormat;
@@ -44,7 +42,7 @@ pub struct StatusArgs {
 /// Execute boot commands.
 pub async fn execute(command: BootCommands, format: OutputFormat) -> anyhow::Result<()> {
     let config = arcbox_core::Config::load()?;
-    let boot_config = boot_asset_config(&config);
+    let boot_config = config.boot_asset_config();
     let cache_dir = boot_config.cache_dir.clone();
 
     match command {
@@ -57,14 +55,9 @@ pub async fn execute(command: BootCommands, format: OutputFormat) -> anyhow::Res
     }
 }
 
-fn boot_asset_config(config: &arcbox_core::Config) -> BootAssetConfig {
-    BootAssetConfig::with_cache_dir(config.data_dir.join("boot"))
-        .with_unpinned_manifest_allowed(config.profile == ArcboxProfile::Development)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use arcbox_constants::paths::ArcboxProfile;
     use arcbox_core::boot_assets::BootAssetProvider;
 
     #[tokio::test]
@@ -72,7 +65,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut config = arcbox_core::Config::for_profile(ArcboxProfile::Development);
         config.data_dir = directory.path().to_owned();
-        let development = boot_asset_config(&config);
+        let development = config.boot_asset_config();
         std::fs::create_dir_all(development.version_cache_dir()).unwrap();
         std::fs::write(
             development.version_cache_dir().join("manifest.json"),
@@ -94,7 +87,7 @@ mod tests {
             .unwrap();
 
         config.profile = ArcboxProfile::Production;
-        let error = BootAssetProvider::with_config(boot_asset_config(&config))
+        let error = BootAssetProvider::with_config(config.boot_asset_config())
             .unwrap()
             .read_cached_manifest_required()
             .await

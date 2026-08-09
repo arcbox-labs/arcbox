@@ -135,6 +135,14 @@ impl Config {
             .map_err(Box::new)
     }
 
+    /// Returns the boot-asset policy selected by this runtime configuration.
+    #[must_use]
+    pub fn boot_asset_config(&self) -> crate::boot_assets::BootAssetConfig {
+        crate::boot_assets::BootAssetConfig::with_cache_dir(self.data_dir.join("boot"))
+            .with_custom_kernel(self.vm.kernel_path.clone())
+            .with_unpinned_manifest_allowed(self.profile == ArcboxProfile::Development)
+    }
+
     /// Returns the path to the persistent data directory (`data/`).
     #[must_use]
     pub fn data_subdir(&self) -> PathBuf {
@@ -430,11 +438,15 @@ mod tests {
     }
 
     #[test]
-    fn development_profile_is_preserved_for_runtime_policy() {
-        assert_eq!(
-            Config::for_profile(ArcboxProfile::Development).profile,
-            ArcboxProfile::Development
-        );
+    fn boot_asset_policy_preserves_profile_and_custom_kernel() {
+        let mut config = Config::for_profile(ArcboxProfile::Development);
+        config.vm.kernel_path = Some(PathBuf::from("/custom/kernel"));
+
+        let boot = config.boot_asset_config();
+
+        assert!(boot.allow_unpinned_manifest);
+        assert_eq!(boot.custom_kernel, config.vm.kernel_path);
+        assert_eq!(boot.cache_dir, config.data_dir.join("boot"));
     }
 
     #[test]
