@@ -301,6 +301,7 @@ dependencies = [
 name = "arcbox-cli"
 version = "0.6.3"
 dependencies = [
+ "anstream",
  "anyhow",
  "arcbox-asset",
  "arcbox-connect",
