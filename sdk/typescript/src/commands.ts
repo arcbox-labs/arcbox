@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 
 import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
+import { timestampDate } from "@bufbuild/protobuf/wkt";
 
 import {
   ArcBoxError,
@@ -154,6 +155,59 @@ export class CommandResult {
  */
 export function normalizeCmd(cmd: string | string[]): string[] {
   return typeof cmd === "string" ? ["/bin/sh", "-lc", cmd] : cmd;
+}
+
+/** Lifecycle state of a command (execution). */
+export type CommandState = "running" | "exited";
+
+/**
+ * One row of a command listing — the summary {@link Commands.list}
+ * returns. Exit is data, mirroring {@link CommandResult}: a signal death
+ * reports `128 + signal` with {@link signal} set; an execution that
+ * ended without an observed exit carries {@link error} instead.
+ */
+export interface CommandInfo {
+  /** Execution id — feed it to `commands.get()` for a live handle. */
+  commandId: string;
+  /** Whether the process runs on a pseudo-TTY. */
+  tty: boolean;
+  state: CommandState;
+  /** When the process was dispatched. */
+  startedAt?: Date;
+  /** When the process terminated (unset while running). */
+  exitedAt?: Date;
+  /** Exit code (`128 + signal` for signal deaths), set on an observed exit. */
+  exitCode?: number;
+  /** Signal name when killed by a signal (e.g. "SIGKILL"). */
+  signal?: string;
+  /** Set when the execution ended without an observed exit. */
+  error?: string;
+}
+
+/** Map one Execution row to the public summary DTO. */
+export function commandInfoFromExecution(execution: Execution): CommandInfo {
+  const out: CommandInfo = {
+    commandId: execution.id,
+    tty: execution.tty,
+    state: execution.state === ExecutionState.EXITED ? "exited" : "running",
+  };
+  if (execution.startedAt !== undefined) {
+    out.startedAt = timestampDate(execution.startedAt);
+  }
+  if (execution.exitedAt !== undefined) {
+    out.exitedAt = timestampDate(execution.exitedAt);
+  }
+  const status = execution.exitStatus?.status;
+  if (status?.case === "code") {
+    out.exitCode = status.value;
+  } else if (status?.case === "signal") {
+    out.exitCode = 128 + status.value;
+    out.signal = signalName(status.value);
+  }
+  if (execution.error !== "") {
+    out.error = execution.error;
+  }
+  return out;
 }
 
 /** Map a POSIX signal number to its conventional name. */
@@ -638,6 +692,24 @@ export class Commands {
       );
     } catch (error) {
       throw toArcBoxError(error, "commands.get");
+    }
+  }
+
+  /**
+   * List this sandbox's commands, running and exited — the rediscovery
+   * path after losing handles (or a whole process): pick an id from a
+   * summary and {@link get} a live handle for it. Executions are
+   * retained for the life of their sandbox.
+   */
+  async list(): Promise<CommandInfo[]> {
+    try {
+      const listing = await this.#client.listExecutions(
+        { sandboxId: this.#sandboxId },
+        unaryOptions(this.#ctx),
+      );
+      return listing.executions.map(commandInfoFromExecution);
+    } catch (error) {
+      throw toArcBoxError(error, "commands.list");
     }
   }
 

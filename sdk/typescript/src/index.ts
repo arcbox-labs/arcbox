@@ -17,12 +17,17 @@ export type {
 
 export { CommandHandle, CommandResult, Commands } from "./commands";
 export type {
+  CommandInfo,
   CommandOutput,
+  CommandState,
   PtySize,
   RunOptions,
   SignalName,
   StdinStatus,
 } from "./commands";
+
+export { Ports } from "./ports";
+export type { WaitForPortOptions } from "./ports";
 
 export { Files, MAX_FILE_BYTES } from "./files";
 export type {
