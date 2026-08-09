@@ -150,13 +150,13 @@ fn normalized_profile(content: &str, shell: ShellKind, snippet: Option<&str>) ->
 }
 
 fn is_managed_source(line: &str, shell: ShellKind) -> bool {
-    let suffix = if matches!(shell, ShellKind::Fish) {
-        "\"; or true"
-    } else {
-        "\" 2>/dev/null || :"
-    };
     line.strip_prefix("source \"")
-        .and_then(|line| line.strip_suffix(suffix))
+        .and_then(|line| match shell {
+            ShellKind::Fish => line
+                .strip_suffix("\"; or true")
+                .or_else(|| line.strip_suffix("\" 2>/dev/null; or true")),
+            ShellKind::Zsh | ShellKind::Bash => line.strip_suffix("\" 2>/dev/null || :"),
+        })
         .is_some_and(|path| {
             Path::new(path).ends_with(Path::new("shell").join(format!("init.{}", shell.as_str())))
         })
@@ -181,7 +181,7 @@ async fn effective_zdotdir_with(
     isolated_home: Option<&Path>,
 ) -> Result<PathBuf> {
     let command = format!("printf '{PROBE_PREFIX}%s\\n' \"${{ZDOTDIR:-$HOME}}\"");
-    let output = run_shell(shell, &command, isolated_home).await?;
+    let output = run_shell(shell, &command, isolated_home, false).await?;
     let value = probe_value(&output).context("zsh did not report its effective ZDOTDIR")?;
     let path = PathBuf::from(value);
     Ok(if path.is_absolute() {
@@ -222,17 +222,26 @@ async fn run_login_probe_with(
             shell_quote(completion),
         ),
     };
-    let output = run_shell(shell_binary, &command, isolated_home).await?;
+    let output = run_shell(shell_binary, &command, isolated_home, true).await?;
     match probe_value(&output).and_then(|value| value.split_once(':')) {
         Some((path, completion)) => Ok((path == "0", completion == "0")),
         None => bail!("{} returned an invalid health probe", shell.as_str()),
     }
 }
 
-async fn run_shell(shell: &Path, command: &str, isolated_home: Option<&Path>) -> Result<String> {
+async fn run_shell(
+    shell: &Path,
+    command: &str,
+    isolated_home: Option<&Path>,
+    interactive: bool,
+) -> Result<String> {
     let mut child = Command::new(shell);
+    child.arg("-l");
+    if interactive {
+        child.arg("-i");
+    }
     child
-        .args(["-l", "-c", command])
+        .args(["-c", command])
         .env("PATH", BASELINE_PATH)
         .kill_on_drop(true);
     if let Some(home) = isolated_home {
@@ -309,18 +318,37 @@ mod tests {
     }
 
     #[test]
-    fn stale_managed_source_is_replaced_and_remains_removable() {
-        let stale = "source \"/old/arcbox/shell/init.zsh\" 2>/dev/null || :";
-        let existing = format!("{PROFILE_MARKER}\n{stale}\nexport KEEP=1\n");
-        let current = source_snippet(ShellKind::Zsh);
+    fn stale_managed_sources_are_replaced_and_remain_removable() {
+        for (shell, stale) in [
+            (
+                ShellKind::Zsh,
+                "source \"/old/arcbox/shell/init.zsh\" 2>/dev/null || :",
+            ),
+            (
+                ShellKind::Bash,
+                "source \"/old/arcbox/shell/init.bash\" 2>/dev/null || :",
+            ),
+            (
+                ShellKind::Fish,
+                "source \"/old/arcbox/shell/init.fish\"; or true",
+            ),
+            (
+                ShellKind::Fish,
+                "source \"/old/arcbox/shell/init.fish\" 2>/dev/null; or true",
+            ),
+        ] {
+            let existing = format!("{PROFILE_MARKER}\n{stale}\n# user content\n");
+            let current = source_snippet(shell);
 
-        let installed = normalized_profile(&existing, ShellKind::Zsh, Some(&current));
-        assert!(!installed.contains(stale));
-        assert!(installed.contains(&current));
-        assert_eq!(
-            normalized_profile(&installed, ShellKind::Zsh, None),
-            "export KEEP=1\n"
-        );
+            let installed = normalized_profile(&existing, shell, Some(&current));
+            assert!(!installed.contains(stale), "{shell:?}");
+            assert!(installed.contains(&current), "{shell:?}");
+            assert_eq!(
+                normalized_profile(&installed, shell, None),
+                "# user content\n",
+                "{shell:?}"
+            );
+        }
     }
 
     #[test]
@@ -388,6 +416,24 @@ mod tests {
             .await
             .unwrap(),
             (true, true)
+        );
+
+        std::fs::write(
+            zdotdir.join(".zshrc"),
+            "export PATH=/usr/bin:/bin\nfpath=(/usr/share/zsh/functions)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_login_probe_with(
+                ShellKind::Zsh,
+                Path::new("/bin/zsh"),
+                &bin,
+                &completion,
+                Some(&home),
+            )
+            .await
+            .unwrap(),
+            (false, false)
         );
     }
 }
