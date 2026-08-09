@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use arcbox_constants::paths::ArcboxProfile;
 use tokio::process::Command;
 
 use super::{ShellKind, bin_dir, completions_dir, shell_dir};
@@ -150,16 +151,28 @@ fn normalized_profile(content: &str, shell: ShellKind, snippet: Option<&str>) ->
 }
 
 fn is_managed_source(line: &str, shell: ShellKind) -> bool {
-    line.strip_prefix("source \"")
-        .and_then(|line| match shell {
-            ShellKind::Fish => line
-                .strip_suffix("\"; or true")
-                .or_else(|| line.strip_suffix("\" 2>/dev/null; or true")),
-            ShellKind::Zsh | ShellKind::Bash => line.strip_suffix("\" 2>/dev/null || :"),
-        })
-        .is_some_and(|path| {
-            Path::new(path).ends_with(Path::new("shell").join(format!("init.{}", shell.as_str())))
-        })
+    let relative = Path::new("shell").join(format!("init.{}", shell.as_str()));
+    if let Some(path) = line.strip_prefix("source \"").and_then(|line| match shell {
+        ShellKind::Fish => line
+            .strip_suffix("\"; or true")
+            .or_else(|| line.strip_suffix("\" 2>/dev/null; or true")),
+        ShellKind::Zsh | ShellKind::Bash => line.strip_suffix("\" 2>/dev/null || :"),
+    }) {
+        let path = Path::new(path);
+        // ponytail: Preserve unknown former ARCBOX_DATA_DIR paths; encode ownership in the marker
+        // before cleaning them automatically.
+        return path == init_path(shell)
+            || [ArcboxProfile::Production, ArcboxProfile::Development]
+                .into_iter()
+                .any(|profile| path == profile.default_data_dir().join(&relative));
+    }
+
+    let suffix = if matches!(shell, ShellKind::Fish) {
+        " 2>/dev/null; or true"
+    } else {
+        " 2>/dev/null || :"
+    };
+    line == format!("source ~/.arcbox/{}{suffix}", relative.display())
 }
 
 async fn read(path: &Path) -> Result<Option<String>> {
@@ -287,7 +300,9 @@ fn shell_quote(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROFILE_MARKER, ShellKind, normalized_profile, probe_value, source_snippet};
+    use super::{
+        ArcboxProfile, PROFILE_MARKER, ShellKind, normalized_profile, probe_value, source_snippet,
+    };
 
     #[test]
     fn profile_normalization_removes_duplicate_injections() {
@@ -318,30 +333,77 @@ mod tests {
     }
 
     #[test]
-    fn stale_managed_sources_are_replaced_and_remain_removable() {
-        for (shell, stale) in [
+    fn orphaned_marker_preserves_lookalike_source_commands() {
+        for (shell, source) in [
             (
                 ShellKind::Zsh,
-                "source \"/old/arcbox/shell/init.zsh\" 2>/dev/null || :",
+                "source \"/opt/project/shell/init.zsh\" 2>/dev/null || :",
             ),
             (
                 ShellKind::Bash,
-                "source \"/old/arcbox/shell/init.bash\" 2>/dev/null || :",
+                "source \"/opt/project/shell/init.bash\" 2>/dev/null || :",
             ),
             (
                 ShellKind::Fish,
-                "source \"/old/arcbox/shell/init.fish\"; or true",
+                "source \"/opt/project/shell/init.fish\"; or true",
             ),
             (
                 ShellKind::Fish,
-                "source \"/old/arcbox/shell/init.fish\" 2>/dev/null; or true",
+                "source \"/opt/project/shell/init.fish\" 2>/dev/null; or true",
+            ),
+        ] {
+            let existing = format!("{PROFILE_MARKER}\n{source}\n");
+
+            assert_eq!(
+                normalized_profile(&existing, shell, None),
+                format!("{source}\n"),
+                "{shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_managed_sources_are_replaced_and_remain_removable() {
+        let production = ArcboxProfile::Production.default_data_dir();
+        let development = ArcboxProfile::Development.default_data_dir();
+        for (shell, stale) in [
+            (
+                ShellKind::Zsh,
+                format!(
+                    "source \"{}\" 2>/dev/null || :",
+                    production.join("shell/init.zsh").display()
+                ),
+            ),
+            (
+                ShellKind::Bash,
+                format!(
+                    "source \"{}\" 2>/dev/null || :",
+                    development.join("shell/init.bash").display()
+                ),
+            ),
+            (
+                ShellKind::Fish,
+                format!(
+                    "source \"{}\"; or true",
+                    production.join("shell/init.fish").display()
+                ),
+            ),
+            (
+                ShellKind::Fish,
+                format!(
+                    "source \"{}\" 2>/dev/null; or true",
+                    development.join("shell/init.fish").display()
+                ),
+            ),
+            (
+                ShellKind::Zsh,
+                "source ~/.arcbox/shell/init.zsh 2>/dev/null || :".to_owned(),
             ),
         ] {
             let existing = format!("{PROFILE_MARKER}\n{stale}\n# user content\n");
             let current = source_snippet(shell);
 
             let installed = normalized_profile(&existing, shell, Some(&current));
-            assert!(!installed.contains(stale), "{shell:?}");
             assert!(installed.contains(&current), "{shell:?}");
             assert_eq!(
                 normalized_profile(&installed, shell, None),
