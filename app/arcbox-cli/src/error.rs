@@ -36,7 +36,9 @@ pub fn machine_request(error: ConnectError, name: &str, operation: &str) -> Erro
             "Machine '{name}' is unavailable during {operation}. Retry the command; if the \
              problem persists, check `abctl daemon status`."
         ),
-        _ => format!("Could not perform {operation} for machine '{name}'."),
+        _ => format!(
+            "Could not perform {operation} for machine '{name}'. Re-run with --debug for details."
+        ),
     };
     actionable(message, error)
 }
@@ -54,7 +56,7 @@ pub fn machine_operation(error: ConnectError, name: &str, action: &str) -> Error
             "Machine '{name}' is unavailable. Retry the command; if the problem persists, \
              check `abctl daemon status`."
         ),
-        _ => format!("Could not {action} machine '{name}'."),
+        _ => format!("Could not {action} machine '{name}'. Re-run with --debug for details."),
     };
     actionable(message, error)
 }
@@ -72,7 +74,9 @@ pub fn sandbox_request(error: ConnectError, id: &str, operation: &str) -> Error 
             "Sandbox '{id}' is unavailable during {operation}. Retry the command; if the \
              problem persists, check `abctl daemon status`."
         ),
-        _ => format!("Could not perform {operation} for sandbox '{id}'."),
+        _ => format!(
+            "Could not perform {operation} for sandbox '{id}'. Re-run with --debug for details."
+        ),
     };
     actionable(message, error)
 }
@@ -121,7 +125,10 @@ pub fn machine_exec_output(error: ConnectError, name: &str, command: &str) -> Er
             ErrorCode::NotFound => {
                 format!("Command '{command}' was not found in machine '{name}'.")
             }
-            _ => format!("Could not read output from '{command}' in machine '{name}'."),
+            _ => format!(
+                "Could not read output from '{command}' in machine '{name}'. Re-run with --debug \
+                 for details."
+            ),
         }
     };
     actionable(message, error)
@@ -253,7 +260,27 @@ mod tests {
         );
         assert_eq!(
             output.to_string(),
-            "Could not read output from 'date' in machine 'dev'."
+            "Could not read output from 'date' in machine 'dev'. Re-run with --debug for details."
         );
+    }
+
+    #[test]
+    fn unclassified_errors_point_to_debug_details() {
+        let errors = [
+            machine_request(ConnectError::internal("raw"), "dev", "ping"),
+            machine_operation(ConnectError::internal("raw"), "dev", "start"),
+            sandbox_request(ConnectError::internal("raw"), "box", "inspection"),
+            machine_exec_output(ConnectError::internal("raw"), "dev", "date"),
+        ];
+        let expected = [
+            "Error: Could not perform ping for machine 'dev'. Re-run with --debug for details.",
+            "Error: Could not start machine 'dev'. Re-run with --debug for details.",
+            "Error: Could not perform inspection for sandbox 'box'. Re-run with --debug for details.",
+            "Error: Could not read output from 'date' in machine 'dev'. Re-run with --debug for details.",
+        ];
+
+        for (error, expected) in errors.iter().zip(expected) {
+            assert_eq!(render(error, false), expected);
+        }
     }
 }

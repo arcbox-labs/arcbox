@@ -745,7 +745,8 @@ mod tests {
         let error = exec_exit_code(None, "dev", "date").unwrap_err();
         assert_eq!(
             crate::error::render(&error, false),
-            "Error: Could not read output from 'date' in machine 'dev'."
+            "Error: Could not read output from 'date' in machine 'dev'. Re-run with --debug for \
+             details."
         );
         assert!(
             crate::error::render(&error, true)
