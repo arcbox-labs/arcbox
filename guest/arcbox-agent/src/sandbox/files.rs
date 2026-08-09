@@ -268,16 +268,25 @@ impl SandboxService {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             loop {
-                match watch.next_event().await {
-                    Ok(Some(event)) => {
-                        if event_tx.send(Ok(Some(event))).await.is_err() {
+                tokio::select! {
+                    event = watch.next_event() => match event {
+                        Ok(Some(event)) => {
+                            if event_tx.send(Ok(Some(event))).await.is_err() {
+                                return;
+                            }
+                        }
+                        terminal => {
+                            let _ = event_tx.send(terminal).await;
                             return;
                         }
-                    }
-                    terminal => {
-                        let _ = event_tx.send(terminal).await;
-                        return;
-                    }
+                    },
+                    // The handler dropped the receiver (host cancelled): stop
+                    // relaying even while no event ever arrives, so the watch
+                    // and its vm-agent connection are released immediately
+                    // rather than on the next filesystem event. Cutting
+                    // `next_event` mid-frame is fine — the connection is being
+                    // torn down either way.
+                    () = event_tx.closed() => return,
                 }
             }
         });

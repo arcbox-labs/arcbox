@@ -166,6 +166,34 @@ pub fn map_events(
     out.into_iter().flatten().collect()
 }
 
+/// True when the batch ends in a rename's unmatched FROM half.
+///
+/// The final event is an `IN_MOVED_FROM` whose matching `IN_MOVED_TO` is
+/// absent from the batch — the TO half may still be in flight, so the
+/// reader should give the queue one bounded chance to complete the pair
+/// before mapping (an unpaired half degrades to `removed`/`created`, which
+/// then stands for a move across the watch boundary or a genuinely split
+/// pair).
+#[must_use]
+pub fn trailing_unpaired_move_from(batch: &[RawWatchEvent]) -> bool {
+    let Some(last) = batch.last() else {
+        return false;
+    };
+    last.mask & IN_MOVED_FROM != 0
+        && !batch
+            .iter()
+            .any(|event| event.mask & IN_MOVED_TO != 0 && event.cookie == last.cookie)
+}
+
+/// True when the kernel reported a queue overflow in this batch.
+///
+/// An unknown number of events was dropped, so the consumer's view can no
+/// longer be kept consistent and the watch must fail rather than stream on.
+#[must_use]
+pub fn has_overflow(batch: &[RawWatchEvent]) -> bool {
+    batch.iter().any(|event| event.mask & IN_Q_OVERFLOW != 0)
+}
+
 /// Join a watched directory and an event's relative name (empty name means
 /// the directory itself, e.g. `IN_DELETE_SELF`).
 fn join_path(dir: &str, name: &str) -> String {
@@ -291,6 +319,35 @@ mod tests {
             (99, IN_CREATE, 0, "orphan"),
         ]));
         assert!(map_events(&batch, root_only).is_empty());
+    }
+
+    #[test]
+    fn trailing_unpaired_move_from_flags_only_the_open_pair() {
+        // FROM with no TO at the end of the batch: the pair may be split.
+        let open = parse_event_buffer(&encode(&[(1, IN_MOVED_FROM, 7, "old")]));
+        assert!(trailing_unpaired_move_from(&open));
+        // A paired batch is complete.
+        let paired = parse_event_buffer(&encode(&[
+            (1, IN_MOVED_FROM, 7, "old"),
+            (1, IN_MOVED_TO, 7, "new"),
+        ]));
+        assert!(!trailing_unpaired_move_from(&paired));
+        // A trailing non-move event closes the window too.
+        let closed = parse_event_buffer(&encode(&[
+            (1, IN_MOVED_FROM, 7, "old"),
+            (1, IN_CREATE, 0, "other"),
+        ]));
+        assert!(!trailing_unpaired_move_from(&closed));
+        assert!(!trailing_unpaired_move_from(&[]));
+    }
+
+    #[test]
+    fn overflow_is_detected() {
+        let batch = parse_event_buffer(&encode(&[(-1, IN_Q_OVERFLOW, 0, "")]));
+        assert!(has_overflow(&batch));
+        assert!(!has_overflow(&parse_event_buffer(&encode(&[(
+            1, IN_CREATE, 0, "f"
+        )]))));
     }
 
     #[test]

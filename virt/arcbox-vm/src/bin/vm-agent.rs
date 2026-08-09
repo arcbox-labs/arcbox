@@ -420,7 +420,8 @@ mod agent {
         MakeDirReq, MoveReq, RemoveReq, StatReq, WatchReq,
     };
     use arcbox_vm::file_watch::{
-        IN_CREATE, IN_MOVED_TO, WATCH_MASK, map_events, parse_event_buffer,
+        IN_CREATE, IN_MOVED_TO, WATCH_MASK, has_overflow, map_events, parse_event_buffer,
+        trailing_unpaired_move_from,
     };
     // Readiness dial-out port — shared with the host-side boot gate.
     use arcbox_vm::vsock::{MSG_WAIT_PORT, READY_PORT};
@@ -1178,6 +1179,22 @@ mod agent {
         Ok(())
     }
 
+    /// How long a batch ending in an unpaired `IN_MOVED_FROM` waits for the
+    /// matching `IN_MOVED_TO` before mapping the batch as-is.
+    const RENAME_PAIR_GRACE_MS: libc::c_int = 5;
+
+    /// True when `fd` becomes readable within `timeout_ms`.
+    fn poll_readable(fd: RawFd, timeout_ms: libc::c_int) -> bool {
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: fds points at one initialized pollfd entry.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+        n > 0 && fds[0].revents & libc::POLLIN != 0
+    }
+
     /// Stream inotify events for a directory until either side closes the
     /// connection: the host closing it is the cancellation signal; sandbox
     /// teardown kills this process, closing it from this side (the host
@@ -1254,7 +1271,33 @@ mod agent {
             if len <= 0 {
                 return;
             }
-            let raw = parse_event_buffer(&buf[..len as usize]);
+            let mut raw = parse_event_buffer(&buf[..len as usize]);
+            // A rename's FROM/TO halves usually share one read; when FROM is
+            // the batch's last event its TO may still be in flight (or the
+            // buffer split the pair), so give the queue one bounded chance
+            // to complete the pair before mapping. A still-unpaired half
+            // degrades to removed/created, which is also what a move across
+            // the watch boundary legitimately looks like.
+            if trailing_unpaired_move_from(&raw) && poll_readable(ifd, RENAME_PAIR_GRACE_MS) {
+                // SAFETY: buf is a valid writable buffer; ifd is a live
+                // inotify fd (the earlier batch is already parsed and owned).
+                let more =
+                    unsafe { libc::read(ifd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+                if more > 0 {
+                    raw.extend(parse_event_buffer(&buf[..more as usize]));
+                }
+            }
+            // The kernel dropped an unknown number of events: the consumer's
+            // view can no longer be kept consistent, so fail the stream
+            // rather than silently streaming a wrong one.
+            if has_overflow(&raw) {
+                let _ = write_frame(
+                    &mut conn,
+                    FILE_ERR,
+                    b"watch overflowed: the kernel dropped events; re-list and re-watch",
+                );
+                return;
+            }
             // Recursive watches follow directories created or moved into the
             // tree. Best-effort: events inside a new directory that fire
             // before its watch lands are unobserved (the inotify recursion
