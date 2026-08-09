@@ -1,7 +1,8 @@
-import type { Client } from "@connectrpc/connect";
+import { setTimeout as sleep } from "node:timers/promises";
+
+import type { CallOptions, Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
 import { noop } from "foxts/noop";
-import { wait } from "foxts/wait";
 
 import { Commands } from "./commands";
 import type { ConnectionOptions } from "./connection";
@@ -9,6 +10,7 @@ import {
   ArcBoxError,
   NotFoundError,
   SandboxStateError,
+  TimeoutError,
   toArcBoxError,
 } from "./errors";
 import { Files } from "./files";
@@ -64,6 +66,16 @@ export interface CreateSandboxOptions {
 
 /** Options for {@link Sandbox.connect}. */
 export interface ConnectSandboxOptions {
+  /**
+   * Overall deadline in milliseconds for the whole connect() call: the
+   * PAUSING settle poll, a checkpoint resume, and the STARTING
+   * readiness wait all share it (default 60_000 — generous because a
+   * checkpoint restore or cold boot legitimately takes a while). On
+   * expiry a {@link TimeoutError} is thrown and the sandbox is left as
+   * it was. `Number.POSITIVE_INFINITY` disables the bound.
+   */
+  timeoutMs?: number;
+  /** Connection override for this entry point. */
   connection?: ConnectionOptions;
 }
 
@@ -86,6 +98,17 @@ type SandboxClient = Client<typeof SandboxService>;
  * should become an event wait.
  */
 const PAUSE_SETTLE_POLL_MS = 500;
+
+/** Default overall deadline for {@link ArcBox.connect} — see {@link ConnectSandboxOptions.timeoutMs}. */
+const CONNECT_TIMEOUT_MS = 60000;
+
+/** Merge the connect deadline signal into a call's options, when one is set. */
+function withSignal(
+  options: CallOptions,
+  signal: AbortSignal | undefined,
+): CallOptions {
+  return { ...options, ...(signal !== undefined && { signal }) };
+}
 
 /**
  * Client entry point. Holds one resolved connection; every handle it
@@ -181,39 +204,66 @@ export class ArcBox {
    * first, then resumes; a STARTING one is waited for. A terminal state
    * is a typed error carrying the observed state. Connecting never
    * touches the sandbox's lifecycle deadlines.
+   *
+   * `timeoutMs` bounds the WHOLE call — the settle poll, a resume, and
+   * the readiness wait share one deadline (default 60s). On expiry a
+   * {@link TimeoutError} is thrown and the sandbox is left as it was.
    */
-  async connect(id: string): Promise<Sandbox> {
+  async connect(
+    id: string,
+    opts: ConnectSandboxOptions = {},
+  ): Promise<Sandbox> {
+    const timeoutMs = opts.timeoutMs ?? CONNECT_TIMEOUT_MS;
+    const timeoutLabel = String(timeoutMs);
+    // One deadline over every wait below — the settle poll, resume, and
+    // the readiness wait; bounding only one of them would be arbitrary
+    // while the neighbouring waits stayed unbounded.
+    const deadline = Number.isFinite(timeoutMs)
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
     try {
-      let info = await this.#client.inspect({ id }, unaryOptions(this.#ctx));
+      let info = await this.#client.inspect(
+        { id },
+        withSignal(unaryOptions(this.#ctx), deadline),
+      );
       // A pausing sandbox's next stop is PAUSED — never READY — so
       // waiting on readiness events would park forever. Poll the
       // checkpoint out, then route on whatever state it settled in.
       while (info.state === SandboxStateProto.PAUSING) {
         // eslint-disable-next-line no-await-in-loop -- sequential by design: each re-inspect waits out the poll interval
-        await wait(PAUSE_SETTLE_POLL_MS);
+        await sleep(PAUSE_SETTLE_POLL_MS, undefined, { signal: deadline });
         // eslint-disable-next-line no-await-in-loop -- sequential by design: the settled state decides the route
-        info = await this.#client.inspect({ id }, unaryOptions(this.#ctx));
+        info = await this.#client.inspect(
+          { id },
+          withSignal(unaryOptions(this.#ctx), deadline),
+        );
       }
       switch (info.state) {
         case SandboxStateProto.READY:
         case SandboxStateProto.RUNNING:
           return new Sandbox(this.#ctx, id);
         case SandboxStateProto.PAUSED:
-          // Deliberately no per-request deadline: restoring a checkpoint
-          // takes as long as it takes, and the RPC returns once READY.
-          await this.#client.resume({ id });
+          // No per-request deadline of its own: restoring a checkpoint
+          // takes as long as it takes, and the RPC returns once READY —
+          // the overall connect deadline is the only bound.
+          await this.#client.resume({ id }, withSignal({}, deadline));
           return new Sandbox(this.#ctx, id);
         case SandboxStateProto.STARTING: {
           const abort = new AbortController();
           try {
             const stream = this.#client.events(
               { sandboxId: id },
-              { signal: abort.signal },
+              {
+                signal:
+                  deadline === undefined
+                    ? abort.signal
+                    : AbortSignal.any([abort.signal, deadline]),
+              },
             );
             const events = stream[Symbol.asyncIterator]();
             const first = events.next();
             first.catch(noop);
-            await this.#waitReady(id, events, first);
+            await this.#waitReady(id, events, first, deadline);
           } finally {
             abort.abort();
           }
@@ -232,6 +282,22 @@ export class ArcBox {
           );
       }
     } catch (error) {
+      // A failure observed after the deadline fired is the deadline
+      // surfacing (an aborted RPC, wait, or event read) — unless the
+      // SDK already typed it, in which case the state error stands.
+      if (deadline?.aborted === true && !(error instanceof ArcBoxError)) {
+        throw toArcBoxError(
+          new TimeoutError(
+            `connect(timeoutMs) elapsed before sandbox ${id} was ready`,
+            {
+              suggestion: "increase the connect timeoutMs option",
+              context: { id, timeoutMs: timeoutLabel },
+              cause: error,
+            },
+          ),
+          "sandbox.connect",
+        );
+      }
       throw toArcBoxError(error, "sandbox.connect");
     }
   }
@@ -270,6 +336,7 @@ export class ArcBox {
     id: string,
     events: AsyncIterator<WatchEventsResponse>,
     firstEvent: Promise<IteratorResult<WatchEventsResponse>>,
+    deadline?: AbortSignal,
   ): Promise<void> {
     const check = (state: SandboxStateProto, error: string): boolean => {
       switch (state) {
@@ -297,7 +364,7 @@ export class ArcBox {
     };
     const inspected = await this.#client.inspect(
       { id },
-      unaryOptions(this.#ctx),
+      withSignal(unaryOptions(this.#ctx), deadline),
     );
     if (check(inspected.state, inspected.error)) {
       return;
@@ -349,7 +416,7 @@ export class ArcBox {
         // eslint-disable-next-line no-await-in-loop -- sequential by design: the re-inspect must resolve before reading further events
         const info = await this.#client.inspect(
           { id },
-          unaryOptions(this.#ctx),
+          withSignal(unaryOptions(this.#ctx), deadline),
         );
         if (check(info.state, info.error)) {
           return;
@@ -398,7 +465,7 @@ export class Sandbox {
     id: string,
     opts: ConnectSandboxOptions = {},
   ): Promise<Sandbox> {
-    return new ArcBox(opts.connection).connect(id);
+    return new ArcBox(opts.connection).connect(id, opts);
   }
 
   /** List sandboxes (auto-paginating). */

@@ -9,8 +9,10 @@ import { create } from "@bufbuild/protobuf";
 import { EmptySchema } from "@bufbuild/protobuf/wkt";
 import type { Transport } from "@connectrpc/connect";
 import { createRouterTransport } from "@connectrpc/connect";
+import { noop } from "foxts/noop";
 import { describe, expect, it } from "vitest";
 
+import { TimeoutError } from "../src/errors.js";
 import {
   KeepAliveSchema,
   SandboxInfoSchema,
@@ -23,6 +25,8 @@ import { ArcBox } from "../src/sandbox.js";
 /** Serves Inspect from a state script, counting every call it answers. */
 class MockLifecycle {
   resumes = 0;
+  /** When set, Resume parks forever — a wedged checkpoint restore. */
+  hangResume = false;
   /**
    * The settle poll is witnessed by this count: `resume` rewrites
    * `states` unconditionally, so the post-state is `[READY]` whether or
@@ -48,6 +52,9 @@ class MockLifecycle {
         },
         resume: () => {
           this.resumes += 1;
+          if (this.hangResume) {
+            return new Promise<never>(noop);
+          }
           this.states = [SandboxStateProto.READY];
           return create(EmptySchema);
         },
@@ -96,6 +103,27 @@ describe("ArcBox.connect lifecycle routing", () => {
     // sandbox is headed.
     expect(daemon.inspects).toBe(2);
     expect(daemon.eventStreams).toBe(0);
+    expect(daemon.resumes).toBe(1);
+  });
+
+  it("bounds a never-settling PAUSING sandbox with timeoutMs", async () => {
+    // A daemon that keeps reporting PAUSING (wedged checkpoint) used to
+    // spin the settle poll forever; the overall deadline is the escape.
+    const daemon = new MockLifecycle([SandboxStateProto.PAUSING]);
+    const attempt = connectAgainst(daemon).connect("sb-1", { timeoutMs: 25 });
+    await expect(attempt).rejects.toBeInstanceOf(TimeoutError);
+    await expect(attempt).rejects.toThrow("connect(timeoutMs) elapsed");
+    expect(daemon.eventStreams).toBe(0);
+    expect(daemon.resumes).toBe(0);
+  });
+
+  it("bounds a hung checkpoint resume with the same deadline", async () => {
+    // Resume deliberately carries no per-request deadline; the overall
+    // connect deadline must still cut a wedged restore loose.
+    const daemon = new MockLifecycle([SandboxStateProto.PAUSED]);
+    daemon.hangResume = true;
+    const attempt = connectAgainst(daemon).connect("sb-1", { timeoutMs: 25 });
+    await expect(attempt).rejects.toBeInstanceOf(TimeoutError);
     expect(daemon.resumes).toBe(1);
   });
 });
