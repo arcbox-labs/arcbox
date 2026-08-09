@@ -145,10 +145,11 @@ fn write_table(
 ) -> io::Result<()> {
     if matches!(mode, TopMode::Live) {
         output.write_all(b"\x1b[2J\x1b[H")?;
-    }
-    output.write_all(stats.render().as_bytes())?;
-    if matches!(mode, TopMode::Live) {
-        output.write_all(b"\nq quit | Ctrl-C quit\n")?;
+        // Raw mode clears OPOST, so bare newlines would stair-step the table.
+        output.write_all(stats.render().replace('\n', "\r\n").as_bytes())?;
+        output.write_all(b"\r\nq quit | Ctrl-C quit\r\n")?;
+    } else {
+        output.write_all(stats.render().as_bytes())?;
     }
     output.flush()
 }
@@ -551,7 +552,9 @@ mod tests {
 
         write_table(&mut output, &stats, TopMode::Snapshot).unwrap();
 
+        assert_eq!(output, stats.render().as_bytes());
         assert!(!output.contains(&0x1b));
+        assert!(!output.contains(&b'\r'));
         assert!(!String::from_utf8(output).unwrap().contains("q quit"));
     }
 
@@ -566,9 +569,15 @@ mod tests {
 
         assert!(output.starts_with(b"\x1b[2J\x1b[H"));
         assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("q quit | Ctrl-C quit")
+            output
+                .windows(b"\r\nq quit | Ctrl-C quit\r\n".len())
+                .any(|bytes| bytes == b"\r\nq quit | Ctrl-C quit\r\n")
+        );
+        assert!(
+            output
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte != b'\n' || index > 0 && output[index - 1] == b'\r')
         );
     }
 }
