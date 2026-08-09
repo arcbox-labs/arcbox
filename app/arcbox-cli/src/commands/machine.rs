@@ -265,7 +265,7 @@ async fn execute_start(args: StartArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to start machine")?;
+        .map_err(|error| crate::error::machine_operation(error, &args.name, "start"))?;
 
     const MAX_AGENT_WAIT_ATTEMPTS: u32 = 20;
     let mut delay = std::time::Duration::from_millis(200);
@@ -280,8 +280,11 @@ async fn execute_start(args: StartArgs) -> Result<()> {
             Ok(_) => break,
             Err(e) => {
                 if attempt == MAX_AGENT_WAIT_ATTEMPTS {
-                    return Err(anyhow::Error::new(e))
-                        .context("Failed to wait for machine agent readiness");
+                    return Err(crate::error::machine_request(
+                        e,
+                        &args.name,
+                        "agent readiness",
+                    ));
                 }
                 tokio::time::sleep(delay).await;
                 delay = std::cmp::min(delay.saturating_mul(2), std::time::Duration::from_secs(2));
@@ -320,7 +323,7 @@ async fn execute_stop(args: StopArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to stop machine")?;
+        .map_err(|error| crate::error::machine_operation(error, &args.name, "stop"))?;
 
     println!("Machine '{}' stopped", args.name);
 
@@ -340,7 +343,7 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to remove machine")?;
+        .map_err(|error| crate::error::machine_operation(error, &args.name, "remove"))?;
 
     println!("Machine '{}' removed", args.name);
 
@@ -411,7 +414,7 @@ async fn execute_status(args: StatusArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to get machine status")?
+        .map_err(|error| crate::error::machine_operation(error, &args.name, "inspect"))?
         .into_owned();
 
     // Unset sub-messages deref to their default instances, which carry the
@@ -442,7 +445,7 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to inspect machine")?
+        .map_err(|error| crate::error::machine_operation(error, &args.name, "inspect"))?
         .into_owned();
 
     // Sub-message derefs fall back to default instances (zero/empty), which
@@ -478,7 +481,7 @@ async fn execute_ping(args: PingArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to ping agent")?
+        .map_err(|error| crate::error::machine_request(error, &args.name, "ping"))?
         .into_owned();
     let elapsed = started.elapsed();
 
@@ -499,7 +502,7 @@ async fn execute_info(args: InfoArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to get system info")?
+        .map_err(|error| crate::error::machine_request(error, &args.name, "system information"))?
         .into_owned();
 
     let total_mb = info.total_memory / 1024 / 1024;
@@ -534,6 +537,7 @@ async fn execute_ssh(args: SshArgs) -> Result<()> {
 /// Runs an interactive PTY session in a machine: local terminal in raw mode,
 /// stdin and SIGWINCH resizes pumped up, merged PTY output written to stdout.
 async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
+    let command = cmd.first().cloned().unwrap_or_default();
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<MachineExecInput>(16);
 
     let tty_size = TerminalSize::current().ok().map(|s| ProtoTerminalSize {
@@ -612,10 +616,9 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
     // stream into independently owned halves: the send half moves into a
     // forwarder task, the receive half stays here.
     let client = machine_client();
-    let stream = client
-        .exec_session()
-        .await
-        .context("Failed to open machine exec session")?;
+    let stream = client.exec_session().await.map_err(|error| {
+        crate::error::machine_request(error, name, "interactive command execution")
+    })?;
     let (mut send, mut recv) = stream.into_split();
 
     // Forwarder: inputs from the pumps → wire. When every pump has dropped
@@ -631,12 +634,11 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
         send.close_send();
     });
 
-    let mut exit_code = 0i32;
-    let mut received_done = false;
+    let mut exit_code = None;
     while let Some(item) = recv
         .message::<pb::MachineExecOutput>()
         .await
-        .context("Failed to read session output")?
+        .map_err(|error| crate::error::machine_exec_output(error, name, &command))?
     {
         let output = item.to_owned_message();
         if !output.data.is_empty() {
@@ -647,17 +649,14 @@ async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
             std::io::stdout().flush()?;
         }
         if output.done {
-            exit_code = output.exit_code;
-            received_done = true;
+            exit_code = Some(output.exit_code);
         }
     }
 
     // Restore the terminal before exiting.
     drop(raw_guard);
 
-    if !received_done {
-        anyhow::bail!("session stream closed without a terminal status frame");
-    }
+    let exit_code = exec_exit_code(exit_code, name, &command)?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -675,6 +674,7 @@ async fn exec_via_grpc(
     env: HashMap<String, String>,
     tty: bool,
 ) -> Result<()> {
+    let command = cmd.first().cloned().unwrap_or_default();
     let client = machine_client();
     let mut stream = client
         .exec(MachineExecRequest {
@@ -687,13 +687,13 @@ async fn exec_via_grpc(
             ..Default::default()
         })
         .await
-        .context("Failed to execute command in machine")?;
+        .map_err(|error| crate::error::machine_request(error, name, "command execution"))?;
 
-    let mut exit_code = 0i32;
+    let mut exit_code = None;
     while let Some(item) = stream
         .message::<pb::MachineExecOutput>()
         .await
-        .context("Failed to read exec output")?
+        .map_err(|error| crate::error::machine_exec_output(error, name, &command))?
     {
         let output = item.to_owned_message();
         if !output.data.is_empty() {
@@ -711,12 +711,45 @@ async fn exec_via_grpc(
             }
         }
         if output.done {
-            exit_code = output.exit_code;
+            exit_code = Some(output.exit_code);
         }
     }
 
+    let exit_code = exec_exit_code(exit_code, name, &command)?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+fn exec_exit_code(exit_code: Option<i32>, name: &str, command: &str) -> Result<i32> {
+    exit_code.ok_or_else(|| {
+        crate::error::machine_exec_output(
+            connectrpc::ConnectError::internal(
+                "exec stream closed without a terminal status frame",
+            ),
+            name,
+            command,
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_requires_a_terminal_status_frame() {
+        assert_eq!(exec_exit_code(Some(7), "dev", "false").unwrap(), 7);
+
+        let error = exec_exit_code(None, "dev", "date").unwrap_err();
+        assert_eq!(
+            crate::error::render(&error, false),
+            "Error: Could not read output from 'date' in machine 'dev'."
+        );
+        assert!(
+            crate::error::render(&error, true)
+                .contains("exec stream closed without a terminal status frame")
+        );
+    }
 }
