@@ -8,11 +8,13 @@ out and then resume, not wait on readiness events that cannot arrive.
 from __future__ import annotations
 
 import httpx
+import pytest
 from google.protobuf import empty_pb2
 
 from arcbox import ArcBox, Connection
 from arcbox._envelope import FLAG_END_STREAM, encode_envelope
 from arcbox._gen import sandbox_pb2
+from arcbox.errors import TimeoutError as ArcBoxTimeoutError
 
 
 def _events_body() -> bytes:
@@ -88,3 +90,14 @@ def test_connect_settles_a_pausing_sandbox_then_resumes() -> None:
     assert daemon.inspects == 2
     assert daemon.event_streams == 0
     assert daemon.resumes == 1
+
+
+def test_connect_bounds_a_never_settling_pausing_sandbox() -> None:
+    # A daemon that keeps reporting PAUSING (wedged checkpoint) used to
+    # spin the settle poll forever; the overall deadline is the escape.
+    daemon = MockLifecycle([sandbox_pb2.SANDBOX_STATE_PAUSING])
+    with pytest.raises(ArcBoxTimeoutError, match=r"connect\(timeout\) elapsed") as excinfo:
+        connect_against(daemon).connect("sb-1", timeout=0.05)
+    assert excinfo.value.operation == "sandbox.connect"
+    assert daemon.event_streams == 0
+    assert daemon.resumes == 0
