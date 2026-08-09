@@ -76,6 +76,8 @@ pub(super) struct DnsStatus {
     pub domain: String,
     pub resolver_path: String,
     pub resolver_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver_error: Option<String>,
     pub server_address: String,
     pub query_name: String,
     pub health: DnsHealth,
@@ -186,8 +188,25 @@ pub(super) async fn inspect_status() -> DnsStatus {
     let resolver = FileResolver::new(PREFIX);
     let domain = dns_domain();
     let port = dns_port();
-    let resolver_installed = resolver.is_registered(&domain);
     let resolver_path = resolver.resolver_dir().join(&domain);
+    let (resolver_installed, resolver_error) = if !resolver.is_registered(&domain) {
+        (
+            false,
+            Some("resolver file is missing or not managed by ArcBox".to_owned()),
+        )
+    } else {
+        match std::fs::read_to_string(&resolver_path) {
+            Ok(content) if resolver_matches(&content, port) => (true, None),
+            Ok(_) => (
+                false,
+                Some(format!("expected nameserver 127.0.0.1 and port {port}")),
+            ),
+            Err(error) => (
+                false,
+                Some(format!("failed to read resolver file: {error}")),
+            ),
+        }
+    };
     let server: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
     let query_name = format!("host.{domain}");
     let health = daemon_health(
@@ -200,6 +219,7 @@ pub(super) async fn inspect_status() -> DnsStatus {
         domain,
         resolver_path: resolver_path.display().to_string(),
         resolver_installed,
+        resolver_error,
         server_address: server.to_string(),
         query_name,
         health,
@@ -207,12 +227,15 @@ pub(super) async fn inspect_status() -> DnsStatus {
 }
 
 fn print_status(status: &DnsStatus) {
-    let installed = if status.resolver_installed {
-        "installed"
+    let resolver = if status.resolver_installed {
+        "configured".to_owned()
     } else {
-        "not installed"
+        format!(
+            "not ready ({})",
+            status.resolver_error.as_deref().unwrap_or("unknown error")
+        )
     };
-    println!("Resolver file: {installed} ({})", status.resolver_path);
+    println!("Resolver file: {resolver} ({})", status.resolver_path);
 
     let server = match &status.health {
         DnsHealth::Healthy => format!(
@@ -246,6 +269,18 @@ fn print_status(status: &DnsStatus) {
     if matches!(&status.health, DnsHealth::DaemonDown) {
         println!("\nStart the ArcBox daemon to provide DNS service.");
     }
+}
+
+fn resolver_matches(content: &str, port: u16) -> bool {
+    has_directive(content, "nameserver", "127.0.0.1")
+        && has_directive(content, "port", &port.to_string())
+}
+
+fn has_directive(content: &str, name: &str, value: &str) -> bool {
+    content.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(name) && fields.next() == Some(value) && fields.next().is_none()
+    })
 }
 
 async fn probe_dns(address: SocketAddr, query_name: &str, deadline: Duration) -> DnsHealth {
@@ -397,6 +432,17 @@ mod tests {
             negative_code(classify(ResponseCode::NoError, false)),
             Some(0)
         );
+    }
+
+    #[test]
+    fn resolver_config_must_select_the_probed_address() {
+        let configured = "# managed by arcbox\nnameserver 127.0.0.1\nport 5553\n";
+        assert!(resolver_matches(configured, 5553));
+        assert!(!resolver_matches(configured, 5554));
+        assert!(!resolver_matches(
+            "# managed by arcbox\nnameserver 127.0.0.2\nport 5553\n",
+            5553
+        ));
     }
 
     #[test]

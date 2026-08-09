@@ -217,6 +217,8 @@ impl Cli {
                 | Commands::Docker(docker::DockerCommands::Setup)
                 | Commands::Top(_)
                 | Commands::Disk(disk::DiskCommands::Usage)
+                | Commands::Machine(machine::MachineCommands::Inspect(_))
+                | Commands::Sandbox(sandbox::SandboxCommands::Inspect(_))
                 | Commands::Doctor => true,
                 #[cfg(target_os = "macos")]
                 Commands::Dns(dns::DnsCommands::Status) => true,
@@ -271,11 +273,11 @@ mod tests {
             (&["docker", "status"], false, false),
             (&["machine", "ls"], false, false),
             (&["machine", "status", "default"], false, false),
-            (&["machine", "inspect", "default"], false, false),
+            (&["machine", "inspect", "default"], true, false),
             (&["machine", "ping", "default"], false, false),
             (&["machine", "info", "default"], false, false),
             (&["sandbox", "ls"], false, false),
-            (&["sandbox", "inspect", "sandbox"], false, false),
+            (&["sandbox", "inspect", "sandbox"], true, false),
             (&["sandbox", "events"], false, false),
             (&["sandbox", "snapshots"], false, false),
             (&["sandbox", "templates"], false, false),

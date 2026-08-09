@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use super::super::OutputFormat;
@@ -59,28 +61,27 @@ pub(in crate::commands) async fn shell_integration_status() -> ShellIntegrationS
         Err(error) => (None, false, Some(format!("{error:#}"))),
     };
     let probe = profile::probe_login(shell).await;
+    let (binary_ok, binary_detail) = match inspect_bin_link(&bin_dir().join("abctl")).await {
+        Ok(status) => status,
+        Err(error) => (false, Some(format!("{error:#}"))),
+    };
     ShellIntegrationStatus {
         shell: shell.as_str().to_owned(),
         profile_path,
         profile_injected,
-        path_ok: probe.path_ok,
+        path_ok: probe.path_ok && binary_ok,
         completion_ok: probe.completion_ok,
-        detail: probe.detail.or(path_error),
+        detail: probe.detail.or(path_error).or_else(|| {
+            (!binary_ok).then(|| {
+                binary_detail.unwrap_or_else(|| "ArcBox abctl symlink is missing".to_owned())
+            })
+        }),
     }
 }
 
 pub(super) async fn status(format: OutputFormat) -> Result<()> {
     let bin_link = bin_dir().join("abctl");
-    let symlink_ok = match tokio::fs::symlink_metadata(&bin_link).await {
-        Ok(metadata) => metadata.file_type().is_symlink(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
-    let symlink_target = if symlink_ok {
-        Some(tokio::fs::read_link(&bin_link).await?.display().to_string())
-    } else {
-        None
-    };
+    let (symlink_ok, symlink_detail) = inspect_bin_link(&bin_link).await?;
 
     let shell = profile::detect_shell();
     let init_path = profile::init_path(shell);
@@ -99,7 +100,7 @@ pub(super) async fn status(format: OutputFormat) -> Result<()> {
         bin_symlink: ComponentStatus {
             ok: symlink_ok,
             path: Some(bin_link.display().to_string()),
-            detail: symlink_target,
+            detail: symlink_detail,
         },
         shell_init: ComponentStatus::at(init_ok, init_path.display().to_string()),
         profile_injected: ComponentStatus {
@@ -140,6 +141,46 @@ pub(super) async fn status(format: OutputFormat) -> Result<()> {
         bail!("ArcBox shell integration is incomplete");
     }
     Ok(())
+}
+
+async fn inspect_bin_link(path: &Path) -> Result<(bool, Option<String>)> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((false, None)),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok((false, Some("not a symlink".to_owned())));
+    }
+
+    let target = tokio::fs::read_link(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let resolved = match tokio::fs::canonicalize(path).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Ok((
+                false,
+                Some(format!("{} (unresolvable: {error})", target.display())),
+            ));
+        }
+    };
+    let current = tokio::fs::canonicalize(std::env::current_exe()?)
+        .await
+        .context("failed to resolve the running abctl executable")?;
+    if resolved == current {
+        Ok((true, Some(target.display().to_string())))
+    } else {
+        Ok((
+            false,
+            Some(format!(
+                "{} resolves to {}, expected {}",
+                target.display(),
+                resolved.display(),
+                current.display()
+            )),
+        ))
+    }
 }
 
 async fn docker_plugin_status() -> (bool, Option<String>) {
@@ -208,4 +249,23 @@ fn print_component(label: &str, component: &ComponentStatus) {
         label,
         detail
     );
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::inspect_bin_link;
+
+    #[tokio::test]
+    async fn bin_link_must_resolve_to_the_running_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("abctl");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+        assert!(inspect_bin_link(&link).await.unwrap().0);
+
+        std::fs::remove_file(&link).unwrap();
+        let foreign = directory.path().join("foreign");
+        std::fs::write(&foreign, "not ArcBox").unwrap();
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+        assert!(!inspect_bin_link(&link).await.unwrap().0);
+    }
 }

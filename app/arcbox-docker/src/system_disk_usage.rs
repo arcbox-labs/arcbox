@@ -1,6 +1,7 @@
 //! Host-side Docker disk-usage query.
 
 use std::path::Path;
+use std::time::Duration;
 
 use arcbox_error::CommonError;
 use http_body_util::{BodyExt as _, Empty};
@@ -12,6 +13,7 @@ use tokio::net::UnixStream;
 use crate::{DockerError, Result};
 
 const SYSTEM_DISK_USAGE_PATH: &str = "/v1.52/system/df";
+const SYSTEM_DISK_USAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bytes Docker reports as removable by its supported cleanup operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +80,24 @@ impl TryFrom<SystemDiskUsageResponse> for DockerReclaimableSpace {
 /// Returns an error when the socket transport, HTTP response, response schema,
 /// or checked category total is invalid.
 pub async fn query_reclaimable_space(socket_path: &Path) -> Result<DockerReclaimableSpace> {
+    query_reclaimable_space_with_timeout(socket_path, SYSTEM_DISK_USAGE_TIMEOUT).await
+}
+
+async fn query_reclaimable_space_with_timeout(
+    socket_path: &Path,
+    deadline: Duration,
+) -> Result<DockerReclaimableSpace> {
+    tokio::time::timeout(deadline, query_reclaimable_space_inner(socket_path))
+        .await
+        .map_err(|_| {
+            CommonError::internal(format!(
+                "Docker disk-usage request timed out after {} seconds",
+                deadline.as_secs_f64()
+            ))
+        })?
+}
+
+async fn query_reclaimable_space_inner(socket_path: &Path) -> Result<DockerReclaimableSpace> {
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
         CommonError::internal(format!("connect {}: {error}", socket_path.display()))
     })?;
@@ -181,5 +201,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn times_out_an_unresponsive_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let error = query_reclaimable_space_with_timeout(&socket, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(error.to_string().contains("timed out"));
     }
 }

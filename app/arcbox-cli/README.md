@@ -57,7 +57,8 @@ I/O. Unsupported `json` or `quiet` combinations exit nonzero instead of
 falling back to decorated text.
 
 Read-only JSON schemas are available for `doctor`, `top`, `disk usage`,
-`boot status`, `boot list`, `setup status`, and, on macOS, `dns status`.
+`boot status`, `boot list`, `setup status`, `machine inspect`,
+`sandbox inspect`, and, on macOS, `dns status`.
 Disk and boot sizes use raw `*_bytes` fields. For read-only commands, quiet
 output is limited to `setup status`, which prints `installed` or `partial` and
 still exits nonzero for a partial setup. If Docker is unavailable, `disk usage`

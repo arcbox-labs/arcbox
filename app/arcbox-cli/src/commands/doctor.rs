@@ -277,7 +277,8 @@ async fn add_macos_checks(checks: &mut Vec<HealthCheck>) {
     } else {
         HealthCheck::fail(
             "DNS resolver",
-            format!("missing {}", dns.resolver_path),
+            dns.resolver_error
+                .unwrap_or_else(|| format!("missing {}", dns.resolver_path)),
             "Run `sudo abctl dns install`.",
         )
     });
