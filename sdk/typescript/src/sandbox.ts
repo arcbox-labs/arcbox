@@ -17,6 +17,7 @@ import {
   toArcBoxError,
 } from "./errors";
 import { Files } from "./files";
+import { Ports } from "./ports";
 import type { WatchEventsResponse } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import {
   IdleAction,
@@ -521,6 +522,8 @@ export class Sandbox {
   readonly commands: Commands;
   /** Move bytes in and out of the sandbox. */
   readonly files: Files;
+  /** Network readiness of the sandbox. */
+  readonly ports: Ports;
 
   readonly #ctx: ClientContext;
   readonly #client: SandboxClient;
@@ -531,6 +534,7 @@ export class Sandbox {
     this.id = id;
     this.commands = new Commands(ctx, id);
     this.files = new Files(ctx, id);
+    this.ports = new Ports(ctx, id);
   }
 
   /** Create a sandbox against the default (or given) connection. */
