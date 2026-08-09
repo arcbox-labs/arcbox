@@ -63,6 +63,27 @@ class OutputChunk:
 
 
 @dataclass(frozen=True)
+class PtySize:
+    """Terminal geometry for a PTY command."""
+
+    #: Terminal width in columns.
+    cols: int
+    #: Terminal height in rows.
+    rows: int
+
+
+@dataclass(frozen=True)
+class StdinStatus:
+    """Stdin acceptance state of a command, as reported by the daemon."""
+
+    #: Bytes accepted and forwarded so far — the offset the next stdin
+    #: write starts at.
+    bytes_written: int
+    #: Whether stdin has been closed.
+    closed: bool
+
+
+@dataclass(frozen=True)
 class CommandResult:
     """A finished command. Non-zero exit is data, not an exception —
     :meth:`expect` is the opt-in raise."""
