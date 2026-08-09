@@ -505,7 +505,7 @@ async fn execute_stop(args: StopArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to stop sandbox")?;
+        .map_err(|error| crate::error::sandbox_request(error, &args.id, "stopping"))?;
 
     println!("Sandbox '{}' stopped", args.id);
     Ok(())
@@ -522,7 +522,7 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to remove sandbox")?;
+        .map_err(|error| crate::error::sandbox_request(error, &args.id, "removal"))?;
 
     println!("Sandbox '{}' removed", args.id);
     Ok(())
@@ -587,11 +587,11 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
 
     let info: pb::SandboxInfo = client
         .inspect(InspectSandboxRequest {
-            id: args.id,
+            id: args.id.clone(),
             ..Default::default()
         })
         .await
-        .context("Failed to inspect sandbox")?
+        .map_err(|error| crate::error::sandbox_request(error, &args.id, "inspection"))?
         .into_owned();
 
     let last_exit_status = info
@@ -711,7 +711,7 @@ pub(super) async fn exec_session(
     client
         .start_execution(start)
         .await
-        .context("Failed to start execution in sandbox")?;
+        .map_err(|error| crate::error::sandbox_request(error, &sandbox_id, "command execution"))?;
 
     // Enable raw terminal mode when TTY is requested.
     let raw_guard = if tty {
@@ -919,13 +919,13 @@ pub(super) async fn exec_session(
         // real outcome rather than reporting a synthetic failure.
         None => client
             .wait_execution(WaitExecutionRequest {
-                sandbox_id,
-                execution_id,
+                sandbox_id: sandbox_id.clone(),
+                execution_id: execution_id.clone(),
                 timeout_seconds: EXEC_WAIT_TIMEOUT_SECS,
                 ..Default::default()
             })
             .await
-            .context("attach stream closed without an exit event")?
+            .map_err(|error| crate::error::execution_wait(error, &sandbox_id, &execution_id))?
             .into_owned(),
     };
     Ok(exit_code_of(&execution))
@@ -939,20 +939,33 @@ async fn execute_events(args: EventsArgs) -> Result<()> {
         Some(value) => parse_event_kind(value)?,
         None => SandboxEventKind::Unspecified,
     };
+    let sandbox_id = args.id.unwrap_or_default();
     let mut stream = client
         .events(SandboxEventsRequest {
-            sandbox_id: args.id.unwrap_or_default(),
+            sandbox_id: sandbox_id.clone(),
             kind: kind.into(),
             ..Default::default()
         })
         .await
-        .context("Failed to subscribe to sandbox events")?;
+        .map_err(|error| {
+            if sandbox_id.is_empty() {
+                anyhow::Error::new(error).context("Failed to subscribe to sandbox events")
+            } else {
+                crate::error::sandbox_request(error, &sandbox_id, "event subscription")
+            }
+        })?;
 
     println!("Listening for sandbox events (Ctrl+C to stop)...");
     while let Some(frame) = stream
         .message::<pb::WatchEventsResponse>()
         .await
-        .context("Failed to read sandbox event")?
+        .map_err(|error| {
+            if sandbox_id.is_empty() {
+                anyhow::Error::new(error).context("Failed to read sandbox event")
+            } else {
+                crate::error::sandbox_request(error, &sandbox_id, "event streaming")
+            }
+        })?
         .map(|item| item.to_owned_message())
     {
         let Some(watch_events_response::Payload::Event(event)) = frame.payload else {
@@ -976,15 +989,16 @@ async fn execute_events(args: EventsArgs) -> Result<()> {
 async fn execute_checkpoint(args: CheckpointArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxSnapshotServiceClient::new(transport.clone(), config.clone());
+    let id = args.id;
 
     let resp: pb::CheckpointResponse = client
         .checkpoint(CheckpointRequest {
-            sandbox_id: args.id,
+            sandbox_id: id.clone(),
             name: args.name,
             ..Default::default()
         })
         .await
-        .context("Failed to checkpoint sandbox")?
+        .map_err(|error| crate::error::sandbox_request(error, &id, "checkpointing"))?
         .into_owned();
 
     println!("Snapshot created");
@@ -1000,15 +1014,16 @@ async fn execute_restore(args: RestoreArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxSnapshotServiceClient::new(transport.clone(), config.clone());
 
+    let snapshot_id = args.snapshot_id;
     let resp: pb::RestoreResponse = client
         .restore(RestoreRequest {
             id: args.sandbox_id.unwrap_or_default(),
-            snapshot_id: args.snapshot_id,
+            snapshot_id: snapshot_id.clone(),
             ttl_seconds: args.ttl,
             ..Default::default()
         })
         .await
-        .context("Failed to restore sandbox")?
+        .map_err(|error| crate::error::snapshot_request(error, &snapshot_id, "restoration"))?
         .into_owned();
 
     println!("Sandbox restored");
@@ -1024,15 +1039,19 @@ async fn execute_list_snapshots(args: ListSnapshotsArgs) -> Result<()> {
     // Follow continuation tokens so the human view stays complete.
     let mut snapshots = Vec::new();
     let mut page_token = String::new();
+    let sandbox_id = args.sandbox_id;
     loop {
         let mut resp: pb::ListSnapshotsResponse = client
             .list_snapshots(ListSnapshotsRequest {
-                sandbox_id: args.sandbox_id.clone().unwrap_or_default(),
+                sandbox_id: sandbox_id.clone().unwrap_or_default(),
                 page_token: page_token.clone(),
                 ..Default::default()
             })
             .await
-            .context("Failed to list snapshots")?
+            .map_err(|error| match sandbox_id.as_deref() {
+                Some(id) => crate::error::sandbox_request(error, id, "snapshot listing"),
+                None => anyhow::Error::new(error).context("Failed to list snapshots"),
+            })?
             .into_owned();
         snapshots.append(&mut resp.snapshots);
         if resp.next_page_token.is_empty() {
@@ -1072,7 +1091,7 @@ async fn execute_delete_snapshot(args: DeleteSnapshotArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to delete snapshot")?;
+        .map_err(|error| crate::error::snapshot_request(error, &args.snapshot_id, "deletion"))?;
 
     println!("Snapshot '{}' deleted", args.snapshot_id);
     Ok(())
@@ -1123,7 +1142,7 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
             const CHUNK: usize = 1024 * 1024;
             let open = WriteFileRequest {
                 payload: WriteFileOpen {
-                    id,
+                    id: id.clone(),
                     path,
                     mode,
                     ..Default::default()
@@ -1156,18 +1175,22 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
             client
                 .write_file(connectrpc::client::stream_iter(requests))
                 .await
-                .context("Failed to write file into sandbox")?;
+                .map_err(|error| {
+                    crate::error::sandbox_request(error, &id, "copying a file into it")
+                })?;
             println!("Copied {total} bytes to {}", args.dst);
         }
         (CpEndpoint::Sandbox { id, path }, CpEndpoint::Local(dst)) => {
             let mut stream = client
                 .read_file(ReadFileRequest {
-                    id,
+                    id: id.clone(),
                     path,
                     ..Default::default()
                 })
                 .await
-                .context("Failed to read file from sandbox")?;
+                .map_err(|error| {
+                    crate::error::sandbox_request(error, &id, "copying a file from it")
+                })?;
 
             let mut out = tokio::fs::File::create(&dst)
                 .await
@@ -1176,7 +1199,9 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
             while let Some(chunk) = stream
                 .message::<pb::FileChunk>()
                 .await
-                .context("Failed to read file stream")?
+                .map_err(|error| {
+                    crate::error::sandbox_request(error, &id, "copying a file from it")
+                })?
                 .map(|item| item.to_owned_message())
             {
                 if !chunk.data.is_empty() {
@@ -1215,7 +1240,7 @@ async fn execute_expose(args: ExposeArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to expose sandbox port")?
+        .map_err(|error| crate::error::sandbox_request(error, &args.id, "port exposure"))?
         .into_owned();
     println!(
         "{}:{}/{} exposed on localhost:{}",
@@ -1236,7 +1261,7 @@ async fn execute_unexpose(args: UnexposeArgs) -> Result<()> {
             ..Default::default()
         })
         .await
-        .context("Failed to unexpose sandbox port")?;
+        .map_err(|error| crate::error::sandbox_request(error, &args.id, "port removal"))?;
     println!("{}:{}/{} unexposed", args.id, args.port, args.protocol);
     Ok(())
 }
