@@ -64,9 +64,8 @@ mod tests {
         );
 
         let missing_working_dir = search_dir.path().join("missing-working-directory");
-        let command = std::env::current_exe().unwrap();
         let cwd_error = spawn_failure(
-            command.to_str().unwrap(),
+            "./arcbox-command-that-does-not-exist",
             missing_working_dir.to_str().unwrap(),
             None,
         );
