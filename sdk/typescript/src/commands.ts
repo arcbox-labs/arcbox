@@ -6,12 +6,17 @@ import { createClient } from "@connectrpc/connect";
 import {
   ArcBoxError,
   CommandFailedError,
+  ConnectionFailedError,
+  ConnectionLostError,
   InvalidArgumentError,
   SandboxDiedError,
   TimeoutError,
   toArcBoxError,
 } from "./errors";
-import type { Execution } from "./gen/arcbox/sandbox/v1/process_pb";
+import type {
+  Execution,
+  ExecutionEvent,
+} from "./gen/arcbox/sandbox/v1/process_pb";
 import {
   ExecutionState,
   SandboxProcessService,
@@ -36,6 +41,14 @@ const SIGNAL_VALUES: Record<SignalName, Signal> = {
   SIGKILL: Signal.SIGKILL,
   SIGTERM: Signal.SIGTERM,
 };
+
+/**
+ * Consecutive dead re-attach dials tolerated before an output stream
+ * surfaces the stream-death error. Delivered output resets the budget,
+ * so a long-lived stream survives any number of isolated drops.
+ */
+const MAX_ATTACH_RETRIES = 3;
+const MAX_ATTACH_RETRIES_LABEL = String(MAX_ATTACH_RETRIES);
 
 /** Terminal geometry for a PTY command. */
 export interface PtySize {
@@ -233,7 +246,9 @@ export class CommandHandle {
    * earliest byte the daemon still retains (8 MiB per channel); replayed
    * buffered output comes first, then live output follows; the stream
    * ends when the process exits (deterministic termination — never
-   * silence).
+   * silence). A transport drop mid-stream re-attaches transparently
+   * from the last delivered offsets (see {@link ConnectionLostError}
+   * for the exhausted-retries case).
    */
   get output(): AsyncIterable<CommandOutput> {
     return this.#streamOutput();
@@ -241,7 +256,7 @@ export class CommandHandle {
 
   async *#streamOutput(): AsyncGenerator<CommandOutput> {
     try {
-      for await (const event of this.#attach()) {
+      for await (const event of this.#attachEvents("commands.output")) {
         if (event.event.case === "output") {
           const chunk = event.event.value;
           yield {
@@ -428,13 +443,72 @@ export class CommandHandle {
     }
   }
 
-  #attach() {
-    return this.#client.attachExecution({
-      sandboxId: this.#sandboxId,
-      executionId: this.commandId,
-      stdoutOffset: 0n,
-      stderrOffset: 0n,
-    });
+  /**
+   * The resumable attach loop shared by {@link output} and the result
+   * collection: streams execution events, tracking the byte offset each
+   * channel has delivered. When the transport drops mid-stream, it
+   * re-attaches from those offsets — the daemon replays nothing already
+   * delivered — so the consumer sees one seamless, gapless stream. Only
+   * consecutive dead dials count against the retry budget (delivered
+   * output resets it); once exhausted, the stream-death
+   * {@link ConnectionLostError} carries the last transport failure.
+   */
+  async *#attachEvents(operation: string): AsyncGenerator<ExecutionEvent> {
+    let stdoutOffset = 0n;
+    let stderrOffset = 0n;
+    let failures = 0;
+    for (;;) {
+      try {
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: each re-attach resumes where the last stream died
+        for await (const event of this.#client.attachExecution({
+          sandboxId: this.#sandboxId,
+          executionId: this.commandId,
+          stdoutOffset,
+          stderrOffset,
+        })) {
+          if (event.event.case === "output") {
+            const chunk = event.event.value;
+            const after = chunk.offset + BigInt(chunk.data.byteLength);
+            if (chunk.channel === StdioChannel.STDERR) {
+              if (after > stderrOffset) {
+                stderrOffset = after;
+                failures = 0;
+              }
+            } else if (after > stdoutOffset) {
+              stdoutOffset = after;
+              failures = 0;
+            }
+          }
+          yield event;
+          if (event.event.case === "exited") {
+            return;
+          }
+        }
+        // A clean server-side end without an exited frame: nothing more
+        // is coming (the daemon closed the record).
+        return;
+      } catch (error) {
+        const mapped = toArcBoxError(error, operation);
+        if (!(mapped instanceof ConnectionFailedError)) {
+          throw mapped;
+        }
+        failures += 1;
+        if (failures > MAX_ATTACH_RETRIES) {
+          throw new ConnectionLostError(
+            "the output stream died and could not be re-attached within " +
+              "the retry budget",
+            {
+              operation,
+              cause: error,
+              context: {
+                commandId: this.commandId,
+                retries: MAX_ATTACH_RETRIES_LABEL,
+              },
+            },
+          );
+        }
+      }
+    }
   }
 
   /**
@@ -450,7 +524,7 @@ export class CommandHandle {
     let nextStdout = 0n;
     let nextStderr = 0n;
     let truncated = false;
-    for await (const event of this.#attach()) {
+    for await (const event of this.#attachEvents("commands.waitForExit")) {
       if (event.event.case === "output") {
         const chunk = event.event.value;
         const isStderr = chunk.channel === StdioChannel.STDERR;

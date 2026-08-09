@@ -43,6 +43,7 @@ export {
   CommandNotFoundError,
   CommandTimeoutError,
   ConnectionFailedError,
+  ConnectionLostError,
   FileNotFoundError,
   FileTooLargeError,
   InvalidArgumentError,

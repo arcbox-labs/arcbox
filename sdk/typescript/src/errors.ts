@@ -59,6 +59,15 @@ export class ConnectionFailedError extends ArcBoxError {
   name = "ConnectionFailedError";
 }
 
+/**
+ * A live stream died mid-flow — and, where the SDK re-attaches
+ * (command output), could not be re-established within the retry
+ * budget. The `cause` chain carries the underlying transport failure.
+ */
+export class ConnectionLostError extends ConnectionFailedError {
+  name = "ConnectionLostError";
+}
+
 /** Authentication is required or was rejected. Reserved for the remote tier (CORE-63). */
 export class AuthenticationError extends ArcBoxError {
   name = "AuthenticationError";
@@ -259,13 +268,23 @@ function classForConnectCode(
 /**
  * Whether the cause chain bottoms out in a connection-level syscall
  * failure. connect-node maps ECONNREFUSED to Code.Unavailable but leaves
- * ENOENT — the missing-socket shape of "daemon not running" — as Unknown,
- * so both are detected here directly.
+ * ENOENT — the missing-socket shape of "daemon not running" — as
+ * Unknown, so both are detected here directly. Mid-stream teardown
+ * shapes (ECONNRESET, EPIPE, ECONNABORTED) are the same family: the
+ * daemon stopped answering.
  */
 function isConnectionRefused(reason: unknown): boolean {
+  const codes = new Set([
+    "ENOENT",
+    "ECONNREFUSED",
+    "ENOTSOCK",
+    "ECONNRESET",
+    "ECONNABORTED",
+    "EPIPE",
+  ]);
   for (let cursor = reason; typeof cursor === "object" && cursor !== null; ) {
     const code = (cursor as { code?: unknown }).code;
-    if (code === "ENOENT" || code === "ECONNREFUSED" || code === "ENOTSOCK") {
+    if (typeof code === "string" && codes.has(code)) {
       return true;
     }
     cursor = (cursor as { cause?: unknown }).cause;
