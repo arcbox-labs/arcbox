@@ -420,8 +420,8 @@ mod agent {
         MakeDirReq, MoveReq, RemoveReq, StatReq, WatchReq,
     };
     use arcbox_vm::file_watch::{
-        IN_CREATE, IN_MOVED_TO, WATCH_MASK, has_overflow, map_events, parse_event_buffer,
-        trailing_unpaired_move_from,
+        IN_CREATE, IN_MOVED_TO, WATCH_MASK, has_overflow, has_unpaired_move_from, map_events,
+        parse_event_buffer,
     };
     // Readiness dial-out port — shared with the host-side boot gate.
     use arcbox_vm::vsock::{MSG_WAIT_PORT, READY_PORT};
@@ -1272,13 +1272,14 @@ mod agent {
                 return;
             }
             let mut raw = parse_event_buffer(&buf[..len as usize]);
-            // A rename's FROM/TO halves usually share one read; when FROM is
-            // the batch's last event its TO may still be in flight (or the
-            // buffer split the pair), so give the queue one bounded chance
-            // to complete the pair before mapping. A still-unpaired half
+            // A rename's FROM/TO halves usually share one read; when the
+            // batch carries an unpaired FROM (its TO still in flight, or
+            // split off by the buffer, possibly with concurrent events
+            // interleaved after it), give the queue one bounded chance to
+            // complete the pair before mapping. A still-unpaired half
             // degrades to removed/created, which is also what a move across
             // the watch boundary legitimately looks like.
-            if trailing_unpaired_move_from(&raw) && poll_readable(ifd, RENAME_PAIR_GRACE_MS) {
+            if has_unpaired_move_from(&raw) && poll_readable(ifd, RENAME_PAIR_GRACE_MS) {
                 // SAFETY: buf is a valid writable buffer; ifd is a live
                 // inotify fd (the earlier batch is already parsed and owned).
                 let more =

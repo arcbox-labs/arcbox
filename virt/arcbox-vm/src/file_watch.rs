@@ -166,23 +166,23 @@ pub fn map_events(
     out.into_iter().flatten().collect()
 }
 
-/// True when the batch ends in a rename's unmatched FROM half.
+/// True when the batch carries a rename's unmatched FROM half.
 ///
-/// The final event is an `IN_MOVED_FROM` whose matching `IN_MOVED_TO` is
-/// absent from the batch — the TO half may still be in flight, so the
-/// reader should give the queue one bounded chance to complete the pair
-/// before mapping (an unpaired half degrades to `removed`/`created`, which
-/// then stands for a move across the watch boundary or a genuinely split
-/// pair).
+/// Any `IN_MOVED_FROM` whose matching `IN_MOVED_TO` is absent from the
+/// batch (events from concurrent operations can interleave between the two
+/// halves, so the FROM need not be last): the TO half may still be in
+/// flight, and the reader should give the queue one bounded chance to
+/// complete the pair before mapping. A still-unpaired half degrades to
+/// `removed`/`created`, which then stands for a move across the watch
+/// boundary or a genuinely split pair.
 #[must_use]
-pub fn trailing_unpaired_move_from(batch: &[RawWatchEvent]) -> bool {
-    let Some(last) = batch.last() else {
-        return false;
-    };
-    last.mask & IN_MOVED_FROM != 0
-        && !batch
-            .iter()
-            .any(|event| event.mask & IN_MOVED_TO != 0 && event.cookie == last.cookie)
+pub fn has_unpaired_move_from(batch: &[RawWatchEvent]) -> bool {
+    batch.iter().any(|from| {
+        from.mask & IN_MOVED_FROM != 0
+            && !batch
+                .iter()
+                .any(|to| to.mask & IN_MOVED_TO != 0 && to.cookie == from.cookie)
+    })
 }
 
 /// True when the kernel reported a queue overflow in this batch.
@@ -322,23 +322,24 @@ mod tests {
     }
 
     #[test]
-    fn trailing_unpaired_move_from_flags_only_the_open_pair() {
+    fn unpaired_move_from_is_flagged_at_any_position() {
         // FROM with no TO at the end of the batch: the pair may be split.
         let open = parse_event_buffer(&encode(&[(1, IN_MOVED_FROM, 7, "old")]));
-        assert!(trailing_unpaired_move_from(&open));
+        assert!(has_unpaired_move_from(&open));
         // A paired batch is complete.
         let paired = parse_event_buffer(&encode(&[
             (1, IN_MOVED_FROM, 7, "old"),
             (1, IN_MOVED_TO, 7, "new"),
         ]));
-        assert!(!trailing_unpaired_move_from(&paired));
-        // A trailing non-move event closes the window too.
-        let closed = parse_event_buffer(&encode(&[
+        assert!(!has_unpaired_move_from(&paired));
+        // Events from concurrent operations can interleave between the
+        // halves, so a non-trailing unpaired FROM still opens the window.
+        let interleaved = parse_event_buffer(&encode(&[
             (1, IN_MOVED_FROM, 7, "old"),
             (1, IN_CREATE, 0, "other"),
         ]));
-        assert!(!trailing_unpaired_move_from(&closed));
-        assert!(!trailing_unpaired_move_from(&[]));
+        assert!(has_unpaired_move_from(&interleaved));
+        assert!(!has_unpaired_move_from(&[]));
     }
 
     #[test]
