@@ -5,13 +5,20 @@ import { createClient } from "@connectrpc/connect";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { timestampDate } from "@bufbuild/protobuf/wkt";
 
-import { FileTooLargeError, toArcBoxError } from "./errors";
+import {
+  ConnectionFailedError,
+  ConnectionLostError,
+  FileTooLargeError,
+  toArcBoxError,
+} from "./errors";
 import type {
   FileStat as FileStatProto,
+  FsEvent as FsEventProto,
   WriteFileRequestSchema,
 } from "./gen/arcbox/sandbox/v1/filesystem_pb";
 import {
   FileKind as FileKindProto,
+  FsEventKind as FsEventKindProto,
   SandboxFilesystemService,
 } from "./gen/arcbox/sandbox/v1/filesystem_pb";
 import type { ClientContext } from "./transport";
@@ -79,6 +86,52 @@ export interface RemoveOptions {
    * non-empty directory fails with a precondition error.
    */
   recursive?: boolean;
+}
+
+/**
+ * Kind of a filesystem event. `"unknown"` covers kinds this SDK
+ * predates.
+ */
+export type FsEventKind =
+  | "created"
+  | "modified"
+  | "removed"
+  | "renamed"
+  | "unknown";
+
+/** One filesystem event, as delivered by {@link Files.watch}. */
+export interface FsEvent {
+  /** What happened. */
+  kind: FsEventKind;
+  /** Absolute path of the affected entry (the old path for `"renamed"`). */
+  path: string;
+  /** New absolute path (set only for `"renamed"`). */
+  renamedTo?: string;
+}
+
+/** Options for {@link Files.watch}. */
+export interface WatchOptions {
+  /** Also watch subdirectories. */
+  recursive?: boolean;
+}
+
+const FS_EVENT_KIND_NAMES: Partial<Record<FsEventKindProto, FsEventKind>> = {
+  [FsEventKindProto.CREATED]: "created",
+  [FsEventKindProto.MODIFIED]: "modified",
+  [FsEventKindProto.REMOVED]: "removed",
+  [FsEventKindProto.RENAMED]: "renamed",
+};
+
+/** Map one wire FsEvent to the public DTO ("unknown" for kinds this SDK predates). */
+export function fsEventFromProto(event: FsEventProto): FsEvent {
+  const out: FsEvent = {
+    kind: FS_EVENT_KIND_NAMES[event.kind] ?? "unknown",
+    path: event.path,
+  };
+  if (event.renamedTo !== "") {
+    out.renamedTo = event.renamedTo;
+  }
+  return out;
 }
 
 const FILE_KIND_NAMES: Partial<Record<FileKindProto, FileKind>> = {
@@ -291,6 +344,65 @@ export class Files {
       );
     } catch (error) {
       throw toArcBoxError(error, "files.move");
+    }
+  }
+
+  /**
+   * Watch a directory for filesystem events, yielded as typed
+   * {@link FsEvent}s (keepalive frames are filtered out). Push-based —
+   * the guest watches inotify directly, never a polling fallback; a
+   * rename within the watched tree arrives as one `"renamed"` event
+   * pairing `path` (old) with `renamedTo` (new).
+   *
+   * The iterator ends when the daemon ends the stream (the sandbox
+   * stopped); breaking out of the loop cancels the watch. A transport
+   * drop mid-stream is surfaced as {@link ConnectionLostError} —
+   * re-watching is the caller's decision, since missed events cannot be
+   * replayed (the same rule as `sandbox.events()`). When the kernel's
+   * event queue overflows, the daemon fails the stream with its
+   * re-list-and-re-watch guidance rather than silently streaming a
+   * wrong view.
+   */
+  watch(path: string, opts: WatchOptions = {}): AsyncIterable<FsEvent> {
+    return this.#streamWatch(path, opts.recursive ?? false);
+  }
+
+  async *#streamWatch(
+    path: string,
+    recursive: boolean,
+  ): AsyncGenerator<FsEvent> {
+    let delivered = false;
+    try {
+      for await (const frame of this.#client.watchDir({
+        id: this.#sandboxId,
+        path,
+        recursive,
+      })) {
+        // The guest confirms an established watch with an immediate
+        // keepalive, so any frame marks the stream as live.
+        delivered = true;
+        if (frame.payload.case === "event") {
+          yield fsEventFromProto(frame.payload.value);
+        }
+      }
+    } catch (error) {
+      const mapped = toArcBoxError(error, "files.watch");
+      // A connection failure after frames flowed is a mid-stream drop
+      // (the stream-death error); before any frame it is an unreachable
+      // daemon, reported as such. Daemon-typed errors (including the
+      // overflow's re-list-and-re-watch guidance) keep their own class.
+      if (
+        delivered &&
+        mapped instanceof ConnectionFailedError &&
+        !(mapped instanceof ConnectionLostError)
+      ) {
+        throw new ConnectionLostError("the watch stream died", {
+          operation: "files.watch",
+          cause: error,
+          context: { path },
+        });
+      }
+      throw mapped;
     }
   }
 }
