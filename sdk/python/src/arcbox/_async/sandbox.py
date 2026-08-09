@@ -54,8 +54,11 @@ _GONE_EVENTS = (
     sandbox_pb2.SANDBOX_EVENT_KIND_REMOVED,
 )
 
-#: How often ``connect`` re-inspects a PAUSING sandbox. No lifecycle
-#: event marks the PAUSING→PAUSED edge, so it is polled out.
+#: How often ``connect`` re-inspects a PAUSING sandbox.
+#: ``SANDBOX_EVENT_KIND_PAUSED`` names this edge in the proto, but the
+#: daemon does not emit it yet (Pause/Resume are CORE-21 stubs), so the
+#: checkpoint is polled out instead. Once it is emitted, this poll
+#: should become an event wait.
 _PAUSE_SETTLE_POLL_SECONDS = 0.5
 
 
