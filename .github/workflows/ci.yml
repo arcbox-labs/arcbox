@@ -234,3 +234,6 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+      - name: Build
+        run: uv build
