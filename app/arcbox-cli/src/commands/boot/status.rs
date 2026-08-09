@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use arcbox_core::boot_assets::{BootAssetConfig, BootAssetManifest, BootAssetProvider};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 use super::super::OutputFormat;
 use super::StatusArgs;
@@ -68,7 +70,8 @@ pub(super) async fn status(
         &config.version,
         &config.arch,
         manifest,
-    );
+    )
+    .await;
 
     if !args.offline {
         match provider.fetch_latest_version().await {
@@ -92,7 +95,7 @@ pub(super) async fn status(
     Ok(())
 }
 
-fn build_report(
+async fn build_report(
     version_dir: &Path,
     version: &str,
     arch: &str,
@@ -130,6 +133,20 @@ fn build_report(
                     artifacts[1].version.clone_from(&target.kernel.version);
                     artifacts[2].source_path = Some(target.rootfs.path.clone());
                     artifacts[2].version.clone_from(&target.rootfs.version);
+                    verify_artifact_checksum(
+                        &mut artifacts[1],
+                        &version_dir.join("kernel"),
+                        &target.kernel.sha256,
+                        &mut reasons,
+                    )
+                    .await;
+                    verify_artifact_checksum(
+                        &mut artifacts[2],
+                        &version_dir.join("rootfs.erofs"),
+                        &target.rootfs.sha256,
+                        &mut reasons,
+                    )
+                    .await;
                     if let Some(runtime) = &target.runtime {
                         let mut artifact =
                             inspect_artifact("runtime", &version_dir.join("runtime.erofs"), false);
@@ -166,6 +183,38 @@ fn build_report(
         latest_version_error: None,
         update_available: false,
     }
+}
+
+async fn verify_artifact_checksum(
+    artifact: &mut ArtifactStatus,
+    path: &Path,
+    expected: &str,
+    reasons: &mut Vec<String>,
+) {
+    if !artifact.present {
+        return;
+    }
+    let detail = match sha256_file(path).await {
+        Ok(actual) if actual == expected => return,
+        Ok(actual) => format!("SHA-256 mismatch: expected {expected}, got {actual}"),
+        Err(error) => format!("could not calculate SHA-256: {error}"),
+    };
+    reasons.push(format!("{}: {detail}", artifact.name));
+    artifact.detail = Some(detail);
+}
+
+async fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn inspect_artifact(name: &'static str, path: &Path, required: bool) -> ArtifactStatus {
@@ -244,7 +293,12 @@ fn render_table(report: &StatusOutput) -> String {
 mod tests {
     use super::*;
 
+    const KERNEL: &[u8] = b"kernel";
+    const ROOTFS: &[u8] = b"rootfs.erofs";
+
     fn manifest(runtime: bool) -> BootAssetManifest {
+        let kernel_sha256 = format!("{:x}", Sha256::digest(KERNEL));
+        let rootfs_sha256 = format!("{:x}", Sha256::digest(ROOTFS));
         let runtime = if runtime {
             r#", "runtime": {"path": "arm64/runtime.erofs", "sha256": "03", "version": "29.0"}"#
         } else {
@@ -257,8 +311,8 @@ mod tests {
                 "built_at": "2026-08-10T00:00:00Z",
                 "targets": {{
                     "arm64": {{
-                        "kernel": {{"path": "arm64/kernel", "sha256": "01"}},
-                        "rootfs": {{"path": "arm64/rootfs.erofs", "sha256": "02"}},
+                        "kernel": {{"path": "arm64/kernel", "sha256": "{kernel_sha256}"}},
+                        "rootfs": {{"path": "arm64/rootfs.erofs", "sha256": "{rootfs_sha256}"}},
                         "kernel_cmdline": "console=hvc0"{runtime}
                     }}
                 }},
@@ -268,12 +322,12 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn missing_required_artifact_is_reported_in_json_and_table() {
+    #[tokio::test]
+    async fn missing_required_artifact_is_reported_in_json_and_table() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("manifest.json"), "{}").unwrap();
-        std::fs::write(directory.path().join("kernel"), "kernel").unwrap();
-        let report = build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(false)));
+        std::fs::write(directory.path().join("kernel"), KERNEL).unwrap();
+        let report = build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(false))).await;
 
         assert!(!report.complete);
         assert!(
@@ -287,13 +341,47 @@ mod tests {
         assert_eq!(json["reasons"][0], "rootfs: missing required artifact");
     }
 
-    #[test]
-    fn legacy_runtime_entry_is_enumerated_but_not_required() {
-        let directory = tempfile::tempdir().unwrap();
-        for name in ["manifest.json", "kernel", "rootfs.erofs"] {
-            std::fs::write(directory.path().join(name), name).unwrap();
+    #[tokio::test]
+    async fn corrupt_required_artifacts_are_reported_in_json_and_table() {
+        for (file_name, artifact_name) in [("kernel", "kernel"), ("rootfs.erofs", "rootfs")] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("manifest.json"), "{}").unwrap();
+            std::fs::write(directory.path().join("kernel"), KERNEL).unwrap();
+            std::fs::write(directory.path().join("rootfs.erofs"), ROOTFS).unwrap();
+            std::fs::write(directory.path().join(file_name), b"corrupt").unwrap();
+
+            let report =
+                build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(false))).await;
+
+            assert!(!report.complete);
+            let artifact = report
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.name == artifact_name)
+                .unwrap();
+            assert!(artifact.present);
+            assert!(
+                artifact
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("SHA-256 mismatch:"))
+            );
+            let reason = format!("Reason: {artifact_name}: SHA-256 mismatch:");
+            assert!(render_table(&report).contains(&reason));
+            let json = serde_json::to_value(report).unwrap();
+            assert_eq!(json["complete"], false);
+            let reason = format!("{artifact_name}: SHA-256 mismatch:");
+            assert!(json["reasons"][0].as_str().unwrap().starts_with(&reason));
         }
-        let report = build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(true)));
+    }
+
+    #[tokio::test]
+    async fn legacy_runtime_entry_is_enumerated_but_not_required() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("manifest.json"), "{}").unwrap();
+        std::fs::write(directory.path().join("kernel"), KERNEL).unwrap();
+        std::fs::write(directory.path().join("rootfs.erofs"), ROOTFS).unwrap();
+        let report = build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(true))).await;
 
         assert!(report.complete);
         let runtime = report
