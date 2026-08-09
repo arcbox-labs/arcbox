@@ -94,7 +94,9 @@ pub fn snapshot_request(error: ConnectError, id: &str, operation: &str) -> Error
             "Snapshot '{id}' is unavailable during {operation}. Retry the command; if the \
              problem persists, check `abctl daemon status`."
         ),
-        _ => format!("Could not perform {operation} for snapshot '{id}'."),
+        _ => format!(
+            "Could not perform {operation} for snapshot '{id}'. Re-run with --debug for details."
+        ),
     };
     actionable(message, error)
 }
@@ -111,7 +113,7 @@ pub fn execution_wait(error: ConnectError, sandbox_id: &str, execution_id: &str)
         ),
         _ => format!(
             "Could not determine the exit status of execution '{execution_id}' in sandbox \
-             '{sandbox_id}'."
+             '{sandbox_id}'. Re-run with --debug for details."
         ),
     };
     actionable(message, error)
@@ -270,12 +272,16 @@ mod tests {
             machine_request(ConnectError::internal("raw"), "dev", "ping"),
             machine_operation(ConnectError::internal("raw"), "dev", "start"),
             sandbox_request(ConnectError::internal("raw"), "box", "inspection"),
+            snapshot_request(ConnectError::internal("raw"), "snap", "restore"),
+            execution_wait(ConnectError::internal("raw"), "box", "exec"),
             machine_exec_output(ConnectError::internal("raw"), "dev", "date"),
         ];
         let expected = [
             "Error: Could not perform ping for machine 'dev'. Re-run with --debug for details.",
             "Error: Could not start machine 'dev'. Re-run with --debug for details.",
             "Error: Could not perform inspection for sandbox 'box'. Re-run with --debug for details.",
+            "Error: Could not perform restore for snapshot 'snap'. Re-run with --debug for details.",
+            "Error: Could not determine the exit status of execution 'exec' in sandbox 'box'. Re-run with --debug for details.",
             "Error: Could not read output from 'date' in machine 'dev'. Re-run with --debug for details.",
         ];
 
