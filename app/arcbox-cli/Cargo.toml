@@ -52,6 +52,7 @@ buffa = { version = "0.9.1", features = ["json"] }
 tower.workspace = true
 buffa-types = { version = "0.9.1", features = ["json"] }
 anstream = { version = "1.0.0", default-features = false }
+hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }

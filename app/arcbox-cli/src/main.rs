@@ -101,7 +101,7 @@ fn run(cli: Cli) -> Result<()> {
             Commands::Boot(cmd) => commands::boot::execute(cmd, cli.format).await,
             Commands::Disk(cmd) => commands::disk::execute(cmd, cli.format).await,
             #[cfg(target_os = "macos")]
-            Commands::Dns(cmd) => commands::dns::execute(cmd).await,
+            Commands::Dns(cmd) => commands::dns::execute(cmd, cli.format).await,
             Commands::Daemon(args) => commands::daemon::execute(args).await,
             Commands::Logs(args) => commands::logs::execute(args).await,
             Commands::Setup(cmd) => commands::setup::execute(cmd, cli.format).await,

@@ -471,7 +471,7 @@ fn read_lock_file(lock_file: &Path) -> Result<Option<i32>> {
 /// Probe whether the daemon is alive by attempting a non-blocking flock
 /// on `daemon.lock`. If the lock is held (EWOULDBLOCK), the daemon is
 /// alive. This is immune to PID reuse — the kernel manages the lock.
-fn daemon_is_alive(lock_file: &Path) -> bool {
+pub(super) fn daemon_is_alive(lock_file: &Path) -> bool {
     use std::os::unix::io::AsRawFd;
     let file = match std::fs::OpenOptions::new().read(true).open(lock_file) {
         Ok(f) => f,
