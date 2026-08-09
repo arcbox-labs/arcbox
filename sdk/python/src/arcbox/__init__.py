@@ -7,6 +7,8 @@ wire code and is deliberately NOT exported. The error hierarchy lives
 in :mod:`arcbox.errors`.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from arcbox._async._client import AsyncConnectClient
 from arcbox._async.commands import AsyncCommandHandle, AsyncCommands, AsyncOutputStream
 from arcbox._async.files import AsyncFiles
@@ -27,6 +29,13 @@ from arcbox._types import (
     SandboxSummary,
     SignalName,
 )
+
+try:
+    __version__ = version("arcbox")
+except PackageNotFoundError:
+    # An uninstalled source tree carries no distribution metadata; a
+    # fixed dev sentinel beats parsing pyproject.toml on every import.
+    __version__ = "0.0.0.dev0"
 
 __all__ = [
     "MAX_FILE_BYTES",
