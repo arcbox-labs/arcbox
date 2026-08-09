@@ -1,11 +1,14 @@
 import { timestampDate } from "@bufbuild/protobuf/wkt";
 
 import type {
+  GetCapabilitiesResponse,
+  SandboxEvent as SandboxEventProto,
   SandboxInfo as SandboxInfoProto,
   SandboxSummary as SandboxSummaryProto,
 } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import {
   IdleAction,
+  SandboxEventKind as SandboxEventKindProto,
   SandboxState as SandboxStateProto,
 } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 
@@ -50,6 +53,59 @@ export interface SandboxInfo {
   onIdle?: IdlePolicy;
   /** On-disk footprint of retained state; paused sandboxes keep paying this. */
   storageBytes: number;
+}
+
+/**
+ * Kind of a sandbox lifecycle event. `"idle"` fires when an execution
+ * exits and the sandbox returns to ready; `"pausing"`/`"resumed"` carry
+ * a `reason` attribute distinguishing client calls from automation
+ * (`idle_timeout` / `auto_resume`).
+ */
+export type SandboxEventKind =
+  | "created"
+  | "ready"
+  | "running"
+  | "idle"
+  | "stopping"
+  | "stopped"
+  | "failed"
+  | "removed"
+  | "pausing"
+  | "paused"
+  | "resumed"
+  | "unknown";
+
+/** One sandbox lifecycle event, as delivered by {@link Sandbox.events}. */
+export interface SandboxEvent {
+  sandboxId: string;
+  kind: SandboxEventKind;
+  /** When it happened (daemon clock). */
+  time?: Date;
+  /**
+   * Per-kind context: `exit_code`/`signal` on `"idle"`, `error` on
+   * `"failed"`, `reason` on `"pausing"`/`"resumed"`.
+   */
+  attributes: Record<string, string>;
+}
+
+/** Nested-virtualization support on this host. */
+export interface NestedVirtCapability {
+  /** True when sandboxes can run (M3+ hardware, VZ backend). */
+  supported: boolean;
+  /** The daemon's authoritative reason, when unsupported. */
+  reason?: string;
+}
+
+/** What the daemon can do — the {@link ArcBox.capabilities} handshake. */
+export interface Capabilities {
+  /** Daemon version string (informational). */
+  daemonVersion: string;
+  /** Sandbox API protocol level. */
+  protocol: number;
+  /** Append-only named feature flags (e.g. "pause_resume"). */
+  features: string[];
+  /** Whether this host can run sandboxes at all. */
+  nestedVirt: NestedVirtCapability;
 }
 
 /** One row of a sandbox listing. */
@@ -169,4 +225,50 @@ function assignIfSet<T, K extends keyof T>(
   if (value !== undefined) {
     target[key] = value;
   }
+}
+
+const EVENT_KIND_NAMES: Partial<
+  Record<SandboxEventKindProto, SandboxEventKind>
+> = {
+  [SandboxEventKindProto.CREATED]: "created",
+  [SandboxEventKindProto.READY]: "ready",
+  [SandboxEventKindProto.RUNNING]: "running",
+  [SandboxEventKindProto.IDLE]: "idle",
+  [SandboxEventKindProto.STOPPING]: "stopping",
+  [SandboxEventKindProto.STOPPED]: "stopped",
+  [SandboxEventKindProto.FAILED]: "failed",
+  [SandboxEventKindProto.REMOVED]: "removed",
+  [SandboxEventKindProto.PAUSING]: "pausing",
+  [SandboxEventKindProto.PAUSED]: "paused",
+  [SandboxEventKindProto.RESUMED]: "resumed",
+};
+
+/** Map one Events frame to the public DTO ("unknown" for kinds this SDK predates). */
+export function sandboxEventFromProto(event: SandboxEventProto): SandboxEvent {
+  const out: SandboxEvent = {
+    sandboxId: event.sandboxId,
+    kind: EVENT_KIND_NAMES[event.kind] ?? "unknown",
+    attributes: event.attributes,
+  };
+  assignIfSet(out, "time", optionalDate(event.time));
+  return out;
+}
+
+/** Map the GetCapabilities response to the public DTO. */
+export function capabilitiesFromProto(
+  response: GetCapabilitiesResponse,
+): Capabilities {
+  const nestedVirt: NestedVirtCapability = {
+    supported: response.nestedVirt?.supported ?? false,
+  };
+  const reason = response.nestedVirt?.reason;
+  if (reason !== undefined && reason !== "") {
+    nestedVirt.reason = reason;
+  }
+  return {
+    daemonVersion: response.daemonVersion,
+    protocol: response.protocol,
+    features: response.features,
+    nestedVirt,
+  };
 }
