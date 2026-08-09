@@ -5,7 +5,9 @@ use crate::error::{CoreError, Result};
 use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
 use arcbox_boot::download::{PrepareProgress, ProgressCallback as InnerProgressCallback};
 use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
+use semver::Version;
 use sha2::Digest;
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 /// Boot assets required for VM startup.
@@ -221,7 +223,10 @@ impl BootAssetProvider {
         ))
     }
 
-    /// Lists all cached version directories.
+    /// Lists cached version directories in ascending semantic-version order.
+    ///
+    /// Prereleases follow SemVer precedence. Invalid names sort lexically after
+    /// valid versions so stray cache directories remain visible and deterministic.
     pub async fn list_cached_versions(&self) -> Result<Vec<String>> {
         let cache_dir = &self.config.cache_dir;
         if !cache_dir.exists() {
@@ -243,7 +248,16 @@ impl BootAssetProvider {
                 }
             }
         }
-        versions.sort();
+        versions.sort_by(
+            |left, right| match (Version::parse(left), Version::parse(right)) {
+                (Ok(left_version), Ok(right_version)) => left_version
+                    .cmp_precedence(&right_version)
+                    .then_with(|| left.cmp(right)),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => left.cmp(right),
+            },
+        );
         Ok(versions)
     }
 
