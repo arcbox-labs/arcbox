@@ -24,6 +24,7 @@ export type {
   RunOptions,
   SignalName,
   StdinStatus,
+  WaitForLogOptions,
 } from "./commands";
 
 export { Ports } from "./ports";

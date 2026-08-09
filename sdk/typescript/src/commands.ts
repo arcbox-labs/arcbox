@@ -51,6 +51,9 @@ const SIGNAL_VALUES: Record<SignalName, Signal> = {
 const MAX_ATTACH_RETRIES = 3;
 const MAX_ATTACH_RETRIES_LABEL = String(MAX_ATTACH_RETRIES);
 
+/** Node clamps timer delays past 2^31 - 1 to 1ms; reject rather than mislead. */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
 /** Terminal geometry for a PTY command. */
 export interface PtySize {
   /** Terminal width in columns. */
@@ -108,6 +111,18 @@ export interface RunOptions {
 export interface CommandOutput {
   channel: "stdout" | "stderr" | "pty";
   data: Uint8Array;
+}
+
+/** Options for {@link CommandHandle.waitForLog}. */
+export interface WaitForLogOptions {
+  /**
+   * Give up after this long. Default: no deadline — the wait still ends
+   * when the command exits. On expiry a {@link TimeoutError} naming
+   * this knob is thrown; the command keeps running. Fractional values
+   * round up; the valid range is 1..2^31 - 1, and
+   * `Number.POSITIVE_INFINITY` disables the bound.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -262,6 +277,59 @@ export function commandResultFromExecution(
   }
 }
 
+/**
+ * Line-oriented pattern scanner over per-channel byte streams. Each
+ * channel gets its own streaming decoder and partial-line buffer, so
+ * interleaved chunks and multi-byte UTF-8 sequences split across chunk
+ * boundaries never corrupt a line. Memory is bounded by the longest
+ * line, not the output length.
+ */
+class LogScanner {
+  readonly #matches: (line: string) => boolean;
+  readonly #channels = new Map<
+    StdioChannel,
+    { decoder: TextDecoder; partial: string }
+  >();
+
+  constructor(pattern: string | RegExp) {
+    this.#matches =
+      typeof pattern === "string"
+        ? (line) => line.includes(pattern)
+        : (line) => {
+            // A global/sticky regex carries stateful lastIndex across
+            // test() calls; reset it so every line is tested afresh.
+            pattern.lastIndex = 0;
+            return pattern.test(line);
+          };
+  }
+
+  /** Feed one chunk; returns the first matching complete line, if any. */
+  push(channel: StdioChannel, data: Uint8Array): string | undefined {
+    let state = this.#channels.get(channel);
+    if (state === undefined) {
+      state = { decoder: new TextDecoder(), partial: "" };
+      this.#channels.set(channel, state);
+    }
+    const lines = (
+      state.partial + state.decoder.decode(data, { stream: true })
+    ).split("\n");
+    // The final element is the new unterminated tail.
+    state.partial = lines.pop() ?? "";
+    return lines.find(this.#matches);
+  }
+
+  /** End of output: test the unterminated tails too. */
+  flush(): string | undefined {
+    for (const state of this.#channels.values()) {
+      const tail = state.partial + state.decoder.decode();
+      if (tail !== "" && this.#matches(tail)) {
+        return tail;
+      }
+    }
+    return undefined;
+  }
+}
+
 type ProcessClient = Client<typeof SandboxProcessService>;
 
 /**
@@ -377,6 +445,100 @@ export class CommandHandle {
       return await this.#collectResult(execution);
     } catch (error) {
       throw toArcBoxError(error, "commands.waitForExit");
+    }
+  }
+
+  /**
+   * Wait until a log line matching `pattern` appears on any of the
+   * command's output channels, and return that line. A `string` pattern
+   * is substring containment; a `RegExp` is tested per line. Purely
+   * SDK-side — no daemon RPC beyond the attach: the offset-addressed
+   * output replays from the beginning (or the earliest retained byte),
+   * so a line printed before the call matches immediately, and a
+   * transport drop resumes through the same re-attach loop as
+   * {@link output}.
+   *
+   * Matching is line-oriented: complete lines are tested as they
+   * arrive, and a trailing unterminated line is tested once the command
+   * exits. If the command exits (or the daemon closes the record)
+   * before any match, an {@link ArcBoxError} is thrown — that is not a
+   * timeout. `timeoutMs` bounds the WAIT, not the process.
+   */
+  async waitForLog(
+    pattern: string | RegExp,
+    opts: WaitForLogOptions = {},
+  ): Promise<string> {
+    let deadline: AbortSignal | undefined;
+    if (opts.timeoutMs !== undefined) {
+      // Same knob discipline as connect(): fractional values round up,
+      // Infinity disables the bound, and the rest of the range is
+      // validated here so a bad knob surfaces as the SDK's typed error.
+      const timeoutMs = Math.ceil(opts.timeoutMs);
+      if (
+        Number.isNaN(timeoutMs) ||
+        timeoutMs <= 0 ||
+        (Number.isFinite(timeoutMs) && timeoutMs > MAX_TIMEOUT_MS)
+      ) {
+        throw new InvalidArgumentError(
+          "waitForLog timeoutMs must be a positive number of milliseconds " +
+            "at most 2**31 - 1 (Number.POSITIVE_INFINITY disables the bound)",
+          {
+            context: { timeoutMs: String(opts.timeoutMs) },
+            operation: "commands.waitForLog",
+          },
+        );
+      }
+      if (Number.isFinite(timeoutMs)) {
+        deadline = AbortSignal.timeout(timeoutMs);
+      }
+    }
+    const patternLabel = String(pattern);
+    const scanner = new LogScanner(pattern);
+    try {
+      for await (const event of this.#attachEvents(
+        "commands.waitForLog",
+        deadline,
+      )) {
+        if (event.event.case === "output") {
+          const chunk = event.event.value;
+          const line = scanner.push(chunk.channel, chunk.data);
+          if (line !== undefined) {
+            return line;
+          }
+        } else if (event.event.case === "exited") {
+          break;
+        }
+      }
+      // The command exited (or the daemon closed the record): a
+      // trailing unterminated line still counts.
+      const tail = scanner.flush();
+      // eslint-disable-next-line sukka/prefer-nullthrow -- a miss must surface as the SDK's typed ArcBoxError with context, not a generic invariant error
+      if (tail === undefined) {
+        throw new ArcBoxError(
+          "the command exited before the log pattern appeared",
+          {
+            operation: "commands.waitForLog",
+            context: { commandId: this.commandId, pattern: patternLabel },
+          },
+        );
+      }
+      return tail;
+    } catch (error) {
+      // A failure observed after the deadline fired is the deadline
+      // surfacing (the aborted attach stream) — the only aborter of
+      // this signal is the timeout.
+      if (deadline?.aborted === true && !(error instanceof TimeoutError)) {
+        throw new TimeoutError(
+          "waitForLog(timeoutMs) elapsed before the log pattern appeared",
+          {
+            suggestion: "increase the waitForLog timeoutMs option",
+            operation: "commands.waitForLog",
+            cause: error,
+            context: { commandId: this.commandId, pattern: patternLabel },
+          },
+        );
+      }
+      throw toArcBoxError(error, "commands.waitForLog");
     }
   }
 
@@ -507,19 +669,25 @@ export class CommandHandle {
    * output resets it); once exhausted, the stream-death
    * {@link ConnectionLostError} carries the last transport failure.
    */
-  async *#attachEvents(operation: string): AsyncGenerator<ExecutionEvent> {
+  async *#attachEvents(
+    operation: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ExecutionEvent> {
     let stdoutOffset = 0n;
     let stderrOffset = 0n;
     let failures = 0;
     for (;;) {
       try {
         // eslint-disable-next-line no-await-in-loop -- sequential by design: each re-attach resumes where the last stream died
-        for await (const event of this.#client.attachExecution({
-          sandboxId: this.#sandboxId,
-          executionId: this.commandId,
-          stdoutOffset,
-          stderrOffset,
-        })) {
+        for await (const event of this.#client.attachExecution(
+          {
+            sandboxId: this.#sandboxId,
+            executionId: this.commandId,
+            stdoutOffset,
+            stderrOffset,
+          },
+          signal === undefined ? undefined : { signal },
+        )) {
           if (event.event.case === "output") {
             const chunk = event.event.value;
             const after = chunk.offset + BigInt(chunk.data.byteLength);
@@ -543,6 +711,10 @@ export class CommandHandle {
         return;
       } catch (error) {
         const mapped = toArcBoxError(error, operation);
+        // An aborted caller deadline is never worth re-dialing for.
+        if (signal?.aborted === true) {
+          throw mapped;
+        }
         if (!(mapped instanceof ConnectionFailedError)) {
           throw mapped;
         }
