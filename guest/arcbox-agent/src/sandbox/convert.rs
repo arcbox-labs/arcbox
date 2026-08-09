@@ -2,6 +2,7 @@
 //! plus the shared id-ordered pagination helper.
 
 use arcbox_connect::sandbox_v1;
+use arcbox_vm::file_io::proto as file_proto;
 use arcbox_vm::{
     CheckpointInfo, CheckpointSummary, ExecutionChannel, ExecutionSnapshot, ExitStatus, IdleAction,
     SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxState, SandboxSummary, StdinState,
@@ -75,6 +76,53 @@ pub(super) fn execution_to_proto(snap: &ExecutionSnapshot) -> sandbox_v1::Execut
         stdout_len: snap.stdout_len,
         stderr_len: snap.stderr_len,
         stdin: stdin_to_proto(snap.stdin).into(),
+        ..Default::default()
+    }
+}
+
+/// Map a file-channel kind string onto the wire enum.
+fn file_kind_to_proto(kind: &str) -> sandbox_v1::FileKind {
+    match kind {
+        file_proto::KIND_FILE => sandbox_v1::FileKind::File,
+        file_proto::KIND_DIR => sandbox_v1::FileKind::Directory,
+        file_proto::KIND_SYMLINK => sandbox_v1::FileKind::Symlink,
+        file_proto::KIND_OTHER => sandbox_v1::FileKind::Other,
+        _ => sandbox_v1::FileKind::Unspecified,
+    }
+}
+
+pub(super) fn file_stat_to_proto(dto: &file_proto::FileStatDto) -> sandbox_v1::FileStat {
+    sandbox_v1::FileStat {
+        name: dto.name.clone(),
+        kind: file_kind_to_proto(&dto.kind).into(),
+        size: dto.size,
+        mode: dto.mode,
+        modified_at: Timestamp {
+            seconds: dto.mtime_secs,
+            // Sub-second nanos are < 1e9; i32 holds them.
+            nanos: i32::try_from(dto.mtime_nanos).unwrap_or(0),
+            ..Default::default()
+        }
+        .into(),
+        uid: dto.uid,
+        gid: dto.gid,
+        symlink_target: dto.symlink_target.clone(),
+        ..Default::default()
+    }
+}
+
+pub(super) fn fs_event_to_proto(dto: file_proto::FsEventDto) -> sandbox_v1::FsEvent {
+    let kind = match dto.kind.as_str() {
+        file_proto::EVENT_CREATED => sandbox_v1::FsEventKind::Created,
+        file_proto::EVENT_MODIFIED => sandbox_v1::FsEventKind::Modified,
+        file_proto::EVENT_REMOVED => sandbox_v1::FsEventKind::Removed,
+        file_proto::EVENT_RENAMED => sandbox_v1::FsEventKind::Renamed,
+        _ => sandbox_v1::FsEventKind::Unspecified,
+    };
+    sandbox_v1::FsEvent {
+        kind: kind.into(),
+        path: dto.path,
+        renamed_to: dto.renamed_to,
         ..Default::default()
     }
 }

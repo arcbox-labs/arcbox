@@ -15,13 +15,15 @@ use self::transport::{AgentTransport, BLOCKING_RPC_TIMEOUT};
 use crate::error::{CoreError, Result};
 use arcbox_connect::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CheckpointResponse, CreateSandboxRequest,
-    CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk,
-    GetStdinStatusRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, PauseSandboxRequest, ReadFileRequest,
-    RemoveSandboxRequest, ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent,
-    SandboxEventsRequest, SandboxInfo, SetLifecycleRequest, SignalExecutionRequest,
-    StartExecutionRequest, StdinStatus, StopSandboxRequest, WaitExecutionRequest, WriteFileOpen,
-    WriteStdinRequest, execution_event,
+    CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk, FileStat,
+    GetStdinStatusRequest, InspectSandboxRequest, ListDirRequest, ListDirResponse,
+    ListExecutionsRequest, ListExecutionsResponse, ListSandboxesRequest, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, MakeDirRequest, MoveEntryRequest,
+    PauseSandboxRequest, ReadFileRequest, RemoveEntryRequest, RemoveSandboxRequest,
+    ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent, SandboxEventsRequest,
+    SandboxInfo, SetLifecycleRequest, SignalExecutionRequest, StartExecutionRequest,
+    StatFileRequest, StdinStatus, StopSandboxRequest, WaitExecutionRequest, WaitForPortRequest,
+    WatchDirRequest, WatchDirResponse, WriteFileOpen, WriteStdinRequest, execution_event,
 };
 use arcbox_connect::v1::{
     AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
@@ -1387,6 +1389,154 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Stats one path inside a sandbox (symlinks reported, not followed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_stat(&mut self, req: StatFileRequest) -> Result<FileStat> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxFileStatRequest,
+            &payload,
+            MessageType::SandboxFileStatResponse,
+        )
+        .await
+    }
+
+    /// Lists a sandbox directory, non-recursively, with full per-entry
+    /// metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_list_dir(&mut self, req: ListDirRequest) -> Result<ListDirResponse> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxFileListDirRequest,
+            &payload,
+            MessageType::SandboxFileListDirResponse,
+        )
+        .await
+    }
+
+    /// Creates a directory inside a sandbox (`mkdir -p` semantics).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_make_dir(&mut self, req: MakeDirRequest) -> Result<()> {
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxFileMakeDirRequest, &req.encode_to_vec())
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxFileMakeDirResponse)
+    }
+
+    /// Removes a file, symlink, or directory inside a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_remove_entry(&mut self, req: RemoveEntryRequest) -> Result<()> {
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxFileRemoveRequest, &req.encode_to_vec())
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxFileRemoveResponse)
+    }
+
+    /// Renames / moves an entry within a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_move_entry(&mut self, req: MoveEntryRequest) -> Result<()> {
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxFileMoveRequest, &req.encode_to_vec())
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxFileMoveResponse)
+    }
+
+    /// Opens a directory watch stream inside a sandbox.
+    ///
+    /// The guest confirms establishment with an immediate keepalive frame
+    /// and interleaves further keepalives while idle; the channel closes
+    /// cleanly when the guest ends the stream (sandbox stop). Consumes the
+    /// client because the stream task requires exclusive transport access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial send fails; in-stream failures
+    /// arrive as `Err` items on the channel.
+    pub async fn sandbox_watch_dir(
+        mut self,
+        req: WatchDirRequest,
+    ) -> Result<mpsc::Receiver<Result<WatchDirResponse>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+        let buf = wire::build_message(MessageType::SandboxFileWatchRequest, "", &payload);
+        self.transport
+            .async_send(buf)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send watch-dir request: {e}")))?;
+
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            loop {
+                let raw = match self.transport.async_recv().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!("recv error: {e}"))))
+                            .await;
+                        break;
+                    }
+                };
+                let (resp_type, _, resp_payload) = match wire::parse_response(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                };
+                if resp_type == MessageType::SandboxFileWatchEnd as u32 {
+                    break; // clean end: the sandbox stopped
+                }
+                if resp_type == MessageType::Error as u32 {
+                    let (code, message) = wire::parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_string()));
+                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    break;
+                }
+                if resp_type != MessageType::SandboxFileWatchEvent as u32 {
+                    let _ = tx
+                        .send(Err(CoreError::Machine(format!(
+                            "unexpected response type: 0x{resp_type:04x}"
+                        ))))
+                        .await;
+                    break;
+                }
+                match WatchDirResponse::decode_from_slice(&resp_payload) {
+                    Ok(frame) => {
+                        if tx.send(Ok(frame)).await.is_err() {
+                            break; // consumer gone: dropping self cancels the watch
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!("decode error: {e}"))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
     /// Runs a command in the machine root (the agent's own mount namespace)
     /// and returns a channel of streaming output.
     ///
@@ -1691,6 +1841,40 @@ impl AgentClient {
             MessageType::SandboxExecWaitResponse,
         )
         .await
+    }
+
+    /// Lists a sandbox's retained executions, running and exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_exec_list(
+        &mut self,
+        req: ListExecutionsRequest,
+    ) -> Result<ListExecutionsResponse> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxExecListRequest,
+            &payload,
+            MessageType::SandboxExecListResponse,
+        )
+        .await
+    }
+
+    /// Waits until something inside a sandbox listens on a TCP port.
+    ///
+    /// The guest enforces the wait budget from `req.timeout_seconds` (the
+    /// caller resolves the default) and answers 504 when it elapses; the
+    /// async transport applies no client-side deadline of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the deadline elapses.
+    pub async fn sandbox_wait_for_port(&mut self, req: WaitForPortRequest) -> Result<()> {
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxWaitForPortRequest, &req.encode_to_vec())
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxWaitForPortResponse)
     }
 
     /// Attaches to an execution's output and returns a channel of

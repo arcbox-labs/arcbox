@@ -66,6 +66,8 @@ impl From<ApiError> for connectrpc::ConnectError {
                     // Stdin offset gap: resync via GetStdinStatus.
                     416 => ErrorCode::OutOfRange,
                     503 => ErrorCode::Unavailable,
+                    // A bounded guest wait elapsed (e.g. WaitForPort).
+                    504 => ErrorCode::DeadlineExceeded,
                     _ => ErrorCode::Internal,
                 };
                 let mut error = Self::new(connect_code, message);
@@ -104,6 +106,30 @@ fn classify_agent_error(code: i32, message: &str) -> Option<connectrpc::ErrorDet
             "list sandboxes with `abctl sandbox list`",
             &[],
         )),
+        // VmmError::PathNotFound → "path not found: {path}" (the sandbox
+        // filesystem verbs, CORE-62).
+        404 if message.starts_with("path not found: ") => {
+            let path = message.strip_prefix("path not found: ").unwrap_or_default();
+            Some(error_info(
+                pb::ErrorCode::FileNotFound,
+                "check the path with `Stat` or `ListDir` on its parent directory",
+                &[("path", path)],
+            ))
+        }
+        // The guest agent's per-file write cap → "file exceeds the
+        // {limit}-byte write limit".
+        400 if message.contains("-byte write limit") => {
+            let limit = message
+                .split("exceeds the ")
+                .nth(1)
+                .and_then(|rest| rest.split("-byte").next())
+                .unwrap_or_default();
+            Some(error_info(
+                pb::ErrorCode::FileTooLarge,
+                "split the payload or ship it through the sandbox's own tooling",
+                &[("limit_bytes", limit)],
+            ))
+        }
         // Guest-side nested-virt probe failure (the daemon's own fail-fast
         // gate attaches this detail directly; this covers agent-originated
         // 412s, e.g. a stale capability view).
@@ -283,6 +309,47 @@ mod tests {
             ),
             Some(pb::ErrorCode::TemplateInvalid)
         );
+        // VmmError::PathNotFound (the filesystem verbs, CORE-62).
+        assert_eq!(
+            classified(404, "path not found: /work/missing.txt"),
+            Some(pb::ErrorCode::FileNotFound)
+        );
+        // The guest agent's per-file write cap.
+        assert_eq!(
+            classified(400, "file exceeds the 268435456-byte write limit"),
+            Some(pb::ErrorCode::FileTooLarge)
+        );
+    }
+
+    #[test]
+    fn file_not_found_context_carries_the_path() {
+        let detail =
+            classify_agent_error(404, "path not found: /work/missing.txt").expect("classified");
+        let info = decode_info(&detail);
+        assert_eq!(
+            info.context.get("path").map(String::as_str),
+            Some("/work/missing.txt")
+        );
+    }
+
+    #[test]
+    fn file_too_large_context_carries_the_limit() {
+        let detail = classify_agent_error(400, "file exceeds the 268435456-byte write limit")
+            .expect("classified");
+        let info = decode_info(&detail);
+        assert_eq!(
+            info.context.get("limit_bytes").map(String::as_str),
+            Some("268435456")
+        );
+    }
+
+    #[test]
+    fn deadline_wire_code_maps_to_deadline_exceeded() {
+        let error = connectrpc::ConnectError::from(ApiError::Core(arcbox_core::CoreError::Agent {
+            code: 504,
+            message: "no listener on port 8080 in sandbox 'box1' within 30s".into(),
+        }));
+        assert_eq!(error.code, connectrpc::ErrorCode::DeadlineExceeded);
     }
 
     #[test]

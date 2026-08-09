@@ -22,13 +22,15 @@ use arcbox_grpc::sandbox_v1::sandbox_service_client::SandboxServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
 use arcbox_protocol::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, Execution, ExecutionEvent,
-    FileChunk, GetCapabilitiesRequest, GetStdinStatusRequest, IdleAction, InspectSandboxRequest,
-    ListSandboxesRequest, PauseSandboxRequest, ReadFileRequest, RemoveSandboxRequest,
-    ResourceLimits, RestoreRequest, ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest,
-    SandboxState, SetLifecycleRequest, Signal, SignalExecutionRequest, StartExecutionRequest,
-    StdioChannel, StopSandboxRequest, WaitExecutionRequest, WatchEventsResponse, WriteFileOpen,
-    WriteFileRequest, WriteStdinRequest, execution_event, exit_status, watch_events_response,
-    write_file_request,
+    ExecutionState, FileChunk, FileKind, FsEventKind, GetCapabilitiesRequest,
+    GetStdinStatusRequest, IdleAction, InspectSandboxRequest, ListDirRequest,
+    ListExecutionsRequest, ListSandboxesRequest, MakeDirRequest, MoveEntryRequest,
+    PauseSandboxRequest, ReadFileRequest, RemoveEntryRequest, RemoveSandboxRequest, ResourceLimits,
+    RestoreRequest, ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest, SandboxState,
+    SetLifecycleRequest, Signal, SignalExecutionRequest, StartExecutionRequest, StatFileRequest,
+    StdioChannel, StopSandboxRequest, WaitExecutionRequest, WaitForPortRequest, WatchDirRequest,
+    WatchEventsResponse, WriteFileOpen, WriteFileRequest, WriteStdinRequest, execution_event,
+    exit_status, watch_dir_response, watch_events_response, write_file_request,
 };
 use tonic::transport::Channel;
 use tracing::{info, warn};
@@ -392,6 +394,19 @@ async fn drive_sandboxes(
     }
     metrics.record("sandbox_file_io", file_started.elapsed().as_secs_f64());
     info!("file round-trip verified");
+
+    // -- CORE-62: filesystem verbs + WatchDir ------------------------------
+    let verbs_started = Instant::now();
+    file_verbs_scenario(&mut files).await?;
+    metrics.record("sandbox_file_verbs", verbs_started.elapsed().as_secs_f64());
+
+    // -- CORE-58 phase 2: ListExecutions + WaitForPort ---------------------
+    let process_started = Instant::now();
+    process_plane_scenario(&mut sandboxes, &mut processes).await?;
+    metrics.record(
+        "sandbox_process_plane",
+        process_started.elapsed().as_secs_f64(),
+    );
 
     // -- Pause / transparent auto-resume / explicit Resume (CORE-21) -------
     let pause_started = Instant::now();
@@ -1426,6 +1441,298 @@ async fn run_and_collect(
         Some(exit_status::Status::Code(0)) => Ok(stdout),
         other => bail!("command {cmd:?} exit status {other:?}: {stdout:?}"),
     }
+}
+
+/// CORE-62 acceptance: the filesystem verbs round-trip against a live
+/// sandbox — mkdir -p semantics, symlink-free stat metadata, a full
+/// listing, rename, the non-empty-remove guard — and a recursive WatchDir
+/// opened before the mutations reports them as events (with keepalives
+/// interleaved) until the client cancels it.
+async fn file_verbs_scenario(files: &mut SandboxFilesystemServiceClient<Channel>) -> Result<()> {
+    let make_dir = MakeDirRequest {
+        id: "smoke1".into(),
+        path: "/tmp/verbs/nested".into(),
+        mode: 0,
+    };
+    files
+        .make_dir(with_machine(make_dir.clone()))
+        .await
+        .context("MakeDir failed")?;
+    // `mkdir -p` semantics: an existing directory succeeds.
+    files
+        .make_dir(with_machine(make_dir))
+        .await
+        .context("MakeDir on an existing directory failed")?;
+
+    let stat = files
+        .stat(with_machine(StatFileRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs/nested".into(),
+        }))
+        .await
+        .context("Stat directory failed")?
+        .into_inner();
+    if stat.kind() != FileKind::Directory {
+        bail!("expected a directory, got {:?}", stat.kind());
+    }
+
+    // Open the watch BEFORE mutating, so the mutations below are events.
+    let mut watch = files
+        .watch_dir(with_machine(WatchDirRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs".into(),
+            recursive: true,
+        }))
+        .await
+        .context("WatchDir failed")?
+        .into_inner();
+
+    let payload = b"file-verbs payload".to_vec();
+    write_file(files, "smoke1", "/tmp/verbs/nested/a.bin", &payload).await?;
+
+    let stat = files
+        .stat(with_machine(StatFileRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs/nested/a.bin".into(),
+        }))
+        .await
+        .context("Stat file failed")?
+        .into_inner();
+    if stat.kind() != FileKind::File || stat.size != payload.len() as u64 {
+        bail!("unexpected file stat: {stat:?}");
+    }
+    if stat.mode != 0o644 {
+        bail!("expected default 0644 mode, got {:o}", stat.mode);
+    }
+    if stat.name != "a.bin" {
+        bail!("expected base name a.bin, got {:?}", stat.name);
+    }
+
+    let listing = files
+        .list_dir(with_machine(ListDirRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs/nested".into(),
+        }))
+        .await
+        .context("ListDir failed")?
+        .into_inner();
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    if names != ["a.bin"] {
+        bail!("unexpected listing: {names:?}");
+    }
+
+    files
+        .r#move(with_machine(MoveEntryRequest {
+            id: "smoke1".into(),
+            from_path: "/tmp/verbs/nested/a.bin".into(),
+            to_path: "/tmp/verbs/nested/b.bin".into(),
+        }))
+        .await
+        .context("Move failed")?;
+
+    // The old path is gone — and carries the FILE_NOT_FOUND classification's
+    // transport code (NOT_FOUND).
+    let err = files
+        .stat(with_machine(StatFileRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs/nested/a.bin".into(),
+        }))
+        .await
+        .err()
+        .context("Stat of the moved-away path unexpectedly succeeded")?;
+    if err.code() != tonic::Code::NotFound {
+        bail!("expected NOT_FOUND for the old path, got {err:?}");
+    }
+    let back = read_file(files, "smoke1", "/tmp/verbs/nested/b.bin").await?;
+    if back != payload {
+        bail!("moved file content mismatch");
+    }
+
+    // The watch saw the mutations: drain until both the file's creation and
+    // the rename appear (keepalives and intermediate events are skipped).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut saw_created, mut saw_renamed, mut saw_keepalive) = (false, false, false);
+    while !(saw_created && saw_renamed) {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("WatchDir events did not arrive within 30s")?;
+        let frame = tokio::time::timeout(remaining, watch.message())
+            .await
+            .context("WatchDir stream stalled")?
+            .context("WatchDir stream error")?
+            .context("WatchDir stream ended before the expected events")?;
+        match frame.payload {
+            Some(watch_dir_response::Payload::Event(event)) => {
+                info!(kind = ?event.kind(), path = %event.path, renamed_to = %event.renamed_to,
+                      "watch event");
+                if event.path == "/tmp/verbs/nested/a.bin"
+                    && matches!(event.kind(), FsEventKind::Created | FsEventKind::Modified)
+                {
+                    saw_created = true;
+                }
+                if event.kind() == FsEventKind::Renamed
+                    && event.path == "/tmp/verbs/nested/a.bin"
+                    && event.renamed_to == "/tmp/verbs/nested/b.bin"
+                {
+                    saw_renamed = true;
+                }
+            }
+            Some(watch_dir_response::Payload::KeepAlive(_)) => saw_keepalive = true,
+            None => {}
+        }
+    }
+    if !saw_keepalive {
+        bail!("WatchDir never interleaved a keepalive frame");
+    }
+    // Client-side cancellation: dropping the stream tears the watch down.
+    drop(watch);
+
+    // A non-empty directory refuses a non-recursive remove...
+    let err = files
+        .remove(with_machine(RemoveEntryRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs".into(),
+            recursive: false,
+        }))
+        .await
+        .err()
+        .context("non-recursive Remove of a non-empty directory succeeded")?;
+    if err.code() != tonic::Code::FailedPrecondition {
+        bail!("expected FAILED_PRECONDITION, got {err:?}");
+    }
+    // ...and a recursive one takes the tree out.
+    files
+        .remove(with_machine(RemoveEntryRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs".into(),
+            recursive: true,
+        }))
+        .await
+        .context("recursive Remove failed")?;
+    let err = files
+        .stat(with_machine(StatFileRequest {
+            id: "smoke1".into(),
+            path: "/tmp/verbs".into(),
+        }))
+        .await
+        .err()
+        .context("Stat of the removed tree unexpectedly succeeded")?;
+    if err.code() != tonic::Code::NotFound {
+        bail!("expected NOT_FOUND after the recursive remove, got {err:?}");
+    }
+
+    info!("filesystem verbs + WatchDir verified");
+    Ok(())
+}
+
+/// CORE-58 phase 2 acceptance: WaitForPort fails fast with
+/// DEADLINE_EXCEEDED while nothing listens, flips once a workload binds
+/// the port (the guest watches its own listen table — no client polling),
+/// and ListExecutions rediscovers the listener both while it runs and
+/// after it exits.
+async fn process_plane_scenario(
+    sandboxes: &mut SandboxServiceClient<Channel>,
+    processes: &mut SandboxProcessServiceClient<Channel>,
+) -> Result<()> {
+    const PORT: u32 = 23456;
+
+    // The listener below needs busybox `nc`; fail with a clear message if
+    // the rootfs busybox was built without it.
+    let nc_probe = run_and_collect(processes, "smoke1", &["/bin/sh", "-c", "command -v nc"]).await;
+    if nc_probe.is_err() {
+        bail!("the sandbox rootfs busybox has no `nc` applet; the WaitForPort phase needs one");
+    }
+    wait_ready(sandboxes, "smoke1").await?;
+
+    // No listener: a 1 s budget elapses as DEADLINE_EXCEEDED.
+    let err = processes
+        .wait_for_port(with_machine(WaitForPortRequest {
+            sandbox_id: "smoke1".into(),
+            port: PORT,
+            timeout_seconds: 1,
+        }))
+        .await
+        .err()
+        .context("WaitForPort succeeded with nothing listening")?;
+    if err.code() != tonic::Code::DeadlineExceeded {
+        bail!("expected DEADLINE_EXCEEDED, got {err:?}");
+    }
+
+    // Start a listener, then wait for the port to come up.
+    let listener = start_execution(
+        processes,
+        "smoke1",
+        "port-listener",
+        &["/bin/sh", "-c", "exec nc -l -p 23456 >/dev/null"],
+        false,
+    )
+    .await?;
+    processes
+        .wait_for_port(with_machine(WaitForPortRequest {
+            sandbox_id: "smoke1".into(),
+            port: PORT,
+            timeout_seconds: 30,
+        }))
+        .await
+        .context("WaitForPort did not observe the listener")?;
+
+    // ListExecutions rediscovers the running listener by id.
+    let listing = processes
+        .list_executions(with_machine(ListExecutionsRequest {
+            sandbox_id: "smoke1".into(),
+        }))
+        .await
+        .context("ListExecutions failed")?
+        .into_inner();
+    let found = listing
+        .executions
+        .iter()
+        .find(|e| e.id == listener.id)
+        .context("listener missing from ListExecutions")?;
+    if found.state() != ExecutionState::Running {
+        bail!("expected the listener RUNNING, got {:?}", found.state());
+    }
+
+    // Tear the listener down and confirm the exited record stays listed.
+    processes
+        .signal_execution(with_machine(SignalExecutionRequest {
+            sandbox_id: "smoke1".into(),
+            execution_id: listener.id.clone(),
+            signal: Signal::Sigkill.into(),
+        }))
+        .await
+        .context("SignalExecution failed")?;
+    let done = processes
+        .wait_execution(with_machine(WaitExecutionRequest {
+            sandbox_id: "smoke1".into(),
+            execution_id: listener.id.clone(),
+            timeout_seconds: 30,
+        }))
+        .await
+        .context("WaitExecution failed")?
+        .into_inner();
+    if done.state() != ExecutionState::Exited {
+        bail!("listener did not exit after SIGKILL: {done:?}");
+    }
+    let listing = processes
+        .list_executions(with_machine(ListExecutionsRequest {
+            sandbox_id: "smoke1".into(),
+        }))
+        .await
+        .context("ListExecutions (after exit) failed")?
+        .into_inner();
+    let found = listing
+        .executions
+        .iter()
+        .find(|e| e.id == listener.id)
+        .context("exited listener missing from ListExecutions")?;
+    if found.state() != ExecutionState::Exited {
+        bail!("expected the listener EXITED, got {:?}", found.state());
+    }
+
+    wait_ready(sandboxes, "smoke1").await?;
+    info!("ListExecutions + WaitForPort verified");
+    Ok(())
 }
 
 async fn write_file(

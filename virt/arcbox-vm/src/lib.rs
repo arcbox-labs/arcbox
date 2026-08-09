@@ -33,6 +33,8 @@ pub mod boot_proto;
 pub mod config;
 pub mod error;
 pub mod file_io;
+pub mod file_watch;
+pub mod listen_table;
 pub mod network;
 pub mod sandbox;
 pub mod snapshot;
@@ -61,7 +63,7 @@ pub use sandbox::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
-pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
+pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 
 // Re-export VmState for system_svc compatibility (internal use only).
 pub use instance::VmState;

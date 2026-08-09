@@ -243,4 +243,40 @@ impl SandboxService {
             .map_err(SandboxError::from)?;
         Ok(convert::execution_to_proto(&snapshot))
     }
+
+    /// List a sandbox's retained executions, running and exited.
+    pub fn list_executions(
+        &self,
+        payload: &[u8],
+    ) -> Result<sandbox_v1::ListExecutionsResponse, SandboxError> {
+        let req = sandbox_v1::ListExecutionsRequest::decode_from_slice(payload)
+            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let snapshots = self
+            .manager
+            .list_executions(&req.sandbox_id)
+            .map_err(SandboxError::from)?;
+        Ok(sandbox_v1::ListExecutionsResponse {
+            executions: snapshots.iter().map(convert::execution_to_proto).collect(),
+            ..Default::default()
+        })
+    }
+
+    /// Wait for a TCP listener inside the sandbox (the caller resolves the
+    /// timeout default; 0 checks once).
+    pub async fn wait_for_port(&self, payload: &[u8]) -> Result<(), SandboxError> {
+        let req = sandbox_v1::WaitForPortRequest::decode_from_slice(payload)
+            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let port = u16::try_from(req.port)
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| SandboxError::InvalidArgument(format!("invalid port {}", req.port)))?;
+        self.manager
+            .wait_sandbox_port(
+                &req.sandbox_id,
+                port,
+                Duration::from_secs(u64::from(req.timeout_seconds)),
+            )
+            .await
+            .map_err(SandboxError::from)
+    }
 }

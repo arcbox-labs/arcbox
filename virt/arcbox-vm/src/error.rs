@@ -61,6 +61,26 @@ pub enum VmmError {
     #[error("vsock error: {0}")]
     Vsock(String),
 
+    /// A path inside a sandbox does not exist. The message shape is a
+    /// contract: the daemon's error classifier keys on the "path not
+    /// found:" prefix to attach the `FILE_NOT_FOUND` registry code.
+    #[error("path not found: {0}")]
+    PathNotFound(String),
+
+    /// A directory operation addressed a non-directory path.
+    #[error("not a directory: {0}")]
+    NotADirectory(String),
+
+    /// Refused to remove a non-empty directory without `recursive`
+    /// (`FAILED_PRECONDITION` per the filesystem contract).
+    #[error("directory not empty: {0}")]
+    DirectoryNotEmpty(String),
+
+    /// A bounded wait elapsed before the awaited condition held
+    /// (`DEADLINE_EXCEEDED` on the daemon surface).
+    #[error("deadline exceeded: {0}")]
+    DeadlineExceeded(String),
+
     /// A retryable operation whose durable result could not be confirmed.
     #[error("service unavailable: {0}")]
     Unavailable(String),

@@ -30,6 +30,10 @@ pub enum SandboxError {
     StdinGap(String),
     /// The host / guest lacks a prerequisite (e.g. nested virtualization).
     Unsupported(String),
+    /// A bounded wait elapsed before the awaited condition held (e.g. a
+    /// `WaitForPort` deadline). Carried as 504 so the daemon maps it onto
+    /// `DEADLINE_EXCEEDED` instead of a blanket `INTERNAL`.
+    Deadline(String),
     /// A retryable runtime condition, including an unconfirmed durable write.
     Unavailable(String),
     /// A runtime or business-logic error.
@@ -47,6 +51,7 @@ impl fmt::Display for SandboxError {
             | Self::SandboxPaused(msg)
             | Self::StdinGap(msg)
             | Self::Unsupported(msg)
+            | Self::Deadline(msg)
             | Self::Unavailable(msg)
             | Self::Internal(msg) => f.write_str(msg),
         }
@@ -71,6 +76,7 @@ impl SandboxError {
             Self::StdinGap(_) => 416,
             Self::SandboxPaused(_) => 423,
             Self::Unavailable(_) => 503,
+            Self::Deadline(_) => 504,
             Self::Internal(_) => 500,
         }
     }
@@ -80,17 +86,28 @@ impl From<arcbox_vm::VmmError> for SandboxError {
     fn from(e: arcbox_vm::VmmError) -> Self {
         use arcbox_vm::VmmError;
         match &e {
-            VmmError::NotFound(_) => Self::NotFound(e.to_string()),
+            // A missing sandbox path keeps its typed "path not found:"
+            // message: the daemon's classifier maps the 404 onto the
+            // FILE_NOT_FOUND registry code by that prefix.
+            VmmError::NotFound(_) | VmmError::PathNotFound(_) => Self::NotFound(e.to_string()),
             VmmError::AlreadyExists(_) => Self::AlreadyExists(e.to_string()),
-            VmmError::WrongState { .. } => Self::WrongState(e.to_string()),
+            // A non-empty directory is a precondition failure (412), like a
+            // wrong sandbox state: retrying without `recursive` never helps.
+            VmmError::WrongState { .. } | VmmError::DirectoryNotEmpty(_) => {
+                Self::WrongState(e.to_string())
+            }
             VmmError::Paused(_) => Self::SandboxPaused(e.to_string()),
             VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
+            VmmError::DeadlineExceeded(_) => Self::Deadline(e.to_string()),
             VmmError::Unavailable(_) | VmmError::AckUnconfirmed { .. } => {
                 Self::Unavailable(e.to_string())
             }
-            // Invalid caller input (e.g. a rejected sandbox id) is a 400, not a
-            // 500 — otherwise a bad request surfaces as INTERNAL to the client.
-            VmmError::Config(_) => Self::InvalidArgument(e.to_string()),
+            // Invalid caller input (e.g. a rejected sandbox id, or a
+            // directory verb aimed at a non-directory) is a 400, not a
+            // 500 — otherwise a bad request surfaces as INTERNAL.
+            VmmError::Config(_) | VmmError::NotADirectory(_) => {
+                Self::InvalidArgument(e.to_string())
+            }
             _ => Self::Internal(e.to_string()),
         }
     }
@@ -128,6 +145,36 @@ mod tests {
         let err = SandboxError::from(arcbox_vm::VmmError::Paused("box".into()));
         assert!(matches!(err, SandboxError::SandboxPaused(_)));
         assert_eq!(err.status_code(), 423);
+    }
+
+    #[test]
+    fn path_not_found_maps_to_404_with_the_classifier_prefix() {
+        let err = SandboxError::from(arcbox_vm::VmmError::PathNotFound("/a/b".into()));
+        assert!(matches!(err, SandboxError::NotFound(_)));
+        assert_eq!(err.status_code(), 404);
+        // The daemon classifier keys on this exact prefix (FILE_NOT_FOUND).
+        assert_eq!(err.to_string(), "path not found: /a/b");
+    }
+
+    #[test]
+    fn directory_not_empty_maps_to_412() {
+        let err = SandboxError::from(arcbox_vm::VmmError::DirectoryNotEmpty("/full".into()));
+        assert_eq!(err.status_code(), 412);
+    }
+
+    #[test]
+    fn not_a_directory_maps_to_400() {
+        let err = SandboxError::from(arcbox_vm::VmmError::NotADirectory("/a/file".into()));
+        assert_eq!(err.status_code(), 400);
+    }
+
+    #[test]
+    fn deadline_maps_to_504_for_the_daemon_deadline_code() {
+        let err = SandboxError::from(arcbox_vm::VmmError::DeadlineExceeded(
+            "no listener on port 8080".into(),
+        ));
+        assert!(matches!(err, SandboxError::Deadline(_)));
+        assert_eq!(err.status_code(), 504);
     }
 
     #[test]

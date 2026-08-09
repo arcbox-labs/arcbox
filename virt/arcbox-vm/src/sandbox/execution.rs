@@ -531,6 +531,19 @@ impl ExecutionRegistry {
             })
     }
 
+    /// Snapshots of every retained execution of one sandbox — running and
+    /// exited, until the retention GC drops them.
+    fn list(&self, sandbox_id: &str) -> Vec<ExecutionSnapshot> {
+        self.inner
+            .lock()
+            .unwrap()
+            .live
+            .iter()
+            .filter(|((sid, _), _)| sid == sandbox_id)
+            .map(|(_, exec)| exec.snapshot())
+            .collect()
+    }
+
     /// Remove `exec`'s entry if it is still the registered generation.
     fn remove_generation(&self, exec: &Arc<Execution>) {
         let key = (exec.sandbox_id.clone(), exec.id.clone());
@@ -828,6 +841,44 @@ impl SandboxManager {
             .get(sandbox_id, execution_id)?
             .wait(timeout)
             .await)
+    }
+
+    /// List a sandbox's retained executions, running and exited, ordered by
+    /// start time (then id, for a stable order under equal timestamps).
+    ///
+    /// The sandbox must exist; an unknown id is `NotFound` rather than an
+    /// empty list, so a caller can tell "no executions" from a typo.
+    pub fn list_executions(&self, sandbox_id: &SandboxId) -> Result<Vec<ExecutionSnapshot>> {
+        self.get_instance(sandbox_id)?;
+        let mut snapshots = self.executions.list(sandbox_id);
+        snapshots.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(snapshots)
+    }
+
+    /// Wait until something inside an alive sandbox listens on TCP `port`,
+    /// or fail with [`VmmError::DeadlineExceeded`] once `timeout` elapses.
+    ///
+    /// The vm-agent watches the guest's own listen table in-process — no
+    /// connect probes that would perturb the workload with spurious
+    /// accepted connections.
+    pub async fn wait_sandbox_port(
+        &self,
+        id: &SandboxId,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<()> {
+        let uds = self.require_alive_vsock(id)?;
+        match vsock::wait_for_port(&uds, port, timeout).await? {
+            crate::vsock::PortWait::Listening => Ok(()),
+            crate::vsock::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+                "no listener on port {port} in sandbox '{id}' within {}s",
+                timeout.as_secs()
+            ))),
+        }
     }
 }
 

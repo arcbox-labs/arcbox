@@ -19,6 +19,27 @@ use super::sandbox_locks::SandboxOperationLocks;
 use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 
+/// Wait budget applied when `WaitForPortRequest.timeout_seconds` is 0, as
+/// documented on the proto field ("0 = daemon default of 30 s").
+const DEFAULT_WAIT_FOR_PORT_TIMEOUT_SECS: u32 = 30;
+
+/// Cap on the caller-supplied wait budget. Each wait occupies one of the
+/// vm-agent's bounded exec-channel connection slots for its whole duration,
+/// so an unbounded timeout would let a handful of requests pin those slots
+/// indefinitely and starve exec traffic to the sandbox.
+const MAX_WAIT_FOR_PORT_TIMEOUT_SECS: u32 = 600;
+
+/// Resolve the effective `WaitForPort` budget: 0 takes the daemon default,
+/// anything else is clamped to [`MAX_WAIT_FOR_PORT_TIMEOUT_SECS`] (the
+/// deadline error at the cap tells the caller when the daemon gave up).
+const fn resolve_wait_for_port_budget(requested: u32) -> u32 {
+    match requested {
+        0 => DEFAULT_WAIT_FOR_PORT_TIMEOUT_SECS,
+        t if t > MAX_WAIT_FOR_PORT_TIMEOUT_SECS => MAX_WAIT_FOR_PORT_TIMEOUT_SECS,
+        t => t,
+    }
+}
+
 /// Execution service implementation.
 ///
 /// Every call addresses one execution inside one sandbox and carries its
@@ -238,27 +259,76 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         Response::ok(execution)
     }
 
-    /// Contract-only stub (CORE-58 phase 1): execution discovery lands
-    /// with CORE-58 phase 2 (guest-agent enumeration).
+    /// Serves from the guest's execution registry without waking the
+    /// sandbox: pausing already interrupted the running executions, so a
+    /// paused sandbox's history answers as-is at no resume cost.
     async fn list_executions(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::ListExecutionsRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ListExecutionsRequest>,
     ) -> ServiceResult<pb::ListExecutionsResponse> {
-        Err(ConnectError::unimplemented(
-            "execution listing is not implemented yet (CORE-58 phase 2)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        let listing = agent
+            .sandbox_exec_list(request.to_owned_message())
+            .await
+            .map_err(ApiError::from)?;
+        Response::ok(listing)
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the guest-agent listen-table
-    /// watch lands with CORE-58 phase 2.
     async fn wait_for_port(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::WaitForPortRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::WaitForPortRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "port readiness waits are not implemented yet (CORE-58 phase 2)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let mut req = request.to_owned_message();
+        // Resolve the proto's "0 = daemon default" and cap the budget here,
+        // so the guest always enforces an explicit, bounded wait.
+        req.timeout_seconds = resolve_wait_for_port_budget(req.timeout_seconds);
+        let runtime = self.runtime.ready()?;
+        sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.sandbox_id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_wait_for_port(req).await
+                }
+            },
+        )
+        .await?;
+        Response::ok(Empty::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_for_port_budget_defaults_and_caps() {
+        assert_eq!(
+            resolve_wait_for_port_budget(0),
+            DEFAULT_WAIT_FOR_PORT_TIMEOUT_SECS
+        );
+        assert_eq!(resolve_wait_for_port_budget(5), 5);
+        assert_eq!(
+            resolve_wait_for_port_budget(MAX_WAIT_FOR_PORT_TIMEOUT_SECS),
+            MAX_WAIT_FOR_PORT_TIMEOUT_SECS
+        );
+        // An adversarial u32::MAX cannot pin a guest exec slot for years.
+        assert_eq!(
+            resolve_wait_for_port_budget(u32::MAX),
+            MAX_WAIT_FOR_PORT_TIMEOUT_SECS
+        );
     }
 }

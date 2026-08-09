@@ -124,6 +124,31 @@ pub enum MessageType {
     /// One chunk of file content during a write stream (payload:
     /// `arcbox.sandbox.v1.FileChunk`; `done == true` on the last chunk).
     SandboxFileChunk = 0x0037,
+    /// Stat one path inside a sandbox (payload:
+    /// `arcbox.sandbox.v1.StatFileRequest`). Answered with
+    /// [`Self::SandboxFileStatResponse`].
+    SandboxFileStatRequest = 0x0038,
+    /// List a sandbox directory non-recursively (payload:
+    /// `arcbox.sandbox.v1.ListDirRequest`). Answered with
+    /// [`Self::SandboxFileListDirResponse`].
+    SandboxFileListDirRequest = 0x0039,
+    /// Create a directory with `mkdir -p` semantics (payload:
+    /// `arcbox.sandbox.v1.MakeDirRequest`). Answered with
+    /// [`Self::SandboxFileMakeDirResponse`].
+    SandboxFileMakeDirRequest = 0x003A,
+    /// Remove a file, symlink, or directory (payload:
+    /// `arcbox.sandbox.v1.RemoveEntryRequest`). Answered with
+    /// [`Self::SandboxFileRemoveResponse`].
+    SandboxFileRemoveRequest = 0x003B,
+    /// Rename / move an entry within a sandbox (payload:
+    /// `arcbox.sandbox.v1.MoveEntryRequest`). Answered with
+    /// [`Self::SandboxFileMoveResponse`].
+    SandboxFileMoveRequest = 0x003C,
+    /// Open a filesystem watch stream (payload:
+    /// `arcbox.sandbox.v1.WatchDirRequest`). The agent answers with a
+    /// stream of [`Self::SandboxFileWatchEvent`] frames, terminated by
+    /// [`Self::SandboxFileWatchEnd`] when the sandbox stops.
+    SandboxFileWatchRequest = 0x003D,
 
     // Sandbox snapshot request types (0x0040 - 0x0043).
     SandboxCheckpointRequest = 0x0040,
@@ -179,6 +204,15 @@ pub enum MessageType {
     /// `arcbox.sandbox.v1.WaitExecutionRequest`). Answered with
     /// [`Self::SandboxExecWaitResponse`].
     SandboxExecWaitRequest = 0x0066,
+    /// List a sandbox's retained executions (payload:
+    /// `arcbox.sandbox.v1.ListExecutionsRequest`). Answered with
+    /// [`Self::SandboxExecListResponse`].
+    SandboxExecListRequest = 0x0067,
+    /// Wait for a TCP listener inside a sandbox (payload:
+    /// `arcbox.sandbox.v1.WaitForPortRequest`). Answered with
+    /// [`Self::SandboxWaitForPortResponse`]; an elapsed deadline is an
+    /// `Error` frame with code 504.
+    SandboxWaitForPortRequest = 0x0068,
 
     /// Starts a machine-level exec: runs a command in the machine root (the
     /// agent's own mount namespace), streamed back as
@@ -266,6 +300,26 @@ pub enum MessageType {
     SandboxFileData = 0x1038,
     /// Acknowledges a completed file-write stream (empty payload).
     SandboxFileWriteResponse = 0x1039,
+    /// Answers [`Self::SandboxFileStatRequest`] (payload:
+    /// `arcbox.sandbox.v1.FileStat`).
+    SandboxFileStatResponse = 0x103A,
+    /// Answers [`Self::SandboxFileListDirRequest`] (payload:
+    /// `arcbox.sandbox.v1.ListDirResponse`).
+    SandboxFileListDirResponse = 0x103B,
+    /// Acknowledges [`Self::SandboxFileMakeDirRequest`] (empty payload).
+    SandboxFileMakeDirResponse = 0x103C,
+    /// Acknowledges [`Self::SandboxFileRemoveRequest`] (empty payload).
+    SandboxFileRemoveResponse = 0x103D,
+    /// Acknowledges [`Self::SandboxFileMoveRequest`] (empty payload).
+    SandboxFileMoveResponse = 0x103E,
+    /// One frame of a directory-watch stream answering
+    /// [`Self::SandboxFileWatchRequest`] (payload:
+    /// `arcbox.sandbox.v1.WatchDirResponse` — an event or a keepalive).
+    SandboxFileWatchEvent = 0x103F,
+    /// Clean end of a directory-watch stream (empty payload): the sandbox
+    /// stopped, so no further events can come. Lives past the snapshot and
+    /// pause/resume blocks because 0x1040-0x1046 were already assigned.
+    SandboxFileWatchEnd = 0x1047,
 
     // Sandbox snapshot response types (0x1040 - 0x1043).
     SandboxCheckpointResponse = 0x1040,
@@ -292,6 +346,12 @@ pub enum MessageType {
     /// Answers [`Self::SandboxExecWaitRequest`] (payload:
     /// `arcbox.sandbox.v1.Execution`).
     SandboxExecWaitResponse = 0x1066,
+    /// Answers [`Self::SandboxExecListRequest`] (payload:
+    /// `arcbox.sandbox.v1.ListExecutionsResponse`).
+    SandboxExecListResponse = 0x1067,
+    /// Acknowledges [`Self::SandboxWaitForPortRequest`] (empty payload):
+    /// the listener exists.
+    SandboxWaitForPortResponse = 0x1068,
 
     /// One machine exec output frame (payload: `arcbox.v1.MachineExecOutput`;
     /// `done == true` on the final frame carrying the exit code).
@@ -342,6 +402,12 @@ impl MessageType {
             0x0035 => Some(Self::SandboxFileReadRequest),
             0x0036 => Some(Self::SandboxFileWriteRequest),
             0x0037 => Some(Self::SandboxFileChunk),
+            0x0038 => Some(Self::SandboxFileStatRequest),
+            0x0039 => Some(Self::SandboxFileListDirRequest),
+            0x003A => Some(Self::SandboxFileMakeDirRequest),
+            0x003B => Some(Self::SandboxFileRemoveRequest),
+            0x003C => Some(Self::SandboxFileMoveRequest),
+            0x003D => Some(Self::SandboxFileWatchRequest),
             // Sandbox snapshot requests.
             0x0040 => Some(Self::SandboxCheckpointRequest),
             0x0041 => Some(Self::SandboxRestoreRequest),
@@ -358,6 +424,8 @@ impl MessageType {
             0x0064 => Some(Self::SandboxExecSignalRequest),
             0x0065 => Some(Self::SandboxExecResizeRequest),
             0x0066 => Some(Self::SandboxExecWaitRequest),
+            0x0067 => Some(Self::SandboxExecListRequest),
+            0x0068 => Some(Self::SandboxWaitForPortRequest),
             // Machine-level exec.
             0x0050 => Some(Self::MachineExecRequest),
             0x0051 => Some(Self::MachineExecInput),
@@ -402,6 +470,13 @@ impl MessageType {
             0x1037 => Some(Self::SandboxEvent),
             0x1038 => Some(Self::SandboxFileData),
             0x1039 => Some(Self::SandboxFileWriteResponse),
+            0x103A => Some(Self::SandboxFileStatResponse),
+            0x103B => Some(Self::SandboxFileListDirResponse),
+            0x103C => Some(Self::SandboxFileMakeDirResponse),
+            0x103D => Some(Self::SandboxFileRemoveResponse),
+            0x103E => Some(Self::SandboxFileMoveResponse),
+            0x103F => Some(Self::SandboxFileWatchEvent),
+            0x1047 => Some(Self::SandboxFileWatchEnd),
             // Sandbox snapshot responses.
             0x1040 => Some(Self::SandboxCheckpointResponse),
             0x1041 => Some(Self::SandboxRestoreResponse),
@@ -414,6 +489,8 @@ impl MessageType {
             0x1064 => Some(Self::SandboxExecSignalResponse),
             0x1065 => Some(Self::SandboxExecResizeResponse),
             0x1066 => Some(Self::SandboxExecWaitResponse),
+            0x1067 => Some(Self::SandboxExecListResponse),
+            0x1068 => Some(Self::SandboxWaitForPortResponse),
             0x1050 => Some(Self::MachineExecOutput),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
@@ -435,6 +512,12 @@ impl MessageType {
                 | Self::SandboxEventsRequest
                 | Self::SandboxFileReadRequest
                 | Self::SandboxFileWriteRequest
+                | Self::SandboxFileStatRequest
+                | Self::SandboxFileListDirRequest
+                | Self::SandboxFileMakeDirRequest
+                | Self::SandboxFileRemoveRequest
+                | Self::SandboxFileMoveRequest
+                | Self::SandboxFileWatchRequest
                 | Self::SandboxPortForwardRequest
                 | Self::SandboxPortForwardRemoveRequest
                 | Self::SandboxCleanupPrepareRequest
@@ -454,6 +537,8 @@ impl MessageType {
                 | Self::SandboxExecSignalRequest
                 | Self::SandboxExecResizeRequest
                 | Self::SandboxExecWaitRequest
+                | Self::SandboxExecListRequest
+                | Self::SandboxWaitForPortRequest
         )
     }
 
@@ -563,9 +648,22 @@ mod tests {
             (0x0035, MessageType::SandboxFileReadRequest),
             (0x0036, MessageType::SandboxFileWriteRequest),
             (0x0037, MessageType::SandboxFileChunk),
+            (0x0038, MessageType::SandboxFileStatRequest),
+            (0x0039, MessageType::SandboxFileListDirRequest),
+            (0x003A, MessageType::SandboxFileMakeDirRequest),
+            (0x003B, MessageType::SandboxFileRemoveRequest),
+            (0x003C, MessageType::SandboxFileMoveRequest),
+            (0x003D, MessageType::SandboxFileWatchRequest),
             (0x1037, MessageType::SandboxEvent),
             (0x1038, MessageType::SandboxFileData),
             (0x1039, MessageType::SandboxFileWriteResponse),
+            (0x103A, MessageType::SandboxFileStatResponse),
+            (0x103B, MessageType::SandboxFileListDirResponse),
+            (0x103C, MessageType::SandboxFileMakeDirResponse),
+            (0x103D, MessageType::SandboxFileRemoveResponse),
+            (0x103E, MessageType::SandboxFileMoveResponse),
+            (0x103F, MessageType::SandboxFileWatchEvent),
+            (0x1047, MessageType::SandboxFileWatchEnd),
             // Sandbox executions (execution redesign, CORE-55/56).
             (0x0060, MessageType::SandboxExecStartRequest),
             (0x0061, MessageType::SandboxExecAttachRequest),
@@ -574,12 +672,16 @@ mod tests {
             (0x0064, MessageType::SandboxExecSignalRequest),
             (0x0065, MessageType::SandboxExecResizeRequest),
             (0x0066, MessageType::SandboxExecWaitRequest),
+            (0x0067, MessageType::SandboxExecListRequest),
+            (0x0068, MessageType::SandboxWaitForPortRequest),
             (0x1060, MessageType::SandboxExecStartResponse),
             (0x1061, MessageType::SandboxExecEvent),
             (0x1062, MessageType::SandboxStdinStatus),
             (0x1064, MessageType::SandboxExecSignalResponse),
             (0x1065, MessageType::SandboxExecResizeResponse),
             (0x1066, MessageType::SandboxExecWaitResponse),
+            (0x1067, MessageType::SandboxExecListResponse),
+            (0x1068, MessageType::SandboxWaitForPortResponse),
             // Sandbox snapshots.
             (0x0040, MessageType::SandboxCheckpointRequest),
             (0x0041, MessageType::SandboxRestoreRequest),
@@ -622,6 +724,12 @@ mod tests {
         assert!(MessageType::SandboxExecWaitRequest.is_sandbox_request());
         assert!(MessageType::SandboxFileReadRequest.is_sandbox_request());
         assert!(MessageType::SandboxFileWriteRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileStatRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileListDirRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileMakeDirRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileRemoveRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileMoveRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileWatchRequest.is_sandbox_request());
         assert!(MessageType::SandboxCheckpointRequest.is_sandbox_request());
         assert!(MessageType::SandboxPauseRequest.is_sandbox_request());
         assert!(MessageType::SandboxResumeRequest.is_sandbox_request());

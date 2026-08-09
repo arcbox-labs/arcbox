@@ -73,6 +73,10 @@ pub(crate) const MSG_NET_RECONFIG: u8 = 0x06;
 /// Payload: `[i32 LE signal]` (4 bytes). Old vm-agents ignore unknown frame
 /// types, so sending this to a pre-signal agent is a silent no-op.
 const MSG_SIGNAL: u8 = 0x07;
+/// Wait until the guest's TCP listen table has a listener on a port.
+/// Payload: JSON [`WaitPortReq`]; answered with `MSG_EXIT` carrying `0`
+/// (listening) or `1` (deadline elapsed).
+pub const MSG_WAIT_PORT: u8 = 0x08;
 
 // Frame type constants — Agent → Host (exec channel).
 const MSG_STDOUT: u8 = 0x10;
@@ -162,6 +166,24 @@ pub struct StartCommand {
     pub tty_width: u16,
     pub tty_height: u16,
     pub timeout_seconds: u32,
+}
+
+/// `MSG_WAIT_PORT` payload, shared with the vm-agent binary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitPortReq {
+    /// TCP port a workload is expected to listen on.
+    pub port: u16,
+    /// Give up after this long (0 = check once and answer immediately).
+    pub timeout_ms: u64,
+}
+
+/// Outcome of a guest listen-table wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortWait {
+    /// A listener on the port exists.
+    Listening,
+    /// The deadline elapsed with no listener.
+    Deadline,
 }
 
 // =============================================================================
@@ -668,6 +690,63 @@ async fn net_reconfig_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWri
         );
     }
     Ok(())
+}
+
+/// Wait until the guest's TCP listen table has a listener on `port`.
+///
+/// Sends [`MSG_WAIT_PORT`] to the exec channel; the vm-agent watches
+/// `/proc/net/tcp{,6}` in-process (never a connect probe) and answers when
+/// the listener appears or `timeout` elapses. The host-side read deadline
+/// adds slack on top of the guest's own budget so a live guest always
+/// answers first.
+pub async fn wait_for_port(uds_path: &Path, port: u16, timeout: Duration) -> Result<PortWait> {
+    let mut stream = connect_to_agent(uds_path).await?;
+    wait_for_port_on_stream(&mut stream, port, timeout).await
+}
+
+/// Send a wait-port frame and decode the agent's verdict.
+///
+/// Extracted from [`wait_for_port`] so the wire protocol can be tested with
+/// `tokio::io::duplex` without needing a real vsock connection.
+async fn wait_for_port_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    port: u16,
+    timeout: Duration,
+) -> Result<PortWait> {
+    let req = WaitPortReq {
+        port,
+        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+    };
+    let payload = serde_json::to_vec(&req)
+        .map_err(|e| VmmError::Vsock(format!("encode WaitPortReq: {e}")))?;
+    write_frame(stream, MSG_WAIT_PORT, &payload)
+        .await
+        .map_err(|e| VmmError::Vsock(format!("write MSG_WAIT_PORT: {e}")))?;
+
+    let read_deadline = timeout + Duration::from_secs(5);
+    let (msg_type, payload) = tokio::time::timeout(read_deadline, read_frame(stream))
+        .await
+        .map_err(|_| VmmError::Vsock("wait for port: timed out waiting for response".into()))?
+        .map_err(|e| VmmError::Vsock(format!("read wait-port response: {e}")))?;
+
+    if msg_type != MSG_EXIT {
+        return Err(VmmError::Vsock(format!(
+            "wait for port: unexpected response type 0x{msg_type:02x}"
+        )));
+    }
+    if payload.len() < 4 {
+        return Err(VmmError::Vsock(format!(
+            "wait for port: payload too short ({} bytes, expected 4)",
+            payload.len()
+        )));
+    }
+    match i32::from_le_bytes(payload[..4].try_into().unwrap()) {
+        0 => Ok(PortWait::Listening),
+        1 => Ok(PortWait::Deadline),
+        code => Err(VmmError::Vsock(format!(
+            "wait for port: agent returned exit code {code}"
+        ))),
+    }
 }
 
 /// Guest-side timing breakdown a net-reconfig `MSG_EXIT` reply may carry:
