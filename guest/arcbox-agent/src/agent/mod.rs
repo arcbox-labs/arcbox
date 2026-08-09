@@ -9,6 +9,8 @@
 use anyhow::Result;
 
 pub mod ensure_runtime;
+#[cfg(any(target_os = "linux", test))]
+mod exec_error;
 
 #[cfg(target_os = "linux")]
 mod linux;

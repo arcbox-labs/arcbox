@@ -776,16 +776,22 @@ impl MachineManager {
     #[cfg(target_os = "macos")]
     pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
         use crate::agent_client::AgentClient;
-        let cid = self
-            .get_cid(name)
-            .ok_or_else(|| CoreError::invalid_state("CID not assigned"))?;
-        let backend = {
+        let (cid, vm_id) = {
             let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
             let machine = machines
                 .get(name)
                 .ok_or_else(|| CoreError::not_found(name.to_string()))?;
-            self.vm_manager.backend(&machine.vm_id)?
+            if machine.state != MachineState::Running {
+                return Err(CoreError::invalid_state(format!(
+                    "machine '{name}' is not running"
+                )));
+            }
+            let cid = machine
+                .cid
+                .ok_or_else(|| CoreError::invalid_state("CID not assigned"))?;
+            (cid, machine.vm_id.clone())
         };
+        let backend = self.vm_manager.backend(&vm_id)?;
         let fd = self.connect_vsock_port(name, AGENT_PORT)?;
         // The transport must follow the backend, not the fd's socket domain:
         // both backends hand over unnamed AF_UNIX fds, but only the HV

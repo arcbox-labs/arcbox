@@ -10,6 +10,8 @@ use connectrpc::{
 };
 use tokio_stream::StreamExt as _;
 
+use crate::error::ApiError;
+
 use super::SharedRuntime;
 
 use super::ConnectRuntimeExt as _;
@@ -164,7 +166,7 @@ impl pb::MachineService for MachineServiceImpl {
             .machine_manager()
             .create(config)
             .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
 
         Response::ok(pb::CreateMachineResponse {
             id: req.name,
@@ -184,7 +186,7 @@ impl pb::MachineService for MachineServiceImpl {
             .machine_manager()
             .start(&id)
             .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
 
         Response::ok(pb::Empty::default())
     }
@@ -224,7 +226,7 @@ impl pb::MachineService for MachineServiceImpl {
         })
         .await
         .map_err(|e| ConnectError::internal(format!("stop task panicked: {e}")))?
-        .map_err(|e| ConnectError::internal(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
         Response::ok(pb::Empty::default())
     }
@@ -240,7 +242,7 @@ impl pb::MachineService for MachineServiceImpl {
         runtime
             .machine_manager()
             .remove(&req.id, req.force)
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
 
         Response::ok(pb::Empty::default())
     }
@@ -370,11 +372,8 @@ impl pb::MachineService for MachineServiceImpl {
             .runtime
             .ready()?
             .get_agent(&id)
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
-        let response = agent
-            .ping()
-            .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
+        let response = agent.ping().await.map_err(ApiError::from)?;
 
         Response::ok(pb::MachinePingResponse {
             message: response.message,
@@ -394,11 +393,8 @@ impl pb::MachineService for MachineServiceImpl {
             .runtime
             .ready()?
             .get_agent(&id)
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
-        let info = agent
-            .get_system_info()
-            .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
+        let info = agent.get_system_info().await.map_err(ApiError::from)?;
 
         Response::ok(pb::MachineSystemInfo {
             kernel_version: info.kernel_version,
@@ -434,11 +430,8 @@ impl pb::MachineService for MachineServiceImpl {
             .runtime
             .ready()?
             .get_agent(&id)
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
-        let resp = agent
-            .disk_trim()
-            .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
+        let resp = agent.disk_trim().await.map_err(ApiError::from)?;
         tracing::debug!(machine = %id, result = %resp.result, "disk compact: fstrim done");
 
         Response::ok(pb::Empty::default())
@@ -460,12 +453,9 @@ impl pb::MachineService for MachineServiceImpl {
             .runtime
             .ready()?
             .get_agent(&req.id)
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
 
-        let mut rx = agent
-            .machine_exec(req)
-            .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+        let mut rx = agent.machine_exec(req).await.map_err(ApiError::from)?;
 
         let stream = async_stream::stream! {
             while let Some(item) = rx.recv().await {
@@ -477,12 +467,8 @@ impl pb::MachineService for MachineServiceImpl {
                             break;
                         }
                     }
-                    Err(arcbox_core::error::CoreError::Agent { code: 400, message }) => {
-                        yield Err(ConnectError::invalid_argument(message));
-                        break;
-                    }
                     Err(e) => {
-                        yield Err(ConnectError::internal(e.to_string()));
+                        yield Err(ConnectError::from(ApiError::from(e)));
                         break;
                     }
                 }
@@ -526,7 +512,7 @@ impl pb::MachineService for MachineServiceImpl {
             .runtime
             .ready()?
             .get_agent(&exec_req.id)
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
 
         // Feed remaining gRPC input (stdin + TTY resizes) into a channel for
         // the core layer. Stream end sends the empty-stdin EOF sentinel.
@@ -551,7 +537,7 @@ impl pb::MachineService for MachineServiceImpl {
         let mut out_rx = agent
             .machine_exec_session(exec_req, in_rx)
             .await
-            .map_err(|e| ConnectError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
 
         let out_stream = async_stream::stream! {
             while let Some(item) = out_rx.recv().await {
@@ -563,12 +549,8 @@ impl pb::MachineService for MachineServiceImpl {
                             break;
                         }
                     }
-                    Err(arcbox_core::error::CoreError::Agent { code: 400, message }) => {
-                        yield Err(ConnectError::invalid_argument(message));
-                        break;
-                    }
                     Err(e) => {
-                        yield Err(ConnectError::internal(e.to_string()));
+                        yield Err(ConnectError::from(ApiError::from(e)));
                         break;
                     }
                 }

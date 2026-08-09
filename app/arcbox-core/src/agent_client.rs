@@ -165,9 +165,10 @@ impl AgentClient {
 
         match &mut self.transport {
             AgentTransport::Async(t) => {
-                t.connect()
-                    .await
-                    .map_err(|e| CoreError::Machine(format!("failed to connect to agent: {e}")))?;
+                t.connect().await.map_err(|source| CoreError::Transport {
+                    context: "failed to connect to agent",
+                    source,
+                })?;
             }
             AgentTransport::Blocking(_) => {
                 // Blocking transport is connected at creation time (from_fd).
@@ -1560,7 +1561,10 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send exec request: {}", e)))?;
+            .map_err(|source| CoreError::Transport {
+                context: "failed to send exec request",
+                source,
+            })?;
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         tokio::spawn(async move {
@@ -1569,7 +1573,10 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("recv error: {}", e))))
+                            .send(Err(CoreError::Transport {
+                                context: "failed to receive exec output",
+                                source: e,
+                            }))
                             .await;
                         break;
                     }
@@ -1647,12 +1654,18 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send exec request: {}", e)))?;
+            .map_err(|source| CoreError::Transport {
+                context: "failed to send exec session request",
+                source,
+            })?;
 
-        let (mut sender, mut receiver) = self
-            .transport
-            .into_split()
-            .map_err(|e| CoreError::Machine(format!("failed to split transport: {e}")))?;
+        let (mut sender, mut receiver) =
+            self.transport
+                .into_split()
+                .map_err(|source| CoreError::Transport {
+                    context: "failed to split exec session transport",
+                    source,
+                })?;
 
         let (out_tx, out_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
 
@@ -1700,7 +1713,10 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = out_tx
-                            .send(Err(CoreError::Machine(format!("recv error: {}", e))))
+                            .send(Err(CoreError::Transport {
+                                context: "failed to receive exec session output",
+                                source: e,
+                            }))
                             .await;
                         break;
                     }
