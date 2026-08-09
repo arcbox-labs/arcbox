@@ -171,6 +171,22 @@ class FileStat:
     symlink_target: str | None = None
 
 
+#: Kind of a filesystem event. "unknown" covers kinds this SDK predates.
+FsEventKind = Literal["created", "modified", "removed", "renamed", "unknown"]
+
+
+@dataclass(frozen=True)
+class FsEvent:
+    """One filesystem event, as delivered by ``files.watch()``."""
+
+    #: What happened.
+    kind: FsEventKind
+    #: Absolute path of the affected entry (the old path for "renamed").
+    path: str
+    #: New absolute path (set only for "renamed").
+    renamed_to: str | None = None
+
+
 @dataclass(frozen=True)
 class SandboxInfo:
     """Full sandbox state, always fetched fresh — never a cached mirror."""
@@ -334,6 +350,24 @@ def file_stat_from_proto(stat: filesystem_pb2.FileStat) -> FileStat:
         gid=stat.gid,
         modified_at=_optional_time(stat.modified_at, stat.HasField("modified_at")),
         symlink_target=stat.symlink_target or None,
+    )
+
+
+_FS_EVENT_KIND_NAMES: dict[int, FsEventKind] = {
+    filesystem_pb2.FS_EVENT_KIND_CREATED: "created",
+    filesystem_pb2.FS_EVENT_KIND_MODIFIED: "modified",
+    filesystem_pb2.FS_EVENT_KIND_REMOVED: "removed",
+    filesystem_pb2.FS_EVENT_KIND_RENAMED: "renamed",
+}
+
+
+def fs_event_from_proto(event: filesystem_pb2.FsEvent) -> FsEvent:
+    """Map one WatchDir frame to the public DTO ("unknown" for kinds
+    this SDK predates)."""
+    return FsEvent(
+        kind=_FS_EVENT_KIND_NAMES.get(event.kind, "unknown"),
+        path=event.path,
+        renamed_to=event.renamed_to or None,
     )
 
 

@@ -8,17 +8,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import httpx
 from google.protobuf import empty_pb2
 
 from arcbox._boundary import wrap_errors
 from arcbox._gen import filesystem_pb2
-from arcbox._types import MAX_FILE_BYTES, file_stat_from_proto
-from arcbox.errors import FileTooLargeError
+from arcbox._types import MAX_FILE_BYTES, file_stat_from_proto, fs_event_from_proto
+from arcbox.errors import ConnectionFailedError, ConnectionLostError, FileTooLargeError
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, AsyncIterator
     from pathlib import PurePosixPath
+    from types import TracebackType
 
-    from arcbox._types import FileStat
+    from arcbox._types import FileStat, FsEvent
 
     from ._client import AsyncConnectClient
 
@@ -29,6 +32,37 @@ _WRITE_CHUNK_BYTES = 256 * 1024
 
 #: Default permission bits for created files (mirrors the daemon's default).
 _DEFAULT_WRITE_MODE = 0o644
+
+
+class AsyncFileWatch:
+    """A directory watch, iterable one typed filesystem event at a time.
+
+    The iterator ends when the daemon ends the stream (the sandbox
+    stopped). When exiting early (``break``), iterate inside the
+    context-manager form — ``async with files.watch(...) as watch`` in
+    the async flavor, ``with`` in the sync one — so the watch closes at
+    the break instead of whenever the generator finalizer runs."""
+
+    def __init__(self, events: AsyncGenerator[FsEvent]) -> None:
+        self._events = events
+
+    def __aiter__(self) -> AsyncIterator[FsEvent]:
+        return self._events
+
+    async def aclose(self) -> None:
+        """Cancel the watch without consuming the rest."""
+        await self._events.aclose()
+
+    async def __aenter__(self) -> AsyncFileWatch:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
 
 
 class AsyncFiles:
@@ -186,3 +220,55 @@ class AsyncFiles:
                 ),
                 empty_pb2.Empty,
             )
+
+    def watch(self, path: str | PurePosixPath, recursive: bool = False) -> AsyncFileWatch:
+        """Watch a directory for filesystem events, yielded as typed
+        :class:`FsEvent` values (keepalive frames are filtered out).
+        Push-based — the guest watches inotify directly, never a
+        polling fallback; a rename within the watched tree arrives as
+        one ``"renamed"`` event pairing ``path`` (old) with
+        ``renamed_to`` (new).
+
+        The iterator ends when the daemon ends the stream (the sandbox
+        stopped); closing the watch (or its context) cancels it. A
+        transport drop mid-stream is surfaced as
+        :class:`arcbox.errors.ConnectionLostError` — re-watching is the
+        caller's decision, since missed events cannot be replayed (the
+        same rule as ``sandbox.events()``). When the kernel's event
+        queue overflows, the daemon fails the stream with its
+        re-list-and-re-watch guidance rather than silently streaming a
+        wrong view."""
+        return AsyncFileWatch(self._stream_watch(str(path), recursive))
+
+    async def _stream_watch(self, path: str, recursive: bool) -> AsyncGenerator[FsEvent]:
+        with wrap_errors("files.watch"):
+            entered = False
+            try:
+                async with self._client.stream(
+                    _FILESYSTEM + "WatchDir",
+                    filesystem_pb2.WatchDirRequest(
+                        id=self._sandbox_id, path=path, recursive=recursive
+                    ),
+                    filesystem_pb2.WatchDirResponse,
+                ) as stream:
+                    entered = True
+                    async for frame in stream:
+                        if frame.WhichOneof("payload") == "event":
+                            yield fs_event_from_proto(frame.event)
+            # ConnectionFailedError covers the drop's OTHER wire shape:
+            # the daemon losing its upstream watch ends the HTTP stream
+            # cleanly with a Connect `unavailable` error frame.
+            # Daemon-typed errors (including the overflow's
+            # re-list-and-re-watch guidance) map to other classes and
+            # keep them.
+            except (httpx.HTTPError, ConnectionFailedError) as exc:
+                if not entered or isinstance(exc, ConnectionLostError):
+                    # Before entry: a dial failure — the daemon was
+                    # never reached. ConnectionLostError is already the
+                    # stream-death error.
+                    raise
+                raise ConnectionLostError(
+                    "the watch stream died",
+                    context={"path": path},
+                    operation="files.watch",
+                ) from exc
