@@ -31,6 +31,7 @@ from arcbox.errors import (
 )
 
 if TYPE_CHECKING:
+    import re
     from collections.abc import Generator, Iterator, Mapping, Sequence
     from types import TracebackType
 
@@ -66,6 +67,52 @@ def _channel_name(channel: int) -> OutputChannel:
 
 def _decode_output(chunks: list[bytes]) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+class _LogScanner:
+    """Line-oriented pattern scanner over per-channel byte streams. Each
+    channel keeps its own partial-line buffer, so interleaved chunks
+    never corrupt a line and a chunk-split line still matches. Lines are
+    decoded only when complete (a ``\\n`` byte is unambiguous in UTF-8,
+    so multi-byte sequences never split a line). Memory is bounded by
+    the longest line, not the output length."""
+
+    def __init__(self, pattern: str | re.Pattern[str]) -> None:
+        self._pattern = pattern
+        self._partials: dict[int, bytes] = {}
+
+    def _matches(self, line: str) -> bool:
+        if isinstance(self._pattern, str):
+            return self._pattern in line
+        return self._pattern.search(line) is not None
+
+    def push(self, channel: int, data: bytes) -> str | None:
+        """Feed one chunk; returns the first matching complete line."""
+        lines = (self._partials.get(channel, b"") + data).split(b"\n")
+        # The final element is the new unterminated tail.
+        self._partials[channel] = lines.pop()
+        for raw in lines:
+            line = raw.decode("utf-8", errors="replace")
+            if self._matches(line):
+                return line
+        return None
+
+    def flush(self) -> str | None:
+        """End of output: test the unterminated tails too."""
+        for raw in self._partials.values():
+            if raw:
+                line = raw.decode("utf-8", errors="replace")
+                if self._matches(line):
+                    return line
+        return None
+
+
+def _wait_for_log_timeout(command_id: str, pattern: str | re.Pattern[str]) -> TimeoutError:
+    return TimeoutError(
+        "wait_for_log(timeout) elapsed before the log pattern appeared",
+        suggestion="increase the wait_for_log timeout argument",
+        context={"command_id": command_id, "pattern": str(pattern)},
+    )
 
 
 class OutputStream:
@@ -239,6 +286,57 @@ class CommandHandle:
                 if execution.state == process_pb2.EXECUTION_STATE_EXITED:
                     break
             return self._collect_result(execution)
+
+    def wait_for_log(self, pattern: str | re.Pattern[str], timeout: float | None = None) -> str:
+        """Wait until a log line matching ``pattern`` appears on any of
+        the command's output channels, and return that line. A ``str``
+        pattern is substring containment; a compiled
+        :class:`re.Pattern` is searched per line. Purely SDK-side — no
+        daemon RPC beyond the attach: the offset-addressed output
+        replays from the beginning (or the earliest retained byte), so
+        a line printed before the call matches immediately, and a
+        transport drop resumes through the same re-attach loop as
+        :attr:`output`.
+
+        Matching is line-oriented: complete lines are tested as they
+        arrive, and a trailing unterminated line is tested once the
+        command exits. If the command exits (or the daemon closes the
+        record) before any match, an :class:`ArcBoxError` is raised —
+        that is not a timeout. ``timeout`` bounds the WAIT, not the
+        process; expiry raises :class:`TimeoutError` naming this knob.
+        The deadline is observed on stream frames (the daemon
+        interleaves keepalives while idle), so expiry can lag by up to
+        the keepalive interval."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        scanner = _LogScanner(pattern)
+        with wrap_errors("commands.wait_for_log"):
+            try:
+                with closing(self._attach_events("commands.wait_for_log")) as events:
+                    for event in events:
+                        kind = event.WhichOneof("event")
+                        if kind == "output":
+                            line = scanner.push(event.output.channel, event.output.data)
+                            if line is not None:
+                                return line
+                        elif kind == "exited":
+                            break
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise _wait_for_log_timeout(self.command_id, pattern)
+            except ConnectionLostError as exc:
+                # The re-attach budget dying past the deadline is the
+                # deadline surfacing, mirroring connect()'s discipline.
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise _wait_for_log_timeout(self.command_id, pattern) from exc
+                raise
+            # The command exited (or the daemon closed the record): a
+            # trailing unterminated line still counts.
+            tail = scanner.flush()
+            if tail is not None:
+                return tail
+            raise ArcBoxError(
+                "the command exited before the log pattern appeared",
+                context={"command_id": self.command_id, "pattern": str(pattern)},
+            )
 
     def _wait_slice(self, slice_seconds: int) -> process_pb2.Execution:
         """One WaitExecution long-poll (0 = an immediate state poll)."""
