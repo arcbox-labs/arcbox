@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Final, Literal, final
 
-from arcbox._gen import process_pb2, sandbox_pb2
+from arcbox._gen import filesystem_pb2, process_pb2, sandbox_pb2
 from arcbox.errors import ArcBoxError, CommandFailedError, SandboxDiedError
 
 if TYPE_CHECKING:
@@ -142,6 +142,33 @@ class CommandResult:
         if self.exit_code != 0:
             raise CommandFailedError(self)
         return self
+
+
+#: What kind of filesystem object a path is. "other" covers device
+#: nodes, FIFOs, and sockets; "unknown" covers kinds this SDK predates.
+FileKind = Literal["file", "directory", "symlink", "other", "unknown"]
+
+
+@dataclass(frozen=True)
+class FileStat:
+    """Metadata of one filesystem entry (``files.stat`` / ``files.list``)."""
+
+    #: Base name of the entry (the final path component).
+    name: str
+    #: Kind of entry (symlinks are reported as "symlink", not followed).
+    kind: FileKind
+    #: Size in bytes (regular files; 0 otherwise).
+    size: int
+    #: Unix permission bits (the low 12 bits of st_mode).
+    mode: int
+    #: Owning user ID.
+    uid: int
+    #: Owning group ID.
+    gid: int
+    #: Last modification time.
+    modified_at: datetime | None = None
+    #: Symlink target (set only when kind is "symlink").
+    symlink_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +311,29 @@ def sandbox_info_from_proto(info: sandbox_pb2.SandboxInfo) -> SandboxInfo:
         idle_timeout=idle_timeout,
         on_idle=on_idle,
         storage_bytes=int(info.storage_bytes),
+    )
+
+
+_FILE_KIND_NAMES: dict[int, FileKind] = {
+    filesystem_pb2.FILE_KIND_FILE: "file",
+    filesystem_pb2.FILE_KIND_DIRECTORY: "directory",
+    filesystem_pb2.FILE_KIND_SYMLINK: "symlink",
+    filesystem_pb2.FILE_KIND_OTHER: "other",
+}
+
+
+def file_stat_from_proto(stat: filesystem_pb2.FileStat) -> FileStat:
+    """Map one wire FileStat to the public DTO ("unknown" for kinds this
+    SDK predates)."""
+    return FileStat(
+        name=stat.name,
+        kind=_FILE_KIND_NAMES.get(stat.kind, "unknown"),
+        size=int(stat.size),
+        mode=stat.mode,
+        uid=stat.uid,
+        gid=stat.gid,
+        modified_at=_optional_time(stat.modified_at, stat.HasField("modified_at")),
+        symlink_target=stat.symlink_target or None,
     )
 
 
