@@ -76,6 +76,11 @@ pub enum VmmError {
     #[error("directory not empty: {0}")]
     DirectoryNotEmpty(String),
 
+    /// A bounded wait elapsed before the awaited condition held
+    /// (`DEADLINE_EXCEEDED` on the daemon surface).
+    #[error("deadline exceeded: {0}")]
+    DeadlineExceeded(String),
+
     /// A retryable operation whose durable result could not be confirmed.
     #[error("service unavailable: {0}")]
     Unavailable(String),

@@ -423,7 +423,7 @@ mod agent {
         IN_CREATE, IN_MOVED_TO, WATCH_MASK, map_events, parse_event_buffer,
     };
     // Readiness dial-out port — shared with the host-side boot gate.
-    use arcbox_vm::vsock::READY_PORT;
+    use arcbox_vm::vsock::{MSG_WAIT_PORT, READY_PORT};
 
     const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -566,6 +566,7 @@ mod agent {
         match msg_type {
             MSG_CLOCK_SYNC => handle_clock_sync(conn, &payload),
             MSG_NET_RECONFIG => handle_net_reconfig(conn, &payload),
+            MSG_WAIT_PORT => handle_wait_port(conn, &payload),
             MSG_START => {
                 let start: StartCommand = match serde_json::from_slice(&payload) {
                     Ok(s) => s,
@@ -584,6 +585,42 @@ mod agent {
                 eprintln!("agent: unexpected frame type 0x{other:02x} on exec port");
             }
         }
+    }
+
+    /// Watch the guest's own TCP listen table until `req.port` has a
+    /// listener or the deadline elapses. Answers `MSG_EXIT` with 0
+    /// (listening) or 1 (deadline). Reading `/proc/net/tcp{,6}` in-process
+    /// keeps the wait free of connect probes that would perturb the
+    /// workload with spurious accepted connections.
+    fn handle_wait_port(mut conn: VsockStream, payload: &[u8]) {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let req: arcbox_vm::vsock::WaitPortReq = match serde_json::from_slice(payload) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("agent: parse WaitPortReq: {e}");
+                let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
+                return;
+            }
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(req.timeout_ms);
+        let code = loop {
+            let listening = [
+                std::fs::read_to_string("/proc/net/tcp").unwrap_or_default(),
+                std::fs::read_to_string("/proc/net/tcp6").unwrap_or_default(),
+            ]
+            .iter()
+            .any(|table| arcbox_vm::listen_table::any_listener_on_port(table, req.port));
+            if listening {
+                break 0i32;
+            }
+            if std::time::Instant::now() >= deadline {
+                break 1i32;
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
+        let _ = write_frame(&mut conn, MSG_EXIT, &code.to_le_bytes());
     }
 
     fn handle_clock_sync(mut conn: VsockStream, payload: &[u8]) {

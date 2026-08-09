@@ -17,11 +17,12 @@ use arcbox_connect::sandbox_v1::{
     AttachExecutionRequest, CheckpointRequest, CheckpointResponse, CreateSandboxRequest,
     CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk, FileStat,
     GetStdinStatusRequest, InspectSandboxRequest, ListDirRequest, ListDirResponse,
-    ListSandboxesRequest, ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    MakeDirRequest, MoveEntryRequest, PauseSandboxRequest, ReadFileRequest, RemoveEntryRequest,
-    RemoveSandboxRequest, ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent,
-    SandboxEventsRequest, SandboxInfo, SetLifecycleRequest, SignalExecutionRequest,
-    StartExecutionRequest, StatFileRequest, StdinStatus, StopSandboxRequest, WaitExecutionRequest,
+    ListExecutionsRequest, ListExecutionsResponse, ListSandboxesRequest, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, MakeDirRequest, MoveEntryRequest,
+    PauseSandboxRequest, ReadFileRequest, RemoveEntryRequest, RemoveSandboxRequest,
+    ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent, SandboxEventsRequest,
+    SandboxInfo, SetLifecycleRequest, SignalExecutionRequest, StartExecutionRequest,
+    StatFileRequest, StdinStatus, StopSandboxRequest, WaitExecutionRequest, WaitForPortRequest,
     WatchDirRequest, WatchDirResponse, WriteFileOpen, WriteStdinRequest, execution_event,
 };
 use arcbox_connect::v1::{
@@ -1840,6 +1841,40 @@ impl AgentClient {
             MessageType::SandboxExecWaitResponse,
         )
         .await
+    }
+
+    /// Lists a sandbox's retained executions, running and exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_exec_list(
+        &mut self,
+        req: ListExecutionsRequest,
+    ) -> Result<ListExecutionsResponse> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxExecListRequest,
+            &payload,
+            MessageType::SandboxExecListResponse,
+        )
+        .await
+    }
+
+    /// Waits until something inside a sandbox listens on a TCP port.
+    ///
+    /// The guest enforces the wait budget from `req.timeout_seconds` (the
+    /// caller resolves the default) and answers 504 when it elapses; the
+    /// async transport applies no client-side deadline of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the deadline elapses.
+    pub async fn sandbox_wait_for_port(&mut self, req: WaitForPortRequest) -> Result<()> {
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxWaitForPortRequest, &req.encode_to_vec())
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxWaitForPortResponse)
     }
 
     /// Attaches to an execution's output and returns a channel of

@@ -535,6 +535,34 @@ where
                 send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
             }
         },
+        MessageType::SandboxExecListRequest => match svc.list_executions(payload) {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxExecListResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxWaitForPortRequest => match svc.wait_for_port(payload).await {
+            Ok(()) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxWaitForPortResponse,
+                    trace_id,
+                    &[],
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
         // -----------------------------------------------------------------
         // Streaming: Events
         // -----------------------------------------------------------------

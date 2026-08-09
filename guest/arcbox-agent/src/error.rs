@@ -30,6 +30,10 @@ pub enum SandboxError {
     StdinGap(String),
     /// The host / guest lacks a prerequisite (e.g. nested virtualization).
     Unsupported(String),
+    /// A bounded wait elapsed before the awaited condition held (e.g. a
+    /// `WaitForPort` deadline). Carried as 504 so the daemon maps it onto
+    /// `DEADLINE_EXCEEDED` instead of a blanket `INTERNAL`.
+    Deadline(String),
     /// A retryable runtime condition, including an unconfirmed durable write.
     Unavailable(String),
     /// A runtime or business-logic error.
@@ -47,6 +51,7 @@ impl fmt::Display for SandboxError {
             | Self::SandboxPaused(msg)
             | Self::StdinGap(msg)
             | Self::Unsupported(msg)
+            | Self::Deadline(msg)
             | Self::Unavailable(msg)
             | Self::Internal(msg) => f.write_str(msg),
         }
@@ -71,6 +76,7 @@ impl SandboxError {
             Self::StdinGap(_) => 416,
             Self::SandboxPaused(_) => 423,
             Self::Unavailable(_) => 503,
+            Self::Deadline(_) => 504,
             Self::Internal(_) => 500,
         }
     }
@@ -92,6 +98,7 @@ impl From<arcbox_vm::VmmError> for SandboxError {
             }
             VmmError::Paused(_) => Self::SandboxPaused(e.to_string()),
             VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
+            VmmError::DeadlineExceeded(_) => Self::Deadline(e.to_string()),
             VmmError::Unavailable(_) | VmmError::AckUnconfirmed { .. } => {
                 Self::Unavailable(e.to_string())
             }
@@ -159,6 +166,15 @@ mod tests {
     fn not_a_directory_maps_to_400() {
         let err = SandboxError::from(arcbox_vm::VmmError::NotADirectory("/a/file".into()));
         assert_eq!(err.status_code(), 400);
+    }
+
+    #[test]
+    fn deadline_maps_to_504_for_the_daemon_deadline_code() {
+        let err = SandboxError::from(arcbox_vm::VmmError::DeadlineExceeded(
+            "no listener on port 8080".into(),
+        ));
+        assert!(matches!(err, SandboxError::Deadline(_)));
+        assert_eq!(err.status_code(), 504);
     }
 
     #[test]

@@ -204,6 +204,15 @@ pub enum MessageType {
     /// `arcbox.sandbox.v1.WaitExecutionRequest`). Answered with
     /// [`Self::SandboxExecWaitResponse`].
     SandboxExecWaitRequest = 0x0066,
+    /// List a sandbox's retained executions (payload:
+    /// `arcbox.sandbox.v1.ListExecutionsRequest`). Answered with
+    /// [`Self::SandboxExecListResponse`].
+    SandboxExecListRequest = 0x0067,
+    /// Wait for a TCP listener inside a sandbox (payload:
+    /// `arcbox.sandbox.v1.WaitForPortRequest`). Answered with
+    /// [`Self::SandboxWaitForPortResponse`]; an elapsed deadline is an
+    /// `Error` frame with code 504.
+    SandboxWaitForPortRequest = 0x0068,
 
     /// Starts a machine-level exec: runs a command in the machine root (the
     /// agent's own mount namespace), streamed back as
@@ -337,6 +346,12 @@ pub enum MessageType {
     /// Answers [`Self::SandboxExecWaitRequest`] (payload:
     /// `arcbox.sandbox.v1.Execution`).
     SandboxExecWaitResponse = 0x1066,
+    /// Answers [`Self::SandboxExecListRequest`] (payload:
+    /// `arcbox.sandbox.v1.ListExecutionsResponse`).
+    SandboxExecListResponse = 0x1067,
+    /// Acknowledges [`Self::SandboxWaitForPortRequest`] (empty payload):
+    /// the listener exists.
+    SandboxWaitForPortResponse = 0x1068,
 
     /// One machine exec output frame (payload: `arcbox.v1.MachineExecOutput`;
     /// `done == true` on the final frame carrying the exit code).
@@ -409,6 +424,8 @@ impl MessageType {
             0x0064 => Some(Self::SandboxExecSignalRequest),
             0x0065 => Some(Self::SandboxExecResizeRequest),
             0x0066 => Some(Self::SandboxExecWaitRequest),
+            0x0067 => Some(Self::SandboxExecListRequest),
+            0x0068 => Some(Self::SandboxWaitForPortRequest),
             // Machine-level exec.
             0x0050 => Some(Self::MachineExecRequest),
             0x0051 => Some(Self::MachineExecInput),
@@ -472,6 +489,8 @@ impl MessageType {
             0x1064 => Some(Self::SandboxExecSignalResponse),
             0x1065 => Some(Self::SandboxExecResizeResponse),
             0x1066 => Some(Self::SandboxExecWaitResponse),
+            0x1067 => Some(Self::SandboxExecListResponse),
+            0x1068 => Some(Self::SandboxWaitForPortResponse),
             0x1050 => Some(Self::MachineExecOutput),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
@@ -518,6 +537,8 @@ impl MessageType {
                 | Self::SandboxExecSignalRequest
                 | Self::SandboxExecResizeRequest
                 | Self::SandboxExecWaitRequest
+                | Self::SandboxExecListRequest
+                | Self::SandboxWaitForPortRequest
         )
     }
 
@@ -651,12 +672,16 @@ mod tests {
             (0x0064, MessageType::SandboxExecSignalRequest),
             (0x0065, MessageType::SandboxExecResizeRequest),
             (0x0066, MessageType::SandboxExecWaitRequest),
+            (0x0067, MessageType::SandboxExecListRequest),
+            (0x0068, MessageType::SandboxWaitForPortRequest),
             (0x1060, MessageType::SandboxExecStartResponse),
             (0x1061, MessageType::SandboxExecEvent),
             (0x1062, MessageType::SandboxStdinStatus),
             (0x1064, MessageType::SandboxExecSignalResponse),
             (0x1065, MessageType::SandboxExecResizeResponse),
             (0x1066, MessageType::SandboxExecWaitResponse),
+            (0x1067, MessageType::SandboxExecListResponse),
+            (0x1068, MessageType::SandboxWaitForPortResponse),
             // Sandbox snapshots.
             (0x0040, MessageType::SandboxCheckpointRequest),
             (0x0041, MessageType::SandboxRestoreRequest),
