@@ -33,6 +33,7 @@ __all__ = [
     "CommandNotFoundError",
     "CommandTimeoutError",
     "ConnectionFailedError",
+    "ConnectionLostError",
     "FileNotFoundError",
     "FileTooLargeError",
     "InvalidArgumentError",
@@ -83,6 +84,12 @@ class InvalidArgumentError(ArcBoxError):
 
 class ConnectionFailedError(ArcBoxError):
     """The daemon is unreachable (socket missing, connection refused, ...)."""
+
+
+class ConnectionLostError(ConnectionFailedError):
+    """A live stream died mid-flow — and, where the SDK re-attaches
+    (command output), could not be re-established within the retry
+    budget. ``__cause__`` carries the underlying transport failure."""
 
 
 class AuthenticationError(ArcBoxError):

@@ -24,7 +24,7 @@ from arcbox._envelope import (
     end_stream_error,
     unary_error,
 )
-from arcbox.errors import ArcBoxError, InvalidArgumentError
+from arcbox.errors import ArcBoxError, ConnectionLostError, InvalidArgumentError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
@@ -170,8 +170,9 @@ class ConnectClient:
         if not ended:
             # Without the terminal frame a truncated body is
             # indistinguishable from success — never report one as
-            # completed (WriteFile rides this path).
-            raise ArcBoxError("the stream ended without an EndStreamResponse")
+            # completed (WriteFile rides this path). Truncation means the
+            # connection died mid-body: a stream-death error.
+            raise ConnectionLostError("the stream ended without an EndStreamResponse")
         if message is None:
             raise ArcBoxError("the stream ended without a response message")
         return message
@@ -251,4 +252,6 @@ class ServerStream(Generic[M]):
                 message = self._response_type()
                 message.ParseFromString(payload)
                 yield message
-        raise ArcBoxError("the stream ended without an EndStreamResponse")
+        # Truncation means the connection died mid-body: a stream-death
+        # error, which resumable consumers treat as retryable.
+        raise ConnectionLostError("the stream ended without an EndStreamResponse")

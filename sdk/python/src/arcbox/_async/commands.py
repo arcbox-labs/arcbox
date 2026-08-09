@@ -6,9 +6,10 @@ import asyncio
 import math
 import time
 import uuid
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from typing import TYPE_CHECKING, Literal, overload
 
+import httpx
 from google.protobuf import empty_pb2
 
 from arcbox._boundary import wrap_errors
@@ -20,7 +21,12 @@ from arcbox._types import (
     StdinStatus,
     command_result_from_execution,
 )
-from arcbox.errors import ArcBoxError, InvalidArgumentError, TimeoutError
+from arcbox.errors import (
+    ArcBoxError,
+    ConnectionLostError,
+    InvalidArgumentError,
+    TimeoutError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
@@ -35,6 +41,11 @@ _PROCESS = "/arcbox.sandbox.v1.SandboxProcessService/"
 #: Longest single WaitExecution long-poll slice, so a dropped daemon
 #: surfaces as an error instead of an infinite silent wait.
 _WAIT_SLICE_SECONDS = 30
+
+#: Consecutive dead re-attach dials tolerated before an output stream
+#: surfaces the stream-death error. Delivered output resets the budget,
+#: so a long-lived stream survives any number of isolated drops.
+_MAX_ATTACH_RETRIES = 3
 
 
 def _normalize_cmd(cmd: str | Sequence[str]) -> list[str]:
@@ -115,20 +126,75 @@ class AsyncCommandHandle:
         earliest byte the daemon still retains (8 MiB per channel);
         replayed buffered output comes first, then live output follows;
         the stream ends when the process exits (deterministic
-        termination — never silence). When breaking out early, iterate
-        via the context-manager form (see :class:`AsyncOutputStream`)."""
+        termination — never silence). A transport drop mid-stream
+        re-attaches transparently from the last delivered offsets (see
+        :class:`arcbox.errors.ConnectionLostError` for the
+        exhausted-retries case). When breaking out early, iterate via
+        the context-manager form (see :class:`AsyncOutputStream`)."""
         return AsyncOutputStream(self._stream_output())
 
     async def _stream_output(self) -> AsyncGenerator[OutputChunk]:
-        with wrap_errors("commands.output"):
-            async with self._attach() as stream:
-                async for event in stream:
-                    kind = event.WhichOneof("event")
-                    if kind == "output":
-                        chunk = event.output
-                        yield OutputChunk(_channel_name(chunk.channel), chunk.data)
-                    elif kind == "exited":
-                        return
+        # aclosing releases the inner attach loop (and its HTTP stream)
+        # deterministically on early exit — breaking out of an async-for
+        # alone would leave it to generator finalization.
+        async with aclosing(self._attach_events("commands.output")) as events:
+            async for event in events:
+                kind = event.WhichOneof("event")
+                if kind == "output":
+                    chunk = event.output
+                    yield OutputChunk(_channel_name(chunk.channel), chunk.data)
+                elif kind == "exited":
+                    return
+
+    async def _attach_events(self, operation: str) -> AsyncGenerator[process_pb2.ExecutionEvent]:
+        """The resumable attach loop shared by :attr:`output` and the
+        result collection: streams execution events, tracking the byte
+        offset each channel has delivered. When the transport drops
+        mid-stream, it re-attaches from those offsets — the daemon
+        replays nothing already delivered — so the consumer sees one
+        seamless, gapless stream. Only consecutive dead dials count
+        against the retry budget (delivered output resets it); once
+        exhausted, the stream-death
+        :class:`arcbox.errors.ConnectionLostError` carries the last
+        transport failure. Daemon-typed stream errors are never
+        retried."""
+        with wrap_errors(operation):
+            stdout_offset = 0
+            stderr_offset = 0
+            failures = 0
+            while True:
+                try:
+                    async with self._attach(stdout_offset, stderr_offset) as stream:
+                        async for event in stream:
+                            kind = event.WhichOneof("event")
+                            if kind == "output":
+                                chunk = event.output
+                                after = chunk.offset + len(chunk.data)
+                                if chunk.channel == process_pb2.STDIO_CHANNEL_STDERR:
+                                    if after > stderr_offset:
+                                        stderr_offset = after
+                                        failures = 0
+                                elif after > stdout_offset:
+                                    stdout_offset = after
+                                    failures = 0
+                            yield event
+                            if kind == "exited":
+                                return
+                    # A clean server-side end without an exited frame:
+                    # nothing more is coming (the daemon closed the record).
+                    return
+                except (httpx.HTTPError, ConnectionLostError) as exc:
+                    failures += 1
+                    if failures > _MAX_ATTACH_RETRIES:
+                        raise ConnectionLostError(
+                            "the output stream died and could not be re-attached "
+                            "within the retry budget",
+                            context={
+                                "command_id": self.command_id,
+                                "retries": str(_MAX_ATTACH_RETRIES),
+                            },
+                            operation=operation,
+                        ) from exc
 
     async def wait_for_exit(self, timeout: float | None = None) -> CommandResult:
         """Wait until the command exits and return its result (server-side
@@ -275,14 +341,16 @@ class AsyncCommandHandle:
         self._stdin_offset = int(status.bytes_written)
         return status
 
-    def _attach(self) -> AsyncServerStream[process_pb2.ExecutionEvent]:
+    def _attach(
+        self, stdout_offset: int, stderr_offset: int
+    ) -> AsyncServerStream[process_pb2.ExecutionEvent]:
         return self._client.stream(
             _PROCESS + "AttachExecution",
             process_pb2.AttachExecutionRequest(
                 sandbox_id=self._sandbox_id,
                 execution_id=self.command_id,
-                stdout_offset=0,
-                stderr_offset=0,
+                stdout_offset=stdout_offset,
+                stderr_offset=stderr_offset,
             ),
             process_pb2.ExecutionEvent,
         )
@@ -298,8 +366,8 @@ class AsyncCommandHandle:
         next_stdout = 0
         next_stderr = 0
         truncated = False
-        async with self._attach() as stream:
-            async for event in stream:
+        async with aclosing(self._attach_events("commands.wait_for_exit")) as events:
+            async for event in events:
                 kind = event.WhichOneof("event")
                 if kind == "output":
                     chunk = event.output
