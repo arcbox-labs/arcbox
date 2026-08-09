@@ -553,6 +553,73 @@ where
         MessageType::SandboxFileWriteRequest => {
             svc.handle_write_file(stream, trace_id, payload).await?;
         }
+        MessageType::SandboxFileStatRequest => match svc.stat_file(payload).await {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxFileStatResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxFileListDirRequest => match svc.list_dir(payload).await {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxFileListDirResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxFileMakeDirRequest => match svc.make_dir(payload).await {
+            Ok(()) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxFileMakeDirResponse,
+                    trace_id,
+                    &[],
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxFileRemoveRequest => match svc.remove_entry(payload).await {
+            Ok(()) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxFileRemoveResponse,
+                    trace_id,
+                    &[],
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxFileMoveRequest => match svc.move_entry(payload).await {
+            Ok(()) => {
+                write_message(stream, MessageType::SandboxFileMoveResponse, trace_id, &[]).await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxFileWatchRequest => {
+            svc.handle_watch_dir(stream, trace_id, payload).await?;
+        }
         // -----------------------------------------------------------------
         // Port forwarding
         // -----------------------------------------------------------------
