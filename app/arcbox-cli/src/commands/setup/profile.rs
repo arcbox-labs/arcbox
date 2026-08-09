@@ -61,7 +61,7 @@ pub(super) async fn inject(shell: ShellKind) -> Result<PathBuf> {
         tokio::fs::create_dir_all(parent).await?;
     }
     let existing = read(&path).await?.unwrap_or_default();
-    let updated = normalized_profile(&existing, Some(&source_snippet(shell)));
+    let updated = normalized_profile(&existing, shell, Some(&source_snippet(shell)));
     if updated != existing {
         tokio::fs::write(&path, updated)
             .await
@@ -75,7 +75,7 @@ pub(super) async fn remove(shell: ShellKind) -> Result<Option<PathBuf>> {
     let Some(existing) = read(&path).await? else {
         return Ok(None);
     };
-    let updated = normalized_profile(&existing, None);
+    let updated = normalized_profile(&existing, shell, None);
     if updated == existing {
         return Ok(None);
     }
@@ -119,12 +119,22 @@ fn source_snippet(shell: ShellKind) -> String {
     )
 }
 
-fn normalized_profile(content: &str, snippet: Option<&str>) -> String {
-    let mut lines = content.lines();
+fn normalized_profile(content: &str, shell: ShellKind, snippet: Option<&str>) -> String {
+    let managed_source = source_snippet(shell)
+        .lines()
+        .nth(1)
+        .expect("source snippet has a command")
+        .to_owned();
+    let mut lines = content.lines().peekable();
     let mut kept = Vec::new();
     while let Some(line) = lines.next() {
         if line == PROFILE_MARKER {
-            lines.next();
+            if lines
+                .peek()
+                .is_some_and(|line| *line == managed_source.as_str())
+            {
+                lines.next();
+            }
         } else {
             kept.push(line);
         }
@@ -262,22 +272,34 @@ fn shell_quote(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROFILE_MARKER, normalized_profile, probe_value};
+    use super::{PROFILE_MARKER, ShellKind, normalized_profile, probe_value, source_snippet};
 
     #[test]
     fn profile_normalization_removes_duplicate_injections() {
-        let snippet = format!("{PROFILE_MARKER}\nsource \"/new/init.zsh\"");
-        let existing = format!(
-            "export KEEP=1\n{PROFILE_MARKER}\nsource \"/old/init.zsh\"\n\n{PROFILE_MARKER}\nsource \"/older/init.zsh\"\n"
-        );
+        let snippet = source_snippet(ShellKind::Zsh);
+        let existing = format!("export KEEP=1\n{snippet}\n\n{snippet}\n");
 
-        let installed = normalized_profile(&existing, Some(&snippet));
+        let installed = normalized_profile(&existing, ShellKind::Zsh, Some(&snippet));
         assert_eq!(installed.matches(PROFILE_MARKER).count(), 1);
         assert!(installed.contains("export KEEP=1"));
-        assert!(installed.contains("/new/init.zsh"));
-        assert!(!installed.contains("/old/init.zsh"));
-        assert_eq!(normalized_profile(&installed, Some(&snippet)), installed);
-        assert_eq!(normalized_profile(&installed, None), "export KEEP=1\n");
+        assert_eq!(
+            normalized_profile(&installed, ShellKind::Zsh, Some(&snippet)),
+            installed
+        );
+        assert_eq!(
+            normalized_profile(&installed, ShellKind::Zsh, None),
+            "export KEEP=1\n"
+        );
+    }
+
+    #[test]
+    fn orphaned_marker_preserves_the_following_user_line() {
+        let existing = format!("{PROFILE_MARKER}\nexport KEEP=1\n");
+
+        assert_eq!(
+            normalized_profile(&existing, ShellKind::Zsh, None),
+            "export KEEP=1\n"
+        );
     }
 
     #[test]

@@ -201,6 +201,7 @@ impl BootAssetProvider {
 
     /// Reads and returns the cached manifest for the current version.
     pub async fn read_cached_manifest_required(&self) -> Result<BootAssetManifest> {
+        self.verify_manifest_pin()?;
         let path = self.config.version_cache_dir().join("manifest.json");
         let bytes = tokio::fs::read(&path)
             .await
@@ -307,7 +308,7 @@ fn manifest_has_binary(manifest: &BootAssetManifest, arch: &str, name: &str) -> 
 
 #[cfg(test)]
 mod manifest_tests {
-    use super::{BootAssetManifest, manifest_has_binary};
+    use super::{BootAssetConfig, BootAssetManifest, BootAssetProvider, manifest_has_binary};
 
     #[test]
     fn binary_capability_is_scoped_to_the_current_architecture() {
@@ -332,5 +333,28 @@ mod manifest_tests {
         assert!(manifest_has_binary(&manifest, "arm64", "FEX"));
         assert!(!manifest_has_binary(&manifest, "x86_64", "FEX"));
         assert!(!manifest_has_binary(&manifest, "arm64", "dockerd"));
+    }
+
+    #[tokio::test]
+    async fn required_manifest_read_rejects_bytes_that_do_not_match_the_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = BootAssetConfig::with_cache_dir(directory.path().to_owned());
+        std::fs::create_dir_all(config.version_cache_dir()).unwrap();
+        std::fs::write(
+            config.version_cache_dir().join("manifest.json"),
+            r#"{
+                "schema_version": 0,
+                "asset_version": "0.8.4",
+                "built_at": "now",
+                "targets": {},
+                "binaries": []
+            }"#,
+        )
+        .unwrap();
+        let provider = BootAssetProvider::with_config(config).unwrap();
+
+        let error = provider.read_cached_manifest_required().await.unwrap_err();
+
+        assert!(error.to_string().contains("manifest SHA256 mismatch"));
     }
 }

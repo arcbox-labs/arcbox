@@ -89,7 +89,9 @@ struct DiskUsageReport {
     docker_data_disk: Option<DiskImageReport>,
     docker_metadata_disk: Option<DiskImageReport>,
     docker_reclaimable: Option<arcbox_docker::DockerReclaimableSpace>,
-    reclaimable_bytes: u64,
+    reclaimable_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docker_reclaimable_error: Option<String>,
 }
 
 impl DiskUsageReport {
@@ -105,7 +107,22 @@ impl DiskUsageReport {
             docker_data_disk: Some(docker_data_disk),
             docker_metadata_disk,
             docker_reclaimable: Some(docker_reclaimable),
-            reclaimable_bytes,
+            reclaimable_bytes: Some(reclaimable_bytes),
+            docker_reclaimable_error: None,
+        }
+    }
+
+    fn without_runtime(
+        docker_data_disk: DiskImageReport,
+        docker_metadata_disk: Option<DiskImageReport>,
+        error: String,
+    ) -> Self {
+        Self {
+            docker_data_disk: Some(docker_data_disk),
+            docker_metadata_disk,
+            docker_reclaimable: None,
+            reclaimable_bytes: None,
+            docker_reclaimable_error: Some(error),
         }
     }
 
@@ -114,7 +131,8 @@ impl DiskUsageReport {
             docker_data_disk: None,
             docker_metadata_disk: None,
             docker_reclaimable: None,
-            reclaimable_bytes: 0,
+            reclaimable_bytes: None,
+            docker_reclaimable_error: None,
         }
     }
 }
@@ -191,12 +209,15 @@ async fn execute_usage(format: OutputFormat) -> Result<()> {
                 "failed to query Docker disk usage through {}",
                 socket_path.display()
             )
-        })?;
-    let report = DiskUsageReport::new(
-        DiskImageReport::new(img_path.clone(), usage),
-        metadata_usage.map(|meta| DiskImageReport::new(meta_path.clone(), meta)),
-        docker_reclaimable,
-    );
+        });
+    let data_report = DiskImageReport::new(img_path.clone(), usage);
+    let metadata_report = metadata_usage.map(|meta| DiskImageReport::new(meta_path.clone(), meta));
+    let report = match &docker_reclaimable {
+        Ok(reclaimable) => DiskUsageReport::new(data_report, metadata_report, *reclaimable),
+        Err(error) => {
+            DiskUsageReport::without_runtime(data_report, metadata_report, format!("{error:#}"))
+        }
+    };
 
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
@@ -209,35 +230,46 @@ async fn execute_usage(format: OutputFormat) -> Result<()> {
             }
 
             println!();
-            println!("Docker reclaimable:");
-            println!(
-                "  Images:                {:.1} GiB",
-                docker_reclaimable.images_bytes as f64 / BYTES_PER_GIB
-            );
-            println!(
-                "  Containers:            {:.1} GiB",
-                docker_reclaimable.containers_bytes as f64 / BYTES_PER_GIB
-            );
-            println!(
-                "  Volumes:               {:.1} GiB",
-                docker_reclaimable.volumes_bytes as f64 / BYTES_PER_GIB
-            );
-            println!(
-                "  Build cache:           {:.1} GiB",
-                docker_reclaimable.build_cache_bytes as f64 / BYTES_PER_GIB
-            );
-            println!(
-                "  Runtime total:         {:.1} GiB",
-                docker_reclaimable.total_bytes as f64 / BYTES_PER_GIB
-            );
-            println!(
-                "  Reclaimable (capped):  {:.1} GiB",
-                report.reclaimable_bytes as f64 / BYTES_PER_GIB
-            );
+            if let Some(reclaimable) = report.docker_reclaimable {
+                println!("Docker reclaimable:");
+                println!(
+                    "  Images:                {:.1} GiB",
+                    reclaimable.images_bytes as f64 / BYTES_PER_GIB
+                );
+                println!(
+                    "  Containers:            {:.1} GiB",
+                    reclaimable.containers_bytes as f64 / BYTES_PER_GIB
+                );
+                println!(
+                    "  Volumes:               {:.1} GiB",
+                    reclaimable.volumes_bytes as f64 / BYTES_PER_GIB
+                );
+                println!(
+                    "  Build cache:           {:.1} GiB",
+                    reclaimable.build_cache_bytes as f64 / BYTES_PER_GIB
+                );
+                println!(
+                    "  Runtime total:         {:.1} GiB",
+                    reclaimable.total_bytes as f64 / BYTES_PER_GIB
+                );
+                println!(
+                    "  Reclaimable (capped):  {:.1} GiB",
+                    report
+                        .reclaimable_bytes
+                        .expect("runtime report has a total") as f64
+                        / BYTES_PER_GIB
+                );
+            } else {
+                println!("Docker reclaimable: unavailable");
+                if let Some(error) = &report.docker_reclaimable_error {
+                    println!("  Error: {error}");
+                }
+            }
         }
         OutputFormat::Quiet => unreachable!(),
     }
 
+    docker_reclaimable?;
     Ok(())
 }
 
@@ -369,7 +401,7 @@ mod tests {
             docker_reclaimable(6000),
         );
 
-        assert_eq!(report.reclaimable_bytes, 55);
+        assert_eq!(report.reclaimable_bytes, Some(55));
     }
 
     #[test]
@@ -411,6 +443,30 @@ mod tests {
                 },
                 "reclaimable_bytes": 50,
             })
+        );
+    }
+
+    #[test]
+    fn unavailable_runtime_keeps_host_disk_facts_in_json() {
+        let report = DiskUsageReport::without_runtime(
+            DiskImageReport::new(
+                "/data/docker.img".into(),
+                DiskUsage {
+                    logical_bytes: 8192,
+                    physical_bytes: 55,
+                },
+            ),
+            None,
+            "Docker socket unavailable".to_owned(),
+        );
+
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["docker_data_disk"]["physical_allocation_bytes"], 55);
+        assert_eq!(json["docker_reclaimable"], serde_json::Value::Null);
+        assert_eq!(json["reclaimable_bytes"], serde_json::Value::Null);
+        assert_eq!(
+            json["docker_reclaimable_error"],
+            "Docker socket unavailable"
         );
     }
 }
