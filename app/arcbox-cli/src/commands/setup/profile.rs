@@ -118,18 +118,13 @@ fn source_snippet(shell: ShellKind) -> String {
 }
 
 fn normalized_profile(content: &str, shell: ShellKind, snippet: Option<&str>) -> String {
-    let managed_source = source_snippet(shell)
-        .lines()
-        .nth(1)
-        .expect("source snippet has a command")
-        .to_owned();
     let mut lines = content.lines().peekable();
     let mut kept = Vec::new();
     while let Some(line) = lines.next() {
         if line == PROFILE_MARKER {
             if lines
                 .peek()
-                .is_some_and(|line| *line == managed_source.as_str())
+                .is_some_and(|line| is_managed_source(line, shell))
             {
                 lines.next();
             }
@@ -152,6 +147,19 @@ fn normalized_profile(content: &str, shell: ShellKind, snippet: Option<&str>) ->
         result.push('\n');
     }
     result
+}
+
+fn is_managed_source(line: &str, shell: ShellKind) -> bool {
+    let suffix = if matches!(shell, ShellKind::Fish) {
+        "\"; or true"
+    } else {
+        "\" 2>/dev/null || :"
+    };
+    line.strip_prefix("source \"")
+        .and_then(|line| line.strip_suffix(suffix))
+        .is_some_and(|path| {
+            Path::new(path).ends_with(Path::new("shell").join(format!("init.{}", shell.as_str())))
+        })
 }
 
 async fn read(path: &Path) -> Result<Option<String>> {
@@ -296,6 +304,21 @@ mod tests {
 
         assert_eq!(
             normalized_profile(&existing, ShellKind::Zsh, None),
+            "export KEEP=1\n"
+        );
+    }
+
+    #[test]
+    fn stale_managed_source_is_replaced_and_remains_removable() {
+        let stale = "source \"/old/arcbox/shell/init.zsh\" 2>/dev/null || :";
+        let existing = format!("{PROFILE_MARKER}\n{stale}\nexport KEEP=1\n");
+        let current = source_snippet(ShellKind::Zsh);
+
+        let installed = normalized_profile(&existing, ShellKind::Zsh, Some(&current));
+        assert!(!installed.contains(stale));
+        assert!(installed.contains(&current));
+        assert_eq!(
+            normalized_profile(&installed, ShellKind::Zsh, None),
             "export KEEP=1\n"
         );
     }
