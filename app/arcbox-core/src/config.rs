@@ -25,9 +25,6 @@
 //! subnet = "10.0.2.0/24"
 //! dns = ["8.8.8.8", "8.8.4.4"]
 //!
-//! [docker]
-//! socket_path = "~/.arcbox/run/docker.sock"
-//!
 //! [container]
 //! guest_docker_vsock_port = 2375
 //!
@@ -307,7 +304,9 @@ impl Default for NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockerConfig {
-    /// Unix socket path for Docker API.
+    /// Unix socket path for Docker API clients.
+    ///
+    /// Daemon startup replaces configured values with its resolved host layout.
     pub socket_path: PathBuf,
     /// Enable Docker API.
     pub enabled: bool,

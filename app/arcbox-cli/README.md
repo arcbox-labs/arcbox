@@ -80,8 +80,10 @@ reclaimable fields to `null`, reports the query error, and exits nonzero.
 
 Socket path resolution order:
 1. `ARCBOX_SOCKET` environment variable
-2. `DOCKER_HOST` (with `unix://` prefix stripped)
-3. Default: `~/.arcbox/docker.sock`
+2. The active profile or `ARCBOX_DATA_DIR` layout (`<data-dir>/run/docker.sock`)
+
+The production default is `~/.arcbox/run/docker.sock`. `DOCKER_HOST` is
+honored by the Docker CLI, not by ArcBox's direct socket clients.
 
 ## License
 

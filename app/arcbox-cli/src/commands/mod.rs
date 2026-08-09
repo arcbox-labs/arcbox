@@ -42,10 +42,20 @@ pub fn resolve_grpc_socket_path() -> PathBuf {
     arcbox_constants::paths::HostLayout::from_env_or_default().grpc_socket
 }
 
-/// Resolves the Docker socket from the CLI override or active configuration.
-pub fn resolve_docker_socket_path(config: &arcbox_core::Config) -> PathBuf {
-    std::env::var_os("ARCBOX_SOCKET")
-        .map_or_else(|| config.docker.socket_path.clone(), PathBuf::from)
+/// Resolves the Docker socket from the CLI override or active host layout.
+pub fn resolve_docker_socket_path() -> PathBuf {
+    let layout = arcbox_constants::paths::HostLayout::from_env_or_default();
+    select_docker_socket_path(
+        std::env::var_os("ARCBOX_SOCKET").map(PathBuf::from),
+        &layout,
+    )
+}
+
+fn select_docker_socket_path(
+    socket_override: Option<PathBuf>,
+    layout: &arcbox_constants::paths::HostLayout,
+) -> PathBuf {
+    socket_override.unwrap_or_else(|| layout.docker_socket.clone())
 }
 
 pub mod agent;
@@ -86,9 +96,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Unix socket path for daemon connection
+    /// Docker API Unix socket override
     ///
-    /// Can also be set via ARCBOX_SOCKET or DOCKER_HOST environment variables.
+    /// Can also be set via the ARCBOX_SOCKET environment variable.
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
@@ -255,9 +265,26 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use arcbox_constants::paths::HostLayout;
     use clap::Parser;
 
-    use super::Cli;
+    use super::{Cli, select_docker_socket_path};
+
+    #[test]
+    fn docker_socket_uses_override_then_host_layout() {
+        let layout = HostLayout::new(PathBuf::from("custom-data"));
+
+        assert_eq!(
+            select_docker_socket_path(None, &layout),
+            layout.docker_socket
+        );
+        assert_eq!(
+            select_docker_socket_path(Some(PathBuf::from("override.sock")), &layout),
+            PathBuf::from("override.sock")
+        );
+    }
 
     #[test]
     fn query_output_format_matrix() {

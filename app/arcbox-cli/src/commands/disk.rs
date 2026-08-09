@@ -3,6 +3,7 @@
 //! Inspect and manage the Docker data disk image.
 
 use anyhow::{Context, Result, bail};
+use arcbox_constants::paths::HostLayout;
 use clap::Subcommand;
 use serde::Serialize;
 
@@ -25,6 +26,13 @@ pub async fn execute(cmd: DiskCommands, format: OutputFormat) -> Result<()> {
 }
 
 const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+fn docker_image_paths(layout: &HostLayout) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        layout.data_subdir.join("docker.img"),
+        layout.data_subdir.join("docker-meta.img"),
+    )
+}
 
 /// Disk usage figures derived from `stat` on the sparse data image.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -177,8 +185,8 @@ async fn execute_usage(format: OutputFormat) -> Result<()> {
         bail!("disk usage does not support quiet output");
     }
 
-    let config = arcbox_core::Config::load()?;
-    let img_path = config.docker_img_path();
+    let layout = HostLayout::from_env_or_default();
+    let (img_path, meta_path) = docker_image_paths(&layout);
 
     if !img_path.exists() {
         match format {
@@ -193,12 +201,11 @@ async fn execute_usage(format: OutputFormat) -> Result<()> {
     }
 
     let usage = read_disk_usage(&img_path)?;
-    let meta_path = config.docker_meta_img_path();
     let metadata_usage = meta_path
         .exists()
         .then(|| read_disk_usage(&meta_path))
         .transpose()?;
-    let socket_path = super::resolve_docker_socket_path(&config);
+    let socket_path = super::resolve_docker_socket_path();
     let docker_reclaimable = arcbox_docker::query_reclaimable_space(&socket_path)
         .await
         .with_context(|| {
@@ -275,8 +282,8 @@ async fn execute_usage(format: OutputFormat) -> Result<()> {
 const DEFAULT_MACHINE: &str = "default";
 
 async fn execute_compact() -> Result<()> {
-    let config = arcbox_core::Config::load()?;
-    let img_path = config.docker_img_path();
+    let layout = HostLayout::from_env_or_default();
+    let (img_path, _) = docker_image_paths(&layout);
 
     if !img_path.exists() {
         println!("Docker data disk not found at {}", img_path.display());
@@ -314,10 +321,12 @@ async fn execute_compact() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    use std::path::PathBuf;
 
+    use arcbox_constants::paths::HostLayout;
     use serde_json::json;
 
-    use super::{DiskImageReport, DiskUsage, DiskUsageReport, read_disk_usage};
+    use super::{DiskImageReport, DiskUsage, DiskUsageReport, docker_image_paths, read_disk_usage};
 
     fn docker_reclaimable(total_bytes: u64) -> arcbox_docker::DockerReclaimableSpace {
         arcbox_docker::DockerReclaimableSpace {
@@ -327,6 +336,19 @@ mod tests {
             build_cache_bytes: 0,
             total_bytes,
         }
+    }
+
+    #[test]
+    fn docker_images_follow_host_layout_data_directory() {
+        let layout = HostLayout::new(PathBuf::from("custom-data"));
+
+        assert_eq!(
+            docker_image_paths(&layout),
+            (
+                PathBuf::from("custom-data/data/docker.img"),
+                PathBuf::from("custom-data/data/docker-meta.img")
+            )
+        );
     }
 
     #[test]

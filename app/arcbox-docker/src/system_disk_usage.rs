@@ -45,6 +45,7 @@ struct SystemDiskUsageResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ReclaimableUsage {
+    #[serde(default)]
     reclaimable: u64,
 }
 
@@ -172,6 +173,22 @@ mod tests {
                 total_bytes: 110,
             }
         );
+    }
+
+    #[test]
+    fn treats_omitted_reclaimable_field_as_zero() {
+        let usage = parse_reclaimable_space(
+            br#"{
+                "ImageUsage": {"Reclaimable": 11},
+                "ContainerUsage": {},
+                "VolumeUsage": {"Reclaimable": 33},
+                "BuildCacheUsage": {"Reclaimable": 44}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(usage.containers_bytes, 0);
+        assert_eq!(usage.total_bytes, 88);
     }
 
     #[test]

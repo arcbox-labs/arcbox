@@ -20,6 +20,7 @@ use hickory_proto::rr::{Name, RecordType};
 use macos_resolver::{FileResolver, ResolverConfig, to_env_prefix};
 use serde::Serialize;
 use tokio::net::UdpSocket;
+use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::OutputFormat;
@@ -81,6 +82,21 @@ pub(super) struct DnsStatus {
     pub server_address: String,
     pub query_name: String,
     pub health: DnsHealth,
+    pub system_resolver: SystemResolverHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum SystemResolverHealth {
+    Healthy,
+    TimedOut,
+    LookupFailed { error: String },
+}
+
+impl SystemResolverHealth {
+    fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
 }
 
 /// Reads the DNS port from `{PREFIX}_DNS_PORT` or falls back to the default.
@@ -209,13 +225,17 @@ pub(super) async fn inspect_status() -> DnsStatus {
     };
     let server: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
     let query_name = format!("host.{domain}");
+    let (service_health, system_resolver) = tokio::join!(
+        probe_dns(server, &query_name, DNS_PROBE_TIMEOUT),
+        probe_system_resolver(&query_name, DNS_PROBE_TIMEOUT),
+    );
     let health = daemon_health(
-        probe_dns(server, &query_name, DNS_PROBE_TIMEOUT).await,
+        service_health,
         super::daemon::daemon_is_alive(&HostLayout::from_env_or_default().lock_file),
     );
 
     DnsStatus {
-        ready: resolver_installed && health.is_healthy(),
+        ready: dns_ready(resolver_installed, &health, &system_resolver),
         domain,
         resolver_path: resolver_path.display().to_string(),
         resolver_installed,
@@ -223,6 +243,7 @@ pub(super) async fn inspect_status() -> DnsStatus {
         server_address: server.to_string(),
         query_name,
         health,
+        system_resolver,
     }
 }
 
@@ -253,6 +274,18 @@ fn print_status(status: &DnsStatus) {
         DnsHealth::Io { error } => format!("probe failed ({error})"),
     };
     println!("DNS server:    {server}");
+    let system_resolver = match &status.system_resolver {
+        SystemResolverHealth::Healthy => {
+            format!("resolved {} through macOS", status.query_name)
+        }
+        SystemResolverHealth::TimedOut => {
+            format!("timed out resolving {}", status.query_name)
+        }
+        SystemResolverHealth::LookupFailed { error } => {
+            format!("failed to resolve {} ({error})", status.query_name)
+        }
+    };
+    println!("System lookup: {system_resolver}");
     println!(
         "Status:        {}",
         if status.ready { "ready" } else { "not ready" }
@@ -281,6 +314,50 @@ fn has_directive(content: &str, name: &str, value: &str) -> bool {
         let mut fields = line.split_whitespace();
         fields.next() == Some(name) && fields.next() == Some(value) && fields.next().is_none()
     })
+}
+
+fn dns_ready(
+    resolver_installed: bool,
+    service: &DnsHealth,
+    system_resolver: &SystemResolverHealth,
+) -> bool {
+    resolver_installed && service.is_healthy() && system_resolver.is_healthy()
+}
+
+async fn probe_system_resolver(query_name: &str, deadline: Duration) -> SystemResolverHealth {
+    let mut command = Command::new("/usr/bin/dscacheutil");
+    command
+        .args(["-q", "host", "-a", "name", query_name])
+        .kill_on_drop(true);
+    match timeout(deadline, command.output()).await {
+        Err(_) => SystemResolverHealth::TimedOut,
+        Ok(Err(error)) => SystemResolverHealth::LookupFailed {
+            error: format!("could not execute dscacheutil: {error}"),
+        },
+        Ok(Ok(output)) if !output.status.success() => SystemResolverHealth::LookupFailed {
+            error: format!(
+                "dscacheutil exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        },
+        Ok(Ok(output)) => classify_system_lookup_stdout(&String::from_utf8_lossy(&output.stdout)),
+    }
+}
+
+fn classify_system_lookup_stdout(stdout: &str) -> SystemResolverHealth {
+    let resolved = stdout.lines().any(|line| {
+        line.split_once(':').is_some_and(|(key, value)| {
+            key.trim() == "ip_address" && value.trim().parse::<Ipv4Addr>().is_ok()
+        })
+    });
+    if resolved {
+        SystemResolverHealth::Healthy
+    } else {
+        SystemResolverHealth::LookupFailed {
+            error: "macOS system resolver returned no IPv4 address".to_owned(),
+        }
+    }
 }
 
 async fn probe_dns(address: SocketAddr, query_name: &str, deadline: Duration) -> DnsHealth {
@@ -442,6 +519,22 @@ mod tests {
         assert!(!resolver_matches(
             "# managed by arcbox\nnameserver 127.0.0.2\nport 5553\n",
             5553
+        ));
+    }
+
+    #[test]
+    fn system_lookup_gates_dns_readiness() {
+        let failed = classify_system_lookup_stdout("");
+        assert!(matches!(failed, SystemResolverHealth::LookupFailed { .. }));
+        assert!(!dns_ready(true, &DnsHealth::Healthy, &failed));
+
+        let healthy =
+            classify_system_lookup_stdout("name: host.arcbox.local\nip_address: 10.0.2.1\n");
+        assert_eq!(healthy, SystemResolverHealth::Healthy);
+        assert!(dns_ready(true, &DnsHealth::Healthy, &healthy));
+        assert!(matches!(
+            classify_system_lookup_stdout("name: host.arcbox.local\nipv6_address: ::1\n"),
+            SystemResolverHealth::LookupFailed { .. }
         ));
     }
 

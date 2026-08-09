@@ -114,18 +114,16 @@ pub async fn execute(format: OutputFormat) -> Result<()> {
 async fn inspect() -> DoctorReport {
     let layout = arcbox_constants::paths::HostLayout::from_env_or_default();
     let mut checks = Vec::new();
-    match arcbox_core::Config::load() {
-        Ok(config) => {
-            let expected_socket = super::resolve_docker_socket_path(&config);
-            checks.push(check_daemon(&layout, &expected_socket));
-            checks.push(check_docker_context(&expected_socket).await);
-        }
-        Err(error) => checks.push(HealthCheck::fail(
+    if let Err(error) = arcbox_core::Config::load() {
+        checks.push(HealthCheck::fail(
             "Configuration",
             format!("{error:#}"),
             "Fix the active ArcBox configuration, then rerun doctor.",
-        )),
+        ));
     }
+    let expected_socket = super::resolve_docker_socket_path();
+    checks.push(check_daemon(&layout, &expected_socket));
+    checks.push(check_docker_context(&expected_socket).await);
     checks.push(check_docker_cli().await);
 
     let shell = super::setup::shell_integration_status().await;
@@ -287,7 +285,7 @@ async fn add_macos_checks(checks: &mut Vec<HealthCheck>) {
             "Run `sudo abctl dns install`.",
         )
     });
-    checks.push(match dns.health {
+    checks.push(match &dns.health {
         super::dns::DnsHealth::Healthy => HealthCheck::pass(
             "DNS service",
             format!("{} answered {}", dns.server_address, dns.query_name),
@@ -324,6 +322,22 @@ async fn add_macos_checks(checks: &mut Vec<HealthCheck>) {
             "DNS service",
             format!("UDP probe failed: {error}"),
             "Check the ArcBox daemon logs and DNS listener configuration.",
+        ),
+    });
+    checks.push(match &dns.system_resolver {
+        super::dns::SystemResolverHealth::Healthy => HealthCheck::pass(
+            "DNS system lookup",
+            format!("{} resolved through macOS", dns.query_name),
+        ),
+        super::dns::SystemResolverHealth::TimedOut => HealthCheck::fail(
+            "DNS system lookup",
+            format!("resolving {} timed out", dns.query_name),
+            "Check the macOS resolver configuration with `abctl dns status`.",
+        ),
+        super::dns::SystemResolverHealth::LookupFailed { error } => HealthCheck::fail(
+            "DNS system lookup",
+            format!("could not resolve {}: {error}", dns.query_name),
+            "Check the macOS resolver configuration with `abctl dns status`.",
         ),
     });
 
