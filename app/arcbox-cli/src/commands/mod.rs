@@ -196,3 +196,125 @@ pub enum Commands {
     /// Show version information
     Version,
 }
+
+impl Cli {
+    /// Rejects output formats that the selected command does not implement.
+    pub fn validate_output_format(&self) -> anyhow::Result<()> {
+        let supported = match self.format {
+            OutputFormat::Table => true,
+            OutputFormat::Json => match &self.command {
+                Commands::Boot(
+                    boot::BootCommands::Prefetch(_)
+                    | boot::BootCommands::Status(_)
+                    | boot::BootCommands::Clear
+                    | boot::BootCommands::List,
+                )
+                | Commands::Setup(
+                    setup::SetupCommands::Install
+                    | setup::SetupCommands::Uninstall
+                    | setup::SetupCommands::Status,
+                )
+                | Commands::Docker(docker::DockerCommands::Setup)
+                | Commands::Top(_)
+                | Commands::Disk(disk::DiskCommands::Usage)
+                | Commands::Doctor => true,
+                #[cfg(target_os = "macos")]
+                Commands::Dns(dns::DnsCommands::Status) => true,
+                _ => false,
+            },
+            OutputFormat::Quiet => matches!(
+                &self.command,
+                Commands::Setup(
+                    setup::SetupCommands::Install
+                        | setup::SetupCommands::Uninstall
+                        | setup::SetupCommands::Status
+                )
+            ),
+        };
+
+        if supported {
+            return Ok(());
+        }
+
+        let format = match self.format {
+            OutputFormat::Json => "json",
+            OutputFormat::Quiet => "quiet",
+            OutputFormat::Table => unreachable!("table output is always supported"),
+        };
+        anyhow::bail!("--format {format} is not supported for this command")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn query_output_format_matrix() {
+        let mut cases: Vec<(&[&str], bool, bool)> = vec![
+            (&["version"], false, false),
+            (&["info"], false, false),
+            (&["doctor"], true, false),
+            (&["top"], true, false),
+            (&["logs"], false, false),
+            (&["daemon", "status"], false, false),
+            (&["setup", "status"], true, true),
+            (&["setup", "completions", "--shell", "zsh"], false, false),
+            (&["disk", "usage"], true, false),
+            (&["boot", "status"], true, false),
+            (&["boot", "list"], true, false),
+            (&["system", "backend"], false, false),
+            (&["kubernetes", "status"], false, false),
+            (&["kubernetes", "kubeconfig"], false, false),
+            (&["docker", "status"], false, false),
+            (&["machine", "ls"], false, false),
+            (&["machine", "status", "default"], false, false),
+            (&["machine", "inspect", "default"], false, false),
+            (&["machine", "ping", "default"], false, false),
+            (&["machine", "info", "default"], false, false),
+            (&["sandbox", "ls"], false, false),
+            (&["sandbox", "inspect", "sandbox"], false, false),
+            (&["sandbox", "events"], false, false),
+            (&["sandbox", "snapshots"], false, false),
+            (&["sandbox", "templates"], false, false),
+            (
+                &["migrate", "from", "docker-desktop", "--dry-run"],
+                false,
+                false,
+            ),
+            (&["migrate", "from", "orbstack", "--dry-run"], false, false),
+        ];
+
+        #[cfg(target_os = "macos")]
+        cases.extend([
+            (&["dns", "status"][..], true, false),
+            (&["macos", "ls"][..], false, false),
+            (&["macos", "ip", "guest"][..], false, false),
+            (
+                &["macos", "image", "resolve", "tahoe-base"][..],
+                false,
+                false,
+            ),
+            (&["macos", "image", "ls"][..], false, false),
+        ]);
+
+        for (args, json, quiet) in cases {
+            assert!(accepts(args, "table"), "table rejected for {args:?}");
+            assert_eq!(accepts(args, "json"), json, "JSON mismatch for {args:?}");
+            assert_eq!(accepts(args, "quiet"), quiet, "quiet mismatch for {args:?}");
+        }
+    }
+
+    fn accepts(args: &[&str], format: &str) -> bool {
+        let argv: Vec<_> = ["abctl", "--format", format]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        Cli::try_parse_from(argv)
+            .expect("matrix command must parse")
+            .validate_output_format()
+            .is_ok()
+    }
+}

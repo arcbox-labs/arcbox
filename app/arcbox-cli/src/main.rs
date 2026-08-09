@@ -43,6 +43,8 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    cli.validate_output_format()?;
+
     // Set ARCBOX_SOCKET env var if --socket was provided.
     // This makes it available to gRPC socket resolution in machine commands.
     // SAFETY: This is called at the start of main(), before any threads are spawned,

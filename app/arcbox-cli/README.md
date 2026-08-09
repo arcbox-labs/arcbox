@@ -50,6 +50,18 @@ kubectl get nodes
 docker run hello-world
 ```
 
+## Output formats
+
+`--format` is global but validated for the selected command before any command
+I/O. Unsupported `json` or `quiet` combinations exit nonzero instead of
+falling back to decorated text.
+
+Read-only JSON schemas are available for `doctor`, `top`, `disk usage`,
+`boot status`, `boot list`, `setup status`, and, on macOS, `dns status`.
+Disk and boot sizes use raw `*_bytes` fields. For read-only commands, quiet
+output is limited to `setup status`, which prints `installed` or `partial` and
+still exits nonzero for a partial setup.
+
 ## Exit status
 
 - `0`: command succeeded.
