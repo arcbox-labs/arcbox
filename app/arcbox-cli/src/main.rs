@@ -99,7 +99,7 @@ fn run(cli: Cli) -> Result<()> {
             Commands::Kubernetes(cmd) => commands::kubernetes::execute(cmd).await,
             Commands::System(cmd) => commands::system::execute(cmd).await,
             Commands::Boot(cmd) => commands::boot::execute(cmd, cli.format).await,
-            Commands::Disk(cmd) => commands::disk::execute(cmd).await,
+            Commands::Disk(cmd) => commands::disk::execute(cmd, cli.format).await,
             #[cfg(target_os = "macos")]
             Commands::Dns(cmd) => commands::dns::execute(cmd).await,
             Commands::Daemon(args) => commands::daemon::execute(args).await,
