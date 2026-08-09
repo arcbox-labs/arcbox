@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use arcbox_core::boot_assets::{BootAssetConfig, BootAssetProvider};
 use serde::Serialize;
 
 use super::super::OutputFormat;
@@ -39,14 +40,10 @@ struct ClearOutput {
 /// Prefetch boot assets and runtime binaries.
 pub(super) async fn prefetch(
     root_data_dir: &Path,
-    boot_cache_dir: PathBuf,
+    mut config: BootAssetConfig,
     args: PrefetchArgs,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    use arcbox_core::boot_assets::{BootAssetConfig, BootAssetProvider};
-
-    let mut config = BootAssetConfig::with_cache_dir(boot_cache_dir);
-
     if let Some(version) = args.asset_version {
         config = config.with_version(version);
     }

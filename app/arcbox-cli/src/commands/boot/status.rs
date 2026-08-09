@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Result, bail};
 use arcbox_core::boot_assets::{BootAssetConfig, BootAssetManifest, BootAssetProvider};
@@ -55,11 +55,10 @@ struct ManifestInfo {
 }
 
 pub(super) async fn status(
-    cache_dir: PathBuf,
+    config: BootAssetConfig,
     args: StatusArgs,
     format: OutputFormat,
 ) -> Result<()> {
-    let config = BootAssetConfig::with_cache_dir(cache_dir);
     let provider = BootAssetProvider::with_config(config.clone())?;
     let manifest = provider
         .read_cached_manifest_required()
