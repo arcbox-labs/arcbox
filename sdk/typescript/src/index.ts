@@ -25,7 +25,13 @@ export type {
 } from "./commands";
 
 export { Files, MAX_FILE_BYTES } from "./files";
-export type { WriteOptions } from "./files";
+export type {
+  FileKind,
+  FileStat,
+  MkdirOptions,
+  RemoveOptions,
+  WriteOptions,
+} from "./files";
 
 export type { ConnectionOptions } from "./connection";
 
