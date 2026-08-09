@@ -76,6 +76,51 @@ fn test_is_cached_requires_all_assets() {
     assert!(provider.is_cached());
 }
 
+#[tokio::test]
+async fn cached_versions_use_semver_order_before_invalid_names() {
+    let temp = tempfile::tempdir().unwrap();
+    for version in [
+        "invalid-z",
+        "0.6.13",
+        "1.0.0",
+        "1.0.0+z",
+        "0.5.13",
+        "1.0.0-alpha.10",
+        "1.0.0+a",
+        "invalid-a",
+        "0.6.2",
+        "1.0.0-alpha.2",
+        "0.5.5",
+    ] {
+        let version_dir = temp.path().join(version);
+        std::fs::create_dir(&version_dir).unwrap();
+        std::fs::write(version_dir.join("manifest.json"), b"{}").unwrap();
+    }
+
+    let provider = BootAssetProvider::with_config(BootAssetConfig {
+        cache_dir: temp.path().to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        provider.list_cached_versions().await.unwrap(),
+        [
+            "0.5.5",
+            "0.5.13",
+            "0.6.2",
+            "0.6.13",
+            "1.0.0-alpha.2",
+            "1.0.0-alpha.10",
+            "1.0.0",
+            "1.0.0+a",
+            "1.0.0+z",
+            "invalid-a",
+            "invalid-z",
+        ]
+    );
+}
+
 #[test]
 fn only_development_config_accepts_a_locally_generated_manifest() {
     let temp = tempfile::tempdir().unwrap();

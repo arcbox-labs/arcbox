@@ -56,3 +56,6 @@ https://boot.arcboxcdn.com/
 The daemon pins the boot asset version via `BOOT_ASSET_VERSION` in
 `app/arcbox-core/src/boot_assets.rs`. This can be overridden at runtime
 with the `ARCBOX_BOOT_ASSET_VERSION` environment variable.
+
+`abctl boot list` sorts cached versions by SemVer precedence, including
+prereleases; invalid version directory names appear afterward in lexical order.

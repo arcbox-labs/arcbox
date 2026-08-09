@@ -114,7 +114,7 @@ fn run(cli: Cli) -> Result<()> {
             #[cfg(target_os = "macos")]
             Commands::Internal(cmd) => commands::internal::execute(cmd).await,
             Commands::Info => execute_info().await,
-            Commands::Version => commands::version::execute().await,
+            Commands::Version => commands::version::execute(cli.format).await,
         }
     });
 
