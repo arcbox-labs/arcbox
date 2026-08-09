@@ -1,11 +1,13 @@
 //! `abctl logs` — view daemon and component log files.
 
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
+
+use arcbox_cli::terminal;
 
 /// Arguments for the logs command.
 #[derive(Debug, Args)]
@@ -45,6 +47,7 @@ pub enum LogComponent {
 /// Execute the logs command.
 pub async fn execute(args: LogsArgs) -> Result<()> {
     let log_path = resolve_log_path(&args);
+    let ansi = terminal::ansi_enabled(io::stdout().is_terminal());
 
     if !log_path.exists() {
         bail!(
@@ -55,9 +58,9 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
     }
 
     if args.follow {
-        tail_follow(&log_path, args.lines).await
+        tail_follow(&log_path, args.lines, ansi).await
     } else {
-        tail_lines(&log_path, args.lines)
+        tail_lines(&log_path, args.lines, ansi)
     }
 }
 
@@ -97,7 +100,11 @@ fn resolve_log_path(args: &LogsArgs) -> PathBuf {
 /// Print the last `n` lines of a file by scanning backwards from the end.
 ///
 /// Reads at most 64 KB chunks from the tail to avoid loading the entire file.
-fn tail_lines(path: &Path, n: usize) -> Result<()> {
+fn tail_lines(path: &Path, n: usize, ansi: bool) -> Result<()> {
+    tail_lines_to(path, n, ansi, &mut io::stdout().lock())
+}
+
+fn tail_lines_to(path: &Path, n: usize, ansi: bool, output: &mut impl Write) -> Result<()> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let file_len = file.metadata()?.len();
@@ -135,7 +142,19 @@ fn tail_lines(path: &Path, n: usize) -> Result<()> {
     file.seek(SeekFrom::Start(start_offset))?;
     let reader = BufReader::new(file);
     for line in reader.lines() {
-        println!("{}", line?);
+        write_log(output, line?.as_bytes(), ansi)?;
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_log(output: &mut impl Write, bytes: &[u8], ansi: bool) -> io::Result<()> {
+    if ansi {
+        return output.write_all(bytes);
+    }
+
+    for printable in anstream::adapter::strip_bytes(bytes) {
+        output.write_all(printable)?;
     }
     Ok(())
 }
@@ -144,8 +163,8 @@ fn tail_lines(path: &Path, n: usize) -> Result<()> {
 ///
 /// Detects log rotation (file replaced via rename) by checking whether the
 /// inode or file size changes, and reopens the path when it does.
-async fn tail_follow(path: &Path, n: usize) -> Result<()> {
-    tail_lines(path, n)?;
+async fn tail_follow(path: &Path, n: usize, ansi: bool) -> Result<()> {
+    tail_lines(path, n, ansi)?;
 
     let mut file =
         std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
@@ -171,7 +190,9 @@ async fn tail_follow(path: &Path, n: usize) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             Ok(_) => {
-                print!("{line}");
+                let mut output = io::stdout().lock();
+                write_log(&mut output, line.as_bytes(), ansi)?;
+                output.flush()?;
             }
             Err(e) => {
                 bail!("Error reading log file: {e}");
@@ -199,4 +220,31 @@ fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
         data_dir.map(PathBuf::as_path),
     )
     .data_dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirected_tail_strips_ansi_bytes() {
+        let mut log = tempfile::NamedTempFile::new().unwrap();
+        log.write_all(b"plain\n\x1b[31merror\x1b[0m\n").unwrap();
+
+        let mut output = Vec::new();
+        tail_lines_to(log.path(), 2, false, &mut output).unwrap();
+
+        assert_eq!(output, b"plain\nerror\n");
+        assert!(!output.contains(&0x1b));
+    }
+
+    #[test]
+    fn interactive_tail_preserves_ansi_bytes() {
+        let input = b"\x1b[32mok\x1b[0m";
+        let mut output = Vec::new();
+
+        write_log(&mut output, input, true).unwrap();
+
+        assert_eq!(output, input);
+    }
 }
