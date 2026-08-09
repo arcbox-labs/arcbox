@@ -8,6 +8,7 @@ use tokio::process::Command;
 use super::{ShellKind, bin_dir, completions_dir, shell_dir};
 
 const PROFILE_MARKER: &str = "# Added by ArcBox: command-line tools and integration";
+const MANAGED_SOURCE_TAG: &str = " # managed by ArcBox";
 const BASELINE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const PROBE_PREFIX: &str = "__ARCBOX_SHELL_PROBE__";
 
@@ -113,7 +114,7 @@ fn source_snippet(shell: ShellKind) -> String {
         " 2>/dev/null || :"
     };
     format!(
-        "{PROFILE_MARKER}\nsource \"{}\"{suffix}",
+        "{PROFILE_MARKER}\nsource \"{}\"{suffix}{MANAGED_SOURCE_TAG}",
         init_path(shell).display()
     )
 }
@@ -151,6 +152,9 @@ fn normalized_profile(content: &str, shell: ShellKind, snippet: Option<&str>) ->
 }
 
 fn is_managed_source(line: &str, shell: ShellKind) -> bool {
+    let (line, tagged) = line
+        .strip_suffix(MANAGED_SOURCE_TAG)
+        .map_or((line, false), |line| (line, true));
     let relative = Path::new("shell").join(format!("init.{}", shell.as_str()));
     if let Some(path) = line.strip_prefix("source \"").and_then(|line| match shell {
         ShellKind::Fish => line
@@ -158,6 +162,9 @@ fn is_managed_source(line: &str, shell: ShellKind) -> bool {
             .or_else(|| line.strip_suffix("\" 2>/dev/null; or true")),
         ShellKind::Zsh | ShellKind::Bash => line.strip_suffix("\" 2>/dev/null || :"),
     }) {
+        if tagged {
+            return true;
+        }
         let path = Path::new(path);
         // ponytail: Preserve unknown former ARCBOX_DATA_DIR paths; encode ownership in the marker
         // before cleaning them automatically.
@@ -357,6 +364,39 @@ mod tests {
             assert_eq!(
                 normalized_profile(&existing, shell, None),
                 format!("{source}\n"),
+                "{shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_custom_sources_are_replaced_across_data_directory_changes() {
+        for (shell, old_source, new_source) in [
+            (
+                ShellKind::Zsh,
+                "source \"/old/custom/shell/init.zsh\" 2>/dev/null || : # managed by ArcBox",
+                "source \"/new/custom/shell/init.zsh\" 2>/dev/null || : # managed by ArcBox",
+            ),
+            (
+                ShellKind::Bash,
+                "source \"/old/custom/shell/init.bash\" 2>/dev/null || : # managed by ArcBox",
+                "source \"/new/custom/shell/init.bash\" 2>/dev/null || : # managed by ArcBox",
+            ),
+            (
+                ShellKind::Fish,
+                "source \"/old/custom/shell/init.fish\"; or true # managed by ArcBox",
+                "source \"/new/custom/shell/init.fish\"; or true # managed by ArcBox",
+            ),
+        ] {
+            let existing = format!("{PROFILE_MARKER}\n{old_source}\n# user content\n");
+            let replacement = format!("{PROFILE_MARKER}\n{new_source}");
+
+            let installed = normalized_profile(&existing, shell, Some(&replacement));
+            assert!(!installed.contains(old_source), "{shell:?}");
+            assert!(installed.contains(new_source), "{shell:?}");
+            assert_eq!(
+                normalized_profile(&installed, shell, None),
+                "# user content\n",
                 "{shell:?}"
             );
         }
