@@ -173,6 +173,55 @@ def test_bounded_retries_exhaust_into_the_stream_death_error() -> None:
     assert len(daemon.attaches) == 4
 
 
+def test_a_server_signaled_unavailable_end_frame_is_retried() -> None:
+    # The drop's other wire shape: the daemon loses its upstream agent
+    # stream and ends the HTTP stream CLEANLY with a Connect
+    # `unavailable` error frame. That must resume like raw truncation.
+    attaches: list[process_pb2.AttachExecutionRequest] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/StartExecution"):
+            req = process_pb2.StartExecutionRequest.FromString(request.content)
+            running = process_pb2.EXECUTION_STATE_RUNNING
+            return proto_response(process_pb2.Execution(id=req.execution_id, state=running))
+        if path.endswith("/AttachExecution"):
+            _flags, payload = EnvelopeDecoder().feed(request.content)[0]
+            attach = process_pb2.AttachExecutionRequest.FromString(payload)
+            attaches.append(attach)
+            if len(attaches) == 1:
+                event = process_pb2.ExecutionEvent()
+                event.output.channel = process_pb2.STDIO_CHANNEL_STDOUT
+                event.output.offset = 0
+                event.output.data = b"hel"
+                end = b'{"error": {"code": "unavailable", "message": "agent stream lost"}}'
+                body = encode_envelope(0, event.SerializeToString()) + encode_envelope(
+                    FLAG_END_STREAM, end
+                )
+                return httpx.Response(
+                    200, content=body, headers={"content-type": "application/connect+proto"}
+                )
+            event = process_pb2.ExecutionEvent()
+            event.output.channel = process_pb2.STDIO_CHANNEL_STDOUT
+            event.output.offset = 3
+            event.output.data = b"lo"
+            exited = process_pb2.ExecutionEvent()
+            exited.exited.execution.CopyFrom(exited_execution())
+            frames = [
+                encode_envelope(0, event.SerializeToString()),
+                encode_envelope(0, exited.SerializeToString()),
+            ]
+            return stream_response(frames, truncated=False)
+        return httpx.Response(404)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://arcbox")
+    sandbox = Sandbox(ConnectClient(Connection(http_client=http)), "sb-1")
+    handle = sandbox.commands.run("emit", background=True)
+    stdout = b"".join(chunk.data for chunk in handle.output)
+    assert stdout == b"hello"
+    assert attaches[1].stdout_offset == 3
+
+
 def test_a_daemon_typed_stream_error_is_surfaced_never_retried() -> None:
     attaches = 0
 

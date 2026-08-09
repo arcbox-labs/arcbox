@@ -114,6 +114,24 @@ class TestEvents:
             for _event in sandbox.events():
                 pass
 
+    def test_a_server_signaled_unavailable_end_frame_is_also_stream_death(self) -> None:
+        # The drop's other wire shape: the daemon loses its upstream
+        # event source and ends the HTTP stream CLEANLY with a Connect
+        # `unavailable` error frame.
+        def handler(_request: httpx.Request) -> httpx.Response:
+            end = b'{"error": {"code": "unavailable", "message": "event source lost"}}'
+            body = event_frame(sandbox_pb2.SANDBOX_EVENT_KIND_READY) + encode_envelope(
+                FLAG_END_STREAM, end
+            )
+            return httpx.Response(
+                200, content=body, headers={"content-type": "application/connect+proto"}
+            )
+
+        sandbox = sync_sandbox(handler)
+        with pytest.raises(ConnectionLostError):
+            for _event in sandbox.events():
+                pass
+
 
 class LifecycleProbe:
     def __init__(self) -> None:

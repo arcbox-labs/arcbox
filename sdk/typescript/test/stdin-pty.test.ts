@@ -22,6 +22,7 @@ import {
   ExecutionSchema,
   ExecutionState,
   SandboxProcessService,
+  Signal,
   StdinStatusSchema,
 } from "../src/gen/arcbox/sandbox/v1/process_pb";
 import type { ClientContext } from "../src/transport";
@@ -40,6 +41,9 @@ class MockDaemon {
   /** Throw this from WriteStdin without accepting anything. */
   rejectWrites?: ConnectError;
 
+  /** Signals delivered via SignalExecution. */
+  signals: number[] = [];
+
   transport(): Transport {
     return createRouterTransport(({ service }) => {
       service(SandboxProcessService, {
@@ -49,6 +53,10 @@ class MockDaemon {
             id: req.executionId,
             state: ExecutionState.RUNNING,
           });
+        },
+        signalExecution: (req) => {
+          this.signals.push(req.signal);
+          return create(EmptySchema);
         },
         writeStdin: (req) => {
           this.writes.push(req);
@@ -221,7 +229,7 @@ describe("stdin", () => {
     expect(result.exitCode).toBe(0);
   });
 
-  it("a feed failure with the process still running is real", async () => {
+  it("a feed failure with the process still running is real, and the leaked process is killed", async () => {
     const daemon = new MockDaemon();
     daemon.rejectWrites = new ConnectError(
       "stdin is already closed",
@@ -231,6 +239,10 @@ describe("stdin", () => {
     await expect(
       daemon.commands().run("cat", { stdin: "data" }),
     ).rejects.toThrow("stdin is already closed");
+    // The caller gets no handle out of a thrown run(): without the
+    // best-effort kill, cat would wait on stdin forever and keep the
+    // sandbox RUNNING.
+    expect(daemon.signals).toEqual([Signal.SIGKILL]);
   });
 
   it("rejects stdin: true on a foreground run before any RPC", async () => {

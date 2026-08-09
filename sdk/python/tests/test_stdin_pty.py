@@ -40,6 +40,7 @@ class MockDaemon:
         self.starts: list[process_pb2.StartExecutionRequest] = []
         self.writes: list[process_pb2.WriteStdinRequest] = []
         self.resizes: list[process_pb2.TerminalSize] = []
+        self.signals: list[int] = []
         self.accepted = 0
         self.closed = False
         #: Accept the next write, then fail its response (a lost response).
@@ -80,6 +81,10 @@ class MockDaemon:
             return proto_response(
                 process_pb2.StdinStatus(bytes_written=self.accepted, closed=self.closed)
             )
+        if path.endswith("/SignalExecution"):
+            signal = process_pb2.SignalExecutionRequest.FromString(request.content)
+            self.signals.append(signal.signal)
+            return proto_response(empty_pb2.Empty())
         if path.endswith("/ResizeExecutionTty"):
             resize = process_pb2.ResizeExecutionTtyRequest.FromString(request.content)
             self.resizes.append(resize.size)
@@ -198,6 +203,10 @@ class TestStdin:
         daemon.wait_state = process_pb2.EXECUTION_STATE_RUNNING
         with pytest.raises(SandboxStateError):
             sync_sandbox(daemon).commands.run("cat", stdin="data")
+        # The caller gets no handle out of a raised run(): without the
+        # best-effort kill, cat would wait on stdin forever and keep the
+        # sandbox RUNNING.
+        assert daemon.signals == [process_pb2.SIGNAL_SIGKILL]
 
     def test_foreground_stdin_true_is_rejected_before_any_rpc(self) -> None:
         daemon = MockDaemon()
