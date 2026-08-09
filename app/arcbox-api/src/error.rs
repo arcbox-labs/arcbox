@@ -43,15 +43,17 @@ impl From<ApiError> for connectrpc::ConnectError {
 
         let message = err.to_string();
         let code = match &err {
-            ApiError::Common(common) => match common {
-                CommonError::Config(_) => ErrorCode::InvalidArgument,
-                CommonError::NotFound(_) => ErrorCode::NotFound,
-                CommonError::AlreadyExists(_) => ErrorCode::AlreadyExists,
-                CommonError::InvalidState(_) => ErrorCode::FailedPrecondition,
-                CommonError::Timeout(_) => ErrorCode::DeadlineExceeded,
-                CommonError::PermissionDenied(_) => ErrorCode::PermissionDenied,
-                _ => ErrorCode::Internal,
-            },
+            ApiError::Common(common) | ApiError::Core(arcbox_core::CoreError::Common(common)) => {
+                match common {
+                    CommonError::Config(_) => ErrorCode::InvalidArgument,
+                    CommonError::NotFound(_) => ErrorCode::NotFound,
+                    CommonError::AlreadyExists(_) => ErrorCode::AlreadyExists,
+                    CommonError::InvalidState(_) => ErrorCode::FailedPrecondition,
+                    CommonError::Timeout(_) => ErrorCode::DeadlineExceeded,
+                    CommonError::PermissionDenied(_) => ErrorCode::PermissionDenied,
+                    _ => ErrorCode::Internal,
+                }
+            }
             // Agent-reported errors carry an HTTP-style code over the wire;
             // the raw message classifies further into the error registry.
             ApiError::Core(arcbox_core::CoreError::Agent {
@@ -74,6 +76,14 @@ impl From<ApiError> for connectrpc::ConnectError {
                 }
                 return error;
             }
+            ApiError::Core(arcbox_core::CoreError::Transport {
+                source:
+                    arcbox_transport::error::TransportError::NotConnected
+                    | arcbox_transport::error::TransportError::ConnectionRefused(_)
+                    | arcbox_transport::error::TransportError::ConnectionReset
+                    | arcbox_transport::error::TransportError::Common(CommonError::Io(_)),
+                ..
+            }) => ErrorCode::Unavailable,
             _ => ErrorCode::Internal,
         };
         Self::new(code, message)
@@ -327,5 +337,35 @@ mod tests {
             registry_code(&error.details[0]),
             pb::ErrorCode::SandboxPaused
         );
+    }
+
+    #[test]
+    fn core_resource_errors_keep_their_connect_codes() {
+        let missing = connectrpc::ConnectError::from(ApiError::Core(
+            arcbox_core::CoreError::not_found("machine dev"),
+        ));
+        assert_eq!(missing.code, connectrpc::ErrorCode::NotFound);
+
+        let stopped = connectrpc::ConnectError::from(ApiError::Core(
+            arcbox_core::CoreError::invalid_state("machine 'dev' is not running"),
+        ));
+        assert_eq!(stopped.code, connectrpc::ErrorCode::FailedPrecondition);
+
+        let command =
+            connectrpc::ConnectError::from(ApiError::Core(arcbox_core::CoreError::Agent {
+                code: 404,
+                message: "command not found: nope".into(),
+            }));
+        assert_eq!(command.code, connectrpc::ErrorCode::NotFound);
+
+        let transport = connectrpc::ConnectError::from(ApiError::Core(
+            arcbox_transport::error::TransportError::ConnectionReset.into(),
+        ));
+        assert_eq!(transport.code, connectrpc::ErrorCode::Unavailable);
+
+        let protocol = connectrpc::ConnectError::from(ApiError::Core(
+            arcbox_transport::error::TransportError::Protocol("bad frame".into()).into(),
+        ));
+        assert_eq!(protocol.code, connectrpc::ErrorCode::Internal);
     }
 }

@@ -103,6 +103,42 @@ fn test_register_mock_machine_idempotent() {
     assert_eq!(machine.cid, Some(10));
 }
 
+#[tokio::test]
+async fn connect_agent_distinguishes_missing_and_stopped_machines() {
+    let temp_dir = tempdir().unwrap();
+    let machine_manager = test_machine_manager(temp_dir.path());
+
+    let missing = machine_manager
+        .connect_agent("missing")
+        .err()
+        .expect("missing machine must fail");
+    assert!(matches!(
+        &missing,
+        CoreError::Common(arcbox_error::CommonError::NotFound(_))
+    ));
+
+    machine_manager
+        .create(MachineConfig {
+            name: "stopped".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let stopped = machine_manager
+        .connect_agent("stopped")
+        .err()
+        .expect("stopped machine must fail");
+    assert!(matches!(
+        &stopped,
+        CoreError::Common(arcbox_error::CommonError::InvalidState(_))
+    ));
+    assert!(
+        stopped
+            .to_string()
+            .contains("machine 'stopped' is not running")
+    );
+}
+
 #[test]
 fn test_select_routable_ip_prefers_ipv4() {
     let ips = vec![

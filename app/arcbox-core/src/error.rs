@@ -40,6 +40,16 @@ pub enum CoreError {
         message: String,
     },
 
+    /// Guest-agent transport error.
+    #[error("{context}: {source}")]
+    Transport {
+        /// Transport operation that failed.
+        context: &'static str,
+        /// Original transport error.
+        #[source]
+        source: arcbox_transport::error::TransportError,
+    },
+
     /// Persistence deserialization error.
     #[error("persistence error: {0}")]
     Persistence(#[from] toml::de::Error),
@@ -117,5 +127,14 @@ impl CoreError {
 impl From<std::io::Error> for CoreError {
     fn from(err: std::io::Error) -> Self {
         Self::Common(CommonError::from(err))
+    }
+}
+
+impl From<arcbox_transport::error::TransportError> for CoreError {
+    fn from(source: arcbox_transport::error::TransportError) -> Self {
+        Self::Transport {
+            context: "guest-agent transport failed",
+            source,
+        }
     }
 }

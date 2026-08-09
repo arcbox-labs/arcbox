@@ -21,6 +21,7 @@ use buffa::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
 
+use super::super::exec_error::spawn_error;
 use crate::rpc::{ErrorResponse, MessageType, write_message};
 
 /// Handles a machine-level exec request on the current connection.
@@ -93,7 +94,7 @@ where
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let err = ErrorResponse::new(500, format!("failed to spawn process: {e}"));
+            let err = spawn_error(&req.cmd[0], e);
             write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
             return Ok(());
         }
@@ -250,7 +251,7 @@ where
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let err = ErrorResponse::new(500, format!("failed to spawn process: {e}"));
+            let err = spawn_error(&req.cmd[0], e);
             write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
             return Ok(());
         }
