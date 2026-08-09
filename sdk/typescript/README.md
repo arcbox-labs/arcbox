@@ -124,19 +124,20 @@ package that already exists on the registry):
 
 ## Status
 
-Phase 2a of CORE-58. Shipped:
+Phases 2a and 2b of CORE-58. Shipped:
 
 | Surface | Notes |
 | --- | --- |
 | `Sandbox` create/connect/list, `kill`/`pause`/`info` | pause/resume are live daemon-side (CORE-21); data-plane calls auto-resume a paused sandbox |
 | `commands.run` | foreground result + background handle; `stdin: string\|bytes` (write-then-close) or `stdin: true` (keep open); `pty: {cols, rows}` |
 | `CommandHandle` | streamed `output` with transparent offset-resume across stream death (bounded retries → `ConnectionLostError`), `waitForExit`, `kill`, `writeStdin`/`closeStdin`/`stdinStatus` (offset-idempotent), `resize` |
-| `commands.get(id)` | re-attach a handle by execution id (stdin cursor seeded from the daemon) |
+| `handle.waitForLog(pattern)` | first log line matching a substring/regex, SDK-side over the replayed offset-addressed output (resumes across drops); deadline → `TimeoutError` naming the knob |
+| `commands.get(id)` / `commands.list()` | re-attach a handle by execution id (stdin cursor seeded from the daemon); list running and exited executions as `CommandInfo` summaries |
 | `sandbox.events()` | typed lifecycle events, keepalives filtered; a mid-stream drop is `ConnectionLostError` |
 | `sandbox.setLifecycle()` | tri-state: omitted = unchanged, `null` = restore default, value = replace |
 | `arcbox.capabilities()` | daemon handshake (version/protocol/features/nested virt), cached per client |
-| `files` | whole-file read/write |
+| `files` | whole-file read/write; path verbs `stat`/`list`/`mkdir`/`remove`/`move` (typed `FileStat`, `mkdir -p` semantics, `FileNotFoundError` with the path in context) |
+| `files.watch(path)` | typed `FsEvent` stream (renames paired, keepalives filtered); ends cleanly on sandbox stop; a mid-stream drop is `ConnectionLostError` — never auto-reconnected (events cannot be replayed) |
+| `ports.waitForPort(port)` | guest-side listen-table wait (no client polling); expiry → `TimeoutError` naming the `timeoutMs` knob (daemon default 30 s, cap 600 s) |
 
-Deferred to phase 2b (the daemon answers Unimplemented today):
-`commands.list()` (ListExecutions), `ports` + `waitForPort`, filesystem
-path verbs (stat/list/mkdir/…), `Template` statics.
+Deferred: `Template` statics.

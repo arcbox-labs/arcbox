@@ -6,11 +6,20 @@
 // point the loop at a dev daemon.
 //
 // This is the design doc's 20-line hello world plus the phase 2a
-// surface: PTY, stdin, re-attach, setLifecycle, capabilities, and
-// events. Still outside scope: ports.expose and waitForPort (2b).
+// surface (PTY, stdin, re-attach, setLifecycle, capabilities, events)
+// and the phase 2b surface (filesystem path verbs, watch, waitForPort,
+// commands.list, waitForLog). Still outside scope: Template statics.
 import { describe, expect, it } from "vitest";
 
-import { ArcBox, Sandbox } from "../src/index";
+import type { FsEvent } from "../src/index";
+import {
+  ArcBox,
+  ArcBoxError,
+  FileNotFoundError,
+  Sandbox,
+  TimeoutError,
+} from "../src/index";
+import { wait } from "foxts/wait";
 
 const enabled = process.env.ARCBOX_SDK_E2E === "1";
 
@@ -115,6 +124,109 @@ describe.skipIf(!enabled)("hello world against a live daemon", () => {
       // info() is always fresh.
       const info = await sandbox.info();
       expect(["ready", "running"]).toContain(info.state);
+    } finally {
+      await sandbox.kill();
+    }
+  }, 300000);
+
+  it("drives the 2b surface: path verbs, watch, waitForPort, list, waitForLog", async () => {
+    const sandbox = await Sandbox.create("", { ttlMs: 300000 });
+    try {
+      // The listener below needs busybox `nc`.
+      expect((await sandbox.commands.run("command -v nc")).exitCode).toBe(0);
+
+      // Path verbs roundtrip: mkdir -p → write → stat → list → move →
+      // remove (with the non-recursive guard).
+      await sandbox.files.mkdir("/tmp/verbs/nested");
+      await sandbox.files.mkdir("/tmp/verbs/nested"); // mkdir -p: idempotent
+      await sandbox.files.writeText("/tmp/verbs/nested/a.txt", "payload\n");
+      const stat = await sandbox.files.stat("/tmp/verbs/nested/a.txt");
+      expect(stat.kind).toBe("file");
+      expect(stat.size).toBe(8);
+      expect(stat.mode).toBe(0o644);
+      expect(stat.name).toBe("a.txt");
+      expect(stat.modifiedAt).toBeInstanceOf(Date);
+      const entries = await sandbox.files.list("/tmp/verbs/nested");
+      expect(entries.map((e) => e.name)).toEqual(["a.txt"]);
+      await sandbox.files.move(
+        "/tmp/verbs/nested/a.txt",
+        "/tmp/verbs/nested/b.txt",
+      );
+      expect(await sandbox.files.readText("/tmp/verbs/nested/b.txt")).toBe(
+        "payload\n",
+      );
+      await expect(
+        sandbox.files.stat("/tmp/verbs/nested/a.txt"),
+      ).rejects.toBeInstanceOf(FileNotFoundError);
+      // A non-empty directory refuses a non-recursive remove...
+      await expect(sandbox.files.remove("/tmp/verbs")).rejects.toBeInstanceOf(
+        ArcBoxError,
+      );
+      // ...and a recursive one takes the tree out.
+      await sandbox.files.remove("/tmp/verbs", { recursive: true });
+      await expect(sandbox.files.stat("/tmp/verbs")).rejects.toBeInstanceOf(
+        FileNotFoundError,
+      );
+
+      // watch: a write inside the watched tree arrives as an event.
+      // Registration is asynchronous, so write markers until the first
+      // event lands (each write is itself a fresh candidate event).
+      await sandbox.files.mkdir("/tmp/watched");
+      const iterator = sandbox.files
+        .watch("/tmp/watched", { recursive: true })
+        [Symbol.asyncIterator]();
+      const first = iterator.next();
+      let event: FsEvent | undefined;
+      for (let i = 0; i < 20 && event === undefined; i++) {
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: each marker write precedes the next race
+        await sandbox.files.writeText(
+          "/tmp/watched/marker.txt",
+          `ping ${String(i)}\n`,
+        );
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: race the pending first event against a beat
+        const winner = await Promise.race([first, wait(1000).then(() => {})]);
+        if (winner !== undefined && winner.done !== true) {
+          event = winner.value;
+        }
+      }
+      expect(event?.path).toBe("/tmp/watched/marker.txt");
+      expect(["created", "modified"]).toContain(event?.kind);
+      await iterator.return?.(undefined); // breaking out cancels the watch
+
+      // waitForPort: nothing listens yet — a 1 s budget times out with
+      // the knob-naming error...
+      await expect(
+        sandbox.ports.waitForPort(23456, { timeoutMs: 1000 }),
+      ).rejects.toBeInstanceOf(TimeoutError);
+      // ...then a background nc listener flips it.
+      const listener = await sandbox.commands.run(
+        ["/bin/sh", "-c", "exec nc -l -p 23456 >/dev/null"],
+        { background: true },
+      );
+      await sandbox.ports.waitForPort(23456, { timeoutMs: 30000 });
+
+      // commands.list rediscovers the running listener by id.
+      const rows = await sandbox.commands.list();
+      expect(
+        rows.some(
+          (row) =>
+            row.commandId === listener.commandId && row.state === "running",
+        ),
+      ).toBe(true);
+      await listener.kill("SIGKILL");
+      await listener.waitForExit(30000);
+
+      // waitForLog catches a delayed echo while the command keeps
+      // running (the wait ends on the match, not the exit).
+      const delayed = await sandbox.commands.run(
+        "sleep 2; echo the-marker-line; sleep 300",
+        { background: true },
+      );
+      expect(
+        await delayed.waitForLog("the-marker-line", { timeoutMs: 30000 }),
+      ).toBe("the-marker-line");
+      await delayed.kill("SIGKILL");
+      await delayed.waitForExit(30000);
     } finally {
       await sandbox.kill();
     }

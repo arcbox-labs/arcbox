@@ -206,20 +206,22 @@ if the bootstrap has been sitting for a while.
 
 ## Status
 
-Phase 2a of CORE-58, on both the sync and async surfaces. Shipped:
+Phases 2a and 2b of CORE-58, on both the sync and async surfaces.
+Shipped:
 
 | Surface | Notes |
 | --- | --- |
 | `Sandbox` create/connect/list, `kill`/`pause`/`info` | pause/resume are live daemon-side (CORE-21); data-plane calls auto-resume a paused sandbox |
 | `commands.run` | foreground result + background handle; `stdin=str\|bytes` (write-then-close) or `stdin=True` (keep open); `pty=PtySize(cols, rows)` |
 | `CommandHandle` | streamed `output` with transparent offset-resume across stream death (bounded retries → `ConnectionLostError`), `wait_for_exit`, `kill`, `write_stdin`/`close_stdin`/`stdin_status` (offset-idempotent), `resize` |
-| `commands.get(id)` | re-attach a handle by execution id (stdin cursor seeded from the daemon) |
+| `handle.wait_for_log(pattern)` | first log line matching a substring/compiled regex, SDK-side over the replayed offset-addressed output (resumes across drops); deadline → `TimeoutError` naming the knob |
+| `commands.get(id)` / `commands.list()` | re-attach a handle by execution id (stdin cursor seeded from the daemon); list running and exited executions as `CommandInfo` summaries |
 | `sandbox.events()` | typed lifecycle events, keepalives filtered; sync reads genuinely block; a mid-stream drop is `ConnectionLostError` |
 | `sandbox.set_lifecycle()` | tri-state: omitted (`UNCHANGED`) = unchanged, `None` = restore default (as on `create`), value = replace |
 | `arcbox.capabilities()` | daemon handshake (version/protocol/features/nested virt), cached per client |
-| `files` | whole-file read/write |
+| `files` | whole-file read/write; path verbs `stat`/`list`/`mkdir`/`remove`/`move` (frozen `FileStat` dataclass, `mkdir -p` semantics, `FileNotFoundError` with the path in context); every path accepts `str` or `PurePosixPath` |
+| `files.watch(path)` | typed `FsEvent` stream via `AsyncFileWatch`/`FileWatch` context managers (renames paired, keepalives filtered); ends cleanly on sandbox stop; a mid-stream drop is `ConnectionLostError` — never auto-reconnected (events cannot be replayed) |
+| `ports.wait_for_port(port)` | guest-side listen-table wait (no client polling); expiry → `TimeoutError` naming the `timeout` knob (daemon default 30 s, cap 600 s) |
 
-Deferred to phase 2b (the daemon answers Unimplemented today):
-`commands.list()` (ListExecutions), `ports` + `wait_for_port`,
-filesystem path verbs (stat/list/mkdir/...), `Template` statics, and the
-SDK-side default idle-reaping policy (design decision 4).
+Deferred: `Template` statics, and the SDK-side default idle-reaping
+policy (design decision 4).
