@@ -413,8 +413,14 @@ mod agent {
     // File I/O channel (vsock:53) — imported from the shared proto module.
     use arcbox_vm::boot_proto::{KernelIpParam, NetReconfigCommand};
     use arcbox_vm::file_io::proto::{
-        FILE_ACK, FILE_DATA, FILE_DONE, FILE_ERR, FILE_PORT, FILE_READ_REQ, FILE_WRITE_REQ,
-        MAX_FILE_SIZE,
+        ERR_NOT_A_DIRECTORY, ERR_NOT_EMPTY, ERR_NOT_FOUND, FILE_ACK, FILE_DATA, FILE_DONE,
+        FILE_ERR, FILE_EVENT, FILE_LIST, FILE_LIST_REQ, FILE_MKDIR_REQ, FILE_MOVE_REQ, FILE_PORT,
+        FILE_READ_REQ, FILE_REMOVE_REQ, FILE_STAT, FILE_STAT_REQ, FILE_WATCH_REQ, FILE_WRITE_REQ,
+        FileStatDto, KIND_DIR, KIND_FILE, KIND_OTHER, KIND_SYMLINK, ListDirReq, MAX_FILE_SIZE,
+        MakeDirReq, MoveReq, RemoveReq, StatReq, WatchReq,
+    };
+    use arcbox_vm::file_watch::{
+        IN_CREATE, IN_MOVED_TO, WATCH_MASK, map_events, parse_event_buffer,
     };
     // Readiness dial-out port — shared with the host-side boot gate.
     use arcbox_vm::vsock::READY_PORT;
@@ -808,6 +814,12 @@ mod agent {
         match msg_type {
             FILE_WRITE_REQ => handle_file_write(conn, &payload),
             FILE_READ_REQ => handle_file_read(conn, &payload),
+            FILE_STAT_REQ => handle_file_stat(conn, &payload),
+            FILE_LIST_REQ => handle_file_list(conn, &payload),
+            FILE_MKDIR_REQ => handle_file_mkdir(conn, &payload),
+            FILE_REMOVE_REQ => handle_file_remove(conn, &payload),
+            FILE_MOVE_REQ => handle_file_move(conn, &payload),
+            FILE_WATCH_REQ => handle_file_watch(conn, &payload),
             other => eprintln!("agent: file: unexpected frame type 0x{other:02x}"),
         }
     }
@@ -926,6 +938,318 @@ mod agent {
             }
         }
         let _ = write_frame(&mut conn, FILE_DONE, &[]);
+    }
+
+    /// Decode a JSON request payload, answering `FILE_ERR` on parse failure.
+    fn parse_file_req<T: serde::de::DeserializeOwned>(
+        conn: &mut VsockStream,
+        payload: &[u8],
+    ) -> Option<T> {
+        match serde_json::from_slice(payload) {
+            Ok(req) => Some(req),
+            Err(e) => {
+                let _ = write_frame(conn, FILE_ERR, format!("parse request: {e}").as_bytes());
+                None
+            }
+        }
+    }
+
+    /// Format a path-verb failure with the machine-readable errno prefix the
+    /// host maps onto typed errors (`arcbox_vm::file_io::decode_file_err`).
+    fn path_err_payload(op: &str, path: &str, e: &std::io::Error) -> String {
+        match e.raw_os_error() {
+            Some(libc::ENOENT) => format!("{ERR_NOT_FOUND}{path}"),
+            Some(libc::ENOTDIR) => format!("{ERR_NOT_A_DIRECTORY}{path}"),
+            Some(libc::ENOTEMPTY) => format!("{ERR_NOT_EMPTY}{path}"),
+            _ => format!("{op} '{path}': {e}"),
+        }
+    }
+
+    /// Stat one path without following symlinks (the wire contract reports
+    /// symlinks as symlinks, `mode` as the low 12 bits of `st_mode`).
+    fn stat_dto(path: &std::path::Path) -> std::io::Result<FileStatDto> {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::symlink_metadata(path)?;
+        let ft = md.file_type();
+        let (kind, symlink_target) = if ft.is_symlink() {
+            let target = std::fs::read_link(path)
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (KIND_SYMLINK, target)
+        } else if ft.is_dir() {
+            (KIND_DIR, String::new())
+        } else if ft.is_file() {
+            (KIND_FILE, String::new())
+        } else {
+            (KIND_OTHER, String::new())
+        };
+        Ok(FileStatDto {
+            name: path.file_name().map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+            kind: kind.to_owned(),
+            size: if ft.is_file() { md.len() } else { 0 },
+            mode: md.mode() & 0o7777,
+            mtime_secs: md.mtime(),
+            mtime_nanos: u32::try_from(md.mtime_nsec()).unwrap_or(0),
+            uid: md.uid(),
+            gid: md.gid(),
+            symlink_target,
+        })
+    }
+
+    fn handle_file_stat(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<StatReq>(&mut conn, header_payload) else {
+            return;
+        };
+        match stat_dto(std::path::Path::new(&req.path))
+            .map_err(|e| path_err_payload("stat", &req.path, &e))
+            .and_then(|dto| serde_json::to_vec(&dto).map_err(|e| format!("encode stat: {e}")))
+        {
+            Ok(body) => {
+                let _ = write_frame(&mut conn, FILE_STAT, &body);
+            }
+            Err(msg) => {
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_list(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<ListDirReq>(&mut conn, header_payload) else {
+            return;
+        };
+        let listing = || -> std::io::Result<Vec<FileStatDto>> {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(&req.path)? {
+                let entry = entry?;
+                // An entry deleted between readdir and stat is not an error
+                // for the listing — skip it.
+                if let Ok(dto) = stat_dto(&entry.path()) {
+                    entries.push(dto);
+                }
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(entries)
+        };
+        match listing()
+            .map_err(|e| path_err_payload("list", &req.path, &e))
+            .and_then(|list| serde_json::to_vec(&list).map_err(|e| format!("encode listing: {e}")))
+        {
+            Ok(body) => {
+                let _ = write_frame(&mut conn, FILE_LIST, &body);
+            }
+            Err(msg) => {
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_mkdir(mut conn: VsockStream, header_payload: &[u8]) {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let Some(req) = parse_file_req::<MakeDirReq>(&mut conn, header_payload) else {
+            return;
+        };
+        // Recursive create is idempotent: an existing directory succeeds.
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(req.mode)
+            .create(&req.path)
+        {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, FILE_ACK, &[]);
+            }
+            Err(e) => {
+                let msg = path_err_payload("mkdir", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_remove(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<RemoveReq>(&mut conn, header_payload) else {
+            return;
+        };
+        let path = std::path::Path::new(&req.path);
+        // Symlink-aware: a symlink to a directory is removed as a link,
+        // never followed into.
+        let result = std::fs::symlink_metadata(path).and_then(|md| {
+            if md.file_type().is_dir() {
+                if req.recursive {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    std::fs::remove_dir(path)
+                }
+            } else {
+                std::fs::remove_file(path)
+            }
+        });
+        match result {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, FILE_ACK, &[]);
+            }
+            Err(e) => {
+                let msg = path_err_payload("remove", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_move(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<MoveReq>(&mut conn, header_payload) else {
+            return;
+        };
+        match std::fs::rename(&req.from, &req.to) {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, FILE_ACK, &[]);
+            }
+            Err(e) => {
+                let msg = path_err_payload("rename", &req.from, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    /// Add an inotify watch on `dir` (and its subtree when `recursive`).
+    /// Per-child errors during the walk are ignored — entries can vanish
+    /// while walking — but the root watch itself must succeed.
+    fn add_watch_tree(
+        ifd: RawFd,
+        dir: &std::path::Path,
+        recursive: bool,
+        watches: &mut HashMap<i32, String>,
+    ) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
+        // SAFETY: ifd is a live inotify fd; c_path is a valid NUL-terminated
+        // string outliving the call.
+        let wd = unsafe { libc::inotify_add_watch(ifd, c_path.as_ptr(), WATCH_MASK) };
+        if wd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        watches.insert(wd, dir.to_string_lossy().into_owned());
+        if recursive && let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    let _ = add_watch_tree(ifd, &entry.path(), true, watches);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream inotify events for a directory until either side closes the
+    /// connection: the host closing it is the cancellation signal; sandbox
+    /// teardown kills this process, closing it from this side (the host
+    /// reads that EOF as the clean end of the watch).
+    fn handle_file_watch(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<WatchReq>(&mut conn, header_payload) else {
+            return;
+        };
+
+        // SAFETY: plain inotify_init1 call; result checked below.
+        let ifd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        if ifd < 0 {
+            let e = std::io::Error::last_os_error();
+            let _ = write_frame(&mut conn, FILE_ERR, format!("inotify_init: {e}").as_bytes());
+            return;
+        }
+        struct InotifyFd(RawFd);
+        impl Drop for InotifyFd {
+            fn drop(&mut self) {
+                // SAFETY: the fd is owned by this guard and closed once.
+                unsafe { libc::close(self.0) };
+            }
+        }
+        let _ifd_guard = InotifyFd(ifd);
+
+        let mut watches: HashMap<i32, String> = HashMap::new();
+        if let Err(e) = add_watch_tree(
+            ifd,
+            std::path::Path::new(&req.path),
+            req.recursive,
+            &mut watches,
+        ) {
+            let msg = path_err_payload("watch", &req.path, &e);
+            let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            return;
+        }
+        if write_frame(&mut conn, FILE_ACK, &[]).is_err() {
+            return;
+        }
+
+        let mut buf = [0u8; 16384];
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: ifd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: conn.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: fds points at two initialized pollfd entries.
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if n < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            // Any readiness on the host connection means it closed — the
+            // host never sends further frames on a watch connection.
+            if fds[1].revents != 0 {
+                return;
+            }
+            if fds[0].revents == 0 {
+                continue;
+            }
+            // SAFETY: buf is a valid writable buffer; ifd is a live inotify fd.
+            let len =
+                unsafe { libc::read(ifd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if len <= 0 {
+                return;
+            }
+            let raw = parse_event_buffer(&buf[..len as usize]);
+            // Recursive watches follow directories created or moved into the
+            // tree. Best-effort: events inside a new directory that fire
+            // before its watch lands are unobserved (the inotify recursion
+            // gap).
+            if req.recursive {
+                for event in &raw {
+                    if event.is_dir()
+                        && event.mask & (IN_CREATE | IN_MOVED_TO) != 0
+                        && let Some(dir) = watches.get(&event.wd)
+                    {
+                        let child = std::path::Path::new(dir).join(&event.name);
+                        let _ = add_watch_tree(ifd, &child, true, &mut watches);
+                    }
+                }
+            }
+            let events = map_events(&raw, |wd| watches.get(&wd).cloned());
+            // Prune after mapping: a removal event still needs its wd→path
+            // resolution for the batch it arrived in.
+            for event in &raw {
+                if event.mask & arcbox_vm::file_watch::IN_IGNORED != 0 {
+                    watches.remove(&event.wd);
+                }
+            }
+            for event in events {
+                let Ok(body) = serde_json::to_vec(&event) else {
+                    continue;
+                };
+                if write_frame(&mut conn, FILE_EVENT, &body).is_err() {
+                    return; // host went away mid-write
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
