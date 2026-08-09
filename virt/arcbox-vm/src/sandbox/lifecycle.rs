@@ -734,24 +734,6 @@ impl SandboxManager {
             .clone()
             .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no vsock configured")))
     }
-
-    /// Read a file from inside an alive sandbox over the vsock file channel.
-    pub async fn read_sandbox_file(&self, id: &SandboxId, path: &str) -> Result<Vec<u8>> {
-        let uds = self.require_alive_vsock(id)?;
-        crate::file_io::read_file(&uds, path).await
-    }
-
-    /// Write a file into an alive sandbox over the vsock file channel.
-    pub async fn write_sandbox_file(
-        &self,
-        id: &SandboxId,
-        path: &str,
-        mode: u32,
-        data: &[u8],
-    ) -> Result<()> {
-        let uds = self.require_alive_vsock(id)?;
-        crate::file_io::write_file(&uds, path, mode, data).await
-    }
 }
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.

@@ -35,6 +35,7 @@ mod boot;
 mod checkpoint;
 mod cleanup;
 mod execution;
+mod files;
 mod lifecycle;
 mod pause;
 mod persistence;
