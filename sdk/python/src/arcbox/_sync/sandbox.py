@@ -13,6 +13,7 @@ import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
+import httpx
 from google.protobuf import empty_pb2
 
 from arcbox._boundary import wrap_errors
@@ -25,7 +26,13 @@ from arcbox._types import (
     sandbox_state_to_proto,
     sandbox_summary_from_proto,
 )
-from arcbox.errors import ArcBoxError, NotFoundError, SandboxStateError
+from arcbox.errors import (
+    ArcBoxError,
+    NotFoundError,
+    RequestTimeoutError,
+    SandboxStateError,
+    TimeoutError,
+)
 
 from ._client import ConnectClient
 from .commands import Commands
@@ -62,9 +69,33 @@ _GONE_EVENTS = (
 #: should become an event wait.
 _PAUSE_SETTLE_POLL_SECONDS = 0.5
 
+#: Default overall deadline for ``connect`` in seconds — generous
+#: because a checkpoint restore or cold boot legitimately takes a
+#: while. ``timeout=None`` disables the bound.
+_CONNECT_TIMEOUT_SECONDS = 60.0
+
 
 def _seconds_to_wire(seconds: float | None) -> int:
     return 0 if seconds is None else math.ceil(seconds)
+
+
+def _connect_deadline_error(sandbox_id: str) -> TimeoutError:
+    return TimeoutError(
+        f"connect(timeout) elapsed before sandbox {sandbox_id} was ready",
+        suggestion="increase the connect timeout argument",
+        context={"id": sandbox_id},
+    )
+
+
+def _budget(deadline: float | None, sandbox_id: str) -> float | None:
+    """Seconds left before ``deadline`` (``None`` = unbounded), raising
+    the connect timeout once it has passed."""
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _connect_deadline_error(sandbox_id)
+    return remaining
 
 
 class ArcBox:
@@ -172,46 +203,75 @@ class ArcBox:
                     )
                 raise
 
-    def connect(self, sandbox_id: str) -> Sandbox:
+    def connect(
+        self, sandbox_id: str, *, timeout: float | None = _CONNECT_TIMEOUT_SECONDS
+    ) -> Sandbox:
         """Attach to an existing sandbox. A PAUSED sandbox is resumed
         (resume completes once it is READY again); a PAUSING one settles
         to PAUSED first, then resumes; a STARTING one is waited for. A
         terminal state is a typed error carrying the observed state.
-        Connecting never touches the sandbox's lifecycle deadlines."""
+        Connecting never touches the sandbox's lifecycle deadlines.
+
+        ``timeout`` bounds the WHOLE call — the settle poll, a resume,
+        and the readiness wait share one deadline (default 60s;
+        ``None`` disables it). On expiry :class:`TimeoutError` is raised
+        and the sandbox is left as it was."""
         with wrap_errors("sandbox.connect"):
-            info = self._inspect(sandbox_id)
-            # A pausing sandbox's next stop is PAUSED — never READY — so
-            # waiting on readiness events would park forever. Poll the
-            # checkpoint out, then route on whatever state it settled in.
-            while info.state == sandbox_pb2.SANDBOX_STATE_PAUSING:
-                time.sleep(_PAUSE_SETTLE_POLL_SECONDS)
-                info = self._inspect(sandbox_id)
-            if info.state in _READY_STATES:
-                return Sandbox(self._client, sandbox_id)
-            if info.state == sandbox_pb2.SANDBOX_STATE_PAUSED:
-                # Deliberately no per-request deadline: restoring a
-                # checkpoint takes as long as it takes, and the RPC
-                # returns once READY.
-                self._client.unary(
-                    _SANDBOX + "Resume",
-                    sandbox_pb2.ResumeSandboxRequest(id=sandbox_id),
-                    empty_pb2.Empty,
-                    timeout=None,
-                )
-                return Sandbox(self._client, sandbox_id)
-            if info.state == sandbox_pb2.SANDBOX_STATE_STARTING:
-                with self._client.stream(
-                    _SANDBOX + "Events",
-                    sandbox_pb2.SandboxEventsRequest(sandbox_id=sandbox_id),
-                    sandbox_pb2.WatchEventsResponse,
-                ) as events:
-                    self._wait_ready(sandbox_id, events)
-                return Sandbox(self._client, sandbox_id)
-            state = sandbox_state_from_proto(info.state)
-            raise SandboxStateError(
-                f"sandbox {sandbox_id} is {state} and cannot be connected to",
-                context={"id": sandbox_id, "state": state, "error": info.error},
+            # One deadline over every wait below — the settle poll,
+            # resume, and the readiness wait; bounding only one of them
+            # would be arbitrary while the neighbouring waits stayed
+            # unbounded.
+            deadline = None if timeout is None else time.monotonic() + timeout
+            try:
+                return self._connect(sandbox_id, deadline)
+            except (RequestTimeoutError, httpx.TimeoutException) as exc:
+                # A per-RPC expiry observed after the overall deadline
+                # passed is the connect budget surfacing, not the
+                # per-request knob.
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise _connect_deadline_error(sandbox_id) from exc
+                raise
+
+    def _connect(self, sandbox_id: str, deadline: float | None) -> Sandbox:
+        info = self._inspect(sandbox_id, deadline=deadline)
+        # A pausing sandbox's next stop is PAUSED — never READY — so
+        # waiting on readiness events would park forever. Poll the
+        # checkpoint out, then route on whatever state it settled in.
+        while info.state == sandbox_pb2.SANDBOX_STATE_PAUSING:
+            remaining = _budget(deadline, sandbox_id)
+            time.sleep(
+                _PAUSE_SETTLE_POLL_SECONDS
+                if remaining is None
+                else min(_PAUSE_SETTLE_POLL_SECONDS, remaining)
             )
+            info = self._inspect(sandbox_id, deadline=deadline)
+        if info.state in _READY_STATES:
+            return Sandbox(self._client, sandbox_id)
+        if info.state == sandbox_pb2.SANDBOX_STATE_PAUSED:
+            # No per-request deadline of its own: restoring a checkpoint
+            # takes as long as it takes, and the RPC returns once READY —
+            # the overall connect deadline is the only bound.
+            self._client.unary(
+                _SANDBOX + "Resume",
+                sandbox_pb2.ResumeSandboxRequest(id=sandbox_id),
+                empty_pb2.Empty,
+                timeout=_budget(deadline, sandbox_id),
+            )
+            return Sandbox(self._client, sandbox_id)
+        if info.state == sandbox_pb2.SANDBOX_STATE_STARTING:
+            with self._client.stream(
+                _SANDBOX + "Events",
+                sandbox_pb2.SandboxEventsRequest(sandbox_id=sandbox_id),
+                sandbox_pb2.WatchEventsResponse,
+                timeout=_budget(deadline, sandbox_id),
+            ) as events:
+                self._wait_ready(sandbox_id, events, deadline=deadline)
+            return Sandbox(self._client, sandbox_id)
+        state = sandbox_state_from_proto(info.state)
+        raise SandboxStateError(
+            f"sandbox {sandbox_id} is {state} and cannot be connected to",
+            context={"id": sandbox_id, "state": state, "error": info.error},
+        )
 
     def list(
         self,
@@ -242,11 +302,19 @@ class ArcBox:
                 if page_token == "":
                     return
 
-    def _inspect(self, sandbox_id: str) -> sandbox_pb2.SandboxInfo:
+    def _inspect(self, sandbox_id: str, deadline: float | None = None) -> sandbox_pb2.SandboxInfo:
+        """Inspect, with the configured per-RPC deadline capped by the
+        remaining connect budget when one is running."""
+        remaining = _budget(deadline, sandbox_id)
+        request = sandbox_pb2.InspectSandboxRequest(id=sandbox_id)
+        if remaining is None:
+            return self._client.unary(_SANDBOX + "Inspect", request, sandbox_pb2.SandboxInfo)
+        base = self._client.request_timeout
         return self._client.unary(
             _SANDBOX + "Inspect",
-            sandbox_pb2.InspectSandboxRequest(id=sandbox_id),
+            request,
             sandbox_pb2.SandboxInfo,
+            timeout=remaining if base is None else min(base, remaining),
         )
 
     def _create(
@@ -295,6 +363,7 @@ class ArcBox:
         self,
         sandbox_id: str,
         events: ServerStream[sandbox_pb2.WatchEventsResponse],
+        deadline: float | None = None,
     ) -> None:
         """Consume lifecycle events until READY/RUNNING, or fail on a
         terminal transition. The subscription was armed before Create, so
@@ -317,10 +386,14 @@ class ArcBox:
                 )
             return False
 
-        info = self._inspect(sandbox_id)
+        info = self._inspect(sandbox_id, deadline=deadline)
         if check(info.state, info.error):
             return
         for frame in events:
+            # The stream's read timeout only bounds silence; frames may
+            # keep arriving (keepalives) without ever tripping it, so the
+            # overall budget is re-checked on every frame.
+            _budget(deadline, sandbox_id)
             payload = frame.WhichOneof("payload")
             if payload == "event":
                 event = frame.event
@@ -338,7 +411,7 @@ class ArcBox:
                         context={"id": sandbox_id, "state": "stopped"},
                     )
             elif payload == "keep_alive":
-                fresh = self._inspect(sandbox_id)
+                fresh = self._inspect(sandbox_id, deadline=deadline)
                 if check(fresh.state, fresh.error):
                     return
         raise ArcBoxError(
@@ -407,12 +480,18 @@ class Sandbox:
         return sandbox
 
     @classmethod
-    def connect(cls, sandbox_id: str, *, connection: Connection | None = None) -> Sandbox:
+    def connect(
+        cls,
+        sandbox_id: str,
+        *,
+        timeout: float | None = _CONNECT_TIMEOUT_SECONDS,
+        connection: Connection | None = None,
+    ) -> Sandbox:
         """Attach to an existing sandbox by id. Client ownership works as
         in :meth:`create`."""
         box = ArcBox(connection)
         try:
-            sandbox = box.connect(sandbox_id)
+            sandbox = box.connect(sandbox_id, timeout=timeout)
         except BaseException:
             box.close()
             raise

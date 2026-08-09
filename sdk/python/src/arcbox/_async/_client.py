@@ -128,11 +128,20 @@ class AsyncConnectClient:
         message.ParseFromString(response.content)
         return message
 
-    def stream(self, path: str, request: Message, response_type: type[M]) -> AsyncServerStream[M]:
+    def stream(
+        self,
+        path: str,
+        request: Message,
+        response_type: type[M],
+        timeout: float | None = None,
+    ) -> AsyncServerStream[M]:
         """One server-streaming RPC. Entering the returned context sends
         the request (that is what registers a subscription server-side);
-        iterate it for messages."""
-        return AsyncServerStream(self._http, path, request, response_type)
+        iterate it for messages. Streams are exempt from the configured
+        ``request_timeout``; ``timeout``, when set, bounds the connect
+        phase and each read gap (used by ``connect``'s overall
+        deadline)."""
+        return AsyncServerStream(self._http, path, request, response_type, timeout)
 
     async def client_stream(
         self, path: str, requests: Iterable[Message], response_type: type[M]
@@ -182,17 +191,23 @@ class AsyncServerStream(Generic[M]):
         path: str,
         request: Message,
         response_type: type[M],
+        timeout: float | None = None,
     ) -> None:
         self._http = http
         self._path = path
         self._body = encode_envelope(0, request.SerializeToString())
         self._response_type = response_type
+        self._timeout = timeout
         self._cm: AbstractAsyncContextManager[httpx.Response] | None = None
         self._response: httpx.Response | None = None
 
     async def __aenter__(self) -> AsyncServerStream[M]:
         cm = self._http.stream(
-            "POST", self._path, content=self._body, headers=_STREAM_HEADERS, timeout=None
+            "POST",
+            self._path,
+            content=self._body,
+            headers=_STREAM_HEADERS,
+            timeout=None if self._timeout is None else httpx.Timeout(self._timeout),
         )
         response = await cm.__aenter__()
         if response.status_code != 200:
