@@ -11,6 +11,7 @@ export { ArcBox, Sandbox } from "./sandbox";
 export type {
   ConnectSandboxOptions,
   CreateSandboxOptions,
+  LifecycleUpdate,
   ListSandboxesOptions,
 } from "./sandbox";
 
@@ -29,7 +30,11 @@ export type { WriteOptions } from "./files";
 export type { ConnectionOptions } from "./connection";
 
 export type {
+  Capabilities,
   IdlePolicy,
+  NestedVirtCapability,
+  SandboxEvent,
+  SandboxEventKind,
   SandboxInfo,
   SandboxState,
   SandboxSummary,

@@ -8,6 +8,8 @@ import { Commands } from "./commands";
 import type { ConnectionOptions } from "./connection";
 import {
   ArcBoxError,
+  ConnectionFailedError,
+  ConnectionLostError,
   InvalidArgumentError,
   NotFoundError,
   SandboxStateError,
@@ -25,8 +27,17 @@ import {
 } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import type { ClientContext } from "./transport";
 import { createClientContext, unaryOptions } from "./transport";
-import type { SandboxInfo, SandboxState, SandboxSummary } from "./types";
+import type {
+  Capabilities,
+  IdlePolicy,
+  SandboxEvent,
+  SandboxInfo,
+  SandboxState,
+  SandboxSummary,
+} from "./types";
 import {
+  capabilitiesFromProto,
+  sandboxEventFromProto,
   sandboxInfoFromProto,
   sandboxStateToProto,
   sandboxSummaryFromProto,
@@ -90,14 +101,38 @@ export interface ListSandboxesOptions {
   connection?: ConnectionOptions;
 }
 
+/**
+ * A lifecycle-deadline update for {@link Sandbox.setLifecycle}. Each
+ * knob is tri-state: **omitted** (or `undefined`) leaves it unchanged;
+ * **`null`** restores the daemon default (no TTL / no idle detection /
+ * the default idle action); a **value** replaces it.
+ */
+export interface LifecycleUpdate {
+  /**
+   * Replace the hard maximum lifetime: expire this long from NOW —
+   * calling repeatedly keeps a busy sandbox alive (E2B timeout
+   * semantics). `null` removes the limit.
+   */
+  ttlMs?: number | null;
+  /**
+   * Replace the idle window, re-arming a live timer. `null` disables
+   * idle detection.
+   */
+  idleTimeoutMs?: number | null;
+  /**
+   * Replace what the daemon does when the idle timeout expires.
+   * `null` restores the daemon default (currently `"kill"`).
+   */
+  onIdle?: IdlePolicy | null;
+}
+
 type SandboxClient = Client<typeof SandboxService>;
 
 /**
- * How often {@link ArcBox.connect} re-inspects a PAUSING sandbox.
- * `SANDBOX_EVENT_KIND_PAUSED` names this edge in the proto, but the
- * daemon does not emit it yet (Pause/Resume are CORE-21 stubs), so the
- * checkpoint is polled out instead. Once it is emitted, this poll
- * should become an event wait.
+ * How often {@link ArcBox.connect} re-inspects a PAUSING sandbox. The
+ * daemon emits `SANDBOX_EVENT_KIND_PAUSED` on this edge (CORE-21), but
+ * the settle poll predates it and remains the simple, robust route — a
+ * poll-to-event-wait conversion is a candidate cleanup, not a bug.
  */
 const PAUSE_SETTLE_POLL_MS = 500;
 
@@ -123,10 +158,34 @@ function withSignal(
 export class ArcBox {
   readonly #ctx: ClientContext;
   readonly #client: SandboxClient;
+  #capabilities?: Promise<Capabilities>;
 
   constructor(options: ConnectionOptions = {}) {
     this.#ctx = createClientContext(options);
     this.#client = createClient(SandboxService, this.#ctx.transport);
+  }
+
+  /**
+   * What the daemon can do: version, sandbox protocol level, feature
+   * flags, and whether nested virtualization is available. Answered
+   * host-side (works before any sandbox exists) and cached for the life
+   * of this client — a failed fetch is not cached, so the next call
+   * retries. The SDK does not gate on it: the daemon fails fast on its
+   * own (a `CapabilityError` from `create`); this is the inspectable
+   * version of the same answer.
+   */
+  capabilities(): Promise<Capabilities> {
+    this.#capabilities ??= this.#fetchCapabilities().catch((error: unknown) => {
+      this.#capabilities = undefined;
+      throw toArcBoxError(error, "arcbox.capabilities");
+    });
+    return this.#capabilities;
+  }
+
+  async #fetchCapabilities(): Promise<Capabilities> {
+    return capabilitiesFromProto(
+      await this.#client.getCapabilities({}, unaryOptions(this.#ctx)),
+    );
   }
 
   /**
@@ -527,11 +586,8 @@ export class Sandbox {
    * Checkpoint the sandbox to disk under the same id and release its
    * runtime resources. Resume happens on the next {@link Sandbox.connect}
    * (or transparently, daemon-side, on the next data-plane call). Trades
-   * RAM for disk: a paused sandbox keeps paying `storageBytes`.
-   *
-   * Requires daemon-side CORE-21: the current local daemon serves
-   * Pause/Resume as contract-only stubs, so this rejects with an
-   * Unimplemented {@link ArcBoxError} until that lands.
+   * RAM for disk: a paused sandbox keeps paying `storageBytes`. Requires
+   * a quiescent sandbox (READY — no running command).
    */
   async pause(): Promise<void> {
     try {
@@ -539,6 +595,84 @@ export class Sandbox {
       await this.#client.pause({ id: this.id });
     } catch (error) {
       throw toArcBoxError(error, "sandbox.pause");
+    }
+  }
+
+  /**
+   * Replace lifecycle deadlines. Each knob is tri-state (see
+   * {@link LifecycleUpdate}): omitted = unchanged, `null` = restore the
+   * daemon default, a value = replace. `ttlMs` re-arms the hard cap
+   * from NOW; `idleTimeoutMs` re-arms a live idle timer. Works in any
+   * non-terminal state, including paused.
+   */
+  async setLifecycle(update: LifecycleUpdate): Promise<void> {
+    try {
+      await this.#client.setLifecycle(
+        {
+          id: this.id,
+          ...(update.ttlMs !== undefined && {
+            ttlSeconds: update.ttlMs === null ? 0 : secondsFromMs(update.ttlMs),
+          }),
+          ...(update.idleTimeoutMs !== undefined && {
+            idleTimeoutSeconds:
+              update.idleTimeoutMs === null
+                ? 0
+                : secondsFromMs(update.idleTimeoutMs),
+          }),
+          ...(update.onIdle !== undefined && {
+            onIdle:
+              update.onIdle === null
+                ? IdleAction.UNSPECIFIED
+                : update.onIdle === "kill"
+                  ? IdleAction.KILL
+                  : IdleAction.PAUSE,
+          }),
+        },
+        unaryOptions(this.#ctx),
+      );
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.setLifecycle");
+    }
+  }
+
+  /**
+   * Subscribe to this sandbox's lifecycle events, yielded as typed
+   * {@link SandboxEvent}s (keepalive frames are filtered out). The
+   * iterator ends when the daemon ends the stream; breaking out of the
+   * loop cancels the subscription. A transport drop mid-stream is
+   * surfaced as {@link ConnectionLostError} — re-subscribing is the
+   * caller's decision, since missed events cannot be replayed.
+   */
+  events(): AsyncIterable<SandboxEvent> {
+    return this.#streamEvents();
+  }
+
+  async *#streamEvents(): AsyncGenerator<SandboxEvent> {
+    let delivered = false;
+    try {
+      for await (const frame of this.#client.events({ sandboxId: this.id })) {
+        delivered = true;
+        if (frame.payload.case === "event") {
+          yield sandboxEventFromProto(frame.payload.value);
+        }
+      }
+    } catch (error) {
+      const mapped = toArcBoxError(error, "sandbox.events");
+      // A connection failure after frames flowed is a mid-stream drop
+      // (the stream-death error); before any frame it is an unreachable
+      // daemon, reported as such.
+      if (
+        delivered &&
+        mapped instanceof ConnectionFailedError &&
+        !(mapped instanceof ConnectionLostError)
+      ) {
+        throw new ConnectionLostError("the event stream died", {
+          operation: "sandbox.events",
+          cause: error,
+          context: { id: this.id },
+        });
+      }
+      throw mapped;
     }
   }
 
