@@ -12,24 +12,30 @@ from importlib.metadata import PackageNotFoundError, version
 from arcbox._async._client import AsyncConnectClient
 from arcbox._async.commands import AsyncCommandHandle, AsyncCommands, AsyncOutputStream
 from arcbox._async.files import AsyncFiles
-from arcbox._async.sandbox import AsyncArcBox, AsyncSandbox
+from arcbox._async.sandbox import AsyncArcBox, AsyncEventStream, AsyncSandbox
 from arcbox._connection import Connection
 from arcbox._sync._client import ConnectClient
 from arcbox._sync.commands import CommandHandle, Commands, OutputStream
 from arcbox._sync.files import Files
-from arcbox._sync.sandbox import ArcBox, Sandbox
+from arcbox._sync.sandbox import ArcBox, EventStream, Sandbox
 from arcbox._types import (
     MAX_FILE_BYTES,
+    UNCHANGED,
+    Capabilities,
     CommandResult,
     IdlePolicy,
+    NestedVirtCapability,
     OutputChannel,
     OutputChunk,
     PtySize,
+    SandboxEvent,
+    SandboxEventKind,
     SandboxInfo,
     SandboxState,
     SandboxSummary,
     SignalName,
     StdinStatus,
+    Unchanged,
 )
 
 try:
@@ -41,29 +47,37 @@ except PackageNotFoundError:
 
 __all__ = [
     "MAX_FILE_BYTES",
+    "UNCHANGED",
     "ArcBox",
     "AsyncArcBox",
     "AsyncCommandHandle",
     "AsyncCommands",
     "AsyncConnectClient",
+    "AsyncEventStream",
     "AsyncFiles",
     "AsyncOutputStream",
     "AsyncSandbox",
+    "Capabilities",
     "CommandHandle",
     "CommandResult",
     "Commands",
     "ConnectClient",
     "Connection",
+    "EventStream",
     "Files",
     "IdlePolicy",
+    "NestedVirtCapability",
     "OutputChannel",
     "OutputChunk",
     "OutputStream",
     "PtySize",
     "Sandbox",
+    "SandboxEvent",
+    "SandboxEventKind",
     "SandboxInfo",
     "SandboxState",
     "SandboxSummary",
     "SignalName",
     "StdinStatus",
+    "Unchanged",
 ]

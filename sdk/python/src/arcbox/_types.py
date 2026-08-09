@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal, final
 
 from arcbox._gen import process_pb2, sandbox_pb2
 from arcbox.errors import ArcBoxError, CommandFailedError, SandboxDiedError
@@ -35,6 +35,42 @@ SandboxState = Literal[
 
 #: What the daemon does when the idle timeout expires.
 IdlePolicy = Literal["kill", "pause"]
+
+#: Kind of a sandbox lifecycle event. "idle" fires when an execution
+#: exits and the sandbox returns to ready; "pausing"/"resumed" carry a
+#: "reason" attribute distinguishing client calls from automation
+#: ("idle_timeout" / "auto_resume").
+SandboxEventKind = Literal[
+    "created",
+    "ready",
+    "running",
+    "idle",
+    "stopping",
+    "stopped",
+    "failed",
+    "removed",
+    "pausing",
+    "paused",
+    "resumed",
+    "unknown",
+]
+
+
+@final
+class Unchanged:
+    """Sentinel type for ``set_lifecycle``: leave this knob as it is.
+
+    ``UNCHANGED`` is its only instance and the default for every knob,
+    so passing it explicitly (e.g. from a conditional update) is
+    equivalent to omitting the argument.
+    """
+
+    def __repr__(self) -> str:
+        return "UNCHANGED"
+
+
+#: The single :class:`Unchanged` sentinel.
+UNCHANGED: Final = Unchanged()
 
 #: Signals deliverable to a command's process group.
 SignalName = Literal["SIGTERM", "SIGKILL", "SIGINT", "SIGHUP", "SIGQUIT"]
@@ -139,6 +175,43 @@ class SandboxInfo:
 
 
 @dataclass(frozen=True)
+class SandboxEvent:
+    """One sandbox lifecycle event, as delivered by ``sandbox.events()``."""
+
+    sandbox_id: str
+    kind: SandboxEventKind
+    #: When it happened (daemon clock).
+    time: datetime | None = None
+    #: Per-kind context: "exit_code"/"signal" on "idle", "error" on
+    #: "failed", "reason" on "pausing"/"resumed".
+    attributes: dict[str, str] = field(default_factory=dict[str, str])
+
+
+@dataclass(frozen=True)
+class NestedVirtCapability:
+    """Nested-virtualization support on this host."""
+
+    #: True when sandboxes can run (M3+ hardware, VZ backend).
+    supported: bool
+    #: The daemon's authoritative reason, when unsupported.
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """What the daemon can do — the ``arcbox.capabilities()`` handshake."""
+
+    #: Daemon version string (informational).
+    daemon_version: str
+    #: Sandbox API protocol level.
+    protocol: int
+    #: Append-only named feature flags (e.g. "pause_resume").
+    features: list[str]
+    #: Whether this host can run sandboxes at all.
+    nested_virt: NestedVirtCapability
+
+
+@dataclass(frozen=True)
 class SandboxSummary:
     """One row of a sandbox listing."""
 
@@ -226,6 +299,43 @@ def sandbox_summary_from_proto(summary: sandbox_pb2.SandboxSummary) -> SandboxSu
         paused_at=_optional_time(summary.paused_at, summary.HasField("paused_at")),
         failed_at=_optional_time(summary.failed_at, summary.HasField("failed_at")),
         storage_bytes=int(summary.storage_bytes),
+    )
+
+
+_EVENT_KIND_NAMES: dict[int, SandboxEventKind] = {
+    sandbox_pb2.SANDBOX_EVENT_KIND_CREATED: "created",
+    sandbox_pb2.SANDBOX_EVENT_KIND_READY: "ready",
+    sandbox_pb2.SANDBOX_EVENT_KIND_RUNNING: "running",
+    sandbox_pb2.SANDBOX_EVENT_KIND_IDLE: "idle",
+    sandbox_pb2.SANDBOX_EVENT_KIND_STOPPING: "stopping",
+    sandbox_pb2.SANDBOX_EVENT_KIND_STOPPED: "stopped",
+    sandbox_pb2.SANDBOX_EVENT_KIND_FAILED: "failed",
+    sandbox_pb2.SANDBOX_EVENT_KIND_REMOVED: "removed",
+    sandbox_pb2.SANDBOX_EVENT_KIND_PAUSING: "pausing",
+    sandbox_pb2.SANDBOX_EVENT_KIND_PAUSED: "paused",
+    sandbox_pb2.SANDBOX_EVENT_KIND_RESUMED: "resumed",
+}
+
+
+def sandbox_event_from_proto(event: sandbox_pb2.SandboxEvent) -> SandboxEvent:
+    """Map one Events frame to the public DTO ("unknown" for kinds this
+    SDK predates)."""
+    return SandboxEvent(
+        sandbox_id=event.sandbox_id,
+        kind=_EVENT_KIND_NAMES.get(event.kind, "unknown"),
+        time=_optional_time(event.time, event.HasField("time")),
+        attributes=dict(event.attributes),
+    )
+
+
+def capabilities_from_proto(response: sandbox_pb2.GetCapabilitiesResponse) -> Capabilities:
+    """Map the GetCapabilities response to the public DTO."""
+    nested = response.nested_virt
+    return Capabilities(
+        daemon_version=response.daemon_version,
+        protocol=response.protocol,
+        features=list(response.features),
+        nested_virt=NestedVirtCapability(supported=nested.supported, reason=nested.reason or None),
     )
 
 

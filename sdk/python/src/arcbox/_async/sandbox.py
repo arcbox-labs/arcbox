@@ -19,8 +19,14 @@ from google.protobuf import empty_pb2
 from arcbox._boundary import wrap_errors
 from arcbox._gen import sandbox_pb2
 from arcbox._types import (
+    UNCHANGED,
+    Capabilities,
+    SandboxEvent,
     SandboxInfo,
     SandboxSummary,
+    Unchanged,
+    capabilities_from_proto,
+    sandbox_event_from_proto,
     sandbox_info_from_proto,
     sandbox_state_from_proto,
     sandbox_state_to_proto,
@@ -28,6 +34,7 @@ from arcbox._types import (
 )
 from arcbox.errors import (
     ArcBoxError,
+    ConnectionLostError,
     InvalidArgumentError,
     NotFoundError,
     RequestTimeoutError,
@@ -40,7 +47,7 @@ from .commands import AsyncCommands
 from .files import AsyncFiles
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
     from types import TracebackType
 
     from arcbox._connection import Connection
@@ -63,11 +70,10 @@ _GONE_EVENTS = (
     sandbox_pb2.SANDBOX_EVENT_KIND_REMOVED,
 )
 
-#: How often ``connect`` re-inspects a PAUSING sandbox.
-#: ``SANDBOX_EVENT_KIND_PAUSED`` names this edge in the proto, but the
-#: daemon does not emit it yet (Pause/Resume are CORE-21 stubs), so the
-#: checkpoint is polled out instead. Once it is emitted, this poll
-#: should become an event wait.
+#: How often ``connect`` re-inspects a PAUSING sandbox. The daemon
+#: emits ``SANDBOX_EVENT_KIND_PAUSED`` on this edge (CORE-21), but the
+#: settle poll predates it and remains the simple, robust route — a
+#: poll-to-event-wait conversion is a candidate cleanup, not a bug.
 _PAUSE_SETTLE_POLL_SECONDS = 0.5
 
 #: Default overall deadline for ``connect`` in seconds — generous
@@ -110,10 +116,30 @@ class AsyncArcBox:
 
     def __init__(self, connection: Connection | None = None) -> None:
         self._client = AsyncConnectClient(connection)
+        self._capabilities: Capabilities | None = None
 
     async def aclose(self) -> None:
         """Close the SDK-owned HTTP client (no-op for an injected one)."""
         await self._client.aclose()
+
+    async def capabilities(self) -> Capabilities:
+        """What the daemon can do: version, sandbox protocol level,
+        feature flags, and whether nested virtualization is available.
+        Answered host-side (works before any sandbox exists) and cached
+        for the life of this client — a failed fetch is not cached, so
+        the next call retries. The SDK does not gate on it: the daemon
+        fails fast on its own (a ``CapabilityError`` from ``create``);
+        this is the inspectable version of the same answer."""
+        if self._capabilities is None:
+            with wrap_errors("arcbox.capabilities"):
+                self._capabilities = capabilities_from_proto(
+                    await self._client.unary(
+                        _SANDBOX + "GetCapabilities",
+                        sandbox_pb2.GetCapabilitiesRequest(),
+                        sandbox_pb2.GetCapabilitiesResponse,
+                    )
+                )
+        return self._capabilities
 
     async def __aenter__(self) -> AsyncArcBox:
         return self
@@ -435,6 +461,37 @@ class AsyncArcBox:
         )
 
 
+class AsyncEventStream:
+    """A sandbox's lifecycle events, iterable one typed event at a time.
+
+    The iterator ends when the daemon ends the stream. When exiting
+    early (``break``), iterate inside the context-manager form —
+    ``async with sandbox.events() as stream`` in the async flavor,
+    ``with`` in the sync one — so the subscription closes at the break
+    instead of whenever the generator finalizer runs."""
+
+    def __init__(self, events: AsyncGenerator[SandboxEvent]) -> None:
+        self._events = events
+
+    def __aiter__(self) -> AsyncIterator[SandboxEvent]:
+        return self._events
+
+    async def aclose(self) -> None:
+        """Cancel the subscription without consuming the rest."""
+        await self._events.aclose()
+
+    async def __aenter__(self) -> AsyncEventStream:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+
 class AsyncSandbox:
     """A handle to one sandbox."""
 
@@ -553,16 +610,78 @@ class AsyncSandbox:
                 empty_pb2.Empty,
             )
 
+    async def set_lifecycle(
+        self,
+        *,
+        ttl: float | Unchanged | None = UNCHANGED,
+        idle_timeout: float | Unchanged | None = UNCHANGED,
+        on_idle: IdlePolicy | Unchanged | None = UNCHANGED,
+    ) -> None:
+        """Replace lifecycle deadlines. Each knob is tri-state: omitted
+        (the :data:`arcbox.UNCHANGED` default) leaves it as it is;
+        ``None`` restores the daemon default (no TTL / no idle detection
+        / the default idle action) — the same meaning ``None`` has on
+        ``create``; a value replaces it. ``ttl`` re-arms the hard cap
+        this many seconds from NOW — calling repeatedly keeps a busy
+        sandbox alive; ``idle_timeout`` re-arms a live idle timer. Works
+        in any non-terminal state, including paused."""
+        with wrap_errors("sandbox.set_lifecycle"):
+            request = sandbox_pb2.SetLifecycleRequest(id=self.id)
+            if not isinstance(ttl, Unchanged):
+                request.ttl_seconds = _seconds_to_wire(ttl)
+            if not isinstance(idle_timeout, Unchanged):
+                request.idle_timeout_seconds = _seconds_to_wire(idle_timeout)
+            if not isinstance(on_idle, Unchanged):
+                request.on_idle = (
+                    sandbox_pb2.IDLE_ACTION_UNSPECIFIED
+                    if on_idle is None
+                    else sandbox_pb2.IDLE_ACTION_KILL
+                    if on_idle == "kill"
+                    else sandbox_pb2.IDLE_ACTION_PAUSE
+                )
+            await self._client.unary(_SANDBOX + "SetLifecycle", request, empty_pb2.Empty)
+
+    def events(self) -> AsyncEventStream:
+        """Subscribe to this sandbox's lifecycle events, yielded as
+        typed :class:`SandboxEvent` values (keepalive frames are
+        filtered out). The iterator ends when the daemon ends the
+        stream; closing the stream (or its context) cancels the
+        subscription. A transport drop mid-stream is surfaced as
+        :class:`arcbox.errors.ConnectionLostError` — re-subscribing is
+        the caller's decision, since missed events cannot be replayed."""
+        return AsyncEventStream(self._stream_events())
+
+    async def _stream_events(self) -> AsyncGenerator[SandboxEvent]:
+        with wrap_errors("sandbox.events"):
+            entered = False
+            try:
+                async with self._client.stream(
+                    _SANDBOX + "Events",
+                    sandbox_pb2.SandboxEventsRequest(sandbox_id=self.id),
+                    sandbox_pb2.WatchEventsResponse,
+                ) as stream:
+                    entered = True
+                    async for frame in stream:
+                        if frame.WhichOneof("payload") == "event":
+                            yield sandbox_event_from_proto(frame.event)
+            except httpx.HTTPError as exc:
+                if not entered:
+                    # A dial failure: the daemon was never reached;
+                    # wrap_errors maps it to ConnectionFailedError.
+                    raise
+                raise ConnectionLostError(
+                    "the event stream died",
+                    context={"id": self.id},
+                    operation="sandbox.events",
+                ) from exc
+
     async def pause(self) -> None:
         """Checkpoint the sandbox to disk under the same id and release
         its runtime resources. Resume happens on the next ``connect``
         (or transparently, daemon-side, on the next data-plane call).
         Trades RAM for disk: a paused sandbox keeps paying
-        ``storage_bytes``.
-
-        Requires daemon-side CORE-21: the current local daemon serves
-        Pause/Resume as contract-only stubs, so this raises an
-        unimplemented :class:`ArcBoxError` until that lands."""
+        ``storage_bytes``. Requires a quiescent sandbox (READY — no
+        running command)."""
         with wrap_errors("sandbox.pause"):
             # No per-request deadline: checkpointing takes as long as it
             # takes.
