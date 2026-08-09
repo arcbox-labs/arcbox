@@ -9,11 +9,10 @@ use super::{bin_dir, profile};
 #[derive(Debug, Clone, Serialize)]
 pub(in crate::commands) struct ShellIntegrationStatus {
     pub(in crate::commands) shell: String,
-    pub(in crate::commands) profile_path: Option<String>,
-    pub(in crate::commands) profile_injected: bool,
-    pub(in crate::commands) path_ok: bool,
-    pub(in crate::commands) completion_ok: bool,
-    pub(in crate::commands) detail: Option<String>,
+    pub(in crate::commands) bin_symlink: ComponentStatus,
+    pub(in crate::commands) profile: ComponentStatus,
+    pub(in crate::commands) login_path: ComponentStatus,
+    pub(in crate::commands) completions: ComponentStatus,
 }
 
 #[derive(Serialize)]
@@ -28,13 +27,13 @@ struct StatusOutput {
     repair: Option<&'static str>,
 }
 
-#[derive(Serialize)]
-struct ComponentStatus {
-    ok: bool,
+#[derive(Debug, Clone, Serialize)]
+pub(in crate::commands) struct ComponentStatus {
+    pub(in crate::commands) ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
+    pub(in crate::commands) path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    pub(in crate::commands) detail: Option<String>,
 }
 
 impl ComponentStatus {
@@ -45,11 +44,24 @@ impl ComponentStatus {
             detail: None,
         }
     }
+
+    fn checked(
+        ok: bool,
+        path: Option<String>,
+        detail: Option<String>,
+        failure: &'static str,
+    ) -> Self {
+        Self {
+            ok,
+            path,
+            detail: (!ok).then(|| detail.unwrap_or_else(|| failure.to_owned())),
+        }
+    }
 }
 
 pub(in crate::commands) async fn shell_integration_status() -> ShellIntegrationStatus {
     let shell = profile::detect_shell();
-    let (profile_path, profile_injected, path_error) = match profile::profile_path(shell).await {
+    let (profile_path, profile_injected, profile_error) = match profile::profile_path(shell).await {
         Ok(path) => match profile::is_injected(&path, shell).await {
             Ok(injected) => (Some(path.display().to_string()), injected, None),
             Err(error) => (
@@ -61,69 +73,58 @@ pub(in crate::commands) async fn shell_integration_status() -> ShellIntegrationS
         Err(error) => (None, false, Some(format!("{error:#}"))),
     };
     let probe = profile::probe_login(shell).await;
-    let (binary_ok, binary_detail) = match inspect_bin_link(&bin_dir().join("abctl")).await {
+    let bin_path = bin_dir().join("abctl");
+    let (binary_ok, binary_detail) = match inspect_bin_link(&bin_path).await {
         Ok(status) => status,
         Err(error) => (false, Some(format!("{error:#}"))),
     };
     ShellIntegrationStatus {
         shell: shell.as_str().to_owned(),
-        profile_path,
-        profile_injected,
-        path_ok: probe.path_ok && binary_ok,
-        completion_ok: probe.completion_ok,
-        detail: probe.detail.or(path_error).or_else(|| {
-            (!binary_ok).then(|| {
-                binary_detail.unwrap_or_else(|| "ArcBox abctl symlink is missing".to_owned())
-            })
-        }),
+        bin_symlink: ComponentStatus {
+            ok: binary_ok,
+            path: Some(bin_path.display().to_string()),
+            detail: binary_detail,
+        },
+        profile: ComponentStatus::checked(
+            profile_injected,
+            profile_path,
+            profile_error,
+            "effective shell profile does not contain ArcBox integration",
+        ),
+        login_path: ComponentStatus::checked(
+            probe.path_ok,
+            Some(bin_dir().display().to_string()),
+            probe.detail.clone(),
+            "effective login shell does not resolve ArcBox abctl",
+        ),
+        completions: ComponentStatus::checked(
+            probe.completion_ok,
+            Some(profile::completion_path(shell).display().to_string()),
+            probe.detail,
+            "completion is not discoverable in the login shell",
+        ),
     }
 }
 
 pub(super) async fn status(format: OutputFormat) -> Result<()> {
-    let bin_link = bin_dir().join("abctl");
-    let (symlink_ok, symlink_detail) = inspect_bin_link(&bin_link).await?;
-
     let shell = profile::detect_shell();
     let init_path = profile::init_path(shell);
     let init_ok = tokio::fs::try_exists(&init_path).await?;
     let integration = shell_integration_status().await;
-    let completion_path = profile::completion_path(shell);
     let (plugins_ok, plugin_detail) = docker_plugin_status().await;
-    let installed = symlink_ok
+    let installed = integration.bin_symlink.ok
         && init_ok
-        && integration.profile_injected
-        && integration.path_ok
-        && integration.completion_ok
+        && integration.profile.ok
+        && integration.login_path.ok
+        && integration.completions.ok
         && plugins_ok;
     let output = StatusOutput {
         installed,
-        bin_symlink: ComponentStatus {
-            ok: symlink_ok,
-            path: Some(bin_link.display().to_string()),
-            detail: symlink_detail,
-        },
+        bin_symlink: integration.bin_symlink,
         shell_init: ComponentStatus::at(init_ok, init_path.display().to_string()),
-        profile_injected: ComponentStatus {
-            ok: integration.profile_injected,
-            path: integration.profile_path.clone(),
-            detail: integration.detail.clone(),
-        },
-        login_path: ComponentStatus {
-            ok: integration.path_ok,
-            path: Some(bin_dir().display().to_string()),
-            detail: integration.detail.clone().or_else(|| {
-                (!integration.path_ok)
-                    .then(|| "effective login shell does not resolve ArcBox abctl".to_owned())
-            }),
-        },
-        completions: ComponentStatus {
-            ok: integration.completion_ok,
-            path: Some(completion_path.display().to_string()),
-            detail: integration.detail.or_else(|| {
-                (!integration.completion_ok)
-                    .then(|| "completion is not discoverable in the login shell".to_owned())
-            }),
-        },
+        profile_injected: integration.profile,
+        login_path: integration.login_path,
+        completions: integration.completions,
         docker_plugins: ComponentStatus {
             ok: plugins_ok,
             path: None,
@@ -253,7 +254,26 @@ fn print_component(label: &str, component: &ComponentStatus) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::inspect_bin_link;
+    use super::{ComponentStatus, inspect_bin_link};
+
+    #[test]
+    fn component_detail_is_scoped_to_a_failed_check() {
+        let passing = ComponentStatus::checked(
+            true,
+            Some("completion".to_owned()),
+            Some("unrelated failure".to_owned()),
+            "missing completion",
+        );
+        let failing = ComponentStatus::checked(
+            false,
+            Some("completion".to_owned()),
+            None,
+            "missing completion",
+        );
+
+        assert_eq!(passing.detail, None);
+        assert_eq!(failing.detail.as_deref(), Some("missing completion"));
+    }
 
     #[tokio::test]
     async fn bin_link_must_resolve_to_the_running_executable() {

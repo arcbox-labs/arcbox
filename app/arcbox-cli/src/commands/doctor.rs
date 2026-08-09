@@ -127,45 +127,71 @@ async fn inspect() -> DoctorReport {
     checks.push(check_docker_cli().await);
 
     let shell = super::setup::shell_integration_status().await;
-    checks.push(if shell.profile_injected {
+    checks.push(if shell.bin_symlink.ok {
+        HealthCheck::pass(
+            "CLI symlink",
+            shell
+                .bin_symlink
+                .path
+                .clone()
+                .unwrap_or_else(|| "ArcBox abctl".to_owned()),
+        )
+    } else {
+        HealthCheck::fail(
+            "CLI symlink",
+            shell.bin_symlink.detail.clone().unwrap_or_else(|| {
+                shell.bin_symlink.path.clone().map_or_else(
+                    || "ArcBox abctl symlink is missing".to_owned(),
+                    |path| format!("missing {path}"),
+                )
+            }),
+            "Run `abctl setup install`.",
+        )
+    });
+    checks.push(if shell.profile.ok {
         HealthCheck::pass(
             "Shell profile",
             shell
-                .profile_path
+                .profile
+                .path
                 .clone()
                 .unwrap_or_else(|| shell.shell.clone()),
         )
     } else {
         HealthCheck::fail(
             "Shell profile",
-            shell.detail.clone().unwrap_or_else(|| {
+            shell.profile.detail.clone().unwrap_or_else(|| {
                 shell
-                    .profile_path
+                    .profile
+                    .path
                     .clone()
                     .unwrap_or_else(|| "profile not detected".to_owned())
             }),
             "Run `abctl setup install`.",
         )
     });
-    checks.push(if shell.path_ok {
+    checks.push(if shell.login_path.ok {
         HealthCheck::pass("Shell PATH", "login shell resolves ArcBox abctl")
     } else {
         HealthCheck::fail(
             "Shell PATH",
             shell
+                .login_path
                 .detail
                 .clone()
                 .unwrap_or_else(|| "login shell does not resolve ArcBox abctl".to_owned()),
             "Run `abctl setup install`, then restart the shell.",
         )
     });
-    checks.push(if shell.completion_ok {
+    checks.push(if shell.completions.ok {
         HealthCheck::pass("Shell completion", "discoverable in the login shell")
     } else {
         HealthCheck::fail(
             "Shell completion",
             shell
+                .completions
                 .detail
+                .clone()
                 .unwrap_or_else(|| "completion is not discoverable".to_owned()),
             "Run `abctl setup install`, then restart the shell.",
         )
