@@ -105,7 +105,7 @@ fn run(cli: Cli) -> Result<()> {
             Commands::Daemon(args) => commands::daemon::execute(args).await,
             Commands::Logs(args) => commands::logs::execute(args).await,
             Commands::Setup(cmd) => commands::setup::execute(cmd, cli.format).await,
-            Commands::Doctor => commands::doctor::execute().await,
+            Commands::Doctor => commands::doctor::execute(cli.format).await,
             Commands::Top(args) => commands::top::execute(args, cli.format).await,
             #[cfg(target_os = "macos")]
             Commands::Install(args) => commands::install::execute(args).await,
