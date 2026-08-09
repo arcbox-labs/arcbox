@@ -1,14 +1,6 @@
+use crate::boot_assets::REQUIRED_RUNTIME_BINARIES;
 use crate::error::{CoreError, Result};
 use std::path::Path;
-
-const REQUIRED_RUNTIME_ASSETS: [&str; 6] = [
-    "dockerd",
-    "containerd",
-    "containerd-shim-runc-v2",
-    "runc",
-    "docker-init",
-    "k3s",
-];
 
 /// Checks that a file exists and has at least one executable permission bit set.
 pub(super) fn check_executable(path: &Path, context: &str) -> Result<()> {
@@ -48,7 +40,7 @@ pub(super) fn ensure_guest_binaries(data_dir: &Path, generation: &str) -> Result
     )?;
 
     let runtime_dir = data_dir.join("runtime").join(generation).join("bin");
-    for name in REQUIRED_RUNTIME_ASSETS {
+    for name in REQUIRED_RUNTIME_BINARIES {
         check_executable(
             &runtime_dir.join(name),
             &format!(
@@ -60,7 +52,7 @@ pub(super) fn ensure_guest_binaries(data_dir: &Path, generation: &str) -> Result
 
     tracing::info!(
         "All guest binaries verified: agent + {} runtime assets",
-        REQUIRED_RUNTIME_ASSETS.len()
+        REQUIRED_RUNTIME_BINARIES.len()
     );
     Ok(())
 }

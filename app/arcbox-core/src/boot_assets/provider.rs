@@ -1,9 +1,11 @@
 use super::BootAssetManifest;
+use super::REQUIRED_RUNTIME_BINARIES;
 use super::config::BootAssetConfig;
 use super::lockfile::boot_asset_manifest_sha256;
 use crate::error::{CoreError, Result};
 use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
 use arcbox_boot::download::{PrepareProgress, ProgressCallback as InnerProgressCallback};
+use arcbox_boot::manifest::Binary;
 use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
 use semver::Version;
 use sha2::Digest;
@@ -135,7 +137,96 @@ impl BootAssetProvider {
             .await
             .map_err(|e| CoreError::config(format!("binary prepare error: {e}")))?;
 
-        self.verify_manifest_pin()
+        let manifest = self.read_cached_manifest_required().await?;
+        self.repair_cached_binary_permissions(&manifest, dest_dir)
+            .await?;
+        self.validate_cached_binaries(dest_dir).await
+    }
+
+    /// Validate every cached runtime binary selected by the pinned manifest.
+    ///
+    /// This performs no downloads. It uses `arcbox-boot`'s checksum and
+    /// `install_dir` rules, then enforces the executable contract required by
+    /// runtime startup.
+    pub async fn validate_cached_binaries(&self, dest_dir: &Path) -> Result<()> {
+        let manifest = self.read_cached_manifest_required().await?;
+        let selected = manifest
+            .binaries
+            .iter()
+            .filter(|binary| binary.targets.contains_key(&self.config.arch))
+            .collect::<Vec<_>>();
+        for name in REQUIRED_RUNTIME_BINARIES {
+            let expected_path = dest_dir.join(name);
+            if !selected.iter().any(|binary| {
+                binary.name == name && binary_install_path(dest_dir, binary) == expected_path
+            }) {
+                return Err(CoreError::config(format!(
+                    "manifest is missing required runtime binary '{name}' for architecture {} at {}",
+                    self.config.arch,
+                    expected_path.display()
+                )));
+            }
+        }
+
+        manifest
+            .validate_binaries(&self.config.arch, dest_dir)
+            .await
+            .map_err(|error| {
+                CoreError::config(format!("cached runtime binary validation failed: {error}"))
+            })?;
+
+        for binary in selected {
+            let path = binary_install_path(dest_dir, binary);
+            let metadata = regular_binary_metadata(binary, &path).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    return Err(CoreError::config(format!(
+                        "runtime binary '{}' is not executable at {}",
+                        binary.name,
+                        path.display()
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn repair_cached_binary_permissions(
+        &self,
+        manifest: &BootAssetManifest,
+        dest_dir: &Path,
+    ) -> Result<()> {
+        for binary in manifest
+            .binaries
+            .iter()
+            .filter(|binary| binary.targets.contains_key(&self.config.arch))
+        {
+            let path = binary_install_path(dest_dir, binary);
+            let metadata = regular_binary_metadata(binary, &path).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(0o755);
+                    tokio::fs::set_permissions(&path, permissions)
+                        .await
+                        .map_err(|error| {
+                            CoreError::config(format!(
+                                "failed to make runtime binary '{}' executable at {}: {error}",
+                                binary.name,
+                                path.display()
+                            ))
+                        })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn cached_manifest_path(&self) -> PathBuf {
@@ -302,6 +393,33 @@ impl BootAssetProvider {
     }
 }
 
+fn binary_install_path(dest_dir: &Path, binary: &Binary) -> PathBuf {
+    binary.install_dir.as_ref().map_or_else(
+        || dest_dir.join(&binary.name),
+        |directory| {
+            dest_dir
+                .parent()
+                .unwrap_or(dest_dir)
+                .join(directory)
+                .join(&binary.name)
+        },
+    )
+}
+
+async fn regular_binary_metadata(binary: &Binary, path: &Path) -> Result<std::fs::Metadata> {
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
+        CoreError::config(format!("failed to inspect {}: {error}", path.display()))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(CoreError::config(format!(
+            "runtime binary '{}' is not a regular file at {}",
+            binary.name,
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
 fn manifest_has_binary(manifest: &BootAssetManifest, arch: &str, name: &str) -> bool {
     manifest
         .binaries
@@ -312,6 +430,72 @@ fn manifest_has_binary(manifest: &BootAssetManifest, arch: &str, name: &str) -> 
 #[cfg(test)]
 mod manifest_tests {
     use super::{BootAssetConfig, BootAssetManifest, BootAssetProvider, manifest_has_binary};
+    use crate::boot_assets::REQUIRED_RUNTIME_BINARIES;
+
+    #[cfg(unix)]
+    fn cached_runtime_fixture() -> (tempfile::TempDir, BootAssetProvider, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use sha2::{Digest as _, Sha256};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_unpinned_manifest_allowed(true);
+        config.arch = "test-arch".to_owned();
+        let version_dir = config.version_cache_dir();
+        let bin_dir = directory
+            .path()
+            .join("runtime")
+            .join(&config.version)
+            .join("bin");
+        let kernel_dir = bin_dir.parent().unwrap().join("kernel");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&kernel_dir).unwrap();
+
+        let mut binaries = Vec::new();
+        for name in REQUIRED_RUNTIME_BINARIES {
+            let path = bin_dir.join(name);
+            std::fs::write(&path, name.as_bytes()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            binaries.push(serde_json::json!({
+                "name": name,
+                "version": "1",
+                "targets": {"test-arch": {
+                    "path": format!("runtime/{name}"),
+                    "sha256": format!("{:x}", Sha256::digest(name.as_bytes()))
+                }}
+            }));
+        }
+
+        let vmlinux = kernel_dir.join("vmlinux");
+        std::fs::write(&vmlinux, b"vmlinux").unwrap();
+        std::fs::set_permissions(&vmlinux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binaries.push(serde_json::json!({
+            "name": "vmlinux",
+            "version": "1",
+            "install_dir": "kernel",
+            "targets": {"test-arch": {
+                "path": "runtime/vmlinux",
+                "sha256": format!("{:x}", Sha256::digest(b"vmlinux"))
+            }}
+        }));
+
+        std::fs::write(
+            version_dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 0,
+                "asset_version": config.version,
+                "built_at": "now",
+                "targets": {},
+                "binaries": binaries
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = BootAssetProvider::with_config(config).unwrap();
+        (directory, provider, bin_dir)
+    }
 
     #[test]
     fn binary_capability_is_scoped_to_the_current_architecture() {
@@ -379,5 +563,187 @@ mod manifest_tests {
         assert!(provider.is_cached());
         std::fs::remove_file(config.custom_kernel.unwrap()).unwrap();
         assert!(!provider.is_cached());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_binary_validation_checks_manifest_paths_hashes_and_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_directory, provider, bin_dir) = cached_runtime_fixture();
+        let kernel_dir = bin_dir.parent().unwrap().join("kernel");
+        let dockerd = bin_dir.join("dockerd");
+        let vmlinux = kernel_dir.join("vmlinux");
+
+        provider.validate_cached_binaries(&bin_dir).await.unwrap();
+
+        std::fs::set_permissions(&dockerd, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = provider
+            .validate_cached_binaries(&bin_dir)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("dockerd' is not executable"));
+
+        std::fs::set_permissions(&dockerd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&dockerd, b"corrupt dockerd").unwrap();
+        let error = provider
+            .validate_cached_binaries(&bin_dir)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("sha256 mismatch for 'dockerd'"),
+            "{error}"
+        );
+
+        std::fs::write(&dockerd, b"dockerd").unwrap();
+        std::fs::remove_file(&vmlinux).unwrap();
+        let error = provider
+            .validate_cached_binaries(&bin_dir)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("vmlinux"));
+    }
+
+    #[tokio::test]
+    async fn cached_binary_validation_requires_the_full_runtime_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_unpinned_manifest_allowed(true);
+        config.arch = "arm64".to_owned();
+        std::fs::create_dir_all(config.version_cache_dir()).unwrap();
+        std::fs::write(
+            config.version_cache_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 0,
+                "asset_version": config.version,
+                "built_at": "now",
+                "targets": {},
+                "binaries": [{
+                    "name": "dockerd",
+                    "version": "1",
+                    "targets": {"arm64": {"path": "dockerd", "sha256": "00"}}
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = BootAssetProvider::with_config(config).unwrap();
+
+        let error = provider
+            .validate_cached_binaries(directory.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing required runtime binary 'containerd' for architecture arm64")
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_binary_validation_requires_runtime_binaries_in_bin() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_unpinned_manifest_allowed(true);
+        config.arch = "arm64".to_owned();
+        std::fs::create_dir_all(config.version_cache_dir()).unwrap();
+        let binaries = REQUIRED_RUNTIME_BINARIES
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "version": "1",
+                    "install_dir": (name == "dockerd").then_some("kernel"),
+                    "targets": {"arm64": {"path": name, "sha256": "00"}}
+                })
+            })
+            .to_vec();
+        std::fs::write(
+            config.version_cache_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 0,
+                "asset_version": config.version,
+                "built_at": "now",
+                "targets": {},
+                "binaries": binaries
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let bin_dir = directory
+            .path()
+            .join("runtime")
+            .join(&config.version)
+            .join("bin");
+        let provider = BootAssetProvider::with_config(config).unwrap();
+
+        let error = provider
+            .validate_cached_binaries(&bin_dir)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing required runtime binary 'dockerd'")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_binary_validation_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (_directory, provider, bin_dir) = cached_runtime_fixture();
+        let dockerd = bin_dir.join("dockerd");
+        let target = bin_dir.join("dockerd.real");
+        std::fs::rename(&dockerd, &target).unwrap();
+        symlink(&target, &dockerd).unwrap();
+
+        let error = provider
+            .validate_cached_binaries(&bin_dir)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("dockerd' is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_prepare_repairs_cached_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_directory, provider, bin_dir) = cached_runtime_fixture();
+        let dockerd = bin_dir.join("dockerd");
+        std::fs::set_permissions(&dockerd, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        provider.prepare_binaries(&bin_dir, None).await.unwrap();
+
+        assert_ne!(
+            std::fs::metadata(dockerd).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_prepare_rejects_a_partial_runtime_contract() {
+        let (_directory, provider, bin_dir) = cached_runtime_fixture();
+        let manifest_path = provider.config().version_cache_dir().join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["binaries"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|binary| binary["name"] != "k3s");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = provider.prepare_binaries(&bin_dir, None).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing required runtime binary 'k3s'")
+        );
     }
 }
