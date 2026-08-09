@@ -37,6 +37,7 @@ EXTRA_REPLACEMENTS = {
     "AsyncCommands": "Commands",
     "AsyncCommandHandle": "CommandHandle",
     "AsyncOutputStream": "OutputStream",
+    "AsyncEventStream": "EventStream",
     "AsyncFiles": "Files",
     "AsyncConnectClient": "ConnectClient",
     "AsyncServerStream": "ServerStream",
