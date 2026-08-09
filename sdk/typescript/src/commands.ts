@@ -709,6 +709,15 @@ export class Commands {
         // The poll itself failed; the original feed error stands.
       }
       if (state?.state !== ExecutionState.EXITED) {
+        // The caller gets no handle out of a thrown run(), so a
+        // still-running process (cat waiting on input) would keep the
+        // sandbox RUNNING with no way to reach it. Best-effort kill;
+        // the feed error is the one to surface.
+        try {
+          await handle.kill("SIGKILL");
+        } catch {
+          // Best-effort only.
+        }
         throw mapped;
       }
     }

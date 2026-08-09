@@ -23,6 +23,7 @@ from arcbox._types import (
 )
 from arcbox.errors import (
     ArcBoxError,
+    ConnectionFailedError,
     ConnectionLostError,
     InvalidArgumentError,
     TimeoutError,
@@ -183,7 +184,13 @@ class AsyncCommandHandle:
                     # A clean server-side end without an exited frame:
                     # nothing more is coming (the daemon closed the record).
                     return
-                except (httpx.HTTPError, ConnectionLostError) as exc:
+                # ConnectionFailedError covers the drop's OTHER wire shape:
+                # the daemon losing its upstream agent stream ends the HTTP
+                # stream cleanly with a Connect `unavailable` error frame,
+                # decoded into ConnectionFailedError (ConnectionLostError —
+                # raw truncation — is its subclass). Daemon-typed errors
+                # map to other classes and are never retried.
+                except (httpx.HTTPError, ConnectionFailedError) as exc:
                     failures += 1
                     if failures > _MAX_ATTACH_RETRIES:
                         raise ConnectionLostError(
@@ -578,4 +585,10 @@ class AsyncCommands:
                     process_pb2.Execution,
                 )
             if state is None or state.state != process_pb2.EXECUTION_STATE_EXITED:
+                # The caller gets no handle out of a thrown run(), so a
+                # still-running process (cat waiting on input) would
+                # keep the sandbox RUNNING with no way to reach it.
+                # Best-effort kill; the feed error is the one to surface.
+                with suppress(Exception):
+                    await handle.kill("SIGKILL")
                 raise

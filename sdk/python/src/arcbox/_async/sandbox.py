@@ -34,6 +34,7 @@ from arcbox._types import (
 )
 from arcbox.errors import (
     ArcBoxError,
+    ConnectionFailedError,
     ConnectionLostError,
     InvalidArgumentError,
     NotFoundError,
@@ -664,10 +665,17 @@ class AsyncSandbox:
                     async for frame in stream:
                         if frame.WhichOneof("payload") == "event":
                             yield sandbox_event_from_proto(frame.event)
-            except httpx.HTTPError as exc:
-                if not entered:
-                    # A dial failure: the daemon was never reached;
-                    # wrap_errors maps it to ConnectionFailedError.
+            # ConnectionFailedError covers the drop's OTHER wire shape:
+            # the daemon losing its upstream event source ends the HTTP
+            # stream cleanly with a Connect `unavailable` error frame,
+            # decoded into ConnectionFailedError. Daemon-typed errors map
+            # to other classes and keep them.
+            except (httpx.HTTPError, ConnectionFailedError) as exc:
+                if not entered or isinstance(exc, ConnectionLostError):
+                    # Before entry: a dial failure — the daemon was never
+                    # reached; wrap_errors maps it to
+                    # ConnectionFailedError. ConnectionLostError is
+                    # already the stream-death error.
                     raise
                 raise ConnectionLostError(
                     "the event stream died",
