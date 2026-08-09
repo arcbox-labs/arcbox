@@ -19,6 +19,7 @@ from arcbox._types import (
     CommandResult,
     OutputChunk,
     StdinStatus,
+    command_info_from_proto,
     command_result_from_execution,
 )
 from arcbox.errors import (
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
     from types import TracebackType
 
-    from arcbox._types import OutputChannel, PtySize, SignalName
+    from arcbox._types import CommandInfo, OutputChannel, PtySize, SignalName
 
     from ._client import AsyncConnectClient, AsyncServerStream
 
@@ -522,6 +523,19 @@ class AsyncCommands:
             return AsyncCommandHandle(
                 self._client, self._sandbox_id, execution.id, stdin_offset=stdin_offset
             )
+
+    async def list(self) -> list[CommandInfo]:
+        """List this sandbox's commands, running and exited — the
+        rediscovery path after losing handles (or a whole process):
+        pick an id from a summary and :meth:`get` a live handle for it.
+        Executions are retained for the life of their sandbox."""
+        with wrap_errors("commands.list"):
+            listing = await self._client.unary(
+                _PROCESS + "ListExecutions",
+                process_pb2.ListExecutionsRequest(sandbox_id=self._sandbox_id),
+                process_pb2.ListExecutionsResponse,
+            )
+            return [command_info_from_proto(execution) for execution in listing.executions]
 
     async def _start(
         self,

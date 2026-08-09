@@ -46,6 +46,7 @@ from arcbox.errors import (
 from ._client import ConnectClient
 from .commands import Commands
 from .files import Files
+from .ports import Ports
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator, Mapping, Sequence
@@ -507,6 +508,8 @@ class Sandbox:
         self.commands = Commands(client, sandbox_id)
         #: Move bytes in and out of the sandbox.
         self.files = Files(client, sandbox_id)
+        #: Network readiness of the sandbox.
+        self.ports = Ports(client, sandbox_id)
 
     @classmethod
     def create(
