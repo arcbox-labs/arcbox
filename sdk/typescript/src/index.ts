@@ -28,8 +28,11 @@ export { Files, MAX_FILE_BYTES } from "./files";
 export type {
   FileKind,
   FileStat,
+  FsEvent,
+  FsEventKind,
   MkdirOptions,
   RemoveOptions,
+  WatchOptions,
   WriteOptions,
 } from "./files";
 
