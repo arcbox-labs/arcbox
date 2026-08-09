@@ -53,6 +53,7 @@ pub(super) async fn prefetch(
     // Clear cache if force.
     if args.force {
         provider.clear_cache().await?;
+        clear_runtime_generation(root_data_dir, &provider.config().version).await?;
     }
 
     match format {
@@ -65,6 +66,15 @@ pub(super) async fn prefetch(
     }
 
     Ok(())
+}
+
+async fn clear_runtime_generation(root_data_dir: &Path, version: &str) -> std::io::Result<()> {
+    let path = root_data_dir.join("runtime").join(version);
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Build an NDJSON progress callback that prints one JSON line per progress event.
@@ -290,4 +300,27 @@ pub(super) async fn list(data_dir: PathBuf, format: OutputFormat) -> anyhow::Res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_runtime_generation;
+
+    #[tokio::test]
+    async fn force_clear_removes_only_the_selected_runtime_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = directory.path().join("runtime/0.8.4/bin");
+        let retained = directory.path().join("runtime/0.8.3/bin");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::write(selected.join("dockerd"), b"old").unwrap();
+        std::fs::write(retained.join("dockerd"), b"retained").unwrap();
+
+        clear_runtime_generation(directory.path(), "0.8.4")
+            .await
+            .unwrap();
+
+        assert!(!selected.exists());
+        assert!(retained.join("dockerd").is_file());
+    }
 }

@@ -49,7 +49,9 @@ pub async fn execute(command: BootCommands, format: OutputFormat) -> anyhow::Res
         BootCommands::Prefetch(args) => {
             cache::prefetch(&config.data_dir, boot_config, args, format).await
         }
-        BootCommands::Status(args) => status::status(boot_config, args, format).await,
+        BootCommands::Status(args) => {
+            status::status(&config.data_dir, boot_config, args, format).await
+        }
         BootCommands::Clear => cache::clear(cache_dir, format).await,
         BootCommands::List => cache::list(cache_dir, format).await,
     }

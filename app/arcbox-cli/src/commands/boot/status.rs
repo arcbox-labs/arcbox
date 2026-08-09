@@ -55,6 +55,7 @@ struct ManifestInfo {
 }
 
 pub(super) async fn status(
+    root_data_dir: &Path,
     config: BootAssetConfig,
     args: StatusArgs,
     format: OutputFormat,
@@ -64,13 +65,19 @@ pub(super) async fn status(
         .read_cached_manifest_required()
         .await
         .map_err(|error| format!("{error:#}"));
-    let mut report = build_report(
-        &config.version_cache_dir(),
-        &config.version,
-        &config.arch,
-        manifest,
-    )
-    .await;
+    let runtime_bin_dir = root_data_dir
+        .join("runtime")
+        .join(&config.version)
+        .join("bin");
+    let runtime_binaries = if manifest.is_ok() {
+        provider
+            .validate_cached_binaries(&runtime_bin_dir)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    } else {
+        Err("manifest unavailable".to_owned())
+    };
+    let mut report = build_report(root_data_dir, &config, manifest, runtime_binaries).await;
 
     if !args.offline {
         match provider.fetch_latest_version().await {
@@ -95,14 +102,19 @@ pub(super) async fn status(
 }
 
 async fn build_report(
-    version_dir: &Path,
-    version: &str,
-    arch: &str,
+    root_data_dir: &Path,
+    config: &BootAssetConfig,
     manifest_result: std::result::Result<BootAssetManifest, String>,
+    runtime_binaries: std::result::Result<(), String>,
 ) -> StatusOutput {
+    let version_dir = config.version_cache_dir();
+    let kernel_path = config
+        .custom_kernel
+        .clone()
+        .unwrap_or_else(|| version_dir.join("kernel"));
     let mut artifacts = vec![
         inspect_artifact("manifest", &version_dir.join("manifest.json"), true),
-        inspect_artifact("kernel", &version_dir.join("kernel"), true),
+        inspect_artifact("kernel", &kernel_path, true),
         inspect_artifact("rootfs", &version_dir.join("rootfs.erofs"), true),
     ];
     let mut reasons = Vec::new();
@@ -111,7 +123,9 @@ async fn build_report(
     match manifest_result {
         Err(error) => {
             artifacts[0].detail = Some(error.clone());
-            reasons.push(format!("manifest: {error}"));
+            if artifacts[0].present {
+                reasons.push(format!("manifest: {error}"));
+            }
         }
         Ok(manifest) => {
             manifest_info = Some(ManifestInfo {
@@ -120,25 +134,29 @@ async fn build_report(
                 built_at: manifest.built_at.clone(),
                 source_sha: manifest.source_sha.clone(),
             });
-            if manifest.asset_version != version {
+            if manifest.asset_version != config.version {
                 reasons.push(format!(
-                    "manifest selects version {}, expected {version}",
-                    manifest.asset_version
+                    "manifest selects version {}, expected {}",
+                    manifest.asset_version, config.version
                 ));
             }
-            match manifest.targets.get(arch) {
+            match manifest.targets.get(&config.arch) {
                 Some(target) => {
-                    artifacts[1].source_path = Some(target.kernel.path.clone());
-                    artifacts[1].version.clone_from(&target.kernel.version);
+                    if config.custom_kernel.is_none() {
+                        artifacts[1].source_path = Some(target.kernel.path.clone());
+                        artifacts[1].version.clone_from(&target.kernel.version);
+                        verify_artifact_checksum(
+                            &mut artifacts[1],
+                            &kernel_path,
+                            &target.kernel.sha256,
+                            &mut reasons,
+                        )
+                        .await;
+                    } else if artifacts[1].present {
+                        artifacts[1].detail = Some("configured custom kernel".to_owned());
+                    }
                     artifacts[2].source_path = Some(target.rootfs.path.clone());
                     artifacts[2].version.clone_from(&target.rootfs.version);
-                    verify_artifact_checksum(
-                        &mut artifacts[1],
-                        &version_dir.join("kernel"),
-                        &target.kernel.sha256,
-                        &mut reasons,
-                    )
-                    .await;
                     verify_artifact_checksum(
                         &mut artifacts[2],
                         &version_dir.join("rootfs.erofs"),
@@ -158,26 +176,58 @@ async fn build_report(
                         artifacts.push(artifact);
                     }
                 }
-                None => reasons.push(format!("manifest has no target for architecture {arch}")),
+                None => reasons.push(format!(
+                    "manifest has no target for architecture {}",
+                    config.arch
+                )),
             }
         }
     }
 
+    let (present, detail) = match runtime_binaries {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error)),
+    };
+    artifacts.push(ArtifactStatus {
+        name: "runtime-binaries",
+        path: root_data_dir
+            .join("runtime")
+            .join(&config.version)
+            .display()
+            .to_string(),
+        required: true,
+        present,
+        size_bytes: None,
+        source_path: None,
+        version: manifest_info
+            .as_ref()
+            .map(|manifest| manifest.asset_version.clone()),
+        detail,
+    });
+
     for artifact in artifacts.iter().filter(|artifact| artifact.required) {
         if !artifact.present {
-            reasons.push(format!("{}: missing required artifact", artifact.name));
+            reasons.push(format!(
+                "{}: {}",
+                artifact.name,
+                artifact
+                    .detail
+                    .as_deref()
+                    .unwrap_or("missing required artifact")
+            ));
         }
     }
     let complete = reasons.is_empty();
     StatusOutput {
-        version: version.to_owned(),
-        arch: arch.to_owned(),
+        version: config.version.clone(),
+        arch: config.arch.clone(),
         cache_dir: version_dir.display().to_string(),
         complete,
         artifacts,
         manifest: manifest_info,
         reasons,
-        repair: (!complete).then_some("Run `abctl boot prefetch --force`."),
+        repair: (!complete)
+            .then_some("Fix the reported path or run `abctl boot prefetch --force`."),
         latest_version: None,
         latest_version_error: None,
         update_available: false,
@@ -295,6 +345,21 @@ mod tests {
     const KERNEL: &[u8] = b"kernel";
     const ROOTFS: &[u8] = b"rootfs.erofs";
 
+    fn config(root_data_dir: &Path) -> BootAssetConfig {
+        let mut config =
+            BootAssetConfig::with_cache_dir(root_data_dir.join("boot")).with_version("0.8.4");
+        config.arch = "arm64".to_owned();
+        config
+    }
+
+    fn write_required_assets(config: &BootAssetConfig) {
+        let version_dir = config.version_cache_dir();
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(version_dir.join("kernel"), KERNEL).unwrap();
+        std::fs::write(version_dir.join("rootfs.erofs"), ROOTFS).unwrap();
+    }
+
     fn manifest(runtime: bool) -> BootAssetManifest {
         let kernel_sha256 = format!("{:x}", Sha256::digest(KERNEL));
         let rootfs_sha256 = format!("{:x}", Sha256::digest(ROOTFS));
@@ -324,9 +389,12 @@ mod tests {
     #[tokio::test]
     async fn missing_required_artifact_is_reported_in_json_and_table() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("manifest.json"), "{}").unwrap();
-        std::fs::write(directory.path().join("kernel"), KERNEL).unwrap();
-        let report = build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(false))).await;
+        let config = config(directory.path());
+        let version_dir = config.version_cache_dir();
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(version_dir.join("kernel"), KERNEL).unwrap();
+        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
 
         assert!(!report.complete);
         assert!(
@@ -344,13 +412,11 @@ mod tests {
     async fn corrupt_required_artifacts_are_reported_in_json_and_table() {
         for (file_name, artifact_name) in [("kernel", "kernel"), ("rootfs.erofs", "rootfs")] {
             let directory = tempfile::tempdir().unwrap();
-            std::fs::write(directory.path().join("manifest.json"), "{}").unwrap();
-            std::fs::write(directory.path().join("kernel"), KERNEL).unwrap();
-            std::fs::write(directory.path().join("rootfs.erofs"), ROOTFS).unwrap();
-            std::fs::write(directory.path().join(file_name), b"corrupt").unwrap();
+            let config = config(directory.path());
+            write_required_assets(&config);
+            std::fs::write(config.version_cache_dir().join(file_name), b"corrupt").unwrap();
 
-            let report =
-                build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(false))).await;
+            let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
 
             assert!(!report.complete);
             let artifact = report
@@ -377,10 +443,9 @@ mod tests {
     #[tokio::test]
     async fn legacy_runtime_entry_is_enumerated_but_not_required() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("manifest.json"), "{}").unwrap();
-        std::fs::write(directory.path().join("kernel"), KERNEL).unwrap();
-        std::fs::write(directory.path().join("rootfs.erofs"), ROOTFS).unwrap();
-        let report = build_report(directory.path(), "0.8.4", "arm64", Ok(manifest(true))).await;
+        let config = config(directory.path());
+        write_required_assets(&config);
+        let report = build_report(directory.path(), &config, Ok(manifest(true)), Ok(())).await;
 
         assert!(report.complete);
         let runtime = report
@@ -391,5 +456,151 @@ mod tests {
         assert!(!runtime.required);
         assert!(!runtime.present);
         assert_eq!(runtime.version.as_deref(), Some("29.0"));
+    }
+
+    #[tokio::test]
+    async fn runtime_binary_validation_is_part_of_the_status_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(directory.path());
+        write_required_assets(&config);
+        let validation_error =
+            "cached runtime binary validation failed: binary 'dockerd' not found".to_owned();
+
+        let report = build_report(
+            directory.path(),
+            &config,
+            Ok(manifest(false)),
+            Err(validation_error.clone()),
+        )
+        .await;
+
+        assert!(!report.complete);
+        let runtime = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "runtime-binaries")
+            .unwrap();
+        assert!(runtime.required);
+        assert!(!runtime.present);
+        assert_eq!(runtime.detail.as_deref(), Some(validation_error.as_str()));
+        assert_eq!(
+            report.reasons,
+            [format!("runtime-binaries: {validation_error}")]
+        );
+        let table = render_table(&report);
+        assert!(table.contains("[-] runtime-binaries"));
+        assert!(table.contains(&format!("Reason: runtime-binaries: {validation_error}")));
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["complete"], false);
+        assert_eq!(
+            json["reasons"][0],
+            format!("runtime-binaries: {validation_error}")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_custom_kernel_is_reported_without_release_checksum_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let custom_kernel = directory.path().join("custom-kernel");
+        let mut config = config(directory.path());
+        config.custom_kernel = Some(custom_kernel.clone());
+        let version_dir = config.version_cache_dir();
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(version_dir.join("rootfs.erofs"), ROOTFS).unwrap();
+        std::fs::write(&custom_kernel, b"custom kernel with a different checksum").unwrap();
+
+        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+
+        assert!(report.complete);
+        let kernel = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "kernel")
+            .unwrap();
+        assert_eq!(kernel.path, custom_kernel.display().to_string());
+        assert!(kernel.present);
+        assert_eq!(kernel.source_path, None);
+        assert_eq!(kernel.version, None);
+        assert_eq!(kernel.detail.as_deref(), Some("configured custom kernel"));
+        let table = render_table(&report);
+        assert!(table.contains(&custom_kernel.display().to_string()));
+        assert!(table.contains("configured custom kernel"));
+        let json = serde_json::to_value(report).unwrap();
+        let kernel = json["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["name"] == "kernel")
+            .unwrap();
+        assert_eq!(kernel["path"], custom_kernel.display().to_string());
+        assert_eq!(kernel["detail"], "configured custom kernel");
+
+        std::fs::remove_file(&custom_kernel).unwrap();
+        std::fs::create_dir(&custom_kernel).unwrap();
+        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+        assert!(!report.complete);
+        let kernel = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "kernel")
+            .unwrap();
+        assert_eq!(
+            kernel.detail.as_deref(),
+            Some("artifact is empty or is not a regular file")
+        );
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| { reason == "kernel: artifact is empty or is not a regular file" })
+        );
+
+        std::fs::remove_dir(&custom_kernel).unwrap();
+        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+        assert!(!report.complete);
+        assert!(
+            report
+                .reasons
+                .contains(&"kernel: missing required artifact".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_binaries_remain_required_when_the_manifest_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(directory.path());
+
+        let report = build_report(
+            directory.path(),
+            &config,
+            Err("manifest pin validation failed".to_owned()),
+            Err("manifest unavailable".to_owned()),
+        )
+        .await;
+
+        let runtime = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "runtime-binaries")
+            .unwrap();
+        assert!(runtime.required);
+        assert!(!runtime.present);
+        assert_eq!(runtime.version, None);
+        assert_eq!(runtime.detail.as_deref(), Some("manifest unavailable"));
+        assert!(
+            report
+                .reasons
+                .contains(&"runtime-binaries: manifest unavailable".to_owned())
+        );
+        assert_eq!(
+            report.reasons,
+            [
+                "manifest: manifest pin validation failed".to_owned(),
+                "kernel: missing required artifact".to_owned(),
+                "rootfs: missing required artifact".to_owned(),
+                "runtime-binaries: manifest unavailable".to_owned(),
+            ]
+        );
     }
 }
