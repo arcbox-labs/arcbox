@@ -95,11 +95,11 @@ describe("commands.list", () => {
   });
 });
 
-describe("ports.waitForPort", () => {
-  function portsOn(transport: Transport): Ports {
-    return new Ports({ transport }, "sb-1");
-  }
+function portsOn(transport: Transport): Ports {
+  return new Ports({ transport }, "sb-1");
+}
 
+describe("ports.waitForPort", () => {
   it("resolves when a listener comes up, sending the requested budget", async () => {
     let seen: WaitForPortRequest | undefined;
     const mock = createRouterTransport(({ service }) => {

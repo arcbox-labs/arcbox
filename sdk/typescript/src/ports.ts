@@ -56,6 +56,8 @@ export class Ports {
       requested === 0
         ? DEFAULT_WAIT_FOR_PORT_SECONDS
         : Math.min(requested, MAX_WAIT_FOR_PORT_SECONDS);
+    const portLabel = String(port);
+    const effectiveLabel = String(effective);
     try {
       await this.#client.waitForPort(
         { sandboxId: this.#sandboxId, port, timeoutSeconds: requested },
@@ -71,7 +73,7 @@ export class Ports {
       // knob — name the right one, mirroring connect()'s discipline.
       if (mapped instanceof RequestTimeoutError) {
         throw new TimeoutError(
-          `waitForPort(timeoutMs) elapsed before port ${String(port)} was listening`,
+          `waitForPort(timeoutMs) elapsed before port ${portLabel} was listening`,
           {
             suggestion:
               "increase the waitForPort timeoutMs option, or check that " +
@@ -79,8 +81,8 @@ export class Ports {
             operation: "ports.waitForPort",
             cause: error,
             context: {
-              port: String(port),
-              timeoutSeconds: String(effective),
+              port: portLabel,
+              timeoutSeconds: effectiveLabel,
             },
           },
         );
