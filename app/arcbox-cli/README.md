@@ -50,6 +50,14 @@ kubectl get nodes
 docker run hello-world
 ```
 
+## Exit status
+
+- `0`: command succeeded.
+- `1`: an `abctl` operation or daemon connection failed.
+- `2`: command-line arguments were invalid.
+- Remote commands (`machine exec`, `sandbox run` / `exec`, and `claude`) propagate the
+  command's exit status; sandbox signal exits use the shell convention `128 + signal`.
+
 ## Configuration
 
 Socket path resolution order:

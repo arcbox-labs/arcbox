@@ -2,14 +2,17 @@
 
 use anyhow::Result;
 use clap::Parser;
+use std::io::IsTerminal as _;
+use std::process::ExitCode;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
 mod connect;
+mod error;
 
 use commands::{Cli, Commands};
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     // Sentry must be initialized before the tokio runtime so that spawned
     // threads inherit the Hub from the main thread.
     // When SENTRY_DSN is unset, this is a no-op with zero overhead.
@@ -29,7 +32,17 @@ fn main() -> Result<()> {
     });
 
     let cli = Cli::parse();
+    let debug = cli.debug;
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}", crate::error::render(&error, debug));
+            ExitCode::FAILURE
+        }
+    }
+}
 
+fn run(cli: Cli) -> Result<()> {
     // Set ARCBOX_SOCKET env var if --socket was provided.
     // This makes it available to gRPC socket resolution in machine commands.
     // SAFETY: This is called at the start of main(), before any threads are spawned,
@@ -58,7 +71,13 @@ fn main() -> Result<()> {
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(arcbox_cli::terminal::ansi_enabled(
+                    std::io::stderr().is_terminal(),
+                )),
+        )
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
