@@ -209,8 +209,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # uv pinned to the same range as pyproject.toml's uv_build
+      # requirement and the publish gate (release-sdk-python.yml), so PR
+      # validation and release run the same toolchain.
       - name: Setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '>=0.12.1,<0.13'
 
       - name: Install dependencies
         run: uv sync --locked
