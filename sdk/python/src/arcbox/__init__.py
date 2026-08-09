@@ -24,10 +24,12 @@ from arcbox._types import (
     IdlePolicy,
     OutputChannel,
     OutputChunk,
+    PtySize,
     SandboxInfo,
     SandboxState,
     SandboxSummary,
     SignalName,
+    StdinStatus,
 )
 
 try:
@@ -57,9 +59,11 @@ __all__ = [
     "OutputChannel",
     "OutputChunk",
     "OutputStream",
+    "PtySize",
     "Sandbox",
     "SandboxInfo",
     "SandboxState",
     "SandboxSummary",
     "SignalName",
+    "StdinStatus",
 ]

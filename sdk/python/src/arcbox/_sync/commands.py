@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import time
 import uuid
+from contextlib import suppress
 from typing import TYPE_CHECKING, Literal, overload
 
 from google.protobuf import empty_pb2
@@ -16,15 +17,16 @@ from arcbox._types import (
     SIGNAL_VALUES,
     CommandResult,
     OutputChunk,
+    StdinStatus,
     command_result_from_execution,
 )
-from arcbox.errors import InvalidArgumentError, TimeoutError
+from arcbox.errors import ArcBoxError, InvalidArgumentError, TimeoutError
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator, Mapping, Sequence
     from types import TracebackType
 
-    from arcbox._types import OutputChannel, SignalName
+    from arcbox._types import OutputChannel, PtySize, SignalName
 
     from ._client import ConnectClient, ServerStream
 
@@ -89,11 +91,23 @@ class CommandHandle:
     decoupled from this object: dropping the handle never kills the
     process."""
 
-    def __init__(self, client: ConnectClient, sandbox_id: str, command_id: str) -> None:
+    def __init__(
+        self,
+        client: ConnectClient,
+        sandbox_id: str,
+        command_id: str,
+        *,
+        stdin_offset: int | None = 0,
+    ) -> None:
         self._client = client
         self._sandbox_id = sandbox_id
         #: Execution id, unique within the sandbox; addressable across clients.
         self.command_id = command_id
+        # The next stdin write offset — advanced only on a successful
+        # write, so a retried write lands at the same offset and the
+        # daemon's deduplication makes it idempotent. None = unknown (a
+        # re-attached handle); resynced lazily via GetStdinStatus.
+        self._stdin_offset = stdin_offset
 
     @property
     def output(self) -> OutputStream:
@@ -179,6 +193,87 @@ class CommandHandle:
                 empty_pb2.Empty,
             )
 
+    def write_stdin(self, data: str | bytes) -> None:
+        """Write bytes (or a UTF-8 string) to the command's stdin.
+        Requires a run started with ``stdin=True`` or a PTY.
+
+        Writes are offset-idempotent: the handle tracks the stdin cursor
+        and advances it only on success, so retrying a failed or lost
+        write *with the same data* is safe — the daemon deduplicates
+        bytes below its accepted count and never double-feeds the
+        process. Issue writes sequentially; the handle tracks a single
+        cursor."""
+        payload = data.encode() if isinstance(data, str) else data
+        with wrap_errors("commands.write_stdin"):
+            offset = self._stdin_cursor()
+            status = self._client.unary(
+                _PROCESS + "WriteStdin",
+                process_pb2.WriteStdinRequest(
+                    sandbox_id=self._sandbox_id,
+                    execution_id=self.command_id,
+                    offset=offset,
+                    data=payload,
+                    eof=False,
+                ),
+                process_pb2.StdinStatus,
+            )
+            self._stdin_offset = int(status.bytes_written)
+
+    def close_stdin(self) -> None:
+        """Close the command's stdin (EOF). Rejected for PTY commands —
+        write Ctrl-D (``"\\x04"``) instead."""
+        with wrap_errors("commands.close_stdin"):
+            offset = self._stdin_cursor()
+            self._client.unary(
+                _PROCESS + "WriteStdin",
+                process_pb2.WriteStdinRequest(
+                    sandbox_id=self._sandbox_id,
+                    execution_id=self.command_id,
+                    offset=offset,
+                    data=b"",
+                    eof=True,
+                ),
+                process_pb2.StdinStatus,
+            )
+
+    def stdin_status(self) -> StdinStatus:
+        """The daemon's stdin acceptance state — the recovery point after
+        a lost write response. Also resyncs the handle's write cursor."""
+        with wrap_errors("commands.stdin_status"):
+            status = self._fetch_stdin_status()
+            return StdinStatus(bytes_written=int(status.bytes_written), closed=status.closed)
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Resize a PTY command's terminal."""
+        with wrap_errors("commands.resize"):
+            self._client.unary(
+                _PROCESS + "ResizeExecutionTty",
+                process_pb2.ResizeExecutionTtyRequest(
+                    sandbox_id=self._sandbox_id,
+                    execution_id=self.command_id,
+                    size=process_pb2.TerminalSize(width=cols, height=rows),
+                ),
+                empty_pb2.Empty,
+            )
+
+    def _stdin_cursor(self) -> int:
+        """The tracked stdin cursor, resynced from the daemon when unknown."""
+        offset = self._stdin_offset
+        if offset is None:
+            offset = int((self._fetch_stdin_status()).bytes_written)
+        return offset
+
+    def _fetch_stdin_status(self) -> process_pb2.StdinStatus:
+        status = self._client.unary(
+            _PROCESS + "GetStdinStatus",
+            process_pb2.GetStdinStatusRequest(
+                sandbox_id=self._sandbox_id, execution_id=self.command_id
+            ),
+            process_pb2.StdinStatus,
+        )
+        self._stdin_offset = int(status.bytes_written)
+        return status
+
     def _attach(self) -> ServerStream[process_pb2.ExecutionEvent]:
         return self._client.stream(
             _PROCESS + "AttachExecution",
@@ -244,6 +339,8 @@ class Commands:
         timeout: float | None = None,
         check: bool = False,
         background: Literal[False] = False,
+        pty: PtySize | None = None,
+        stdin: str | bytes | bool | None = None,
     ) -> CommandResult: ...
 
     @overload
@@ -256,6 +353,8 @@ class Commands:
         user: str | None = None,
         timeout: float | None = None,
         background: Literal[True],
+        pty: PtySize | None = None,
+        stdin: str | bytes | bool | None = None,
     ) -> CommandHandle: ...
 
     def run(
@@ -268,6 +367,8 @@ class Commands:
         timeout: float | None = None,
         check: bool = False,
         background: bool = False,
+        pty: PtySize | None = None,
+        stdin: str | bytes | bool | None = None,
     ) -> CommandResult | CommandHandle:
         """Run a command. Foreground (default): returns the complete
         :class:`CommandResult` once the process exits — non-zero exit is
@@ -277,18 +378,74 @@ class Commands:
 
         ``timeout`` kills the whole process group after that many
         seconds; expiry surfaces as signal death in the result
-        (exit-as-data), not as a raised error."""
+        (exit-as-data), not as a raised error.
+
+        ``pty`` allocates a pseudo-terminal of that size: output then
+        arrives merged on the ``"pty"`` channel and stdin stays open —
+        end input by writing Ctrl-D (``"\\x04"``) via ``write_stdin``.
+
+        ``stdin``: a string (UTF-8) or bytes is written and then closed
+        before the run resolves (subprocess semantics); ``True`` keeps
+        stdin open for manual ``write_stdin``/``close_stdin`` —
+        background runs only. ``None``/``False``: the process starts
+        with stdin already at EOF."""
         if background and check:
             raise InvalidArgumentError(
                 "check=True applies to foreground runs; call "
                 ".wait_for_exit() and .expect() on the handle instead",
                 operation="commands.run",
             )
-        handle = self._start(cmd, cwd=cwd, env=env, user=user, timeout=timeout)
+        if stdin is True and not background:
+            raise InvalidArgumentError(
+                "stdin=True keeps stdin open for the handle and requires "
+                "background=True; pass str or bytes to feed a foreground run",
+                operation="commands.run",
+            )
+        stdin_data = stdin.encode() if isinstance(stdin, str) else stdin
+        if isinstance(stdin_data, bytes) and pty is not None:
+            raise InvalidArgumentError(
+                "a PTY's stdin cannot be closed after a one-shot write; use "
+                'background=True with write_stdin, ending input with Ctrl-D ("\\x04")',
+                operation="commands.run",
+            )
+        handle = self._start(
+            cmd,
+            cwd=cwd,
+            env=env,
+            user=user,
+            timeout=timeout,
+            pty=pty,
+            stdin_open=stdin is True or isinstance(stdin_data, bytes),
+        )
+        if isinstance(stdin_data, bytes):
+            self._feed_stdin(handle, stdin_data)
         if background:
             return handle
         result = handle.wait_for_exit()
         return result.expect() if check else result
+
+    def get(self, command_id: str) -> CommandHandle:
+        """Re-attach to an execution by id — from another process, or
+        after losing the handle. Verifies the execution exists (an
+        unknown id is a typed not-found error) and seeds the handle's
+        stdin cursor from the daemon's accepted count so later writes
+        resume without a gap."""
+        with wrap_errors("commands.get"):
+            execution = self._client.unary(
+                _PROCESS + "WaitExecution",
+                process_pb2.WaitExecutionRequest(
+                    sandbox_id=self._sandbox_id,
+                    execution_id=command_id,
+                    timeout_seconds=0,
+                ),
+                process_pb2.Execution,
+            )
+            stdin_offset = (
+                int(execution.stdin.bytes_written) if execution.HasField("stdin") else None
+            )
+            return CommandHandle(
+                self._client, self._sandbox_id, execution.id, stdin_offset=stdin_offset
+            )
 
     def _start(
         self,
@@ -298,24 +455,58 @@ class Commands:
         env: Mapping[str, str] | None,
         user: str | None,
         timeout: float | None,
+        pty: PtySize | None,
+        stdin_open: bool,
     ) -> CommandHandle:
         with wrap_errors("commands.run"):
             # The execution id is minted client-side: a lost response
             # leaves an addressable execution, and retries are idempotent
             # by contract.
             execution_id = str(uuid.uuid4())
+            request = process_pb2.StartExecutionRequest(
+                sandbox_id=self._sandbox_id,
+                execution_id=execution_id,
+                cmd=_normalize_cmd(cmd),
+                env=dict(env) if env else {},
+                working_dir=cwd or "",
+                user=user or "",
+                timeout_seconds=0 if timeout is None else math.ceil(timeout),
+                # A PTY inherently keeps stdin open (EOF is not
+                # expressible on a terminal); otherwise stdin stays open
+                # exactly when the caller feeds or drives it.
+                stdin=pty is not None or stdin_open,
+                tty=pty is not None,
+            )
+            if pty is not None:
+                request.tty_size.width = pty.cols
+                request.tty_size.height = pty.rows
             execution = self._client.unary(
-                _PROCESS + "StartExecution",
-                process_pb2.StartExecutionRequest(
-                    sandbox_id=self._sandbox_id,
-                    execution_id=execution_id,
-                    cmd=_normalize_cmd(cmd),
-                    env=dict(env) if env else {},
-                    working_dir=cwd or "",
-                    user=user or "",
-                    timeout_seconds=0 if timeout is None else math.ceil(timeout),
-                    stdin=False,
-                ),
-                process_pb2.Execution,
+                _PROCESS + "StartExecution", request, process_pb2.Execution
             )
             return CommandHandle(self._client, self._sandbox_id, execution.id)
+
+    def _feed_stdin(self, handle: CommandHandle, data: bytes) -> None:
+        """Write-then-close the one-shot stdin payload. A process is free
+        to exit without consuming its stdin (`subprocess` semantics):
+        when the feed fails but the execution has already exited, the
+        exit result is the truth and the failed feed is noise — the
+        write merely raced the exit. Any other failure is real and
+        surfaces."""
+        try:
+            handle.write_stdin(data)
+            handle.close_stdin()
+        except ArcBoxError:
+            state: process_pb2.Execution | None = None
+            # If the poll itself fails, the original feed error stands.
+            with suppress(Exception):
+                state = self._client.unary(
+                    _PROCESS + "WaitExecution",
+                    process_pb2.WaitExecutionRequest(
+                        sandbox_id=self._sandbox_id,
+                        execution_id=handle.command_id,
+                        timeout_seconds=0,
+                    ),
+                    process_pb2.Execution,
+                )
+            if state is None or state.state != process_pb2.EXECUTION_STATE_EXITED:
+                raise
