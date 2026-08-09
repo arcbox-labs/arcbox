@@ -19,6 +19,10 @@ use super::sandbox_locks::SandboxOperationLocks;
 use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
 
+/// Wait budget applied when `WaitForPortRequest.timeout_seconds` is 0, as
+/// documented on the proto field ("0 = daemon default of 30 s").
+const DEFAULT_WAIT_FOR_PORT_TIMEOUT_SECS: u32 = 30;
+
 /// Execution service implementation.
 ///
 /// Every call addresses one execution inside one sandbox and carries its
@@ -238,27 +242,55 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
         Response::ok(execution)
     }
 
-    /// Contract-only stub (CORE-58 phase 1): execution discovery lands
-    /// with CORE-58 phase 2 (guest-agent enumeration).
+    /// Serves from the guest's execution registry without waking the
+    /// sandbox: pausing already interrupted the running executions, so a
+    /// paused sandbox's history answers as-is at no resume cost.
     async fn list_executions(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::ListExecutionsRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ListExecutionsRequest>,
     ) -> ServiceResult<pb::ListExecutionsResponse> {
-        Err(ConnectError::unimplemented(
-            "execution listing is not implemented yet (CORE-58 phase 2)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        let listing = agent
+            .sandbox_exec_list(request.to_owned_message())
+            .await
+            .map_err(ApiError::from)?;
+        Response::ok(listing)
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the guest-agent listen-table
-    /// watch lands with CORE-58 phase 2.
     async fn wait_for_port(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::WaitForPortRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::WaitForPortRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "port readiness waits are not implemented yet (CORE-58 phase 2)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let mut req = request.to_owned_message();
+        if req.timeout_seconds == 0 {
+            // The proto documents 0 as "the daemon default of 30 s"; resolve
+            // it here so the guest always enforces an explicit budget.
+            req.timeout_seconds = DEFAULT_WAIT_FOR_PORT_TIMEOUT_SECS;
+        }
+        let runtime = self.runtime.ready()?;
+        sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.sandbox_id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_wait_for_port(req).await
+                }
+            },
+        )
+        .await?;
+        Response::ok(Empty::default())
     }
 }

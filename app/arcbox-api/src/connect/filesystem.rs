@@ -167,75 +167,183 @@ impl pb::SandboxFilesystemService for SandboxFilesystemServiceImpl {
         Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
-    /// CORE-62 (guest-agent implementation).
     async fn stat(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::StatFileRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::StatFileRequest>,
     ) -> ServiceResult<pb::FileStat> {
-        Err(ConnectError::unimplemented(
-            "stat is not implemented yet (CORE-62)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        let stat = sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_stat(req).await
+                }
+            },
+        )
+        .await?;
+        Response::ok(stat)
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
-    /// CORE-62 (guest-agent implementation).
     async fn list_dir(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::ListDirRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ListDirRequest>,
     ) -> ServiceResult<pb::ListDirResponse> {
-        Err(ConnectError::unimplemented(
-            "list_dir is not implemented yet (CORE-62)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        let listing = sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_list_dir(req).await
+                }
+            },
+        )
+        .await?;
+        Response::ok(listing)
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
-    /// CORE-62 (guest-agent implementation).
     async fn make_dir(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::MakeDirRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::MakeDirRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "make_dir is not implemented yet (CORE-62)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_make_dir(req).await
+                }
+            },
+        )
+        .await?;
+        Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
-    /// CORE-62 (guest-agent implementation).
     async fn remove(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::RemoveEntryRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::RemoveEntryRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "remove is not implemented yet (CORE-62)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_remove_entry(req).await
+                }
+            },
+        )
+        .await?;
+        Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
-    /// CORE-62 (guest-agent implementation).
     async fn r#move(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::MoveEntryRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::MoveEntryRequest>,
     ) -> ServiceResult<Empty> {
-        Err(ConnectError::unimplemented(
-            "move is not implemented yet (CORE-62)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+        sandbox_resume::with_auto_resume(
+            runtime,
+            &self.operations,
+            &ctx,
+            &machine,
+            &req.id,
+            || {
+                let req = req.clone();
+                async {
+                    let mut agent = runtime.get_agent(&machine)?;
+                    agent.sandbox_move_entry(req).await
+                }
+            },
+        )
+        .await?;
+        Response::ok(Empty::default())
     }
 
-    /// Contract-only stub (CORE-58 phase 1): the path verbs land with
-    /// CORE-62 (guest-agent implementation).
     async fn watch_dir(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::WatchDirRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::WatchDirRequest>,
     ) -> ServiceResult<ServiceStream<pb::WatchDirResponse>> {
-        Err(ConnectError::unimplemented(
-            "watch_dir is not implemented yet (CORE-62)",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let runtime = self.runtime.ready()?;
+
+        // Optimistic first attempt, mirroring read_file: the guest confirms
+        // an established watch with an immediate keepalive frame, so peeking
+        // the first item is fast — a SANDBOX_PAUSED answer becomes one
+        // resume + one fresh watch instead of an in-stream error.
+        let agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
+        let mut rx = agent
+            .sandbox_watch_dir(req.clone())
+            .await
+            .map_err(ApiError::from)?;
+        let first = match rx.recv().await {
+            Some(Err(error)) if sandbox_resume::is_sandbox_paused(&error) => {
+                if sandbox_resume::auto_resume_opted_out(&ctx) {
+                    return Err(ConnectError::from(ApiError::from(error)));
+                }
+                sandbox_resume::resume(
+                    runtime,
+                    &self.operations,
+                    &machine,
+                    &req.id,
+                    sandbox_resume::REASON_AUTO_RESUME,
+                )
+                .await?;
+                let agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
+                rx = agent.sandbox_watch_dir(req).await.map_err(ApiError::from)?;
+                rx.recv().await
+            }
+            other => other,
+        };
+
+        let stream = tokio_stream::iter(first)
+            .chain(ReceiverStream::new(rx))
+            .map(|r| r.map_err(|e| ConnectError::from(ApiError::from(e))));
+        // The guest already interleaves its own keepalives; this adds the
+        // daemon-side ones the proto promises even if that hop stalls.
+        let stream = with_keepalive(stream, || pb::WatchDirResponse {
+            payload: pb::KeepAlive::default().into(),
+            ..Default::default()
+        });
+        Response::ok(Box::pin(stream))
     }
 }
