@@ -99,6 +99,25 @@ def handle_for(handler: Callable[[httpx.Request], httpx.Response]) -> CommandHan
     return CommandHandle(ConnectClient(Connection(http_client=http)), "sb-1", "cmd")
 
 
+class RecordingAttach(FlakyAttach):
+    """FlakyAttach that also records each dial's transport read timeout
+    (the deadline plumbing is only visible via the request's timeout
+    extension — MockTransport never acts on it)."""
+
+    def __init__(
+        self,
+        chunks: list[tuple[int, int, str]],
+        die_after: list[int] | None = None,
+    ) -> None:
+        super().__init__(chunks, die_after)
+        self.read_timeouts: list[float | None] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        timeout = request.extensions.get("timeout")
+        self.read_timeouts.append(None if timeout is None else timeout.get("read"))
+        return super().__call__(request)
+
+
 def test_matches_a_line_split_across_chunks_and_channels() -> None:
     daemon = FlakyAttach(
         [
@@ -200,11 +219,16 @@ def test_nan_is_rejected_and_infinity_disables_the_bound() -> None:
     # timeouts raw AND silently disable every comparison); math.inf
     # disables the bound like the TS flavor's POSITIVE_INFINITY, and a
     # -inf deadline is simply already expired.
-    daemon = FlakyAttach([(STDOUT, 0, "the-marker\n")])
+    daemon = RecordingAttach([(STDOUT, 0, "the-marker\n")])
     with pytest.raises(InvalidArgumentError) as exc_info:
         handle_for(daemon).wait_for_log("x", timeout=float("nan"))
     assert exc_info.value.operation == "commands.wait_for_log"
+    assert daemon.read_timeouts == []  # rejected before any request
     assert handle_for(daemon).wait_for_log("the-marker", timeout=float("inf")) == "the-marker"
+    # inf -> deadline None: the dial carries NO read timeout — the
+    # observable half of the fix (an inf deadline previously flowed
+    # into httpx.Timeout raw).
+    assert daemon.read_timeouts[-1] is None
     with pytest.raises(TimeoutError):
         handle_for(daemon).wait_for_log("the-marker", timeout=float("-inf"))
 
@@ -214,24 +238,16 @@ def test_the_attach_read_gap_is_bounded_by_the_remaining_budget() -> None:
     # outlive the wait_for_log budget: each attach dial carries a read
     # timeout equal to the remaining time (visible to the transport via
     # the request's timeout extension).
-    read_timeouts: list[float | None] = []
-
-    class Recorder(FlakyAttach):
-        def __call__(self, request: httpx.Request) -> httpx.Response:
-            timeout = request.extensions.get("timeout")
-            read_timeouts.append(None if timeout is None else timeout.get("read"))
-            return super().__call__(request)
-
-    bounded = Recorder([(STDOUT, 0, "the-marker\n")])
+    bounded = RecordingAttach([(STDOUT, 0, "the-marker\n")])
     assert handle_for(bounded).wait_for_log("the-marker", timeout=30) == "the-marker"
-    assert read_timeouts[0] is not None
-    assert 0 < read_timeouts[0] <= 30
+    assert bounded.read_timeouts[0] is not None
+    assert 0 < bounded.read_timeouts[0] <= 30
 
     # Without a deadline (and for plain output streaming) the attach
     # stays unbounded — long-lived streams must not time out on idle.
-    unbounded = Recorder([(STDOUT, 0, "the-marker\n")])
+    unbounded = RecordingAttach([(STDOUT, 0, "the-marker\n")])
     assert handle_for(unbounded).wait_for_log("the-marker") == "the-marker"
-    assert read_timeouts[-1] is None
+    assert unbounded.read_timeouts == [None]
 
 
 def test_a_daemon_typed_stream_error_keeps_its_own_class() -> None:
