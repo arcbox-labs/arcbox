@@ -189,6 +189,31 @@ def test_a_dead_attach_without_a_deadline_stays_stream_death() -> None:
         handle_for(daemon).wait_for_log("never")
 
 
+def test_the_attach_read_gap_is_bounded_by_the_remaining_budget() -> None:
+    # A wedged stream that stops producing frames entirely must not
+    # outlive the wait_for_log budget: each attach dial carries a read
+    # timeout equal to the remaining time (visible to the transport via
+    # the request's timeout extension).
+    read_timeouts: list[float | None] = []
+
+    class Recorder(FlakyAttach):
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            timeout = request.extensions.get("timeout")
+            read_timeouts.append(None if timeout is None else timeout.get("read"))
+            return super().__call__(request)
+
+    bounded = Recorder([(STDOUT, 0, "the-marker\n")])
+    assert handle_for(bounded).wait_for_log("the-marker", timeout=30) == "the-marker"
+    assert read_timeouts[0] is not None
+    assert 0 < read_timeouts[0] <= 30
+
+    # Without a deadline (and for plain output streaming) the attach
+    # stays unbounded — long-lived streams must not time out on idle.
+    unbounded = Recorder([(STDOUT, 0, "the-marker\n")])
+    assert handle_for(unbounded).wait_for_log("the-marker") == "the-marker"
+    assert read_timeouts[-1] is None
+
+
 def test_a_daemon_typed_stream_error_keeps_its_own_class() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         end = json.dumps({"error": {"code": "not_found", "message": "no such execution"}}).encode()
