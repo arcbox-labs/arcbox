@@ -15,6 +15,17 @@
 //!   UDP, ICMP replies). The protocol above recovers from loss; bounded
 //!   queue overflow drops them.
 //!
+//! # Queue-then-flush
+//!
+//! [`GuestTx::send`] only enqueues; [`GuestTx::flush`] issues the syscalls.
+//! Everything queued within one event-loop iteration therefore leaves in a
+//! single batched `sendmsg_x` instead of one `write(2)` per frame — the
+//! iteration produces bursts (a fast-path poll returns every frame read
+//! from every host socket, a guest read burst produces one ACK per frame),
+//! and at 1500-byte frames a 10 Gbps link is ~833K frames/s, i.e. ~833K
+//! syscalls/s before batching (ABX-313). The event loop flushes on every
+//! iteration, so a frame never waits for a later wakeup.
+//!
 //! # macOS socketpair overflow semantics
 //!
 //! When the VZ side of the `SOCK_DGRAM` socketpair stops draining (guest RX
@@ -24,6 +35,11 @@
 //! back to writable in that state, so an ENOBUFS-blocked queue is drained by
 //! a short retry timer ([`NOBUFS_RETRY_DELAY`]) instead of
 //! `AsyncFd::writable()`; an `EAGAIN`-blocked queue uses write-readiness.
+//!
+//! `sendmsg_x` reports only how many datagrams it accepted, never an errno
+//! once it accepted at least one, so [`GuestTx::flush`] hands the first
+//! refusal to a single `write(2)` — that call carries the errno the
+//! blocked-state machine above needs.
 
 use std::collections::VecDeque;
 use std::io;
@@ -32,6 +48,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arcbox_xnu_net::BatchDgram;
 use tokio::sync::mpsc;
 
 use crate::darwin::egress::HostEgress;
@@ -116,6 +133,10 @@ pub(super) struct GuestTxStats {
     pub queue_high_water: usize,
     /// Frames successfully written to the guest FD (or inject sink).
     pub tx_frames: u64,
+    /// Write syscalls issued to the guest FD (batched and single combined).
+    /// `tx_frames / tx_syscalls` is the realised batching factor — the
+    /// number ABX-313 exists to move.
+    pub tx_syscalls: u64,
 }
 
 /// Outcome of a single non-blocking write attempt.
@@ -134,8 +155,11 @@ pub(super) struct GuestTx {
     /// Inject-thread sink (HV backend). When set, frames bypass the
     /// socketpair entirely.
     frame_sink: Option<Arc<dyn FrameSink>>,
-    /// Frames awaiting socketpair capacity, in delivery order.
+    /// Frames awaiting delivery, in order. Emptied by [`GuestTx::flush`]
+    /// unless the guest FD refuses them.
     queue: VecDeque<FrameBuf>,
+    /// Pre-allocated `msghdr_x`/`iovec` arrays for the batched write.
+    batch: BatchDgram,
     /// Why the last write failed, if a backlog is pending.
     blocked: Option<WriteBlock>,
     /// Delivery counters.
@@ -149,14 +173,19 @@ impl GuestTx {
         Self {
             frame_sink,
             queue: VecDeque::new(),
+            batch: BatchDgram::new(),
             blocked: None,
             stats: GuestTxStats::default(),
         }
     }
 
-    /// True when frames are queued waiting for socketpair capacity. Bulk
+    /// True when frames the guest FD refused are still pending. Bulk
     /// producers (fast-path host-socket reads) must be gated on this so the
     /// backlog stays bounded and backpressure reaches the remote sender.
+    ///
+    /// Only meaningful **after** a [`flush`](Self::flush): between a
+    /// [`send`](Self::send) and the next flush the queue holds frames that
+    /// have not been offered to the FD yet, which is not backpressure.
     pub(super) fn has_backlog(&self) -> bool {
         !self.queue.is_empty()
     }
@@ -176,18 +205,18 @@ impl GuestTx {
         self.has_backlog()
     }
 
-    /// Sends one frame to the guest.
+    /// Queues one frame for the guest; [`flush`](Self::flush) delivers it.
     ///
-    /// Reliable frames always reach the guest FD eventually: they are
-    /// written directly when the queue is empty and queued otherwise. Lossy
-    /// frames follow the same path but are dropped (and counted) once
-    /// [`LOSSY_QUEUE_CAP`] frames are pending.
-    pub(super) fn send(&mut self, guest_fd: RawFd, frame: &[u8], class: DeliveryClass) {
+    /// Takes ownership so the frame moves into the queue (or into the inject
+    /// channel) without a copy. Reliable frames are never dropped here;
+    /// lossy frames are dropped (and counted) once [`LOSSY_QUEUE_CAP`]
+    /// frames are pending.
+    pub(super) fn send(&mut self, frame: Vec<u8>, class: DeliveryClass) {
         if let Some(sink) = &self.frame_sink {
             // Inject-thread path (HV): bounded channel, drop-on-full.
             // TODO(ABX-420): reliable frames need the lossless contract on
             // this path too; count failures so post-mortems can see them.
-            if sink.send(frame.to_vec()) {
+            if sink.send(frame) {
                 self.stats.tx_frames += 1;
             } else {
                 self.stats.sink_send_failures += 1;
@@ -196,30 +225,32 @@ impl GuestTx {
             return;
         }
 
-        if self.queue.is_empty() {
-            match self.try_write(guest_fd, frame) {
-                WriteOutcome::Consumed => {}
-                WriteOutcome::Blocked(block) => {
-                    self.blocked = Some(block);
-                    self.push(frame);
-                }
-            }
-            return;
-        }
-
-        // Backlog pending: append to preserve per-flow frame order.
         if class == DeliveryClass::Lossy && self.queue.len() >= LOSSY_QUEUE_CAP {
             self.stats.lossy_dropped += 1;
             tracing::debug!("Lossy queue cap ({LOSSY_QUEUE_CAP}) reached, dropping frame");
             return;
         }
-        self.push(frame);
+        self.queue.push_back(FrameBuf::from(frame));
+        self.stats.queue_high_water = self.stats.queue_high_water.max(self.queue.len());
     }
 
-    /// Drains the pending queue until it empties or the FD blocks again,
-    /// updating the blocked state accordingly.
-    pub(super) fn drain(&mut self, guest_fd: RawFd) {
+    /// Writes the pending queue to `guest_fd` until it empties or the FD
+    /// blocks, updating the blocked state accordingly.
+    ///
+    /// Two phases: batched `sendmsg_x` while more than one frame is pending,
+    /// then single `write(2)`s. The second phase both handles the tail and
+    /// is what classifies a refusal — see the module docs.
+    pub(super) fn flush(&mut self, guest_fd: RawFd) {
         self.blocked = None;
+
+        while self.queue.len() > 1 {
+            let sent = self.try_write_batch(guest_fd);
+            if sent == 0 {
+                break;
+            }
+            self.queue.drain(..sent);
+        }
+
         // Pop before writing (`try_write` needs `&mut self` for counters);
         // a blocked frame is pushed back to the front, preserving order.
         while let Some(frame) = self.queue.pop_front() {
@@ -234,8 +265,33 @@ impl GuestTx {
         }
     }
 
+    /// Offers the head of the queue to one `sendmsg_x`, returning how many
+    /// frames it accepted.
+    ///
+    /// `0` means the caller must fall back to a single write: a batch that
+    /// accepted nothing reports no usable errno (and one that accepted some
+    /// reports none at all), while the blocked-state machine needs to tell
+    /// `EAGAIN` from `ENOBUFS`.
+    fn try_write_batch(&mut self, guest_fd: RawFd) -> usize {
+        let Self {
+            queue,
+            batch,
+            stats,
+            ..
+        } = self;
+        stats.tx_syscalls += 1;
+        match batch.send_batch_iter(guest_fd, queue.iter().map(|frame| &**frame)) {
+            Ok(sent) => {
+                stats.tx_frames += sent as u64;
+                sent
+            }
+            Err(_) => 0,
+        }
+    }
+
     /// Attempts one non-blocking write of `frame` to `guest_fd`.
     fn try_write(&mut self, guest_fd: RawFd, frame: &[u8]) -> WriteOutcome {
+        self.stats.tx_syscalls += 1;
         match fd_write(guest_fd, frame) {
             Ok(n) if n >= frame.len() => {
                 self.stats.tx_frames += 1;
@@ -270,11 +326,6 @@ impl GuestTx {
         }
     }
 
-    fn push(&mut self, frame: &[u8]) {
-        self.queue.push_back(FrameBuf::from(frame.to_vec()));
-        self.stats.queue_high_water = self.stats.queue_high_water.max(self.queue.len());
-    }
-
     /// Logs a delivery-counter snapshot. Called from the maintenance tick;
     /// a backlog that persists across consecutive reports indicates a
     /// wedged drain, and `tx_frames` advancing while a connection is
@@ -287,6 +338,7 @@ impl GuestTx {
             queue_len = self.queue.len(),
             blocked = ?self.blocked,
             tx_frames = s.tx_frames,
+            tx_syscalls = s.tx_syscalls,
             rx_frames,
             enobufs = s.enobufs_events,
             would_block = s.would_block_events,
@@ -301,20 +353,16 @@ impl GuestTx {
     }
 }
 
-/// Non-blocking drain of the reply channel. Delivers pending proxy
-/// responses (DNS, UDP, ICMP) to the guest without blocking the event loop.
+/// Non-blocking drain of the reply channel. Queues pending proxy responses
+/// (DNS, UDP, ICMP) for the guest without blocking the event loop.
 ///
 /// Limits each call to `DRAIN_REPLY_BATCH` frames to avoid starving other
 /// `select!` branches.
-pub(super) fn drain_reply_rx(
-    reply_rx: &mut mpsc::Receiver<Vec<u8>>,
-    guest_tx: &mut GuestTx,
-    guest_fd: RawFd,
-) {
+pub(super) fn drain_reply_rx(reply_rx: &mut mpsc::Receiver<Vec<u8>>, guest_tx: &mut GuestTx) {
     for _ in 0..DRAIN_REPLY_BATCH {
         match reply_rx.try_recv() {
             Ok(reply_frame) => {
-                guest_tx.send(guest_fd, &reply_frame, DeliveryClass::Lossy);
+                guest_tx.send(reply_frame, DeliveryClass::Lossy);
             }
             Err(_) => break,
         }

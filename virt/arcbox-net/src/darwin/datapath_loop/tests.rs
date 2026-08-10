@@ -37,8 +37,9 @@ fn shrink_socket_buffers(fd: RawFd) {
 fn send_until_backlog(tx: &mut GuestTx, fd: RawFd, frame: &[u8]) -> usize {
     let mut sent = 0usize;
     for _ in 0..10_000 {
-        tx.send(fd, frame, DeliveryClass::Reliable);
+        tx.send(frame.to_vec(), DeliveryClass::Reliable);
         sent += 1;
+        tx.flush(fd);
         if tx.has_backlog() {
             return sent;
         }
@@ -101,22 +102,51 @@ fn test_fd_write_roundtrip() {
 }
 
 #[test]
-fn guest_tx_direct_write_when_unblocked() {
+fn guest_tx_flush_delivers_a_queued_frame() {
     let (a, b) = socketpair();
     set_nonblocking(a.as_raw_fd()).unwrap();
 
     let mut tx = GuestTx::new(None);
-    let frame_data = b"direct write frame";
-    tx.send(a.as_raw_fd(), frame_data, DeliveryClass::Reliable);
+    let frame_data = b"queued frame".to_vec();
+    tx.send(frame_data.clone(), DeliveryClass::Reliable);
+    assert_eq!(tx.stats.tx_syscalls, 0, "send must not touch the fd");
 
-    assert!(
-        !tx.has_backlog(),
-        "queue should be empty after direct write"
-    );
+    tx.flush(a.as_raw_fd());
+    assert!(!tx.has_backlog(), "queue should be empty after a flush");
 
     let mut buf = [0u8; 128];
     let n = fd_read(b.as_raw_fd(), &mut buf).unwrap();
     assert_eq!(&buf[..n], frame_data.as_slice());
+}
+
+/// The point of ABX-313: a burst produced within one event-loop iteration
+/// costs one syscall, not one per frame — and still arrives in order.
+#[test]
+fn guest_tx_flush_batches_a_burst_into_one_syscall() {
+    let (a, b) = socketpair();
+    set_nonblocking(a.as_raw_fd()).unwrap();
+
+    let mut tx = GuestTx::new(None);
+    const BURST: u8 = 32;
+    for i in 0..BURST {
+        tx.send(vec![i; 64], DeliveryClass::Reliable);
+    }
+
+    tx.flush(a.as_raw_fd());
+
+    assert!(!tx.has_backlog(), "the whole burst should fit");
+    assert_eq!(u64::from(BURST), tx.stats.tx_frames);
+    assert_eq!(
+        tx.stats.tx_syscalls, 1,
+        "{BURST} frames must cost a single sendmsg_x"
+    );
+
+    let mut buf = [0u8; 128];
+    for i in 0..BURST {
+        let n = fd_read(b.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(n, 64);
+        assert_eq!(buf[0], i, "batched frames must arrive in send order");
+    }
 }
 
 /// Regression test for the container-egress black hole: when the socketpair
@@ -140,14 +170,15 @@ fn guest_tx_reliable_survives_socketpair_overflow() {
         f
     };
 
+    // Queue in bursts so the batched write — not just the single-write
+    // fallback — is what overruns the socketpair.
     let mut sent = 0usize;
-    for _ in 0..10_000 {
-        tx.send(
-            a.as_raw_fd(),
-            &make_frame(sent as u32),
-            DeliveryClass::Reliable,
-        );
-        sent += 1;
+    for _ in 0..1_000 {
+        for _ in 0..16 {
+            tx.send(make_frame(sent as u32), DeliveryClass::Reliable);
+            sent += 1;
+        }
+        tx.flush(a.as_raw_fd());
         if tx.has_backlog() {
             break;
         }
@@ -158,11 +189,7 @@ fn guest_tx_reliable_survives_socketpair_overflow() {
     assert!(tx.awaits_retry(), "backlog must arm the retry timer");
     // Keep producing while blocked — everything must queue.
     for _ in 0..16 {
-        tx.send(
-            a.as_raw_fd(),
-            &make_frame(sent as u32),
-            DeliveryClass::Reliable,
-        );
+        tx.send(make_frame(sent as u32), DeliveryClass::Reliable);
         sent += 1;
     }
 
@@ -184,7 +211,7 @@ fn guest_tx_reliable_survives_socketpair_overflow() {
             received += 1;
             progressed = true;
         }
-        tx.drain(a.as_raw_fd());
+        tx.flush(a.as_raw_fd());
         if !progressed {
             idle_rounds += 1;
         }
@@ -216,7 +243,7 @@ fn guest_tx_lossy_capped_reliable_uncapped() {
     send_until_backlog(&mut tx, a.as_raw_fd(), &frame);
 
     for _ in 0..(LOSSY_QUEUE_CAP + 100) {
-        tx.send(a.as_raw_fd(), &frame, DeliveryClass::Lossy);
+        tx.send(frame.clone(), DeliveryClass::Lossy);
     }
     assert!(
         tx.stats.lossy_dropped >= 100,
@@ -225,7 +252,7 @@ fn guest_tx_lossy_capped_reliable_uncapped() {
     );
 
     let hwm_before = tx.stats.queue_high_water;
-    tx.send(a.as_raw_fd(), &frame, DeliveryClass::Reliable);
+    tx.send(frame.clone(), DeliveryClass::Reliable);
     assert!(
         tx.stats.queue_high_water > hwm_before,
         "reliable frames must still be accepted past the lossy cap"

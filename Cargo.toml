@@ -225,6 +225,7 @@ arcbox-error = { version = "0.6.3", path = "common/arcbox-error" } # x-release-p
 arcbox-route = { version = "0.6.3", path = "common/arcbox-route" } # x-release-please-version
 arcbox-packet = { version = "0.6.3", path = "common/arcbox-packet" } # x-release-please-version
 arcbox-datapath = { version = "0.6.3", path = "common/arcbox-datapath" } # x-release-please-version
+arcbox-xnu-net = { version = "0.6.3", path = "common/arcbox-xnu-net" } # x-release-please-version
 arcbox-conntrack = { version = "0.6.3", path = "common/arcbox-conntrack" } # x-release-please-version
 arcbox-fakeip = { version = "0.6.3", path = "common/arcbox-fakeip" } # x-release-please-version
 arcbox-proxy = { version = "0.6.3", path = "common/arcbox-proxy" } # x-release-please-version
