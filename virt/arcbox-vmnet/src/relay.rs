@@ -310,3 +310,181 @@ impl VmnetRelay {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+    use std::time::{Duration, Instant};
+
+    /// Test context collecting every frame the event callback drains.
+    struct TestCtx {
+        vmnet: Arc<Vmnet>,
+        frames: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl TestCtx {
+        fn drain(&self) {
+            let mut buf = vec![0u8; MAX_FRAME_SIZE];
+            while let Ok(n) = self.vmnet.read_packet(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                self.frames.lock().unwrap().push(buf[..n].to_vec());
+            }
+        }
+    }
+
+    /// # Safety
+    /// `ctx` is an `Arc<TestCtx>` pointer kept alive by the block.
+    unsafe extern "C" fn test_on_event(ctx: *const std::ffi::c_void) {
+        // SAFETY: per the block's retain/release contract below.
+        unsafe { &*ctx.cast::<TestCtx>() }.drain();
+    }
+
+    /// # Safety
+    /// `ctx` must originate from `Arc::as_ptr` on a live `Arc<TestCtx>`.
+    unsafe extern "C" fn test_retain(ctx: *const std::ffi::c_void) {
+        // SAFETY: per contract above.
+        unsafe { Arc::increment_strong_count(ctx.cast::<TestCtx>()) }
+    }
+
+    /// # Safety
+    /// `ctx` must hold a strong count taken by `test_retain`.
+    unsafe extern "C" fn test_release(ctx: *const std::ffi::c_void) {
+        // SAFETY: per contract above.
+        unsafe { Arc::decrement_strong_count(ctx.cast::<TestCtx>()) }
+    }
+
+    /// Builds a minimal DHCP DISCOVER as a raw Ethernet frame.
+    fn build_dhcp_discover(mac: [u8; 6]) -> Vec<u8> {
+        // BOOTP fixed part (236 bytes) + magic cookie + options.
+        let mut bootp = vec![0u8; 236];
+        bootp[0] = 1; // op = BOOTREQUEST
+        bootp[1] = 1; // htype = Ethernet
+        bootp[2] = 6; // hlen
+        bootp[4..8].copy_from_slice(&0x2A2A_2A2Au32.to_be_bytes()); // xid
+        bootp[10..12].copy_from_slice(&0x8000u16.to_be_bytes()); // broadcast flag
+        bootp[28..34].copy_from_slice(&mac); // chaddr
+        bootp.extend_from_slice(&[0x63, 0x82, 0x53, 0x63]); // DHCP magic
+        bootp.extend_from_slice(&[53, 1, 1]); // option: DHCP message type = DISCOVER
+        bootp.push(255); // end option
+
+        let udp_len = 8 + bootp.len();
+        let ip_len = 20 + udp_len;
+
+        let mut ip = vec![
+            0x45, 0, // version/IHL, TOS
+        ];
+        ip.extend_from_slice(&u16::try_from(ip_len).unwrap().to_be_bytes());
+        ip.extend_from_slice(&[0, 0, 0, 0]); // id, flags/frag
+        ip.extend_from_slice(&[64, 17, 0, 0]); // TTL, UDP, checksum placeholder
+        ip.extend_from_slice(&[0, 0, 0, 0]); // src 0.0.0.0
+        ip.extend_from_slice(&[255, 255, 255, 255]); // dst broadcast
+        let sum = ip_header_checksum(&ip);
+        ip[10..12].copy_from_slice(&sum.to_be_bytes());
+
+        let mut udp = Vec::new();
+        udp.extend_from_slice(&68u16.to_be_bytes()); // src port
+        udp.extend_from_slice(&67u16.to_be_bytes()); // dst port
+        udp.extend_from_slice(&u16::try_from(udp_len).unwrap().to_be_bytes());
+        udp.extend_from_slice(&[0, 0]); // checksum 0 = disabled
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xFF; 6]); // dst broadcast
+        frame.extend_from_slice(&mac);
+        frame.extend_from_slice(&[0x08, 0x00]); // IPv4
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&udp);
+        frame.extend_from_slice(&bootp);
+        frame
+    }
+
+    fn ip_header_checksum(header: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for chunk in header.chunks(2) {
+            sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        while sum > 0xFFFF {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Returns true if `frame` is a UDP datagram from port 67 (a DHCP
+    /// server reply — OFFER for our DISCOVER).
+    fn is_dhcp_reply(frame: &[u8]) -> bool {
+        frame.len() > 36
+            && frame[12..14] == [0x08, 0x00]
+            && frame[23] == 17
+            && u16::from_be_bytes([frame[34], frame[35]]) == 67
+    }
+
+    /// Empirical pin of the event-callback semantics the relay depends on:
+    /// registration delivers `PACKETS_AVAILABLE` when a packet arrives (a
+    /// DHCP OFFER provoked from vmnet's built-in DHCP server), drain-to-empty
+    /// collects it, and `clear_event_callback` releases the framework's
+    /// block copy so the context is disposed rather than leaked.
+    #[test]
+    #[ignore = "requires macOS vmnet entitlements and root"]
+    fn event_callback_delivers_dhcp_offer() {
+        let vmnet = Arc::new(Vmnet::new_shared().expect("failed to create shared vmnet"));
+
+        let ctx = Arc::new(TestCtx {
+            vmnet: Arc::clone(&vmnet),
+            frames: Mutex::new(Vec::new()),
+        });
+        let weak: Weak<TestCtx> = Arc::downgrade(&ctx);
+
+        // SAFETY: trampolines uphold the block contract for Arc<TestCtx>.
+        let block = unsafe {
+            create_vmnet_event_block(
+                Arc::as_ptr(&ctx).cast(),
+                test_on_event,
+                test_retain,
+                test_release,
+            )
+        };
+        vmnet
+            .set_event_callback(block)
+            .expect("event callback registration failed");
+        // SAFETY: block is the live heap block created above.
+        unsafe { _Block_release(block) };
+
+        // Provoke a reply: vmnet's DHCP server answers a DISCOVER. Resend
+        // periodically in case the first lands before the server is ready.
+        let discover = build_dhcp_discover(vmnet.mac());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut offered = false;
+        while Instant::now() < deadline {
+            vmnet
+                .write_packet(&discover)
+                .expect("write DISCOVER failed");
+            std::thread::sleep(Duration::from_millis(200));
+            if ctx.frames.lock().unwrap().iter().any(|f| is_dhcp_reply(f)) {
+                offered = true;
+                break;
+            }
+        }
+        assert!(
+            offered,
+            "no DHCP reply delivered via event callback; frames seen: {}",
+            ctx.frames.lock().unwrap().len()
+        );
+
+        // Unregister and drop our reference: the framework's dispose must
+        // release the block-owned strong count, leaving the Weak dead.
+        vmnet.clear_event_callback();
+        drop(ctx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak.upgrade().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "TestCtx leaked: block dispose never released the context"
+        );
+
+        vmnet.stop();
+    }
+}
