@@ -21,7 +21,12 @@ from arcbox import CommandHandle, Connection
 from arcbox._envelope import FLAG_END_STREAM, encode_envelope
 from arcbox._gen import process_pb2
 from arcbox._sync._client import ConnectClient
-from arcbox.errors import ArcBoxError, ConnectionLostError, TimeoutError
+from arcbox.errors import (
+    ArcBoxError,
+    ConnectionLostError,
+    InvalidArgumentError,
+    TimeoutError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -187,6 +192,21 @@ def test_a_dead_attach_without_a_deadline_stays_stream_death() -> None:
     daemon = FlakyAttach([(STDOUT, 0, "x\n")], die_after=[0, 0, 0, 0, 0])
     with pytest.raises(ConnectionLostError):
         handle_for(daemon).wait_for_log("never")
+
+
+def test_nan_is_rejected_and_infinity_disables_the_bound() -> None:
+    # The deadline feeds the transport's read timeout, so NaN must be
+    # rejected at the boundary (it would otherwise reach socket
+    # timeouts raw AND silently disable every comparison); math.inf
+    # disables the bound like the TS flavor's POSITIVE_INFINITY, and a
+    # -inf deadline is simply already expired.
+    daemon = FlakyAttach([(STDOUT, 0, "the-marker\n")])
+    with pytest.raises(InvalidArgumentError) as exc_info:
+        handle_for(daemon).wait_for_log("x", timeout=float("nan"))
+    assert exc_info.value.operation == "commands.wait_for_log"
+    assert handle_for(daemon).wait_for_log("the-marker", timeout=float("inf")) == "the-marker"
+    with pytest.raises(TimeoutError):
+        handle_for(daemon).wait_for_log("the-marker", timeout=float("-inf"))
 
 
 def test_the_attach_read_gap_is_bounded_by_the_remaining_budget() -> None:

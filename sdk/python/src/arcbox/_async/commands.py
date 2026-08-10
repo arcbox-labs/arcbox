@@ -319,11 +319,21 @@ class AsyncCommandHandle:
         The deadline is observed on stream frames (the daemon
         interleaves keepalives while idle), so expiry can lag by up to
         the keepalive interval; a stream that goes completely silent is
-        bounded too — each read gap is capped at the remaining
-        budget."""
-        deadline = None if timeout is None else time.monotonic() + timeout
+        bounded too — each read gap is capped at the remaining budget.
+        ``None`` and ``math.inf`` disable the bound; NaN is rejected —
+        the deadline feeds the transport's read timeout, so it must be
+        a real number."""
         scanner = _LogScanner(pattern)
         with wrap_errors("commands.wait_for_log"):
+            if timeout is not None and math.isnan(timeout):
+                raise InvalidArgumentError(
+                    "wait_for_log timeout must be a number of seconds "
+                    "(None or math.inf disables the bound)",
+                    context={"timeout": str(timeout)},
+                )
+            deadline = (
+                None if timeout is None or timeout == math.inf else time.monotonic() + timeout
+            )
             try:
                 async with aclosing(
                     self._attach_events("commands.wait_for_log", deadline)
