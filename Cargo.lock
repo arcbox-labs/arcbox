@@ -775,6 +775,7 @@ dependencies = [
  "arcbox-proxy",
  "arcbox-route",
  "arcbox-vmnet",
+ "arcbox-xnu-net",
  "bytes",
  "chrono",
  "clap",
