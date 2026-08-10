@@ -345,15 +345,33 @@ pub struct SandboxNetworkIdentity {
     pub expose: crate::network::ExposeTarget,
 }
 
+/// Longest accepted id, sized by the tightest consumer: the jailer API
+/// socket `{chroot_base}/firecracker/{id}/root/run/firecracker.socket`
+/// must fit AF_UNIX's 107-byte `sun_path`. With the guest chroot base
+/// (`/var/lib/arcbox/jailer`) the fixed overhead is 63 bytes, leaving 44
+/// for the id. An oversized id otherwise fails as an opaque "timed out
+/// waiting for socket": fc-sdk's readiness probe is a `connect()`, which
+/// ENAMETOOLONGs on every attempt even though Firecracker is up and bound
+/// inside the chroot (caught by the CORE-107 prewarm e2e, whose 51-char
+/// builder id overflowed the budget by 7 bytes).
+const MAX_ID_LEN: usize = 44;
+
 /// Validate a caller-supplied sandbox or snapshot id.
 ///
 /// Ids become filesystem path components, jailer `--id` values, and dm/TAP name
-/// fragments, so they are restricted to `[A-Za-z0-9_-]`. This rejects path
-/// traversal (`/`, `\`, `..`), NUL, whitespace, and anything the jailer would
-/// otherwise reject much later with an opaque boot failure.
+/// fragments, so they are restricted to `[A-Za-z0-9_-]` and capped at
+/// [`MAX_ID_LEN`]. This rejects path traversal (`/`, `\`, `..`), NUL,
+/// whitespace, and anything the jailer would otherwise reject much later with
+/// an opaque boot failure.
 pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(VmmError::Config(format!("{kind} must not be empty")));
+    }
+    if id.len() > MAX_ID_LEN {
+        return Err(VmmError::Config(format!(
+            "invalid {kind} {id:?}: at most {MAX_ID_LEN} characters \
+             (the jailer socket path must fit the AF_UNIX limit)"
+        )));
     }
     if !id
         .bytes()
@@ -483,6 +501,10 @@ mod tests {
         for ok in ["sandbox1", "a-b_c", "0f3e9d16-1234", "A_B-9"] {
             assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
         }
+        // A 36-char UUID fits; anything past the jailer socket budget must
+        // fail fast instead of surfacing as an fc-sdk connect timeout.
+        assert!(validate_id("id", &"a".repeat(44)).is_ok());
+        assert!(validate_id("id", &"a".repeat(45)).is_err());
         for bad in ["", "..", ".", "a/b", "a\\b", "a b", "a.b", "a\0b", "../etc"] {
             assert!(
                 validate_id("id", bad).is_err(),
