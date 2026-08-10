@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use arcbox_connect::sandbox_v1 as pb;
-use arcbox_connect::sandbox_v1::{SandboxServiceClient, watch_events_response};
+use arcbox_connect::sandbox_v1::{
+    SandboxServiceClient, SandboxSnapshotServiceClient, watch_events_response,
+};
 use connectrpc::client::{ClientTransport, ServerStream, SharedHttp2Connection};
 use tokio::sync::OnceCell;
 
@@ -15,17 +17,21 @@ use crate::client::ClientContext;
 use crate::connection::Connection;
 use crate::error::{Error, ErrorKind, Result};
 use crate::types::{
-    Capabilities, IdlePolicy, LifecycleUpdate, SandboxInfo, SandboxState, SandboxSummary, Update,
-    capabilities_from_wire, idle_action_to_wire, info_from_wire, seconds_to_wire, state_to_wire,
-    summary_from_wire,
+    Capabilities, IdlePolicy, LifecycleUpdate, SandboxEvent, SandboxInfo, SandboxState,
+    SandboxSummary, Snapshot, Update, capabilities_from_wire, idle_action_to_wire, info_from_wire,
+    sandbox_event_from_wire, seconds_to_wire, snapshot_from_wire, state_to_wire, summary_from_wire,
+    time_from_wire,
 };
 
 /// The one concrete client this SDK drives: the generated Connect
 /// client over the shared lazy HTTP/2 Unix-socket transport.
 type SandboxClient = SandboxServiceClient<SharedHttp2Connection>;
 
+/// The generated snapshot client over the shared transport.
+type SnapshotClient = SandboxSnapshotServiceClient<SharedHttp2Connection>;
+
 /// The server stream [`SandboxClient::events`] returns.
-type EventStream = ServerStream<
+type EventWireStream = ServerStream<
     <SharedHttp2Connection as ClientTransport>::ResponseBody,
     pb::__buffa::view::WatchEventsResponseView<'static>,
 >;
@@ -117,6 +123,39 @@ pub struct ListOptions {
     pub labels: BTreeMap<String, String>,
 }
 
+/// Options for [`Sandbox::checkpoint`].
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointOptions {
+    /// Human-readable name recorded on the snapshot.
+    pub name: Option<String>,
+    /// Labels recorded on the snapshot, filterable in
+    /// [`ArcBox::list_snapshots`].
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// Options for [`ArcBox::restore`].
+#[derive(Debug, Clone, Default)]
+pub struct RestoreOptions {
+    /// Hard maximum lifetime of the restored sandbox (unset = no
+    /// limit). Same semantics as [`CreateOptions::ttl`].
+    pub ttl: Option<Duration>,
+    /// Labels for the restored sandbox.
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// Assign a fresh TAP interface and IP to the restored sandbox.
+    /// Required when running several sandboxes restored from the same
+    /// snapshot concurrently.
+    pub fresh_network: bool,
+}
+
+/// Options for [`ArcBox::list_snapshots`].
+#[derive(Debug, Clone, Default)]
+pub struct ListSnapshotsOptions {
+    /// Keep only snapshots checkpointed from this sandbox.
+    pub sandbox_id: Option<String>,
+    /// Keep only snapshots carrying all of these labels.
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
 /// Client entry point. Holds one lazily-dialled connection; every
 /// handle it creates shares it. Cheap to clone.
 #[derive(Clone)]
@@ -152,6 +191,10 @@ impl ArcBox {
 
     fn client(&self) -> SandboxClient {
         SandboxServiceClient::new(self.ctx.transport.clone(), self.ctx.config.clone())
+    }
+
+    fn snapshots(&self) -> SnapshotClient {
+        SandboxSnapshotServiceClient::new(self.ctx.transport.clone(), self.ctx.config.clone())
     }
 
     /// What the daemon can do: version, protocol level, feature flags,
@@ -394,6 +437,93 @@ impl ArcBox {
         }
     }
 
+    /// Restore a new sandbox from a snapshot. The restored sandbox
+    /// starts READY — there is no boot to wait for. It gets a fresh id,
+    /// minted client-side so retries stay idempotent (the create()
+    /// rule); the origin sandbox is untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::NotFound`] for a missing snapshot; otherwise any
+    /// RPC failure. On failure the minted id gets a best-effort forced
+    /// removal so nothing leaks.
+    pub async fn restore(&self, snapshot_id: &str, options: RestoreOptions) -> Result<Sandbox> {
+        let id = uuid::Uuid::new_v4().to_string();
+        // No client-side deadline: restoring takes as long as it takes.
+        let restored = self
+            .snapshots()
+            .restore(pb::RestoreRequest {
+                id: id.clone(),
+                snapshot_id: snapshot_id.to_owned(),
+                labels: options.labels.into_iter().collect(),
+                network_override: options.fresh_network,
+                ttl_seconds: seconds_to_wire(options.ttl),
+                ..Default::default()
+            })
+            .await;
+        if let Err(error) = restored {
+            // The sandbox may exist even though restore() failed
+            // (response lost) and ttl is optional, so a leaked VM could
+            // run forever. Best-effort removal; a failure here must not
+            // mask the original error.
+            let _ = self
+                .client()
+                .remove(pb::RemoveSandboxRequest {
+                    id,
+                    force: true,
+                    ..Default::default()
+                })
+                .await;
+            return Err(Error::from_connect(error, "snapshots.restore"));
+        }
+        Ok(Sandbox::attached(self.ctx.clone(), id))
+    }
+
+    /// List the snapshot catalog, auto-paginating server-side pages.
+    ///
+    /// # Errors
+    ///
+    /// Any RPC failure, mapped onto [`Error`].
+    pub async fn list_snapshots(&self, options: ListSnapshotsOptions) -> Result<Vec<Snapshot>> {
+        let client = self.snapshots();
+        let mut rows = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let page = client
+                .list_snapshots(pb::ListSnapshotsRequest {
+                    sandbox_id: options.sandbox_id.clone().unwrap_or_default(),
+                    labels: options.labels.clone().into_iter().collect(),
+                    page_token,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| Error::from_connect(error, "snapshots.list"))?
+                .into_owned();
+            rows.extend(page.snapshots.into_iter().map(snapshot_from_wire));
+            page_token = page.next_page_token;
+            if page_token.is_empty() {
+                return Ok(rows);
+            }
+        }
+    }
+
+    /// Delete a snapshot and its on-disk data.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::NotFound`] for a missing snapshot; otherwise any
+    /// RPC failure.
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<()> {
+        self.snapshots()
+            .delete_snapshot(pb::DeleteSnapshotRequest {
+                snapshot_id: snapshot_id.to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| Error::from_connect(error, "snapshots.delete"))?;
+        Ok(())
+    }
+
     /// Consume lifecycle events until READY/RUNNING, or fail on a
     /// terminal transition. The subscription was armed before Create;
     /// the one residual window — Create processed before the
@@ -402,7 +532,7 @@ impl ArcBox {
     async fn wait_ready(
         &self,
         id: &str,
-        mut events: EventStream,
+        mut events: EventWireStream,
         operation: &'static str,
     ) -> Result<()> {
         let check = |state: SandboxState, error: &Option<String>| -> Result<bool> {
@@ -522,6 +652,69 @@ impl Sandbox {
         crate::Commands::attached(self.ctx.clone(), self.id.clone())
     }
 
+    /// Move bytes in and out of the sandbox.
+    #[must_use]
+    pub fn files(&self) -> crate::Files {
+        crate::Files::attached(self.ctx.clone(), self.id.clone())
+    }
+
+    /// Network reachability and readiness of the sandbox.
+    #[must_use]
+    pub fn ports(&self) -> crate::Ports {
+        crate::Ports::attached(self.ctx.clone(), self.id.clone())
+    }
+
+    /// Subscribe to this sandbox's lifecycle events (keepalive frames
+    /// filtered). The subscription is dialled on the first
+    /// [`next`](EventStream::next); the stream ends when the daemon
+    /// ends it. Events cannot be replayed, so re-subscribing after an
+    /// error is the caller's decision.
+    #[must_use]
+    pub fn events(&self) -> EventStream {
+        EventStream {
+            ctx: self.ctx.clone(),
+            sandbox_id: self.id.clone(),
+            stream: None,
+            done: false,
+        }
+    }
+
+    /// Checkpoint this sandbox into a reusable snapshot: paused,
+    /// snapshotted, then resumed, automatically — the sandbox keeps
+    /// running under the same id. Requires a quiescent sandbox (READY —
+    /// no running command). Restore the returned snapshot into fresh
+    /// sandboxes with [`ArcBox::restore`].
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::SandboxState`] when the sandbox is not quiescent;
+    /// otherwise any RPC failure.
+    pub async fn checkpoint(&self, options: CheckpointOptions) -> Result<Snapshot> {
+        let name = options.name.unwrap_or_default();
+        // No client-side deadline: checkpointing takes as long as it
+        // takes.
+        let response =
+            SandboxSnapshotServiceClient::new(self.ctx.transport.clone(), self.ctx.config.clone())
+                .checkpoint(pb::CheckpointRequest {
+                    sandbox_id: self.id.clone(),
+                    name: name.clone(),
+                    labels: options.labels.clone().into_iter().collect(),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| Error::from_connect(error, "sandbox.checkpoint"))?
+                .into_owned();
+        // The response carries only id + creation time; name and labels
+        // echo the request, which is exactly what the catalog recorded.
+        Ok(Snapshot {
+            id: response.snapshot_id,
+            sandbox_id: self.id.clone(),
+            name,
+            labels: options.labels,
+            created_at: time_from_wire(response.created_at.as_option()),
+        })
+    }
+
     /// Fetch the sandbox's current state — always fresh, never cached.
     ///
     /// # Errors
@@ -615,6 +808,63 @@ impl Sandbox {
             .await
             .map_err(|error| Error::from_connect(error, "sandbox.set_lifecycle"))?;
         Ok(())
+    }
+}
+
+/// A sandbox's lifecycle events, read one at a time with
+/// [`next`](Self::next). The subscription is dialled on the first call.
+pub struct EventStream {
+    ctx: ClientContext,
+    sandbox_id: String,
+    stream: Option<EventWireStream>,
+    done: bool,
+}
+
+impl EventStream {
+    /// The next event, or `None` when the daemon ended the stream.
+    ///
+    /// # Errors
+    ///
+    /// Any RPC failure, mapped onto [`Error`].
+    pub async fn next(&mut self) -> Result<Option<SandboxEvent>> {
+        if self.done {
+            return Ok(None);
+        }
+        if self.stream.is_none() {
+            let stream =
+                SandboxServiceClient::new(self.ctx.transport.clone(), self.ctx.config.clone())
+                    .events(pb::SandboxEventsRequest {
+                        sandbox_id: self.sandbox_id.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|error| {
+                        self.done = true;
+                        Error::from_connect(error, "sandbox.events")
+                    })?;
+            self.stream = Some(stream);
+        }
+        let stream = self.stream.as_mut().expect("stream attached above");
+        loop {
+            match stream.message::<pb::WatchEventsResponse>().await {
+                Ok(Some(frame)) => {
+                    if let Some(watch_events_response::Payload::Event(event)) =
+                        frame.to_owned_message().payload
+                    {
+                        return Ok(Some(sandbox_event_from_wire(*event)));
+                    }
+                    // Keepalives prove liveness but carry no event.
+                }
+                Ok(None) => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Err(Error::from_connect(error, "sandbox.events"));
+                }
+            }
+        }
     }
 }
 
