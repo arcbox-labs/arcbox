@@ -197,6 +197,8 @@ async fn image_content_key(image_ref: &str) -> Result<String> {
 /// **chunked** transfer-encoding; copying the raw connection bytes splices
 /// the chunk headers into the tar and it fails to unpack with an opaque
 /// "archive header checksum mismatch". Let the HTTP library do framing.
+pub(super) use docker::{build_image, inspect_image};
+
 mod docker {
     use anyhow::{Context, Result, bail};
     use arcbox_constants::paths::DOCKER_API_UNIX_SOCKET;
@@ -210,7 +212,7 @@ mod docker {
     const MAX_INSPECT_BYTES: usize = 4 * 1024 * 1024;
 
     /// `GET /images/{ref}/json`, parsed as JSON.
-    pub(super) async fn inspect_image(image_ref: &str) -> Result<serde_json::Value> {
+    pub(in crate::sandbox) async fn inspect_image(image_ref: &str) -> Result<serde_json::Value> {
         let path = format!("/images/{}/json", urlencode(image_ref));
         let mut response = get(&path).await?;
         let status = response.status();
@@ -263,11 +265,121 @@ mod docker {
         Ok(())
     }
 
+    /// Largest build-progress stream accepted before bailing (a runaway
+    /// build log, not a hostile dockerd, is the realistic trigger).
+    const MAX_BUILD_LOG_BYTES: usize = 64 * 1024 * 1024;
+
+    /// `POST /build` with an in-memory tar context holding one `Dockerfile`,
+    /// tagging the result `tag`.
+    ///
+    /// dockerd answers HTTP 200 even when the build fails: failure arrives
+    /// as `{"error":…,"errorDetail":…}` objects inside the newline-delimited
+    /// JSON progress stream, so the stream is parsed and the last progress
+    /// line is folded into the error. The context contains only the
+    /// Dockerfile — `COPY`/`ADD` of local paths cannot work and fails inside
+    /// the build with dockerd's own "not found" message.
+    pub(in crate::sandbox) async fn build_image(dockerfile: &[u8], tag: &str) -> Result<()> {
+        let mut context_tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(dockerfile.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        context_tar
+            .append_data(&mut header, "Dockerfile", dockerfile)
+            .context("failed to build the in-memory build context")?;
+        let context_bytes = context_tar
+            .into_inner()
+            .context("failed to finish the in-memory build context")?;
+
+        let path = format!(
+            "/build?t={}&platform={}",
+            urlencode(tag),
+            urlencode(&platform_slug()?)
+        );
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(path)
+            .header(hyper::header::HOST, "localhost")
+            .header(hyper::header::CONTENT_TYPE, "application/x-tar")
+            .body(http_body_util::Full::new(Bytes::from(context_bytes)))
+            .context("failed to build the docker build request")?;
+        let mut response = send(request).await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("docker build returned HTTP {status}");
+        }
+
+        // Newline-delimited JSON progress; remember the last stream line so
+        // a failure names the step that produced it.
+        let mut buffer = Vec::new();
+        let mut last_progress = String::new();
+        let mut seen = 0usize;
+        while let Some(frame) = response.frame().await {
+            let frame = frame.context("failed to stream the docker build progress")?;
+            let Some(chunk) = frame.data_ref() else {
+                continue;
+            };
+            seen += chunk.len();
+            if seen > MAX_BUILD_LOG_BYTES {
+                bail!("docker build progress exceeds {MAX_BUILD_LOG_BYTES} bytes");
+            }
+            buffer.extend_from_slice(chunk);
+            while let Some(newline) = buffer.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=newline).collect();
+                check_build_progress_line(&line, &mut last_progress)?;
+            }
+        }
+        if !buffer.is_empty() {
+            check_build_progress_line(&buffer, &mut last_progress)?;
+        }
+        Ok(())
+    }
+
+    /// Parse one build-progress line; `error` objects become failures.
+    fn check_build_progress_line(line: &[u8], last_progress: &mut String) -> Result<()> {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            // Interleaved non-JSON output is progress noise, not a failure.
+            return Ok(());
+        };
+        if let Some(error) = value.get("error").and_then(|e| e.as_str()) {
+            let at = if last_progress.is_empty() {
+                String::new()
+            } else {
+                format!(" (last step: {})", last_progress.trim())
+            };
+            bail!("docker build failed: {error}{at}");
+        }
+        if let Some(stream) = value.get("stream").and_then(|s| s.as_str())
+            && !stream.trim().is_empty()
+        {
+            stream.clone_into(last_progress);
+        }
+        Ok(())
+    }
+
     /// Dial the docker socket and issue a `GET`, returning the response.
+    async fn get(path: &str) -> Result<hyper::Response<hyper::body::Incoming>> {
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(path)
+            .header(hyper::header::HOST, "localhost")
+            .body(Empty::<Bytes>::new())
+            .context("failed to build the docker request")?;
+        send(request).await
+    }
+
+    /// Dial the docker socket and send `request`, returning the response.
     ///
     /// The connection task is detached: it drives the HTTP state machine
     /// while the caller consumes the body, and ends when the body does.
-    async fn get(path: &str) -> Result<hyper::Response<hyper::body::Incoming>> {
+    /// The authority is unused (the connector dials a fixed socket) but
+    /// HTTP/1.1 requires a Host header, which callers set.
+    async fn send<B>(request: hyper::Request<B>) -> Result<hyper::Response<hyper::body::Incoming>>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: std::error::Error + Send + Sync,
+    {
         let stream = UnixStream::connect(DOCKER_API_UNIX_SOCKET)
             .await
             .with_context(|| format!("failed to connect {DOCKER_API_UNIX_SOCKET}"))?;
@@ -281,19 +393,21 @@ mod docker {
             }
         });
 
-        // The authority is unused (the connector dials a fixed socket) but
-        // HTTP/1.1 requires a Host header.
-        let request = hyper::Request::builder()
-            .method(hyper::Method::GET)
-            .uri(path)
-            .header(hyper::header::HOST, "localhost")
-            .body(Empty::<Bytes>::new())
-            .context("failed to build the docker request")?;
-
         sender
             .send_request(request)
             .await
             .context("failed to send the docker request")
+    }
+
+    /// This guest's platform in the `os/arch` form `/build` expects (unlike
+    /// `/images/{ref}/get`, whose `platform` is the JSON OCI shape).
+    fn platform_slug() -> Result<String> {
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            other => bail!("unsupported guest architecture for sandbox images: {other}"),
+        };
+        Ok(format!("linux/{arch}"))
     }
 
     /// This guest's platform as the JSON-encoded OCI platform the Engine API
@@ -330,7 +444,46 @@ mod docker {
 
     #[cfg(test)]
     mod tests {
-        use super::{platform_json, urlencode};
+        use super::{check_build_progress_line, platform_json, platform_slug, urlencode};
+
+        #[test]
+        fn build_progress_error_objects_fail_and_name_the_last_step() {
+            let mut last = String::new();
+            check_build_progress_line(br#"{"stream":"Step 2/3 : RUN false\n"}"#, &mut last)
+                .expect("progress is not a failure");
+            assert_eq!(last, "Step 2/3 : RUN false\n");
+
+            let err = check_build_progress_line(
+                br#"{"error":"process did not complete successfully"}"#,
+                &mut last,
+            )
+            .expect_err("error objects must fail the build");
+            let message = err.to_string();
+            assert!(
+                message.contains("process did not complete successfully"),
+                "{message}"
+            );
+            assert!(message.contains("Step 2/3 : RUN false"), "{message}");
+        }
+
+        #[test]
+        fn build_progress_tolerates_noise_and_skips_blank_streams() {
+            let mut last = String::from("Step 1/1 : FROM alpine\n");
+            // Interleaved non-JSON output is progress noise, not a failure.
+            check_build_progress_line(b"not json at all", &mut last).expect("noise tolerated");
+            // Whitespace-only stream frames must not clobber the last step.
+            check_build_progress_line(br#"{"stream":"\n"}"#, &mut last).expect("blank stream");
+            assert_eq!(last, "Step 1/1 : FROM alpine\n");
+            // Non-error JSON (status/aux frames) passes through.
+            check_build_progress_line(br#"{"aux":{"ID":"sha256:ab"}}"#, &mut last)
+                .expect("aux frame");
+        }
+
+        #[test]
+        fn build_platform_is_the_os_arch_slug() {
+            let slug = platform_slug().expect("supported test architecture");
+            assert!(slug == "linux/arm64" || slug == "linux/amd64", "{slug}");
+        }
 
         #[test]
         fn platform_json_is_the_guest_platform() {
