@@ -498,8 +498,10 @@ impl TemplateCatalog {
 /// Inputs are content identities, never file metadata, so an identical
 /// rebuild reproduces the digest: `source_identity` (the rootfs cache file
 /// stem for image builds — it encodes the layer content key and the injected
-/// vm-agent key — or the promoted snapshot id), the warm snapshot id, and
-/// the canonicalized defaults and labels. Field-tagged and NUL-separated so
+/// vm-agent key — or the promoted ORIGIN snapshot id), `warm_identity` (a
+/// content tag like `prewarmed:<geometry>` or `promoted` — never a freshly
+/// minted snapshot id, which would randomize the digest per build), and the
+/// canonicalized defaults and labels. Field-tagged and NUL-separated so
 /// adjacent inputs cannot alias.
 #[must_use]
 #[allow(
@@ -509,7 +511,7 @@ impl TemplateCatalog {
 )]
 pub fn compute_digest(
     source_identity: &str,
-    warm_snapshot_id: Option<&str>,
+    warm_identity: Option<&str>,
     defaults: &TemplateDefaultsSpec,
     labels: &HashMap<String, String>,
 ) -> String {
@@ -547,7 +549,7 @@ pub fn compute_digest(
     let mut hasher = Sha256::new();
     for (tag, value) in [
         ("source", source_identity),
-        ("warm", warm_snapshot_id.unwrap_or("")),
+        ("warm", warm_identity.unwrap_or("")),
     ] {
         hasher.update(tag.as_bytes());
         hasher.update([0]);

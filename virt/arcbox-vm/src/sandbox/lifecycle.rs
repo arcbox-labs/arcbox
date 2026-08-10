@@ -4,6 +4,14 @@ use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransi
 use super::types::{SandboxBootTask, action};
 use super::*;
 
+/// Whether a create may restore from warm sources and publish into the
+/// warm-cache LRU. [`Disabled`](Self::Disabled) exists for the prewarm
+/// builder (CORE-107), whose boot must be a plain cold boot.
+pub(super) enum WarmPolicy {
+    Auto,
+    Disabled,
+}
+
 impl SandboxManager {
     /// Replay a durable Create outcome without resolving its template again.
     pub async fn replay_sandbox_create(
@@ -25,8 +33,23 @@ impl SandboxManager {
     /// Create a sandbox with a stable key for durable request replay.
     pub async fn create_sandbox_keyed(
         &self,
+        spec: SandboxSpec,
+        request_key: &str,
+    ) -> Result<(SandboxId, String)> {
+        self.create_sandbox_inner(spec, request_key, WarmPolicy::Auto)
+            .await
+    }
+
+    /// [`Self::create_sandbox_keyed`] with explicit warm behaviour: the
+    /// prewarm builder (CORE-107) passes [`WarmPolicy::Disabled`] so its own
+    /// boot neither restores from a warm source nor publishes into the
+    /// warm-cache LRU (which would burn one of the `MAX_WARM_KEYS` slots on
+    /// a duplicate full-memory snapshot).
+    pub(super) async fn create_sandbox_inner(
+        &self,
         mut spec: SandboxSpec,
         request_key: &str,
+        warm_policy: WarmPolicy,
     ) -> Result<(SandboxId, String)> {
         // Do not allocate any per-id resources until the startup orphan sweep
         // has run — otherwise a re-created same-id sandbox races it.
@@ -68,6 +91,61 @@ impl SandboxManager {
         super::validate_id("sandbox id", &id)?;
         spec.id = Some(id.clone());
 
+        // Template warm-restore (CORE-107): a catalog template carrying a
+        // pre-warmed snapshot restores it directly — the sub-second start the
+        // template was built for. Same restore path as the warm cache below
+        // (`WarmCreate` origin delivers the CREATED→READY event contract and
+        // runs the effective spec's cmd after Ready; the checkpoint was taken
+        // idle and cmd-less, so defaults-vs-checkpoint divergence resolves to
+        // the spec). A geometry mismatch — the caller overrode `limits` —
+        // makes the snapshot unusable and cold-boots from the template
+        // rootfs, correct per the wholesale-replace contract. Unlike the
+        // warm cache, a kernel bump does NOT invalidate a template snapshot:
+        // a published template pins its artifacts, and the restore resurrects
+        // the kernel it was built with.
+        if matches!(warm_policy, WarmPolicy::Auto)
+            && let Some(warm) = spec.template_warm.clone()
+            && super::templates::template_restore_eligible(
+                &self.config,
+                &spec,
+                caller_supplied_boot,
+                &warm,
+            )
+        {
+            info!(
+                sandbox_id = %id,
+                snapshot_id = %warm.snapshot_id,
+                "template create: restoring the template's pre-warmed snapshot"
+            );
+            let mut warm_spec = spec.clone();
+            warm_spec.id = Some(id.clone());
+            match self
+                .restore_from_snapshot(
+                    super::checkpoint::RestoreRequest {
+                        snapshot_id: warm.snapshot_id.clone(),
+                        network_override: true,
+                        spec: warm_spec,
+                        origin: super::checkpoint::RestoreOrigin::WarmCreate,
+                    },
+                    request_key,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                // Post-commit ambiguity: the sandbox is running under this
+                // id — cold-booting would recreate a live sandbox.
+                Err(error @ VmmError::AckUnconfirmed { .. }) => return Err(error),
+                Err(error) => {
+                    warn!(
+                        sandbox_id = %id,
+                        snapshot_id = %warm.snapshot_id,
+                        %error,
+                        "template warm restore failed; cold-booting from the template rootfs"
+                    );
+                }
+            }
+        }
+
         // Warm create (CORE-77): a Create whose boot shape matches a cached
         // template snapshot restores instead of cold-booting. Decided before
         // any resource allocation — the restore path owns its own id
@@ -75,7 +153,9 @@ impl SandboxManager {
         // (`network_override`, free with net-invariant snapshots). On a miss
         // the boot task publishes the snapshot once the guest is Ready.
         let mut warm_publish = None;
-        if super::warm::warm_eligible(&self.config, &spec, caller_supplied_boot) {
+        if matches!(warm_policy, WarmPolicy::Auto)
+            && super::warm::warm_eligible(&self.config, &spec, caller_supplied_boot)
+        {
             match super::warm::derive_warm_key(&spec) {
                 Ok(key) => match super::warm::find_warm_snapshot(&self.snapshots, &key) {
                     Ok(Some(snapshot_id)) => {

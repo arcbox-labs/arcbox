@@ -12,11 +12,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use super::SandboxManager;
+use super::types::{SandboxId, SandboxSpec, SandboxState};
 use crate::error::{Result, VmmError};
 use crate::snapshot::{SnapshotDraft, SnapshotGeometry};
-use crate::template_catalog::{ReleasedArtifacts, ResolvedTemplate, TEMPLATE_LABEL, TemplateEntry};
+use crate::template_catalog::{
+    ReleasedArtifacts, ResolvedTemplate, TEMPLATE_LABEL, TemplateDefaultsSpec, TemplateEntry,
+};
 
 /// A checkpoint copied into template ownership: everything the build
 /// orchestrator needs to assemble the catalog entry.
@@ -142,6 +146,125 @@ impl SandboxManager {
         })
     }
 
+    /// Boot the built rootfs once with the template's effective geometry and
+    /// an empty cmd, checkpoint at READY, and destroy the builder — the
+    /// snapshot then serves creates as the template's warm start point.
+    /// Requires jailer mode (restore does). The builder's warm behaviour is
+    /// disabled so a prewarm neither restores from nor publishes into the
+    /// warm-cache LRU.
+    pub async fn prewarm_template(
+        &self,
+        name: &str,
+        rootfs_path: &str,
+        defaults: &TemplateDefaultsSpec,
+    ) -> Result<PrewarmOutcome> {
+        if self.config.firecracker.jailer.is_none() {
+            return Err(VmmError::FailedPrecondition(
+                "prewarm requires jailer mode (snapshot restore does)".into(),
+            ));
+        }
+        let vcpus = if defaults.vcpus != 0 {
+            defaults.vcpus
+        } else {
+            u32::try_from(self.config.defaults.vcpus).unwrap_or(1)
+        };
+        let memory_mib = if defaults.memory_mib != 0 {
+            defaults.memory_mib
+        } else {
+            self.config.defaults.memory_mib
+        };
+        let builder_id = format!("template-build-{}", Uuid::new_v4());
+        let spec = SandboxSpec {
+            id: Some(builder_id.clone()),
+            rootfs: rootfs_path.to_owned(),
+            vcpus,
+            memory_mib,
+            // Deliberately no cmd: the checkpoint captures freshly-Ready and
+            // idle. A cmd baked into the memory image would re-run on every
+            // restore on top of the effective spec's cmd.
+            ..Default::default()
+        };
+        let (id, _ip) = self
+            .create_sandbox_inner(
+                spec,
+                &Uuid::new_v4().to_string(),
+                super::lifecycle::WarmPolicy::Disabled,
+            )
+            .await?;
+        let checkpoint = self.prewarm_checkpoint(&id, name).await;
+        // The builder dies regardless of checkpoint success. A failed
+        // teardown fails the build: a leaked live builder VM has no reaper
+        // (no HealthMonitor loop), so success here would silently keep its
+        // vCPUs/memory allocated. The fresh snapshot is dropped too — no
+        // record references it yet — and the error names the builder id so
+        // the operator can remove it and retry.
+        if let Err(remove_error) = self.remove_sandbox(&id, true).await {
+            if let Ok((snapshot_id, _)) = &checkpoint {
+                self.discard_promoted_snapshot(snapshot_id).await;
+            }
+            return Err(VmmError::Unavailable(format!(
+                "prewarm builder sandbox {id} could not be removed ({remove_error}); \
+                 remove it manually and retry the build"
+            )));
+        }
+        let (snapshot_id, artifact_bytes) = checkpoint?;
+        Ok(PrewarmOutcome {
+            warm: crate::template_catalog::WarmArtifact {
+                snapshot_id,
+                vcpus,
+                memory_mib,
+            },
+            artifact_bytes,
+        })
+    }
+
+    /// Wait for the builder to reach READY, then checkpoint it under the
+    /// template label. Polled rather than event-driven: a lagged broadcast
+    /// receiver would miss the READY edge, while polling cannot.
+    async fn prewarm_checkpoint(&self, id: &SandboxId, template: &str) -> Result<(String, u64)> {
+        const READY_POLL_MS: u64 = 250;
+        const READY_TIMEOUT_SECS: u64 = 180;
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(READY_TIMEOUT_SECS);
+        loop {
+            let info = self.inspect_sandbox(id)?;
+            match info.state {
+                SandboxState::Ready => break,
+                SandboxState::Failed => {
+                    return Err(VmmError::FailedPrecondition(format!(
+                        "prewarm boot failed: {}",
+                        info.error.unwrap_or_else(|| "unknown boot failure".into())
+                    )));
+                }
+                _ if tokio::time::Instant::now() >= deadline => {
+                    return Err(VmmError::DeadlineExceeded(format!(
+                        "prewarm builder did not reach READY within {READY_TIMEOUT_SECS}s"
+                    )));
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(READY_POLL_MS)).await,
+            }
+        }
+        let info = super::checkpoint::checkpoint_impl(
+            &self.instances,
+            &self.snapshots,
+            &self.config,
+            id,
+            super::checkpoint::CheckpointRequest {
+                name: format!("template-{template}"),
+                labels: HashMap::from([(TEMPLATE_LABEL.to_owned(), template.to_owned())]),
+                expected_state: SandboxState::Ready,
+                resume_after: true,
+            },
+        )
+        .await?;
+        let meta = self.snapshots.find_by_id(&info.snapshot_id)?;
+        let mut artifact_bytes = std::fs::metadata(&meta.vmstate_path).map_or(0, |m| m.len());
+        if let Some(mem) = &meta.mem_path {
+            artifact_bytes += std::fs::metadata(mem).map_or(0, |m| m.len());
+        }
+        Ok((info.snapshot_id, artifact_bytes))
+    }
+
     /// Best-effort removal of a just-promoted copy whose catalog
     /// registration failed — without it the copy would sit as a
     /// (recoverable) orphan until an operator noticed the log line.
@@ -182,6 +305,41 @@ impl SandboxManager {
             }
         }
     }
+}
+
+/// Result of a prewarm boot-and-checkpoint.
+#[derive(Debug)]
+pub struct PrewarmOutcome {
+    /// The template's warm artifact (snapshot id + capture geometry).
+    pub warm: crate::template_catalog::WarmArtifact,
+    /// On-disk footprint of the checkpoint files.
+    pub artifact_bytes: u64,
+}
+
+/// Whether a template's pre-warmed snapshot can serve this create: restore
+/// needs the jailer, the invariant tap identity, no caller-pinned boot
+/// recipe, and an exactly matching geometry — a memory snapshot resumes
+/// only onto its capture shape. Checked against the effective
+/// (defaults-applied) spec. Deliberately NOT gated on
+/// `config.firecracker.warm_create`: that flag governs the implicit CORE-77
+/// cache, while a template's prewarm was explicitly requested at build time
+/// — adding the gate would silently disable prewarm for anyone running with
+/// the cache off. Stopping restores from a bad snapshot = rebuild or delete
+/// the template.
+pub(super) fn template_restore_eligible(
+    config: &crate::config::VmmConfig,
+    spec: &SandboxSpec,
+    caller_supplied_boot: bool,
+    warm: &crate::sandbox::TemplateWarmRef,
+) -> bool {
+    config.firecracker.jailer.is_some()
+        && !caller_supplied_boot
+        && spec.network.mode == "tap"
+        && !spec.boot_args.contains("ip=")
+        && spec.mounts.is_empty()
+        && spec.ssh_public_key.is_none()
+        && spec.vcpus == warm.vcpus
+        && spec.memory_mib == warm.memory_mib
 }
 
 /// Copy `src` to `dst` (mode 0600, fsynced), reflinking when the filesystem

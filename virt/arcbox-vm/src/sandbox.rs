@@ -57,7 +57,7 @@ pub use pause::reason as pause_reason;
 pub use types::{
     CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
     SandboxEvent, SandboxId, SandboxInfo, SandboxInstance, SandboxMountSpec, SandboxNetworkInfo,
-    SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
+    SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary, TemplateWarmRef,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;

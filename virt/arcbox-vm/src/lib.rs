@@ -59,6 +59,7 @@ pub use sandbox::{
     CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
     SandboxEvent, SandboxId, SandboxInfo, SandboxManager, SandboxMountSpec, SandboxNetworkIdentity,
     SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
+    TemplateWarmRef,
 };
 pub use sandbox::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,

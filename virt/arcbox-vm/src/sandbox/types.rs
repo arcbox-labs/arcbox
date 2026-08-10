@@ -141,6 +141,23 @@ pub struct SandboxSpec {
     pub idle_timeout_seconds: u32,
     /// What to do when the idle timeout expires.
     pub on_idle: IdleAction,
+    /// The catalog template's pre-warmed snapshot, when the create resolved
+    /// one (CORE-107). A boot-recipe input like `rootfs`: the create path
+    /// restores it instead of cold-booting when eligible, and it rides the
+    /// journaled effective spec so crash replay keeps working. `None` for
+    /// non-catalog templates and warm-less catalog entries.
+    pub template_warm: Option<TemplateWarmRef>,
+}
+
+/// A template's pre-warmed boot-to-ready snapshot, threaded through
+/// [`SandboxSpec`] (CORE-107).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateWarmRef {
+    /// Snapshot id in the snapshot catalog.
+    pub snapshot_id: String,
+    /// Capture-time geometry; restore is eligible only on an exact match.
+    pub vcpus: u32,
+    pub memory_mib: u64,
 }
 
 /// Parameters to restore a sandbox from a checkpoint.
