@@ -111,6 +111,8 @@ export class CommandHandle {
 
   readonly #handle: ArcBoxCommandHandle;
   #pump: Promise<void> | undefined;
+  /** Set by {@link disconnect}: the pump stops delivering and detaches. */
+  #disconnected = false;
   /**
    * Boxed so an `undefined` failure is still a failure, and so the
    * original error object survives — the SDK throws typed classes and
@@ -131,9 +133,16 @@ export class CommandHandle {
   }
 
   async #pumpOutput(sinks: OutputSinks): Promise<void> {
-    const decoder = new TextDecoder();
+    // One streaming decoder per channel: stdout and stderr interleave
+    // on the wire, and a multibyte character split across frames must
+    // reassemble within its own channel, not against the other's bytes.
+    const decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() };
     try {
       for await (const chunk of this.#handle.output) {
+        if (this.#disconnected) {
+          // Breaking out of for-await closes the underlying stream.
+          break;
+        }
         // A terminal merges stdout and stderr and carries escape
         // sequences, so its bytes go to onData undecoded — decoding
         // them as text would corrupt what a terminal emulator needs.
@@ -141,16 +150,30 @@ export class CommandHandle {
           await sinks.onData(chunk.data);
           continue;
         }
-        const sink =
-          chunk.channel === "stderr" ? sinks.onStderr : sinks.onStdout;
+        const channel = chunk.channel === "stderr" ? "stderr" : "stdout";
+        const sink = channel === "stderr" ? sinks.onStderr : sinks.onStdout;
         if (sink !== undefined) {
-          await sink(decoder.decode(chunk.data, { stream: true }));
+          await sink(decoders[channel].decode(chunk.data, { stream: true }));
+        }
+      }
+      if (!this.#disconnected) {
+        // Flush a partial multibyte character buffered at end of stream.
+        const stdoutTail = decoders.stdout.decode();
+        if (stdoutTail !== "" && sinks.onStdout !== undefined) {
+          await sinks.onStdout(stdoutTail);
+        }
+        const stderrTail = decoders.stderr.decode();
+        if (stderrTail !== "" && sinks.onStderr !== undefined) {
+          await sinks.onStderr(stderrTail);
         }
       }
     } catch (error) {
       // Surfaced by wait(): throwing out of a detached pump would be an
-      // unhandled rejection with no caller to receive it.
-      this.#pumpFailure = { error };
+      // unhandled rejection with no caller to receive it. A failure
+      // after disconnect() is that teardown, not something to report.
+      if (!this.#disconnected) {
+        this.#pumpFailure = { error };
+      }
     }
   }
 
@@ -189,10 +212,12 @@ export class CommandHandle {
   /**
    * Stop receiving output without killing the command.
    *
-   * The pump is bound to this handle's stream, so dropping the handle
-   * already stops delivery; this makes that explicit.
+   * Delivery stops at the next chunk boundary — the pump swallows it,
+   * breaks out, and breaking closes the underlying stream. Output the
+   * daemon retains still arrives with the result via {@link wait}.
    */
   async disconnect(): Promise<void> {
+    this.#disconnected = true;
     this.#pump = undefined;
     await Promise.resolve();
   }
@@ -269,14 +294,13 @@ export class Commands {
   /** List the sandbox's running commands. */
   async list(): Promise<ProcessInfo[]> {
     const infos = await this.#commands.list();
-    return infos
-      .filter((info) => info.state === "running")
-      .map((info) => ({
-        pid: info.commandId,
-        cmd: "",
-        args: [],
-        envs: {},
-      }));
+    const running: ProcessInfo[] = [];
+    for (const info of infos) {
+      if (info.state === "running") {
+        running.push({ pid: info.commandId, cmd: "", args: [], envs: {} });
+      }
+    }
+    return running;
   }
 }
 

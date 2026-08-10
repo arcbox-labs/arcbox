@@ -69,6 +69,46 @@ export interface SandboxInfo {
 }
 
 /**
+ * What {@link Sandbox.list} returns: both of `e2b`'s listing shapes at
+ * once. Awaiting it yields the whole listing (the daemon streams every
+ * page already); calling {@link nextItems} pages e2b-style — one page,
+ * carrying that same complete listing.
+ */
+export class SandboxPaginator implements PromiseLike<SandboxInfo[]> {
+  readonly #all: Promise<SandboxInfo[]>;
+  #consumed = false;
+
+  constructor(all: Promise<SandboxInfo[]>) {
+    this.#all = all;
+  }
+
+  /** Whether {@link nextItems} has a page left (exactly one, the whole listing). */
+  get hasNext(): boolean {
+    return !this.#consumed;
+  }
+
+  /** The next page: the complete listing first, `[]` from then on. */
+  async nextItems(): Promise<SandboxInfo[]> {
+    if (this.#consumed) {
+      return [];
+    }
+    this.#consumed = true;
+    return this.#all;
+  }
+
+  // eslint-disable-next-line sukka/unicorn/no-thenable -- deliberate: e2b v1 code awaits list() while v2 code holds the paginator; PromiseLike is the one shape that serves both
+  then<TResult1 = SandboxInfo[], TResult2 = never>(
+    onfulfilled?:
+      | ((value: SandboxInfo[]) => TResult1 | PromiseLike<TResult1>)
+      | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    // eslint-disable-next-line promise/prefer-catch -- not a consumer call: this IS the PromiseLike implementation, forwarding both callbacks
+    return this.#all.then(onfulfilled, onrejected);
+  }
+}
+
+/**
  * `e2b`'s cloud sandbox, served by the local ArcBox daemon.
  *
  * The shape follows `e2b` deliberately, including the parts that read
@@ -148,39 +188,39 @@ export class Sandbox {
   }
 
   /**
-   * List sandboxes.
-   *
-   * `e2b` returns a paginator; the daemon streams every page already, so
-   * this resolves the whole listing. `paginator.nextItems()` on the
-   * result is provided for callers written against the paginator.
+   * List sandboxes, as a {@link SandboxPaginator} that is also
+   * awaitable: `await Sandbox.list()` yields the whole listing, and
+   * `Sandbox.list().nextItems()` pages e2b-style (one page carrying
+   * that same complete listing — the daemon streams every page
+   * already).
    */
-  static async list(
-    this: void,
-    opts: SandboxListOpts = {},
-  ): Promise<SandboxInfo[]> {
-    const client = new ArcBox(opts.connection);
-    const wanted = opts.query?.state;
-    const rows: SandboxInfo[] = [];
-    for await (const summary of client.list({
-      ...(opts.query?.metadata !== undefined && {
-        labels: opts.query.metadata,
-      }),
-    })) {
-      if (wanted !== undefined && !wanted.includes(summary.state)) {
-        continue;
+  static list(this: void, opts: SandboxListOpts = {}): SandboxPaginator {
+    const collect = async (): Promise<SandboxInfo[]> => {
+      const client = new ArcBox(opts.connection);
+      const wanted = opts.query?.state;
+      const rows: SandboxInfo[] = [];
+      for await (const summary of client.list({
+        ...(opts.query?.metadata !== undefined && {
+          labels: opts.query.metadata,
+        }),
+      })) {
+        if (wanted !== undefined && !wanted.includes(summary.state)) {
+          continue;
+        }
+        const row: SandboxInfo = {
+          sandboxId: summary.id,
+          templateId: "",
+          metadata: summary.labels,
+          state: summary.state,
+        };
+        if (summary.createdAt !== undefined) {
+          row.startedAt = summary.createdAt;
+        }
+        rows.push(row);
       }
-      const row: SandboxInfo = {
-        sandboxId: summary.id,
-        templateId: "",
-        metadata: summary.labels,
-        state: summary.state,
-      };
-      if (summary.createdAt !== undefined) {
-        row.startedAt = summary.createdAt;
-      }
-      rows.push(row);
-    }
-    return rows;
+      return rows;
+    };
+    return new SandboxPaginator(collect());
   }
 
   /** Kill a sandbox by id. Resolves `false` when it was already gone. */

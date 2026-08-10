@@ -18,6 +18,7 @@
 export {
   DEFAULT_SANDBOX_TIMEOUT_MS,
   Sandbox,
+  SandboxPaginator,
   type ConnectionOpts,
   type SandboxConnectOpts,
   type SandboxInfo,

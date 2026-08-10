@@ -4,6 +4,8 @@ import type { FileStat, Files, FsEvent } from "../index";
 import { FileNotFoundError } from "../index";
 
 import { missingBit } from "foxts/bitwise";
+import { extractErrorMessage } from "foxts/extract-error-message";
+import { noop } from "foxts/noop";
 
 import { unsupported } from "./errors";
 /** Kind of a filesystem entry, as `e2b` names them. */
@@ -69,15 +71,16 @@ export interface WatchOpts {
   /** Watch subdirectories too. */
   recursive?: boolean;
   /**
-   * Called once when the watch ends — with the error that killed it, or
-   * with nothing on a clean end (sandbox stop, {@link WatchHandle.stop}).
+   * Called once when the watch ends **on its own** — with the error
+   * that killed it, or with nothing on a clean end (sandbox stop).
+   * Not called for {@link WatchHandle.stop}.
    */
   onExit?: (error?: Error) => void | Promise<void>;
 }
 
 /**
- * A running directory watch. {@link stop} cancels it; the sandbox
- * stopping ends it cleanly on its own.
+ * A running directory watch. {@link stop} cancels delivery; the sandbox
+ * stopping ends the watch cleanly on its own.
  */
 export class WatchHandle {
   readonly #stop: () => Promise<void>;
@@ -86,7 +89,11 @@ export class WatchHandle {
     this.#stop = stop;
   }
 
-  /** Cancel the watch. Idempotent. */
+  /**
+   * Stop delivering events. Idempotent, resolves immediately — the
+   * underlying subscription closes on the next event or when the
+   * sandbox stops (a pending read cannot be interrupted client-side).
+   */
   async stop(): Promise<void> {
     await this.#stop();
   }
@@ -279,11 +286,10 @@ export class Filesystem {
 
   /**
    * Watch a directory and push each change into `onEvent`, `e2b`'s
-   * callback shape over ArcBox's event iterable. Resolves once the
-   * watch is established. Event paths are made relative to `path`,
-   * matching `e2b`'s `name` field.
+   * callback shape over ArcBox's event iterable. Event paths are made
+   * relative to `path`, matching `e2b`'s `name` field.
    */
-  async watchDir(
+  watchDir(
     path: string,
     onEvent: (event: FilesystemEvent) => void | Promise<void>,
     opts: WatchOpts = {},
@@ -293,12 +299,15 @@ export class Filesystem {
     });
     const iterator = stream[Symbol.asyncIterator]();
     const prefix = path.endsWith("/") ? path : `${path}/`;
-    let stopped = false;
-    const pump = (async () => {
+    // Shared with the pump: an event or error that lands after stop()
+    // is the teardown that was asked for, not something to deliver.
+    const state = { stopped: false };
+    void (async () => {
       try {
         while (true) {
+          // eslint-disable-next-line no-await-in-loop -- sequential by design: events are delivered one at a time, in order
           const next = await iterator.next();
-          if (next.done === true) {
+          if (next.done === true || state.stopped) {
             break;
           }
           const type = EVENT_TYPES[next.value.kind];
@@ -308,26 +317,38 @@ export class Filesystem {
           const name = next.value.path.startsWith(prefix)
             ? next.value.path.slice(prefix.length)
             : next.value.path;
+          // eslint-disable-next-line no-await-in-loop -- sequential by design: the next event waits for the sink
           await onEvent({ name, type });
         }
-        await opts.onExit?.();
-      } catch (error) {
-        if (stopped) {
-          // Cancellation surfaces as the iterator failing; that is the
-          // clean end stop() asked for, not a watch failure.
+        if (!state.stopped) {
           await opts.onExit?.();
+        }
+      } catch (error) {
+        if (state.stopped) {
           return;
         }
+        // Always a fresh Error with the original as `cause`: the SDK's
+        // typed class (and anything else) survives there, and the
+        // callback's declared parameter type holds without a cast.
         await opts.onExit?.(
-          error instanceof Error ? error : new Error(String(error)),
+          new Error(extractErrorMessage(error) ?? "the watch stream failed", {
+            cause: error,
+          }),
         );
       }
     })();
-    return new WatchHandle(async () => {
-      stopped = true;
-      await iterator.return?.();
-      await pump;
-    });
+    return Promise.resolve(
+      new WatchHandle(() => {
+        state.stopped = true;
+        // A pending read cannot be interrupted without transport-level
+        // cancellation, and the generator queues return() behind it —
+        // so stop() must not await either. The subscription itself
+        // closes when the queued return() drains: on the next event, or
+        // when the sandbox stops.
+        void iterator.return?.().catch(noop);
+        return Promise.resolve();
+      }),
+    );
   }
 }
 

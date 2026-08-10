@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import codecs
 from typing import TYPE_CHECKING, Literal, overload
 
 from arcbox import PtySize as ArcBoxPtySize
@@ -37,6 +38,8 @@ class CommandHandle:
         self.pid = handle.command_id
         self._failure: BaseException | None = None
         self._pump: Pump | None = None
+        # Set by disconnect(): the pump stops delivering and detaches.
+        self._disconnected = False
         if on_stdout is not None or on_stderr is not None or on_data is not None:
             self._pump = Pump(lambda: self._pump_output(on_stdout, on_stderr, on_data))
 
@@ -46,8 +49,18 @@ class CommandHandle:
         on_stderr: Callable[[str], object] | None,
         on_data: Callable[[bytes], object] | None,
     ) -> None:
+        # One incremental decoder per channel: stdout and stderr
+        # interleave on the wire, and a multibyte character split across
+        # frames must reassemble within its own channel.
+        decoders = {
+            "stdout": codecs.getincrementaldecoder("utf-8")("replace"),
+            "stderr": codecs.getincrementaldecoder("utf-8")("replace"),
+        }
         try:
             for chunk in self._handle.output:
+                if self._disconnected:
+                    # Breaking out closes the underlying stream.
+                    break
                 # A terminal merges stdout and stderr and carries escape
                 # sequences, so its bytes go to on_data undecoded —
                 # decoding them as text would corrupt what a terminal
@@ -55,13 +68,26 @@ class CommandHandle:
                 if on_data is not None:
                     call(on_data, chunk.data)
                     continue
-                sink = on_stderr if chunk.channel == "stderr" else on_stdout
+                channel = "stderr" if chunk.channel == "stderr" else "stdout"
+                sink = on_stderr if channel == "stderr" else on_stdout
                 if sink is not None:
-                    call(sink, chunk.data.decode("utf-8", errors="replace"))
+                    call(sink, decoders[channel].decode(chunk.data))
+            if not self._disconnected:
+                # Flush a partial multibyte character buffered at end of
+                # stream.
+                stdout_tail = decoders["stdout"].decode(b"", final=True)
+                if stdout_tail and on_stdout is not None:
+                    call(on_stdout, stdout_tail)
+                stderr_tail = decoders["stderr"].decode(b"", final=True)
+                if stderr_tail and on_stderr is not None:
+                    call(on_stderr, stderr_tail)
         except Exception as error:
             # Surfaced by wait(): raising out of a detached pump would be
-            # an unretrieved exception with no caller to receive it.
-            self._failure = error
+            # an unretrieved exception with no caller to receive it. A
+            # failure after disconnect() is that teardown, not something
+            # to report.
+            if not self._disconnected:
+                self._failure = error
 
     def wait(self) -> CommandResult:
         """Wait for the command to finish.
@@ -71,10 +97,11 @@ class CommandHandle:
         result = self._handle.wait_for_exit()
         if self._pump is not None:
             self._pump.join()
-        if self._failure is not None:
+        failure = self._failure
+        if failure is not None:
             # Re-raises exactly what the stream raised: the SDK's typed
             # exception classes must reach the caller intact.
-            raise self._failure
+            raise failure
         return expect_zero_exit(result)
 
     def kill(self, signal: str = "SIGKILL") -> bool:
@@ -95,7 +122,13 @@ class CommandHandle:
         self._handle.resize(size.cols, size.rows)
 
     def disconnect(self) -> None:
-        """Stop receiving output without killing the command."""
+        """Stop receiving output without killing the command.
+
+        The async flavor cancels the pump task outright; the sync one
+        cannot interrupt its thread, so the flag makes the pump swallow
+        the next chunk, break out, and detach. Output the daemon retains
+        still arrives with the result via :meth:`wait`."""
+        self._disconnected = True
         pump, self._pump = self._pump, None
         if pump is not None:
             pump.cancel()

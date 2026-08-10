@@ -81,6 +81,7 @@ class MockDaemon {
         exposePort: () =>
           create(ExposePortResponseSchema, { hostPort: this.hostPort }),
         remove: () => create(EmptySchema),
+        list: () => ({ sandboxes: [], nextPageToken: "" }),
       });
       service(SandboxProcessService, {
         startExecution: () => create(ExecutionSchema, { id: "cmd" }),
@@ -246,6 +247,27 @@ describe("create", () => {
   });
 });
 
+describe("list", () => {
+  it("is awaitable AND paginator-shaped, for both e2b styles", async () => {
+    const daemon = new MockDaemon();
+
+    // v1 style: await the listing directly.
+    const rows = await Sandbox.list({
+      connection: { transport: daemon.transport },
+    });
+    expect(rows).toEqual([]);
+
+    // v2 style: hold the paginator, page through it.
+    const paginator = Sandbox.list({
+      connection: { transport: daemon.transport },
+    });
+    expect(paginator.hasNext).toBe(true);
+    expect(await paginator.nextItems()).toEqual([]);
+    expect(paginator.hasNext).toBe(false);
+    expect(await paginator.nextItems()).toEqual([]);
+  });
+});
+
 describe("setTimeout", () => {
   it("re-arms only the ttl, leaving the idle knobs alone", async () => {
     const daemon = new MockDaemon();
@@ -297,7 +319,7 @@ describe("files", () => {
         seen.push([event.type, event.name]);
       },
       {
-        onExit: () => {
+        onExit() {
           ended = true;
         },
       },
