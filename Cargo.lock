@@ -6497,6 +6497,7 @@ dependencies = [
  "arcbox-fakeip",
  "arcbox-packet",
  "arcbox-proxy",
+ "arcbox-xnu-net",
  "crossbeam-channel",
  "libc",
  "socket2 0.6.4",
