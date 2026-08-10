@@ -17,6 +17,7 @@ import type {
   CheckpointResponse,
   SnapshotSummary as SnapshotSummaryProto,
 } from "./gen/arcbox/sandbox/v1/snapshot_pb";
+import type { Template as TemplateProto } from "./gen/arcbox/sandbox/v1/template_pb";
 
 /** Lifecycle state of a sandbox. See `sandbox.proto` for the state machine. */
 export type SandboxState =
@@ -303,6 +304,35 @@ export function exposedPortFromProto(port: ExposedPortProto): ExposedPort {
     hostPort: port.hostPort,
     protocol: portProtocolFromProto(port.protocol),
   };
+}
+
+/** A catalog template row (one per version; drafts have `version === ""`). */
+export interface TemplateInfo {
+  name: string;
+  /** Published version ("" = unpublished draft). */
+  version: string;
+  /** Content digest pinning this version's artifacts. */
+  digest: string;
+  /** Whether the template carries a pre-warmed boot-to-ready snapshot. */
+  warm: boolean;
+  /** On-disk footprint of the version's artifacts. */
+  sizeBytes: number;
+  labels: Record<string, string>;
+  createdAt?: Date;
+}
+
+/** Map one Template message to the public DTO. */
+export function templateInfoFromProto(proto: TemplateProto): TemplateInfo {
+  const out: TemplateInfo = {
+    name: proto.name,
+    version: proto.version,
+    digest: proto.digest,
+    warm: proto.warmSnapshotId !== "",
+    sizeBytes: Number(proto.sizeBytes),
+    labels: proto.labels,
+  };
+  assignIfSet(out, "createdAt", optionalDate(proto.createdAt));
+  return out;
 }
 
 /** Map one ListSnapshots row to the public DTO. */

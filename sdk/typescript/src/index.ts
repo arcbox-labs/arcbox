@@ -49,6 +49,16 @@ export type {
   WriteOptions,
 } from "./files";
 
+export { Template } from "./templates";
+export type {
+  BuildTemplateOptions,
+  ListTemplatesOptions,
+  ReadyProbe,
+  TemplateConnectOptions,
+  TemplateDefaults,
+  TemplateSource,
+} from "./templates";
+
 export type { ConnectionOptions } from "./connection";
 
 export type {
@@ -63,6 +73,7 @@ export type {
   SandboxState,
   SandboxSummary,
   Snapshot,
+  TemplateInfo,
 } from "./types";
 
 export {
