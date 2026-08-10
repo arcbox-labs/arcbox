@@ -13,9 +13,32 @@ use std::os::fd::RawFd;
 /// kernel cap on `recvmmsg`/`sendmmsg`, but this constant is shared for
 /// uniform buffer pre-allocation.
 ///
-/// If you target hosts that may carry non-default sysctls, clamp your
-/// per-call `bufs.len()` to a value you know is safe.
+/// [`BatchDgram`] reads the live sysctls once per process and clamps every
+/// call for you ([`BatchDgram::send_capacity`] /
+/// [`BatchDgram::recv_capacity`]); this constant stays the upper bound on
+/// pre-allocation and on what a caller may usefully pass.
 pub const MAX_BATCH: usize = 256;
+
+/// The live per-call caps, read once per process.
+///
+/// Returned as `(send, recv)`, each already clamped to [`MAX_BATCH`]. On
+/// Linux there is no kernel cap, so both are [`MAX_BATCH`].
+fn kernel_caps() -> (usize, usize) {
+    static CAPS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *CAPS.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            (
+                crate::ffi::darwin::sysctl_batch_cap(c"kern.ipc.maxsendmsgx"),
+                crate::ffi::darwin::sysctl_batch_cap(c"kern.ipc.maxrecvmsgx"),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (MAX_BATCH, MAX_BATCH)
+        }
+    })
+}
 
 /// Result of a single datagram within a batch receive.
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +68,7 @@ pub struct BatchDgram {
 // SAFETY: BatchDgram contains raw pointers in its iovec/msghdr arrays, which
 // is why the auto-impl of `Send` is denied. Those pointers are only valid
 // for the duration of a single recv_batch/send_batch call — they alias the
-// caller-supplied buffer slices, get filled in by `setup_recv`/`setup_send`,
+// caller-supplied buffer slices, get filled in by `setup_recv`/`send_batch_iter`,
 // and are passed to the kernel by the immediately-following syscall under
 // `&mut self`. Between calls they are stale and never dereferenced by Rust.
 // Moving the struct across threads therefore moves no live aliases. We
@@ -80,7 +103,22 @@ impl BatchDgram {
         }
     }
 
-    /// Receives up to `bufs.len()` datagrams (capped at [`MAX_BATCH`]) from `fd`.
+    /// The largest batch [`send_batch`](Self::send_batch) will issue on this
+    /// host: [`MAX_BATCH`] clamped to the live `kern.ipc.maxsendmsgx`.
+    #[must_use]
+    pub fn send_capacity() -> usize {
+        kernel_caps().0
+    }
+
+    /// The largest batch [`recv_batch`](Self::recv_batch) will issue on this
+    /// host: [`MAX_BATCH`] clamped to the live `kern.ipc.maxrecvmsgx`.
+    #[must_use]
+    pub fn recv_capacity() -> usize {
+        kernel_caps().1
+    }
+
+    /// Receives up to `bufs.len()` datagrams (capped at
+    /// [`recv_capacity`](Self::recv_capacity)) from `fd`.
     ///
     /// On success returns a slice of [`RxEntry`] whose length equals the
     /// number of datagrams received; `entries[i].len` is the byte length
@@ -94,7 +132,7 @@ impl BatchDgram {
     ///
     /// Returns `io::Error` for syscall failures, including `WouldBlock`.
     pub fn recv_batch(&mut self, fd: RawFd, bufs: &mut [&mut [u8]]) -> io::Result<&[RxEntry]> {
-        let count = bufs.len().min(MAX_BATCH);
+        let count = bufs.len().min(Self::recv_capacity());
         if count == 0 {
             return Ok(&[]);
         }
@@ -121,7 +159,8 @@ impl BatchDgram {
         &self.entries[..count]
     }
 
-    /// Sends up to `bufs.len()` datagrams (capped at [`MAX_BATCH`]) on `fd`.
+    /// Sends up to `bufs.len()` datagrams (capped at
+    /// [`send_capacity`](Self::send_capacity)) on `fd`.
     ///
     /// Returns the number of datagrams actually sent. `EINTR` is retried
     /// internally. Returns `Err(WouldBlock)` when the FD's send buffer is
@@ -132,12 +171,37 @@ impl BatchDgram {
     ///
     /// Returns `io::Error` for syscall failures, including `WouldBlock`.
     pub fn send_batch(&mut self, fd: RawFd, bufs: &[&[u8]]) -> io::Result<usize> {
-        let count = bufs.len().min(MAX_BATCH);
+        self.send_batch_iter(fd, bufs.iter().copied())
+    }
+
+    /// Sends up to [`send_capacity`](Self::send_capacity) datagrams yielded
+    /// by `bufs` on `fd`.
+    ///
+    /// The iterator form lets a caller feed a non-contiguous container (a
+    /// `VecDeque` of queued frames, say) straight into the pre-allocated
+    /// iovec array without materializing a `&[&[u8]]` slice first.
+    /// Otherwise identical to [`send_batch`](Self::send_batch).
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` for syscall failures, including `WouldBlock`.
+    pub fn send_batch_iter<'a, I>(&mut self, fd: RawFd, bufs: I) -> io::Result<usize>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut count = 0;
+        for buf in bufs.into_iter().take(Self::send_capacity()) {
+            self.iovecs[count] = libc::iovec {
+                iov_base: buf.as_ptr().cast_mut().cast(),
+                iov_len: buf.len(),
+            };
+            count += 1;
+        }
         if count == 0 {
             return Ok(0);
         }
 
-        self.setup_send(bufs, count);
+        self.setup_hdrs_send(count);
 
         self.platform_send(fd, count)
     }
@@ -152,16 +216,6 @@ impl BatchDgram {
             };
         }
         self.setup_hdrs_recv(count);
-    }
-
-    fn setup_send(&mut self, bufs: &[&[u8]], count: usize) {
-        for (i, buf) in bufs.iter().enumerate().take(count) {
-            self.iovecs[i] = libc::iovec {
-                iov_base: buf.as_ptr().cast_mut().cast(),
-                iov_len: buf.len(),
-            };
-        }
-        self.setup_hdrs_send(count);
     }
 
     // ── macOS implementation ───────────────────────────────────────────
@@ -546,27 +600,56 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
+    /// The per-call caps come from the live sysctls, so a host that tuned
+    /// `kern.ipc.max{send,recv}msgx` down gets a shorter batch instead of the
+    /// `EINVAL` an unclamped `cnt` would earn.
+    #[test]
+    fn capacities_are_within_the_kernel_caps() {
+        for (cap, name) in [
+            (BatchDgram::send_capacity(), "kern.ipc.maxsendmsgx"),
+            (BatchDgram::recv_capacity(), "kern.ipc.maxrecvmsgx"),
+        ] {
+            assert!(
+                (1..=MAX_BATCH).contains(&cap),
+                "{name} capacity {cap} outside 1..={MAX_BATCH}"
+            );
+            #[cfg(target_os = "macos")]
+            assert!(cap <= read_sysctl(name), "{name} capacity {cap} exceeds it");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_sysctl(name: &str) -> usize {
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .arg("-n")
+            .arg(name)
+            .output()
+            .expect("sysctl");
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
     #[test]
     fn test_max_batch_cap() {
-        // With more queued datagrams than `MAX_BATCH` and a longer `bufs`
-        // slice, a single `recv_batch` should return exactly `MAX_BATCH`
-        // entries — not the full `bufs.len()` and not less.
+        // With more queued datagrams than one call can take and a longer
+        // `bufs` slice, a single `recv_batch` should return exactly
+        // `recv_capacity()` entries — not the full `bufs.len()`, not less.
         let (a, b) = socketpair();
 
+        let cap = BatchDgram::recv_capacity();
         let extra = 10;
-        for _ in 0..MAX_BATCH + extra {
+        for _ in 0..cap + extra {
             write_datagram(a.as_raw_fd(), &[0xAA; 8]);
         }
 
-        let mut buffers: Vec<Vec<u8>> = (0..MAX_BATCH + extra * 2).map(|_| vec![0u8; 64]).collect();
+        let mut buffers: Vec<Vec<u8>> = (0..cap + extra * 2).map(|_| vec![0u8; 64]).collect();
         let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
 
         let mut batch = BatchDgram::new();
         let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
         assert_eq!(
             entries.len(),
-            MAX_BATCH,
-            "first call must return exactly MAX_BATCH ({MAX_BATCH}) entries"
+            cap,
+            "first call must return exactly recv_capacity ({cap}) entries"
         );
         for entry in entries {
             assert_eq!(entry.len, 8);
@@ -610,6 +693,66 @@ mod tests {
         let send_bufs: Vec<&[u8]> = vec![];
         let sent = batch.send_batch(b.as_raw_fd(), &send_bufs).unwrap();
         assert_eq!(sent, 0);
+    }
+
+    /// `send_batch_iter` accepts a non-contiguous source (the shape the
+    /// datapath's pending-frame `VecDeque` has) and preserves send order.
+    #[test]
+    fn send_batch_iter_sends_from_a_non_contiguous_queue() {
+        let (a, b) = socketpair();
+
+        let mut queue: std::collections::VecDeque<Vec<u8>> = (0..8u8)
+            .map(|i| vec![i; 64])
+            .collect::<std::collections::VecDeque<_>>(
+        );
+        // Force a wrapped (two-slice) internal layout.
+        queue.rotate_left(3);
+
+        let mut batch = BatchDgram::new();
+        let sent = batch
+            .send_batch_iter(a.as_raw_fd(), queue.iter().map(Vec::as_slice))
+            .unwrap();
+        assert_eq!(sent, 8);
+
+        let mut buf = [0u8; 128];
+        for expected in &queue {
+            let n = read_datagram(b.as_raw_fd(), &mut buf);
+            assert_eq!(n, 64);
+            assert_eq!(buf[0], expected[0], "datagram order must be preserved");
+        }
+    }
+
+    /// A batch that overruns the peer's receive buffer is a **partial send**,
+    /// not a failure: the kernel reports how many datagrams it accepted and
+    /// leaves the rest untouched. Callers must requeue `bufs[n..]` and learn
+    /// the blocking errno from a follow-up call — the batch call itself
+    /// carries no errno once it has sent at least one datagram.
+    #[test]
+    fn partial_send_reports_accepted_count() {
+        let (a, b) = socketpair();
+        // Shrink both ends so a modest batch overruns the peer buffer.
+        set_buf_size(a.as_raw_fd(), libc::SO_SNDBUF, 8192);
+        set_buf_size(b.as_raw_fd(), libc::SO_RCVBUF, 8192);
+
+        let count = BatchDgram::send_capacity();
+        let payloads: Vec<Vec<u8>> = (0..count).map(|_| vec![0xEE; 2048]).collect();
+        let bufs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+
+        let mut batch = BatchDgram::new();
+        let sent = batch.send_batch(a.as_raw_fd(), &bufs).unwrap();
+        assert!(
+            sent > 0 && sent < count,
+            "expected a partial send, got {sent}/{count}"
+        );
+
+        // The follow-up call is what surfaces the blocking errno.
+        let err = batch
+            .send_batch(a.as_raw_fd(), &bufs[sent..])
+            .expect_err("a full peer buffer must block the next batch");
+        assert!(
+            err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::ENOBUFS),
+            "unexpected block errno: {err}"
+        );
     }
 
     #[test]
