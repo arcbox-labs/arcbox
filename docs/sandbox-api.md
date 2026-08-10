@@ -269,11 +269,12 @@ mapping. Mappings are removed automatically on Stop/Remove/TTL. CLI:
 `ListExposedPorts{id}` returns the daemon's current host listeners as
 `{sandbox_port, host_port, protocol}` records in stable order. A known
 sandbox with no listeners returns an empty list; an unknown sandbox returns
-`NOT_FOUND`, and an unready daemon or unreachable sandbox registry returns
-`UNAVAILABLE`. The guest relay port is deliberately internal and is not
-part of Desktop reconciliation. Stop, Remove, Pause, TTL cleanup, and daemon
-restart discard these mappings; the response is a current snapshot, not
-history or persisted configuration.
+`NOT_FOUND`, and an unready daemon, an unreachable sandbox registry, or a
+concurrent cleanup that prevents a stable snapshot returns `UNAVAILABLE`.
+The guest relay port is deliberately internal and is not part of Desktop
+reconciliation. Stop, Remove, Pause, TTL cleanup, and daemon restart discard
+these mappings; the response is a current snapshot, not history or persisted
+configuration.
 
 ### Pause / Resume (CORE-21)
 
