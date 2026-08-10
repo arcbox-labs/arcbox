@@ -66,9 +66,10 @@ impl SandboxManager {
     /// would otherwise outlive it). The catalog entry is already gone, so a
     /// failed snapshot delete must not fail the mutation — it would strand
     /// the caller with a half-deleted template it can only retry into
-    /// `TemplateNotFound`. Leftovers are orphaned but inert (they carry no
-    /// `arcbox.warm_key`, so the warm LRU ignores them) and warrant a
-    /// warning, not an error.
+    /// `TemplateNotFound`. Leftovers are orphaned but recoverable: they carry
+    /// no `arcbox.warm_key` (warm LRU ignores them), and once no record
+    /// references them the checkpoint deletion guard steps aside, so
+    /// `DeleteSnapshot` by id reclaims the disk.
     async fn delete_released_snapshots(&self, released: &ReleasedArtifacts) {
         for snapshot_id in &released.snapshot_ids {
             self.drain_pool(Some(snapshot_id)).await;
@@ -143,11 +144,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn template_snapshots_are_hidden_and_delete_refused_on_the_checkpoint_surface() {
+    async fn template_snapshots_are_hidden_and_delete_refused_while_referenced() {
         let dir = tempfile::tempdir().unwrap();
         let m = manager(dir.path()).await;
         let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
         let snapshot_id = publish_template_snapshot(&catalog, "code");
+        m.register_template_draft("code", entry_with_warm(&snapshot_id))
+            .await
+            .unwrap();
 
         let listed = m.list_checkpoints(None).unwrap();
         assert!(
@@ -164,6 +168,19 @@ mod tests {
             catalog.find_by_id(&snapshot_id).is_ok(),
             "guard must not delete"
         );
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_template_snapshot_is_reclaimable_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manager(dir.path()).await;
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        // Labeled, but no catalog record references it — the failure-mode
+        // orphan. DeleteSnapshot by id is the recovery path and must work.
+        let snapshot_id = publish_template_snapshot(&catalog, "ghost");
+
+        m.delete_checkpoint(&snapshot_id).await.unwrap();
+        assert!(catalog.find_by_id(&snapshot_id).is_err());
     }
 
     #[tokio::test]

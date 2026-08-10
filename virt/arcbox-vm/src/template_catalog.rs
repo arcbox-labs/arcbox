@@ -350,6 +350,23 @@ impl TemplateCatalog {
         Ok(self.released_after_commit(&removed))
     }
 
+    /// True when any catalog entry references `snapshot_id` as its warm
+    /// artifact. The checkpoint surface's deletion guard keys on this so an
+    /// orphaned template-labeled snapshot (record gone after a failed
+    /// post-commit cleanup) stays reclaimable via `DeleteSnapshot`.
+    pub fn references_snapshot(&self, snapshot_id: &str) -> Result<bool> {
+        let _guard = self.lock.lock().unwrap();
+        Ok(self
+            .read_all()?
+            .iter()
+            .flat_map(TemplateRecord::entries)
+            .any(|e| {
+                e.warm
+                    .as_ref()
+                    .is_some_and(|w| w.snapshot_id == snapshot_id)
+            }))
+    }
+
     /// Rootfs images that catalog entries need to stay bootable — a pin
     /// source for the converted-rootfs cache sweep, alongside
     /// [`SnapshotCatalog::referenced_rootfs_paths`](crate::snapshot::SnapshotCatalog::referenced_rootfs_paths).

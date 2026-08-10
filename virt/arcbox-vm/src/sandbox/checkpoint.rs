@@ -1076,9 +1076,12 @@ impl SandboxManager {
     ///
     /// Internal pause checkpoints are refused — deleting one would strand
     /// its paused sandbox; they die with the sandbox via `Remove`.
-    /// Template-owned snapshots (CORE-107) are likewise refused: the
-    /// catalog still references them, so they are reclaimed only through
-    /// template deletion.
+    /// Template-owned snapshots (CORE-107) are refused while the catalog
+    /// still references them — they are reclaimed through template deletion.
+    /// A labeled snapshot no record references (orphaned by a failed
+    /// post-commit cleanup) is deliberately deletable: this is the operator's
+    /// only recovery path, since `list_checkpoints` hides it and
+    /// `delete_template` answers `TemplateNotFound`.
     pub async fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
         let meta = self.snapshots.find_by_id(snapshot_id)?;
         if meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
@@ -1088,7 +1091,11 @@ impl SandboxManager {
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
             });
         }
-        if let Some(owner) = meta.labels.get(crate::template_catalog::TEMPLATE_LABEL) {
+        // Fail closed on a catalog scan error: never delete what an
+        // unreadable catalog might still reference.
+        if let Some(owner) = meta.labels.get(crate::template_catalog::TEMPLATE_LABEL)
+            && self.templates.references_snapshot(snapshot_id)?
+        {
             return Err(VmmError::FailedPrecondition(format!(
                 "snapshot {snapshot_id} is owned by template {owner}; delete the template instead"
             )));
