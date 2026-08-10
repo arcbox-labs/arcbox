@@ -97,6 +97,11 @@ service SandboxService {
     // on Stop/Remove.
     rpc ExposePort(ExposePortRequest) returns (ExposePortResponse);
 
+    // List the daemon's current host listeners for one sandbox. Returns
+    // NOT_FOUND when the sandbox does not exist and UNAVAILABLE while its
+    // state cannot be verified.
+    rpc ListExposedPorts(ListExposedPortsRequest) returns (ListExposedPortsResponse);
+
     // Remove a previously exposed port mapping.
     rpc UnexposePort(UnexposePortRequest) returns (google.protobuf.Empty);
 }
@@ -615,6 +620,28 @@ message ExposePortResponse {
     uint32 host_port = 1;
     // Reserved-range guest port carrying the DNAT relay.
     uint32 guest_port = 2;
+}
+
+// Request to list a sandbox's current exposed ports.
+message ListExposedPortsRequest {
+    // Sandbox ID.
+    string id = 1;
+}
+
+// One host listener currently owned by a sandbox.
+message ExposedPort {
+    // Port the workload listens on inside the sandbox.
+    uint32 sandbox_port = 1;
+    // Loopback host port where the service is reachable.
+    uint32 host_port = 2;
+    // Transport protocol.
+    PortProtocol protocol = 3;
+}
+
+// Response to ListExposedPorts.
+message ListExposedPortsResponse {
+    // Current mappings, ordered by sandbox port, protocol, then host port.
+    repeated ExposedPort ports = 1;
 }
 
 // Request to remove an exposed port mapping.

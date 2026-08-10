@@ -467,6 +467,33 @@ pub struct ExposePortResponse {
     #[prost(uint32, tag = "2")]
     pub guest_port: u32,
 }
+/// Request to list a sandbox's current exposed ports.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListExposedPortsRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+}
+/// One host listener currently owned by a sandbox.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExposedPort {
+    /// Port the workload listens on inside the sandbox.
+    #[prost(uint32, tag = "1")]
+    pub sandbox_port: u32,
+    /// Loopback host port where the service is reachable.
+    #[prost(uint32, tag = "2")]
+    pub host_port: u32,
+    /// Transport protocol.
+    #[prost(enumeration = "PortProtocol", tag = "3")]
+    pub protocol: i32,
+}
+/// Response to ListExposedPorts.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExposedPortsResponse {
+    /// Current mappings, ordered by sandbox port, protocol, then host port.
+    #[prost(message, repeated, tag = "1")]
+    pub ports: ::prost::alloc::vec::Vec<ExposedPort>,
+}
 /// Request to remove an exposed port mapping.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnexposePortRequest {

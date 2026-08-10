@@ -416,6 +416,28 @@ class ExposePortResponse(_message.Message):
     guest_port: int
     def __init__(self, host_port: _Optional[int] = ..., guest_port: _Optional[int] = ...) -> None: ...
 
+class ListExposedPortsRequest(_message.Message):
+    __slots__ = ("id",)
+    ID_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    def __init__(self, id: _Optional[str] = ...) -> None: ...
+
+class ExposedPort(_message.Message):
+    __slots__ = ("sandbox_port", "host_port", "protocol")
+    SANDBOX_PORT_FIELD_NUMBER: _ClassVar[int]
+    HOST_PORT_FIELD_NUMBER: _ClassVar[int]
+    PROTOCOL_FIELD_NUMBER: _ClassVar[int]
+    sandbox_port: int
+    host_port: int
+    protocol: PortProtocol
+    def __init__(self, sandbox_port: _Optional[int] = ..., host_port: _Optional[int] = ..., protocol: _Optional[_Union[PortProtocol, str]] = ...) -> None: ...
+
+class ListExposedPortsResponse(_message.Message):
+    __slots__ = ("ports",)
+    PORTS_FIELD_NUMBER: _ClassVar[int]
+    ports: _containers.RepeatedCompositeFieldContainer[ExposedPort]
+    def __init__(self, ports: _Optional[_Iterable[_Union[ExposedPort, _Mapping]]] = ...) -> None: ...
+
 class UnexposePortRequest(_message.Message):
     __slots__ = ("id", "sandbox_port", "protocol")
     ID_FIELD_NUMBER: _ClassVar[int]
