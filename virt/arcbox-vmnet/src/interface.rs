@@ -909,12 +909,27 @@ mod tests {
     #[test]
     #[ignore = "requires macOS vmnet entitlements and root"]
     fn test_vmnet_read_no_data() {
-        let vmnet = Vmnet::new_shared().expect("Failed to create vmnet");
-        let mut buf = [0u8; 1500];
+        // Isolated host-only: every Shared-mode interface joins the same
+        // NAT subnet, so a concurrently running test's broadcast traffic
+        // (e.g. the relay DHCP loopback test) reaches a Shared interface
+        // here and breaks the "no data" premise. Isolation gives this
+        // interface its own empty L2 network. The buffer is sized to
+        // max_packet_size — a bare 1500 is smaller than a full frame and
+        // turns an arriving packet into VMNET_PACKET_TOO_BIG.
+        let vmnet = Vmnet::new(VmnetConfig::host_only().with_isolation(true))
+            .expect("Failed to create vmnet");
+        let mut buf = vec![0u8; vmnet.max_packet_size()];
 
-        let result = vmnet.read_packet(&mut buf);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
+        // Drain any stray host chatter; the contract under test is that an
+        // empty queue reads as Ok(0), never an error.
+        for _ in 0..32 {
+            match vmnet.read_packet(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) => panic!("read_packet on an idle interface failed: {e}"),
+            }
+        }
+        panic!("queue never drained to empty");
     }
 
     #[test]
