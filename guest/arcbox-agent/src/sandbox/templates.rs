@@ -123,24 +123,25 @@ impl SandboxService {
                 "build source is required: docker_ref, dockerfile, or snapshot_id".into(),
             )
         })?;
-        if req.prewarm && !matches!(source, Source::SnapshotId(_)) {
-            // Loud, not silently ignored: a caller asking for a warm
-            // template must not receive a cold one labeled as built.
-            return Err(SandboxError::Unsupported(
-                "prewarm is not implemented yet (CORE-107)".into(),
-            ));
-        }
         let _flight = self.begin_template_build(&req.name)?;
         let labels: HashMap<String, String> = req.labels.clone().into_iter().collect();
         match source {
             Source::DockerRef(image) => {
-                self.build_template_from_docker(&req.name, &image, defaults, labels)
+                self.build_template_from_docker(&req.name, &image, defaults, labels, req.prewarm)
                     .await
             }
             Source::Dockerfile(dockerfile) => {
-                self.build_template_from_dockerfile(&req.name, &dockerfile, defaults, labels)
-                    .await
+                self.build_template_from_dockerfile(
+                    &req.name,
+                    &dockerfile,
+                    defaults,
+                    labels,
+                    req.prewarm,
+                )
+                .await
             }
+            // `prewarm` is ignored for snapshot sources — warm by
+            // construction, per the proto.
             Source::SnapshotId(snapshot_id) => {
                 self.build_template_from_snapshot(&req.name, &snapshot_id, defaults, labels)
                     .await
@@ -168,10 +169,11 @@ impl SandboxService {
             .promote_snapshot_to_template(snapshot_id, name)
             .await
             .map_err(SandboxError::from)?;
-        // Source identity is the origin checkpoint; the fresh copy id makes
-        // each promotion a distinct content instance, so a displaced draft's
-        // copy is released rather than aliased.
-        let digest = compute_digest(snapshot_id, Some(&promoted.snapshot_id), &defaults, &labels);
+        // Content identity is the ORIGIN checkpoint, never the fresh copy id:
+        // re-promoting the same source must reproduce the digest so Publish
+        // stays idempotent and canonical refs pin content. Displaced copies
+        // are released by snapshot id, which needs no digest involvement.
+        let digest = compute_digest(snapshot_id, Some("promoted"), &defaults, &labels);
         // Any failure between the committed copy and its registration must
         // take the copy with it, or it sits orphaned outside every listing.
         let rootfs_bytes = match tokio::fs::metadata(&promoted.rootfs_path).await {
@@ -200,6 +202,24 @@ impl SandboxService {
             created_at: chrono::Utc::now(),
             size_bytes: promoted.artifact_bytes + rootfs_bytes,
         };
+        self.register_draft(name, entry).await
+    }
+
+    /// Register a built entry, discarding its warm snapshot when
+    /// registration fails — the snapshot would otherwise sit as a
+    /// (recoverable) orphan until an operator noticed the log line.
+    async fn register_draft(
+        &self,
+        name: &str,
+        entry: TemplateEntry,
+    ) -> Result<sandbox_v1::Template, SandboxError> {
+        // The registration step joins the same per-name operation lock
+        // Publish/Delete hold, so the final catalog mutation serializes with
+        // theirs; the long build phases deliberately run outside it (holding
+        // it for minutes would block every other verb on the name — the
+        // in-flight guard already keeps concurrent Builds out).
+        let _operation = self.operations.lock(&operation_key(name)).await;
+        let warm_id = entry.warm.as_ref().map(|w| w.snapshot_id.clone());
         match self.manager.register_template_draft(name, entry).await {
             Ok(entry) => Ok(convert::template_to_proto(name, &entry)),
             // `Unavailable` is the atomic-write durability-uncertain shape:
@@ -212,9 +232,9 @@ impl SandboxService {
             Err(error) => {
                 // Registration certainly did not commit — the copy is
                 // otherwise orphaned (recoverable, but why wait).
-                self.manager
-                    .discard_promoted_snapshot(&promoted.snapshot_id)
-                    .await;
+                if let Some(snapshot_id) = warm_id {
+                    self.manager.discard_promoted_snapshot(&snapshot_id).await;
+                }
                 Err(SandboxError::from(error))
             }
         }
@@ -234,6 +254,7 @@ impl SandboxService {
         dockerfile: &str,
         defaults: TemplateDefaultsSpec,
         labels: HashMap<String, String>,
+        prewarm: bool,
     ) -> Result<sandbox_v1::Template, SandboxError> {
         if dockerfile.trim().is_empty() {
             return Err(SandboxError::InvalidArgument(
@@ -248,18 +269,19 @@ impl SandboxService {
                 .await
                 .map_err(|e| SandboxError::Internal(format!("template build {name}: {e:#}")))?;
         }
-        self.build_template_from_docker(name, &tag, defaults, labels)
+        self.build_template_from_docker(name, &tag, defaults, labels, prewarm)
             .await
     }
 
     /// Export `image` from the guest's dockerd, convert it to a cached ext4,
-    /// and register the draft entry.
+    /// optionally boot-and-checkpoint it (prewarm), and register the draft.
     async fn build_template_from_docker(
         &self,
         name: &str,
         image: &str,
         defaults: TemplateDefaultsSpec,
         labels: HashMap<String, String>,
+        prewarm: bool,
     ) -> Result<sandbox_v1::Template, SandboxError> {
         if image.trim().is_empty() {
             return Err(SandboxError::InvalidArgument(
@@ -289,33 +311,38 @@ impl SandboxService {
                 SandboxError::Internal(format!("unparsable rootfs cache path {rootfs}"))
             })?
             .to_owned();
-        let size_bytes = tokio::fs::metadata(&rootfs)
+        let rootfs_bytes = tokio::fs::metadata(&rootfs)
             .await
             .map_err(|e| SandboxError::Internal(format!("stat {rootfs}: {e}")))?
             .len();
-        let digest = compute_digest(&source_identity, None, &defaults, &labels);
+        let (warm, artifact_bytes) = if prewarm {
+            let outcome = self
+                .manager
+                .prewarm_template(name, &rootfs, &defaults)
+                .await
+                .map_err(SandboxError::from)?;
+            (Some(outcome.warm), outcome.artifact_bytes)
+        } else {
+            (None, 0)
+        };
+        // The warm input is a content TAG (prewarmed + geometry), never the
+        // freshly minted snapshot id — an identical rebuild must reproduce
+        // the digest or idempotent re-publish breaks.
+        let warm_tag = warm
+            .as_ref()
+            .map(|w| format!("prewarmed:{}x{}", w.vcpus, w.memory_mib));
+        let digest = compute_digest(&source_identity, warm_tag.as_deref(), &defaults, &labels);
         let entry = TemplateEntry {
             version: String::new(),
             digest,
             rootfs_path: rootfs,
-            warm: None,
+            warm,
             defaults,
             labels,
             created_at: chrono::Utc::now(),
-            size_bytes,
+            size_bytes: rootfs_bytes + artifact_bytes,
         };
-        // The registration step joins the same per-name operation lock
-        // Publish/Delete hold, so the final catalog mutation serializes with
-        // theirs; the long build phases above deliberately run outside it
-        // (holding it for minutes would block every other verb on the name —
-        // the in-flight guard already keeps concurrent Builds out).
-        let _operation = self.operations.lock(&operation_key(name)).await;
-        let entry = self
-            .manager
-            .register_template_draft(name, entry)
-            .await
-            .map_err(SandboxError::from)?;
-        Ok(convert::template_to_proto(name, &entry))
+        self.register_draft(name, entry).await
     }
 
     /// Mark `name` as having a build in flight; the guard clears it on drop.

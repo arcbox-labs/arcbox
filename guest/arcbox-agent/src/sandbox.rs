@@ -244,6 +244,20 @@ impl SandboxService {
         }
 
         spec.rootfs = self.resolve_template(&source).await?;
+        if let templates::TemplateSource::Catalog(resolved) = &source {
+            // The template's pre-warmed snapshot rides the spec so the
+            // manager can restore instead of cold-booting when eligible.
+            spec.template_warm =
+                resolved
+                    .entry
+                    .warm
+                    .as_ref()
+                    .map(|warm| arcbox_vm::TemplateWarmRef {
+                        snapshot_id: warm.snapshot_id.clone(),
+                        vcpus: warm.vcpus,
+                        memory_mib: warm.memory_mib,
+                    });
+        }
 
         let (id, ip_address) = self
             .manager
@@ -656,6 +670,9 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
         ssh_public_key: req.ssh_public_key,
         idle_timeout_seconds: req.idle_timeout_seconds,
         on_idle: idle_action_to_spec(req.on_idle.as_known().unwrap_or_default()),
+        // Filled by create_once from the resolved catalog entry; a request
+        // never names a snapshot directly (CORE-54).
+        template_warm: None,
     }
 }
 
