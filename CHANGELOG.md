@@ -5,6 +5,113 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4](https://github.com/arcboxlabs/arcbox/compare/v0.6.3...v0.6.4) (2026-08-10)
+
+
+### Features
+
+* **agent:** serve sandbox pause/resume over vsock (CORE-21) ([43de608](https://github.com/arcboxlabs/arcbox/commit/43de60802524f49c7a8e441e00d93d73020caa16))
+* **api:** classify agent errors into the sandbox error registry (CORE-58) ([072c937](https://github.com/arcboxlabs/arcbox/commit/072c9376ec492eb122aa4ec906b8ad87e275f323))
+* **api:** list sandbox exposed ports (CORE-102) ([#585](https://github.com/arcboxlabs/arcbox/issues/585)) ([e40e57a](https://github.com/arcboxlabs/arcbox/commit/e40e57af1005bdfe5f339abd22c511ad24f3bf81))
+* **api:** real GetCapabilities + nested-virt fail-fast on Create (CORE-13) ([cb5ed3c](https://github.com/arcboxlabs/arcbox/commit/cb5ed3c3d02987ffdc8c3609677cd36b50f67aa3))
+* **api:** real Pause/Resume + daemon-side transparent auto-resume (CORE-21) ([0f1a782](https://github.com/arcboxlabs/arcbox/commit/0f1a78234d510a4c754acd51049c5dd82bd4462a))
+* **core:** AgentClient pause/resume RPCs (CORE-21) ([1874e39](https://github.com/arcboxlabs/arcbox/commit/1874e39e5d54d3b8e13ef4ad46282453c435b82d))
+* **e2e:** idle auto-pause + SetLifecycle + capabilities scenario; docs (CORE-21/60/13) ([90216b2](https://github.com/arcboxlabs/arcbox/commit/90216b25b82b434251db57aa6ea3473edfe61ddb))
+* **e2e:** pause / auto-resume / explicit-resume scenario (CORE-21) ([fdae9b5](https://github.com/arcboxlabs/arcbox/commit/fdae9b5d083b7d70bee92ddc60632fcd0a47da23))
+* **rpc:** pause/resume vsock wire types (CORE-21) ([bea2938](https://github.com/arcboxlabs/arcbox/commit/bea2938115c82342e0c9f8894ae589f1f52a4d24))
+* **sandbox:** implement template Build from a docker_ref source (CORE-107) ([#593](https://github.com/arcboxlabs/arcbox/issues/593)) ([a7db0d4](https://github.com/arcboxlabs/arcbox/commit/a7db0d44f2450e746ba692ad791585ace47c905b))
+* **sandbox:** implement template Build from inline Dockerfile content (CORE-107) ([#594](https://github.com/arcboxlabs/arcbox/issues/594)) ([fd3bb9f](https://github.com/arcboxlabs/arcbox/commit/fd3bb9f22055cd13a9933b8675d1bc887c7b8955))
+* **sandbox:** implement the filesystem verbs and process-plane queries (CORE-62) ([#582](https://github.com/arcboxlabs/arcbox/issues/582)) ([cad4fee](https://github.com/arcboxlabs/arcbox/commit/cad4fee2785bf0aae61df077ccb83792cb2a6be0))
+* **sandbox:** network-identity-invariant snapshots ([#562](https://github.com/arcboxlabs/arcbox/issues/562)) ([4149fb1](https://github.com/arcboxlabs/arcbox/commit/4149fb1b4bfd021399398a98173348981f7114bf))
+* **sandbox:** serve eligible creates from warm template snapshots ([#569](https://github.com/arcboxlabs/arcbox/issues/569)) ([d23c12b](https://github.com/arcboxlabs/arcbox/commit/d23c12b8b4c8c9a238e6ac6d2d4baa725e508fa2))
+* **sandbox:** template catalog store with GC pins (CORE-107) ([#590](https://github.com/arcboxlabs/arcbox/issues/590)) ([82c8b65](https://github.com/arcboxlabs/arcbox/commit/82c8b651dfca672853bc2235cf4715163212f8db))
+* **sandbox:** wire SetLifecycle end to end (CORE-60) ([ecdf7d2](https://github.com/arcboxlabs/arcbox/commit/ecdf7d21f5d89d09f7e8114c2160a0742e4657f4))
+* **sandbox:** wire the template catalog RPCs end to end (CORE-107) ([#592](https://github.com/arcboxlabs/arcbox/issues/592)) ([a92fb13](https://github.com/arcboxlabs/arcbox/commit/a92fb136ef5ff0e64c437bd28fcbf887d624ecf7))
+* **vm:** idle detection + on_idle policy and re-armable TTL deadlines (CORE-21/60) ([d5b2dff](https://github.com/arcboxlabs/arcbox/commit/d5b2dff5b81c9fcd4e5d7a7e06b57d91283b6935))
+* **vm:** sandbox pause/resume on the same id (CORE-21) ([a244ce2](https://github.com/arcboxlabs/arcbox/commit/a244ce256df775fe1f6827037bab6e5eba37ddb6))
+
+
+### Bug Fixes
+
+* **agent:** disambiguate exec ENOENT failures ([62aa0c4](https://github.com/arcboxlabs/arcbox/commit/62aa0c491e4fe044f8a0c7de7724ddf0122cc3c7))
+* **ci:** harden the SDK publish jobs against the review findings ([ef4e411](https://github.com/arcboxlabs/arcbox/commit/ef4e4112d4ba087b2f3283af58e76f3599328934))
+* **ci:** install with --frozen so a release tag's version bump is not fatal ([76ae8ee](https://github.com/arcboxlabs/arcbox/commit/76ae8ee0d9c97202b800ddb24ab075740b138fc7))
+* **ci:** pin the publish jobs' actions and drop their cache/credential surface ([2fb3528](https://github.com/arcboxlabs/arcbox/commit/2fb3528e2b52bc5472eac82151293a13d013ed7a))
+* **cli:** clarify component and boot versions ([134da85](https://github.com/arcboxlabs/arcbox/commit/134da85966e5a1a6ba33f4d5aa94b54e8d0b8257))
+* **cli:** classify machine and sandbox failures ([9256795](https://github.com/arcboxlabs/arcbox/commit/925679513221ae4dcac0e825155073a959fecb73))
+* **cli:** complete debug guidance fallbacks ([052d392](https://github.com/arcboxlabs/arcbox/commit/052d392dc319307a0c919e9ebeb7d77ee48bdf2e))
+* **cli:** preserve raw-mode output and debug guidance ([28591dd](https://github.com/arcboxlabs/arcbox/commit/28591dd00f87ab804de086fd55885b72886ffaa8))
+* **cli:** render actionable command failures ([85abe57](https://github.com/arcboxlabs/arcbox/commit/85abe57c84a025681fc8a8ef879e4ae8dd3b30d9))
+* **cli:** resolve CORE-91/92/93/94/95/98 production audit findings ([#577](https://github.com/arcboxlabs/arcbox/issues/577)) ([56567d1](https://github.com/arcboxlabs/arcbox/commit/56567d12034b6519666f0a639a223bc6edc24194))
+* **cli:** restore top controls and sanitize ANSI ([dc37582](https://github.com/arcboxlabs/arcbox/commit/dc375825e62e7025f55da16f38bbeace4bf4669f))
+* **e2e:** apply the cold-download READY budget to the sdk_py harness too ([277a1dd](https://github.com/arcboxlabs/arcbox/commit/277a1dd224f2b2a163670d9aae80ad525960ec1a))
+* **e2e:** apply the cold-download READY budget to the sdk_ts harness too ([9984dcf](https://github.com/arcboxlabs/arcbox/commit/9984dcf518209b4d2c9a520f3df8d0363973e5ec))
+* **e2e:** budget the sandbox smoke's cold runtime-binary download ([8b5dfad](https://github.com/arcboxlabs/arcbox/commit/8b5dfadba4815428c4a0adb4815332ea9ccda2a0))
+* **e2e:** drop the stray doc bullet from the sdk_ts READY budget comment ([d856408](https://github.com/arcboxlabs/arcbox/commit/d85640812fadb1330f25d608fd84291b88d19d67))
+* **e2e:** seed guest runtime binaries into the generation directory ([4b2041b](https://github.com/arcboxlabs/arcbox/commit/4b2041bb873b4f2a74343275ff89ea09e81eefa7))
+* **exec:** preserve actionable resource errors ([63fc728](https://github.com/arcboxlabs/arcbox/commit/63fc728ced56a1642fb9044530a4908d69bf43a0))
+* **release:** resume partial crates.io publishes ([#548](https://github.com/arcboxlabs/arcbox/issues/548)) ([34a5e64](https://github.com/arcboxlabs/arcbox/commit/34a5e641aa91e5f47a63e92efdef0b0d53c4b7cd))
+* **sandbox:** abort resume when the Resuming commit is not durable ([01dd386](https://github.com/arcboxlabs/arcbox/commit/01dd38659c5a1125f331c8dde13d2d27fdc06dc5))
+* **sandbox:** address the lifecycle-knobs review findings ([5bcd4cb](https://github.com/arcboxlabs/arcbox/commit/5bcd4cbd987c574b8ee169f2a258d01fbe40ac2b))
+* **sandbox:** classify file read/write errors on the file channel ([#586](https://github.com/arcboxlabs/arcbox/issues/586)) ([b79304a](https://github.com/arcboxlabs/arcbox/commit/b79304a5b525e5e5421af34d3f606e679f72e8c7))
+* **sandbox:** close the idle-pause -&gt; resume network-finalization race ([45cd0e6](https://github.com/arcboxlabs/arcbox/commit/45cd0e6241abc81244939cc65c862ba60461c934))
+* **sandbox:** fix the TAP-teardown race and surface swallowed RPC failures ([#567](https://github.com/arcboxlabs/arcbox/issues/567)) ([49d7119](https://github.com/arcboxlabs/arcbox/commit/49d711934e6c5928d02a5380b33c2ea656493975))
+* **sandbox:** keep paused_at stable across failed resumes; prove the resumed TAP ([4036c21](https://github.com/arcboxlabs/arcbox/commit/4036c21aa21ffd953991a5521f44af4219cecf4d))
+* **sandbox:** survive the pause-commit-to-journal-clear crash window ([4189097](https://github.com/arcboxlabs/arcbox/commit/4189097ae56beda443c4ac9bd33e8091ee3ab683))
+* **vm:** gate dm-snapshot CoW on device-mapper usability, not binary existence ([253a55e](https://github.com/arcboxlabs/arcbox/commit/253a55e1e6167f1eba851ce1889ccbbbafa9d052))
+
+
+### Performance Improvements
+
+* **net:** batch guest-bound frame writes with sendmsg_x (ABX-313) ([943d9cd](https://github.com/arcboxlabs/arcbox/commit/943d9cd0cfd458282b6482ccfe6b9a036ab78279))
+* **sandbox:** cold-start probe + restore fast path round 1 ([#555](https://github.com/arcboxlabs/arcbox/issues/555)) ([1b4b766](https://github.com/arcboxlabs/arcbox/commit/1b4b766906262f7ffa86acb8977a633f014464c2))
+* **sandbox:** eBPF TCX datapath for invariant sandbox NAT ([#566](https://github.com/arcboxlabs/arcbox/issues/566)) ([46ef5a3](https://github.com/arcboxlabs/arcbox/commit/46ef5a369ca6dec1ab681dcb22380b507e4cc85d))
+* **sandbox:** gate READY on agent vsock readiness and back off the connect poll ([#559](https://github.com/arcboxlabs/arcbox/issues/559)) ([6d8ab5f](https://github.com/arcboxlabs/arcbox/commit/6d8ab5f0b62af86bb53866a0fc0fd4dd5fbf6b95))
+* **sandbox:** make boot readiness an event via guest vsock dial-out ([#560](https://github.com/arcboxlabs/arcbox/issues/560)) ([b8b7631](https://github.com/arcboxlabs/arcbox/commit/b8b7631b60eb9927ec8aeb91490e43e8d596abaf))
+* **sandbox:** pre-warm restore slots behind an LRU snapshot pool ([#561](https://github.com/arcboxlabs/arcbox/issues/561)) ([6a08111](https://github.com/arcboxlabs/arcbox/commit/6a081119530efeca260cf0d8f253f482ec07c87f))
+* **sandbox:** quiet microVM console + reconfig latency attribution + resolv on tmpfs (round 2) ([#558](https://github.com/arcboxlabs/arcbox/issues/558)) ([72f0e74](https://github.com/arcboxlabs/arcbox/commit/72f0e745d05b99d1ce775f13a9d9e0b5feabe33b))
+* **sandbox:** self-sync the guest clock from ptp_kvm, off the restore path ([#568](https://github.com/arcboxlabs/arcbox/issues/568)) ([21c5232](https://github.com/arcboxlabs/arcbox/commit/21c52321b8fcaf9a4e228884ceb11ebcd1eddd65))
+* **splicetcp:** batch guest-to-host frame reads with recvmsg_x (ABX-313) ([48413aa](https://github.com/arcboxlabs/arcbox/commit/48413aaa042c6d827cdb9c95e84ab0f47e086d99))
+* **xnu-net:** iterator send API and live sysctl batch caps ([693b29b](https://github.com/arcboxlabs/arcbox/commit/693b29b8f48019131ddd82fa760275557aae2860))
+
+
+### Tests
+
+* **agent:** cover missing working directory ([2cd0810](https://github.com/arcboxlabs/arcbox/commit/2cd0810ef06ab7d770778cae3764c2510f957fcc))
+* **e2e:** sdk_py harness — Python SDK hello world vs isolated daemon ([e5189b2](https://github.com/arcboxlabs/arcbox/commit/e5189b252833e43e43c4e7c5d6d9ab8f5274066d))
+* **sandbox:** cover the terminal-state TTL guard and the List storage path ([9089f48](https://github.com/arcboxlabs/arcbox/commit/9089f48b6ef2a4d7e33bbcbad706ae84a63d5bff))
+
+
+### Documentation
+
+* **common:** record the batch-I/O contract the datapath now depends on ([f8e427b](https://github.com/arcboxlabs/arcbox/commit/f8e427b97eb6bff3405b2007c2dfe4729c8546fd))
+* **sandbox:** pause/resume semantics + resolve the Pause-from-RUNNING ambiguity ([7efe0d5](https://github.com/arcboxlabs/arcbox/commit/7efe0d55d07a368f15cd7bfec328075db8c22591))
+* **sdk:** mark the PyPI publish workflow pending and record the bootstrap caveats ([d240b92](https://github.com/arcboxlabs/arcbox/commit/d240b92b1e4277f7c41f1dd30f89a608e5c7eb05))
+* **xnu-net:** pin XNU's silent recv truncation ([93bcf7d](https://github.com/arcboxlabs/arcbox/commit/93bcf7d0235ab9401534ec66c028e65cb38cf33b))
+
+
+### Build System
+
+* **sdk:** register @arcbox/sandbox as a release-please component ([d36184a](https://github.com/arcboxlabs/arcbox/commit/d36184a2f35f742b2f0f2a5e6df1143b87ea718e))
+* **sdk:** register arcbox (Python) as a release-please component ([3b44845](https://github.com/arcboxlabs/arcbox/commit/3b44845028754de220e5a94bae54096daf6cddcf))
+
+
+### Continuous Integration
+
+* hash-pin actions and harden ci.yml per zizmor ([88d6220](https://github.com/arcboxlabs/arcbox/commit/88d62200ed5a10798848e8e7a412c4cd8856fb96))
+* **sdk:** gate the TypeScript and Python SDKs on every PR ([f1cda25](https://github.com/arcboxlabs/arcbox/commit/f1cda25ff028a6a9cdb8ac898d58455faf1a6776))
+* **sdk:** mirror the release uv build in the Python PR gate ([89a9323](https://github.com/arcboxlabs/arcbox/commit/89a932388e575e4d7afda43ebb07791c6e96951a))
+* **sdk:** pin the PR gate's uv to the release toolchain range ([a7f5d51](https://github.com/arcboxlabs/arcbox/commit/a7f5d51c35f74c72750913080ecdb46f590ab3ed))
+* **sdk:** publish @arcbox/sandbox to npm on the sdk-typescript tag ([bf9af74](https://github.com/arcboxlabs/arcbox/commit/bf9af74c1268b8e8296f2a2d496d72567c7b7754))
+* **sdk:** publish arcbox (Python) to PyPI on the sdk-python tag ([cf33b8c](https://github.com/arcboxlabs/arcbox/commit/cf33b8c91732dd1288fe480d383a3881f75916a5))
+
+
+### Miscellaneous Chores
+
+* **assets:** pin boot assets 0.8.4 with the two-arch microvm kernel ([#572](https://github.com/arcboxlabs/arcbox/issues/572)) ([50e59cd](https://github.com/arcboxlabs/arcbox/commit/50e59cddb176a2b6b6e4a992e8a6dfa445a12c5b))
+* **master:** release sdk-python 0.1.1 ([05e7cf5](https://github.com/arcboxlabs/arcbox/commit/05e7cf532bedfe84c948f8bed9db46019656ae43))
+* **master:** release sdk-typescript 0.1.1 ([79f6170](https://github.com/arcboxlabs/arcbox/commit/79f61709db4fcf26b478d0d4bdeb7a1e0c252b96))
+
 ## [0.6.3](https://github.com/arcboxlabs/arcbox/compare/v0.6.2...v0.6.3) (2026-08-03)
 
 
