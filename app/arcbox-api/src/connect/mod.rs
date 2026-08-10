@@ -202,6 +202,24 @@ fn wire_protocol(
     }
 }
 
+fn exposed_port(
+    mapping: arcbox_core::SandboxPortMapping,
+) -> arcbox_connect::sandbox_v1::ExposedPort {
+    use arcbox_connect::sandbox_v1::{ExposedPort, PortProtocol};
+    use arcbox_core::SandboxPortProtocol;
+
+    ExposedPort {
+        sandbox_port: u32::from(mapping.sandbox_port),
+        host_port: u32::from(mapping.host_port),
+        protocol: match mapping.protocol {
+            SandboxPortProtocol::Tcp => PortProtocol::Tcp,
+            SandboxPortProtocol::Udp => PortProtocol::Udp,
+        }
+        .into(),
+        ..Default::default()
+    }
+}
+
 /// Registers every Connect-served service on one router.
 ///
 /// Kept here rather than in the daemon so that adding a service is one edit
@@ -301,5 +319,20 @@ mod tests {
             .sandbox_machine_id()
             .expect_err("other machines must be rejected");
         assert_eq!(error.code, connectrpc::ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn exposed_port_preserves_the_authoritative_mapping() {
+        let port = exposed_port(arcbox_core::SandboxPortMapping {
+            sandbox_port: 8080,
+            host_port: 45_000,
+            protocol: arcbox_core::SandboxPortProtocol::Udp,
+        });
+        assert_eq!(port.sandbox_port, 8080);
+        assert_eq!(port.host_port, 45_000);
+        assert_eq!(
+            port.protocol.as_known(),
+            Some(arcbox_connect::sandbox_v1::PortProtocol::Udp)
+        );
     }
 }

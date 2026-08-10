@@ -242,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn one_endpoint_answers_connect_grpc_and_grpc_web() {
         let (_dir, socket, shutdown) = spawn_control_plane().await;
-        let path = "/arcbox.sandbox.v1.SandboxService/List";
+        let path = "/arcbox.sandbox.v1.SandboxService/ListExposedPorts";
 
         // 1. Connect, JSON over HTTP/1.1 — the `curl` case.
         let response = http1_request(
@@ -283,8 +283,8 @@ mod tests {
             .await
             .expect("gRPC connect over the same socket");
         let status = arcbox_grpc::SandboxServiceClient::new(channel)
-            .list(tonic::Request::new(
-                arcbox_grpc::arcbox_protocol::sandbox_v1::ListSandboxesRequest::default(),
+            .list_exposed_ports(tonic::Request::new(
+                arcbox_grpc::arcbox_protocol::sandbox_v1::ListExposedPortsRequest::default(),
             ))
             .await
             .expect_err("empty runtime is unavailable");

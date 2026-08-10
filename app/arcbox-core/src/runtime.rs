@@ -166,6 +166,26 @@ pub struct SandboxPortExposure {
     pub guest_port: u16,
 }
 
+/// One sandbox mapping currently backed by a host listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxPortMapping {
+    /// Port the workload listens on inside the sandbox.
+    pub sandbox_port: u16,
+    /// Loopback host port where the service is reachable.
+    pub host_port: u16,
+    /// Transport protocol.
+    pub protocol: SandboxPortProtocol,
+}
+
+/// Transport protocol of an exposed sandbox port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SandboxPortProtocol {
+    /// TCP.
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
 impl Runtime {
     /// Creates a new runtime with the given configuration.
     ///
@@ -1251,6 +1271,65 @@ impl Runtime {
         }
     }
 
+    /// Snapshots one sandbox's authoritative host listeners if cleanup has not raced.
+    pub async fn sandbox_port_mappings_if_unchanged(
+        &self,
+        sandbox_id: &str,
+        expected_generation: u64,
+    ) -> Option<Vec<SandboxPortMapping>> {
+        let host_state = self.sandbox_host_state.lock().await;
+        if *host_state != expected_generation {
+            return None;
+        }
+        let mut mappings = Vec::new();
+
+        #[cfg(target_os = "macos")]
+        for (key, (_, rules)) in self.inbound_rules.read().await.iter() {
+            let Some((owner, sandbox_port)) = Self::sandbox_port_key_parts(key) else {
+                continue;
+            };
+            if owner != sandbox_id {
+                continue;
+            }
+            mappings.extend(
+                rules
+                    .iter()
+                    .map(|(_, host_port, protocol)| SandboxPortMapping {
+                        sandbox_port,
+                        host_port: *host_port,
+                        protocol: match protocol {
+                            InboundProtocol::Tcp => SandboxPortProtocol::Tcp,
+                            InboundProtocol::Udp => SandboxPortProtocol::Udp,
+                        },
+                    }),
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        for (key, forwarder) in self.port_forwarders.read().await.iter() {
+            let Some((owner, sandbox_port)) = Self::sandbox_port_key_parts(key) else {
+                continue;
+            };
+            if owner != sandbox_id {
+                continue;
+            }
+            mappings.extend(forwarder.rules().iter().map(|rule| SandboxPortMapping {
+                sandbox_port,
+                host_port: rule.host_addr.port(),
+                protocol: match rule.protocol {
+                    arcbox_net::port_forward::Protocol::Tcp => SandboxPortProtocol::Tcp,
+                    arcbox_net::port_forward::Protocol::Udp => SandboxPortProtocol::Udp,
+                },
+            }));
+        }
+
+        mappings.sort_unstable_by_key(|mapping| {
+            (mapping.sandbox_port, mapping.protocol, mapping.host_port)
+        });
+        drop(host_state);
+        Some(mappings)
+    }
+
     /// Removes every host listener a sandbox owns (Stop/Remove teardown).
     pub async fn remove_sandbox_ports(&self, sandbox_id: &str) {
         let mut keys: HashSet<String> = self
@@ -1335,10 +1414,14 @@ impl Runtime {
     }
 
     fn sandbox_port_key_owner(key: &str) -> Option<&str> {
+        Self::sandbox_port_key_parts(key).map(|(owner, _)| owner)
+    }
+
+    fn sandbox_port_key_parts(key: &str) -> Option<(&str, u16)> {
         let (sandbox_id, binding) = key.strip_prefix("sandbox:")?.rsplit_once(':')?;
         let (port, protocol) = binding.split_once('/')?;
-        (!sandbox_id.is_empty() && port.parse::<u16>().is_ok() && !protocol.is_empty())
-            .then_some(sandbox_id)
+        let port = port.parse().ok()?;
+        (!sandbox_id.is_empty() && !protocol.is_empty()).then_some((sandbox_id, port))
     }
 
     fn sandbox_dns_owner(sandbox_id: &str) -> String {

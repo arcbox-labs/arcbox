@@ -378,6 +378,127 @@ async fn sandbox_cleanup_matches_the_exact_authority_owner() {
     }
 }
 
+#[tokio::test]
+async fn sandbox_port_mappings_filter_sort_and_fence_cleanup() {
+    let (runtime, _tmp) = networking_test_runtime();
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::net::Ipv4Addr;
+
+        let mut rules = runtime.inbound_rules.write().await;
+        rules.insert(
+            Runtime::sandbox_port_key("target", 8080, "tcp"),
+            (
+                "default".into(),
+                vec![(Ipv4Addr::LOCALHOST, 45_001, super::InboundProtocol::Tcp)],
+            ),
+        );
+        rules.insert(
+            Runtime::sandbox_port_key("target", 5353, "udp"),
+            (
+                "default".into(),
+                vec![(Ipv4Addr::LOCALHOST, 45_002, super::InboundProtocol::Udp)],
+            ),
+        );
+        rules.insert(
+            Runtime::sandbox_port_key("target", 8080, "udp"),
+            (
+                "default".into(),
+                vec![(Ipv4Addr::LOCALHOST, 45_000, super::InboundProtocol::Udp)],
+            ),
+        );
+        rules.insert(
+            Runtime::sandbox_port_key("target:other", 80, "tcp"),
+            ("default".into(), Vec::new()),
+        );
+        rules.insert("container-id".into(), ("default".into(), Vec::new()));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let mut forwarders = runtime.port_forwarders.write().await;
+        for (key, rule) in [
+            (
+                Runtime::sandbox_port_key("target", 8080, "tcp"),
+                super::PortForwardRule::tcp(
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45_001).into(),
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_001).into(),
+                ),
+            ),
+            (
+                Runtime::sandbox_port_key("target", 5353, "udp"),
+                super::PortForwardRule::udp(
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45_002).into(),
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_002).into(),
+                ),
+            ),
+            (
+                Runtime::sandbox_port_key("target", 8080, "udp"),
+                super::PortForwardRule::udp(
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45_000).into(),
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_000).into(),
+                ),
+            ),
+            (
+                Runtime::sandbox_port_key("target:other", 80, "tcp"),
+                super::PortForwardRule::tcp(
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45_003).into(),
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_003).into(),
+                ),
+            ),
+            (
+                "container-id".into(),
+                super::PortForwardRule::tcp(
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45_004).into(),
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80).into(),
+                ),
+            ),
+        ] {
+            let mut forwarder = super::PortForwarder::new();
+            forwarder.add_rule(rule);
+            forwarders.insert(key, forwarder);
+        }
+    }
+
+    assert!(runtime.sandbox_port_keys.read().await.is_empty());
+    let generation = runtime.sandbox_host_state_generation().await;
+    let expected = vec![
+        super::SandboxPortMapping {
+            sandbox_port: 5353,
+            host_port: 45_002,
+            protocol: super::SandboxPortProtocol::Udp,
+        },
+        super::SandboxPortMapping {
+            sandbox_port: 8080,
+            host_port: 45_001,
+            protocol: super::SandboxPortProtocol::Tcp,
+        },
+        super::SandboxPortMapping {
+            sandbox_port: 8080,
+            host_port: 45_000,
+            protocol: super::SandboxPortProtocol::Udp,
+        },
+    ];
+    assert_eq!(
+        runtime
+            .sandbox_port_mappings_if_unchanged("target", generation)
+            .await,
+        Some(expected)
+    );
+
+    *runtime.lock_sandbox_host_state().await += 1;
+    assert_eq!(
+        runtime
+            .sandbox_port_mappings_if_unchanged("target", generation)
+            .await,
+        None,
+        "a cleanup race must not return an empty or stale snapshot"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn conflicting_sandbox_cleanup_does_not_remove_the_existing_listener() {

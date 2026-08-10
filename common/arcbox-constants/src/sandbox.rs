@@ -21,4 +21,6 @@ pub const SANDBOX_FEATURES: &[&str] = &[
     "idle_policy",
     // SetLifecycle re-arms TTL / replaces idle knobs (CORE-60).
     "set_lifecycle",
+    // Authoritative host-listener reconciliation (CORE-102).
+    "list_exposed_ports",
 ];

@@ -17,6 +17,7 @@ use arcbox_core::SandboxPortExposure;
 use super::SharedRuntime;
 use crate::ApiError;
 
+use super::exposed_port;
 use super::sandbox_cleanup;
 use super::sandbox_locks::SandboxOperationLocks;
 use super::sandbox_resume;
@@ -372,6 +373,53 @@ impl pb::SandboxService for SandboxServiceImpl {
             ..Default::default()
         };
         Response::ok(resp)
+    }
+
+    async fn list_exposed_ports(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ListExposedPortsRequest>,
+    ) -> ServiceResult<pb::ListExposedPortsResponse> {
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let _operation = self.operations.lock(&machine, &req.id).await;
+        let runtime = self.runtime.ready()?;
+        let mut agent = runtime.get_agent(&machine).map_err(|error| {
+            ConnectError::unavailable(format!("sandbox state unavailable: {error}"))
+        })?;
+        // A retry turns a concurrent TTL/idle deletion into the existing 404
+        // boundary without holding host state across the guest RPC.
+        for _ in 0..2 {
+            let host_generation = runtime.sandbox_host_state_generation().await;
+            agent
+                .sandbox_inspect(pb::InspectSandboxRequest {
+                    id: req.id.clone(),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| match error {
+                    error @ arcbox_core::CoreError::Agent { code: 404, .. } => {
+                        ConnectError::from(ApiError::from(error))
+                    }
+                    error => {
+                        ConnectError::unavailable(format!("sandbox state unavailable: {error}"))
+                    }
+                })?;
+
+            if let Some(mappings) = runtime
+                .sandbox_port_mappings_if_unchanged(&req.id, host_generation)
+                .await
+            {
+                let ports = mappings.into_iter().map(exposed_port).collect();
+                return Response::ok(pb::ListExposedPortsResponse {
+                    ports,
+                    ..Default::default()
+                });
+            }
+        }
+        Err(ConnectError::unavailable(
+            "sandbox cleanup prevented a stable exposed-port snapshot; retry",
+        ))
     }
 
     async fn unexpose_port(

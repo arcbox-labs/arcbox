@@ -962,6 +962,7 @@ async fn assert_capabilities(sandboxes: &mut SandboxServiceClient<Channel>) -> R
         "auto_resume",
         "idle_policy",
         "set_lifecycle",
+        "list_exposed_ports",
     ] {
         if !caps.features.iter().any(|f| f == feature) {
             bail!("missing feature flag {feature:?} in {:?}", caps.features);
