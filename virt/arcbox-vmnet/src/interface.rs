@@ -641,9 +641,70 @@ impl Vmnet {
         Ok(data.len())
     }
 
+    /// Registers a packets-available event callback block on the
+    /// interface's dispatch queue.
+    ///
+    /// The framework takes its own reference to `block`; the caller keeps
+    /// (and must eventually `_Block_release`) its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the framework rejects the registration.
+    pub(crate) fn set_event_callback(&self, block: *const std::ffi::c_void) -> Result<()> {
+        // SAFETY: interface and queue are valid for the lifetime of self;
+        // block is a valid heap block from `create_vmnet_event_block`.
+        let status = unsafe {
+            vmnet_interface_set_event_callback(
+                self.interface,
+                VmnetInterfaceEvent::PacketsAvailable,
+                self.queue,
+                block,
+            )
+        };
+        if !status.is_success() {
+            return Err(VmnetError::config(format!(
+                "vmnet_interface_set_event_callback failed: {}",
+                status.message()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Unregisters the event callback, releasing the framework's reference
+    /// to the handler block (and, through its dispose helper, the context
+    /// the block owns).
+    ///
+    /// Per `vmnet.h`, events are disabled when callback **and queue** are
+    /// both NULL. Idempotent: clearing when nothing is registered is
+    /// harmless, so both `Vmnet::stop` and the relay's exit path call it.
+    pub(crate) fn clear_event_callback(&self) {
+        // SAFETY: NULL queue + NULL callback is the documented disable form;
+        // an in-flight invocation is safe because GCD holds its own
+        // reference to a dispatched block for the invocation's duration.
+        let status = unsafe {
+            vmnet_interface_set_event_callback(
+                self.interface,
+                VmnetInterfaceEvent::PacketsAvailable,
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        if !status.is_success() {
+            tracing::debug!(
+                "vmnet_interface_set_event_callback(NULL) returned: {}",
+                status.message()
+            );
+        }
+    }
+
     /// Stops the vmnet interface.
     pub fn stop(&self) {
         if self.running.swap(false, Ordering::AcqRel) {
+            // Release the event handler block first: the native interface
+            // holds block → context → Arc<Vmnet>, and this call is what
+            // breaks that cycle when the relay task never got to run its
+            // own clear (e.g. runtime shutdown aborted it).
+            self.clear_event_callback();
             // SAFETY: vmnet_stop_interface is safe when called with valid parameters.
             unsafe {
                 vmnet_stop_interface(self.interface, self.queue, ptr::null());
@@ -848,12 +909,27 @@ mod tests {
     #[test]
     #[ignore = "requires macOS vmnet entitlements and root"]
     fn test_vmnet_read_no_data() {
-        let vmnet = Vmnet::new_shared().expect("Failed to create vmnet");
-        let mut buf = [0u8; 1500];
+        // Isolated host-only: every Shared-mode interface joins the same
+        // NAT subnet, so a concurrently running test's broadcast traffic
+        // (e.g. the relay DHCP loopback test) reaches a Shared interface
+        // here and breaks the "no data" premise. Isolation gives this
+        // interface its own empty L2 network. The buffer is sized to
+        // max_packet_size — a bare 1500 is smaller than a full frame and
+        // turns an arriving packet into VMNET_PACKET_TOO_BIG.
+        let vmnet = Vmnet::new(VmnetConfig::host_only().with_isolation(true))
+            .expect("Failed to create vmnet");
+        let mut buf = vec![0u8; vmnet.max_packet_size()];
 
-        let result = vmnet.read_packet(&mut buf);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
+        // Drain any stray host chatter; the contract under test is that an
+        // empty queue reads as Ok(0), never an error.
+        for _ in 0..32 {
+            match vmnet.read_packet(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) => panic!("read_packet on an idle interface failed: {e}"),
+            }
+        }
+        panic!("queue never drained to empty");
     }
 
     #[test]

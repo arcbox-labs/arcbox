@@ -86,6 +86,18 @@ files above.
   release wraps past bounds checks — both are bugs; tests must cover
   near-`u64::MAX` inputs.
 
+## vmnet relay (bridge NIC, `arcbox-vmnet`)
+
+- The vmnet → guest read path is **event-driven** via
+  `vmnet_interface_set_event_callback` (ABX-517) — do not reintroduce a
+  polling/blocking read thread; the deleted 1 kHz poll cost ~half of the
+  daemon's idle CPU and its cancel-then-join teardown could hang
+  `Runtime::drop`. The callback context is owned by the handler block
+  (copy retains, dispose releases) and must never be freed manually;
+  `Vmnet::clear_event_callback` — called from both `Vmnet::stop` and the
+  relay's exit path, idempotent — is what breaks the
+  interface → block → ctx → `Arc<Vmnet>` cycle. Keep both call sites.
+
 ## Debugging — failure signature → first commands → likely cause
 
 Triage rule first: **re-run the same scenario under

@@ -370,16 +370,17 @@ unsafe extern "C" {
 }
 
 // ============================================================================
-// Objective-C Block ABI for vmnet completion handler
+// Objective-C Block ABI for vmnet handlers
 // ============================================================================
 //
 // vmnet_start_interface expects a block with signature:
 //   void (^)(vmnet_return_t status, xpc_object_t interface_param)
+// vmnet_interface_set_event_callback expects:
+//   void (^)(interface_event_t event_mask, xpc_object_t event)
 //
-// We build this block manually using the stable C ABI layout described in
+// We build these blocks manually using the stable C ABI layout described in
 // the Clang Block Implementation Specification.
 
-#[cfg(feature = "vmnet")]
 #[repr(C)]
 pub struct BlockDescriptor {
     pub reserved: usize,
@@ -406,7 +407,6 @@ pub struct VmnetCompletionBlock {
     pub semaphore: DispatchSemaphore,
 }
 
-#[cfg(feature = "vmnet")]
 unsafe extern "C" {
     /// Block ISA for stack-allocated blocks.
     #[link_name = "_NSConcreteStackBlock"]
@@ -470,7 +470,6 @@ static VMNET_BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
 };
 
 /// Block flags: `BLOCK_HAS_COPY_DISPOSE` (1 << 25).
-#[cfg(feature = "vmnet")]
 const BLOCK_HAS_COPY_DISPOSE: i32 = 1 << 25;
 
 /// Creates a heap-allocated vmnet completion block.
@@ -495,6 +494,111 @@ pub unsafe fn create_vmnet_completion_block(sema: DispatchSemaphore) -> *mut c_v
     };
     // SAFETY: _Block_copy takes a pointer to a valid stack block and returns
     // a heap-allocated copy that is safe to pass to vmnet.
+    unsafe { _Block_copy((&raw const stack_block).cast()) }
+}
+
+/// Event block layout matching the C ABI for Objective-C blocks.
+///
+/// Passed to `vmnet_interface_set_event_callback`; vmnet invokes it as
+/// `void (^)(interface_event_t event_mask, xpc_object_t event)` on the
+/// registered dispatch queue. The captures are a raw context pointer plus
+/// the three function pointers that operate on it; the copy/dispose helpers
+/// route through `retain`/`release`, so the context lives exactly as long
+/// as the framework's copy of the block.
+#[repr(C)]
+pub struct VmnetEventBlock {
+    pub isa: *const c_void,
+    pub flags: i32,
+    pub reserved: i32,
+    /// `event_mask` is deliberately a raw `u32` (`interface_event_t` is
+    /// `OBJC_OPTIONS(uint32_t, ...)`): a Rust enum here would be UB for any
+    /// mask value the framework adds later.
+    pub invoke: unsafe extern "C" fn(*mut Self, u32, XpcObjectT),
+    pub descriptor: *const BlockDescriptor,
+    // Captured variables:
+    pub ctx: *const c_void,
+    pub handler: unsafe extern "C" fn(*const c_void),
+    pub retain: unsafe extern "C" fn(*const c_void),
+    pub release: unsafe extern "C" fn(*const c_void),
+}
+
+/// Event block invoke function: forwards to the captured handler.
+///
+/// # Safety
+///
+/// Called by vmnet.framework on the registered dispatch queue; `block` must
+/// point to a valid `VmnetEventBlock` created by `create_vmnet_event_block`.
+unsafe extern "C" fn vmnet_event_block_invoke(
+    block: *mut VmnetEventBlock,
+    _event_mask: u32,
+    _event: XpcObjectT,
+) {
+    // SAFETY: `block` is a live block copy; `ctx` is kept alive by the
+    // block's retain/release helpers until the copy is disposed.
+    unsafe { ((*block).handler)((*block).ctx) }
+}
+
+/// Event block copy helper: retain the captured context.
+unsafe extern "C" fn vmnet_event_block_copy(dst: *mut c_void, _src: *const c_void) {
+    // SAFETY: dst points to a VmnetEventBlock allocated by _Block_copy.
+    unsafe {
+        let block = dst.cast::<VmnetEventBlock>();
+        ((*block).retain)((*block).ctx);
+    }
+}
+
+/// Event block dispose helper: release the captured context.
+unsafe extern "C" fn vmnet_event_block_dispose(block: *mut c_void) {
+    // SAFETY: block points to a VmnetEventBlock being destroyed.
+    unsafe {
+        let block = block.cast::<VmnetEventBlock>();
+        ((*block).release)((*block).ctx);
+    }
+}
+
+static VMNET_EVENT_BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<VmnetEventBlock>(),
+    copy_helper: vmnet_event_block_copy,
+    dispose_helper: vmnet_event_block_dispose,
+};
+
+/// Creates a heap-allocated vmnet event-callback block.
+///
+/// The copy into the returned heap block calls `retain(ctx)` once; the
+/// matching `release(ctx)` runs when the last block copy is disposed. The
+/// caller therefore passes a *borrowed* `ctx` and must:
+/// 1. register the block (the framework takes its own reference), then
+/// 2. drop its own reference with `_Block_release`.
+///
+/// If registration fails, step 2 alone disposes the block and releases the
+/// context — no special error path is needed.
+///
+/// # Safety
+///
+/// `handler`, `retain`, and `release` must be safe to call with `ctx` from
+/// arbitrary dispatch-queue threads for as long as any block copy exists.
+#[must_use]
+pub unsafe fn create_vmnet_event_block(
+    ctx: *const c_void,
+    handler: unsafe extern "C" fn(*const c_void),
+    retain: unsafe extern "C" fn(*const c_void),
+    release: unsafe extern "C" fn(*const c_void),
+) -> *mut c_void {
+    let stack_block = VmnetEventBlock {
+        isa: unsafe { NS_CONCRETE_STACK_BLOCK },
+        flags: BLOCK_HAS_COPY_DISPOSE,
+        reserved: 0,
+        invoke: vmnet_event_block_invoke,
+        descriptor: &raw const VMNET_EVENT_BLOCK_DESCRIPTOR,
+        ctx,
+        handler,
+        retain,
+        release,
+    };
+    // SAFETY: _Block_copy takes a pointer to a valid stack block and returns
+    // a heap-allocated copy (running the copy helper above) that is safe to
+    // pass to vmnet.
     unsafe { _Block_copy((&raw const stack_block).cast()) }
 }
 
@@ -586,5 +690,20 @@ mod tests {
         assert_eq!(offset_of!(VmnetPacket, vm_pkt_iov), 8);
         assert_eq!(offset_of!(VmnetPacket, vm_pkt_iovcnt), 16);
         assert_eq!(offset_of!(VmnetPacket, vm_flags), 20);
+    }
+
+    /// Pins `VmnetEventBlock` to the Clang block ABI: the runtime reads
+    /// `invoke` at offset 16 and `descriptor` at offset 24; a drift there
+    /// makes the framework call through a garbage function pointer.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn vmnet_event_block_matches_block_abi() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<VmnetEventBlock>(), 64);
+        assert_eq!(offset_of!(VmnetEventBlock, isa), 0);
+        assert_eq!(offset_of!(VmnetEventBlock, invoke), 16);
+        assert_eq!(offset_of!(VmnetEventBlock, descriptor), 24);
+        assert_eq!(VMNET_EVENT_BLOCK_DESCRIPTOR.size, 64);
     }
 }
