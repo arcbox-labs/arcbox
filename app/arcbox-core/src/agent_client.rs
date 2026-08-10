@@ -14,16 +14,18 @@ mod wire;
 use self::transport::{AgentTransport, BLOCKING_RPC_TIMEOUT};
 use crate::error::{CoreError, Result};
 use arcbox_connect::sandbox_v1::{
-    AttachExecutionRequest, CheckpointRequest, CheckpointResponse, CreateSandboxRequest,
-    CreateSandboxResponse, DeleteSnapshotRequest, Execution, ExecutionEvent, FileChunk, FileStat,
-    GetStdinStatusRequest, InspectSandboxRequest, ListDirRequest, ListDirResponse,
-    ListExecutionsRequest, ListExecutionsResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, MakeDirRequest, MoveEntryRequest,
-    PauseSandboxRequest, ReadFileRequest, RemoveEntryRequest, RemoveSandboxRequest,
-    ResizeExecutionTtyRequest, RestoreRequest, RestoreResponse, SandboxEvent, SandboxEventsRequest,
-    SandboxInfo, SetLifecycleRequest, SignalExecutionRequest, StartExecutionRequest,
-    StatFileRequest, StdinStatus, StopSandboxRequest, WaitExecutionRequest, WaitForPortRequest,
-    WatchDirRequest, WatchDirResponse, WriteFileOpen, WriteStdinRequest, execution_event,
+    AttachExecutionRequest, BuildTemplateRequest, CheckpointRequest, CheckpointResponse,
+    CreateSandboxRequest, CreateSandboxResponse, DeleteSnapshotRequest, DeleteTemplateRequest,
+    Execution, ExecutionEvent, FileChunk, FileStat, GetStdinStatusRequest, GetTemplateRequest,
+    InspectSandboxRequest, ListDirRequest, ListDirResponse, ListExecutionsRequest,
+    ListExecutionsResponse, ListSandboxesRequest, ListSandboxesResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, ListTemplatesRequest, ListTemplatesResponse, MakeDirRequest,
+    MoveEntryRequest, PauseSandboxRequest, PublishTemplateRequest, ReadFileRequest,
+    RemoveEntryRequest, RemoveSandboxRequest, ResizeExecutionTtyRequest, RestoreRequest,
+    RestoreResponse, SandboxEvent, SandboxEventsRequest, SandboxInfo, SetLifecycleRequest,
+    SignalExecutionRequest, StartExecutionRequest, StatFileRequest, StdinStatus,
+    StopSandboxRequest, Template, WaitExecutionRequest, WaitForPortRequest, WatchDirRequest,
+    WatchDirResponse, WriteFileOpen, WriteStdinRequest, execution_event,
 };
 use arcbox_connect::v1::{
     AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
@@ -2194,6 +2196,86 @@ impl AgentClient {
             .rpc_call(MessageType::SandboxDeleteSnapshotRequest, &payload)
             .await?;
         Self::expect_ack_response_type(resp_type, MessageType::SandboxDeleteSnapshotResponse)
+    }
+
+    /// Builds a template and registers it as the catalog draft. Blocks for
+    /// the whole build (image export, rootfs conversion, optional prewarm).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_template_build(&mut self, req: BuildTemplateRequest) -> Result<Template> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxTemplateBuildRequest,
+            &payload,
+            MessageType::SandboxTemplateBuildResponse,
+        )
+        .await
+    }
+
+    /// Freezes a template's draft as an immutable version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_template_publish(
+        &mut self,
+        req: PublishTemplateRequest,
+    ) -> Result<Template> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxTemplatePublishRequest,
+            &payload,
+            MessageType::SandboxTemplatePublishResponse,
+        )
+        .await
+    }
+
+    /// Resolves a `name[:version]` template reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_template_get(&mut self, req: GetTemplateRequest) -> Result<Template> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxTemplateGetRequest,
+            &payload,
+            MessageType::SandboxTemplateGetResponse,
+        )
+        .await
+    }
+
+    /// Lists catalog templates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_template_list(
+        &mut self,
+        req: ListTemplatesRequest,
+    ) -> Result<ListTemplatesResponse> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxTemplateListRequest,
+            &payload,
+            MessageType::SandboxTemplateListResponse,
+        )
+        .await
+    }
+
+    /// Deletes a template version, or a whole template with its artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_template_delete(&mut self, req: DeleteTemplateRequest) -> Result<()> {
+        let payload = req.encode_to_vec();
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxTemplateDeleteRequest, &payload)
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxTemplateDeleteResponse)
     }
 }
 

@@ -716,6 +716,76 @@ where
                 send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
             }
         },
+        // -----------------------------------------------------------------
+        // Template catalog (CORE-107)
+        // -----------------------------------------------------------------
+        MessageType::SandboxTemplateBuildRequest => {
+            // The daemon keeps Build UNIMPLEMENTED until the build pipeline
+            // lands, so this arm is a defensive answer, not a surface.
+            send_sandbox_error(
+                stream,
+                trace_id,
+                500,
+                "template Build is not yet implemented (CORE-107)",
+            )
+            .await?;
+        }
+        MessageType::SandboxTemplatePublishRequest => match svc.publish_template(payload).await {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxTemplatePublishResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxTemplateGetRequest => match svc.get_template(payload) {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxTemplateGetResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxTemplateListRequest => match svc.list_templates(payload) {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxTemplateListResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
+        MessageType::SandboxTemplateDeleteRequest => match svc.delete_template(payload).await {
+            Ok(()) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxTemplateDeleteResponse,
+                    trace_id,
+                    &[],
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
         _ => {
             send_sandbox_error(stream, trace_id, 400, "unrecognised sandbox message type").await?;
         }

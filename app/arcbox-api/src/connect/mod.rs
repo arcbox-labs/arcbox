@@ -247,7 +247,7 @@ pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
             clone(),
             Arc::clone(&sandbox_operations),
         )))
-        .add_service(Arc::new(TemplateServiceImpl::new()))
+        .add_service(Arc::new(TemplateServiceImpl::new(clone())))
         // The daemon's own services, all on Connect since CORE-68.
         .add_service(Arc::new(IconServiceImpl::new()))
         .add_service(Arc::new(StatsServiceImpl::new(clone())))
