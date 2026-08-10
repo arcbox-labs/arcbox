@@ -1,0 +1,32 @@
+[package]
+name = "arcbox"
+description = "ArcBox Sandbox SDK for Rust — run isolated microVM sandboxes on your Mac"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# crates.io publishing is gated on connectrpc reaching the registry (the
+# git pin below fails `cargo publish` loudly until then) — see README.
+
+[dependencies]
+arcbox-connect = { path = "../../rpc/arcbox-connect" }
+base64 = "0.22.1"
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
+connectrpc = { version = "0.8.1", features = ["client"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
+thiserror.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+buffa-types = "0.9.1"
+connectrpc = { version = "0.8.1", features = ["client", "axum"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
+futures-core = "0.3.33"
+tempfile.workspace = true
+tokio-stream.workspace = true
+
+[lints]
+workspace = true
