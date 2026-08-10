@@ -516,6 +516,12 @@ impl Sandbox {
         &self.id
     }
 
+    /// Run processes inside the sandbox.
+    #[must_use]
+    pub fn commands(&self) -> crate::Commands {
+        crate::Commands::attached(self.ctx.clone(), self.id.clone())
+    }
+
     /// Fetch the sandbox's current state — always fresh, never cached.
     ///
     /// # Errors
