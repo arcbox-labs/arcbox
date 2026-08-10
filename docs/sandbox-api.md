@@ -183,7 +183,7 @@ keyed on the image's layer diff IDs, so an unchanged image is converted
 once. Make the image available first — `docker pull` / `docker build`
 through the ArcBox Docker context both land in that store. CLI:
 `abctl sandbox create --from-image <ref>` / `--from-dockerfile <path>` /
-`--from-template <name>` produce the reference for you.
+`--from-preset <name>` produce the reference for you; `--template <name[:version]>` passes a catalog reference through directly.
 
 ### Executions (CORE-55)
 

@@ -357,7 +357,7 @@ fn truncate(s: &str, width: usize) -> String {
 }
 
 /// Binary-scaled human size ("3.2 GiB").
-fn fmt_bytes(bytes: u64) -> String {
+pub(super) fn fmt_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

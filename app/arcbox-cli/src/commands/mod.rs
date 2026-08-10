@@ -313,7 +313,7 @@ mod tests {
             (&["sandbox", "inspect", "sandbox"], true, false),
             (&["sandbox", "events"], false, false),
             (&["sandbox", "snapshots"], false, false),
-            (&["sandbox", "templates"], false, false),
+            (&["sandbox", "presets"], false, false),
             (
                 &["migrate", "from", "docker-desktop", "--dry-run"],
                 false,

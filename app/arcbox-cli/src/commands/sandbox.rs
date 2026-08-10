@@ -86,8 +86,92 @@ pub enum SandboxCommands {
     /// Delete a snapshot
     #[command(name = "snapshot-rm")]
     DeleteSnapshot(DeleteSnapshotArgs),
-    /// List built-in rootfs templates
-    Templates(TemplatesArgs),
+    /// Manage the template catalog (build, publish, list, inspect, delete)
+    #[command(subcommand)]
+    Template(TemplateCommands),
+    /// List built-in Dockerfile presets (see `create --from-preset`)
+    Presets(TemplatesArgs),
+}
+
+#[derive(Subcommand)]
+pub enum TemplateCommands {
+    /// Build a template from a source and register it as the catalog draft
+    Build(TemplateBuildArgs),
+    /// Freeze the template's draft as an immutable version
+    Publish(TemplatePublishArgs),
+    /// Resolve a `name[:version]` reference and show the template
+    #[command(alias = "inspect")]
+    Get(TemplateGetArgs),
+    /// List catalog templates
+    #[command(name = "ls", alias = "list")]
+    List(TemplateListArgs),
+    /// Delete a template version, or a whole template with its artifacts
+    #[command(alias = "rm")]
+    Delete(TemplateDeleteArgs),
+}
+
+#[derive(Args)]
+pub struct TemplateBuildArgs {
+    /// Template name to register the result under
+    pub name: String,
+    /// Build from a local Docker image reference
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_snapshot"])]
+    pub from_image: Option<String>,
+    /// Build from a Dockerfile (path; the build context is the file alone)
+    #[arg(long, conflicts_with_all = ["from_image", "from_snapshot"])]
+    pub from_dockerfile: Option<String>,
+    /// Promote an existing checkpoint into the template's warm snapshot
+    #[arg(long, conflicts_with_all = ["from_image", "from_dockerfile"])]
+    pub from_snapshot: Option<String>,
+    /// Also boot once and checkpoint at READY (ignored for --from-snapshot)
+    #[arg(long)]
+    pub prewarm: bool,
+    /// Default vCPUs for sandboxes created from this template (0 = daemon default)
+    #[arg(long, default_value = "0")]
+    pub cpus: u32,
+    /// Default memory in MiB (0 = daemon default)
+    #[arg(long, default_value = "0")]
+    pub memory: u64,
+    /// Template labels (key=value, repeatable)
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    /// Emit the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+#[command(disable_version_flag = true)]
+pub struct TemplatePublishArgs {
+    /// Template name
+    pub name: String,
+    /// Version to freeze the draft as (e.g. "1.2.0")
+    pub version: String,
+    /// Emit the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TemplateGetArgs {
+    /// `name` or `name:version`
+    pub reference: String,
+    /// Emit the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TemplateListArgs {
+    /// Emit the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TemplateDeleteArgs {
+    /// `name` (all versions + draft) or `name:version` (one version)
+    pub reference: String,
 }
 
 #[derive(Args)]
@@ -96,14 +180,17 @@ pub struct CreateArgs {
     #[arg(long)]
     pub id: Option<String>,
     /// Build the sandbox image from a Dockerfile
-    #[arg(long, conflicts_with_all = ["from_image", "from_template"])]
+    #[arg(long, conflicts_with_all = ["from_image", "from_preset", "template"])]
     pub from_dockerfile: Option<String>,
     /// Use an existing Docker image as the sandbox image
-    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_template"])]
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_preset", "template"])]
     pub from_image: Option<String>,
-    /// Use a built-in template as the sandbox image (see `sandbox templates`)
-    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image"])]
-    pub from_template: Option<String>,
+    /// Use a built-in Dockerfile preset as the sandbox image (see `sandbox presets`)
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image", "template"])]
+    pub from_preset: Option<String>,
+    /// Create from a catalog template: `name[:version]` (see `sandbox template ls`)
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image", "from_preset"])]
+    pub template: Option<String>,
     /// Number of vCPUs (0 = daemon default)
     #[arg(long, default_value = "0")]
     pub cpus: u32,
@@ -287,7 +374,8 @@ pub async fn execute(cmd: SandboxCommands) -> Result<()> {
         SandboxCommands::Restore(args) => execute_restore(args).await,
         SandboxCommands::ListSnapshots(args) => execute_list_snapshots(args).await,
         SandboxCommands::DeleteSnapshot(args) => execute_delete_snapshot(args).await,
-        SandboxCommands::Templates(args) => execute_templates(args),
+        SandboxCommands::Template(cmd) => execute_template(cmd).await,
+        SandboxCommands::Presets(args) => execute_templates(args),
     }
 }
 
@@ -305,6 +393,203 @@ pub(super) async fn resolve_template(name: &str) -> Result<String> {
     arcbox_cli::rootfs_builder::resolve_from_dockerfile_contents(template.dockerfile.as_bytes())
         .await
         .with_context(|| format!("Failed to build the '{name}' template image"))
+}
+
+async fn execute_template(cmd: TemplateCommands) -> Result<()> {
+    let (transport, config) = sandbox_channel();
+    let client = pb::TemplateServiceClient::new(transport, config);
+    match cmd {
+        TemplateCommands::Build(args) => {
+            let request = template_build_request(&args)?;
+            let template = client
+                .build(request)
+                .await
+                .with_context(|| format!("failed to build template '{}'", args.name))?
+                .into_owned();
+            print_template(&template, args.json)
+        }
+        TemplateCommands::Publish(args) => {
+            let template = client
+                .publish(pb::PublishTemplateRequest {
+                    name: args.name.clone(),
+                    version: args.version.clone(),
+                    ..Default::default()
+                })
+                .await
+                .with_context(|| format!("failed to publish '{}:{}'", args.name, args.version))?
+                .into_owned();
+            print_template(&template, args.json)
+        }
+        TemplateCommands::Get(args) => {
+            let template = client
+                .get(pb::GetTemplateRequest {
+                    reference: args.reference.clone(),
+                    ..Default::default()
+                })
+                .await
+                .with_context(|| format!("failed to resolve template '{}'", args.reference))?
+                .into_owned();
+            print_template(&template, args.json)
+        }
+        TemplateCommands::List(args) => {
+            let templates = drain_pages(|page_token| {
+                let client = &client;
+                async move {
+                    let resp = client
+                        .list(pb::ListTemplatesRequest {
+                            page_token,
+                            ..Default::default()
+                        })
+                        .await
+                        .context("failed to list templates")?
+                        .into_owned();
+                    Ok((resp.templates, resp.next_page_token))
+                }
+            })
+            .await?;
+            if args.json {
+                let rows: Vec<_> = templates.iter().map(template_json).collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            if templates.is_empty() {
+                println!("No templates found.");
+                return Ok(());
+            }
+            println!(
+                "{:<24} {:<12} {:<8} {:<12} DIGEST",
+                "NAME", "VERSION", "WARM", "SIZE"
+            );
+            for t in &templates {
+                let version = if t.version.is_empty() {
+                    "(draft)"
+                } else {
+                    &t.version
+                };
+                println!(
+                    "{:<24} {:<12} {:<8} {:<12} {}",
+                    t.name,
+                    version,
+                    if t.warm_snapshot_id.is_empty() {
+                        "-"
+                    } else {
+                        "yes"
+                    },
+                    super::top::fmt_bytes(t.size_bytes),
+                    t.digest,
+                );
+            }
+            Ok(())
+        }
+        TemplateCommands::Delete(args) => {
+            client
+                .delete(pb::DeleteTemplateRequest {
+                    reference: args.reference.clone(),
+                    ..Default::default()
+                })
+                .await
+                .with_context(|| format!("failed to delete template '{}'", args.reference))?;
+            println!("Deleted template {}", args.reference);
+            Ok(())
+        }
+    }
+}
+
+/// Resolve `template build` flags into the request: source selection,
+/// defaults presence (absent unless a geometry flag was given), labels.
+fn template_build_request(args: &TemplateBuildArgs) -> Result<pb::BuildTemplateRequest> {
+    let source = if let Some(image) = &args.from_image {
+        pb::build_template_request::Source::DockerRef(image.clone())
+    } else if let Some(path) = &args.from_dockerfile {
+        let contents =
+            std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+        pb::build_template_request::Source::Dockerfile(contents)
+    } else if let Some(snapshot_id) = &args.from_snapshot {
+        pb::build_template_request::Source::SnapshotId(snapshot_id.clone())
+    } else {
+        anyhow::bail!(
+            "a build source is required: --from-image, --from-dockerfile, or --from-snapshot"
+        );
+    };
+    let defaults = (args.cpus != 0 || args.memory != 0).then(|| pb::TemplateDefaults {
+        limits: Some(pb::ResourceLimits {
+            vcpus: args.cpus,
+            memory_mib: args.memory,
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    });
+    Ok(pb::BuildTemplateRequest {
+        name: args.name.clone(),
+        source: Some(source),
+        defaults: defaults.into(),
+        labels: parse_labels(&args.labels)?.into_iter().collect(),
+        prewarm: args.prewarm,
+        ..Default::default()
+    })
+}
+
+/// Drain every continuation page so the human view stays complete. `fetch`
+/// receives the page token ("" first) and returns one page plus the next
+/// token ("" ends the walk).
+async fn drain_pages<T, Fut>(mut fetch: impl FnMut(String) -> Fut) -> Result<Vec<T>>
+where
+    Fut: std::future::Future<Output = Result<(Vec<T>, String)>>,
+{
+    let mut items = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let (mut page, next) = fetch(page_token).await?;
+        items.append(&mut page);
+        if next.is_empty() {
+            break;
+        }
+        page_token = next;
+    }
+    Ok(items)
+}
+
+/// Hand-mapped JSON view (rpc/AGENTS.md: user-facing JSON never comes from
+/// generated shapes).
+fn template_json(t: &pb::Template) -> serde_json::Value {
+    serde_json::json!({
+        "name": t.name,
+        "version": t.version,
+        "digest": t.digest,
+        "warm": !t.warm_snapshot_id.is_empty(),
+        "size_bytes": t.size_bytes,
+        "labels": t.labels.iter().collect::<std::collections::BTreeMap<_, _>>(),
+    })
+}
+
+fn print_template(t: &pb::Template, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&template_json(t))?);
+        return Ok(());
+    }
+    let version = if t.version.is_empty() {
+        "(draft)"
+    } else {
+        &t.version
+    };
+    println!("Name:    {}", t.name);
+    println!("Version: {version}");
+    println!("Digest:  {}", t.digest);
+    println!(
+        "Warm:    {}",
+        if t.warm_snapshot_id.is_empty() {
+            "no"
+        } else {
+            "yes"
+        }
+    );
+    println!("Size:    {}", super::top::fmt_bytes(t.size_bytes));
+    if !t.labels.is_empty() {
+        let labels: std::collections::BTreeMap<_, _> = t.labels.iter().collect();
+        println!("Labels:  {labels:?}");
+    }
+    Ok(())
 }
 
 fn execute_templates(args: TemplatesArgs) -> Result<()> {
@@ -442,6 +727,31 @@ fn exit_code_of(execution: &Execution) -> i32 {
     }
 }
 
+/// Assemble the create request. `limits` is present only when a geometry
+/// flag was given: an absent field inherits the template's default limits,
+/// while a present one — even all-zero — replaces them wholesale
+/// (sandbox.proto contract).
+fn create_request(
+    args: &CreateArgs,
+    template: String,
+    labels: HashMap<String, String>,
+) -> CreateSandboxRequest {
+    CreateSandboxRequest {
+        id: args.id.clone().unwrap_or_default(),
+        labels: labels.into_iter().collect(),
+        template,
+        limits: (args.cpus != 0 || args.memory != 0)
+            .then(|| ResourceLimits {
+                vcpus: args.cpus,
+                memory_mib: args.memory,
+                ..Default::default()
+            })
+            .into(),
+        ttl_seconds: args.ttl,
+        ..Default::default()
+    }
+}
+
 async fn execute_create(args: CreateArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxServiceClient::new(transport.clone(), config.clone());
@@ -458,28 +768,16 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         arcbox_cli::rootfs_builder::resolve_from_image(image_ref)
             .await
             .context("Failed to resolve Docker image")?
-    } else if let Some(name) = &args.from_template {
+    } else if let Some(name) = &args.from_preset {
         resolve_template(name).await?
+    } else if let Some(reference) = &args.template {
+        reference.clone()
     } else {
         String::new()
     };
 
-    let req = CreateSandboxRequest {
-        id: args.id.unwrap_or_default(),
-        labels: labels.into_iter().collect(),
-        template,
-        limits: ResourceLimits {
-            vcpus: args.cpus,
-            memory_mib: args.memory,
-            ..Default::default()
-        }
-        .into(),
-        ttl_seconds: args.ttl,
-        ..Default::default()
-    };
-
     let resp: pb::CreateSandboxResponse = client
-        .create(req)
+        .create(create_request(&args, template, labels))
         .await
         .context("Failed to create sandbox")?
         .into_owned();
@@ -536,25 +834,22 @@ async fn execute_list(args: ListArgs) -> Result<()> {
         Some(value) => parse_state(value)?,
         None => SandboxState::Unspecified,
     };
-    // Follow continuation tokens so the human view stays complete.
-    let mut sandboxes = Vec::new();
-    let mut page_token = String::new();
-    loop {
-        let mut resp: pb::ListSandboxesResponse = client
-            .list(ListSandboxesRequest {
-                state: state.into(),
-                page_token: page_token.clone(),
-                ..Default::default()
-            })
-            .await
-            .context("Failed to list sandboxes")?
-            .into_owned();
-        sandboxes.append(&mut resp.sandboxes);
-        if resp.next_page_token.is_empty() {
-            break;
+    let sandboxes = drain_pages(|page_token| {
+        let client = &client;
+        async move {
+            let resp: pb::ListSandboxesResponse = client
+                .list(ListSandboxesRequest {
+                    state: state.into(),
+                    page_token,
+                    ..Default::default()
+                })
+                .await
+                .context("Failed to list sandboxes")?
+                .into_owned();
+            Ok((resp.sandboxes, resp.next_page_token))
         }
-        page_token = resp.next_page_token;
-    }
+    })
+    .await?;
 
     if args.quiet {
         for sb in &sandboxes {
@@ -1036,29 +1331,27 @@ async fn execute_list_snapshots(args: ListSnapshotsArgs) -> Result<()> {
     let (transport, config) = sandbox_channel();
     let client = SandboxSnapshotServiceClient::new(transport.clone(), config.clone());
 
-    // Follow continuation tokens so the human view stays complete.
-    let mut snapshots = Vec::new();
-    let mut page_token = String::new();
     let sandbox_id = args.sandbox_id;
-    loop {
-        let mut resp: pb::ListSnapshotsResponse = client
-            .list_snapshots(ListSnapshotsRequest {
-                sandbox_id: sandbox_id.clone().unwrap_or_default(),
-                page_token: page_token.clone(),
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| match sandbox_id.as_deref() {
-                Some(id) => crate::error::sandbox_request(error, id, "snapshot listing"),
-                None => anyhow::Error::new(error).context("Failed to list snapshots"),
-            })?
-            .into_owned();
-        snapshots.append(&mut resp.snapshots);
-        if resp.next_page_token.is_empty() {
-            break;
+    let snapshots = drain_pages(|page_token| {
+        let client = &client;
+        let sandbox_id = &sandbox_id;
+        async move {
+            let resp: pb::ListSnapshotsResponse = client
+                .list_snapshots(ListSnapshotsRequest {
+                    sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                    page_token,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| match sandbox_id.as_deref() {
+                    Some(id) => crate::error::sandbox_request(error, id, "snapshot listing"),
+                    None => anyhow::Error::new(error).context("Failed to list snapshots"),
+                })?
+                .into_owned();
+            Ok((resp.snapshots, resp.next_page_token))
         }
-        page_token = resp.next_page_token;
-    }
+    })
+    .await?;
 
     if snapshots.is_empty() {
         println!("No snapshots found.");
@@ -1264,4 +1557,183 @@ async fn execute_unexpose(args: UnexposeArgs) -> Result<()> {
         .map_err(|error| crate::error::sandbox_request(error, &args.id, "port removal"))?;
     println!("{}:{}/{} unexposed", args.id, args.port, args.protocol);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_args() -> TemplateBuildArgs {
+        TemplateBuildArgs {
+            name: "web".into(),
+            from_image: None,
+            from_dockerfile: None,
+            from_snapshot: None,
+            prewarm: false,
+            cpus: 0,
+            memory: 0,
+            labels: Vec::new(),
+            json: false,
+        }
+    }
+
+    fn create_args() -> CreateArgs {
+        CreateArgs {
+            id: None,
+            from_dockerfile: None,
+            from_image: None,
+            from_preset: None,
+            template: None,
+            cpus: 0,
+            memory: 0,
+            label: Vec::new(),
+            ttl: 0,
+        }
+    }
+
+    #[test]
+    fn build_request_maps_each_source_flag() {
+        let req = template_build_request(&TemplateBuildArgs {
+            from_image: Some("alpine:3.20".into()),
+            ..build_args()
+        })
+        .unwrap();
+        match req.source {
+            Some(pb::build_template_request::Source::DockerRef(ref image)) => {
+                assert_eq!(image, "alpine:3.20");
+            }
+            _ => panic!("expected a DockerRef source"),
+        }
+        assert_eq!(req.name, "web");
+
+        let req = template_build_request(&TemplateBuildArgs {
+            from_snapshot: Some("snap-1".into()),
+            ..build_args()
+        })
+        .unwrap();
+        match req.source {
+            Some(pb::build_template_request::Source::SnapshotId(ref id)) => {
+                assert_eq!(id, "snap-1");
+            }
+            _ => panic!("expected a SnapshotId source"),
+        }
+    }
+
+    #[test]
+    fn build_request_reads_the_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Dockerfile");
+        std::fs::write(&path, "FROM alpine\n").unwrap();
+        let req = template_build_request(&TemplateBuildArgs {
+            from_dockerfile: Some(path.to_string_lossy().into_owned()),
+            ..build_args()
+        })
+        .unwrap();
+        match req.source {
+            Some(pb::build_template_request::Source::Dockerfile(ref contents)) => {
+                assert_eq!(contents, "FROM alpine\n");
+            }
+            _ => panic!("expected a Dockerfile source"),
+        }
+    }
+
+    #[test]
+    fn build_request_requires_a_source() {
+        let err = template_build_request(&build_args()).unwrap_err();
+        assert!(err.to_string().contains("--from-image"), "{err}");
+    }
+
+    #[test]
+    fn build_defaults_are_present_only_with_a_geometry_flag() {
+        let req = template_build_request(&TemplateBuildArgs {
+            from_image: Some("alpine".into()),
+            ..build_args()
+        })
+        .unwrap();
+        assert!(req.defaults.as_option().is_none());
+
+        let req = template_build_request(&TemplateBuildArgs {
+            from_image: Some("alpine".into()),
+            memory: 512,
+            ..build_args()
+        })
+        .unwrap();
+        let defaults = req.defaults.as_option().expect("defaults present");
+        let limits = defaults.limits.as_option().expect("limits present");
+        assert_eq!(limits.vcpus, 0);
+        assert_eq!(limits.memory_mib, 512);
+    }
+
+    #[test]
+    fn create_without_geometry_flags_leaves_limits_absent() {
+        let req = create_request(&create_args(), "web:1".into(), HashMap::new());
+        assert!(
+            req.limits.as_option().is_none(),
+            "a present limits field would discard the template's default geometry"
+        );
+        assert_eq!(req.template, "web:1");
+    }
+
+    #[test]
+    fn create_with_a_geometry_flag_replaces_limits_wholesale() {
+        let req = create_request(
+            &CreateArgs {
+                cpus: 2,
+                ..create_args()
+            },
+            String::new(),
+            HashMap::new(),
+        );
+        let limits = req.limits.as_option().expect("limits present");
+        assert_eq!(limits.vcpus, 2);
+        assert_eq!(limits.memory_mib, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_pages_follows_continuation_tokens() {
+        let mut calls = Vec::new();
+        let items = drain_pages(|token| {
+            calls.push(token.clone());
+            let page = match token.as_str() {
+                "" => (vec![1, 2], "next".to_string()),
+                "next" => (vec![3], String::new()),
+                other => panic!("unexpected token {other}"),
+            };
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(items, vec![1, 2, 3]);
+        assert_eq!(calls, vec!["", "next"]);
+    }
+
+    #[tokio::test]
+    async fn drain_pages_propagates_a_page_error() {
+        let result: Result<Vec<u32>> = drain_pages(|_| async { anyhow::bail!("boom") }).await;
+        assert!(result.unwrap_err().to_string().contains("boom"));
+    }
+
+    #[test]
+    fn template_json_is_the_stable_hand_mapped_shape() {
+        let template = pb::Template {
+            name: "web".into(),
+            version: "1.0".into(),
+            digest: "sha256:abc".into(),
+            warm_snapshot_id: "snap-1".into(),
+            size_bytes: 42,
+            labels: std::iter::once(("team".to_string(), "infra".to_string())).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            template_json(&template),
+            serde_json::json!({
+                "name": "web",
+                "version": "1.0",
+                "digest": "sha256:abc",
+                "warm": true,
+                "size_bytes": 42,
+                "labels": {"team": "infra"},
+            })
+        );
+    }
 }
