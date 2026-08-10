@@ -20,7 +20,7 @@ import pytest
 from google.protobuf import empty_pb2, message
 
 from arcbox import ArcBox, Connection, Sandbox, Snapshot
-from arcbox._gen import snapshot_pb2
+from arcbox._gen import sandbox_pb2, snapshot_pb2
 from arcbox._sync._client import ConnectClient
 from arcbox.errors import NotFoundError, SandboxStateError
 
@@ -89,8 +89,11 @@ class TestRestore:
             assert request.url.path.endswith("/Restore")
             req = snapshot_pb2.RestoreRequest.FromString(request.content)
             requests.append(req)
+            # A deliberately different id: an implementation that took
+            # its identity from the response instead of the client-minted
+            # id must fail the assertions below.
             return proto_response(
-                snapshot_pb2.RestoreResponse(id=req.id, ip_address="192.168.64.7")
+                snapshot_pb2.RestoreResponse(id="server-side-id", ip_address="192.168.64.7")
             )
 
         sandbox = sync_box(handler).restore(
@@ -103,12 +106,19 @@ class TestRestore:
         # Seconds round UP to whole wire seconds.
         assert req.ttl_seconds == 91
         # The id is minted client-side (idempotent retries) and is the
-        # handle's identity.
+        # handle's identity — never the response's.
         assert sandbox.id == req.id
+        assert sandbox.id != "server-side-id"
         uuid.UUID(sandbox.id)
 
     def test_wraps_a_missing_snapshot_naming_the_operation(self) -> None:
-        def handler(_request: httpx.Request) -> httpx.Response:
+        removed: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/Remove"):
+                req = sandbox_pb2.RemoveSandboxRequest.FromString(request.content)
+                removed.append(req.id)
+                return proto_response(empty_pb2.Empty())
             body = json.dumps(
                 {"code": "not_found", "message": "snapshot snap-9 not found"}
             ).encode()
@@ -117,6 +127,11 @@ class TestRestore:
         with pytest.raises(NotFoundError) as exc_info:
             sync_box(handler).restore("snap-9")
         assert exc_info.value.operation == "snapshots.restore"
+        # A failed restore may still have created the sandbox (response
+        # lost), so the minted id gets a best-effort forced removal —
+        # the create() rule.
+        assert len(removed) == 1
+        uuid.UUID(removed[0])
 
 
 class TestListSnapshots:

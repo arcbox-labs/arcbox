@@ -165,7 +165,6 @@ export interface ListSnapshotsOptions {
   sandboxId?: string;
   /** Keep only snapshots carrying all of these labels. */
   labels?: Record<string, string>;
-  connection?: ConnectionOptions;
 }
 
 type SandboxClient = Client<typeof SandboxService>;
@@ -475,6 +474,13 @@ export class ArcBox {
       });
       return new Sandbox(this.#ctx, id);
     } catch (error) {
+      // The sandbox may exist even though restore() failed (response
+      // lost) and ttlMs is optional, so a leaked VM could run forever.
+      // Best-effort removal; a failure here (e.g. nothing was restored)
+      // must not mask the original error — the create() rule.
+      await this.#client
+        .remove({ id, force: true }, unaryOptions(this.#ctx))
+        .catch(noop);
       throw toArcBoxError(error, "snapshots.restore");
     }
   }

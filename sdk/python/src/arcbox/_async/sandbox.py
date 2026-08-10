@@ -366,20 +366,34 @@ class AsyncArcBox:
         same snapshot concurrently."""
         with wrap_errors("snapshots.restore"):
             sandbox_id = str(uuid.uuid4())
-            # No per-request deadline: restoring takes as long as it
-            # takes.
-            await self._client.unary(
-                _SNAPSHOT + "Restore",
-                snapshot_pb2.RestoreRequest(
-                    id=sandbox_id,
-                    snapshot_id=snapshot_id,
-                    labels=dict(labels) if labels else {},
-                    network_override=fresh_network,
-                    ttl_seconds=_seconds_to_wire(ttl),
-                ),
-                snapshot_pb2.RestoreResponse,
-                timeout=None,
-            )
+            try:
+                # No per-request deadline: restoring takes as long as it
+                # takes.
+                await self._client.unary(
+                    _SNAPSHOT + "Restore",
+                    snapshot_pb2.RestoreRequest(
+                        id=sandbox_id,
+                        snapshot_id=snapshot_id,
+                        labels=dict(labels) if labels else {},
+                        network_override=fresh_network,
+                        ttl_seconds=_seconds_to_wire(ttl),
+                    ),
+                    snapshot_pb2.RestoreResponse,
+                    timeout=None,
+                )
+            except BaseException:
+                # The sandbox may exist even though restore() failed
+                # (response lost) and ttl is optional, so a leaked VM
+                # could run forever. Best-effort removal; a failure here
+                # (e.g. nothing was restored) must not mask the original
+                # error — the create() rule.
+                with suppress(Exception):
+                    await self._client.unary(
+                        _SANDBOX + "Remove",
+                        sandbox_pb2.RemoveSandboxRequest(id=sandbox_id, force=True),
+                        empty_pb2.Empty,
+                    )
+                raise
             return AsyncSandbox(self._client, sandbox_id)
 
     async def list_snapshots(

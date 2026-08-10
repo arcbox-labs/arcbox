@@ -18,6 +18,7 @@ import type {
   ListSnapshotsRequest,
   RestoreRequest,
 } from "../src/gen/arcbox/sandbox/v1/snapshot_pb";
+import { SandboxService } from "../src/gen/arcbox/sandbox/v1/sandbox_pb";
 import {
   CheckpointResponseSchema,
   ListSnapshotsResponseSchema,
@@ -28,7 +29,8 @@ import { ArcBox, Sandbox } from "../src/sandbox";
 
 const CREATED = new Date("2026-08-10T08:00:00Z");
 
-const RE_UUID = /^[0-9a-f-]{36}$/;
+const RE_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 describe("sandbox.checkpoint", () => {
   it("returns the catalog row the daemon recorded", async () => {
@@ -82,8 +84,11 @@ describe("arcbox.restore", () => {
       service(SandboxSnapshotService, {
         restore(req) {
           seen = req;
+          // A deliberately different id: an implementation that took its
+          // identity from the response instead of the client-minted id
+          // must fail the assertions below.
           return create(RestoreResponseSchema, {
-            id: req.id,
+            id: "server-side-id",
             ipAddress: "192.168.64.7",
           });
         },
@@ -100,16 +105,24 @@ describe("arcbox.restore", () => {
     // Milliseconds round UP to whole wire seconds.
     expect(seen?.ttlSeconds).toBe(91);
     // The id is minted client-side (idempotent retries) and is the
-    // handle's identity.
+    // handle's identity — never the response's.
     expect(sandbox.id).toBe(seen?.id);
+    expect(sandbox.id).not.toBe("server-side-id");
     expect(sandbox.id).toMatch(RE_UUID);
   });
 
   it("wraps a missing snapshot as NotFoundError with the operation", async () => {
+    const removed: string[] = [];
     const mock = createRouterTransport(({ service }) => {
       service(SandboxSnapshotService, {
         restore() {
           throw new ConnectError("snapshot snap-9 not found", Code.NotFound);
+        },
+      });
+      service(SandboxService, {
+        remove(req) {
+          removed.push(req.id);
+          return {};
         },
       });
     });
@@ -118,6 +131,11 @@ describe("arcbox.restore", () => {
     await expect(restoring).rejects.toMatchObject({
       operation: "snapshots.restore",
     });
+    // A failed restore may still have created the sandbox (response
+    // lost), so the minted id gets a best-effort forced removal — the
+    // create() rule.
+    expect(removed).toHaveLength(1);
+    expect(removed[0]).toMatch(RE_UUID);
   });
 });
 
