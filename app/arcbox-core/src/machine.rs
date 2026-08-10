@@ -869,6 +869,39 @@ impl MachineManager {
         self.vm_manager.connect_vsock(&machine.vm_id, port)
     }
 
+    /// Connects to the machine's agent and pings it once.
+    ///
+    /// A ping is also a wall-clock sync: the request carries the host's
+    /// `timestamp_secs`, which the agent applies via `clock_settime`.
+    /// `connect_agent` is a blocking hypervisor call, so it runs off the
+    /// async executor; the transport it yields is blocking on the HV
+    /// socketpair and async on VZ/Linux vsock, so the ping dispatches on
+    /// `is_blocking()`.
+    ///
+    /// # Errors
+    /// Returns an error if the machine is not running, the agent is
+    /// unreachable, or the ping fails.
+    pub async fn ping_agent(self: Arc<Self>, machine_name: String) -> Result<()> {
+        let manager = Arc::clone(&self);
+        let name = machine_name.clone();
+        let connected = tokio::task::spawn_blocking(move || manager.connect_agent(&name)).await;
+        match connected {
+            Ok(Ok(mut agent)) => {
+                if agent.is_blocking() {
+                    tokio::task::spawn_blocking(move || agent.ping_blocking().map(|_| ()))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(CoreError::Vm(format!("agent ping task panicked: {e}")))
+                        })
+                } else {
+                    agent.ping().await.map(|_| ())
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(CoreError::Vm(format!("agent connect task panicked: {e}"))),
+        }
+    }
+
     /// Reads serial console output for a running machine (macOS only).
     #[cfg(target_os = "macos")]
     pub fn read_console_output(&self, name: &str) -> Result<String> {

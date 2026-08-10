@@ -66,8 +66,12 @@ members = [
     "app/arcbox-cli",
     "app/arcbox-daemon",
     "app/arcbox-helper",
-    "app/arcbox",
     "app/arcbox-migration",
+
+    # ============================================
+    # SDK (client library, MIT OR Apache-2.0)
+    # ============================================
+    "sdk/rust",
 
     # ============================================
     # Guest Components (MIT OR Apache-2.0)

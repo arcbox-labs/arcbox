@@ -5,6 +5,7 @@ mod control_plane;
 mod dns_service;
 mod kubernetes_proxy;
 mod nfs_mount;
+mod power;
 mod recovery;
 mod self_setup;
 mod services;
