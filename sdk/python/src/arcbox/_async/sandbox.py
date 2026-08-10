@@ -17,13 +17,14 @@ import httpx
 from google.protobuf import empty_pb2
 
 from arcbox._boundary import wrap_errors
-from arcbox._gen import sandbox_pb2
+from arcbox._gen import sandbox_pb2, snapshot_pb2
 from arcbox._types import (
     UNCHANGED,
     Capabilities,
     SandboxEvent,
     SandboxInfo,
     SandboxSummary,
+    Snapshot,
     Unchanged,
     capabilities_from_proto,
     sandbox_event_from_proto,
@@ -31,6 +32,8 @@ from arcbox._types import (
     sandbox_state_from_proto,
     sandbox_state_to_proto,
     sandbox_summary_from_proto,
+    snapshot_from_checkpoint,
+    snapshot_from_proto,
 )
 from arcbox.errors import (
     ArcBoxError,
@@ -58,6 +61,7 @@ if TYPE_CHECKING:
     from ._client import AsyncServerStream
 
 _SANDBOX = "/arcbox.sandbox.v1.SandboxService/"
+_SNAPSHOT = "/arcbox.sandbox.v1.SandboxSnapshotService/"
 
 _READY_STATES = (sandbox_pb2.SANDBOX_STATE_READY, sandbox_pb2.SANDBOX_STATE_RUNNING)
 _GONE_STATES = (sandbox_pb2.SANDBOX_STATE_STOPPING, sandbox_pb2.SANDBOX_STATE_STOPPED)
@@ -343,6 +347,91 @@ class AsyncArcBox:
                 if page_token == "":
                     return
 
+    async def restore(
+        self,
+        snapshot_id: str,
+        *,
+        ttl: float | None = None,
+        labels: Mapping[str, str] | None = None,
+        fresh_network: bool = False,
+    ) -> AsyncSandbox:
+        """Restore a new sandbox from a snapshot. The restored sandbox
+        starts READY — there is no boot to wait for. It gets a fresh id,
+        minted client-side so retries stay idempotent (the ``create``
+        rule); the origin sandbox is untouched.
+
+        ``ttl`` caps the restored sandbox's lifetime in seconds (``None``
+        = no limit). ``fresh_network`` assigns a fresh TAP interface and
+        IP — required when running several sandboxes restored from the
+        same snapshot concurrently."""
+        with wrap_errors("snapshots.restore"):
+            sandbox_id = str(uuid.uuid4())
+            try:
+                # No per-request deadline: restoring takes as long as it
+                # takes.
+                await self._client.unary(
+                    _SNAPSHOT + "Restore",
+                    snapshot_pb2.RestoreRequest(
+                        id=sandbox_id,
+                        snapshot_id=snapshot_id,
+                        labels=dict(labels) if labels else {},
+                        network_override=fresh_network,
+                        ttl_seconds=_seconds_to_wire(ttl),
+                    ),
+                    snapshot_pb2.RestoreResponse,
+                    timeout=None,
+                )
+            except BaseException:
+                # The sandbox may exist even though restore() failed
+                # (response lost) and ttl is optional, so a leaked VM
+                # could run forever. Best-effort removal; a failure here
+                # (e.g. nothing was restored) must not mask the original
+                # error — the create() rule.
+                with suppress(Exception):
+                    await self._client.unary(
+                        _SANDBOX + "Remove",
+                        sandbox_pb2.RemoveSandboxRequest(id=sandbox_id, force=True),
+                        empty_pb2.Empty,
+                    )
+                raise
+            return AsyncSandbox(self._client, sandbox_id)
+
+    async def list_snapshots(
+        self,
+        *,
+        sandbox_id: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> AsyncIterator[Snapshot]:
+        """List the snapshot catalog, auto-paginating server-side pages.
+        ``sandbox_id`` keeps only snapshots checkpointed from that
+        sandbox; ``labels`` keeps only snapshots carrying all of them."""
+        with wrap_errors("snapshots.list"):
+            page_token = ""
+            while True:
+                page = await self._client.unary(
+                    _SNAPSHOT + "ListSnapshots",
+                    snapshot_pb2.ListSnapshotsRequest(
+                        sandbox_id=sandbox_id or "",
+                        labels=dict(labels) if labels else {},
+                        page_token=page_token,
+                    ),
+                    snapshot_pb2.ListSnapshotsResponse,
+                )
+                for row in page.snapshots:
+                    yield snapshot_from_proto(row)
+                page_token = page.next_page_token
+                if page_token == "":
+                    return
+
+    async def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot and its on-disk data."""
+        with wrap_errors("snapshots.delete"):
+            await self._client.unary(
+                _SNAPSHOT + "DeleteSnapshot",
+                snapshot_pb2.DeleteSnapshotRequest(snapshot_id=snapshot_id),
+                empty_pb2.Empty,
+            )
+
     async def _inspect(
         self, sandbox_id: str, deadline: float | None = None
     ) -> sandbox_pb2.SandboxInfo:
@@ -594,6 +683,30 @@ class AsyncSandbox:
             async for summary in box.list(state=state, labels=labels):
                 yield summary
 
+    @classmethod
+    async def restore(
+        cls,
+        snapshot_id: str,
+        *,
+        ttl: float | None = None,
+        labels: Mapping[str, str] | None = None,
+        fresh_network: bool = False,
+        connection: Connection | None = None,
+    ) -> AsyncSandbox:
+        """Restore a new sandbox from a snapshot — see
+        :meth:`AsyncArcBox.restore`. Client ownership works as in
+        :meth:`create`."""
+        box = AsyncArcBox(connection)
+        try:
+            sandbox = await box.restore(
+                snapshot_id, ttl=ttl, labels=labels, fresh_network=fresh_network
+            )
+        except BaseException:
+            await box.aclose()
+            raise
+        sandbox._owns_client = True
+        return sandbox
+
     async def info(self) -> SandboxInfo:
         """Fetch the sandbox's current state — always fresh, never cached."""
         with wrap_errors("sandbox.info"):
@@ -704,6 +817,29 @@ class AsyncSandbox:
                 empty_pb2.Empty,
                 timeout=None,
             )
+
+    async def checkpoint(
+        self,
+        *,
+        name: str = "",
+        labels: Mapping[str, str] | None = None,
+    ) -> Snapshot:
+        """Checkpoint this sandbox into a reusable snapshot: paused,
+        snapshotted, then resumed, automatically — the sandbox keeps
+        running under the same id. Requires a quiescent sandbox (READY —
+        no running command). Restore the returned snapshot into fresh
+        sandboxes with :meth:`AsyncArcBox.restore`."""
+        with wrap_errors("sandbox.checkpoint"):
+            recorded = dict(labels) if labels else {}
+            # No per-request deadline: checkpointing takes as long as it
+            # takes.
+            response = await self._client.unary(
+                _SNAPSHOT + "Checkpoint",
+                snapshot_pb2.CheckpointRequest(sandbox_id=self.id, name=name, labels=recorded),
+                snapshot_pb2.CheckpointResponse,
+                timeout=None,
+            )
+            return snapshot_from_checkpoint(response, self.id, name, recorded)
 
     async def __aenter__(self) -> AsyncSandbox:
         return self

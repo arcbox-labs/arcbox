@@ -9,10 +9,13 @@
 
 export { ArcBox, Sandbox } from "./sandbox";
 export type {
+  CheckpointOptions,
   ConnectSandboxOptions,
   CreateSandboxOptions,
   LifecycleUpdate,
   ListSandboxesOptions,
+  ListSnapshotsOptions,
+  RestoreOptions,
 } from "./sandbox";
 
 export { CommandHandle, CommandResult, Commands } from "./commands";
@@ -28,7 +31,11 @@ export type {
 } from "./commands";
 
 export { Ports } from "./ports";
-export type { WaitForPortOptions } from "./ports";
+export type {
+  ExposePortOptions,
+  UnexposePortOptions,
+  WaitForPortOptions,
+} from "./ports";
 
 export { Files, MAX_FILE_BYTES } from "./files";
 export type {
@@ -46,13 +53,16 @@ export type { ConnectionOptions } from "./connection";
 
 export type {
   Capabilities,
+  ExposedPort,
   IdlePolicy,
   NestedVirtCapability,
+  PortProtocol,
   SandboxEvent,
   SandboxEventKind,
   SandboxInfo,
   SandboxState,
   SandboxSummary,
+  Snapshot,
 } from "./types";
 
 export {

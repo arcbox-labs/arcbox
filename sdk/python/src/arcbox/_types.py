@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Final, Literal, final
 
-from arcbox._gen import filesystem_pb2, process_pb2, sandbox_pb2
+from arcbox._gen import filesystem_pb2, process_pb2, sandbox_pb2, snapshot_pb2
 from arcbox.errors import ArcBoxError, CommandFailedError, SandboxDiedError
 
 if TYPE_CHECKING:
@@ -35,6 +35,9 @@ SandboxState = Literal[
 
 #: What the daemon does when the idle timeout expires.
 IdlePolicy = Literal["kill", "pause"]
+
+#: Transport protocol of an exposed port.
+PortProtocol = Literal["tcp", "udp"]
 
 #: Kind of a sandbox lifecycle event. "idle" fires when an execution
 #: exits and the sandbox returns to ready; "pausing"/"resumed" carry a
@@ -297,6 +300,31 @@ class SandboxSummary:
     storage_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class ExposedPort:
+    """One host listener currently forwarding into a sandbox."""
+
+    #: Port the workload listens on inside the sandbox.
+    sandbox_port: int
+    #: Loopback host port where the service is reachable.
+    host_port: int
+    protocol: PortProtocol = "tcp"
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """One checkpointed sandbox image in the snapshot catalog."""
+
+    id: str
+    #: The sandbox this snapshot was checkpointed from.
+    sandbox_id: str
+    #: Human-readable name recorded at checkpoint time.
+    name: str = ""
+    #: Labels recorded at checkpoint time, filterable in listings.
+    labels: dict[str, str] = field(default_factory=dict[str, str])
+    created_at: datetime | None = None
+
+
 _STATE_VALUES: dict[SandboxState, sandbox_pb2.SandboxState] = {
     "unknown": sandbox_pb2.SANDBOX_STATE_UNSPECIFIED,
     "starting": sandbox_pb2.SANDBOX_STATE_STARTING,
@@ -411,6 +439,54 @@ def sandbox_summary_from_proto(summary: sandbox_pb2.SandboxSummary) -> SandboxSu
         paused_at=_optional_time(summary.paused_at, summary.HasField("paused_at")),
         failed_at=_optional_time(summary.failed_at, summary.HasField("failed_at")),
         storage_bytes=int(summary.storage_bytes),
+    )
+
+
+def port_protocol_to_proto(protocol: PortProtocol) -> sandbox_pb2.PortProtocol:
+    """Public protocol -> wire enum (never UNSPECIFIED — "tcp" is explicit)."""
+    return sandbox_pb2.PORT_PROTOCOL_UDP if protocol == "udp" else sandbox_pb2.PORT_PROTOCOL_TCP
+
+
+def port_protocol_from_proto(protocol: int) -> PortProtocol:
+    """Wire protocol -> public name (the wire reserves UNSPECIFIED for TCP)."""
+    return "udp" if protocol == sandbox_pb2.PORT_PROTOCOL_UDP else "tcp"
+
+
+def exposed_port_from_proto(port: sandbox_pb2.ExposedPort) -> ExposedPort:
+    """Map one ListExposedPorts row to the public DTO."""
+    return ExposedPort(
+        sandbox_port=port.sandbox_port,
+        host_port=port.host_port,
+        protocol=port_protocol_from_proto(port.protocol),
+    )
+
+
+def snapshot_from_proto(summary: snapshot_pb2.SnapshotSummary) -> Snapshot:
+    """Map one ListSnapshots row to the public DTO."""
+    return Snapshot(
+        id=summary.id,
+        sandbox_id=summary.sandbox_id,
+        name=summary.name,
+        labels=dict(summary.labels),
+        created_at=_optional_time(summary.created_at, summary.HasField("created_at")),
+    )
+
+
+def snapshot_from_checkpoint(
+    response: snapshot_pb2.CheckpointResponse,
+    sandbox_id: str,
+    name: str,
+    labels: dict[str, str],
+) -> Snapshot:
+    """Build the catalog row a Checkpoint response describes. The
+    response carries only id + creation time; name and labels echo the
+    request, which is exactly what the catalog recorded."""
+    return Snapshot(
+        id=response.snapshot_id,
+        sandbox_id=sandbox_id,
+        name=name,
+        labels=labels,
+        created_at=_optional_time(response.created_at, response.HasField("created_at")),
     )
 
 

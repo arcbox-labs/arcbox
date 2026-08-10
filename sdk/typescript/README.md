@@ -139,5 +139,8 @@ Phases 2a and 2b of CORE-58. Shipped:
 | `files` | whole-file read/write; path verbs `stat`/`list`/`mkdir`/`remove`/`move` (typed `FileStat`, `mkdir -p` semantics, `FileNotFoundError` with the path in context) |
 | `files.watch(path)` | typed `FsEvent` stream (renames paired, keepalives filtered); ends cleanly on sandbox stop; a mid-stream drop is `ConnectionLostError` — never auto-reconnected (events cannot be replayed) |
 | `ports.waitForPort(port)` | guest-side listen-table wait (no client polling); expiry → `TimeoutError` naming the `timeoutMs` knob (daemon default 30 s, cap 600 s) |
+| `ports.expose(port)` / `unexpose` / `list` | publish a guest port on host loopback (daemon-allocated or specific host port, tcp/udp); `list` reads the daemon's authoritative live listener table |
+| `sandbox.checkpoint()` | pause + snapshot + resume under the same id; returns the `Snapshot` catalog row |
+| `ArcBox.restore(snapshotId)` | new READY sandbox from a snapshot (fresh client-minted id; `freshNetwork` for concurrent restores); plus `listSnapshots` (auto-paginating) and `deleteSnapshot` |
 
 Deferred: `Template` statics.

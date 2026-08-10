@@ -222,6 +222,9 @@ Shipped:
 | `files` | whole-file read/write; path verbs `stat`/`list`/`mkdir`/`remove`/`move` (frozen `FileStat` dataclass, `mkdir -p` semantics, `FileNotFoundError` with the path in context); every path accepts `str` or `PurePosixPath` |
 | `files.watch(path)` | typed `FsEvent` stream via `AsyncFileWatch`/`FileWatch` context managers (renames paired, keepalives filtered); ends cleanly on sandbox stop; a mid-stream drop is `ConnectionLostError` — never auto-reconnected (events cannot be replayed) |
 | `ports.wait_for_port(port)` | guest-side listen-table wait (no client polling); expiry → `TimeoutError` naming the `timeout` knob (daemon default 30 s, cap 600 s) |
+| `ports.expose(port)` / `unexpose` / `list` | publish a guest port on host loopback (daemon-allocated or specific host port, tcp/udp); `list` reads the daemon's authoritative live listener table |
+| `sandbox.checkpoint()` | pause + snapshot + resume under the same id; returns the frozen `Snapshot` catalog row |
+| `ArcBox.restore(snapshot_id)` | new READY sandbox from a snapshot (fresh client-minted id; `fresh_network=True` for concurrent restores); plus `list_snapshots` (auto-paginating) and `delete_snapshot` |
 
 Deferred: `Template` statics, and the SDK-side default idle-reaping
 policy (design decision 4).
