@@ -389,13 +389,22 @@ impl TemplateCatalog {
     /// already durable, so a failed catalog-wide scan (an unrelated corrupt
     /// record) must not turn into an error the caller would read as "nothing
     /// happened". Releasing nothing is the safe direction — a logged orphan,
-    /// never a deleted snapshot something still references.
+    /// never a deleted snapshot something still references. The warning names
+    /// every candidate id: `list_checkpoints` hides template-labeled
+    /// snapshots, so this log line is how an operator discovers what to
+    /// reclaim with `DeleteSnapshot` once the catalog reads cleanly.
     fn released_after_commit(&self, removed: &[TemplateEntry]) -> ReleasedArtifacts {
         self.released_by(removed).unwrap_or_else(|error| {
+            let candidates: Vec<&str> = removed
+                .iter()
+                .filter_map(|e| e.warm.as_ref().map(|w| w.snapshot_id.as_str()))
+                .collect();
             warn!(
                 %error,
+                snapshot_ids = candidates.join(","),
                 "template catalog scan failed after a committed mutation; \
-                 skipping artifact release (warm snapshots may be orphaned)"
+                 skipping artifact release (listed warm snapshots may be \
+                 orphaned; reclaim via DeleteSnapshot once the catalog parses)"
             );
             ReleasedArtifacts::default()
         })
