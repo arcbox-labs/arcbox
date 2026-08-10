@@ -20,11 +20,16 @@
 //! an actionable suggestion, and the failed operation.
 
 mod client;
+mod commands;
 mod connection;
 mod error;
 mod sandbox;
 mod types;
 
+pub use commands::{
+    Channel, Cmd, CommandHandle, CommandInfo, CommandResult, CommandState, Commands, OutputChunk,
+    OutputStream, PtySize, RunOptions, Signal, Stdin, StdinStatus,
+};
 pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
 pub use sandbox::{ArcBox, ConnectOptions, CreateOptions, ListOptions, Sandbox};

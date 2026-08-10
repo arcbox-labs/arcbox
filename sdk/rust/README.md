@@ -63,14 +63,17 @@ TypeScript and Python SDKs.
 
 ## Status
 
-Phase 1 of the Rust SDK: connection resolution, the registry-derived
-error type, and the sandbox lifecycle core — `capabilities`, `create`
-(readiness watch armed before Create; failed creates remove their
-client-minted id), `connect` (PAUSING settle poll, PAUSED resume,
-STARTING readiness wait, one overall deadline), `list`
-(auto-paginating), `info`, `kill`, `pause`, and tri-state
-`set_lifecycle`.
+Shipped: connection resolution, the registry-derived error type, the
+sandbox lifecycle core — `capabilities`, `create` (readiness watch
+armed before Create; failed creates remove their client-minted id),
+`connect` (PAUSING settle poll, PAUSED resume, STARTING readiness wait,
+one overall deadline), `list` (auto-paginating), `info`, `kill`,
+`pause`, tri-state `set_lifecycle` — and the commands surface:
+`run` (foreground, output collected, non-zero exit is data) / `spawn`
+(background handle), an output stream that re-attaches at the retained
+byte offsets across transport drops, offset-idempotent `write_stdin`
+(serialized; a failed write re-reads the daemon's accepted count),
+`close_stdin`, `stdin_status`, `resize`, `kill(signal)`, `get`
+(stdin cursor seeded from the daemon), and `list`.
 
-Next: the commands surface (`run`/`spawn`, offset-idempotent stdin,
-output streams with attach-resume), then files, ports, snapshots, and
-events.
+Next: files, ports, snapshots, and events.
