@@ -719,17 +719,20 @@ where
         // -----------------------------------------------------------------
         // Template catalog (CORE-107)
         // -----------------------------------------------------------------
-        MessageType::SandboxTemplateBuildRequest => {
-            // The daemon keeps Build UNIMPLEMENTED until the build pipeline
-            // lands, so this arm is a defensive answer, not a surface.
-            send_sandbox_error(
-                stream,
-                trace_id,
-                500,
-                "template Build is not yet implemented (CORE-107)",
-            )
-            .await?;
-        }
+        MessageType::SandboxTemplateBuildRequest => match svc.build_template(payload).await {
+            Ok(resp) => {
+                write_message(
+                    stream,
+                    MessageType::SandboxTemplateBuildResponse,
+                    trace_id,
+                    &resp.encode_to_vec(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, e.status_code(), &e.to_string()).await?;
+            }
+        },
         MessageType::SandboxTemplatePublishRequest => match svc.publish_template(payload).await {
             Ok(resp) => {
                 write_message(

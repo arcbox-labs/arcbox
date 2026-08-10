@@ -1,12 +1,12 @@
 //! Sandbox template catalog service — control plane (CORE-107).
 //!
-//! Pure forwarders to the guest agent, mirroring `snapshot.rs`: the catalog
-//! and every artifact it references live inside the System VM. `Build` alone
-//! stays UNIMPLEMENTED until the build pipeline lands.
+//! Pure forwarders to the guest agent, mirroring `snapshot.rs`: the catalog,
+//! every artifact it references, and the build pipeline live inside the
+//! System VM.
 
 use arcbox_connect::sandbox_v1 as pb;
 use buffa_types::google::protobuf::Empty;
-use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 
 use super::SharedRuntime;
 use super::{ConnectRuntimeExt as _, ContextExt as _};
@@ -32,17 +32,32 @@ impl TemplateServiceImpl {
               Router rather than named by callers"
 )]
 impl pb::TemplateService for TemplateServiceImpl {
-    /// UNIMPLEMENTED until the build pipeline lands (CORE-107 PR3+); the
-    /// rest of the catalog surface already answers.
+    /// Blocks for the whole build (image export, rootfs conversion). Safe on
+    /// this transport: sandbox RPCs ride the async vsock arm, which applies
+    /// no read deadline.
     async fn build(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, pb::BuildTemplateRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb::BuildTemplateRequest>,
     ) -> ServiceResult<pb::Template> {
-        Err(ConnectError::unimplemented(
-            "template Build is not implemented yet (CORE-107 build pipeline); \
-             Get/List/Publish/Delete already answer",
-        ))
+        let machine = ctx.sandbox_machine_id()?;
+        let req = request.to_owned_message();
+        let name = req.name.clone();
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        // The RPC error otherwise reaches only the caller; the daemon log
+        // must record a failed catalog mutation on its own (CORE-82).
+        let resp = agent
+            .sandbox_template_build(req)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(machine = %machine, template = %name, %error, "template build failed");
+            })
+            .map_err(ApiError::from)?;
+        Response::ok(resp)
     }
 
     async fn publish(
