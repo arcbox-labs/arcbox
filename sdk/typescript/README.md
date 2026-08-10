@@ -199,4 +199,4 @@ Phases 2a and 2b of CORE-58. Shipped:
 | `sandbox.checkpoint()` | pause + snapshot + resume under the same id; returns the `Snapshot` catalog row |
 | `ArcBox.restore(snapshotId)` | new READY sandbox from a snapshot (fresh client-minted id; `freshNetwork` for concurrent restores); plus `listSnapshots` (auto-paginating) and `deleteSnapshot` |
 
-Deferred: `Template` statics.
+Template statics shipped: `Template.build/get/list/delete` + instance `publish()/delete()`; `Sandbox.create` accepts a `Template` instance; `noDefaultCmd`/`noDefaultEnv` create options carry explicit-empty overrides.
