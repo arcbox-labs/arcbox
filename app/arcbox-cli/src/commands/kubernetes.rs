@@ -38,6 +38,7 @@ pub enum KubernetesCommands {
 struct KubernetesIntegrationState {
     enabled: bool,
     previous_context: Option<String>,
+    managed_context: Option<String>,
 }
 
 pub async fn execute(cmd: KubernetesCommands) -> Result<()> {
@@ -248,14 +249,13 @@ async fn set_current_context(home: &Path, context: &str) -> Result<()> {
     Ok(())
 }
 
-async fn delete_context_entries(home: &Path) -> Result<()> {
+async fn delete_context_entries(home: &Path, managed_context: &str) -> Result<()> {
     let kubectl = kubectl_bin(home);
     let kubeconfig = user_kubeconfig_path(home);
     if !kubectl.exists() || !kubeconfig.exists() {
         return Ok(());
     }
 
-    let managed_context = managed_context_name();
     for args in [
         vec!["config", "delete-context", managed_context],
         vec!["config", "delete-cluster", managed_context],
@@ -272,7 +272,7 @@ async fn delete_context_entries(home: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn refresh_managed_kubeconfig(home: &Path) -> Result<()> {
+async fn refresh_managed_kubeconfig(home: &Path) -> Result<String> {
     let client = kubernetes_client();
     let response: pb::KubernetesKubeconfigResponse = client
         .get_kubeconfig(pb::KubernetesKubeconfigRequest::default())
@@ -285,7 +285,18 @@ async fn refresh_managed_kubeconfig(home: &Path) -> Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
     write_private_file(&managed, response.kubeconfig).await?;
-    Ok(())
+    Ok(resolve_managed_context_name(
+        response.context_name,
+        managed_context_name(),
+    ))
+}
+
+fn resolve_managed_context_name(context_name: String, profile_default: &str) -> String {
+    if context_name.is_empty() {
+        profile_default.to_owned()
+    } else {
+        context_name
+    }
 }
 
 async fn refresh_if_enabled(home: &Path) -> Result<()> {
@@ -294,10 +305,35 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
         return Ok(());
     }
 
-    refresh_managed_kubeconfig(home).await?;
+    let current_context = current_context(home).await?;
+    let restore_managed_context = should_restore_managed_context(
+        current_context.as_deref(),
+        state.managed_context.as_deref(),
+        managed_context_name(),
+    );
+    let managed_context = refresh_managed_kubeconfig(home).await?;
+    delete_context_entries(home, &managed_context).await?;
     merge_managed_kubeconfig(home).await?;
-    set_current_context(home, managed_context_name()).await?;
+    if restore_managed_context {
+        set_current_context(home, &managed_context).await?;
+    }
+    save_state(
+        home,
+        &KubernetesIntegrationState {
+            managed_context: Some(managed_context),
+            ..state
+        },
+    )
+    .await?;
     Ok(())
+}
+
+fn should_restore_managed_context(
+    current_context: Option<&str>,
+    previous_managed_context: Option<&str>,
+    profile_default: &str,
+) -> bool {
+    current_context == Some(previous_managed_context.unwrap_or(profile_default))
 }
 
 async fn execute_start() -> Result<()> {
@@ -412,18 +448,18 @@ async fn execute_enable() -> Result<()> {
     let home = home_dir()?;
     install_kubernetes_tools(&home).await?;
 
-    let managed_context = managed_context_name();
     let previous_context = current_context(&home).await?;
-    refresh_managed_kubeconfig(&home).await?;
-    delete_context_entries(&home).await?;
+    let managed_context = refresh_managed_kubeconfig(&home).await?;
+    delete_context_entries(&home, &managed_context).await?;
     merge_managed_kubeconfig(&home).await?;
-    set_current_context(&home, managed_context).await?;
+    set_current_context(&home, &managed_context).await?;
 
     save_state(
         &home,
         &KubernetesIntegrationState {
             enabled: true,
-            previous_context: previous_context.filter(|ctx| ctx != managed_context),
+            previous_context: previous_context.filter(|ctx| ctx != &managed_context),
+            managed_context: Some(managed_context.clone()),
         },
     )
     .await?;
@@ -437,9 +473,16 @@ async fn execute_enable() -> Result<()> {
 async fn execute_disable() -> Result<()> {
     let home = home_dir()?;
     let state = load_state(&home).await?;
+    let managed_context = state
+        .managed_context
+        .clone()
+        .unwrap_or_else(|| managed_context_name().to_owned());
+    let current_context = current_context(&home).await?;
 
-    delete_context_entries(&home).await?;
-    if let Some(previous) = state.previous_context.as_deref() {
+    delete_context_entries(&home, &managed_context).await?;
+    if current_context.as_deref() == Some(managed_context.as_str())
+        && let Some(previous) = state.previous_context.as_deref()
+    {
         let _ = set_current_context(&home, previous).await;
     }
 
@@ -448,6 +491,7 @@ async fn execute_disable() -> Result<()> {
         &KubernetesIntegrationState {
             enabled: false,
             previous_context: state.previous_context,
+            managed_context: state.managed_context,
         },
     )
     .await?;
@@ -465,4 +509,45 @@ async fn execute_kubeconfig() -> Result<()> {
         .into_owned();
     print!("{}", response.kubeconfig);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_managed_context_name, should_restore_managed_context};
+
+    #[test]
+    fn context_name_uses_old_daemon_fallback_only_when_missing() {
+        assert_eq!(
+            resolve_managed_context_name(String::new(), "arcbox"),
+            "arcbox"
+        );
+        assert_eq!(
+            resolve_managed_context_name("arcbox-dev-instance-1".to_owned(), "arcbox-dev"),
+            "arcbox-dev-instance-1"
+        );
+    }
+
+    #[test]
+    fn refresh_restores_only_the_context_owned_by_this_instance() {
+        assert!(should_restore_managed_context(
+            Some("arcbox-dev-a"),
+            Some("arcbox-dev-a"),
+            "arcbox-dev"
+        ));
+        assert!(should_restore_managed_context(
+            Some("arcbox-dev"),
+            None,
+            "arcbox-dev"
+        ));
+        assert!(!should_restore_managed_context(
+            Some("arcbox-dev-b"),
+            Some("arcbox-dev-a"),
+            "arcbox-dev"
+        ));
+        assert!(!should_restore_managed_context(
+            None,
+            Some("arcbox-dev-a"),
+            "arcbox-dev"
+        ));
+    }
 }

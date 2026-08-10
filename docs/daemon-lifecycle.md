@@ -28,8 +28,9 @@ boot_runtime             Construct Runtime, boot the System VM   variable
     │                    published from inside Runtime::init so
     │                    the span covers the guest boot alone.
     │
-start_runtime_services   DNS, Docker API, recovery               ~instant
-    │                    Reported as NETWORK_READY.
+start_runtime_services   DNS, Docker API, critical recovery      ~instant
+    │                    Then optional production Docker context;
+    │                    reported as NETWORK_READY.
     │
 mark_ready               SetupPhase::Ready
 ```
@@ -55,13 +56,17 @@ startup failure.
   `READY` are published ~300 µs apart with no await point between them and
   a snapshot channel would collapse them (see `SetupState` in
   `arcbox-api/src/system.rs`).
-- `NETWORK_READY` covers whichever host services this daemon runs. A
-  `--no-linux-vm` daemon reaches it with DNS alone — `start_services` skips
-  the Docker API and the Kubernetes proxy in that mode. DNS and the Docker
-  API are both *bound* by the time it is published, and a bind failure on
-  either fails startup with `FAILED` instead of reaching this phase. The
-  Kubernetes proxy is the exception: a port 16443 already in use is
-  tolerated by design, so the phase does not promise it.
+- `NETWORK_READY` covers whichever host services this daemon promises. A
+  `--no-linux-vm` daemon reaches it with DNS alone. DNS, Docker, and an
+  explicitly requested Kubernetes proxy are *bound* by then; a bind failure
+  becomes `FAILED`. The canonical best-effort port 16443 remains the exception:
+  a conflict leaves Kubernetes RPCs unavailable without failing startup.
+- A non-default container CIDR is reconciled before runtime services start;
+  an existing route owned by another interface fails startup. The canonical
+  production CIDR keeps its existing background recovery behavior.
+- `--docker-integration` is production-only. Its global Docker context switch
+  runs after startup-critical recovery, so a resolver failure cannot leave a
+  dead ArcBox context selected.
 - Enum ordinal ≠ progression order (`DOWNLOADING_ASSETS = 8` occurs before
   `READY = 6`). Clients must match on the value, never compare ordinals.
   New phases are appended with the next free number regardless of where

@@ -4,9 +4,14 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::SystemServiceClient;
+use arcbox_constants::paths::ArcboxProfile;
 use serde::Serialize;
 use tokio::process::Command;
+
+use crate::connect;
 
 use super::OutputFormat;
 
@@ -299,8 +304,13 @@ async fn check_docker_cli() -> HealthCheck {
 }
 
 async fn run_docker(arguments: &[&str]) -> std::result::Result<String, String> {
+    let context =
+        arcbox_cli::runtime_selection::docker_context_name().map_err(|error| error.to_string())?;
     let mut command = Command::new("docker");
-    command.args(arguments).kill_on_drop(true);
+    command
+        .args(["--context", &context])
+        .args(arguments)
+        .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(5), command.output())
         .await
         .map_err(|_| format!("docker {} timed out", arguments.join(" ")))?
@@ -336,6 +346,38 @@ fn endpoint_matches_socket(endpoint: &str, expected: &Path) -> Result<bool, Stri
 
 #[cfg(target_os = "macos")]
 async fn add_macos_checks(checks: &mut Vec<HealthCheck>) {
+    if ArcboxProfile::from_env_or_default() == ArcboxProfile::Development {
+        match setup_status().await {
+            Ok(status) => {
+                checks.push(if status.dns_resolver_installed {
+                    HealthCheck::pass("DNS resolver", "installed for this instance")
+                } else {
+                    HealthCheck::fail(
+                        "DNS resolver",
+                        "not installed for this instance",
+                        "Restart the ArcBox development instance.",
+                    )
+                });
+                checks.push(if status.route_installed {
+                    HealthCheck::pass("Container route", "installed for this instance")
+                } else {
+                    HealthCheck::fail(
+                        "Container route",
+                        "not installed for this instance",
+                        "Restart the ArcBox development instance.",
+                    )
+                });
+            }
+            Err(error) => checks.push(HealthCheck::fail(
+                "Instance networking",
+                format!("status query failed: {error}"),
+                "Restart the ArcBox development instance.",
+            )),
+        }
+        checks.push(check_helper().await);
+        return;
+    }
+
     let dns = super::dns::inspect_status().await;
     checks.push(if dns.resolver_installed {
         HealthCheck::pass("DNS resolver", dns.resolver_path)
@@ -422,29 +464,19 @@ async fn add_macos_checks(checks: &mut Vec<HealthCheck>) {
 
 #[cfg(target_os = "macos")]
 async fn check_container_route() -> HealthCheck {
-    let Some((bridge, _)) = arcbox_core::bridge_discovery::find_bridge_with_vmenet() else {
-        return HealthCheck::fail(
-            "Container route",
-            "cannot identify the ArcBox bridge",
-            "Repair the bridge before checking its route.",
-        );
-    };
-    match arcbox_core::route_reconciler::container_route_mode(&bridge).await {
-        Ok(Some(arcbox_core::route_reconciler::RouteMode::Preferred)) => {
-            HealthCheck::pass("Container route", format!("172.16.0.0/12 -> {bridge}"))
+    match setup_status().await {
+        Ok(status) if status.route_installed => {
+            HealthCheck::pass("Container route", "installed for this instance")
         }
-        Ok(Some(arcbox_core::route_reconciler::RouteMode::SplitFallback)) => {
-            HealthCheck::pass("Container route", format!("split /13 routes -> {bridge}"))
-        }
-        Ok(None) => HealthCheck::fail(
+        Ok(_) => HealthCheck::fail(
             "Container route",
-            format!("container routes do not point to {bridge}"),
+            "not installed for this instance",
             "Restart the ArcBox daemon to reconcile networking.",
         ),
         Err(error) => HealthCheck::fail(
             "Container route",
-            error.to_string(),
-            "Check route permissions and the ArcBox daemon logs.",
+            format!("status query failed: {error}"),
+            "Restart the ArcBox daemon.",
         ),
     }
 }
@@ -474,6 +506,15 @@ async fn check_helper() -> HealthCheck {
             "Run `sudo abctl _install --no-daemon --no-shell`.",
         ),
     }
+}
+
+async fn setup_status() -> Result<pb::SetupStatus> {
+    let (transport, config) = connect::daemon(&super::resolve_grpc_socket_path());
+    let response = SystemServiceClient::new(transport, config)
+        .get_setup_status(pb::Empty::default())
+        .await
+        .context("failed to query daemon setup status")?;
+    Ok(response.into_owned())
 }
 
 #[cfg(test)]

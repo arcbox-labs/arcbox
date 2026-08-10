@@ -97,6 +97,13 @@ impl Ipv4Net {
         Ipv4Addr::from(Self::prefix_to_mask(self.prefix))
     }
 
+    /// Returns whether this network and `other` share any addresses.
+    #[inline]
+    pub fn overlaps(self, other: Self) -> bool {
+        let shared_mask = Self::prefix_to_mask(self.prefix.min(other.prefix));
+        u32::from(self.addr) & shared_mask == u32::from(other.addr) & shared_mask
+    }
+
     /// Converts a prefix length to a `u32` mask in host byte order.
     const fn prefix_to_mask(prefix: u8) -> u32 {
         if prefix == 0 {
@@ -176,6 +183,15 @@ pub struct RouteInfo {
     pub ifindex: u16,
     /// Route flags (`RTF_*`).
     pub flags: i32,
+}
+
+/// An IPv4 routing-table entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteEntry {
+    /// Exact network matched by this entry.
+    pub network: Ipv4Net,
+    /// Interface and flag metadata for the route.
+    pub info: RouteInfo,
 }
 
 /// Result of a non-destructive route-add attempt.
@@ -343,6 +359,26 @@ pub fn get(net: Ipv4Net) -> Result<Option<RouteInfo>, String> {
     }
 }
 
+/// Lists all non-default routing-table entries that overlap `net`.
+///
+/// The default route is omitted because every IPv4 network overlaps it and a
+/// more-specific interface route is expected to take precedence over it.
+///
+/// # Errors
+///
+/// Returns an error string when the kernel routing table cannot be read or a
+/// returned entry is malformed.
+pub fn overlapping(net: Ipv4Net) -> Result<Vec<RouteEntry>, String> {
+    let table =
+        msg::route_table().map_err(|error| format!("routing table dump failed: {error}"))?;
+    decode_route_table(&table).map(|entries| {
+        entries
+            .into_iter()
+            .filter(|entry| entry.network.prefix() != 0 && entry.network.overlaps(net))
+            .collect()
+    })
+}
+
 /// Resolves an interface name to its kernel index.
 pub fn interface_index(interface: &str) -> Result<u16, String> {
     let interface = CString::new(interface).map_err(|e| format!("invalid interface name: {e}"))?;
@@ -378,6 +414,51 @@ fn prefix_from_mask(mask: Ipv4Addr) -> Option<u8> {
         u32::MAX << (32 - prefix)
     };
     (mask == expected).then_some(prefix)
+}
+
+fn decode_route_table(mut table: &[u8]) -> Result<Vec<RouteEntry>, String> {
+    let header_size = std::mem::size_of::<libc::rt_msghdr>();
+    let mut entries = Vec::new();
+
+    while !table.is_empty() {
+        if table.len() < header_size {
+            return Err("routing table entry is shorter than rt_msghdr".to_owned());
+        }
+        // SAFETY: the length check above guarantees a complete header and the
+        // kernel dump has no Rust alignment guarantee.
+        let header = unsafe { std::ptr::read_unaligned(table.as_ptr().cast::<libc::rt_msghdr>()) };
+        let message_len = usize::from(header.rtm_msglen);
+        if message_len < header_size || message_len > table.len() {
+            return Err(format!(
+                "routing table entry has invalid length {message_len}"
+            ));
+        }
+        if header.rtm_version != libc::RTM_VERSION as u8 {
+            return Err(format!(
+                "routing table entry has unsupported version {}",
+                header.rtm_version
+            ));
+        }
+
+        let message = &table[..message_len];
+        let (destination, netmask) = msg::parse_ipv4_route(message, &header)
+            .map_err(|error| format!("failed to parse routing table entry: {error}"))?;
+        let prefix = prefix_from_mask(netmask)
+            .ok_or_else(|| "routing table entry has a non-contiguous netmask".to_owned())?;
+        let address = Ipv4Addr::from(u32::from(destination) & u32::from(netmask));
+        let network = Ipv4Net::new(address, prefix)
+            .map_err(|error| format!("routing table entry has an invalid network: {error}"))?;
+        entries.push(RouteEntry {
+            network,
+            info: RouteInfo {
+                ifindex: header.rtm_index,
+                flags: header.rtm_flags,
+            },
+        });
+        table = &table[message_len..];
+    }
+
+    Ok(entries)
 }
 
 fn decode_route_event(message: &[u8]) -> io::Result<Option<RouteEvent>> {
@@ -498,6 +579,66 @@ mod tests {
             "0.0.0.0/0".parse::<Ipv4Net>().unwrap().mask(),
             Ipv4Addr::UNSPECIFIED
         );
+    }
+
+    #[test]
+    fn ipv4net_overlap_detects_covering_and_contained_networks() {
+        let network: Ipv4Net = "10.64.32.0/20".parse().unwrap();
+
+        assert!(network.overlaps("10.64.0.0/16".parse().unwrap()));
+        assert!(network.overlaps("10.64.35.0/24".parse().unwrap()));
+        assert!(network.overlaps(network));
+        assert!(!network.overlaps("10.64.48.0/20".parse().unwrap()));
+    }
+
+    #[test]
+    fn route_table_decoder_reads_concatenated_entries() {
+        let mut table = Vec::new();
+        for (network, ifindex) in [("10.64.0.0/16", 12), ("10.64.35.0/24", 17)] {
+            let network: Ipv4Net = network.parse().unwrap();
+            let destination = sockaddr::make_dst(network);
+            let netmask = sockaddr::make_netmask(network);
+            let mut message =
+                msg::build_msg(msg::MsgType::Get, &destination, None, &netmask).unwrap();
+            // SAFETY: `build_msg` always returns a complete, aligned-independent
+            // rt_msghdr prefix, and write_unaligned accepts the byte buffer.
+            let mut header =
+                unsafe { std::ptr::read_unaligned(message.as_ptr().cast::<libc::rt_msghdr>()) };
+            header.rtm_index = ifindex;
+            // SAFETY: the same complete-header invariant applies to this write.
+            unsafe { std::ptr::write_unaligned(message.as_mut_ptr().cast(), header) };
+            table.extend(message);
+        }
+
+        let entries = decode_route_table(&table).unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                RouteEntry {
+                    network: "10.64.0.0/16".parse().unwrap(),
+                    info: RouteInfo {
+                        ifindex: 12,
+                        flags: libc::RTF_UP | libc::RTF_STATIC,
+                    },
+                },
+                RouteEntry {
+                    network: "10.64.35.0/24".parse().unwrap(),
+                    info: RouteInfo {
+                        ifindex: 17,
+                        flags: libc::RTF_UP | libc::RTF_STATIC,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_query_reads_the_live_ipv4_table() {
+        let all_ipv4: Ipv4Net = "0.0.0.0/0".parse().unwrap();
+        let entries = overlapping(all_ipv4).unwrap();
+
+        assert!(entries.iter().all(|entry| entry.network.prefix() != 0));
     }
 
     #[test]

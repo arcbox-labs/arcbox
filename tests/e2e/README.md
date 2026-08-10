@@ -26,13 +26,17 @@ macOS virtualization support (plus a local Docker CLI for the daemon-level test)
   boot-assets scenario and the `hv_e2e` probe capture it automatically on
   failure, while the VM is still alive.
 
-## Parallel daemons: one data dir per daemon
+## Parallel daemon control planes: one data dir per daemon
 
-Everything a daemon contends on — flock, gRPC/Docker sockets, logs, machine
-state — derives from `--data-dir` (`HostLayout`), so daemons with distinct data
-dirs run side by side. That is the isolation contract for parallel fix work:
+Persistent state — flock, gRPC/Docker sockets, logs, and machines — derives
+from `--data-dir` (`HostLayout`). The harness also requests kernel-assigned
+DNS and Kubernetes ports, so daemon control planes with distinct data dirs run
+side by side. That is the isolation contract for parallel fix work:
 **one worktree/agent = one data dir**, and the harness enforces it —
 `DaemonHandle::spawn` refuses a data dir inside `~/.arcbox` or `~/.arcbox-dev`.
+
+The container CIDR and host route are not isolated by the harness. Never run
+multiple VM-booting harness daemons, or one beside a live ArcBox daemon.
 
 Three host-global resources are *not* covered by the data dir. Tests must not
 touch them:

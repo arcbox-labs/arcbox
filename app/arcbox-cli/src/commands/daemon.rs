@@ -7,7 +7,11 @@
 //! - inspect daemon status (`abctl daemon status`)
 
 use anyhow::{Context, Result, bail};
-use arcbox_constants::paths::{ArcboxProfile, HostLayout};
+use arcbox_constants::{
+    container_network::ContainerNetwork,
+    paths::{ArcboxProfile, HostLayout},
+};
+use arcbox_helper::validate::Domain;
 use clap::{Args, ValueEnum};
 use humantime::format_duration;
 use std::ffi::OsString;
@@ -37,6 +41,30 @@ pub struct DaemonArgs {
     /// Data directory for ArcBox.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+
+    /// DNS suffix served by this daemon (default: arcbox.local).
+    #[arg(long)]
+    pub dns_domain: Option<Domain>,
+
+    /// Host UDP port for DNS; 0 asks the OS to allocate one (default: 5553).
+    #[arg(long)]
+    pub dns_port: Option<u16>,
+
+    /// Install `/etc/resolver/<dns-domain>` for this isolated instance.
+    #[arg(long)]
+    pub install_dns_resolver: bool,
+
+    /// Host TCP port for the Kubernetes API proxy; 0 asks the OS to allocate one.
+    #[arg(long)]
+    pub kubernetes_port: Option<u16>,
+
+    /// Name written into the Kubernetes kubeconfig.
+    #[arg(long)]
+    pub kubernetes_context: Option<String>,
+
+    /// Private IPv4 pool used by this instance's container networks.
+    #[arg(long)]
+    pub container_cidr: Option<ContainerNetwork>,
 
     /// Runtime profile (production or development).
     #[arg(long)]
@@ -406,6 +434,29 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
         daemon_args.push(OsString::from("--data-dir"));
         daemon_args.push(data_dir.as_os_str().to_os_string());
     }
+    if let Some(domain) = &args.dns_domain {
+        daemon_args.push(OsString::from("--dns-domain"));
+        daemon_args.push(OsString::from(domain.to_string()));
+    }
+    if let Some(port) = args.dns_port {
+        daemon_args.push(OsString::from("--dns-port"));
+        daemon_args.push(OsString::from(port.to_string()));
+    }
+    if args.install_dns_resolver {
+        daemon_args.push(OsString::from("--install-dns-resolver"));
+    }
+    if let Some(port) = args.kubernetes_port {
+        daemon_args.push(OsString::from("--kubernetes-port"));
+        daemon_args.push(OsString::from(port.to_string()));
+    }
+    if let Some(context) = &args.kubernetes_context {
+        daemon_args.push(OsString::from("--kubernetes-context"));
+        daemon_args.push(OsString::from(context));
+    }
+    if let Some(network) = args.container_cidr {
+        daemon_args.push(OsString::from("--container-cidr"));
+        daemon_args.push(OsString::from(network.to_string()));
+    }
     if let Some(profile) = args.profile {
         daemon_args.push(OsString::from("--profile"));
         daemon_args.push(OsString::from(profile.as_str()));
@@ -509,7 +560,12 @@ fn send_sigterm(pid: i32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpawnLock, read_lock_file, wait_for_lock_handoff};
+    use super::{
+        DaemonAction, DaemonArgs, SpawnLock, build_daemon_args, read_lock_file,
+        wait_for_lock_handoff,
+    };
+    use arcbox_constants::paths::ArcboxProfile;
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::io::AsRawFd;
     use tempfile::tempdir;
@@ -517,6 +573,50 @@ mod tests {
     fn flock_nb(file: &fs::File) -> bool {
         // SAFETY: flock on a valid fd owned by the test.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    #[test]
+    fn daemon_args_forward_isolated_instance_configuration() {
+        let args = DaemonArgs {
+            action: DaemonAction::Start,
+            socket: None,
+            grpc_socket: None,
+            data_dir: None,
+            dns_domain: Some("feature.dev.arcbox.local".parse().unwrap()),
+            dns_port: Some(0),
+            install_dns_resolver: true,
+            kubernetes_port: Some(0),
+            kubernetes_context: Some("arcbox-dev-feature".to_string()),
+            container_cidr: Some("10.64.16.0/20".parse().unwrap()),
+            profile: Some(ArcboxProfile::Development),
+            kernel: None,
+            foreground: false,
+            docker_integration: false,
+            no_linux_vm: false,
+            guest_docker_vsock_port: None,
+            no_mount_nfs: false,
+        };
+
+        assert_eq!(
+            build_daemon_args(&args),
+            [
+                "--dns-domain",
+                "feature.dev.arcbox.local",
+                "--dns-port",
+                "0",
+                "--install-dns-resolver",
+                "--kubernetes-port",
+                "0",
+                "--kubernetes-context",
+                "arcbox-dev-feature",
+                "--container-cidr",
+                "10.64.16.0/20",
+                "--profile",
+                "development",
+            ]
+            .map(OsString::from)
+            .to_vec()
+        );
     }
 
     #[test]

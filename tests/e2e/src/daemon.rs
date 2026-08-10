@@ -130,18 +130,22 @@ impl DaemonHandle {
             .arg("--data-dir")
             .arg(&config.data_dir)
             .arg("--foreground")
+            // The Kubernetes proxy is fail-fast so an occupied production
+            // port can never be mistaken for this daemon. Let the kernel pick
+            // an isolated endpoint for every harness process.
+            .arg("--kubernetes-port")
+            .arg("0")
             // Keep the guest-data NFS mount off the shared ~/ArcBox by pointing
             // it inside the isolated data dir. A caller can override via env.
             .env("ARCBOX_HOST_MOUNT_DIR", config.data_dir.join("ArcBox"))
             .args(&config.args)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
-        // The DNS service binds a fixed localhost port (5553 by default) —
-        // the one host-global a test daemon would still fight an installed
-        // ArcBox (or a sibling test) over. Give each daemon its own port
-        // unless the scenario pinned one.
+        // Let the bound DNS socket choose its own port unless the scenario
+        // intentionally pins one. This avoids a probe-and-release race with
+        // production or a sibling harness.
         if !config.env.iter().any(|(key, _)| key == "ARCBOX_DNS_PORT") {
-            command.env("ARCBOX_DNS_PORT", ephemeral_udp_port()?.to_string());
+            command.env("ARCBOX_DNS_PORT", "0");
         }
         for (key, value) in &config.env {
             command.env(key, value);
@@ -431,14 +435,6 @@ impl Service<Uri> for UnixConnector {
             Ok(TokioIo::new(stream))
         })
     }
-}
-
-/// Reserves an OS-assigned localhost UDP port and releases it for the
-/// daemon's DNS service to claim. Racy in principle; in practice ephemeral
-/// ports don't collide within the spawn window.
-fn ephemeral_udp_port() -> Result<u16> {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").context("probing for a free UDP port")?;
-    Ok(socket.local_addr()?.port())
 }
 
 #[cfg(test)]

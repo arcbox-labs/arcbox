@@ -1,6 +1,6 @@
 //! ArcBox CLI - High-performance container and VM runtime.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
@@ -53,12 +53,66 @@ fn run(cli: Cli) -> Result<()> {
         unsafe {
             std::env::set_var("ARCBOX_SOCKET", socket.as_os_str());
         }
+        if let Some(data_dir) = arcbox_cli::runtime_selection::data_dir_from_docker_socket(socket) {
+            let development_instance =
+                arcbox_cli::runtime_selection::is_development_instance(&data_dir);
+            let selected_profile = cli.profile.or_else(|| {
+                std::env::var(arcbox_constants::env::PROFILE)
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            });
+            if development_instance
+                && selected_profile.is_some_and(|profile| {
+                    profile != arcbox_constants::paths::ArcboxProfile::Development
+                })
+            {
+                bail!(
+                    "--socket selects an isolated development instance, but the selected profile is production"
+                );
+            }
+            if let Some(configured) = std::env::var_os(arcbox_constants::env::DATA_DIR) {
+                if std::path::Path::new(&configured) != data_dir {
+                    bail!(
+                        "--socket selects {}, but {} selects {}",
+                        data_dir.display(),
+                        arcbox_constants::env::DATA_DIR,
+                        std::path::Path::new(&configured).display()
+                    );
+                }
+            } else {
+                // SAFETY: startup is still single-threaded.
+                unsafe {
+                    std::env::set_var(arcbox_constants::env::DATA_DIR, &data_dir);
+                }
+            }
+            if development_instance && selected_profile.is_none() {
+                // SAFETY: startup is still single-threaded.
+                unsafe {
+                    std::env::set_var(
+                        arcbox_constants::env::PROFILE,
+                        arcbox_constants::paths::ArcboxProfile::Development.as_str(),
+                    );
+                }
+            }
+        }
     }
     if let Some(profile) = cli.profile {
         // SAFETY: This is called at the start of main(), before any threads are spawned,
         // and we're the only ones modifying this environment variable.
         unsafe {
             std::env::set_var(arcbox_constants::env::PROFILE, profile.as_str());
+        }
+    }
+    if std::env::var_os(arcbox_constants::env::DOCKER_CONTEXT).is_none() {
+        let profile = arcbox_constants::paths::ArcboxProfile::from_env_or_default();
+        let data_dir = arcbox_constants::paths::HostLayout::from_env_or_default().data_dir;
+        if let Some(context) =
+            arcbox_cli::runtime_selection::docker_context_name_for(profile, &data_dir)
+        {
+            // SAFETY: startup is still single-threaded.
+            unsafe {
+                std::env::set_var(arcbox_constants::env::DOCKER_CONTEXT, context);
+            }
         }
     }
 

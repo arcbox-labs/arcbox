@@ -23,3 +23,4 @@ mod system_info;
 mod vsock;
 
 pub use agent::Agent;
+pub use cmdline::container_network;

@@ -35,6 +35,10 @@ const MAX_MSG_SIZE: usize = 512;
 /// Maximum number of read attempts when waiting for a matching RTM_GET reply.
 const MAX_READ_ATTEMPTS: usize = 50;
 
+/// Maximum attempts when the routing table grows between the size and data
+/// `sysctl` calls.
+const MAX_DUMP_ATTEMPTS: usize = 3;
+
 /// Routing message type for [`build_msg`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgType {
@@ -242,6 +246,62 @@ pub fn route_query(msg: &[u8]) -> io::Result<GetReply> {
         io::ErrorKind::TimedOut,
         "no matching RTM_GET reply after maximum read attempts",
     ))
+}
+
+/// Returns a point-in-time dump of the IPv4 routing table.
+pub(crate) fn route_table() -> io::Result<Vec<u8>> {
+    let mut mib = [
+        libc::CTL_NET,
+        libc::PF_ROUTE,
+        0,
+        libc::AF_INET,
+        libc::NET_RT_DUMP,
+        0,
+    ];
+
+    for attempt in 1..=MAX_DUMP_ATTEMPTS {
+        let mut size = 0usize;
+        // SAFETY: `mib` contains the documented six-element routing-table MIB,
+        // `size` is writable, and both data pointers are null for a size query.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                6,
+                std::ptr::null_mut(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut table = vec![0u8; size];
+        // SAFETY: `table` has `size` writable bytes, `size` remains writable,
+        // and the remaining arguments are the same valid read-only MIB query.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                6,
+                table.as_mut_ptr().cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result == 0 {
+            table.truncate(size);
+            return Ok(table);
+        }
+
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOMEM) || attempt == MAX_DUMP_ATTEMPTS {
+            return Err(error);
+        }
+    }
+
+    unreachable!()
 }
 
 pub(crate) fn parse_ipv4_route(

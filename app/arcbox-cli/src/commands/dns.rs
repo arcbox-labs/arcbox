@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use arcbox_constants::paths::HostLayout;
+use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use clap::Subcommand;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
@@ -129,11 +129,22 @@ pub enum DnsCommands {
 
 /// Executes the dns subcommand.
 pub async fn execute(cmd: DnsCommands, format: OutputFormat) -> Result<()> {
+    validate_dns_scope(ArcboxProfile::from_env_or_default())?;
+
     match cmd {
         DnsCommands::Install => execute_install().await,
         DnsCommands::Uninstall => execute_uninstall().await,
         DnsCommands::Status => execute_status(format).await,
     }
+}
+
+fn validate_dns_scope(profile: ArcboxProfile) -> Result<()> {
+    if profile == ArcboxProfile::Development {
+        bail!(
+            "Development DNS resolvers are managed by each instance daemon; refusing the machine-wide DNS command."
+        );
+    }
+    Ok(())
 }
 
 /// Creates `/etc/resolver/<domain>` as a permanent entry.
@@ -604,5 +615,11 @@ mod tests {
             probe_dns(address, "host.arcbox.local", Duration::from_millis(20)).await,
             DnsHealth::TimedOut
         );
+    }
+
+    #[test]
+    fn development_dns_commands_are_rejected() {
+        assert!(validate_dns_scope(ArcboxProfile::Development).is_err());
+        assert!(validate_dns_scope(ArcboxProfile::Production).is_ok());
     }
 }

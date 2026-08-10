@@ -14,9 +14,10 @@ use crate::error::{EngineError, Result};
 use crate::event::Event;
 use crate::machine::MachineConfig;
 use arcbox_constants::cmdline::{
-    DEBUG_CONSOLE_KEY, DOCKER_METADATA_DEVICE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
-    HV_EARLYCON_DIRECTIVE, RUNTIME_GENERATION_KEY,
+    CONTAINER_NETWORK_KEY, DEBUG_CONSOLE_KEY, DOCKER_METADATA_DEVICE_KEY,
+    GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE, RUNTIME_GENERATION_KEY,
 };
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::devices::DOCKER_METADATA_BLOCK_DEVICE;
 use arcbox_error::CommonError;
 
@@ -284,7 +285,6 @@ impl LifecycleShared {
             hook.call();
         }
     }
-
     /// Creates the default machine with EROFS rootfs and no initramfs.
     ///
     /// Block devices:
@@ -405,6 +405,8 @@ impl LifecycleShared {
                 cmdline.push_str(&port.to_string());
             }
         }
+
+        cmdline = with_container_network(cmdline, self.config.container_network);
 
         // Declare the ext4 metadata device this machine attaches as vdc.
         // Unlike the data device (auto-detected for its HVC fast path), the
@@ -652,6 +654,21 @@ impl LifecycleShared {
 
         Ok(())
     }
+}
+
+/// Replaces any container-network token with the validated lifecycle value.
+pub(super) fn with_container_network(cmdline: String, network: ContainerNetwork) -> String {
+    let mut cmdline = cmdline
+        .split_whitespace()
+        .filter(|token| !token.starts_with(CONTAINER_NETWORK_KEY))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !cmdline.is_empty() {
+        cmdline.push(' ');
+    }
+    cmdline.push_str(CONTAINER_NETWORK_KEY);
+    cmdline.push_str(&network.to_string());
+    cmdline
 }
 
 /// Ensures an explicit `earlycon=` directive on the custom-HV backend.

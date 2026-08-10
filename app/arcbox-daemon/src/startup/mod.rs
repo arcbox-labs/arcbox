@@ -2,11 +2,13 @@
 
 mod assets;
 mod cleanup;
+mod container_network_lease;
 mod lock;
 mod pipeline;
 mod resource_cleanup;
 
 pub use assets::find_bundle_contents;
+pub use container_network_lease::ContainerNetworkLease;
 pub use lock::DaemonLock;
 pub use pipeline::{ReadyDaemon, Startup};
 
@@ -17,16 +19,17 @@ use anyhow::{Context, Result};
 use arcbox_api::SetupPhase;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_core::{Config, InitProgress, Runtime};
+use arcbox_helper::validate::Domain;
 use macos_resolver::to_env_prefix;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::DaemonArgs;
 use crate::context::{DaemonContext, EarlyContext, StartupHandles, VmArgs};
 
 const DNS_PREFIX: &str = "arcbox";
-const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
-/// Canonical host DNS port. Only the daemon serving this port owns the
-/// `/etc/resolver/<domain>` entry (see `recovery::run`).
+pub const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
+/// Canonical production DNS port. Isolated instances may request port 0 and
+/// publish the actual bound port through their unique resolver domain.
 pub const DEFAULT_DNS_PORT: u16 = 5553;
 
 /// Phase 1: directories, config, sockets. No runtime, no lock yet.
@@ -63,8 +66,9 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
     std::fs::create_dir_all(&layout.data_subdir)
         .context("Failed to create persistent data directory")?;
 
-    let dns_domain = dns_domain();
-    let dns_port = dns_port();
+    let dns_domain = dns_domain(args.dns_domain)?;
+    let dns_port = dns_port(args.dns_port);
+    let kubernetes_context = kubernetes_context(profile, args.kubernetes_context)?;
 
     Ok(EarlyContext {
         profile,
@@ -74,12 +78,17 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
         setup_state: handles.setup_state,
         shutdown: handles.shutdown,
         daemon_lock_slot: handles.daemon_lock,
+        container_network_lease_slot: handles.container_network_lease,
         dns_domain,
         dns_port,
+        install_dns_resolver: args.install_dns_resolver,
+        kubernetes_port: args.kubernetes_port,
+        kubernetes_context,
         docker_integration: args.docker_integration,
         mount_nfs: !args.no_mount_nfs,
         vm_args: VmArgs {
             guest_docker_vsock_port: args.guest_docker_vsock_port,
+            container_cidr: args.container_cidr,
             kernel: args.kernel,
             no_linux_vm: args.no_linux_vm,
         },
@@ -115,8 +124,12 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
         early_runtime: early.early_runtime,
         setup_state: early.setup_state,
         shutdown: early.shutdown,
+        container_network_lease_slot: early.container_network_lease_slot,
         dns_domain: early.dns_domain,
         dns_port: early.dns_port,
+        install_dns_resolver: early.install_dns_resolver,
+        kubernetes_port: early.kubernetes_port,
+        kubernetes_context: early.kubernetes_context,
         docker_integration: early.docker_integration,
         mount_nfs: early.mount_nfs,
         vm_args: early.vm_args,
@@ -198,7 +211,7 @@ async fn wait_for_resources(_ctx: &DaemonContext) -> Result<()> {
 /// progress and before [`init_runtime`] so the runtime sees coherent artifacts
 /// for the launched app version.
 async fn prepare_assets(ctx: &DaemonContext) -> Result<assets::PreparedAssets> {
-    let config = effective_config(ctx);
+    let config = effective_config(ctx)?;
     let prepared = assets::prepare(&config, &ctx.setup_state).await?;
     ctx.setup_state
         .set_phase(SetupPhase::AssetsReady, "Boot assets ready");
@@ -212,9 +225,15 @@ async fn prepare_assets(ctx: &DaemonContext) -> Result<assets::PreparedAssets> {
 /// publishes VM_STARTING → VM_READY around the guest boot itself.
 /// Returns the initialized runtime.
 async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
-    let config = effective_config(ctx);
+    let config = effective_config(ctx)?;
+    if config.vm.autostart
+        && let Some(lease) = ContainerNetworkLease::acquire(config.container.cidr)?
+    {
+        ctx.container_network_lease_slot
+            .set(lease)
+            .map_err(|_| anyhow::anyhow!("container network lease already configured"))?;
+    }
     let selected_guest_docker_port = config.container.guest_docker_vsock_port;
-
     let runtime = Arc::new(Runtime::new(config).context("Failed to create runtime")?);
     // Publish the diagnostics handle before the VM boots: a stuck boot
     // must stay observable via GetVirtioDebug while `shared_runtime`
@@ -248,6 +267,7 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     info!(
         data_dir = %ctx.layout.data_dir.display(),
         guest_docker_vsock_port = selected_guest_docker_port,
+        container_cidr = %runtime.config().container.cidr,
         "Runtime initialized"
     );
 
@@ -263,20 +283,14 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
         false
     };
 
-    ctx.shared_runtime
-        .set(Arc::clone(&runtime))
-        .map_err(|_| anyhow::anyhow!("init_runtime called twice"))?;
     if sandbox_cleanup_supported {
         arcbox_api::spawn_sandbox_cleanup(Arc::clone(&runtime));
     }
     Ok(runtime)
 }
 
-fn effective_config(ctx: &DaemonContext) -> Config {
-    let mut config = Config::load_for_profile(ctx.profile).unwrap_or_else(|err| {
-        warn!(error = %err, "Failed to load config file; falling back to defaults");
-        Config::for_profile(ctx.profile)
-    });
+fn effective_config(ctx: &DaemonContext) -> Result<Config> {
+    let mut config = Config::load_for_profile(ctx.profile).context("Failed to load config")?;
     // The daemon's layout (sockets, lock file) was already resolved from
     // --profile/--data-dir/--socket, so it must win over config files.
     config.data_dir.clone_from(&ctx.layout.data_dir);
@@ -286,6 +300,9 @@ fn effective_config(ctx: &DaemonContext) -> Config {
         .clone_from(&ctx.layout.docker_socket);
     if let Some(port) = ctx.vm_args.guest_docker_vsock_port {
         config.container.guest_docker_vsock_port = port;
+    }
+    if let Some(cidr) = ctx.vm_args.container_cidr {
+        config.container.cidr = cidr;
     }
 
     // The --kernel CLI flag wins over the config file; Runtime::new
@@ -298,7 +315,7 @@ fn effective_config(ctx: &DaemonContext) -> Config {
     if ctx.vm_args.no_linux_vm {
         config.vm.autostart = false;
     }
-    config
+    Ok(config)
 }
 
 /// Resolve the data directory from an optional override.
@@ -309,7 +326,10 @@ pub fn resolve_data_dir(profile: ArcboxProfile, data_dir: Option<&PathBuf>) -> P
     HostLayout::resolve_for_profile_from_env(profile, data_dir.map(PathBuf::as_path)).data_dir
 }
 
-fn dns_port() -> u16 {
+fn dns_port(cli_port: Option<u16>) -> u16 {
+    if let Some(port) = cli_port {
+        return port;
+    }
     let key = format!("{}_DNS_PORT", to_env_prefix(DNS_PREFIX));
     std::env::var(key)
         .ok()
@@ -317,7 +337,59 @@ fn dns_port() -> u16 {
         .unwrap_or(DEFAULT_DNS_PORT)
 }
 
-fn dns_domain() -> String {
+fn dns_domain(cli_domain: Option<Domain>) -> Result<String> {
+    if let Some(domain) = cli_domain {
+        return Ok(domain.to_string());
+    }
     let key = format!("{}_DNS_DOMAIN", to_env_prefix(DNS_PREFIX));
-    std::env::var(key).unwrap_or_else(|_| DEFAULT_DNS_DOMAIN.to_string())
+    std::env::var(key)
+        .map_or_else(
+            |_| Ok(DEFAULT_DNS_DOMAIN.to_string()),
+            |domain| domain.parse::<Domain>().map(|domain| domain.to_string()),
+        )
+        .map_err(anyhow::Error::msg)
+        .context("Invalid DNS domain")
+}
+
+fn kubernetes_context(profile: ArcboxProfile, requested: Option<String>) -> Result<String> {
+    let context = requested.unwrap_or_else(|| profile.docker_context_name().to_owned());
+    let bytes = context.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 253
+        || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!(
+            "Kubernetes context must be 1-253 ASCII letters, digits, '.', '_' or '-', with an alphanumeric first and last character"
+        );
+    }
+    Ok(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kubernetes_context;
+    use arcbox_constants::paths::ArcboxProfile;
+
+    #[test]
+    fn kubernetes_context_defaults_by_profile_and_rejects_yaml_syntax() {
+        assert_eq!(
+            kubernetes_context(ArcboxProfile::Production, None).unwrap(),
+            "arcbox"
+        );
+        assert_eq!(
+            kubernetes_context(
+                ArcboxProfile::Development,
+                Some("arcbox-dev-worktree-1".to_owned())
+            )
+            .unwrap(),
+            "arcbox-dev-worktree-1"
+        );
+        assert!(
+            kubernetes_context(ArcboxProfile::Development, Some("bad: value".to_owned())).is_err()
+        );
+    }
 }

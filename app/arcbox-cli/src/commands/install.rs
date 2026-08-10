@@ -29,6 +29,8 @@ pub struct InstallArgs {
 
 /// Executes the install command.
 pub async fn execute(args: InstallArgs) -> Result<()> {
+    validate_install_scope(ArcboxProfile::from_env_or_default(), &args)?;
+
     println!("ArcBox Install");
     println!("==============");
     println!();
@@ -70,6 +72,15 @@ pub async fn execute(args: InstallArgs) -> Result<()> {
     println!("ArcBox installed. The daemon will start automatically.");
     println!("DNS, Docker socket, and boot assets are configured on first daemon start.");
 
+    Ok(())
+}
+
+fn validate_install_scope(profile: ArcboxProfile, args: &InstallArgs) -> Result<()> {
+    if profile == ArcboxProfile::Development && (!args.no_daemon || !args.no_shell) {
+        bail!(
+            "Development installs may only update the shared helper; rerun with --no-daemon --no-shell. The Desktop app manages per-instance daemon and shell state."
+        );
+    }
     Ok(())
 }
 
@@ -329,4 +340,30 @@ fn home_for_user(username: &str) -> Option<PathBuf> {
     // SAFETY: pw is non-null and pw_dir is a valid C string.
     let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
     Some(PathBuf::from(dir.to_string_lossy().into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InstallArgs, validate_install_scope};
+    use arcbox_constants::paths::ArcboxProfile;
+
+    #[test]
+    fn development_install_only_allows_the_helper_path() {
+        let args = InstallArgs {
+            no_daemon: true,
+            no_shell: true,
+            helper_path: None,
+        };
+        assert!(validate_install_scope(ArcboxProfile::Development, &args).is_ok());
+
+        for (no_daemon, no_shell) in [(false, true), (true, false), (false, false)] {
+            let args = InstallArgs {
+                no_daemon,
+                no_shell,
+                helper_path: None,
+            };
+            assert!(validate_install_scope(ArcboxProfile::Development, &args).is_err());
+            assert!(validate_install_scope(ArcboxProfile::Production, &args).is_ok());
+        }
+    }
 }

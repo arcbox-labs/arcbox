@@ -6,7 +6,7 @@ description = "Privileged helper daemon for host mutations (routes, DNS, sockets
 # root helper, or behavior the current daemon hard-requires). Ordinary runtime
 # bumps must NOT change this, or every Desktop user gets an admin-password
 # reinstall prompt.
-version = "1.0.2"
+version = "1.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
