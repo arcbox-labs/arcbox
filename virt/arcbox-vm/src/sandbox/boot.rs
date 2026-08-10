@@ -141,36 +141,6 @@ pub(super) async fn boot_sandbox(
 
             let ready_at = Utc::now();
 
-            // do_boot persisted every cleanup resource before completing the
-            // handoff, so only the lifecycle phase remains to make Ready.
-            let durable_ready =
-                records
-                    .transition(&id, generation, SandboxTransition::Ready)
-                    .and_then(|commit| match commit.durability_error {
-                        Some(error) => Err(VmmError::Unavailable(format!(
-                            "sandbox {id} ready state is visible, but durability is unconfirmed: {error}"
-                        ))),
-                        None => Ok(()),
-                    });
-            if let Err(record_error) = durable_ready {
-                let message = format!("failed to persist ready state: {record_error}");
-                fail_started_boot(
-                    &id,
-                    generation,
-                    &message,
-                    &vm_dir,
-                    &instances,
-                    &network,
-                    &config,
-                    &cow_manager,
-                    &records,
-                    &events_tx,
-                )
-                .await;
-                error!(sandbox_id = %id, error = %record_error, "sandbox ready state was not durable");
-                return;
-            }
-
             // Hand the post-boot API objects to the instance. Every cleanup
             // resource was transferred before configuration could be aborted.
             let mut vm = Some(vm);
@@ -216,6 +186,77 @@ pub(super) async fn boot_sandbox(
                     .await;
             }
 
+            // Ready probe (CORE-107): the initial cmd is the only listener
+            // source in a sandbox (vm-agent is init; a docker ENTRYPOINT
+            // never runs), so a probed boot starts the cmd FIRST and holds
+            // READY back until the probe passes; expiry fails the boot. The
+            // durable Ready transition sits after the probe on purpose — a
+            // probe failure then fails from the recorded Starting phase, and
+            // a crash mid-probe reconciles as an interrupted boot rather
+            // than a Ready sandbox that never probed.
+            let probed_cmd_started = if let Some(probe) = spec.ready_probe.clone() {
+                let started = if spec.cmd.is_empty() {
+                    false
+                } else {
+                    run_initial_cmd(&id, spec.clone(), &vsock_uds_path, &instances, &events_tx)
+                        .await
+                };
+                if let Err(probe_error) = run_ready_probe(&probe, &vsock_uds_path).await {
+                    let message = format!("ready probe failed: {probe_error}");
+                    fail_started_boot(
+                        &id,
+                        generation,
+                        &message,
+                        &vm_dir,
+                        &instances,
+                        &network,
+                        &config,
+                        &cow_manager,
+                        &records,
+                        &events_tx,
+                    )
+                    .await;
+                    error!(sandbox_id = %id, error = %probe_error, "sandbox ready probe failed");
+                    return;
+                }
+                // A failed pre-probe start is NOT "started": the ordinary
+                // post-READY launch below then gets its one attempt, exactly
+                // like an unprobed boot.
+                started
+            } else {
+                false
+            };
+
+            // do_boot persisted every cleanup resource before completing the
+            // handoff, so only the lifecycle phase remains to make Ready.
+            let durable_ready =
+                records
+                    .transition(&id, generation, SandboxTransition::Ready)
+                    .and_then(|commit| match commit.durability_error {
+                        Some(error) => Err(VmmError::Unavailable(format!(
+                            "sandbox {id} ready state is visible, but durability is unconfirmed: {error}"
+                        ))),
+                        None => Ok(()),
+                    });
+            if let Err(record_error) = durable_ready {
+                let message = format!("failed to persist ready state: {record_error}");
+                fail_started_boot(
+                    &id,
+                    generation,
+                    &message,
+                    &vm_dir,
+                    &instances,
+                    &network,
+                    &config,
+                    &cow_manager,
+                    &records,
+                    &events_tx,
+                )
+                .await;
+                error!(sandbox_id = %id, error = %record_error, "sandbox ready state was not durable");
+                return;
+            }
+
             let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
             info!(sandbox_id = %id, "sandbox booted and ready");
 
@@ -223,8 +264,8 @@ pub(super) async fn boot_sandbox(
             // sandbox stays alive when it exits (Running → Ready + "idle"),
             // exactly like an explicit Run. A start failure is logged and
             // leaves the sandbox Ready — the caller can still Run/Exec.
-            if !spec.cmd.is_empty() {
-                run_initial_cmd(&id, spec, &vsock_uds_path, &instances, &events_tx).await;
+            if !probed_cmd_started && !spec.cmd.is_empty() {
+                let _ = run_initial_cmd(&id, spec, &vsock_uds_path, &instances, &events_tx).await;
             }
         }
         Err(mut failure) => {
@@ -412,6 +453,122 @@ async fn fail_started_boot(
     }
 }
 
+/// Default probe deadline when the template leaves `timeout_seconds` at 0
+/// (matches the WaitForPort daemon default).
+const READY_PROBE_DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Delay between command-probe attempts.
+const READY_PROBE_RETRY_MS: u64 = 500;
+
+/// Run a template's readiness probe against the booted guest (CORE-107).
+///
+/// Port form: the vm-agent's listen-table watcher — never a connect probe,
+/// which would perturb the workload. Command form: a one-shot exec retried
+/// until it exits 0 or the deadline elapses.
+pub(super) async fn run_ready_probe(
+    probe: &crate::template_catalog::ReadyProbeSpec,
+    vsock_uds_path: &Path,
+) -> Result<()> {
+    use crate::template_catalog::ReadyProbeSpec;
+    let effective = |timeout_seconds: u32| {
+        std::time::Duration::from_secs(if timeout_seconds == 0 {
+            READY_PROBE_DEFAULT_TIMEOUT_SECS
+        } else {
+            u64::from(timeout_seconds)
+        })
+    };
+    match probe {
+        ReadyProbeSpec::Port {
+            port,
+            timeout_seconds,
+        } => {
+            match vsock::wait_for_port(vsock_uds_path, *port, effective(*timeout_seconds)).await? {
+                vsock::PortWait::Listening => Ok(()),
+                vsock::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+                    "no listener on port {port} within the ready-probe deadline"
+                ))),
+            }
+        }
+        ReadyProbeSpec::Command {
+            cmd,
+            timeout_seconds,
+        } => {
+            let deadline = tokio::time::Instant::now() + effective(*timeout_seconds);
+            let mut last_status: Option<String> = None;
+            loop {
+                // Each attempt is bounded twice over: the host-side timeout
+                // caps the await even if the exec stream stalls, and the
+                // remaining budget rides StartCommand.timeout_seconds so the
+                // guest kills a never-exiting probe process instead of
+                // leaking it. Without both, `timeout_seconds` would not be
+                // an upper bound at all — a non-exiting probe command parked
+                // this await forever.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(VmmError::DeadlineExceeded(format!(
+                        "ready-probe command did not exit 0 within the deadline ({})",
+                        last_status.as_deref().unwrap_or("no attempt completed")
+                    )));
+                }
+                // The guest kill timer has whole-second granularity; the
+                // host timeout enforces the exact remaining budget.
+                let budget_secs = u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX);
+                match tokio::time::timeout(
+                    remaining,
+                    run_probe_command(cmd, vsock_uds_path, budget_secs),
+                )
+                .await
+                {
+                    Ok(Ok(ExitStatus::Code(0))) => return Ok(()),
+                    Ok(Ok(status)) => last_status = Some(format!("last exit: {status:?}")),
+                    Ok(Err(error)) => last_status = Some(format!("last error: {error}")),
+                    Err(_) => {
+                        return Err(VmmError::DeadlineExceeded(format!(
+                            "ready-probe command did not exit within the deadline ({})",
+                            last_status.as_deref().unwrap_or("no attempt completed")
+                        )));
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(VmmError::DeadlineExceeded(format!(
+                        "ready-probe command did not exit 0 within the deadline ({})",
+                        last_status.as_deref().unwrap_or("no attempt completed")
+                    )));
+                }
+                let nap = std::time::Duration::from_millis(READY_PROBE_RETRY_MS)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                tokio::time::sleep(nap).await;
+            }
+        }
+    }
+}
+
+/// One probe attempt: run the command and wait for its exit status.
+async fn run_probe_command(
+    cmd: &[String],
+    vsock_uds_path: &Path,
+    timeout_seconds: u32,
+) -> Result<ExitStatus> {
+    let start = StartCommand {
+        cmd: cmd.to_vec(),
+        env: HashMap::new(),
+        working_dir: String::new(),
+        user: String::new(),
+        tty: false,
+        tty_width: 80,
+        tty_height: 24,
+        timeout_seconds,
+    };
+    let (_input, mut output) = vsock::exec(vsock_uds_path, start).await?;
+    while let Some(chunk) = output.recv().await {
+        if let OutputChunk::Exit(status) = chunk? {
+            return Ok(status);
+        }
+    }
+    Err(VmmError::Vsock(
+        "probe command stream ended without an exit status".into(),
+    ))
+}
+
 /// Start the initial `cmd` from the creation spec and drain its output.
 ///
 /// Uses the same workload path as `Run` (`start_run_workload`), so state
@@ -419,13 +576,18 @@ async fn fail_started_boot(
 /// and is discarded chunk by chunk to keep the exit handler flowing. Also
 /// driven by the warm-create restore path (CORE-77), which owes a restored
 /// Create the same initial workload a cold boot runs.
+///
+/// Returns whether the workload actually started (`true` = live). Probed
+/// paths record it so a failed pre-probe start still gets the ordinary
+/// post-READY attempt; a `false` from that attempt is final (warned, the
+/// sandbox stays Ready, the caller can still Run/Exec).
 pub(super) async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
     vsock_uds_path: &Path,
     instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
-) {
+) -> bool {
     let start = StartCommand {
         cmd: spec.cmd,
         env: spec.env,
@@ -441,9 +603,11 @@ pub(super) async fn run_initial_cmd(
         Ok(mut rx) => {
             info!(sandbox_id = %id, "initial cmd started");
             tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            true
         }
         Err(e) => {
             warn!(sandbox_id = %id, error = %e, "initial cmd failed to start; sandbox stays ready");
+            false
         }
     }
 }
