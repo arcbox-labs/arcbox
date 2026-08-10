@@ -1,6 +1,7 @@
 import { timestampDate } from "@bufbuild/protobuf/wkt";
 
 import type {
+  ExposedPort as ExposedPortProto,
   GetCapabilitiesResponse,
   SandboxEvent as SandboxEventProto,
   SandboxInfo as SandboxInfoProto,
@@ -8,9 +9,14 @@ import type {
 } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import {
   IdleAction,
+  PortProtocol as PortProtocolProto,
   SandboxEventKind as SandboxEventKindProto,
   SandboxState as SandboxStateProto,
 } from "./gen/arcbox/sandbox/v1/sandbox_pb";
+import type {
+  CheckpointResponse,
+  SnapshotSummary as SnapshotSummaryProto,
+} from "./gen/arcbox/sandbox/v1/snapshot_pb";
 
 /** Lifecycle state of a sandbox. See `sandbox.proto` for the state machine. */
 export type SandboxState =
@@ -119,6 +125,30 @@ export interface SandboxSummary {
   pausedAt?: Date;
   failedAt?: Date;
   storageBytes: number;
+}
+
+/** Transport protocol of an exposed port. */
+export type PortProtocol = "tcp" | "udp";
+
+/** One host listener currently forwarding into a sandbox. */
+export interface ExposedPort {
+  /** Port the workload listens on inside the sandbox. */
+  sandboxPort: number;
+  /** Loopback host port where the service is reachable. */
+  hostPort: number;
+  protocol: PortProtocol;
+}
+
+/** One checkpointed sandbox image in the snapshot catalog. */
+export interface Snapshot {
+  id: string;
+  /** The sandbox this snapshot was checkpointed from. */
+  sandboxId: string;
+  /** Human-readable name recorded at checkpoint time. */
+  name: string;
+  /** Labels recorded at checkpoint time, filterable in listings. */
+  labels: Record<string, string>;
+  createdAt?: Date;
 }
 
 const STATE_NAMES: Partial<Record<SandboxStateProto, SandboxState>> = {
@@ -251,6 +281,55 @@ export function sandboxEventFromProto(event: SandboxEventProto): SandboxEvent {
     attributes: event.attributes,
   };
   assignIfSet(out, "time", optionalDate(event.time));
+  return out;
+}
+
+/** Public protocol → wire enum (never UNSPECIFIED — "tcp" is explicit). */
+export function portProtocolToProto(protocol: PortProtocol): PortProtocolProto {
+  return protocol === "udp" ? PortProtocolProto.UDP : PortProtocolProto.TCP;
+}
+
+/** Wire protocol → public name (the wire reserves UNSPECIFIED for TCP). */
+export function portProtocolFromProto(
+  protocol: PortProtocolProto,
+): PortProtocol {
+  return protocol === PortProtocolProto.UDP ? "udp" : "tcp";
+}
+
+/** Map one ListExposedPorts row to the public DTO. */
+export function exposedPortFromProto(port: ExposedPortProto): ExposedPort {
+  return {
+    sandboxPort: port.sandboxPort,
+    hostPort: port.hostPort,
+    protocol: portProtocolFromProto(port.protocol),
+  };
+}
+
+/** Map one ListSnapshots row to the public DTO. */
+export function snapshotFromProto(summary: SnapshotSummaryProto): Snapshot {
+  const out: Snapshot = {
+    id: summary.id,
+    sandboxId: summary.sandboxId,
+    name: summary.name,
+    labels: summary.labels,
+  };
+  assignIfSet(out, "createdAt", optionalDate(summary.createdAt));
+  return out;
+}
+
+/**
+ * Build the catalog row a Checkpoint response describes. The response
+ * carries only id + creation time; name and labels echo the request,
+ * which is exactly what the catalog recorded.
+ */
+export function snapshotFromCheckpoint(
+  response: CheckpointResponse,
+  sandboxId: string,
+  name: string,
+  labels: Record<string, string>,
+): Snapshot {
+  const out: Snapshot = { id: response.snapshotId, sandboxId, name, labels };
+  assignIfSet(out, "createdAt", optionalDate(response.createdAt));
   return out;
 }
 

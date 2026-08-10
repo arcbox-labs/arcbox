@@ -26,6 +26,7 @@ import {
   SandboxService,
   SandboxState as SandboxStateProto,
 } from "./gen/arcbox/sandbox/v1/sandbox_pb";
+import { SandboxSnapshotService } from "./gen/arcbox/sandbox/v1/snapshot_pb";
 import type { ClientContext } from "./transport";
 import { createClientContext, unaryOptions } from "./transport";
 import type {
@@ -35,6 +36,7 @@ import type {
   SandboxInfo,
   SandboxState,
   SandboxSummary,
+  Snapshot,
 } from "./types";
 import {
   capabilitiesFromProto,
@@ -42,6 +44,8 @@ import {
   sandboxInfoFromProto,
   sandboxStateToProto,
   sandboxSummaryFromProto,
+  snapshotFromCheckpoint,
+  snapshotFromProto,
 } from "./types";
 
 /** Options for {@link Sandbox.create}. */
@@ -127,7 +131,45 @@ export interface LifecycleUpdate {
   onIdle?: IdlePolicy | null;
 }
 
+/** Options for {@link Sandbox.checkpoint}. */
+export interface CheckpointOptions {
+  /** Human-readable name recorded on the snapshot. */
+  name?: string;
+  /** Labels recorded on the snapshot, filterable in {@link ArcBox.listSnapshots}. */
+  labels?: Record<string, string>;
+}
+
+/** Options for {@link ArcBox.restore}. */
+export interface RestoreOptions {
+  /**
+   * Hard maximum lifetime of the restored sandbox in milliseconds
+   * (unset = no limit). Same semantics as
+   * {@link CreateSandboxOptions.ttlMs}.
+   */
+  ttlMs?: number;
+  /** Labels for the restored sandbox. */
+  labels?: Record<string, string>;
+  /**
+   * Assign a fresh TAP interface and IP to the restored sandbox.
+   * Required when running several sandboxes restored from the same
+   * snapshot concurrently.
+   */
+  freshNetwork?: boolean;
+  /** Connection override for this entry point. */
+  connection?: ConnectionOptions;
+}
+
+/** Options for {@link ArcBox.listSnapshots}. */
+export interface ListSnapshotsOptions {
+  /** Keep only snapshots checkpointed from this sandbox. */
+  sandboxId?: string;
+  /** Keep only snapshots carrying all of these labels. */
+  labels?: Record<string, string>;
+  connection?: ConnectionOptions;
+}
+
 type SandboxClient = Client<typeof SandboxService>;
+type SnapshotClient = Client<typeof SandboxSnapshotService>;
 
 /**
  * How often {@link ArcBox.connect} re-inspects a PAUSING sandbox. The
@@ -159,11 +201,13 @@ function withSignal(
 export class ArcBox {
   readonly #ctx: ClientContext;
   readonly #client: SandboxClient;
+  readonly #snapshots: SnapshotClient;
   #capabilities?: Promise<Capabilities>;
 
   constructor(options: ConnectionOptions = {}) {
     this.#ctx = createClientContext(options);
     this.#client = createClient(SandboxService, this.#ctx.transport);
+    this.#snapshots = createClient(SandboxSnapshotService, this.#ctx.transport);
   }
 
   /**
@@ -410,6 +454,68 @@ export class ArcBox {
   }
 
   /**
+   * Restore a new sandbox from a snapshot. The restored sandbox starts
+   * READY — there is no boot to wait for. It gets a fresh id, minted
+   * client-side so retries stay idempotent (the create() rule); the
+   * origin sandbox is untouched.
+   */
+  async restore(
+    snapshotId: string,
+    opts: RestoreOptions = {},
+  ): Promise<Sandbox> {
+    const id = crypto.randomUUID();
+    try {
+      // No per-request deadline: restoring takes as long as it takes.
+      await this.#snapshots.restore({
+        id,
+        snapshotId,
+        labels: opts.labels ?? {},
+        networkOverride: opts.freshNetwork ?? false,
+        ttlSeconds: secondsFromMs(opts.ttlMs),
+      });
+      return new Sandbox(this.#ctx, id);
+    } catch (error) {
+      throw toArcBoxError(error, "snapshots.restore");
+    }
+  }
+
+  /** List the snapshot catalog (auto-paginating). */
+  async *listSnapshots(
+    opts: ListSnapshotsOptions = {},
+  ): AsyncIterable<Snapshot> {
+    try {
+      let pageToken = "";
+      do {
+        // eslint-disable-next-line no-await-in-loop -- sequential by design: each request needs the previous page's token
+        const page = await this.#snapshots.listSnapshots(
+          {
+            sandboxId: opts.sandboxId ?? "",
+            labels: opts.labels ?? {},
+            pageToken,
+          },
+          unaryOptions(this.#ctx),
+        );
+        yield* page.snapshots.map(snapshotFromProto);
+        pageToken = page.nextPageToken;
+      } while (pageToken !== "");
+    } catch (error) {
+      throw toArcBoxError(error, "snapshots.list");
+    }
+  }
+
+  /** Delete a snapshot and its on-disk data. */
+  async deleteSnapshot(snapshotId: string): Promise<void> {
+    try {
+      await this.#snapshots.deleteSnapshot(
+        { snapshotId },
+        unaryOptions(this.#ctx),
+      );
+    } catch (error) {
+      throw toArcBoxError(error, "snapshots.delete");
+    }
+  }
+
+  /**
    * Consume lifecycle events until READY/RUNNING, or fail on a terminal
    * transition. The subscription was armed before Create, so nothing can
    * be missed; the one residual window — Create processed before the
@@ -527,10 +633,12 @@ export class Sandbox {
 
   readonly #ctx: ClientContext;
   readonly #client: SandboxClient;
+  readonly #snapshots: SnapshotClient;
 
   constructor(ctx: ClientContext, id: string) {
     this.#ctx = ctx;
     this.#client = createClient(SandboxService, ctx.transport);
+    this.#snapshots = createClient(SandboxSnapshotService, ctx.transport);
     this.id = id;
     this.commands = new Commands(ctx, id);
     this.files = new Files(ctx, id);
@@ -561,6 +669,15 @@ export class Sandbox {
     opts: ListSandboxesOptions = {},
   ): AsyncIterable<SandboxSummary> {
     return new ArcBox(opts.connection).list(opts);
+  }
+
+  /** Restore a new sandbox from a snapshot — see {@link ArcBox.restore}. */
+  static restore(
+    this: void,
+    snapshotId: string,
+    opts: RestoreOptions = {},
+  ): Promise<Sandbox> {
+    return new ArcBox(opts.connection).restore(snapshotId, opts);
   }
 
   /** Fetch the sandbox's current state — always fresh, never cached. */
@@ -599,6 +716,29 @@ export class Sandbox {
       await this.#client.pause({ id: this.id });
     } catch (error) {
       throw toArcBoxError(error, "sandbox.pause");
+    }
+  }
+
+  /**
+   * Checkpoint this sandbox into a reusable snapshot: paused,
+   * snapshotted, then resumed, automatically — the sandbox keeps
+   * running under the same id. Requires a quiescent sandbox (READY — no
+   * running command). Restore the returned snapshot into fresh
+   * sandboxes with {@link ArcBox.restore}.
+   */
+  async checkpoint(opts: CheckpointOptions = {}): Promise<Snapshot> {
+    const name = opts.name ?? "";
+    const labels = opts.labels ?? {};
+    try {
+      // No per-request deadline: checkpointing takes as long as it takes.
+      const response = await this.#snapshots.checkpoint({
+        sandboxId: this.id,
+        name,
+        labels,
+      });
+      return snapshotFromCheckpoint(response, this.id, name, labels);
+    } catch (error) {
+      throw toArcBoxError(error, "sandbox.checkpoint");
     }
   }
 

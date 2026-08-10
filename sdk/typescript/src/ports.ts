@@ -8,7 +8,11 @@ import {
   toArcBoxError,
 } from "./errors";
 import { SandboxProcessService } from "./gen/arcbox/sandbox/v1/process_pb";
+import { SandboxService } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import type { ClientContext } from "./transport";
+import { unaryOptions } from "./transport";
+import type { ExposedPort, PortProtocol } from "./types";
+import { exposedPortFromProto, portProtocolToProto } from "./types";
 
 /** Daemon default wait budget when no timeout is given (`process.proto`). */
 const DEFAULT_WAIT_FOR_PORT_SECONDS = 30;
@@ -33,18 +37,102 @@ export interface WaitForPortOptions {
   timeoutMs?: number;
 }
 
+/** Options for {@link Ports.expose}. */
+export interface ExposePortOptions {
+  /**
+   * Specific host port to bind. Omit it to have the daemon allocate
+   * one — the allocated port is in the returned mapping. Ports below
+   * 1024 fail under the unprivileged daemon.
+   */
+  hostPort?: number;
+  /** Transport protocol (default `"tcp"`). */
+  protocol?: PortProtocol;
+}
+
+/** Options for {@link Ports.unexpose}. */
+export interface UnexposePortOptions {
+  /** Transport protocol of the mapping to remove (default `"tcp"`). */
+  protocol?: PortProtocol;
+}
+
 type ProcessClient = Client<typeof SandboxProcessService>;
+type SandboxClient = Client<typeof SandboxService>;
 
 /**
- * The `sandbox.ports` namespace: network readiness of one sandbox.
+ * The `sandbox.ports` namespace: network reachability and readiness of
+ * one sandbox — publish guest ports on host loopback, and wait for the
+ * workload to listen.
  */
 export class Ports {
+  readonly #ctx: ClientContext;
   readonly #client: ProcessClient;
+  readonly #sandbox: SandboxClient;
   readonly #sandboxId: string;
 
   constructor(ctx: ClientContext, sandboxId: string) {
+    this.#ctx = ctx;
     this.#client = createClient(SandboxProcessService, ctx.transport);
+    this.#sandbox = createClient(SandboxService, ctx.transport);
     this.#sandboxId = sandboxId;
+  }
+
+  /**
+   * Publish a sandbox port on host loopback and return the mapping.
+   * Idempotent for an existing identical mapping. The daemon owns the
+   * host listener; it disappears with the sandbox (and on
+   * {@link unexpose}).
+   */
+  async expose(
+    port: number,
+    opts: ExposePortOptions = {},
+  ): Promise<ExposedPort> {
+    const protocol = opts.protocol ?? "tcp";
+    try {
+      const response = await this.#sandbox.exposePort(
+        {
+          id: this.#sandboxId,
+          sandboxPort: port,
+          hostPort: opts.hostPort ?? 0,
+          protocol: portProtocolToProto(protocol),
+        },
+        unaryOptions(this.#ctx),
+      );
+      return { sandboxPort: port, hostPort: response.hostPort, protocol };
+    } catch (error) {
+      throw toArcBoxError(error, "ports.expose");
+    }
+  }
+
+  /** Remove a previously exposed mapping and close its host listener. */
+  async unexpose(port: number, opts: UnexposePortOptions = {}): Promise<void> {
+    try {
+      await this.#sandbox.unexposePort(
+        {
+          id: this.#sandboxId,
+          sandboxPort: port,
+          protocol: portProtocolToProto(opts.protocol ?? "tcp"),
+        },
+        unaryOptions(this.#ctx),
+      );
+    } catch (error) {
+      throw toArcBoxError(error, "ports.unexpose");
+    }
+  }
+
+  /**
+   * The sandbox's current exposed-port mappings, from the daemon's
+   * authoritative live listener table — never a session-local cache.
+   */
+  async list(): Promise<ExposedPort[]> {
+    try {
+      const response = await this.#sandbox.listExposedPorts(
+        { id: this.#sandboxId },
+        unaryOptions(this.#ctx),
+      );
+      return response.ports.map(exposedPortFromProto);
+    } catch (error) {
+      throw toArcBoxError(error, "ports.list");
+    }
   }
 
   /**
