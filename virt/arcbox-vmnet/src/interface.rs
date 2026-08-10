@@ -641,9 +641,70 @@ impl Vmnet {
         Ok(data.len())
     }
 
+    /// Registers a packets-available event callback block on the
+    /// interface's dispatch queue.
+    ///
+    /// The framework takes its own reference to `block`; the caller keeps
+    /// (and must eventually `_Block_release`) its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the framework rejects the registration.
+    pub(crate) fn set_event_callback(&self, block: *const std::ffi::c_void) -> Result<()> {
+        // SAFETY: interface and queue are valid for the lifetime of self;
+        // block is a valid heap block from `create_vmnet_event_block`.
+        let status = unsafe {
+            vmnet_interface_set_event_callback(
+                self.interface,
+                VmnetInterfaceEvent::PacketsAvailable,
+                self.queue,
+                block,
+            )
+        };
+        if !status.is_success() {
+            return Err(VmnetError::config(format!(
+                "vmnet_interface_set_event_callback failed: {}",
+                status.message()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Unregisters the event callback, releasing the framework's reference
+    /// to the handler block (and, through its dispose helper, the context
+    /// the block owns).
+    ///
+    /// Per `vmnet.h`, events are disabled when callback **and queue** are
+    /// both NULL. Idempotent: clearing when nothing is registered is
+    /// harmless, so both `Vmnet::stop` and the relay's exit path call it.
+    pub(crate) fn clear_event_callback(&self) {
+        // SAFETY: NULL queue + NULL callback is the documented disable form;
+        // an in-flight invocation is safe because GCD holds its own
+        // reference to a dispatched block for the invocation's duration.
+        let status = unsafe {
+            vmnet_interface_set_event_callback(
+                self.interface,
+                VmnetInterfaceEvent::PacketsAvailable,
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        if !status.is_success() {
+            tracing::debug!(
+                "vmnet_interface_set_event_callback(NULL) returned: {}",
+                status.message()
+            );
+        }
+    }
+
     /// Stops the vmnet interface.
     pub fn stop(&self) {
         if self.running.swap(false, Ordering::AcqRel) {
+            // Release the event handler block first: the native interface
+            // holds block → context → Arc<Vmnet>, and this call is what
+            // breaks that cycle when the relay task never got to run its
+            // own clear (e.g. runtime shutdown aborted it).
+            self.clear_event_callback();
             // SAFETY: vmnet_stop_interface is safe when called with valid parameters.
             unsafe {
                 vmnet_stop_interface(self.interface, self.queue, ptr::null());
