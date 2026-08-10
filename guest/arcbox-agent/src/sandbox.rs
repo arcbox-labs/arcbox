@@ -136,15 +136,24 @@ impl SandboxService {
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
-        let request = sandbox_v1::CreateSandboxRequest::decode_from_slice(payload)
+        let mut request = sandbox_v1::CreateSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         if create_uses_network(&request) {
             self.manager.wait_startup_cleanup_complete().await;
         }
+        // Catalog resolution runs BEFORE both idempotency layers: the pinned
+        // canonical ref (`name:version@digest`) is substituted into the
+        // request itself, so the durable create key AND the in-process
+        // registry (which compares whole requests) both diverge on a retry
+        // after a Publish changed what the reference means — instead of
+        // silently replaying the old content. Template defaults are folded
+        // in here too, so the key hashes the effective workload and the
+        // `no_default_*` flags need no key-domain change.
+        let source = self.resolve_template_source(&mut request)?;
         let _operation = self.operations.lock(&request.id).await;
         let create_key = crate::create_key::create_key(&request);
         if request.id.is_empty() {
-            return self.create_once(request, &create_key).await;
+            return self.create_once(request, source, &create_key).await;
         }
 
         let id = request.id.clone();
@@ -157,7 +166,7 @@ impl SandboxService {
             })? {
                 CreateReserve::Existing(response) => return Ok(response),
                 CreateReserve::Slot(slot) => {
-                    let response = self.create_once(request, &create_key).await?;
+                    let response = self.create_once(request, source, &create_key).await?;
                     slot.commit(&response);
                     return Ok(response);
                 }
@@ -168,9 +177,36 @@ impl SandboxService {
         }
     }
 
+    /// Classify `request.template` and, for catalog references, pin and
+    /// default-merge the request in place (see `create` for why this happens
+    /// before the idempotency layers).
+    fn resolve_template_source(
+        &self,
+        request: &mut sandbox_v1::CreateSandboxRequest,
+    ) -> Result<templates::TemplateSource, SandboxError> {
+        match template::Template::parse(&request.template) {
+            Ok(template::Template::Default) => return Ok(templates::TemplateSource::Default),
+            Ok(template::Template::DockerImage(image)) => {
+                return Ok(templates::TemplateSource::DockerImage(image));
+            }
+            // Not one of the two local forms — a catalog-shaped reference,
+            // whose grammar and existence the catalog itself decides.
+            Err(_) => {}
+        }
+        let resolved = self
+            .manager
+            .get_template(request.template.trim())
+            .map_err(SandboxError::from)?;
+        templates::validate_template_overrides(request)?;
+        request.template = resolved.canonical_ref();
+        templates::merge_template_defaults(request, &resolved.entry.defaults);
+        Ok(templates::TemplateSource::Catalog(resolved))
+    }
+
     async fn create_once(
         &self,
         request: sandbox_v1::CreateSandboxRequest,
+        source: templates::TemplateSource,
         create_key: &str,
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
         if !request.id.is_empty()
@@ -188,7 +224,6 @@ impl SandboxService {
             });
         }
 
-        let template = template::Template::parse(&request.template)?;
         let mut spec = proto_to_spec(request);
 
         // V1 contract: reject declared-but-unimplemented spec fields
@@ -208,7 +243,7 @@ impl SandboxService {
             ));
         }
 
-        spec.rootfs = self.resolve_template(&template).await?;
+        spec.rootfs = self.resolve_template(&source).await?;
 
         let (id, ip_address) = self
             .manager
@@ -224,13 +259,13 @@ impl SandboxService {
         })
     }
 
-    /// Resolve a template to the guest path of a bootable ext4 rootfs.
+    /// Resolve a template source to the guest path of a bootable ext4 rootfs.
     async fn resolve_template(
         &self,
-        template: &template::Template,
+        source: &templates::TemplateSource,
     ) -> Result<String, SandboxError> {
-        match template {
-            template::Template::Default => {
+        match source {
+            templates::TemplateSource::Default => {
                 // Built on first use, and rebuilt when the staged vm-agent is
                 // newer than the cached image.
                 crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
@@ -238,7 +273,7 @@ impl SandboxService {
                     .map_err(|e| SandboxError::Internal(format!("default template: {e}")))?;
                 Ok(self.default_rootfs.clone())
             }
-            template::Template::DockerImage(image) => {
+            templates::TemplateSource::DockerImage(image) => {
                 let layout = template::export_docker_image(image)
                     .await
                     .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))?;
@@ -252,6 +287,28 @@ impl SandboxService {
                 crate::rootfs_builder::convert_layer_to_rootfs(&layout, &pinned)
                     .await
                     .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))
+            }
+            templates::TemplateSource::Catalog(resolved) => {
+                let path = &resolved.entry.rootfs_path;
+                if !std::path::Path::new(path).is_file() {
+                    // Distinguish the caller-visible race — a concurrent
+                    // Delete unpinned the rootfs and a build's sweep
+                    // reclaimed it — from genuine pin corruption. Neither is
+                    // a rebuild trigger.
+                    return Err(match self.manager.get_template(&resolved.name) {
+                        Err(VmmError::TemplateNotFound(_)) => {
+                            SandboxError::from(VmmError::TemplateNotFound(format!(
+                                "{} (deleted while this create was resolving it)",
+                                resolved.name
+                            )))
+                        }
+                        _ => SandboxError::Internal(format!(
+                            "template {} rootfs {path} is missing; the catalog pin failed",
+                            resolved.name
+                        )),
+                    });
+                }
+                Ok(path.clone())
             }
         }
     }

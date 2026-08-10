@@ -27,6 +27,62 @@ fn operation_key(name: &str) -> String {
     format!("template:{name}")
 }
 
+/// What `CreateSandboxRequest.template` resolved to.
+pub(super) enum TemplateSource {
+    /// Built-in busybox + `vm-agent` image.
+    Default,
+    /// `docker:<ref>` — exported and converted at create time.
+    DockerImage(String),
+    /// A catalog template: pre-built rootfs, defaults already merged into
+    /// the request, canonical ref already pinned.
+    Catalog(arcbox_vm::template_catalog::ResolvedTemplate),
+}
+
+/// Reject the contradictory override combination the proto calls out:
+/// `no_default_cmd` claims "explicitly no command" while `cmd` supplies one.
+pub(super) fn validate_template_overrides(
+    request: &sandbox_v1::CreateSandboxRequest,
+) -> Result<(), SandboxError> {
+    if request.no_default_cmd && !request.cmd.is_empty() {
+        return Err(SandboxError::InvalidArgument(
+            "no_default_cmd cannot be combined with a non-empty cmd".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fold a catalog template's defaults into the request (the proto's
+/// per-field override contract): a set `limits` replaces the default
+/// wholesale (zero subfield = daemon default) while an unset one inherits
+/// the template's; a non-empty `cmd` replaces, an empty one inherits unless
+/// `no_default_cmd` says "explicitly none"; `env` merges per key with the
+/// request winning unless `no_default_env` discards the template's map.
+/// `exposed_ports`/`ready_probe` have no per-create counterpart and stay on
+/// the template entry. Runs before the create key is computed.
+pub(super) fn merge_template_defaults(
+    request: &mut sandbox_v1::CreateSandboxRequest,
+    defaults: &TemplateDefaultsSpec,
+) {
+    if request.limits.as_option().is_none() && (defaults.vcpus != 0 || defaults.memory_mib != 0) {
+        request.limits = Some(sandbox_v1::ResourceLimits {
+            vcpus: defaults.vcpus,
+            memory_mib: defaults.memory_mib,
+            ..Default::default()
+        })
+        .into();
+    }
+    if !request.no_default_cmd && request.cmd.is_empty() {
+        request.cmd = defaults.cmd.clone();
+    }
+    if !request.no_default_env {
+        for (key, value) in &defaults.env {
+            if !request.env.contains_key(key) {
+                request.env.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// Content-addressed tag for a Dockerfile build:
 /// `arcbox-template-build:<sha256[..16]>` of the Dockerfile bytes.
 fn dockerfile_tag(dockerfile: &[u8]) -> String {
@@ -352,7 +408,7 @@ impl SandboxService {
 
 #[cfg(test)]
 mod tests {
-    use super::dockerfile_tag;
+    use super::*;
 
     #[test]
     fn dockerfile_tag_is_content_addressed_and_valid() {
@@ -366,5 +422,109 @@ mod tests {
         assert_eq!(repo, "arcbox-template-build");
         assert_eq!(tag.len(), 16);
         assert!(tag.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    fn defaults() -> TemplateDefaultsSpec {
+        TemplateDefaultsSpec {
+            vcpus: 4,
+            memory_mib: 2048,
+            cmd: vec!["python".into(), "app.py".into()],
+            env: HashMap::from([
+                ("SHARED".to_string(), "template".to_string()),
+                ("ONLY_TEMPLATE".to_string(), "yes".to_string()),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unset_limits_inherit_and_set_limits_replace_wholesale() {
+        let mut request = sandbox_v1::CreateSandboxRequest::default();
+        merge_template_defaults(&mut request, &defaults());
+        assert_eq!(request.limits.vcpus, 4);
+        assert_eq!(request.limits.memory_mib, 2048);
+
+        // A set message replaces wholesale: the zero memory_mib means the
+        // DAEMON default, never a per-field fall-through to the template.
+        let mut request = sandbox_v1::CreateSandboxRequest {
+            limits: Some(sandbox_v1::ResourceLimits {
+                vcpus: 1,
+                memory_mib: 0,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        merge_template_defaults(&mut request, &defaults());
+        assert_eq!(request.limits.vcpus, 1);
+        assert_eq!(request.limits.memory_mib, 0);
+    }
+
+    #[test]
+    fn cmd_inherits_replaces_or_suppresses() {
+        let mut request = sandbox_v1::CreateSandboxRequest::default();
+        merge_template_defaults(&mut request, &defaults());
+        assert_eq!(
+            request.cmd,
+            vec!["python".to_string(), "app.py".to_string()]
+        );
+
+        let mut request = sandbox_v1::CreateSandboxRequest {
+            cmd: vec!["bash".into()],
+            ..Default::default()
+        };
+        merge_template_defaults(&mut request, &defaults());
+        assert_eq!(request.cmd, vec!["bash".to_string()]);
+
+        let mut request = sandbox_v1::CreateSandboxRequest {
+            no_default_cmd: true,
+            ..Default::default()
+        };
+        merge_template_defaults(&mut request, &defaults());
+        assert!(request.cmd.is_empty(), "explicit empty must stay empty");
+    }
+
+    #[test]
+    fn env_merges_per_key_with_the_request_winning() {
+        let mut request = sandbox_v1::CreateSandboxRequest::default();
+        request.env.insert("SHARED".into(), "request".into());
+        request.env.insert("ONLY_REQUEST".into(), "yes".into());
+        merge_template_defaults(&mut request, &defaults());
+        assert_eq!(
+            request.env.get("SHARED").map(String::as_str),
+            Some("request")
+        );
+        assert_eq!(
+            request.env.get("ONLY_TEMPLATE").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            request.env.get("ONLY_REQUEST").map(String::as_str),
+            Some("yes")
+        );
+
+        let mut request = sandbox_v1::CreateSandboxRequest {
+            no_default_env: true,
+            ..Default::default()
+        };
+        request.env.insert("ONLY_REQUEST".into(), "yes".into());
+        merge_template_defaults(&mut request, &defaults());
+        assert!(!request.env.contains_key("ONLY_TEMPLATE"));
+        assert_eq!(request.env.len(), 1);
+    }
+
+    #[test]
+    fn contradictory_cmd_flags_are_rejected() {
+        let request = sandbox_v1::CreateSandboxRequest {
+            no_default_cmd: true,
+            cmd: vec!["bash".into()],
+            ..Default::default()
+        };
+        assert!(validate_template_overrides(&request).is_err());
+        let request = sandbox_v1::CreateSandboxRequest {
+            no_default_cmd: true,
+            ..Default::default()
+        };
+        assert!(validate_template_overrides(&request).is_ok());
     }
 }
