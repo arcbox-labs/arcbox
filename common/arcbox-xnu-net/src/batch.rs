@@ -128,6 +128,14 @@ impl BatchDgram {
     /// has no pending data — callers integrating with a readiness reactor
     /// rely on this to clear readiness.
     ///
+    /// **Size each buffer for the largest datagram the peer can send.** A
+    /// datagram that overruns its slot is truncated *silently*: XNU's
+    /// `recvmsg_x` leaves `msg_flags` zeroed rather than raising `MSG_TRUNC`
+    /// the way plain `recvmsg` would (measured on macOS 26.4), and the
+    /// iovecs are fixed before the syscall, so there is no way to notice
+    /// after the fact or to grow a slot mid-call. Regression:
+    /// `oversized_datagram_is_truncated_without_a_flag`.
+    ///
     /// # Errors
     ///
     /// Returns `io::Error` for syscall failures, including `WouldBlock`.
@@ -571,6 +579,33 @@ mod tests {
         for entry in entries.iter().take(3) {
             assert_eq!(entry.len, 50);
         }
+    }
+
+    /// XNU truncates an oversized datagram **without** setting `MSG_TRUNC`,
+    /// so a short `len` is the only trace and a full-slot `len` is
+    /// indistinguishable from a datagram that happened to fit. Callers must
+    /// size slots for the largest datagram the peer can send; this pins the
+    /// behaviour so a kernel that starts reporting it is noticed.
+    #[test]
+    fn oversized_datagram_is_truncated_without_a_flag() {
+        let (a, b) = socketpair();
+
+        write_datagram(a.as_raw_fd(), &[0x5A; 4096]);
+
+        let mut batch = BatchDgram::new();
+        let mut buf = vec![0u8; 1024];
+        let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
+
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].len, 1024, "only the slot's worth is delivered");
+
+        // The discarded 3072 bytes are gone — not left queued for a second
+        // call, which would at least be recoverable.
+        let err = batch
+            .recv_batch(b.as_raw_fd(), &mut bufs)
+            .expect_err("the truncated tail must not remain queued");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
