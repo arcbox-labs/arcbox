@@ -25,6 +25,14 @@ fn operation_key(name: &str) -> String {
     format!("template:{name}")
 }
 
+/// Content-addressed tag for a Dockerfile build:
+/// `arcbox-template-build:<sha256[..16]>` of the Dockerfile bytes.
+fn dockerfile_tag(dockerfile: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let hex = format!("{:x}", Sha256::digest(dockerfile));
+    format!("arcbox-template-build:{}", &hex[..16])
+}
+
 /// Clears the in-flight marker for a template build on drop, so every error
 /// path frees the name.
 struct BuildFlight<'a> {
@@ -71,15 +79,46 @@ impl SandboxService {
                 self.build_template_from_docker(&req.name, &image, defaults, labels)
                     .await
             }
-            Source::Dockerfile(_) => Err(SandboxError::Unsupported(
-                "dockerfile builds are not implemented yet (CORE-107); \
-                 build the image through the docker context and use docker_ref"
-                    .into(),
-            )),
+            Source::Dockerfile(dockerfile) => {
+                self.build_template_from_dockerfile(&req.name, &dockerfile, defaults, labels)
+                    .await
+            }
             Source::SnapshotId(_) => Err(SandboxError::Unsupported(
                 "snapshot promotion is not implemented yet (CORE-107)".into(),
             )),
         }
+    }
+
+    /// Build inline Dockerfile content in the guest's dockerd, then proceed
+    /// exactly as a `docker_ref` build of the resulting image.
+    ///
+    /// The tag is content-addressed (`arcbox-template-build:<sha256[..16]>`
+    /// of the Dockerfile bytes): an identical rebuild reuses the image, and
+    /// two concurrent Builds of different templates cannot race one mutable
+    /// tag. The build context holds only the Dockerfile — `COPY`/`ADD` of
+    /// local paths fails inside the build with dockerd's own message.
+    async fn build_template_from_dockerfile(
+        &self,
+        name: &str,
+        dockerfile: &str,
+        defaults: TemplateDefaultsSpec,
+        labels: HashMap<String, String>,
+    ) -> Result<sandbox_v1::Template, SandboxError> {
+        if dockerfile.trim().is_empty() {
+            return Err(SandboxError::InvalidArgument(
+                "dockerfile content must not be empty".into(),
+            ));
+        }
+        let tag = dockerfile_tag(dockerfile.as_bytes());
+        if template::inspect_image(&tag).await.is_ok() {
+            tracing::info!(template = name, %tag, "reusing previously built dockerfile image");
+        } else {
+            template::build_image(dockerfile.as_bytes(), &tag)
+                .await
+                .map_err(|e| SandboxError::Internal(format!("template build {name}: {e:#}")))?;
+        }
+        self.build_template_from_docker(name, &tag, defaults, labels)
+            .await
     }
 
     /// Export `image` from the guest's dockerd, convert it to a cached ext4,
@@ -233,5 +272,24 @@ impl SandboxService {
             .delete_template(&req.reference)
             .await
             .map_err(SandboxError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dockerfile_tag;
+
+    #[test]
+    fn dockerfile_tag_is_content_addressed_and_valid() {
+        let a = dockerfile_tag(b"FROM alpine\n");
+        let b = dockerfile_tag(b"FROM alpine\n");
+        let c = dockerfile_tag(b"FROM debian\n");
+        assert_eq!(a, b, "identical content must reuse the tag");
+        assert_ne!(a, c, "different content must not share a tag");
+        // repo:tag shape docker accepts, 16-hex suffix.
+        let (repo, tag) = a.split_once(':').expect("repo:tag");
+        assert_eq!(repo, "arcbox-template-build");
+        assert_eq!(tag.len(), 16);
+        assert!(tag.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }
