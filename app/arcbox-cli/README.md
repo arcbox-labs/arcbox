@@ -50,6 +50,30 @@ kubectl get nodes
 docker run hello-world
 ```
 
+## Output formats
+
+`--format` is global but validated for the selected command before any command
+I/O. Unsupported `json` or `quiet` combinations exit nonzero instead of
+falling back to decorated text.
+
+Read-only JSON schemas are available for `doctor`, `top`, `disk usage`,
+`boot status`, `boot list`, `setup status`, `machine inspect`,
+`sandbox inspect`, and, on macOS, `dns status`.
+Disk and boot sizes use raw `*_bytes` fields. For read-only commands, quiet
+output is limited to `setup status`, which prints `installed`, `partial`, or
+`unknown`.
+
+Status exit codes are health contracts: `doctor`, `dns status`, `boot status`,
+and `setup status` exit nonzero when their report is unhealthy or incomplete.
+A check that could not be run is reported as `unknown` rather than failed —
+`doctor` counts it separately and `setup status` still exits zero, because a
+login-shell probe that times out says nothing about the integration itself.
+Drift the daemon repairs on its next start is likewise reported as a detail,
+not as an incomplete cache: `boot status` says so for a runtime binary missing
+its executable bit instead of asking for a re-download.
+If Docker is unavailable, `disk usage` keeps host image facts, sets runtime
+reclaimable fields to `null`, reports the query error, and exits nonzero.
+
 ## Exit status
 
 - `0`: command succeeded.
@@ -62,8 +86,10 @@ docker run hello-world
 
 Socket path resolution order:
 1. `ARCBOX_SOCKET` environment variable
-2. `DOCKER_HOST` (with `unix://` prefix stripped)
-3. Default: `~/.arcbox/docker.sock`
+2. The active profile or `ARCBOX_DATA_DIR` layout (`<data-dir>/run/docker.sock`)
+
+The production default is `~/.arcbox/run/docker.sock`. `DOCKER_HOST` is
+honored by the Docker CLI, not by ArcBox's direct socket clients.
 
 ## License
 

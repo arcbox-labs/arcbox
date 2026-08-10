@@ -18,14 +18,26 @@ are checksum-verified against the pinned manifest, copied into a
 version-keyed generation on the guest Btrfs data disk, and executed only from
 that local generation.
 
+`abctl boot status` requires the effective kernel, rootfs, and every manifest
+runtime binary selected for the current architecture. A configured
+`vm.kernel_path` replaces the managed release kernel; the custom path must be a
+non-empty regular file, while only the managed kernel is checked against the
+release checksum. Runtime binaries are checked at their manifest-defined paths
+for checksum, regular-file type, and executable permissions.
+
+Manifests published before this guest-cache design may still contain a legacy
+`runtime` entry. Current `arcbox-boot` consumers preserve that metadata for
+compatibility but do not use or cache `runtime.erofs`; `abctl boot status`
+lists it as a non-required legacy artifact.
+
 ## Responsibilities In This Repository
 
 1. Download, verify, and cache boot assets at runtime:
-   `app/arcbox-core/src/boot_assets.rs` (thin wrapper around `arcbox-boot` crate)
+   `app/arcbox-core/src/boot_assets/` (thin wrapper around `arcbox-boot` crate)
 2. Wire boot assets into VM lifecycle:
-   `app/arcbox-core/src/vm_lifecycle.rs`
+   `app/arcbox-core/src/vm_lifecycle/`
 3. Provide CLI operations (`prefetch` / `status` / `list` / `clear`):
-   `app/arcbox-cli/src/commands/boot.rs`
+   `app/arcbox-cli/src/commands/boot/`
 
 ## Responsibilities In boot-assets Repository
 
@@ -53,9 +65,9 @@ https://boot.arcboxcdn.com/
 
 ## Version Pinning
 
-The daemon pins the boot asset version via `BOOT_ASSET_VERSION` in
-`app/arcbox-core/src/boot_assets.rs`. This can be overridden at runtime
-with the `ARCBOX_BOOT_ASSET_VERSION` environment variable.
+The daemon pins the boot asset version in the root `assets.lock`, loaded by
+`app/arcbox-core/src/boot_assets/lockfile.rs`. This can be overridden at
+runtime with the `ARCBOX_BOOT_ASSET_VERSION` environment variable.
 
 `abctl boot list` sorts cached versions by SemVer precedence, including
 prereleases; invalid version directory names appear afterward in lexical order.

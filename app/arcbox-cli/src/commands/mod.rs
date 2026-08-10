@@ -42,6 +42,22 @@ pub fn resolve_grpc_socket_path() -> PathBuf {
     arcbox_constants::paths::HostLayout::from_env_or_default().grpc_socket
 }
 
+/// Resolves the Docker socket from the CLI override or active host layout.
+pub fn resolve_docker_socket_path() -> PathBuf {
+    let layout = arcbox_constants::paths::HostLayout::from_env_or_default();
+    select_docker_socket_path(
+        std::env::var_os("ARCBOX_SOCKET").map(PathBuf::from),
+        &layout,
+    )
+}
+
+fn select_docker_socket_path(
+    socket_override: Option<PathBuf>,
+    layout: &arcbox_constants::paths::HostLayout,
+) -> PathBuf {
+    socket_override.unwrap_or_else(|| layout.docker_socket.clone())
+}
+
 pub mod agent;
 pub mod boot;
 pub mod cli_plugins;
@@ -80,9 +96,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Unix socket path for daemon connection
+    /// Docker API Unix socket override
     ///
-    /// Can also be set via ARCBOX_SOCKET or DOCKER_HOST environment variables.
+    /// Can also be set via the ARCBOX_SOCKET environment variable.
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
@@ -195,4 +211,145 @@ pub enum Commands {
 
     /// Show version information
     Version,
+}
+
+impl Cli {
+    /// Rejects output formats that the selected command does not implement.
+    pub fn validate_output_format(&self) -> anyhow::Result<()> {
+        let supported = match self.format {
+            OutputFormat::Table => true,
+            OutputFormat::Json => match &self.command {
+                Commands::Boot(
+                    boot::BootCommands::Prefetch(_)
+                    | boot::BootCommands::Status(_)
+                    | boot::BootCommands::Clear
+                    | boot::BootCommands::List,
+                )
+                | Commands::Setup(
+                    setup::SetupCommands::Install
+                    | setup::SetupCommands::Uninstall
+                    | setup::SetupCommands::Status,
+                )
+                | Commands::Docker(docker::DockerCommands::Setup)
+                | Commands::Top(_)
+                | Commands::Disk(disk::DiskCommands::Usage)
+                | Commands::Machine(machine::MachineCommands::Inspect(_))
+                | Commands::Sandbox(sandbox::SandboxCommands::Inspect(_))
+                | Commands::Doctor => true,
+                #[cfg(target_os = "macos")]
+                Commands::Dns(dns::DnsCommands::Status) => true,
+                _ => false,
+            },
+            OutputFormat::Quiet => matches!(
+                &self.command,
+                Commands::Setup(
+                    setup::SetupCommands::Install
+                        | setup::SetupCommands::Uninstall
+                        | setup::SetupCommands::Status
+                )
+            ),
+        };
+
+        if supported {
+            return Ok(());
+        }
+
+        let format = match self.format {
+            OutputFormat::Json => "json",
+            OutputFormat::Quiet => "quiet",
+            OutputFormat::Table => unreachable!("table output is always supported"),
+        };
+        anyhow::bail!("--format {format} is not supported for this command")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use arcbox_constants::paths::HostLayout;
+    use clap::Parser;
+
+    use super::{Cli, select_docker_socket_path};
+
+    #[test]
+    fn docker_socket_uses_override_then_host_layout() {
+        let layout = HostLayout::new(PathBuf::from("custom-data"));
+
+        assert_eq!(
+            select_docker_socket_path(None, &layout),
+            layout.docker_socket
+        );
+        assert_eq!(
+            select_docker_socket_path(Some(PathBuf::from("override.sock")), &layout),
+            PathBuf::from("override.sock")
+        );
+    }
+
+    #[test]
+    fn query_output_format_matrix() {
+        let mut cases: Vec<(&[&str], bool, bool)> = vec![
+            (&["version"], false, false),
+            (&["info"], false, false),
+            (&["doctor"], true, false),
+            (&["top"], true, false),
+            (&["logs"], false, false),
+            (&["daemon", "status"], false, false),
+            (&["setup", "status"], true, true),
+            (&["setup", "completions", "--shell", "zsh"], false, false),
+            (&["disk", "usage"], true, false),
+            (&["boot", "status"], true, false),
+            (&["boot", "list"], true, false),
+            (&["system", "backend"], false, false),
+            (&["kubernetes", "status"], false, false),
+            (&["kubernetes", "kubeconfig"], false, false),
+            (&["docker", "status"], false, false),
+            (&["machine", "ls"], false, false),
+            (&["machine", "status", "default"], false, false),
+            (&["machine", "inspect", "default"], true, false),
+            (&["machine", "ping", "default"], false, false),
+            (&["machine", "info", "default"], false, false),
+            (&["sandbox", "ls"], false, false),
+            (&["sandbox", "inspect", "sandbox"], true, false),
+            (&["sandbox", "events"], false, false),
+            (&["sandbox", "snapshots"], false, false),
+            (&["sandbox", "templates"], false, false),
+            (
+                &["migrate", "from", "docker-desktop", "--dry-run"],
+                false,
+                false,
+            ),
+            (&["migrate", "from", "orbstack", "--dry-run"], false, false),
+        ];
+
+        #[cfg(target_os = "macos")]
+        cases.extend([
+            (&["dns", "status"][..], true, false),
+            (&["macos", "ls"][..], false, false),
+            (&["macos", "ip", "guest"][..], false, false),
+            (
+                &["macos", "image", "resolve", "tahoe-base"][..],
+                false,
+                false,
+            ),
+            (&["macos", "image", "ls"][..], false, false),
+        ]);
+
+        for (args, json, quiet) in cases {
+            assert!(accepts(args, "table"), "table rejected for {args:?}");
+            assert_eq!(accepts(args, "json"), json, "JSON mismatch for {args:?}");
+            assert_eq!(accepts(args, "quiet"), quiet, "quiet mismatch for {args:?}");
+        }
+    }
+
+    fn accepts(args: &[&str], format: &str) -> bool {
+        let argv: Vec<_> = ["abctl", "--format", format]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        Cli::try_parse_from(argv)
+            .expect("matrix command must parse")
+            .validate_output_format()
+            .is_ok()
+    }
 }

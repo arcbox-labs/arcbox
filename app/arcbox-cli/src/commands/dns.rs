@@ -8,11 +8,22 @@
 //! - `abctl dns uninstall` — remove resolver file (requires sudo)
 //! - `abctl dns status`    — check resolver file and DNS reachability
 
-use anyhow::{Context, Result};
-use clap::Subcommand;
-use macos_resolver::{FileResolver, ResolverConfig, to_env_prefix};
-use std::net::{SocketAddr, UdpSocket};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use arcbox_constants::paths::HostLayout;
+use clap::Subcommand;
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{Name, RecordType};
+use macos_resolver::{FileResolver, ResolverConfig, to_env_prefix};
+use serde::Serialize;
+use tokio::net::UdpSocket;
+use tokio::process::Command;
+use tokio::time::timeout;
+
+use super::OutputFormat;
 
 /// Prefix for marker comment and environment variable namespace.
 ///
@@ -25,6 +36,68 @@ const DEFAULT_DNS_PORT: u16 = 5553;
 
 /// Default domain suffix (overridable via `ARCBOX_DNS_DOMAIN`).
 const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
+
+const DNS_PROBE_ID: u16 = 0xabcd;
+const DNS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum DnsHealth {
+    Healthy,
+    Negative {
+        response_code: u16,
+        description: String,
+    },
+    DaemonDown,
+    ListenerAbsent,
+    TimedOut,
+    Malformed {
+        error: String,
+    },
+    Io {
+        error: String,
+    },
+}
+
+impl DnsHealth {
+    fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+
+    fn malformed(error: impl Into<String>) -> Self {
+        Self::Malformed {
+            error: error.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DnsStatus {
+    pub ready: bool,
+    pub domain: String,
+    pub resolver_path: String,
+    pub resolver_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver_error: Option<String>,
+    pub server_address: String,
+    pub query_name: String,
+    pub health: DnsHealth,
+    pub system_resolver: SystemResolverHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum SystemResolverHealth {
+    Healthy,
+    TimedOut,
+    LookupFailed { error: String },
+}
+
+impl SystemResolverHealth {
+    fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
 
 /// Reads the DNS port from `{PREFIX}_DNS_PORT` or falls back to the default.
 fn dns_port() -> u16 {
@@ -55,11 +128,11 @@ pub enum DnsCommands {
 }
 
 /// Executes the dns subcommand.
-pub async fn execute(cmd: DnsCommands) -> Result<()> {
+pub async fn execute(cmd: DnsCommands, format: OutputFormat) -> Result<()> {
     match cmd {
         DnsCommands::Install => execute_install().await,
         DnsCommands::Uninstall => execute_uninstall().await,
-        DnsCommands::Status => execute_status().await,
+        DnsCommands::Status => execute_status(format).await,
     }
 }
 
@@ -111,64 +184,425 @@ async fn execute_uninstall() -> Result<()> {
     }
 }
 
-/// Checks resolver file presence and DNS server reachability.
-async fn execute_status() -> Result<()> {
+async fn execute_status(format: OutputFormat) -> Result<()> {
+    let status = inspect_status().await;
+
+    match format {
+        OutputFormat::Table => print_status(&status),
+        OutputFormat::Json => println!("{}", serde_json::to_string(&status)?),
+        OutputFormat::Quiet => bail!("quiet output is not supported for dns status"),
+    }
+
+    if status.ready {
+        Ok(())
+    } else {
+        bail!("DNS status is not ready")
+    }
+}
+
+pub(super) async fn inspect_status() -> DnsStatus {
     let resolver = FileResolver::new(PREFIX);
     let domain = dns_domain();
     let port = dns_port();
-    let installed = resolver.is_registered(&domain);
-
-    if installed {
-        println!("Resolver file: installed (/etc/resolver/{domain})");
+    let resolver_path = resolver.resolver_dir().join(&domain);
+    let (resolver_installed, resolver_error) = if !resolver.is_registered(&domain) {
+        (
+            false,
+            Some("resolver file is missing or not managed by ArcBox".to_owned()),
+        )
     } else {
-        println!("Resolver file: not installed");
-    }
+        match std::fs::read_to_string(&resolver_path) {
+            Ok(content) if resolver_matches(&content, port) => (true, None),
+            Ok(_) => (
+                false,
+                Some(format!("expected nameserver 127.0.0.1 and port {port}")),
+            ),
+            Err(error) => (
+                false,
+                Some(format!("failed to read resolver file: {error}")),
+            ),
+        }
+    };
+    let server: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let query_name = format!("host.{domain}");
+    let (service_health, system_resolver) = tokio::join!(
+        probe_dns(server, &query_name, DNS_PROBE_TIMEOUT),
+        probe_system_resolver(&query_name, DNS_PROBE_TIMEOUT),
+    );
+    let health = daemon_health(
+        service_health,
+        super::daemon::daemon_is_alive(&HostLayout::from_env_or_default().lock_file),
+    );
 
-    let reachable = is_dns_port_reachable(port);
-    if reachable {
-        println!("DNS server:    reachable (127.0.0.1:{port})");
-    } else {
-        println!("DNS server:    not reachable (127.0.0.1:{port})");
+    DnsStatus {
+        ready: dns_ready(resolver_installed, &health, &system_resolver),
+        domain,
+        resolver_path: resolver_path.display().to_string(),
+        resolver_installed,
+        resolver_error,
+        server_address: server.to_string(),
+        query_name,
+        health,
+        system_resolver,
     }
-
-    if !installed {
-        println!();
-        println!("Run 'sudo abctl dns install' to enable *.{domain} DNS resolution.");
-    }
-    if !reachable {
-        println!();
-        println!("Start the ArcBox daemon to provide DNS service on port {port}.");
-    }
-
-    Ok(())
 }
 
-/// Quick UDP probe to check if something is listening on the DNS port.
-fn is_dns_port_reachable(port: u16) -> bool {
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-        return false;
+fn print_status(status: &DnsStatus) {
+    let resolver = if status.resolver_installed {
+        "configured".to_owned()
+    } else {
+        format!(
+            "not ready ({})",
+            status.resolver_error.as_deref().unwrap_or("unknown error")
+        )
     };
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+    println!("Resolver file: {resolver} ({})", status.resolver_path);
 
-    // Send a minimal DNS query (just enough to elicit a response).
-    // ID=0x1234, flags=0x0100 (standard query), 1 question, QNAME=., QTYPE=A, QCLASS=IN
-    let query: [u8; 17] = [
-        0x12, 0x34, // ID
-        0x01, 0x00, // Flags: standard query
-        0x00, 0x01, // QDCOUNT: 1
-        0x00, 0x00, // ANCOUNT: 0
-        0x00, 0x00, // NSCOUNT: 0
-        0x00, 0x00, // ARCOUNT: 0
-        0x00, // QNAME: root (.)
-        0x00, 0x01, // QTYPE: A
-        0x00, 0x01, // QCLASS: IN
-    ];
+    let server = match &status.health {
+        DnsHealth::Healthy => format!(
+            "healthy ({} answered A for {})",
+            status.server_address, status.query_name
+        ),
+        DnsHealth::Negative {
+            response_code,
+            description,
+        } => format!("negative response (code {response_code}: {description})"),
+        DnsHealth::DaemonDown => "daemon not running".to_string(),
+        DnsHealth::ListenerAbsent => format!("no listener at {}", status.server_address),
+        DnsHealth::TimedOut => format!("timed out at {}", status.server_address),
+        DnsHealth::Malformed { error } => format!("malformed response ({error})"),
+        DnsHealth::Io { error } => format!("probe failed ({error})"),
+    };
+    println!("DNS server:    {server}");
+    let system_resolver = match &status.system_resolver {
+        SystemResolverHealth::Healthy => {
+            format!("resolved {} through macOS", status.query_name)
+        }
+        SystemResolverHealth::TimedOut => {
+            format!("timed out resolving {}", status.query_name)
+        }
+        SystemResolverHealth::LookupFailed { error } => {
+            format!("failed to resolve {} ({error})", status.query_name)
+        }
+    };
+    println!("System lookup: {system_resolver}");
+    println!(
+        "Status:        {}",
+        if status.ready { "ready" } else { "not ready" }
+    );
 
-    if socket.send_to(&query, addr).is_err() {
-        return false;
+    if !status.resolver_installed {
+        println!();
+        println!(
+            "Run 'sudo abctl dns install' to enable *.{} DNS resolution.",
+            status.domain
+        );
     }
 
-    let mut buf = [0u8; 512];
-    socket.recv_from(&mut buf).is_ok()
+    if matches!(&status.health, DnsHealth::DaemonDown) {
+        println!("\nStart the ArcBox daemon to provide DNS service.");
+    }
+}
+
+fn resolver_matches(content: &str, port: u16) -> bool {
+    has_directive(content, "nameserver", "127.0.0.1")
+        && has_directive(content, "port", &port.to_string())
+}
+
+fn has_directive(content: &str, name: &str, value: &str) -> bool {
+    content.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(name) && fields.next() == Some(value) && fields.next().is_none()
+    })
+}
+
+fn dns_ready(
+    resolver_installed: bool,
+    service: &DnsHealth,
+    system_resolver: &SystemResolverHealth,
+) -> bool {
+    resolver_installed && service.is_healthy() && system_resolver.is_healthy()
+}
+
+async fn probe_system_resolver(query_name: &str, deadline: Duration) -> SystemResolverHealth {
+    let mut command = Command::new("/usr/bin/dscacheutil");
+    command
+        .args(["-q", "host", "-a", "name", query_name])
+        .kill_on_drop(true);
+    match timeout(deadline, command.output()).await {
+        Err(_) => SystemResolverHealth::TimedOut,
+        Ok(Err(error)) => SystemResolverHealth::LookupFailed {
+            error: format!("could not execute dscacheutil: {error}"),
+        },
+        Ok(Ok(output)) if !output.status.success() => SystemResolverHealth::LookupFailed {
+            error: format!(
+                "dscacheutil exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        },
+        Ok(Ok(output)) => classify_system_lookup_stdout(&String::from_utf8_lossy(&output.stdout)),
+    }
+}
+
+fn classify_system_lookup_stdout(stdout: &str) -> SystemResolverHealth {
+    let resolved = stdout.lines().any(|line| {
+        line.split_once(':').is_some_and(|(key, value)| {
+            key.trim() == "ip_address" && value.trim().parse::<Ipv4Addr>().is_ok()
+        })
+    });
+    if resolved {
+        SystemResolverHealth::Healthy
+    } else {
+        SystemResolverHealth::LookupFailed {
+            error: "macOS system resolver returned no IPv4 address".to_owned(),
+        }
+    }
+}
+
+async fn probe_dns(address: SocketAddr, query_name: &str, deadline: Duration) -> DnsHealth {
+    let (expected_query, request) = match build_probe_query(query_name) {
+        Ok(request) => request,
+        Err(error) => return DnsHealth::malformed(error),
+    };
+
+    let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
+        Ok(socket) => socket,
+        Err(error) => return transport_error("bind", error),
+    };
+    if let Err(error) = socket.connect(address).await {
+        return transport_error("connect", error);
+    }
+    if let Err(error) = socket.send(&request).await {
+        return transport_error("send", error);
+    }
+
+    let mut response = [0_u8; 4096];
+    match timeout(deadline, socket.recv(&mut response)).await {
+        Err(_) => DnsHealth::TimedOut,
+        Ok(Err(error)) => transport_error("receive", error),
+        Ok(Ok(length)) => classify_response(&response[..length], &expected_query),
+    }
+}
+
+fn build_probe_query(query_name: &str) -> std::result::Result<(Query, Vec<u8>), String> {
+    let mut name = Name::from_ascii(query_name).map_err(|error| error.to_string())?;
+    name.set_fqdn(true);
+    let query = Query::query(name, RecordType::A);
+    let mut message = Message::new(DNS_PROBE_ID, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(query.clone());
+    let wire = message.to_vec().map_err(|error| error.to_string())?;
+    Ok((query, wire))
+}
+
+fn classify_response(wire: &[u8], expected_query: &Query) -> DnsHealth {
+    let response = match Message::from_vec(wire) {
+        Ok(response) => response,
+        Err(error) => return DnsHealth::malformed(error.to_string()),
+    };
+
+    if response.metadata.id != DNS_PROBE_ID {
+        return DnsHealth::malformed(format!(
+            "transaction ID mismatch: expected {DNS_PROBE_ID:#06x}, got {:#06x}",
+            response.metadata.id
+        ));
+    }
+    if response.metadata.message_type != MessageType::Response {
+        return DnsHealth::malformed("packet is not a DNS response");
+    }
+    if response.metadata.truncation {
+        return DnsHealth::malformed("UDP response is truncated");
+    }
+    if response.queries.as_slice() != std::slice::from_ref(expected_query) {
+        return DnsHealth::malformed("response question does not match the request");
+    }
+
+    let response_code = response.metadata.response_code;
+    if response_code != ResponseCode::NoError {
+        return DnsHealth::Negative {
+            response_code: u16::from(response_code),
+            description: response_code.to_string(),
+        };
+    }
+
+    if response.answers.iter().any(|answer| {
+        &answer.name == expected_query.name()
+            && answer.dns_class == expected_query.query_class()
+            && answer.record_type() == RecordType::A
+    }) {
+        DnsHealth::Healthy
+    } else {
+        DnsHealth::Negative {
+            response_code: u16::from(ResponseCode::NoError),
+            description: "NODATA (no matching A answer)".to_string(),
+        }
+    }
+}
+
+fn transport_error(operation: &str, error: io::Error) -> DnsHealth {
+    if error.kind() == io::ErrorKind::ConnectionRefused {
+        DnsHealth::ListenerAbsent
+    } else {
+        DnsHealth::Io {
+            error: format!("{operation}: {error}"),
+        }
+    }
+}
+
+fn daemon_health(health: DnsHealth, daemon_alive: bool) -> DnsHealth {
+    if !daemon_alive && matches!(health, DnsHealth::ListenerAbsent | DnsHealth::TimedOut) {
+        DnsHealth::DaemonDown
+    } else {
+        health
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use hickory_proto::rr::{RData, Record, rdata::A};
+
+    use super::*;
+
+    fn query() -> Query {
+        build_probe_query("host.arcbox.local").unwrap().0
+    }
+
+    fn response_wire(query: &Query, response_code: ResponseCode, answer: bool) -> Vec<u8> {
+        let mut response = Message::response(DNS_PROBE_ID, OpCode::Query);
+        response.metadata.response_code = response_code;
+        response.add_query(query.clone());
+        if answer {
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                60,
+                RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+            ));
+        }
+        response.to_vec().unwrap()
+    }
+
+    fn is_malformed(health: DnsHealth) -> bool {
+        matches!(health, DnsHealth::Malformed { .. })
+    }
+
+    fn negative_code(health: DnsHealth) -> Option<u16> {
+        match health {
+            DnsHealth::Negative { response_code, .. } => Some(response_code),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn validates_positive_and_negative_dns_responses() {
+        let query = query();
+        let classify =
+            |code, answer| classify_response(&response_wire(&query, code, answer), &query);
+        assert_eq!(classify(ResponseCode::NoError, true), DnsHealth::Healthy);
+        assert_eq!(
+            negative_code(classify(ResponseCode::NXDomain, false)),
+            Some(3)
+        );
+        assert_eq!(
+            negative_code(classify(ResponseCode::NoError, false)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn resolver_config_must_select_the_probed_address() {
+        let configured = "# managed by arcbox\nnameserver 127.0.0.1\nport 5553\n";
+        assert!(resolver_matches(configured, 5553));
+        assert!(!resolver_matches(configured, 5554));
+        assert!(!resolver_matches(
+            "# managed by arcbox\nnameserver 127.0.0.2\nport 5553\n",
+            5553
+        ));
+    }
+
+    #[test]
+    fn system_lookup_gates_dns_readiness() {
+        let failed = classify_system_lookup_stdout("");
+        assert!(matches!(failed, SystemResolverHealth::LookupFailed { .. }));
+        assert!(!dns_ready(true, &DnsHealth::Healthy, &failed));
+
+        let healthy =
+            classify_system_lookup_stdout("name: host.arcbox.local\nip_address: 10.0.2.1\n");
+        assert_eq!(healthy, SystemResolverHealth::Healthy);
+        assert!(dns_ready(true, &DnsHealth::Healthy, &healthy));
+        assert!(matches!(
+            classify_system_lookup_stdout("name: host.arcbox.local\nipv6_address: ::1\n"),
+            SystemResolverHealth::LookupFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_and_mismatched_dns_responses() {
+        let query = query();
+        assert!(is_malformed(classify_response(&[0, 1, 2], &query)));
+
+        let mut wrong_id = Message::response(DNS_PROBE_ID + 1, OpCode::Query);
+        wrong_id.add_query(query.clone());
+        assert!(is_malformed(classify_response(
+            &wrong_id.to_vec().unwrap(),
+            &query
+        )));
+    }
+
+    #[test]
+    fn classifies_transport_and_daemon_state() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        let health = transport_error("receive", refused);
+        assert_eq!(health, DnsHealth::ListenerAbsent);
+        assert_eq!(daemon_health(health.clone(), false), DnsHealth::DaemonDown);
+        assert_eq!(daemon_health(health, true), DnsHealth::ListenerAbsent);
+        assert_eq!(
+            daemon_health(DnsHealth::TimedOut, true),
+            DnsHealth::TimedOut
+        );
+    }
+
+    #[test]
+    fn serializes_typed_health_status() {
+        let health = DnsHealth::Negative {
+            response_code: 3,
+            description: "NXDomain".to_string(),
+        };
+        let json = serde_json::to_value(health).unwrap();
+        assert_eq!(json["status"], "negative");
+        assert_eq!(json["response_code"], 3);
+    }
+
+    #[tokio::test]
+    async fn probes_a_real_udp_dns_exchange() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buffer = [0_u8; 512];
+            let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+            let request = Message::from_vec(&buffer[..length]).unwrap();
+            let query = request.queries.first().unwrap();
+            let response = response_wire(query, ResponseCode::NoError, true);
+            server.send_to(&response, peer).await.unwrap();
+        });
+
+        assert_eq!(
+            probe_dns(address, "host.arcbox.local", Duration::from_secs(1)).await,
+            DnsHealth::Healthy
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_udp_probe_timeout() {
+        let silent_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = silent_server.local_addr().unwrap();
+
+        assert_eq!(
+            probe_dns(address, "host.arcbox.local", Duration::from_millis(20)).await,
+            DnsHealth::TimedOut
+        );
+    }
 }

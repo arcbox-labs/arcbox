@@ -43,6 +43,8 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    cli.validate_output_format()?;
+
     // Set ARCBOX_SOCKET env var if --socket was provided.
     // This makes it available to gRPC socket resolution in machine commands.
     // SAFETY: This is called at the start of main(), before any threads are spawned,
@@ -99,13 +101,13 @@ fn run(cli: Cli) -> Result<()> {
             Commands::Kubernetes(cmd) => commands::kubernetes::execute(cmd).await,
             Commands::System(cmd) => commands::system::execute(cmd).await,
             Commands::Boot(cmd) => commands::boot::execute(cmd, cli.format).await,
-            Commands::Disk(cmd) => commands::disk::execute(cmd).await,
+            Commands::Disk(cmd) => commands::disk::execute(cmd, cli.format).await,
             #[cfg(target_os = "macos")]
-            Commands::Dns(cmd) => commands::dns::execute(cmd).await,
+            Commands::Dns(cmd) => commands::dns::execute(cmd, cli.format).await,
             Commands::Daemon(args) => commands::daemon::execute(args).await,
             Commands::Logs(args) => commands::logs::execute(args).await,
             Commands::Setup(cmd) => commands::setup::execute(cmd, cli.format).await,
-            Commands::Doctor => commands::doctor::execute().await,
+            Commands::Doctor => commands::doctor::execute(cli.format).await,
             Commands::Top(args) => commands::top::execute(args, cli.format).await,
             #[cfg(target_os = "macos")]
             Commands::Install(args) => commands::install::execute(args).await,

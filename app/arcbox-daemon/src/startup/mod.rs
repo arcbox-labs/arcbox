@@ -198,7 +198,8 @@ async fn wait_for_resources(_ctx: &DaemonContext) -> Result<()> {
 /// progress and before [`init_runtime`] so the runtime sees coherent artifacts
 /// for the launched app version.
 async fn prepare_assets(ctx: &DaemonContext) -> Result<assets::PreparedAssets> {
-    let prepared = assets::prepare(&ctx.layout.data_dir, &ctx.setup_state).await?;
+    let config = effective_config(ctx);
+    let prepared = assets::prepare(&config, &ctx.setup_state).await?;
     ctx.setup_state
         .set_phase(SetupPhase::AssetsReady, "Boot assets ready");
     Ok(prepared)
@@ -211,29 +212,8 @@ async fn prepare_assets(ctx: &DaemonContext) -> Result<assets::PreparedAssets> {
 /// publishes VM_STARTING → VM_READY around the guest boot itself.
 /// Returns the initialized runtime.
 async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
-    let mut config = Config::load_for_profile(ctx.profile).unwrap_or_else(|err| {
-        warn!(error = %err, "Failed to load config file; falling back to defaults");
-        Config::for_profile(ctx.profile)
-    });
-    // The daemon's layout (sockets, lock file) was already resolved from
-    // --profile/--data-dir/--socket, so it must win over config files.
-    config.data_dir = ctx.layout.data_dir.clone();
-    config.docker.socket_path = ctx.layout.docker_socket.clone();
-    if let Some(port) = ctx.vm_args.guest_docker_vsock_port {
-        config.container.guest_docker_vsock_port = port;
-    }
+    let config = effective_config(ctx);
     let selected_guest_docker_port = config.container.guest_docker_vsock_port;
-
-    // The --kernel CLI flag wins over the config file; Runtime::new
-    // propagates config.vm.* into the VM lifecycle config.
-    if let Some(ref kernel) = ctx.vm_args.kernel {
-        config.vm.kernel_path = Some(kernel.clone());
-    }
-
-    // --no-linux-vm wins over the config file, forcing VM-host-only mode.
-    if ctx.vm_args.no_linux_vm {
-        config.vm.autostart = false;
-    }
 
     let runtime = Arc::new(Runtime::new(config).context("Failed to create runtime")?);
     // Publish the diagnostics handle before the VM boots: a stuck boot
@@ -287,6 +267,35 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
         arcbox_api::spawn_sandbox_cleanup(Arc::clone(&runtime));
     }
     Ok(runtime)
+}
+
+fn effective_config(ctx: &DaemonContext) -> Config {
+    let mut config = Config::load_for_profile(ctx.profile).unwrap_or_else(|err| {
+        warn!(error = %err, "Failed to load config file; falling back to defaults");
+        Config::for_profile(ctx.profile)
+    });
+    // The daemon's layout (sockets, lock file) was already resolved from
+    // --profile/--data-dir/--socket, so it must win over config files.
+    config.data_dir.clone_from(&ctx.layout.data_dir);
+    config
+        .docker
+        .socket_path
+        .clone_from(&ctx.layout.docker_socket);
+    if let Some(port) = ctx.vm_args.guest_docker_vsock_port {
+        config.container.guest_docker_vsock_port = port;
+    }
+
+    // The --kernel CLI flag wins over the config file; Runtime::new
+    // propagates config.vm.* into the VM lifecycle config.
+    if let Some(ref kernel) = ctx.vm_args.kernel {
+        config.vm.kernel_path = Some(kernel.clone());
+    }
+
+    // --no-linux-vm wins over the config file, forcing VM-host-only mode.
+    if ctx.vm_args.no_linux_vm {
+        config.vm.autostart = false;
+    }
+    config
 }
 
 /// Resolve the data directory from an optional override.

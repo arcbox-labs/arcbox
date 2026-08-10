@@ -61,6 +61,13 @@ impl BootAssetConfig {
         self
     }
 
+    /// Use an externally configured kernel instead of the cached release kernel.
+    #[must_use]
+    pub fn with_custom_kernel(mut self, kernel: Option<PathBuf>) -> Self {
+        self.custom_kernel = kernel;
+        self
+    }
+
     /// Allow local development boot assets whose manifest is generated after
     /// the daemon was compiled.
     #[must_use]
