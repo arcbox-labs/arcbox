@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::error::{Result, VmmError};
 use crate::sandbox::atomic_write;
@@ -175,6 +176,18 @@ pub struct PutDraftOutcome {
     pub released: ReleasedArtifacts,
 }
 
+/// Result of publishing: the frozen version plus any released artifacts.
+///
+/// An idempotent re-publish can collapse a rebuilt same-digest draft whose
+/// warm snapshot the published version never shared; that snapshot comes
+/// back here for the caller to reclaim.
+#[derive(Debug)]
+pub struct PublishOutcome {
+    /// The published entry.
+    pub entry: TemplateEntry,
+    pub released: ReleasedArtifacts,
+}
+
 /// Snapshot ids released by a catalog mutation.
 ///
 /// Owned by removed entries and referenced by no remaining entry anywhere in
@@ -217,7 +230,7 @@ impl TemplateCatalog {
         entry.version = String::new();
         let displaced = record.draft.replace(entry.clone());
         self.write_record(&record)?;
-        let released = self.released_by(displaced.as_slice())?;
+        let released = self.released_after_commit(displaced.as_slice());
         Ok(PutDraftOutcome { entry, released })
     }
 
@@ -225,9 +238,11 @@ impl TemplateCatalog {
     ///
     /// Idempotent against retries: re-publishing an existing version succeeds
     /// when there is no draft (the earlier attempt committed) or when the
-    /// draft's digest matches the published content; a digest clash is
-    /// [`VmmError::TemplateVersionExists`].
-    pub fn publish(&self, name: &str, version: &str) -> Result<TemplateEntry> {
+    /// draft's digest matches the published content — releasing that draft's
+    /// exclusively-owned artifacts; a digest clash is
+    /// [`VmmError::TemplateVersionExists`] (the divergent draft survives for
+    /// publishing under a new version, and a later `put_draft` releases it).
+    pub fn publish(&self, name: &str, version: &str) -> Result<PublishOutcome> {
         validate_template_name(name)?;
         validate_template_version(version)?;
         let _guard = self.lock.lock().unwrap();
@@ -237,11 +252,21 @@ impl TemplateCatalog {
         if let Some(existing) = record.versions.iter().find(|e| e.version == version) {
             let existing = existing.clone();
             return match record.draft.as_ref() {
-                None => Ok(existing),
+                None => Ok(PublishOutcome {
+                    entry: existing,
+                    released: ReleasedArtifacts::default(),
+                }),
                 Some(draft) if draft.digest == existing.digest => {
-                    record.draft = None;
+                    let displaced = record.draft.take();
                     self.write_record(&record)?;
-                    Ok(existing)
+                    // Refcount after the write so the scan observes the
+                    // record without the draft, or the snapshot still looks
+                    // referenced and is never released.
+                    let released = self.released_after_commit(displaced.as_slice());
+                    Ok(PublishOutcome {
+                        entry: existing,
+                        released,
+                    })
                 }
                 Some(_) => Err(VmmError::TemplateVersionExists(format!(
                     "{name}:{version} is already published with different content"
@@ -256,7 +281,10 @@ impl TemplateCatalog {
         entry.version = version.to_string();
         record.versions.push(entry.clone());
         self.write_record(&record)?;
-        Ok(entry)
+        Ok(PublishOutcome {
+            entry,
+            released: ReleasedArtifacts::default(),
+        })
     }
 
     /// Resolve a `name` or `name:version` reference.
@@ -283,6 +311,7 @@ impl TemplateCatalog {
     /// Every catalog row: per name (lexical order), published versions in
     /// publish order, then the draft.
     pub fn list(&self) -> Result<Vec<(String, TemplateEntry)>> {
+        let _guard = self.lock.lock().unwrap();
         let mut rows = Vec::new();
         for record in self.read_all()? {
             for entry in record.entries() {
@@ -318,13 +347,16 @@ impl TemplateCatalog {
                 vec![entry]
             }
         };
-        self.released_by(&removed)
+        Ok(self.released_after_commit(&removed))
     }
 
     /// Rootfs images that catalog entries need to stay bootable — a pin
     /// source for the converted-rootfs cache sweep, alongside
     /// [`SnapshotCatalog::referenced_rootfs_paths`](crate::snapshot::SnapshotCatalog::referenced_rootfs_paths).
     pub fn rootfs_paths(&self) -> Result<BTreeSet<PathBuf>> {
+        // Held so a listing cannot straddle a mutation and momentarily miss
+        // a path the cache sweep must keep pinned.
+        let _guard = self.lock.lock().unwrap();
         let mut pinned = BTreeSet::new();
         for record in self.read_all()? {
             for entry in record.entries() {
@@ -334,6 +366,22 @@ impl TemplateCatalog {
             }
         }
         Ok(pinned)
+    }
+
+    /// [`Self::released_by`] for the post-commit position: the mutation is
+    /// already durable, so a failed catalog-wide scan (an unrelated corrupt
+    /// record) must not turn into an error the caller would read as "nothing
+    /// happened". Releasing nothing is the safe direction — a logged orphan,
+    /// never a deleted snapshot something still references.
+    fn released_after_commit(&self, removed: &[TemplateEntry]) -> ReleasedArtifacts {
+        self.released_by(removed).unwrap_or_else(|error| {
+            warn!(
+                %error,
+                "template catalog scan failed after a committed mutation; \
+                 skipping artifact release (warm snapshots may be orphaned)"
+            );
+            ReleasedArtifacts::default()
+        })
     }
 
     /// Snapshot ids among `removed` that no remaining catalog entry
@@ -555,7 +603,7 @@ mod tests {
         c.put_draft("code", entry("sha256:d1", "/r.ext4")).unwrap();
         c.publish("code", "1.0").unwrap();
         // Retry after commit (no draft left): succeeds, returns the version.
-        assert_eq!(c.publish("code", "1.0").unwrap().digest, "sha256:d1");
+        assert_eq!(c.publish("code", "1.0").unwrap().entry.digest, "sha256:d1");
         // Identical rebuild then re-publish: idempotent, draft consumed.
         c.put_draft("code", entry("sha256:d1", "/r.ext4")).unwrap();
         c.publish("code", "1.0").unwrap();
@@ -567,7 +615,42 @@ mod tests {
             VmmError::TemplateVersionExists(_)
         ));
         // The clashing draft survives for publishing under a new version.
-        assert_eq!(c.publish("code", "1.1").unwrap().digest, "sha256:d2");
+        assert_eq!(c.publish("code", "1.1").unwrap().entry.digest, "sha256:d2");
+    }
+
+    #[test]
+    fn collapsing_a_same_digest_draft_releases_its_fresh_snapshot() {
+        let (_dir, c) = catalog();
+        c.put_draft("code", warm_entry("sha256:d1", "snap-a"))
+            .unwrap();
+        c.publish("code", "1.0").unwrap();
+        // A rebuild can produce identical content with a freshly allocated
+        // warm snapshot; the idempotent re-publish must not leak it.
+        c.put_draft("code", warm_entry("sha256:d1", "snap-b"))
+            .unwrap();
+        let outcome = c.publish("code", "1.0").unwrap();
+        assert_eq!(outcome.entry.warm.as_ref().unwrap().snapshot_id, "snap-a");
+        assert_eq!(outcome.released.snapshot_ids, vec!["snap-b".to_string()]);
+    }
+
+    #[test]
+    fn a_corrupt_sibling_record_does_not_fail_a_committed_mutation() {
+        let (dir, c) = catalog();
+        c.put_draft("code", warm_entry("sha256:d1", "snap-1"))
+            .unwrap();
+        std::fs::write(
+            dir.path().join("template-catalog").join("broken.json"),
+            b"not json",
+        )
+        .unwrap();
+        // The delete commits and reports success; the scan failure only
+        // suppresses artifact release (logged orphan, safe direction).
+        let released = c.delete("code").unwrap();
+        assert!(released.snapshot_ids.is_empty());
+        assert!(matches!(
+            c.resolve("code").unwrap_err(),
+            VmmError::TemplateNotFound(_)
+        ));
     }
 
     #[test]

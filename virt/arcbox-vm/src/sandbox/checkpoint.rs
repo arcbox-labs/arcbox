@@ -1042,6 +1042,8 @@ impl SandboxManager {
     ///
     /// Internal pause checkpoints are hidden: they are lifecycle state, not
     /// user-owned snapshots, and deleting one would strand a paused sandbox.
+    /// Template-owned snapshots (CORE-107) are hidden for the same reason —
+    /// they surface via `TemplateService.Get/List`, not as user checkpoints.
     pub fn list_checkpoints(&self, sandbox_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
         let infos = match sandbox_id {
             Some(sid) => self.snapshots.list(sid)?,
@@ -1050,6 +1052,10 @@ impl SandboxManager {
         Ok(infos
             .into_iter()
             .filter(|s| s.name.as_deref() != Some(super::pause::PAUSE_SNAPSHOT_NAME))
+            .filter(|s| {
+                !s.labels
+                    .contains_key(crate::template_catalog::TEMPLATE_LABEL)
+            })
             .map(|s| CheckpointSummary {
                 id: s.id,
                 sandbox_id: s.vm_id,
@@ -1070,6 +1076,9 @@ impl SandboxManager {
     ///
     /// Internal pause checkpoints are refused — deleting one would strand
     /// its paused sandbox; they die with the sandbox via `Remove`.
+    /// Template-owned snapshots (CORE-107) are likewise refused: the
+    /// catalog still references them, so they are reclaimed only through
+    /// template deletion.
     pub async fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
         let meta = self.snapshots.find_by_id(snapshot_id)?;
         if meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
@@ -1078,6 +1087,11 @@ impl SandboxManager {
                 expected: "a user checkpoint".into(),
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
             });
+        }
+        if let Some(owner) = meta.labels.get(crate::template_catalog::TEMPLATE_LABEL) {
+            return Err(VmmError::FailedPrecondition(format!(
+                "snapshot {snapshot_id} is owned by template {owner}; delete the template instead"
+            )));
         }
         self.drain_pool(Some(snapshot_id)).await;
         self.snapshots.delete_by_id(snapshot_id)
