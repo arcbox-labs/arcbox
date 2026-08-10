@@ -11,6 +11,7 @@ mod execution;
 mod files;
 mod snapshots;
 mod template;
+mod templates;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

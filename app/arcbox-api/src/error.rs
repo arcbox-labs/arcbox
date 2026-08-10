@@ -116,6 +116,18 @@ fn classify_agent_error(code: i32, message: &str) -> Option<connectrpc::ErrorDet
             "list sandboxes with `abctl sandbox list`",
             &[],
         )),
+        // VmmError::TemplateNotFound → "template not found: {reference}"
+        // (the template catalog, CORE-107).
+        404 if message.starts_with("template not found: ") => {
+            let reference = message
+                .strip_prefix("template not found: ")
+                .unwrap_or_default();
+            Some(error_info(
+                pb::ErrorCode::TemplateNotFound,
+                "list catalog templates with `TemplateService.List`, or build one first",
+                &[("reference", reference)],
+            ))
+        }
         // VmmError::PathNotFound → "path not found: {path}" (the sandbox
         // filesystem verbs, CORE-62).
         404 if message.starts_with("path not found: ") => {
@@ -318,6 +330,12 @@ mod tests {
                 "unknown template \"typo\"; expected \"\" or \"docker:<image>\""
             ),
             Some(pb::ErrorCode::TemplateInvalid)
+        );
+        // VmmError::TemplateNotFound (the template catalog, CORE-107) —
+        // distinct from the sandbox 404 despite sharing the wire code.
+        assert_eq!(
+            classified(404, "template not found: code:9.9"),
+            Some(pb::ErrorCode::TemplateNotFound)
         );
         // VmmError::PathNotFound (the filesystem verbs, CORE-62).
         assert_eq!(

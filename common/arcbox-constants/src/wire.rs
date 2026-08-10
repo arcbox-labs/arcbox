@@ -214,6 +214,29 @@ pub enum MessageType {
     /// `Error` frame with code 504.
     SandboxWaitForPortRequest = 0x0068,
 
+    // Sandbox template catalog request types (0x0070 - 0x0074), CORE-107.
+    /// Build a template from a source and register it as the catalog draft
+    /// (payload: `arcbox.sandbox.v1.BuildTemplateRequest`). Blocks until the
+    /// build completes. Answered with
+    /// [`Self::SandboxTemplateBuildResponse`].
+    SandboxTemplateBuildRequest = 0x0070,
+    /// Freeze a template's draft as an immutable version (payload:
+    /// `arcbox.sandbox.v1.PublishTemplateRequest`). Answered with
+    /// [`Self::SandboxTemplatePublishResponse`].
+    SandboxTemplatePublishRequest = 0x0071,
+    /// Resolve a `name[:version]` template reference (payload:
+    /// `arcbox.sandbox.v1.GetTemplateRequest`). Answered with
+    /// [`Self::SandboxTemplateGetResponse`].
+    SandboxTemplateGetRequest = 0x0072,
+    /// List catalog templates (payload:
+    /// `arcbox.sandbox.v1.ListTemplatesRequest`). Answered with
+    /// [`Self::SandboxTemplateListResponse`].
+    SandboxTemplateListRequest = 0x0073,
+    /// Delete a template version, or a whole template with its artifacts
+    /// (payload: `arcbox.sandbox.v1.DeleteTemplateRequest`). Answered with
+    /// [`Self::SandboxTemplateDeleteResponse`].
+    SandboxTemplateDeleteRequest = 0x0074,
+
     /// Starts a machine-level exec: runs a command in the machine root (the
     /// agent's own mount namespace), streamed back as
     /// [`Self::MachineExecOutput`] frames (payload:
@@ -353,6 +376,22 @@ pub enum MessageType {
     /// the listener exists.
     SandboxWaitForPortResponse = 0x1068,
 
+    // Sandbox template catalog response types (0x1070 - 0x1074), CORE-107.
+    /// Answers [`Self::SandboxTemplateBuildRequest`] (payload:
+    /// `arcbox.sandbox.v1.Template` — the registered draft).
+    SandboxTemplateBuildResponse = 0x1070,
+    /// Answers [`Self::SandboxTemplatePublishRequest`] (payload:
+    /// `arcbox.sandbox.v1.Template` — the frozen version).
+    SandboxTemplatePublishResponse = 0x1071,
+    /// Answers [`Self::SandboxTemplateGetRequest`] (payload:
+    /// `arcbox.sandbox.v1.Template`).
+    SandboxTemplateGetResponse = 0x1072,
+    /// Answers [`Self::SandboxTemplateListRequest`] (payload:
+    /// `arcbox.sandbox.v1.ListTemplatesResponse`).
+    SandboxTemplateListResponse = 0x1073,
+    /// Acknowledges [`Self::SandboxTemplateDeleteRequest`] (empty payload).
+    SandboxTemplateDeleteResponse = 0x1074,
+
     /// One machine exec output frame (payload: `arcbox.v1.MachineExecOutput`;
     /// `done == true` on the final frame carrying the exit code).
     MachineExecOutput = 0x1050,
@@ -426,6 +465,11 @@ impl MessageType {
             0x0066 => Some(Self::SandboxExecWaitRequest),
             0x0067 => Some(Self::SandboxExecListRequest),
             0x0068 => Some(Self::SandboxWaitForPortRequest),
+            0x0070 => Some(Self::SandboxTemplateBuildRequest),
+            0x0071 => Some(Self::SandboxTemplatePublishRequest),
+            0x0072 => Some(Self::SandboxTemplateGetRequest),
+            0x0073 => Some(Self::SandboxTemplateListRequest),
+            0x0074 => Some(Self::SandboxTemplateDeleteRequest),
             // Machine-level exec.
             0x0050 => Some(Self::MachineExecRequest),
             0x0051 => Some(Self::MachineExecInput),
@@ -491,6 +535,11 @@ impl MessageType {
             0x1066 => Some(Self::SandboxExecWaitResponse),
             0x1067 => Some(Self::SandboxExecListResponse),
             0x1068 => Some(Self::SandboxWaitForPortResponse),
+            0x1070 => Some(Self::SandboxTemplateBuildResponse),
+            0x1071 => Some(Self::SandboxTemplatePublishResponse),
+            0x1072 => Some(Self::SandboxTemplateGetResponse),
+            0x1073 => Some(Self::SandboxTemplateListResponse),
+            0x1074 => Some(Self::SandboxTemplateDeleteResponse),
             0x1050 => Some(Self::MachineExecOutput),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
@@ -539,6 +588,11 @@ impl MessageType {
                 | Self::SandboxExecWaitRequest
                 | Self::SandboxExecListRequest
                 | Self::SandboxWaitForPortRequest
+                | Self::SandboxTemplateBuildRequest
+                | Self::SandboxTemplatePublishRequest
+                | Self::SandboxTemplateGetRequest
+                | Self::SandboxTemplateListRequest
+                | Self::SandboxTemplateDeleteRequest
         )
     }
 
@@ -674,6 +728,11 @@ mod tests {
             (0x0066, MessageType::SandboxExecWaitRequest),
             (0x0067, MessageType::SandboxExecListRequest),
             (0x0068, MessageType::SandboxWaitForPortRequest),
+            (0x0070, MessageType::SandboxTemplateBuildRequest),
+            (0x0071, MessageType::SandboxTemplatePublishRequest),
+            (0x0072, MessageType::SandboxTemplateGetRequest),
+            (0x0073, MessageType::SandboxTemplateListRequest),
+            (0x0074, MessageType::SandboxTemplateDeleteRequest),
             (0x1060, MessageType::SandboxExecStartResponse),
             (0x1061, MessageType::SandboxExecEvent),
             (0x1062, MessageType::SandboxStdinStatus),
@@ -682,6 +741,11 @@ mod tests {
             (0x1066, MessageType::SandboxExecWaitResponse),
             (0x1067, MessageType::SandboxExecListResponse),
             (0x1068, MessageType::SandboxWaitForPortResponse),
+            (0x1070, MessageType::SandboxTemplateBuildResponse),
+            (0x1071, MessageType::SandboxTemplatePublishResponse),
+            (0x1072, MessageType::SandboxTemplateGetResponse),
+            (0x1073, MessageType::SandboxTemplateListResponse),
+            (0x1074, MessageType::SandboxTemplateDeleteResponse),
             // Sandbox snapshots.
             (0x0040, MessageType::SandboxCheckpointRequest),
             (0x0041, MessageType::SandboxRestoreRequest),
@@ -734,6 +798,8 @@ mod tests {
         assert!(MessageType::SandboxPauseRequest.is_sandbox_request());
         assert!(MessageType::SandboxResumeRequest.is_sandbox_request());
         assert!(MessageType::SandboxSetLifecycleRequest.is_sandbox_request());
+        assert!(MessageType::SandboxTemplateBuildRequest.is_sandbox_request());
+        assert!(MessageType::SandboxTemplateDeleteRequest.is_sandbox_request());
         assert!(!MessageType::PingRequest.is_sandbox_request());
         assert!(!MessageType::SandboxCreateResponse.is_sandbox_request());
     }

@@ -3,6 +3,7 @@
 
 use arcbox_connect::sandbox_v1;
 use arcbox_vm::file_io::proto as file_proto;
+use arcbox_vm::template_catalog::{ReadyProbeSpec, TemplateDefaultsSpec, TemplateEntry};
 use arcbox_vm::{
     CheckpointInfo, CheckpointSummary, ExecutionChannel, ExecutionSnapshot, ExitStatus, IdleAction,
     SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxState, SandboxSummary, StdinState,
@@ -266,6 +267,72 @@ pub(super) fn checkpoint_summary_to_proto(s: CheckpointSummary) -> sandbox_v1::S
         name: s.name,
         labels: s.labels.into_iter().collect(),
         created_at: timestamp_from_rfc3339(&s.created_at).into(),
+        ..Default::default()
+    }
+}
+
+// Template catalog entries cross the wire as `Template` messages; the
+// guest-absolute rootfs path is the documented `rootfs_ref` cache reference.
+
+pub(super) fn template_to_proto(name: &str, entry: &TemplateEntry) -> sandbox_v1::Template {
+    sandbox_v1::Template {
+        name: name.to_owned(),
+        version: entry.version.clone(),
+        digest: entry.digest.clone(),
+        rootfs_ref: entry.rootfs_path.clone(),
+        warm_snapshot_id: entry
+            .warm
+            .as_ref()
+            .map(|w| w.snapshot_id.clone())
+            .unwrap_or_default(),
+        defaults: template_defaults_to_proto(&entry.defaults).into(),
+        created_at: timestamp(entry.created_at).into(),
+        labels: entry.labels.clone().into_iter().collect(),
+        size_bytes: entry.size_bytes,
+        ..Default::default()
+    }
+}
+
+fn template_defaults_to_proto(spec: &TemplateDefaultsSpec) -> Option<sandbox_v1::TemplateDefaults> {
+    if *spec == TemplateDefaultsSpec::default() {
+        return None;
+    }
+    let limits = (spec.vcpus != 0 || spec.memory_mib != 0).then(|| sandbox_v1::ResourceLimits {
+        vcpus: spec.vcpus,
+        memory_mib: spec.memory_mib,
+        ..Default::default()
+    });
+    Some(sandbox_v1::TemplateDefaults {
+        limits: limits.into(),
+        cmd: spec.cmd.clone(),
+        env: spec.env.clone().into_iter().collect(),
+        exposed_ports: spec.exposed_ports.clone(),
+        ready_probe: spec.ready_probe.as_ref().map(ready_probe_to_proto).into(),
+        ..Default::default()
+    })
+}
+
+fn ready_probe_to_proto(spec: &ReadyProbeSpec) -> sandbox_v1::ReadyProbe {
+    use sandbox_v1::ready_probe::Probe;
+    let (probe, timeout_seconds) = match spec {
+        ReadyProbeSpec::Port {
+            port,
+            timeout_seconds,
+        } => (Probe::Port(u32::from(*port)), *timeout_seconds),
+        ReadyProbeSpec::Command {
+            cmd,
+            timeout_seconds,
+        } => (
+            Probe::Command(Box::new(sandbox_v1::CommandProbe {
+                cmd: cmd.clone(),
+                ..Default::default()
+            })),
+            *timeout_seconds,
+        ),
+    };
+    sandbox_v1::ReadyProbe {
+        timeout_seconds,
+        probe: Some(probe),
         ..Default::default()
     }
 }
