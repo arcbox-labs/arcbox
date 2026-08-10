@@ -1271,8 +1271,16 @@ impl Runtime {
         }
     }
 
-    /// Lists one sandbox's mappings from the authoritative host listeners.
-    pub async fn sandbox_port_mappings(&self, sandbox_id: &str) -> Vec<SandboxPortMapping> {
+    /// Snapshots one sandbox's authoritative host listeners if cleanup has not raced.
+    pub async fn sandbox_port_mappings_if_unchanged(
+        &self,
+        sandbox_id: &str,
+        expected_generation: u64,
+    ) -> Option<Vec<SandboxPortMapping>> {
+        let host_state = self.sandbox_host_state.lock().await;
+        if *host_state != expected_generation {
+            return None;
+        }
         let mut mappings = Vec::new();
 
         #[cfg(target_os = "macos")]
@@ -1318,7 +1326,8 @@ impl Runtime {
         mappings.sort_unstable_by_key(|mapping| {
             (mapping.sandbox_port, mapping.protocol, mapping.host_port)
         });
-        mappings
+        drop(host_state);
+        Some(mappings)
     }
 
     /// Removes every host listener a sandbox owns (Stop/Remove teardown).

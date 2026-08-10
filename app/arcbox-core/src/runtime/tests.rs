@@ -379,7 +379,7 @@ async fn sandbox_cleanup_matches_the_exact_authority_owner() {
 }
 
 #[tokio::test]
-async fn sandbox_port_mappings_read_and_filter_listener_authority() {
+async fn sandbox_port_mappings_filter_sort_and_fence_cleanup() {
     let (runtime, _tmp) = networking_test_runtime();
 
     #[cfg(target_os = "macos")]
@@ -464,25 +464,38 @@ async fn sandbox_port_mappings_read_and_filter_listener_authority() {
     }
 
     assert!(runtime.sandbox_port_keys.read().await.is_empty());
+    let generation = runtime.sandbox_host_state_generation().await;
+    let expected = vec![
+        super::SandboxPortMapping {
+            sandbox_port: 5353,
+            host_port: 45_002,
+            protocol: super::SandboxPortProtocol::Udp,
+        },
+        super::SandboxPortMapping {
+            sandbox_port: 8080,
+            host_port: 45_001,
+            protocol: super::SandboxPortProtocol::Tcp,
+        },
+        super::SandboxPortMapping {
+            sandbox_port: 8080,
+            host_port: 45_000,
+            protocol: super::SandboxPortProtocol::Udp,
+        },
+    ];
     assert_eq!(
-        runtime.sandbox_port_mappings("target").await,
-        vec![
-            super::SandboxPortMapping {
-                sandbox_port: 5353,
-                host_port: 45_002,
-                protocol: super::SandboxPortProtocol::Udp,
-            },
-            super::SandboxPortMapping {
-                sandbox_port: 8080,
-                host_port: 45_001,
-                protocol: super::SandboxPortProtocol::Tcp,
-            },
-            super::SandboxPortMapping {
-                sandbox_port: 8080,
-                host_port: 45_000,
-                protocol: super::SandboxPortProtocol::Udp,
-            },
-        ]
+        runtime
+            .sandbox_port_mappings_if_unchanged("target", generation)
+            .await,
+        Some(expected)
+    );
+
+    *runtime.lock_sandbox_host_state().await += 1;
+    assert_eq!(
+        runtime
+            .sandbox_port_mappings_if_unchanged("target", generation)
+            .await,
+        None,
+        "a cleanup race must not return an empty or stale snapshot"
     );
 }
 
