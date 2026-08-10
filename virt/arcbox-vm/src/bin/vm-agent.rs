@@ -923,7 +923,8 @@ mod agent {
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            let _ = write_frame(&mut conn, FILE_ERR, format!("create dirs: {e}").as_bytes());
+            let msg = path_err_payload("create dirs", &req.path, &e);
+            let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
             return;
         }
 
@@ -944,7 +945,8 @@ mod agent {
                 let _ = write_frame(&mut conn, FILE_ACK, &[]);
             }
             Err(e) => {
-                let _ = write_frame(&mut conn, FILE_ERR, format!("write file: {e}").as_bytes());
+                let msg = path_err_payload("write", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
             }
         }
     }
@@ -965,7 +967,8 @@ mod agent {
         let data = match std::fs::read(&req.path) {
             Ok(d) => d,
             Err(e) => {
-                let _ = write_frame(&mut conn, FILE_ERR, format!("read file: {e}").as_bytes());
+                let msg = path_err_payload("read", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
                 return;
             }
         };
@@ -992,7 +995,7 @@ mod agent {
         }
     }
 
-    /// Format a path-verb failure with the machine-readable errno prefix the
+    /// Format a file-op failure with the machine-readable errno prefix the
     /// host maps onto typed errors (`arcbox_vm::file_io::decode_file_err`).
     fn path_err_payload(op: &str, path: &str, e: &std::io::Error) -> String {
         match e.raw_os_error() {
@@ -1062,10 +1065,14 @@ mod agent {
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&req.path)? {
                 let entry = entry?;
-                // An entry deleted between readdir and stat is not an error
-                // for the listing — skip it.
-                if let Ok(dto) = stat_dto(&entry.path()) {
-                    entries.push(dto);
+                match stat_dto(&entry.path()) {
+                    Ok(dto) => entries.push(dto),
+                    // An entry deleted between readdir and stat is not an
+                    // error for the listing — skip it. Anything else
+                    // (EACCES, I/O) fails the listing rather than silently
+                    // truncating it.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
                 }
             }
             entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1090,9 +1097,11 @@ mod agent {
             return;
         };
         // Recursive create is idempotent: an existing directory succeeds.
+        // `0` means "agent default", mirroring the write handler's `0o644`.
+        let mode = if req.mode == 0 { 0o755 } else { req.mode };
         match std::fs::DirBuilder::new()
             .recursive(true)
-            .mode(req.mode)
+            .mode(mode)
             .create(&req.path)
         {
             Ok(()) => {
@@ -2247,6 +2256,89 @@ mod agent {
             let killed = exit_payload(WaitOutcome::Signaled(9));
             assert_eq!(i32::from_le_bytes(killed[..4].try_into().unwrap()), 137);
             assert_eq!(i32::from_le_bytes(killed[4..].try_into().unwrap()), 9);
+        }
+
+        /// Wrap one end of a socketpair as the handler's connection; drive
+        /// frames from the returned test end.
+        fn conn_pair() -> (VsockStream, std::os::unix::net::UnixStream) {
+            use std::os::fd::IntoRawFd as _;
+            let (theirs, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+            // SAFETY: into_raw_fd transfers ownership of an open socket fd;
+            // VsockStream closes it on drop.
+            let conn = unsafe { VsockStream::from_raw_fd(theirs.into_raw_fd()) };
+            (conn, ours)
+        }
+
+        fn path_req(path: &std::path::Path) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({ "path": path })).unwrap()
+        }
+
+        #[test]
+        fn read_of_missing_path_is_classified() {
+            let (conn, mut host) = conn_pair();
+            handle_file_read(conn, br#"{"path":"/definitely/missing"}"#);
+            let (ty, payload) = read_frame(&mut host).unwrap();
+            assert_eq!(ty, FILE_ERR);
+            assert_eq!(
+                std::str::from_utf8(&payload).unwrap(),
+                "ENOENT: /definitely/missing"
+            );
+        }
+
+        #[test]
+        fn read_of_a_directory_reports_the_fallback_message() {
+            let dir = tempfile::tempdir().unwrap();
+            let (conn, mut host) = conn_pair();
+            handle_file_read(conn, &path_req(dir.path()));
+            let (ty, payload) = read_frame(&mut host).unwrap();
+            assert_eq!(ty, FILE_ERR);
+            let msg = std::str::from_utf8(&payload).unwrap();
+            assert!(msg.starts_with("read '"), "unexpected payload: {msg}");
+        }
+
+        #[test]
+        fn mkdir_mode_zero_defaults_to_the_agent_default() {
+            use std::os::unix::fs::MetadataExt as _;
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("made");
+            let req = serde_json::to_vec(&MakeDirReq {
+                path: target.to_str().unwrap().to_owned(),
+                mode: 0,
+            })
+            .unwrap();
+            let (conn, mut host) = conn_pair();
+            handle_file_mkdir(conn, &req);
+            let (ty, _) = read_frame(&mut host).unwrap();
+            assert_eq!(ty, FILE_ACK);
+            // The exact bits depend on the process umask; the bug this pins
+            // down produced a mode-0000 directory.
+            let mode = std::fs::metadata(&target).unwrap().mode() & 0o7777;
+            assert_eq!(mode & 0o700, 0o700, "mode 0 must fall back, got {mode:o}");
+        }
+
+        #[test]
+        fn list_fails_rather_than_truncates_on_unreadable_entry() {
+            // Root bypasses DAC, so the permission denial cannot be staged.
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("a.txt"), b"x").unwrap();
+            // r-- : the entry names still list, but per-entry stat is denied.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+            let (conn, mut host) = conn_pair();
+            handle_file_list(conn, &path_req(&root));
+            let (ty, payload) = read_frame(&mut host).unwrap();
+            // Restore access so the tempdir can be removed.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(ty, FILE_ERR);
+            let msg = std::str::from_utf8(&payload).unwrap();
+            assert!(msg.starts_with("list '"), "unexpected payload: {msg}");
         }
     }
 }

@@ -31,8 +31,9 @@
 //! the host closing it is the cancellation signal, the agent side closing
 //! it (sandbox stop) is the clean end of the stream.
 //!
-//! `FILE_ERR` payloads for the path verbs carry a machine-readable errno
-//! prefix (`ERR_NOT_FOUND` and friends) so the host maps them onto typed
+//! `FILE_ERR` payloads carry a machine-readable errno prefix
+//! (`ERR_NOT_FOUND` and friends) on every verb — the path verbs and the
+//! read/write flows alike — so the host maps them onto typed
 //! [`VmmError`] variants instead of a blanket vsock error.
 //!
 //! ## Write flow
@@ -126,7 +127,7 @@ pub mod proto {
     }
 
     /// `FILE_MKDIR_REQ` payload. `mode` carries the Unix permission bits
-    /// for created directories (already defaulted by the caller).
+    /// for created directories; `0` defaults to `0o755` on the agent side.
     #[derive(Debug, Serialize, Deserialize)]
     pub struct MakeDirReq {
         pub path: String,
@@ -251,9 +252,7 @@ async fn write_file_inner(uds_path: &Path, path: &str, mode: u32, data: &[u8]) -
 
     match resp_type {
         FILE_ACK => Ok(()),
-        FILE_ERR => Err(VmmError::Vsock(
-            String::from_utf8_lossy(&payload).into_owned(),
-        )),
+        FILE_ERR => Err(decode_file_err(&payload)),
         other => Err(VmmError::Vsock(format!(
             "file write: unexpected response type 0x{other:02x}"
         ))),
@@ -292,11 +291,7 @@ async fn read_file_inner(uds_path: &Path, path: &str) -> Result<Vec<u8>> {
                 }
             }
             FILE_DONE => return Ok(buf),
-            FILE_ERR => {
-                return Err(VmmError::Vsock(
-                    String::from_utf8_lossy(&payload).into_owned(),
-                ));
-            }
+            FILE_ERR => return Err(decode_file_err(&payload)),
             other => {
                 return Err(VmmError::Vsock(format!(
                     "file read: unexpected frame type 0x{other:02x}"
@@ -308,8 +303,9 @@ async fn read_file_inner(uds_path: &Path, path: &str) -> Result<Vec<u8>> {
 
 /// Map a `FILE_ERR` payload onto a typed error.
 ///
-/// Path-verb errors carry the errno prefixes from [`proto`]; anything else
-/// (including all errors from old vm-agents) stays a vsock error.
+/// Every verb — path verbs and read/write alike — carries the errno
+/// prefixes from [`proto`]; anything else (including all errors from old
+/// vm-agents) stays a vsock error.
 fn decode_file_err(payload: &[u8]) -> VmmError {
     let text = String::from_utf8_lossy(payload).into_owned();
     if let Some(path) = text.strip_prefix(proto::ERR_NOT_FOUND) {
@@ -379,7 +375,8 @@ pub async fn list_dir(uds_path: &Path, path: &str) -> Result<Vec<FileStatDto>> {
 }
 
 /// Create a directory (and missing parents) inside the sandbox. Succeeds
-/// when the directory already exists. `mode` must already be defaulted.
+/// when the directory already exists. `mode` is the Unix permission bits;
+/// `0` defaults to `0o755` on the agent side.
 pub async fn make_dir(uds_path: &Path, path: &str, mode: u32) -> Result<()> {
     let req = MakeDirReq {
         path: path.to_owned(),
@@ -768,6 +765,43 @@ mod tests {
 
         let err = remove_entry(&path, "/full", false).await.unwrap_err();
         assert!(matches!(err, VmmError::DirectoryNotEmpty(p) if p == "/full"));
+    }
+
+    #[tokio::test]
+    async fn read_file_error_is_classified() {
+        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+            let _ = async_read_frame(&mut stream).await.unwrap();
+            async_write_frame(&mut stream, FILE_ERR, b"ENOENT: /missing")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let err = read_file(&path, "/missing").await.unwrap_err();
+        assert!(matches!(err, VmmError::PathNotFound(p) if p == "/missing"));
+    }
+
+    #[tokio::test]
+    async fn write_file_error_is_classified() {
+        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+            // Consume WRITE_REQ, then the data frames until DONE.
+            let _ = async_read_frame(&mut stream).await.unwrap();
+            loop {
+                let (ty, _) = async_read_frame(&mut stream).await.unwrap();
+                if ty == FILE_DONE {
+                    break;
+                }
+            }
+            async_write_frame(&mut stream, FILE_ERR, b"ENOTDIR: /plain.txt/sub")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let err = write_file(&path, "/plain.txt/sub", 0, b"x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VmmError::NotADirectory(p) if p == "/plain.txt/sub"));
     }
 
     #[tokio::test]
