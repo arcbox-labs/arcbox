@@ -15,7 +15,7 @@ seam (CORE-57):
 | File | Service | Plane |
 |---|---|---|
 | `sandbox.proto` | `SandboxService` | control — lifecycle, events, published ports |
-| `template.proto` | `TemplateService` | control — the template catalog (CORE-21, contract-only) |
+| `template.proto` | `TemplateService` | control — the template catalog (CORE-107) |
 | `process.proto` | `SandboxProcessService` | data — executions |
 | `filesystem.proto` | `SandboxFilesystemService` | data — file transfer + path verbs |
 | `snapshot.proto` | `SandboxSnapshotService` | checkpoint / restore |
@@ -66,31 +66,24 @@ message (`/dev/kvm` is absent in the guest).
 
 ## Proto stability
 
-`arcbox.sandbox.v1` is **pre-release**: it is being redesigned contract-first
-under CORE-52 (the execution API below is the CORE-55/56 shape) and is
-exempted from the CI `buf breaking` gate until it ships in a public SDK
-(`rpc/arcbox-protocol/proto/buf.yaml`). Every other proto in the
-repository stays additive-only. Fields documented as "NOT supported in
-Sandbox V1" (`image`, `mounts`, `ssh_public_key`) are rejected with
-`FAILED_PRECONDITION` rather than silently ignored, and will gain
-behavior in later releases without a wire break.
+`arcbox.sandbox.v1` shipped in the public SDKs (npm `@arcbox/sandbox`,
+PyPI `arcbox`) and is **additive-only**, enforced by the CI
+`buf breaking` gate like every other proto in the repository
+(`rpc/arcbox-protocol/proto/buf.yaml` — the pre-release exemption was
+removed when the template catalog, its last surface, shipped under
+CORE-107). Fields documented as "NOT supported in Sandbox V1" (`image`,
+`mounts`, `ssh_public_key`) are rejected with `FAILED_PRECONDITION`
+rather than silently ignored, and will gain behavior in later releases
+without a wire break.
 
-**Contract-only additions (CORE-58 phase 1).** The SDK-prerequisite
-surface is on the wire ahead of its implementation; these RPCs answer
-`UNIMPLEMENTED` today, each naming its follow-up issue:
-
-- `TemplateService` (`template.proto`) — the template catalog (CORE-21;
-  Build additionally gated on CORE-5/CORE-16).
-- `SandboxProcessService.ListExecutions/WaitForPort` (CORE-58 phase 2).
-- The `SandboxFilesystemService` path verbs — `Stat`, `ListDir`,
-  `MakeDir`, `Remove`, `Move`, `WatchDir` (CORE-62).
-
-`SandboxService.Pause/Resume` with daemon-side transparent auto-resume
-(CORE-21), the idle detector (`idle_timeout_seconds` + `on_idle`),
-`SetLifecycle` (CORE-60), and `GetCapabilities` (CORE-13) are
-implemented — see their sections below. The `errors.proto` registry is
-attached as an `ErrorInfo` Connect error detail on the principal error
-paths (see **Error model**).
+Every declared RPC is implemented: the lifecycle plane
+(`Pause`/`Resume` with transparent auto-resume, the idle detector,
+`SetLifecycle`, `GetCapabilities`), the data plane (executions incl.
+`ListExecutions`/`WaitForPort`, file transfer + path verbs +
+`WatchDir`), snapshots, and the template catalog (`TemplateService`,
+see **Templates**). The `errors.proto` registry is attached as an
+`ErrorInfo` Connect error detail on the principal error paths (see
+**Error model**).
 
 ## Sandbox state machine
 
@@ -109,7 +102,9 @@ States are the `SandboxState` enum (`SANDBOX_STATE_*`); events carry the
 
 - `READY` means the in-VM agent is accepting executions: on a cold boot
   the transition (and its event) fires only after the guest has booted
-  and the agent answers over vsock, not when the VM process starts.
+  and the agent answers over vsock, not when the VM process starts. A
+  template `ready_probe` moves it later still — the initial cmd starts
+  and the probe must pass first (see **Templates**).
 - A sandbox is **not destroyed** when its execution exits — it returns to
   `READY` and accepts further `StartExecution` calls.
 - Destruction happens via `Stop`/`Remove`, `ttl_seconds` (hard maximum
@@ -144,7 +139,7 @@ Key fields:
 | `limits.vcpus` / `limits.memory_mib` | 0 → daemon defaults (1 vCPU, 512 MiB) |
 | `template` | opaque reference to what boots — see **Templates** below |
 | `cmd`, `env`, `working_dir`, `user` | initial workload launched automatically once ready; exit returns the sandbox to `READY` with an `IDLE` event |
-| `no_default_cmd`, `no_default_env` | explicit-empty overrides of a catalog template's default cmd/env — proto3 repeated/map fields cannot distinguish omitted from empty (CORE-21, contract-only today) |
+| `no_default_cmd`, `no_default_env` | explicit-empty overrides of a catalog template's default cmd/env — proto3 repeated/map fields cannot distinguish omitted from empty |
 | `network.mode` | `NETWORK_MODE_ENABLED` (default, IP from 172.20.0.0/16) or `NETWORK_MODE_NONE` |
 | `ttl_seconds` | hard maximum lifetime from creation (not reset by activity; re-armable via `SetLifecycle`); always destroys |
 | `idle_timeout_seconds`, `on_idle` | idle reaping after this many seconds without a running execution: `KILL` (default) destroys, `PAUSE` checkpoints (CORE-21); both knobs are replaceable via `SetLifecycle` |
@@ -160,11 +155,39 @@ crosses the API (CORE-54). Local mode accepts:
 |---|---|
 | `""` | the built-in minimal image (busybox + init), built on first use |
 | `"docker:<ref>"` | a Docker image in the guest's own image store |
+| `"name[:version]"` | a catalog template (`TemplateService`, CORE-107); a bare name resolves to the newest published version, or the draft when nothing is published |
 
-Anything else is rejected with `INVALID_ARGUMENT` — a bare
-`name[:version]` addresses the template catalog (`TemplateService`,
-CORE-21; contract-only today), so it is never guessed at as an image
-reference.
+An unresolvable catalog reference is `NOT_FOUND` with a
+`TEMPLATE_NOT_FOUND` detail — it is never guessed at as an image
+reference. Before either idempotency layer runs, the daemon substitutes
+the resolved canonical reference (`name:version@sha256:<digest>`) into
+the request, so a retry that races a `Publish` diverges loudly instead
+of silently replaying older content.
+
+**The catalog** (`TemplateService`: `Build`, `Publish`, `Get`, `List`,
+`Delete`) lives inside the VM alongside the artifacts it describes.
+`Build` registers the result as the template's mutable **draft**;
+`Publish` freezes the draft as an immutable version under a
+content digest. Build sources (exactly one):
+
+- `docker_ref` — a local Docker image reference, exported from the
+  guest's dockerd and converted to ext4 (cached on layer diff IDs).
+- `dockerfile` — inline Dockerfile content, built in-guest first (the
+  build context is the file alone), then converted like `docker_ref`.
+- `snapshot_id` — promote an existing checkpoint: no build runs, and a
+  private copy of the checkpoint becomes the template's warm snapshot.
+  The promoted snapshot leaves the user-checkpoint surface: it is hidden
+  from `ListSnapshots` and shielded from `DeleteSnapshot` while
+  referenced.
+
+`prewarm: true` additionally boots the built rootfs once (ready probe
+included) and checkpoints it at READY, so the template carries a warm
+snapshot. Creating from a warm template **restores that snapshot's
+memory image** for sub-second READY, provided the effective geometry
+matches the snapshot's (`limits` overridden per create → cold boot from
+the template rootfs, correct per the wholesale-replace rule below).
+Unlike the warm-create cache, a kernel bump does not invalidate a
+template's snapshot: a published template pins its artifacts.
 
 Catalog templates carry defaults (`limits`, `cmd`, `env`,
 `exposed_ports`, `ready_probe`). A create request overrides them
@@ -177,13 +200,23 @@ presence. `no_default_cmd` / `no_default_env` express the
 explicitly-empty case that proto3 repeated/map shape cannot
 (`exposed_ports` and `ready_probe` have no per-create counterpart).
 
+A `ready_probe` default (port form: something listens on a TCP port;
+command form: a command exits 0; `timeout_seconds` 0 → 30 s, capped at
+600 s) moves the READY transition: the initial cmd is started first,
+the probe must pass before the sandbox reports READY, and probe expiry
+transitions the sandbox to `FAILED`. Resuming a paused sandbox does not
+re-probe — the probe is a creation-readiness contract.
+
 A `docker:` template is resolved **inside the VM**: the guest exports the
 image from its own dockerd, converts it to ext4, and caches the result
 keyed on the image's layer diff IDs, so an unchanged image is converted
 once. Make the image available first — `docker pull` / `docker build`
 through the ArcBox Docker context both land in that store. CLI:
 `abctl sandbox create --from-image <ref>` / `--from-dockerfile <path>` /
-`--from-template <name>` produce the reference for you.
+`--from-preset <name>` produce the reference for you;
+`--template <name[:version]>` passes a catalog reference through, and
+`abctl sandbox template build|publish|get|ls|rm` drives the catalog
+itself.
 
 ### Executions (CORE-55)
 
@@ -416,10 +449,11 @@ map onto gRPC statuses:
 The daemon additionally attaches the `errors.proto` registry as an
 `arcbox.sandbox.v1.ErrorInfo` Connect error detail (code + actionable
 suggestion + structured context) on the principal paths, which SDKs map
-to typed exceptions: `SANDBOX_NOT_FOUND` / `EXECUTION_NOT_FOUND` on
-not-found, `SANDBOX_NOT_READY` (context `state`) / `SANDBOX_FAILED` on
-wrong-state, `SANDBOX_PAUSED`, `TEMPLATE_INVALID`, and
-`NESTED_VIRT_UNSUPPORTED` (both the host fail-fast and the guest probe).
+to typed exceptions: `SANDBOX_NOT_FOUND` / `EXECUTION_NOT_FOUND` /
+`TEMPLATE_NOT_FOUND` on not-found, `SANDBOX_NOT_READY` (context
+`state`) / `SANDBOX_FAILED` on wrong-state, `SANDBOX_PAUSED`,
+`TEMPLATE_INVALID`, and `NESTED_VIRT_UNSUPPORTED` (both the host
+fail-fast and the guest probe).
 `TTL_EXPIRED` is not yet attachable: TTL expiry removes the record, so a
 later call sees plain `SANDBOX_NOT_FOUND`.
 
