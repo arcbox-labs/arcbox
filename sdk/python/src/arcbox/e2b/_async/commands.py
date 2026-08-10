@@ -125,12 +125,14 @@ class AsyncCommandHandle:
 
         The async flavor cancels the pump task outright; the sync one
         cannot interrupt its thread, so the flag makes the pump swallow
-        the next chunk, break out, and detach. Output the daemon retains
-        still arrives with the result via :meth:`wait`."""
+        the next chunk, break out, and detach. The pump stays joinable
+        either way — :meth:`wait` still joins it, and it ends by the
+        command's exit at the latest, when the output stream ends.
+        Output the daemon retains still arrives with the result via
+        :meth:`wait`."""
         self._disconnected = True
-        pump, self._pump = self._pump, None
-        if pump is not None:
-            pump.cancel()
+        if self._pump is not None:
+            self._pump.cancel()
 
 
 class AsyncCommands:

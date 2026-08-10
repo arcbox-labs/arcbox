@@ -110,7 +110,7 @@ export class CommandHandle {
   readonly pid: string;
 
   readonly #handle: ArcBoxCommandHandle;
-  #pump: Promise<void> | undefined;
+  readonly #pump: Promise<void> | undefined;
   /** Set by {@link disconnect}: the pump stops delivering and detaches. */
   #disconnected = false;
   /**
@@ -213,12 +213,15 @@ export class CommandHandle {
    * Stop receiving output without killing the command.
    *
    * Delivery stops at the next chunk boundary — the pump swallows it,
-   * breaks out, and breaking closes the underlying stream. Output the
-   * daemon retains still arrives with the result via {@link wait}.
+   * breaks out, and breaking closes the underlying stream. A callback
+   * already in flight completes (a pending read cannot be interrupted
+   * client-side). The pump itself stays joinable: {@link wait} still
+   * awaits it, and it ends by the command's exit at the latest, when
+   * the output stream ends. Output the daemon retains still arrives
+   * with the result via {@link wait}.
    */
   async disconnect(): Promise<void> {
     this.#disconnected = true;
-    this.#pump = undefined;
     await Promise.resolve();
   }
 }
