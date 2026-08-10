@@ -69,7 +69,10 @@ impl SandboxManager {
     /// `TemplateNotFound`. Leftovers are orphaned but recoverable: they carry
     /// no `arcbox.warm_key` (warm LRU ignores them), and once no record
     /// references them the checkpoint deletion guard steps aside, so
-    /// `DeleteSnapshot` by id reclaims the disk.
+    /// `DeleteSnapshot` by id reclaims the disk — provided the catalog still
+    /// parses. An unreadable record makes that guard fail closed (an
+    /// unreadable catalog must never authorise a delete), so recovery then
+    /// starts with removing the bad record.
     async fn delete_released_snapshots(&self, released: &ReleasedArtifacts) {
         for snapshot_id in &released.snapshot_ids {
             self.drain_pool(Some(snapshot_id)).await;
