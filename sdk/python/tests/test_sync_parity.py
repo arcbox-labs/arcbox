@@ -28,6 +28,7 @@ from arcbox import (
     AsyncFiles,
     AsyncOutputStream,
     AsyncSandbox,
+    AsyncTemplate,
     CommandHandle,
     Commands,
     ConnectClient,
@@ -35,6 +36,7 @@ from arcbox import (
     Files,
     OutputStream,
     Sandbox,
+    Template,
     e2b,
 )
 
@@ -48,6 +50,7 @@ PAIRS = [
     (AsyncOutputStream, OutputStream),
     (AsyncEventStream, EventStream),
     (AsyncFiles, Files),
+    (AsyncTemplate, Template),
     (AsyncConnectClient, ConnectClient),
     # The e2b compatibility surface mirrors through the same transform.
     (e2b.AsyncSandbox, e2b.Sandbox),

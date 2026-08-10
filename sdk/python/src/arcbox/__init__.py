@@ -14,12 +14,14 @@ from arcbox._async.commands import AsyncCommandHandle, AsyncCommands, AsyncOutpu
 from arcbox._async.files import AsyncFiles, AsyncFileWatch
 from arcbox._async.ports import AsyncPorts
 from arcbox._async.sandbox import AsyncArcBox, AsyncEventStream, AsyncSandbox
+from arcbox._async.templates import AsyncTemplate
 from arcbox._connection import Connection
 from arcbox._sync._client import ConnectClient
 from arcbox._sync.commands import CommandHandle, Commands, OutputStream
 from arcbox._sync.files import Files, FileWatch
 from arcbox._sync.ports import Ports
 from arcbox._sync.sandbox import ArcBox, EventStream, Sandbox
+from arcbox._sync.templates import Template
 from arcbox._types import (
     MAX_FILE_BYTES,
     UNCHANGED,
@@ -46,6 +48,7 @@ from arcbox._types import (
     SignalName,
     Snapshot,
     StdinStatus,
+    TemplateInfo,
     Unchanged,
 )
 
@@ -70,6 +73,7 @@ __all__ = [
     "AsyncOutputStream",
     "AsyncPorts",
     "AsyncSandbox",
+    "AsyncTemplate",
     "Capabilities",
     "CommandHandle",
     "CommandInfo",
@@ -103,5 +107,7 @@ __all__ = [
     "SignalName",
     "Snapshot",
     "StdinStatus",
+    "Template",
+    "TemplateInfo",
     "Unchanged",
 ]

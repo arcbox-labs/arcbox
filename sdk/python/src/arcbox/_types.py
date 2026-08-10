@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Final, Literal, final
 
-from arcbox._gen import filesystem_pb2, process_pb2, sandbox_pb2, snapshot_pb2
+from arcbox._gen import filesystem_pb2, process_pb2, sandbox_pb2, snapshot_pb2, template_pb2
 from arcbox.errors import ArcBoxError, CommandFailedError, SandboxDiedError
 
 if TYPE_CHECKING:
@@ -312,6 +312,23 @@ class ExposedPort:
 
 
 @dataclass(frozen=True)
+class TemplateInfo:
+    """One catalog template row (one per version; drafts have version == "")."""
+
+    name: str
+    #: Published version ("" = unpublished draft).
+    version: str
+    #: Content digest pinning this version's artifacts.
+    digest: str
+    #: Whether the template carries a pre-warmed boot-to-ready snapshot.
+    warm: bool = False
+    #: On-disk footprint of the version's artifacts.
+    size_bytes: int = 0
+    labels: dict[str, str] = field(default_factory=dict[str, str])
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class Snapshot:
     """One checkpointed sandbox image in the snapshot catalog."""
 
@@ -458,6 +475,19 @@ def exposed_port_from_proto(port: sandbox_pb2.ExposedPort) -> ExposedPort:
         sandbox_port=port.sandbox_port,
         host_port=port.host_port,
         protocol=port_protocol_from_proto(port.protocol),
+    )
+
+
+def template_info_from_proto(proto: template_pb2.Template) -> TemplateInfo:
+    """Map one Template message to the public DTO."""
+    return TemplateInfo(
+        name=proto.name,
+        version=proto.version,
+        digest=proto.digest,
+        warm=proto.warm_snapshot_id != "",
+        size_bytes=proto.size_bytes,
+        labels=dict(proto.labels),
+        created_at=_optional_time(proto.created_at, proto.HasField("created_at")),
     )
 
 
