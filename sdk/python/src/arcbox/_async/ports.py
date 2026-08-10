@@ -10,7 +10,7 @@ from google.protobuf import empty_pb2
 
 from arcbox._boundary import wrap_errors
 from arcbox._gen import process_pb2
-from arcbox.errors import RequestTimeoutError, TimeoutError
+from arcbox.errors import InvalidArgumentError, RequestTimeoutError, TimeoutError
 
 if TYPE_CHECKING:
     from ._client import AsyncConnectClient
@@ -39,17 +39,30 @@ class AsyncPorts:
         listener is up; raises :class:`arcbox.errors.TimeoutError`
         naming this knob when the budget elapses first.
 
-        ``timeout`` defaults to the daemon's 30 s; values past the
+        ``timeout`` must be positive and finite; ``None`` (the default)
+        means the daemon's 30 s (the wire reserves 0 for that default,
+        so a literal zero budget is not expressible). Values past the
         daemon's 600 s cap are clamped to it."""
-        # 0 on the wire = the daemon default; the daemon clamps anything
-        # past its cap, so the effective budget is known client-side too.
-        requested = 0 if timeout is None else math.ceil(timeout)
-        effective = (
-            _DEFAULT_WAIT_FOR_PORT_SECONDS
-            if requested == 0
-            else min(requested, _MAX_WAIT_FOR_PORT_SECONDS)
-        )
         with wrap_errors("ports.wait_for_port"):
+            # Validate at the boundary: 0 would silently collide with
+            # the wire's use-the-default sentinel (a 30 s wait, not an
+            # immediate check), and negative/NaN/inf would reach the
+            # timer and protobuf layers as raw invalid values.
+            if timeout is not None and not (timeout > 0 and math.isfinite(timeout)):
+                raise InvalidArgumentError(
+                    "wait_for_port timeout must be a positive finite number of "
+                    "seconds (omit it for the daemon's 30 s default)",
+                    context={"timeout": str(timeout)},
+                )
+            # 0 on the wire = the daemon default; the daemon clamps
+            # anything past its cap, so the effective budget is known
+            # client-side too.
+            requested = 0 if timeout is None else math.ceil(timeout)
+            effective = (
+                _DEFAULT_WAIT_FOR_PORT_SECONDS
+                if requested == 0
+                else min(requested, _MAX_WAIT_FOR_PORT_SECONDS)
+            )
             try:
                 await self._client.unary(
                     _PROCESS + "WaitForPort",

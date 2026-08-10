@@ -870,8 +870,11 @@ export class Commands {
   /**
    * List this sandbox's commands, running and exited — the rediscovery
    * path after losing handles (or a whole process): pick an id from a
-   * summary and {@link get} a live handle for it. Executions are
-   * retained for the life of their sandbox.
+   * summary and {@link get} a live handle for it. Running executions
+   * stay listed as long as they run; exited ones are retained for a
+   * bounded window after exit (currently five minutes guest-side) and
+   * then dropped, after which neither `list` nor `get` rediscovers
+   * them.
    */
   async list(): Promise<CommandInfo[]> {
     try {

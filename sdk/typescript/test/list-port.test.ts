@@ -151,6 +151,31 @@ describe("ports.waitForPort", () => {
     });
   });
 
+  it("rejects zero and other nonsensical budgets before any request", async () => {
+    // 0 would silently collide with the wire's use-the-default sentinel
+    // (a 30 s wait, not an immediate check).
+    let requests = 0;
+    const mock = createRouterTransport(({ service }) => {
+      service(SandboxProcessService, {
+        waitForPort() {
+          requests += 1;
+          return {};
+        },
+      });
+    });
+    const ports = portsOn(mock);
+    const bad = [0, -1, Number.NaN, Number.POSITIVE_INFINITY];
+    for (let i = 0, len = bad.length; i < len; i++) {
+      const timeoutMs = bad[i];
+      // eslint-disable-next-line no-await-in-loop -- sequential by design: assert each rejected knob in turn
+      await expect(ports.waitForPort(80, { timeoutMs })).rejects.toMatchObject({
+        name: "InvalidArgumentError",
+        operation: "ports.waitForPort",
+      });
+    }
+    expect(requests).toBe(0);
+  });
+
   it("a non-deadline daemon error keeps its own class", async () => {
     const mock = createRouterTransport(({ service }) => {
       service(SandboxProcessService, {
