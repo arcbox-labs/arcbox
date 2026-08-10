@@ -24,8 +24,10 @@ export interface WaitForPortOptions {
   /**
    * Give up after this long. Must be positive and finite; omit it for
    * the daemon's 30 s default (the wire reserves 0 for that default,
-   * so a literal zero budget is not expressible). Values past the
-   * daemon's 600 s cap are clamped to it. On expiry a
+   * so a literal zero budget is not expressible). The wire's
+   * granularity is whole seconds, so a fractional budget rounds UP to
+   * the next second — never down toward the reserved 0. Values past
+   * the daemon's 600 s cap are clamped to it. On expiry a
    * {@link TimeoutError} naming this knob is thrown.
    */
   timeoutMs?: number;

@@ -41,8 +41,10 @@ class AsyncPorts:
 
         ``timeout`` must be positive and finite; ``None`` (the default)
         means the daemon's 30 s (the wire reserves 0 for that default,
-        so a literal zero budget is not expressible). Values past the
-        daemon's 600 s cap are clamped to it."""
+        so a literal zero budget is not expressible). The wire's
+        granularity is whole seconds, so a fractional budget rounds UP
+        to the next second — never down toward the reserved 0. Values
+        past the daemon's 600 s cap are clamped to it."""
         with wrap_errors("ports.wait_for_port"):
             # Validate at the boundary: 0 would silently collide with
             # the wire's use-the-default sentinel (a 30 s wait, not an
