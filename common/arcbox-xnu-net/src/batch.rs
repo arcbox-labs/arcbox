@@ -154,6 +154,49 @@ impl BatchDgram {
         Ok(&self.entries[..n])
     }
 
+    /// Receives into `buf` treated as back-to-back slots of `slot_len` bytes.
+    ///
+    /// Equivalent to [`recv_batch`](Self::recv_batch) over
+    /// `buf.chunks_mut(slot_len)`, but without materializing that
+    /// `&mut [&mut [u8]]` — a reactor loop reading fixed-size frames would
+    /// otherwise allocate one such slice per syscall. Datagram `i` lands at
+    /// `buf[i * slot_len..][..entries[i].len]`, and the same sizing rule as
+    /// `recv_batch` applies: an oversized datagram is truncated silently.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slot_len` is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` for syscall failures, including `WouldBlock`.
+    pub fn recv_batch_chunked(
+        &mut self,
+        fd: RawFd,
+        buf: &mut [u8],
+        slot_len: usize,
+    ) -> io::Result<&[RxEntry]> {
+        assert!(slot_len > 0, "slot_len must be non-zero");
+        let count = (buf.len() / slot_len).min(Self::recv_capacity());
+        if count == 0 {
+            return Ok(&[]);
+        }
+
+        for (i, slot) in buf.chunks_mut(slot_len).take(count).enumerate() {
+            self.iovecs[i] = libc::iovec {
+                iov_base: slot.as_mut_ptr().cast(),
+                iov_len: slot_len,
+            };
+        }
+        self.setup_hdrs_recv(count);
+
+        let n = self.platform_recv(fd, count)?;
+
+        self.collect_recv(n);
+
+        Ok(&self.entries[..n])
+    }
+
     /// Returns the first `count` [`RxEntry`] slots from the last
     /// [`recv_batch`](Self::recv_batch) call.
     ///
@@ -606,6 +649,36 @@ mod tests {
             .recv_batch(b.as_raw_fd(), &mut bufs)
             .expect_err("the truncated tail must not remain queued");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// The chunked form must place datagram `i` at slot `i` and report the
+    /// same lengths as the slice form.
+    #[test]
+    fn recv_batch_chunked_slots_datagrams_in_order() {
+        let (a, b) = socketpair();
+
+        let sizes = [1usize, 700, 64, 1024];
+        for (i, &size) in sizes.iter().enumerate() {
+            write_datagram(a.as_raw_fd(), &vec![i as u8; size]);
+        }
+
+        const SLOT: usize = 2048;
+        let mut buf = vec![0u8; SLOT * 8];
+        let mut batch = BatchDgram::new();
+
+        let entries = batch
+            .recv_batch_chunked(b.as_raw_fd(), &mut buf, SLOT)
+            .unwrap();
+        let lens: Vec<usize> = entries.iter().map(|e| e.len).collect();
+        assert_eq!(lens, sizes);
+
+        for (i, &size) in sizes.iter().enumerate() {
+            let slot = &buf[i * SLOT..][..size];
+            assert!(
+                slot.iter().all(|&byte| byte == i as u8),
+                "datagram {i} landed in the wrong slot"
+            );
+        }
     }
 
     #[test]
