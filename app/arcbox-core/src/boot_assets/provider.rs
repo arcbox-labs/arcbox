@@ -474,6 +474,13 @@ mod manifest_tests {
     use super::{BootAssetConfig, BootAssetManifest, BootAssetProvider, manifest_has_binary};
     use crate::boot_assets::REQUIRED_RUNTIME_BINARIES;
 
+    /// Pinned so these tests never read `ARCBOX_BOOT_ASSET_VERSION`: a sibling
+    /// test sets it to `9.9.9` under a lock only that test takes, and the
+    /// default config reads it at construction. Inheriting `9.9.9` here makes
+    /// `arcbox-boot` expect manifest schema 9 and the fixture's manifest is
+    /// rejected — a flake that depends purely on thread scheduling.
+    const FIXTURE_VERSION: &str = "0.8.4";
+
     #[cfg(unix)]
     fn cached_runtime_fixture() -> (tempfile::TempDir, BootAssetProvider, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt as _;
@@ -482,6 +489,7 @@ mod manifest_tests {
 
         let directory = tempfile::tempdir().unwrap();
         let mut config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_version(FIXTURE_VERSION)
             .with_unpinned_manifest_allowed(true);
         config.arch = "test-arch".to_owned();
         let version_dir = config.version_cache_dir();
@@ -569,7 +577,8 @@ mod manifest_tests {
     #[tokio::test]
     async fn required_manifest_read_rejects_bytes_that_do_not_match_the_pin() {
         let directory = tempfile::tempdir().unwrap();
-        let config = BootAssetConfig::with_cache_dir(directory.path().to_owned());
+        let config = BootAssetConfig::with_cache_dir(directory.path().to_owned())
+            .with_version(FIXTURE_VERSION);
         std::fs::create_dir_all(config.version_cache_dir()).unwrap();
         std::fs::write(
             config.version_cache_dir().join("manifest.json"),
@@ -593,6 +602,7 @@ mod manifest_tests {
     fn cache_accepts_a_configured_custom_kernel() {
         let directory = tempfile::tempdir().unwrap();
         let config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_version(FIXTURE_VERSION)
             .with_custom_kernel(Some(directory.path().join("custom-kernel")));
         std::fs::create_dir_all(config.version_cache_dir()).unwrap();
         std::fs::write(
@@ -652,6 +662,7 @@ mod manifest_tests {
     async fn cached_binary_validation_requires_the_full_runtime_contract() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_version(FIXTURE_VERSION)
             .with_unpinned_manifest_allowed(true);
         config.arch = "arm64".to_owned();
         std::fs::create_dir_all(config.version_cache_dir()).unwrap();
@@ -689,6 +700,7 @@ mod manifest_tests {
     async fn cached_binary_validation_requires_runtime_binaries_in_bin() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = BootAssetConfig::with_cache_dir(directory.path().join("boot"))
+            .with_version(FIXTURE_VERSION)
             .with_unpinned_manifest_allowed(true);
         config.arch = "arm64".to_owned();
         std::fs::create_dir_all(config.version_cache_dir()).unwrap();
