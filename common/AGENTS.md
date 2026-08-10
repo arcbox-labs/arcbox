@@ -124,17 +124,39 @@ distribution".
 
 ## arcbox-xnu-net — macOS batch DGRAM kernel landmines
 
+It carries both halves of the datapath's guest socketpair I/O (ABX-313):
+`GuestTx::flush` (`virt/arcbox-net/src/darwin/datapath_loop/guest_tx.rs`)
+sends, `FdFrameSource::drain` (`common/splicetcp/src/frame_source.rs`)
+receives. A semantics change here lands on both directions at once.
+
 - `msghdr_x` must be **fully zeroed before every `recvmsg_x`** — older XNU
   kernels validate all fields, not just the ones we set (`src/ffi.rs`,
   `src/batch.rs` re-zeros per call). `recvmsg_x`/`sendmsg_x` are private-but-
   stable XNU symbols from `libsystem_kernel.dylib`.
 - `MAX_BATCH = 256` matches the **default** `kern.ipc.maxrecvmsgx` /
-  `maxsendmsgx`. These sysctls are tunable down; calling with `cnt > max`
-  returns **EINVAL** (a hard failure, not a short batch). Clamp per-call len if
-  targeting hardened hosts.
+  `maxsendmsgx`. These sysctls are tunable down and `cnt > max` returns
+  **EINVAL** (a hard failure, not a short batch), so the crate reads both once
+  per process and clamps every call itself
+  (`BatchDgram::{send,recv}_capacity`). Callers no longer clamp — but a caller
+  that pre-sizes buffers off `MAX_BATCH` will over-allocate on such a host.
+- **An oversized datagram is truncated *silently* on recv.** XNU leaves
+  `msg_flags` zeroed instead of raising `MSG_TRUNC` (measured macOS 26.4;
+  `oversized_datagram_is_truncated_without_a_flag` pins it) and the discarded
+  tail is not left queued. Slots are sized before the syscall and cannot grow,
+  so every buffer must be at least the largest datagram the peer can send —
+  this is why `MAX_FRAME_SIZE` stays 65535 in `frame_source.rs`.
+- **A send that overruns the peer is a partial send, not an error.**
+  `sendmsg_x` returns the accepted count and carries **no errno** once it
+  accepted anything, so the caller must requeue `bufs[n..]` and learn *why* it
+  blocked from a follow-up call. `GuestTx::flush` depends on this: it needs
+  `EAGAIN` vs `ENOBUFS` for its blocked-state machine, so it hands the first
+  refusal to a single `write(2)`. Regression:
+  `partial_send_reports_accepted_count`.
 - The fd must be `O_NONBLOCK`; `recv_batch` returns `WouldBlock` when idle and
   readiness reactors rely on that to clear readiness. A blocking fd wedges the
-  reactor.
+  reactor. A reactor must also drain **to** `WouldBlock` rather than stop at
+  the first short batch — it clears readiness afterwards, so a datagram that
+  arrived mid-drain would wait for an unrelated wakeup.
 
 ## arcbox-fakeip / arcbox-proxy — proxy awareness
 
@@ -157,7 +179,19 @@ distribution".
   subnet (default `192.168.64.0/24`).
 - **Batch recv fails with EINVAL on some hosts** → check `sysctl
   kern.ipc.maxrecvmsgx kern.ipc.maxsendmsgx`; a lowered cap below the per-call
-  `cnt` is EINVAL. Confirm the fd is `O_NONBLOCK`.
+  `cnt` is EINVAL. `BatchDgram` clamps to these itself, so an EINVAL here means
+  the clamp was bypassed (a hand-rolled `recvmsg_x` call). Confirm the fd is
+  `O_NONBLOCK`.
+- **Guest-bound frames stop flowing while `guest-tx delivery counters` shows
+  `queue_len` stuck non-zero** → the datapath queues on `send` and only writes
+  on `flush`, so a missing `GuestTx::flush` in a new event-loop path strands
+  everything it queued. `rg -n "guest_tx.flush" virt/arcbox-net/src/darwin` —
+  the tail flush must also precede the `has_backlog` fast-path gate, or the
+  gate reads "produced this iteration" as backpressure and starves the poll.
+- **`tx_frames / tx_syscalls` sits at ~1 in the same log line** → batching is
+  not engaging: either every flush sees a single queued frame (an event-loop
+  path flushing too eagerly) or `sendmsg_x` is failing and every frame falls
+  through to the single-write classifier.
 - **Malformed DNS response for a client** → diff the flag/count bytes in the
   builder; confirm ANCOUNT/NSCOUNT/ARCOUNT are zeroed on the negative paths.
 - **Sporadic memory corruption near the datapath** → look for a second
