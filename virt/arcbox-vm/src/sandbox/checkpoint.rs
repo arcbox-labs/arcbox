@@ -98,7 +98,7 @@ pub(super) async fn checkpoint_impl(
     // — a sandbox restored from a pre-warmed pool slot lives in the
     // slot's chroot, and FC resolves snapshot paths inside it — plus
     // the guest's network addressing mode and the VM API handle.
-    let (kernel_path, rootfs_path, chroot_owner, net_invariant, vm) = {
+    let (kernel_path, rootfs_path, chroot_owner, net_invariant, geometry, vm) = {
         let instance = instances
             .read()
             .unwrap()
@@ -130,6 +130,10 @@ pub(super) async fn checkpoint_impl(
                 .clone()
                 .unwrap_or_else(|| sandbox_id.clone()),
             inst.net_invariant,
+            crate::snapshot::SnapshotGeometry {
+                vcpus: inst.spec.vcpus,
+                memory_mib: inst.spec.memory_mib,
+            },
             vm,
         )
     };
@@ -221,6 +225,7 @@ pub(super) async fn checkpoint_impl(
         kernel_path: Some(kernel_path),
         rootfs_path: Some(rootfs_path),
         net_invariant,
+        geometry: Some(geometry),
     })?;
 
     let snap_dir_path = meta

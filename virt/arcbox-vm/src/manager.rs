@@ -456,8 +456,10 @@ impl VmmManager {
             kernel_path: None,
             rootfs_path: None,
             // General VMs boot whatever network the caller configured; only
-            // sandbox checkpoints carry the invariant identity.
+            // sandbox checkpoints carry the invariant identity, and nothing
+            // restores these onto a differently-shaped VM.
             net_invariant: false,
+            geometry: None,
         })?;
 
         if was_running {

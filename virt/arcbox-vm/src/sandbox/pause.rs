@@ -1041,6 +1041,7 @@ mod tests {
                 kernel_path: None,
                 rootfs_path: None,
                 net_invariant: false,
+                geometry: None,
             })
             .unwrap();
         let pending = manager.snapshots.begin("box").unwrap();
@@ -1054,6 +1055,7 @@ mod tests {
                 kernel_path: None,
                 rootfs_path: None,
                 net_invariant: false,
+                geometry: None,
             })
             .unwrap();
 
@@ -1093,6 +1095,7 @@ mod tests {
                 kernel_path: None,
                 rootfs_path: None,
                 net_invariant: false,
+                geometry: None,
             })
             .unwrap();
 

@@ -609,6 +609,7 @@ mod tests {
                 kernel_path: None,
                 rootfs_path: None,
                 net_invariant: true,
+                geometry: None,
             })
             .unwrap()
             .id

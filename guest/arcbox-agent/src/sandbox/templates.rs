@@ -12,7 +12,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use arcbox_connect::sandbox_v1;
-use arcbox_vm::template_catalog::{TemplateDefaultsSpec, TemplateEntry, compute_digest};
+use arcbox_vm::template_catalog::{
+    TemplateDefaultsSpec, TemplateEntry, WarmArtifact, compute_digest,
+};
 use buffa::Message;
 
 use super::{SandboxService, convert, template};
@@ -83,9 +85,82 @@ impl SandboxService {
                 self.build_template_from_dockerfile(&req.name, &dockerfile, defaults, labels)
                     .await
             }
-            Source::SnapshotId(_) => Err(SandboxError::Unsupported(
-                "snapshot promotion is not implemented yet (CORE-107)".into(),
-            )),
+            Source::SnapshotId(snapshot_id) => {
+                self.build_template_from_snapshot(&req.name, &snapshot_id, defaults, labels)
+                    .await
+            }
+        }
+    }
+
+    /// Promote an existing checkpoint into a template: the copied snapshot
+    /// becomes the template's warm start point ("warm by construction" —
+    /// `prewarm` is ignored for this source, per the proto). No build runs.
+    async fn build_template_from_snapshot(
+        &self,
+        name: &str,
+        snapshot_id: &str,
+        defaults: TemplateDefaultsSpec,
+        labels: HashMap<String, String>,
+    ) -> Result<sandbox_v1::Template, SandboxError> {
+        if snapshot_id.trim().is_empty() {
+            return Err(SandboxError::InvalidArgument(
+                "snapshot_id must name a checkpoint".into(),
+            ));
+        }
+        let promoted = self
+            .manager
+            .promote_snapshot_to_template(snapshot_id, name)
+            .await
+            .map_err(SandboxError::from)?;
+        // Source identity is the origin checkpoint; the fresh copy id makes
+        // each promotion a distinct content instance, so a displaced draft's
+        // copy is released rather than aliased.
+        let digest = compute_digest(snapshot_id, Some(&promoted.snapshot_id), &defaults, &labels);
+        // Any failure between the committed copy and its registration must
+        // take the copy with it, or it sits orphaned outside every listing.
+        let rootfs_bytes = match tokio::fs::metadata(&promoted.rootfs_path).await {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                self.manager
+                    .discard_promoted_snapshot(&promoted.snapshot_id)
+                    .await;
+                return Err(SandboxError::Internal(format!(
+                    "stat {}: {e}",
+                    promoted.rootfs_path
+                )));
+            }
+        };
+        let entry = TemplateEntry {
+            version: String::new(),
+            digest,
+            rootfs_path: promoted.rootfs_path.clone(),
+            warm: Some(WarmArtifact {
+                snapshot_id: promoted.snapshot_id.clone(),
+                vcpus: promoted.geometry.vcpus,
+                memory_mib: promoted.geometry.memory_mib,
+            }),
+            defaults,
+            labels,
+            created_at: chrono::Utc::now(),
+            size_bytes: promoted.artifact_bytes + rootfs_bytes,
+        };
+        match self.manager.register_template_draft(name, entry).await {
+            Ok(entry) => Ok(convert::template_to_proto(name, &entry)),
+            // `Unavailable` is the atomic-write durability-uncertain shape:
+            // the record may already be renamed into place and referencing
+            // the snapshot, so deleting it here would install a template
+            // whose warm restore points at missing artifacts. Leave the
+            // copy; the error is retryable and the referenced-or-orphan
+            // outcome is safe either way.
+            Err(error @ arcbox_vm::VmmError::Unavailable(_)) => Err(SandboxError::from(error)),
+            Err(error) => {
+                // Registration certainly did not commit — the copy is
+                // otherwise orphaned (recoverable, but why wait).
+                self.manager
+                    .discard_promoted_snapshot(&promoted.snapshot_id)
+                    .await;
+                Err(SandboxError::from(error))
+            }
         }
     }
 
