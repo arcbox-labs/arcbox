@@ -227,6 +227,9 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     // a mirror started after it returns would report the VM down across the
     // whole window between the agent answering and dockerd coming up.
     crate::services::spawn_vm_running_mirror(ctx, &runtime);
+    // Armed here for the same reason: a host sleep can land during the boot
+    // below, and the wake that follows must still re-sync the guest clock.
+    crate::power::spawn_wake_clock_sync(&runtime, &ctx.shutdown);
     // The guest boot is the longest stretch of startup and the only one a
     // client cannot infer from anything else, so the runtime reports its
     // milestones from inside and they are published as they arrive.
