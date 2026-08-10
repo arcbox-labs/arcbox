@@ -242,7 +242,7 @@ class AsyncFiles:
 
     async def _stream_watch(self, path: str, recursive: bool) -> AsyncGenerator[FsEvent]:
         with wrap_errors("files.watch"):
-            entered = False
+            delivered = False
             try:
                 async with self._client.stream(
                     _FILESYSTEM + "WatchDir",
@@ -251,8 +251,11 @@ class AsyncFiles:
                     ),
                     filesystem_pb2.WatchDirResponse,
                 ) as stream:
-                    entered = True
                     async for frame in stream:
+                        # Any frame marks the stream live — the guest
+                        # confirms an established watch with an
+                        # immediate keepalive.
+                        delivered = True
                         if frame.WhichOneof("payload") == "event":
                             yield fs_event_from_proto(frame.event)
             # ConnectionFailedError covers the drop's OTHER wire shape:
@@ -262,9 +265,10 @@ class AsyncFiles:
             # re-list-and-re-watch guidance) map to other classes and
             # keep them.
             except (httpx.HTTPError, ConnectionFailedError) as exc:
-                if not entered or isinstance(exc, ConnectionLostError):
-                    # Before entry: a dial failure — the daemon was
-                    # never reached. ConnectionLostError is already the
+                if not delivered or isinstance(exc, ConnectionLostError):
+                    # Before any frame: an unreachable daemon — nothing
+                    # can have been missed (the TS SDK classifies this
+                    # identically). ConnectionLostError is already the
                     # stream-death error.
                     raise
                 raise ConnectionLostError(

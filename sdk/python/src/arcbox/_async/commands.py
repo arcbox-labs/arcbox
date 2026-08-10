@@ -195,7 +195,9 @@ class AsyncCommandHandle:
                 elif kind == "exited":
                     return
 
-    async def _attach_events(self, operation: str) -> AsyncGenerator[process_pb2.ExecutionEvent]:
+    async def _attach_events(
+        self, operation: str, deadline: float | None = None
+    ) -> AsyncGenerator[process_pb2.ExecutionEvent]:
         """The resumable attach loop shared by :attr:`output` and the
         result collection: streams execution events, tracking the byte
         offset each channel has delivered. When the transport drops
@@ -206,14 +208,22 @@ class AsyncCommandHandle:
         exhausted, the stream-death
         :class:`arcbox.errors.ConnectionLostError` carries the last
         transport failure. Daemon-typed stream errors are never
-        retried."""
+        retried.
+
+        ``deadline`` (a ``time.monotonic`` instant, used by
+        ``wait_for_log``) caps the connect phase and every read gap at
+        the remaining budget, so even a totally silent (wedged) stream
+        cannot outlive the caller's timeout — the expired read surfaces
+        through the retry budget as the stream-death error, which the
+        caller translates against its own deadline."""
         with wrap_errors(operation):
             stdout_offset = 0
             stderr_offset = 0
             failures = 0
             while True:
+                read_timeout = None if deadline is None else max(deadline - time.monotonic(), 0.05)
                 try:
-                    async with self._attach(stdout_offset, stderr_offset) as stream:
+                    async with self._attach(stdout_offset, stderr_offset, read_timeout) as stream:
                         async for event in stream:
                             kind = event.WhichOneof("event")
                             if kind == "output":
@@ -308,12 +318,16 @@ class AsyncCommandHandle:
         process; expiry raises :class:`TimeoutError` naming this knob.
         The deadline is observed on stream frames (the daemon
         interleaves keepalives while idle), so expiry can lag by up to
-        the keepalive interval."""
+        the keepalive interval; a stream that goes completely silent is
+        bounded too — each read gap is capped at the remaining
+        budget."""
         deadline = None if timeout is None else time.monotonic() + timeout
         scanner = _LogScanner(pattern)
         with wrap_errors("commands.wait_for_log"):
             try:
-                async with aclosing(self._attach_events("commands.wait_for_log")) as events:
+                async with aclosing(
+                    self._attach_events("commands.wait_for_log", deadline)
+                ) as events:
                     async for event in events:
                         # Deadline first, so a frame landing past expiry
                         # cannot flip a timeout into a late success (or
@@ -456,7 +470,7 @@ class AsyncCommandHandle:
         return status
 
     def _attach(
-        self, stdout_offset: int, stderr_offset: int
+        self, stdout_offset: int, stderr_offset: int, read_timeout: float | None = None
     ) -> AsyncServerStream[process_pb2.ExecutionEvent]:
         return self._client.stream(
             _PROCESS + "AttachExecution",
@@ -467,6 +481,7 @@ class AsyncCommandHandle:
                 stderr_offset=stderr_offset,
             ),
             process_pb2.ExecutionEvent,
+            timeout=read_timeout,
         )
 
     async def _collect_result(self, execution: process_pb2.Execution) -> CommandResult:

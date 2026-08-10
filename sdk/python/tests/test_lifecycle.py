@@ -24,7 +24,7 @@ from arcbox._async._client import AsyncConnectClient
 from arcbox._envelope import FLAG_END_STREAM, encode_envelope
 from arcbox._gen import sandbox_pb2
 from arcbox._sync._client import ConnectClient
-from arcbox.errors import ConnectionLostError
+from arcbox.errors import ConnectionFailedError, ConnectionLostError
 
 if TYPE_CHECKING:
     from google.protobuf.message import Message
@@ -131,6 +131,24 @@ class TestEvents:
         with pytest.raises(ConnectionLostError):
             for _event in sandbox.events():
                 pass
+
+    def test_an_unavailable_end_with_zero_frames_stays_an_unreachable_daemon_error(self) -> None:
+        # No frame was ever delivered, so nothing can have been missed:
+        # the daemon is unreachable, not a stream that died (the TS SDK
+        # classifies this identically).
+        def handler(_request: httpx.Request) -> httpx.Response:
+            end = b'{"error": {"code": "unavailable", "message": "daemon gone"}}'
+            return httpx.Response(
+                200,
+                content=encode_envelope(FLAG_END_STREAM, end),
+                headers={"content-type": "application/connect+proto"},
+            )
+
+        sandbox = sync_sandbox(handler)
+        with pytest.raises(ConnectionFailedError) as exc_info:
+            for _event in sandbox.events():
+                pass
+        assert not isinstance(exc_info.value, ConnectionLostError)
 
 
 class LifecycleProbe:

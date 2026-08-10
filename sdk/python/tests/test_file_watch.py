@@ -142,3 +142,22 @@ def test_a_server_signaled_unavailable_end_frame_is_also_stream_death() -> None:
     with pytest.raises(ConnectionLostError):
         for _event in sandbox.files.watch("/tmp/w"):
             pass
+
+
+def test_an_unavailable_end_with_zero_frames_stays_an_unreachable_daemon_error() -> None:
+    # No frame was ever delivered, so nothing can have been missed: the
+    # daemon is unreachable, not a stream that died (the TS SDK
+    # classifies this identically).
+    def handler(_request: httpx.Request) -> httpx.Response:
+        end = b'{"error": {"code": "unavailable", "message": "daemon gone"}}'
+        return httpx.Response(
+            200,
+            content=encode_envelope(FLAG_END_STREAM, end),
+            headers={"content-type": "application/connect+proto"},
+        )
+
+    sandbox = sync_sandbox(handler)
+    with pytest.raises(ConnectionFailedError) as exc_info:
+        for _event in sandbox.files.watch("/tmp/w"):
+            pass
+    assert not isinstance(exc_info.value, ConnectionLostError)

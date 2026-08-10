@@ -657,15 +657,17 @@ class AsyncSandbox:
 
     async def _stream_events(self) -> AsyncGenerator[SandboxEvent]:
         with wrap_errors("sandbox.events"):
-            entered = False
+            delivered = False
             try:
                 async with self._client.stream(
                     _SANDBOX + "Events",
                     sandbox_pb2.SandboxEventsRequest(sandbox_id=self.id),
                     sandbox_pb2.WatchEventsResponse,
                 ) as stream:
-                    entered = True
                     async for frame in stream:
+                        # Any frame (keepalives included) marks the
+                        # stream live.
+                        delivered = True
                         if frame.WhichOneof("payload") == "event":
                             yield sandbox_event_from_proto(frame.event)
             # ConnectionFailedError covers the drop's OTHER wire shape:
@@ -674,11 +676,11 @@ class AsyncSandbox:
             # decoded into ConnectionFailedError. Daemon-typed errors map
             # to other classes and keep them.
             except (httpx.HTTPError, ConnectionFailedError) as exc:
-                if not entered or isinstance(exc, ConnectionLostError):
-                    # Before entry: a dial failure — the daemon was never
-                    # reached; wrap_errors maps it to
-                    # ConnectionFailedError. ConnectionLostError is
-                    # already the stream-death error.
+                if not delivered or isinstance(exc, ConnectionLostError):
+                    # Before any frame: an unreachable daemon — nothing
+                    # can have been missed (the TS SDK classifies this
+                    # identically). ConnectionLostError is already the
+                    # stream-death error.
                     raise
                 raise ConnectionLostError(
                     "the event stream died",
