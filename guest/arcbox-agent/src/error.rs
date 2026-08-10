@@ -89,13 +89,19 @@ impl From<arcbox_vm::VmmError> for SandboxError {
             // A missing sandbox path keeps its typed "path not found:"
             // message: the daemon's classifier maps the 404 onto the
             // FILE_NOT_FOUND registry code by that prefix.
-            VmmError::NotFound(_) | VmmError::PathNotFound(_) => Self::NotFound(e.to_string()),
-            VmmError::AlreadyExists(_) => Self::AlreadyExists(e.to_string()),
+            // A missing template keeps its typed "template not found:"
+            // message for the same reason (TEMPLATE_NOT_FOUND, CORE-107).
+            VmmError::NotFound(_) | VmmError::PathNotFound(_) | VmmError::TemplateNotFound(_) => {
+                Self::NotFound(e.to_string())
+            }
+            VmmError::AlreadyExists(_) | VmmError::TemplateVersionExists(_) => {
+                Self::AlreadyExists(e.to_string())
+            }
             // A non-empty directory is a precondition failure (412), like a
             // wrong sandbox state: retrying without `recursive` never helps.
-            VmmError::WrongState { .. } | VmmError::DirectoryNotEmpty(_) => {
-                Self::WrongState(e.to_string())
-            }
+            VmmError::WrongState { .. }
+            | VmmError::DirectoryNotEmpty(_)
+            | VmmError::FailedPrecondition(_) => Self::WrongState(e.to_string()),
             VmmError::Paused(_) => Self::SandboxPaused(e.to_string()),
             VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
             VmmError::DeadlineExceeded(_) => Self::Deadline(e.to_string()),
@@ -154,6 +160,21 @@ mod tests {
         assert_eq!(err.status_code(), 404);
         // The daemon classifier keys on this exact prefix (FILE_NOT_FOUND).
         assert_eq!(err.to_string(), "path not found: /a/b");
+    }
+
+    #[test]
+    fn template_errors_keep_their_classifier_prefixes_and_codes() {
+        let err = SandboxError::from(arcbox_vm::VmmError::TemplateNotFound("code:9.9".into()));
+        assert!(matches!(err, SandboxError::NotFound(_)));
+        assert_eq!(err.status_code(), 404);
+        // The daemon classifier keys on this exact prefix (TEMPLATE_NOT_FOUND).
+        assert_eq!(err.to_string(), "template not found: code:9.9");
+
+        let err = SandboxError::from(arcbox_vm::VmmError::TemplateVersionExists("x".into()));
+        assert_eq!(err.status_code(), 409);
+
+        let err = SandboxError::from(arcbox_vm::VmmError::FailedPrecondition("no draft".into()));
+        assert_eq!(err.status_code(), 412);
     }
 
     #[test]

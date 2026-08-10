@@ -41,6 +41,7 @@ pub mod snapshot;
 pub mod snapshot_cow;
 pub mod spawn;
 pub mod store;
+pub mod template_catalog;
 pub mod user_spec;
 pub mod vsock;
 

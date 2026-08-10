@@ -238,12 +238,19 @@ pub(super) async fn checkpoint_impl(
 }
 
 impl SandboxManager {
-    /// Rootfs images that existing snapshots need to stay restorable.
+    /// Rootfs images that existing snapshots or catalog templates need to
+    /// stay restorable/bootable.
     ///
     /// Exposed so whoever owns the converted-rootfs cache can pin them; see
-    /// [`SnapshotCatalog::referenced_rootfs_paths`].
+    /// [`SnapshotCatalog::referenced_rootfs_paths`] and
+    /// [`TemplateCatalog::rootfs_paths`](crate::template_catalog::TemplateCatalog::rootfs_paths).
+    /// The union matters: a non-prewarmed template pins no snapshot, so
+    /// without the catalog half a vm-agent update plus a create for the same
+    /// docker layer would sweep the template's ext4 as superseded.
     pub fn pinned_rootfs_paths(&self) -> Result<std::collections::BTreeSet<PathBuf>> {
-        self.snapshots.referenced_rootfs_paths()
+        let mut pinned = self.snapshots.referenced_rootfs_paths()?;
+        pinned.extend(self.templates.rootfs_paths()?);
+        Ok(pinned)
     }
 
     /// Checkpoint a `Ready` sandbox into the snapshot catalog.
@@ -1035,6 +1042,8 @@ impl SandboxManager {
     ///
     /// Internal pause checkpoints are hidden: they are lifecycle state, not
     /// user-owned snapshots, and deleting one would strand a paused sandbox.
+    /// Template-owned snapshots (CORE-107) are hidden for the same reason —
+    /// they surface via `TemplateService.Get/List`, not as user checkpoints.
     pub fn list_checkpoints(&self, sandbox_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
         let infos = match sandbox_id {
             Some(sid) => self.snapshots.list(sid)?,
@@ -1043,6 +1052,10 @@ impl SandboxManager {
         Ok(infos
             .into_iter()
             .filter(|s| s.name.as_deref() != Some(super::pause::PAUSE_SNAPSHOT_NAME))
+            .filter(|s| {
+                !s.labels
+                    .contains_key(crate::template_catalog::TEMPLATE_LABEL)
+            })
             .map(|s| CheckpointSummary {
                 id: s.id,
                 sandbox_id: s.vm_id,
@@ -1063,6 +1076,12 @@ impl SandboxManager {
     ///
     /// Internal pause checkpoints are refused — deleting one would strand
     /// its paused sandbox; they die with the sandbox via `Remove`.
+    /// Template-owned snapshots (CORE-107) are refused while the catalog
+    /// still references them — they are reclaimed through template deletion.
+    /// A labeled snapshot no record references (orphaned by a failed
+    /// post-commit cleanup) is deliberately deletable: this is the operator's
+    /// only recovery path, since `list_checkpoints` hides it and
+    /// `delete_template` answers `TemplateNotFound`.
     pub async fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
         let meta = self.snapshots.find_by_id(snapshot_id)?;
         if meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
@@ -1071,6 +1090,15 @@ impl SandboxManager {
                 expected: "a user checkpoint".into(),
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
             });
+        }
+        // Fail closed on a catalog scan error: never delete what an
+        // unreadable catalog might still reference.
+        if let Some(owner) = meta.labels.get(crate::template_catalog::TEMPLATE_LABEL)
+            && self.templates.references_snapshot(snapshot_id)?
+        {
+            return Err(VmmError::FailedPrecondition(format!(
+                "snapshot {snapshot_id} is owned by template {owner}; delete the template instead"
+            )));
         }
         self.drain_pool(Some(snapshot_id)).await;
         self.snapshots.delete_by_id(snapshot_id)

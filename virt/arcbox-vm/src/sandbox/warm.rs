@@ -129,12 +129,18 @@ pub(super) fn warm_eligible(
         && spec.ssh_public_key.is_none()
 }
 
-/// Reject caller-supplied labels that would collide with the reserved
-/// warm-cache label.
+/// Reject caller-supplied labels that would collide with a reserved label:
+/// the warm-cache key or the template-catalog ownership marker (CORE-107).
 pub(super) fn reject_reserved_labels(labels: &HashMap<String, String>) -> Result<()> {
     if labels.contains_key(WARM_KEY_LABEL) {
         return Err(VmmError::Config(format!(
             "snapshot label {WARM_KEY_LABEL} is reserved for the warm-create cache"
+        )));
+    }
+    if labels.contains_key(crate::template_catalog::TEMPLATE_LABEL) {
+        return Err(VmmError::Config(format!(
+            "snapshot label {} is reserved for the template catalog",
+            crate::template_catalog::TEMPLATE_LABEL
         )));
     }
     Ok(())
@@ -578,6 +584,13 @@ mod tests {
         labels.insert("env".to_owned(), "prod".to_owned());
         assert!(reject_reserved_labels(&labels).is_ok());
         labels.insert(WARM_KEY_LABEL.to_owned(), "deadbeef".to_owned());
+        assert!(reject_reserved_labels(&labels).is_err());
+
+        let mut labels = HashMap::new();
+        labels.insert(
+            crate::template_catalog::TEMPLATE_LABEL.to_owned(),
+            "code".to_owned(),
+        );
         assert!(reject_reserved_labels(&labels).is_err());
     }
 

@@ -77,7 +77,13 @@ fn atomic_write_inner(
 }
 
 /// Atomically persists a non-lifecycle file.
-pub(super) fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// Re-exported at the `sandbox` module root for the template catalog.
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "re-exported outside the sandbox module; a pub(super) item cannot be re-exported wider (E0364)"
+)]
+pub(crate) fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
     match atomic_write_inner(destination, bytes) {
         Ok(()) => Ok(()),
         Err(AtomicWriteError::NotCommitted(error)) => Err(error.into()),

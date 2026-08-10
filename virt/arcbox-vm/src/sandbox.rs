@@ -29,6 +29,7 @@ use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager};
 use crate::spawn::{spawn_direct, spawn_jailer};
+use crate::template_catalog::TemplateCatalog;
 use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 
 mod boot;
@@ -41,10 +42,13 @@ mod pause;
 mod persistence;
 mod pool;
 mod reconcile;
+mod templates;
 mod timers;
 mod types;
 mod warm;
 mod workload;
+
+pub(crate) use persistence::atomic_write;
 
 pub use execution::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
@@ -68,6 +72,8 @@ pub struct SandboxManager {
     records: Arc<persistence::SandboxRecordStore>,
     network: Arc<NetworkManager>,
     snapshots: Arc<SnapshotCatalog>,
+    /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
+    templates: Arc<TemplateCatalog>,
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
@@ -102,6 +108,7 @@ impl SandboxManager {
             config.firecracker.sandbox_datapath,
         )?);
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
+        let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir)?);
 
@@ -184,6 +191,7 @@ impl SandboxManager {
             records,
             network,
             snapshots,
+            templates,
             config,
             events_tx,
             cow_manager,
