@@ -238,12 +238,19 @@ pub(super) async fn checkpoint_impl(
 }
 
 impl SandboxManager {
-    /// Rootfs images that existing snapshots need to stay restorable.
+    /// Rootfs images that existing snapshots or catalog templates need to
+    /// stay restorable/bootable.
     ///
     /// Exposed so whoever owns the converted-rootfs cache can pin them; see
-    /// [`SnapshotCatalog::referenced_rootfs_paths`].
+    /// [`SnapshotCatalog::referenced_rootfs_paths`] and
+    /// [`TemplateCatalog::rootfs_paths`](crate::template_catalog::TemplateCatalog::rootfs_paths).
+    /// The union matters: a non-prewarmed template pins no snapshot, so
+    /// without the catalog half a vm-agent update plus a create for the same
+    /// docker layer would sweep the template's ext4 as superseded.
     pub fn pinned_rootfs_paths(&self) -> Result<std::collections::BTreeSet<PathBuf>> {
-        self.snapshots.referenced_rootfs_paths()
+        let mut pinned = self.snapshots.referenced_rootfs_paths()?;
+        pinned.extend(self.templates.rootfs_paths()?);
+        Ok(pinned)
     }
 
     /// Checkpoint a `Ready` sandbox into the snapshot catalog.

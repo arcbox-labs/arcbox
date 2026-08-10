@@ -76,6 +76,22 @@ pub enum VmmError {
     #[error("directory not empty: {0}")]
     DirectoryNotEmpty(String),
 
+    /// A catalog template reference did not resolve. The message shape is a
+    /// contract: the daemon's classifier keys on the "template not found:"
+    /// prefix to attach the `TEMPLATE_NOT_FOUND` registry code (CORE-107).
+    #[error("template not found: {0}")]
+    TemplateNotFound(String),
+
+    /// Publishing would repoint an existing immutable template version at
+    /// different content (409 on the daemon surface).
+    #[error("template version already exists: {0}")]
+    TemplateVersionExists(String),
+
+    /// A required precondition does not hold and retrying the same request
+    /// never helps (`FAILED_PRECONDITION` on the daemon surface).
+    #[error("failed precondition: {0}")]
+    FailedPrecondition(String),
+
     /// A bounded wait elapsed before the awaited condition held
     /// (`DEADLINE_EXCEEDED` on the daemon surface).
     #[error("deadline exceeded: {0}")]

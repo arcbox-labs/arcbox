@@ -262,6 +262,7 @@ Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
 | `/var/lib/arcbox/sandbox/sandbox-records` | Durable Sandbox lifecycle records | agent |
 | `/var/lib/arcbox/sandbox/snapshots` | Sandbox checkpoint catalog and data | agent |
 | `/var/lib/arcbox/sandbox/cow` | Sandbox dm-snapshot CoW files | agent |
+| `/var/lib/arcbox/sandbox/template-catalog` | Template catalog metadata, one JSON per template name (artifacts live in the rootfs cache / snapshot catalog) | agent |
 | `/var/lib/arcbox/sandbox/rootfs.ext4` | Default sandbox rootfs (busybox + vm-agent, auto-built) | agent |
 | `/var/lib/arcbox/sandbox/rootfs-<layer>-<agent>.ext4` | Converted image rootfs cache, keyed on the source layer and the injected `vm-agent`; superseded entries are swept on the next conversion unless a snapshot still needs them as its dm-snapshot origin | agent |
 | `/var/lib/arcbox/jailer` | Firecracker jailer chroots | agent |
