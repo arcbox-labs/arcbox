@@ -20,7 +20,12 @@ from google.protobuf import empty_pb2
 from arcbox import Connection, Sandbox
 from arcbox._gen import process_pb2
 from arcbox._sync._client import ConnectClient
-from arcbox.errors import NotFoundError, RequestTimeoutError, TimeoutError
+from arcbox.errors import (
+    InvalidArgumentError,
+    NotFoundError,
+    RequestTimeoutError,
+    TimeoutError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -119,6 +124,22 @@ class TestWaitForPort:
         assert "wait_for_port timeout" in exc_info.value.suggestion
         assert exc_info.value.context == {"port": "8080", "timeout_seconds": "10"}
         assert isinstance(exc_info.value.__cause__, RequestTimeoutError)
+
+    def test_rejects_zero_and_other_nonsensical_budgets_before_any_request(self) -> None:
+        # 0 would silently collide with the wire's use-the-default
+        # sentinel (a 30 s wait, not an immediate check).
+        requests: list[process_pb2.WaitForPortRequest] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(process_pb2.WaitForPortRequest.FromString(request.content))
+            return proto_response(empty_pb2.Empty())
+
+        sandbox = sync_sandbox(handler)
+        for timeout in (0, -1, float("nan"), float("inf")):
+            with pytest.raises(InvalidArgumentError) as exc_info:
+                sandbox.ports.wait_for_port(80, timeout=timeout)
+            assert exc_info.value.operation == "ports.wait_for_port"
+        assert requests == []
 
     def test_a_non_deadline_daemon_error_keeps_its_own_class(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:

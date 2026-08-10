@@ -313,6 +313,12 @@ class CommandHandle:
             try:
                 with closing(self._attach_events("commands.wait_for_log")) as events:
                     for event in events:
+                        # Deadline first, so a frame landing past expiry
+                        # cannot flip a timeout into a late success (or
+                        # a late exit error) — the strictness the TS
+                        # flavor gets from aborting the attach stream.
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise _wait_for_log_timeout(self.command_id, pattern)
                         kind = event.WhichOneof("event")
                         if kind == "output":
                             line = scanner.push(event.output.channel, event.output.data)
@@ -320,14 +326,14 @@ class CommandHandle:
                                 return line
                         elif kind == "exited":
                             break
-                        if deadline is not None and time.monotonic() >= deadline:
-                            raise _wait_for_log_timeout(self.command_id, pattern)
             except ConnectionLostError as exc:
                 # The re-attach budget dying past the deadline is the
                 # deadline surfacing, mirroring connect()'s discipline.
                 if deadline is not None and time.monotonic() >= deadline:
                     raise _wait_for_log_timeout(self.command_id, pattern) from exc
                 raise
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _wait_for_log_timeout(self.command_id, pattern)
             # The command exited (or the daemon closed the record): a
             # trailing unterminated line still counts.
             tail = scanner.flush()
@@ -626,7 +632,10 @@ class Commands:
         """List this sandbox's commands, running and exited — the
         rediscovery path after losing handles (or a whole process):
         pick an id from a summary and :meth:`get` a live handle for it.
-        Executions are retained for the life of their sandbox."""
+        Running executions stay listed as long as they run; exited ones
+        are retained for a bounded window after exit (currently five
+        minutes guest-side) and then dropped, after which neither
+        ``list`` nor ``get`` rediscovers them."""
         with wrap_errors("commands.list"):
             listing = self._client.unary(
                 _PROCESS + "ListExecutions",

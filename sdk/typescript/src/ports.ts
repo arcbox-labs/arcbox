@@ -1,7 +1,12 @@
 import type { Client } from "@connectrpc/connect";
 import { createClient } from "@connectrpc/connect";
 
-import { RequestTimeoutError, TimeoutError, toArcBoxError } from "./errors";
+import {
+  InvalidArgumentError,
+  RequestTimeoutError,
+  TimeoutError,
+  toArcBoxError,
+} from "./errors";
 import { SandboxProcessService } from "./gen/arcbox/sandbox/v1/process_pb";
 import type { ClientContext } from "./transport";
 
@@ -17,8 +22,10 @@ const MAX_WAIT_FOR_PORT_SECONDS = 600;
 /** Options for {@link Ports.waitForPort}. */
 export interface WaitForPortOptions {
   /**
-   * Give up after this long. Default: the daemon's 30 s; values past
-   * the daemon's 600 s cap are clamped to it. On expiry a
+   * Give up after this long. Must be positive and finite; omit it for
+   * the daemon's 30 s default (the wire reserves 0 for that default,
+   * so a literal zero budget is not expressible). Values past the
+   * daemon's 600 s cap are clamped to it. On expiry a
    * {@link TimeoutError} naming this knob is thrown.
    */
   timeoutMs?: number;
@@ -48,6 +55,23 @@ export class Ports {
     port: number,
     opts: WaitForPortOptions = {},
   ): Promise<void> {
+    // Validate at the boundary: 0 would silently collide with the
+    // wire's use-the-default sentinel (a 30 s wait, not an immediate
+    // check), and negative/NaN/Infinity would reach the timer and
+    // protobuf layers as raw invalid values.
+    if (
+      opts.timeoutMs !== undefined &&
+      (!(opts.timeoutMs > 0) || !Number.isFinite(opts.timeoutMs))
+    ) {
+      throw new InvalidArgumentError(
+        "waitForPort timeoutMs must be a positive finite number of " +
+          "milliseconds (omit it for the daemon's 30 s default)",
+        {
+          context: { timeoutMs: String(opts.timeoutMs) },
+          operation: "ports.waitForPort",
+        },
+      );
+    }
     // 0 on the wire = the daemon default; the daemon clamps anything
     // past its cap, so the effective budget is known client-side too.
     const requested =

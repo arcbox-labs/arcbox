@@ -167,6 +167,14 @@ def test_the_deadline_surfaces_as_a_timeout_error_naming_the_knob() -> None:
     assert exc_info.value.suggestion == "increase the wait_for_log timeout argument"
 
 
+def test_a_match_arriving_past_the_deadline_is_still_a_timeout() -> None:
+    # Deadline-first ordering: a frame landing after expiry must not
+    # flip the timeout into a late success (or a late exit error).
+    daemon = FlakyAttach([(STDOUT, 0, "the-marker\n")])
+    with pytest.raises(TimeoutError):
+        handle_for(daemon).wait_for_log("the-marker", timeout=0.0)
+
+
 def test_a_dead_attach_past_the_deadline_is_the_timeout_not_stream_death() -> None:
     # Every dial dies immediately; with the deadline already passed the
     # exhausted retry budget surfaces as the wait_for_log timeout.
