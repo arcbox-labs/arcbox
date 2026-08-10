@@ -147,6 +147,10 @@ pub struct SandboxSpec {
     /// journaled effective spec so crash replay keeps working. `None` for
     /// non-catalog templates and warm-less catalog entries.
     pub template_warm: Option<TemplateWarmRef>,
+    /// The catalog template's readiness probe (CORE-107): READY is withheld
+    /// until it passes; expiry fails the boot. `None` = ready on
+    /// exec-acceptance. Filled from the resolved template, never the request.
+    pub ready_probe: Option<crate::template_catalog::ReadyProbeSpec>,
 }
 
 /// A template's pre-warmed boot-to-ready snapshot, threaded through

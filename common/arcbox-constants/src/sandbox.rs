@@ -23,4 +23,10 @@ pub const SANDBOX_FEATURES: &[&str] = &[
     "set_lifecycle",
     // Authoritative host-listener reconciliation (CORE-102).
     "list_exposed_ports",
+    // The template catalog: Build/Publish/Get/List/Delete plus
+    // name[:version] resolution in Create (CORE-107).
+    "templates",
+    // TemplateDefaults.ready_probe gates READY on port/command probes
+    // (CORE-107).
+    "ready_probe",
 ];

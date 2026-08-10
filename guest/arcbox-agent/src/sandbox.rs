@@ -257,6 +257,7 @@ impl SandboxService {
                         vcpus: warm.vcpus,
                         memory_mib: warm.memory_mib,
                     });
+            spec.ready_probe = resolved.entry.defaults.ready_probe.clone();
         }
 
         let (id, ip_address) = self
@@ -671,8 +672,9 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
         idle_timeout_seconds: req.idle_timeout_seconds,
         on_idle: idle_action_to_spec(req.on_idle.as_known().unwrap_or_default()),
         // Filled by create_once from the resolved catalog entry; a request
-        // never names a snapshot directly (CORE-54).
+        // never names a snapshot or a probe directly (CORE-54).
         template_warm: None,
+        ready_probe: None,
     }
 }
 
