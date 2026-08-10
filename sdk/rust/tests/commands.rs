@@ -695,3 +695,37 @@ async fn wait_survives_an_attach_stream_that_never_recovers() {
     assert_eq!(result.exit_code, 0);
     assert!(result.truncated);
 }
+
+#[tokio::test]
+async fn a_direct_output_consumer_sees_truncation_when_the_stream_gives_up() {
+    let mock = Arc::new(MockDaemon::default());
+    // Every attach dies. Unlike the wait() test above, this drives
+    // handle.output() directly — the accessor itself must report the
+    // loss, not a compensating write in wait().
+    *mock.attach_scripts.lock().unwrap() = vec![
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+    ];
+    let (_dir, path) = serve(mock.clone()).await;
+
+    let handle = commands_for(&path)
+        .await
+        .spawn("cat", RunOptions::default())
+        .await
+        .unwrap();
+    let mut output = handle.output();
+    assert!(!output.truncated());
+    let error = loop {
+        match output.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the stream must give up, not end cleanly"),
+            Err(error) => break error,
+        }
+    };
+
+    assert_eq!(error.kind(), arcbox::ErrorKind::Unavailable);
+    assert!(output.truncated());
+}
