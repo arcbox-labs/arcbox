@@ -1007,7 +1007,15 @@ async fn template_catalog_scenario(
     if prewarmed.warm_snapshot_id.is_empty() {
         bail!("a prewarm build must record a warm snapshot");
     }
-    let mut boot_ids = Vec::new();
+    // Warm-vs-cold discriminator: the boot-time write of /etc/resolv.conf
+    // (a symlink into the /run tmpfs; invariant-network restores never
+    // rewrite it) carries a nanosecond mtime minted once in the BUILDER.
+    // Both clones restore that memory+tmpfs image, so their stamps are
+    // identical; cold boots each write their own. NOT boot_id — the
+    // kernel mints /proc/sys/kernel/random/boot_id lazily on first read,
+    // which nothing in the cmd-less builder ever did, so every clone
+    // would mint a fresh one and read as a cold boot.
+    let mut stamps = Vec::new();
     for id in ["smoke-prewarm1", "smoke-prewarm2"] {
         sandboxes
             .create(with_machine(CreateSandboxRequest {
@@ -1018,11 +1026,11 @@ async fn template_catalog_scenario(
             .await
             .with_context(|| format!("Create {id} from the prewarmed template failed"))?;
         wait_for_state(sandboxes, id, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
-        boot_ids.push(
+        stamps.push(
             run_and_collect(
                 processes,
                 id,
-                &["/bin/cat", "/proc/sys/kernel/random/boot_id"],
+                &["/bin/stat", "-c", "%y", "/etc/resolv.conf"],
             )
             .await?
             .trim()
@@ -1036,10 +1044,15 @@ async fn template_catalog_scenario(
             .await
             .with_context(|| format!("Remove {id} failed"))?;
     }
-    if boot_ids[0].is_empty() || boot_ids[0] != boot_ids[1] {
+    // Sub-second precision is what makes stamp equality meaningful; a
+    // seconds-only stat would risk a false pass, so fail loudly instead.
+    if !stamps[0].contains('.') {
+        bail!("resolv.conf stamp has no sub-second precision: {stamps:?}");
+    }
+    if stamps[0] != stamps[1] {
         bail!(
-            "prewarmed creates must share the builder's boot (memory restore), \
-             got boot ids {boot_ids:?}"
+            "prewarmed creates must share the builder's boot image (memory \
+             restore), got distinct resolv.conf stamps {stamps:?}"
         );
     }
     metrics.record("template_prewarm", prewarm_started.elapsed().as_secs_f64());
