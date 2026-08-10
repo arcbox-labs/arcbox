@@ -74,6 +74,65 @@ and every handle it creates shares its client. An injected
 `http_client` always belongs to the caller and is never closed by the
 SDK.
 
+## E2B-compatible surface
+
+`arcbox.e2b` serves the [`e2b`](https://e2b.dev) SDK's shape, so existing
+E2B code runs against the local daemon with one import change:
+
+```python
+from arcbox.e2b import Sandbox  # was: from e2b import Sandbox
+
+sandbox = Sandbox.create(timeout_ms=300_000)
+sandbox.files.write("/tmp/hello.txt", "hello\n")
+print(sandbox.commands.run("cat /tmp/hello.txt").stdout)
+sandbox.kill()
+```
+
+`AsyncSandbox` mirrors it, as in `e2b`. No API key and no network: E2B's
+cloud arguments (`api_key`, `domain`, `access_token`, ...) are accepted
+and ignored, so an app that reads `E2B_API_KEY` from its environment
+keeps working.
+
+Most of the surface is a rename. These behaviours genuinely differ:
+
+- **Time is milliseconds here**, as `e2b` counts it, converted to this
+  SDK's float seconds at that one boundary.
+- **`get_host(port)` needs the port exposed first.** E2B fronts every
+  sandbox port with an edge proxy at `{port}-{id}.e2b.app` and so can
+  answer for a port nobody declared; ArcBox forwards on request, so
+  `sandbox.expose_port(3000)` comes first and `get_host(3000)` is
+  synchronous from there on. An un-exposed port raises rather than
+  returning an address nothing is listening on.
+- **`set_timeout` replaces rather than extends.** E2B only pushes the
+  deadline out; ArcBox re-arms it from now.
+- **`'base'` and an omitted template** both resolve to the built-in
+  minimal template. Other names come from the local catalog, not E2B's
+  registry.
+- **`files.get_info().owner`/`.group` are numeric** — the daemon reports
+  uids and gids, and inventing a name would not be honest.
+- **`commands.list()` reports ids only** — the daemon does not report
+  argv, so `cmd`/`args`/`envs` are empty rather than invented.
+- **`watch_dir(...).stop()` is best-effort in the sync flavor** — a
+  pumping thread cannot be interrupted mid-read; the daemon thread ends
+  when the watch stream does. The async flavor cancels for real.
+- **The exception classes are aliases of `arcbox.errors`'**, not new
+  subclasses, so `except SandboxException` matches what the SDK raises.
+  `CommandExitException` is real and is raised by `commands.run()` on a
+  non-zero exit, as in E2B.
+- **Only the instance form of `kill()` exists.** `e2b` carries
+  `Sandbox.kill(sandbox_id)` and `sandbox.kill()` under one name, which
+  Python cannot express; reach a sandbox you do not hold through
+  `Sandbox.connect(sandbox_id)` first.
+
+Anything with no local counterpart raises `UnsupportedException` on the
+first call rather than failing quietly: `fork`, volumes, signed
+upload/download URLs, `get_metrics`, the MCP gateway, the `Template`
+build DSL, and `git.dangerously_authenticate`. `NotEnoughSpaceException`,
+`RateLimitException`, `GitAuthException`, `GitUpstreamException`,
+`BuildException`, `FileUploadException` and `VolumeException` are
+exported so existing imports resolve, but a local daemon has no quota,
+no registry build and no volumes, so nothing raises them.
+
 ## Development
 
 Inside the arcbox repo (`sdk/python`):

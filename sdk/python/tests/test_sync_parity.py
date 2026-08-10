@@ -35,6 +35,7 @@ from arcbox import (
     Files,
     OutputStream,
     Sandbox,
+    e2b,
 )
 
 SDK_ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +49,14 @@ PAIRS = [
     (AsyncEventStream, EventStream),
     (AsyncFiles, Files),
     (AsyncConnectClient, ConnectClient),
+    # The e2b compatibility surface mirrors through the same transform.
+    (e2b.AsyncSandbox, e2b.Sandbox),
+    (e2b.AsyncCommands, e2b.Commands),
+    (e2b.AsyncCommandHandle, e2b.CommandHandle),
+    (e2b.AsyncPty, e2b.Pty),
+    (e2b.AsyncFilesystem, e2b.Filesystem),
+    (e2b.AsyncWatchHandle, e2b.WatchHandle),
+    (e2b.AsyncGit, e2b.Git),
 ]
 
 
