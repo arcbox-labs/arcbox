@@ -345,9 +345,10 @@ pub struct SandboxNetworkIdentity {
     pub expose: crate::network::ExposeTarget,
 }
 
-/// Longest accepted id, sized by the tightest consumer: the jailer API
-/// socket `{chroot_base}/firecracker/{id}/root/run/firecracker.socket`
-/// must fit AF_UNIX's 107-byte `sun_path`. With the guest chroot base
+/// Longest sandbox id accepted at request ingress, sized by the tightest
+/// consumer: the jailer API socket
+/// `{chroot_base}/firecracker/{id}/root/run/firecracker.socket` must fit
+/// AF_UNIX's 107-byte `sun_path`. With the guest chroot base
 /// (`/var/lib/arcbox/jailer`) the fixed overhead is 63 bytes, leaving 44
 /// for the id. An oversized id otherwise fails as an opaque "timed out
 /// waiting for socket": fc-sdk's readiness probe is a `connect()`, which
@@ -359,19 +360,19 @@ const MAX_ID_LEN: usize = 44;
 /// Validate a caller-supplied sandbox or snapshot id.
 ///
 /// Ids become filesystem path components, jailer `--id` values, and dm/TAP name
-/// fragments, so they are restricted to `[A-Za-z0-9_-]` and capped at
-/// [`MAX_ID_LEN`]. This rejects path traversal (`/`, `\`, `..`), NUL,
-/// whitespace, and anything the jailer would otherwise reject much later with
-/// an opaque boot failure.
+/// fragments, so they are restricted to `[A-Za-z0-9_-]`. This rejects path
+/// traversal (`/`, `\`, `..`), NUL, whitespace, and anything the jailer would
+/// otherwise reject much later with an opaque boot failure.
+///
+/// Deliberately NO length cap here: this also runs against persisted
+/// records (reconcile, record loads) — where rejecting one legacy
+/// over-long id would abort a whole sweep — and against snapshot /
+/// execution ids that never enter the jailer path. The jailer budget is
+/// enforced only where a sandbox id enters the system:
+/// [`validate_new_sandbox_id`].
 pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(VmmError::Config(format!("{kind} must not be empty")));
-    }
-    if id.len() > MAX_ID_LEN {
-        return Err(VmmError::Config(format!(
-            "invalid {kind} {id:?}: at most {MAX_ID_LEN} characters \
-             (the jailer socket path must fit the AF_UNIX limit)"
-        )));
     }
     if !id
         .bytes()
@@ -382,6 +383,19 @@ pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Validate a sandbox id at request ingress (create / restore), where the
+/// id becomes a jailer identity — [`validate_id`] plus the [`MAX_ID_LEN`]
+/// socket-path budget.
+pub(super) fn validate_new_sandbox_id(id: &str) -> Result<()> {
+    if id.len() > MAX_ID_LEN {
+        return Err(VmmError::Config(format!(
+            "invalid sandbox id {id:?}: at most {MAX_ID_LEN} characters \
+             (the jailer socket path must fit the AF_UNIX limit)"
+        )));
+    }
+    validate_id("sandbox id", id)
 }
 
 /// Atomically reserve `id` in the instance map with a placeholder instance.
@@ -502,9 +516,13 @@ mod tests {
             assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
         }
         // A 36-char UUID fits; anything past the jailer socket budget must
-        // fail fast instead of surfacing as an fc-sdk connect timeout.
-        assert!(validate_id("id", &"a".repeat(44)).is_ok());
-        assert!(validate_id("id", &"a".repeat(45)).is_err());
+        // fail fast at ingress instead of surfacing as an fc-sdk connect
+        // timeout. The generic validator stays uncapped — it also runs
+        // against persisted records and non-jailer (snapshot/execution)
+        // ids, where a legacy over-long id must not become fatal.
+        assert!(validate_new_sandbox_id(&"a".repeat(44)).is_ok());
+        assert!(validate_new_sandbox_id(&"a".repeat(45)).is_err());
+        assert!(validate_id("id", &"a".repeat(60)).is_ok());
         for bad in ["", "..", ".", "a/b", "a\\b", "a b", "a.b", "a\0b", "../etc"] {
             assert!(
                 validate_id("id", bad).is_err(),

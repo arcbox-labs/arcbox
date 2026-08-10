@@ -389,6 +389,7 @@ async fn drive_sandboxes(
     template_catalog_scenario(
         &mut sandboxes,
         &mut processes,
+        &mut files,
         &mut snapshots,
         &mut templates,
         metrics,
@@ -720,13 +721,17 @@ async fn sandbox_from_docker_template(
 ///   from the promoted template can carry it only by restoring the
 ///   checkpoint's memory image — a cold boot from the template rootfs
 ///   (which does carry the checkpoint's DISK state) loses it.
-/// - `/proc/sys/kernel/random/boot_id` is minted once per kernel boot and
-///   lives in the memory image, so two creates from the prewarmed template
-///   report the SAME boot id iff both restored the builder's snapshot;
-///   cold boots mint fresh ones.
+/// - The boot-time `/etc/resolv.conf` write (into the `/run` tmpfs) carries
+///   a nanosecond mtime minted once in the prewarm BUILDER, so two creates
+///   report the SAME stamp iff both restored the builder's memory image;
+///   cold boots each write their own. NOT `boot_id`: the kernel mints
+///   `/proc/sys/kernel/random/boot_id` lazily on first read, which nothing
+///   in the cmd-less builder ever did, so every restored clone would mint
+///   a fresh one and read as a cold boot.
 async fn template_catalog_scenario(
     sandboxes: &mut SandboxServiceClient<Channel>,
     processes: &mut SandboxProcessServiceClient<Channel>,
+    files: &mut SandboxFilesystemServiceClient<Channel>,
     snapshots: &mut SandboxSnapshotServiceClient<Channel>,
     templates: &mut TemplateServiceClient<Channel>,
     metrics: &mut RunMetrics,
@@ -1087,6 +1092,19 @@ async fn template_catalog_scenario(
         }))
         .await
         .context("template Build (command probe) failed")?;
+    // Subscribe BEFORE the create so READY cannot be missed: the gating
+    // proof is *when* READY fires, not that a ready state is eventually
+    // reached — the cmd claims the workload slot the moment it starts,
+    // so a state poll observes Running whether or not the probe gated
+    // anything.
+    let mut probe_events = sandboxes
+        .events(with_machine(SandboxEventsRequest {
+            sandbox_id: "smoke-probe1".into(),
+            ..Default::default()
+        }))
+        .await
+        .context("probe events subscribe failed")?
+        .into_inner();
     sandboxes
         .create(with_machine(CreateSandboxRequest {
             id: "smoke-probe1".into(),
@@ -1095,8 +1113,15 @@ async fn template_catalog_scenario(
         }))
         .await
         .context("Create with a command probe failed")?;
-    // The probe passes only once the default cmd has produced its marker,
-    // so reaching a ready state at all proves the cmd-then-probe ordering.
+    next_event(&mut probe_events, SandboxEventKind::Ready, None).await?;
+    // At the instant READY was delivered the probe must already have
+    // passed: the marker its command requires appears ~2 s into the
+    // default cmd, so a build that dropped probe gating fires READY
+    // before the marker exists and this read fails. File reads ride the
+    // vsock file channel, not the (busy) workload slot.
+    read_file(files, "smoke-probe1", "/run/probe-up")
+        .await
+        .context("READY fired before the ready probe passed (/run/probe-up missing)")?;
     // The cmd keeps running, so the settled state is Running.
     wait_for_state(
         sandboxes,

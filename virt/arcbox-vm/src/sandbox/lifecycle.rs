@@ -111,7 +111,7 @@ impl SandboxManager {
 
         // Restrict caller-supplied ids to a safe charset (path components,
         // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
-        super::validate_id("sandbox id", &id)?;
+        super::validate_new_sandbox_id(&id)?;
         spec.id = Some(id.clone());
 
         // Template warm-restore (CORE-107): a catalog template carrying a
