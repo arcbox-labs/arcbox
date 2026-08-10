@@ -54,6 +54,62 @@ Every entry point takes a `connection` options slot
 (`socketPath` / `apiUrl` / `apiKey` / `requestTimeoutMs` / injected
 `transport` for mocking).
 
+## E2B-compatible surface
+
+`@arcbox/sandbox/e2b` serves the [`e2b`](https://e2b.dev) SDK's shape, so
+existing E2B code runs against the local daemon with one import change:
+
+```ts
+import { Sandbox } from '@arcbox/sandbox/e2b'; // was: from 'e2b'
+
+const sandbox = await Sandbox.create({ timeoutMs: 300_000 });
+await sandbox.files.write('/tmp/hello.txt', 'hello\n');
+console.log((await sandbox.commands.run('cat /tmp/hello.txt')).stdout);
+await sandbox.kill();
+```
+
+No API key and no network: E2B's connection options (`apiKey`, `domain`,
+`accessToken`, ...) are accepted and ignored, so an app that reads
+`E2B_API_KEY` from its environment keeps working.
+
+Most of the surface is a rename the type checker already checks for you.
+These behaviours genuinely differ:
+
+- **`getHost(port)` needs the port exposed first.** E2B fronts every
+  sandbox port with an edge proxy at `{port}-{id}.e2b.app` and so can
+  answer for a port nobody declared; ArcBox forwards on request, so
+  `await sandbox.exposePort(3000)` comes first and `getHost(3000)` is
+  synchronous from there on. An un-exposed port throws rather than
+  returning an address nothing is listening on.
+- **`setTimeout` replaces rather than extends.** E2B only pushes the
+  deadline out; ArcBox re-arms it from now.
+- **`'base'` and an omitted template** both resolve to the built-in
+  minimal template. Other names come from the local catalog, not E2B's
+  registry.
+- **`files.getInfo().owner`/`.group` are numeric** — the daemon reports
+  uids and gids, and inventing a name would not be honest.
+- **`commands.list()` reports ids only** — the daemon does not report
+  argv, so `cmd`/`args`/`envs` are empty rather than invented.
+- **The error classes are aliases of this package's**, not new
+  subclasses, so `instanceof SandboxError` matches what the SDK throws.
+  `CommandExitError` is real and is thrown by `commands.run()` on a
+  non-zero exit, as in E2B.
+
+Anything with no local counterpart throws `UnsupportedError` on the
+first call rather than failing quietly: `fork`, volumes, signed
+upload/download URLs, `getMetrics`, the MCP gateway, the `Template`
+build DSL, `git.dangerouslyAuthenticate`, and
+`files.read({ format: 'blob' | 'stream' })`. `NotEnoughSpaceError`,
+`RateLimitError`, `GitAuthError`, `GitUpstreamError`, `BuildError`,
+`FileUploadError` and `VolumeError` are exported so existing imports
+resolve, but a local daemon has no quota, no registry build and no
+volumes, so nothing raises them.
+
+> Aliasing a dependency that imports `e2b` itself (`e2b-code-interpreter`
+> and friends) needs a package whose *entry point* is the E2B surface;
+> a subpath export cannot be aliased that way. Direct imports are what
+> this covers.
+
 ## Development
 
 Inside the arcbox repo (`sdk/typescript`):

@@ -17,6 +17,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./e2b": {
+      "types": "./dist/e2b/index.d.ts",
+      "default": "./dist/e2b/index.js"
     }
   },
   "scripts": {

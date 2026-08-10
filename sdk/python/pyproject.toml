@@ -33,6 +33,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 # gen_sync.py mirrors this ignore for its scratch directory, which sits
 # outside the project root where this pattern cannot anchor.
 "src/arcbox/_sync/*" = ["UP028"]
+"src/arcbox/e2b/_sync/*" = ["UP028"]
 
 [tool.pyright]
 include = ["src", "tests", "scripts"]

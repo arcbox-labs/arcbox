@@ -23,6 +23,21 @@ export default sukka(
     },
   },
   {
+    files: ["src/e2b/**/*.ts", "test/e2b.test.ts"],
+    rules: {
+      // The e2b surface mirrors a foreign API, so its shape is not ours
+      // to choose. Its unsupported members exist to be found and to
+      // refuse; they take no `this` because they touch no state, and
+      // dropping them would turn "e2b has this, we don't" into a
+      // TypeError at the call site.
+      "@typescript-eslint/class-methods-use-this": "off",
+      // The indexed form buys nothing on the handful of entries those
+      // loops walk, and under noUncheckedIndexedAccess it forces an
+      // undefined check per iteration that the iterator form does not.
+      "sukka/prefer-indexed-array-loop": "off",
+    },
+  },
+  {
     files: ["package.json"],
     rules: {
       // npm "files" negations must FOLLOW the pattern they negate
