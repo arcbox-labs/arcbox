@@ -586,3 +586,112 @@ async fn open_stdin_is_refused_on_a_foreground_run() {
     assert_eq!(error.kind(), arcbox::ErrorKind::InvalidArgument);
     assert!(mock.starts.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_missing_exit_status_is_an_error_not_a_success() {
+    let mock = Arc::new(MockDaemon::default());
+    // The daemon pairs a missing exit_status with its error field.
+    *mock.attach_scripts.lock().unwrap() = vec![vec![Ok(pb::ExecutionEvent {
+        event: Some(execution_event::Event::from(pb::ExecutionExited {
+            execution: pb::Execution {
+                id: "cmd".into(),
+                state: pb::ExecutionState::EXECUTION_STATE_EXITED.into(),
+                error: "guest session ended before the exit was observed".into(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    })]];
+    let (_dir, path) = serve(mock.clone()).await;
+
+    let error = commands_for(&path)
+        .await
+        .run("true", RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), arcbox::ErrorKind::Internal);
+    assert!(error.to_string().contains("guest session ended"));
+}
+
+#[tokio::test]
+async fn a_failed_stdin_seed_kills_the_started_command() {
+    let mock = Arc::new(MockDaemon::default());
+    *mock.fail_stdin.lock().unwrap() = Some(ConnectError::unavailable("daemon restarting"));
+    let (_dir, path) = serve(mock.clone()).await;
+
+    let error = commands_for(&path)
+        .await
+        .spawn(
+            "cat",
+            RunOptions {
+                stdin: Stdin::Data(b"seed".to_vec()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), arcbox::ErrorKind::Unavailable);
+    // The command was already running; without a handle returned it
+    // must not be left half-fed — best-effort SIGKILL.
+    let signals = mock.signals.lock().unwrap();
+    assert_eq!(signals.len(), 1);
+    assert_eq!(
+        signals[0].signal.as_known(),
+        Some(pb::Signal::SIGNAL_SIGKILL)
+    );
+}
+
+#[tokio::test]
+async fn a_retention_gap_marks_the_output_truncated() {
+    let mock = Arc::new(MockDaemon::default());
+    // The first chunk starts at offset 7 while the stream asked for 0:
+    // the wire's one notification that retention dropped bytes.
+    *mock.attach_scripts.lock().unwrap() = vec![vec![
+        Ok(output_frame(
+            pb::StdioChannel::STDIO_CHANNEL_STDOUT,
+            7,
+            b"tail",
+        )),
+        Ok(exited_frame(exit_status::Status::Code(0))),
+    ]];
+    let (_dir, path) = serve(mock.clone()).await;
+
+    let result = commands_for(&path)
+        .await
+        .run("cat big.log", RunOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.truncated);
+    assert_eq!(result.stdout, b"tail");
+}
+
+#[tokio::test]
+async fn wait_survives_an_attach_stream_that_never_recovers() {
+    let mock = Arc::new(MockDaemon::default());
+    // Every attach dies: the re-attach budget runs out, and the
+    // authoritative WaitExecution decides the outcome — truncated,
+    // because output was lost with the stream.
+    *mock.attach_scripts.lock().unwrap() = vec![
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+        vec![Err(ConnectError::unavailable("dead"))],
+    ];
+    let (_dir, path) = serve(mock.clone()).await;
+
+    let result = commands_for(&path)
+        .await
+        .run("true", RunOptions::default())
+        .await
+        .unwrap();
+
+    // The mock's WaitExecution answers a clean zero exit.
+    assert_eq!(result.exit_code, 0);
+    assert!(result.truncated);
+}

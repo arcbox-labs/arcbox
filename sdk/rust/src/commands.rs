@@ -157,6 +157,10 @@ pub enum Channel {
 #[derive(Debug, Clone)]
 pub struct OutputChunk {
     pub channel: Channel,
+    /// Byte offset this chunk starts at within its channel. A jump past
+    /// the previous chunk's end means retention already dropped bytes —
+    /// the stream's [`OutputStream::truncated`] flag records it.
+    pub offset: u64,
     pub data: Vec<u8>,
 }
 
@@ -172,6 +176,9 @@ pub struct CommandResult {
     pub signal: Option<String>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// True when retention or a dead stream dropped output bytes —
+    /// `stdout`/`stderr` are then incomplete.
+    pub truncated: bool,
 }
 
 impl CommandResult {
@@ -325,8 +332,18 @@ impl Commands {
             stdin_cursor: Arc::new(tokio::sync::Mutex::new(Some(0))),
         };
         if let Stdin::Data(data) = options.stdin {
-            handle.write_stdin(&data).await?;
-            handle.close_stdin().await?;
+            let seeded = async {
+                handle.write_stdin(&data).await?;
+                handle.close_stdin().await
+            }
+            .await;
+            if let Err(error) = seeded {
+                // The command is already running; without its stdin it
+                // would sit half-fed with no handle returned to manage
+                // it. Best-effort kill; the original error stands.
+                let _ = handle.kill(Signal::Kill).await;
+                return Err(error);
+            }
         }
         Ok(handle)
     }
@@ -426,6 +443,7 @@ impl CommandHandle {
             stderr_offset: 0,
             attempts: 0,
             done: false,
+            truncated: false,
             exited: None,
         }
     }
@@ -460,19 +478,30 @@ impl CommandHandle {
 
     async fn wait_inner(&self) -> Result<CommandResult> {
         // Collect the output; the stream ends when the command exits
-        // and carries the exit through its final event.
+        // and carries the exit through its final event. A stream that
+        // dies past its re-attach budget is NOT the command's outcome —
+        // the authoritative wait below decides, with the output marked
+        // truncated.
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut output = self.output();
-        while let Some(chunk) = output.next().await? {
-            match chunk.channel {
-                Channel::Stderr => stderr.extend_from_slice(&chunk.data),
-                // A terminal merges the streams; deliver as stdout.
-                Channel::Stdout | Channel::Pty => stdout.extend_from_slice(&chunk.data),
+        loop {
+            match output.next().await {
+                Ok(Some(chunk)) => match chunk.channel {
+                    Channel::Stderr => stderr.extend_from_slice(&chunk.data),
+                    // A terminal merges the streams; deliver as stdout.
+                    Channel::Stdout | Channel::Pty => stdout.extend_from_slice(&chunk.data),
+                },
+                Ok(None) => break,
+                Err(_) => {
+                    output.truncated = true;
+                    break;
+                }
             }
         }
+        let truncated = output.truncated;
         if let Some(execution) = output.exited.take() {
-            return Ok(result_from_wire(&execution, stdout, stderr));
+            return result_from_wire(&execution, stdout, stderr, truncated);
         }
         // The stream ended without an exit event (attach gave up, or
         // the daemon closed early): the authoritative wait decides.
@@ -489,7 +518,7 @@ impl CommandHandle {
                 .map_err(|error| Error::from_connect(error, "commands.wait"))?
                 .into_owned();
             if execution.state.as_known() == Some(pb::ExecutionState::EXECUTION_STATE_EXITED) {
-                return Ok(result_from_wire(&execution, stdout, stderr));
+                return result_from_wire(&execution, stdout, stderr, truncated);
             }
         }
     }
@@ -653,6 +682,9 @@ pub struct OutputStream {
     stderr_offset: u64,
     attempts: u32,
     done: bool,
+    /// True once an offset jump proved retention dropped bytes, or the
+    /// stream died past its re-attach budget.
+    truncated: bool,
     /// The exit the stream delivered, when it ended with one.
     exited: Option<pb::Execution>,
 }
@@ -694,23 +726,25 @@ impl OutputStream {
                                 _ => Channel::Stdout,
                             };
                             // Advance past this chunk even when empty, so
-                            // a resume never re-reads it. The server may
-                            // report a higher offset than we tracked
-                            // (retention trimming); trust it.
+                            // a resume never re-reads it. A chunk offset
+                            // past what we tracked is the wire's one
+                            // notification that retention already dropped
+                            // bytes — record it rather than absorb it.
                             let end = output.offset.saturating_add(output.data.len() as u64);
-                            match channel {
-                                Channel::Stderr => {
-                                    self.stderr_offset = self.stderr_offset.max(end);
-                                }
-                                Channel::Stdout | Channel::Pty => {
-                                    self.stdout_offset = self.stdout_offset.max(end);
-                                }
+                            let tracked = match channel {
+                                Channel::Stderr => &mut self.stderr_offset,
+                                Channel::Stdout | Channel::Pty => &mut self.stdout_offset,
+                            };
+                            if output.offset > *tracked {
+                                self.truncated = true;
                             }
+                            *tracked = (*tracked).max(end);
                             if output.data.is_empty() {
                                 continue;
                             }
                             return Ok(Some(OutputChunk {
                                 channel,
+                                offset: output.offset,
                                 data: output.data,
                             }));
                         }
@@ -756,6 +790,12 @@ impl OutputStream {
             .map_err(|error| Error::from_connect(error, "commands.output"))
     }
 
+    /// Whether retention or a dead stream dropped output bytes so far.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
     /// One more attempt, with backoff. `true` = keep trying.
     async fn bump_attempts(&mut self) -> bool {
         self.attempts += 1;
@@ -793,14 +833,39 @@ fn signal_name(value: i32) -> String {
     }
 }
 
-fn result_from_wire(execution: &pb::Execution, stdout: Vec<u8>, stderr: Vec<u8>) -> CommandResult {
+/// Build the result, refusing an execution that ended without an
+/// observed exit — the daemon pairs a missing `exit_status` with its
+/// `error` field, and reporting that as exit 0 would fake a success.
+fn result_from_wire(
+    execution: &pb::Execution,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+) -> Result<CommandResult> {
     let (exit_code, signal) = exit_parts(execution);
-    CommandResult {
-        exit_code: exit_code.unwrap_or(0),
+    let Some(exit_code) = exit_code else {
+        let reason = if execution.error.is_empty() {
+            "the execution ended without an observed exit"
+        } else {
+            &execution.error
+        };
+        return Err(Error::new(
+            ErrorKind::Internal,
+            format!(
+                "command {} did not run to completion: {reason}",
+                execution.id
+            ),
+            "commands.wait",
+        )
+        .with_context("command_id", &*execution.id));
+    };
+    Ok(CommandResult {
+        exit_code,
         signal,
         stdout,
         stderr,
-    }
+        truncated,
+    })
 }
 
 fn info_from_wire(execution: pb::Execution) -> CommandInfo {
