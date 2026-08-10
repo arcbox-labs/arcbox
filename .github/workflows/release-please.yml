@@ -81,7 +81,14 @@ jobs:
             echo "::endgroup::"
           done
 
-  # Update arcbox-desktop version file when a new release is created.
+  # Bump the daemon arcbox-desktop embeds when a new release is created.
+  #
+  # This job only announces the tag. Writing arcbox.version is half a bump —
+  # the generated Swift gRPC client is pinned to the same ref and desktop CI
+  # rejects a PR where the two disagree — and regenerating that client needs
+  # macOS and Xcode. So arcbox-desktop owns the bump in its own `Bump ArcBox`
+  # workflow and this dispatches it. Dispatch is fire-and-forget: a failure
+  # there surfaces in that repo's Actions tab, not in this release run.
   update-desktop:
     name: Update arcbox-desktop
     needs: release-please
@@ -95,36 +102,16 @@ jobs:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
           repositories: arcbox-desktop
+          # The bump workflow mints its own token for the branch and the PR;
+          # this one only has to start it.
+          permission-actions: write
 
-      - name: Update arcbox-desktop version
+      - name: Dispatch the arcbox-desktop bump
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          BRANCH="chore/bump-arcbox-${TAG}"
-
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/arcboxlabs/arcbox-desktop.git" \
-            /tmp/arcbox-desktop
-          cd /tmp/arcbox-desktop
-          git config user.name "arcbox-labs[bot]"
-          git config user.email "254083426+arcbox-labs[bot]@users.noreply.github.com"
-
-          CURRENT=$(cat arcbox.version | tr -d '[:space:]')
-          if [ "$CURRENT" = "$TAG" ]; then
-            echo "arcbox-desktop already at $TAG, skipping."
-            exit 0
-          fi
-
-          git checkout -b "$BRANCH"
-          echo "$TAG" > arcbox.version
-          git add arcbox.version
-          git commit -m "chore: bump arcbox version to ${TAG}"
-          git push origin "$BRANCH"
-
-          gh pr create \
+          gh workflow run bump-arcbox.yml \
             --repo arcboxlabs/arcbox-desktop \
-            --base master \
-            --head "$BRANCH" \
-            --title "chore: bump arcbox version to ${TAG}" \
-            --body "Automated update from [arcbox ${TAG}](https://github.com/arcboxlabs/arcbox/releases/tag/${TAG})."
+            --ref master \
+            --field version="$TAG"
