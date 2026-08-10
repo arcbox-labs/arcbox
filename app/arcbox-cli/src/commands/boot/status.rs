@@ -2,7 +2,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use arcbox_core::boot_assets::{BootAssetConfig, BootAssetManifest, BootAssetProvider};
+use arcbox_core::boot_assets::{
+    BootAssetConfig, BootAssetManifest, BootAssetProvider, CachedBinaryReport,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -77,7 +79,7 @@ pub(super) async fn status(
     } else {
         Err("manifest unavailable".to_owned())
     };
-    let mut report = build_report(root_data_dir, &config, manifest, runtime_binaries).await;
+    let mut report = build_report(&runtime_bin_dir, &config, manifest, runtime_binaries).await;
 
     if !args.offline {
         match provider.fetch_latest_version().await {
@@ -102,10 +104,10 @@ pub(super) async fn status(
 }
 
 async fn build_report(
-    root_data_dir: &Path,
+    runtime_bin_dir: &Path,
     config: &BootAssetConfig,
     manifest_result: std::result::Result<BootAssetManifest, String>,
-    runtime_binaries: std::result::Result<(), String>,
+    runtime_binaries: std::result::Result<CachedBinaryReport, String>,
 ) -> StatusOutput {
     let version_dir = config.version_cache_dir();
     let kernel_path = config
@@ -184,17 +186,17 @@ async fn build_report(
         }
     }
 
+    // Permission drift is repaired by the next daemon start, so it is a detail
+    // on a present artifact — never a reason to report the cache incomplete
+    // and send the user into a full re-download.
     let (present, detail) = match runtime_binaries {
-        Ok(()) => (true, None),
+        Ok(report) if report.is_clean() => (true, None),
+        Ok(report) => (true, Some(repairable_detail(&report))),
         Err(error) => (false, Some(error)),
     };
     artifacts.push(ArtifactStatus {
         name: "runtime-binaries",
-        path: root_data_dir
-            .join("runtime")
-            .join(&config.version)
-            .display()
-            .to_string(),
+        path: runtime_bin_dir.display().to_string(),
         required: true,
         present,
         size_bytes: None,
@@ -232,6 +234,17 @@ async fn build_report(
         latest_version_error: None,
         update_available: false,
     }
+}
+
+fn repairable_detail(report: &CachedBinaryReport) -> String {
+    let names = report
+        .not_executable
+        .iter()
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("executable bit missing on {names}; the daemon repairs this on its next start")
 }
 
 async fn verify_artifact_checksum(
@@ -345,6 +358,13 @@ mod tests {
     const KERNEL: &[u8] = b"kernel";
     const ROOTFS: &[u8] = b"rootfs.erofs";
 
+    fn runtime_bin_dir(root_data_dir: &Path, config: &BootAssetConfig) -> std::path::PathBuf {
+        root_data_dir
+            .join("runtime")
+            .join(&config.version)
+            .join("bin")
+    }
+
     fn config(root_data_dir: &Path) -> BootAssetConfig {
         let mut config =
             BootAssetConfig::with_cache_dir(root_data_dir.join("boot")).with_version("0.8.4");
@@ -394,7 +414,13 @@ mod tests {
         std::fs::create_dir_all(&version_dir).unwrap();
         std::fs::write(version_dir.join("manifest.json"), "{}").unwrap();
         std::fs::write(version_dir.join("kernel"), KERNEL).unwrap();
-        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+        let report = build_report(
+            &runtime_bin_dir(directory.path(), &config),
+            &config,
+            Ok(manifest(false)),
+            Ok(CachedBinaryReport::default()),
+        )
+        .await;
 
         assert!(!report.complete);
         assert!(
@@ -416,7 +442,13 @@ mod tests {
             write_required_assets(&config);
             std::fs::write(config.version_cache_dir().join(file_name), b"corrupt").unwrap();
 
-            let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+            let report = build_report(
+                &runtime_bin_dir(directory.path(), &config),
+                &config,
+                Ok(manifest(false)),
+                Ok(CachedBinaryReport::default()),
+            )
+            .await;
 
             assert!(!report.complete);
             let artifact = report
@@ -445,7 +477,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = config(directory.path());
         write_required_assets(&config);
-        let report = build_report(directory.path(), &config, Ok(manifest(true)), Ok(())).await;
+        let report = build_report(
+            &runtime_bin_dir(directory.path(), &config),
+            &config,
+            Ok(manifest(true)),
+            Ok(CachedBinaryReport::default()),
+        )
+        .await;
 
         assert!(report.complete);
         let runtime = report
@@ -458,6 +496,44 @@ mod tests {
         assert_eq!(runtime.version.as_deref(), Some("29.0"));
     }
 
+    /// The daemon repairs a missing executable bit on its next start, so
+    /// reporting it as an incomplete cache would send the user into a
+    /// re-download for drift that fixes itself. The reported path must also be
+    /// the directory validation actually walked, since `repair` tells the user
+    /// to fix it.
+    #[tokio::test]
+    async fn repairable_permission_drift_is_reported_without_failing_the_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(directory.path());
+        write_required_assets(&config);
+        let bin_dir = runtime_bin_dir(directory.path(), &config);
+
+        let report = build_report(
+            &bin_dir,
+            &config,
+            Ok(manifest(false)),
+            Ok(CachedBinaryReport {
+                not_executable: vec![bin_dir.join("dockerd")],
+            }),
+        )
+        .await;
+
+        assert!(report.complete);
+        assert_eq!(report.repair, None);
+        let runtime = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "runtime-binaries")
+            .unwrap();
+        assert!(runtime.present);
+        assert_eq!(runtime.path, bin_dir.display().to_string());
+        assert_eq!(
+            runtime.detail.as_deref(),
+            Some("executable bit missing on dockerd; the daemon repairs this on its next start")
+        );
+        assert!(report.reasons.is_empty());
+    }
+
     #[tokio::test]
     async fn runtime_binary_validation_is_part_of_the_status_contract() {
         let directory = tempfile::tempdir().unwrap();
@@ -467,7 +543,7 @@ mod tests {
             "cached runtime binary validation failed: binary 'dockerd' not found".to_owned();
 
         let report = build_report(
-            directory.path(),
+            &runtime_bin_dir(directory.path(), &config),
             &config,
             Ok(manifest(false)),
             Err(validation_error.clone()),
@@ -510,7 +586,13 @@ mod tests {
         std::fs::write(version_dir.join("rootfs.erofs"), ROOTFS).unwrap();
         std::fs::write(&custom_kernel, b"custom kernel with a different checksum").unwrap();
 
-        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+        let report = build_report(
+            &runtime_bin_dir(directory.path(), &config),
+            &config,
+            Ok(manifest(false)),
+            Ok(CachedBinaryReport::default()),
+        )
+        .await;
 
         assert!(report.complete);
         let kernel = report
@@ -538,7 +620,13 @@ mod tests {
 
         std::fs::remove_file(&custom_kernel).unwrap();
         std::fs::create_dir(&custom_kernel).unwrap();
-        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+        let report = build_report(
+            &runtime_bin_dir(directory.path(), &config),
+            &config,
+            Ok(manifest(false)),
+            Ok(CachedBinaryReport::default()),
+        )
+        .await;
         assert!(!report.complete);
         let kernel = report
             .artifacts
@@ -557,7 +645,13 @@ mod tests {
         );
 
         std::fs::remove_dir(&custom_kernel).unwrap();
-        let report = build_report(directory.path(), &config, Ok(manifest(false)), Ok(())).await;
+        let report = build_report(
+            &runtime_bin_dir(directory.path(), &config),
+            &config,
+            Ok(manifest(false)),
+            Ok(CachedBinaryReport::default()),
+        )
+        .await;
         assert!(!report.complete);
         assert!(
             report
@@ -572,7 +666,7 @@ mod tests {
         let config = config(directory.path());
 
         let report = build_report(
-            directory.path(),
+            &runtime_bin_dir(directory.path(), &config),
             &config,
             Err("manifest pin validation failed".to_owned()),
             Err("manifest unavailable".to_owned()),

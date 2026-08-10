@@ -42,6 +42,26 @@ impl BootAssets {
 /// Progress callback type.
 pub type ProgressCallback = Box<dyn Fn(PrepareProgress) + Send + Sync>;
 
+/// What validating the cached runtime binaries found beyond the pass/fail of
+/// presence and checksums.
+///
+/// Everything reported here is repaired by the next `prepare_binaries`, so a
+/// non-empty report describes drift a daemon start fixes on its own — not a
+/// reason to re-download.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CachedBinaryReport {
+    /// Cached runtime binaries whose executable bit is missing.
+    pub not_executable: Vec<PathBuf>,
+}
+
+impl CachedBinaryReport {
+    /// True when the cache is exactly as a fresh install would leave it.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.not_executable.is_empty()
+    }
+}
+
 /// Boot asset provider — delegates to `arcbox_boot::AssetManager`.
 pub struct BootAssetProvider {
     manager: AssetManager,
@@ -140,7 +160,9 @@ impl BootAssetProvider {
         let manifest = self.read_cached_manifest_required().await?;
         self.repair_cached_binary_permissions(&manifest, dest_dir)
             .await?;
-        self.validate_cached_binaries(dest_dir).await
+        self.validate_cached_binaries_with(&manifest, dest_dir)
+            .await?;
+        Ok(())
     }
 
     /// Validate every cached runtime binary selected by the pinned manifest.
@@ -148,8 +170,17 @@ impl BootAssetProvider {
     /// This performs no downloads. It uses `arcbox-boot`'s checksum and
     /// `install_dir` rules, then enforces the executable contract required by
     /// runtime startup.
-    pub async fn validate_cached_binaries(&self, dest_dir: &Path) -> Result<()> {
+    pub async fn validate_cached_binaries(&self, dest_dir: &Path) -> Result<CachedBinaryReport> {
         let manifest = self.read_cached_manifest_required().await?;
+        self.validate_cached_binaries_with(&manifest, dest_dir)
+            .await
+    }
+
+    async fn validate_cached_binaries_with(
+        &self,
+        manifest: &BootAssetManifest,
+        dest_dir: &Path,
+    ) -> Result<CachedBinaryReport> {
         let selected = manifest
             .binaries
             .iter()
@@ -175,7 +206,8 @@ impl BootAssetProvider {
                 CoreError::config(format!("cached runtime binary validation failed: {error}"))
             })?;
 
-        for binary in selected {
+        let mut report = CachedBinaryReport::default();
+        for binary in selected.into_iter().filter(|binary| is_executable(binary)) {
             let path = binary_install_path(dest_dir, binary);
             let metadata = regular_binary_metadata(binary, &path).await?;
             #[cfg(unix)]
@@ -183,16 +215,14 @@ impl BootAssetProvider {
                 use std::os::unix::fs::PermissionsExt as _;
 
                 if metadata.permissions().mode() & 0o111 == 0 {
-                    return Err(CoreError::config(format!(
-                        "runtime binary '{}' is not executable at {}",
-                        binary.name,
-                        path.display()
-                    )));
+                    report.not_executable.push(path);
                 }
             }
+            #[cfg(not(unix))]
+            let _ = metadata;
         }
 
-        Ok(())
+        Ok(report)
     }
 
     async fn repair_cached_binary_permissions(
@@ -204,6 +234,7 @@ impl BootAssetProvider {
             .binaries
             .iter()
             .filter(|binary| binary.targets.contains_key(&self.config.arch))
+            .filter(|binary| is_executable(binary))
         {
             let path = binary_install_path(dest_dir, binary);
             let metadata = regular_binary_metadata(binary, &path).await?;
@@ -393,6 +424,16 @@ impl BootAssetProvider {
     }
 }
 
+/// Binaries the guest runtime execs are installed into the runtime `bin`
+/// directory, which the manifest expresses by leaving `install_dir` unset. An
+/// entry that names an `install_dir` is a companion asset installed elsewhere
+/// — the microVM `vmlinux` under `kernel/` is the shipped example — so it is
+/// checksum-verified like everything else but never held to an executable's
+/// contract.
+fn is_executable(binary: &Binary) -> bool {
+    binary.install_dir.is_none()
+}
+
 fn binary_install_path(dest_dir: &Path, binary: &Binary) -> PathBuf {
     binary.install_dir.as_ref().map_or_else(
         || dest_dir.join(&binary.name),
@@ -412,7 +453,8 @@ async fn regular_binary_metadata(binary: &Binary, path: &Path) -> Result<std::fs
     })?;
     if !metadata.file_type().is_file() {
         return Err(CoreError::config(format!(
-            "runtime binary '{}' is not a regular file at {}",
+            "runtime binary '{}' is not a regular file at {}; run `abctl boot prefetch --force` \
+             to reinstall it",
             binary.name,
             path.display()
         )));
@@ -468,9 +510,11 @@ mod manifest_tests {
             }));
         }
 
+        // A kernel image, deliberately left non-executable: it is a companion
+        // asset, not something the runtime execs.
         let vmlinux = kernel_dir.join("vmlinux");
         std::fs::write(&vmlinux, b"vmlinux").unwrap();
-        std::fs::set_permissions(&vmlinux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&vmlinux, std::fs::Permissions::from_mode(0o644)).unwrap();
         binaries.push(serde_json::json!({
             "name": "vmlinux",
             "version": "1",
@@ -575,14 +619,14 @@ mod manifest_tests {
         let dockerd = bin_dir.join("dockerd");
         let vmlinux = kernel_dir.join("vmlinux");
 
-        provider.validate_cached_binaries(&bin_dir).await.unwrap();
+        let report = provider.validate_cached_binaries(&bin_dir).await.unwrap();
+        assert!(report.is_clean());
 
+        // A missing executable bit is drift the next daemon start repairs, so
+        // it is reported rather than raised as a validation failure.
         std::fs::set_permissions(&dockerd, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let error = provider
-            .validate_cached_binaries(&bin_dir)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("dockerd' is not executable"));
+        let report = provider.validate_cached_binaries(&bin_dir).await.unwrap();
+        assert_eq!(report.not_executable, vec![dockerd.clone()]);
 
         std::fs::set_permissions(&dockerd, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(&dockerd, b"corrupt dockerd").unwrap();
@@ -689,12 +733,29 @@ mod manifest_tests {
         );
     }
 
+    /// The regular-file rule is a hard, unrepairable failure — it must apply
+    /// only to what the runtime actually execs. Holding a companion asset to
+    /// it would let a symlinked kernel image block `Runtime::init` outright.
     #[cfg(unix)]
     #[tokio::test]
-    async fn cached_binary_validation_rejects_symlinks() {
+    async fn symlink_rejection_is_scoped_to_executables() {
         use std::os::unix::fs::symlink;
 
         let (_directory, provider, bin_dir) = cached_runtime_fixture();
+        let kernel_dir = bin_dir.parent().unwrap().join("kernel");
+        let vmlinux = kernel_dir.join("vmlinux");
+        let vmlinux_target = kernel_dir.join("vmlinux.real");
+        std::fs::rename(&vmlinux, &vmlinux_target).unwrap();
+        symlink(&vmlinux_target, &vmlinux).unwrap();
+
+        assert!(
+            provider
+                .validate_cached_binaries(&bin_dir)
+                .await
+                .unwrap()
+                .is_clean()
+        );
+
         let dockerd = bin_dir.join("dockerd");
         let target = bin_dir.join("dockerd.real");
         std::fs::rename(&dockerd, &target).unwrap();
