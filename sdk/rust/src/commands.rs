@@ -285,7 +285,10 @@ impl Commands {
     /// # Errors
     ///
     /// [`ErrorKind::InvalidArgument`] for [`Stdin::Data`] combined with
-    /// a PTY (a terminal's input is interactive by nature); otherwise
+    /// a PTY (a terminal's input is interactive by nature). A failed
+    /// [`Stdin::Data`] seed happens after the command started: it is
+    /// best-effort killed, and the error's context carries the
+    /// `command_id` so [`Commands::get`] can still reach it. Otherwise
     /// any RPC failure.
     pub async fn spawn(&self, cmd: impl Into<Cmd>, options: RunOptions) -> Result<CommandHandle> {
         self.start(cmd.into(), options, "commands.spawn").await
@@ -507,10 +510,9 @@ impl CommandHandle {
                     Channel::Stdout | Channel::Pty => stdout.extend_from_slice(&chunk.data),
                 },
                 Ok(None) => break,
-                Err(_) => {
-                    output.truncated = true;
-                    break;
-                }
+                // The stream recorded its own truncation when it gave
+                // up; the authoritative wait below decides the outcome.
+                Err(_) => break,
             }
         }
         let truncated = output.truncated;
@@ -722,6 +724,9 @@ impl OutputStream {
                         if self.bump_attempts().await {
                             continue;
                         }
+                        // Giving up before the exit: whatever the
+                        // command still writes will never be observed.
+                        self.truncated = true;
                         self.done = true;
                         return Err(error);
                     }
@@ -783,6 +788,8 @@ impl OutputStream {
                     if self.bump_attempts().await {
                         continue;
                     }
+                    // Same give-up: unobserved bytes are lost to us.
+                    self.truncated = true;
                     self.done = true;
                     return Err(Error::from_connect(error, "commands.output"));
                 }
