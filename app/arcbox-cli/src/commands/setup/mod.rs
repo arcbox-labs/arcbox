@@ -15,7 +15,7 @@ mod install;
 mod profile;
 mod status;
 
-pub(super) use status::shell_integration_status;
+pub(super) use status::{ComponentStatus, shell_integration_status};
 
 /// Shell integration setup commands.
 #[derive(Subcommand)]

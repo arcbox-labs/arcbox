@@ -27,9 +27,19 @@ struct StatusOutput {
     repair: Option<&'static str>,
 }
 
+/// A check's outcome. `Unknown` means the check could not be run at all —
+/// distinct from `Failed`, which means it ran and the component is broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(in crate::commands) enum CheckState {
+    Ok,
+    Failed,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(in crate::commands) struct ComponentStatus {
-    pub(in crate::commands) ok: bool,
+    pub(in crate::commands) state: CheckState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::commands) path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,9 +47,21 @@ pub(in crate::commands) struct ComponentStatus {
 }
 
 impl ComponentStatus {
+    pub(in crate::commands) fn is_ok(&self) -> bool {
+        self.state == CheckState::Ok
+    }
+
+    pub(in crate::commands) fn is_failed(&self) -> bool {
+        self.state == CheckState::Failed
+    }
+
     fn at(ok: bool, path: impl Into<String>) -> Self {
         Self {
-            ok,
+            state: if ok {
+                CheckState::Ok
+            } else {
+                CheckState::Failed
+            },
             path: Some(path.into()),
             detail: None,
         }
@@ -52,9 +74,21 @@ impl ComponentStatus {
         failure: &'static str,
     ) -> Self {
         Self {
-            ok,
+            state: if ok {
+                CheckState::Ok
+            } else {
+                CheckState::Failed
+            },
             path,
             detail: (!ok).then(|| detail.unwrap_or_else(|| failure.to_owned())),
+        }
+    }
+
+    fn unknown(path: Option<String>, detail: String) -> Self {
+        Self {
+            state: CheckState::Unknown,
+            path,
+            detail: Some(detail),
         }
     }
 }
@@ -78,10 +112,19 @@ pub(in crate::commands) async fn shell_integration_status() -> ShellIntegrationS
         Ok(status) => status,
         Err(error) => (false, Some(format!("{error:#}"))),
     };
+    let (login_path, completions) = login_components(
+        probe,
+        Some(bin_dir().display().to_string()),
+        Some(profile::completion_path(shell).display().to_string()),
+    );
     ShellIntegrationStatus {
         shell: shell.as_str().to_owned(),
         bin_symlink: ComponentStatus {
-            ok: binary_ok,
+            state: if binary_ok {
+                CheckState::Ok
+            } else {
+                CheckState::Failed
+            },
             path: Some(bin_path.display().to_string()),
             detail: binary_detail,
         },
@@ -91,17 +134,42 @@ pub(in crate::commands) async fn shell_integration_status() -> ShellIntegrationS
             profile_error,
             "effective shell profile does not contain ArcBox integration",
         ),
-        login_path: ComponentStatus::checked(
-            probe.path_ok,
-            Some(bin_dir().display().to_string()),
-            probe.detail.clone(),
-            "effective login shell does not resolve ArcBox abctl",
+        login_path,
+        completions,
+    }
+}
+
+/// Splits one login-shell probe into the two components it answers for.
+///
+/// A probe that never ran leaves both `Unknown`: it observed neither the PATH
+/// nor the completion, and calling that "not installed" both misreports a
+/// healthy setup and offers a repair that cannot fix a probe failure.
+fn login_components(
+    probe: profile::LoginProbe,
+    login_bin: Option<String>,
+    completion: Option<String>,
+) -> (ComponentStatus, ComponentStatus) {
+    match probe {
+        profile::LoginProbe::Verified {
+            path_ok,
+            completion_ok,
+        } => (
+            ComponentStatus::checked(
+                path_ok,
+                login_bin,
+                None,
+                "effective login shell does not resolve ArcBox abctl",
+            ),
+            ComponentStatus::checked(
+                completion_ok,
+                completion,
+                None,
+                "completion is not discoverable in the login shell",
+            ),
         ),
-        completions: ComponentStatus::checked(
-            probe.completion_ok,
-            Some(profile::completion_path(shell).display().to_string()),
-            probe.detail,
-            "completion is not discoverable in the login shell",
+        profile::LoginProbe::Unverified { detail } => (
+            ComponentStatus::unknown(login_bin, format!("login shell probe failed: {detail}")),
+            ComponentStatus::unknown(completion, format!("login shell probe failed: {detail}")),
         ),
     }
 }
@@ -112,12 +180,26 @@ pub(super) async fn status(format: OutputFormat) -> Result<()> {
     let init_ok = tokio::fs::try_exists(&init_path).await?;
     let integration = shell_integration_status().await;
     let (plugins_ok, plugin_detail) = docker_plugin_status().await;
-    let installed = integration.bin_symlink.ok
-        && init_ok
-        && integration.profile.ok
-        && integration.login_path.ok
-        && integration.completions.ok
-        && plugins_ok;
+    let components = [
+        integration.bin_symlink.clone(),
+        ComponentStatus::at(init_ok, init_path.display().to_string()),
+        integration.profile.clone(),
+        integration.login_path.clone(),
+        integration.completions.clone(),
+        ComponentStatus {
+            state: if plugins_ok {
+                CheckState::Ok
+            } else {
+                CheckState::Failed
+            },
+            path: None,
+            detail: plugin_detail.clone(),
+        },
+    ];
+    let installed = components.iter().all(ComponentStatus::is_ok);
+    // A check that could not run is not a broken integration: report it, but
+    // do not claim the setup is partial or exit nonzero over it.
+    let broken = components.iter().any(ComponentStatus::is_failed);
     let output = StatusOutput {
         installed,
         bin_symlink: integration.bin_symlink,
@@ -126,19 +208,30 @@ pub(super) async fn status(format: OutputFormat) -> Result<()> {
         login_path: integration.login_path,
         completions: integration.completions,
         docker_plugins: ComponentStatus {
-            ok: plugins_ok,
+            state: if plugins_ok {
+                CheckState::Ok
+            } else {
+                CheckState::Failed
+            },
             path: None,
             detail: plugin_detail,
         },
-        repair: (!installed).then_some("Run `abctl setup install` and restart your shell."),
+        repair: broken.then_some("Run `abctl setup install` and restart your shell."),
     };
 
+    let summary = if installed {
+        "installed"
+    } else if broken {
+        "partial"
+    } else {
+        "unknown"
+    };
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string(&output)?),
-        OutputFormat::Quiet => println!("{}", if installed { "installed" } else { "partial" }),
-        OutputFormat::Table => print_table(&output),
+        OutputFormat::Quiet => println!("{summary}"),
+        OutputFormat::Table => print_table(&output, summary),
     }
-    if !installed {
+    if broken {
         bail!("ArcBox shell integration is incomplete");
     }
     Ok(())
@@ -215,7 +308,7 @@ async fn docker_plugin_status() -> (bool, Option<String>) {
     )
 }
 
-fn print_table(output: &StatusOutput) {
+fn print_table(output: &StatusOutput, summary: &str) {
     println!("ArcBox CLI Setup Status");
     println!("=======================\n");
     print_component("CLI symlink", &output.bin_symlink);
@@ -224,14 +317,7 @@ fn print_table(output: &StatusOutput) {
     print_component("Login PATH", &output.login_path);
     print_component("Completions", &output.completions);
     print_component("Docker plugins", &output.docker_plugins);
-    println!(
-        "\nStatus: {}",
-        if output.installed {
-            "installed"
-        } else {
-            "partial"
-        }
-    );
+    println!("\nStatus: {summary}");
     if let Some(repair) = output.repair {
         println!("Repair: {repair}");
     }
@@ -244,17 +330,49 @@ fn print_component(label: &str, component: &ComponentStatus) {
         (None, Some(detail)) => detail.clone(),
         (None, None) => String::new(),
     };
-    println!(
-        "  [{}] {:<20} {}",
-        if component.ok { "+" } else { "-" },
-        label,
-        detail
-    );
+    let mark = match component.state {
+        CheckState::Ok => "+",
+        CheckState::Failed => "-",
+        CheckState::Unknown => "?",
+    };
+    println!("  [{mark}] {label:<20} {detail}");
 }
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{ComponentStatus, inspect_bin_link};
+    use super::{CheckState, ComponentStatus, inspect_bin_link, login_components, profile};
+
+    #[test]
+    fn a_probe_that_could_not_run_is_unknown_rather_than_failed() {
+        let (path, completion) = login_components(
+            profile::LoginProbe::Unverified {
+                detail: "login shell probe timed out".to_owned(),
+            },
+            Some("/bin".to_owned()),
+            Some("/completions/_abctl".to_owned()),
+        );
+
+        for component in [&path, &completion] {
+            assert_eq!(component.state, CheckState::Unknown);
+            assert!(!component.is_failed());
+            assert!(!component.is_ok());
+            assert_eq!(
+                component.detail.as_deref(),
+                Some("login shell probe failed: login shell probe timed out")
+            );
+        }
+
+        let (path, completion) = login_components(
+            profile::LoginProbe::Verified {
+                path_ok: true,
+                completion_ok: false,
+            },
+            None,
+            None,
+        );
+        assert!(path.is_ok());
+        assert!(completion.is_failed());
+    }
 
     #[test]
     fn component_detail_is_scoped_to_a_failed_check() {

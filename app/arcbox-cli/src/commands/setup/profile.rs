@@ -12,11 +12,17 @@ const MANAGED_SOURCE_TAG: &str = " # managed by ArcBox";
 const BASELINE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const PROBE_PREFIX: &str = "__ARCBOX_SHELL_PROBE__";
 
+/// What an interactive login shell reported about the ArcBox integration.
+///
+/// `Unverified` is a distinct state on purpose: running the user's rc files
+/// (`-l -i`) can fail for reasons that say nothing about the integration — an
+/// rc file that `exec`s into another shell, or a heavy `.zshrc` that outruns
+/// the probe timeout. Folding that into "not installed" reports a healthy
+/// install as broken and offers a repair that cannot help.
 #[derive(Debug)]
-pub(super) struct LoginProbe {
-    pub path_ok: bool,
-    pub completion_ok: bool,
-    pub detail: Option<String>,
+pub(super) enum LoginProbe {
+    Verified { path_ok: bool, completion_ok: bool },
+    Unverified { detail: String },
 }
 
 pub(super) fn detect_shell() -> ShellKind {
@@ -94,15 +100,12 @@ pub(super) async fn is_injected(path: &Path, shell: ShellKind) -> Result<bool> {
 
 pub(super) async fn probe_login(shell: ShellKind) -> LoginProbe {
     match run_login_probe(shell).await {
-        Ok((path_ok, completion_ok)) => LoginProbe {
+        Ok((path_ok, completion_ok)) => LoginProbe::Verified {
             path_ok,
             completion_ok,
-            detail: None,
         },
-        Err(error) => LoginProbe {
-            path_ok: false,
-            completion_ok: false,
-            detail: Some(format!("{error:#}")),
+        Err(error) => LoginProbe::Unverified {
+            detail: format!("{error:#}"),
         },
     }
 }

@@ -15,6 +15,9 @@ use super::OutputFormat;
 enum CheckState {
     Pass,
     Fail,
+    /// The check could not be run. Reported, but never counted as a failure —
+    /// see `ComponentStatus::Unknown` in the setup status module.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,12 +47,22 @@ impl HealthCheck {
             repair: Some(repair),
         }
     }
+
+    fn unknown(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: CheckState::Unknown,
+            detail: detail.into(),
+            repair: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Summary {
     passed: usize,
     failed: usize,
+    unknown: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,15 +74,20 @@ struct DoctorReport {
 
 impl DoctorReport {
     fn new(checks: Vec<HealthCheck>) -> Self {
-        let passed = checks
-            .iter()
-            .filter(|check| check.status == CheckState::Pass)
-            .count();
-        let failed = checks.len() - passed;
+        let count = |state: CheckState| checks.iter().filter(|c| c.status == state).count();
+        let (passed, failed, unknown) = (
+            count(CheckState::Pass),
+            count(CheckState::Fail),
+            count(CheckState::Unknown),
+        );
         Self {
             healthy: failed == 0,
             checks,
-            summary: Summary { passed, failed },
+            summary: Summary {
+                passed,
+                failed,
+                unknown,
+            },
         }
     }
 
@@ -79,6 +97,7 @@ impl DoctorReport {
             let state = match check.status {
                 CheckState::Pass => "PASS",
                 CheckState::Fail => "FAIL",
+                CheckState::Unknown => "UNKN",
             };
             writeln!(output, "  [{state}] {}: {}", check.name, check.detail)
                 .expect("writing to a String cannot fail");
@@ -93,6 +112,10 @@ impl DoctorReport {
             self.summary.passed, self.summary.failed
         )
         .expect("writing to a String cannot fail");
+        if self.summary.unknown > 0 {
+            write!(output, ", {} unknown", self.summary.unknown)
+                .expect("writing to a String cannot fail");
+        }
         output
     }
 }
@@ -127,80 +150,93 @@ async fn inspect() -> DoctorReport {
     checks.push(check_docker_cli().await);
 
     let shell = super::setup::shell_integration_status().await;
-    checks.push(if shell.bin_symlink.ok {
-        HealthCheck::pass(
-            "CLI symlink",
+    checks.push(shell_check(
+        "CLI symlink",
+        &shell.bin_symlink,
+        || {
             shell
                 .bin_symlink
                 .path
                 .clone()
-                .unwrap_or_else(|| "ArcBox abctl".to_owned()),
-        )
-    } else {
-        HealthCheck::fail(
-            "CLI symlink",
-            shell.bin_symlink.detail.clone().unwrap_or_else(|| {
-                shell.bin_symlink.path.clone().map_or_else(
-                    || "ArcBox abctl symlink is missing".to_owned(),
-                    |path| format!("missing {path}"),
-                )
-            }),
-            "Run `abctl setup install`.",
-        )
-    });
-    checks.push(if shell.profile.ok {
-        HealthCheck::pass(
-            "Shell profile",
+                .unwrap_or_else(|| "ArcBox abctl".to_owned())
+        },
+        || {
+            shell.bin_symlink.path.clone().map_or_else(
+                || "ArcBox abctl symlink is missing".to_owned(),
+                |path| format!("missing {path}"),
+            )
+        },
+        "Run `abctl setup install`.",
+    ));
+    checks.push(shell_check(
+        "Shell profile",
+        &shell.profile,
+        || {
             shell
                 .profile
                 .path
                 .clone()
-                .unwrap_or_else(|| shell.shell.clone()),
-        )
-    } else {
-        HealthCheck::fail(
-            "Shell profile",
-            shell.profile.detail.clone().unwrap_or_else(|| {
-                shell
-                    .profile
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| "profile not detected".to_owned())
-            }),
-            "Run `abctl setup install`.",
-        )
-    });
-    checks.push(if shell.login_path.ok {
-        HealthCheck::pass("Shell PATH", "login shell resolves ArcBox abctl")
-    } else {
-        HealthCheck::fail(
-            "Shell PATH",
+                .unwrap_or_else(|| shell.shell.clone())
+        },
+        || {
             shell
-                .login_path
-                .detail
+                .profile
+                .path
                 .clone()
-                .unwrap_or_else(|| "login shell does not resolve ArcBox abctl".to_owned()),
-            "Run `abctl setup install`, then restart the shell.",
-        )
-    });
-    checks.push(if shell.completions.ok {
-        HealthCheck::pass("Shell completion", "discoverable in the login shell")
-    } else {
-        HealthCheck::fail(
-            "Shell completion",
-            shell
-                .completions
-                .detail
-                .clone()
-                .unwrap_or_else(|| "completion is not discoverable".to_owned()),
-            "Run `abctl setup install`, then restart the shell.",
-        )
-    });
+                .unwrap_or_else(|| "profile not detected".to_owned())
+        },
+        "Run `abctl setup install`.",
+    ));
+    checks.push(shell_check(
+        "Shell PATH",
+        &shell.login_path,
+        || "login shell resolves ArcBox abctl".to_owned(),
+        || "login shell does not resolve ArcBox abctl".to_owned(),
+        "Run `abctl setup install`, then restart the shell.",
+    ));
+    checks.push(shell_check(
+        "Shell completion",
+        &shell.completions,
+        || "discoverable in the login shell".to_owned(),
+        || "completion is not discoverable".to_owned(),
+        "Run `abctl setup install`, then restart the shell.",
+    ));
 
     #[cfg(target_os = "macos")]
     add_macos_checks(&mut checks).await;
 
     DoctorReport::new(checks)
+}
+
+/// Maps a shell-integration component onto a doctor check.
+///
+/// A component whose check could not run stays `Unknown` here too: reporting
+/// it as a failure would tell the user to repair an install that may be
+/// perfectly healthy, and would fail `doctor` on a probe's own bad day.
+fn shell_check(
+    name: &'static str,
+    component: &super::setup::ComponentStatus,
+    passed: impl FnOnce() -> String,
+    failed: impl FnOnce() -> String,
+    repair: &'static str,
+) -> HealthCheck {
+    if component.is_ok() {
+        HealthCheck::pass(name, passed())
+    } else if component.is_failed() {
+        HealthCheck::fail(
+            name,
+            component.detail.clone().unwrap_or_else(failed),
+            repair,
+        )
+    } else {
+        HealthCheck::unknown(
+            name,
+            component
+                .detail
+                .clone()
+                .unwrap_or_else(|| format!("{name} could not be checked")),
+        )
+    }
 }
 
 fn check_daemon(layout: &arcbox_constants::paths::HostLayout, socket: &Path) -> HealthCheck {
