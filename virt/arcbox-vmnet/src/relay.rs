@@ -212,6 +212,13 @@ impl VmnetRelay {
         // SAFETY: dup_fd is a valid fd from dup().
         let reader_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(dup_fd) };
 
+        // Constructed before the callback registration on purpose: it is the
+        // last fallible step, so once the callback is registered the only
+        // exit is the loop below, whose tail always unregisters. An error
+        // path between registration and the loop would strand the callback
+        // (and the Vmnet it retains) until `Vmnet::stop`.
+        let async_fd = AsyncFd::new(guest_fd)?;
+
         // vmnet → guest: event callback on the interface's dispatch queue.
         let ctx = Arc::new(ReadCtx {
             vmnet: Arc::clone(&self.vmnet),
@@ -239,8 +246,6 @@ impl VmnetRelay {
         // SAFETY: block is the live heap block created above.
         unsafe { _Block_release(block) };
         registered.map_err(std::io::Error::other)?;
-
-        let async_fd = AsyncFd::new(guest_fd)?;
 
         // guest → vmnet: async
         let vmnet_write = Arc::clone(&self.vmnet);
