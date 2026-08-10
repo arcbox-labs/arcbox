@@ -65,7 +65,9 @@ jobs:
         run: cargo clippy -p arcbox-vm -- -D warnings
 
       - name: Unit tests
-        run: cargo test --lib -p arcbox-vm
+        # --bins covers the vm-agent guest handlers, whose tests are
+        # target_os = "linux" and never run under the macOS workspace job.
+        run: cargo test --lib --bins -p arcbox-vm
 
   # ---------------------------------------------------------------------------
   # Job 2: integration tests — requires root (TAP interface creation)
