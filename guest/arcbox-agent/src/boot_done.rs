@@ -47,39 +47,58 @@ const SYSTEMD_WANTS: &str = "/etc/systemd/system/multi-user.target.wants/arcbox-
 const OPENRC_SERVICE: &str = "/etc/init.d/arcbox-boot-done";
 const OPENRC_RUNLEVEL: &str = "/etc/runlevels/default/arcbox-boot-done";
 
-/// `WantedBy` the target it is also ordered `After`, which is the documented
-/// way to run something once the boot transaction has settled.
-const SYSTEMD_UNIT_BODY: &str = "\
-[Unit]
+/// The unit that writes the sentinel.
+///
+/// `WantedBy=multi-user.target` pulls it into the boot; `After=` on the same
+/// target orders it after that target is *reached*. Be precise about what
+/// that buys: a `.wants` symlink adds no ordering of its own, so the target
+/// is reached once the units that declare `Before=multi-user.target` are
+/// done — conventional for distro service units, but not something the
+/// symlink guarantees. `After=network-online.target` is listed as well and
+/// costs nothing: without a matching `Wants=` it constrains ordering only on
+/// images where something else already activates that target, and imposes
+/// nothing where nothing does. Deliberately no `Wants=network-online.target`
+/// — on an image with no wait-online provider the target never activates,
+/// and the hook would never run.
+fn systemd_unit_body() -> String {
+    format!(
+        "[Unit]
 Description=ArcBox boot-completion sentinel
 After=multi-user.target
+After=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'cat /proc/sys/kernel/random/boot_id > /run/arcbox-boot-done'
+ExecStart=/bin/sh -c 'cat {BOOT_ID} > {SENTINEL}'
 
 [Install]
 WantedBy=multi-user.target
-";
+"
+    )
+}
 
-/// `after *` orders this behind every other service in the runlevel.
-const OPENRC_SERVICE_BODY: &str = "\
-#!/sbin/openrc-run
+/// `after *` orders this behind every other service in the runlevel, which
+/// is openrc's own way to say "last".
+fn openrc_service_body() -> String {
+    format!(
+        "#!/sbin/openrc-run
 description=\"ArcBox boot-completion sentinel\"
 
-depend() {
+depend() {{
     after *
-}
+}}
 
-start() {
-    cat /proc/sys/kernel/random/boot_id > /run/arcbox-boot-done
-}
+start() {{
+    cat {BOOT_ID} > {SENTINEL}
+}}
 
-stop() {
+stop() {{
     return 0
+}}
+"
+    )
 }
-";
 
 /// Whether a hook is installed, i.e. whether a sentinel is coming at all.
 ///
@@ -133,7 +152,7 @@ pub fn install() -> bool {
 }
 
 fn install_systemd() -> bool {
-    if let Err(e) = write_file(SYSTEMD_UNIT, SYSTEMD_UNIT_BODY, 0o644) {
+    if let Err(e) = write_file(SYSTEMD_UNIT, &systemd_unit_body(), 0o644) {
         tracing::warn!(error = %e, "failed to write the systemd boot-done unit");
         return false;
     }
@@ -158,7 +177,7 @@ fn symlink_into_wants() -> std::io::Result<()> {
 }
 
 fn install_openrc() -> bool {
-    if let Err(e) = write_file(OPENRC_SERVICE, OPENRC_SERVICE_BODY, 0o755) {
+    if let Err(e) = write_file(OPENRC_SERVICE, &openrc_service_body(), 0o755) {
         tracing::warn!(error = %e, "failed to write the openrc boot-done service");
         return false;
     }
@@ -194,6 +213,19 @@ fn write_file(path: &str, body: &str, mode: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generating the bodies with `format!` means the shell braces in the
+    /// openrc service have to be escaped, and getting that wrong yields a
+    /// file openrc cannot parse — a hook that installs and never fires,
+    /// which is the one failure mode that costs a readiness timeout rather
+    /// than degrading safely.
+    #[test]
+    fn the_openrc_body_survives_format_escaping() {
+        let body = openrc_service_body();
+        assert!(body.contains("depend() {\n    after *\n}"), "{body}");
+        assert!(body.contains("start() {\n"), "{body}");
+        assert!(!body.contains("{{") && !body.contains("}}"), "{body}");
+    }
 
     /// A leftover sentinel from a previous boot must not read as complete —
     /// the case a bare "does the file exist" check would get wrong.
