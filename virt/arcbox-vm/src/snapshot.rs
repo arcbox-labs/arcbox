@@ -11,6 +11,18 @@ use uuid::Uuid;
 use crate::config::SnapshotType;
 use crate::error::{Result, VmmError};
 
+/// VM geometry a memory snapshot was captured with.
+///
+/// A Firecracker memory snapshot restores only onto identical
+/// vcpus/memory, so anything that restores a snapshot onto a caller-shaped
+/// VM (template promotion, CORE-107) needs the capture-time geometry.
+/// Absent on metas written before this field existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotGeometry {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+}
+
 /// Metadata stored alongside each snapshot on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMeta {
@@ -48,6 +60,10 @@ pub struct SnapshotMeta {
     /// legacy snapshots read back `false` and keep the reconfig-RPC path.
     #[serde(default)]
     pub net_invariant: bool,
+    /// Capture-time VM geometry. `serde(default)` so legacy metas read back
+    /// `None` (consumers that need it reject with an actionable error).
+    #[serde(default)]
+    pub geometry: Option<SnapshotGeometry>,
 }
 
 /// Info returned to callers / gRPC layer.
@@ -154,6 +170,8 @@ pub struct SnapshotDraft {
     pub rootfs_path: Option<String>,
     /// Whether the origin guest ran the invariant network identity (CORE-81).
     pub net_invariant: bool,
+    /// Capture-time VM geometry, when the producer knows it.
+    pub geometry: Option<SnapshotGeometry>,
 }
 
 /// A snapshot being written, not yet part of the catalog.
@@ -208,6 +226,7 @@ impl PendingSnapshot<'_> {
             kernel_path: draft.kernel_path,
             rootfs_path: draft.rootfs_path,
             net_invariant: draft.net_invariant,
+            geometry: draft.geometry,
         };
 
         sync_private_file(&staging.join(VMSTATE_FILE))?;
@@ -497,6 +516,7 @@ mod tests {
             kernel_path: None,
             rootfs_path: None,
             net_invariant: false,
+            geometry: None,
         }
     }
 
