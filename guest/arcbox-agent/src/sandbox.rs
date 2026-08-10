@@ -60,6 +60,10 @@ pub struct SandboxService {
     manager: Arc<SandboxManager>,
     creates: Arc<CreateRegistry>,
     operations: SandboxOperationLocks,
+    /// Template names with a Build in flight; a second Build on a busy name
+    /// errors instead of silently queueing behind a long conversion
+    /// (CORE-107). See `templates.rs`.
+    template_builds: Mutex<std::collections::HashSet<String>>,
     /// Default rootfs image path; auto-built on first use when missing.
     default_rootfs: String,
 }
@@ -115,6 +119,7 @@ impl SandboxService {
             manager,
             creates,
             operations: SandboxOperationLocks::default(),
+            template_builds: Mutex::new(std::collections::HashSet::new()),
             default_rootfs,
         })
     }

@@ -293,6 +293,80 @@ pub(super) fn template_to_proto(name: &str, entry: &TemplateEntry) -> sandbox_v1
     }
 }
 
+/// Maximum ready-probe timeout accepted at Build time (matches the
+/// WaitForPort cap).
+const MAX_READY_PROBE_TIMEOUT_SECS: u32 = 600;
+
+/// Decode + validate `TemplateDefaults` from a Build request. Validation
+/// happens once here, at the boundary: a stored entry is trusted downstream.
+pub(super) fn template_defaults_from_proto(
+    pb: &sandbox_v1::TemplateDefaults,
+) -> Result<TemplateDefaultsSpec, crate::error::SandboxError> {
+    use crate::error::SandboxError;
+    for port in &pb.exposed_ports {
+        if *port == 0 || *port > u32::from(u16::MAX) {
+            return Err(SandboxError::InvalidArgument(format!(
+                "exposed_ports entry {port} is out of range (1-65535)"
+            )));
+        }
+    }
+    Ok(TemplateDefaultsSpec {
+        vcpus: pb.limits.vcpus,
+        memory_mib: pb.limits.memory_mib,
+        cmd: pb.cmd.clone(),
+        env: pb.env.clone().into_iter().collect(),
+        exposed_ports: pb.exposed_ports.clone(),
+        ready_probe: pb
+            .ready_probe
+            .as_option()
+            .map(ready_probe_from_proto)
+            .transpose()?,
+    })
+}
+
+fn ready_probe_from_proto(
+    pb: &sandbox_v1::ReadyProbe,
+) -> Result<ReadyProbeSpec, crate::error::SandboxError> {
+    use crate::error::SandboxError;
+    use sandbox_v1::ready_probe::Probe;
+    if pb.timeout_seconds > MAX_READY_PROBE_TIMEOUT_SECS {
+        return Err(SandboxError::InvalidArgument(format!(
+            "ready_probe timeout_seconds {} exceeds the {MAX_READY_PROBE_TIMEOUT_SECS}s cap",
+            pb.timeout_seconds
+        )));
+    }
+    match pb.probe.as_ref() {
+        Some(Probe::Port(port)) => {
+            let port = u16::try_from(*port)
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| {
+                    SandboxError::InvalidArgument(format!(
+                        "ready_probe port {port} is out of range (1-65535)"
+                    ))
+                })?;
+            Ok(ReadyProbeSpec::Port {
+                port,
+                timeout_seconds: pb.timeout_seconds,
+            })
+        }
+        Some(Probe::Command(command)) => {
+            if command.cmd.is_empty() {
+                return Err(SandboxError::InvalidArgument(
+                    "ready_probe command must not be empty".into(),
+                ));
+            }
+            Ok(ReadyProbeSpec::Command {
+                cmd: command.cmd.clone(),
+                timeout_seconds: pb.timeout_seconds,
+            })
+        }
+        None => Err(SandboxError::InvalidArgument(
+            "ready_probe requires a port or a command".into(),
+        )),
+    }
+}
+
 fn template_defaults_to_proto(spec: &TemplateDefaultsSpec) -> Option<sandbox_v1::TemplateDefaults> {
     if *spec == TemplateDefaultsSpec::default() {
         return None;

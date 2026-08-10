@@ -493,6 +493,75 @@ impl TemplateCatalog {
     }
 }
 
+/// Deterministic content digest for a template entry (`sha256:<hex>`).
+///
+/// Inputs are content identities, never file metadata, so an identical
+/// rebuild reproduces the digest: `source_identity` (the rootfs cache file
+/// stem for image builds — it encodes the layer content key and the injected
+/// vm-agent key — or the promoted snapshot id), the warm snapshot id, and
+/// the canonicalized defaults and labels. Field-tagged and NUL-separated so
+/// adjacent inputs cannot alias.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "callers pass the catalog's std-hasher label maps; a hasher type \
+              parameter would serve zero call sites"
+)]
+pub fn compute_digest(
+    source_identity: &str,
+    warm_snapshot_id: Option<&str>,
+    defaults: &TemplateDefaultsSpec,
+    labels: &HashMap<String, String>,
+) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    /// Canonical serialization shadow: map fields become ordered so the JSON
+    /// bytes are deterministic regardless of `HashMap` iteration order.
+    #[derive(Serialize)]
+    struct CanonicalDefaults<'a> {
+        vcpus: u32,
+        memory_mib: u64,
+        cmd: &'a [String],
+        env: std::collections::BTreeMap<&'a str, &'a str>,
+        exposed_ports: &'a [u32],
+        ready_probe: &'a Option<ReadyProbeSpec>,
+    }
+
+    let canonical = CanonicalDefaults {
+        vcpus: defaults.vcpus,
+        memory_mib: defaults.memory_mib,
+        cmd: &defaults.cmd,
+        env: defaults
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect(),
+        exposed_ports: &defaults.exposed_ports,
+        ready_probe: &defaults.ready_probe,
+    };
+    let sorted_labels: std::collections::BTreeMap<&str, &str> = labels
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut hasher = Sha256::new();
+    for (tag, value) in [
+        ("source", source_identity),
+        ("warm", warm_snapshot_id.unwrap_or("")),
+    ] {
+        hasher.update(tag.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    hasher.update(b"defaults\0");
+    hasher.update(serde_json::to_vec(&canonical).expect("plain data serialization cannot fail"));
+    hasher.update(b"\0labels\0");
+    hasher
+        .update(serde_json::to_vec(&sorted_labels).expect("plain data serialization cannot fail"));
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 /// Validate a template name.
 ///
 /// Names become file names, snapshot `vm_id` components, and reference
@@ -778,6 +847,40 @@ mod tests {
         for path in ["/cache/ra.ext4", "/cache/ra2.ext4", "/cache/rb.ext4"] {
             assert!(pinned.contains(Path::new(path)), "missing {path}");
         }
+    }
+
+    #[test]
+    fn digest_is_deterministic_and_input_sensitive() {
+        let mut defaults = TemplateDefaultsSpec {
+            vcpus: 2,
+            ..Default::default()
+        };
+        defaults.env.insert("A".into(), "1".into());
+        defaults.env.insert("B".into(), "2".into());
+        let labels = HashMap::from([("team".to_string(), "ml".to_string())]);
+
+        let d1 = compute_digest("rootfs-aa-bb", Some("snap-1"), &defaults, &labels);
+        let d2 = compute_digest("rootfs-aa-bb", Some("snap-1"), &defaults, &labels);
+        assert_eq!(d1, d2, "same inputs must reproduce the digest");
+        assert!(d1.starts_with("sha256:"));
+
+        for (source, warm) in [
+            ("rootfs-aa-cc", Some("snap-1")),
+            ("rootfs-aa-bb", Some("snap-2")),
+            ("rootfs-aa-bb", None),
+        ] {
+            assert_ne!(d1, compute_digest(source, warm, &defaults, &labels));
+        }
+        let mut other = defaults.clone();
+        other.cmd = vec!["python".into()];
+        assert_ne!(
+            d1,
+            compute_digest("rootfs-aa-bb", Some("snap-1"), &other, &labels)
+        );
+        assert_ne!(
+            d1,
+            compute_digest("rootfs-aa-bb", Some("snap-1"), &defaults, &HashMap::new())
+        );
     }
 
     #[test]
