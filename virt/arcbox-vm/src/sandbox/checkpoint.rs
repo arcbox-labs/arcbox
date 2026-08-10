@@ -961,6 +961,8 @@ impl SandboxManager {
             }
         };
 
+        let warm_create = matches!(request.origin, RestoreOrigin::WarmCreate);
+
         // Populate the reserved instance in place, then commit the reservation
         // so it survives (the placeholder inserted by reserve_id is otherwise
         // removed on drop). All resources are now tracked on the instance and
@@ -974,12 +976,19 @@ impl SandboxManager {
             inst.vsock_uds_path = Some(actual_vsock_path.clone());
             inst.cow_handle = pending_cow.take();
             inst.net_invariant = snap_meta.net_invariant;
-            inst.state = SandboxState::Ready;
+            // A warm create that owes the spec's initial cmd stays
+            // `Starting` so the workload slot is reserved for that cmd —
+            // an Inspect-polling client must not see Ready here and steal
+            // it with an exec (the cold-boot tail has the same guard).
+            inst.state = if warm_create && !effective_spec.cmd.is_empty() {
+                SandboxState::Starting
+            } else {
+                SandboxState::Ready
+            };
             inst.ready_at = Some(Utc::now());
         }
         reservation.commit();
 
-        let warm_create = matches!(request.origin, RestoreOrigin::WarmCreate);
         if warm_create {
             // The Create event contract: watchers see CREATED then READY for
             // this id in that order, exactly as a cold boot emits them.
@@ -988,45 +997,47 @@ impl SandboxManager {
                 .send(SandboxEvent::new(&new_id, action::CREATED));
         }
 
-        // Ready probe on a warm create (CORE-107): READY carries the same
-        // promise as a probed cold boot. The cmd starts first (it is the
-        // only listener source); a prewarmed snapshot's listener lives in
-        // the memory image, so the port form passes near-instantly there.
-        // Unlike the cold-boot path, this runs POST-commit — the cmd needs
-        // the populated Ready instance, and the restore transaction's
-        // rollback machinery ends at reservation.commit — so a probe
-        // failure is unwound with the post-commit verb (force remove), and
-        // the caller's create falls back to a cold boot that probes from
+        // Initial cmd + ready probe on a warm create (CORE-107): READY
+        // carries the same promise as a probed cold boot. The cmd starts
+        // first through the reserved Initial claim (it is the only listener
+        // source); a prewarmed snapshot's listener lives in the memory
+        // image, so the port form passes near-instantly there. Unlike the
+        // cold-boot path, this runs POST-commit — the cmd needs the
+        // populated instance, and the restore transaction's rollback
+        // machinery ends at reservation.commit — so a probe failure is
+        // unwound with the post-commit verb (force remove), and the
+        // caller's create falls back to a cold boot that probes from
         // scratch — when the teardown succeeded; a failed teardown leaves
         // the record Removing, which blocks the same-id retry until startup
         // reconcile clears it (the warn below carries the id). A crash
         // mid-probe leaves a durable Ready record whose FC process is dead;
         // startup reconcile normalizes it, and the create RPC never
         // returned, so no client ever saw an unprobed READY.
-        let mut probed_cmd_started = false;
-        if warm_create && let Some(probe) = effective_spec.ready_probe.clone() {
-            if !effective_spec.cmd.is_empty() {
-                probed_cmd_started = super::boot::run_initial_cmd(
-                    &new_id,
-                    effective_spec.clone(),
-                    &actual_vsock_path,
-                    &self.instances,
-                    &self.events_tx,
-                )
-                .await;
+        let cmd_started = if warm_create && !effective_spec.cmd.is_empty() {
+            super::boot::run_initial_cmd(
+                &new_id,
+                effective_spec.clone(),
+                &actual_vsock_path,
+                &self.instances,
+                &self.events_tx,
+            )
+            .await
+        } else {
+            false
+        };
+        if warm_create
+            && let Some(probe) = effective_spec.ready_probe.clone()
+            && let Err(probe_error) = super::boot::run_ready_probe(&probe, &actual_vsock_path).await
+        {
+            let message = format!("ready probe failed after restore: {probe_error}");
+            if let Err(remove_error) = self.remove_sandbox(&new_id, true).await {
+                warn!(
+                    sandbox_id = %new_id,
+                    error = %remove_error,
+                    "failed to tear down the probe-failed restore"
+                );
             }
-            if let Err(probe_error) = super::boot::run_ready_probe(&probe, &actual_vsock_path).await
-            {
-                let message = format!("ready probe failed after restore: {probe_error}");
-                if let Err(remove_error) = self.remove_sandbox(&new_id, true).await {
-                    warn!(
-                        sandbox_id = %new_id,
-                        error = %remove_error,
-                        "failed to tear down the probe-failed restore"
-                    );
-                }
-                return Err(VmmError::FailedPrecondition(message));
-            }
+            return Err(VmmError::FailedPrecondition(message));
         }
         let _ = self
             .events_tx
@@ -1061,10 +1072,11 @@ impl SandboxManager {
         // the successful restore is what makes it eligible for pooling.
         self.spawn_pool_refill(&request.snapshot_id);
 
-        // A warm create still owes the Create contract's initial workload:
-        // run it through the same path as a cold boot, after Ready. Kept off
-        // the timing log above — the workload is the user's, not restore's.
-        if warm_create && !probed_cmd_started && !effective_spec.cmd.is_empty() {
+        // A failed initial start released the claim (the sandbox is Ready);
+        // give the cmd its one ordinary post-READY attempt, exactly as the
+        // cold-boot tail does. Kept off the timing log above — the workload
+        // is the user's, not restore's.
+        if warm_create && !cmd_started && !effective_spec.cmd.is_empty() {
             let _ = super::boot::run_initial_cmd(
                 &new_id,
                 effective_spec,

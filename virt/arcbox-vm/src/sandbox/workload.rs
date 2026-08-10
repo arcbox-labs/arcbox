@@ -1,15 +1,33 @@
 use super::types::action;
 use super::*;
 
-/// Guarded `Ready → Running` transition.
+/// Which caller is taking the single-workload slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkloadClaim {
+    /// The public Run/Exec surface: claims from `Ready` only.
+    Api,
+    /// The boot/restore pipeline's own initial cmd: additionally claims
+    /// from `Starting`. A boot with an initial cmd keeps the instance
+    /// `Starting` until this claim, so an Inspect-polling client cannot
+    /// slip an exec into the boot tail (the warm-snapshot publish pause is
+    /// a wide window) and silently steal the slot the template's default
+    /// cmd was owed — the CORE-107 e2e caught exactly that.
+    Initial,
+}
+
+/// Guarded transition into `Running` — the sandbox's single-workload claim.
 ///
-/// This is the sandbox's single-workload claim. It is taken **before** any
-/// command is dispatched into the guest, so a caller that loses a concurrent
-/// race (or arrives after a `stop` set `Stopping`) is rejected with
-/// `WrongState` *without* having launched a process. A blind assignment here
-/// was the original defect: two concurrent `Run`s would both dispatch, then
-/// one would be told it lost — after its command was already executing.
-pub(super) fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
+/// It is taken **before** any command is dispatched into the guest, so a
+/// caller that loses a concurrent race (or arrives after a `stop` set
+/// `Stopping`) is rejected with `WrongState` *without* having launched a
+/// process. A blind assignment here was the original defect: two concurrent
+/// `Run`s would both dispatch, then one would be told it lost — after its
+/// command was already executing.
+pub(super) fn claim_workload(
+    id: &SandboxId,
+    instances: &InstanceMap,
+    claim: WorkloadClaim,
+) -> Result<()> {
     let arc = instances
         .read()
         .unwrap()
@@ -17,15 +35,25 @@ pub(super) fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<(
         .cloned()
         .ok_or_else(|| VmmError::NotFound(id.clone()))?;
     let mut inst = arc.lock().unwrap();
-    if inst.state != SandboxState::Ready {
+    let allowed = inst.state == SandboxState::Ready
+        || (claim == WorkloadClaim::Initial && inst.state == SandboxState::Starting);
+    if !allowed {
         return Err(VmmError::WrongState {
             id: id.clone(),
-            expected: "Ready".into(),
+            expected: match claim {
+                WorkloadClaim::Api => "Ready".into(),
+                WorkloadClaim::Initial => "Starting or Ready".into(),
+            },
             actual: inst.state.to_string(),
         });
     }
     inst.state = SandboxState::Running;
     Ok(())
+}
+
+/// The public Run/Exec claim: `Ready → Running` only.
+pub(super) fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
+    claim_workload(id, instances, WorkloadClaim::Api)
 }
 
 /// Roll a claim back to `Ready` after a failed dispatch.
@@ -113,18 +141,20 @@ fn spawn_exit_watcher(
 /// Start a non-interactive workload over the sandbox's vsock and wire up the
 /// `Running → Ready` state machine.
 ///
-/// Shared by `Run` and the initial `cmd` launched right after boot: claims the
-/// sandbox (`Ready → Running`) **before** connecting so a losing racer never
-/// dispatches a command, launches the session, then spawns the exit watcher.
-/// A launch failure rolls the claim back to `Ready`.
+/// Shared by `Run` (`WorkloadClaim::Api`) and the initial `cmd` launched by
+/// the boot/restore tails (`WorkloadClaim::Initial`): claims the sandbox
+/// **before** connecting so a losing racer never dispatches a command,
+/// launches the session, then spawns the exit watcher. A launch failure
+/// rolls the claim back to `Ready`.
 pub(super) async fn start_run_workload(
     id: &SandboxId,
     uds_path: &Path,
     start: StartCommand,
     instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
+    claim: WorkloadClaim,
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
-    claim_running(id, instances)?;
+    claim_workload(id, instances, claim)?;
 
     let inner_rx = match vsock::run(uds_path, start).await {
         Ok(rx) => rx,
@@ -167,7 +197,15 @@ impl SandboxManager {
             timeout_seconds,
         };
 
-        start_run_workload(id, &uds_path, start, &self.instances, &self.events_tx).await
+        start_run_workload(
+            id,
+            &uds_path,
+            start,
+            &self.instances,
+            &self.events_tx,
+            WorkloadClaim::Api,
+        )
+        .await
     }
 }
 
@@ -202,6 +240,24 @@ mod tests {
         // the guard that stops a concurrent workload from being dispatched.
         let err = claim_running(&"s".to_owned(), &instances).unwrap_err();
         assert!(matches!(err, VmmError::WrongState { .. }));
+        assert_eq!(state_of("s", &instances), SandboxState::Running);
+    }
+
+    #[test]
+    fn initial_claim_reserves_the_slot_from_starting() {
+        // The boot tail keeps a cmd-carrying instance `Starting`; only the
+        // Initial claim may take the slot from there.
+        let instances = instance_map("s", SandboxState::Starting);
+        assert!(matches!(
+            claim_running(&"s".to_owned(), &instances).unwrap_err(),
+            VmmError::WrongState { .. }
+        ));
+        claim_workload(&"s".to_owned(), &instances, WorkloadClaim::Initial).unwrap();
+        assert_eq!(state_of("s", &instances), SandboxState::Running);
+
+        // The post-READY retry path claims from Ready with the same verb.
+        let instances = instance_map("s", SandboxState::Ready);
+        claim_workload(&"s".to_owned(), &instances, WorkloadClaim::Initial).unwrap();
         assert_eq!(state_of("s", &instances), SandboxState::Running);
     }
 

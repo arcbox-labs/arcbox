@@ -156,7 +156,19 @@ pub(super) async fn boot_sandbox(
                         } else {
                             inst.vm = vm.take();
                             inst.vsock_uds_path = Some(vsock_uds_path.clone());
-                            inst.state = SandboxState::Ready;
+                            // With an initial cmd the instance stays
+                            // `Starting`: the tail below moves it straight
+                            // to Running via the reserved Initial claim, so
+                            // an Inspect-polling client can never see Ready
+                            // during the warm-publish pause and steal the
+                            // workload slot the cmd is owed (that silently
+                            // dropped a template's default cmd — caught by
+                            // the CORE-107 e2e).
+                            inst.state = if spec.cmd.is_empty() {
+                                SandboxState::Ready
+                            } else {
+                                SandboxState::Starting
+                            };
                             inst.ready_at = Some(ready_at);
                             true
                         }
@@ -182,50 +194,61 @@ pub(super) async fn boot_sandbox(
             // hang. READY promises the sandbox accepts executions, so it
             // cannot fire while the guest is about to stop answering.
             if let Some(ticket) = &warm_publish {
-                super::warm::publish_after_boot(&id, ticket, &instances, &config, &cow_manager)
-                    .await;
+                // A cmd-carrying instance is still `Starting` (see above);
+                // the checkpoint precondition must match what this pipeline
+                // set, not what an API caller would see.
+                let expected = if spec.cmd.is_empty() {
+                    SandboxState::Ready
+                } else {
+                    SandboxState::Starting
+                };
+                super::warm::publish_after_boot(
+                    &id,
+                    ticket,
+                    &instances,
+                    &config,
+                    &cow_manager,
+                    expected,
+                )
+                .await;
             }
 
-            // Ready probe (CORE-107): the initial cmd is the only listener
-            // source in a sandbox (vm-agent is init; a docker ENTRYPOINT
-            // never runs), so a probed boot starts the cmd FIRST and holds
-            // READY back until the probe passes; expiry fails the boot. The
-            // durable Ready transition sits after the probe on purpose — a
-            // probe failure then fails from the recorded Starting phase, and
-            // a crash mid-probe reconciles as an interrupted boot rather
-            // than a Ready sandbox that never probed.
-            let probed_cmd_started = if let Some(probe) = spec.ready_probe.clone() {
-                let started = if spec.cmd.is_empty() {
-                    false
-                } else {
-                    run_initial_cmd(&id, spec.clone(), &vsock_uds_path, &instances, &events_tx)
-                        .await
-                };
-                if let Err(probe_error) = run_ready_probe(&probe, &vsock_uds_path).await {
-                    let message = format!("ready probe failed: {probe_error}");
-                    fail_started_boot(
-                        &id,
-                        generation,
-                        &message,
-                        &vm_dir,
-                        &instances,
-                        &network,
-                        &config,
-                        &cow_manager,
-                        &records,
-                        &events_tx,
-                    )
-                    .await;
-                    error!(sandbox_id = %id, error = %probe_error, "sandbox ready probe failed");
-                    return;
-                }
-                // A failed pre-probe start is NOT "started": the ordinary
-                // post-READY launch below then gets its one attempt, exactly
-                // like an unprobed boot.
-                started
-            } else {
+            // Initial cmd + ready probe (CORE-107). Every cmd-carrying boot
+            // starts the cmd here, through the reserved Initial claim — the
+            // slot could not have been taken by anyone else. A probed boot
+            // additionally needs the cmd running before it probes: the cmd
+            // is the only listener source in a sandbox (vm-agent is init; a
+            // docker ENTRYPOINT never runs). READY is held back until the
+            // probe passes; expiry fails the boot. The durable Ready
+            // transition sits after the probe on purpose — a probe failure
+            // then fails from the recorded Starting phase, and a crash
+            // mid-probe reconciles as an interrupted boot rather than a
+            // Ready sandbox that never probed.
+            let cmd_started = if spec.cmd.is_empty() {
                 false
+            } else {
+                run_initial_cmd(&id, spec.clone(), &vsock_uds_path, &instances, &events_tx).await
             };
+            if let Some(probe) = spec.ready_probe.clone()
+                && let Err(probe_error) = run_ready_probe(&probe, &vsock_uds_path).await
+            {
+                let message = format!("ready probe failed: {probe_error}");
+                fail_started_boot(
+                    &id,
+                    generation,
+                    &message,
+                    &vm_dir,
+                    &instances,
+                    &network,
+                    &config,
+                    &cow_manager,
+                    &records,
+                    &events_tx,
+                )
+                .await;
+                error!(sandbox_id = %id, error = %probe_error, "sandbox ready probe failed");
+                return;
+            }
 
             // do_boot persisted every cleanup resource before completing the
             // handoff, so only the lifecycle phase remains to make Ready.
@@ -260,11 +283,11 @@ pub(super) async fn boot_sandbox(
             let _ = events_tx.send(SandboxEvent::new(&id, action::READY));
             info!(sandbox_id = %id, "sandbox booted and ready");
 
-            // Launch the initial workload, if the spec carries one. The
-            // sandbox stays alive when it exits (Running → Ready + "idle"),
-            // exactly like an explicit Run. A start failure is logged and
-            // leaves the sandbox Ready — the caller can still Run/Exec.
-            if !probed_cmd_started && !spec.cmd.is_empty() {
+            // A failed initial start released the claim (the sandbox is
+            // Ready); give the cmd its one ordinary post-READY attempt. A
+            // second failure is final — warned, the sandbox stays Ready,
+            // the caller can still Run/Exec.
+            if !cmd_started && !spec.cmd.is_empty() {
                 let _ = run_initial_cmd(&id, spec, &vsock_uds_path, &instances, &events_tx).await;
             }
         }
@@ -577,10 +600,14 @@ async fn run_probe_command(
 /// driven by the warm-create restore path (CORE-77), which owes a restored
 /// Create the same initial workload a cold boot runs.
 ///
-/// Returns whether the workload actually started (`true` = live). Probed
-/// paths record it so a failed pre-probe start still gets the ordinary
-/// post-READY attempt; a `false` from that attempt is final (warned, the
-/// sandbox stays Ready, the caller can still Run/Exec).
+/// Claims with `WorkloadClaim::Initial`: the boot/restore tails call this
+/// while the instance is still `Starting` — the slot was reserved for the
+/// initial cmd so a racing exec cannot steal it — and the post-READY retry
+/// claims the released `Ready` with the same verb.
+///
+/// Returns whether the workload actually started (`true` = live). A failed
+/// start gets one ordinary post-READY retry; a `false` from that attempt is
+/// final (warned, the sandbox stays Ready, the caller can still Run/Exec).
 pub(super) async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
@@ -598,7 +625,15 @@ pub(super) async fn run_initial_cmd(
         tty_height: 24,
         timeout_seconds: 0,
     };
-    match super::workload::start_run_workload(id, vsock_uds_path, start, instances, events_tx).await
+    match super::workload::start_run_workload(
+        id,
+        vsock_uds_path,
+        start,
+        instances,
+        events_tx,
+        super::workload::WorkloadClaim::Initial,
+    )
+    .await
     {
         Ok(mut rx) => {
             info!(sandbox_id = %id, "initial cmd started");
