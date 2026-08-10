@@ -4,7 +4,9 @@
 //! wait for the exit); [`Commands::spawn`] is the background form,
 //! returning a [`CommandHandle`] whose output stream survives transport
 //! drops by re-attaching at the retained byte offsets — the daemon
-//! addresses output by offset, so nothing is lost or replayed.
+//! addresses output by offset, so nothing is ever replayed, and any
+//! loss (retention trimming, a stream dead past its budget) is
+//! detectable through the truncation flags rather than silent.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -176,8 +178,11 @@ pub struct CommandResult {
     pub signal: Option<String>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    /// True when retention or a dead stream dropped output bytes —
-    /// `stdout`/`stderr` are then incomplete.
+    /// True when `stdout`/`stderr` may be incomplete: a retention gap
+    /// *proved* bytes were dropped, or the output stream died past its
+    /// re-attach budget before the exit (bytes after the death, if any,
+    /// were never observed). Conservative: a dead stream on a silent
+    /// command sets it too.
     pub truncated: bool,
 }
 
@@ -260,7 +265,9 @@ impl Commands {
     /// # Errors
     ///
     /// [`ErrorKind::InvalidArgument`] for [`Stdin::Open`] (only a
-    /// spawned handle can keep writing); otherwise any RPC failure.
+    /// spawned handle can keep writing); [`ErrorKind::Internal`] when
+    /// the execution ended without an observed exit (the daemon's
+    /// error detail is the message); otherwise any RPC failure.
     pub async fn run(&self, cmd: impl Into<Cmd>, options: RunOptions) -> Result<CommandResult> {
         if matches!(options.stdin, Stdin::Open) {
             return Err(Error::new(
@@ -340,9 +347,12 @@ impl Commands {
             if let Err(error) = seeded {
                 // The command is already running; without its stdin it
                 // would sit half-fed with no handle returned to manage
-                // it. Best-effort kill; the original error stands.
+                // it. Best-effort kill; the original error stands, and
+                // it carries the execution id so a caller can reach the
+                // command through commands.get() if the kill also
+                // failed.
                 let _ = handle.kill(Signal::Kill).await;
-                return Err(error);
+                return Err(error.with_context("command_id", &*handle.command_id));
             }
         }
         Ok(handle)
@@ -433,7 +443,9 @@ impl CommandHandle {
     ///
     /// The stream re-attaches at the retained byte offsets when the
     /// transport drops — output is offset-addressed daemon-side, so
-    /// nothing is lost or replayed. It ends when the command exits.
+    /// nothing is ever replayed; loss (retention trimming) is recorded
+    /// on [`OutputStream::truncated`] rather than silent. It ends when
+    /// the command exits.
     #[must_use]
     pub fn output(&self) -> OutputStream {
         OutputStream {
@@ -454,8 +466,10 @@ impl CommandHandle {
     ///
     /// # Errors
     ///
-    /// [`ErrorKind::Timeout`] when `timeout` elapses first; otherwise
-    /// any RPC failure.
+    /// [`ErrorKind::Timeout`] when `timeout` elapses first;
+    /// [`ErrorKind::Internal`] when the execution ended without an
+    /// observed exit (the daemon's error detail is the message);
+    /// otherwise any RPC failure.
     pub async fn wait(&self, timeout: Option<Duration>) -> Result<CommandResult> {
         match timeout {
             None => self.wait_inner().await,
@@ -790,7 +804,8 @@ impl OutputStream {
             .map_err(|error| Error::from_connect(error, "commands.output"))
     }
 
-    /// Whether retention or a dead stream dropped output bytes so far.
+    /// Whether output may be incomplete so far: a proven retention gap,
+    /// or a stream that died past its re-attach budget.
     #[must_use]
     pub fn truncated(&self) -> bool {
         self.truncated
