@@ -9,6 +9,8 @@
 // surface (PTY, stdin, re-attach, setLifecycle, capabilities, events)
 // and the phase 2b surface (filesystem path verbs, watch, waitForPort,
 // commands.list, waitForLog). Still outside scope: Template statics.
+import { noop } from "foxts/noop";
+import { wait } from "foxts/wait";
 import { describe, expect, it } from "vitest";
 
 import type { FsEvent } from "../src/index";
@@ -19,7 +21,6 @@ import {
   Sandbox,
   TimeoutError,
 } from "../src/index";
-import { wait } from "foxts/wait";
 
 const enabled = process.env.ARCBOX_SDK_E2E === "1";
 
@@ -172,19 +173,18 @@ describe.skipIf(!enabled)("hello world against a live daemon", () => {
       // Registration is asynchronous, so write markers until the first
       // event lands (each write is itself a fresh candidate event).
       await sandbox.files.mkdir("/tmp/watched");
-      const iterator = sandbox.files
-        .watch("/tmp/watched", { recursive: true })
-        [Symbol.asyncIterator]();
+      const watched = sandbox.files.watch("/tmp/watched", { recursive: true });
+      const iterator = watched[Symbol.asyncIterator]();
       const first = iterator.next();
       let event: FsEvent | undefined;
-      for (let i = 0; i < 20 && event === undefined; i++) {
+      for (let i = 0; event === undefined && i < 20; i++) {
         // eslint-disable-next-line no-await-in-loop -- sequential by design: each marker write precedes the next race
         await sandbox.files.writeText(
           "/tmp/watched/marker.txt",
           `ping ${String(i)}\n`,
         );
         // eslint-disable-next-line no-await-in-loop -- sequential by design: race the pending first event against a beat
-        const winner = await Promise.race([first, wait(1000).then(() => {})]);
+        const winner = await Promise.race([first, wait(1000).then(noop)]);
         if (winner !== undefined && winner.done !== true) {
           event = winner.value;
         }
