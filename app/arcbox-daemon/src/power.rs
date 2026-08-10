@@ -40,6 +40,7 @@ pub fn spawn_wake_clock_sync(runtime: &Arc<Runtime>, shutdown: &CancellationToke
             warn!(%error, "host wake observer unavailable; guest clock will not re-sync after sleep");
             return;
         }
+        info!("host wake observer registered; guest clock re-syncs after sleep");
         let runtime = Arc::clone(runtime);
         let shutdown = shutdown.clone();
         drop(tokio::spawn(async move {
@@ -262,13 +263,34 @@ mod imp {
         fn CFRunLoopGetCurrent() -> CfRunLoopRef;
         fn CFRunLoopAddSource(rl: CfRunLoopRef, source: CfRunLoopSourceRef, mode: CfStringRef);
         fn CFRunLoopRemoveSource(rl: CfRunLoopRef, source: CfRunLoopSourceRef, mode: CfStringRef);
-        fn CFRunLoopRunInMode(mode: CfStringRef, seconds: f64, return_after_source: u8) -> i32;
+        fn CFRunLoopRun();
+        fn CFRunLoopStop(rl: CfRunLoopRef);
     }
 
-    /// How long the run loop blocks between shutdown checks. The callback
-    /// fires from inside `CFRunLoopRunInMode`, so this only bounds how long
-    /// teardown waits, not notification latency.
-    const RUN_LOOP_TICK_SECS: f64 = 1.0;
+    /// The observer thread's run loop, handed to the shutdown watcher.
+    ///
+    /// `CFRunLoopStop` is one of the few run-loop calls that is safe from
+    /// another thread — it takes the run loop's own lock — which is what
+    /// lets shutdown wake a parked observer without polling it.
+    #[derive(Clone, Copy)]
+    struct RunLoopHandle(CfRunLoopRef);
+
+    // SAFETY: the pointer is only ever passed to CFRunLoopStop, which CF
+    // documents as callable from any thread.
+    unsafe impl Send for RunLoopHandle {}
+
+    impl RunLoopHandle {
+        /// Stops the observer's run loop, letting its thread run teardown.
+        ///
+        /// A method rather than a field read at the call site on purpose:
+        /// Rust 2021's disjoint capture would otherwise move the bare
+        /// pointer into the shutdown task and drop this type's `Send`.
+        fn stop(self) {
+            // SAFETY: CFRunLoopStop is thread-safe; the observer thread only
+            // exits after this call, so the run loop is alive here.
+            unsafe { CFRunLoopStop(self.0) };
+        }
+    }
 
     /// State the IOKit callback needs. Lives for the observer thread's whole
     /// life and is only touched from that thread's run loop.
@@ -301,13 +323,11 @@ mod imp {
                 // `arg` is the notification token IOKit expects back.
                 unsafe { IOAllowPowerChange(observer.root_port, arg as isize) };
             }
-            K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON => {
-                // A full-capacity channel already has a wake pending — the
-                // sync reads the clock when it runs, so coalescing is exact.
-                // DarkWake delivers this too; a redundant sync is harmless.
-                if observer.wakes.try_send(()).is_err() {
-                    debug!("host wake: sync already pending");
-                }
+            // A full channel already has a wake pending — the sync reads the
+            // clock when it runs, so coalescing is exact. DarkWake delivers
+            // this too; a redundant sync is harmless.
+            K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON if observer.wakes.try_send(()).is_err() => {
+                debug!("host wake: sync already pending");
             }
             _ => {}
         }
@@ -325,22 +345,31 @@ mod imp {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("arcbox-power".to_owned())
-            .spawn(move || run_observer(&wakes, &shutdown, &ready_tx))?;
+            .spawn(move || run_observer(&wakes, &ready_tx))?;
         // Registration happens on that thread; surface its outcome here so a
         // failure is reported by the caller rather than only logged.
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(std::io::Error::other(
-                "power observer thread exited before registering",
-            )),
-        }
+        let run_loop = match ready_rx.recv() {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::other(
+                    "power observer thread exited before registering",
+                ));
+            }
+        };
+        // Stop the run loop on shutdown rather than having it wake on a
+        // timer to check: an idle daemon must cost no periodic wakeups
+        // (ABX-517).
+        drop(tokio::spawn(async move {
+            shutdown.cancelled().await;
+            run_loop.stop();
+        }));
+        Ok(())
     }
 
     fn run_observer(
         wakes: &mpsc::Sender<()>,
-        shutdown: &CancellationToken,
-        ready: &std::sync::mpsc::Sender<std::io::Result<()>>,
+        ready: &std::sync::mpsc::Sender<std::io::Result<RunLoopHandle>>,
     ) {
         let mut port: IoNotificationPortRef = std::ptr::null_mut();
         let mut notifier: IoObjectT = 0;
@@ -373,13 +402,12 @@ mod imp {
         let run_loop = unsafe { CFRunLoopGetCurrent() };
         // SAFETY: all three handles are valid and belong to this thread.
         unsafe { CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode) };
-        let _ = ready.send(Ok(()));
+        let _ = ready.send(Ok(RunLoopHandle(run_loop)));
 
-        while !shutdown.is_cancelled() {
-            // SAFETY: running this thread's own run loop; the callback fires
-            // from inside and only touches `observer`.
-            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, RUN_LOOP_TICK_SECS, 0) };
-        }
+        // Parks until `CFRunLoopStop` runs on shutdown. The callback fires
+        // from inside, on this thread, and only touches `observer`.
+        // SAFETY: running this thread's own run loop.
+        unsafe { CFRunLoopRun() };
 
         // Teardown order is load-bearing: stop delivery (deregister + detach
         // the source) before the port and the callback's context go away, or
