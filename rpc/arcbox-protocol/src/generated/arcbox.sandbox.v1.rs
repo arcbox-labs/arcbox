@@ -1613,8 +1613,8 @@ pub struct BuildTemplateRequest {
     pub labels:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// Also boot the built rootfs once and checkpoint it at READY, so the
-    /// template carries a warm snapshot (requires CORE-16; ignored for
-    /// `snapshot_id` sources, which are warm by construction).
+    /// template carries a warm snapshot (ignored for `snapshot_id` sources,
+    /// which are warm by construction).
     #[prost(bool, tag = "7")]
     pub prewarm: bool,
     /// What to build the rootfs from.
