@@ -150,15 +150,25 @@ This file is only the non-obvious operational knowledge.
 4. Add a method on `AgentClient` (`app/arcbox-core/src/agent_client.rs`) that
    buffa-encodes and frames the message via `rpc_call`.
 
-**EXCEPTION — the sandbox family (`Sandbox*`/`Template*` message types)**
-skips steps 1 and 3's codec half: its messages live in the
-`arcbox/sandbox/v1` protos (not `agent.proto`), and
-`MessageType::is_sandbox_request()` routes the whole family to
-`handle_sandbox_message` (`guest/arcbox-agent/src/agent/linux/sandbox.rs`)
-*before* the `rpc.rs` codec, which therefore has no arms for it. A new
-sandbox-family message needs: the proto (all three build-script arrays),
-the `MessageType` variant + `is_sandbox_request()` arm, a
+**EXCEPTION — the sandbox family (every `MessageType` for which
+`is_sandbox_request()` is true: the `Sandbox*` types incl. the
+`SandboxTemplate*` catalog types, plus `WatchSandboxCleanupRequest`)**
+skips step 3's codec half: `MessageType::is_sandbox_request()` routes the
+whole family to `handle_sandbox_message`
+(`guest/arcbox-agent/src/agent/linux/sandbox.rs`) *before* the `rpc.rs`
+codec, which therefore has no arms for it. Step 1's proto file splits by
+audience: messages of the public sandbox API live in the
+`arcbox/sandbox/v1` protos (all three build-script arrays), while
+host↔guest-internal control frames (`SandboxPortForwardRequest`,
+`SandboxCleanupTicket`, `SandboxResumeCommand`, …) stay in `agent.proto` —
+never expose an internal frame through the public schema. A new
+sandbox-family message needs: the proto (in the right file per that
+split), the `MessageType` variant + `is_sandbox_request()` arm, a
 `handle_sandbox_message` dispatch arm, and the `AgentClient` method.
+`MachineExecRequest` is the one other codec bypass: streaming multi-frame
+handlers dispatch before `parse_request`
+(`guest/arcbox-agent/src/agent/linux/rpc.rs`), so it has no `rpc.rs` arms
+either.
 
 **Change the wire contract / add a meaning-bearing field:**
 - Bump `AGENT_PROTOCOL_VERSION` (and `MIN_AGENT_PROTOCOL_VERSION` if dropping
