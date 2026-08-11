@@ -19,21 +19,10 @@ modules:
     name: buf.build/arcboxlabs/sandbox
     includes:
       - arcbox/sandbox/v1
+# No exemptions: the sandbox API shipped in the public SDKs (npm
+# `@arcbox/sandbox`, PyPI `arcbox`) with the CORE-107 template catalog as
+# its final surface, so `arcbox.sandbox.v1` is additive-only from here —
+# like every other proto in the repository.
 breaking:
   use:
     - FILE
-  ignore:
-    # Pre-release surface being redesigned contract-first under CORE-52
-    # (Sandbox SDK); CORE-54/55/56/57 intentionally break it. Remove this
-    # exemption once the sandbox API ships in a public SDK.
-    - arcbox/sandbox/v1
-    # The flat file this replaced (CORE-57 moved it into the package
-    # directory above). Kept so the gate does not read its deletion as a
-    # break; drop it once master no longer has it.
-    - sandbox.proto
-    # Never files in this repo: with the single pre-split module, buf
-    # materialized the well-known types as image files, and the module
-    # split above stops doing so — which the gate would otherwise read as
-    # deleting them. Drop once master carries the split config.
-    - google/protobuf/empty.proto
-    - google/protobuf/timestamp.proto

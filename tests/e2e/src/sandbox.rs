@@ -20,17 +20,21 @@ use arcbox_grpc::sandbox_v1::sandbox_filesystem_service_client::SandboxFilesyste
 use arcbox_grpc::sandbox_v1::sandbox_process_service_client::SandboxProcessServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_service_client::SandboxServiceClient;
 use arcbox_grpc::sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
+use arcbox_grpc::sandbox_v1::template_service_client::TemplateServiceClient;
 use arcbox_protocol::sandbox_v1::{
-    AttachExecutionRequest, CheckpointRequest, CreateSandboxRequest, Execution, ExecutionEvent,
+    AttachExecutionRequest, BuildTemplateRequest, CheckpointRequest, CommandProbe,
+    CreateSandboxRequest, DeleteSnapshotRequest, DeleteTemplateRequest, Execution, ExecutionEvent,
     ExecutionState, FileChunk, FileKind, FsEventKind, GetCapabilitiesRequest,
-    GetStdinStatusRequest, IdleAction, InspectSandboxRequest, ListDirRequest,
-    ListExecutionsRequest, ListSandboxesRequest, MakeDirRequest, MoveEntryRequest,
-    PauseSandboxRequest, ReadFileRequest, RemoveEntryRequest, RemoveSandboxRequest, ResourceLimits,
-    RestoreRequest, ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest, SandboxState,
+    GetStdinStatusRequest, GetTemplateRequest, IdleAction, InspectSandboxRequest, ListDirRequest,
+    ListExecutionsRequest, ListSandboxesRequest, ListSnapshotsRequest, ListTemplatesRequest,
+    MakeDirRequest, MoveEntryRequest, PauseSandboxRequest, PublishTemplateRequest, ReadFileRequest,
+    ReadyProbe, RemoveEntryRequest, RemoveSandboxRequest, ResourceLimits, RestoreRequest,
+    ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest, SandboxState,
     SetLifecycleRequest, Signal, SignalExecutionRequest, StartExecutionRequest, StatFileRequest,
-    StdioChannel, StopSandboxRequest, WaitExecutionRequest, WaitForPortRequest, WatchDirRequest,
-    WatchEventsResponse, WriteFileOpen, WriteFileRequest, WriteStdinRequest, execution_event,
-    exit_status, watch_dir_response, watch_events_response, write_file_request,
+    StdioChannel, StopSandboxRequest, TemplateDefaults, WaitExecutionRequest, WaitForPortRequest,
+    WatchDirRequest, WatchEventsResponse, WriteFileOpen, WriteFileRequest, WriteStdinRequest,
+    build_template_request, execution_event, exit_status, ready_probe, watch_dir_response,
+    watch_events_response, write_file_request,
 };
 use tonic::transport::Channel;
 use tracing::{info, warn};
@@ -282,6 +286,7 @@ async fn drive_sandboxes(
     let mut sandboxes = SandboxServiceClient::new(channel.clone());
     let mut processes = SandboxProcessServiceClient::new(channel.clone());
     let mut files = SandboxFilesystemServiceClient::new(channel.clone());
+    let mut templates = TemplateServiceClient::new(channel.clone());
     let mut snapshots = SandboxSnapshotServiceClient::new(channel);
 
     // -- Create (with an initial cmd, exercising the auto-run path) --------
@@ -379,6 +384,17 @@ async fn drive_sandboxes(
         "sandbox_docker_template",
         template_started.elapsed().as_secs_f64(),
     );
+
+    // -- CORE-107: the template catalog end-to-end -------------------------
+    template_catalog_scenario(
+        &mut sandboxes,
+        &mut processes,
+        &mut files,
+        &mut snapshots,
+        &mut templates,
+        metrics,
+    )
+    .await?;
 
     // -- File round-trip ------------------------------------------------
     let file_started = Instant::now();
@@ -686,6 +702,527 @@ async fn sandbox_from_docker_template(
         bail!("template sandbox is not running the pulled image: {os_release:?}");
     }
     info!("docker template resolved and booted inside the guest");
+    Ok(())
+}
+
+/// CORE-107 acceptance: the template catalog end-to-end.
+///
+/// Covers all three Build sources — a Dockerfile built in-guest (publish →
+/// create by bare name, with the template's default cmd/env observable from
+/// inside the guest), a checkpoint promotion (whose create must restore the
+/// checkpoint's MEMORY image), and a docker ref with `prewarm` (whose
+/// creates must share one boot) — plus both ready-probe outcomes and
+/// deletion down to an empty catalog.
+///
+/// Warm-vs-cold discriminators, chosen because a warm-restore failure
+/// silently falls back to a cold boot that also reaches READY:
+/// - `/run` is tmpfs in the sandbox guest (`vm-agent` mount table), so a
+///   marker written there exists only in guest memory. The sandbox created
+///   from the promoted template can carry it only by restoring the
+///   checkpoint's memory image — a cold boot from the template rootfs
+///   (which does carry the checkpoint's DISK state) loses it.
+/// - The boot-time `/etc/resolv.conf` write (into the `/run` tmpfs) carries
+///   a nanosecond mtime minted once in the prewarm BUILDER, so two creates
+///   report the SAME stamp iff both restored the builder's memory image;
+///   cold boots each write their own. NOT `boot_id`: the kernel mints
+///   `/proc/sys/kernel/random/boot_id` lazily on first read, which nothing
+///   in the cmd-less builder ever did, so every restored clone would mint
+///   a fresh one and read as a cold boot.
+async fn template_catalog_scenario(
+    sandboxes: &mut SandboxServiceClient<Channel>,
+    processes: &mut SandboxProcessServiceClient<Channel>,
+    files: &mut SandboxFilesystemServiceClient<Channel>,
+    snapshots: &mut SandboxSnapshotServiceClient<Channel>,
+    templates: &mut TemplateServiceClient<Channel>,
+    metrics: &mut RunMetrics,
+) -> Result<()> {
+    let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
+    let geometry = ResourceLimits {
+        vcpus: 1,
+        memory_mib: 256,
+    };
+
+    // -- Build (Dockerfile source) -----------------------------------------
+    // The base image is already in the guest docker store (pulled by the
+    // docker-template phase), so the in-guest build needs no registry.
+    let build_started = Instant::now();
+    let dockerfile = format!("FROM {image}\nRUN echo dockerfile-built > /template-mark\n");
+    let draft = templates
+        .build(with_machine(BuildTemplateRequest {
+            name: "smoke-web".into(),
+            source: Some(build_template_request::Source::Dockerfile(dockerfile)),
+            defaults: Some(TemplateDefaults {
+                limits: Some(geometry),
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo \"$SMOKE_TEMPLATE_ENV\" > /run/tpl-env".into(),
+                ],
+                env: [("SMOKE_TEMPLATE_ENV".to_owned(), "from-template".to_owned())].into(),
+                ..Default::default()
+            }),
+            labels: [("suite".to_owned(), "smoke".to_owned())].into(),
+            ..Default::default()
+        }))
+        .await
+        .context("template Build (dockerfile) failed")?
+        .into_inner();
+    if !draft.version.is_empty() || draft.digest.is_empty() {
+        bail!(
+            "Build must register a digested draft, got version={:?} digest={:?}",
+            draft.version,
+            draft.digest
+        );
+    }
+    metrics.record("template_build", build_started.elapsed().as_secs_f64());
+    info!(digest = %draft.digest, "template draft built from a Dockerfile in-guest");
+
+    // -- Publish -----------------------------------------------------------
+    let publish_started = Instant::now();
+    let published = templates
+        .publish(with_machine(PublishTemplateRequest {
+            name: "smoke-web".into(),
+            version: "1.0".into(),
+        }))
+        .await
+        .context("template Publish failed")?
+        .into_inner();
+    if published.version != "1.0" || published.digest != draft.digest {
+        bail!(
+            "Publish must freeze the draft digest as 1.0, got version={:?} digest={:?}",
+            published.version,
+            published.digest
+        );
+    }
+    metrics.record("template_publish", publish_started.elapsed().as_secs_f64());
+
+    // -- Create by bare name; defaults observable in the guest -------------
+    let create_started = Instant::now();
+    let got = templates
+        .get(with_machine(GetTemplateRequest {
+            reference: "smoke-web".into(),
+        }))
+        .await
+        .context("template Get failed")?
+        .into_inner();
+    if got.version != "1.0" {
+        bail!(
+            "bare-name Get must resolve the published version, got {:?}",
+            got.version
+        );
+    }
+    sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-tpl".into(),
+            template: "smoke-web".into(),
+            // No limits and no cmd: both must come from the template.
+            ..Default::default()
+        }))
+        .await
+        .context("Create from the published template failed")?;
+    wait_for_state(
+        sandboxes,
+        "smoke-tpl",
+        SandboxState::Ready,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
+    // The template's default cmd (running under its default env) may still
+    // be racing the readiness flip; poll for its artifact.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let out = run_and_collect(
+            processes,
+            "smoke-tpl",
+            &[
+                "/bin/sh",
+                "-c",
+                "cat /run/tpl-env 2>/dev/null; cat /template-mark",
+            ],
+        )
+        .await?;
+        if out.contains("from-template") && out.contains("dockerfile-built") {
+            break;
+        }
+        if Instant::now() > deadline {
+            bail!("template defaults not observable in the guest: {out:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    metrics.record("template_create", create_started.elapsed().as_secs_f64());
+    info!("bare-name create resolved the published version and applied its default cmd + env");
+
+    // A miss must classify as the TEMPLATE_NOT_FOUND surface, not a
+    // generic failure.
+    match sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-tpl-missing".into(),
+            template: "smoke-no-such".into(),
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(_) => bail!("Create from a missing template must fail"),
+        Err(status) => {
+            if status.code() != tonic::Code::NotFound
+                || !status.message().contains("template not found")
+            {
+                bail!("missing template must be NotFound/'template not found', got {status:?}");
+            }
+        }
+    }
+
+    // -- Promotion → warm restore ------------------------------------------
+    let promote_started = Instant::now();
+    run_and_collect(
+        processes,
+        "smoke-tpl",
+        &["/bin/sh", "-c", "echo warm > /run/smoke-warm-marker"],
+    )
+    .await?;
+    wait_ready(sandboxes, "smoke-tpl").await?;
+    let snapshot_id = snapshots
+        .checkpoint(with_machine(CheckpointRequest {
+            sandbox_id: "smoke-tpl".into(),
+            name: "template-source".into(),
+            ..Default::default()
+        }))
+        .await
+        .context("Checkpoint for promotion failed")?
+        .into_inner()
+        .snapshot_id;
+    let warm_tpl = templates
+        .build(with_machine(BuildTemplateRequest {
+            name: "smoke-warm".into(),
+            source: Some(build_template_request::Source::SnapshotId(
+                snapshot_id.clone(),
+            )),
+            defaults: Some(TemplateDefaults {
+                // Must match the checkpoint's geometry (inherited from
+                // smoke-web) or the restore is ineligible — which the
+                // marker assertion below would catch as a cold boot.
+                limits: Some(geometry),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .context("template Build (snapshot promotion) failed")?
+        .into_inner();
+    if warm_tpl.warm_snapshot_id.is_empty() {
+        bail!("promotion must record a warm snapshot");
+    }
+    if warm_tpl.warm_snapshot_id == snapshot_id {
+        bail!("promotion must copy the checkpoint, not alias it");
+    }
+
+    // The template-owned snapshot is not a user checkpoint: hidden from
+    // the listing and shielded from user deletion while referenced.
+    let listed = snapshots
+        .list_snapshots(with_machine(ListSnapshotsRequest::default()))
+        .await
+        .context("ListSnapshots failed")?
+        .into_inner();
+    let ids: Vec<&str> = listed.snapshots.iter().map(|s| s.id.as_str()).collect();
+    if !ids.contains(&snapshot_id.as_str()) {
+        bail!("the user checkpoint must stay listed, got {ids:?}");
+    }
+    if ids.contains(&warm_tpl.warm_snapshot_id.as_str()) {
+        bail!("the template-owned snapshot must be hidden from the listing");
+    }
+    if snapshots
+        .delete_snapshot(with_machine(DeleteSnapshotRequest {
+            snapshot_id: warm_tpl.warm_snapshot_id.clone(),
+        }))
+        .await
+        .is_ok()
+    {
+        bail!("deleting a template-owned snapshot must be refused");
+    }
+
+    // The source sandbox is no longer needed; the template must outlive it.
+    sandboxes
+        .remove(with_machine(RemoveSandboxRequest {
+            id: "smoke-tpl".into(),
+            force: true,
+        }))
+        .await
+        .context("Remove smoke-tpl failed")?;
+
+    sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-warm1".into(),
+            template: "smoke-warm".into(),
+            ..Default::default()
+        }))
+        .await
+        .context("Create from the promoted template failed")?;
+    wait_for_state(
+        sandboxes,
+        "smoke-warm1",
+        SandboxState::Ready,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
+    let marker = run_and_collect(
+        processes,
+        "smoke-warm1",
+        &[
+            "/bin/sh",
+            "-c",
+            "cat /run/smoke-warm-marker 2>/dev/null || echo MISSING",
+        ],
+    )
+    .await?;
+    if !marker.contains("warm") || marker.contains("MISSING") {
+        bail!(
+            "tmpfs marker absent — the create cold-booted instead of restoring \
+             the promoted checkpoint's memory image: {marker:?}"
+        );
+    }
+    sandboxes
+        .remove(with_machine(RemoveSandboxRequest {
+            id: "smoke-warm1".into(),
+            force: true,
+        }))
+        .await
+        .context("Remove smoke-warm1 failed")?;
+    metrics.record(
+        "template_promote_warm",
+        promote_started.elapsed().as_secs_f64(),
+    );
+    info!("promoted template restored the checkpoint's memory image");
+
+    // -- Prewarm at build time ---------------------------------------------
+    let prewarm_started = Instant::now();
+    let prewarmed = templates
+        .build(with_machine(BuildTemplateRequest {
+            name: "smoke-prewarm".into(),
+            source: Some(build_template_request::Source::DockerRef(image.clone())),
+            defaults: Some(TemplateDefaults {
+                limits: Some(geometry),
+                ..Default::default()
+            }),
+            prewarm: true,
+            ..Default::default()
+        }))
+        .await
+        .context("template Build (prewarm) failed")?
+        .into_inner();
+    if prewarmed.warm_snapshot_id.is_empty() {
+        bail!("a prewarm build must record a warm snapshot");
+    }
+    // Warm-vs-cold discriminator: the boot-time write of /etc/resolv.conf
+    // (a symlink into the /run tmpfs; invariant-network restores never
+    // rewrite it) carries a nanosecond mtime minted once in the BUILDER.
+    // Both clones restore that memory+tmpfs image, so their stamps are
+    // identical; cold boots each write their own. NOT boot_id — the
+    // kernel mints /proc/sys/kernel/random/boot_id lazily on first read,
+    // which nothing in the cmd-less builder ever did, so every clone
+    // would mint a fresh one and read as a cold boot.
+    let mut stamps = Vec::new();
+    for id in ["smoke-prewarm1", "smoke-prewarm2"] {
+        sandboxes
+            .create(with_machine(CreateSandboxRequest {
+                id: id.into(),
+                template: "smoke-prewarm".into(),
+                ..Default::default()
+            }))
+            .await
+            .with_context(|| format!("Create {id} from the prewarmed template failed"))?;
+        wait_for_state(sandboxes, id, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
+        stamps.push(
+            run_and_collect(
+                processes,
+                id,
+                &["/bin/stat", "-c", "%y", "/etc/resolv.conf"],
+            )
+            .await?
+            .trim()
+            .to_owned(),
+        );
+        sandboxes
+            .remove(with_machine(RemoveSandboxRequest {
+                id: id.into(),
+                force: true,
+            }))
+            .await
+            .with_context(|| format!("Remove {id} failed"))?;
+    }
+    // Sub-second precision is what makes stamp equality meaningful; a
+    // seconds-only stat would risk a false pass, so fail loudly instead.
+    if !stamps[0].contains('.') {
+        bail!("resolv.conf stamp has no sub-second precision: {stamps:?}");
+    }
+    if stamps[0] != stamps[1] {
+        bail!(
+            "prewarmed creates must share the builder's boot image (memory \
+             restore), got distinct resolv.conf stamps {stamps:?}"
+        );
+    }
+    metrics.record("template_prewarm", prewarm_started.elapsed().as_secs_f64());
+    info!("both prewarmed creates restored the builder's memory image");
+
+    // -- Ready probes: command form gates READY, port form fails on expiry --
+    let probe_started = Instant::now();
+    templates
+        .build(with_machine(BuildTemplateRequest {
+            name: "smoke-probe".into(),
+            source: Some(build_template_request::Source::DockerRef(image.clone())),
+            defaults: Some(TemplateDefaults {
+                limits: Some(geometry),
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep 2; touch /run/probe-up; sleep 300".into(),
+                ],
+                ready_probe: Some(ReadyProbe {
+                    timeout_seconds: 60,
+                    probe: Some(ready_probe::Probe::Command(CommandProbe {
+                        cmd: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            "test -f /run/probe-up".into(),
+                        ],
+                    })),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .context("template Build (command probe) failed")?;
+    // Subscribe BEFORE the create so READY cannot be missed: the gating
+    // proof is *when* READY fires, not that a ready state is eventually
+    // reached — the cmd claims the workload slot the moment it starts,
+    // so a state poll observes Running whether or not the probe gated
+    // anything.
+    let mut probe_events = sandboxes
+        .events(with_machine(SandboxEventsRequest {
+            sandbox_id: "smoke-probe1".into(),
+            ..Default::default()
+        }))
+        .await
+        .context("probe events subscribe failed")?
+        .into_inner();
+    sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-probe1".into(),
+            template: "smoke-probe".into(),
+            ..Default::default()
+        }))
+        .await
+        .context("Create with a command probe failed")?;
+    next_event(
+        &mut probe_events,
+        SandboxEventKind::Ready,
+        None,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
+    // At the instant READY was delivered the probe must already have
+    // passed: the marker its command requires appears ~2 s into the
+    // default cmd, so a build that dropped probe gating fires READY
+    // before the marker exists and this read fails. File reads ride the
+    // vsock file channel, not the (busy) workload slot.
+    read_file(files, "smoke-probe1", "/run/probe-up")
+        .await
+        .context("READY fired before the ready probe passed (/run/probe-up missing)")?;
+    // The cmd keeps running, so the settled state is Running.
+    wait_for_state(
+        sandboxes,
+        "smoke-probe1",
+        SandboxState::Running,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
+    sandboxes
+        .remove(with_machine(RemoveSandboxRequest {
+            id: "smoke-probe1".into(),
+            force: true,
+        }))
+        .await
+        .context("Remove smoke-probe1 failed")?;
+
+    templates
+        .build(with_machine(BuildTemplateRequest {
+            name: "smoke-probe-fail".into(),
+            source: Some(build_template_request::Source::DockerRef(image.clone())),
+            defaults: Some(TemplateDefaults {
+                limits: Some(geometry),
+                cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+                ready_probe: Some(ReadyProbe {
+                    timeout_seconds: 5,
+                    // Nothing ever listens here.
+                    probe: Some(ready_probe::Probe::Port(59999)),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .context("template Build (port probe) failed")?;
+    sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-probe-fail1".into(),
+            template: "smoke-probe-fail".into(),
+            ..Default::default()
+        }))
+        .await
+        .context("Create with a doomed port probe failed")?;
+    wait_for_state(
+        sandboxes,
+        "smoke-probe-fail1",
+        SandboxState::Failed,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
+    sandboxes
+        .remove(with_machine(RemoveSandboxRequest {
+            id: "smoke-probe-fail1".into(),
+            force: true,
+        }))
+        .await
+        .context("Remove smoke-probe-fail1 failed")?;
+    metrics.record("template_probe", probe_started.elapsed().as_secs_f64());
+    info!("command probe gated READY; port probe expiry transitioned FAILED");
+
+    // -- Delete down to an empty catalog -----------------------------------
+    let delete_started = Instant::now();
+    for name in [
+        "smoke-web",
+        "smoke-warm",
+        "smoke-prewarm",
+        "smoke-probe",
+        "smoke-probe-fail",
+    ] {
+        templates
+            .delete(with_machine(DeleteTemplateRequest {
+                reference: name.into(),
+            }))
+            .await
+            .with_context(|| format!("template Delete {name} failed"))?;
+    }
+    let listed = templates
+        .list(with_machine(ListTemplatesRequest::default()))
+        .await
+        .context("template List after delete failed")?
+        .into_inner();
+    if !listed.templates.is_empty() {
+        bail!(
+            "the catalog must be empty after the deletes, got {} rows",
+            listed.templates.len()
+        );
+    }
+    // With the referencing template gone, the user checkpoint deletes
+    // normally.
+    snapshots
+        .delete_snapshot(with_machine(DeleteSnapshotRequest { snapshot_id }))
+        .await
+        .context("deleting the user checkpoint after the template delete failed")?;
+    metrics.record("template_delete", delete_started.elapsed().as_secs_f64());
+
+    info!("template catalog scenario passed");
     Ok(())
 }
 
@@ -1024,8 +1561,14 @@ async fn idle_lifecycle_scenario(
     wait_for_state(sandboxes, ID, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
 
     // No execution runs, so the 2 s idle window expires and auto-pauses.
-    next_event(&mut events, SandboxEventKind::Pausing, Some("idle_timeout")).await?;
-    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Pausing,
+        Some("idle_timeout"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
+    next_event(&mut events, SandboxEventKind::Paused, None, EVENT_TIMEOUT).await?;
     let info = inspect(sandboxes, ID).await?;
     if info.state() != SandboxState::Paused {
         bail!("expected auto-paused sandbox, got {:?}", info.state());
@@ -1044,7 +1587,13 @@ async fn idle_lifecycle_scenario(
     if !stdout.contains("idle-wake") {
         bail!("post-auto-resume exec output missing marker: {stdout:?}");
     }
-    next_event(&mut events, SandboxEventKind::Resumed, Some("auto_resume")).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Resumed,
+        Some("auto_resume"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
 
     // Disarm the idle window and re-arm the TTL from now (CORE-60). This
     // races the freshly re-armed 2 s idle timer and must land well inside
@@ -1148,8 +1697,14 @@ async fn pause_resume_scenario(
     if info.storage_bytes == 0 {
         bail!("paused sandbox must report a nonzero storage_bytes");
     }
-    next_event(&mut events, SandboxEventKind::Pausing, Some("pause")).await?;
-    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Pausing,
+        Some("pause"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
+    next_event(&mut events, SandboxEventKind::Paused, None, EVENT_TIMEOUT).await?;
     info!(storage_bytes = info.storage_bytes, "sandbox paused");
 
     // Pause is idempotent on a paused sandbox.
@@ -1194,7 +1749,13 @@ async fn pause_resume_scenario(
     if stdout.trim() != disk_marker.len().to_string() {
         bail!("disk marker size after auto-resume: {stdout:?}");
     }
-    next_event(&mut events, SandboxEventKind::Resumed, Some("auto_resume")).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Resumed,
+        Some("auto_resume"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
     wait_ready(sandboxes, "smoke1").await?;
     let back = read_file(files, "smoke1", "/pause-disk-marker.bin").await?;
     if back != disk_marker {
@@ -1216,14 +1777,20 @@ async fn pause_resume_scenario(
         }))
         .await
         .context("second Pause failed")?;
-    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    next_event(&mut events, SandboxEventKind::Paused, None, EVENT_TIMEOUT).await?;
     sandboxes
         .resume(with_machine(ResumeSandboxRequest {
             id: "smoke1".into(),
         }))
         .await
         .context("Resume failed")?;
-    next_event(&mut events, SandboxEventKind::Resumed, Some("resume")).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Resumed,
+        Some("resume"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
     // Resume is idempotent on a live sandbox.
     sandboxes
         .resume(with_machine(ResumeSandboxRequest {
@@ -1276,14 +1843,20 @@ async fn pause_resume_scenario(
     Ok(resumed_ip)
 }
 
+/// Post-boot event waits: pause/resume/idle edges on an already-booted
+/// sandbox, where a minute is generous. Waits that span a boot pass their
+/// own budget.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Scans the events stream (skipping keepalives and unrelated kinds) until
 /// `kind` arrives, asserting its "reason" attribute when specified.
 async fn next_event(
     stream: &mut tonic::Streaming<WatchEventsResponse>,
     kind: SandboxEventKind,
     reason: Option<&str>,
+    timeout: Duration,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())

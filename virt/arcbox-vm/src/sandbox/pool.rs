@@ -234,7 +234,16 @@ pub(super) async fn prepare_slot(
         .jailer
         .as_ref()
         .ok_or_else(|| VmmError::Config("restore slot pooling requires jailer isolation".into()))?;
-    let slot_id = format!("{POOL_SLOT_PREFIX}{}", Uuid::new_v4());
+    // Short suffix on purpose: the slot id becomes a jailer identity and
+    // must fit the API-socket budget (`max_sandbox_id_len`) under any
+    // configured chroot layout — internal mints bypass the ingress
+    // validator, so they keep themselves comfortably inside it. 16 hex
+    // chars keep collisions out of reach for a handful of pool slots;
+    // reconcile parses slot ids by prefix, so pre-existing full-UUID
+    // journals stay adoptable.
+    let mut suffix = Uuid::new_v4().simple().to_string();
+    suffix.truncate(16);
+    let slot_id = format!("{POOL_SLOT_PREFIX}{suffix}");
     let vm_dir = PathBuf::from(&fc_cfg.data_dir)
         .join("sandboxes")
         .join(&slot_id);

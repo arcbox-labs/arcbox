@@ -273,6 +273,13 @@ impl NetworkManager {
         Ok(allocation)
     }
 
+    /// Whether `vm_id`'s released network is still quarantined awaiting
+    /// host-side cleanup finalization (a same-id [`Self::reserve`] is
+    /// refused until then).
+    pub(crate) fn quarantine_pending(&self, vm_id: &str) -> bool {
+        self.quarantined.lock().unwrap().contains_key(vm_id)
+    }
+
     /// Reserves an IP and computes its deterministic TAP metadata without
     /// creating any host resource. Sandbox lifecycle code journals this value
     /// before calling [`Self::activate`].

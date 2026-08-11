@@ -40,6 +40,29 @@ impl SandboxManager {
             .await
     }
 
+    /// Bounded wait for the host to finalize a just-removed same-id
+    /// sandbox's network cleanup, so a cold-boot fallback can re-reserve.
+    ///
+    /// A failed warm restore unwinds with an internal force remove, which
+    /// quarantines the id's network until the host completes the cleanup
+    /// ticket — delivered over the always-open `WatchSandboxCleanup` stream
+    /// (terminal events prompt it; a 1 s rescan backstops), so this
+    /// normally resolves within a second or two. On expiry the fallback
+    /// proceeds anyway and `reserve` surfaces the honest UNAVAILABLE.
+    async fn await_network_release(&self, id: &SandboxId) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while self.network.quarantine_pending(id) {
+            if std::time::Instant::now() > deadline {
+                warn!(
+                    sandbox_id = %id,
+                    "network cleanup still awaiting host finalization; cold boot will report it"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// [`Self::create_sandbox_keyed`] with explicit warm behaviour: the
     /// prewarm builder (CORE-107) passes [`WarmPolicy::Disabled`] so its own
     /// boot neither restores from a warm source nor publishes into the
@@ -88,7 +111,7 @@ impl SandboxManager {
 
         // Restrict caller-supplied ids to a safe charset (path components,
         // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
-        super::validate_id("sandbox id", &id)?;
+        super::validate_new_sandbox_id(&id, &self.config)?;
         spec.id = Some(id.clone());
 
         // Template warm-restore (CORE-107): a catalog template carrying a
@@ -142,6 +165,7 @@ impl SandboxManager {
                         %error,
                         "template warm restore failed; cold-booting from the template rootfs"
                     );
+                    self.await_network_release(&id).await;
                 }
             }
         }
@@ -207,6 +231,7 @@ impl SandboxManager {
                                     %error,
                                     "warm restore failed; cold-booting instead"
                                 );
+                                self.await_network_release(&id).await;
                                 warm_publish = Some(super::warm::WarmPublishTicket {
                                     key,
                                     cache: Arc::clone(&self.warm),

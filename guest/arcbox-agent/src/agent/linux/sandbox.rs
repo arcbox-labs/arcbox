@@ -353,7 +353,14 @@ where
                     return Ok(());
                 }
             };
-            let _operation = svc.lock_operation(&ticket.id).await;
+            // Deliberately NOT under the per-sandbox operation lock: the
+            // handshake is generation-guarded by the ticket token (a stale
+            // ticket fails 404/412, which the host treats as obsolete), and
+            // a same-id create legitimately HOLDS the operation lock while
+            // awaiting this very finalization — the warm-restore
+            // probe-failure fallback removes its sandbox and then waits for
+            // the network quarantine to clear. Taking the lock here
+            // deadlocked that fallback (CORE-107 e2e).
             match svc.prepare_cleanup(&ticket).await {
                 Ok(_) => {
                     write_message(
@@ -380,7 +387,9 @@ where
                     return Ok(());
                 }
             };
-            let _operation = svc.lock_operation(&ticket.id).await;
+            // No operation lock, same reason as the Prepare arm above: the
+            // token CAS is the guard, and a create awaiting quarantine
+            // release holds the lock this would need.
             let result = async {
                 let sandbox_ip = svc.prepare_cleanup(&ticket).await?;
                 if ticket.startup {

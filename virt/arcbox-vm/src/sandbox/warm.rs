@@ -267,16 +267,19 @@ pub(super) struct WarmPublishTicket {
     pub(super) pool: Arc<super::pool::SlotPool>,
 }
 
-/// Publish the warm snapshot for a freshly Ready, still-idle sandbox.
+/// Publish the warm snapshot for a freshly booted, still-idle sandbox.
 ///
 /// Single-flighted per key, and every failure is a warn — cache population
-/// must never fail a healthy boot.
+/// must never fail a healthy boot. `expected_state` is what the boot tail
+/// left the instance in: `Ready` for a cmd-less boot, `Starting` when the
+/// tail is still holding the workload slot for the initial cmd.
 pub(super) async fn publish_after_boot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
     instances: &super::InstanceMap,
     config: &VmmConfig,
     cow_manager: &CowManager,
+    expected_state: SandboxState,
 ) {
     if !ticket.cache.begin_publish(&ticket.key) {
         debug!(
@@ -286,7 +289,15 @@ pub(super) async fn publish_after_boot(
         return;
     }
     let started = std::time::Instant::now();
-    let published = publish_warm_snapshot(sandbox_id, ticket, instances, config, cow_manager).await;
+    let published = publish_warm_snapshot(
+        sandbox_id,
+        ticket,
+        instances,
+        config,
+        cow_manager,
+        expected_state,
+    )
+    .await;
     ticket.cache.end_publish(&ticket.key);
     match published {
         Ok(Some(snapshot_id)) => {
@@ -316,6 +327,7 @@ async fn publish_warm_snapshot(
     instances: &super::InstanceMap,
     config: &VmmConfig,
     cow_manager: &CowManager,
+    expected_state: SandboxState,
 ) -> Result<Option<String>> {
     // A concurrent first-create may have published while this guest booted.
     if warm_entries(&ticket.snapshots)?
@@ -335,7 +347,7 @@ async fn publish_warm_snapshot(
         super::checkpoint::CheckpointRequest {
             name,
             labels,
-            expected_state: SandboxState::Ready,
+            expected_state,
             resume_after: true,
         },
     )
