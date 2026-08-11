@@ -37,10 +37,10 @@ tokio-util = "0.7"
 arcbox-docker-tools.workspace = true
 filetime = "0.2.29"
 arcbox-transport.workspace = true
-connectrpc = { version = "0.8.1", features = ["axum"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1", features = ["axum"] }
 hyper-util = { version = "0.1.20", features = ["server", "server-auto", "server-graceful", "tokio", "http1", "http2", "service"] }
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
-connectrpc-reflection = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", version = "0.8.0" }
+connectrpc-reflection = { package = "arcbox-connectrpc-reflection", version = "0.9.0-arcbox.1" }
 arcbox-connect.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -65,7 +65,7 @@ workspace = true
 [dev-dependencies]
 arcbox-grpc.workspace = true
 arcbox-protocol.workspace = true
-connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec", features = ["client"] }
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1", features = ["client"] }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
