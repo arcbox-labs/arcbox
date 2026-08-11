@@ -132,6 +132,27 @@ generated file, the guest handler (4), and the host caller (5): the
 `MessageType` variant (2) and the `rpc.rs` parse/`message_type`/`encode_payload`
 arms (3) already exist — do not duplicate them.
 
+**EXCEPTION — the sandbox family (every `MessageType` for which
+`is_sandbox_request()` is true: the `Sandbox*` types incl. the
+`SandboxTemplate*` catalog types, plus `WatchSandboxCleanupRequest`)**
+replaces steps 3 and 4: `MessageType::is_sandbox_request()` routes the
+whole family to `handle_sandbox_message` (`agent/linux/sandbox.rs`)
+*before* the `rpc.rs` codec — do not add `rpc.rs` arms for it. Step 1's
+proto file splits by audience: public sandbox API messages live in the
+`arcbox/sandbox/v1` protos (all three build-script arrays, see
+`rpc/AGENTS.md`); host↔guest-internal control frames
+(`SandboxPortForwardRequest`, `SandboxCleanupTicket`,
+`SandboxResumeCommand`, …) stay in `agent.proto` — never expose an
+internal frame through the public schema. A new sandbox-family message
+needs: the proto (in the right file per that split), the `MessageType`
+variant + `is_sandbox_request()` arm, a `handle_sandbox_message` dispatch
+arm, and the `AgentClient` method. `MachineExecRequest` is the one other
+codec bypass: dispatched by name before `parse_request`
+(`agent/linux/rpc.rs`), so it has no `rpc.rs` arms either. Streaming
+alone does not waive step 3 — `WatchReadiness`/`WatchStats`/
+`WatchMemoryPressure` stream too and keep their codec arms (step 4's
+`handle_watch_readiness` pattern).
+
 Then run the `buf` breaking check, decide whether the change alters existing
 message *meaning* (if so, bump `AGENT_PROTOCOL_VERSION`), and add a test on the
 real request path — not just a leaf helper.
