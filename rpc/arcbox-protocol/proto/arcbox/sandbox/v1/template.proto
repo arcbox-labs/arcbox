@@ -23,10 +23,11 @@ import "google/protobuf/timestamp.proto";
 
 // TemplateService manages the template catalog. Control plane.
 //
-// Contract-only in CORE-58 phase 1: the daemon answers UNIMPLEMENTED
-// until the catalog lands with CORE-21. Build additionally depends on the
-// rootfs pipeline (CORE-5) and, for pre-warmed snapshots, FC 1.16
-// network overrides (CORE-16).
+// Served as of CORE-107: every RPC below is implemented, all three Build
+// sources work, and `CreateSandboxRequest.template` resolves
+// `name[:version]` against the catalog. Clients that also talk to older
+// daemons feature-detect on the `templates` flag in `SANDBOX_FEATURES`
+// rather than on this service existing.
 service TemplateService {
     // Build a template from a source and register it in the catalog.
     // Blocks until the build completes; a streaming progress variant can
@@ -141,8 +142,8 @@ message BuildTemplateRequest {
     // Labels for the template.
     map<string, string> labels = 6;
     // Also boot the built rootfs once and checkpoint it at READY, so the
-    // template carries a warm snapshot (requires CORE-16; ignored for
-    // `snapshot_id` sources, which are warm by construction).
+    // template carries a warm snapshot (ignored for `snapshot_id` sources,
+    // which are warm by construction).
     bool prewarm = 7;
 }
 
