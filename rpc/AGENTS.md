@@ -165,10 +165,11 @@ never expose an internal frame through the public schema. A new
 sandbox-family message needs: the proto (in the right file per that
 split), the `MessageType` variant + `is_sandbox_request()` arm, a
 `handle_sandbox_message` dispatch arm, and the `AgentClient` method.
-`MachineExecRequest` is the one other codec bypass: streaming multi-frame
-handlers dispatch before `parse_request`
-(`guest/arcbox-agent/src/agent/linux/rpc.rs`), so it has no `rpc.rs` arms
-either.
+`MachineExecRequest` is the one other codec bypass: it is dispatched by
+name before `parse_request` (`guest/arcbox-agent/src/agent/linux/rpc.rs`),
+so it has no `rpc.rs` arms either. Streaming alone does not waive the
+codec — `WatchReadiness`/`WatchStats`/`WatchMemoryPressure` stream too and
+keep their `rpc.rs` arms.
 
 **Change the wire contract / add a meaning-bearing field:**
 - Bump `AGENT_PROTOCOL_VERSION` (and `MIN_AGENT_PROTOCOL_VERSION` if dropping

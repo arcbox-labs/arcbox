@@ -146,9 +146,12 @@ proto file splits by audience: public sandbox API messages live in the
 internal frame through the public schema. A new sandbox-family message
 needs: the proto (in the right file per that split), the `MessageType`
 variant + `is_sandbox_request()` arm, a `handle_sandbox_message` dispatch
-arm, and the `AgentClient` method. `MachineExecRequest` bypasses the
-codec the same way (streaming multi-frame handler dispatched before
-`parse_request`, `agent/linux/rpc.rs`) — it has no `rpc.rs` arms either.
+arm, and the `AgentClient` method. `MachineExecRequest` is the one other
+codec bypass: dispatched by name before `parse_request`
+(`agent/linux/rpc.rs`), so it has no `rpc.rs` arms either. Streaming
+alone does not waive step 3 — `WatchReadiness`/`WatchStats`/
+`WatchMemoryPressure` stream too and keep their codec arms (step 4's
+`handle_watch_readiness` pattern).
 
 Then run the `buf` breaking check, decide whether the change alters existing
 message *meaning* (if so, bump `AGENT_PROTOCOL_VERSION`), and add a test on the
