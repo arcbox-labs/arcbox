@@ -8,7 +8,7 @@
 
 /// A Dockerfile embedded in the binary.
 pub struct Template {
-    /// Name used by `--from-template` and `sandbox templates`.
+    /// Name used by `--from-preset` and `sandbox presets`.
     pub name: &'static str,
     /// One-line summary shown when listing.
     pub description: &'static str,

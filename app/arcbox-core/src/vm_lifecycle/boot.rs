@@ -209,30 +209,12 @@ impl LifecycleShared {
     /// the guest clock stays at the kernel default epoch and every TLS
     /// handshake fails certificate validity checks. Best effort: a failed
     /// sync only warns (readiness already proved the agent reachable, and
-    /// the guest can also be synced by any later ping).
+    /// the guest can also be synced by any later ping — the daemon's wake
+    /// observer re-syncs after every host sleep, ABX-518).
     async fn sync_guest_clock(&self) {
-        let machine_manager = self.machine_manager.clone();
-        let machine_name = self.machine_name.clone();
-        // `connect_agent` yields a blocking transport on the HV AF_UNIX
-        // socketpair and an async one on AF_VSOCK (VZ) / Linux; ping over
-        // whichever the client actually has.
-        let connected =
-            tokio::task::spawn_blocking(move || machine_manager.connect_agent(&machine_name)).await;
-        let result = match connected {
-            Ok(Ok(mut agent)) => {
-                if agent.is_blocking() {
-                    tokio::task::spawn_blocking(move || agent.ping_blocking().map(|_| ()))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(CoreError::Vm(format!("clock sync task panicked: {e}")))
-                        })
-                } else {
-                    agent.ping().await.map(|_| ())
-                }
-            }
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(CoreError::Vm(format!("clock sync task panicked: {e}"))),
-        };
+        let result = Arc::clone(&self.machine_manager)
+            .ping_agent(self.machine_name.clone())
+            .await;
         match result {
             Ok(()) => tracing::info!("guest wall clock synced from host"),
             Err(e) => tracing::warn!(error = %e, "guest clock sync ping failed"),

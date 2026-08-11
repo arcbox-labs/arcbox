@@ -27,6 +27,7 @@ import {
   SandboxState as SandboxStateProto,
 } from "./gen/arcbox/sandbox/v1/sandbox_pb";
 import { SandboxSnapshotService } from "./gen/arcbox/sandbox/v1/snapshot_pb";
+import type { Template } from "./templates";
 import type { ClientContext } from "./transport";
 import { createClientContext, unaryOptions } from "./transport";
 import type {
@@ -69,8 +70,16 @@ export interface CreateSandboxOptions {
   memoryMib?: number;
   /** Initial command launched after boot; its exit returns the sandbox to READY. */
   cmd?: string[];
+  /**
+   * Explicitly run NO initial command, suppressing a catalog template's
+   * default cmd (proto3 cannot distinguish omitted from empty). Rejected
+   * when combined with a non-empty `cmd`.
+   */
+  noDefaultCmd?: boolean;
   /** Environment for the initial command, merged over the template's env. */
   env?: Record<string, string>;
+  /** Discard the catalog template's default env instead of merging it. */
+  noDefaultEnv?: boolean;
   /** Labels for filtering in list/events. */
   labels?: Record<string, string>;
   /** `false` disables networking entirely (no network device). */
@@ -241,9 +250,11 @@ export class ArcBox {
    * idempotent.
    */
   async create(
-    template = "",
+    template: string | Template = "",
     opts: CreateSandboxOptions = {},
   ): Promise<Sandbox> {
+    const templateRef =
+      typeof template === "string" ? template : template.reference;
     const id = crypto.randomUUID();
     const abort = new AbortController();
     try {
@@ -262,10 +273,12 @@ export class ArcBox {
       await this.#client.create(
         {
           id,
-          template,
+          template: templateRef,
           labels: opts.labels ?? {},
           cmd: opts.cmd ?? [],
+          noDefaultCmd: opts.noDefaultCmd ?? false,
           env: opts.env ?? {},
+          noDefaultEnv: opts.noDefaultEnv ?? false,
           ...((opts.vcpus !== undefined || opts.memoryMib !== undefined) && {
             limits: {
               vcpus: opts.vcpus ?? 0,
@@ -654,7 +667,7 @@ export class Sandbox {
   /** Create a sandbox against the default (or given) connection. */
   static create(
     this: void,
-    template = "",
+    template: string | Template = "",
     opts: CreateSandboxOptions = {},
   ): Promise<Sandbox> {
     return new ArcBox(opts.connection).create(template, opts);

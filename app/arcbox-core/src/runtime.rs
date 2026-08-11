@@ -549,6 +549,28 @@ impl Runtime {
         self.vm_lifecycle.subscribe_state()
     }
 
+    /// Re-syncs the System VM's wall clock from the host.
+    ///
+    /// The agent applies the ping's `timestamp_secs` via `clock_settime`, so
+    /// a bare ping is the sync. Neither backend steps the guest clock across
+    /// a host sleep — the guest drifts by the accumulated sleep time — so
+    /// the daemon's power observer calls this on every wake (ABX-518).
+    ///
+    /// Returns `false` without pinging when the VM is not ready (nothing to
+    /// sync; the boot path sets the clock on the next readiness).
+    ///
+    /// # Errors
+    /// Returns an error if the agent is unreachable or the ping fails.
+    pub async fn sync_system_vm_clock(&self) -> Result<bool> {
+        if !self.vm_lifecycle.subscribe_state().borrow().is_ready() {
+            return Ok(false);
+        }
+        Arc::clone(&self.machine_manager)
+            .ping_agent(DEFAULT_MACHINE_NAME.to_string())
+            .await?;
+        Ok(true)
+    }
+
     /// Returns the guest dockerd vsock port for the System VM.
     #[must_use]
     pub const fn system_vm_docker_vsock_port(&self) -> u32 {
