@@ -24,17 +24,17 @@ use arcbox_grpc::sandbox_v1::template_service_client::TemplateServiceClient;
 use arcbox_protocol::sandbox_v1::{
     AttachExecutionRequest, BuildTemplateRequest, CheckpointRequest, CommandProbe,
     CreateSandboxRequest, DeleteSnapshotRequest, DeleteTemplateRequest, Execution, ExecutionEvent,
-    ExecutionState, FileChunk, FileKind, FsEventKind, GetCapabilitiesRequest,
+    ExecutionState, ExposePortRequest, FileChunk, FileKind, FsEventKind, GetCapabilitiesRequest,
     GetStdinStatusRequest, GetTemplateRequest, IdleAction, InspectSandboxRequest, ListDirRequest,
-    ListExecutionsRequest, ListSandboxesRequest, ListSnapshotsRequest, ListTemplatesRequest,
-    MakeDirRequest, MoveEntryRequest, PauseSandboxRequest, PublishTemplateRequest, ReadFileRequest,
-    ReadyProbe, RemoveEntryRequest, RemoveSandboxRequest, ResourceLimits, RestoreRequest,
-    ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest, SandboxState,
-    SetLifecycleRequest, Signal, SignalExecutionRequest, StartExecutionRequest, StatFileRequest,
-    StdioChannel, StopSandboxRequest, TemplateDefaults, WaitExecutionRequest, WaitForPortRequest,
-    WatchDirRequest, WatchEventsResponse, WriteFileOpen, WriteFileRequest, WriteStdinRequest,
-    build_template_request, execution_event, exit_status, ready_probe, watch_dir_response,
-    watch_events_response, write_file_request,
+    ListExecutionsRequest, ListExposedPortsRequest, ListSandboxesRequest, ListSnapshotsRequest,
+    ListTemplatesRequest, MakeDirRequest, MoveEntryRequest, PauseSandboxRequest,
+    PublishTemplateRequest, ReadFileRequest, ReadyProbe, RemoveEntryRequest, RemoveSandboxRequest,
+    ResourceLimits, RestoreRequest, ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest,
+    SandboxState, SetLifecycleRequest, Signal, SignalExecutionRequest, StartExecutionRequest,
+    StatFileRequest, StdioChannel, StopSandboxRequest, TemplateDefaults, WaitExecutionRequest,
+    WaitForPortRequest, WatchDirRequest, WatchEventsResponse, WriteFileOpen, WriteFileRequest,
+    WriteStdinRequest, build_template_request, execution_event, exit_status, ready_probe,
+    watch_dir_response, watch_events_response, write_file_request,
 };
 use tonic::transport::Channel;
 use tracing::{info, warn};
@@ -446,6 +446,14 @@ async fn drive_sandboxes(
     metrics.record(
         "sandbox_idle_lifecycle",
         lifecycle_started.elapsed().as_secs_f64(),
+    );
+
+    // -- CORE-19/20: caller-less teardown releases host resources ----------
+    let cleanup_started = Instant::now();
+    expose_cleanup_scenario(&mut sandboxes).await?;
+    metrics.record(
+        "sandbox_expose_cleanup",
+        cleanup_started.elapsed().as_secs_f64(),
     );
 
     // -- Checkpoint / Restore --------------------------------------------
@@ -1648,6 +1656,124 @@ async fn idle_lifecycle_scenario(
         }))
         .await
         .context("Remove smoke-idle failed")?;
+    Ok(())
+}
+
+/// CORE-19/20 acceptance: host resources a sandbox owns are released by the
+/// daemon's cleanup watcher when the guest reaps the sandbox with no
+/// daemon-side caller involved. TTL expiry is deliberately the trigger —
+/// it is the teardown path where nobody is around to clean up: the reap
+/// happens inside the guest, the cleanup ticket rides the always-open
+/// `WatchSandboxCleanup` stream, and the daemon must drop its expose
+/// listener on its own. DNS deregistration rides the same ticket arm
+/// (`connect/sandbox_cleanup.rs::complete`) and is covered by runtime unit
+/// tests; the host listener is the half observable from outside the daemon.
+async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) -> Result<()> {
+    const ID: &str = "smoke-cleanup";
+
+    sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: ID.into(),
+            limits: Some(ResourceLimits {
+                vcpus: 1,
+                memory_mib: 256,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .context("Create smoke-cleanup failed")?;
+    wait_for_state(sandboxes, ID, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
+
+    // Reserve a genuinely ephemeral host port: with host_port omitted the
+    // daemon reuses the guest relay port, and every System VM allocates
+    // those from the same 40000+ pool — two concurrent isolated smoke runs
+    // would deterministically collide on the host loopback (the fixed-port
+    // isolation rule in tests/e2e/AGENTS.md). Bind-then-drop yields a port
+    // unique host-wide; the reuse race in the gap is negligible here.
+    let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|probe| probe.local_addr())
+        .context("reserving an ephemeral host port")?
+        .port();
+    let exposed = sandboxes
+        .expose_port(with_machine(ExposePortRequest {
+            id: ID.into(),
+            sandbox_port: 8080,
+            host_port: u32::from(host_port),
+            ..Default::default()
+        }))
+        .await
+        .context("ExposePort failed")?
+        .into_inner();
+    if exposed.host_port != u32::from(host_port) {
+        bail!(
+            "ExposePort bound {} instead of the requested {host_port}",
+            exposed.host_port
+        );
+    }
+
+    // The daemon's loopback listener accepts (the guest side needs no
+    // workload behind it for the TCP handshake — accept happens host-side).
+    tokio::net::TcpStream::connect(("127.0.0.1", host_port))
+        .await
+        .with_context(|| format!("host listener 127.0.0.1:{host_port} not accepting"))?;
+    let listed = sandboxes
+        .list_exposed_ports(with_machine(ListExposedPortsRequest { id: ID.into() }))
+        .await
+        .context("ListExposedPorts failed")?
+        .into_inner();
+    if !listed
+        .ports
+        .iter()
+        .any(|p| p.sandbox_port == 8080 && p.host_port == u32::from(host_port))
+    {
+        bail!("exposed mapping missing from ListExposedPorts: {listed:?}");
+    }
+    info!(host_port, "expose listener live on loopback");
+
+    sandboxes
+        .set_lifecycle(with_machine(SetLifecycleRequest {
+            id: ID.into(),
+            ttl_seconds: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .context("SetLifecycle (ttl) failed")?;
+
+    // The guest reaps the sandbox first...
+    let reap_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match sandboxes
+            .inspect(with_machine(InspectSandboxRequest { id: ID.into() }))
+            .await
+        {
+            Err(status) if status.code() == tonic::Code::NotFound => break,
+            Ok(_) | Err(_) if Instant::now() < reap_deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(info) => bail!(
+                "sandbox never TTL-reaped (state: {:?})",
+                info.into_inner().state()
+            ),
+            Err(status) => bail!("Inspect failed while waiting for the TTL reap: {status}"),
+        }
+    }
+    // ...then the cleanup ticket must release the host listener. Re-binding
+    // the port from this process is the strongest observable: a closed but
+    // still-bound listener fails it, and so does any leaked forwarder. A
+    // fresh budget — the reap wait above must not eat the cleanup window.
+    let release_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match std::net::TcpListener::bind(("127.0.0.1", host_port)) {
+            Ok(_) => break,
+            Err(_) if Instant::now() < release_deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => {
+                bail!("host port {host_port} never released after the TTL reap: {error}")
+            }
+        }
+    }
+    info!(host_port, "TTL reap released the host listener");
     Ok(())
 }
 
