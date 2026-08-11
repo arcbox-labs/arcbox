@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.1.2](https://github.com/arcboxlabs/arcbox/compare/sdk-python-v0.1.1...sdk-python-v0.1.2) (2026-08-11)
+
+
+### Features
+
+* **api:** list sandbox exposed ports (CORE-102) ([#585](https://github.com/arcboxlabs/arcbox/issues/585)) ([e40e57a](https://github.com/arcboxlabs/arcbox/commit/e40e57af1005bdfe5f339abd22c511ad24f3bf81))
+* **sdk-py:** Template catalog client (CORE-107) ([#605](https://github.com/arcboxlabs/arcbox/issues/605)) ([a405f39](https://github.com/arcboxlabs/arcbox/commit/a405f39b82c8640b3f76973ea7c13fee5a797b8e))
+* **sdk:** commands.list and ports.wait_for_port for Python ([ad13faa](https://github.com/arcboxlabs/arcbox/commit/ad13faac347ce2189cca396998a44b1b02fa3225))
+* **sdk:** directory watch stream for Python ([b770d32](https://github.com/arcboxlabs/arcbox/commit/b770d323faa53e3c01f461dafbffb2c17fc4532d))
+* **sdk:** E2B-compatible surface as @arcbox/sandbox/e2b and arcbox.e2b ([#589](https://github.com/arcboxlabs/arcbox/issues/589)) ([fc55512](https://github.com/arcboxlabs/arcbox/commit/fc55512444bc5eaa042db86e6237d40cbd8d0f46))
+* **sdk:** events, set_lifecycle, and capabilities for Python ([2e1d778](https://github.com/arcboxlabs/arcbox/commit/2e1d77840b3142e6969bcdab404de9fbc6dc4a98))
+* **sdk:** filesystem path verbs for Python ([dff8cbd](https://github.com/arcboxlabs/arcbox/commit/dff8cbd603dc520e5a45db5f77949ebfb5397321))
+* **sdk:** offset-resume across stream death for Python output ([729d412](https://github.com/arcboxlabs/arcbox/commit/729d41274c0b7348cd0a3ccd23fbd6543b324ac4))
+* **sdk:** PTY, stdin, and command re-attach for Python ([5650ac7](https://github.com/arcboxlabs/arcbox/commit/5650ac706a5458107ca119eb3b96366071d4d30e))
+* **sdk:** snapshot and exposed-port clients in both SDKs ([#588](https://github.com/arcboxlabs/arcbox/issues/588)) ([ed932f9](https://github.com/arcboxlabs/arcbox/commit/ed932f989db83d4f08ddd49dbe4b37a2df26761f))
+* **sdk:** wait_for_log on the command handle for Python ([633d62d](https://github.com/arcboxlabs/arcbox/commit/633d62df4d85055775b6f38b58f76ec5cdc4a3c3))
+
+
+### Bug Fixes
+
+* **sdk:** bound connect()'s waits with one overall deadline (Python) ([2b6180a](https://github.com/arcboxlabs/arcbox/commit/2b6180aff7b3909a19b56acbbf2c18c450e4c2b9))
+* **sdk:** expose __version__ in the Python package ([55cf895](https://github.com/arcboxlabs/arcbox/commit/55cf895e05747d2a1d72a3061791f8d011a6604f))
+* **sdk:** keep NaN and infinity out of the wait_for_log transport deadline ([7c7861b](https://github.com/arcboxlabs/arcbox/commit/7c7861baa8f924b6ae790702603776205f3a9543))
+* **sdk:** review round 1 — timeout validation, deadline ordering, retention docs ([bdc158e](https://github.com/arcboxlabs/arcbox/commit/bdc158e38fdd49d0d78be2645eed23f800ecc621))
+* **sdk:** review round 2 — bound silent streams, first-frame drop classification ([8bbe9b8](https://github.com/arcboxlabs/arcbox/commit/8bbe9b8c53d64d29f44b568a6b0fcff398d58bbe))
+* **sdk:** treat server-signaled unavailable as stream death; kill leaked stdin feeds ([73bced0](https://github.com/arcboxlabs/arcbox/commit/73bced0312660dab6ff9cbd769049a0ca45ea9d0))
+* **sdk:** validate the connect timeout knob at the boundary ([7883a84](https://github.com/arcboxlabs/arcbox/commit/7883a8431d43ad6869727865eae4337e144b1259))
+
+
+### Tests
+
+* **sdk:** extend the gated e2e suites with the phase 2a surface ([3a656ff](https://github.com/arcboxlabs/arcbox/commit/3a656fff43528924c044749c0b5d601bcafe6280))
+* **sdk:** extend the gated e2e suites with the phase 2b surface ([3329a21](https://github.com/arcboxlabs/arcbox/commit/3329a219cf0a02f9297a0e27d29dd2b6aa101916))
+* **sdk:** pin the inf-disables-the-bound branch via the recorded read timeout ([6ad91a8](https://github.com/arcboxlabs/arcbox/commit/6ad91a8d63560e601cf0d0b99343a1fad3d8a075))
+* **sdk:** port the TS connect-test corrections to the Python twin ([5e33ab0](https://github.com/arcboxlabs/arcbox/commit/5e33ab01448ab36cb4b90fa37995df1ede2dc8e6))
+* **sdk:** template catalog e2e phase in both SDK suites (CORE-107) ([#609](https://github.com/arcboxlabs/arcbox/issues/609)) ([e59fc0e](https://github.com/arcboxlabs/arcbox/commit/e59fc0e3bd90c2804114f4161e27d80600ac000b))
+
+
+### Documentation
+
+* **sdk:** state the whole-second wire granularity on the waitForPort knob ([a54746e](https://github.com/arcboxlabs/arcbox/commit/a54746e10b9c44b9ac1a6cd442eddee092b82fc8))
+
+
+### Continuous Integration
+
+* **sdk:** gate the TypeScript and Python SDKs on every PR ([f1cda25](https://github.com/arcboxlabs/arcbox/commit/f1cda25ff028a6a9cdb8ac898d58455faf1a6776))
+
 ## [0.1.1](https://github.com/arcboxlabs/arcbox/compare/sdk-python-v0.1.0...sdk-python-v0.1.1) (2026-08-08)
 
 
