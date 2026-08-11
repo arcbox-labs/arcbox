@@ -59,6 +59,14 @@ build-fleet-agent:
 fleet-proto-sync:
 	buf export buf.build/arcboxlabs/fleet -o fleet/arcbox-fleet-proto/proto
 
+# arcbox-connect generates from a committed descriptor set, because its .proto
+# sources live in arcbox-protocol and cargo cannot package another package's
+# directory. Run this after editing any proto it compiles — its build script
+# fails until you do. This is the only step that needs protoc; building the
+# crate does not.
+refresh-connect-descriptor:
+	rpc/arcbox-connect/descriptor/refresh.sh
+
 ## ── Quality ────────────────────────────────────────────
 
 check:
