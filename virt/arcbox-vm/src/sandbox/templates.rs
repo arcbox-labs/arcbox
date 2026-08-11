@@ -174,10 +174,11 @@ impl SandboxManager {
             self.config.defaults.memory_mib
         };
         // Short id on purpose: it must fit the jailer socket path budget
-        // (`validate_id`'s MAX_ID_LEN) — `template-build-<full uuid>` was 51
-        // chars and overflowed AF_UNIX's `sun_path`, failing the builder
-        // boot as an opaque socket timeout. 16 hex chars keep collisions
-        // out of reach for an ephemeral, single-flighted builder.
+        // (`max_sandbox_id_len`, enforced by `validate_new_sandbox_id`) —
+        // `template-build-<full uuid>` was 51 chars and overflowed AF_UNIX's
+        // `sun_path`, failing the builder boot as an opaque socket timeout.
+        // 16 hex chars keep collisions out of reach for an ephemeral,
+        // single-flighted builder.
         let mut suffix = Uuid::new_v4().simple().to_string();
         suffix.truncate(16);
         let builder_id = format!("tpl-build-{suffix}");

@@ -345,17 +345,36 @@ pub struct SandboxNetworkIdentity {
     pub expose: crate::network::ExposeTarget,
 }
 
-/// Longest sandbox id accepted at request ingress, sized by the tightest
-/// consumer: the jailer API socket
-/// `{chroot_base}/firecracker/{id}/root/run/firecracker.socket` must fit
-/// AF_UNIX's 107-byte `sun_path`. With the guest chroot base
-/// (`/var/lib/arcbox/jailer`) the fixed overhead is 63 bytes, leaving 44
-/// for the id. An oversized id otherwise fails as an opaque "timed out
-/// waiting for socket": fc-sdk's readiness probe is a `connect()`, which
-/// ENAMETOOLONGs on every attempt even though Firecracker is up and bound
-/// inside the chroot (caught by the CORE-107 prewarm e2e, whose 51-char
-/// builder id overflowed the budget by 7 bytes).
-const MAX_ID_LEN: usize = 44;
+/// Stock sandbox id budget: what [`max_sandbox_id_len`] computes for the
+/// guest config (`/var/lib/arcbox/jailer` + `firecracker`), kept as the
+/// fallback when no jailer is configured — direct mode has no jailer
+/// socket, but ids still become path components everywhere else.
+const STOCK_MAX_ID_LEN: usize = 44;
+
+/// Longest sandbox id the configured jailer layout leaves room for: the
+/// jailer API socket
+/// `{chroot_base}/{fc_basename}/{id}/root/run/firecracker.socket` must fit
+/// AF_UNIX's 107-byte `sun_path`. An oversized id otherwise fails as an
+/// opaque "timed out waiting for socket": fc-sdk's readiness probe is a
+/// `connect()`, which ENAMETOOLONGs on every attempt even though
+/// Firecracker is up and bound inside the chroot (caught by the CORE-107
+/// prewarm e2e, whose 51-char builder id overflowed the stock budget by
+/// 7 bytes). Computed from the config so a longer chroot base or binary
+/// name tightens the budget instead of silently reintroducing the
+/// timeout.
+pub(super) fn max_sandbox_id_len(config: &VmmConfig) -> usize {
+    const SUN_PATH: usize = 107;
+    const TAIL: usize = "/root/run/firecracker.socket".len();
+    let Some(jc) = &config.firecracker.jailer else {
+        return STOCK_MAX_ID_LEN;
+    };
+    // Mirrors spawn_jailer / checkpoint_impl: fc-sdk's default chroot base.
+    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+    let exec = Path::new(&config.firecracker.binary)
+        .file_name()
+        .map_or(0, |name| name.len());
+    SUN_PATH.saturating_sub(base.len() + 1 + exec + 1 + TAIL)
+}
 
 /// Validate a caller-supplied sandbox or snapshot id.
 ///
@@ -386,12 +405,13 @@ pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
 }
 
 /// Validate a sandbox id at request ingress (create / restore), where the
-/// id becomes a jailer identity — [`validate_id`] plus the [`MAX_ID_LEN`]
-/// socket-path budget.
-pub(super) fn validate_new_sandbox_id(id: &str) -> Result<()> {
-    if id.len() > MAX_ID_LEN {
+/// id becomes a jailer identity — [`validate_id`] plus the
+/// [`max_sandbox_id_len`] socket-path budget.
+pub(super) fn validate_new_sandbox_id(id: &str, config: &VmmConfig) -> Result<()> {
+    let max = max_sandbox_id_len(config);
+    if id.len() > max {
         return Err(VmmError::Config(format!(
-            "invalid sandbox id {id:?}: at most {MAX_ID_LEN} characters \
+            "invalid sandbox id {id:?}: at most {max} characters \
              (the jailer socket path must fit the AF_UNIX limit)"
         )));
     }
@@ -520,8 +540,33 @@ mod tests {
         // timeout. The generic validator stays uncapped — it also runs
         // against persisted records and non-jailer (snapshot/execution)
         // ids, where a legacy over-long id must not become fatal.
-        assert!(validate_new_sandbox_id(&"a".repeat(44)).is_ok());
-        assert!(validate_new_sandbox_id(&"a".repeat(45)).is_err());
+        let mut config = VmmConfig::default();
+        config.firecracker.binary = "/usr/local/bin/firecracker".into();
+        config.firecracker.jailer = Some(crate::config::JailerConfig {
+            binary: "/usr/local/bin/jailer".into(),
+            uid: 0,
+            gid: 0,
+            chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
+            netns: None,
+            new_pid_ns: false,
+            cgroup_version: None,
+            parent_cgroup: None,
+            resource_limits: Vec::new(),
+        });
+        // The stock guest layout leaves exactly 44 bytes for the id.
+        assert_eq!(max_sandbox_id_len(&config), 44);
+        assert!(validate_new_sandbox_id(&"a".repeat(44), &config).is_ok());
+        assert!(validate_new_sandbox_id(&"a".repeat(45), &config).is_err());
+        // A longer chroot base tightens the budget instead of silently
+        // reintroducing the connect timeout.
+        config
+            .firecracker
+            .jailer
+            .as_mut()
+            .expect("jailer set above")
+            .chroot_base_dir = Some(format!("/var/lib/arcbox/jailer/{}", "x".repeat(10)));
+        assert_eq!(max_sandbox_id_len(&config), 33);
+        assert!(validate_new_sandbox_id(&"a".repeat(34), &config).is_err());
         assert!(validate_id("id", &"a".repeat(60)).is_ok());
         for bad in ["", "..", ".", "a/b", "a\\b", "a b", "a.b", "a\0b", "../etc"] {
             assert!(

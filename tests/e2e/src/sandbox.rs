@@ -1113,7 +1113,13 @@ async fn template_catalog_scenario(
         }))
         .await
         .context("Create with a command probe failed")?;
-    next_event(&mut probe_events, SandboxEventKind::Ready, None).await?;
+    next_event(
+        &mut probe_events,
+        SandboxEventKind::Ready,
+        None,
+        SANDBOX_READY_TIMEOUT,
+    )
+    .await?;
     // At the instant READY was delivered the probe must already have
     // passed: the marker its command requires appears ~2 s into the
     // default cmd, so a build that dropped probe gating fires READY
@@ -1555,8 +1561,14 @@ async fn idle_lifecycle_scenario(
     wait_for_state(sandboxes, ID, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
 
     // No execution runs, so the 2 s idle window expires and auto-pauses.
-    next_event(&mut events, SandboxEventKind::Pausing, Some("idle_timeout")).await?;
-    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Pausing,
+        Some("idle_timeout"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
+    next_event(&mut events, SandboxEventKind::Paused, None, EVENT_TIMEOUT).await?;
     let info = inspect(sandboxes, ID).await?;
     if info.state() != SandboxState::Paused {
         bail!("expected auto-paused sandbox, got {:?}", info.state());
@@ -1575,7 +1587,13 @@ async fn idle_lifecycle_scenario(
     if !stdout.contains("idle-wake") {
         bail!("post-auto-resume exec output missing marker: {stdout:?}");
     }
-    next_event(&mut events, SandboxEventKind::Resumed, Some("auto_resume")).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Resumed,
+        Some("auto_resume"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
 
     // Disarm the idle window and re-arm the TTL from now (CORE-60). This
     // races the freshly re-armed 2 s idle timer and must land well inside
@@ -1679,8 +1697,14 @@ async fn pause_resume_scenario(
     if info.storage_bytes == 0 {
         bail!("paused sandbox must report a nonzero storage_bytes");
     }
-    next_event(&mut events, SandboxEventKind::Pausing, Some("pause")).await?;
-    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Pausing,
+        Some("pause"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
+    next_event(&mut events, SandboxEventKind::Paused, None, EVENT_TIMEOUT).await?;
     info!(storage_bytes = info.storage_bytes, "sandbox paused");
 
     // Pause is idempotent on a paused sandbox.
@@ -1725,7 +1749,13 @@ async fn pause_resume_scenario(
     if stdout.trim() != disk_marker.len().to_string() {
         bail!("disk marker size after auto-resume: {stdout:?}");
     }
-    next_event(&mut events, SandboxEventKind::Resumed, Some("auto_resume")).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Resumed,
+        Some("auto_resume"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
     wait_ready(sandboxes, "smoke1").await?;
     let back = read_file(files, "smoke1", "/pause-disk-marker.bin").await?;
     if back != disk_marker {
@@ -1747,14 +1777,20 @@ async fn pause_resume_scenario(
         }))
         .await
         .context("second Pause failed")?;
-    next_event(&mut events, SandboxEventKind::Paused, None).await?;
+    next_event(&mut events, SandboxEventKind::Paused, None, EVENT_TIMEOUT).await?;
     sandboxes
         .resume(with_machine(ResumeSandboxRequest {
             id: "smoke1".into(),
         }))
         .await
         .context("Resume failed")?;
-    next_event(&mut events, SandboxEventKind::Resumed, Some("resume")).await?;
+    next_event(
+        &mut events,
+        SandboxEventKind::Resumed,
+        Some("resume"),
+        EVENT_TIMEOUT,
+    )
+    .await?;
     // Resume is idempotent on a live sandbox.
     sandboxes
         .resume(with_machine(ResumeSandboxRequest {
@@ -1807,14 +1843,20 @@ async fn pause_resume_scenario(
     Ok(resumed_ip)
 }
 
+/// Post-boot event waits: pause/resume/idle edges on an already-booted
+/// sandbox, where a minute is generous. Waits that span a boot pass their
+/// own budget.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Scans the events stream (skipping keepalives and unrelated kinds) until
 /// `kind` arrives, asserting its "reason" attribute when specified.
 async fn next_event(
     stream: &mut tonic::Streaming<WatchEventsResponse>,
     kind: SandboxEventKind,
     reason: Option<&str>,
+    timeout: Duration,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
