@@ -17,7 +17,8 @@ This file is only the non-obvious operational knowledge.
 
 - **Daemon control plane = Connect** (`arcbox-connect` + `connectrpc`),
   served over the Unix socket. Every daemon service — Machine, Kubernetes,
-  Migration, System, Stats, Icon, the four sandbox services, plus Macos on
+  Migration, System, Stats, Icon, the five sandbox services (Sandbox,
+  Template, Process, Filesystem, Snapshot), plus Macos on
   macOS — registers on `arcbox_api::connect::router`, and
   `app/arcbox-daemon/src/control_plane.rs` serves that router directly
   through hyper's protocol-detecting builder (HTTP/1.1 **and** HTTP/2). WHY:
@@ -80,14 +81,13 @@ This file is only the non-obvious operational knowledge.
   comment; diverge and cross-backend frames silently mismatch.
 - **`AgentClient::connect()` is a no-op on the blocking path** — the HV
   transport is connected at creation (`from_fd`); only the async path dials.
-- **`arcbox-protocol/proto/buf.yaml` exempts ONLY the sandbox surface from
-  the CI `buf breaking` gate** — both `arcbox/sandbox/v1` (the package dir)
-  and the flat `sandbox.proto` it replaced, since deleting a file is itself a
-  break. The sandbox surface is pre-release and being redesigned
-  contract-first (CORE-52); every other proto in the dir stays under the
-  default `FILE` breaking rules. Remove the exemption when the
-  sandbox API ships in a public SDK. The fleet protos'
-  `fleet/arcbox-fleet-proto/buf.yaml` is a separate, unrelated gate.
+- **Every proto in the dir is additive-only under the CI `buf breaking`
+  gate — there are NO exemptions.** The historical sandbox carve-out
+  (pre-release CORE-52 redesign) was removed when the template catalog,
+  the surface's last piece, shipped in the public SDKs (CORE-107):
+  `arcbox.sandbox.v1` now breaks the gate like everything else. The fleet
+  protos' `fleet/arcbox-fleet-proto/buf.yaml` is a separate, unrelated
+  gate.
 - **Well-known types map to `pbjson-types`, not `prost-types`**
   (`extern_path(".google.protobuf", "::pbjson_types")` in BOTH
   `arcbox-protocol/build.rs` and `arcbox-grpc/build.rs` — keep them in
@@ -149,6 +149,16 @@ This file is only the non-obvious operational knowledge.
    extending checklist is authoritative for this half.
 4. Add a method on `AgentClient` (`app/arcbox-core/src/agent_client.rs`) that
    buffa-encodes and frames the message via `rpc_call`.
+
+**EXCEPTION — the sandbox family (`Sandbox*`/`Template*` message types)**
+skips steps 1 and 3's codec half: its messages live in the
+`arcbox/sandbox/v1` protos (not `agent.proto`), and
+`MessageType::is_sandbox_request()` routes the whole family to
+`handle_sandbox_message` (`guest/arcbox-agent/src/agent/linux/sandbox.rs`)
+*before* the `rpc.rs` codec, which therefore has no arms for it. A new
+sandbox-family message needs: the proto (all three build-script arrays),
+the `MessageType` variant + `is_sandbox_request()` arm, a
+`handle_sandbox_message` dispatch arm, and the `AgentClient` method.
 
 **Change the wire contract / add a meaning-bearing field:**
 - Bump `AGENT_PROTOCOL_VERSION` (and `MIN_AGENT_PROTOCOL_VERSION` if dropping
