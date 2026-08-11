@@ -27,11 +27,12 @@ use arcbox_protocol::sandbox_v1::{
     ExecutionState, ExposePortRequest, FileChunk, FileKind, FsEventKind, GetCapabilitiesRequest,
     GetStdinStatusRequest, GetTemplateRequest, IdleAction, InspectSandboxRequest, ListDirRequest,
     ListExecutionsRequest, ListExposedPortsRequest, ListSandboxesRequest, ListSnapshotsRequest,
-    ListTemplatesRequest, MakeDirRequest, MoveEntryRequest, PauseSandboxRequest,
+    ListTemplatesRequest, MakeDirRequest, Mount, MoveEntryRequest, PauseSandboxRequest,
     PublishTemplateRequest, ReadFileRequest, ReadyProbe, RemoveEntryRequest, RemoveSandboxRequest,
-    ResourceLimits, RestoreRequest, ResumeSandboxRequest, SandboxEventKind, SandboxEventsRequest,
-    SandboxState, SetLifecycleRequest, Signal, SignalExecutionRequest, StartExecutionRequest,
-    StatFileRequest, StdioChannel, StopSandboxRequest, TemplateDefaults, WaitExecutionRequest,
+    ResizeExecutionTtyRequest, ResourceLimits, RestoreRequest, ResumeSandboxRequest,
+    SandboxEventKind, SandboxEventsRequest, SandboxState, SetLifecycleRequest, Signal,
+    SignalExecutionRequest, StartExecutionRequest, StatFileRequest, StdioChannel,
+    StopSandboxRequest, TemplateDefaults, TerminalSize, UnexposePortRequest, WaitExecutionRequest,
     WaitForPortRequest, WatchDirRequest, WatchEventsResponse, WriteFileOpen, WriteFileRequest,
     WriteStdinRequest, build_template_request, execution_event, exit_status, ready_probe,
     watch_dir_response, watch_events_response, write_file_request,
@@ -448,7 +449,21 @@ async fn drive_sandboxes(
         lifecycle_started.elapsed().as_secs_f64(),
     );
 
-    // -- CORE-19/20: caller-less teardown releases host resources ----------
+    // -- CORE-8: TTY size + resize + non-default user ----------------------
+    let tty_started = Instant::now();
+    exec_tty_and_user_scenario(&mut processes, "smoke1").await?;
+    metrics.record("sandbox_exec_tty_user", tty_started.elapsed().as_secs_f64());
+    wait_ready(&mut sandboxes, "smoke1").await?;
+
+    // -- CORE-11/12: rejection contracts on the lifecycle surface ----------
+    let rejection_started = Instant::now();
+    create_rejection_scenario(&mut sandboxes, &mut processes, "smoke1").await?;
+    metrics.record(
+        "sandbox_rejections",
+        rejection_started.elapsed().as_secs_f64(),
+    );
+
+    // -- CORE-2/19/20: expose → unexpose, then caller-less TTL teardown ----
     let cleanup_started = Instant::now();
     expose_cleanup_scenario(&mut sandboxes).await?;
     metrics.record(
@@ -1684,51 +1699,36 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         .context("Create smoke-cleanup failed")?;
     wait_for_state(sandboxes, ID, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
 
-    // Reserve a genuinely ephemeral host port: with host_port omitted the
-    // daemon reuses the guest relay port, and every System VM allocates
-    // those from the same 40000+ pool — two concurrent isolated smoke runs
-    // would deterministically collide on the host loopback (the fixed-port
-    // isolation rule in tests/e2e/AGENTS.md). Bind-then-drop yields a port
-    // unique host-wide; the reuse race in the gap is negligible here.
-    let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .and_then(|probe| probe.local_addr())
-        .context("reserving an ephemeral host port")?
-        .port();
-    let exposed = sandboxes
-        .expose_port(with_machine(ExposePortRequest {
+    // First the caller-driven path: expose, prove the listener, unexpose,
+    // prove it is gone. This is the half a client controls explicitly.
+    let first_port = expose_and_assert(sandboxes, ID, 8080).await?;
+    sandboxes
+        .unexpose_port(with_machine(UnexposePortRequest {
             id: ID.into(),
             sandbox_port: 8080,
-            host_port: u32::from(host_port),
             ..Default::default()
         }))
         .await
-        .context("ExposePort failed")?
-        .into_inner();
-    if exposed.host_port != u32::from(host_port) {
-        bail!(
-            "ExposePort bound {} instead of the requested {host_port}",
-            exposed.host_port
-        );
-    }
-
-    // The daemon's loopback listener accepts (the guest side needs no
-    // workload behind it for the TCP handshake — accept happens host-side).
-    tokio::net::TcpStream::connect(("127.0.0.1", host_port))
+        .context("UnexposePort failed")?;
+    if tokio::net::TcpStream::connect(("127.0.0.1", first_port))
         .await
-        .with_context(|| format!("host listener 127.0.0.1:{host_port} not accepting"))?;
+        .is_ok()
+    {
+        bail!("host listener 127.0.0.1:{first_port} still accepting after UnexposePort");
+    }
     let listed = sandboxes
         .list_exposed_ports(with_machine(ListExposedPortsRequest { id: ID.into() }))
         .await
-        .context("ListExposedPorts failed")?
+        .context("ListExposedPorts after unexpose failed")?
         .into_inner();
-    if !listed
-        .ports
-        .iter()
-        .any(|p| p.sandbox_port == 8080 && p.host_port == u32::from(host_port))
-    {
-        bail!("exposed mapping missing from ListExposedPorts: {listed:?}");
+    if !listed.ports.is_empty() {
+        bail!("UnexposePort left mappings behind: {listed:?}");
     }
-    info!(host_port, "expose listener live on loopback");
+    info!(host_port = first_port, "UnexposePort released the listener");
+
+    // Then the caller-less path: a fresh exposure the guest's TTL reap must
+    // clean up on its own.
+    let host_port = expose_and_assert(sandboxes, ID, 8081).await?;
 
     sandboxes
         .set_lifecycle(with_machine(SetLifecycleRequest {
@@ -1774,6 +1774,323 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         }
     }
     info!(host_port, "TTL reap released the host listener");
+    Ok(())
+}
+
+/// Expose `sandbox_port` on a host port this process reserved, and assert the
+/// listener accepts and is listed. Returns the host port.
+///
+/// The port is reserved by binding `127.0.0.1:0` and dropping the probe
+/// rather than passing `host_port: 0`: an omitted host port makes the daemon
+/// reuse the guest relay port, and every System VM allocates those from the
+/// same 40000+ pool, so two concurrent isolated smoke runs would
+/// deterministically collide on the host loopback (the fixed-port isolation
+/// rule in tests/e2e/AGENTS.md). The reuse race in the drop-to-expose gap is
+/// negligible here.
+async fn expose_and_assert(
+    sandboxes: &mut SandboxServiceClient<Channel>,
+    id: &str,
+    sandbox_port: u32,
+) -> Result<u16> {
+    let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|probe| probe.local_addr())
+        .context("reserving an ephemeral host port")?
+        .port();
+    let exposed = sandboxes
+        .expose_port(with_machine(ExposePortRequest {
+            id: id.to_owned(),
+            sandbox_port,
+            host_port: u32::from(host_port),
+            ..Default::default()
+        }))
+        .await
+        .context("ExposePort failed")?
+        .into_inner();
+    if exposed.host_port != u32::from(host_port) {
+        bail!(
+            "ExposePort bound {} instead of the requested {host_port}",
+            exposed.host_port
+        );
+    }
+
+    // The daemon's loopback listener accepts (the guest side needs no
+    // workload behind it for the TCP handshake — accept happens host-side).
+    tokio::net::TcpStream::connect(("127.0.0.1", host_port))
+        .await
+        .with_context(|| format!("host listener 127.0.0.1:{host_port} not accepting"))?;
+    let listed = sandboxes
+        .list_exposed_ports(with_machine(ListExposedPortsRequest { id: id.to_owned() }))
+        .await
+        .context("ListExposedPorts failed")?
+        .into_inner();
+    if !listed
+        .ports
+        .iter()
+        .any(|p| p.sandbox_port == sandbox_port && p.host_port == u32::from(host_port))
+    {
+        bail!("exposed mapping missing from ListExposedPorts: {listed:?}");
+    }
+    info!(host_port, sandbox_port, "expose listener live on loopback");
+    Ok(host_port)
+}
+
+/// CORE-8 acceptance, the TTY half: the initial `tty_size` reaches the guest
+/// PTY, `ResizeExecutionTty` changes it mid-session, a resize is refused for
+/// an execution that has no PTY, and a non-default `user` is honored.
+///
+/// `stty size` prints `<rows> <cols>`, read back from inside the guest — the
+/// only way to prove the size survived every host layer (the CORE-8 bug was
+/// that it was dropped on the way down). The user is a numeric uid pair
+/// because the default sandbox rootfs ships an `/etc/passwd` with root only;
+/// `resolve_user` takes numeric ids without a passwd entry, so this asserts
+/// the plumbing without depending on the image's user database.
+async fn exec_tty_and_user_scenario(
+    processes: &mut SandboxProcessServiceClient<Channel>,
+    sandbox_id: &str,
+) -> Result<()> {
+    let initial = processes
+        .start_execution(with_machine(StartExecutionRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: "tty-initial".into(),
+            cmd: vec!["/bin/sh".into(), "-c".into(), "stty size".into()],
+            tty: true,
+            tty_size: Some(TerminalSize {
+                width: 80,
+                height: 24,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .context("StartExecution (tty) failed")?
+        .into_inner();
+    let (out, done) = collect_output(processes, sandbox_id, &initial.id).await?;
+    match done.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(0)) => {}
+        other => bail!("tty `stty size` exit status {other:?}: {out:?}"),
+    }
+    if !out.contains("24 80") {
+        bail!("initial tty_size never reached the PTY; `stty size` said {out:?}");
+    }
+    info!("initial tty_size reached the guest PTY");
+
+    // Resize mid-session against an interactive shell. Stdin bytes and
+    // resizes ride one ordered per-session queue, so a resize enqueued
+    // before the command bytes is in effect when `stty` runs.
+    let shell = processes
+        .start_execution(with_machine(StartExecutionRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: "tty-resize".into(),
+            cmd: vec!["/bin/sh".into()],
+            tty: true,
+            tty_size: Some(TerminalSize {
+                width: 80,
+                height: 24,
+            }),
+            stdin: true,
+            ..Default::default()
+        }))
+        .await
+        .context("StartExecution (tty shell) failed")?
+        .into_inner();
+    processes
+        .resize_execution_tty(with_machine(ResizeExecutionTtyRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: shell.id.clone(),
+            size: Some(TerminalSize {
+                width: 120,
+                height: 50,
+            }),
+        }))
+        .await
+        .context("ResizeExecutionTty failed")?;
+    // A TTY execution cannot take `eof` (the proto says send Ctrl-D), so the
+    // shell is ended with `exit`.
+    processes
+        .write_stdin(with_machine(WriteStdinRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: shell.id.clone(),
+            offset: 0,
+            data: b"stty size\nexit\n".to_vec(),
+            eof: false,
+        }))
+        .await
+        .context("tty stdin write failed")?;
+    let (out, done) = collect_output(processes, sandbox_id, &shell.id).await?;
+    match done.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(0)) => {}
+        other => bail!("tty shell exit status {other:?}: {out:?}"),
+    }
+    if !out.contains("50 120") {
+        bail!("ResizeExecutionTty did not reach the PTY; `stty size` said {out:?}");
+    }
+    info!("ResizeExecutionTty resized the live guest PTY");
+
+    // Without a PTY there is nothing to resize; that must be an error rather
+    // than a silently dropped request.
+    let plain =
+        start_execution(processes, sandbox_id, "no-tty-resize", &["/bin/cat"], true).await?;
+    let refused = processes
+        .resize_execution_tty(with_machine(ResizeExecutionTtyRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: plain.id.clone(),
+            size: Some(TerminalSize {
+                width: 120,
+                height: 50,
+            }),
+        }))
+        .await;
+    match refused {
+        Err(status) if status.code() == tonic::Code::InvalidArgument => {}
+        Err(status) => {
+            bail!("resize without a TTY failed with {status:?}, expected InvalidArgument")
+        }
+        Ok(_) => bail!("resize was accepted for an execution with no TTY"),
+    }
+    processes
+        .write_stdin(with_machine(WriteStdinRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: plain.id.clone(),
+            offset: 0,
+            data: Vec::new(),
+            eof: true,
+        }))
+        .await
+        .context("closing the no-tty execution's stdin")?;
+    collect_output(processes, sandbox_id, &plain.id).await?;
+
+    let uid = run_with_user(
+        processes,
+        sandbox_id,
+        "uid-check",
+        &["/bin/id", "-u"],
+        "65534:65534",
+    )
+    .await?;
+    if uid.trim() != "65534" {
+        bail!("`user` was ignored: id -u printed {uid:?}");
+    }
+    let gid = run_with_user(
+        processes,
+        sandbox_id,
+        "gid-check",
+        &["/bin/id", "-g"],
+        "65534:65534",
+    )
+    .await?;
+    if gid.trim() != "65534" {
+        bail!("the group half of `user` was ignored: id -g printed {gid:?}");
+    }
+    info!("non-default user and group reached the guest process");
+    Ok(())
+}
+
+/// Run a command as `user` and return its stdout, asserting a zero exit.
+async fn run_with_user(
+    client: &mut SandboxProcessServiceClient<Channel>,
+    sandbox_id: &str,
+    execution_id: &str,
+    cmd: &[&str],
+    user: &str,
+) -> Result<String> {
+    let execution = client
+        .start_execution(with_machine(StartExecutionRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            execution_id: execution_id.to_owned(),
+            cmd: cmd.iter().map(|s| (*s).to_owned()).collect(),
+            user: user.to_owned(),
+            ..Default::default()
+        }))
+        .await
+        .with_context(|| format!("StartExecution as {user} failed"))?
+        .into_inner();
+    let (stdout, done) = collect_output(client, sandbox_id, &execution.id).await?;
+    match done.exit_status.as_ref().and_then(|s| s.status) {
+        Some(exit_status::Status::Code(0)) => Ok(stdout),
+        other => bail!("{cmd:?} as {user} exit status {other:?}: {stdout:?}"),
+    }
+}
+
+/// The rejection contracts a client can hit on the lifecycle surface:
+/// declared-but-unimplemented spec fields (CORE-11/12), a reused sandbox id,
+/// and addressing a sandbox that does not exist. Each is a documented status
+/// code, and each is asserted here because the guest enforces them far from
+/// the daemon boundary where a refactor could silently turn one into a
+/// generic INTERNAL — or, worse, into a success that ignores the field.
+async fn create_rejection_scenario(
+    sandboxes: &mut SandboxServiceClient<Channel>,
+    processes: &mut SandboxProcessServiceClient<Channel>,
+    live_id: &str,
+) -> Result<()> {
+    let base = || CreateSandboxRequest {
+        limits: Some(ResourceLimits {
+            vcpus: 1,
+            memory_mib: 256,
+        }),
+        ..Default::default()
+    };
+
+    // `mounts` and `ssh_public_key` are still live proto fields (unlike the
+    // reserved `image`/`kernel`/`rootfs`), documented as FAILED_PRECONDITION.
+    let mounted = sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-reject-mounts".into(),
+            mounts: vec![Mount {
+                source: "/tmp".into(),
+                target: "/host-tmp".into(),
+                readonly: true,
+            }],
+            ..base()
+        }))
+        .await;
+    match mounted {
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
+        Err(status) => bail!("mounts rejected with {status:?}, expected FailedPrecondition"),
+        Ok(_) => bail!("a create with mounts was accepted"),
+    }
+
+    let keyed = sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: "smoke-reject-ssh".into(),
+            ssh_public_key: Some("ssh-ed25519 AAAA test".into()),
+            ..base()
+        }))
+        .await;
+    match keyed {
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
+        Err(status) => {
+            bail!("ssh_public_key rejected with {status:?}, expected FailedPrecondition")
+        }
+        Ok(_) => bail!("a create with ssh_public_key was accepted"),
+    }
+
+    // A live id reused for a *different* request is a collision, not an
+    // idempotent replay — the retry-safety contract cuts both ways.
+    let collided = sandboxes
+        .create(with_machine(CreateSandboxRequest {
+            id: live_id.to_owned(),
+            cmd: vec!["/bin/false".into()],
+            ..base()
+        }))
+        .await;
+    match collided {
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {}
+        Err(status) => bail!("id reuse rejected with {status:?}, expected AlreadyExists"),
+        Ok(_) => bail!("a differing create reused an existing sandbox id"),
+    }
+
+    let missing = processes
+        .start_execution(with_machine(StartExecutionRequest {
+            sandbox_id: "smoke-does-not-exist".into(),
+            cmd: vec!["/bin/true".into()],
+            ..Default::default()
+        }))
+        .await;
+    match missing {
+        Err(status) if status.code() == tonic::Code::NotFound => {}
+        Err(status) => bail!("exec on a missing sandbox failed with {status:?}, expected NotFound"),
+        Ok(_) => bail!("an execution started in a sandbox that does not exist"),
+    }
+    info!("field, id-reuse, and missing-sandbox rejections all carry their documented codes");
     Ok(())
 }
 
