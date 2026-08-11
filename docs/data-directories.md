@@ -92,7 +92,6 @@ execution.
 | Path | Purpose | Creator |
 |------|---------|---------|
 | `bin/abctl` | CLI symlink | cli (`abctl setup install`) |
-| `bin/arcbox` | Compatibility symlink → abctl | cli (`abctl setup install`) |
 | `bin/arcbox-daemon` | Fallback daemon binary path | cli |
 | `bin/arcbox-agent` | Guest agent binary | daemon (bundle seed / boot cache) |
 | `bin/vm-agent` | Sandbox microVM init binary (guest sees `/arcbox/bin/vm-agent`) | daemon (bundle seed / boot cache) |
