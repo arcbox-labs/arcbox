@@ -144,10 +144,19 @@ fn connection_lost(error: &ConnectError) -> bool {
     if error.code == ErrorCode::Unavailable {
         return true;
     }
-    // connectrpc c5c1a6f reports body-read and missing-END_STREAM failures as these Internal messages.
+    // connectrpc reports body-read and missing-END_STREAM failures as Internal
+    // with these messages — it exposes no distinct code to match on, so the
+    // message text is the only signal, and it is not a stability contract.
+    //
+    // The body-read wording moved between revisions: "error reading response
+    // body" became "failed to read response body" when the three body-read
+    // sites were centralised on one helper. Both are matched because a miss
+    // here is silent — a lost connection degrades to the generic "could not
+    // read output" message with nothing failing to say so.
     error.code == ErrorCode::Internal
         && error.message.as_deref().is_some_and(|message| {
             message.starts_with("error reading response body:")
+                || message.starts_with("failed to read response body")
                 || message == "Connect streaming response ended without END_STREAM envelope"
         })
 }
@@ -254,6 +263,21 @@ mod tests {
             truncated.to_string(),
             "Connection to machine 'dev' was lost while running 'date'."
         );
+
+        // Both body-read wordings connectrpc has used. Only the message text
+        // distinguishes these from an output failure, so a wording drift here
+        // is invisible without a case per spelling.
+        for message in [
+            "error reading response body: connection reset",
+            "failed to read response body: connection reset",
+        ] {
+            let body_read = machine_exec_output(ConnectError::internal(message), "dev", "date");
+            assert_eq!(
+                body_read.to_string(),
+                "Connection to machine 'dev' was lost while running 'date'.",
+                "body-read failure was not recognised as a lost connection: {message}"
+            );
+        }
 
         let output = machine_exec_output(
             ConnectError::internal("failed to decode response"),
