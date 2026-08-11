@@ -1716,6 +1716,11 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
     {
         bail!("host listener 127.0.0.1:{first_port} still accepting after UnexposePort");
     }
+    // Refusing connections is not the same as releasing the port: a listener
+    // shut down but never closed rejects connects while still holding the
+    // bind. Re-binding is what proves the resource is actually gone.
+    std::net::TcpListener::bind(("127.0.0.1", first_port))
+        .with_context(|| format!("host port {first_port} still bound after UnexposePort"))?;
     let listed = sandboxes
         .list_exposed_ports(with_machine(ListExposedPortsRequest { id: ID.into() }))
         .await
@@ -1840,10 +1845,16 @@ async fn expose_and_assert(
 ///
 /// `stty size` prints `<rows> <cols>`, read back from inside the guest — the
 /// only way to prove the size survived every host layer (the CORE-8 bug was
-/// that it was dropped on the way down). The user is a numeric uid pair
-/// because the default sandbox rootfs ships an `/etc/passwd` with root only;
-/// `resolve_user` takes numeric ids without a passwd entry, so this asserts
-/// the plumbing without depending on the image's user database.
+/// that it was dropped on the way down). Both sizes below must be values no
+/// fallback path can produce, or the assertion passes on a dropped field:
+/// 80x24 is the default at three independent layers
+/// (`sandbox/execution.rs`'s and `sandbox/workload.rs`'s `tty_size.map_or`,
+/// and vm-agent's `default_tty_width`/`default_tty_height` serde defaults).
+///
+/// The user is a numeric uid pair because the default sandbox rootfs ships
+/// an `/etc/passwd` with root only; `resolve_user` takes numeric ids without
+/// a passwd entry, so this asserts the plumbing without depending on the
+/// image's user database.
 async fn exec_tty_and_user_scenario(
     processes: &mut SandboxProcessServiceClient<Channel>,
     sandbox_id: &str,
@@ -1855,8 +1866,8 @@ async fn exec_tty_and_user_scenario(
             cmd: vec!["/bin/sh".into(), "-c".into(), "stty size".into()],
             tty: true,
             tty_size: Some(TerminalSize {
-                width: 80,
-                height: 24,
+                width: 100,
+                height: 37,
             }),
             ..Default::default()
         }))
@@ -1868,14 +1879,16 @@ async fn exec_tty_and_user_scenario(
         Some(exit_status::Status::Code(0)) => {}
         other => bail!("tty `stty size` exit status {other:?}: {out:?}"),
     }
-    if !out.contains("24 80") {
+    if !out.contains("37 100") {
         bail!("initial tty_size never reached the PTY; `stty size` said {out:?}");
     }
     info!("initial tty_size reached the guest PTY");
 
     // Resize mid-session against an interactive shell. Stdin bytes and
     // resizes ride one ordered per-session queue, so a resize enqueued
-    // before the command bytes is in effect when `stty` runs.
+    // before the command bytes is in effect when `stty` runs. The start size
+    // is distinct from both the defaults and the resized size, so a failure
+    // message says which half broke.
     let shell = processes
         .start_execution(with_machine(StartExecutionRequest {
             sandbox_id: sandbox_id.to_owned(),
@@ -1883,8 +1896,8 @@ async fn exec_tty_and_user_scenario(
             cmd: vec!["/bin/sh".into()],
             tty: true,
             tty_size: Some(TerminalSize {
-                width: 80,
-                height: 24,
+                width: 90,
+                height: 30,
             }),
             stdin: true,
             ..Default::default()
