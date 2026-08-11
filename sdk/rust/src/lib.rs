@@ -23,6 +23,8 @@ mod client;
 mod commands;
 mod connection;
 mod error;
+mod files;
+mod ports;
 mod sandbox;
 mod types;
 
@@ -32,8 +34,16 @@ pub use commands::{
 };
 pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
-pub use sandbox::{ArcBox, ConnectOptions, CreateOptions, ListOptions, Sandbox};
+pub use files::{
+    FileKind, FileStat, Files, FsEvent, FsEventKind, MAX_FILE_BYTES, MkdirOptions, RemoveOptions,
+    WatchOptions, WatchStream, WriteOptions,
+};
+pub use ports::{ExposeOptions, ExposedPort, Ports, Protocol};
+pub use sandbox::{
+    ArcBox, CheckpointOptions, ConnectOptions, CreateOptions, EventStream, ListOptions,
+    ListSnapshotsOptions, RestoreOptions, Sandbox,
+};
 pub use types::{
-    Capabilities, IdlePolicy, LifecycleUpdate, NestedVirtCapability, SandboxInfo, SandboxState,
-    SandboxSummary, Update,
+    Capabilities, IdlePolicy, LifecycleUpdate, NestedVirtCapability, SandboxEvent,
+    SandboxEventKind, SandboxInfo, SandboxState, SandboxSummary, Snapshot, Update,
 };

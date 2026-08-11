@@ -104,6 +104,53 @@ pub struct Capabilities {
     pub nested_virt: NestedVirtCapability,
 }
 
+/// One checkpointed sandbox image in the snapshot catalog.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Snapshot {
+    pub id: String,
+    /// The sandbox this snapshot was checkpointed from.
+    pub sandbox_id: String,
+    /// Human-readable name recorded at checkpoint time.
+    pub name: String,
+    /// Labels recorded at checkpoint time, filterable in listings.
+    pub labels: BTreeMap<String, String>,
+    pub created_at: Option<SystemTime>,
+}
+
+/// Kind of a sandbox lifecycle event. `Unknown` covers wire values
+/// this SDK predates. `Idle` fires when an execution exits and the
+/// sandbox returns to ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SandboxEventKind {
+    Created,
+    Ready,
+    Running,
+    Idle,
+    Stopping,
+    Stopped,
+    Failed,
+    Removed,
+    Pausing,
+    Paused,
+    Resumed,
+    Unknown,
+}
+
+/// One sandbox lifecycle event, as delivered by `Sandbox::events`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SandboxEvent {
+    pub sandbox_id: String,
+    pub kind: SandboxEventKind,
+    /// When it happened (daemon clock).
+    pub time: Option<SystemTime>,
+    /// Per-kind context: `exit_code`/`signal` on `Idle`, `error` on
+    /// `Failed`, `reason` on `Pausing`/`Resumed`.
+    pub attributes: BTreeMap<String, String>,
+}
+
 /// One knob of a lifecycle update: leave it, clear it to the daemon
 /// default, or set a value. [`Update::Unchanged`] is the `Default`, so
 /// struct-update syntax touches only the knobs it names.
@@ -185,7 +232,7 @@ pub fn seconds_to_wire(duration: Option<Duration>) -> u32 {
     }
 }
 
-fn time_from_wire(timestamp: Option<&Timestamp>) -> Option<SystemTime> {
+pub fn time_from_wire(timestamp: Option<&Timestamp>) -> Option<SystemTime> {
     let timestamp = timestamp?;
     let seconds = u64::try_from(timestamp.seconds).ok()?;
     UNIX_EPOCH.checked_add(Duration::new(seconds, timestamp.nanos.try_into().ok()?))
@@ -256,6 +303,44 @@ pub fn capabilities_from_wire(response: pb::GetCapabilitiesResponse) -> Capabili
                 .map(|nested| nested.reason.clone())
                 .filter(|reason| !reason.is_empty()),
         },
+    }
+}
+
+impl From<pb::SnapshotSummary> for Snapshot {
+    fn from(summary: pb::SnapshotSummary) -> Self {
+        Self {
+            id: summary.id,
+            sandbox_id: summary.sandbox_id,
+            name: summary.name,
+            labels: summary.labels.into_iter().collect(),
+            created_at: time_from_wire(summary.created_at.as_option()),
+        }
+    }
+}
+
+impl From<pb::SandboxEvent> for SandboxEvent {
+    fn from(event: pb::SandboxEvent) -> Self {
+        use pb::SandboxEventKind as Kind;
+        let kind = match event.kind.as_known() {
+            Some(Kind::SANDBOX_EVENT_KIND_CREATED) => SandboxEventKind::Created,
+            Some(Kind::SANDBOX_EVENT_KIND_READY) => SandboxEventKind::Ready,
+            Some(Kind::SANDBOX_EVENT_KIND_RUNNING) => SandboxEventKind::Running,
+            Some(Kind::SANDBOX_EVENT_KIND_IDLE) => SandboxEventKind::Idle,
+            Some(Kind::SANDBOX_EVENT_KIND_STOPPING) => SandboxEventKind::Stopping,
+            Some(Kind::SANDBOX_EVENT_KIND_STOPPED) => SandboxEventKind::Stopped,
+            Some(Kind::SANDBOX_EVENT_KIND_FAILED) => SandboxEventKind::Failed,
+            Some(Kind::SANDBOX_EVENT_KIND_REMOVED) => SandboxEventKind::Removed,
+            Some(Kind::SANDBOX_EVENT_KIND_PAUSING) => SandboxEventKind::Pausing,
+            Some(Kind::SANDBOX_EVENT_KIND_PAUSED) => SandboxEventKind::Paused,
+            Some(Kind::SANDBOX_EVENT_KIND_RESUMED) => SandboxEventKind::Resumed,
+            _ => SandboxEventKind::Unknown,
+        };
+        Self {
+            sandbox_id: event.sandbox_id,
+            kind,
+            time: time_from_wire(event.time.as_option()),
+            attributes: event.attributes.into_iter().collect(),
+        }
     }
 }
 

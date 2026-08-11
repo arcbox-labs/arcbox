@@ -76,4 +76,22 @@ byte offsets across transport drops, offset-idempotent `write_stdin`
 `close_stdin`, `stdin_status`, `resize`, `kill(signal)`, `get`
 (stdin cursor seeded from the daemon), and `list`.
 
-Next: files, ports, snapshots, and events.
+Also shipped, completing the data plane:
+
+- **files**: streamed `read`/`write` (bytes end to end; `write` takes
+  `impl AsRef<[u8]>`), `stat`/`list`/`mkdir`/`remove`/`rename` (typed
+  `FileStat`, `mkdir -p` semantics, symlinks reported not followed),
+  and `watch` — a typed `FsEvent` stream, keepalives filtered, clean
+  end on sandbox stop.
+- **ports**: `wait_for_port` (guest-side listen-table wait; expiry is a
+  `Timeout` naming this knob), `expose`/`unexpose`/`list` (host
+  loopback publishing; `list` reads the daemon's authoritative live
+  listener table).
+- **snapshots**: `checkpoint` (pause + snapshot + resume under the same
+  id), `restore` (fresh client-minted id; failed restores force-remove
+  it), auto-paginating `list_snapshots`, `delete_snapshot`.
+- **events**: `Sandbox::events()` — typed lifecycle events, keepalives
+  filtered.
+
+Deferred: `wait_for_log` (filter `output()` directly), the remote tier
+(CORE-63), and Template statics.
