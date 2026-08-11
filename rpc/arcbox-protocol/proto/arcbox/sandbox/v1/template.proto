@@ -26,8 +26,9 @@ import "google/protobuf/timestamp.proto";
 // Served as of CORE-107: every RPC below is implemented, all three Build
 // sources work, and `CreateSandboxRequest.template` resolves
 // `name[:version]` against the catalog. Clients that also talk to older
-// daemons feature-detect on the `templates` flag in `SANDBOX_FEATURES`
-// rather than on this service existing.
+// daemons detect it with the `templates` flag in
+// `GetCapabilitiesResponse.features` rather than on this service
+// existing.
 service TemplateService {
     // Build a template from a source and register it in the catalog.
     // Blocks until the build completes; a streaming progress variant can

@@ -297,8 +297,8 @@ export type BuildTemplateRequest = Message<"arcbox.sandbox.v1.BuildTemplateReque
 
   /**
    * Also boot the built rootfs once and checkpoint it at READY, so the
-   * template carries a warm snapshot (requires CORE-16; ignored for
-   * `snapshot_id` sources, which are warm by construction).
+   * template carries a warm snapshot (ignored for `snapshot_id` sources,
+   * which are warm by construction).
    *
    * @generated from field: bool prewarm = 7;
    */
@@ -451,10 +451,12 @@ export const DeleteTemplateRequestSchema: GenMessage<DeleteTemplateRequest> = /*
 /**
  * TemplateService manages the template catalog. Control plane.
  *
- * Contract-only in CORE-58 phase 1: the daemon answers UNIMPLEMENTED
- * until the catalog lands with CORE-21. Build additionally depends on the
- * rootfs pipeline (CORE-5) and, for pre-warmed snapshots, FC 1.16
- * network overrides (CORE-16).
+ * Served as of CORE-107: every RPC below is implemented, all three Build
+ * sources work, and `CreateSandboxRequest.template` resolves
+ * `name[:version]` against the catalog. Clients that also talk to older
+ * daemons detect it with the `templates` flag in
+ * `GetCapabilitiesResponse.features` rather than on this service
+ * existing.
  *
  * @generated from service arcbox.sandbox.v1.TemplateService
  */
