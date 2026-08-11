@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.1.2](https://github.com/arcboxlabs/arcbox/compare/sdk-typescript-v0.1.1...sdk-typescript-v0.1.2) (2026-08-11)
+
+
+### Features
+
+* **api:** list sandbox exposed ports (CORE-102) ([#585](https://github.com/arcboxlabs/arcbox/issues/585)) ([e40e57a](https://github.com/arcboxlabs/arcbox/commit/e40e57af1005bdfe5f339abd22c511ad24f3bf81))
+* **sdk-ts:** Template catalog client (CORE-107) ([#604](https://github.com/arcboxlabs/arcbox/issues/604)) ([817ab96](https://github.com/arcboxlabs/arcbox/commit/817ab96771829da668aef7f6df0d3a9024a8a243))
+* **sdk:** commands.list and ports.waitForPort for TypeScript ([ebb06aa](https://github.com/arcboxlabs/arcbox/commit/ebb06aaf9912714c3e15ae7307bc08e3db9f4243))
+* **sdk:** directory watch stream for TypeScript ([17818b2](https://github.com/arcboxlabs/arcbox/commit/17818b26241906871a644361e03dd0fdd8215aad))
+* **sdk:** E2B-compatible surface as @arcbox/sandbox/e2b and arcbox.e2b ([#589](https://github.com/arcboxlabs/arcbox/issues/589)) ([fc55512](https://github.com/arcboxlabs/arcbox/commit/fc55512444bc5eaa042db86e6237d40cbd8d0f46))
+* **sdk:** events, setLifecycle, and capabilities for TypeScript ([729e815](https://github.com/arcboxlabs/arcbox/commit/729e8158656008abb7348d701fd78efc45074e2a))
+* **sdk:** filesystem path verbs for TypeScript ([c44edd5](https://github.com/arcboxlabs/arcbox/commit/c44edd551494a7f25b4cd0d2da27e1367c5d55d5))
+* **sdk:** offset-resume across stream death for TypeScript output ([743c373](https://github.com/arcboxlabs/arcbox/commit/743c373319e4ef3f76d3bad2623b8d2283c3029a))
+* **sdk:** PTY, stdin, and command re-attach for TypeScript ([5a301e0](https://github.com/arcboxlabs/arcbox/commit/5a301e0587bbea5ba36f883b2325b7d29375f473))
+* **sdk:** snapshot and exposed-port clients in both SDKs ([#588](https://github.com/arcboxlabs/arcbox/issues/588)) ([ed932f9](https://github.com/arcboxlabs/arcbox/commit/ed932f989db83d4f08ddd49dbe4b37a2df26761f))
+* **sdk:** waitForLog on the command handle for TypeScript ([c57b56c](https://github.com/arcboxlabs/arcbox/commit/c57b56ccd2fd81e40a10cf910e00bfb24d8d1daf))
+
+
+### Bug Fixes
+
+* **sdk:** bound connect()'s waits with one overall deadline (TypeScript) ([ec883a7](https://github.com/arcboxlabs/arcbox/commit/ec883a76251c22629eae83a3fa98f6857bdeb9d7))
+* **sdk:** review round 1 — timeout validation, deadline ordering, retention docs ([bdc158e](https://github.com/arcboxlabs/arcbox/commit/bdc158e38fdd49d0d78be2645eed23f800ecc621))
+* **sdk:** satisfy the strict lint set in the TS e2e watch loop ([9b55655](https://github.com/arcboxlabs/arcbox/commit/9b556551c360d85273bd2e221beb6b8a93007027))
+* **sdk:** treat server-signaled unavailable as stream death; kill leaked stdin feeds ([73bced0](https://github.com/arcboxlabs/arcbox/commit/73bced0312660dab6ff9cbd769049a0ca45ea9d0))
+* **sdk:** validate the connect timeout knob at the boundary ([7883a84](https://github.com/arcboxlabs/arcbox/commit/7883a8431d43ad6869727865eae4337e144b1259))
+
+
+### Tests
+
+* **sdk:** extend the gated e2e suites with the phase 2a surface ([3a656ff](https://github.com/arcboxlabs/arcbox/commit/3a656fff43528924c044749c0b5d601bcafe6280))
+* **sdk:** extend the gated e2e suites with the phase 2b surface ([3329a21](https://github.com/arcboxlabs/arcbox/commit/3329a219cf0a02f9297a0e27d29dd2b6aa101916))
+* **sdk:** template catalog e2e phase in both SDK suites (CORE-107) ([#609](https://github.com/arcboxlabs/arcbox/issues/609)) ([e59fc0e](https://github.com/arcboxlabs/arcbox/commit/e59fc0e3bd90c2804114f4161e27d80600ac000b))
+
+
+### Documentation
+
+* **sdk:** state the whole-second wire granularity on the waitForPort knob ([a54746e](https://github.com/arcboxlabs/arcbox/commit/a54746e10b9c44b9ac1a6cd442eddee092b82fc8))
+
+
+### Continuous Integration
+
+* **sdk:** gate the TypeScript and Python SDKs on every PR ([f1cda25](https://github.com/arcboxlabs/arcbox/commit/f1cda25ff028a6a9cdb8ac898d58455faf1a6776))
+
 ## [0.1.1](https://github.com/arcboxlabs/arcbox/compare/sdk-typescript-v0.1.0...sdk-typescript-v0.1.1) (2026-08-08)
 
 

@@ -1,6 +1,6 @@
 {
   "name": "@arcbox/sandbox",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "ArcBox Sandbox SDK for TypeScript — run isolated microVM sandboxes on your Mac",
   "repository": {
     "type": "git",
