@@ -61,6 +61,7 @@ EXTRA_REPLACEMENTS = {
     "AsyncFileWatch": "FileWatch",
     "AsyncFiles": "Files",
     "AsyncPorts": "Ports",
+    "AsyncTemplate": "Template",
     "AsyncConnectClient": "ConnectClient",
     "AsyncServerStream": "ServerStream",
     # The e2b tree's public class names.

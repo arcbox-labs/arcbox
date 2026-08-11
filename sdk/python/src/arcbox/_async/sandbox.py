@@ -50,6 +50,7 @@ from ._client import AsyncConnectClient
 from .commands import AsyncCommands
 from .files import AsyncFiles
 from .ports import AsyncPorts
+from .templates import AsyncTemplate
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
@@ -160,7 +161,7 @@ class AsyncArcBox:
 
     async def create(
         self,
-        template: str = "",
+        template: str | AsyncTemplate = "",
         *,
         ttl: float | None = None,
         idle_timeout: float | None = None,
@@ -168,12 +169,22 @@ class AsyncArcBox:
         vcpus: int | None = None,
         memory_mib: int | None = None,
         cmd: Sequence[str] | None = None,
+        no_default_cmd: bool = False,
         env: Mapping[str, str] | None = None,
+        no_default_env: bool = False,
         labels: Mapping[str, str] | None = None,
         network: bool | None = None,
         wait_until_ready: bool = True,
     ) -> AsyncSandbox:
         """Create a sandbox and (by default) wait until it is READY.
+
+        ``template`` is a Docker image reference, a catalog reference
+        (``name[:version]``), or an :class:`AsyncTemplate` instance
+        (which pins its exact reference). A catalog template's defaults
+        are inherited unless overridden: ``cmd``/``env`` replace/merge
+        per the proto contract, and ``no_default_cmd`` /
+        ``no_default_env`` suppress the template's default cmd / env
+        without supplying replacements.
 
         ``ttl`` is the hard maximum lifetime — on expiry the daemon
         always destroys the sandbox. ``idle_timeout`` + ``on_idle`` is
@@ -184,6 +195,7 @@ class AsyncArcBox:
         subscribe-then-act, so no transition is missed (the CORE-67
         rule) — and so retries stay idempotent.
         """
+        reference = template if isinstance(template, str) else template.reference
         with wrap_errors("sandbox.create"):
             sandbox_id = str(uuid.uuid4())
             try:
@@ -195,14 +207,16 @@ class AsyncArcBox:
                     ) as events:
                         await self._create(
                             sandbox_id,
-                            template,
+                            reference,
                             ttl=ttl,
                             idle_timeout=idle_timeout,
                             on_idle=on_idle,
                             vcpus=vcpus,
                             memory_mib=memory_mib,
                             cmd=cmd,
+                            no_default_cmd=no_default_cmd,
                             env=env,
+                            no_default_env=no_default_env,
                             labels=labels,
                             network=network,
                         )
@@ -210,14 +224,16 @@ class AsyncArcBox:
                 else:
                     await self._create(
                         sandbox_id,
-                        template,
+                        reference,
                         ttl=ttl,
                         idle_timeout=idle_timeout,
                         on_idle=on_idle,
                         vcpus=vcpus,
                         memory_mib=memory_mib,
                         cmd=cmd,
+                        no_default_cmd=no_default_cmd,
                         env=env,
+                        no_default_env=no_default_env,
                         labels=labels,
                         network=network,
                     )
@@ -460,7 +476,9 @@ class AsyncArcBox:
         vcpus: int | None,
         memory_mib: int | None,
         cmd: Sequence[str] | None,
+        no_default_cmd: bool,
         env: Mapping[str, str] | None,
+        no_default_env: bool,
         labels: Mapping[str, str] | None,
         network: bool | None,
     ) -> None:
@@ -469,7 +487,9 @@ class AsyncArcBox:
             template=template,
             labels=dict(labels) if labels else {},
             cmd=list(cmd) if cmd else [],
+            no_default_cmd=no_default_cmd,
             env=dict(env) if env else {},
+            no_default_env=no_default_env,
             ttl_seconds=_seconds_to_wire(ttl),
             idle_timeout_seconds=_seconds_to_wire(idle_timeout),
             on_idle=(
@@ -605,7 +625,7 @@ class AsyncSandbox:
     @classmethod
     async def create(
         cls,
-        template: str = "",
+        template: str | AsyncTemplate = "",
         *,
         ttl: float | None = None,
         idle_timeout: float | None = None,
@@ -613,16 +633,19 @@ class AsyncSandbox:
         vcpus: int | None = None,
         memory_mib: int | None = None,
         cmd: Sequence[str] | None = None,
+        no_default_cmd: bool = False,
         env: Mapping[str, str] | None = None,
+        no_default_env: bool = False,
         labels: Mapping[str, str] | None = None,
         network: bool | None = None,
         wait_until_ready: bool = True,
         connection: Connection | None = None,
     ) -> AsyncSandbox:
         """Create a sandbox against the default (or given) connection.
-        The handle owns the hidden entry point's HTTP client and closes
-        it on context exit; without the context manager, hold an
-        :class:`AsyncArcBox` instead for deterministic cleanup."""
+        Parameters as in :meth:`AsyncArcBox.create`. The handle owns the
+        hidden entry point's HTTP client and closes it on context exit;
+        without the context manager, hold an :class:`AsyncArcBox`
+        instead for deterministic cleanup."""
         box = AsyncArcBox(connection)
         try:
             sandbox = await box.create(
@@ -633,7 +656,9 @@ class AsyncSandbox:
                 vcpus=vcpus,
                 memory_mib=memory_mib,
                 cmd=cmd,
+                no_default_cmd=no_default_cmd,
                 env=env,
+                no_default_env=no_default_env,
                 labels=labels,
                 network=network,
                 wait_until_ready=wait_until_ready,

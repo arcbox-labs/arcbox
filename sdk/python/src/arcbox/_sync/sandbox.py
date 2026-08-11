@@ -50,6 +50,7 @@ from ._client import ConnectClient
 from .commands import Commands
 from .files import Files
 from .ports import Ports
+from .templates import Template
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator, Mapping, Sequence
@@ -160,7 +161,7 @@ class ArcBox:
 
     def create(
         self,
-        template: str = "",
+        template: str | Template = "",
         *,
         ttl: float | None = None,
         idle_timeout: float | None = None,
@@ -168,12 +169,22 @@ class ArcBox:
         vcpus: int | None = None,
         memory_mib: int | None = None,
         cmd: Sequence[str] | None = None,
+        no_default_cmd: bool = False,
         env: Mapping[str, str] | None = None,
+        no_default_env: bool = False,
         labels: Mapping[str, str] | None = None,
         network: bool | None = None,
         wait_until_ready: bool = True,
     ) -> Sandbox:
         """Create a sandbox and (by default) wait until it is READY.
+
+        ``template`` is a Docker image reference, a catalog reference
+        (``name[:version]``), or an :class:`AsyncTemplate` instance
+        (which pins its exact reference). A catalog template's defaults
+        are inherited unless overridden: ``cmd``/``env`` replace/merge
+        per the proto contract, and ``no_default_cmd`` /
+        ``no_default_env`` suppress the template's default cmd / env
+        without supplying replacements.
 
         ``ttl`` is the hard maximum lifetime — on expiry the daemon
         always destroys the sandbox. ``idle_timeout`` + ``on_idle`` is
@@ -184,6 +195,7 @@ class ArcBox:
         subscribe-then-act, so no transition is missed (the CORE-67
         rule) — and so retries stay idempotent.
         """
+        reference = template if isinstance(template, str) else template.reference
         with wrap_errors("sandbox.create"):
             sandbox_id = str(uuid.uuid4())
             try:
@@ -195,14 +207,16 @@ class ArcBox:
                     ) as events:
                         self._create(
                             sandbox_id,
-                            template,
+                            reference,
                             ttl=ttl,
                             idle_timeout=idle_timeout,
                             on_idle=on_idle,
                             vcpus=vcpus,
                             memory_mib=memory_mib,
                             cmd=cmd,
+                            no_default_cmd=no_default_cmd,
                             env=env,
+                            no_default_env=no_default_env,
                             labels=labels,
                             network=network,
                         )
@@ -210,14 +224,16 @@ class ArcBox:
                 else:
                     self._create(
                         sandbox_id,
-                        template,
+                        reference,
                         ttl=ttl,
                         idle_timeout=idle_timeout,
                         on_idle=on_idle,
                         vcpus=vcpus,
                         memory_mib=memory_mib,
                         cmd=cmd,
+                        no_default_cmd=no_default_cmd,
                         env=env,
+                        no_default_env=no_default_env,
                         labels=labels,
                         network=network,
                     )
@@ -458,7 +474,9 @@ class ArcBox:
         vcpus: int | None,
         memory_mib: int | None,
         cmd: Sequence[str] | None,
+        no_default_cmd: bool,
         env: Mapping[str, str] | None,
+        no_default_env: bool,
         labels: Mapping[str, str] | None,
         network: bool | None,
     ) -> None:
@@ -467,7 +485,9 @@ class ArcBox:
             template=template,
             labels=dict(labels) if labels else {},
             cmd=list(cmd) if cmd else [],
+            no_default_cmd=no_default_cmd,
             env=dict(env) if env else {},
+            no_default_env=no_default_env,
             ttl_seconds=_seconds_to_wire(ttl),
             idle_timeout_seconds=_seconds_to_wire(idle_timeout),
             on_idle=(
@@ -603,7 +623,7 @@ class Sandbox:
     @classmethod
     def create(
         cls,
-        template: str = "",
+        template: str | Template = "",
         *,
         ttl: float | None = None,
         idle_timeout: float | None = None,
@@ -611,16 +631,19 @@ class Sandbox:
         vcpus: int | None = None,
         memory_mib: int | None = None,
         cmd: Sequence[str] | None = None,
+        no_default_cmd: bool = False,
         env: Mapping[str, str] | None = None,
+        no_default_env: bool = False,
         labels: Mapping[str, str] | None = None,
         network: bool | None = None,
         wait_until_ready: bool = True,
         connection: Connection | None = None,
     ) -> Sandbox:
         """Create a sandbox against the default (or given) connection.
-        The handle owns the hidden entry point's HTTP client and closes
-        it on context exit; without the context manager, hold an
-        :class:`AsyncArcBox` instead for deterministic cleanup."""
+        Parameters as in :meth:`AsyncArcBox.create`. The handle owns the
+        hidden entry point's HTTP client and closes it on context exit;
+        without the context manager, hold an :class:`AsyncArcBox`
+        instead for deterministic cleanup."""
         box = ArcBox(connection)
         try:
             sandbox = box.create(
@@ -631,7 +654,9 @@ class Sandbox:
                 vcpus=vcpus,
                 memory_mib=memory_mib,
                 cmd=cmd,
+                no_default_cmd=no_default_cmd,
                 env=env,
+                no_default_env=no_default_env,
                 labels=labels,
                 network=network,
                 wait_until_ready=wait_until_ready,

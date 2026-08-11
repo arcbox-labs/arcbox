@@ -284,6 +284,8 @@ Shipped:
 | `ports.expose(port)` / `unexpose` / `list` | publish a guest port on host loopback (daemon-allocated or specific host port, tcp/udp); `list` reads the daemon's authoritative live listener table |
 | `sandbox.checkpoint()` | pause + snapshot + resume under the same id; returns the frozen `Snapshot` catalog row |
 | `ArcBox.restore(snapshot_id)` | new READY sandbox from a snapshot (fresh client-minted id; `fresh_network=True` for concurrent restores); plus `list_snapshots` (auto-paginating) and `delete_snapshot` |
+| `Template.build(name, ...)` | build a catalog template from exactly one source (`image=` local Docker ref, `dockerfile=` inline content, `snapshot=` checkpoint promotion) with default limits/cmd/env, a ready probe (`ready_probe_port=` or `ready_probe_command=`), and `prewarm=True` for a boot-to-READY warm snapshot; no client deadline — builds block as long as they need |
+| `Template.get/list/delete_reference`, instance `publish(version)`/`delete()` | resolve `name[:version]` (bare name = newest published, else draft), auto-paginating list, delete a version or the whole template; `publish` freezes the draft immutably |
+| `create(template=Template \| "name[:version]")` | a `Template` instance pins its exact reference; template defaults are inherited unless overridden (`vcpus`/`memory_mib` replace limits wholesale; `no_default_cmd`/`no_default_env` suppress inherited cmd/env) |
 
-Deferred: `Template` statics, and the SDK-side default idle-reaping
-policy (design decision 4).
+Deferred: the SDK-side default idle-reaping policy (design decision 4).
