@@ -1684,18 +1684,32 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         .context("Create smoke-cleanup failed")?;
     wait_for_state(sandboxes, ID, SandboxState::Ready, SANDBOX_READY_TIMEOUT).await?;
 
-    // Ephemeral host port (host_port: 0) per the e2e isolation rules.
+    // Reserve a genuinely ephemeral host port: with host_port omitted the
+    // daemon reuses the guest relay port, and every System VM allocates
+    // those from the same 40000+ pool — two concurrent isolated smoke runs
+    // would deterministically collide on the host loopback (the fixed-port
+    // isolation rule in tests/e2e/AGENTS.md). Bind-then-drop yields a port
+    // unique host-wide; the reuse race in the gap is negligible here.
+    let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|probe| probe.local_addr())
+        .context("reserving an ephemeral host port")?
+        .port();
     let exposed = sandboxes
         .expose_port(with_machine(ExposePortRequest {
             id: ID.into(),
             sandbox_port: 8080,
+            host_port: u32::from(host_port),
             ..Default::default()
         }))
         .await
         .context("ExposePort failed")?
         .into_inner();
-    let host_port = u16::try_from(exposed.host_port)
-        .with_context(|| format!("host port out of range: {}", exposed.host_port))?;
+    if exposed.host_port != u32::from(host_port) {
+        bail!(
+            "ExposePort bound {} instead of the requested {host_port}",
+            exposed.host_port
+        );
+    }
 
     // The daemon's loopback listener accepts (the guest side needs no
     // workload behind it for the TCP handshake — accept happens host-side).
@@ -1726,14 +1740,14 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         .context("SetLifecycle (ttl) failed")?;
 
     // The guest reaps the sandbox first...
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let reap_deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match sandboxes
             .inspect(with_machine(InspectSandboxRequest { id: ID.into() }))
             .await
         {
             Err(status) if status.code() == tonic::Code::NotFound => break,
-            Ok(_) | Err(_) if Instant::now() < deadline => {
+            Ok(_) | Err(_) if Instant::now() < reap_deadline => {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Ok(info) => bail!(
@@ -1745,11 +1759,13 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
     }
     // ...then the cleanup ticket must release the host listener. Re-binding
     // the port from this process is the strongest observable: a closed but
-    // still-bound listener fails it, and so does any leaked forwarder.
+    // still-bound listener fails it, and so does any leaked forwarder. A
+    // fresh budget — the reap wait above must not eat the cleanup window.
+    let release_deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match std::net::TcpListener::bind(("127.0.0.1", host_port)) {
             Ok(_) => break,
-            Err(_) if Instant::now() < deadline => {
+            Err(_) if Instant::now() < release_deadline => {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(error) => {
