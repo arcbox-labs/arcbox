@@ -8,7 +8,8 @@ point the loop at a dev daemon.
 This is the design doc's 20-line hello world plus the phase 2a surface
 (PTY, stdin, re-attach, set_lifecycle, capabilities, events) and the
 phase 2b surface (filesystem path verbs, watch, wait_for_port,
-commands.list, wait_for_log). Still outside scope: Template statics.
+commands.list, wait_for_log) and the template catalog (Template
+statics, snapshot promotion, create-by-name).
 The sync flavor exercises the generated tree end to end — including
 genuinely blocking event-stream reads.
 """
@@ -16,11 +17,12 @@ genuinely blocking event-stream reads.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 
 import pytest
 
-from arcbox import ArcBox, AsyncSandbox, FsEvent, PtySize, Sandbox
+from arcbox import ArcBox, AsyncSandbox, FsEvent, PtySize, Sandbox, Template
 from arcbox.errors import ArcBoxError
 from arcbox.errors import FileNotFoundError as SandboxFileNotFoundError
 from arcbox.errors import TimeoutError as SandboxTimeoutError
@@ -222,6 +224,47 @@ def test_events_observe_the_idle_auto_pause() -> None:
         assert sandbox.info().state == "paused"
     finally:
         sandbox.kill()
+
+
+def test_template_catalog_roundtrip() -> None:
+    # Snapshot-promotion source: no docker image involved, so this runs on
+    # any sandbox-capable host. The strict warm-vs-cold split is the daemon
+    # e2e's job; here the contract is the round trip — the checkpoint's
+    # state must be what a create-by-name boots into.
+    with ArcBox() as box:
+        snapshot_id = ""
+        source = box.create("", ttl=300)
+        try:
+            source.files.write_text("/tmp/tpl-mark", "from-snapshot\n")
+            snapshot_id = source.checkpoint(name="sdk-py-tpl-source").id
+        finally:
+            source.kill()
+        try:
+            # The build handle owns its client; context exit releases it
+            # (the published handle shares it and never closes it).
+            with Template.build("sdk-py-e2e-tpl", snapshot=snapshot_id) as draft:
+                assert draft.version == ""
+                assert draft.digest != ""
+
+                published = draft.publish("1.0")
+                assert published.reference == "sdk-py-e2e-tpl:1.0"
+
+                rows = [row for row in Template.list() if row.name == "sdk-py-e2e-tpl"]
+                assert [row.version for row in rows] == ["1.0"]
+                assert all(row.warm for row in rows)
+
+                sandbox = box.create("sdk-py-e2e-tpl", ttl=300)
+                try:
+                    marked = sandbox.commands.run(["/bin/cat", "/tmp/tpl-mark"])
+                    assert marked.expect().stdout == "from-snapshot\n"
+                finally:
+                    sandbox.kill()
+        finally:
+            with contextlib.suppress(ArcBoxError):
+                Template.delete_reference("sdk-py-e2e-tpl")
+            if snapshot_id:
+                with contextlib.suppress(ArcBoxError):
+                    box.delete_snapshot(snapshot_id)
 
 
 @pytest.mark.anyio
