@@ -1,6 +1,6 @@
 [project]
 name = "arcbox"
-version = "0.1.1"
+version = "0.1.2"
 description = "ArcBox Sandbox SDK for Python — run isolated microVM sandboxes on your Mac"
 readme = "README.md"
 authors = [{ name = "ArcBox, Inc." }]
