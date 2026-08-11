@@ -735,10 +735,17 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
     // ("can't find device 'x'", exit 2) while a dev host has iproute2
     // ("Cannot find device \"x\"", exit 1), so any wording test would pass
     // CI and still fail in production.
+    //
+    // PATH lookup, not an absolute path: the System VM rootfs installs the
+    // busybox `ip` applet at /bin/ip (BUSYBOX_SYMLINKS in boot-assets
+    // rootfs.rs) while Linux hosts carry iproute2 in /sbin or /usr/sbin —
+    // no single absolute path exists in both environments, and the old
+    // hardcoded /usr/sbin/ip made every create that lost the sysfs race
+    // above fail with ENOENT inside the guest.
     let sysfs = format!("/sys/class/net/{tap_name}");
     let mut delete_error = None;
     if std::path::Path::new(&sysfs).exists() {
-        let output = std::process::Command::new("/usr/sbin/ip")
+        let output = std::process::Command::new("ip")
             .args(["link", "delete", tap_name])
             .output()
             .map_err(|error| {

@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.5](https://github.com/arcboxlabs/arcbox/compare/v0.6.4...v0.6.5) (2026-08-11)
+
+
+### Features
+
+* **cli:** template catalog verbs and the presets rename (CORE-107) ([#602](https://github.com/arcboxlabs/arcbox/issues/602)) ([518cd46](https://github.com/arcboxlabs/arcbox/commit/518cd46cde5291bf4b5b7be8eed7950d0d2767a5))
+* **sandbox:** enforce template ready probes on boot and warm restore (CORE-107) ([#600](https://github.com/arcboxlabs/arcbox/issues/600)) ([3f01be9](https://github.com/arcboxlabs/arcbox/commit/3f01be960c25e5b20678c895e5253249ea08ecc4))
+* **sandbox:** implement snapshot promotion into templates (CORE-107) ([#595](https://github.com/arcboxlabs/arcbox/issues/595)) ([9bf0ae8](https://github.com/arcboxlabs/arcbox/commit/9bf0ae8d90ed874c01848f4b2913cd54c107ff16))
+* **sandbox:** prewarm builds and template warm-restore on create (CORE-107) ([#599](https://github.com/arcboxlabs/arcbox/issues/599)) ([898f645](https://github.com/arcboxlabs/arcbox/commit/898f645ab58b463fabb9c7b9d0f20f4d4e7dcdeb))
+* **sandbox:** resolve catalog templates in Create with pinned keys and default merge (CORE-107) ([#597](https://github.com/arcboxlabs/arcbox/issues/597)) ([1b42544](https://github.com/arcboxlabs/arcbox/commit/1b425446125aeebc529cda81cdf622740ddc0afa))
+* **sdk:** arcbox — the native Rust SDK, phase 1 (lifecycle core) ([#603](https://github.com/arcboxlabs/arcbox/issues/603)) ([90f9fa8](https://github.com/arcboxlabs/arcbox/commit/90f9fa8d3beedd65ba06385d89dc45d66b0a0a68))
+* **sdk:** commands surface for the Rust SDK ([#606](https://github.com/arcboxlabs/arcbox/issues/606)) ([9b55a70](https://github.com/arcboxlabs/arcbox/commit/9b55a70b53ceb576e3b35e58173cd3ef0685aa7b))
+* **sdk:** files, ports, snapshots and events for the Rust SDK ([#608](https://github.com/arcboxlabs/arcbox/issues/608)) ([86bc3c6](https://github.com/arcboxlabs/arcbox/commit/86bc3c6fe24fb25b23014635109cc5a50457e651))
+
+
+### Bug Fixes
+
+* **sandbox:** PATH-resolve the TAP-delete ip binary; prove caller-less cleanup releases host resources (CORE-19/20) ([#612](https://github.com/arcboxlabs/arcbox/issues/612)) ([5b5adfe](https://github.com/arcboxlabs/arcbox/commit/5b5adfe764938195ee163be954f4096c2afab23d))
+
+
+### Performance Improvements
+
+* **vmnet:** event-driven relay read path, drop the 1 kHz poll thread ([#596](https://github.com/arcboxlabs/arcbox/issues/596)) ([9f05e30](https://github.com/arcboxlabs/arcbox/commit/9f05e309bdb6153de6bcb4a7dabd1f62d04ba781))
+
+
+### Tests
+
+* **e2e:** template catalog scenario + the four bugs it caught; docs + proto freeze (CORE-107) ([#607](https://github.com/arcboxlabs/arcbox/issues/607)) ([6ccb5aa](https://github.com/arcboxlabs/arcbox/commit/6ccb5aa74fbd4d9db07c9045daab7e7611a46b34))
+
+
+### Documentation
+
+* **agents:** sync AGENTS.md with the shipped template catalog (CORE-107) ([#610](https://github.com/arcboxlabs/arcbox/issues/610)) ([17334a9](https://github.com/arcboxlabs/arcbox/commit/17334a9e7be7440c1900c8ad5097adf38bac8269))
+
+
+### Continuous Integration
+
+* hand the desktop bump to arcbox-desktop ([#601](https://github.com/arcboxlabs/arcbox/issues/601)) ([fa11e85](https://github.com/arcboxlabs/arcbox/commit/fa11e8591673eecff2d559aaf2d09cfb26784e1d))
+
+
+### Miscellaneous Chores
+
+* **cli:** retire the arcbox rename shim ([#554](https://github.com/arcboxlabs/arcbox/issues/554)) ([95b1edf](https://github.com/arcboxlabs/arcbox/commit/95b1edfcb872ccbac31c97406568ad074cfbb1d4))
+
 ## [0.6.4](https://github.com/arcboxlabs/arcbox/compare/v0.6.3...v0.6.4) (2026-08-10)
 
 
