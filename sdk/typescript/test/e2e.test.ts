@@ -8,7 +8,8 @@
 // This is the design doc's 20-line hello world plus the phase 2a
 // surface (PTY, stdin, re-attach, setLifecycle, capabilities, events)
 // and the phase 2b surface (filesystem path verbs, watch, waitForPort,
-// commands.list, waitForLog). Still outside scope: Template statics.
+// commands.list, waitForLog) and the template catalog (Template statics,
+// snapshot promotion, create-by-name).
 import { noop } from "foxts/noop";
 import { wait } from "foxts/wait";
 import { describe, expect, it } from "vitest";
@@ -19,6 +20,7 @@ import {
   ArcBoxError,
   FileNotFoundError,
   Sandbox,
+  Template,
   TimeoutError,
 } from "../src/index";
 
@@ -258,6 +260,59 @@ describe.skipIf(!enabled)("hello world against a live daemon", () => {
       expect((await sandbox.info()).state).toBe("paused");
     } finally {
       await sandbox.kill();
+    }
+  }, 300000);
+
+  it("drives the template catalog: promote, publish, create by name, delete", async () => {
+    // Snapshot-promotion source: no docker image involved, so this runs
+    // on any sandbox-capable host. The strict warm-vs-cold split is the
+    // daemon e2e's job; here the contract is the round trip — the
+    // checkpoint's state must be what a create-by-name boots into.
+    const box = new ArcBox();
+    let snapshotId = "";
+    const source = await box.create("", { ttlMs: 300000 });
+    try {
+      await source.files.writeText("/tmp/tpl-mark", "from-snapshot\n");
+      snapshotId = (await source.checkpoint({ name: "sdk-ts-tpl-source" })).id;
+    } finally {
+      await source.kill();
+    }
+    try {
+      const draft = await Template.build("sdk-ts-e2e-tpl", {
+        snapshot: snapshotId,
+      });
+      expect(draft.version).toBe("");
+      expect(draft.digest).not.toBe("");
+
+      const published = await draft.publish("1.0");
+      expect(published.reference).toBe("sdk-ts-e2e-tpl:1.0");
+
+      const versions: string[] = [];
+      for await (const row of Template.list()) {
+        if (row.name === "sdk-ts-e2e-tpl") {
+          versions.push(row.version);
+          expect(row.warm).toBe(true);
+        }
+      }
+      expect(versions).toEqual(["1.0"]);
+
+      const sandbox = await Sandbox.create("sdk-ts-e2e-tpl", {
+        ttlMs: 300000,
+      });
+      try {
+        const marked = await sandbox.commands.run([
+          "/bin/cat",
+          "/tmp/tpl-mark",
+        ]);
+        expect(marked.expect().stdout).toBe("from-snapshot\n");
+      } finally {
+        await sandbox.kill();
+      }
+    } finally {
+      await Template.delete("sdk-ts-e2e-tpl").catch(noop);
+      if (snapshotId !== "") {
+        await box.deleteSnapshot(snapshotId).catch(noop);
+      }
     }
   }, 300000);
 });
