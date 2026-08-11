@@ -306,39 +306,41 @@ pub fn capabilities_from_wire(response: pb::GetCapabilitiesResponse) -> Capabili
     }
 }
 
-/// Map one ListSnapshots row to the public DTO.
-pub fn snapshot_from_wire(summary: pb::SnapshotSummary) -> Snapshot {
-    Snapshot {
-        id: summary.id,
-        sandbox_id: summary.sandbox_id,
-        name: summary.name,
-        labels: summary.labels.into_iter().collect(),
-        created_at: time_from_wire(summary.created_at.as_option()),
+impl From<pb::SnapshotSummary> for Snapshot {
+    fn from(summary: pb::SnapshotSummary) -> Self {
+        Self {
+            id: summary.id,
+            sandbox_id: summary.sandbox_id,
+            name: summary.name,
+            labels: summary.labels.into_iter().collect(),
+            created_at: time_from_wire(summary.created_at.as_option()),
+        }
     }
 }
 
-/// Map one Events frame to the public DTO.
-pub fn sandbox_event_from_wire(event: pb::SandboxEvent) -> SandboxEvent {
-    use pb::SandboxEventKind as Kind;
-    let kind = match event.kind.as_known() {
-        Some(Kind::SANDBOX_EVENT_KIND_CREATED) => SandboxEventKind::Created,
-        Some(Kind::SANDBOX_EVENT_KIND_READY) => SandboxEventKind::Ready,
-        Some(Kind::SANDBOX_EVENT_KIND_RUNNING) => SandboxEventKind::Running,
-        Some(Kind::SANDBOX_EVENT_KIND_IDLE) => SandboxEventKind::Idle,
-        Some(Kind::SANDBOX_EVENT_KIND_STOPPING) => SandboxEventKind::Stopping,
-        Some(Kind::SANDBOX_EVENT_KIND_STOPPED) => SandboxEventKind::Stopped,
-        Some(Kind::SANDBOX_EVENT_KIND_FAILED) => SandboxEventKind::Failed,
-        Some(Kind::SANDBOX_EVENT_KIND_REMOVED) => SandboxEventKind::Removed,
-        Some(Kind::SANDBOX_EVENT_KIND_PAUSING) => SandboxEventKind::Pausing,
-        Some(Kind::SANDBOX_EVENT_KIND_PAUSED) => SandboxEventKind::Paused,
-        Some(Kind::SANDBOX_EVENT_KIND_RESUMED) => SandboxEventKind::Resumed,
-        _ => SandboxEventKind::Unknown,
-    };
-    SandboxEvent {
-        sandbox_id: event.sandbox_id,
-        kind,
-        time: time_from_wire(event.time.as_option()),
-        attributes: event.attributes.into_iter().collect(),
+impl From<pb::SandboxEvent> for SandboxEvent {
+    fn from(event: pb::SandboxEvent) -> Self {
+        use pb::SandboxEventKind as Kind;
+        let kind = match event.kind.as_known() {
+            Some(Kind::SANDBOX_EVENT_KIND_CREATED) => SandboxEventKind::Created,
+            Some(Kind::SANDBOX_EVENT_KIND_READY) => SandboxEventKind::Ready,
+            Some(Kind::SANDBOX_EVENT_KIND_RUNNING) => SandboxEventKind::Running,
+            Some(Kind::SANDBOX_EVENT_KIND_IDLE) => SandboxEventKind::Idle,
+            Some(Kind::SANDBOX_EVENT_KIND_STOPPING) => SandboxEventKind::Stopping,
+            Some(Kind::SANDBOX_EVENT_KIND_STOPPED) => SandboxEventKind::Stopped,
+            Some(Kind::SANDBOX_EVENT_KIND_FAILED) => SandboxEventKind::Failed,
+            Some(Kind::SANDBOX_EVENT_KIND_REMOVED) => SandboxEventKind::Removed,
+            Some(Kind::SANDBOX_EVENT_KIND_PAUSING) => SandboxEventKind::Pausing,
+            Some(Kind::SANDBOX_EVENT_KIND_PAUSED) => SandboxEventKind::Paused,
+            Some(Kind::SANDBOX_EVENT_KIND_RESUMED) => SandboxEventKind::Resumed,
+            _ => SandboxEventKind::Unknown,
+        };
+        Self {
+            sandbox_id: event.sandbox_id,
+            kind,
+            time: time_from_wire(event.time.as_option()),
+            attributes: event.attributes.into_iter().collect(),
+        }
     }
 }
 

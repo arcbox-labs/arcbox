@@ -143,8 +143,11 @@ impl Files {
     /// # Errors
     ///
     /// [`ErrorKind::FileNotFound`] for a missing path;
-    /// [`ErrorKind::FileTooLarge`] past the daemon's per-file cap;
-    /// otherwise any RPC failure.
+    /// [`ErrorKind::FileTooLarge`] past [`MAX_FILE_BYTES`], checked
+    /// client-side while collecting (nothing bounds a read wire-side);
+    /// [`ErrorKind::ConnectionLost`] when the stream ends before the
+    /// final chunk's done marker — a truncated transfer is never
+    /// returned as a success. Otherwise any RPC failure.
     pub async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let mut stream: ReadStream = self
             .client()
@@ -161,17 +164,41 @@ impl Files {
                 Ok(Some(chunk)) => {
                     let chunk = chunk.to_owned_message();
                     content.extend_from_slice(&chunk.data);
+                    if content.len() > MAX_FILE_BYTES {
+                        return Err(Error::new(
+                            ErrorKind::FileTooLarge,
+                            format!(
+                                "the file exceeds the {MAX_FILE_BYTES}-byte cap this \
+                                 client collects into memory"
+                            ),
+                            "files.read",
+                        )
+                        .with_context("limit_bytes", MAX_FILE_BYTES.to_string()));
+                    }
                     if chunk.done {
                         return Ok(content);
                     }
                 }
-                Ok(None) => return Ok(content),
+                // The done marker is the transfer's integrity signal: a
+                // stream that ends without it delivered a prefix, not
+                // the file.
+                Ok(None) => {
+                    return Err(Error::new(
+                        ErrorKind::ConnectionLost,
+                        "the read stream ended before the file was fully transferred",
+                        "files.read",
+                    ));
+                }
                 Err(error) => return Err(Error::from_connect(error, "files.read")),
             }
         }
     }
 
     /// Write `data` to `path`, creating missing parent directories.
+    ///
+    /// `data` is taken by value (`Vec<u8>` moves in for free; `&str` /
+    /// `&[u8]` copy once) and streamed lazily, so the peak footprint is
+    /// the payload plus one wire chunk — never a second full copy.
     ///
     /// # Errors
     ///
@@ -181,10 +208,10 @@ impl Files {
     pub async fn write(
         &self,
         path: &str,
-        data: impl AsRef<[u8]>,
+        data: impl Into<Vec<u8>>,
         options: WriteOptions,
     ) -> Result<()> {
-        let data = data.as_ref();
+        let data: Vec<u8> = data.into();
         if data.len() > MAX_FILE_BYTES {
             return Err(Error::new(
                 ErrorKind::FileTooLarge,
@@ -196,7 +223,7 @@ impl Files {
             )
             .with_context("limit_bytes", MAX_FILE_BYTES.to_string()));
         }
-        let mut frames = vec![pb::WriteFileRequest {
+        let open = pb::WriteFileRequest {
             payload: Some(write_file_request::Payload::from(pb::WriteFileOpen {
                 id: self.sandbox_id.clone(),
                 path: path.to_owned(),
@@ -204,23 +231,28 @@ impl Files {
                 ..Default::default()
             })),
             ..Default::default()
-        }];
-        for chunk in data.chunks(WRITE_CHUNK_BYTES) {
-            frames.push(pb::WriteFileRequest {
+        };
+        let total = data.len();
+        let chunks = (0..total).step_by(WRITE_CHUNK_BYTES).map(move |start| {
+            let end = (start + WRITE_CHUNK_BYTES).min(total);
+            pb::WriteFileRequest {
                 payload: Some(write_file_request::Payload::from(pb::FileChunk {
-                    data: chunk.to_vec(),
+                    data: data[start..end].to_vec(),
                     ..Default::default()
                 })),
                 ..Default::default()
-            });
-        }
-        frames.push(pb::WriteFileRequest {
+            }
+        });
+        let done = pb::WriteFileRequest {
             payload: Some(write_file_request::Payload::from(pb::FileChunk {
                 done: true,
                 ..Default::default()
             })),
             ..Default::default()
-        });
+        };
+        let frames = std::iter::once(open)
+            .chain(chunks)
+            .chain(std::iter::once(done));
         self.client()
             .write_file(connectrpc::client::stream_iter(frames))
             .await
@@ -245,7 +277,7 @@ impl Files {
             .await
             .map_err(|error| Error::from_connect(error, "files.stat"))?
             .into_owned();
-        Ok(stat_from_wire(stat))
+        Ok(FileStat::from(stat))
     }
 
     /// List a directory's entries, non-recursively, sorted by name.
@@ -265,7 +297,7 @@ impl Files {
             .await
             .map_err(|error| Error::from_connect(error, "files.list"))?
             .into_owned();
-        Ok(response.entries.into_iter().map(stat_from_wire).collect())
+        Ok(response.entries.into_iter().map(FileStat::from).collect())
     }
 
     /// Create a directory and any missing parents (`mkdir -p`
@@ -393,7 +425,7 @@ impl WatchStream {
                     if let Some(pb::watch_dir_response::Payload::Event(event)) =
                         frame.to_owned_message().payload
                     {
-                        return Ok(Some(fs_event_from_wire(*event)));
+                        return Ok(Some(FsEvent::from(*event)));
                     }
                     // Keepalives prove liveness but carry no event.
                 }
@@ -410,37 +442,41 @@ impl WatchStream {
     }
 }
 
-fn stat_from_wire(stat: pb::FileStat) -> FileStat {
-    let kind = match stat.kind.as_known() {
-        Some(pb::FileKind::FILE_KIND_FILE) => FileKind::File,
-        Some(pb::FileKind::FILE_KIND_DIRECTORY) => FileKind::Directory,
-        Some(pb::FileKind::FILE_KIND_SYMLINK) => FileKind::Symlink,
-        Some(pb::FileKind::FILE_KIND_OTHER) => FileKind::Other,
-        _ => FileKind::Unknown,
-    };
-    FileStat {
-        name: stat.name,
-        kind,
-        size: stat.size,
-        mode: stat.mode,
-        modified_at: time_from_wire(stat.modified_at.as_option()),
-        uid: stat.uid,
-        gid: stat.gid,
-        symlink_target: (!stat.symlink_target.is_empty()).then_some(stat.symlink_target),
+impl From<pb::FileStat> for FileStat {
+    fn from(stat: pb::FileStat) -> Self {
+        let kind = match stat.kind.as_known() {
+            Some(pb::FileKind::FILE_KIND_FILE) => FileKind::File,
+            Some(pb::FileKind::FILE_KIND_DIRECTORY) => FileKind::Directory,
+            Some(pb::FileKind::FILE_KIND_SYMLINK) => FileKind::Symlink,
+            Some(pb::FileKind::FILE_KIND_OTHER) => FileKind::Other,
+            _ => FileKind::Unknown,
+        };
+        Self {
+            name: stat.name,
+            kind,
+            size: stat.size,
+            mode: stat.mode,
+            modified_at: time_from_wire(stat.modified_at.as_option()),
+            uid: stat.uid,
+            gid: stat.gid,
+            symlink_target: (!stat.symlink_target.is_empty()).then_some(stat.symlink_target),
+        }
     }
 }
 
-fn fs_event_from_wire(event: pb::FsEvent) -> FsEvent {
-    let kind = match event.kind.as_known() {
-        Some(pb::FsEventKind::FS_EVENT_KIND_CREATED) => FsEventKind::Created,
-        Some(pb::FsEventKind::FS_EVENT_KIND_MODIFIED) => FsEventKind::Modified,
-        Some(pb::FsEventKind::FS_EVENT_KIND_REMOVED) => FsEventKind::Removed,
-        Some(pb::FsEventKind::FS_EVENT_KIND_RENAMED) => FsEventKind::Renamed,
-        _ => FsEventKind::Unknown,
-    };
-    FsEvent {
-        kind,
-        path: event.path,
-        renamed_to: (!event.renamed_to.is_empty()).then_some(event.renamed_to),
+impl From<pb::FsEvent> for FsEvent {
+    fn from(event: pb::FsEvent) -> Self {
+        let kind = match event.kind.as_known() {
+            Some(pb::FsEventKind::FS_EVENT_KIND_CREATED) => FsEventKind::Created,
+            Some(pb::FsEventKind::FS_EVENT_KIND_MODIFIED) => FsEventKind::Modified,
+            Some(pb::FsEventKind::FS_EVENT_KIND_REMOVED) => FsEventKind::Removed,
+            Some(pb::FsEventKind::FS_EVENT_KIND_RENAMED) => FsEventKind::Renamed,
+            _ => FsEventKind::Unknown,
+        };
+        Self {
+            kind,
+            path: event.path,
+            renamed_to: (!event.renamed_to.is_empty()).then_some(event.renamed_to),
+        }
     }
 }

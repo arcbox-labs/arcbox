@@ -19,8 +19,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::types::{
     Capabilities, IdlePolicy, LifecycleUpdate, SandboxEvent, SandboxInfo, SandboxState,
     SandboxSummary, Snapshot, Update, capabilities_from_wire, idle_action_to_wire, info_from_wire,
-    sandbox_event_from_wire, seconds_to_wire, snapshot_from_wire, state_to_wire, summary_from_wire,
-    time_from_wire,
+    seconds_to_wire, state_to_wire, summary_from_wire, time_from_wire,
 };
 
 /// The one concrete client this SDK drives: the generated Connect
@@ -130,7 +129,7 @@ pub struct CheckpointOptions {
     pub name: Option<String>,
     /// Labels recorded on the snapshot, filterable in
     /// [`ArcBox::list_snapshots`].
-    pub labels: std::collections::BTreeMap<String, String>,
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Options for [`ArcBox::restore`].
@@ -140,10 +139,11 @@ pub struct RestoreOptions {
     /// limit). Same semantics as [`CreateOptions::ttl`].
     pub ttl: Option<Duration>,
     /// Labels for the restored sandbox.
-    pub labels: std::collections::BTreeMap<String, String>,
+    pub labels: BTreeMap<String, String>,
     /// Assign a fresh TAP interface and IP to the restored sandbox.
-    /// Required when running several sandboxes restored from the same
-    /// snapshot concurrently.
+    /// Without it the restored sandbox reuses the origin's recorded
+    /// NIC — the origin must not be running. Required when running
+    /// several sandboxes restored from the same snapshot concurrently.
     pub fresh_network: bool,
 }
 
@@ -153,7 +153,7 @@ pub struct ListSnapshotsOptions {
     /// Keep only snapshots checkpointed from this sandbox.
     pub sandbox_id: Option<String>,
     /// Keep only snapshots carrying all of these labels.
-    pub labels: std::collections::BTreeMap<String, String>,
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Client entry point. Holds one lazily-dialled connection; every
@@ -440,7 +440,10 @@ impl ArcBox {
     /// Restore a new sandbox from a snapshot. The restored sandbox
     /// starts READY — there is no boot to wait for. It gets a fresh id,
     /// minted client-side so retries stay idempotent (the create()
-    /// rule); the origin sandbox is untouched.
+    /// rule). Without [`RestoreOptions::fresh_network`] the restored
+    /// sandbox reuses the origin's recorded NIC, so the origin must not
+    /// be running — and [`Sandbox::checkpoint`] resumes it, so pause or
+    /// kill it first (or set `fresh_network`).
     ///
     /// # Errors
     ///
@@ -499,7 +502,7 @@ impl ArcBox {
                 .await
                 .map_err(|error| Error::from_connect(error, "snapshots.list"))?
                 .into_owned();
-            rows.extend(page.snapshots.into_iter().map(snapshot_from_wire));
+            rows.extend(page.snapshots.into_iter().map(Snapshot::from));
             page_token = page.next_page_token;
             if page_token.is_empty() {
                 return Ok(rows);
@@ -851,7 +854,7 @@ impl EventStream {
                     if let Some(watch_events_response::Payload::Event(event)) =
                         frame.to_owned_message().payload
                     {
-                        return Ok(Some(sandbox_event_from_wire(*event)));
+                        return Ok(Some(SandboxEvent::from(*event)));
                     }
                     // Keepalives prove liveness but carry no event.
                 }

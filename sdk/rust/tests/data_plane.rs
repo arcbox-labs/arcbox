@@ -555,6 +555,26 @@ async fn read_collects_chunks_until_done() {
 }
 
 #[tokio::test]
+async fn a_read_stream_that_ends_without_done_is_an_error() {
+    let mock = Arc::new(MockDaemon::default());
+    // A prefix without the done marker: the transfer was cut short.
+    *mock.read_chunks.lock().unwrap() = vec![pb::FileChunk {
+        data: b"hel".to_vec(),
+        ..Default::default()
+    }];
+    let (_dir, path) = serve(mock.clone()).await;
+
+    let error = sandbox_for(&path)
+        .await
+        .files()
+        .read("/tmp/hello.txt")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), arcbox::ErrorKind::ConnectionLost);
+}
+
+#[tokio::test]
 async fn path_verbs_carry_their_shapes_and_stat_maps() {
     let mock = Arc::new(MockDaemon::default());
     let (_dir, path) = serve(mock.clone()).await;
@@ -643,6 +663,10 @@ async fn expose_and_list_map_the_port_shapes() {
 
     let mapping = ports.expose(8080, ExposeOptions::default()).await.unwrap();
     assert_eq!(mapping.host_port, 49152);
+    // The mapping's identity is the caller's sandbox port — the
+    // response's guest_port (61000 here) is the DNAT relay, never the
+    // sandbox port.
+    assert_eq!(mapping.sandbox_port, 8080);
     assert_eq!(mapping.protocol, Protocol::Tcp);
     // The wire never carries UNSPECIFIED outbound.
     assert_eq!(
