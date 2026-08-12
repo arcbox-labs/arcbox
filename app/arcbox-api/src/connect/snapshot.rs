@@ -9,9 +9,9 @@ use std::sync::Arc;
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::sandbox_cleanup;
-use super::sandbox_locks::SandboxOperationLocks;
 use super::{ConnectRuntimeExt as _, ContextExt as _};
+use arcbox_computer::cleanup as sandbox_cleanup;
+use arcbox_computer::locks::SandboxOperationLocks;
 
 /// Sandbox snapshot service implementation.
 pub struct SandboxSnapshotServiceImpl {
@@ -81,16 +81,10 @@ impl pb::SandboxSnapshotService for SandboxSnapshotServiceImpl {
                 tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox restore failed");
             })
             .map_err(ApiError::from)?;
-        let _host_state = runtime.lock_sandbox_host_state().await;
-
-        // Register restored sandbox DNS.
-        // Replays retain the original result even after Stop, so always
-        // confirm that the exact sandbox and IP are still live.
-        if let Ok(ip) = resp.ip_address.parse()
-            && sandbox_cleanup::live_sandbox_matches(runtime, &machine, &resp.id, ip).await
-        {
-            runtime.register_sandbox_dns(&resp.id, ip).await;
-        }
+        // Register restored sandbox DNS (shared live-match discipline;
+        // see register_live_sandbox_dns).
+        sandbox_cleanup::register_live_sandbox_dns(runtime, &machine, &resp.id, &resp.ip_address)
+            .await;
 
         Response::ok(resp)
     }

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use arcbox_connect::sandbox_v1 as pb;
 use arcbox_connect::sandbox_v1::{KeepAlive, WatchEventsResponse, watch_events_response};
-use arcbox_connect::v1::{SandboxPortForwardRemoveRequest, SandboxPortForwardRequest};
 use buffa_types::google::protobuf::Empty;
 use connectrpc::{
     ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
@@ -12,16 +11,15 @@ use connectrpc::{
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
-use arcbox_core::SandboxPortExposure;
-
 use super::SharedRuntime;
 use crate::ApiError;
 
 use super::exposed_port;
-use super::sandbox_cleanup;
-use super::sandbox_locks::SandboxOperationLocks;
 use super::sandbox_resume;
-use super::{ConnectRuntimeExt as _, ContextExt as _, protocol_key, wire_protocol, with_keepalive};
+use super::{ConnectRuntimeExt as _, ContextExt as _, port_protocol, with_keepalive};
+use arcbox_computer::cleanup as sandbox_cleanup;
+use arcbox_computer::locks::SandboxOperationLocks;
+use arcbox_computer::ports;
 
 /// Sandbox lifecycle service implementation.
 ///
@@ -78,16 +76,10 @@ impl pb::SandboxService for SandboxServiceImpl {
                 tracing::warn!(machine = %machine, sandbox_id = %sandbox_id, %error, "sandbox create failed");
             })
             .map_err(ApiError::from)?;
-        let _host_state = runtime.lock_sandbox_host_state().await;
-
-        // Register sandbox DNS so the host can resolve sandbox-id.arcbox.local.
-        // Replays retain the original result even after Stop, so always
-        // confirm that the exact sandbox and IP are still live.
-        if let Ok(ip) = resp.ip_address.parse()
-            && sandbox_cleanup::live_sandbox_matches(runtime, &machine, &resp.id, ip).await
-        {
-            runtime.register_sandbox_dns(&resp.id, ip).await;
-        }
+        // Register sandbox DNS so the host can resolve sandbox-id.arcbox.local
+        // (shared live-match discipline; see register_live_sandbox_dns).
+        sandbox_cleanup::register_live_sandbox_dns(runtime, &machine, &resp.id, &resp.ip_address)
+            .await;
 
         Response::ok(resp)
     }
@@ -300,76 +292,28 @@ impl pb::SandboxService for SandboxServiceImpl {
             .ok_or_else(|| ConnectError::invalid_argument("sandbox_port must be 1-65535"))?;
         let host_port = u16::try_from(req.host_port)
             .map_err(|_| ConnectError::invalid_argument("host_port must be 0-65535"))?;
-        let requested = req.protocol.as_known().unwrap_or_default();
-        let protocol = protocol_key(requested).to_owned();
-        let wire = wire_protocol(requested);
+        let protocol = port_protocol(req.protocol.as_known().unwrap_or_default());
         let runtime = self.runtime.ready()?;
-        let host_generation = runtime.sandbox_host_state_generation().await;
 
-        // Guest half: allocate the reserved relay port and install the DNAT.
-        let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
-        let forwarded = agent
-            .sandbox_port_forward(SandboxPortForwardRequest {
-                id: req.id.clone(),
-                sandbox_port: u32::from(sandbox_port),
-                protocol: wire.into(),
-                ..Default::default()
-            })
-            .await
-            .map_err(ApiError::from)?;
-        let guest_port = u16::try_from(forwarded.guest_port)
-            .map_err(|_| ConnectError::internal("agent returned an invalid guest port"))?;
-        let rollback_request = || SandboxPortForwardRemoveRequest {
-            id: req.id.clone(),
-            sandbox_port: u32::from(sandbox_port),
-            protocol: wire.into(),
-            ..Default::default()
-        };
-        let host_state = runtime.lock_sandbox_host_state().await;
-        if *host_state != host_generation {
-            let primary = ConnectError::unavailable(
-                "sandbox host cleanup raced port exposure; retry to confirm the result",
-            );
-            if let Err(rollback) = agent.sandbox_port_forward_remove(rollback_request()).await {
-                tracing::warn!(
-                    sandbox_id = %req.id,
-                    error = %rollback,
-                    "failed to roll back guest DNAT after host cleanup race"
-                );
-            }
-            return Err(primary);
-        }
-
-        // Host half: bind the listener; default the host port to the relay
-        // port for a stable, collision-free mapping.
-        let host_port = if host_port == 0 {
-            guest_port
-        } else {
-            host_port
-        };
-        let exposure = SandboxPortExposure {
-            sandbox_id: req.id.clone(),
+        let exposed = ports::expose(
+            runtime,
+            &machine,
+            &req.id,
             sandbox_port,
-            protocol: protocol.clone(),
             host_port,
-            guest_port,
-        };
-        if let Err(e) = runtime.expose_sandbox_port(&machine, &exposure).await {
-            // Roll back the guest DNAT so a failed bind leaves no half rule.
-            let primary = ConnectError::from(ApiError::from(e));
-            if let Err(rollback) = agent.sandbox_port_forward_remove(rollback_request()).await {
-                tracing::warn!(
-                    sandbox_id = %req.id,
-                    error = %rollback,
-                    "failed to roll back guest DNAT after host bind failure"
-                );
-            }
-            return Err(primary);
-        }
+            protocol,
+        )
+        .await
+        .map_err(|error| match error {
+            ports::ExposePortError::Raced => ConnectError::unavailable(
+                "sandbox host cleanup raced port exposure; retry to confirm the result",
+            ),
+            ports::ExposePortError::Engine(e) => ConnectError::from(ApiError::from(e)),
+        })?;
 
         let resp = pb::ExposePortResponse {
-            host_port: u32::from(host_port),
-            guest_port: u32::from(guest_port),
+            host_port: u32::from(exposed.host_port),
+            guest_port: u32::from(exposed.guest_port),
             ..Default::default()
         };
         Response::ok(resp)
@@ -384,42 +328,25 @@ impl pb::SandboxService for SandboxServiceImpl {
         let req = request.to_owned_message();
         let _operation = self.operations.lock(&machine, &req.id).await;
         let runtime = self.runtime.ready()?;
-        let mut agent = runtime.get_agent(&machine).map_err(|error| {
-            ConnectError::unavailable(format!("sandbox state unavailable: {error}"))
-        })?;
-        // A retry turns a concurrent TTL/idle deletion into the existing 404
-        // boundary without holding host state across the guest RPC.
-        for _ in 0..2 {
-            let host_generation = runtime.sandbox_host_state_generation().await;
-            agent
-                .sandbox_inspect(pb::InspectSandboxRequest {
-                    id: req.id.clone(),
-                    ..Default::default()
-                })
+        let mappings =
+            ports::list(runtime, &machine, &req.id)
                 .await
                 .map_err(|error| match error {
-                    error @ arcbox_engine::EngineError::Agent { code: 404, .. } => {
-                        ConnectError::from(ApiError::from(error))
+                    ports::ListExposedPortsError::Sandbox(e) => {
+                        ConnectError::from(ApiError::from(e))
                     }
-                    error => {
-                        ConnectError::unavailable(format!("sandbox state unavailable: {error}"))
+                    ports::ListExposedPortsError::Unavailable(e) => {
+                        ConnectError::unavailable(format!("sandbox state unavailable: {e}"))
                     }
+                    ports::ListExposedPortsError::Unstable => ConnectError::unavailable(
+                        "sandbox cleanup prevented a stable exposed-port snapshot; retry",
+                    ),
                 })?;
-
-            if let Some(mappings) = runtime
-                .sandbox_port_mappings_if_unchanged(&req.id, host_generation)
-                .await
-            {
-                let ports = mappings.into_iter().map(exposed_port).collect();
-                return Response::ok(pb::ListExposedPortsResponse {
-                    ports,
-                    ..Default::default()
-                });
-            }
-        }
-        Err(ConnectError::unavailable(
-            "sandbox cleanup prevented a stable exposed-port snapshot; retry",
-        ))
+        let listed = mappings.into_iter().map(exposed_port).collect();
+        Response::ok(pb::ListExposedPortsResponse {
+            ports: listed,
+            ..Default::default()
+        })
     }
 
     async fn unexpose_port(
@@ -434,26 +361,9 @@ impl pb::SandboxService for SandboxServiceImpl {
             .ok()
             .filter(|p| *p != 0)
             .ok_or_else(|| ConnectError::invalid_argument("sandbox_port must be 1-65535"))?;
-        let requested = req.protocol.as_known().unwrap_or_default();
-        let protocol = protocol_key(requested);
-        let wire = wire_protocol(requested);
-
+        let protocol = port_protocol(req.protocol.as_known().unwrap_or_default());
         let runtime = self.runtime.ready()?;
-        // Close the host listener before freeing the guest relay port. If the
-        // guest delete fails, the safe half is already closed and a retry can
-        // finish it without a cross-sandbox forwarding window.
-        runtime
-            .unexpose_sandbox_port(&req.id, sandbox_port, protocol)
-            .await;
-
-        let mut agent = runtime.get_agent(&machine).map_err(ApiError::from)?;
-        agent
-            .sandbox_port_forward_remove(SandboxPortForwardRemoveRequest {
-                id: req.id.clone(),
-                sandbox_port: u32::from(sandbox_port),
-                protocol: wire.into(),
-                ..Default::default()
-            })
+        ports::unexpose(runtime, &machine, &req.id, sandbox_port, protocol)
             .await
             .map_err(ApiError::from)?;
 

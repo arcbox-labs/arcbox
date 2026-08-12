@@ -247,6 +247,7 @@ dependencies = [
 name = "arcbox-api"
 version = "0.6.5"
 dependencies = [
+ "arcbox-computer",
  "arcbox-connect",
  "arcbox-constants",
  "arcbox-core",
@@ -344,6 +345,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-computer"
+version = "0.6.5"
+dependencies = [
+ "arcbox-connect",
+ "arcbox-engine",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "arcbox-connect"
 version = "0.6.5"
 dependencies = [
@@ -388,6 +399,7 @@ dependencies = [
 name = "arcbox-core"
 version = "0.6.5"
 dependencies = [
+ "arcbox-computer",
  "arcbox-connect",
  "arcbox-constants",
  "arcbox-dns",

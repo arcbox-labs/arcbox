@@ -56,6 +56,10 @@ pub enum EngineError {
         source: arcbox_transport::error::TransportError,
     },
 
+    /// Network error (host listeners, forwarding).
+    #[error("network error: {0}")]
+    Net(#[from] arcbox_net::NetError),
+
     /// Image-layer error (boot assets, machine images).
     #[error(transparent)]
     Image(#[from] arcbox_image::ImageError),

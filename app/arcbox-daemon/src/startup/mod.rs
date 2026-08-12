@@ -256,7 +256,7 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     }
 
     let sandbox_cleanup_supported = if runtime.config().vm.autostart {
-        arcbox_api::initialize_sandbox_cleanup(&runtime)
+        arcbox_api::initialize_sandbox_cleanup(runtime.as_ref())
             .await
             .context("Failed to initialize sandbox cleanup")?
     } else {

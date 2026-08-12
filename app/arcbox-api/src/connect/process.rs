@@ -15,9 +15,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::sandbox_locks::SandboxOperationLocks;
 use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
+use arcbox_computer::SandboxHost as _;
+use arcbox_computer::locks::SandboxOperationLocks;
 
 /// Wait budget applied when `WaitForPortRequest.timeout_seconds` is 0, as
 /// documented on the proto field ("0 = daemon default of 30 s").
@@ -92,7 +93,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             || {
                 let req = req.clone();
                 async {
-                    let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
+                    let mut agent = runtime.agent(&machine)?;
                     agent.sandbox_exec_start(req).await
                 }
             },
@@ -142,7 +143,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             || {
                 let req = req.clone();
                 async {
-                    let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
+                    let mut agent = runtime.agent(&machine)?;
                     agent.sandbox_stdin_write(req).await
                 }
             },
@@ -174,7 +175,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
                 || {
                     let req = req.clone();
                     async {
-                        let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
+                        let mut agent = runtime.agent(&machine)?;
                         agent.sandbox_stdin_write(req).await
                     }
                 },
@@ -300,7 +301,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             || {
                 let req = req.clone();
                 async {
-                    let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
+                    let mut agent = runtime.agent(&machine)?;
                     agent.sandbox_wait_for_port(req).await
                 }
             },
