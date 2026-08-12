@@ -35,6 +35,13 @@ pub trait SandboxHost: Send + Sync {
     /// Deregisters one sandbox's DNS records.
     fn deregister_dns(&self, sandbox_id: &str) -> impl Future<Output = ()> + Send;
 
+    /// Registers a sandbox's DNS records at `ip`.
+    fn register_dns(
+        &self,
+        sandbox_id: &str,
+        ip: std::net::IpAddr,
+    ) -> impl Future<Output = ()> + Send;
+
     /// Connects to a machine's guest agent, in the engine vocabulary.
     ///
     /// # Errors
@@ -66,6 +73,10 @@ impl<H: SandboxHost> SandboxHost for std::sync::Arc<H> {
 
     async fn deregister_dns(&self, sandbox_id: &str) {
         (**self).deregister_dns(sandbox_id).await;
+    }
+
+    async fn register_dns(&self, sandbox_id: &str, ip: std::net::IpAddr) {
+        (**self).register_dns(sandbox_id, ip).await;
     }
 
     fn agent(&self, machine: &str) -> arcbox_engine::Result<AgentClient> {

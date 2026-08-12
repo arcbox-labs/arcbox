@@ -14,5 +14,6 @@
 pub mod cleanup;
 pub mod host;
 pub mod locks;
+pub mod resume;
 
 pub use host::SandboxHost;

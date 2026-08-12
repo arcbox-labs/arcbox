@@ -27,6 +27,10 @@ impl SandboxHost for Runtime {
         self.deregister_sandbox_dns(sandbox_id).await;
     }
 
+    async fn register_dns(&self, sandbox_id: &str, ip: std::net::IpAddr) {
+        self.register_sandbox_dns(sandbox_id, ip).await;
+    }
+
     fn agent(&self, machine: &str) -> arcbox_engine::Result<AgentClient> {
         self.machine_manager().connect_agent(machine)
     }
