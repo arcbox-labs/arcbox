@@ -19,7 +19,7 @@ pub use config::BootAssetConfig;
 pub use lockfile::{boot_asset_cdn, boot_asset_version};
 pub use provider::{BootAssetProvider, BootAssets, CachedBinaryReport, ProgressCallback};
 
-pub(crate) const REQUIRED_RUNTIME_BINARIES: [&str; 6] = [
+pub const REQUIRED_RUNTIME_BINARIES: [&str; 6] = [
     "dockerd",
     "containerd",
     "containerd-shim-runc-v2",

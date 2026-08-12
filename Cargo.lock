@@ -252,6 +252,7 @@ dependencies = [
  "arcbox-core",
  "arcbox-docker",
  "arcbox-error",
+ "arcbox-image",
  "arcbox-transport",
  "async-stream",
  "base64",
@@ -394,6 +395,7 @@ dependencies = [
  "arcbox-fs",
  "arcbox-helper",
  "arcbox-hypervisor",
+ "arcbox-image",
  "arcbox-migration",
  "arcbox-net",
  "arcbox-route",
@@ -411,7 +413,6 @@ dependencies = [
  "ifbridge",
  "libc",
  "reqwest 0.12.28",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -738,6 +739,26 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "arcbox-image"
+version = "0.6.5"
+dependencies = [
+ "arcbox-boot",
+ "arcbox-constants",
+ "arcbox-error",
+ "dirs",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

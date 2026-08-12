@@ -28,6 +28,7 @@ connectrpc = { git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6
 buffa = { version = "0.9.1", features = ["json"] }
 buffa-types = { version = "0.9.1", features = ["json"] }
 arcbox-transport.workspace = true
+arcbox-image.workspace = true
 
 [dev-dependencies]
 base64 = "0.22.1"

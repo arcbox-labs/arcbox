@@ -36,7 +36,7 @@ const fn stage_name(stage: PullStage) -> &'static str {
 fn parse_source(reference: &str, manifest_url: &str) -> Result<RemoteSource, ConnectError> {
     match (reference.is_empty(), manifest_url.is_empty()) {
         (false, true) => Ok(RemoteSource::Reference(reference.parse().map_err(
-            |e: arcbox_core::CoreError| ConnectError::invalid_argument(e.to_string()),
+            |e: arcbox_image::ImageError| ConnectError::invalid_argument(e.to_string()),
         )?)),
         (true, false) => Ok(RemoteSource::Manifest(RemoteLocation::parse(manifest_url))),
         _ => Err(ConnectError::invalid_argument(

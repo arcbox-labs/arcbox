@@ -16,7 +16,7 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
-use crate::error::{CoreError, Result};
+use crate::error::{ImageError, Result};
 
 /// A parsed image reference: `stream` or `stream@version`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub struct ImageReference {
 }
 
 impl FromStr for ImageReference {
-    type Err = CoreError;
+    type Err = ImageError;
 
     fn from_str(s: &str) -> Result<Self> {
         let (stream, version) = match s.split_once('@') {
@@ -40,11 +40,11 @@ impl FromStr for ImageReference {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
         {
-            return Err(CoreError::image(format!("invalid image reference '{s}'")));
+            return Err(ImageError::image(format!("invalid image reference '{s}'")));
         }
         if let Some(v) = &version {
             if v.is_empty() {
-                return Err(CoreError::image(format!("invalid image reference '{s}'")));
+                return Err(ImageError::image(format!("invalid image reference '{s}'")));
             }
         }
         Ok(Self {
@@ -97,13 +97,13 @@ impl RemoteIndex {
         let stream = self
             .images
             .get(&reference.stream)
-            .ok_or_else(|| CoreError::not_found(format!("image stream '{}'", reference.stream)))?;
+            .ok_or_else(|| ImageError::not_found(format!("image stream '{}'", reference.stream)))?;
         let version = reference
             .version
             .clone()
             .unwrap_or_else(|| stream.latest.clone());
         let entry = stream.versions.get(&version).ok_or_else(|| {
-            CoreError::not_found(format!("image '{}@{version}'", reference.stream))
+            ImageError::not_found(format!("image '{}@{version}'", reference.stream))
         })?;
         Ok((version, entry.manifest.clone()))
     }
@@ -147,7 +147,7 @@ impl RemoteLocation {
             Self::Http(url) => {
                 let joined = url
                     .join(relative)
-                    .map_err(|e| CoreError::image(format!("join '{relative}' to {url}: {e}")))?;
+                    .map_err(|e| ImageError::image(format!("join '{relative}' to {url}: {e}")))?;
                 Ok(Self::Http(joined))
             }
             Self::File(path) => {
@@ -184,11 +184,11 @@ impl RemoteLocation {
                 let resp = reqwest::get(url.clone())
                     .await
                     .and_then(reqwest::Response::error_for_status)
-                    .map_err(|e| CoreError::image(format!("fetch {url}: {e}")))?;
+                    .map_err(|e| ImageError::image(format!("fetch {url}: {e}")))?;
                 let bytes = resp
                     .bytes()
                     .await
-                    .map_err(|e| CoreError::image(format!("fetch {url}: {e}")))?;
+                    .map_err(|e| ImageError::image(format!("fetch {url}: {e}")))?;
                 Ok(bytes.to_vec())
             }
             Self::File(path) => Ok(std::fs::read(path)?),
@@ -201,7 +201,7 @@ impl RemoteLocation {
     /// Returns an error on fetch failure or JSON that does not match `T`.
     pub async fn fetch_json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         let bytes = self.fetch_bytes().await?;
-        serde_json::from_slice(&bytes).map_err(|e| CoreError::image(format!("parse {self}: {e}")))
+        serde_json::from_slice(&bytes).map_err(|e| ImageError::image(format!("parse {self}: {e}")))
     }
 }
 
@@ -221,7 +221,7 @@ impl fmt::Display for RemoteLocation {
 /// therefore be exactly one normal path component: this rejects empty names,
 /// embedded NUL, absolute paths, path separators, and `.`/`..`, so a caller-
 /// or manifest-supplied name can never escape its root.
-pub(crate) fn validate_name(name: &str) -> Result<()> {
+pub fn validate_name(name: &str) -> Result<()> {
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(only)), None)
@@ -229,7 +229,7 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
         {
             Ok(())
         }
-        _ => Err(CoreError::image(format!("invalid name '{name}'"))),
+        _ => Err(ImageError::image(format!("invalid name '{name}'"))),
     }
 }
 
@@ -240,17 +240,17 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 /// makes those flows safe against early return and cancellation: if it is
 /// dropped before `disarm` (an error, or the future being dropped at an await
 /// point), the partial directory is removed rather than leaked.
-pub(crate) struct StagingGuard {
+pub struct StagingGuard {
     path: Option<PathBuf>,
 }
 
 impl StagingGuard {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         Self { path: Some(path) }
     }
 
     /// Keeps the directory (it has been renamed into its final location).
-    pub(crate) fn disarm(&mut self) {
+    pub fn disarm(&mut self) {
         self.path = None;
     }
 }

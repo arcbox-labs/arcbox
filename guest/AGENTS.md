@@ -54,7 +54,7 @@ non-obvious invariants and failure signatures.
   (`.github/workflows/release.yml`). arcbox consumes a new release by bumping
   BOTH `[boot] version` and `manifest_sha256` in `assets.lock`, which is
   `include_str!`-embedded into the daemon at COMPILE time
-  (`app/arcbox-core/src/boot_assets/lockfile.rs`) — editing `assets.lock`
+  (`engine/arcbox-image/src/boot_assets/lockfile.rs`) — editing `assets.lock`
   without rebuilding the daemon changes nothing.
 - **Guest wall clock comes from the Ping handler.** HV exposes no RTC (ABX-416),
   so `handle_ping` calls `sync_clock_from_host(req.timestamp_secs)` →

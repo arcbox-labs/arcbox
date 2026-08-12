@@ -280,7 +280,7 @@ above). When editing either side, keep in lockstep:
   `runtime/AGENTS.md` means by "the pull path elsewhere" — there is no host-side
   pull module to call; drive it through the Docker API proxy.
 
-## Boot-asset pin (`arcbox-core/src/boot_assets`)
+## Boot-asset pin (`engine/arcbox-image`)
 
 - `assets.lock` is embedded at COMPILE TIME
   (`include_str!("../../../../assets.lock")`, `lockfile.rs`): the daemon

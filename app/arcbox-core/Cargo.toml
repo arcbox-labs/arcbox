@@ -44,7 +44,7 @@ zstd = "0.13.3"
 base64 = "0.22.1"
 arcbox-connect.workspace = true
 buffa = "0.9.1"
-semver = "1.0.28"
+arcbox-image.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-route.workspace = true

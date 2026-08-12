@@ -57,7 +57,12 @@ members = [
     "runtime/arcbox-oci",
 
     # ============================================
-    # L6-7: Application (MIT OR Apache-2.0)
+    # L6: Engine (MIT OR Apache-2.0)
+    # ============================================
+    "engine/arcbox-image",
+
+    # ============================================
+    # L7: Application (MIT OR Apache-2.0)
     # ============================================
     "app/arcbox-core",
     "app/arcbox-api",
@@ -256,7 +261,6 @@ arcbox-net = { version = "0.6.5", path = "virt/arcbox-net" } # x-release-please-
 arcbox-vmnet = { version = "0.6.5", path = "virt/arcbox-vmnet" } # x-release-please-version
 arcbox-net-inject = { version = "0.6.5", path = "virt/arcbox-net-inject" } # x-release-please-version
 arcbox-dhcp = { version = "0.6.5", path = "virt/arcbox-dhcp" } # x-release-please-version
-arcbox-container = { version = "0.6.5", path = "runtime/arcbox-container" } # x-release-please-version
 arcbox-protocol = { version = "0.6.5", path = "rpc/arcbox-protocol" } # x-release-please-version
 arcbox-grpc = { version = "0.6.5", path = "rpc/arcbox-grpc" } # x-release-please-version
 arcbox-connect = { version = "0.6.5", path = "rpc/arcbox-connect" } # x-release-please-version
@@ -267,6 +271,7 @@ arcbox-docker = { version = "0.6.5", path = "app/arcbox-docker" } # x-release-pl
 # Pinned to app/arcbox-helper's own version (not workspace.package). Do not
 # attach x-release-please-version — helper releases are manual.
 arcbox-helper = { version = "1.0.2", path = "app/arcbox-helper" }
+arcbox-image = { version = "0.6.5", path = "engine/arcbox-image" } # x-release-please-version
 arcbox-core = { version = "0.6.5", path = "app/arcbox-core" } # x-release-please-version
 arcbox-api = { version = "0.6.5", path = "app/arcbox-api" } # x-release-please-version
 arcbox-migration = { version = "0.6.5", path = "app/arcbox-migration" } # x-release-please-version
