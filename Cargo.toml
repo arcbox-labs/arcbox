@@ -60,6 +60,7 @@ members = [
     # L6: Engine (MIT OR Apache-2.0)
     # ============================================
     "engine/arcbox-image",
+    "engine/arcbox-engine",
 
     # ============================================
     # L7: Application (MIT OR Apache-2.0)
@@ -273,6 +274,7 @@ arcbox-docker = { version = "0.6.5", path = "app/arcbox-docker" } # x-release-pl
 # attach x-release-please-version — helper releases are manual.
 arcbox-helper = { version = "1.0.2", path = "app/arcbox-helper" }
 arcbox-image = { version = "0.6.5", path = "engine/arcbox-image" } # x-release-please-version
+arcbox-engine = { version = "0.6.5", path = "engine/arcbox-engine" } # x-release-please-version
 arcbox-core = { version = "0.6.5", path = "app/arcbox-core" } # x-release-please-version
 arcbox-api = { version = "0.6.5", path = "app/arcbox-api" } # x-release-please-version
 arcbox-migration = { version = "0.6.5", path = "app/arcbox-migration" } # x-release-please-version

@@ -1,0 +1,31 @@
+[package]
+name = "arcbox-engine"
+description = "Embeddable, daemon-free VM engine for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-connect = { workspace = true }
+arcbox-constants = { workspace = true }
+arcbox-error = { workspace = true }
+arcbox-transport = { workspace = true }
+arcbox-vmm = { workspace = true }
+buffa = "0.9.1"
+bytes = { workspace = true }
+chrono = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

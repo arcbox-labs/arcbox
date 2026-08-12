@@ -17,7 +17,7 @@ use std::time::Duration;
 use arcbox_connect::v1::{MachineStats, WatchStatsRequest};
 use tokio::sync::broadcast;
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::machine::MachineManager;
 
 /// Sample cadence requested from the agent.
@@ -189,7 +189,10 @@ pub struct AgentStatsStream {
 
 impl StatsStream for AgentStatsStream {
     async fn next(&mut self, max_wait: Duration) -> Result<MachineStats> {
-        self.agent.next_machine_stats(max_wait).await
+        self.agent
+            .next_machine_stats(max_wait)
+            .await
+            .map_err(CoreError::from)
     }
 }
 

@@ -666,8 +666,12 @@ impl Runtime {
             tokio::task::spawn_blocking(move || agent.container_fs_paths_blocking(&id))
                 .await
                 .map_err(|e| CoreError::Vm(format!("container fs paths task panicked: {e}")))?
+                .map_err(CoreError::from)
         } else {
-            agent.container_fs_paths(container_id).await
+            agent
+                .container_fs_paths(container_id)
+                .await
+                .map_err(CoreError::from)
         }
     }
 
@@ -692,8 +696,12 @@ impl Runtime {
             tokio::task::spawn_blocking(move || agent.image_fs_paths_blocking(&id))
                 .await
                 .map_err(|e| CoreError::Vm(format!("image fs paths task panicked: {e}")))?
+                .map_err(CoreError::from)
         } else {
-            agent.image_fs_paths(top_chain_id).await
+            agent
+                .image_fs_paths(top_chain_id)
+                .await
+                .map_err(CoreError::from)
         }
     }
 

@@ -251,6 +251,7 @@ dependencies = [
  "arcbox-constants",
  "arcbox-core",
  "arcbox-docker",
+ "arcbox-engine",
  "arcbox-error",
  "arcbox-image",
  "arcbox-transport",
@@ -390,6 +391,7 @@ dependencies = [
  "arcbox-connect",
  "arcbox-constants",
  "arcbox-dns",
+ "arcbox-engine",
  "arcbox-error",
  "arcbox-fs",
  "arcbox-helper",
@@ -570,6 +572,26 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xshell",
+]
+
+[[package]]
+name = "arcbox-engine"
+version = "0.6.5"
+dependencies = [
+ "arcbox-connect",
+ "arcbox-constants",
+ "arcbox-error",
+ "arcbox-transport",
+ "arcbox-vmm",
+ "buffa",
+ "bytes",
+ "chrono",
+ "libc",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

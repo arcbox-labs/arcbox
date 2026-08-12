@@ -28,7 +28,6 @@
 //!           ▼            ▼
 //!      arcbox-vmm   arcbox-fs
 //! ```
-pub mod agent_client;
 #[cfg(target_os = "macos")]
 pub mod bridge_discovery;
 pub mod config;
@@ -45,15 +44,16 @@ pub mod route_reconciler;
 pub mod runtime;
 pub mod sandbox_capability;
 pub mod stats_hub;
-pub mod trace;
 pub mod vm;
 pub mod vm_lifecycle;
 
-// Image management moved to the engine layer (arcbox-image); the module
-// paths and crate-root items below are compatibility re-exports.
+// Image management and the engine core moved to the engine layer
+// (arcbox-image, arcbox-engine); the module paths and crate-root items
+// below are compatibility re-exports.
+pub use arcbox_engine::{agent_client, trace};
 pub use arcbox_image::{boot_assets, machine_image, remote_image};
 
-pub use agent_client::{AgentClient, ExecSessionInput, WriteFileChunk};
+pub use arcbox_engine::agent_client::{AgentClient, ExecSessionInput, WriteFileChunk};
 pub use arcbox_image::boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
     PreparePhase, boot_asset_version,

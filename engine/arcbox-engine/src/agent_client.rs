@@ -12,7 +12,7 @@ mod transport;
 mod wire;
 
 use self::transport::{AgentTransport, BLOCKING_RPC_TIMEOUT};
-use crate::error::{CoreError, Result};
+use crate::error::{EngineError, Result};
 use arcbox_connect::sandbox_v1::{
     AttachExecutionRequest, BuildTemplateRequest, CheckpointRequest, CheckpointResponse,
     CreateSandboxRequest, CreateSandboxResponse, DeleteSnapshotRequest, DeleteTemplateRequest,
@@ -115,7 +115,7 @@ impl AgentClient {
     #[cfg(target_os = "macos")]
     pub fn from_fd_blocking(cid: u32, fd: std::os::unix::io::RawFd) -> Result<Self> {
         let transport = unsafe { BlockingVsockTransport::from_raw_fd(fd) }
-            .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {e}")))?;
+            .map_err(|e| EngineError::Machine(format!("invalid vsock fd: {e}")))?;
         Ok(Self {
             cid,
             transport: AgentTransport::Blocking(transport),
@@ -136,7 +136,7 @@ impl AgentClient {
     pub fn from_fd_async(cid: u32, fd: std::os::unix::io::RawFd) -> Result<Self> {
         let addr = VsockAddr::new(cid, AGENT_PORT);
         let transport = VsockTransport::from_raw_fd(fd, addr)
-            .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {e}")))?;
+            .map_err(|e| EngineError::Machine(format!("invalid vsock fd: {e}")))?;
         Ok(Self {
             cid,
             transport: AgentTransport::Async(transport),
@@ -151,7 +151,7 @@ impl AgentClient {
     }
 
     /// Builds a V2 wire message with an optional `trace_id`.
-    pub(crate) fn build_message(msg_type: MessageType, trace_id: &str, payload: &[u8]) -> Bytes {
+    pub fn build_message(msg_type: MessageType, trace_id: &str, payload: &[u8]) -> Bytes {
         wire::build_message(msg_type, trace_id, payload)
     }
 
@@ -167,7 +167,7 @@ impl AgentClient {
 
         match &mut self.transport {
             AgentTransport::Async(t) => {
-                t.connect().await.map_err(|source| CoreError::Transport {
+                t.connect().await.map_err(|source| EngineError::Transport {
                     context: "failed to connect to agent",
                     source,
                 })?;
@@ -188,7 +188,7 @@ impl AgentClient {
             if let AgentTransport::Async(t) = &mut self.transport {
                 t.disconnect()
                     .await
-                    .map_err(|e| CoreError::Machine(format!("failed to disconnect: {e}")))?;
+                    .map_err(|e| EngineError::Machine(format!("failed to disconnect: {e}")))?;
             }
             self.connected = false;
         }
@@ -226,10 +226,10 @@ impl AgentClient {
                 // Send request.
                 t.send(buf)
                     .await
-                    .map_err(|e| CoreError::Machine(format!("{msg_type:?} send failed: {e}")))?;
+                    .map_err(|e| EngineError::Machine(format!("{msg_type:?} send failed: {e}")))?;
                 // Receive response.
                 t.recv().await.map_err(|e| {
-                    CoreError::Machine(format!("{msg_type:?} response receive failed: {e}"))
+                    EngineError::Machine(format!("{msg_type:?} response receive failed: {e}"))
                 })?
             }
             AgentTransport::Blocking(t) => {
@@ -239,10 +239,10 @@ impl AgentClient {
                 tokio::task::block_in_place(|| {
                     let deadline = Instant::now() + BLOCKING_RPC_TIMEOUT;
                     t.send(&buf, deadline).map_err(|e| {
-                        CoreError::Machine(format!("{msg_type:?} send failed: {e}"))
+                        EngineError::Machine(format!("{msg_type:?} send failed: {e}"))
                     })?;
                     t.recv(deadline).map_err(|e| {
-                        CoreError::Machine(format!("{msg_type:?} response receive failed: {e}"))
+                        EngineError::Machine(format!("{msg_type:?} response receive failed: {e}"))
                     })
                 })?
             }
@@ -253,7 +253,7 @@ impl AgentClient {
         // Check for error response.
         if resp_type == MessageType::Error as u32 {
             let (code, message) = wire::parse_error_response(&payload)?;
-            return Err(CoreError::Agent { code, message });
+            return Err(EngineError::Agent { code, message });
         }
 
         Ok((resp_type, payload))
@@ -273,13 +273,13 @@ impl AgentClient {
             AgentTransport::Blocking(t) => {
                 let deadline = Instant::now() + BLOCKING_RPC_TIMEOUT;
                 t.send(&buf, deadline)
-                    .map_err(|e| CoreError::Machine(format!("{msg_type:?} send failed: {e}")))?;
+                    .map_err(|e| EngineError::Machine(format!("{msg_type:?} send failed: {e}")))?;
                 t.recv(deadline).map_err(|e| {
-                    CoreError::Machine(format!("{msg_type:?} response receive failed: {e}"))
+                    EngineError::Machine(format!("{msg_type:?} response receive failed: {e}"))
                 })?
             }
             AgentTransport::Async(_) => {
-                return Err(CoreError::Machine(
+                return Err(EngineError::Machine(
                     "rpc_call_blocking called on async transport".into(),
                 ));
             }
@@ -288,21 +288,21 @@ impl AgentClient {
         let (resp_type, _resp_trace, payload) = wire::parse_response(&response)?;
         if resp_type == MessageType::Error as u32 {
             let (code, message) = wire::parse_error_response(&payload)?;
-            return Err(CoreError::Agent { code, message });
+            return Err(EngineError::Agent { code, message });
         }
         Ok((resp_type, payload))
     }
 
     fn decode_response<T: Message>(payload: &[u8]) -> Result<T> {
         T::decode_from_slice(payload)
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+            .map_err(|e| EngineError::Machine(format!("failed to decode response: {e}")))
     }
 
     fn expect_response_type(resp_type: u32, expected: MessageType) -> Result<()> {
         if resp_type == expected as u32 {
             Ok(())
         } else {
-            Err(CoreError::Machine(format!(
+            Err(EngineError::Machine(format!(
                 "unexpected response type: 0x{resp_type:04x}"
             )))
         }
@@ -312,7 +312,7 @@ impl AgentClient {
         if resp_type == expected as u32 || resp_type == MessageType::Empty as u32 {
             Ok(())
         } else {
-            Err(CoreError::Machine(format!(
+            Err(EngineError::Machine(format!(
                 "unexpected response type: 0x{resp_type:04x}"
             )))
         }
@@ -358,14 +358,14 @@ impl AgentClient {
         use arcbox_constants::wire::{AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION};
 
         if resp.protocol_version == 0 {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "guest agent did not complete a compatible handshake \
                  (agent version {}, response {:?}); fix the reported guest boot contract",
                 resp.version, resp.message,
             )));
         }
         if resp.protocol_version < MIN_AGENT_PROTOCOL_VERSION {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "guest agent is incompatible with this daemon: agent protocol {} \
                  (agent version {}, response {:?}), daemon requires >= {}. The staged agent \
                  binary is stale — reinstall or update ArcBox so the bundled \
@@ -414,7 +414,7 @@ impl AgentClient {
     pub fn kill_agent_blocking(&mut self) -> Result<()> {
         let (resp_type, _payload) = self.rpc_call_blocking(MessageType::KillAgentRequest, &[])?;
         if resp_type != MessageType::KillAgentResponse as u32 {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "unexpected response type: {resp_type}"
             )));
         }
@@ -532,12 +532,12 @@ impl AgentClient {
         let (resp_type, resp_payload) =
             self.rpc_call_blocking(MessageType::EnsureRuntimeRequest, &payload)?;
         if resp_type != MessageType::EnsureRuntimeResponse as u32 {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "unexpected response type: {resp_type}"
             )));
         }
         RuntimeEnsureResponse::decode_from_slice(&resp_payload)
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+            .map_err(|e| EngineError::Machine(format!("failed to decode response: {e}")))
     }
 
     /// Gets guest runtime status.
@@ -582,14 +582,14 @@ impl AgentClient {
         match &mut self.transport {
             AgentTransport::Async(t) => {
                 t.send(buf).await.map_err(|e| {
-                    CoreError::Machine(format!("failed to send readiness watch request: {e}"))
+                    EngineError::Machine(format!("failed to send readiness watch request: {e}"))
                 })?;
 
                 let deadline = tokio::time::Instant::now() + timeout;
                 loop {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
-                        return Err(CoreError::Machine(
+                        return Err(EngineError::Machine(
                             "timeout waiting for guest readiness event".to_string(),
                         ));
                     }
@@ -597,12 +597,12 @@ impl AgentClient {
                     let raw = tokio::time::timeout(remaining, t.recv())
                         .await
                         .map_err(|_| {
-                            CoreError::Machine(
+                            EngineError::Machine(
                                 "timeout waiting for guest readiness event".to_string(),
                             )
                         })?
                         .map_err(|e| {
-                            CoreError::Machine(format!("failed to receive readiness event: {e}"))
+                            EngineError::Machine(format!("failed to receive readiness event: {e}"))
                         })?;
 
                     let event = Self::decode_readiness_event(&raw)?;
@@ -614,12 +614,12 @@ impl AgentClient {
             AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
                 let deadline = Instant::now() + timeout;
                 t.send(&buf, deadline).map_err(|e| {
-                    CoreError::Machine(format!("failed to send readiness watch request: {e}"))
+                    EngineError::Machine(format!("failed to send readiness watch request: {e}"))
                 })?;
 
                 loop {
                     let raw = t.recv(deadline).map_err(|e| {
-                        CoreError::Machine(format!("failed to receive readiness event: {e}"))
+                        EngineError::Machine(format!("failed to receive readiness event: {e}"))
                     })?;
                     let event = Self::decode_readiness_event(&raw)?;
                     if readiness_event_is_terminal(&event) || !start_runtime_if_needed {
@@ -649,19 +649,19 @@ impl AgentClient {
         let buf = Self::build_message(MessageType::WatchReadinessRequest, trace_id, &payload);
 
         let AgentTransport::Blocking(t) = &mut self.transport else {
-            return Err(CoreError::Machine(
+            return Err(EngineError::Machine(
                 "blocking readiness watch called on async transport".to_string(),
             ));
         };
 
         let deadline = Instant::now() + timeout;
         t.send(&buf, deadline).map_err(|e| {
-            CoreError::Machine(format!("failed to send readiness watch request: {e}"))
+            EngineError::Machine(format!("failed to send readiness watch request: {e}"))
         })?;
 
         loop {
             let raw = t.recv(deadline).map_err(|e| {
-                CoreError::Machine(format!("failed to receive readiness event: {e}"))
+                EngineError::Machine(format!("failed to receive readiness event: {e}"))
             })?;
             let event = Self::decode_readiness_event(&raw)?;
             if readiness_event_is_terminal(&event) || !start_runtime_if_needed {
@@ -686,12 +686,14 @@ impl AgentClient {
 
         match &mut self.transport {
             AgentTransport::Async(t) => t.send(buf).await.map_err(|e| {
-                CoreError::Machine(format!("failed to send memory pressure watch request: {e}"))
+                EngineError::Machine(format!("failed to send memory pressure watch request: {e}"))
             }),
             AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 t.send(&buf, deadline).map_err(|e| {
-                    CoreError::Machine(format!("failed to send memory pressure watch request: {e}"))
+                    EngineError::Machine(format!(
+                        "failed to send memory pressure watch request: {e}"
+                    ))
                 })
             }),
         }
@@ -712,16 +714,20 @@ impl AgentClient {
                 let raw = tokio::time::timeout(max_wait, t.recv())
                     .await
                     .map_err(|_| {
-                        CoreError::Machine("timeout waiting for memory pressure event".to_string())
+                        EngineError::Machine(
+                            "timeout waiting for memory pressure event".to_string(),
+                        )
                     })?
                     .map_err(|e| {
-                        CoreError::Machine(format!("failed to receive memory pressure event: {e}"))
+                        EngineError::Machine(format!(
+                            "failed to receive memory pressure event: {e}"
+                        ))
                     })?;
                 Self::decode_memory_pressure_event(&raw)
             }
             AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
                 let raw = t.recv(Instant::now() + max_wait).map_err(|e| {
-                    CoreError::Machine(format!("failed to receive memory pressure event: {e}"))
+                    EngineError::Machine(format!("failed to receive memory pressure event: {e}"))
                 })?;
                 Self::decode_memory_pressure_event(&raw)
             }),
@@ -743,12 +749,12 @@ impl AgentClient {
 
         match &mut self.transport {
             AgentTransport::Async(t) => t.send(buf).await.map_err(|e| {
-                CoreError::Machine(format!("failed to send stats watch request: {e}"))
+                EngineError::Machine(format!("failed to send stats watch request: {e}"))
             }),
             AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 t.send(&buf, deadline).map_err(|e| {
-                    CoreError::Machine(format!("failed to send stats watch request: {e}"))
+                    EngineError::Machine(format!("failed to send stats watch request: {e}"))
                 })
             }),
         }
@@ -763,15 +769,17 @@ impl AgentClient {
             AgentTransport::Async(t) => {
                 let raw = tokio::time::timeout(max_wait, t.recv())
                     .await
-                    .map_err(|_| CoreError::Machine("timeout waiting for stats frame".to_string()))?
+                    .map_err(|_| {
+                        EngineError::Machine("timeout waiting for stats frame".to_string())
+                    })?
                     .map_err(|e| {
-                        CoreError::Machine(format!("failed to receive stats frame: {e}"))
+                        EngineError::Machine(format!("failed to receive stats frame: {e}"))
                     })?;
                 Self::decode_machine_stats(&raw)
             }
             AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
                 let raw = t.recv(Instant::now() + max_wait).map_err(|e| {
-                    CoreError::Machine(format!("failed to receive stats frame: {e}"))
+                    EngineError::Machine(format!("failed to receive stats frame: {e}"))
                 })?;
                 Self::decode_machine_stats(&raw)
             }),
@@ -782,45 +790,46 @@ impl AgentClient {
         let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
         if resp_type == MessageType::Error as u32 {
             let (code, message) = wire::parse_error_response(&resp_payload)?;
-            return Err(CoreError::Agent { code, message });
+            return Err(EngineError::Agent { code, message });
         }
         if resp_type != MessageType::MachineStats as u32 {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "unexpected stats response type: 0x{resp_type:04x}"
             )));
         }
         MachineStats::decode_from_slice(&resp_payload)
-            .map_err(|e| CoreError::Machine(format!("failed to decode machine stats: {e}")))
+            .map_err(|e| EngineError::Machine(format!("failed to decode machine stats: {e}")))
     }
 
     fn decode_memory_pressure_event(raw: &[u8]) -> Result<MemoryPressureEvent> {
         let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
         if resp_type == MessageType::Error as u32 {
             let (code, message) = wire::parse_error_response(&resp_payload)?;
-            return Err(CoreError::Agent { code, message });
+            return Err(EngineError::Agent { code, message });
         }
         if resp_type != MessageType::MemoryPressureEvent as u32 {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "unexpected memory pressure response type: 0x{resp_type:04x}"
             )));
         }
-        MemoryPressureEvent::decode_from_slice(&resp_payload)
-            .map_err(|e| CoreError::Machine(format!("failed to decode memory pressure event: {e}")))
+        MemoryPressureEvent::decode_from_slice(&resp_payload).map_err(|e| {
+            EngineError::Machine(format!("failed to decode memory pressure event: {e}"))
+        })
     }
 
     fn decode_readiness_event(raw: &[u8]) -> Result<ReadinessEvent> {
         let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
         if resp_type == MessageType::Error as u32 {
             let (code, message) = wire::parse_error_response(&resp_payload)?;
-            return Err(CoreError::Agent { code, message });
+            return Err(EngineError::Agent { code, message });
         }
         if resp_type != MessageType::ReadinessEvent as u32 {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "unexpected readiness response type: 0x{resp_type:04x}"
             )));
         }
         ReadinessEvent::decode_from_slice(&resp_payload)
-            .map_err(|e| CoreError::Machine(format!("failed to decode readiness event: {e}")))
+            .map_err(|e| EngineError::Machine(format!("failed to decode readiness event: {e}")))
     }
 
     /// Starts the native Kubernetes cluster in the guest VM.
@@ -1259,7 +1268,7 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send read-file request: {e}")))?;
+            .map_err(|e| EngineError::Machine(format!("failed to send read-file request: {e}")))?;
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         tokio::spawn(async move {
@@ -1268,7 +1277,7 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("recv error: {e}"))))
+                            .send(Err(EngineError::Machine(format!("recv error: {e}"))))
                             .await;
                         break;
                     }
@@ -1283,12 +1292,12 @@ impl AgentClient {
                 if resp_type == MessageType::Error as u32 {
                     let (code, message) = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| (500, "unknown error".to_string()));
-                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    let _ = tx.send(Err(EngineError::Agent { code, message })).await;
                     break;
                 }
                 if resp_type != MessageType::SandboxFileData as u32 {
                     let _ = tx
-                        .send(Err(CoreError::Machine(format!(
+                        .send(Err(EngineError::Machine(format!(
                             "unexpected response type: 0x{resp_type:04x}"
                         ))))
                         .await;
@@ -1303,7 +1312,7 @@ impl AgentClient {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("decode error: {e}"))))
+                            .send(Err(EngineError::Machine(format!("decode error: {e}"))))
                             .await;
                         break;
                     }
@@ -1336,7 +1345,7 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send write-file open: {e}")))?;
+            .map_err(|e| EngineError::Machine(format!("failed to send write-file open: {e}")))?;
 
         while let Some(item) = data_rx.recv().await {
             let data = match item {
@@ -1346,7 +1355,7 @@ impl AgentClient {
                     // the connection; the guest sees the stream end before
                     // `done` and discards the partial file instead of
                     // committing a truncated one.
-                    return Err(CoreError::Machine(
+                    return Err(EngineError::Machine(
                         "write_file aborted: client stream ended before completion".to_owned(),
                     ));
                 }
@@ -1361,7 +1370,7 @@ impl AgentClient {
             self.transport
                 .async_send(frame)
                 .await
-                .map_err(|e| CoreError::Machine(format!("failed to send file chunk: {e}")))?;
+                .map_err(|e| EngineError::Machine(format!("failed to send file chunk: {e}")))?;
         }
         let done = FileChunk {
             data: Vec::new(),
@@ -1372,20 +1381,20 @@ impl AgentClient {
         self.transport
             .async_send(frame)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send final chunk: {e}")))?;
+            .map_err(|e| EngineError::Machine(format!("failed to send final chunk: {e}")))?;
 
         let raw = self
             .transport
             .async_recv()
             .await
-            .map_err(|e| CoreError::Machine(format!("recv error: {e}")))?;
+            .map_err(|e| EngineError::Machine(format!("recv error: {e}")))?;
         let (resp_type, _, resp_payload) = wire::parse_response(&raw)?;
         if resp_type == MessageType::Error as u32 {
             let (code, message) = wire::parse_error_response(&resp_payload)?;
-            return Err(CoreError::Agent { code, message });
+            return Err(EngineError::Agent { code, message });
         }
         if resp_type != MessageType::SandboxFileWriteResponse as u32 {
-            return Err(CoreError::Machine(format!(
+            return Err(EngineError::Machine(format!(
                 "unexpected response type: 0x{resp_type:04x}"
             )));
         }
@@ -1483,7 +1492,7 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send watch-dir request: {e}")))?;
+            .map_err(|e| EngineError::Machine(format!("failed to send watch-dir request: {e}")))?;
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         tokio::spawn(async move {
@@ -1492,7 +1501,7 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("recv error: {e}"))))
+                            .send(Err(EngineError::Machine(format!("recv error: {e}"))))
                             .await;
                         break;
                     }
@@ -1510,12 +1519,12 @@ impl AgentClient {
                 if resp_type == MessageType::Error as u32 {
                     let (code, message) = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| (500, "unknown error".to_string()));
-                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    let _ = tx.send(Err(EngineError::Agent { code, message })).await;
                     break;
                 }
                 if resp_type != MessageType::SandboxFileWatchEvent as u32 {
                     let _ = tx
-                        .send(Err(CoreError::Machine(format!(
+                        .send(Err(EngineError::Machine(format!(
                             "unexpected response type: 0x{resp_type:04x}"
                         ))))
                         .await;
@@ -1529,7 +1538,7 @@ impl AgentClient {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("decode error: {e}"))))
+                            .send(Err(EngineError::Machine(format!("decode error: {e}"))))
                             .await;
                         break;
                     }
@@ -1563,7 +1572,7 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|source| CoreError::Transport {
+            .map_err(|source| EngineError::Transport {
                 context: "failed to send exec request",
                 source,
             })?;
@@ -1575,7 +1584,7 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Transport {
+                            .send(Err(EngineError::Transport {
                                 context: "failed to receive exec output",
                                 source: e,
                             }))
@@ -1595,13 +1604,13 @@ impl AgentClient {
                 if resp_type == MessageType::Error as u32 {
                     let (code, message) = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| (500, "unknown error".to_string()));
-                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    let _ = tx.send(Err(EngineError::Agent { code, message })).await;
                     break;
                 }
 
                 if resp_type != MessageType::MachineExecOutput as u32 {
                     let _ = tx
-                        .send(Err(CoreError::Machine(format!(
+                        .send(Err(EngineError::Machine(format!(
                             "unexpected response type: 0x{:04x}",
                             resp_type
                         ))))
@@ -1620,7 +1629,7 @@ impl AgentClient {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("decode error: {}", e))))
+                            .send(Err(EngineError::Machine(format!("decode error: {}", e))))
                             .await;
                         break;
                     }
@@ -1656,7 +1665,7 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|source| CoreError::Transport {
+            .map_err(|source| EngineError::Transport {
                 context: "failed to send exec session request",
                 source,
             })?;
@@ -1664,7 +1673,7 @@ impl AgentClient {
         let (mut sender, mut receiver) =
             self.transport
                 .into_split()
-                .map_err(|source| CoreError::Transport {
+                .map_err(|source| EngineError::Transport {
                     context: "failed to split exec session transport",
                     source,
                 })?;
@@ -1715,7 +1724,7 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = out_tx
-                            .send(Err(CoreError::Transport {
+                            .send(Err(EngineError::Transport {
                                 context: "failed to receive exec session output",
                                 source: e,
                             }))
@@ -1735,13 +1744,13 @@ impl AgentClient {
                 if resp_type == MessageType::Error as u32 {
                     let (code, message) = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| (500, "unknown error".to_string()));
-                    let _ = out_tx.send(Err(CoreError::Agent { code, message })).await;
+                    let _ = out_tx.send(Err(EngineError::Agent { code, message })).await;
                     break;
                 }
 
                 if resp_type != MessageType::MachineExecOutput as u32 {
                     let _ = out_tx
-                        .send(Err(CoreError::Machine(format!(
+                        .send(Err(EngineError::Machine(format!(
                             "unexpected response type: 0x{:04x}",
                             resp_type
                         ))))
@@ -1758,7 +1767,7 @@ impl AgentClient {
                     }
                     Err(e) => {
                         let _ = out_tx
-                            .send(Err(CoreError::Machine(format!("decode error: {}", e))))
+                            .send(Err(EngineError::Machine(format!("decode error: {}", e))))
                             .await;
                         break;
                     }
@@ -1917,7 +1926,7 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send attach request: {}", e)))?;
+            .map_err(|e| EngineError::Machine(format!("failed to send attach request: {}", e)))?;
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         tokio::spawn(async move {
@@ -1926,7 +1935,7 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("recv error: {}", e))))
+                            .send(Err(EngineError::Machine(format!("recv error: {}", e))))
                             .await;
                         break;
                     }
@@ -1943,13 +1952,13 @@ impl AgentClient {
                 if resp_type == MessageType::Error as u32 {
                     let (code, message) = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| (500, "unknown error".to_string()));
-                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    let _ = tx.send(Err(EngineError::Agent { code, message })).await;
                     break;
                 }
 
                 if resp_type != MessageType::SandboxExecEvent as u32 {
                     let _ = tx
-                        .send(Err(CoreError::Machine(format!(
+                        .send(Err(EngineError::Machine(format!(
                             "unexpected response type: 0x{:04x}",
                             resp_type
                         ))))
@@ -1968,7 +1977,7 @@ impl AgentClient {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("decode error: {}", e))))
+                            .send(Err(EngineError::Machine(format!("decode error: {}", e))))
                             .await;
                         break;
                     }
@@ -1999,7 +2008,7 @@ impl AgentClient {
         self.transport
             .async_send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send events request: {}", e)))?;
+            .map_err(|e| EngineError::Machine(format!("failed to send events request: {}", e)))?;
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         tokio::spawn(async move {
@@ -2008,7 +2017,7 @@ impl AgentClient {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("recv error: {}", e))))
+                            .send(Err(EngineError::Machine(format!("recv error: {}", e))))
                             .await;
                         break;
                     }
@@ -2025,13 +2034,13 @@ impl AgentClient {
                 if resp_type == MessageType::Error as u32 {
                     let (code, message) = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| (500, "unknown error".to_string()));
-                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    let _ = tx.send(Err(EngineError::Agent { code, message })).await;
                     break;
                 }
 
                 if resp_type != MessageType::SandboxEvent as u32 {
                     let _ = tx
-                        .send(Err(CoreError::Machine(format!(
+                        .send(Err(EngineError::Machine(format!(
                             "unexpected response type: 0x{:04x}",
                             resp_type
                         ))))
@@ -2049,7 +2058,7 @@ impl AgentClient {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!("decode error: {}", e))))
+                            .send(Err(EngineError::Machine(format!("decode error: {}", e))))
                             .await;
                         break;
                     }
@@ -2076,7 +2085,7 @@ impl AgentClient {
             &request.encode_to_vec(),
         );
         self.transport.async_send(buffer).await.map_err(|error| {
-            CoreError::Machine(format!("failed to send sandbox cleanup watch: {error}"))
+            EngineError::Machine(format!("failed to send sandbox cleanup watch: {error}"))
         })?;
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
@@ -2086,7 +2095,7 @@ impl AgentClient {
                     Ok(raw) => raw,
                     Err(error) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!(
+                            .send(Err(EngineError::Machine(format!(
                                 "sandbox cleanup watch receive failed: {error}"
                             ))))
                             .await;
@@ -2103,12 +2112,12 @@ impl AgentClient {
                 if response_type == MessageType::Error as u32 {
                     let (code, message) = wire::parse_error_response(&payload)
                         .unwrap_or_else(|_| (500, "unknown error".to_owned()));
-                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    let _ = tx.send(Err(EngineError::Agent { code, message })).await;
                     break;
                 }
                 if response_type != MessageType::SandboxCleanupEvent as u32 {
                     let _ = tx
-                        .send(Err(CoreError::Machine(format!(
+                        .send(Err(EngineError::Machine(format!(
                             "unexpected sandbox cleanup response: 0x{response_type:04x}"
                         ))))
                         .await;
@@ -2122,7 +2131,7 @@ impl AgentClient {
                     }
                     Err(error) => {
                         let _ = tx
-                            .send(Err(CoreError::Machine(format!(
+                            .send(Err(EngineError::Machine(format!(
                                 "sandbox cleanup ticket decode failed: {error}"
                             ))))
                             .await;

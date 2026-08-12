@@ -798,10 +798,11 @@ impl MachineManager {
         // socketpair needs the blocking transport (tokio/kqueue stalls on
         // rapid connect/teardown cycles), and only the async transport
         // supports the streaming sandbox RPCs VZ clients rely on.
-        match backend {
+        let client = match backend {
             arcbox_vmm::VmBackend::Hv => AgentClient::from_fd_blocking(cid, fd),
             arcbox_vmm::VmBackend::Vz => AgentClient::from_fd_async(cid, fd),
-        }
+        };
+        client.map_err(CoreError::from)
     }
 
     /// Connects to a vsock port on a running machine (macOS).
@@ -888,13 +889,15 @@ impl MachineManager {
         match connected {
             Ok(Ok(mut agent)) => {
                 if agent.is_blocking() {
-                    tokio::task::spawn_blocking(move || agent.ping_blocking().map(|_| ()))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(CoreError::Vm(format!("agent ping task panicked: {e}")))
-                        })
+                    tokio::task::spawn_blocking(move || {
+                        agent.ping_blocking().map(|_| ()).map_err(CoreError::from)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(CoreError::Vm(format!("agent ping task panicked: {e}")))
+                    })
                 } else {
-                    agent.ping().await.map(|_| ())
+                    agent.ping().await.map(|_| ()).map_err(CoreError::from)
                 }
             }
             Ok(Err(e)) => Err(e),

@@ -1,4 +1,4 @@
-use crate::error::{CoreError, Result};
+use crate::error::{EngineError, Result};
 use arcbox_constants::wire::{
     ERROR_HEADER_SIZE, FRAME_HEADER_SIZE, MessageType, TRACE_LEN_FIELD_SIZE, TYPE_FIELD_SIZE,
 };
@@ -33,7 +33,7 @@ pub(super) fn build_message(msg_type: MessageType, trace_id: &str, payload: &[u8
 /// Parses a V2 wire response. Returns (`resp_type`, `trace_id`, payload).
 pub(super) fn parse_response(response: &[u8]) -> Result<(u32, String, Vec<u8>)> {
     if response.len() < FRAME_HEADER_SIZE {
-        return Err(CoreError::Machine("response too short".to_string()));
+        return Err(EngineError::Machine("response too short".to_string()));
     }
     let mut cursor = std::io::Cursor::new(response);
     let length = cursor.get_u32() as usize;
@@ -69,7 +69,7 @@ pub(super) fn parse_response(response: &[u8]) -> Result<(u32, String, Vec<u8>)> 
 /// Parses an error response from the agent into `(status code, message)`.
 ///
 /// The code is HTTP-style (400/404/409/412/500/503) and is mapped onto a
-/// gRPC status by the API layer via `CoreError::Agent`.
+/// gRPC status by the API layer via `EngineError::Agent`.
 pub(super) fn parse_error_response(payload: &[u8]) -> Result<(i32, String)> {
     if payload.len() < ERROR_HEADER_SIZE {
         return Ok((500, "unknown error".to_string()));
@@ -85,7 +85,7 @@ pub(super) fn parse_error_response(payload: &[u8]) -> Result<(i32, String)> {
 
     let message =
         String::from_utf8(payload[ERROR_HEADER_SIZE..ERROR_HEADER_SIZE + msg_len].to_vec())
-            .map_err(|_| CoreError::Machine("invalid error message encoding".to_string()))?;
+            .map_err(|_| EngineError::Machine("invalid error message encoding".to_string()))?;
     Ok((code, message))
 }
 

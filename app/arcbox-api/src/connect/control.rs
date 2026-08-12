@@ -398,7 +398,7 @@ impl pb::SandboxService for SandboxServiceImpl {
                 })
                 .await
                 .map_err(|error| match error {
-                    error @ arcbox_core::CoreError::Agent { code: 404, .. } => {
+                    error @ arcbox_engine::EngineError::Agent { code: 404, .. } => {
                         ConnectError::from(ApiError::from(error))
                     }
                     error => {
