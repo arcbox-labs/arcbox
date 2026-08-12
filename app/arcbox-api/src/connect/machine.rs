@@ -83,7 +83,7 @@ impl pb::MachineService for MachineServiceImpl {
                 })
                 .await
                 .map_err(|e| match &e {
-                    arcbox_core::error::CoreError::Common(c) if c.is_not_found() => {
+                    arcbox_image::ImageError::Common(c) if c.is_not_found() => {
                         ConnectError::not_found(e.to_string())
                     }
                     _ => ConnectError::internal(e.to_string()),

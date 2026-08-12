@@ -57,7 +57,12 @@ members = [
     "runtime/arcbox-oci",
 
     # ============================================
-    # L6-7: Application (MIT OR Apache-2.0)
+    # L6: Engine (MIT OR Apache-2.0)
+    # ============================================
+    "engine/arcbox-image",
+
+    # ============================================
+    # L7: Application (MIT OR Apache-2.0)
     # ============================================
     "app/arcbox-core",
     "app/arcbox-api",
@@ -267,6 +272,7 @@ arcbox-docker = { version = "0.6.5", path = "app/arcbox-docker" } # x-release-pl
 # Pinned to app/arcbox-helper's own version (not workspace.package). Do not
 # attach x-release-please-version — helper releases are manual.
 arcbox-helper = { version = "1.0.2", path = "app/arcbox-helper" }
+arcbox-image = { version = "0.6.5", path = "engine/arcbox-image" } # x-release-please-version
 arcbox-core = { version = "0.6.5", path = "app/arcbox-core" } # x-release-please-version
 arcbox-api = { version = "0.6.5", path = "app/arcbox-api" } # x-release-please-version
 arcbox-migration = { version = "0.6.5", path = "app/arcbox-migration" } # x-release-please-version

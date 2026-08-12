@@ -33,7 +33,7 @@ lists it as a non-required legacy artifact.
 ## Responsibilities In This Repository
 
 1. Download, verify, and cache boot assets at runtime:
-   `app/arcbox-core/src/boot_assets/` (thin wrapper around `arcbox-boot` crate)
+   `engine/arcbox-image/src/boot_assets/` (thin wrapper around `arcbox-boot` crate)
 2. Wire boot assets into VM lifecycle:
    `app/arcbox-core/src/vm_lifecycle/`
 3. Provide CLI operations (`prefetch` / `status` / `list` / `clear`):
@@ -66,7 +66,7 @@ https://boot.arcboxcdn.com/
 ## Version Pinning
 
 The daemon pins the boot asset version in the root `assets.lock`, loaded by
-`app/arcbox-core/src/boot_assets/lockfile.rs`. This can be overridden at
+`engine/arcbox-image/src/boot_assets/lockfile.rs`. This can be overridden at
 runtime with the `ARCBOX_BOOT_ASSET_VERSION` environment variable.
 
 `abctl boot list` sorts cached versions by SemVer precedence, including

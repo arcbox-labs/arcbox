@@ -29,7 +29,6 @@
 //!      arcbox-vmm   arcbox-fs
 //! ```
 pub mod agent_client;
-pub mod boot_assets;
 #[cfg(target_os = "macos")]
 pub mod bridge_discovery;
 pub mod config;
@@ -37,12 +36,10 @@ pub mod container_backend;
 pub mod error;
 pub mod event;
 pub mod machine;
-pub mod machine_image;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod migration;
 pub mod persistence;
-pub mod remote_image;
 #[cfg(target_os = "macos")]
 pub mod route_reconciler;
 pub mod runtime;
@@ -52,12 +49,16 @@ pub mod trace;
 pub mod vm;
 pub mod vm_lifecycle;
 
+// Image management moved to the engine layer (arcbox-image); the module
+// paths and crate-root items below are compatibility re-exports.
+pub use arcbox_image::{boot_assets, machine_image, remote_image};
+
 pub use agent_client::{AgentClient, ExecSessionInput, WriteFileChunk};
-pub use arcbox_vmm::{DeviceDebug, QueueDebug, VmBackend};
-pub use boot_assets::{
+pub use arcbox_image::boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
     PreparePhase, boot_asset_version,
 };
+pub use arcbox_vmm::{DeviceDebug, QueueDebug, VmBackend};
 pub use config::{Config, ContainerRuntimeConfig};
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;

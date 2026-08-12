@@ -138,3 +138,14 @@ impl From<arcbox_transport::error::TransportError> for CoreError {
         }
     }
 }
+
+// The engine-layer image error maps variant-for-variant, so `is_not_found()`
+// and friends keep answering the same through either type.
+impl From<arcbox_image::ImageError> for CoreError {
+    fn from(err: arcbox_image::ImageError) -> Self {
+        match err {
+            arcbox_image::ImageError::Common(c) => Self::Common(c),
+            arcbox_image::ImageError::Image(msg) => Self::Image(msg),
+        }
+    }
+}

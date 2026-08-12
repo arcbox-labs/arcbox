@@ -2,7 +2,7 @@ use super::BootAssetManifest;
 use super::REQUIRED_RUNTIME_BINARIES;
 use super::config::BootAssetConfig;
 use super::lockfile::boot_asset_manifest_sha256;
-use crate::error::{CoreError, Result};
+use crate::error::{ImageError, Result};
 use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
 use arcbox_boot::download::{PrepareProgress, ProgressCallback as InnerProgressCallback};
 use arcbox_boot::manifest::Binary;
@@ -79,7 +79,7 @@ impl BootAssetProvider {
     pub fn with_config(config: BootAssetConfig) -> Result<Self> {
         let inner_config = Self::build_inner_config(&config);
         let manager = AssetManager::new(inner_config)
-            .map_err(|e| CoreError::config(format!("invalid boot asset config: {e}")))?;
+            .map_err(|e| ImageError::config(format!("invalid boot asset config: {e}")))?;
         Ok(Self { manager, config })
     }
 
@@ -115,7 +115,7 @@ impl BootAssetProvider {
             .manager
             .prepare(cb)
             .await
-            .map_err(|e| CoreError::config(format!("boot asset error: {e}")))?;
+            .map_err(|e| ImageError::config(format!("boot asset error: {e}")))?;
 
         self.verify_manifest_pin()?;
 
@@ -155,7 +155,7 @@ impl BootAssetProvider {
         self.manager
             .prepare_binaries(dest_dir, cb)
             .await
-            .map_err(|e| CoreError::config(format!("binary prepare error: {e}")))?;
+            .map_err(|e| ImageError::config(format!("binary prepare error: {e}")))?;
 
         let manifest = self.read_cached_manifest_required().await?;
         self.repair_cached_binary_permissions(&manifest, dest_dir)
@@ -191,7 +191,7 @@ impl BootAssetProvider {
             if !selected.iter().any(|binary| {
                 binary.name == name && binary_install_path(dest_dir, binary) == expected_path
             }) {
-                return Err(CoreError::config(format!(
+                return Err(ImageError::config(format!(
                     "manifest is missing required runtime binary '{name}' for architecture {} at {}",
                     self.config.arch,
                     expected_path.display()
@@ -203,7 +203,7 @@ impl BootAssetProvider {
             .validate_binaries(&self.config.arch, dest_dir)
             .await
             .map_err(|error| {
-                CoreError::config(format!("cached runtime binary validation failed: {error}"))
+                ImageError::config(format!("cached runtime binary validation failed: {error}"))
             })?;
 
         let mut report = CachedBinaryReport::default();
@@ -248,7 +248,7 @@ impl BootAssetProvider {
                     tokio::fs::set_permissions(&path, permissions)
                         .await
                         .map_err(|error| {
-                            CoreError::config(format!(
+                            ImageError::config(format!(
                                 "failed to make runtime binary '{}' executable at {}: {error}",
                                 binary.name,
                                 path.display()
@@ -284,12 +284,12 @@ impl BootAssetProvider {
             return Ok(());
         };
         let bytes = std::fs::read(self.cached_manifest_path())
-            .map_err(|e| CoreError::config(format!("read manifest: {e}")))?;
+            .map_err(|e| ImageError::config(format!("read manifest: {e}")))?;
         let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
         if actual == expected {
             Ok(())
         } else {
-            Err(CoreError::config(format!(
+            Err(ImageError::config(format!(
                 "manifest SHA256 mismatch: expected {expected}, got {actual}"
             )))
         }
@@ -319,7 +319,7 @@ impl BootAssetProvider {
         if dir.exists() {
             tokio::fs::remove_dir_all(&dir)
                 .await
-                .map_err(|e| CoreError::config(format!("failed to clear cache: {e}")))?;
+                .map_err(|e| ImageError::config(format!("failed to clear cache: {e}")))?;
         }
         Ok(())
     }
@@ -330,18 +330,18 @@ impl BootAssetProvider {
         let path = self.config.version_cache_dir().join("manifest.json");
         let bytes = tokio::fs::read(&path)
             .await
-            .map_err(|e| CoreError::config(format!("failed to read manifest: {e}")))?;
+            .map_err(|e| ImageError::config(format!("failed to read manifest: {e}")))?;
         serde_json::from_slice(&bytes)
-            .map_err(|e| CoreError::config(format!("failed to parse manifest: {e}")))
+            .map_err(|e| ImageError::config(format!("failed to parse manifest: {e}")))
     }
 
-    pub(crate) fn cached_manifest_has_binary(&self, name: &str) -> Result<bool> {
+    pub fn cached_manifest_has_binary(&self, name: &str) -> Result<bool> {
         self.verify_manifest_pin()?;
         let path = self.cached_manifest_path();
         let bytes = std::fs::read(&path)
-            .map_err(|e| CoreError::config(format!("failed to read {}: {e}", path.display())))?;
+            .map_err(|e| ImageError::config(format!("failed to read {}: {e}", path.display())))?;
         let manifest: BootAssetManifest = serde_json::from_slice(&bytes)
-            .map_err(|e| CoreError::config(format!("failed to parse {}: {e}", path.display())))?;
+            .map_err(|e| ImageError::config(format!("failed to parse {}: {e}", path.display())))?;
         Ok(manifest_has_binary(
             &manifest,
             &self.manager.config().arch,
@@ -361,11 +361,11 @@ impl BootAssetProvider {
         let mut versions = Vec::new();
         let mut entries = tokio::fs::read_dir(cache_dir)
             .await
-            .map_err(|e| CoreError::config(format!("failed to read cache dir: {e}")))?;
+            .map_err(|e| ImageError::config(format!("failed to read cache dir: {e}")))?;
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| CoreError::config(format!("failed to read cache entry: {e}")))?
+            .map_err(|e| ImageError::config(format!("failed to read cache entry: {e}")))?
         {
             let path = entry.path();
             if path.is_dir() && path.join("manifest.json").exists() {
@@ -395,11 +395,11 @@ impl BootAssetProvider {
         let url = format!("{}/latest.json", self.config.cdn_base_url);
         let resp = reqwest::get(&url)
             .await
-            .map_err(|e| CoreError::config(format!("failed to fetch latest version: {e}")))?;
+            .map_err(|e| ImageError::config(format!("failed to fetch latest version: {e}")))?;
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| CoreError::config(format!("failed to parse latest.json: {e}")))?;
+            .map_err(|e| ImageError::config(format!("failed to parse latest.json: {e}")))?;
         Ok(body
             .get("version")
             .and_then(serde_json::Value::as_str)
@@ -419,7 +419,7 @@ impl BootAssetProvider {
     fn rebuild_manager(&mut self) -> Result<()> {
         let inner_config = Self::build_inner_config(&self.config);
         self.manager = AssetManager::new(inner_config)
-            .map_err(|e| CoreError::config(format!("invalid boot asset config: {e}")))?;
+            .map_err(|e| ImageError::config(format!("invalid boot asset config: {e}")))?;
         Ok(())
     }
 }
@@ -449,10 +449,10 @@ fn binary_install_path(dest_dir: &Path, binary: &Binary) -> PathBuf {
 
 async fn regular_binary_metadata(binary: &Binary, path: &Path) -> Result<std::fs::Metadata> {
     let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
-        CoreError::config(format!("failed to inspect {}: {error}", path.display()))
+        ImageError::config(format!("failed to inspect {}: {error}", path.display()))
     })?;
     if !metadata.file_type().is_file() {
-        return Err(CoreError::config(format!(
+        return Err(ImageError::config(format!(
             "runtime binary '{}' is not a regular file at {}; run `abctl boot prefetch --force` \
              to reinstall it",
             binary.name,

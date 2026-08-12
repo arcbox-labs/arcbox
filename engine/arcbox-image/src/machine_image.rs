@@ -15,7 +15,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::{CoreError, Result};
+use crate::error::{ImageError, Result};
 use crate::remote_image::{ImageReference, RemoteLocation, StagingGuard, validate_name};
 
 /// Default base location of the published image index (the `linux/` namespace
@@ -223,16 +223,17 @@ impl MachineImageManager {
         let dir = self.images_dir.join(stream).join(version);
         let manifest_path = dir.join(MANIFEST_FILE);
         if !manifest_path.exists() {
-            return Err(CoreError::not_found(format!(
+            return Err(ImageError::not_found(format!(
                 "machine image {stream}@{version}"
             )));
         }
         let manifest: MachineImageManifest =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
-                .map_err(|e| CoreError::image(format!("parse {}: {e}", manifest_path.display())))?;
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?).map_err(|e| {
+                ImageError::image(format!("parse {}: {e}", manifest_path.display()))
+            })?;
         let image = MachineImage { dir, manifest };
         if !image.rootfs_path().exists() {
-            return Err(CoreError::not_found(format!(
+            return Err(ImageError::not_found(format!(
                 "machine image {stream}@{version} (rootfs missing)"
             )));
         }
@@ -313,7 +314,7 @@ impl MachineImageManager {
         .await?;
 
         let mut manifest_json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| CoreError::image(format!("serialize manifest: {e}")))?;
+            .map_err(|e| ImageError::image(format!("serialize manifest: {e}")))?;
         manifest_json.push('\n');
         std::fs::write(staging.join(MANIFEST_FILE), manifest_json)?;
 
@@ -342,7 +343,7 @@ impl MachineImageManager {
         let base = self.base.as_dir();
         let index: MachineImageIndex = base.join("index.json")?.fetch_json().await?;
         if index.schema_version != INDEX_SCHEMA_VERSION {
-            return Err(CoreError::image(format!(
+            return Err(ImageError::image(format!(
                 "unsupported image index schema_version {}",
                 index.schema_version
             )));
@@ -351,7 +352,7 @@ impl MachineImageManager {
         let (stream_name, stream, version) = match selector {
             ImageSelector::Reference(reference) => {
                 let stream = index.images.get(&reference.stream).ok_or_else(|| {
-                    CoreError::not_found(format!("image stream '{}'", reference.stream))
+                    ImageError::not_found(format!("image stream '{}'", reference.stream))
                 })?;
                 let version = reference
                     .version
@@ -388,7 +389,7 @@ impl MachineImageManager {
                             .map(|s| s.release.as_str())
                             .collect();
                         releases.sort_unstable();
-                        return Err(CoreError::not_found(if releases.is_empty() {
+                        return Err(ImageError::not_found(if releases.is_empty() {
                             format!("no published image for distro '{distro}' on {arch}")
                         } else {
                             format!(
@@ -402,7 +403,7 @@ impl MachineImageManager {
                     multiple => {
                         let releases: Vec<&str> =
                             multiple.iter().map(|(_, s)| s.release.as_str()).collect();
-                        return Err(CoreError::image(format!(
+                        return Err(ImageError::image(format!(
                             "distro '{distro}' has multiple releases on {arch} \
                              ({}); specify one",
                             releases.join(", ")
@@ -413,12 +414,12 @@ impl MachineImageManager {
         };
 
         let entry = stream.versions.get(&version).ok_or_else(|| {
-            CoreError::not_found(format!("machine image '{stream_name}@{version}'"))
+            ImageError::not_found(format!("machine image '{stream_name}@{version}'"))
         })?;
         let manifest_location = base.join(&entry.manifest)?;
         let manifest: MachineImageManifest = manifest_location.fetch_json().await?;
         if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
-            return Err(CoreError::image(format!(
+            return Err(ImageError::image(format!(
                 "unsupported image manifest schema_version {}",
                 manifest.schema_version
             )));
@@ -429,7 +430,7 @@ impl MachineImageManager {
         validate_name(&manifest.version)?;
         validate_name(&manifest.rootfs.path)?;
         if manifest.name != stream_name || manifest.version != version {
-            return Err(CoreError::image(format!(
+            return Err(ImageError::image(format!(
                 "manifest identifies as {}@{}, expected {stream_name}@{version}",
                 manifest.name, manifest.version
             )));
@@ -463,16 +464,16 @@ async fn fetch_rootfs(
             let mut resp = reqwest::get(url.clone())
                 .await
                 .and_then(reqwest::Response::error_for_status)
-                .map_err(|e| CoreError::image(format!("download {url}: {e}")))?;
+                .map_err(|e| ImageError::image(format!("download {url}: {e}")))?;
             on_progress(0, rootfs.size);
             while let Some(bytes) = resp
                 .chunk()
                 .await
-                .map_err(|e| CoreError::image(format!("download {url}: {e}")))?
+                .map_err(|e| ImageError::image(format!("download {url}: {e}")))?
             {
                 written += bytes.len() as u64;
                 if written > rootfs.size {
-                    return Err(CoreError::image(format!(
+                    return Err(ImageError::image(format!(
                         "{}: response exceeds manifest size {}",
                         rootfs.path, rootfs.size
                     )));
@@ -495,7 +496,7 @@ async fn fetch_rootfs(
 
     let digest = format!("{:x}", hasher.finalize());
     if written != rootfs.size || digest != rootfs.sha256 {
-        return Err(CoreError::image(format!(
+        return Err(ImageError::image(format!(
             "{}: expected {} bytes sha256:{}, got {written} bytes sha256:{digest}",
             rootfs.path, rootfs.size, rootfs.sha256
         )));
