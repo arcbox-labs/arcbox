@@ -207,6 +207,7 @@ mod linux_impl {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::backend::NetworkBackend;
     use crate::error::NetError;
     use crate::linux::{
         BridgeConfig, LinuxBridge, LinuxFirewall, LinuxTap, NatRule as FirewallNatRule, TapConfig,

@@ -203,8 +203,8 @@ impl NetlinkHandle {
         }
 
         // Bind to the netlink socket. Zero-init instead of a struct literal:
-        // musl models the padding field as a distinct type, so field-by-field
-        // construction is not portable across libcs.
+        // libc models `nl_pad` as `Padding<c_ushort>` (not an integer), so a
+        // field-by-field literal does not compile on any Linux target.
         // SAFETY: sockaddr_nl is a plain-old-data C struct; all-zeroes is a
         // valid bit pattern for it.
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
@@ -806,7 +806,8 @@ impl NetlinkHandle {
     ///
     /// Returns an error if the interface is not found.
     pub fn get_ifname(&self, ifindex: u32) -> Result<String> {
-        // c_char is i8 on glibc but u8 on musl; stay libc-agnostic.
+        // c_char signedness is arch-dependent (u8 on aarch64, i8 on x86_64);
+        // annotate the buffer so it types on both.
         let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
         let ret = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr()) };
         if ret.is_null() {
@@ -821,7 +822,7 @@ impl NetlinkHandle {
             .unwrap_or(libc::IF_NAMESIZE);
         #[allow(
             clippy::unnecessary_cast,
-            reason = "c_char is already u8 on musl but i8 on glibc; the cast keeps both building"
+            reason = "c_char is u8 on aarch64 and i8 on x86_64; the cast keeps both building"
         )]
         let name_bytes: Vec<u8> = buf[..len].iter().map(|&c| c as u8).collect();
         String::from_utf8(name_bytes).map_err(|e| NetError::Netlink(e.to_string()))
