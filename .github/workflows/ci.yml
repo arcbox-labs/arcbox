@@ -126,9 +126,10 @@ jobs:
   # see root CLAUDE.md "Guest Agent Cross-Compilation") because gnu/musl and
   # x86_64/aarch64 each pick different concrete types for a few libc
   # primitives (e.g. `c_char`'s signedness is arch-, not libc-, driven) that
-  # the gnu-only first step can't exercise; scoped to arcbox-net + splicetcp
-  # only — arcbox-image's TLS deps pull in `ring`, whose build script needs a
-  # musl C cross-compiler this runner doesn't have. Scoped to the crates that
+  # the gnu-only first step can't exercise; scoped to arcbox-net + splicetcp +
+  # arcbox-hypervisor + arcbox-virtio-net — arcbox-image is the one exclusion,
+  # since its TLS deps pull in `ring`, whose build script needs a musl C
+  # cross-compiler this runner doesn't have. Scoped to the crates that
   # make the platform-neutrality promise — the workspace as a whole still
   # contains macOS-only crates (arcbox-vz, arcbox-vmnet). Extend the -p list
   # as engine/computer crates land.
@@ -163,10 +164,10 @@ jobs:
             ${{ runner.os }}-cargo-linux-engine-
 
       - name: Check engine-layer crates on Linux
-        run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp
+        run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net
 
-      - name: Check net stack on aarch64-unknown-linux-musl
-        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp
+      - name: Check engine-layer crates on aarch64-unknown-linux-musl
+        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net
 
   # Pure proto-contract analysis — no Rust toolchain, no build. Runs in
   # parallel with `ci` on a cheap Linux runner. The desktop and agent

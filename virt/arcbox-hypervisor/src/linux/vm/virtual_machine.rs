@@ -7,7 +7,8 @@ use crate::{
 };
 
 use super::virtio::{VIRTIO_MMIO_SIZE, bincode_serialize_device_config};
-use super::{KvmMemory, KvmVcpu, KvmVm, VirtioDeviceInfo, VmState};
+use super::{KvmMemory, KvmVm, VirtioDeviceInfo, VmState};
+use crate::linux::KvmVcpu;
 
 impl VirtualMachine for KvmVm {
     type Vcpu = KvmVcpu;
