@@ -15,27 +15,31 @@ cd "$(dirname "$0")/.."
 PROTO_DIR="../arcbox-protocol/proto"
 OUT="descriptor/arcbox_connect.protoset"
 HASH="descriptor/protos.sha256"
+LIST="descriptor/protos.txt"
 
-# Keep in step with PROTOS in build.rs.
-PROTOS=(
-  common.proto
-  machine.proto
-  macos.proto
-  container.proto
-  image.proto
-  agent.proto
-  api.proto
-  kubernetes.proto
-  stats.proto
-  arcbox/sandbox/v1/sandbox.proto
-  arcbox/sandbox/v1/process.proto
-  arcbox/sandbox/v1/filesystem.proto
-  arcbox/sandbox/v1/snapshot.proto
-  arcbox/sandbox/v1/template.proto
-  arcbox/sandbox/v1/errors.proto
-)
+# The one list, shared with build.rs. A second copy here would be a second
+# thing to forget when a proto is added, and the build would then fail with a
+# stale-descriptor message pointing at the wrong cause.
+PROTOS=()
+while IFS= read -r line; do
+  line="${line%%#*}"
+  line="$(printf '%s' "$line" | tr -d '[:space:]')"
+  [ -n "$line" ] && PROTOS+=("$line")
+done < "$LIST"
 
 PROTOC="${PROTOC:-protoc}"
+
+# build.rs hashes with the sha2 crate; this has to produce the same digest, and
+# the two platforms disagree about which tool exists. A mismatch is loud (the
+# build fails telling you to refresh), not silent.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 | awk '{print $1}'; }
+else
+  echo "need sha256sum or shasum on PATH" >&2
+  exit 1
+fi
 
 # --experimental_allow_proto3_optional: older protoc still on some CI runners
 # requires it and newer ones ignore it — the same stance as
@@ -57,7 +61,7 @@ PROTOC="${PROTOC:-protoc}"
     printf '%s\0' "$name"
     cat "$PROTO_DIR/$name"
   done
-} | shasum -a 256 | awk '{print $1}' > "$HASH"
+} | sha256 > "$HASH"
 
 echo "descriptor: $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"
 echo "sources:    $(cat "$HASH")"

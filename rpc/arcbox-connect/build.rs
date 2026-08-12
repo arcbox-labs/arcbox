@@ -27,37 +27,30 @@
 
 use std::path::{Path, PathBuf};
 
-/// Every proto compiled into this crate's surface.
-///
-/// The daemon's own surface (CORE-68) shares one `arcbox.v1` package, so
-/// message generation is all-or-nothing here even though the services move
-/// onto Connect one at a time. `common.proto` must be listed explicitly: it
-/// defines this package's hand-rolled `Timestamp` and `Mount`, which are NOT
-/// the well-known types.
-const PROTOS: &[&str] = &[
-    "common.proto",
-    "machine.proto",
-    "macos.proto",
-    "container.proto",
-    "image.proto",
-    "agent.proto",
-    "api.proto",
-    "kubernetes.proto",
-    "stats.proto",
-    "arcbox/sandbox/v1/sandbox.proto",
-    "arcbox/sandbox/v1/process.proto",
-    "arcbox/sandbox/v1/filesystem.proto",
-    "arcbox/sandbox/v1/snapshot.proto",
-    "arcbox/sandbox/v1/template.proto",
-    "arcbox/sandbox/v1/errors.proto",
-];
-
 const DESCRIPTOR: &str = "descriptor/arcbox_connect.protoset";
 const SOURCE_HASH: &str = "descriptor/protos.sha256";
+const PROTO_LIST: &str = "descriptor/protos.txt";
 const REFRESH: &str = "make refresh-connect-descriptor";
+
+/// The protos compiled into this crate's surface, read from the same file
+/// `refresh.sh` reads.
+///
+/// Deliberately not a `const` array here: a second copy of the list is a
+/// second thing to forget when a proto is added, and forgetting it fails the
+/// build with a stale-descriptor message that points at the wrong cause.
+fn protos() -> Vec<String> {
+    let list = std::fs::read_to_string(PROTO_LIST)
+        .unwrap_or_else(|e| panic!("reading {PROTO_LIST}: {e}"));
+    list.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
 
 fn main() {
     let descriptor = PathBuf::from(DESCRIPTOR);
+    let protos = protos();
     assert!(
         descriptor.is_file(),
         "{DESCRIPTOR} is missing; regenerate it with `{REFRESH}`"
@@ -69,7 +62,7 @@ fn main() {
     // absent and there is nothing to check — the descriptor is all there is.
     let proto_dir = Path::new("../arcbox-protocol/proto");
     if proto_dir.is_dir() {
-        check_descriptor_is_current(proto_dir);
+        check_descriptor_is_current(proto_dir, &protos);
     }
 
     // `FILE_DESCRIPTOR_SET` includes this from OUT_DIR — the path the build
@@ -80,7 +73,7 @@ fn main() {
         .expect("staging the descriptor set into OUT_DIR");
 
     connectrpc_build::Config::new()
-        .files(PROTOS)
+        .files(&protos)
         .descriptor_set(&descriptor)
         .emit_rerun_directives(false)
         .include_file("_connectrpc.rs")
@@ -96,15 +89,16 @@ fn main() {
 
 /// Fail the build when a proto has been edited without refreshing the
 /// committed descriptor, which would otherwise generate stale code silently.
-fn check_descriptor_is_current(proto_dir: &Path) {
-    for proto in PROTOS {
+fn check_descriptor_is_current(proto_dir: &Path, protos: &[String]) {
+    println!("cargo:rerun-if-changed={PROTO_LIST}");
+    for proto in protos {
         println!("cargo:rerun-if-changed={}", proto_dir.join(proto).display());
     }
     println!("cargo:rerun-if-changed={SOURCE_HASH}");
 
     let recorded = std::fs::read_to_string(SOURCE_HASH)
         .unwrap_or_else(|e| panic!("reading {SOURCE_HASH}: {e}; regenerate with `{REFRESH}`"));
-    let actual = hash_sources(proto_dir);
+    let actual = hash_sources(proto_dir, protos);
     assert!(
         recorded.trim() == actual,
         "the .proto sources changed but {DESCRIPTOR} was not refreshed, so this \
@@ -119,10 +113,10 @@ fn check_descriptor_is_current(proto_dir: &Path) {
 ///
 /// Hashes the sources rather than the descriptor: two protoc versions can
 /// encode the same protos differently, and that is not drift.
-fn hash_sources(proto_dir: &Path) -> String {
+fn hash_sources(proto_dir: &Path, protos: &[String]) -> String {
     use sha2::{Digest, Sha256};
 
-    let mut names: Vec<&str> = PROTOS.to_vec();
+    let mut names: Vec<&str> = protos.iter().map(String::as_str).collect();
     names.sort_unstable();
 
     let mut hasher = Sha256::new();

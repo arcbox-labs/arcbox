@@ -100,17 +100,25 @@ This file is only the non-obvious operational knowledge.
 
 **Add/change a daemon gRPC message or service:**
 1. Edit the `.proto`.
-2. If it's a *new* `.proto` file, add it to all **three** proto arrays:
+2. If it's a *new* `.proto` file, add it to all **three** proto lists:
    `arcbox-protocol/build.rs` (prost, messages), `arcbox-grpc/build.rs`
-   (tonic, services), **and** `arcbox-connect/build.rs` (buffa messages plus
-   the Connect service traits the daemon actually implements). Miss one →
-   missing message types or service stubs with a confusing compile error;
-   miss the last and step 5 has no trait to register.
-3. Rebuild (regenerates + rustfmts `src/generated/*.rs`) and commit the result.
-4. Add a hand-written re-export in `arcbox-protocol/src/lib.rs` (the flat
+   (tonic, services), **and** `arcbox-connect/descriptor/protos.txt` (buffa
+   messages plus the Connect service traits the daemon actually implements —
+   a plain list, read by both that crate's build script and its refresh
+   script, so there is only ever one of it). Miss one → missing message types
+   or service stubs with a confusing compile error; miss the last and step 6
+   has no trait to register.
+3. For any edit under `arcbox-protocol/proto/` that arcbox-connect compiles,
+   run `make refresh-connect-descriptor`. That crate generates from a
+   committed descriptor set, because its sources live in another package and
+   cargo cannot package another package's directory; its build script hashes
+   the sources and fails until the descriptor matches. protoc is needed for
+   this step and no other.
+4. Rebuild (regenerates + rustfmts `src/generated/*.rs`) and commit the result.
+5. Add a hand-written re-export in `arcbox-protocol/src/lib.rs` (the flat
    `pub use v1::{...}` block and the per-module `pub mod`) — nothing generates
    or checks these; a new message is invisible downstream until listed.
-5. If it's a new service the daemon must serve, register it on
+6. If it's a new service the daemon must serve, register it on
    `arcbox_api::connect::router` with `.add_service(...)` — the daemon
    serves only that router (see the sandbox checklist below). What died
    with tonic is the daemon's `Server::builder().add_service()` chain in
@@ -118,10 +126,11 @@ This file is only the non-obvious operational knowledge.
    method of the same name.
 
 **Add/change something under `arcbox.sandbox.v1` (the Connect surface):**
-1. Edit the `.proto`; a *new* file goes into all three build-script arrays
-   listed in step 2 above (`arcbox-connect`, `arcbox-protocol`,
-   `arcbox-grpc`) — connectrpc codegen is the one that emits the service
-   traits the daemon implements.
+1. Edit the `.proto`; a *new* file goes into all three proto lists named in
+   step 2 above (`arcbox-connect`, `arcbox-protocol`, `arcbox-grpc`) —
+   connectrpc codegen is the one that emits the service traits the daemon
+   implements. Any edit here also needs step 3's
+   `make refresh-connect-descriptor`.
 2. Implement the method in `app/arcbox-api/src/connect/` against the
    connectrpc trait, not a tonic one, working in the buffa types directly
    (`request.to_owned_message()` in, owned messages out — the blanket
