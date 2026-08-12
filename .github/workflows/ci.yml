@@ -163,10 +163,10 @@ jobs:
             ${{ runner.os }}-cargo-linux-engine-
 
       - name: Check engine-layer crates on Linux
-        run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp
+        run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net
 
       - name: Check net stack on aarch64-unknown-linux-musl
-        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp
+        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net
 
   # Pure proto-contract analysis — no Rust toolchain, no build. Runs in
   # parallel with `ci` on a cheap Linux runner. The desktop and agent

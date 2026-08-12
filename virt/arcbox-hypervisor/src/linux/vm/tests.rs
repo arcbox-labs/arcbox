@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use super::virtio::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_GAP, VIRTIO_MMIO_SIZE};
-    use super::*;
+    use super::super::virtio::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_GAP, VIRTIO_MMIO_SIZE};
+    use super::super::*;
     use crate::memory::PAGE_SIZE;
-    use crate::traits::VirtualMachine;
-    use crate::types::CpuArch;
+    use crate::traits::{Vcpu, VirtualMachine};
+    use crate::types::{CpuArch, VirtioDeviceConfig, VirtioDeviceType};
     use std::sync::Arc;
 
     #[test]
@@ -119,7 +119,7 @@ mod tests {
         assert!(devices[0].notify_fd >= 0);
 
         // Add a network device.
-        let net_config = VirtioDeviceConfig::net();
+        let net_config = VirtioDeviceConfig::network_with_mac("02:00:00:00:00:01");
         vm.add_virtio_device(net_config).unwrap();
 
         // Verify second device.
@@ -133,7 +133,7 @@ mod tests {
 
         // Cannot add device after VM starts.
         vm.start().unwrap();
-        let fs_config = VirtioDeviceConfig::filesystem("/share", "share");
+        let fs_config = VirtioDeviceConfig::filesystem("/share", "share", false);
         let result = vm.add_virtio_device(fs_config);
         assert!(result.is_err());
     }
