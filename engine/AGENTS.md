@@ -30,7 +30,7 @@ The restructure plan and its locked decisions live in the company repo:
 - `arcbox-image` — the boot-asset chain, distro machine-image index, and
   shared remote-image fetch/staging primitives. `assets.lock` is
   `include_str!`-embedded at COMPILE TIME
-  (`arcbox-image/src/boot_assets/lockfile.rs`, path
+  (`engine/arcbox-image/src/boot_assets/lockfile.rs`, path
   `../../../../assets.lock` — four levels up to the repo root, same depth
   as its old home under `app/arcbox-core/src/`); editing `assets.lock`
   without rebuilding the daemon changes nothing. The pin semantics and
