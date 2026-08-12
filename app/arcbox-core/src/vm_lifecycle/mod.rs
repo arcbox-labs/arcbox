@@ -88,7 +88,7 @@ const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 ///
 /// The ext4 volume holds only the fsync-hot boltdb metadata directories —
 /// bulk data stays on the btrfs data image — so 2 GiB is ~100x headroom.
-/// See internal-docs/plans/ext4-metadata-volume.md.
+/// See ../company/engineering/arcbox/plans/ext4-metadata-volume.md.
 const DOCKER_METADATA_IMAGE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub(crate) use boot::ensure_sparse_block_image;

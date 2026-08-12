@@ -84,7 +84,7 @@ pub struct MachineRootfs {
     /// Image format (`squashfs`), used for the kernel `rootfstype=`.
     pub format: String,
     /// Boot shim staging the rootfs (see
-    /// `internal-docs/plans/machine-boot-shim.md`). When set, devices are
+    /// `../company/engineering/arcbox/plans/machine-boot-shim.md`). When set, devices are
     /// vda=shim EROFS / vdb=rootfs / vdc=data and the kernel command line
     /// follows the machine-init contract; when `None`, the rootfs itself
     /// boots as vda (custom-kernel testing).
@@ -198,7 +198,7 @@ fn default_distro_cmdline(rootfs_format: &str) -> String {
 
 /// Kernel command line for the machine boot shim: the shim EROFS boots as
 /// root and stages the distro rootfs + data disk named by the `arcbox.*`
-/// keys (see `internal-docs/plans/machine-boot-shim.md`). User mounts ride
+/// keys (see `../company/engineering/arcbox/plans/machine-boot-shim.md`). User mounts ride
 /// along as a `tag=guest_path[:ro]` table the shim replays.
 fn machine_shim_cmdline(rootfs_format: &str, mounts: &[MachineMount]) -> String {
     use arcbox_constants::cmdline::{

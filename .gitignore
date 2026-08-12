@@ -35,3 +35,6 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# Internal planning docs live in the private company repo (engineering/arcbox/)
+/internal-docs/
