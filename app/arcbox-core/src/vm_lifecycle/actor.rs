@@ -172,6 +172,7 @@ impl RealBalloonDeps {
         self.shared
             .machine_manager
             .connect_agent(&self.shared.machine_name)
+            .map_err(CoreError::from)
     }
 }
 
@@ -211,6 +212,7 @@ impl BalloonDeps for RealBalloonDeps {
             .machine_manager
             .vm_manager()
             .set_balloon_target(&info.vm_id, bytes)
+            .map_err(CoreError::from)
     }
 
     /// Any failure (connect, RPC, timeout) folds to `None`: the policy treats

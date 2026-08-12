@@ -10,6 +10,10 @@
 
 pub mod agent_client;
 pub mod error;
+pub mod event;
+pub mod machine;
+pub mod persistence;
 pub mod trace;
+pub mod vm;
 
 pub use error::{EngineError, Result};

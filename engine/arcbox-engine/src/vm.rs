@@ -2,10 +2,11 @@
 
 mod types;
 
-use crate::error::{CoreError, Result};
+use crate::error::{EngineError, Result};
 use crate::machine::MachineState;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -63,7 +64,7 @@ impl VmManager {
 
         self.vms
             .write()
-            .map_err(|_| CoreError::LockPoisoned)?
+            .map_err(|_| EngineError::LockPoisoned)?
             .insert(id.clone(), entry);
 
         tracing::info!("Created VM {}", id);
@@ -76,17 +77,17 @@ impl VmManager {
     ///
     /// Returns an error if the VM is running or not found.
     pub fn set_guest_cid(&self, id: &VmId, guest_cid: u32) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if matches!(
             entry.info.state,
             MachineState::Running | MachineState::Starting
         ) {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot set guest_cid while VM is {:?}",
                 entry.info.state
             )));
@@ -111,24 +112,24 @@ impl VmManager {
     ///
     /// Returns an error if the VM is not found.
     pub fn backend(&self, id: &VmId) -> Result<arcbox_vmm::VmBackend> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
         vms.get(id)
             .map(|entry| entry.config.backend)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))
+            .ok_or_else(|| EngineError::not_found(id.to_string()))
     }
 
     pub fn set_backend(&self, id: &VmId, backend: arcbox_vmm::VmBackend) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if matches!(
             entry.info.state,
             MachineState::Running | MachineState::Starting
         ) {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot set backend while VM is {:?}",
                 entry.info.state
             )));
@@ -211,14 +212,14 @@ impl VmManager {
         id: &VmId,
         shared_dns_hosts: Option<std::sync::Arc<arcbox_dns::LocalHostsTable>>,
     ) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Created && entry.info.state != MachineState::Stopped {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot start VM in state {:?}",
                 entry.info.state
             )));
@@ -263,17 +264,17 @@ impl VmManager {
     ///
     /// Returns an error if the VM cannot be stopped.
     pub fn stop(&self, id: &VmId) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if !matches!(
             entry.info.state,
             MachineState::Running | MachineState::Stopping
         ) {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot stop VM in state {:?}",
                 entry.info.state
             )));
@@ -319,14 +320,14 @@ impl VmManager {
     /// Returns an error if the entry is missing, has no VMM, or the reboot
     /// (teardown + re-initialization) fails.
     pub fn reboot(&self, id: &VmId) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
         let vmm = entry
             .vmm
             .as_mut()
-            .ok_or_else(|| CoreError::invalid_state(format!("VM {id} has no VMM to reboot")))?;
+            .ok_or_else(|| EngineError::invalid_state(format!("VM {id} has no VMM to reboot")))?;
         vmm.reboot()?;
         entry.info.state = MachineState::Running;
         tracing::info!("Rebooted VM {}", id);
@@ -345,16 +346,16 @@ impl VmManager {
         // Pre-check: determine whether to send the shutdown RPC based on
         // current state. Only Running VMs accept vsock connections.
         let should_send_rpc = {
-            let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+            let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
             let entry = vms
                 .get(id)
-                .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(id.to_string()))?;
             match entry.info.state {
                 MachineState::Running => true,
                 MachineState::Stopping => false,
                 MachineState::Stopped => return Ok(true),
                 other => {
-                    return Err(CoreError::invalid_state(format!(
+                    return Err(EngineError::invalid_state(format!(
                         "cannot stop VM in state {:?}",
                         other
                     )));
@@ -376,11 +377,11 @@ impl VmManager {
         // Phase 2: Take VMM out under write lock so the blocking wait below
         // doesn't hold the lock for up to `timeout`.
         let vmm = {
-            let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+            let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
             let entry = vms
                 .get_mut(id)
-                .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
             if !matches!(
                 entry.info.state,
@@ -389,7 +390,7 @@ impl VmManager {
                 if entry.info.state == MachineState::Stopped {
                     return Ok(true);
                 }
-                return Err(CoreError::invalid_state(format!(
+                return Err(EngineError::invalid_state(format!(
                     "cannot stop VM in state {:?}",
                     entry.info.state
                 )));
@@ -399,17 +400,17 @@ impl VmManager {
             entry
                 .vmm
                 .take()
-                .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?
+                .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?
         };
 
         // Phase 3: Wait for VM to reach Stopped state (PSCI will trigger this).
-        let stop_result = vmm.wait_for_stopped(timeout).map_err(CoreError::from);
+        let stop_result = vmm.wait_for_stopped(timeout).map_err(EngineError::from);
 
         // Re-acquire to update final state. The entry may have been removed
         // by a concurrent force_stop while the lock was released — if so,
         // safely drop the Vmm (skipping the macOS VF stop path) and return
         // Ok since the force path already handled teardown.
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
         let Some(entry) = vms.get_mut(id) else {
             tracing::warn!("VM {id} removed during graceful stop (concurrent force stop)");
             // Force path already handled teardown. Skip the macOS VF stop
@@ -480,7 +481,11 @@ impl VmManager {
             ..Default::default()
         };
         let payload = req.encode_to_vec();
-        let frame = crate::AgentClient::build_message(MessageType::ShutdownRequest, "", &payload);
+        let frame = crate::agent_client::AgentClient::build_message(
+            MessageType::ShutdownRequest,
+            "",
+            &payload,
+        );
 
         // Send the request frame.
         let written = {
@@ -492,7 +497,7 @@ impl VmManager {
             if n < 0 {
                 // SAFETY: closing a valid fd.
                 unsafe { libc::close(fd) };
-                return Err(CoreError::Vm(format!(
+                return Err(EngineError::Vm(format!(
                     "vsock write failed: {}",
                     std::io::Error::last_os_error()
                 )));
@@ -502,7 +507,7 @@ impl VmManager {
         if written != frame.len() {
             // SAFETY: closing a valid fd.
             unsafe { libc::close(fd) };
-            return Err(CoreError::Vm("vsock short write".to_string()));
+            return Err(EngineError::Vm("vsock short write".to_string()));
         }
 
         // Wait for the response with a 2s timeout.
@@ -517,9 +522,11 @@ impl VmManager {
             // SAFETY: closing a valid fd.
             unsafe { libc::close(fd) };
             return if poll_ret == 0 {
-                Err(CoreError::Vm("shutdown RPC response timed out".to_string()))
+                Err(EngineError::Vm(
+                    "shutdown RPC response timed out".to_string(),
+                ))
             } else {
-                Err(CoreError::Vm(format!(
+                Err(EngineError::Vm(format!(
                     "vsock poll failed: {}",
                     std::io::Error::last_os_error()
                 )))
@@ -544,14 +551,14 @@ impl VmManager {
     /// terminate the daemon process unexpectedly.
     #[cfg(target_os = "macos")]
     pub fn force_stop_without_hypervisor(&self, id: &VmId) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot force stop VM in state {:?}",
                 entry.info.state
             )));
@@ -578,11 +585,11 @@ impl VmManager {
     ///
     /// Returns an error if the VM cannot be paused.
     pub fn pause(&self, id: &VmId) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if let Some(ref mut vmm) = entry.vmm {
             vmm.pause()?;
@@ -597,11 +604,11 @@ impl VmManager {
     ///
     /// Returns an error if the VM cannot be resumed.
     pub fn resume(&self, id: &VmId) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if let Some(ref mut vmm) = entry.vmm {
             vmm.resume()?;
@@ -623,14 +630,14 @@ impl VmManager {
     ) -> Result<SnapshotInfo> {
         let pause_vm = options.pause_vm;
         let context = {
-            let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+            let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
             let entry = vms
                 .get_mut(id)
-                .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
             if entry.info.state != MachineState::Running {
-                return Err(CoreError::invalid_state(format!(
+                return Err(EngineError::invalid_state(format!(
                     "cannot snapshot VM in state {:?}",
                     entry.info.state
                 )));
@@ -639,7 +646,7 @@ impl VmManager {
             let vmm = entry
                 .vmm
                 .as_mut()
-                .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+                .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
             let resume_after_capture = if pause_vm && vmm.state() == VmmState::Running {
                 vmm.pause()?;
@@ -648,7 +655,7 @@ impl VmManager {
                 false
             };
 
-            let capture_result = vmm.capture_snapshot_context().map_err(CoreError::from);
+            let capture_result = vmm.capture_snapshot_context().map_err(EngineError::from);
 
             if resume_after_capture {
                 vmm.resume()?;
@@ -660,7 +667,7 @@ impl VmManager {
         self.snapshot_manager
             .create_vm_with_context(id.as_str(), options, context)
             .await
-            .map_err(CoreError::from)
+            .map_err(EngineError::from)
     }
 
     /// Lists snapshots for a VM, newest first.
@@ -680,7 +687,7 @@ impl VmManager {
         self.snapshot_manager
             .delete(snapshot_id)
             .await
-            .map_err(CoreError::from)
+            .map_err(EngineError::from)
     }
 
     /// Prunes old snapshots for a VM, keeping only `keep` most recent snapshots.
@@ -705,7 +712,7 @@ impl VmManager {
             self.snapshot_manager
                 .delete(&snapshot.id)
                 .await
-                .map_err(CoreError::from)?;
+                .map_err(EngineError::from)?;
             deleted.push(snapshot.id);
         }
 
@@ -723,16 +730,16 @@ impl VmManager {
         let info = self
             .snapshot_manager
             .get(snapshot_id)
-            .ok_or_else(|| CoreError::not_found(format!("snapshot {snapshot_id}")))?;
+            .ok_or_else(|| EngineError::not_found(format!("snapshot {snapshot_id}")))?;
 
         if info.target_type != SnapshotTargetType::Vm {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "snapshot {snapshot_id} is not a VM snapshot"
             )));
         }
 
         if info.target_id != id.as_str() {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "snapshot {snapshot_id} belongs to VM {}, not {}",
                 info.target_id, id
             )));
@@ -741,25 +748,25 @@ impl VmManager {
         self.snapshot_manager
             .restore(snapshot_id)
             .await
-            .map_err(CoreError::from)?;
+            .map_err(EngineError::from)?;
 
         let restore_data = self
             .snapshot_manager
             .take_restore_data(snapshot_id)
             .ok_or_else(|| {
-                CoreError::invalid_state(format!(
+                EngineError::invalid_state(format!(
                     "snapshot {snapshot_id} restore data unavailable after restore"
                 ))
             })?;
 
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot restore VM in state {:?}",
                 entry.info.state
             )));
@@ -768,7 +775,7 @@ impl VmManager {
         let vmm = entry
             .vmm
             .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+            .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
         // Pause the VM before applying snapshot state so guest CPUs don't
         // execute while memory and device state are being overwritten.
@@ -783,7 +790,7 @@ impl VmManager {
             vmm.resume()?;
         }
 
-        apply_result.map_err(CoreError::from)
+        apply_result.map_err(EngineError::from)
     }
 
     /// Gets VM information.
@@ -807,14 +814,14 @@ impl VmManager {
     ///
     /// Returns an error if the VM cannot be removed.
     pub fn remove(&self, id: &VmId) -> Result<()> {
-        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut vms = self.vms.write().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state == MachineState::Running {
-            return Err(CoreError::invalid_state(
+            return Err(EngineError::invalid_state(
                 "cannot remove running VM".to_string(),
             ));
         }
@@ -839,14 +846,14 @@ impl VmManager {
     /// # Errors
     /// Returns an error if the VM is not found, not running, or connection fails.
     pub fn connect_vsock(&self, id: &VmId, port: u32) -> Result<std::os::unix::io::RawFd> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot connect vsock: VM is {:?}",
                 entry.info.state
             )));
@@ -855,22 +862,22 @@ impl VmManager {
         let vmm = entry
             .vmm
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+            .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
-        vmm.connect_vsock(port).map_err(CoreError::from)
+        vmm.connect_vsock(port).map_err(EngineError::from)
     }
 
     /// Reads serial console output from a running VM (macOS only).
     #[cfg(target_os = "macos")]
     pub fn read_console_output(&self, id: &VmId) -> Result<String> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot read console output: VM is {:?}",
                 entry.info.state
             )));
@@ -879,22 +886,22 @@ impl VmManager {
         let vmm = entry
             .vmm
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+            .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
-        vmm.read_console_output().map_err(CoreError::from)
+        vmm.read_console_output().map_err(EngineError::from)
     }
 
     /// Reads agent log output (hvc1) from a running VM (macOS only).
     #[cfg(target_os = "macos")]
     pub fn read_agent_log_output(&self, id: &VmId) -> Result<String> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot read agent log: VM is {:?}",
                 entry.info.state
             )));
@@ -903,9 +910,9 @@ impl VmManager {
         let vmm = entry
             .vmm
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+            .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
-        vmm.read_agent_log_output().map_err(CoreError::from)
+        vmm.read_agent_log_output().map_err(EngineError::from)
     }
 
     /// Sets the target memory size for the balloon device on a running VM.
@@ -922,14 +929,14 @@ impl VmManager {
     /// Returns an error if the VM is not found, not running, or balloon operation fails.
     #[cfg(target_os = "macos")]
     pub fn set_balloon_target(&self, id: &VmId, target_bytes: u64) -> Result<()> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot set balloon target: VM is {:?}",
                 entry.info.state
             )));
@@ -938,10 +945,10 @@ impl VmManager {
         let vmm = entry
             .vmm
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+            .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
         vmm.set_balloon_target(target_bytes)
-            .map_err(CoreError::from)
+            .map_err(EngineError::from)
     }
 
     /// Gets the current target memory size from the balloon device.
@@ -971,14 +978,14 @@ impl VmManager {
     /// Returns current balloon stats including target, current, and configured memory sizes.
     #[cfg(target_os = "macos")]
     pub fn get_balloon_stats(&self, id: &VmId) -> Result<arcbox_hypervisor::BalloonStats> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         if entry.info.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "cannot get balloon stats: VM is {:?}",
                 entry.info.state
             )));
@@ -987,7 +994,7 @@ impl VmManager {
         let vmm = entry
             .vmm
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+            .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
         Ok(vmm.get_balloon_stats())
     }
@@ -1003,16 +1010,16 @@ impl VmManager {
     /// Returns an error if the VM is not found or its VMM has not been
     /// created.
     pub fn debug_snapshot(&self, id: &VmId) -> Result<arcbox_vmm::VmDebugSnapshot> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
 
         let vmm = entry
             .vmm
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+            .ok_or_else(|| EngineError::invalid_state("VMM not initialized"))?;
 
         Ok(vmm.debug_snapshot())
     }
@@ -1032,21 +1039,20 @@ impl VmManager {
         entry.vmm.as_mut()?.take_inbound_listener_manager()
     }
 
-    /// Returns the vmnet bridge interface name for a running VM.
+    /// Returns the formatted MAC of the vmnet shared interface for a
+    /// running VM.
     ///
     /// After vmnet creates the shared interface, the system also creates a
-    /// bridge with a vmnet member. We resolve it via the MAC that vmnet
-    /// reported. Since vmnet has already started, the bridge is immediately
-    /// present — no retry needed.
+    /// bridge with a vmnet member; resolving that bridge from this MAC is
+    /// the composing layer's job (host bridge discovery lives above the
+    /// engine — see arcbox-core's `MachineBridgeExt`).
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    pub fn vmnet_bridge_name(&self, id: &VmId) -> Option<String> {
+    pub fn vmnet_interface_mac(&self, id: &VmId) -> Option<String> {
         let vms = self.vms.read().ok()?;
         let entry = vms.get(id)?;
         let vmm = entry.vmm.as_ref()?;
         let info = vmm.vmnet_interface_info()?;
-        let mac_str = arcbox_net::darwin::format_mac(&info.mac);
-        let bridge = crate::bridge_discovery::resolve_bridge_by_mac(&mac_str)?;
-        Some(bridge.name)
+        Some(arcbox_net::darwin::format_mac(&info.mac))
     }
 
     #[cfg(test)]
@@ -1060,12 +1066,84 @@ impl VmManager {
 
     #[cfg(test)]
     pub(crate) fn build_vmm_config_for_test(&self, id: &VmId) -> Result<VmmConfig> {
-        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
         Ok(Self::build_vmm_config(entry))
     }
+}
+
+/// Ensures a sparse, thin-provisioned block image of `size_bytes` virtual
+/// size exists at `path`, creating parent directories as needed.
+///
+/// `set_len` extends only the logical size (EOF); it reserves no physical
+/// blocks, so the host file stays sparse and consumes disk only for blocks
+/// the guest actually writes — matching OrbStack's thin data image.
+///
+/// We deliberately do NOT pre-allocate physical space. An upfront macOS
+/// `F_PREALLOCATE` reservation (previously capped at 64 GiB) made a fresh
+/// install report tens of GiB of disk usage with zero containers — wasteful
+/// and a regression against OrbStack on idle footprint. APFS/Btrfs allocate
+/// on write lazily, so the working set still benefits from CoW without the
+/// upfront cost. An existing image is never shrunk.
+pub fn ensure_sparse_block_image(path: &Path, size_bytes: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            EngineError::config(format!(
+                "failed to create block image directory '{}': {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+
+    let file_exists = path.exists();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| {
+            EngineError::config(format!(
+                "failed to open block image '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+    let current_len = file.metadata().map_err(|e| {
+        EngineError::config(format!(
+            "failed to stat block image '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    // Extend the logical size only — `set_len` leaves the file sparse, so
+    // no physical disk is consumed until the guest writes. Never shrink an
+    // existing image (guards against a smaller `size_bytes` truncating
+    // user data).
+    if current_len.len() < size_bytes {
+        file.set_len(size_bytes).map_err(|e| {
+            EngineError::config(format!(
+                "failed to resize block image '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+    }
+
+    if !file_exists {
+        tracing::info!(
+            path = %path.display(),
+            size_bytes,
+            "created persistent docker data image"
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

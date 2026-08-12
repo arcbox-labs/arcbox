@@ -421,6 +421,7 @@ fn resolve_container_bridge(runtime: &Runtime) -> Option<String> {
     ) {
         return None;
     }
+    use arcbox_core::bridge_discovery::MachineBridgeExt as _;
     runtime
         .machine_manager()
         .vmnet_bridge_name(arcbox_core::DEFAULT_MACHINE_NAME)

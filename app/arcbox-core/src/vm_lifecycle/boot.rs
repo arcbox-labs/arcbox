@@ -5,8 +5,6 @@
 //! Completion is reported back as an [`InternalEvent`]; the bodies are ports
 //! of the pre-actor `start_default_vm` / `wait_for_agent` / `shutdown`.
 
-use std::fs::OpenOptions;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,7 +81,7 @@ impl LifecycleShared {
         })
         .await
         .map_err(|e| CoreError::Vm(format!("stop task panicked: {e}")))
-        .and_then(|r| r);
+        .and_then(|r| r.map_err(CoreError::from));
 
         let outcome = match stop_result {
             Ok(()) => {
@@ -250,7 +248,7 @@ impl LifecycleShared {
                     // Check if we should retry.
                     // Avoid wrapping "VM error: ..." multiple times when propagating.
                     let recovery_error = match &e {
-                        CoreError::Vm(msg) => msg.as_str(),
+                        arcbox_engine::EngineError::Vm(msg) => msg.as_str(),
                         _ => &e.to_string(),
                     };
                     match self.recovery.handle_failure(recovery_error) {
@@ -280,6 +278,7 @@ impl LifecycleShared {
     /// not populated) but does not gate VM readiness.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     fn spawn_route_reconciler(&self) {
+        use crate::bridge_discovery::MachineBridgeExt as _;
         if let Some(bridge) = self.machine_manager.vmnet_bridge_name(&self.machine_name) {
             // vmnet path: bridge name is known instantly, only need
             // helper retry (1-2 attempts for XPC readiness).
@@ -342,7 +341,7 @@ impl LifecycleShared {
             .data_dir
             .join(arcbox_constants::paths::host::DATA)
             .join(&self.data_image_filename);
-        ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
+        crate::vm::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
 
         // Don't inject docker_data_device into cmdline — let the agent
         // auto-detect. It prefers /dev/arcboxhvc1 (HVC fast path) when
@@ -360,7 +359,7 @@ impl LifecycleShared {
             .data_dir
             .join(arcbox_constants::paths::host::DATA)
             .join(metadata_image_filename(&self.data_image_filename));
-        ensure_sparse_block_image(&metadata_image, DOCKER_METADATA_IMAGE_SIZE_BYTES)?;
+        crate::vm::ensure_sparse_block_image(&metadata_image, DOCKER_METADATA_IMAGE_SIZE_BYTES)?;
         block_devices.push(crate::vm::BlockDeviceConfig {
             path: metadata_image.to_string_lossy().to_string(),
             read_only: false,
@@ -726,82 +725,9 @@ pub(super) fn agent_timeout_error(last_error: Option<&str>) -> CoreError {
     }
 }
 
-/// Ensures a sparse, thin-provisioned block image of `size_bytes` virtual
-/// size exists at `path`, creating parent directories as needed.
-///
-/// `set_len` extends only the logical size (EOF); it reserves no physical
-/// blocks, so the host file stays sparse and consumes disk only for blocks
-/// the guest actually writes — matching OrbStack's thin data image.
-///
-/// We deliberately do NOT pre-allocate physical space. An upfront macOS
-/// `F_PREALLOCATE` reservation (previously capped at 64 GiB) made a fresh
-/// install report tens of GiB of disk usage with zero containers — wasteful
-/// and a regression against OrbStack on idle footprint. APFS/Btrfs allocate
-/// on write lazily, so the working set still benefits from CoW without the
-/// upfront cost. An existing image is never shrunk.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "re-exported at the vm_lifecycle root so MachineManager can provision per-machine data disks"
-)]
-pub(crate) fn ensure_sparse_block_image(path: &Path, size_bytes: u64) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CoreError::config(format!(
-                "failed to create block image directory '{}': {}",
-                parent.display(),
-                e
-            ))
-        })?;
-    }
-
-    let file_exists = path.exists();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|e| {
-            CoreError::config(format!(
-                "failed to open block image '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-    let current_len = file.metadata().map_err(|e| {
-        CoreError::config(format!(
-            "failed to stat block image '{}': {}",
-            path.display(),
-            e
-        ))
-    })?;
-
-    // Extend the logical size only — `set_len` leaves the file sparse, so
-    // no physical disk is consumed until the guest writes. Never shrink an
-    // existing image (guards against a smaller `size_bytes` truncating
-    // user data).
-    if current_len.len() < size_bytes {
-        file.set_len(size_bytes).map_err(|e| {
-            CoreError::config(format!(
-                "failed to resize block image '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-    }
-
-    if !file_exists {
-        tracing::info!(
-            path = %path.display(),
-            size_bytes,
-            "created persistent docker data image"
-        );
-    }
-
-    Ok(())
-}
-
-const fn is_not_found_error(err: &CoreError) -> bool {
-    matches!(err, CoreError::Common(CommonError::NotFound(_)))
+const fn is_not_found_error(err: &arcbox_engine::EngineError) -> bool {
+    matches!(
+        err,
+        arcbox_engine::EngineError::Common(CommonError::NotFound(_))
+    )
 }

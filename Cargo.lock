@@ -580,18 +580,23 @@ version = "0.6.5"
 dependencies = [
  "arcbox-connect",
  "arcbox-constants",
+ "arcbox-dns",
  "arcbox-error",
+ "arcbox-hypervisor",
+ "arcbox-net",
  "arcbox-transport",
  "arcbox-vmm",
  "buffa",
  "bytes",
  "chrono",
  "libc",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

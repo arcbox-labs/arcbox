@@ -462,7 +462,9 @@ impl Runtime {
     ///
     /// Returns an error if the System VM's VMM has not been created.
     pub fn system_vm_debug_snapshot(&self) -> Result<arcbox_vmm::VmDebugSnapshot> {
-        self.machine_manager.debug_snapshot(DEFAULT_MACHINE_NAME)
+        self.machine_manager
+            .debug_snapshot(DEFAULT_MACHINE_NAME)
+            .map_err(CoreError::from)
     }
 
     /// Returns the System VM's current hypervisor backend.
@@ -625,13 +627,17 @@ impl Runtime {
     /// Returns an error if the machine is not found or connection fails.
     #[cfg(target_os = "macos")]
     pub fn get_agent(&self, machine_name: &str) -> Result<crate::agent_client::AgentClient> {
-        self.machine_manager.connect_agent(machine_name)
+        self.machine_manager
+            .connect_agent(machine_name)
+            .map_err(CoreError::from)
     }
 
     /// Gets an agent client for a machine (Linux version).
     #[cfg(target_os = "linux")]
     pub fn get_agent(&self, machine_name: &str) -> Result<crate::agent_client::AgentClient> {
-        self.machine_manager.connect_agent(machine_name)
+        self.machine_manager
+            .connect_agent(machine_name)
+            .map_err(CoreError::from)
     }
 
     /// Connects to a machine's guest service via vsock port.
@@ -640,7 +646,9 @@ impl Runtime {
     ///
     /// Returns an error if the machine is not running or the vsock port is not reachable.
     pub fn connect_vsock_port(&self, machine_name: &str, port: u32) -> Result<std::os::fd::RawFd> {
-        self.machine_manager.connect_vsock_port(machine_name, port)
+        self.machine_manager
+            .connect_vsock_port(machine_name, port)
+            .map_err(CoreError::from)
     }
 
     /// Resolves a container's filesystem layer directories (guest paths)

@@ -52,8 +52,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use actor::{Command, LifecycleActor, LifecycleShared};
 
-/// Default machine name used for container operations.
-pub const DEFAULT_MACHINE_NAME: &str = "default";
+pub use arcbox_engine::machine::DEFAULT_MACHINE_NAME;
 
 /// Default startup timeout in seconds.
 ///
@@ -91,7 +90,6 @@ const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 /// See ../company/engineering/arcbox/plans/ext4-metadata-volume.md.
 const DOCKER_METADATA_IMAGE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-pub(crate) use boot::ensure_sparse_block_image;
 pub use health::HealthMonitor;
 pub use recovery::{BackoffStrategy, RecoveryAction, RecoveryPolicy};
 pub use types::{DefaultVmConfig, VmLifecycleConfig, VmLifecycleState};
