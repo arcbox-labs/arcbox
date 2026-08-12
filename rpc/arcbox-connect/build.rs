@@ -65,16 +65,14 @@ fn main() {
         check_descriptor_is_current(proto_dir, &protos);
     }
 
-    // `FILE_DESCRIPTOR_SET` includes this from OUT_DIR — the path the build
-    // script wrote to when it still ran protoc. Copy rather than change that
-    // contract; reflection reads the constant, not the file.
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR unset"));
-    std::fs::copy(&descriptor, out_dir.join("arcbox_connect.protoset"))
-        .expect("staging the descriptor set into OUT_DIR");
-
     connectrpc_build::Config::new()
         .files(&protos)
         .descriptor_set(&descriptor)
+        // `FILE_DESCRIPTOR_SET` includes this from OUT_DIR — the path the
+        // build script wrote to when it still ran protoc. A precompiled set
+        // is written through byte-for-byte, so reflection sees exactly the
+        // committed bytes, source info included.
+        .emit_descriptor_set("arcbox_connect.protoset")
         .emit_rerun_directives(false)
         .include_file("_connectrpc.rs")
         .generate_json(true)
