@@ -2,8 +2,8 @@ use super::boot::{agent_timeout_error, ensure_earlycon};
 use super::types::{DesiredBoot, machine_drift_reason, metadata_image_filename};
 use super::*;
 use crate::machine::MachineState;
+use crate::vm::ensure_sparse_block_image;
 use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
-use arcbox_engine::vm::ensure_sparse_block_image;
 
 #[test]
 fn test_lifecycle_state_is_ready() {

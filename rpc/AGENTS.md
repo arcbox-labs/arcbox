@@ -48,7 +48,7 @@ This file is only the non-obvious operational knowledge.
   zero consumers. The real channel is a custom length-prefixed frame keyed by
   `arcbox_constants::wire::MessageType`, dispatched in
   `guest/arcbox-agent/src/rpc.rs` and driven by `AgentClient`
-  (`app/arcbox-core/src/agent_client.rs`). Editing the tonic `AgentService`
+  (`engine/arcbox-engine/src/agent_client.rs`). Editing the tonic `AgentService`
   does nothing at runtime.
 - The `arcbox-protocol/src/lib.rs` top-of-file doc says "ttrpc" — **stale**.
   There is no ttrpc dependency; trust this file over that comment.
@@ -147,7 +147,7 @@ This file is only the non-obvious operational knowledge.
    `encode_payload`) and the `handle_request` dispatch in
    `guest/arcbox-agent/src/agent/linux/rpc.rs` — `guest/AGENTS.md`'s
    extending checklist is authoritative for this half.
-4. Add a method on `AgentClient` (`app/arcbox-core/src/agent_client.rs`) that
+4. Add a method on `AgentClient` (`engine/arcbox-engine/src/agent_client.rs`) that
    buffa-encodes and frames the message via `rpc_call`.
 
 **EXCEPTION — the sandbox family (every `MessageType` for which
@@ -175,8 +175,8 @@ keep their `rpc.rs` arms.
 - Bump `AGENT_PROTOCOL_VERSION` (and `MIN_AGENT_PROTOCOL_VERSION` if dropping
   old-agent support) in `wire.rs`.
 - The handshake gate (`check_agent_protocol`) is called from **three** sites —
-  update/verify all: `app/arcbox-core/src/machine.rs` (ready probe) and both
-  boot arms in `app/arcbox-core/src/vm_lifecycle/boot.rs` (blocking HV +
+  update/verify all: `engine/arcbox-engine/src/machine.rs` (ready probe) and both
+  boot arms in `engine/arcbox-engine/src/vm_lifecycle/boot.rs` (blocking HV +
   async VZ/Linux). Miss one and a stale staged agent yields an opaque
   readiness timeout instead of the actionable "staged agent is stale" error
   (the ABX-410 / commit b90d2368 class this was built to prevent).

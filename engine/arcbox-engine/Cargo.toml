@@ -14,6 +14,7 @@ arcbox-constants = { workspace = true }
 arcbox-dns = { workspace = true }
 arcbox-error = { workspace = true }
 arcbox-hypervisor = { workspace = true }
+arcbox-image.workspace = true
 arcbox-net = { workspace = true }
 arcbox-transport = { workspace = true }
 arcbox-vmm = { workspace = true }
@@ -22,9 +23,11 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
+statig = "0.4.1"
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = "0.7"
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

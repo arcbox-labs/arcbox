@@ -41,12 +41,11 @@ pub mod route_reconciler;
 pub mod runtime;
 pub mod sandbox_capability;
 pub mod stats_hub;
-pub mod vm_lifecycle;
 
 // Image management and the engine core moved to the engine layer
 // (arcbox-image, arcbox-engine); the module paths and crate-root items
 // below are compatibility re-exports.
-pub use arcbox_engine::{agent_client, event, machine, persistence, trace, vm};
+pub use arcbox_engine::{agent_client, event, machine, persistence, trace, vm, vm_lifecycle};
 pub use arcbox_image::{boot_assets, machine_image, remote_image};
 
 pub use arcbox_engine::agent_client::{AgentClient, ExecSessionInput, WriteFileChunk};

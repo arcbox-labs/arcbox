@@ -113,7 +113,7 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 - Guest boots and daemon reaches READY, but every registry pull / TLS
   handshake fails certificate-validity checks. First: check the daemon log
   for `guest clock sync ping failed` (a warn, not an error);
-  `rg -n "sync_guest_clock" app/arcbox-core/src/vm_lifecycle/boot.rs`.
+  `rg -n "sync_guest_clock" engine/arcbox-engine/src/vm_lifecycle/boot.rs`.
   Likely cause: the HV backend has no RTC (ABX-416); the guest wall clock is
   pushed only by the best-effort post-readiness agent ping
   (`AgentPingRequest.timestamp_secs` → agent `clock_settime`). If that ping
@@ -156,12 +156,12 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 - `MachineManager::connect_agent` yields different transports by backend:
   blocking on the HV AF_UNIX socketpair, async on VZ AF_VSOCK and on Linux.
   Branch on `AgentClient::is_blocking()`
-  (`arcbox-core/src/agent_client.rs`); calling a `*_blocking` RPC on VZ (or
+  (`engine/arcbox-engine/src/agent_client.rs`); calling a `*_blocking` RPC on VZ (or
   an async RPC on HV) fails deterministically. `sync_guest_clock`
   (`vm_lifecycle/boot.rs`) is the reference pattern: `spawn_blocking` the
   connect, then dispatch `ping_blocking` vs `ping` on `is_blocking()`.
 
-## VM lifecycle internals (`arcbox-core/src/vm_lifecycle`)
+## VM lifecycle internals (`engine/arcbox-engine/src/vm_lifecycle`)
 
 - `VmLifecycleManager` is a thin facade over a single actor
   (`actor.rs`): mutations go through `Command` variants on an `mpsc`

@@ -465,7 +465,7 @@ impl<D: BalloonDeps> BalloonController<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::CoreError;
+    use crate::error::EngineError;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -483,8 +483,8 @@ mod tests {
         async fn next_frame(&mut self, max_wait: Duration) -> Result<WatchFrame> {
             match tokio::time::timeout(max_wait, self.frames.recv()).await {
                 Ok(Some(frame)) => Ok(frame),
-                Ok(None) => Err(CoreError::Machine("watch transport closed".into())),
-                Err(_) => Err(CoreError::Machine("watch silence deadline".into())),
+                Ok(None) => Err(EngineError::Machine("watch transport closed".into())),
+                Err(_) => Err(EngineError::Machine("watch silence deadline".into())),
             }
         }
     }
@@ -554,7 +554,7 @@ mod tests {
         fn set_balloon_target(&self, bytes: u64) -> Result<()> {
             self.set_attempts.fetch_add(1, Ordering::SeqCst);
             if self.fail_set_target.load(Ordering::SeqCst) {
-                return Err(CoreError::Machine("injected balloon failure".into()));
+                return Err(EngineError::Machine("injected balloon failure".into()));
             }
             self.targets.lock().unwrap().push(bytes);
             Ok(())
@@ -575,7 +575,7 @@ mod tests {
         async fn open_pressure_watch(&self) -> Result<FakeWatch> {
             self.watches_opened.fetch_add(1, Ordering::SeqCst);
             if !self.watch_supported {
-                return Err(CoreError::Agent {
+                return Err(EngineError::Agent {
                     code: 400,
                     message: "invalid request: unexpected message type".into(),
                 });

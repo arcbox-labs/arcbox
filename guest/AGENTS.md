@@ -94,7 +94,7 @@ non-obvious invariants and failure signatures.
   copies the **newest-mtime** agent across those three locations, so a fresh
   build that wasn't re-staged loses to an old binary from another tree (ABX-385
   field-skew class). Wrong-version agents now surface as the handshake rejection
-  (`app/arcbox-core/src/agent_client.rs`).
+  (`engine/arcbox-engine/src/agent_client.rs`).
 - **"engine ready" then intermittent 500/EOF on first API calls** →
   read `~/.arcbox/log/agent.log`, grep for `DockerProbe` / `/_ping`. Cause:
   readiness gated on socket rather than the `/_ping` probe (ABX-408 regression).
@@ -124,7 +124,7 @@ Every link below must change together; missing one fails as an opaque
    (or a streaming handler like `handle_watch_readiness`, which holds the
    connection open and emits a sequence of `ReadinessEvent` frames rather than a
    single response — mirror that shape for new streaming RPCs).
-5. `app/arcbox-core/src/agent_client.rs` — the host caller.
+5. `engine/arcbox-engine/src/agent_client.rs` — the host caller.
 
 The full set above is for a **new message type**. Adding a *field* to an
 already-wired message (e.g. a new `AgentPingRequest` field) touches only 1, the

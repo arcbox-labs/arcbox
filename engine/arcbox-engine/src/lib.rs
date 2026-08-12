@@ -15,5 +15,6 @@ pub mod machine;
 pub mod persistence;
 pub mod trace;
 pub mod vm;
+pub mod vm_lifecycle;
 
 pub use error::{EngineError, Result};

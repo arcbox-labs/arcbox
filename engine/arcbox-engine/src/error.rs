@@ -56,6 +56,10 @@ pub enum EngineError {
         source: arcbox_transport::error::TransportError,
     },
 
+    /// Image-layer error (boot assets, machine images).
+    #[error(transparent)]
+    Image(#[from] arcbox_image::ImageError),
+
     /// Persistence deserialization error.
     #[error("persistence error: {0}")]
     Persistence(#[from] toml::de::Error),

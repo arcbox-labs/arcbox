@@ -106,6 +106,38 @@ pub struct VmLifecycleConfig {
     /// currently `Vz` — Apple-managed and stable). Switch to `Hv` (custom VMM
     /// + FEX) via the System VM backend control.
     pub backend: arcbox_vmm::VmBackend,
+    /// Composer-installed host hook fired after the VM starts.
+    ///
+    /// Host-side route installation (bridge discovery, privileged-helper
+    /// retries) lives above the engine; `None` means no host routing
+    /// applies (non-macOS, or tests).
+    pub route_hook: Option<RouteHook>,
+}
+
+/// Composer-installed host hook fired after the VM starts.
+///
+/// Newtype over the closure so `VmLifecycleConfig` keeps its `Debug` and
+/// `Clone` derives.
+#[derive(Clone)]
+pub struct RouteHook(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl RouteHook {
+    /// Wraps a host-route installation closure.
+    #[must_use]
+    pub fn new(hook: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self(hook)
+    }
+
+    /// Fires the hook.
+    pub fn call(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for RouteHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RouteHook")
+    }
 }
 
 impl Default for VmLifecycleConfig {
@@ -121,6 +153,7 @@ impl Default for VmLifecycleConfig {
             guest_docker_vsock_port: None,
             allow_unpinned_boot_manifest: false,
             backend: arcbox_vmm::VmBackend::default(),
+            route_hook: None,
         }
     }
 }

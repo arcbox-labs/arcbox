@@ -247,6 +247,17 @@ impl Runtime {
             event_bus.clone(),
         ));
 
+        // Host-side route installation is composed here and injected into the
+        // engine: the engine fires the hook after the VM starts, the hook
+        // owns bridge discovery + helper retries (macOS-only concern).
+        #[cfg(target_os = "macos")]
+        {
+            vm_lifecycle_config.route_hook = Some(crate::route_reconciler::system_vm_route_hook(
+                &machine_manager,
+                &event_bus,
+            ));
+        }
+
         // Build the single System VM. The daemon runs one utility VM (default
         // backend VZ); amd64 workloads run inside it via the active backend's
         // x86 translator (VZ→Rosetta, HV→FEX), so there is no separate VM.

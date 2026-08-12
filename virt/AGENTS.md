@@ -116,7 +116,7 @@ readiness (nothing to snapshot, nothing on `WatchSetupStatus`), not as a
 readiness signal.
 
 - **Interactive serial shell into a hung HV guest.** On the custom-HV
-  backend, `resolve_desired_boot` (`app/arcbox-core/src/vm_lifecycle/boot.rs`,
+  backend, `resolve_desired_boot` (`engine/arcbox-engine/src/vm_lifecycle/boot.rs`,
   the `DEBUG_CONSOLE_KEY` block) always appends
   `arcbox.debug_console=<data_dir>/run/console.sock` to the kernel cmdline;
   the guest rcS spawns a root shell keyed on the same token

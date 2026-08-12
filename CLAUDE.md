@@ -23,7 +23,7 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
   that mark is a one-way ratchet — the guest freeing 3GB leaves the host
   paying for it forever. Only HV can ever release it (VZ guest RAM lives
   in Apple's XPC process, unreachable by `madvise`). Evidence in
-  `app/arcbox-core/src/vm_lifecycle/balloon/mod.rs`.
+  `engine/arcbox-engine/src/vm_lifecycle/balloon/mod.rs`.
 ² Same-context comparison (container vs container, same-day pairing).
   Cache-hot native is not a valid denominator for FUSE metadata —
   methodology and current numbers in `docs/fs-perf-limits.md`.

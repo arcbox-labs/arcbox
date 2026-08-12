@@ -35,7 +35,7 @@ lists it as a non-required legacy artifact.
 1. Download, verify, and cache boot assets at runtime:
    `engine/arcbox-image/src/boot_assets/` (thin wrapper around `arcbox-boot` crate)
 2. Wire boot assets into VM lifecycle:
-   `app/arcbox-core/src/vm_lifecycle/`
+   `engine/arcbox-engine/src/vm_lifecycle/`
 3. Provide CLI operations (`prefetch` / `status` / `list` / `clear`):
    `app/arcbox-cli/src/commands/boot/`
 
