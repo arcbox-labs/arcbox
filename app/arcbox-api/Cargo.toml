@@ -32,7 +32,6 @@ arcbox-image.workspace = true
 arcbox-engine.workspace = true
 
 [dev-dependencies]
-arcbox-vmm = { workspace = true }
 base64 = "0.22.1"
 http = "1.5.0"
 tokio = { workspace = true, features = ["test-util"] }

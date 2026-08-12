@@ -255,7 +255,6 @@ dependencies = [
  "arcbox-error",
  "arcbox-image",
  "arcbox-transport",
- "arcbox-vmm",
  "async-stream",
  "base64",
  "buffa",

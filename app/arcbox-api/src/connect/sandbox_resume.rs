@@ -36,37 +36,20 @@ pub(super) const SANDBOX_PAUSED_WIRE_CODE: i32 = 423;
 pub(super) const REASON_RESUME: &str = "resume";
 pub(super) const REASON_AUTO_RESUME: &str = "auto_resume";
 
-/// Converts a `CoreError` from `Runtime::get_agent` into the engine
-/// vocabulary the sandbox call paths speak. Lossless for every variant
-/// `connect_agent` can produce — including `Vmm`, reachable on macOS via
-/// `connect_vsock_port` -> `VmManager::connect_vsock`. The residual arm
-/// covers variants that cannot originate from an agent connect:
-/// `Fs`/`Net`/`Macos`/`Vz` (no `EngineError` counterpart at all) and
-/// `Snapshot`/`Persistence`/`Image` (mirrored in `EngineError`, but never
-/// produced by this call chain).
-fn core_to_engine_agent_error(e: arcbox_core::CoreError) -> EngineError {
-    use arcbox_core::CoreError;
-    match e {
-        CoreError::Common(c) => EngineError::Common(c),
-        CoreError::Vmm(e) => EngineError::Vmm(e),
-        CoreError::Vm(m) => EngineError::Vm(m),
-        CoreError::Machine(m) => EngineError::Machine(m),
-        CoreError::Agent { code, message } => EngineError::Agent { code, message },
-        CoreError::Transport { context, source } => EngineError::Transport { context, source },
-        CoreError::LockPoisoned => EngineError::LockPoisoned,
-        other => EngineError::Machine(other.to_string()),
-    }
-}
-
-/// Connects to a machine's agent, converting the error via
-/// [`core_to_engine_agent_error`].
+/// Connects to a machine's agent in the engine error vocabulary the
+/// sandbox call paths speak.
+///
+/// `MachineManager::connect_agent` already returns `EngineError` natively
+/// — there is nothing to convert here. (`Runtime::get_agent` is the
+/// app-layer wrapper that maps the same call through `CoreError` for
+/// callers that want the full app-error vocabulary instead; going
+/// through it and back would be a lossy round trip, since `CoreError`
+/// carries variants `EngineError` has no counterpart for.)
 pub(super) fn engine_agent(
     runtime: &Runtime,
     machine: &str,
 ) -> Result<arcbox_core::AgentClient, EngineError> {
-    runtime
-        .get_agent(machine)
-        .map_err(core_to_engine_agent_error)
+    runtime.machine_manager().connect_agent(machine)
 }
 
 /// True when this agent error means "the sandbox is paused".
@@ -271,17 +254,5 @@ mod tests {
         assert!(!auto_resume_opted_out(&ctx_with_header(Some("false"))));
         assert!(auto_resume_opted_out(&ctx_with_header(Some("1"))));
         assert!(auto_resume_opted_out(&ctx_with_header(Some("true"))));
-    }
-
-    /// `connect_agent` (macOS) reaches `VmManager::connect_vsock`, which can
-    /// fail with a structured `VmmError` surfaced as `CoreError::Vmm`. This
-    /// must convert to `EngineError::Vmm`, not fall into the stringifying
-    /// catch-all — losing the variant would erase the error's structured
-    /// identity for every caller matching on `EngineError::Vmm`.
-    #[test]
-    fn vmm_error_survives_the_conversion_structured() {
-        let core_err = arcbox_core::CoreError::Vmm(arcbox_vmm::VmmError::NotInitialized);
-        let engine_err = core_to_engine_agent_error(core_err);
-        assert!(matches!(engine_err, EngineError::Vmm(_)));
     }
 }
