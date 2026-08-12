@@ -179,7 +179,7 @@ impl LinuxTap {
         }
 
         // Create TAP device
-        let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
+        let ret = unsafe { libc::ioctl(fd, TUNSETIFF as _, &ifr) };
         if ret < 0 {
             unsafe { libc::close(fd) };
             return Err(NetError::Tap(format!(
@@ -204,7 +204,7 @@ impl LinuxTap {
         // Set vnet header size if enabled
         if config.vnet_hdr {
             let hdr_sz: i32 = 12; // sizeof(virtio_net_hdr_v1)
-            let ret = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETVNETHDRSZ, &hdr_sz) };
+            let ret = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETVNETHDRSZ as _, &hdr_sz) };
             if ret < 0 {
                 return Err(NetError::Tap(format!(
                     "TUNSETVNETHDRSZ failed: {}",
@@ -214,7 +214,7 @@ impl LinuxTap {
 
             // Enable offload features
             let offload = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
-            let ret = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETOFFLOAD, offload) };
+            let ret = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETOFFLOAD as _, offload) };
             if ret < 0 {
                 tracing::warn!(
                     "TUNSETOFFLOAD failed (non-fatal): {}",
@@ -292,8 +292,13 @@ impl LinuxTap {
         Ok(())
     }
 
-    /// Returns the TAP device name.
+    /// Returns the TAP device MAC address.
     #[must_use]
+    pub fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    /// Returns the TAP device name.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -379,7 +384,7 @@ impl LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)
@@ -400,7 +405,7 @@ impl LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)
@@ -431,7 +436,7 @@ impl NetworkBackend for LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)
@@ -445,7 +450,7 @@ impl NetworkBackend for LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)

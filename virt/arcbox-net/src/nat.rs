@@ -204,7 +204,10 @@ pub struct NatEndpoint {
 // Linux-specific NAT network implementation
 #[cfg(target_os = "linux")]
 mod linux_impl {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::error::NetError;
     use crate::linux::{
         BridgeConfig, LinuxBridge, LinuxFirewall, LinuxTap, NatRule as FirewallNatRule, TapConfig,
     };

@@ -14,7 +14,6 @@ arcbox-datapath = { workspace = true }
 arcbox-fakeip = { workspace = true }
 arcbox-packet = { workspace = true }
 arcbox-proxy = { workspace = true }
-arcbox-xnu-net.workspace = true
 crossbeam-channel = "0.5"
 libc = { workspace = true }
 socket2 = "0.6"
@@ -30,3 +29,6 @@ tokio-frame-sink = []
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+arcbox-xnu-net.workspace = true
