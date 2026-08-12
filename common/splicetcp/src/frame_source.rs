@@ -6,9 +6,11 @@
 //! Both the VM datapath (over a socketpair) and the host tunnel (over a
 //! `utun`, via the [`shim`](crate::shim)) supply a [`FrameSource`].
 
+#[cfg(target_os = "macos")]
 use std::io;
 use std::os::fd::RawFd;
 
+#[cfg(target_os = "macos")]
 use arcbox_xnu_net::BatchDgram;
 
 /// Largest L2 frame we read from a source in a single `read`.
@@ -16,12 +18,14 @@ use arcbox_xnu_net::BatchDgram;
 /// Also the batch-receive slot size: a datagram that overruns its slot is
 /// truncated silently (see [`BatchDgram::recv_batch_chunked`]), so this must
 /// stay at or above the largest datagram the peer can hand us.
+#[cfg(target_os = "macos")]
 const MAX_FRAME_SIZE: usize = 65535;
 
 /// Frames one `recvmsg_x` collects. The backing buffer is
 /// `RX_BATCH * MAX_FRAME_SIZE` of zeroed — hence lazily faulted — address
 /// space, so the resident cost tracks the frames that actually arrive, not
 /// the reservation.
+#[cfg(target_os = "macos")]
 const RX_BATCH: usize = 32;
 
 /// A source of inbound L2 Ethernet frames.
@@ -50,6 +54,7 @@ pub trait FrameSource {
 /// (A `utun` is L3 and has its own source,
 /// [`UtunFrameSource`](crate::utun::UtunFrameSource), wrapped for the
 /// classifier by the [`shim`](crate::shim).)
+#[cfg(target_os = "macos")]
 pub struct FdFrameSource {
     fd: RawFd,
     /// [`RX_BATCH`] back-to-back [`MAX_FRAME_SIZE`] slots.
@@ -58,6 +63,7 @@ pub struct FdFrameSource {
     batch: BatchDgram,
 }
 
+#[cfg(target_os = "macos")]
 impl FdFrameSource {
     /// Wraps a (non-blocking) raw fd. The fd is not owned — its lifetime is
     /// managed by the caller (typically an `AsyncFd<OwnedFd>` registered for
@@ -72,6 +78,7 @@ impl FdFrameSource {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl FrameSource for FdFrameSource {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
@@ -116,7 +123,9 @@ impl FrameSource for FdFrameSource {
     }
 }
 
-#[cfg(test)]
+// Every test here drives `FdFrameSource` directly (the batched XNU recv
+// path), so the whole module is macOS-only along with the type it tests.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 

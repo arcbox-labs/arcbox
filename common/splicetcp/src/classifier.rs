@@ -455,10 +455,17 @@ fn learn_guest_mac(mac: [u8; 6], guest_mac: &mut Option<[u8; 6]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only `fd_source_drain_reads_and_classifies` below needs raw-fd
+    // plumbing and `FdFrameSource`, which is macOS-only; gate that import
+    // and its helpers with it rather than the whole test module, since
+    // every other test here exercises platform-neutral classifier logic.
+    #[cfg(target_os = "macos")]
     use std::os::fd::{FromRawFd, RawFd};
 
+    #[cfg(target_os = "macos")]
     use crate::frame_source::{FdFrameSource, FrameSource};
 
+    #[cfg(target_os = "macos")]
     fn socketpair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
         use std::os::fd::OwnedFd;
         let mut fds: [i32; 2] = [0; 2];
@@ -469,6 +476,7 @@ mod tests {
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
     }
 
+    #[cfg(target_os = "macos")]
     fn set_nonblocking(fd: RawFd) {
         // SAFETY: fcntl on a valid fd.
         unsafe {
@@ -478,6 +486,7 @@ mod tests {
     }
 
     /// Writes raw bytes to an FD.
+    #[cfg(target_os = "macos")]
     fn fd_write_raw(fd: RawFd, data: &[u8]) {
         // SAFETY: writing from valid buffer to valid fd.
         unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
@@ -815,6 +824,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn fd_source_drain_reads_and_classifies() {
         use std::os::fd::AsRawFd;
         let (host_fd, guest_fd) = socketpair();
