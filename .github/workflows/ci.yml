@@ -117,9 +117,13 @@ jobs:
   # The engine layer and the net stack under it promise platform
   # neutrality (architecture charter, company repo): this compile gate
   # keeps darwin-only deps target-gated so a Linux host build never rots
-  # again. Scoped to the crates that make that promise — the workspace as
-  # a whole still contains macOS-only crates (arcbox-vz, arcbox-vmnet).
-  # Extend the -p list as engine/computer crates land.
+  # again. `--tests` is load-bearing: a plain `cargo check` skips test
+  # targets, so a macOS-only symbol reintroduced into a `#[cfg(test)]`
+  # module (as happened once already) would pass the gate while still
+  # breaking `cargo test` on Linux. Scoped to the crates that make the
+  # platform-neutrality promise — the workspace as a whole still contains
+  # macOS-only crates (arcbox-vz, arcbox-vmnet). Extend the -p list as
+  # engine/computer crates land.
   linux-engine:
     name: Linux engine-layer check
     runs-on: ubuntu-latest
@@ -150,7 +154,7 @@ jobs:
             ${{ runner.os }}-cargo-linux-engine-
 
       - name: Check engine-layer crates on Linux
-        run: cargo check -p arcbox-image -p arcbox-net -p splicetcp
+        run: cargo check --tests -p arcbox-image -p arcbox-net -p splicetcp
 
   # Pure proto-contract analysis — no Rust toolchain, no build. Runs in
   # parallel with `ci` on a cheap Linux runner. The desktop and agent

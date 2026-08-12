@@ -123,7 +123,9 @@ impl FrameSource for FdFrameSource {
     }
 }
 
-#[cfg(test)]
+// Every test here drives `FdFrameSource` directly (the batched XNU recv
+// path), so the whole module is macOS-only along with the type it tests.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
