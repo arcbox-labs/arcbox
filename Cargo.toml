@@ -261,6 +261,7 @@ arcbox-net = { version = "0.6.5", path = "virt/arcbox-net" } # x-release-please-
 arcbox-vmnet = { version = "0.6.5", path = "virt/arcbox-vmnet" } # x-release-please-version
 arcbox-net-inject = { version = "0.6.5", path = "virt/arcbox-net-inject" } # x-release-please-version
 arcbox-dhcp = { version = "0.6.5", path = "virt/arcbox-dhcp" } # x-release-please-version
+arcbox-container = { version = "0.6.5", path = "runtime/arcbox-container" } # x-release-please-version
 arcbox-protocol = { version = "0.6.5", path = "rpc/arcbox-protocol" } # x-release-please-version
 arcbox-grpc = { version = "0.6.5", path = "rpc/arcbox-grpc" } # x-release-please-version
 arcbox-connect = { version = "0.6.5", path = "rpc/arcbox-connect" } # x-release-please-version

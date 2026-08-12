@@ -387,7 +387,6 @@ dependencies = [
 name = "arcbox-core"
 version = "0.6.5"
 dependencies = [
- "arcbox-boot",
  "arcbox-connect",
  "arcbox-constants",
  "arcbox-dns",
