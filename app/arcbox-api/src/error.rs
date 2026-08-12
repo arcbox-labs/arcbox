@@ -26,6 +26,14 @@ pub enum ApiError {
     Transport(String),
 }
 
+// Engine errors classify exactly like their CoreError twins: route through
+// the variant-for-variant CoreError conversion so Connect codes stay stable.
+impl From<arcbox_engine::EngineError> for ApiError {
+    fn from(err: arcbox_engine::EngineError) -> Self {
+        Self::Core(arcbox_core::CoreError::from(err))
+    }
+}
+
 // Allow automatic conversion from std::io::Error to ApiError via CommonError.
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {

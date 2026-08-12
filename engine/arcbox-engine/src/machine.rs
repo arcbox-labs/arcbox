@@ -3,7 +3,7 @@
 //! A "machine" is a high-level abstraction over a VM that provides
 //! a Linux environment for running containers.
 
-use crate::error::{CoreError, Result};
+use crate::error::{EngineError, Result};
 use crate::persistence::MachinePersistence;
 use crate::vm::{SharedDirConfig, VmConfig, VmId, VmManager};
 use arcbox_constants::ports::AGENT_PORT;
@@ -14,6 +14,9 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+/// Default machine name used for container operations.
+pub const DEFAULT_MACHINE_NAME: &str = "default";
 
 /// Machine state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,19 +241,19 @@ fn mount_tag(index: usize) -> String {
 /// be absolute and free of the cmdline table separators.
 fn validate_mount(mount: &MachineMount) -> Result<()> {
     if !std::path::Path::new(&mount.host_path).is_dir() {
-        return Err(CoreError::config(format!(
+        return Err(EngineError::config(format!(
             "mount host path '{}' is not a directory",
             mount.host_path
         )));
     }
     if !mount.guest_path.starts_with('/') {
-        return Err(CoreError::config(format!(
+        return Err(EngineError::config(format!(
             "mount guest path '{}' must be absolute",
             mount.guest_path
         )));
     }
     if mount.guest_path.contains(',') || mount.guest_path.contains('=') {
-        return Err(CoreError::config(format!(
+        return Err(EngineError::config(format!(
             "mount guest path '{}' must not contain ',' or '='",
             mount.guest_path
         )));
@@ -389,7 +392,7 @@ impl MachineManager {
     /// is skipped: its lifecycle actor publishes the same events, so emitting
     /// here too would double them.
     fn publish_event(&self, name: &str, event: crate::event::Event) {
-        if name != crate::vm_lifecycle::DEFAULT_MACHINE_NAME {
+        if name != DEFAULT_MACHINE_NAME {
             self.event_bus.publish(event);
         }
     }
@@ -412,10 +415,13 @@ impl MachineManager {
         // and user-driven, so the alternative (insert a `Creating` sentinel,
         // drop the lock for I/O, then finalize/rollback) is not worth its
         // orphan-state failure mode.
-        let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut machines = self
+            .machines
+            .write()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         if machines.contains_key(&config.name) {
-            return Err(CoreError::already_exists(config.name));
+            return Err(EngineError::already_exists(config.name));
         }
 
         let machine_dir = self.machines_dir.join(&config.name);
@@ -444,7 +450,7 @@ impl MachineManager {
         // dropping them.
         if !config.mounts.is_empty() {
             if config.rootfs.as_ref().is_none_or(|r| r.shim.is_none()) {
-                return Err(CoreError::config(
+                return Err(EngineError::config(
                     "mounts require a shim-booted distro machine",
                 ));
             }
@@ -467,13 +473,13 @@ impl MachineManager {
                 // boot-assets kernel; without a shim an explicit kernel is
                 // required or the VM would boot with an empty kernel path.
                 if rootfs.shim.is_none() && config.kernel.is_none() {
-                    return Err(CoreError::config(
+                    return Err(EngineError::config(
                         "a distro rootfs without a boot shim requires an explicit \
                          kernel (pass --kernel)",
                     ));
                 }
                 let data_disk = machine_dir.join("data.img");
-                crate::vm_lifecycle::ensure_sparse_block_image(
+                crate::vm::ensure_sparse_block_image(
                     &data_disk,
                     config.disk_gb.saturating_mul(1024 * 1024 * 1024),
                 )?;
@@ -581,7 +587,7 @@ impl MachineManager {
         let is_machine_vm = self
             .machines
             .read()
-            .map_err(|_| CoreError::LockPoisoned)?
+            .map_err(|_| EngineError::LockPoisoned)?
             .get(name)
             .and_then(|m| m.distro.as_ref())
             .is_some();
@@ -593,7 +599,10 @@ impl MachineManager {
         // Update machine state
         let started_at = Utc::now();
         {
-            let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+            let mut machines = self
+                .machines
+                .write()
+                .map_err(|_| EngineError::LockPoisoned)?;
 
             if let Some(machine) = machines.get_mut(name) {
                 machine.state = MachineState::Running;
@@ -617,7 +626,7 @@ impl MachineManager {
         // For machine VMs, wait for agent readiness and discover IP.
         if is_machine_vm {
             self.wait_for_machine_ready(name).await.map_err(|e| {
-                CoreError::Machine(format!(
+                EngineError::Machine(format!(
                     "Machine '{name}' started but readiness check failed: {e}"
                 ))
             })?;
@@ -675,7 +684,7 @@ impl MachineManager {
 
             if std::time::Instant::now() >= deadline {
                 self.log_console_tail(name);
-                return Err(CoreError::Machine(format!(
+                return Err(EngineError::Machine(format!(
                     "Machine '{name}' agent did not report a routable IP within timeout"
                 )));
             }
@@ -685,7 +694,10 @@ impl MachineManager {
 
         // Back on async context — update state.
         {
-            let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+            let mut machines = self
+                .machines
+                .write()
+                .map_err(|_| EngineError::LockPoisoned)?;
             if let Some(machine) = machines.get_mut(name) {
                 machine.ip_address = Some(ip.clone());
             }
@@ -699,20 +711,23 @@ impl MachineManager {
 
     fn assign_cid_for_start(&self, name: &str) -> Result<(VmId, u32)> {
         let (vm_id, cid) = {
-            let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+            let machines = self
+                .machines
+                .read()
+                .map_err(|_| EngineError::LockPoisoned)?;
 
             let machine = machines
                 .get(name)
-                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
             if machine.state == MachineState::Running {
-                return Err(CoreError::invalid_state(format!(
+                return Err(EngineError::invalid_state(format!(
                     "machine '{name}' is already running"
                 )));
             }
 
             if machine.state == MachineState::Starting || machine.state == MachineState::Stopping {
-                return Err(CoreError::invalid_state(format!(
+                return Err(EngineError::invalid_state(format!(
                     "machine '{name}' is in transition state"
                 )));
             }
@@ -747,10 +762,10 @@ impl MachineManager {
     ///
     /// Only available when the `vmnet` feature is enabled and the VM is running.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    pub fn vmnet_bridge_name(&self, name: &str) -> Option<String> {
+    pub fn vmnet_interface_mac(&self, name: &str) -> Option<String> {
         let machines = self.machines.read().ok()?;
         let machine = machines.get(name)?;
-        self.vm_manager.vmnet_bridge_name(&machine.vm_id)
+        self.vm_manager.vmnet_interface_mac(&machine.vm_id)
     }
 
     /// Returns the bridge NIC MAC address for a machine's VM.
@@ -777,18 +792,21 @@ impl MachineManager {
     pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
         use crate::agent_client::AgentClient;
         let (cid, vm_id) = {
-            let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+            let machines = self
+                .machines
+                .read()
+                .map_err(|_| EngineError::LockPoisoned)?;
             let machine = machines
                 .get(name)
-                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(name.to_string()))?;
             if machine.state != MachineState::Running {
-                return Err(CoreError::invalid_state(format!(
+                return Err(EngineError::invalid_state(format!(
                     "machine '{name}' is not running"
                 )));
             }
             let cid = machine
                 .cid
-                .ok_or_else(|| CoreError::invalid_state("CID not assigned"))?;
+                .ok_or_else(|| EngineError::invalid_state("CID not assigned"))?;
             (cid, machine.vm_id.clone())
         };
         let backend = self.vm_manager.backend(&vm_id)?;
@@ -809,14 +827,17 @@ impl MachineManager {
     /// This is a generic helper used by agent and guest runtime proxy paths.
     #[cfg(target_os = "macos")]
     pub fn connect_vsock_port(&self, name: &str, port: u32) -> Result<std::os::unix::io::RawFd> {
-        let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "machine '{name}' is not running"
             )));
         }
@@ -829,14 +850,17 @@ impl MachineManager {
     pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
         use crate::agent_client::AgentClient;
 
-        let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "machine '{}' is not running",
                 name
             )));
@@ -844,7 +868,7 @@ impl MachineManager {
 
         let cid = machine
             .cid
-            .ok_or_else(|| CoreError::invalid_state("CID not assigned"))?;
+            .ok_or_else(|| EngineError::invalid_state("CID not assigned"))?;
 
         // On Linux, AgentClient connects directly via AF_VSOCK
         Ok(AgentClient::new(cid))
@@ -853,14 +877,17 @@ impl MachineManager {
     /// Connects to a vsock port on a running machine (Linux).
     #[cfg(target_os = "linux")]
     pub fn connect_vsock_port(&self, name: &str, port: u32) -> Result<std::os::unix::io::RawFd> {
-        let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "machine '{}' is not running",
                 name
             )));
@@ -891,28 +918,31 @@ impl MachineManager {
                     tokio::task::spawn_blocking(move || agent.ping_blocking().map(|_| ()))
                         .await
                         .unwrap_or_else(|e| {
-                            Err(CoreError::Vm(format!("agent ping task panicked: {e}")))
+                            Err(EngineError::Vm(format!("agent ping task panicked: {e}")))
                         })
                 } else {
                     agent.ping().await.map(|_| ())
                 }
             }
             Ok(Err(e)) => Err(e),
-            Err(e) => Err(CoreError::Vm(format!("agent connect task panicked: {e}"))),
+            Err(e) => Err(EngineError::Vm(format!("agent connect task panicked: {e}"))),
         }
     }
 
     /// Reads serial console output for a running machine (macOS only).
     #[cfg(target_os = "macos")]
     pub fn read_console_output(&self, name: &str) -> Result<String> {
-        let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "machine '{name}' is not running"
             )));
         }
@@ -957,14 +987,17 @@ impl MachineManager {
     /// Reads agent log output (hvc1) for a running machine (macOS only).
     #[cfg(target_os = "macos")]
     pub fn read_agent_log_output(&self, name: &str) -> Result<String> {
-        let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "machine '{name}' is not running"
             )));
         }
@@ -984,11 +1017,14 @@ impl MachineManager {
     /// Returns an error if the machine is not found or its VMM has not
     /// been created.
     pub fn debug_snapshot(&self, name: &str) -> Result<arcbox_vmm::VmDebugSnapshot> {
-        let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         self.vm_manager.debug_snapshot(&machine.vm_id)
     }
@@ -1003,17 +1039,20 @@ impl MachineManager {
     ///
     /// Returns an error if the machine cannot be stopped.
     pub fn stop(&self, name: &str) -> Result<()> {
-        let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut machines = self
+            .machines
+            .write()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get_mut(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         if !matches!(
             machine.state,
             MachineState::Running | MachineState::Stopping
         ) {
-            return Err(CoreError::invalid_state(format!(
+            return Err(EngineError::invalid_state(format!(
                 "machine '{name}' is not running"
             )));
         }
@@ -1065,10 +1104,13 @@ impl MachineManager {
     /// Returns an error if the machine is unknown or the reboot fails.
     pub fn reboot(&self, name: &str) -> Result<()> {
         let vm_id = {
-            let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+            let machines = self
+                .machines
+                .read()
+                .map_err(|_| EngineError::LockPoisoned)?;
             machines
                 .get(name)
-                .ok_or_else(|| CoreError::not_found(name.to_string()))?
+                .ok_or_else(|| EngineError::not_found(name.to_string()))?
                 .vm_id
                 .clone()
         };
@@ -1096,15 +1138,18 @@ impl MachineManager {
     pub fn set_backend(&self, name: &str, backend: arcbox_vmm::VmBackend) -> Result<()> {
         // Validate and capture the VM id without mutating anything yet.
         let vm_id = {
-            let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+            let machines = self
+                .machines
+                .read()
+                .map_err(|_| EngineError::LockPoisoned)?;
             let machine = machines
                 .get(name)
-                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(name.to_string()))?;
             if matches!(
                 machine.state,
                 MachineState::Running | MachineState::Starting
             ) {
-                return Err(CoreError::invalid_state(format!(
+                return Err(EngineError::invalid_state(format!(
                     "cannot switch backend while machine '{name}' is {:?}",
                     machine.state
                 )));
@@ -1121,7 +1166,7 @@ impl MachineManager {
         if let Some(machine) = self
             .machines
             .write()
-            .map_err(|_| CoreError::LockPoisoned)?
+            .map_err(|_| EngineError::LockPoisoned)?
             .get_mut(name)
         {
             machine.backend = backend;
@@ -1136,14 +1181,17 @@ impl MachineManager {
     /// shutdown timed out or is unavailable.
     pub fn graceful_stop(&self, name: &str, timeout: Duration) -> Result<bool> {
         let vm_id = {
-            let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+            let mut machines = self
+                .machines
+                .write()
+                .map_err(|_| EngineError::LockPoisoned)?;
 
             let machine = machines
                 .get_mut(name)
-                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
             if machine.state != MachineState::Running {
-                return Err(CoreError::invalid_state(format!(
+                return Err(EngineError::invalid_state(format!(
                     "machine '{name}' is not running"
                 )));
             }
@@ -1154,11 +1202,14 @@ impl MachineManager {
 
         match self.vm_manager.graceful_stop(&vm_id, timeout) {
             Ok(true) => {
-                let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+                let mut machines = self
+                    .machines
+                    .write()
+                    .map_err(|_| EngineError::LockPoisoned)?;
 
                 let machine = machines
                     .get_mut(name)
-                    .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+                    .ok_or_else(|| EngineError::not_found(name.to_string()))?;
                 machine.state = MachineState::Stopped;
                 machine.cid = None;
 
@@ -1231,15 +1282,18 @@ impl MachineManager {
     ///
     /// Returns an error if the machine cannot be removed.
     pub fn remove(&self, name: &str, force: bool) -> Result<()> {
-        let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut machines = self
+            .machines
+            .write()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
 
         // Check if machine is running
         if machine.state == MachineState::Running && !force {
-            return Err(CoreError::invalid_state(
+            return Err(EngineError::invalid_state(
                 "cannot remove running machine (use --force)".to_string(),
             ));
         }
@@ -1249,14 +1303,17 @@ impl MachineManager {
             let vm_id = machine.vm_id.clone();
             drop(machines); // Release lock before stopping
             self.vm_manager.stop(&vm_id)?;
-            machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+            machines = self
+                .machines
+                .write()
+                .map_err(|_| EngineError::LockPoisoned)?;
         }
 
         // Get VM ID before removing from map.
         let vm_id = {
             let m = machines
                 .get(name)
-                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+                .ok_or_else(|| EngineError::not_found(name.to_string()))?;
             m.vm_id.clone()
         };
 
@@ -1310,7 +1367,10 @@ impl MachineManager {
     /// # Note
     /// This is intended for unit testing only and should not be used in production.
     pub fn register_mock_machine(&self, name: &str, cid: u32) -> Result<()> {
-        let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+        let mut machines = self
+            .machines
+            .write()
+            .map_err(|_| EngineError::LockPoisoned)?;
 
         if machines.contains_key(name) {
             return Ok(()); // Already registered

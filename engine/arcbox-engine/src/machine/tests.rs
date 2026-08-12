@@ -114,7 +114,7 @@ async fn connect_agent_distinguishes_missing_and_stopped_machines() {
         .expect("missing machine must fail");
     assert!(matches!(
         &missing,
-        CoreError::Common(arcbox_error::CommonError::NotFound(_))
+        EngineError::Common(arcbox_error::CommonError::NotFound(_))
     ));
 
     machine_manager
@@ -130,7 +130,7 @@ async fn connect_agent_distinguishes_missing_and_stopped_machines() {
         .expect("stopped machine must fail");
     assert!(matches!(
         &stopped,
-        CoreError::Common(arcbox_error::CommonError::InvalidState(_))
+        EngineError::Common(arcbox_error::CommonError::InvalidState(_))
     ));
     assert!(
         stopped
@@ -205,7 +205,7 @@ async fn test_create_concurrent_same_name_no_duplicate() {
     };
     assert_eq!(winner, name);
     match loser {
-        CoreError::Common(ref c) if c.is_already_exists() => {}
+        EngineError::Common(ref c) if c.is_already_exists() => {}
         other => panic!("loser should be AlreadyExists, got {other:?}"),
     }
 

@@ -7,6 +7,7 @@ use arcbox_connect::sandbox_v1::{InspectSandboxRequest, SandboxInfo, SandboxStat
 use arcbox_connect::v1::SandboxCleanupTicket;
 use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
 use arcbox_core::{AgentClient, CoreError, Runtime};
+use arcbox_engine::EngineError;
 
 /// Validate a cleanup generation, remove host-owned state, then let the guest
 /// recycle its DNAT relay and quarantined IP.
@@ -14,7 +15,7 @@ pub(super) async fn complete(
     runtime: &Runtime,
     agent: &mut AgentClient,
     ticket: &SandboxCleanupTicket,
-) -> arcbox_core::Result<()> {
+) -> arcbox_engine::Result<()> {
     let mut host_generation = runtime.lock_sandbox_host_state().await;
     if let Err(error) = agent.sandbox_cleanup_prepare(ticket).await {
         return if obsolete_ticket(&error) {
@@ -79,7 +80,7 @@ pub async fn initialize(runtime: &Runtime) -> arcbox_core::Result<bool> {
         let ticket = match event {
             Ok(ticket) => ticket,
             Err(error) if sandbox_unavailable(&error) => return Ok(false),
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let startup = ticket.startup;
         let mut agent = runtime.get_agent(DEFAULT_MACHINE_NAME)?;
@@ -120,18 +121,18 @@ async fn watch_once(runtime: &Runtime) -> arcbox_core::Result<()> {
     ))
 }
 
-fn obsolete_ticket(error: &CoreError) -> bool {
+fn obsolete_ticket(error: &EngineError) -> bool {
     matches!(
         error,
-        CoreError::Agent {
+        EngineError::Agent {
             code: 404 | 412,
             ..
         }
     )
 }
 
-fn sandbox_unavailable(error: &CoreError) -> bool {
-    matches!(error, CoreError::Agent { code: 412, .. })
+fn sandbox_unavailable(error: &EngineError) -> bool {
+    matches!(error, EngineError::Agent { code: 412, .. })
 }
 
 #[cfg(test)]
@@ -141,20 +142,20 @@ mod tests {
     #[test]
     fn only_missing_or_wrong_generation_tickets_are_obsolete() {
         for code in [404, 412] {
-            assert!(obsolete_ticket(&CoreError::Agent {
+            assert!(obsolete_ticket(&EngineError::Agent {
                 code,
                 message: "stale".into(),
             }));
         }
-        assert!(!obsolete_ticket(&CoreError::Agent {
+        assert!(!obsolete_ticket(&EngineError::Agent {
             code: 503,
             message: "retry".into(),
         }));
-        assert!(sandbox_unavailable(&CoreError::Agent {
+        assert!(sandbox_unavailable(&EngineError::Agent {
             code: 412,
             message: "nested virtualization unavailable".into(),
         }));
-        assert!(!sandbox_unavailable(&CoreError::Agent {
+        assert!(!sandbox_unavailable(&EngineError::Agent {
             code: 503,
             message: "data volume unavailable".into(),
         }));

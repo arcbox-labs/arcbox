@@ -40,10 +40,10 @@ mod serial;
 mod tests;
 mod types;
 
-use crate::boot_assets::BootAssetProvider;
-use crate::error::{CoreError, Result};
+use crate::error::{EngineError, Result};
 use crate::event::EventBus;
 use crate::machine::{MachineInfo, MachineManager};
+use arcbox_image::boot_assets::BootAssetProvider;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -52,8 +52,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use actor::{Command, LifecycleActor, LifecycleShared};
 
-/// Default machine name used for container operations.
-pub const DEFAULT_MACHINE_NAME: &str = "default";
+pub use crate::machine::DEFAULT_MACHINE_NAME;
 
 /// Default startup timeout in seconds.
 ///
@@ -91,10 +90,9 @@ const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 /// See ../company/engineering/arcbox/plans/ext4-metadata-volume.md.
 const DOCKER_METADATA_IMAGE_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-pub(crate) use boot::ensure_sparse_block_image;
 pub use health::HealthMonitor;
 pub use recovery::{BackoffStrategy, RecoveryAction, RecoveryPolicy};
-pub use types::{DefaultVmConfig, VmLifecycleConfig, VmLifecycleState};
+pub use types::{DefaultVmConfig, RouteHook, VmLifecycleConfig, VmLifecycleState};
 
 /// Holds the VM out of idle while a host-side operation is in flight.
 ///
@@ -182,7 +180,7 @@ impl VmLifecycleManager {
     ) -> Result<Self> {
         let boot_assets = Arc::new(
             BootAssetProvider::with_config(
-                crate::boot_assets::BootAssetConfig::with_cache_dir(data_dir.join("boot"))
+                arcbox_image::boot_assets::BootAssetConfig::with_cache_dir(data_dir.join("boot"))
                     .with_unpinned_manifest_allowed(config.allow_unpinned_boot_manifest),
             )?
             .with_kernel(config.default_vm.kernel.clone().unwrap_or_default())?,
@@ -274,10 +272,10 @@ impl VmLifecycleManager {
         self.ensure_actor();
         self.cmd_tx
             .send(command)
-            .map_err(|_| CoreError::Vm("VM lifecycle actor terminated".to_string()))?;
+            .map_err(|_| EngineError::Vm("VM lifecycle actor terminated".to_string()))?;
         reply_rx
             .await
-            .map_err(|_| CoreError::Vm("VM lifecycle actor terminated".to_string()))?
+            .map_err(|_| EngineError::Vm("VM lifecycle actor terminated".to_string()))?
     }
 
     /// Returns the machine name this lifecycle manager owns.

@@ -5,14 +5,12 @@
 //! Completion is reported back as an [`InternalEvent`]; the bodies are ports
 //! of the pre-actor `start_default_vm` / `wait_for_agent` / `shutdown`.
 
-use std::fs::OpenOptions;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::error::{CoreError, Result};
+use crate::error::{EngineError, Result};
 use crate::event::Event;
 use crate::machine::MachineConfig;
 use arcbox_constants::cmdline::{
@@ -82,7 +80,7 @@ impl LifecycleShared {
             }
         })
         .await
-        .map_err(|e| CoreError::Vm(format!("stop task panicked: {e}")))
+        .map_err(|e| EngineError::Vm(format!("stop task panicked: {e}")))
         .and_then(|r| r);
 
         let outcome = match stop_result {
@@ -122,7 +120,7 @@ impl LifecycleShared {
         // async workers.
         tokio::task::spawn_blocking(move || mm.reboot(&name))
             .await
-            .map_err(|e| CoreError::Vm(format!("reboot task panicked: {e}")))??;
+            .map_err(|e| EngineError::Vm(format!("reboot task panicked: {e}")))??;
         // The teardown dropped the bridge along with the VMM; the fresh boot
         // created a new one, so the host container-subnet route must be
         // reinstalled exactly like after a normal start.
@@ -250,13 +248,13 @@ impl LifecycleShared {
                     // Check if we should retry.
                     // Avoid wrapping "VM error: ..." multiple times when propagating.
                     let recovery_error = match &e {
-                        CoreError::Vm(msg) => msg.as_str(),
+                        EngineError::Vm(msg) => msg.as_str(),
                         _ => &e.to_string(),
                     };
                     match self.recovery.handle_failure(recovery_error) {
                         RecoveryAction::RetryAfter(delay) => {
                             if tokio::time::Instant::now() + delay > deadline {
-                                return Err(CoreError::Vm(format!(
+                                return Err(EngineError::Vm(format!(
                                     "VM startup timeout after {} retries",
                                     self.recovery.retry_count()
                                 )));
@@ -266,7 +264,7 @@ impl LifecycleShared {
                             tokio::time::sleep(delay).await;
                         }
                         RecoveryAction::GiveUp(err) => {
-                            return Err(CoreError::Vm(err));
+                            return Err(EngineError::Vm(err));
                         }
                     }
                 }
@@ -274,52 +272,18 @@ impl LifecycleShared {
         }
     }
 
-    /// Installs the host route for container subnets via the bridge NIC.
+    /// Fires the composer-installed route hook.
     ///
-    /// Non-blocking: retries transient failures (helper not ready, bridge FDB
-    /// not populated) but does not gate VM readiness.
-    #[cfg(all(target_os = "macos", feature = "vmnet"))]
+    /// Host-side route installation (bridge discovery + privileged-helper
+    /// retries) lives above the engine; the composing layer injects it via
+    /// `VmLifecycleConfig::route_hook` (see arcbox-core's
+    /// `route_reconciler::system_vm_route_hook`). `None` means no host
+    /// routing applies (non-macOS, or tests).
     fn spawn_route_reconciler(&self) {
-        if let Some(bridge) = self.machine_manager.vmnet_bridge_name(&self.machine_name) {
-            // vmnet path: bridge name is known instantly, only need
-            // helper retry (1-2 attempts for XPC readiness).
-            let event_bus = self.event_bus.clone();
-            let name = self.machine_name.clone();
-            drop(tokio::spawn(async move {
-                match crate::route_reconciler::ensure_route_for_bridge(&bridge).await {
-                    Ok(()) => {
-                        event_bus.publish(Event::ContainerRouteInstalled { name });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to install container route (vmnet)");
-                    }
-                }
-            }));
+        if let Some(hook) = &self.config.route_hook {
+            hook.call();
         }
     }
-
-    /// See the vmnet variant; this path discovers the bridge by scanning the
-    /// kernel FDB (retries up to ~10s for FDB learning).
-    #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
-    fn spawn_route_reconciler(&self) {
-        if let Some(mac) = self.machine_manager.bridge_mac(&self.machine_name) {
-            let event_bus = self.event_bus.clone();
-            let name = self.machine_name.clone();
-            drop(tokio::spawn(async move {
-                match crate::route_reconciler::ensure_route_with_retry(&mac).await {
-                    Ok(()) => {
-                        event_bus.publish(Event::ContainerRouteInstalled { name });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to install container route");
-                    }
-                }
-            }));
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn spawn_route_reconciler(&self) {}
 
     /// Creates the default machine with EROFS rootfs and no initramfs.
     ///
@@ -342,7 +306,7 @@ impl LifecycleShared {
             .data_dir
             .join(arcbox_constants::paths::host::DATA)
             .join(&self.data_image_filename);
-        ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
+        crate::vm::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
 
         // Don't inject docker_data_device into cmdline — let the agent
         // auto-detect. It prefers /dev/arcboxhvc1 (HVC fast path) when
@@ -360,7 +324,7 @@ impl LifecycleShared {
             .data_dir
             .join(arcbox_constants::paths::host::DATA)
             .join(metadata_image_filename(&self.data_image_filename));
-        ensure_sparse_block_image(&metadata_image, DOCKER_METADATA_IMAGE_SIZE_BYTES)?;
+        crate::vm::ensure_sparse_block_image(&metadata_image, DOCKER_METADATA_IMAGE_SIZE_BYTES)?;
         block_devices.push(crate::vm::BlockDeviceConfig {
             path: metadata_image.to_string_lossy().to_string(),
             read_only: false,
@@ -602,7 +566,7 @@ impl LifecycleShared {
             Err(agent_timeout_error(last_readiness_err.as_deref()))
         })
         .await
-        .map_err(|e| CoreError::Vm(format!("probe task panicked: {e}")))?;
+        .map_err(|e| EngineError::Vm(format!("probe task panicked: {e}")))?;
 
         match probe_result? {
             AgentProbe::Ready => {}
@@ -719,89 +683,13 @@ pub(super) fn ensure_earlycon(cmdline: String, backend: arcbox_vmm::VmBackend) -
 /// Builds the "timeout waiting for agent" error, folding in the last observed
 /// readiness error so a genuine guest-reported failure isn't masked as a plain
 /// timeout (per-iteration errors are otherwise only logged at debug level).
-pub(super) fn agent_timeout_error(last_error: Option<&str>) -> CoreError {
+pub(super) fn agent_timeout_error(last_error: Option<&str>) -> EngineError {
     match last_error {
-        Some(e) => CoreError::Vm(format!("timeout waiting for agent (last error: {e})")),
-        None => CoreError::Vm("timeout waiting for agent".to_string()),
+        Some(e) => EngineError::Vm(format!("timeout waiting for agent (last error: {e})")),
+        None => EngineError::Vm("timeout waiting for agent".to_string()),
     }
 }
 
-/// Ensures a sparse, thin-provisioned block image of `size_bytes` virtual
-/// size exists at `path`, creating parent directories as needed.
-///
-/// `set_len` extends only the logical size (EOF); it reserves no physical
-/// blocks, so the host file stays sparse and consumes disk only for blocks
-/// the guest actually writes — matching OrbStack's thin data image.
-///
-/// We deliberately do NOT pre-allocate physical space. An upfront macOS
-/// `F_PREALLOCATE` reservation (previously capped at 64 GiB) made a fresh
-/// install report tens of GiB of disk usage with zero containers — wasteful
-/// and a regression against OrbStack on idle footprint. APFS/Btrfs allocate
-/// on write lazily, so the working set still benefits from CoW without the
-/// upfront cost. An existing image is never shrunk.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "re-exported at the vm_lifecycle root so MachineManager can provision per-machine data disks"
-)]
-pub(crate) fn ensure_sparse_block_image(path: &Path, size_bytes: u64) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CoreError::config(format!(
-                "failed to create block image directory '{}': {}",
-                parent.display(),
-                e
-            ))
-        })?;
-    }
-
-    let file_exists = path.exists();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|e| {
-            CoreError::config(format!(
-                "failed to open block image '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-    let current_len = file.metadata().map_err(|e| {
-        CoreError::config(format!(
-            "failed to stat block image '{}': {}",
-            path.display(),
-            e
-        ))
-    })?;
-
-    // Extend the logical size only — `set_len` leaves the file sparse, so
-    // no physical disk is consumed until the guest writes. Never shrink an
-    // existing image (guards against a smaller `size_bytes` truncating
-    // user data).
-    if current_len.len() < size_bytes {
-        file.set_len(size_bytes).map_err(|e| {
-            CoreError::config(format!(
-                "failed to resize block image '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-    }
-
-    if !file_exists {
-        tracing::info!(
-            path = %path.display(),
-            size_bytes,
-            "created persistent docker data image"
-        );
-    }
-
-    Ok(())
-}
-
-const fn is_not_found_error(err: &CoreError) -> bool {
-    matches!(err, CoreError::Common(CommonError::NotFound(_)))
+const fn is_not_found_error(err: &EngineError) -> bool {
+    matches!(err, EngineError::Common(CommonError::NotFound(_)))
 }

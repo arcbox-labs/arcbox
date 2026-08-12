@@ -44,6 +44,7 @@ base64 = "0.22.1"
 arcbox-connect.workspace = true
 buffa = "0.9.1"
 arcbox-image.workspace = true
+arcbox-engine.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-route.workspace = true
@@ -61,7 +62,7 @@ backend-native = []
 backend-guest-docker = []
 provision-bundled = []
 provision-distro = []
-vmnet = ["arcbox-vmm/vmnet"]
+vmnet = ["arcbox-vmm/vmnet", "arcbox-engine/vmnet"]
 gic = ["arcbox-vmm/gic"]
 # Retained-but-unshipped macOS IPSW installer (install_from_ipsw + Apple IPSW
 # download). The product acquires images via `pull` only; this stays compiled

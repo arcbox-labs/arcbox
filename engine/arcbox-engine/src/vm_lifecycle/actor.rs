@@ -20,10 +20,10 @@ use statig::blocking::IntoStateMachineExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::boot_assets::BootAssetProvider;
-use crate::error::{CoreError, Result};
+use crate::error::{EngineError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::MachineManager;
+use arcbox_image::boot_assets::BootAssetProvider;
 
 use super::balloon;
 use super::balloon::controller::{
@@ -157,7 +157,7 @@ impl LifecycleShared {
     fn get_cid(&self) -> Result<u32> {
         self.machine_manager
             .get_cid(&self.machine_name)
-            .ok_or_else(|| CoreError::Machine("default machine has no CID".to_string()))
+            .ok_or_else(|| EngineError::Machine("default machine has no CID".to_string()))
     }
 }
 
@@ -206,7 +206,7 @@ impl BalloonDeps for RealBalloonDeps {
             .shared
             .machine_manager
             .get(&self.shared.machine_name)
-            .ok_or_else(|| CoreError::Machine("machine record missing".to_string()))?;
+            .ok_or_else(|| EngineError::Machine("machine record missing".to_string()))?;
         self.shared
             .machine_manager
             .vm_manager()
@@ -519,7 +519,7 @@ impl LifecycleActor {
             }
             Effect::FailWaiters(reason) => {
                 for waiter in self.waiters.drain(..) {
-                    let _ = waiter.send(Err(CoreError::Vm(reason.clone())));
+                    let _ = waiter.send(Err(EngineError::Vm(reason.clone())));
                 }
             }
         }
@@ -658,7 +658,7 @@ impl LifecycleActor {
             InternalEvent::BootFailed(reason) => {
                 self.dispatch(machine, VmEvent::Failure);
                 for waiter in self.waiters.drain(..) {
-                    let _ = waiter.send(Err(CoreError::Vm(reason.clone())));
+                    let _ = waiter.send(Err(EngineError::Vm(reason.clone())));
                 }
                 // A shutdown parked behind this boot has nothing left to stop.
                 if std::mem::take(&mut self.pending_stop) {
@@ -676,7 +676,7 @@ impl LifecycleActor {
             InternalEvent::StopFailed(reason) => {
                 self.dispatch(machine, VmEvent::Failure);
                 for waiter in self.stop_waiters.drain(..) {
-                    let _ = waiter.send(Err(CoreError::Vm(reason.clone())));
+                    let _ = waiter.send(Err(EngineError::Vm(reason.clone())));
                 }
             }
         }

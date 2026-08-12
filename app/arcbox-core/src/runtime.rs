@@ -247,6 +247,18 @@ impl Runtime {
             event_bus.clone(),
         ));
 
+        // Host-side route installation is composed here and injected into the
+        // engine: the engine fires the hook after the VM starts, the hook
+        // owns bridge discovery + helper retries (macOS-only concern).
+        #[cfg(target_os = "macos")]
+        {
+            vm_lifecycle_config.route_hook = Some(crate::route_reconciler::system_vm_route_hook(
+                &machine_manager,
+                &event_bus,
+                crate::vm_lifecycle::DEFAULT_MACHINE_NAME,
+            ));
+        }
+
         // Build the single System VM. The daemon runs one utility VM (default
         // backend VZ); amd64 workloads run inside it via the active backend's
         // x86 translator (VZ→Rosetta, HV→FEX), so there is no separate VM.
@@ -462,7 +474,9 @@ impl Runtime {
     ///
     /// Returns an error if the System VM's VMM has not been created.
     pub fn system_vm_debug_snapshot(&self) -> Result<arcbox_vmm::VmDebugSnapshot> {
-        self.machine_manager.debug_snapshot(DEFAULT_MACHINE_NAME)
+        self.machine_manager
+            .debug_snapshot(DEFAULT_MACHINE_NAME)
+            .map_err(CoreError::from)
     }
 
     /// Returns the System VM's current hypervisor backend.
@@ -625,13 +639,17 @@ impl Runtime {
     /// Returns an error if the machine is not found or connection fails.
     #[cfg(target_os = "macos")]
     pub fn get_agent(&self, machine_name: &str) -> Result<crate::agent_client::AgentClient> {
-        self.machine_manager.connect_agent(machine_name)
+        self.machine_manager
+            .connect_agent(machine_name)
+            .map_err(CoreError::from)
     }
 
     /// Gets an agent client for a machine (Linux version).
     #[cfg(target_os = "linux")]
     pub fn get_agent(&self, machine_name: &str) -> Result<crate::agent_client::AgentClient> {
-        self.machine_manager.connect_agent(machine_name)
+        self.machine_manager
+            .connect_agent(machine_name)
+            .map_err(CoreError::from)
     }
 
     /// Connects to a machine's guest service via vsock port.
@@ -640,7 +658,9 @@ impl Runtime {
     ///
     /// Returns an error if the machine is not running or the vsock port is not reachable.
     pub fn connect_vsock_port(&self, machine_name: &str, port: u32) -> Result<std::os::fd::RawFd> {
-        self.machine_manager.connect_vsock_port(machine_name, port)
+        self.machine_manager
+            .connect_vsock_port(machine_name, port)
+            .map_err(CoreError::from)
     }
 
     /// Resolves a container's filesystem layer directories (guest paths)
@@ -666,8 +686,12 @@ impl Runtime {
             tokio::task::spawn_blocking(move || agent.container_fs_paths_blocking(&id))
                 .await
                 .map_err(|e| CoreError::Vm(format!("container fs paths task panicked: {e}")))?
+                .map_err(CoreError::from)
         } else {
-            agent.container_fs_paths(container_id).await
+            agent
+                .container_fs_paths(container_id)
+                .await
+                .map_err(CoreError::from)
         }
     }
 
@@ -692,8 +716,12 @@ impl Runtime {
             tokio::task::spawn_blocking(move || agent.image_fs_paths_blocking(&id))
                 .await
                 .map_err(|e| CoreError::Vm(format!("image fs paths task panicked: {e}")))?
+                .map_err(CoreError::from)
         } else {
-            agent.image_fs_paths(top_chain_id).await
+            agent
+                .image_fs_paths(top_chain_id)
+                .await
+                .map_err(CoreError::from)
         }
     }
 

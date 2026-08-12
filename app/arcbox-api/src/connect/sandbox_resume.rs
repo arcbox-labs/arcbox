@@ -15,7 +15,8 @@
 use std::sync::Arc;
 
 use arcbox_connect::v1::SandboxResumeCommand;
-use arcbox_core::{CoreError, Runtime};
+use arcbox_core::Runtime;
+use arcbox_engine::EngineError;
 use connectrpc::{ConnectError, RequestContext};
 
 use super::sandbox_cleanup;
@@ -35,11 +36,27 @@ pub(super) const SANDBOX_PAUSED_WIRE_CODE: i32 = 423;
 pub(super) const REASON_RESUME: &str = "resume";
 pub(super) const REASON_AUTO_RESUME: &str = "auto_resume";
 
+/// Connects to a machine's agent in the engine error vocabulary the
+/// sandbox call paths speak.
+///
+/// `MachineManager::connect_agent` already returns `EngineError` natively
+/// — there is nothing to convert here. (`Runtime::get_agent` is the
+/// app-layer wrapper that maps the same call through `CoreError` for
+/// callers that want the full app-error vocabulary instead; going
+/// through it and back would be a lossy round trip, since `CoreError`
+/// carries variants `EngineError` has no counterpart for.)
+pub(super) fn engine_agent(
+    runtime: &Runtime,
+    machine: &str,
+) -> Result<arcbox_core::AgentClient, EngineError> {
+    runtime.machine_manager().connect_agent(machine)
+}
+
 /// True when this agent error means "the sandbox is paused".
-pub(super) fn is_sandbox_paused(error: &CoreError) -> bool {
+pub(super) fn is_sandbox_paused(error: &EngineError) -> bool {
     matches!(
         error,
-        CoreError::Agent {
+        EngineError::Agent {
             code: SANDBOX_PAUSED_WIRE_CODE,
             ..
         }
@@ -94,7 +111,7 @@ pub(super) async fn resume(
                 .await;
             match attempt {
                 Ok(resumed) => break resumed,
-                Err(CoreError::Agent { code: 503, message })
+                Err(EngineError::Agent { code: 503, message })
                     if tokio::time::Instant::now() < deadline =>
                 {
                     tracing::debug!(
@@ -140,7 +157,7 @@ pub(super) async fn with_auto_resume<T, F, Fut>(
 ) -> Result<T, ConnectError>
 where
     F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, CoreError>>,
+    Fut: Future<Output = Result<T, EngineError>>,
 {
     match call().await {
         Ok(value) => Ok(value),
@@ -190,7 +207,7 @@ pub(super) async fn ensure_resumed_for_write(
         Some(SandboxState::Paused | SandboxState::Pausing)
     ) {
         if auto_resume_opted_out(ctx) {
-            return Err(ConnectError::from(ApiError::from(CoreError::Agent {
+            return Err(ConnectError::from(ApiError::from(EngineError::Agent {
                 code: SANDBOX_PAUSED_WIRE_CODE,
                 message: format!("sandbox '{sandbox_id}' is paused"),
             })));
@@ -214,17 +231,19 @@ mod tests {
 
     #[test]
     fn only_the_paused_wire_code_triggers_auto_resume() {
-        assert!(is_sandbox_paused(&CoreError::Agent {
+        assert!(is_sandbox_paused(&EngineError::Agent {
             code: 423,
             message: "sandbox 'box' is paused".into(),
         }));
         for code in [400, 404, 409, 412, 416, 500, 503] {
-            assert!(!is_sandbox_paused(&CoreError::Agent {
+            assert!(!is_sandbox_paused(&EngineError::Agent {
                 code,
                 message: "other".into(),
             }));
         }
-        assert!(!is_sandbox_paused(&CoreError::Machine("dead vsock".into())));
+        assert!(!is_sandbox_paused(&EngineError::Machine(
+            "dead vsock".into()
+        )));
     }
 
     #[test]

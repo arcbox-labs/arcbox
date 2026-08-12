@@ -32,6 +32,7 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     {
         use arcbox_core::DEFAULT_MACHINE_NAME;
+        use arcbox_core::bridge_discovery::MachineBridgeExt as _;
         if let Some(ColdStartRoutePlan::VmnetBridge(bridge)) = cold_start_route_plan(
             runtime
                 .machine_manager()

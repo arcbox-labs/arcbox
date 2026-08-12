@@ -139,8 +139,26 @@ impl From<arcbox_transport::error::TransportError> for CoreError {
     }
 }
 
-// The engine-layer image error maps variant-for-variant, so `is_not_found()`
-// and friends keep answering the same through either type.
+// The engine-layer errors map variant-for-variant, so `is_not_found()` and
+// friends keep answering the same through either type.
+impl From<arcbox_engine::EngineError> for CoreError {
+    fn from(err: arcbox_engine::EngineError) -> Self {
+        use arcbox_engine::EngineError as E;
+        match err {
+            E::Common(c) => Self::Common(c),
+            E::Vmm(e) => Self::Vmm(e),
+            E::Snapshot(e) => Self::Snapshot(e),
+            E::Vm(msg) => Self::Vm(msg),
+            E::Machine(msg) => Self::Machine(msg),
+            E::Agent { code, message } => Self::Agent { code, message },
+            E::Transport { context, source } => Self::Transport { context, source },
+            E::Image(img) => Self::from(img),
+            E::Persistence(e) => Self::Persistence(e),
+            E::LockPoisoned => Self::LockPoisoned,
+        }
+    }
+}
+
 impl From<arcbox_image::ImageError> for CoreError {
     fn from(err: arcbox_image::ImageError) -> Self {
         match err {

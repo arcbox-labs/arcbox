@@ -92,7 +92,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             || {
                 let req = req.clone();
                 async {
-                    let mut agent = runtime.get_agent(&machine)?;
+                    let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
                     agent.sandbox_exec_start(req).await
                 }
             },
@@ -142,7 +142,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             || {
                 let req = req.clone();
                 async {
-                    let mut agent = runtime.get_agent(&machine)?;
+                    let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
                     agent.sandbox_stdin_write(req).await
                 }
             },
@@ -174,7 +174,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
                 || {
                     let req = req.clone();
                     async {
-                        let mut agent = runtime.get_agent(&machine)?;
+                        let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
                         agent.sandbox_stdin_write(req).await
                     }
                 },
@@ -300,7 +300,7 @@ impl pb::SandboxProcessService for SandboxProcessServiceImpl {
             || {
                 let req = req.clone();
                 async {
-                    let mut agent = runtime.get_agent(&machine)?;
+                    let mut agent = sandbox_resume::engine_agent(runtime, &machine)?;
                     agent.sandbox_wait_for_port(req).await
                 }
             },
