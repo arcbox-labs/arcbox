@@ -176,27 +176,14 @@ impl ContextExt for RequestContext {
     }
 }
 
-/// Map the public port protocol onto the host-side exposure key
-/// (`UNSPECIFIED` defaults to TCP).
-fn protocol_key(protocol: arcbox_connect::sandbox_v1::PortProtocol) -> &'static str {
-    use arcbox_connect::sandbox_v1::PortProtocol;
-    match protocol {
-        PortProtocol::Udp => "udp",
-        _ => "tcp",
-    }
-}
-
-/// Map the public port protocol onto the host↔guest wire enum.
-///
-/// The vsock payloads carry their own protocol enum so the published
-/// contract is never imported by the internal wire (CORE-57).
-fn wire_protocol(
+/// Map the public port protocol onto the computer layer's enum.
+fn port_protocol(
     protocol: arcbox_connect::sandbox_v1::PortProtocol,
-) -> arcbox_connect::v1::SandboxPortProtocol {
-    use arcbox_connect::sandbox_v1::PortProtocol;
+) -> arcbox_computer::ports::SandboxPortProtocol {
+    use arcbox_computer::ports::SandboxPortProtocol;
     match protocol {
-        PortProtocol::Udp => arcbox_connect::v1::SandboxPortProtocol::Udp,
-        _ => arcbox_connect::v1::SandboxPortProtocol::Tcp,
+        arcbox_connect::sandbox_v1::PortProtocol::Udp => SandboxPortProtocol::Udp,
+        _ => SandboxPortProtocol::Tcp,
     }
 }
 

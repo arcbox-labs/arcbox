@@ -150,42 +150,10 @@ pub struct Runtime {
     >,
 }
 
-/// Parameters of one sandbox port exposure (the host listener half).
-///
-/// The guest half — DNAT from `guest_port` to the sandbox — is installed by
-/// the guest agent before this is applied.
-pub struct SandboxPortExposure {
-    /// Sandbox that owns the mapping.
-    pub sandbox_id: String,
-    /// Port the workload listens on inside the sandbox.
-    pub sandbox_port: u16,
-    /// `"tcp"` or `"udp"`.
-    pub protocol: String,
-    /// Host port to bind (loopback-reachable).
-    pub host_port: u16,
-    /// Reserved-range guest relay port the agent allocated.
-    pub guest_port: u16,
-}
-
-/// One sandbox mapping currently backed by a host listener.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SandboxPortMapping {
-    /// Port the workload listens on inside the sandbox.
-    pub sandbox_port: u16,
-    /// Loopback host port where the service is reachable.
-    pub host_port: u16,
-    /// Transport protocol.
-    pub protocol: SandboxPortProtocol,
-}
-
-/// Transport protocol of an exposed sandbox port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SandboxPortProtocol {
-    /// TCP.
-    Tcp,
-    /// UDP.
-    Udp,
-}
+// The port value types moved to the computer layer with the exposure
+// protocols; re-exported so `arcbox_core::SandboxPortExposure` paths keep
+// resolving during the migration.
+pub use arcbox_computer::ports::{SandboxPortExposure, SandboxPortMapping, SandboxPortProtocol};
 
 impl Runtime {
     /// Creates a new runtime with the given configuration.

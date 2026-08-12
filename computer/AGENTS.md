@@ -26,6 +26,13 @@ and its locked decisions live in the company repo:
 
 - `arcbox-computer` — `cleanup` (durable cleanup-ticket protocol: the
   generation fence bump, startup-vs-targeted teardown, obsolete-ticket
-  swallowing), `locks` (weak-map per-`(machine, sandbox)` operation
-  locks), `host` (the `SandboxHost` seam + Arc blanket impl). Later cuts
-  add the resume and port-exposure protocols per the charter.
+  swallowing, and `register_live_sandbox_dns`, the shared
+  Create/Restore/Resume DNS discipline), `resume` (transparent-resume
+  protocol: 503 retry budget, paused wire code 423, write pre-flight),
+  `ports` (exposure protocols and the port value types: guest-DNAT-then-
+  host-bind with compensating rollbacks, the generation-fenced list
+  snapshot, host-half-first unexpose), `locks` (weak-map per-`(machine,
+  sandbox)` operation locks), `host` (the `SandboxHost` seam + Arc
+  blanket impl). Domain errors are modeled, not stringified
+  (`ExposePortError::Raced`, `ListExposedPortsError::Unstable`) — the
+  arcbox-api adapters map them onto Connect codes.

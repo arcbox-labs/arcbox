@@ -31,6 +31,42 @@ impl SandboxHost for Runtime {
         self.register_sandbox_dns(sandbox_id, ip).await;
     }
 
+    async fn host_state_generation(&self) -> u64 {
+        self.sandbox_host_state_generation().await
+    }
+
+    async fn expose_port(
+        &self,
+        machine: &str,
+        exposure: &arcbox_computer::ports::SandboxPortExposure,
+    ) -> arcbox_engine::Result<()> {
+        use crate::error::CoreError;
+        self.expose_sandbox_port(machine, exposure)
+            .await
+            .map_err(|e| match e {
+                // Listener binding fails with I/O-flavored (Common) or
+                // net-stack errors; anything else cannot originate from
+                // this path and is carried as text.
+                CoreError::Common(c) => arcbox_engine::EngineError::Common(c),
+                CoreError::Net(n) => arcbox_engine::EngineError::Net(n),
+                other => arcbox_engine::EngineError::Machine(other.to_string()),
+            })
+    }
+
+    async fn unexpose_port(&self, sandbox_id: &str, sandbox_port: u16, protocol_key: &str) {
+        self.unexpose_sandbox_port(sandbox_id, sandbox_port, protocol_key)
+            .await;
+    }
+
+    async fn port_mappings_if_unchanged(
+        &self,
+        sandbox_id: &str,
+        expected_generation: u64,
+    ) -> Option<Vec<arcbox_computer::ports::SandboxPortMapping>> {
+        self.sandbox_port_mappings_if_unchanged(sandbox_id, expected_generation)
+            .await
+    }
+
     fn agent(&self, machine: &str) -> arcbox_engine::Result<AgentClient> {
         self.machine_manager().connect_agent(machine)
     }

@@ -152,6 +152,7 @@ impl From<arcbox_engine::EngineError> for CoreError {
             E::Machine(msg) => Self::Machine(msg),
             E::Agent { code, message } => Self::Agent { code, message },
             E::Transport { context, source } => Self::Transport { context, source },
+            E::Net(e) => Self::Net(e),
             E::Image(img) => Self::from(img),
             E::Persistence(e) => Self::Persistence(e),
             E::LockPoisoned => Self::LockPoisoned,

@@ -107,12 +107,7 @@ pub async fn resume<H: SandboxHost>(
         }
     };
 
-    let _host_state = host.lock_host_state().await;
-    if let Ok(ip) = resumed.ip_address.parse()
-        && cleanup::live_sandbox_matches(host, machine, sandbox_id, ip).await
-    {
-        host.register_dns(sandbox_id, ip).await;
-    }
+    cleanup::register_live_sandbox_dns(host, machine, sandbox_id, &resumed.ip_address).await;
     Ok(())
 }
 

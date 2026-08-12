@@ -61,6 +61,26 @@ pub async fn live_sandbox_matches<H: SandboxHost>(
     live_sandbox_info_matches(&info, ip)
 }
 
+/// Register `sandbox_id`'s DNS at `ip_address` only if that address still
+/// names the live sandbox, under the host-state lock.
+///
+/// The shared DNS discipline of Create, Restore, and Resume: replays
+/// retain the original result even after Stop, so the liveness of the
+/// exact (sandbox, IP) pair is always re-confirmed before registering.
+pub async fn register_live_sandbox_dns<H: SandboxHost>(
+    host: &H,
+    machine: &str,
+    sandbox_id: &str,
+    ip_address: &str,
+) {
+    let _host_state = host.lock_host_state().await;
+    if let Ok(ip) = ip_address.parse()
+        && live_sandbox_matches(host, machine, sandbox_id, ip).await
+    {
+        host.register_dns(sandbox_id, ip).await;
+    }
+}
+
 fn live_sandbox_info_matches(info: &SandboxInfo, ip: std::net::IpAddr) -> bool {
     let live = matches!(
         info.state.as_known(),

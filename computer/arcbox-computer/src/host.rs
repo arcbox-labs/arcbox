@@ -42,6 +42,36 @@ pub trait SandboxHost: Send + Sync {
         ip: std::net::IpAddr,
     ) -> impl Future<Output = ()> + Send;
 
+    /// Reads the host-state generation without locking it.
+    fn host_state_generation(&self) -> impl Future<Output = u64> + Send;
+
+    /// Binds the host listener half of one port exposure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host listener cannot be bound.
+    fn expose_port(
+        &self,
+        machine: &str,
+        exposure: &crate::ports::SandboxPortExposure,
+    ) -> impl Future<Output = arcbox_engine::Result<()>> + Send;
+
+    /// Closes the host listener half of one exposure (idempotent).
+    fn unexpose_port(
+        &self,
+        sandbox_id: &str,
+        sandbox_port: u16,
+        protocol_key: &str,
+    ) -> impl Future<Output = ()> + Send;
+
+    /// Snapshots one sandbox's mappings, or `None` if the host-state
+    /// generation moved past `expected_generation`.
+    fn port_mappings_if_unchanged(
+        &self,
+        sandbox_id: &str,
+        expected_generation: u64,
+    ) -> impl Future<Output = Option<Vec<crate::ports::SandboxPortMapping>>> + Send;
+
     /// Connects to a machine's guest agent, in the engine vocabulary.
     ///
     /// # Errors
@@ -77,6 +107,34 @@ impl<H: SandboxHost> SandboxHost for std::sync::Arc<H> {
 
     async fn register_dns(&self, sandbox_id: &str, ip: std::net::IpAddr) {
         (**self).register_dns(sandbox_id, ip).await;
+    }
+
+    async fn host_state_generation(&self) -> u64 {
+        (**self).host_state_generation().await
+    }
+
+    async fn expose_port(
+        &self,
+        machine: &str,
+        exposure: &crate::ports::SandboxPortExposure,
+    ) -> arcbox_engine::Result<()> {
+        (**self).expose_port(machine, exposure).await
+    }
+
+    async fn unexpose_port(&self, sandbox_id: &str, sandbox_port: u16, protocol_key: &str) {
+        (**self)
+            .unexpose_port(sandbox_id, sandbox_port, protocol_key)
+            .await;
+    }
+
+    async fn port_mappings_if_unchanged(
+        &self,
+        sandbox_id: &str,
+        expected_generation: u64,
+    ) -> Option<Vec<crate::ports::SandboxPortMapping>> {
+        (**self)
+            .port_mappings_if_unchanged(sandbox_id, expected_generation)
+            .await
     }
 
     fn agent(&self, machine: &str) -> arcbox_engine::Result<AgentClient> {
