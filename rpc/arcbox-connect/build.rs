@@ -39,8 +39,8 @@ const REFRESH: &str = "make refresh-connect-descriptor";
 /// second thing to forget when a proto is added, and forgetting it fails the
 /// build with a stale-descriptor message that points at the wrong cause.
 fn protos() -> Vec<String> {
-    let list = std::fs::read_to_string(PROTO_LIST)
-        .unwrap_or_else(|e| panic!("reading {PROTO_LIST}: {e}"));
+    let list =
+        std::fs::read_to_string(PROTO_LIST).unwrap_or_else(|e| panic!("reading {PROTO_LIST}: {e}"));
     list.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
