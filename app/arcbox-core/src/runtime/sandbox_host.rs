@@ -44,9 +44,14 @@ impl SandboxHost for Runtime {
         self.expose_sandbox_port(machine, exposure)
             .await
             .map_err(|e| match e {
-                // Listener binding fails with I/O-flavored (Common) or
-                // net-stack errors; anything else cannot originate from
-                // this path and is carried as text.
+                // Common/Net cover the non-macOS fallback (PortForwarder's
+                // direct TCP/UDP connect can fail with either). On P0
+                // macOS, `start_port_forwarding_macos` only ever
+                // constructs `CoreError::Machine` — Common/Net are
+                // unreachable there, and `other` is the sole arm that
+                // fires. Kept as a match on the full error type, not a
+                // cfg'd one, so a future macOS error path lands here
+                // losslessly without a second edit site.
                 CoreError::Common(c) => arcbox_engine::EngineError::Common(c),
                 CoreError::Net(n) => arcbox_engine::EngineError::Net(n),
                 other => arcbox_engine::EngineError::Machine(other.to_string()),

@@ -448,7 +448,6 @@ version = "0.6.5"
 dependencies = [
  "anyhow",
  "arcbox-api",
- "arcbox-computer",
  "arcbox-connect",
  "arcbox-constants",
  "arcbox-core",
