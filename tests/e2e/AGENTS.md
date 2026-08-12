@@ -71,7 +71,7 @@ run fails, and which paths must change together.
 
 - This ladder proves liveness, not datapath throughput. The `network_iperf`
   test now records the full iperf3 throughput matrix programmatically
-  (`internal-docs/plans/network-iperf-matrix.md`), but by default gates on
+  (`../company/engineering/arcbox/plans/network-iperf-matrix.md`), but by default gates on
   liveness only — VZ throughput is too run-to-run variable for an automated
   Gbps target, so a real floor is opt-in (`ARCBOX_E2E_IPERF_MIN_GBPS`).
   Prove an RX/TX regression fixed (iperf zero -> baseline restored) with

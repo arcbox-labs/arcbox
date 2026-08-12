@@ -355,7 +355,7 @@ impl LifecycleShared {
         // Attach the ext4 metadata volume (vdc): the fsync-hot boltdb
         // metadata lives there while bulk data stays on the btrfs data disk.
         // The two images are a paired set — see
-        // internal-docs/plans/ext4-metadata-volume.md.
+        // ../company/engineering/arcbox/plans/ext4-metadata-volume.md.
         let metadata_image = self
             .data_dir
             .join(arcbox_constants::paths::host::DATA)
