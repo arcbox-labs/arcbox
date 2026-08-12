@@ -255,6 +255,7 @@ impl Runtime {
             vm_lifecycle_config.route_hook = Some(crate::route_reconciler::system_vm_route_hook(
                 &machine_manager,
                 &event_bus,
+                crate::vm_lifecycle::DEFAULT_MACHINE_NAME,
             ));
         }
 

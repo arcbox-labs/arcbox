@@ -408,33 +408,41 @@ pub async fn ensure_route_for_bridge(bridge_name: &str) -> Result<(), RouteError
     unreachable!()
 }
 
-/// Builds the composer-side route hook for the System VM.
+/// Builds the composer-side route hook for a machine's lifecycle.
 ///
 /// The lifecycle engine fires it after the VM starts; it resolves the
 /// bridge (vmnet interface name, or a kernel-FDB scan by MAC) and installs
 /// the container-subnet route, publishing `ContainerRouteInstalled` on
 /// success. Non-blocking: route failures never gate VM readiness.
+///
+/// `machine_name` is keyed to whichever lifecycle installs the hook — today
+/// that is always the System VM (`Runtime::new` passes
+/// [`crate::vm_lifecycle::DEFAULT_MACHINE_NAME`]), but a future per-role
+/// lifecycle built via `VmLifecycleManager::for_machine` must pass its own
+/// name so bridge lookup and the published event stay keyed on the right
+/// machine.
 pub fn system_vm_route_hook(
     machine_manager: &std::sync::Arc<crate::machine::MachineManager>,
     event_bus: &crate::event::EventBus,
+    machine_name: &str,
 ) -> crate::vm_lifecycle::RouteHook {
-    use crate::vm_lifecycle::DEFAULT_MACHINE_NAME;
-
     let mm = std::sync::Arc::clone(machine_manager);
     let bus = event_bus.clone();
+    let machine_name = machine_name.to_string();
     crate::vm_lifecycle::RouteHook::new(std::sync::Arc::new(move || {
         #[cfg(feature = "vmnet")]
         {
             // vmnet path: bridge name is known instantly, only need
             // helper retry (1-2 attempts for XPC readiness).
             use crate::bridge_discovery::MachineBridgeExt as _;
-            if let Some(bridge) = mm.vmnet_bridge_name(DEFAULT_MACHINE_NAME) {
+            if let Some(bridge) = mm.vmnet_bridge_name(&machine_name) {
                 let bus = bus.clone();
+                let name = machine_name.clone();
                 drop(tokio::spawn(async move {
                     match ensure_route_for_bridge(&bridge).await {
-                        Ok(()) => bus.publish(crate::event::Event::ContainerRouteInstalled {
-                            name: DEFAULT_MACHINE_NAME.to_string(),
-                        }),
+                        Ok(()) => {
+                            bus.publish(crate::event::Event::ContainerRouteInstalled { name });
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to install container route (vmnet)");
                         }
@@ -446,13 +454,14 @@ pub fn system_vm_route_hook(
         {
             // Discover the bridge by scanning the kernel FDB (retries up
             // to ~10s for FDB learning).
-            if let Some(mac) = mm.bridge_mac(DEFAULT_MACHINE_NAME) {
+            if let Some(mac) = mm.bridge_mac(&machine_name) {
                 let bus = bus.clone();
+                let name = machine_name.clone();
                 drop(tokio::spawn(async move {
                     match ensure_route_with_retry(&mac).await {
-                        Ok(()) => bus.publish(crate::event::Event::ContainerRouteInstalled {
-                            name: DEFAULT_MACHINE_NAME.to_string(),
-                        }),
+                        Ok(()) => {
+                            bus.publish(crate::event::Event::ContainerRouteInstalled { name });
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to install container route");
                         }
