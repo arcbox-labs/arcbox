@@ -18,10 +18,10 @@ use super::SharedRuntime;
 use crate::ApiError;
 
 use super::exposed_port;
-use super::sandbox_cleanup;
-use super::sandbox_locks::SandboxOperationLocks;
 use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, protocol_key, wire_protocol, with_keepalive};
+use arcbox_computer::cleanup as sandbox_cleanup;
+use arcbox_computer::locks::SandboxOperationLocks;
 
 /// Sandbox lifecycle service implementation.
 ///

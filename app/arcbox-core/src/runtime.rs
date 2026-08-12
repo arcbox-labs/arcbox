@@ -3,6 +3,7 @@
 mod assets;
 mod kubeconfig;
 mod progress;
+mod sandbox_host;
 
 #[cfg(test)]
 mod tests;

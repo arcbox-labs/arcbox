@@ -19,9 +19,9 @@ use arcbox_core::Runtime;
 use arcbox_engine::EngineError;
 use connectrpc::{ConnectError, RequestContext};
 
-use super::sandbox_cleanup;
-use super::sandbox_locks::SandboxOperationLocks;
 use crate::ApiError;
+use arcbox_computer::cleanup as sandbox_cleanup;
+use arcbox_computer::locks::SandboxOperationLocks;
 
 /// Reserved request header opting out of transparent resume.
 pub(super) const NO_AUTO_RESUME_HEADER: &str = "x-arcbox-no-auto-resume";

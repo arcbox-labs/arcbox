@@ -40,7 +40,8 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `virt/` — Virtualization.framework bindings, cross-platform hypervisor traits, VMM, VirtIO devices, VirtioFS, networking (NAT/DHCP/DNS)
 - `rpc/` — protobuf definitions, gRPC services, vsock/unix transport
 - `runtime/` — container state, OCI image/runtime
-- `engine/` — embeddable, daemon-free engine library (boot assets, machine images; growing per the architecture charter in the company repo)
+- `engine/` — embeddable, daemon-free engine library (boot assets, machine images, VM/machine lifecycle, agent client; growing per the architecture charter in the company repo)
+- `computer/` — agent-computer domain layer: transport-free sandbox protocols behind the `SandboxHost` seam
 - `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`abctl`, not `arcbox`), daemon binary (`arcbox-daemon`), facade crate
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — test resources and fixture build scripts
@@ -57,6 +58,7 @@ govern, and are imported here:
 @virt/arcbox-vz/AGENTS.md
 @virt/arcbox-virtio-blk/AGENTS.md
 @engine/AGENTS.md
+@computer/AGENTS.md
 @app/AGENTS.md
 @guest/AGENTS.md
 @rpc/AGENTS.md

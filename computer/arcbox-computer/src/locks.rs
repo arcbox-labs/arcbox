@@ -1,3 +1,5 @@
+//! Per-sandbox operation serialization.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -6,17 +8,19 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 type OperationKey = (String, String);
 type OperationMap = HashMap<OperationKey, Weak<AsyncMutex<()>>>;
 
+/// Per-`(machine, sandbox)` async operation locks.
+///
+/// A weak map: entries are garbage-collected on lookup once no
+/// operation holds them, so the map never grows with dead sandboxes.
 #[derive(Default)]
-pub(super) struct SandboxOperationLocks {
+pub struct SandboxOperationLocks {
     entries: Mutex<OperationMap>,
 }
 
 impl SandboxOperationLocks {
-    pub(super) async fn lock(
-        &self,
-        machine: &str,
-        sandbox_id: &str,
-    ) -> Option<OwnedMutexGuard<()>> {
+    /// Locks operations for one sandbox; `None` when `sandbox_id` is
+    /// empty (nothing to serialize against).
+    pub async fn lock(&self, machine: &str, sandbox_id: &str) -> Option<OwnedMutexGuard<()>> {
         if sandbox_id.is_empty() {
             return None;
         }

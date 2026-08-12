@@ -1,0 +1,18 @@
+[package]
+name = "arcbox-computer"
+description = "Agent-computer domain layer for ArcBox: transport-free sandbox protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-connect = { workspace = true }
+arcbox-engine = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

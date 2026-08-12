@@ -45,6 +45,7 @@ arcbox-connect.workspace = true
 buffa = "0.9.1"
 arcbox-image.workspace = true
 arcbox-engine.workspace = true
+arcbox-computer.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-route.workspace = true

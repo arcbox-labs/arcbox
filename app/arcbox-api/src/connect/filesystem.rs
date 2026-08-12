@@ -17,9 +17,9 @@ use arcbox_core::WriteFileChunk;
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::sandbox_locks::SandboxOperationLocks;
 use super::sandbox_resume;
 use super::{ConnectRuntimeExt as _, ContextExt as _, with_keepalive};
+use arcbox_computer::locks::SandboxOperationLocks;
 
 /// Filesystem service implementation.
 ///

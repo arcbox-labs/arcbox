@@ -31,9 +31,7 @@ mod machine;
 mod macos;
 mod migration;
 mod process;
-mod sandbox_cleanup;
 mod sandbox_errors;
-mod sandbox_locks;
 mod sandbox_resume;
 mod snapshot;
 mod stats;
@@ -50,6 +48,9 @@ use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
 use connectrpc::{ConnectError, RequestContext};
 use tokio_stream::{Stream, StreamExt as _};
 
+pub use arcbox_computer::cleanup::{
+    initialize as initialize_sandbox_cleanup, spawn as spawn_sandbox_cleanup,
+};
 pub use control::SandboxServiceImpl;
 pub use filesystem::SandboxFilesystemServiceImpl;
 pub use icon::IconServiceImpl;
@@ -59,9 +60,6 @@ pub use machine::MachineServiceImpl;
 pub use macos::MacosServiceImpl;
 pub use migration::MigrationServiceImpl;
 pub use process::SandboxProcessServiceImpl;
-pub use sandbox_cleanup::{
-    initialize as initialize_sandbox_cleanup, spawn as spawn_sandbox_cleanup,
-};
 pub use snapshot::SandboxSnapshotServiceImpl;
 pub use stats::StatsServiceImpl;
 pub use system::{SetupState, SystemServiceImpl};
@@ -229,7 +227,7 @@ fn exposed_port(
 #[must_use]
 pub fn router(runtime: SharedRuntime) -> connectrpc::Router {
     let clone = || Arc::clone(&runtime);
-    let sandbox_operations = Arc::new(sandbox_locks::SandboxOperationLocks::default());
+    let sandbox_operations = Arc::new(arcbox_computer::locks::SandboxOperationLocks::default());
     let router = connectrpc::Router::new()
         .add_service(Arc::new(SandboxServiceImpl::new(
             clone(),

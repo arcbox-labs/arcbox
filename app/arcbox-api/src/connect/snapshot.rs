@@ -9,9 +9,9 @@ use std::sync::Arc;
 use super::SharedRuntime;
 use crate::ApiError;
 
-use super::sandbox_cleanup;
-use super::sandbox_locks::SandboxOperationLocks;
 use super::{ConnectRuntimeExt as _, ContextExt as _};
+use arcbox_computer::cleanup as sandbox_cleanup;
+use arcbox_computer::locks::SandboxOperationLocks;
 
 /// Sandbox snapshot service implementation.
 pub struct SandboxSnapshotServiceImpl {
