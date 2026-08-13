@@ -27,7 +27,9 @@
         }
       ],
       "changelog-path": "CHANGELOG.md",
-      "exclude-paths": ["fleet", "sdk/typescript", "sdk/python"]
+      "exclude-paths": ["fleet", "sdk/typescript", "sdk/python"],
+      "draft": true,
+      "force-tag-creation": true
     },
     "fleet": {
       "component": "fleet-agent",
