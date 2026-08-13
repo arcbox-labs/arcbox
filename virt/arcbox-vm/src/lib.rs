@@ -16,10 +16,11 @@
 //! | `arcbox-vmm` | host | boot + manage the guest VM | Virtualization.framework / KVM |
 //! | `arcbox-vm` | guest | nested sandbox microVMs | Firecracker (`fc-sdk`) |
 //!
-//! # Status: **frozen**
-//!
-//! New features should go into `arcbox-vmm` / `arcbox-hypervisor`.  This
-//! crate receives bug-fixes and sandbox-specific work only.
+//! It also ships the `vm-agent` binary, which becomes PID 1 *inside* each
+//! sandbox. That binary imports only this crate's protocol leaves
+//! (`boot_proto`, `file_io::proto`, `file_watch`, `vsock` constants,
+//! `listen_table`, `user_spec`) — never the manager. Keep it that way:
+//! it is cross-compiled to musl and staged into every sandbox rootfs.
 //!
 //! # Public API
 //!
