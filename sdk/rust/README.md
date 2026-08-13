@@ -53,13 +53,14 @@ daemon speaks.
 
 ## Publishing
 
-Not on crates.io yet: the SDK speaks Connect through the `connectrpc`
-crate, which the workspace pins to a git revision until its 0.9 release
-reaches the registry. `cargo publish` fails loudly on the git
-dependency, so an accidental publish cannot ship a broken manifest.
-When `connectrpc` (and `arcbox-connect`) are on the registry, this
-crate publishes as `arcbox` on its own release-please cadence like the
-TypeScript and Python SDKs.
+Published as `arcbox` by the release tag's coordinated
+`cargo publish --workspace`, on the workspace version — not on a
+cadence of its own like the TypeScript and Python SDKs, which live in
+other registries. Two reasons it rides the workspace: crates.io already
+carries `arcbox` 0.6.3 from the runtime facade this SDK replaced, so a
+0.1.x line would publish and then never be selected by
+`cargo add arcbox`; and the same run publishes `arcbox-connect`, the
+path dependency this crate resolves against.
 
 ## Status
 
