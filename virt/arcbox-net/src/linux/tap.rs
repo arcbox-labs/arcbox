@@ -84,6 +84,8 @@ impl TapConfig {
 /// # Example
 ///
 /// ```no_run
+/// // `recv`/`send` arrive through the backend trait, not inherently.
+/// use arcbox_net::backend::NetworkBackend;
 /// use arcbox_net::linux::{LinuxTap, TapConfig};
 ///
 /// let config = TapConfig::new()

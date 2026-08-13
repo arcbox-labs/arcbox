@@ -6,6 +6,9 @@
 use crate::error::{EngineError, Result};
 use crate::persistence::MachinePersistence;
 use crate::vm::{SharedDirConfig, VmConfig, VmId, VmManager};
+// Only the macOS `connect_agent` dials the agent port — the vsock helper it
+// rides is macOS-only.
+#[cfg(target_os = "macos")]
 use arcbox_constants::ports::AGENT_PORT;
 use arcbox_constants::virtiofs::{MOUNT_PRIVATE, MOUNT_USERS, TAG_ARCBOX, TAG_PRIVATE, TAG_USERS};
 use chrono::{DateTime, Utc};

@@ -117,22 +117,45 @@ jobs:
   # The engine layer and the net stack under it promise platform
   # neutrality (architecture charter, company repo; engine/AGENTS.md: "every
   # crate must compile and pass unit tests on Linux as well as macOS"): this
-  # compile gate keeps darwin-only deps target-gated so a Linux host build
-  # never rots again. `--all-targets` is load-bearing: a plain `cargo check`
-  # skips test/example/bench targets, so a macOS-only symbol reintroduced
-  # into a `#[cfg(test)]` module (as happened once already) would pass the
-  # gate while still breaking `cargo test` on Linux. A second step repeats
-  # the check on aarch64-unknown-linux-musl (the real cross-compile target,
-  # see root CLAUDE.md "Guest Agent Cross-Compilation") because gnu/musl and
-  # x86_64/aarch64 each pick different concrete types for a few libc
-  # primitives (e.g. `c_char`'s signedness is arch-, not libc-, driven) that
-  # the gnu-only first step can't exercise; scoped to arcbox-net + splicetcp +
-  # arcbox-hypervisor + arcbox-virtio-net — arcbox-image is the one exclusion,
-  # since its TLS deps pull in `ring`, whose build script needs a musl C
-  # cross-compiler this runner doesn't have. Scoped to the crates that
-  # make the platform-neutrality promise — the workspace as a whole still
-  # contains macOS-only crates (arcbox-vz, arcbox-vmnet). Extend the -p list
-  # as engine/computer crates land.
+  # job keeps darwin-only deps target-gated so a Linux host build never rots
+  # again. `--all-targets` on the check step is load-bearing: a plain
+  # `cargo check` skips test targets, so a macOS-only symbol reintroduced
+  # into a `#[cfg(test)]` module (as happened once already) would pass while
+  # still breaking `cargo test` on Linux — `--all-targets` builds the
+  # `lib test` target and type-checks it.
+  #
+  # The test step covers the two things `--all-targets` still cannot: it
+  # RUNS the tests (a Linux/macOS behavioral difference type-checks fine —
+  # see the splicetcp note below), and it compiles DOCTESTS, which no
+  # `cargo check` invocation ever does. That second gap was not theoretical:
+  # `LinuxTap`'s doctest had been calling a trait method without importing
+  # the trait since the Linux arm was revived, and only this step caught it.
+  # Every KVM-touching test in `arcbox-hypervisor` is already `#[ignore]`d
+  # ("Requires /dev/kvm", not available on this runner); the netlink/tap
+  # tests in `arcbox-net` self-skip at runtime when not root. `splicetcp` is
+  # the one crate checked but not tested: two of its tcp_bridge tests
+  # calibrate a 4 KiB socket buffer to force a partial-take, and Linux
+  # doubles a `SO_SNDBUF` request and enforces a floor, so the buffer
+  # swallows the whole payload and the tests' own "this must exercise the
+  # partial-take path" guards fire. The guards are right — they refuse to
+  # pass vacuously — but the constant is macOS-calibrated; sizing the
+  # payload against the *granted* buffer would let them run here too. That
+  # pair is also the reason the test step exists at all: it type-checks
+  # identically on both platforms and only diverges when run.
+  #
+  # A second step repeats the *check* (not the tests — a musl-arm64 test
+  # binary can't run on this x86_64 runner) on aarch64-unknown-linux-musl
+  # (the real cross-compile target, see root CLAUDE.md "Guest Agent
+  # Cross-Compilation") because gnu/musl and x86_64/aarch64 each pick
+  # different concrete types for a few libc primitives (e.g. `c_char`'s
+  # signedness is arch-, not libc-, driven) that the gnu-only steps can't
+  # exercise. The musl step drops every crate whose graph reaches `ring` —
+  # arcbox-image, plus arcbox-engine and arcbox-computer above it — because
+  # ring's build script needs a musl C cross-compiler this runner doesn't
+  # have. Scoped to the crates that make the platform-neutrality promise —
+  # the workspace as a whole still contains macOS-only crates (arcbox-vz,
+  # arcbox-vmnet). Extend all three -p lists as further engine/computer
+  # crates land.
   linux-engine:
     name: Linux engine-layer check
     runs-on: ubuntu-latest
@@ -150,6 +173,16 @@ jobs:
           toolchain: stable
           targets: aarch64-unknown-linux-musl
 
+      # arcbox-engine and arcbox-computer depend on arcbox-connect, whose
+      # build.rs shells out to `protoc` directly (rpc/arcbox-connect/build.rs)
+      # rather than a vendored binary. The musl step below never touches
+      # those two crates, so this only gates the gnu step, but installing it
+      # once up front is simpler than conditioning on the target.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -164,10 +197,16 @@ jobs:
             ${{ runner.os }}-cargo-linux-engine-
 
       - name: Check engine-layer crates on Linux
-        run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net
+        run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
+
+      # `--no-fail-fast` so one red run reports every broken crate rather
+      # than stopping at the first, which otherwise hides later failures
+      # behind a fix-and-rerun loop.
+      - name: Test engine-layer crates on Linux
+        run: cargo test --no-fail-fast -p arcbox-image -p arcbox-net -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
 
       - name: Check engine-layer crates on aarch64-unknown-linux-musl
-        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net
+        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm
 
   # Pure proto-contract analysis — no Rust toolchain, no build. Runs in
   # parallel with `ci` on a cheap Linux runner. The desktop and agent
