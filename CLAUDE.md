@@ -143,7 +143,12 @@ without the others reintroduces a failure already paid for.
 - **`update-desktop` waits for the assets and is not gated on the trigger.**
   `workflow_dispatch` is how a half-finished release is recovered, which is the
   case that job exists for; gating on `push` would re-attach assets there and
-  leave desktop un-bumped in silence.
+  leave desktop un-bumped in silence. The guard that replaces it is a
+  *newest-release* check, not a trigger check: the dispatch `tag` is free-form
+  and flows straight into the bump, so recovering a superseded tag would
+  propose moving desktop's `arcbox.version` **backwards**. A redundant bump is
+  cheap; a downgrade is not. Do not remove that check believing the worst case
+  is a no-op.
 - **The release cache is written from master, never from a tag.** A tag cannot
   read another tag's caches, so no release can warm the next one. `ci.yml`
   writes `macOS-cargo-release-*`; `Release Build` restores only, and must not

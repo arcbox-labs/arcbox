@@ -482,11 +482,22 @@ jobs:
           # this one only has to start it.
           permission-actions: write
 
+      # The tag is free-form on the workflow_dispatch path and flows straight
+      # into the bump, so recovering a superseded tag would propose moving
+      # desktop's arcbox.version *backwards*. A redundant bump is cheap; a
+      # downgrade is not. Only the newest release announces itself.
       - name: Dispatch the arcbox-desktop bump
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.version.outputs.version }}
         run: |
+          set -euo pipefail
+          latest=$(gh release view --json tagName --jq .tagName)
+          if [ "$TAG" != "$latest" ]; then
+            echo "::notice::$TAG is superseded by $latest; not bumping desktop backwards"
+            exit 0
+          fi
           gh workflow run bump-arcbox.yml \
             --repo arcboxlabs/arcbox-desktop \
             --ref master \
