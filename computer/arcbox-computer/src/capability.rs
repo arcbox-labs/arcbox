@@ -38,14 +38,20 @@ impl NestedVirtCapability {
 
 /// Nested-virt capability for a given hypervisor backend on this host.
 ///
-/// The backend half is re-evaluated per call because a backend switch
-/// changes it at runtime; the hardware probe underneath is cached.
+/// Both halves are re-evaluated per call: a backend switch changes the
+/// first at runtime, and off macOS the hardware probe is deliberately not
+/// cached either (a `kvm_*` module can load after the first query).
+///
+/// The reason names only the cause, with no subject of its own, because
+/// every consumer supplies its own framing — `sandbox_errors` prefixes
+/// "sandboxes cannot run on this host: " before returning
+/// `NESTED_VIRT_UNSUPPORTED`, and `GetCapabilities` reports it bare.
 #[must_use]
 pub fn nested_virt_for_backend(backend: VmBackend) -> NestedVirtCapability {
     if !backend.supports_nested_virt() {
         return NestedVirtCapability::unsupported(format!(
-            "sandboxes require nested virtualization, which the {} backend does not support; \
-             switch to the VZ backend (`abctl system backend vz`)",
+            "the {} backend does not support nested virtualization; switch to the VZ backend \
+             (`abctl system backend vz`)",
             backend.as_str().to_uppercase()
         ));
     }
@@ -53,10 +59,7 @@ pub fn nested_virt_for_backend(backend: VmBackend) -> NestedVirtCapability {
     if host.supported {
         NestedVirtCapability::supported()
     } else {
-        // The probe phrases its reason as the requirement that failed, with
-        // no subject of its own, so the sandbox context goes in front
-        // rather than being stapled on after an explanation.
-        NestedVirtCapability::unsupported(format!("sandboxes cannot run: {}", host.reason))
+        NestedVirtCapability::unsupported(host.reason)
     }
 }
 
@@ -101,6 +104,21 @@ mod tests {
             let capability = nested_virt_for_backend(backend);
             assert_eq!(capability.supported, host_nested_virt().supported);
             assert_eq!(capability.supported, capability.reason.is_empty());
+        }
+    }
+
+    // Every consumer supplies its own framing — `sandbox_errors` prefixes
+    // "sandboxes cannot run on this host: " — so a reason that names the
+    // subject itself renders as "sandboxes cannot run on this host:
+    // sandboxes …". Keep the reason a bare cause.
+    #[test]
+    fn the_reason_never_supplies_its_own_subject() {
+        for backend in [VmBackend::Hv, VmBackend::Vz] {
+            let reason = nested_virt_for_backend(backend).reason;
+            assert!(
+                !reason.to_lowercase().contains("sandbox"),
+                "reason must name the cause, not the subject: {reason}"
+            );
         }
     }
 }

@@ -1,7 +1,9 @@
 //! VMM daemon configuration types.
 //!
-//! Three unrelated concerns, one module: jailer sandboxing parameters, the
-//! top-level `config.toml` shape, and the Firecracker snapshot-type vocabulary.
+//! One module per concern — [`jailer`] for the sandboxing parameters,
+//! [`vmm`] for the top-level `config.toml` shape, [`snapshot`] for the
+//! Firecracker snapshot-type vocabulary — re-exported here so callers keep
+//! writing `crate::config::JailerConfig`.
 
 mod jailer;
 mod snapshot;
