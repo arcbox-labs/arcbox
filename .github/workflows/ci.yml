@@ -124,7 +124,15 @@ jobs:
   # `cargo test`, which is exactly the gap this job exists to close. Every
   # KVM-touching test in `arcbox-hypervisor` is already `#[ignore]`d
   # ("Requires /dev/kvm", not available on this runner); the netlink/tap
-  # tests in `arcbox-net` self-skip at runtime when not root. A second step
+  # tests in `arcbox-net` self-skip at runtime when not root. `splicetcp` is
+  # the one crate checked but not tested: two of its tcp_bridge tests
+  # calibrate a 4 KiB socket buffer to force a partial-take, and Linux
+  # doubles a `SO_SNDBUF` request and enforces a floor, so the buffer
+  # swallows the whole payload and the tests' own "this must exercise the
+  # partial-take path" guards fire. The guards are right — they refuse to
+  # pass vacuously — but the constant is macOS-calibrated; sizing the
+  # payload against the *granted* buffer would let them run here too. A
+  # second step
   # repeats the *check* (not the tests — a musl-arm64 test binary can't run
   # on this x86_64 runner without emulation) on aarch64-unknown-linux-musl
   # (the real cross-compile target, see root CLAUDE.md "Guest Agent
@@ -182,7 +190,7 @@ jobs:
         run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
 
       - name: Test engine-layer crates on Linux
-        run: cargo test -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
+        run: cargo test -p arcbox-image -p arcbox-net -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
 
       - name: Check engine-layer crates on aarch64-unknown-linux-musl
         run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm
