@@ -71,8 +71,15 @@ fi
 
 # Hash the sources, not the descriptor: protoc versions do not agree
 # byte-for-byte on their output, and that difference is not drift.
+#
+# `LC_ALL=C` is not decoration. build.rs sorts with `sort_unstable()`, which is
+# byte-lexicographic unconditionally, while bare `sort` collates by locale — so
+# on a machine whose locale disagrees, the shell would hash one order and
+# build.rs another, and the assert would send you to a refresh that reproduces
+# the mismatch. Today's names collate identically either way; that is luck, not
+# a property to depend on.
 {
-  for name in $(printf '%s\n' "${PROTOS[@]}" | sort); do
+  for name in $(printf '%s\n' "${PROTOS[@]}" | LC_ALL=C sort); do
     printf '%s\0' "$name"
     cat "$PROTO_DIR/$name"
   done
