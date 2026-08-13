@@ -189,8 +189,11 @@ jobs:
       - name: Check engine-layer crates on Linux
         run: cargo check --all-targets -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
 
+      # `--no-fail-fast` so one red run reports every broken crate rather
+      # than stopping at the first, which otherwise hides later failures
+      # behind a fix-and-rerun loop.
       - name: Test engine-layer crates on Linux
-        run: cargo test -p arcbox-image -p arcbox-net -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
+        run: cargo test --no-fail-fast -p arcbox-image -p arcbox-net -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-engine -p arcbox-computer
 
       - name: Check engine-layer crates on aarch64-unknown-linux-musl
         run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm
