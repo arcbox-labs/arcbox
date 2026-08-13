@@ -7,15 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-# crates.io publishing is gated on connectrpc reaching the registry (the
-# git pin below fails `cargo publish` loudly until then) — see README.
+# Still unpublishable, but no longer because of connectrpc: that now resolves
+# from the registry as arcbox-connectrpc. What `cargo publish` stops on is
+# `arcbox-connect` below — a path dependency with no version, which cannot get
+# one until arcbox-connect 0.6.5 is on crates.io.
 
 [dependencies]
 arcbox-connect = { path = "../../rpc/arcbox-connect" }
 base64 = "0.22.1"
 buffa = { version = "0.9.1", features = ["json"] }
 buffa-types = { version = "0.9.1", features = ["json"] }
-connectrpc = { version = "0.8.1", features = ["client"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1", features = ["client"] }
 thiserror.workspace = true
 tokio = { workspace = true }
 uuid.workspace = true
@@ -23,7 +25,7 @@ uuid.workspace = true
 [dev-dependencies]
 axum.workspace = true
 buffa-types = "0.9.1"
-connectrpc = { version = "0.8.1", features = ["client", "axum"], git = "https://github.com/connectrpc/connect-rust", rev = "c5c1a6faa5d7f4d681662731db61e1fbe7796eec" }
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1", features = ["client", "axum"] }
 futures-core = "0.3.33"
 tempfile.workspace = true
 tokio-stream.workspace = true
