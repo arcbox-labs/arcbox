@@ -150,6 +150,16 @@ jobs:
           toolchain: stable
           targets: aarch64-unknown-linux-musl
 
+      # arcbox-engine and arcbox-computer depend on arcbox-connect, whose
+      # build.rs shells out to `protoc` directly (rpc/arcbox-connect/build.rs)
+      # rather than a vendored binary. The musl step below never touches
+      # those two crates, so this only gates the gnu step, but installing it
+      # once up front is simpler than conditioning on the target.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
