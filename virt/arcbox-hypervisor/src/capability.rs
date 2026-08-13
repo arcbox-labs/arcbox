@@ -19,9 +19,10 @@ pub struct NestedVirtSupport {
     pub supported: bool,
     /// Why not, when `supported` is false; empty otherwise.
     ///
-    /// Phrased as the requirement that failed, with no leading subject,
-    /// so a caller can prefix its own context (`"sandboxes cannot run:
-    /// {reason}"`) without ending up with two stapled-together clauses.
+    /// Phrased as the requirement that failed, with no leading subject, so
+    /// a caller can prefix its own context — `arcbox-api` renders it as
+    /// `"sandboxes cannot run on this host: {reason}"` — without ending up
+    /// with two stapled-together clauses.
     pub reason: &'static str,
 }
 
