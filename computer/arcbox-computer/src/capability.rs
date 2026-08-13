@@ -53,7 +53,10 @@ pub fn nested_virt_for_backend(backend: VmBackend) -> NestedVirtCapability {
     if host.supported {
         NestedVirtCapability::supported()
     } else {
-        NestedVirtCapability::unsupported(format!("{}; sandboxes cannot run", host.reason))
+        // The probe phrases its reason as the requirement that failed, with
+        // no subject of its own, so the sandbox context goes in front
+        // rather than being stapled on after an explanation.
+        NestedVirtCapability::unsupported(format!("sandboxes cannot run: {}", host.reason))
     }
 }
 

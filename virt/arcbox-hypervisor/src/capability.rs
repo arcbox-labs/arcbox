@@ -18,6 +18,10 @@ pub struct NestedVirtSupport {
     /// True when the hardware and kernel allow a nested guest.
     pub supported: bool,
     /// Why not, when `supported` is false; empty otherwise.
+    ///
+    /// Phrased as the requirement that failed, with no leading subject,
+    /// so a caller can prefix its own context (`"sandboxes cannot run:
+    /// {reason}"`) without ending up with two stapled-together clauses.
     pub reason: &'static str,
 }
 
@@ -53,8 +57,8 @@ fn cached_or_reprobed() -> bool {
 
 #[cfg(target_os = "macos")]
 const UNSUPPORTED_REASON: &str = concat!(
-    "this Mac does not support nested virtualization; ",
-    "it requires Apple Silicon M3 or newer with macOS 15 or newer",
+    "nested virtualization requires Apple Silicon M3 or newer ",
+    "with macOS 15 or newer",
 );
 
 /// `VZGenericPlatformConfiguration.isNestedVirtualizationSupported`.
@@ -94,6 +98,18 @@ fn probe_nested_virt() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The reason is user-facing: `arcbox-computer` surfaces it verbatim in
+    // the `NESTED_VIRT_UNSUPPORTED` error a failing `Create` returns, so
+    // the hardware requirement it names is contract, not an internal
+    // string. Pin it here, where the constant lives.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_reason_names_the_hardware_requirement() {
+        let reason = super::UNSUPPORTED_REASON;
+        assert!(reason.contains("M3"), "{reason}");
+        assert!(reason.contains("macOS 15"), "{reason}");
+    }
 
     #[test]
     fn an_unsupported_host_always_carries_a_reason() {
