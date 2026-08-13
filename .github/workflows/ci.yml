@@ -356,12 +356,12 @@ jobs:
         with:
           toolchain: stable
 
-      # arcbox-hv and arcbox-helper keep their own release cadences and the
-      # release excludes them; mirror it so the two commands stay one command.
+      # arcbox-hv keeps its own release cadence and the release excludes it;
+      # mirror the exclusion so the two commands stay one command.
       - name: Dry-run the coordinated workspace publish
         run: |
           cargo publish --workspace \
-            --exclude arcbox-hv --exclude arcbox-helper \
+            --exclude arcbox-hv \
             --no-verify --locked --dry-run
 
   # ==========================================================================
