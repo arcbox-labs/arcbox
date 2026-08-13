@@ -23,16 +23,32 @@ pub struct NestedVirtSupport {
 
 /// Probes nested-virtualization support on this host.
 ///
-/// Cached: on every platform this is a fixed hardware/kernel property, so
-/// the answer cannot change while the process lives.
+/// Cached on macOS, where this is a fixed hardware/OS property that
+/// cannot change while the process lives. Re-probed on every call
+/// elsewhere: on Linux the answer depends on the `kvm_intel`/`kvm_amd`
+/// module being loaded, and this function is reachable — via the sandbox
+/// capability gate — before any VM has ever booted (in particular under
+/// `--no-linux-vm`, where nothing in this process ever opens `/dev/kvm`).
+/// A query that lands before the module autoloads would otherwise cache a
+/// false negative for the rest of the process's life.
 #[must_use]
 pub fn host_nested_virt() -> NestedVirtSupport {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let supported = *SUPPORTED.get_or_init(probe_nested_virt);
+    let supported = cached_or_reprobed();
     NestedVirtSupport {
         supported,
         reason: if supported { "" } else { UNSUPPORTED_REASON },
     }
+}
+
+#[cfg(target_os = "macos")]
+fn cached_or_reprobed() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(probe_nested_virt)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cached_or_reprobed() -> bool {
+    probe_nested_virt()
 }
 
 #[cfg(target_os = "macos")]
@@ -86,7 +102,11 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_is_cached_and_therefore_stable() {
+    fn the_probe_is_stable_across_repeated_calls() {
+        // Cached on macOS (a fixed hardware property); re-probed every call
+        // on Linux (see `cached_or_reprobed`). Either way, two calls back to
+        // back must agree — nothing in this process changes kernel module
+        // state between them.
         assert_eq!(host_nested_virt(), host_nested_virt());
     }
 }
