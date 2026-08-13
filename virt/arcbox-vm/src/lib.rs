@@ -16,10 +16,11 @@
 //! | `arcbox-vmm` | host | boot + manage the guest VM | Virtualization.framework / KVM |
 //! | `arcbox-vm` | guest | nested sandbox microVMs | Firecracker (`fc-sdk`) |
 //!
-//! # Status: **frozen**
-//!
-//! New features should go into `arcbox-vmm` / `arcbox-hypervisor`.  This
-//! crate receives bug-fixes and sandbox-specific work only.
+//! It also ships the `vm-agent` binary, which becomes PID 1 *inside* each
+//! sandbox. That binary imports only this crate's protocol leaves
+//! (`boot_proto`, `file_io::proto`, `file_watch`, `vsock` constants,
+//! `listen_table`, `user_spec`) — never the manager. Keep it that way:
+//! it is cross-compiled to musl and staged into every sandbox rootfs.
 //!
 //! # Public API
 //!
@@ -29,6 +30,7 @@
 //! - [`SnapshotCatalog`] — checkpoint tracking
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
 
+mod atomic_file;
 pub mod boot_proto;
 pub mod config;
 pub mod error;
@@ -40,14 +42,9 @@ pub mod sandbox;
 pub mod snapshot;
 pub mod snapshot_cow;
 pub mod spawn;
-pub mod store;
 pub mod template_catalog;
 pub mod user_spec;
 pub mod vsock;
-
-// Keep the general VM manager available for internal tooling.
-pub mod instance;
-pub mod manager;
 
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
@@ -66,6 +63,3 @@ pub use sandbox::{
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
 pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-
-// Re-export VmState for system_svc compatibility (internal use only).
-pub use instance::VmState;

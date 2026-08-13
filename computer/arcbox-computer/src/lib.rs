@@ -10,10 +10,12 @@
 //! import, ever — and it must compile and pass unit tests on Linux as
 //! well as macOS.
 
+pub mod capability;
 pub mod cleanup;
 pub mod host;
 pub mod locks;
 pub mod ports;
 pub mod resume;
 
+pub use capability::{NestedVirtCapability, nested_virt_for_backend};
 pub use host::SandboxHost;

@@ -39,7 +39,6 @@ pub mod migration;
 #[cfg(target_os = "macos")]
 pub mod route_reconciler;
 pub mod runtime;
-pub mod sandbox_capability;
 pub mod stats_hub;
 
 // Image management and the engine core moved to the engine layer
@@ -48,6 +47,7 @@ pub mod stats_hub;
 pub use arcbox_engine::{agent_client, event, machine, persistence, trace, vm, vm_lifecycle};
 pub use arcbox_image::{boot_assets, machine_image, remote_image};
 
+pub use arcbox_computer::NestedVirtCapability;
 pub use arcbox_engine::agent_client::{AgentClient, ExecSessionInput, WriteFileChunk};
 pub use arcbox_image::boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
@@ -69,7 +69,6 @@ pub use migration::MigrationManager;
 pub use runtime::{
     InitProgress, Runtime, SandboxPortExposure, SandboxPortMapping, SandboxPortProtocol,
 };
-pub use sandbox_capability::NestedVirtCapability;
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
 pub use vm_lifecycle::{
     ActivityScope, DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig,

@@ -18,3 +18,9 @@ pub mod vm;
 pub mod vm_lifecycle;
 
 pub use error::{EngineError, Result};
+
+// The platform vocabulary the layers above compose with. They reach the
+// hypervisor through here, which is what keeps `arcbox-vmm` and
+// `arcbox-hypervisor` off their dependency lists (charter D4).
+pub use arcbox_hypervisor::{NestedVirtSupport, host_nested_virt};
+pub use arcbox_vmm::VmBackend;

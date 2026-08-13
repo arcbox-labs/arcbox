@@ -48,8 +48,6 @@ mod types;
 mod warm;
 mod workload;
 
-pub(crate) use persistence::atomic_write;
-
 pub use execution::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
