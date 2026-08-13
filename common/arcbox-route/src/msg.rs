@@ -261,7 +261,7 @@ pub(crate) fn route_table() -> io::Result<Vec<u8>> {
 
     for attempt in 1..=MAX_DUMP_ATTEMPTS {
         let mut size = 0usize;
-        // SAFETY: `mib` contains the documented six-element routing-table MIB,
+        // Safety: `mib` contains the documented six-element routing-table MIB,
         // `size` is writable, and both data pointers are null for a size query.
         let result = unsafe {
             libc::sysctl(
@@ -278,7 +278,7 @@ pub(crate) fn route_table() -> io::Result<Vec<u8>> {
         }
 
         let mut table = vec![0u8; size];
-        // SAFETY: `table` has `size` writable bytes, `size` remains writable,
+        // Safety: `table` has `size` writable bytes, `size` remains writable,
         // and the remaining arguments are the same valid read-only MIB query.
         let result = unsafe {
             libc::sysctl(

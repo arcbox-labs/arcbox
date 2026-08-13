@@ -424,7 +424,7 @@ fn decode_route_table(mut table: &[u8]) -> Result<Vec<RouteEntry>, String> {
         if table.len() < header_size {
             return Err("routing table entry is shorter than rt_msghdr".to_owned());
         }
-        // SAFETY: the length check above guarantees a complete header and the
+        // Safety: the length check above guarantees a complete header and the
         // kernel dump has no Rust alignment guarantee.
         let header = unsafe { std::ptr::read_unaligned(table.as_ptr().cast::<libc::rt_msghdr>()) };
         let message_len = usize::from(header.rtm_msglen);
@@ -600,12 +600,12 @@ mod tests {
             let netmask = sockaddr::make_netmask(network);
             let mut message =
                 msg::build_msg(msg::MsgType::Get, &destination, None, &netmask).unwrap();
-            // SAFETY: `build_msg` always returns a complete, aligned-independent
+            // Safety: `build_msg` always returns a complete, aligned-independent
             // rt_msghdr prefix, and write_unaligned accepts the byte buffer.
             let mut header =
                 unsafe { std::ptr::read_unaligned(message.as_ptr().cast::<libc::rt_msghdr>()) };
             header.rtm_index = ifindex;
-            // SAFETY: the same complete-header invariant applies to this write.
+            // Safety: the same complete-header invariant applies to this write.
             unsafe { std::ptr::write_unaligned(message.as_mut_ptr().cast(), header) };
             table.extend(message);
         }
