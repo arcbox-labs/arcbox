@@ -40,14 +40,9 @@ pub mod sandbox;
 pub mod snapshot;
 pub mod snapshot_cow;
 pub mod spawn;
-pub mod store;
 pub mod template_catalog;
 pub mod user_spec;
 pub mod vsock;
-
-// Keep the general VM manager available for internal tooling.
-pub mod instance;
-pub mod manager;
 
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
@@ -66,6 +61,3 @@ pub use sandbox::{
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
 pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-
-// Re-export VmState for system_svc compatibility (internal use only).
-pub use instance::VmState;
