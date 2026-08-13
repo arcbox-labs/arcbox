@@ -62,6 +62,15 @@ carries `arcbox` 0.6.3 from the runtime facade this SDK replaced, so a
 `cargo add arcbox`; and the same run publishes `arcbox-connect`, the
 path dependency this crate resolves against.
 
+Versions **0.6.3 and below on crates.io are not this crate**: they are
+the `arcbox` runtime facade — a re-export shell over `arcbox-core` and
+the VM crates — which this SDK replaced by taking the name. The API
+changes completely at 0.6.6, inside a version line semver says it
+shouldn't. The facade had no dependents on the registry and its
+re-exports were commented out, so nothing can be broken by it, but a
+`arcbox = "0.6"` requirement written against the old crate does need
+rewriting rather than merely re-resolving.
+
 ## Status
 
 Shipped: connection resolution, the registry-derived error type, the
