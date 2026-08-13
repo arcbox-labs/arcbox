@@ -63,10 +63,14 @@
 pub mod blk_worker;
 pub mod boot;
 pub mod builder;
+// Intentionally not `pub` — only used by darwin_hv to spawn the worker.
+#[cfg(target_os = "macos")]
 pub(crate) mod console_rx_worker;
+// DAX windows are mapped through Hypervisor.framework; darwin_hv is the
+// only consumer.
+#[cfg(target_os = "macos")]
 pub mod dax;
 pub mod device;
-// Intentionally not `pub` — only used by darwin_hv to spawn the worker.
 pub mod error;
 pub mod event;
 pub mod fdt;
