@@ -13,7 +13,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use arcbox_constants::paths::ArcboxProfile;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
@@ -74,8 +73,9 @@ pub async fn resolve_from_dockerfile_contents(contents: &[u8]) -> Result<String>
 /// reference exists in the guest's image store — catching a typo here rather
 /// than as an opaque create failure.
 pub async fn resolve_from_image(image_ref: &str) -> Result<String> {
+    let context = crate::runtime_selection::docker_context_name()?;
     let output = Command::new("docker")
-        .args(["--context", docker_context(), "image", "inspect", image_ref])
+        .args(["--context", &context, "image", "inspect", image_ref])
         .output()
         .await
         .context("failed to spawn docker image inspect")?;
@@ -84,14 +84,6 @@ pub async fn resolve_from_image(image_ref: &str) -> Result<String> {
         bail!("image {image_ref} is not available to ArcBox:\n{stderr}");
     }
     Ok(template_ref(image_ref))
-}
-
-/// Docker context for the active runtime profile.
-///
-/// `main` mirrors `--profile` into `ARCBOX_PROFILE`, so this follows the flag
-/// as well as the environment.
-fn docker_context() -> &'static str {
-    ArcboxProfile::from_env_or_default().docker_context_name()
 }
 
 /// Wrap a Docker image reference as a sandbox template reference.
@@ -110,10 +102,11 @@ async fn build_and_resolve(
     context_dir: &Path,
 ) -> Result<String> {
     let tag = format!("arcbox-sandbox:{}", cache_key(contents));
+    let context = crate::runtime_selection::docker_context_name()?;
 
     eprintln!("Building Docker image...");
     let output = Command::new("docker")
-        .args(["--context", docker_context(), "build", "-t", &tag, "-f"])
+        .args(["--context", &context, "build", "-t", &tag, "-f"])
         .arg(dockerfile)
         .arg(context_dir)
         .output()

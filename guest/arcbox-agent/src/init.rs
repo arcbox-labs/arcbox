@@ -871,7 +871,14 @@ exit 0
     /// Docker's own heuristics pick a lower value.
     fn write_docker_daemon_config() {
         mkdir_p("/etc/docker");
-        let content = super::docker_daemon_json();
+        let network = match crate::agent::container_network() {
+            Ok(network) => network,
+            Err(error) => {
+                tracing::error!(%error, "refusing to write Docker config for invalid container network");
+                return;
+            }
+        };
+        let content = super::docker_daemon_json(network);
         if let Err(e) = std::fs::write("/etc/docker/daemon.json", &content) {
             tracing::warn!(error = %e, "failed to write /etc/docker/daemon.json");
         }
@@ -944,10 +951,20 @@ const NOFILE_LIMIT: u64 = 1_048_576;
 /// with stale overlay2 remnants back to the legacy store. dockerd 29 logs a
 /// benign "no longer needed" warning for it.
 #[cfg(any(target_os = "linux", test))]
-fn docker_daemon_json() -> String {
+fn docker_daemon_json(network: arcbox_constants::container_network::ContainerNetwork) -> String {
+    let bridge = format!(
+        "{}/{}",
+        network.docker_bridge_gateway(),
+        network.docker_network_prefix()
+    );
     serde_json::json!({
         "dns": ["10.0.2.1"],
         "allow-direct-routing": true,
+        "bip": bridge,
+        "default-address-pools": [{
+            "base": network.to_string(),
+            "size": network.docker_network_prefix()
+        }],
         "default-ulimits": {
             "nofile": { "Name": "nofile", "Soft": NOFILE_LIMIT, "Hard": NOFILE_LIMIT }
         },
@@ -1022,9 +1039,13 @@ fn report_missing_mounts(
 mod tests {
     use super::*;
 
+    fn default_daemon_json() -> String {
+        docker_daemon_json(arcbox_constants::container_network::ContainerNetwork::default())
+    }
+
     #[test]
     fn daemon_json_contains_nofile_ulimit() {
-        let json = docker_daemon_json();
+        let json = default_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let nofile = &v["default-ulimits"]["nofile"];
         assert_eq!(nofile["Soft"], 1048576);
@@ -1034,23 +1055,47 @@ mod tests {
 
     #[test]
     fn daemon_json_contains_dns() {
-        let json = docker_daemon_json();
+        let json = default_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["dns"][0], "10.0.2.1");
     }
 
     #[test]
     fn daemon_json_allows_direct_container_routing() {
-        let json = docker_daemon_json();
+        let json = default_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["allow-direct-routing"], true);
     }
 
     #[test]
+    fn daemon_json_preserves_the_production_docker_bridge() {
+        let json = default_daemon_json();
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(value["bip"], "172.17.0.1/16");
+        assert_eq!(value["default-address-pools"][0]["base"], "172.16.0.0/12");
+        assert_eq!(value["default-address-pools"][0]["size"], 16);
+    }
+
+    #[test]
     fn daemon_json_enables_containerd_snapshotter() {
-        let json = docker_daemon_json();
+        let json = default_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["features"]["containerd-snapshotter"], true);
+    }
+
+    #[test]
+    fn daemon_json_uses_the_selected_container_pool() {
+        let network = arcbox_constants::container_network::ContainerNetwork::from_kernel_cmdline(
+            "root=/dev/vda arcbox.container_network=10.80.0.0/20",
+        )
+        .unwrap();
+        let json = docker_daemon_json(network);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(value["bip"], "10.80.1.1/24");
+        assert_eq!(value["default-address-pools"][0]["base"], "10.80.0.0/20");
+        assert_eq!(value["default-address-pools"][0]["size"], 24);
     }
 
     #[test]

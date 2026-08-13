@@ -24,7 +24,7 @@ use arcbox_constants::paths::{
 use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
 
 use super::btrfs::ensure_data_mount;
-use super::cmdline::docker_api_vsock_port;
+use super::cmdline::{container_network, docker_api_vsock_port};
 use super::probe::{probe_docker_api_ready, probe_first_ready_socket, probe_unix_socket};
 use super::rpc::sync_clock_from_host;
 use super::runtime_cache::ensure_local_runtime;
@@ -49,9 +49,6 @@ const REQUIRED_RUNTIME_BINARIES: &[&str] = &[
 /// enough that TLS certificates issued after 2020 pass validation.
 /// 2020-01-01T00:00:00Z
 const MIN_SANE_EPOCH: u64 = 1_577_836_800;
-
-/// All Docker bridge subnets routed from macOS through the bridge NIC.
-const CONTAINER_SUBNET: &str = "172.16.0.0/12";
 
 /// Polling fallback for firewall managers that recreate `DOCKER-USER`.
 const DIRECT_ROUTING_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
@@ -168,22 +165,28 @@ pub(super) async fn handle_runtime_status(_req: RuntimeStatusRequest) -> RpcResp
 /// unstable because Docker prepends its own chains on startup. The matching
 /// daemon option `allow-direct-routing` removes Docker's earlier raw-table
 /// per-container drops; this rule then bypasses its unpublished-port drop.
+fn direct_routing_rule<'a>(bridge_iface: &'a str, network: &'a str) -> [&'a str; 7] {
+    [
+        "DOCKER-USER",
+        "-i",
+        bridge_iface,
+        "-d",
+        network,
+        "-j",
+        "ACCEPT",
+    ]
+}
+
 async fn ensure_direct_container_routing() -> Result<()> {
     let _guard = direct_routing_lock().lock().await;
+    let network = container_network().map_err(anyhow::Error::msg)?;
     let Some(bridge_iface) = crate::init::detect_bridge_interface() else {
         tracing::debug!("no bridge NIC found; skipping direct container routing rule");
         return Ok(());
     };
+    let network = network.to_string();
 
-    let rule = [
-        "DOCKER-USER",
-        "-i",
-        bridge_iface.as_str(),
-        "-d",
-        CONTAINER_SUBNET,
-        "-j",
-        "ACCEPT",
-    ];
+    let rule = direct_routing_rule(&bridge_iface, &network);
     let check = Command::new("/sbin/iptables")
         .args(["-w", "2", "-C"])
         .args(rule)
@@ -215,7 +218,7 @@ async fn ensure_direct_container_routing() -> Result<()> {
 
     tracing::info!(
         interface = bridge_iface,
-        subnet = CONTAINER_SUBNET,
+        subnet = network,
         "direct container routing rule installed"
     );
     Ok(())
@@ -814,9 +817,10 @@ pub(super) async fn ensure_nfs_export() -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    use arcbox_constants::container_network::ContainerNetwork;
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
 
-    use super::{DockerProbe, shared_containerd_config};
+    use super::{DockerProbe, direct_routing_rule, shared_containerd_config};
 
     #[test]
     fn shared_containerd_config_uses_k3s_cni_paths() {
@@ -824,6 +828,28 @@ mod tests {
         assert!(config.contains("bin_dir = \"/var/lib/rancher/k3s/data/cni\""));
         assert!(config.contains("conf_dir = \"/var/lib/rancher/k3s/agent/etc/cni/net.d\""));
         assert!(config.contains("max_conf_num = 1"));
+    }
+
+    #[test]
+    fn cmdline_container_network_drives_the_firewall_destination() {
+        let network = ContainerNetwork::from_kernel_cmdline(
+            "root=/dev/vda arcbox.container_network=10.80.0.0/20",
+        )
+        .unwrap()
+        .to_string();
+
+        assert_eq!(
+            direct_routing_rule("eth0", &network),
+            [
+                "DOCKER-USER",
+                "-i",
+                "eth0",
+                "-d",
+                "10.80.0.0/20",
+                "-j",
+                "ACCEPT"
+            ]
+        );
     }
 
     fn probe(socket_exists: bool, socket_ok: bool, api_ok: bool) -> DockerProbe {

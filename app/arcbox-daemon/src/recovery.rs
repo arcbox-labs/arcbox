@@ -4,6 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::paths::HostLayout;
 use arcbox_core::Runtime;
 use tracing::info;
@@ -12,76 +15,89 @@ use crate::context::DaemonContext;
 use crate::self_setup;
 use crate::self_setup::SetupTask as _;
 
-/// Runs all recovery and best-effort setup tasks.
+/// Runs recovery and host setup tasks.
 ///
 /// - Recovers DNS and port forwarding for containers that survived a daemon restart
 /// - Re-installs the container subnet route (cold-start reconcile)
-/// - Installs DNS resolver and Docker socket via helper (best-effort)
-pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
-    // Every recovery task here reconciles Linux-VM container networking or
-    // Docker integration; none apply in VM-host-only mode.
-    if !runtime.config().vm.autostart {
-        return;
+/// - Installs DNS resolver and Docker socket via helper
+///
+/// An explicitly requested DNS resolver is startup-critical. Canonical
+/// production setup and all other host integrations remain best-effort.
+pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>, dns_port: u16) -> Result<()> {
+    let linux_vm = runtime.config().vm.autostart;
+    if linux_vm {
+        recover_container_networking(runtime).await;
     }
-
-    recover_container_networking(runtime).await;
 
     // Cold-start route reconcile (non-blocking). This is load-bearing after
     // app updates or daemon restarts where the VM survives but the host route
     // may have been removed or stolen by another network service.
-    #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    {
+    #[cfg(target_os = "macos")]
+    if linux_vm {
         use arcbox_core::DEFAULT_MACHINE_NAME;
+        #[cfg(feature = "vmnet")]
         use arcbox_core::bridge_discovery::MachineBridgeExt as _;
-        if let Some(ColdStartRoutePlan::VmnetBridge(bridge)) = cold_start_route_plan(
-            runtime
-                .machine_manager()
-                .vmnet_bridge_name(DEFAULT_MACHINE_NAME),
-            None,
-        ) {
-            spawn_vmnet_route_reconcile(Arc::clone(&ctx.setup_state), bridge);
-        }
-    }
-
-    #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
-    {
-        use arcbox_core::DEFAULT_MACHINE_NAME;
-        if let Some(ColdStartRoutePlan::BridgeMac(mac)) = cold_start_route_plan(
-            None,
-            runtime.machine_manager().bridge_mac(DEFAULT_MACHINE_NAME),
-        ) {
-            let setup_state = Arc::clone(&ctx.setup_state);
-            drop(tokio::spawn(async move {
-                match arcbox_core::route_reconciler::ensure_route_with_retry(&mac).await {
-                    Ok(()) => setup_state.set_route_installed(true),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to install container route on cold start");
-                    }
-                }
-            }));
+        #[cfg(feature = "vmnet")]
+        let vmnet_bridge = runtime
+            .machine_manager()
+            .vmnet_bridge_name(DEFAULT_MACHINE_NAME);
+        #[cfg(not(feature = "vmnet"))]
+        let vmnet_bridge = None;
+        let bridge_mac = runtime.machine_manager().bridge_mac(DEFAULT_MACHINE_NAME);
+        match cold_start_route_plan(vmnet_bridge, bridge_mac) {
+            #[cfg(feature = "vmnet")]
+            Some(ColdStartRoutePlan::VmnetBridge(bridge)) => spawn_vmnet_route_reconcile(
+                Arc::clone(&ctx.setup_state),
+                bridge,
+                runtime.config().container.cidr,
+            ),
+            Some(ColdStartRoutePlan::BridgeMac(mac)) => spawn_bridge_mac_route_reconcile(
+                Arc::clone(&ctx.setup_state),
+                mac,
+                runtime.config().container.cidr,
+            ),
+            None => {}
         }
     }
 
     // Best-effort self-setup (non-blocking).
     //
-    // The `/etc/resolver/<domain>` entry belongs to the daemon serving the
-    // canonical DNS port. A daemon on any other port (an e2e harness daemon
-    // with an ephemeral port, an ad-hoc dev run) must never rewrite the
-    // host-global resolver away from the installed daemon — after it exits,
-    // host DNS would point at a dead port.
-    let dns_task =
-        (ctx.dns_port == crate::startup::DEFAULT_DNS_PORT).then(|| self_setup::DnsResolver {
+    let default_data_dir = HostLayout::resolve_for_profile_from_env(ctx.profile, None).data_dir;
+
+    // Host resolver files are a privileged global mutation. Canonical
+    // production DNS is implicit; any isolated domain requires the launch
+    // contract to authorize it explicitly rather than inferring ownership
+    // from caller-controlled text.
+    let owns_dns = owns_dns_resolver(
+        ctx.profile,
+        ctx.install_dns_resolver,
+        &ctx.dns_domain,
+        &ctx.layout.data_dir,
+        &default_data_dir,
+    );
+    if ctx.install_dns_resolver {
+        let dns = self_setup::DnsResolver {
             domain: ctx.dns_domain.clone(),
-            port: ctx.dns_port,
-        });
-    if dns_task.is_none() {
+            port: dns_port,
+        };
+        self_setup::run_required(&dns)
+            .await
+            .context("explicit DNS resolver setup failed")?;
+        ctx.setup_state.set_dns_installed(true);
+    }
+    let dns_task = (owns_dns && !ctx.install_dns_resolver).then(|| self_setup::DnsResolver {
+        domain: ctx.dns_domain.clone(),
+        port: dns_port,
+    });
+    if !owns_dns {
         tracing::debug!(
-            port = ctx.dns_port,
-            "non-default DNS port; skipping /etc/resolver self-setup"
+            domain = ctx.dns_domain,
+            data_dir = %ctx.layout.data_dir.display(),
+            "non-canonical DNS owner; skipping /etc/resolver self-setup"
         );
     }
-    // The `/var/run/docker.sock` symlink likewise belongs to the daemon
-    // running its profile's canonical data dir: the link target embeds the
+    // The `/var/run/docker.sock` symlink belongs to the production daemon
+    // running its canonical data dir: the link target embeds the
     // data dir, so a daemon on an overridden one (an e2e harness daemon on
     // a temp dir, an ad-hoc dev run) would re-point the host-global Docker
     // socket at a path that dies with it. `ARCBOX_DATA_DIR` counts as
@@ -89,8 +105,9 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     // daemon instance; the installer persists it into the launchd plist's
     // EnvironmentVariables so a relocated install still satisfies this
     // check (its plist also passes the same path as `--data-dir`).
-    let default_data_dir = HostLayout::resolve_for_profile_from_env(ctx.profile, None).data_dir;
-    let socket_task = (ctx.layout.data_dir == default_data_dir).then(|| self_setup::DockerSocket {
+    let owns_global_host_setup =
+        owns_implicit_host_setup(ctx.profile, &ctx.layout.data_dir, &default_data_dir);
+    let socket_task = (linux_vm && owns_global_host_setup).then(|| self_setup::DockerSocket {
         target: ctx.layout.docker_socket.clone(),
     });
     if socket_task.is_none() {
@@ -101,16 +118,16 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     }
 
     // The `/etc/hosts` ArcBox alias is host-global like the docker socket:
-    // only the daemon on its profile's canonical data dir installs it. It
+    // only the production daemon on its canonical data dir installs it. It
     // exists so the ~/ArcBox NFS mount can use `ArcBox:/` as its source
     // (Finder shows the source host name); daemons without it simply mount
     // from `127.0.0.1:/`.
-    let hosts_task = (ctx.mount_nfs && ctx.layout.data_dir == default_data_dir)
-        .then_some(self_setup::HostsAlias);
+    let hosts_task =
+        (linux_vm && ctx.mount_nfs && owns_global_host_setup).then_some(self_setup::HostsAlias);
 
     // Create /usr/local/bin/ symlinks for Docker CLI tools if running from
     // bundle with docker integration enabled.
-    let cli_tasks: Vec<Box<dyn self_setup::SetupTask>> = if ctx.docker_integration {
+    let cli_tasks: Vec<Box<dyn self_setup::SetupTask>> = if linux_vm && ctx.docker_integration {
         if let Some(contents) = crate::startup::find_bundle_contents() {
             let xbin = contents.join("MacOS/xbin");
             if xbin.is_dir() {
@@ -155,7 +172,7 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     });
 
     // Docker CLI tools installation (non-blocking, best-effort).
-    if ctx.docker_integration {
+    if linux_vm && ctx.docker_integration {
         let data_dir = ctx.layout.data_dir.clone();
         let setup_state = Arc::clone(&ctx.setup_state);
         tokio::spawn(async move {
@@ -167,6 +184,28 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
             }
         });
     }
+    Ok(())
+}
+
+fn owns_dns_resolver(
+    profile: arcbox_constants::paths::ArcboxProfile,
+    explicitly_enabled: bool,
+    domain: &str,
+    data_dir: &Path,
+    canonical_data_dir: &Path,
+) -> bool {
+    explicitly_enabled
+        || (profile == arcbox_constants::paths::ArcboxProfile::Production
+            && domain == crate::startup::DEFAULT_DNS_DOMAIN
+            && data_dir == canonical_data_dir)
+}
+
+fn owns_implicit_host_setup(
+    profile: arcbox_constants::paths::ArcboxProfile,
+    data_dir: &Path,
+    canonical_data_dir: &Path,
+) -> bool {
+    profile == arcbox_constants::paths::ArcboxProfile::Production && data_dir == canonical_data_dir
 }
 
 #[cfg(target_os = "macos")]
@@ -174,33 +213,60 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
 enum ColdStartRoutePlan {
     #[cfg(feature = "vmnet")]
     VmnetBridge(String),
-    #[cfg(not(feature = "vmnet"))]
     BridgeMac(String),
 }
 
-#[cfg(all(target_os = "macos", feature = "vmnet"))]
+#[cfg(target_os = "macos")]
 fn cold_start_route_plan(
     vmnet_bridge: Option<String>,
-    _bridge_mac: Option<String>,
-) -> Option<ColdStartRoutePlan> {
-    vmnet_bridge.map(ColdStartRoutePlan::VmnetBridge)
-}
-
-#[cfg(all(target_os = "macos", not(feature = "vmnet")))]
-fn cold_start_route_plan(
-    _vmnet_bridge: Option<String>,
     bridge_mac: Option<String>,
 ) -> Option<ColdStartRoutePlan> {
+    #[cfg(feature = "vmnet")]
+    if let Some(bridge) = vmnet_bridge {
+        return Some(ColdStartRoutePlan::VmnetBridge(bridge));
+    }
+    #[cfg(not(feature = "vmnet"))]
+    let _ = vmnet_bridge;
     bridge_mac.map(ColdStartRoutePlan::BridgeMac)
 }
 
 #[cfg(all(target_os = "macos", feature = "vmnet"))]
-fn spawn_vmnet_route_reconcile(setup_state: Arc<arcbox_api::SetupState>, bridge: String) {
+fn spawn_vmnet_route_reconcile(
+    setup_state: Arc<arcbox_api::SetupState>,
+    bridge: String,
+    container_network: ContainerNetwork,
+) {
     drop(tokio::spawn(async move {
-        match arcbox_core::route_reconciler::ensure_route_for_bridge(&bridge).await {
+        match arcbox_core::route_reconciler::ensure_route_for_bridge_with_network(
+            &bridge,
+            container_network,
+        )
+        .await
+        {
             Ok(()) => setup_state.set_route_installed(true),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to install container route on cold start (vmnet)");
+            }
+        }
+    }));
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_bridge_mac_route_reconcile(
+    setup_state: Arc<arcbox_api::SetupState>,
+    mac: String,
+    container_network: ContainerNetwork,
+) {
+    drop(tokio::spawn(async move {
+        match arcbox_core::route_reconciler::ensure_route_with_retry_for_network(
+            &mac,
+            container_network,
+        )
+        .await
+        {
+            Ok(()) => setup_state.set_route_installed(true),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install container route on cold start");
             }
         }
     }));
@@ -325,6 +391,68 @@ async fn recover_container_networking(runtime: &Arc<Runtime>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dns_resolver_owner_isolated_by_domain_or_canonical_data_dir() {
+        let canonical = Path::new("/canonical");
+
+        assert!(owns_dns_resolver(
+            arcbox_constants::paths::ArcboxProfile::Production,
+            false,
+            crate::startup::DEFAULT_DNS_DOMAIN,
+            canonical,
+            canonical
+        ));
+        assert!(!owns_dns_resolver(
+            arcbox_constants::paths::ArcboxProfile::Production,
+            false,
+            crate::startup::DEFAULT_DNS_DOMAIN,
+            Path::new("/isolated-test"),
+            canonical
+        ));
+        assert!(!owns_dns_resolver(
+            arcbox_constants::paths::ArcboxProfile::Production,
+            false,
+            "ad-hoc.dev.arcbox.local",
+            Path::new("/isolated-test"),
+            canonical
+        ));
+        assert!(owns_dns_resolver(
+            arcbox_constants::paths::ArcboxProfile::Development,
+            true,
+            "dev-id.dev.arcbox.local",
+            Path::new("/isolated-dev"),
+            canonical
+        ));
+        assert!(!owns_dns_resolver(
+            arcbox_constants::paths::ArcboxProfile::Development,
+            false,
+            crate::startup::DEFAULT_DNS_DOMAIN,
+            canonical,
+            canonical
+        ));
+    }
+
+    #[test]
+    fn implicit_host_setup_belongs_only_to_canonical_production() {
+        let canonical = Path::new("/canonical");
+
+        assert!(owns_implicit_host_setup(
+            arcbox_constants::paths::ArcboxProfile::Production,
+            canonical,
+            canonical,
+        ));
+        assert!(!owns_implicit_host_setup(
+            arcbox_constants::paths::ArcboxProfile::Production,
+            Path::new("/isolated"),
+            canonical,
+        ));
+        assert!(!owns_implicit_host_setup(
+            arcbox_constants::paths::ArcboxProfile::Development,
+            canonical,
+            canonical,
+        ));
+    }
+
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     #[test]
     fn cold_start_route_plan_uses_vmnet_bridge() {
@@ -338,10 +466,15 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     #[test]
-    fn cold_start_route_plan_skips_when_vmnet_bridge_is_unknown() {
+    fn cold_start_route_plan_falls_back_to_bridge_mac() {
         let plan = cold_start_route_plan(None, Some("fe:b2:14:4d:a4:64".to_string()));
 
-        assert_eq!(plan, None);
+        assert_eq!(
+            plan,
+            Some(ColdStartRoutePlan::BridgeMac(
+                "fe:b2:14:4d:a4:64".to_string()
+            ))
+        );
     }
 
     #[cfg(all(target_os = "macos", not(feature = "vmnet")))]

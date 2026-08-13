@@ -20,6 +20,8 @@ mod stub;
 
 #[cfg(target_os = "linux")]
 pub use linux::Agent;
+#[cfg(target_os = "linux")]
+pub use linux::container_network;
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::Agent;

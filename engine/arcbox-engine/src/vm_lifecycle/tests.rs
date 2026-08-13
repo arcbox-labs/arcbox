@@ -1,9 +1,10 @@
-use super::boot::{agent_timeout_error, ensure_earlycon};
+use super::boot::{agent_timeout_error, ensure_earlycon, with_container_network};
 use super::types::{DesiredBoot, machine_drift_reason, metadata_image_filename};
 use super::*;
 use crate::machine::MachineState;
 use crate::vm::ensure_sparse_block_image;
 use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
+use arcbox_constants::container_network::ContainerNetwork;
 
 #[test]
 fn test_lifecycle_state_is_ready() {
@@ -56,6 +57,25 @@ fn ensure_earlycon_respects_explicit_directive() {
     let cmdline = "console=hvc0 earlycon=pl011,0x9000000 root=/dev/vda".to_string();
     let out = ensure_earlycon(cmdline.clone(), arcbox_vmm::VmBackend::Hv);
     assert_eq!(out, cmdline);
+}
+
+#[test]
+fn container_network_cmdline_is_authoritative_and_unique() {
+    let network: ContainerNetwork = "10.64.0.0/16".parse().unwrap();
+    let cmdline = with_container_network(
+        "root=/dev/vda arcbox.container_network=172.16.0.0/12 console=hvc0".to_string(),
+        network,
+    );
+
+    assert!(cmdline.contains("arcbox.container_network=10.64.0.0/16"));
+    assert!(!cmdline.contains("172.16.0.0/12"));
+    assert_eq!(
+        cmdline
+            .split_whitespace()
+            .filter(|token| token.starts_with("arcbox.container_network="))
+            .count(),
+        1
+    );
 }
 
 #[test]

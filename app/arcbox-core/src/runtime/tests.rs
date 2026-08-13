@@ -1,6 +1,6 @@
 use super::Runtime;
 use super::assets::{check_executable, ensure_guest_binaries};
-use super::kubeconfig::rewrite_kubeconfig_server;
+use super::kubeconfig::rewrite_kubeconfig;
 use crate::config::Config;
 use std::path::PathBuf;
 
@@ -65,16 +65,41 @@ fn test_ensure_guest_binaries_missing_runtime() {
 }
 
 #[test]
-fn test_rewrite_kubeconfig_server_updates_arcbox_refs() {
+fn test_rewrite_kubeconfig_updates_endpoint_and_context() {
     let kubeconfig = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: default\ncontexts:\n- context:\n    cluster: default\n    user: default\n  name: default\ncurrent-context: default\nusers:\n- name: default\n  user: {}\n";
 
-    let rewritten = rewrite_kubeconfig_server(kubeconfig);
-    assert!(rewritten.contains("server: https://127.0.0.1:16443"));
-    assert!(rewritten.contains("name: arcbox"));
-    assert!(rewritten.contains("- name: arcbox"));
-    assert!(rewritten.contains("cluster: arcbox"));
-    assert!(rewritten.contains("user: arcbox"));
-    assert!(rewritten.contains("current-context: arcbox"));
+    let rewritten = rewrite_kubeconfig(
+        kubeconfig,
+        "https://127.0.0.1:24123",
+        "arcbox-dev-worktree-1",
+    );
+    assert!(rewritten.contains("server: https://127.0.0.1:24123"));
+    assert!(rewritten.contains("name: arcbox-dev-worktree-1"));
+    assert!(rewritten.contains("- name: arcbox-dev-worktree-1"));
+    assert!(rewritten.contains("cluster: arcbox-dev-worktree-1"));
+    assert!(rewritten.contains("user: arcbox-dev-worktree-1"));
+    assert!(rewritten.contains("current-context: arcbox-dev-worktree-1"));
+}
+
+#[tokio::test]
+async fn kubernetes_status_uses_the_bound_host_port() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(Config {
+        data_dir: temp_dir.path().to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+    runtime
+        .set_kubernetes_host_endpoint(24_123, "arcbox-dev-worktree-1".to_owned())
+        .unwrap();
+
+    let status = runtime.kubernetes_status().await.unwrap();
+    assert_eq!(status.endpoint, "https://127.0.0.1:24123");
+    assert!(
+        runtime
+            .set_kubernetes_host_endpoint(24_124, "arcbox-dev-worktree-2".to_owned())
+            .is_err()
+    );
 }
 
 #[cfg(unix)]

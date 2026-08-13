@@ -95,6 +95,18 @@ impl Client {
             .await??)
     }
 
+    /// Removes an exact direct route only while it still belongs to `iface`.
+    pub async fn route_remove_if_owned(
+        &self,
+        subnet: &str,
+        iface: &str,
+    ) -> Result<bool, ClientError> {
+        Ok(self
+            .inner
+            .route_remove_if_owned(tarpc::context::current(), subnet.into(), iface.into())
+            .await??)
+    }
+
     /// Installs a DNS resolver file for `domain` on port `port`.
     pub async fn dns_install(&self, domain: &str, port: u16) -> Result<(), ClientError> {
         Ok(self

@@ -27,11 +27,13 @@
 //!
 //! [container]
 //! guest_docker_vsock_port = 2375
+//! cidr = "172.16.0.0/12"
 //!
 //! [logging]
 //! level = "info"
 //! ```
 
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
 use figment::{
@@ -341,6 +343,13 @@ impl DockerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContainerRuntimeConfig {
+    /// Private address pool shared by Docker, guest firewall rules, and the
+    /// host route to this runtime's bridge.
+    #[serde(
+        serialize_with = "serialize_container_network",
+        deserialize_with = "deserialize_container_network"
+    )]
+    pub cidr: ContainerNetwork,
     /// Guest dockerd API vsock port.
     pub guest_docker_vsock_port: u32,
     /// Backend startup timeout in milliseconds.
@@ -357,10 +366,36 @@ pub struct ContainerRuntimeConfig {
 impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
+            cidr: ContainerNetwork::default(),
             guest_docker_vsock_port: DOCKER_API_VSOCK_PORT,
             startup_timeout_ms: 150_000,
         }
     }
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde serialize_with requires a shared reference"
+)]
+fn serialize_container_network<S>(
+    network: &ContainerNetwork,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_str(network)
+}
+
+fn deserialize_container_network<'de, D>(deserializer: D) -> Result<ContainerNetwork, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(D::Error::custom)
 }
 
 /// Logging configuration.
@@ -431,6 +466,7 @@ mod tests {
         assert!(config.vm.memory_mb <= 16384);
         assert_eq!(config.machine.disk_gb, 50);
         assert!(config.docker.enabled);
+        assert_eq!(config.container.cidr.to_string(), "172.16.0.0/12");
         assert_eq!(
             config.container.guest_docker_vsock_port,
             DOCKER_API_VSOCK_PORT
@@ -483,6 +519,36 @@ mod tests {
             .extract()
             .expect("config with vm.backend");
         assert_eq!(config.vm.backend, arcbox_vmm::VmBackend::Hv);
+    }
+
+    #[test]
+    fn container_cidr_is_validated_while_loading_config() {
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[container]\ncidr = \"10.80.0.0/20\""))
+            .extract()
+            .expect("valid container address pool");
+        assert_eq!(config.container.cidr.to_string(), "10.80.0.0/20");
+
+        let invalid = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[container]\ncidr = \"10.80.1.0/20\""))
+            .extract::<Config>();
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err, reason = "figment::Jail closure signature")]
+    fn container_cidr_parses_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ARCBOX_CONTAINER_CIDR", "10.96.0.0/16");
+            let config: Config = Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Env::prefixed("ARCBOX_").split("_"))
+                .extract()?;
+            assert_eq!(config.container.cidr.to_string(), "10.96.0.0/16");
+            Ok(())
+        });
     }
 
     #[test]

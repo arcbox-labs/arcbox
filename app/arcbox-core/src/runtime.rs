@@ -33,13 +33,13 @@ use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol}
 #[cfg(not(target_os = "macos"))]
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
 use assets::ensure_guest_binaries;
-use kubeconfig::{KUBERNETES_HOST_ENDPOINT, rewrite_kubeconfig_server};
+use kubeconfig::{host_endpoint, rewrite_kubeconfig};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(target_os = "macos"))]
 use std::net::{SocketAddr, SocketAddrV4};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard, RwLock as TokioRwLock};
@@ -82,9 +82,17 @@ struct DnsRegistration {
     revision: u64,
 }
 
+struct KubernetesHostEndpoint {
+    port: u16,
+    context_name: String,
+}
+
 pub struct Runtime {
     /// Configuration.
     config: Config,
+    /// Actual loopback port owned by the daemon's Kubernetes proxy. Set once
+    /// after bind and before this runtime is exposed through the control plane.
+    kubernetes_host_endpoint: OnceLock<KubernetesHostEndpoint>,
     /// Event bus.
     event_bus: EventBus,
     /// VM manager.
@@ -196,6 +204,7 @@ impl Runtime {
     ) -> Result<Self> {
         vm_lifecycle_config.guest_docker_vsock_port =
             Some(config.container.guest_docker_vsock_port);
+        vm_lifecycle_config.container_network = config.container.cidr;
         vm_lifecycle_config.allow_unpinned_boot_manifest =
             config.profile == arcbox_constants::paths::ArcboxProfile::Development;
 
@@ -220,6 +229,7 @@ impl Runtime {
         // engine: the engine fires the hook after the VM starts, the hook
         // owns bridge discovery + helper retries (macOS-only concern).
         #[cfg(target_os = "macos")]
+        if config.container.cidr == arcbox_constants::container_network::ContainerNetwork::default()
         {
             vm_lifecycle_config.route_hook = Some(crate::route_reconciler::system_vm_route_hook(
                 &machine_manager,
@@ -260,6 +270,7 @@ impl Runtime {
 
         Ok(Self {
             config,
+            kubernetes_host_endpoint: OnceLock::new(),
             event_bus,
             vm_manager,
             machine_manager,
@@ -333,6 +344,44 @@ impl Runtime {
     #[must_use]
     pub const fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Records the host endpoint owned by the Kubernetes API proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for port zero, an unsafe context name, or a duplicate set.
+    pub fn set_kubernetes_host_endpoint(&self, port: u16, context_name: String) -> Result<()> {
+        if port == 0 {
+            return Err(CoreError::config(
+                "Kubernetes host port must be the actual bound port",
+            ));
+        }
+        let bytes = context_name.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 253
+            || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(CoreError::config("Invalid Kubernetes context name"));
+        }
+        self.kubernetes_host_endpoint
+            .set(KubernetesHostEndpoint { port, context_name })
+            .map_err(|_| CoreError::invalid_state("Kubernetes host port already configured"))
+    }
+
+    fn kubernetes_host_endpoint(&self) -> Result<&KubernetesHostEndpoint> {
+        self.kubernetes_host_endpoint.get().map_or_else(
+            || {
+                Err(CoreError::invalid_state(
+                    "Kubernetes host proxy is unavailable",
+                ))
+            },
+            Ok,
+        )
     }
 
     /// Returns the event bus.
@@ -711,9 +760,11 @@ impl Runtime {
     ///
     /// Returns an error if the VM cannot be started or the guest request fails.
     pub async fn start_kubernetes(&self) -> Result<KubernetesStartResponse> {
+        let endpoint = self.kubernetes_host_endpoint()?;
         self.vm_lifecycle.ensure_ready().await?;
         let mut agent = self.get_agent(DEFAULT_MACHINE_NAME)?;
-        let response = agent.start_kubernetes().await?;
+        let mut response = agent.start_kubernetes().await?;
+        response.endpoint = host_endpoint(endpoint.port);
         self.vm_lifecycle
             .set_kubernetes_hold(response.running)
             .await;
@@ -726,6 +777,7 @@ impl Runtime {
     ///
     /// Returns an error if the guest request fails.
     pub async fn stop_kubernetes(&self) -> Result<KubernetesStopResponse> {
+        self.kubernetes_host_endpoint()?;
         if !self.vm_lifecycle.is_running().await {
             self.vm_lifecycle.set_kubernetes_hold(false).await;
             return Ok(KubernetesStopResponse {
@@ -747,6 +799,7 @@ impl Runtime {
     ///
     /// Returns an error if the guest request fails.
     pub async fn delete_kubernetes(&self) -> Result<KubernetesDeleteResponse> {
+        self.kubernetes_host_endpoint()?;
         self.vm_lifecycle.ensure_ready().await?;
         let mut agent = self.get_agent(DEFAULT_MACHINE_NAME)?;
         let response = agent.delete_kubernetes().await?;
@@ -760,11 +813,12 @@ impl Runtime {
     ///
     /// Returns an error if the guest request fails while the VM is running.
     pub async fn kubernetes_status(&self) -> Result<KubernetesStatusResponse> {
+        let endpoint = host_endpoint(self.kubernetes_host_endpoint()?.port);
         if !self.vm_lifecycle.is_running().await {
             return Ok(KubernetesStatusResponse {
                 running: false,
                 api_ready: false,
-                endpoint: KUBERNETES_HOST_ENDPOINT.to_string(),
+                endpoint,
                 detail: "default vm not running".to_string(),
                 services: vec![ServiceStatus {
                     name: "k3s".to_string(),
@@ -777,7 +831,8 @@ impl Runtime {
         }
 
         let mut agent = self.get_agent(DEFAULT_MACHINE_NAME)?;
-        let response = agent.get_kubernetes_status().await?;
+        let mut response = agent.get_kubernetes_status().await?;
+        response.endpoint = endpoint;
         self.vm_lifecycle
             .set_kubernetes_hold(response.running)
             .await;
@@ -790,12 +845,15 @@ impl Runtime {
     ///
     /// Returns an error if the guest request fails.
     pub async fn kubernetes_kubeconfig(&self) -> Result<KubernetesKubeconfigResponse> {
+        let endpoint = self.kubernetes_host_endpoint()?;
         self.vm_lifecycle.ensure_ready().await?;
         let mut agent = self.get_agent(DEFAULT_MACHINE_NAME)?;
         let mut response = agent.get_kubeconfig().await?;
-        response.kubeconfig = rewrite_kubeconfig_server(&response.kubeconfig);
-        response.context_name = "arcbox".to_string();
-        response.endpoint = KUBERNETES_HOST_ENDPOINT.to_string();
+        let host_endpoint = host_endpoint(endpoint.port);
+        response.kubeconfig =
+            rewrite_kubeconfig(&response.kubeconfig, &host_endpoint, &endpoint.context_name);
+        response.context_name.clone_from(&endpoint.context_name);
+        response.endpoint = host_endpoint;
         Ok(response)
     }
 

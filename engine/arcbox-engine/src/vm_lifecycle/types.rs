@@ -1,4 +1,5 @@
 use crate::machine::{MachineInfo, MachineState};
+use arcbox_constants::container_network::ContainerNetwork;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -98,6 +99,8 @@ pub struct VmLifecycleConfig {
     pub skip_vm_check: bool,
     /// Guest docker API vsock port propagated via kernel cmdline.
     pub guest_docker_vsock_port: Option<u32>,
+    /// Container address pool propagated to the guest and host route manager.
+    pub container_network: ContainerNetwork,
     /// Allow locally generated boot manifests in the development profile.
     pub allow_unpinned_boot_manifest: bool,
     /// macOS hypervisor backend this lifecycle's machine will use.
@@ -151,6 +154,7 @@ impl Default for VmLifecycleConfig {
             default_vm: DefaultVmConfig::default(),
             skip_vm_check: false,
             guest_docker_vsock_port: None,
+            container_network: ContainerNetwork::default(),
             allow_unpinned_boot_manifest: false,
             backend: arcbox_vmm::VmBackend::default(),
             route_hook: None,

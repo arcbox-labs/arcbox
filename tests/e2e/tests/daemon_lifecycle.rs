@@ -157,10 +157,6 @@ impl Fixture {
 
     /// Spawns a daemon against the fixture's shared data dir.
     fn spawn(&self) -> Result<DaemonHandle> {
-        let dns_port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|s| s.local_addr())
-            .context("probing a free DNS port")?
-            .port();
         DaemonHandle::spawn(DaemonConfig {
             binary: self.root.join("target/release/arcbox-daemon"),
             data_dir: self.data_dir.path().to_owned(),
@@ -168,7 +164,6 @@ impl Fixture {
             env: vec![
                 ("ARCBOX_BOOT_ASSET_VERSION".to_owned(), self.version.clone()),
                 ("ARCBOX_VM_BACKEND".to_owned(), "vz".to_owned()),
-                ("ARCBOX_DNS_PORT".to_owned(), dns_port.to_string()),
                 ("RUST_LOG".to_owned(), "info".to_owned()),
             ],
         })

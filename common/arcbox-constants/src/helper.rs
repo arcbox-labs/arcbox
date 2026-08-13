@@ -2,7 +2,7 @@
 //! string format) the Desktop app.
 //!
 //! The helper crate (`arcbox-helper`) owns an **independent** Cargo version
-//! (currently `1.0.2`), not `workspace.package.version`. Compare that version
+//! (currently `1.1.0`), not `workspace.package.version`. Compare that version
 //! — never the daemon/workspace crate version — when deciding whether to
 //! reinstall the root binary.
 //!
@@ -19,7 +19,7 @@
 ///
 /// Must stay in sync with `app/arcbox-helper/Cargo.toml` `version` (and the
 /// workspace path-dep pin) whenever the floor moves.
-pub const MIN_HELPER_VERSION: &str = "1.0.2";
+pub const MIN_HELPER_VERSION: &str = "1.1.0";
 
 /// Strips the optional `arcbox-helper ` prefix and whitespace from a version line.
 #[must_use]

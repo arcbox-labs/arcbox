@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub mod cmdline;
+pub mod container_network;
 pub mod devices;
 pub mod env;
 #[cfg(feature = "std")]

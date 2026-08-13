@@ -7,6 +7,7 @@ use arcbox_constants::cmdline::{
     DOCKER_METADATA_DEVICE_KEY as DOCKER_METADATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
     RUNTIME_GENERATION_KEY,
 };
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
 use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
 use arcbox_constants::ports::{DOCKER_API_VSOCK_PORT, KUBERNETES_API_VSOCK_PORT};
@@ -43,6 +44,14 @@ pub(super) fn docker_api_vsock_port() -> u32 {
     }
 
     DOCKER_API_VSOCK_PORT
+}
+
+/// Returns the validated container address pool declared by the host.
+pub fn container_network() -> Result<ContainerNetwork, String> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline")
+        .map_err(|error| format!("read kernel cmdline: {error}"))?;
+    ContainerNetwork::from_kernel_cmdline(&cmdline)
+        .map_err(|error| format!("invalid container network on kernel cmdline: {error}"))
 }
 
 pub(super) fn docker_data_device() -> String {
