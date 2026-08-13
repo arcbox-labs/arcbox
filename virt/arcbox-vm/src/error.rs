@@ -132,6 +132,25 @@ pub enum VmmError {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, VmmError>;
 
+/// A durable write that never landed is an I/O failure; one that landed
+/// without a confirmed rename is [`VmmError::Unavailable`] — the caller
+/// may retry, and the retry is safe because the write is idempotent.
+///
+/// Callers that can do better than this (the sandbox record store keeps
+/// the record and warns) match on [`AtomicWriteError`] themselves instead
+/// of going through here.
+impl From<arcbox_atomic_file::AtomicWriteError> for VmmError {
+    fn from(err: arcbox_atomic_file::AtomicWriteError) -> Self {
+        use arcbox_atomic_file::AtomicWriteError;
+        match err {
+            AtomicWriteError::NotCommitted { source, .. } => Self::Io(source),
+            error @ AtomicWriteError::DurabilityUncertain { .. } => {
+                Self::Unavailable(error.to_string())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

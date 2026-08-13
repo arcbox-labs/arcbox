@@ -23,7 +23,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::atomic_file;
 use crate::error::{Result, VmmError};
 
 /// Directory under the vmm data dir holding one JSON file per template name.
@@ -479,7 +478,7 @@ impl TemplateCatalog {
         })
         .map_err(VmmError::Io)?;
         let bytes = serde_json::to_vec_pretty(record)?;
-        atomic_file::write(&self.record_path(&record.name), &bytes)
+        arcbox_atomic_file::write(&self.record_path(&record.name), &bytes).map_err(VmmError::from)
     }
 
     fn remove_record(&self, name: &str) -> Result<()> {

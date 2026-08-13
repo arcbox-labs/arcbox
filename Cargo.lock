@@ -286,6 +286,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-atomic-file"
+version = "0.6.6"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "arcbox-boot"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1154,6 +1163,7 @@ name = "arcbox-vm"
 version = "0.6.6"
 dependencies = [
  "anyhow",
+ "arcbox-atomic-file",
  "aya",
  "chrono",
  "fc-sdk",

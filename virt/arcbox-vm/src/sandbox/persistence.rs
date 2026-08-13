@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::atomic_file::{self, AtomicWriteError};
+use arcbox_atomic_file::AtomicWriteError;
 
 use super::types::IdleAction;
 use super::{SandboxId, SandboxSpec, validate_id};
@@ -557,10 +557,15 @@ impl SandboxRecordStore {
     fn save_unlocked(&self, record: &SandboxRecord) -> Result<Option<String>> {
         validate_record(&record.id, record)?;
         let bytes = serde_json::to_vec_pretty(record)?;
-        match atomic_file::write_reporting_durability(&self.record_path(&record.id), &bytes) {
+        // A record that reached the filesystem but whose rename is not
+        // yet confirmed durable is still the record: keep it and report the
+        // doubt upward, rather than failing a write that did land.
+        match arcbox_atomic_file::write(&self.record_path(&record.id), &bytes) {
             Ok(()) => Ok(None),
-            Err(AtomicWriteError::NotCommitted(error)) => Err(error.into()),
-            Err(AtomicWriteError::DurabilityUncertain(error)) => Ok(Some(error.to_string())),
+            Err(error @ AtomicWriteError::NotCommitted { .. }) => Err(error.into()),
+            Err(error @ AtomicWriteError::DurabilityUncertain { .. }) => {
+                Ok(Some(error.to_string()))
+            }
         }
     }
 

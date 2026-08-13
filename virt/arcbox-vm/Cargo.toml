@@ -12,6 +12,7 @@ name = "vm-agent"
 path = "src/bin/vm-agent.rs"
 
 [dependencies]
+arcbox-atomic-file.workspace = true
 fc-sdk.workspace       = true
 tokio.workspace        = true
 thiserror.workspace    = true
