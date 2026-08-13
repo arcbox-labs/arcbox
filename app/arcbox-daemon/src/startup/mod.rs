@@ -51,6 +51,9 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
         layout.grpc_socket = grpc;
     }
 
+    let dns_domain = dns_domain(args.dns_domain)?;
+    validate_explicit_dns_resolver(profile, args.install_dns_resolver, &dns_domain)?;
+
     std::fs::create_dir_all(&layout.data_dir).context("Failed to create data directory")?;
     std::fs::create_dir_all(&layout.run_dir).context("Failed to create run directory")?;
     // The gRPC/Docker sockets live in run_dir and are the daemon's only access
@@ -66,7 +69,6 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
     std::fs::create_dir_all(&layout.data_subdir)
         .context("Failed to create persistent data directory")?;
 
-    let dns_domain = dns_domain(args.dns_domain)?;
     let dns_port = dns_port(args.dns_port);
     let kubernetes_context = kubernetes_context(profile, args.kubernetes_context)?;
 
@@ -93,6 +95,18 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
             no_linux_vm: args.no_linux_vm,
         },
     })
+}
+
+fn validate_explicit_dns_resolver(
+    profile: ArcboxProfile,
+    enabled: bool,
+    domain: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        profile == ArcboxProfile::Production || !enabled || domain != DEFAULT_DNS_DOMAIN,
+        "development --install-dns-resolver requires a non-canonical --dns-domain"
+    );
+    Ok(())
 }
 
 /// Acquire the daemon lock, consuming the [`EarlyContext`].
@@ -371,7 +385,7 @@ fn kubernetes_context(profile: ArcboxProfile, requested: Option<String>) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::kubernetes_context;
+    use super::{DEFAULT_DNS_DOMAIN, kubernetes_context, validate_explicit_dns_resolver};
     use arcbox_constants::paths::ArcboxProfile;
 
     #[test]
@@ -390,6 +404,26 @@ mod tests {
         );
         assert!(
             kubernetes_context(ArcboxProfile::Development, Some("bad: value".to_owned())).is_err()
+        );
+    }
+
+    #[test]
+    fn development_cannot_claim_the_production_resolver_domain() {
+        assert!(
+            validate_explicit_dns_resolver(ArcboxProfile::Development, true, DEFAULT_DNS_DOMAIN)
+                .is_err()
+        );
+        assert!(
+            validate_explicit_dns_resolver(
+                ArcboxProfile::Development,
+                true,
+                "worktree.dev.arcbox.local"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_explicit_dns_resolver(ArcboxProfile::Production, true, DEFAULT_DNS_DOMAIN)
+                .is_ok()
         );
     }
 }

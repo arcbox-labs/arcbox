@@ -306,11 +306,12 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
     }
 
     let current_context = current_context(home).await?;
-    let restore_managed_context = should_restore_managed_context(
-        current_context.as_deref(),
-        state.managed_context.as_deref(),
-        managed_context_name(),
-    );
+    let restore_managed_context = owns_global_current_context(ArcboxProfile::from_env_or_default())
+        && should_restore_managed_context(
+            current_context.as_deref(),
+            state.managed_context.as_deref(),
+            managed_context_name(),
+        );
     let managed_context = refresh_managed_kubeconfig(home).await?;
     delete_context_entries(home, &managed_context).await?;
     merge_managed_kubeconfig(home).await?;
@@ -326,6 +327,10 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+fn owns_global_current_context(profile: ArcboxProfile) -> bool {
+    profile == ArcboxProfile::Production
 }
 
 fn should_restore_managed_context(
@@ -448,11 +453,18 @@ async fn execute_enable() -> Result<()> {
     let home = home_dir()?;
     install_kubernetes_tools(&home).await?;
 
-    let previous_context = current_context(&home).await?;
+    let owns_current_context = owns_global_current_context(ArcboxProfile::from_env_or_default());
+    let previous_context = if owns_current_context {
+        current_context(&home).await?
+    } else {
+        None
+    };
     let managed_context = refresh_managed_kubeconfig(&home).await?;
     delete_context_entries(&home, &managed_context).await?;
     merge_managed_kubeconfig(&home).await?;
-    set_current_context(&home, &managed_context).await?;
+    if owns_current_context {
+        set_current_context(&home, &managed_context).await?;
+    }
 
     save_state(
         &home,
@@ -465,7 +477,12 @@ async fn execute_enable() -> Result<()> {
     .await?;
 
     println!("Kubernetes integration enabled.");
-    println!("Current context: {managed_context}");
+    if owns_current_context {
+        println!("Current context: {managed_context}");
+    } else {
+        println!("Context added: {managed_context}");
+        println!("Select it explicitly with 'kubectl config use-context {managed_context}'.");
+    }
     println!("kubectl installed to {}", kubectl_bin(&home).display());
     Ok(())
 }
@@ -513,7 +530,10 @@ async fn execute_kubeconfig() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_managed_context_name, should_restore_managed_context};
+    use super::{
+        owns_global_current_context, resolve_managed_context_name, should_restore_managed_context,
+    };
+    use arcbox_constants::paths::ArcboxProfile;
 
     #[test]
     fn context_name_uses_old_daemon_fallback_only_when_missing() {
@@ -549,5 +569,11 @@ mod tests {
             Some("arcbox-dev-a"),
             "arcbox-dev"
         ));
+    }
+
+    #[test]
+    fn only_production_owns_the_global_current_context() {
+        assert!(owns_global_current_context(ArcboxProfile::Production));
+        assert!(!owns_global_current_context(ArcboxProfile::Development));
     }
 }
