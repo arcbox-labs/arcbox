@@ -65,8 +65,8 @@ path dependency this crate resolves against.
 Versions **0.6.3 and below on crates.io are not this crate**: they are
 the `arcbox` runtime facade — a re-export shell over `arcbox-core` and
 the VM crates — which this SDK replaced by taking the name. The API
-changes completely at 0.6.6, inside a version line semver says it
-shouldn't. The facade had no dependents on the registry and its
+changes completely at the first release that carries this SDK, inside
+a version line semver says it shouldn't. The facade had no dependents on the registry and its
 re-exports were commented out, so nothing can be broken by it, but a
 `arcbox = "0.6"` requirement written against the old crate does need
 rewriting rather than merely re-resolving.
