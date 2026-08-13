@@ -53,9 +53,9 @@ The restructure plan and its locked decisions live in the company repo:
 
 ## Durable writes
 
-Anything here that persists state writes through
-`common/arcbox-atomic-file` rather than hand-rolling temp-then-rename.
-Note it is **not** the same primitive as `arcbox-engine`'s private
+New code that atomically replaces a **file** uses
+`common/arcbox-atomic-file` rather than hand-rolling temp-then-rename. It
+is **not** the same primitive as `arcbox-engine`'s private
 `atomic_write`, which deliberately skips `fsync` for config files: the
 crate fsyncs the file *and* the parent directory, and reports
 `NotCommitted` separately from `DurabilityUncertain` so a caller can tell
@@ -63,3 +63,18 @@ crate fsyncs the file *and* the parent directory, and reports
 Pick the variant handling deliberately — a catalog that must not lie
 about what it persisted treats the second as an error; a record store may
 keep the record and warn.
+
+Two places in `arcbox-snapshot` still roll their own, and both are
+deliberate rather than missed:
+
+- `snapshot::PendingSnapshot::commit` renames a whole **directory** into
+  place. The crate covers files only; there is nothing to reuse.
+- `snapshot_cow::persistence::write_owner_marker` writes the
+  template-loop recovery markers. Migrating it is not a drop-in: it also
+  `create_dir_all`s the marker directory, chmods it `0o700`, and fsyncs
+  the **grandparent** so the directory creation itself is durable — and,
+  less obviously, `cleanup_stale_template_markers` reaps leftover temps
+  by matching the `TEMPLATE_MARKER_TEMP_PREFIX` (`.tmp-`) *prefix*, which
+  the crate's `.{stem}.{uuid}.tmp` names do not have. Migrate the writer
+  and that sweep together or crash recovery silently stops collecting
+  its own orphans.
