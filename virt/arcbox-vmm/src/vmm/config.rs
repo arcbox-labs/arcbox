@@ -166,11 +166,25 @@ impl VmBackend {
     /// the hardware separately
     /// ([`arcbox_hypervisor::host_nested_virt`]) — this only rules a
     /// backend out.
+    ///
+    /// Only macOS backends make this distinction — `VmBackend` selects
+    /// between Apple's two frameworks, and `Vmm::initialize` on Linux
+    /// (`vmm/linux.rs`) always boots through KVM regardless of this field,
+    /// so it is not even that platform's backend selector. Off macOS every
+    /// variant defers entirely to the hardware probe, matching what the
+    /// field actually controls there: nothing.
     #[must_use]
     pub const fn supports_nested_virt(self) -> bool {
-        match self {
-            Self::Hv => false,
-            Self::Vz => true,
+        #[cfg(target_os = "macos")]
+        {
+            match self {
+                Self::Hv => false,
+                Self::Vz => true,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
         }
     }
 }

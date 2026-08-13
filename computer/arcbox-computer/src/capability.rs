@@ -61,6 +61,11 @@ pub fn nested_virt_for_backend(backend: VmBackend) -> NestedVirtCapability {
 mod tests {
     use super::*;
 
+    // `VmBackend::Hv` only refuses nesting on macOS, where it names
+    // Hypervisor.framework specifically. Off macOS the enum selects
+    // nothing (see `VmBackend::supports_nested_virt`), so this case
+    // belongs with the cross-platform test below instead.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_backend_that_cannot_nest_is_refused_with_an_actionable_reason() {
         let capability = nested_virt_for_backend(VmBackend::Hv);
@@ -72,6 +77,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_nesting_backend_defers_to_the_hardware_probe() {
         let capability = nested_virt_for_backend(VmBackend::Vz);
@@ -80,5 +86,18 @@ mod tests {
         // supported capability carries no reason, an unsupported one always
         // does — an empty reason would reach the client as a bare error.
         assert_eq!(capability.supported, capability.reason.is_empty());
+    }
+
+    // Off macOS `VmBackend` is not a real backend selector (`Vmm::initialize`
+    // on Linux always boots through KVM regardless of it), so neither
+    // variant should pre-empt the hardware probe there.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_every_backend_defers_to_the_hardware_probe() {
+        for backend in [VmBackend::Hv, VmBackend::Vz] {
+            let capability = nested_virt_for_backend(backend);
+            assert_eq!(capability.supported, host_nested_virt().supported);
+            assert_eq!(capability.supported, capability.reason.is_empty());
+        }
     }
 }
