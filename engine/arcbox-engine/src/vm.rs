@@ -926,8 +926,9 @@ impl VmManager {
     /// * `target_bytes` - Target memory size in bytes
     ///
     /// # Errors
-    /// Returns an error if the VM is not found, not running, or balloon operation fails.
-    #[cfg(target_os = "macos")]
+    /// Returns an error if the VM is not found, not running, or balloon
+    /// operation fails — including on platforms with no balloon backend,
+    /// where `Vmm::set_balloon_target` reports the gap.
     pub fn set_balloon_target(&self, id: &VmId, target_bytes: u64) -> Result<()> {
         let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
 

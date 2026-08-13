@@ -12,9 +12,18 @@ use std::time::Duration;
 /// trigger a tokio/kqueue reactor stall when rapidly created and torn down in a
 /// retry loop, causing timer wakeups to stop firing. The blocking transport
 /// uses `libc::poll` + `std::os::unix::net::UnixStream` and never touches the
-/// tokio reactor.
+/// tokio reactor — so it is constructed only on macOS, though its arms stay
+/// compiled everywhere to keep the RPC bodies platform-free.
 pub(super) enum AgentTransport {
     Async(VsockTransport),
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "the HV socketpair is macOS-only, so its sole constructor \
+                      `AgentClient::from_fd_blocking` is too"
+        )
+    )]
     Blocking(BlockingVsockTransport),
 }
 

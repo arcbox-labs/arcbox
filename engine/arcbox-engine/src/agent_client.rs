@@ -45,7 +45,9 @@ use arcbox_connect::v1::{
 use arcbox_constants::ports::AGENT_PORT;
 use arcbox_constants::wire::MessageType;
 use arcbox_transport::Transport;
-use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
+#[cfg(target_os = "macos")]
+use arcbox_transport::vsock::BlockingVsockTransport;
+use arcbox_transport::vsock::{VsockAddr, VsockTransport};
 use buffa::Message;
 use bytes::Bytes;
 use std::time::{Duration, Instant};
