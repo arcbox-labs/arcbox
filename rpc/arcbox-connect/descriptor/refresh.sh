@@ -20,11 +20,26 @@ LIST="descriptor/protos.txt"
 # The one list, shared with build.rs. A second copy here would be a second
 # thing to forget when a proto is added, and the build would then fail with a
 # stale-descriptor message pointing at the wrong cause.
+#
+# One list is only half of it: the two readers have to agree on how to read it,
+# or the same failure returns through a different door. The rule below is
+# exactly build.rs's — trim, skip blank, skip a line whose first character is
+# '#' — with no inline comments and no internal whitespace stripping, because
+# those are things one parser can do and the other cannot.
+#
+# `|| [ -n "$line" ]` is the load-bearing part: `read` returns non-zero on a
+# final line with no trailing newline and bash would drop it, while Rust's
+# `str::lines()` keeps it. Strip the newline off protos.txt and without this
+# the last proto vanishes from protoc and the hash while build.rs still counts
+# it — the assert fires, and the refresh it names regenerates the mismatch.
 PROTOS=()
-while IFS= read -r line; do
-  line="${line%%#*}"
-  line="$(printf '%s' "$line" | tr -d '[:space:]')"
-  [ -n "$line" ] && PROTOS+=("$line")
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  case "$line" in
+    '' | '#'*) continue ;;
+  esac
+  PROTOS+=("$line")
 done < "$LIST"
 
 PROTOC="${PROTOC:-protoc}"
