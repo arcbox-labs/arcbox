@@ -288,7 +288,7 @@ pub(super) async fn release_runtime_resources(
             && let Err(error) = cow_manager.teardown_checked(&handle).await
         {
             arc.lock().unwrap().cow_handle = Some(handle);
-            return Err(error);
+            return Err(error.into());
         }
     }
     cow_manager.cleanup_setup_orphan(id).await?;

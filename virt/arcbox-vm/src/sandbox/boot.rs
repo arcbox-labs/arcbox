@@ -1,6 +1,7 @@
 use super::persistence::{SandboxRecordStore, SandboxTransition};
 use super::types::action;
 use super::*;
+use arcbox_snapshot::SnapshotError;
 
 type BootOutput = (Arc<fc_sdk::Vm>, PathBuf, vsock::ReadyListener);
 
@@ -823,7 +824,7 @@ pub(super) async fn stage_rootfs_cow_or_copy(
                         "mknod failed, falling back to rootfs copy"
                     );
                     if let Err(error) = cow_manager.teardown_checked(&handle).await {
-                        return Err(fail(error, Some(handle)));
+                        return Err(fail(error.into(), Some(handle)));
                     }
                     journal(None).map_err(|error| fail(error, None))?;
                     stage_rootfs_copy_for_jailer(chroot, rootfs, uid, gid)
@@ -833,7 +834,7 @@ pub(super) async fn stage_rootfs_cow_or_copy(
                 }
             }
         }
-        Err(e) if matches!(e, VmmError::Unavailable(_)) => Err(fail(e, None)),
+        Err(e) if matches!(e, SnapshotError::Unavailable(_)) => Err(fail(e.into(), None)),
         Err(e) => {
             debug!(
                 owner_id,
@@ -1143,8 +1144,8 @@ async fn do_boot(
                     }
                 }
                 Err(e) => {
-                    if matches!(e, VmmError::Unavailable(_)) {
-                        return Err(e);
+                    if matches!(e, SnapshotError::Unavailable(_)) {
+                        return Err(e.into());
                     }
                     debug!(
                         sandbox_id = %id,
@@ -1179,8 +1180,8 @@ async fn do_boot(
                     create_rootfs_symlink(vm_dir, &cow_handle.as_ref().unwrap().dm_device)?
                 }
                 Err(e) => {
-                    if matches!(e, VmmError::Unavailable(_)) {
-                        return Err(e);
+                    if matches!(e, SnapshotError::Unavailable(_)) {
+                        return Err(e.into());
                     }
                     debug!(
                         sandbox_id = %id,

@@ -36,3 +36,30 @@ The restructure plan and its locked decisions live in the company repo:
   without rebuilding the daemon changes nothing. The pin semantics and
   failure signatures stay documented in `app/AGENTS.md` ("Boot-asset
   pin").
+- `arcbox-snapshot` — snapshot lineage: the checkpoint catalog
+  (`snapshot`), the device-mapper copy-on-write rootfs manager checkpoints
+  are cloned through (`snapshot_cow`), and the template catalog that
+  promotes a snapshot into a versioned base image (`template_catalog`).
+  Consumed by `virt/arcbox-vm` guest-side today; the charter's snapshot
+  registry client belongs here rather than above it.
+  - The device-mapper paths only *do* anything on Linux (`dmsetup`, thin
+    pools) but compile everywhere, which is what lets the layer above
+    keep its own platform-neutrality promise.
+  - `CowManager`'s test seam (`CowTestProbe`, `new_with_test_probe`) is
+    behind the **`test-probe` feature**, not `#[cfg(test)]`: a
+    `cfg(test)` item does not exist for another crate's tests, and its
+    only consumer — `arcbox-vm`'s cleanup tests — now lives in one.
+    `arcbox-vm` turns the feature on in its dev-dependencies.
+
+## Durable writes
+
+Anything here that persists state writes through
+`common/arcbox-atomic-file` rather than hand-rolling temp-then-rename.
+Note it is **not** the same primitive as `arcbox-engine`'s private
+`atomic_write`, which deliberately skips `fsync` for config files: the
+crate fsyncs the file *and* the parent directory, and reports
+`NotCommitted` separately from `DurabilityUncertain` so a caller can tell
+"nothing happened" from "it happened, but might not survive power loss".
+Pick the variant handling deliberately — a catalog that must not lie
+about what it persisted treats the second as an error; a record store may
+keep the record and warn.

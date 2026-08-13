@@ -82,6 +82,16 @@ impl SandboxError {
     }
 }
 
+/// The snapshot layer reaches the wire through the table below rather
+/// than growing a second one: `arcbox-vm` already converts
+/// `SnapshotError` variant-for-variant, so the two stay in step by
+/// construction.
+impl From<arcbox_snapshot::SnapshotError> for SandboxError {
+    fn from(e: arcbox_snapshot::SnapshotError) -> Self {
+        Self::from(arcbox_vm::VmmError::from(e))
+    }
+}
+
 impl From<arcbox_vm::VmmError> for SandboxError {
     fn from(e: arcbox_vm::VmmError) -> Self {
         use arcbox_vm::VmmError;

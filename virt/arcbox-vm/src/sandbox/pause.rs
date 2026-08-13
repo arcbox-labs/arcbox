@@ -492,7 +492,7 @@ impl SandboxManager {
         if let Some(handle) = cow_handle {
             if let Err(error) = self.cow_manager.detach_keep_cow(&handle).await {
                 arc.lock().unwrap().cow_handle = Some(handle);
-                return Err(error);
+                return Err(error.into());
             }
             // A slot-keyed overlay must become sandbox-keyed: resume's
             // `reattach`, the restart sweep's keep-list, and `Remove` all

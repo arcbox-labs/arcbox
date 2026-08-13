@@ -9,7 +9,7 @@ use super::{
     BUSYBOX, CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
     TEMPLATE_PENDING_PREFIX, dmsetup_remove, losetup_detach,
 };
-use crate::error::{Result, VmmError};
+use crate::error::{Result, SnapshotError};
 
 #[derive(Clone, Default)]
 pub(super) struct SetupOrphan {
@@ -43,10 +43,7 @@ impl CowManager {
     /// so Resume can re-assemble the dm-snapshot with every written block
     /// intact (CORE-21). Deleting those files here would silently destroy a
     /// paused sandbox's disk across an agent restart.
-    pub(crate) fn reconcile_stale(
-        &self,
-        keep_cow_ids: &std::collections::HashSet<String>,
-    ) -> Result<()> {
+    pub fn reconcile_stale(&self, keep_cow_ids: &std::collections::HashSet<String>) -> Result<()> {
         let dmsetup = self.dmsetup_bin.as_deref();
 
         // 1. Remove stale dm devices first — they pin the loop devices
@@ -113,7 +110,7 @@ impl CowManager {
 
     pub(super) fn write_template_marker(&self, loop_dev: &str, template_path: &Path) -> Result<()> {
         let Some(marker) = self.template_marker_path(loop_dev) else {
-            return Err(VmmError::DeviceMapper(format!(
+            return Err(SnapshotError::DeviceMapper(format!(
                 "unparseable template loop device: {loop_dev}"
             )));
         };
@@ -140,8 +137,8 @@ impl CowManager {
         pending: &Path,
         loop_device: Option<&str>,
         template_path: &Path,
-        error: VmmError,
-    ) -> VmmError {
+        error: SnapshotError,
+    ) -> SnapshotError {
         let mut failures = Vec::new();
         let detached = match loop_device {
             Some(loop_device) => match self.detach_template_loop(loop_device).await {
@@ -181,7 +178,7 @@ impl CowManager {
             let entry = entry?;
             let marker_path = entry.path();
             let Some(loop_basename) = marker_path.file_name().and_then(|n| n.to_str()) else {
-                return Err(VmmError::DeviceMapper(format!(
+                return Err(SnapshotError::DeviceMapper(format!(
                     "invalid template marker path: {}",
                     marker_path.display()
                 )));
@@ -192,7 +189,7 @@ impl CowManager {
             }
             let expected_backing = std::fs::read_to_string(&marker_path)?.trim().to_string();
             if expected_backing.is_empty() {
-                return Err(VmmError::DeviceMapper(format!(
+                return Err(SnapshotError::DeviceMapper(format!(
                     "empty template marker: {}",
                     marker_path.display()
                 )));
@@ -238,15 +235,17 @@ impl CowManager {
         dm_name: Option<&str>,
         cow_loop: Option<&str>,
         cow_file: Option<&Path>,
-        error: VmmError,
-    ) -> VmmError {
+        error: SnapshotError,
+    ) -> SnapshotError {
         let mut failures = Vec::new();
         let mut orphan = SetupOrphan::default();
         let dm_removed = match dm_name {
             Some(dm_name) if Path::new(&format!("/dev/mapper/{dm_name}")).exists() => {
                 let cleanup = match self.dmsetup_bin.as_deref() {
                     Some(dmsetup) => dmsetup_remove(dmsetup, dm_name).await,
-                    None => Err(VmmError::DeviceMapper("dmsetup binary not found".into())),
+                    None => Err(SnapshotError::DeviceMapper(
+                        "dmsetup binary not found".into(),
+                    )),
                 };
                 match cleanup {
                     Ok(()) => true,
@@ -297,7 +296,7 @@ impl CowManager {
         incomplete_cleanup(error, failures)
     }
 
-    pub(crate) async fn cleanup_setup_orphan(&self, sandbox_id: &str) -> Result<()> {
+    pub async fn cleanup_setup_orphan(&self, sandbox_id: &str) -> Result<()> {
         let Some(orphan) = self.setup_orphans.lock().unwrap().get(sandbox_id).cloned() else {
             return Ok(());
         };
@@ -308,7 +307,7 @@ impl CowManager {
             let dmsetup = self
                 .dmsetup_bin
                 .as_deref()
-                .ok_or_else(|| VmmError::DeviceMapper("dmsetup binary not found".into()))?;
+                .ok_or_else(|| SnapshotError::DeviceMapper("dmsetup binary not found".into()))?;
             dmsetup_remove(dmsetup, dm_name).await?;
         }
         if let (Some(cow_loop), Some(cow_file)) = (&orphan.cow_loop, &orphan.cow_file)
@@ -390,10 +389,10 @@ impl CowManager {
 fn write_owner_marker(marker: &Path, backing: &Path) -> Result<()> {
     let parent = marker
         .parent()
-        .ok_or_else(|| VmmError::DeviceMapper("resource marker has no parent".into()))?;
+        .ok_or_else(|| SnapshotError::DeviceMapper("resource marker has no parent".into()))?;
     let name = marker
         .file_name()
-        .ok_or_else(|| VmmError::DeviceMapper("resource marker has no file name".into()))?;
+        .ok_or_else(|| SnapshotError::DeviceMapper("resource marker has no file name".into()))?;
     std::fs::create_dir_all(parent)?;
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     let temporary = parent.join(format!(
@@ -425,7 +424,7 @@ pub(super) fn clear_owner_marker(marker: &Path) -> Result<()> {
     }
     let parent = marker
         .parent()
-        .ok_or_else(|| VmmError::DeviceMapper("resource marker has no parent".into()))?;
+        .ok_or_else(|| SnapshotError::DeviceMapper("resource marker has no parent".into()))?;
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -438,7 +437,7 @@ pub(super) fn remove_file_durable(path: &Path) -> Result<()> {
     }
     let parent = path
         .parent()
-        .ok_or_else(|| VmmError::DeviceMapper("owned file has no parent".into()))?;
+        .ok_or_else(|| SnapshotError::DeviceMapper("owned file has no parent".into()))?;
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -483,12 +482,15 @@ fn loop_backing_path(loop_name: &str) -> Result<Option<String>> {
     }
 }
 
-fn incomplete_cleanup(error: VmmError, failures: impl IntoIterator<Item = String>) -> VmmError {
+fn incomplete_cleanup(
+    error: SnapshotError,
+    failures: impl IntoIterator<Item = String>,
+) -> SnapshotError {
     let failures: Vec<_> = failures.into_iter().collect();
     if failures.is_empty() {
         error
     } else {
-        VmmError::Unavailable(format!(
+        SnapshotError::Unavailable(format!(
             "{error}; resource rollback is incomplete: {}",
             failures.join("; ")
         ))
@@ -498,11 +500,11 @@ fn incomplete_cleanup(error: VmmError, failures: impl IntoIterator<Item = String
 fn run_sync_checked(command: &mut Command) -> Result<std::process::Output> {
     let output = command
         .output()
-        .map_err(|error| VmmError::DeviceMapper(format!("command spawn: {error}")))?;
+        .map_err(|error| SnapshotError::DeviceMapper(format!("command spawn: {error}")))?;
     if output.status.success() {
         Ok(output)
     } else {
-        Err(VmmError::DeviceMapper(
+        Err(SnapshotError::DeviceMapper(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ))
     }

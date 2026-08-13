@@ -132,6 +132,30 @@ pub enum VmmError {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, VmmError>;
 
+/// Variant-for-variant, so a snapshot or template failure keeps the exact
+/// shape callers already match on — the daemon maps `TemplateNotFound`
+/// and `TemplateVersionExists` onto their own wire codes, and folding
+/// either into a generic error would change the surface.
+impl From<arcbox_snapshot::SnapshotError> for VmmError {
+    fn from(err: arcbox_snapshot::SnapshotError) -> Self {
+        use arcbox_error::CommonError;
+        use arcbox_snapshot::SnapshotError as S;
+        match err {
+            S::Common(CommonError::Io(io)) => Self::Io(io),
+            S::Common(CommonError::Config(msg)) => Self::Config(msg),
+            S::Common(CommonError::NotFound(msg)) => Self::NotFound(msg),
+            S::Common(CommonError::AlreadyExists(msg)) => Self::AlreadyExists(msg),
+            S::Common(other) => Self::Other(other.to_string()),
+            S::Snapshot(msg) => Self::Snapshot(msg),
+            S::DeviceMapper(msg) => Self::DeviceMapper(msg),
+            S::TemplateNotFound(msg) => Self::TemplateNotFound(msg),
+            S::TemplateVersionExists(msg) => Self::TemplateVersionExists(msg),
+            S::FailedPrecondition(msg) => Self::FailedPrecondition(msg),
+            S::Unavailable(msg) => Self::Unavailable(msg),
+        }
+    }
+}
+
 /// A durable write that never landed is an I/O failure; one that landed
 /// without a confirmed rename is [`VmmError::Unavailable`] — the caller
 /// may retry, and the retry is safe because the write is idempotent.

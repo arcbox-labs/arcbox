@@ -203,6 +203,7 @@ dependencies = [
  "arcbox-ext4",
  "arcbox-logging",
  "arcbox-pty",
+ "arcbox-snapshot",
  "arcbox-vm",
  "async-trait",
  "buffa",
@@ -1034,6 +1035,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-snapshot"
+version = "0.6.6"
+dependencies = [
+ "arcbox-atomic-file",
+ "arcbox-error",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "arcbox-transport"
 version = "0.6.6"
 dependencies = [
@@ -1164,6 +1182,8 @@ version = "0.6.6"
 dependencies = [
  "anyhow",
  "arcbox-atomic-file",
+ "arcbox-error",
+ "arcbox-snapshot",
  "aya",
  "chrono",
  "fc-sdk",
