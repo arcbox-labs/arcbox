@@ -9,10 +9,6 @@ jobs:
   release-please:
     name: Release Please
     runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -81,37 +77,7 @@ jobs:
             echo "::endgroup::"
           done
 
-  # Bump the daemon arcbox-desktop embeds when a new release is created.
-  #
-  # This job only announces the tag. Writing arcbox.version is half a bump —
-  # the generated Swift gRPC client is pinned to the same ref and desktop CI
-  # rejects a PR where the two disagree — and regenerating that client needs
-  # macOS and Xcode. So arcbox-desktop owns the bump in its own `Bump ArcBox`
-  # workflow and this dispatches it. Dispatch is fire-and-forget: a failure
-  # there surfaces in that repo's Actions tab, not in this release run.
-  update-desktop:
-    name: Update arcbox-desktop
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          repositories: arcbox-desktop
-          # The bump workflow mints its own token for the branch and the PR;
-          # this one only has to start it.
-          permission-actions: write
-
-      - name: Dispatch the arcbox-desktop bump
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
-        run: |
-          gh workflow run bump-arcbox.yml \
-            --repo arcboxlabs/arcbox-desktop \
-            --ref master \
-            --field version="$TAG"
+  # The arcbox-desktop bump used to be dispatched from here, on release_created.
+  # It now lives in Release Build's `update-desktop`, which waits for the
+  # binaries to be attached — a tag alone is not something desktop can build
+  # against. See that job for why.

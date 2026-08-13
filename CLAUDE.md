@@ -117,6 +117,47 @@ When asked to plan, the plan must be fully resolved before implementation begins
 - PR merges are squash-only (merge commits are disabled on the repo). For stacked PRs, merge the base PR first — and expect GitHub to close the stacked PR when the base branch is deleted; recovery is: re-push the old base ref, reopen the PR, retarget it to master, delete the ref again, then close/reopen once more to trigger CI (pushes made while a PR is closed fire no events).
 - Review-bot findings (pullfrog/Codex/Greptile) get verified against the code first, then either fixed with a reply + thread resolution, or refuted with evidence in the reply. Never resolve a thread silently.
 
+## Releasing (the ordering is the contract)
+
+A release runs: merge the release PR → release-please creates the tag **and a
+draft GitHub release** → the tag push starts `Release Build` →
+`package-and-release` attaches the tarball and *then* publishes → the
+arcbox-desktop bump is announced. Each arrow is load-bearing; changing one
+without the others reintroduces a failure already paid for.
+
+- **The release stays a draft until its assets exist.** `release-please-config.json`
+  sets `draft` + `force-tag-creation`. v0.6.4 published the moment its tag was
+  cut, its macOS build then timed out, and the assetless release sat at the top
+  of the releases page — and told arcbox-desktop to bump to it, whose DMG build
+  failed eight hours later on a missing protoc, three layers from the cause.
+- **`force-tag-creation` is not optional alongside `draft`.** GitHub withholds
+  the git tag for a draft release, and `Release Build` triggers on tag pushes;
+  without it nothing builds at all.
+- **`draft` belongs on the root package only.** `fleet`, `sdk/typescript` and
+  `sdk/python` publish from other workflows and would sit as drafts forever.
+  Their tags carry component prefixes, so they never trigger `Release Build`.
+- **Publishing uses the app token, not `GITHUB_TOKEN`.** A draft created by one
+  integration cannot be modified by another — arcbox-desktop spent a release
+  cycle discovering that as a 403 on the update, *after* finding the draft.
+  Keep that token narrowed to this repo and to contents.
+- **`update-desktop` waits for the assets and is not gated on the trigger.**
+  `workflow_dispatch` is how a half-finished release is recovered, which is the
+  case that job exists for; gating on `push` would re-attach assets there and
+  leave desktop un-bumped in silence. The guard that replaces it is a
+  *newest-release* check, not a trigger check: the dispatch `tag` is free-form
+  and flows straight into the bump, so recovering a superseded tag would
+  propose moving desktop's `arcbox.version` **backwards**. A redundant bump is
+  cheap; a downgrade is not. Do not remove that check believing the worst case
+  is a no-op.
+- **The release cache is written from master, never from a tag.** A tag cannot
+  read another tag's caches, so no release can warm the next one. `ci.yml`
+  writes `macOS-cargo-release-*`; `Release Build` restores only, and must not
+  fall back to CI's `macOS-cargo-` debug cache — that fallback made the build
+  look cached while it recompiled the whole graph.
+- **A red release run is not evidence of a missing artifact, and green is not
+  evidence of a present one.** Check `gh release view <tag> --json assets`
+  before concluding anything about a release.
+
 ## Licensing
 
 - All crates: MIT OR Apache-2.0

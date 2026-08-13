@@ -149,7 +149,7 @@ jobs:
   build-macos-arm64:
     name: Build macOS ARM64
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -164,11 +164,22 @@ jobs:
         timeout-minutes: 5
         run: brew install protobuf
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      # Restore only. A cache saved here lands in this tag's scope, and GitHub
+      # does not let one tag read another tag's caches — every release would
+      # save a few GB that nothing can ever read. The entry this restores is
+      # written by ci.yml's `warm-release-cache` job on master, which is a
+      # scope tags *can* read.
+      #
+      # No `${{ runner.os }}-cargo-` fallback: that key belongs to CI's debug
+      # cache, and a debug `target/` shares nothing with a release build beyond
+      # the registry download. Matching it made the build look cached while it
+      # recompiled the whole dependency graph — which is how v0.6.4 hit the
+      # old 15-minute step timeout and shipped a release with no assets.
+      - name: Restore release build cache
+        id: cargo_cache
+        uses: actions/cache/restore@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -176,7 +187,11 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-release-
-            ${{ runner.os }}-cargo-
+
+      - name: Report cache state
+        run: |
+          echo "Exact release-cache hit: ${{ steps.cargo_cache.outputs.cache-hit }}"
+          echo "Restored from: ${{ steps.cargo_cache.outputs.cache-matched-key }}"
 
       - name: Import signing certificate
         env:
@@ -217,8 +232,13 @@ jobs:
           echo "$APPLE_PROVISIONING_PROFILE" | base64 --decode \
             > "$PROFILE_DIR/arcbox-daemon.provisionprofile"
 
+      # 40 minutes, not 15. The warm cache carries the dependency graph but is
+      # keyed on Cargo.lock alone, so every workspace member still compiles
+      # here — and those are not cheap (arcbox-api alone ran past six minutes
+      # on v0.6.4). A release must not fail for being slow; it is the timeout
+      # of last resort, not a budget.
       - name: Build arcbox binaries (release)
-        timeout-minutes: 15
+        timeout-minutes: 40
         run: cargo build --release --locked -p arcbox-cli -p arcbox-daemon -p arcbox-helper
 
       - name: Codesign arcbox-daemon
@@ -333,10 +353,33 @@ jobs:
     name: Package & Upload Release
     needs: [version, build-macos-arm64, build-agent]
     runs-on: ubuntu-latest
+    # contents: read is for the checkout below. The releases API is spoken to
+    # with the app token instead — see the token step.
     permissions:
-      contents: write
+      contents: read
 
     steps:
+      # release-please cuts the release as a draft (see release-please-config
+      # .json) and does it as this app. GITHUB_TOKEN cannot modify another
+      # integration's draft — arcbox-desktop learned that the hard way on
+      # v1.34.5, taking a 403 on the update after finding the draft fine. So
+      # publish as the app that owns it.
+      #
+      # Narrowed to this repository and to contents, because the job around it
+      # was just dropped to `contents: read` — which makes this the only
+      # elevated credential in scope, and an un-narrowed installation token
+      # carries every permission the app holds in every repo it is installed
+      # on. Flipping a draft to published needs contents: write here, nothing
+      # else.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          repositories: arcbox
+          permission-contents: write
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -358,10 +401,16 @@ jobs:
       - name: Create desktop tarball
         run: cargo xtask release package-tarball --version "${{ needs.version.outputs.version }}"
 
-      - name: Upload assets to GitHub Release
+      # `draft: false` is what publishes it: the action uploads the tarball into
+      # the draft first and flips it afterwards. A build that fails before this
+      # point therefore leaves a draft, not the assetless release v0.6.4 left
+      # sitting at the top of the releases page for eight hours.
+      - name: Publish GitHub Release with assets
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ steps.app-token.outputs.token }}
           tag_name: ${{ needs.version.outputs.version }}
+          draft: false
           files: |
             *.tar.gz
             *.tar.gz.sha256
@@ -393,3 +442,63 @@ jobs:
           access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
           version: ${{ needs.version.outputs.version }}
           links: https://github.com/${{ github.repository }}/releases/tag/${{ needs.version.outputs.version }}
+
+  # ==========================================================================
+  # Bump the daemon arcbox-desktop embeds, once this release is installable.
+  #
+  # This used to fire from Release Please the moment a tag was cut, which meant
+  # desktop was told about a version whose binaries did not exist yet. v0.6.4
+  # is what that costs: the macOS build timed out, desktop was bumped anyway,
+  # and its DMG build then failed on a release with no assets. Gating on
+  # package-and-release makes the announcement mean "downloadable".
+  #
+  # This job only announces the tag. Writing arcbox.version is half a bump —
+  # the generated Swift gRPC client is pinned to the same ref and desktop CI
+  # rejects a PR where the two disagree — and regenerating that client needs
+  # macOS and Xcode. So arcbox-desktop owns the bump in its own `Bump ArcBox`
+  # workflow and this dispatches it. Dispatch is fire-and-forget: a failure
+  # there surfaces in that repo's Actions tab, not in this release run.
+  # ==========================================================================
+  update-desktop:
+    name: Update arcbox-desktop
+    needs: [version, package-and-release]
+    # Deliberately not gated on the trigger. workflow_dispatch is how a release
+    # that died mid-way gets recovered — the v0.6.4 case this job exists for —
+    # and gating on `push` would re-attach the assets on that path and then
+    # leave desktop un-bumped, silently. `needs: package-and-release` already
+    # means the binaries are attached, which is the condition that matters. A
+    # redundant bump PR is cheap; a missing one is what cost us a release.
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          repositories: arcbox-desktop
+          # The bump workflow mints its own token for the branch and the PR;
+          # this one only has to start it.
+          permission-actions: write
+
+      # The tag is free-form on the workflow_dispatch path and flows straight
+      # into the bump, so recovering a superseded tag would propose moving
+      # desktop's arcbox.version *backwards*. A redundant bump is cheap; a
+      # downgrade is not. Only the newest release announces itself.
+      - name: Dispatch the arcbox-desktop bump
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release view --json tagName --jq .tagName)
+          if [ "$TAG" != "$latest" ]; then
+            echo "::notice::$TAG is superseded by $latest; not bumping desktop backwards"
+            exit 0
+          fi
+          gh workflow run bump-arcbox.yml \
+            --repo arcboxlabs/arcbox-desktop \
+            --ref master \
+            --field version="$TAG"
