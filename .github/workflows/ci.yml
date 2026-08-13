@@ -118,11 +118,19 @@ jobs:
   # neutrality (architecture charter, company repo; engine/AGENTS.md: "every
   # crate must compile and pass unit tests on Linux as well as macOS"): this
   # job keeps darwin-only deps target-gated so a Linux host build never rots
-  # again, and actually runs the crates' unit tests rather than stopping at
-  # `cargo check` — a macOS-only symbol reintroduced into a `#[cfg(test)]`
-  # module compiles clean under `check --all-targets` and only breaks at
-  # `cargo test`, which is exactly the gap this job exists to close. Every
-  # KVM-touching test in `arcbox-hypervisor` is already `#[ignore]`d
+  # again. `--all-targets` on the check step is load-bearing: a plain
+  # `cargo check` skips test targets, so a macOS-only symbol reintroduced
+  # into a `#[cfg(test)]` module (as happened once already) would pass while
+  # still breaking `cargo test` on Linux — `--all-targets` builds the
+  # `lib test` target and type-checks it.
+  #
+  # The test step covers the two things `--all-targets` still cannot: it
+  # RUNS the tests (a Linux/macOS behavioral difference type-checks fine —
+  # see the splicetcp note below), and it compiles DOCTESTS, which no
+  # `cargo check` invocation ever does. That second gap was not theoretical:
+  # `LinuxTap`'s doctest had been calling a trait method without importing
+  # the trait since the Linux arm was revived, and only this step caught it.
+  # Every KVM-touching test in `arcbox-hypervisor` is already `#[ignore]`d
   # ("Requires /dev/kvm", not available on this runner); the netlink/tap
   # tests in `arcbox-net` self-skip at runtime when not root. `splicetcp` is
   # the one crate checked but not tested: two of its tcp_bridge tests
@@ -131,10 +139,12 @@ jobs:
   # swallows the whole payload and the tests' own "this must exercise the
   # partial-take path" guards fire. The guards are right — they refuse to
   # pass vacuously — but the constant is macOS-calibrated; sizing the
-  # payload against the *granted* buffer would let them run here too. A
-  # second step
-  # repeats the *check* (not the tests — a musl-arm64 test binary can't run
-  # on this x86_64 runner without emulation) on aarch64-unknown-linux-musl
+  # payload against the *granted* buffer would let them run here too. That
+  # pair is also the reason the test step exists at all: it type-checks
+  # identically on both platforms and only diverges when run.
+  #
+  # A second step repeats the *check* (not the tests — a musl-arm64 test
+  # binary can't run on this x86_64 runner) on aarch64-unknown-linux-musl
   # (the real cross-compile target, see root CLAUDE.md "Guest Agent
   # Cross-Compilation") because gnu/musl and x86_64/aarch64 each pick
   # different concrete types for a few libc primitives (e.g. `c_char`'s
