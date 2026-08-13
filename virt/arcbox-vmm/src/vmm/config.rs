@@ -157,6 +157,22 @@ impl VmBackend {
             _ => None,
         }
     }
+
+    /// Whether this backend can run a nested guest at all.
+    ///
+    /// A property of the backend, independent of the host: the custom HV
+    /// VMM exposes no `/dev/kvm` to its guest, so nothing inside can boot
+    /// a VM however capable the hardware is. Callers still have to check
+    /// the hardware separately
+    /// ([`arcbox_hypervisor::host_nested_virt`]) — this only rules a
+    /// backend out.
+    #[must_use]
+    pub const fn supports_nested_virt(self) -> bool {
+        match self {
+            Self::Hv => false,
+            Self::Vz => true,
+        }
+    }
 }
 
 /// VMM state.

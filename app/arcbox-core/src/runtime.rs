@@ -454,6 +454,17 @@ impl Runtime {
         self.vm_lifecycle.backend()
     }
 
+    /// Whether this host can run sandboxes on the System VM's *current*
+    /// backend, and why not when it cannot.
+    ///
+    /// Re-evaluated per call because `switch_system_vm_backend` changes
+    /// the backend half at runtime; the hardware probe underneath is
+    /// cached for the life of the process.
+    #[must_use]
+    pub fn sandbox_nested_virt(&self) -> arcbox_computer::NestedVirtCapability {
+        arcbox_computer::nested_virt_for_backend(self.system_vm_backend())
+    }
+
     /// Switches the System VM's hypervisor backend (HV <-> VZ) and restarts the
     /// VM so it takes effect.
     ///

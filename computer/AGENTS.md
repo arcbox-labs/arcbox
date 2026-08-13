@@ -33,6 +33,23 @@ and its locked decisions live in the company repo:
   host-bind with compensating rollbacks, the generation-fenced list
   snapshot, host-half-first unexpose), `locks` (weak-map per-`(machine,
   sandbox)` operation locks), `host` (the `SandboxHost` seam + Arc
-  blanket impl). Domain errors are modeled, not stringified
+  blanket impl), `capability` (can this host run sandboxes at all).
+  Domain errors are modeled, not stringified
   (`ExposePortError::Raced`, `ListExposedPortsError::Unstable`) — the
   arcbox-api adapters map them onto Connect codes.
+
+## Reaching the platform without a `#[cfg]`
+
+`capability` is the reference for how this layer asks a platform
+question. It composes two halves, neither of which it implements:
+`VmBackend::supports_nested_virt` (a property of the backend, defined
+with the enum in `arcbox-vmm`) and `arcbox_hypervisor::host_nested_virt`
+(the hardware/kernel probe, which carries the *platform's own* reason
+string so the caller does not have to write one per target). Both arrive
+re-exported from `arcbox-engine`, which is why this crate depends on
+neither `arcbox-vmm` nor `arcbox-hypervisor` directly (charter D4).
+
+The rule it embodies: a `#[cfg(target_os)]` in this layer means a
+platform difference leaked past its seam. Push the difference down to
+where the platform knowledge already lives, and let this layer compose
+the answers.
