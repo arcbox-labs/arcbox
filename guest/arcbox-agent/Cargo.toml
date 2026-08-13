@@ -55,6 +55,7 @@ buffa-types = "0.9.1"
 arcbox-pty.workspace = true
 tokio-vsock = "0.5"
 arcbox-vm = { workspace = true }
+arcbox-snapshot = { workspace = true }
 tonic.workspace = true
 tonic-prost.workspace = true
 tower.workspace = true

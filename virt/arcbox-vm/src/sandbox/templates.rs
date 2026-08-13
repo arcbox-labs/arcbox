@@ -21,6 +21,7 @@ use crate::snapshot::{SnapshotDraft, SnapshotGeometry};
 use crate::template_catalog::{
     ReleasedArtifacts, ResolvedTemplate, TEMPLATE_LABEL, TemplateDefaultsSpec, TemplateEntry,
 };
+use arcbox_snapshot::SnapshotError;
 
 /// A checkpoint copied into template ownership: everything the build
 /// orchestrator needs to assemble the catalog entry.
@@ -41,13 +42,13 @@ pub struct PromotedSnapshot {
 impl SandboxManager {
     /// Resolve a `name[:version]` catalog reference.
     pub fn get_template(&self, reference: &str) -> Result<ResolvedTemplate> {
-        self.templates.resolve(reference)
+        self.templates.resolve(reference).map_err(Into::into)
     }
 
     /// Every catalog row: `(name, entry)` — published versions in publish
     /// order, then the draft, grouped by name.
     pub fn list_templates(&self) -> Result<Vec<(String, TemplateEntry)>> {
-        self.templates.list()
+        self.templates.list().map_err(Into::into)
     }
 
     /// Install a built entry as `name`'s draft, reclaiming any warm snapshot
@@ -302,9 +303,9 @@ impl SandboxManager {
             match self.snapshots.delete_by_id(snapshot_id) {
                 Ok(()) => {}
                 // `find_by_id` reports a missing snapshot as
-                // `VmmError::Snapshot("… not found")` — benign here: a retried
-                // mutation already deleted it.
-                Err(crate::error::VmmError::Snapshot(msg)) if msg.ends_with("not found") => {}
+                // `SnapshotError::Snapshot("… not found")` — benign here: a
+                // retried mutation already deleted it.
+                Err(SnapshotError::Snapshot(msg)) if msg.ends_with("not found") => {}
                 Err(error) => warn!(
                     snapshot_id,
                     %error,

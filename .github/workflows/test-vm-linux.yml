@@ -6,6 +6,11 @@ on:
     paths:
       - "guest/arcbox-agent/**"
       - "virt/arcbox-vm/**"
+      # The snapshot catalog and the device-mapper CoW manager moved out of
+      # arcbox-vm; this suite is still the only one that drives dmsetup and
+      # thin pools on real KVM, so it has to follow them.
+      - "engine/arcbox-snapshot/**"
+      - "common/arcbox-atomic-file/**"
       - "common/arcbox-constants/**"
       - "rpc/arcbox-protocol/**"
       - "Cargo.toml"
@@ -16,6 +21,11 @@ on:
     paths:
       - "guest/arcbox-agent/**"
       - "virt/arcbox-vm/**"
+      # The snapshot catalog and the device-mapper CoW manager moved out of
+      # arcbox-vm; this suite is still the only one that drives dmsetup and
+      # thin pools on real KVM, so it has to follow them.
+      - "engine/arcbox-snapshot/**"
+      - "common/arcbox-atomic-file/**"
       - "common/arcbox-constants/**"
       - "rpc/arcbox-protocol/**"
       - "Cargo.toml"
@@ -59,15 +69,15 @@ jobs:
           restore-keys: linux-cargo-
 
       - name: Check formatting
-        run: cargo fmt -p arcbox-vm --check
+        run: cargo fmt -p arcbox-vm -p arcbox-snapshot --check
 
       - name: Clippy
-        run: cargo clippy -p arcbox-vm -- -D warnings
+        run: cargo clippy -p arcbox-vm -p arcbox-snapshot -- -D warnings
 
       - name: Unit tests
         # --bins covers the vm-agent guest handlers, whose tests are
         # target_os = "linux" and never run under the macOS workspace job.
-        run: cargo test --lib --bins -p arcbox-vm
+        run: cargo test --lib --bins -p arcbox-vm -p arcbox-snapshot
 
   # ---------------------------------------------------------------------------
   # Job 2: integration tests — requires root (TAP interface creation)

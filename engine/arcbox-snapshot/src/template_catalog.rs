@@ -23,8 +23,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::atomic_file;
-use crate::error::{Result, VmmError};
+use crate::error::{Result, SnapshotError};
 
 /// Directory under the vmm data dir holding one JSON file per template name.
 const CATALOG_DIR: &str = "template-catalog";
@@ -240,7 +239,7 @@ impl TemplateCatalog {
     /// when there is no draft (the earlier attempt committed) or when the
     /// draft's digest matches the published content — releasing that draft's
     /// exclusively-owned artifacts; a digest clash is
-    /// [`VmmError::TemplateVersionExists`] (the divergent draft survives for
+    /// [`SnapshotError::TemplateVersionExists`] (the divergent draft survives for
     /// publishing under a new version, and a later `put_draft` releases it).
     pub fn publish(&self, name: &str, version: &str) -> Result<PublishOutcome> {
         validate_template_name(name)?;
@@ -248,7 +247,7 @@ impl TemplateCatalog {
         let _guard = self.lock.lock().unwrap();
         let mut record = self
             .read_record(name)?
-            .ok_or_else(|| VmmError::TemplateNotFound(name.to_string()))?;
+            .ok_or_else(|| SnapshotError::TemplateNotFound(name.to_string()))?;
         if let Some(existing) = record.versions.iter().find(|e| e.version == version) {
             let existing = existing.clone();
             return match record.draft.as_ref() {
@@ -268,13 +267,13 @@ impl TemplateCatalog {
                         released,
                     })
                 }
-                Some(_) => Err(VmmError::TemplateVersionExists(format!(
+                Some(_) => Err(SnapshotError::TemplateVersionExists(format!(
                     "{name}:{version} is already published with different content"
                 ))),
             };
         }
         let mut entry = record.draft.take().ok_or_else(|| {
-            VmmError::FailedPrecondition(format!(
+            SnapshotError::FailedPrecondition(format!(
                 "template {name} has no draft to publish; run Build first"
             ))
         })?;
@@ -292,7 +291,7 @@ impl TemplateCatalog {
         let (name, version) = parse_reference(reference)?;
         let record = self
             .read_record(name)?
-            .ok_or_else(|| VmmError::TemplateNotFound(reference.to_string()))?;
+            .ok_or_else(|| SnapshotError::TemplateNotFound(reference.to_string()))?;
         let entry = match version {
             Some(v) => record.versions.iter().find(|e| e.version == v).cloned(),
             None => record
@@ -301,7 +300,7 @@ impl TemplateCatalog {
                 .cloned()
                 .or_else(|| record.draft.clone()),
         }
-        .ok_or_else(|| VmmError::TemplateNotFound(reference.to_string()))?;
+        .ok_or_else(|| SnapshotError::TemplateNotFound(reference.to_string()))?;
         Ok(ResolvedTemplate {
             name: record.name,
             entry,
@@ -328,7 +327,7 @@ impl TemplateCatalog {
         let _guard = self.lock.lock().unwrap();
         let mut record = self
             .read_record(name)?
-            .ok_or_else(|| VmmError::TemplateNotFound(reference.to_string()))?;
+            .ok_or_else(|| SnapshotError::TemplateNotFound(reference.to_string()))?;
         let removed: Vec<TemplateEntry> = match version {
             None => {
                 let mut entries: Vec<_> = record.versions.drain(..).collect();
@@ -341,7 +340,7 @@ impl TemplateCatalog {
                     .versions
                     .iter()
                     .position(|e| e.version == v)
-                    .ok_or_else(|| VmmError::TemplateNotFound(reference.to_string()))?;
+                    .ok_or_else(|| SnapshotError::TemplateNotFound(reference.to_string()))?;
                 let entry = record.versions.remove(index);
                 self.write_record(&record)?;
                 vec![entry]
@@ -444,7 +443,7 @@ impl TemplateCatalog {
         match std::fs::read_to_string(self.record_path(name)) {
             Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(VmmError::Io(e)),
+            Err(e) => Err(SnapshotError::from(e)),
         }
     }
 
@@ -456,12 +455,12 @@ impl TemplateCatalog {
             return Ok(Vec::new());
         }
         let mut records = Vec::new();
-        for dirent in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
-            let path = dirent.map_err(VmmError::Io)?.path();
+        for dirent in std::fs::read_dir(&self.root).map_err(SnapshotError::from)? {
+            let path = dirent.map_err(SnapshotError::from)?.path();
             if !path.is_file() || path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let json = std::fs::read_to_string(&path).map_err(VmmError::Io)?;
+            let json = std::fs::read_to_string(&path).map_err(SnapshotError::from)?;
             records.push(serde_json::from_str(&json)?);
         }
         records.sort_by(|a: &TemplateRecord, b: &TemplateRecord| a.name.cmp(&b.name));
@@ -472,23 +471,24 @@ impl TemplateCatalog {
         if record.is_empty() {
             return self.remove_record(&record.name);
         }
-        std::fs::create_dir_all(&self.root).map_err(VmmError::Io)?;
+        std::fs::create_dir_all(&self.root).map_err(SnapshotError::from)?;
         std::fs::set_permissions(&self.root, {
             use std::os::unix::fs::PermissionsExt;
             std::fs::Permissions::from_mode(0o700)
         })
-        .map_err(VmmError::Io)?;
+        .map_err(SnapshotError::from)?;
         let bytes = serde_json::to_vec_pretty(record)?;
-        atomic_file::write(&self.record_path(&record.name), &bytes)
+        arcbox_atomic_file::write(&self.record_path(&record.name), &bytes)
+            .map_err(SnapshotError::from)
     }
 
     fn remove_record(&self, name: &str) -> Result<()> {
         match std::fs::remove_file(self.record_path(name)) {
             Ok(()) => std::fs::File::open(&self.root)
                 .and_then(|dir| dir.sync_all())
-                .map_err(VmmError::Io),
+                .map_err(SnapshotError::from),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(VmmError::Io(e)),
+            Err(e) => Err(SnapshotError::from(e)),
         }
     }
 }
@@ -580,10 +580,10 @@ pub fn validate_template_version(version: &str) -> Result<()> {
 
 fn validate_component(kind: &str, value: &str, allow_dot: bool) -> Result<()> {
     if value.is_empty() {
-        return Err(VmmError::Config(format!("{kind} must not be empty")));
+        return Err(SnapshotError::config(format!("{kind} must not be empty")));
     }
     if value.len() > MAX_COMPONENT_LEN {
-        return Err(VmmError::Config(format!(
+        return Err(SnapshotError::config(format!(
             "{kind} must be at most {MAX_COMPONENT_LEN} characters"
         )));
     }
@@ -592,7 +592,7 @@ fn validate_component(kind: &str, value: &str, allow_dot: bool) -> Result<()> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || (allow_dot && b == b'.'));
     if !valid {
         let extra = if allow_dot { ", '.'" } else { "" };
-        return Err(VmmError::Config(format!(
+        return Err(SnapshotError::config(format!(
             "invalid {kind} {value:?}: only ASCII letters, digits, '-', '_'{extra} are allowed"
         )));
     }
@@ -617,6 +617,7 @@ fn parse_reference(reference: &str) -> Result<(&str, Option<&str>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arcbox_error::CommonError;
 
     fn entry(digest: &str, rootfs: &str) -> TemplateEntry {
         TemplateEntry {
@@ -690,7 +691,7 @@ mod tests {
         c.put_draft("code", entry("sha256:d1", "/r.ext4")).unwrap();
         assert!(matches!(
             c.resolve("code:9.9").unwrap_err(),
-            VmmError::TemplateNotFound(_)
+            SnapshotError::TemplateNotFound(_)
         ));
     }
 
@@ -709,7 +710,7 @@ mod tests {
         c.put_draft("code", entry("sha256:d2", "/r.ext4")).unwrap();
         assert!(matches!(
             c.publish("code", "1.0").unwrap_err(),
-            VmmError::TemplateVersionExists(_)
+            SnapshotError::TemplateVersionExists(_)
         ));
         // The clashing draft survives for publishing under a new version.
         assert_eq!(c.publish("code", "1.1").unwrap().entry.digest, "sha256:d2");
@@ -746,7 +747,7 @@ mod tests {
         assert!(released.snapshot_ids.is_empty());
         assert!(matches!(
             c.resolve("code").unwrap_err(),
-            VmmError::TemplateNotFound(_)
+            SnapshotError::TemplateNotFound(_)
         ));
     }
 
@@ -757,11 +758,11 @@ mod tests {
         c.publish("code", "1.0").unwrap();
         assert!(matches!(
             c.publish("code", "2.0").unwrap_err(),
-            VmmError::FailedPrecondition(_)
+            SnapshotError::FailedPrecondition(_)
         ));
         assert!(matches!(
             c.publish("ghost", "1.0").unwrap_err(),
-            VmmError::TemplateNotFound(_)
+            SnapshotError::TemplateNotFound(_)
         ));
     }
 
@@ -783,11 +784,11 @@ mod tests {
         assert_eq!(released.snapshot_ids, vec!["snap-2".to_string()]);
         assert!(matches!(
             c.resolve("code").unwrap_err(),
-            VmmError::TemplateNotFound(_)
+            SnapshotError::TemplateNotFound(_)
         ));
         assert!(matches!(
             c.delete("code").unwrap_err(),
-            VmmError::TemplateNotFound(_)
+            SnapshotError::TemplateNotFound(_)
         ));
     }
 
@@ -903,18 +904,21 @@ mod tests {
         let (_dir, c) = catalog();
         for bad in ["", "../etc", "a/b", "a b", ":1.0", "名字", &"x".repeat(65)] {
             assert!(
-                matches!(c.resolve(bad), Err(VmmError::Config(_))),
+                matches!(
+                    c.resolve(bad),
+                    Err(SnapshotError::Common(CommonError::Config(_)))
+                ),
                 "accepted {bad:?}"
             );
         }
         // Versions allow dots; '@' stays reserved for canonical refs.
         assert!(matches!(
             c.resolve("code:1.0@sha256"),
-            Err(VmmError::Config(_))
+            Err(SnapshotError::Common(CommonError::Config(_)))
         ));
         assert!(matches!(
             c.put_draft("docker:img", entry("d", "/r")).unwrap_err(),
-            VmmError::Config(_)
+            SnapshotError::Common(CommonError::Config(_))
         ));
     }
 }

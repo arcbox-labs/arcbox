@@ -9,6 +9,7 @@ members = [
     "common/arcbox-error",
     "common/arcbox-dns",
     "common/arcbox-asset",
+    "common/arcbox-atomic-file",
     "common/arcbox-logging",
     "common/arcbox-route",
     "common/arcbox-xnu-net",
@@ -60,6 +61,7 @@ members = [
     # L6: Engine (MIT OR Apache-2.0)
     # ============================================
     "engine/arcbox-image",
+    "engine/arcbox-snapshot",
     "engine/arcbox-engine",
 
     # ============================================
@@ -224,6 +226,8 @@ ifbridge = "0.1"
 libproc = "0.14"
 
 arcbox-asset = { version = "0.6.6", path = "common/arcbox-asset", features = ["download"] } # x-release-please-version
+arcbox-atomic-file = { version = "0.6.6", path = "common/arcbox-atomic-file" } # x-release-please-version
+arcbox-snapshot = { version = "0.6.6", path = "engine/arcbox-snapshot" } # x-release-please-version
 arcbox-docker-tools = { version = "0.6.6", path = "app/arcbox-docker-tools" } # x-release-please-version
 
 # External crates

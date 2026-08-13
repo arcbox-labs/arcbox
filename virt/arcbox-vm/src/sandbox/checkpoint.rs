@@ -1159,6 +1159,6 @@ impl SandboxManager {
             )));
         }
         self.drain_pool(Some(snapshot_id)).await;
-        self.snapshots.delete_by_id(snapshot_id)
+        self.snapshots.delete_by_id(snapshot_id).map_err(Into::into)
     }
 }

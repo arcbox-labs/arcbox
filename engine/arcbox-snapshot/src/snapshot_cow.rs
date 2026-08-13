@@ -6,7 +6,7 @@
 //! use the same rootfs; only written blocks consume disk space.
 //!
 //! Requires `CONFIG_DM_SNAPSHOT=y` in the guest kernel and the `dmsetup`
-//! binary at one of [`DMSETUP_CANDIDATES`].  `PATH` is not searched — the
+//! binary at one of `DMSETUP_CANDIDATES` (private).  `PATH` is not searched — the
 //! guest does not have a meaningful one.
 
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-probe"))]
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -23,7 +23,7 @@ use std::sync::{
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
-use crate::error::{Result, VmmError};
+use crate::error::{Result, SnapshotError};
 
 mod persistence;
 
@@ -71,10 +71,10 @@ const TEMPLATE_MARKER_TEMP_PREFIX: &str = ".tmp-";
 /// `dmsetup create` errors out with a confusing message.
 fn validate_dm_name_suffix(sandbox_id: &str) -> Result<()> {
     if sandbox_id.is_empty() {
-        return Err(VmmError::DeviceMapper("empty sandbox id".into()));
+        return Err(SnapshotError::DeviceMapper("empty sandbox id".into()));
     }
     if DM_NAME_PREFIX.len() + sandbox_id.len() > DM_NAME_MAX_LEN {
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "sandbox id too long for dm-name (max {} chars after prefix)",
             DM_NAME_MAX_LEN - DM_NAME_PREFIX.len()
         )));
@@ -83,7 +83,7 @@ fn validate_dm_name_suffix(sandbox_id: &str) -> Result<()> {
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '-')))
     {
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "sandbox id contains character {bad:?} not allowed in dm-name"
         )));
     }
@@ -122,14 +122,14 @@ pub struct CowHandle {
     pub template_path: PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-probe"))]
 #[derive(Default)]
-pub(crate) struct CowTestProbe {
+pub struct CowTestProbe {
     setups: AtomicUsize,
     teardowns: Mutex<Vec<String>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-probe"))]
 impl CowTestProbe {
     fn setup(&self, sandbox_id: &str, rootfs_path: &str, cow_dir: &Path) -> CowHandle {
         self.setups.fetch_add(1, Ordering::SeqCst);
@@ -147,11 +147,11 @@ impl CowTestProbe {
         self.teardowns.lock().unwrap().push(handle.dm_name.clone());
     }
 
-    pub(crate) fn setup_count(&self) -> usize {
+    pub fn setup_count(&self) -> usize {
         self.setups.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn teardown_count(&self) -> usize {
+    pub fn teardown_count(&self) -> usize {
         self.teardowns.lock().unwrap().len()
     }
 }
@@ -168,7 +168,7 @@ pub struct CowManager {
     losetup_lock: AsyncMutex<()>,
     cow_dir: PathBuf,
     dmsetup_bin: Option<String>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-probe"))]
     test_probe: Option<Arc<CowTestProbe>>,
 }
 
@@ -218,13 +218,13 @@ impl CowManager {
             losetup_lock: AsyncMutex::new(()),
             cow_dir,
             dmsetup_bin,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-probe"))]
             test_probe: None,
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_test_probe(data_dir: &str, probe: Arc<CowTestProbe>) -> Result<Self> {
+    #[cfg(any(test, feature = "test-probe"))]
+    pub fn new_with_test_probe(data_dir: &str, probe: Arc<CowTestProbe>) -> Result<Self> {
         let mut manager = Self::new(data_dir)?;
         manager.test_probe = Some(probe);
         Ok(manager)
@@ -257,12 +257,12 @@ impl CowManager {
         reuse_existing_cow: bool,
     ) -> Result<CowHandle> {
         validate_dm_name_suffix(sandbox_id)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-probe"))]
         if let Some(probe) = &self.test_probe {
             return Ok(probe.setup(sandbox_id, rootfs_path, &self.cow_dir));
         }
         if self.setup_orphans.lock().unwrap().contains_key(sandbox_id) {
-            return Err(VmmError::Unavailable(format!(
+            return Err(SnapshotError::Unavailable(format!(
                 "sandbox {sandbox_id} still owns resources from an incomplete CoW setup"
             )));
         }
@@ -270,7 +270,7 @@ impl CowManager {
         let dmsetup = self
             .dmsetup_bin
             .as_deref()
-            .ok_or_else(|| VmmError::DeviceMapper("dmsetup binary not found".into()))?;
+            .ok_or_else(|| SnapshotError::DeviceMapper("dmsetup binary not found".into()))?;
 
         let template = PathBuf::from(rootfs_path);
 
@@ -286,7 +286,7 @@ impl CowManager {
                 let mut templates = self.templates.lock().unwrap();
                 let entry = templates.get_mut(&template);
                 if entry.as_ref().is_some_and(|entry| entry.refcount == 0) {
-                    return Err(VmmError::Unavailable(format!(
+                    return Err(SnapshotError::Unavailable(format!(
                         "template {} still owns resources from an incomplete CoW setup",
                         template.display()
                     )));
@@ -315,7 +315,7 @@ impl CowManager {
                 let mut templates = self.templates.lock().unwrap();
                 let entry = templates.get_mut(&template);
                 if entry.as_ref().is_some_and(|entry| entry.refcount == 0) {
-                    return Err(VmmError::Unavailable(format!(
+                    return Err(SnapshotError::Unavailable(format!(
                         "template {} still owns resources from an incomplete CoW setup",
                         template.display()
                     )));
@@ -414,7 +414,7 @@ impl CowManager {
         if reuse_existing_cow {
             let verified = std::fs::metadata(&cow_file)
                 .map_err(|e| {
-                    VmmError::DeviceMapper(format!(
+                    SnapshotError::DeviceMapper(format!(
                         "preserved cow file {}: {e}",
                         cow_file.display()
                     ))
@@ -423,7 +423,7 @@ impl CowManager {
                     if metadata.len() == cow_size {
                         Ok(())
                     } else {
-                        Err(VmmError::DeviceMapper(format!(
+                        Err(SnapshotError::DeviceMapper(format!(
                             "preserved cow file {} is {} bytes but template needs {cow_size}",
                             cow_file.display(),
                             metadata.len()
@@ -512,7 +512,7 @@ impl CowManager {
     /// released. Crash reconciliation and durable Remove use this result to
     /// avoid declaring cleanup complete when a retry is still required.
     pub async fn teardown_checked(&self, handle: &CowHandle) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-probe"))]
         if let Some(probe) = &self.test_probe {
             probe.teardown(handle);
             return Ok(());
@@ -520,7 +520,7 @@ impl CowManager {
         let dmsetup = self
             .dmsetup_bin
             .as_deref()
-            .ok_or_else(|| VmmError::DeviceMapper("dmsetup binary not found".into()))?;
+            .ok_or_else(|| SnapshotError::DeviceMapper("dmsetup binary not found".into()))?;
         let mut failures = Vec::new();
 
         // 1. Remove dm device.
@@ -584,7 +584,7 @@ impl CowManager {
             info!(sandbox = %handle.dm_name, "dm-snapshot teardown complete");
             Ok(())
         } else {
-            Err(VmmError::DeviceMapper(failures.join("; ")))
+            Err(SnapshotError::DeviceMapper(failures.join("; ")))
         }
     }
 
@@ -596,7 +596,7 @@ impl CowManager {
     /// failed step keeps the handle valid for retry, exactly like
     /// [`Self::teardown_checked`].
     pub async fn detach_keep_cow(&self, handle: &CowHandle) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-probe"))]
         if let Some(probe) = &self.test_probe {
             probe.teardown(handle);
             return Ok(());
@@ -604,7 +604,7 @@ impl CowManager {
         let dmsetup = self
             .dmsetup_bin
             .as_deref()
-            .ok_or_else(|| VmmError::DeviceMapper("dmsetup binary not found".into()))?;
+            .ok_or_else(|| SnapshotError::DeviceMapper("dmsetup binary not found".into()))?;
         let mut failures = Vec::new();
 
         if Path::new(&handle.dm_device).exists()
@@ -625,7 +625,7 @@ impl CowManager {
             info!(sandbox = %handle.dm_name, "dm-snapshot detached, cow file retained");
             Ok(())
         } else {
-            Err(VmmError::DeviceMapper(failures.join("; ")))
+            Err(SnapshotError::DeviceMapper(failures.join("; ")))
         }
     }
 
@@ -659,8 +659,8 @@ impl CowManager {
 async fn run_cmd(mut cmd: Command) -> Result<std::process::Output> {
     tokio::task::spawn_blocking(move || cmd.output())
         .await
-        .map_err(|e| VmmError::DeviceMapper(format!("spawn_blocking join: {e}")))?
-        .map_err(|e| VmmError::DeviceMapper(format!("command spawn: {e}")))
+        .map_err(|e| SnapshotError::DeviceMapper(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| SnapshotError::DeviceMapper(format!("command spawn: {e}")))
 }
 
 /// Attach a file as a loop device.  Returns the device path (e.g. `/dev/loop0`).
@@ -673,7 +673,7 @@ async fn run_cmd(mut cmd: Command) -> Result<std::process::Output> {
 async fn losetup_attach(bin: &str, path: &Path, read_only: bool) -> Result<String> {
     let path_str = path
         .to_str()
-        .ok_or_else(|| VmmError::DeviceMapper("non-UTF-8 path".into()))?;
+        .ok_or_else(|| SnapshotError::DeviceMapper("non-UTF-8 path".into()))?;
 
     let mut cmd = Command::new(bin);
     if read_only {
@@ -684,14 +684,14 @@ async fn losetup_attach(bin: &str, path: &Path, read_only: bool) -> Result<Strin
     let output = run_cmd(cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "losetup attach {}: {stderr}",
             path.display()
         )));
     }
     let dev = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if dev.is_empty() {
-        return Err(VmmError::DeviceMapper(
+        return Err(SnapshotError::DeviceMapper(
             "losetup --show returned empty device path".into(),
         ));
     }
@@ -707,7 +707,7 @@ async fn losetup_detach(bin: &str, dev: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "losetup -d {dev}: {stderr}"
         )));
     }
@@ -723,7 +723,7 @@ async fn blockdev_getsz(bin: &str, dev: &str) -> Result<u64> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "blockdev --getsz {dev}: {stderr}"
         )));
     }
@@ -731,7 +731,7 @@ async fn blockdev_getsz(bin: &str, dev: &str) -> Result<u64> {
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse::<u64>()
-        .map_err(|e| VmmError::DeviceMapper(format!("blockdev parse: {e}")))
+        .map_err(|e| SnapshotError::DeviceMapper(format!("blockdev parse: {e}")))
 }
 
 /// Create a dm-snapshot device via `dmsetup create`.
@@ -743,7 +743,7 @@ async fn dmsetup_create(bin: &str, name: &str, table: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "dmsetup create {name}: {stderr}"
         )));
     }
@@ -759,7 +759,7 @@ async fn dmsetup_remove(bin: &str, name: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "dmsetup remove {name}: {stderr}"
         )));
     }
@@ -767,9 +767,12 @@ async fn dmsetup_remove(bin: &str, name: &str) -> Result<()> {
 }
 
 /// Create a sparse file of the given size in bytes.
-async fn create_sparse_file(path: &Path, size: u64) -> std::result::Result<(), (VmmError, bool)> {
+async fn create_sparse_file(
+    path: &Path,
+    size: u64,
+) -> std::result::Result<(), (SnapshotError, bool)> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> std::result::Result<(), (VmmError, bool)> {
+    tokio::task::spawn_blocking(move || -> std::result::Result<(), (SnapshotError, bool)> {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -777,28 +780,32 @@ async fn create_sparse_file(path: &Path, size: u64) -> std::result::Result<(), (
             .open(&path)
             .map_err(|e| {
                 (
-                    VmmError::DeviceMapper(format!("create cow file: {e}")),
+                    SnapshotError::DeviceMapper(format!("create cow file: {e}")),
                     false,
                 )
             })?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| {
                 (
-                    VmmError::DeviceMapper(format!("secure cow file: {e}")),
+                    SnapshotError::DeviceMapper(format!("secure cow file: {e}")),
                     true,
                 )
             })?;
         file.set_len(size).map_err(|e| {
             (
-                VmmError::DeviceMapper(format!("truncate cow file: {e}")),
+                SnapshotError::DeviceMapper(format!("truncate cow file: {e}")),
                 true,
             )
         })?;
-        file.sync_all()
-            .map_err(|e| (VmmError::DeviceMapper(format!("sync cow file: {e}")), true))?;
+        file.sync_all().map_err(|e| {
+            (
+                SnapshotError::DeviceMapper(format!("sync cow file: {e}")),
+                true,
+            )
+        })?;
         let parent = path.parent().ok_or_else(|| {
             (
-                VmmError::DeviceMapper("cow file has no parent".into()),
+                SnapshotError::DeviceMapper("cow file has no parent".into()),
                 true,
             )
         })?;
@@ -806,7 +813,7 @@ async fn create_sparse_file(path: &Path, size: u64) -> std::result::Result<(), (
             .and_then(|directory| directory.sync_all())
             .map_err(|e| {
                 (
-                    VmmError::DeviceMapper(format!("sync cow directory: {e}")),
+                    SnapshotError::DeviceMapper(format!("sync cow directory: {e}")),
                     true,
                 )
             })?;
@@ -815,7 +822,7 @@ async fn create_sparse_file(path: &Path, size: u64) -> std::result::Result<(), (
     .await
     .map_err(|e| {
         (
-            VmmError::DeviceMapper(format!("spawn_blocking join: {e}")),
+            SnapshotError::DeviceMapper(format!("spawn_blocking join: {e}")),
             false,
         )
     })?
@@ -831,20 +838,22 @@ pub async fn device_major_minor(path: &str) -> Result<(u32, u32)> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!("stat {path}: {stderr}")));
+        return Err(SnapshotError::DeviceMapper(format!(
+            "stat {path}: {stderr}"
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = stdout.split_whitespace().collect();
     if parts.len() != 2 {
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "unexpected stat output for {path}: {stdout}"
         )));
     }
     let major = u32::from_str_radix(parts[0], 16)
-        .map_err(|e| VmmError::DeviceMapper(format!("parse major: {e}")))?;
+        .map_err(|e| SnapshotError::DeviceMapper(format!("parse major: {e}")))?;
     let minor = u32::from_str_radix(parts[1], 16)
-        .map_err(|e| VmmError::DeviceMapper(format!("parse minor: {e}")))?;
+        .map_err(|e| SnapshotError::DeviceMapper(format!("parse minor: {e}")))?;
     Ok((major, minor))
 }
 
@@ -852,7 +861,7 @@ pub async fn device_major_minor(path: &str) -> Result<(u32, u32)> {
 pub async fn mknod_blkdev(node_path: &Path, major: u32, minor: u32) -> Result<()> {
     let path_str = node_path
         .to_str()
-        .ok_or_else(|| VmmError::DeviceMapper("non-UTF-8 node path".into()))?;
+        .ok_or_else(|| SnapshotError::DeviceMapper("non-UTF-8 node path".into()))?;
     let mut cmd = Command::new(BUSYBOX);
     cmd.args([
         "mknod",
@@ -864,7 +873,7 @@ pub async fn mknod_blkdev(node_path: &Path, major: u32, minor: u32) -> Result<()
     let output = run_cmd(cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!(
+        return Err(SnapshotError::DeviceMapper(format!(
             "mknod {path_str}: {stderr}"
         )));
     }
@@ -998,7 +1007,7 @@ mod tests {
                 None,
                 None,
                 None,
-                VmmError::DeviceMapper("create failed".into()),
+                SnapshotError::DeviceMapper("create failed".into()),
             )
             .await;
 
@@ -1027,7 +1036,7 @@ mod tests {
 
         assert!(matches!(
             mgr.setup("box", template.to_str().unwrap()).await,
-            Err(VmmError::Unavailable(_))
+            Err(SnapshotError::Unavailable(_))
         ));
         assert_eq!(
             mgr.templates

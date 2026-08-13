@@ -8,8 +8,16 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::SnapshotType;
-use crate::error::{Result, VmmError};
+use crate::error::{Result, SnapshotError};
+
+/// Snapshot type — mirrors Firecracker terminology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotType {
+    /// Capture full memory + VM state.
+    Full,
+    /// Capture only dirty pages since the last snapshot.
+    Diff,
+}
 
 /// VM geometry a memory snapshot was captured with.
 ///
@@ -108,14 +116,16 @@ const MEM_FILE: &str = "mem";
 const STAGING_SUFFIX: &str = ".partial";
 
 fn secure_dir(path: &Path) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(VmmError::Io)
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(SnapshotError::from)
 }
 
 fn sync_private_file(path: &Path) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(VmmError::Io)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(SnapshotError::from)?;
     std::fs::File::open(path)
         .and_then(|file| file.sync_all())
-        .map_err(VmmError::Io)
+        .map_err(SnapshotError::from)
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -125,17 +135,17 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)
-        .map_err(VmmError::Io)?;
+        .map_err(SnapshotError::from)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(VmmError::Io)?;
-    file.write_all(bytes).map_err(VmmError::Io)?;
-    file.sync_all().map_err(VmmError::Io)
+        .map_err(SnapshotError::from)?;
+    file.write_all(bytes).map_err(SnapshotError::from)?;
+    file.sync_all().map_err(SnapshotError::from)
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
     std::fs::File::open(path)
         .and_then(|dir| dir.sync_all())
-        .map_err(VmmError::Io)
+        .map_err(SnapshotError::from)
 }
 
 /// True when `path` is a published snapshot directory.
@@ -237,11 +247,11 @@ impl PendingSnapshot<'_> {
         write_private_file(&SnapshotCatalog::meta_path(&staging), &json)?;
         secure_dir(&staging)?;
         sync_dir(&staging)?;
-        std::fs::rename(&staging, &published).map_err(VmmError::Io)?;
+        std::fs::rename(&staging, &published).map_err(SnapshotError::from)?;
         self.published = true;
         let owner = published.parent().expect("snapshot directory has an owner");
         sync_dir(owner).map_err(|error| {
-            VmmError::Unavailable(format!(
+            SnapshotError::Unavailable(format!(
                 "snapshot {} is visible, but publish durability is unconfirmed: {error}",
                 meta.id
             ))
@@ -308,7 +318,7 @@ impl SnapshotCatalog {
             id: Uuid::new_v4().to_string(),
             published: false,
         };
-        std::fs::create_dir_all(pending.dir()).map_err(VmmError::Io)?;
+        std::fs::create_dir_all(pending.dir()).map_err(SnapshotError::from)?;
         secure_dir(&self.root)?;
         secure_dir(&self.vm_dir(vm_id))?;
         secure_dir(&pending.dir())?;
@@ -327,7 +337,7 @@ impl SnapshotCatalog {
             return Ok(vec![]);
         }
         let mut entries: Vec<SnapshotMeta> = std::fs::read_dir(&dir)
-            .map_err(VmmError::Io)?
+            .map_err(SnapshotError::from)?
             .filter_map(|e| e.ok())
             .filter(|e| is_catalog_entry(&e.path()))
             .map(|e| self.read_meta(&e.path()))
@@ -346,11 +356,11 @@ impl SnapshotCatalog {
     pub fn delete(&self, vm_id: &str, snapshot_id: &str) -> Result<()> {
         let path = self.snapshot_dir(vm_id, snapshot_id);
         if !path.exists() {
-            return Err(VmmError::Snapshot(format!(
+            return Err(SnapshotError::Snapshot(format!(
                 "snapshot {snapshot_id} not found for VM {vm_id}"
             )));
         }
-        std::fs::remove_dir_all(&path).map_err(VmmError::Io)?;
+        std::fs::remove_dir_all(&path).map_err(SnapshotError::from)?;
         sync_dir(&self.vm_dir(vm_id))?;
         info!(snapshot_id, vm_id, "snapshot deleted");
         Ok(())
@@ -390,12 +400,12 @@ impl SnapshotCatalog {
     /// Find a snapshot by ID alone, searching across all owner directories.
     pub fn find_by_id(&self, snapshot_id: &str) -> Result<SnapshotMeta> {
         if !self.root.exists() {
-            return Err(VmmError::Snapshot(format!(
+            return Err(SnapshotError::Snapshot(format!(
                 "snapshot {snapshot_id} not found"
             )));
         }
-        for entry in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
-            let entry = entry.map_err(VmmError::Io)?;
+        for entry in std::fs::read_dir(&self.root).map_err(SnapshotError::from)? {
+            let entry = entry.map_err(SnapshotError::from)?;
             if entry.path().is_dir() {
                 let snap_path = entry.path().join(snapshot_id);
                 if is_catalog_entry(&snap_path) {
@@ -403,7 +413,7 @@ impl SnapshotCatalog {
                 }
             }
         }
-        Err(VmmError::Snapshot(format!(
+        Err(SnapshotError::Snapshot(format!(
             "snapshot {snapshot_id} not found"
         )))
     }
@@ -414,8 +424,8 @@ impl SnapshotCatalog {
             return Ok(vec![]);
         }
         let mut all: Vec<SnapshotInfo> = vec![];
-        for entry in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
-            let entry = entry.map_err(VmmError::Io)?;
+        for entry in std::fs::read_dir(&self.root).map_err(SnapshotError::from)? {
+            let entry = entry.map_err(SnapshotError::from)?;
             if entry.path().is_dir() {
                 let owner_id = entry.file_name().to_string_lossy().into_owned();
                 let mut infos = self.list(&owner_id)?;
@@ -438,13 +448,13 @@ impl SnapshotCatalog {
             return Ok(BTreeSet::new());
         }
         let mut pinned = BTreeSet::new();
-        for vm in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
-            let vm_dir = vm.map_err(VmmError::Io)?.path();
+        for vm in std::fs::read_dir(&self.root).map_err(SnapshotError::from)? {
+            let vm_dir = vm.map_err(SnapshotError::from)?.path();
             if !vm_dir.is_dir() {
                 continue;
             }
-            for snapshot in std::fs::read_dir(&vm_dir).map_err(VmmError::Io)? {
-                let snapshot_dir = snapshot.map_err(VmmError::Io)?.path();
+            for snapshot in std::fs::read_dir(&vm_dir).map_err(SnapshotError::from)? {
+                let snapshot_dir = snapshot.map_err(SnapshotError::from)?.path();
                 if !is_catalog_entry(&snapshot_dir) {
                     continue;
                 }
@@ -488,7 +498,7 @@ impl SnapshotCatalog {
     }
 
     fn read_meta(&self, dir: &Path) -> Result<SnapshotMeta> {
-        let json = std::fs::read_to_string(Self::meta_path(dir)).map_err(VmmError::Io)?;
+        let json = std::fs::read_to_string(Self::meta_path(dir)).map_err(SnapshotError::from)?;
         let meta = serde_json::from_str(&json)?;
         Ok(meta)
     }
@@ -497,7 +507,6 @@ impl SnapshotCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SnapshotType;
 
     /// Publish a snapshot the way a producer does: stage, write a `vmstate`,
     /// then commit.

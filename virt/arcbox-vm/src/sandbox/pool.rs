@@ -501,7 +501,7 @@ impl SandboxManager {
                 // Re-resolve the snapshot: it may have been deleted since.
                 let staged = match snapshots.find_by_id(&snapshot_id) {
                     Ok(meta) => prepare_slot(&config, &cow_manager, &meta).await,
-                    Err(error) => Err(error),
+                    Err(error) => Err(error.into()),
                 };
                 match staged {
                     Ok(slot) => match pool.offer(&snapshot_id, slot) {

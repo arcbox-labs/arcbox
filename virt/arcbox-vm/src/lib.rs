@@ -27,10 +27,14 @@
 //! - [`SandboxManager`] — top-level sandbox orchestrator
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
 //! - [`NetworkManager`] — TAP lifecycle & IP allocation
-//! - [`SnapshotCatalog`] — checkpoint tracking
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
+//!
+//! Snapshot lineage — the checkpoint catalog, the copy-on-write rootfs
+//! manager, and the template catalog — lives in `arcbox-snapshot` in the
+//! engine layer. The `crate::{snapshot, snapshot_cow, template_catalog}`
+//! paths are re-exports of it so existing imports keep resolving; name
+//! `arcbox_snapshot` directly in new code.
 
-mod atomic_file;
 pub mod boot_proto;
 pub mod config;
 pub mod error;
@@ -39,12 +43,13 @@ pub mod file_watch;
 pub mod listen_table;
 pub mod network;
 pub mod sandbox;
-pub mod snapshot;
-pub mod snapshot_cow;
 pub mod spawn;
-pub mod template_catalog;
 pub mod user_spec;
 pub mod vsock;
+
+// The snapshot lineage moved to the engine layer (arcbox-snapshot); these
+// paths stay so `arcbox-agent` and this crate's own modules keep compiling.
+pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
