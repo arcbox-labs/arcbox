@@ -30,6 +30,7 @@
 //! - [`SnapshotCatalog`] — checkpoint tracking
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
 
+mod atomic_file;
 pub mod boot_proto;
 pub mod config;
 pub mod error;

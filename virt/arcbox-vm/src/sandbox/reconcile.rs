@@ -149,7 +149,7 @@ impl SandboxStateRecord {
 /// Atomically persist crash-recovery metadata before resources are exposed.
 pub(super) fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(record)?;
-    super::persistence::atomic_write(&vm_dir.join(STATE_FILE), &bytes)?;
+    crate::atomic_file::write(&vm_dir.join(STATE_FILE), &bytes)?;
     Ok(())
 }
 

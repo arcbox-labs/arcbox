@@ -1,7 +1,6 @@
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -10,89 +9,14 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::atomic_file::{self, AtomicWriteError};
+
 use super::types::IdleAction;
 use super::{SandboxId, SandboxSpec, validate_id};
 use crate::error::{Result, VmmError};
 
 const RECORD_VERSION: u32 = 1;
 const RECORDS_DIR: &str = "sandbox-records";
-
-#[derive(Debug)]
-enum AtomicWriteError {
-    NotCommitted(std::io::Error),
-    DurabilityUncertain(std::io::Error),
-}
-
-/// Atomically replace one file and make the rename durable.
-fn atomic_write_inner(
-    destination: &Path,
-    bytes: &[u8],
-) -> std::result::Result<(), AtomicWriteError> {
-    let parent = destination.parent().ok_or_else(|| {
-        AtomicWriteError::NotCommitted(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("path has no parent: {}", destination.display()),
-        ))
-    })?;
-    let temp_path = parent.join(format!(
-        ".{}.{}.tmp",
-        destination
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("sandbox"),
-        Uuid::new_v4()
-    ));
-    (|| {
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp_path)?;
-        temp.write_all(bytes)?;
-        temp.sync_all()?;
-        drop(temp);
-        fs::rename(&temp_path, destination)?;
-        Ok::<(), std::io::Error>(())
-    })()
-    .map_err(|original| {
-        let cleanup = fs::remove_file(&temp_path);
-        match cleanup {
-            Ok(()) => AtomicWriteError::NotCommitted(original),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                AtomicWriteError::NotCommitted(original)
-            }
-            Err(cleanup_error) => AtomicWriteError::NotCommitted(std::io::Error::new(
-                original.kind(),
-                format!(
-                    "{original}; failed to remove temporary file {}: {cleanup_error}",
-                    temp_path.display()
-                ),
-            )),
-        }
-    })?;
-
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(AtomicWriteError::DurabilityUncertain)
-}
-
-/// Atomically persists a non-lifecycle file.
-///
-/// Re-exported at the `sandbox` module root for the template catalog.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "re-exported outside the sandbox module; a pub(super) item cannot be re-exported wider (E0364)"
-)]
-pub(crate) fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
-    match atomic_write_inner(destination, bytes) {
-        Ok(()) => Ok(()),
-        Err(AtomicWriteError::NotCommitted(error)) => Err(error.into()),
-        Err(AtomicWriteError::DurabilityUncertain(error)) => Err(VmmError::Unavailable(format!(
-            "{} was renamed but directory durability is unconfirmed: {error}",
-            destination.display()
-        ))),
-    }
-}
 
 /// Durable control-plane phase for one sandbox generation.
 ///
@@ -633,7 +557,7 @@ impl SandboxRecordStore {
     fn save_unlocked(&self, record: &SandboxRecord) -> Result<Option<String>> {
         validate_record(&record.id, record)?;
         let bytes = serde_json::to_vec_pretty(record)?;
-        match atomic_write_inner(&self.record_path(&record.id), &bytes) {
+        match atomic_file::write_reporting_durability(&self.record_path(&record.id), &bytes) {
             Ok(()) => Ok(None),
             Err(AtomicWriteError::NotCommitted(error)) => Err(error.into()),
             Err(AtomicWriteError::DurabilityUncertain(error)) => Ok(Some(error.to_string())),
