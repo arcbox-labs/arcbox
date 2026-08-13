@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6](https://github.com/arcboxlabs/arcbox/compare/v0.6.5...v0.6.6) (2026-08-13)
+
+
+### Bug Fixes
+
+* **hypervisor:** make the KVM backend compile on Linux again ([#624](https://github.com/arcboxlabs/arcbox/issues/624)) ([a4f61cc](https://github.com/arcboxlabs/arcbox/commit/a4f61ccf518d5e59b55ef80f26a01c8f41fc39b2))
+* **net:** make the Linux half of the net stack compile again ([#622](https://github.com/arcboxlabs/arcbox/issues/622)) ([6390b42](https://github.com/arcboxlabs/arcbox/commit/6390b4256c842d46572825b8fd85b3c6df860bd4))
+
+
+### Code Refactoring
+
+* **computer:** open the computer layer — sandbox protocols behind the SandboxHost seam (restructure phase 3) ([#623](https://github.com/arcboxlabs/arcbox/issues/623)) ([b92a424](https://github.com/arcboxlabs/arcbox/commit/b92a42434a787ff3f5358abb2862adbf2302f133))
+* **engine:** extract arcbox-engine from arcbox-core (restructure phase 2) ([#621](https://github.com/arcboxlabs/arcbox/issues/621)) ([0aa48c9](https://github.com/arcboxlabs/arcbox/commit/0aa48c9e2e4ed6cc806341f180dd4e7889bb54dd))
+* **engine:** extract arcbox-image from arcbox-core (restructure phase 1) ([#620](https://github.com/arcboxlabs/arcbox/issues/620)) ([e76b67e](https://github.com/arcboxlabs/arcbox/commit/e76b67e7f3fe73f0b760d44b6ea9d76427d6b7c1))
+
+
+### Tests
+
+* **e2e:** cover the TTY, user, unexpose, and rejection contracts (CORE-18) ([#614](https://github.com/arcboxlabs/arcbox/issues/614)) ([5709e4f](https://github.com/arcboxlabs/arcbox/commit/5709e4f3184874bab1c137212b9419ef6f5983a7))
+
+
+### Documentation
+
+* move internal-docs to the private company repo ([#619](https://github.com/arcboxlabs/arcbox/issues/619)) ([648b6f6](https://github.com/arcboxlabs/arcbox/commit/648b6f622f5be896083362bc565eaf867470aaff))
+* **rpc:** the template catalog is served, not contract-only ([#617](https://github.com/arcboxlabs/arcbox/issues/617)) ([e4c55e1](https://github.com/arcboxlabs/arcbox/commit/e4c55e1418ff806d623bbbe036a37a077187d81d))
+
+
+### Build System
+
+* adopt arcbox-connectrpc, and make arcbox-connect publishable ([#618](https://github.com/arcboxlabs/arcbox/issues/618)) ([78fc6fd](https://github.com/arcboxlabs/arcbox/commit/78fc6fd297a2a052fd87a6d9f2926e1cdc2699c6))
+
+
+### Continuous Integration
+
+* **release:** make release runs mean something ([#611](https://github.com/arcboxlabs/arcbox/issues/611)) ([8d2bbe1](https://github.com/arcboxlabs/arcbox/commit/8d2bbe1fb8c598448f817363b82b01c3eb0d955b))
+
+
+### Miscellaneous Chores
+
+* **master:** release sdk-python 0.1.2 ([#580](https://github.com/arcboxlabs/arcbox/issues/580)) ([26b9a1e](https://github.com/arcboxlabs/arcbox/commit/26b9a1e4c28f173af760d2f7051b62dfd59d40f0))
+* **master:** release sdk-typescript 0.1.2 ([#581](https://github.com/arcboxlabs/arcbox/issues/581)) ([fd52f52](https://github.com/arcboxlabs/arcbox/commit/fd52f52886870e4d16fdaa105f57d9b1ec6927fc))
+
 ## [0.6.5](https://github.com/arcboxlabs/arcbox/compare/v0.6.4...v0.6.5) (2026-08-11)
 
 
