@@ -1,7 +1,7 @@
 //! Container runtime lifecycle: bring up containerd + dockerd, surface readiness,
 //! and serve the EnsureRuntime/RuntimeStatus RPC handlers.
 //!
-//! Spawns the bundled `containerd` and `dockerd` from the EROFS rootfs, verifies
+//! Materializes the bundled `containerd` and `dockerd` onto Btrfs, verifies
 //! kernel/filesystem prerequisites (cgroup2, overlayfs, devpts, …), and polls
 //! socket readiness with both connect-level and HTTP-level probes.
 
@@ -10,22 +10,24 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use arcbox_connect::v1::{
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+};
 use arcbox_constants::paths::{
     ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_SOCKET, DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
     K3S_CNI_BIN_DIR, K3S_CNI_CONF_DIR,
 };
 use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
-use arcbox_protocol::agent::{
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-};
 
 use super::btrfs::ensure_data_mount;
-use super::cmdline::docker_api_vsock_port;
+use super::cmdline::{container_network, docker_api_vsock_port};
 use super::probe::{probe_docker_api_ready, probe_first_ready_socket, probe_unix_socket};
 use super::rpc::sync_clock_from_host;
+use super::runtime_cache::ensure_local_runtime;
 use crate::agent::ensure_runtime;
 use crate::rpc::RpcResponse;
 
@@ -47,6 +49,9 @@ const REQUIRED_RUNTIME_BINARIES: &[&str] = &[
 /// enough that TLS certificates issued after 2020 pass validation.
 /// 2020-01-01T00:00:00Z
 const MIN_SANE_EPOCH: u64 = 1_577_836_800;
+
+/// Polling fallback for firewall managers that recreate `DOCKER-USER`.
+const DIRECT_ROUTING_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Idempotent, non-blocking EnsureRuntime handler.
 ///
@@ -72,7 +77,18 @@ pub(super) async fn handle_ensure_runtime(req: RuntimeEnsureRequest) -> RpcRespo
 /// Performs the actual runtime start sequence (called only by the driver).
 async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
     let mut notes = Vec::new();
-    let note = try_start_bundled_runtime().await;
+    let note = match try_start_bundled_runtime().await {
+        Ok(note) => note,
+        Err(message) => {
+            return RuntimeEnsureResponse {
+                ready: false,
+                endpoint: format!("vsock:{}", docker_api_vsock_port()),
+                message,
+                status: ensure_runtime::STATUS_FAILED.to_string(),
+                ..Default::default()
+            };
+        }
+    };
     if !note.is_empty() {
         notes.push(note);
     }
@@ -90,22 +106,34 @@ async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
         status = collect_runtime_status().await;
     }
 
-    let mut message = status.detail.clone();
-    if !notes.is_empty() {
-        message = format!("{}; {}", notes.join("; "), status.detail);
+    let routing_error = if status.docker_ready {
+        ensure_direct_container_routing().await.err()
+    } else {
+        None
+    };
+
+    let mut message = if notes.is_empty() {
+        status.detail.clone()
+    } else {
+        format!("{}; {}", notes.join("; "), status.detail)
+    };
+    if let Some(error) = &routing_error {
+        message = format!("{message}; direct container routing setup failed: {error:#}");
     }
 
-    let result_status = if status.docker_ready {
+    let ready = status.docker_ready && routing_error.is_none();
+    let result_status = if ready {
         ensure_runtime::STATUS_STARTED.to_string()
     } else {
         ensure_runtime::STATUS_FAILED.to_string()
     };
 
     RuntimeEnsureResponse {
-        ready: status.docker_ready,
+        ready,
         endpoint: status.endpoint,
         message,
         status: result_status,
+        ..Default::default()
     }
 }
 
@@ -121,11 +149,103 @@ async fn do_ensure_runtime_probe() -> RuntimeEnsureResponse {
         } else {
             ensure_runtime::STATUS_FAILED.to_string()
         },
+        ..Default::default()
     }
 }
 
 pub(super) async fn handle_runtime_status(_req: RuntimeStatusRequest) -> RpcResponse {
     RpcResponse::RuntimeStatus(collect_runtime_status().await)
+}
+
+/// Allows traffic arriving on the vmnet bridge NIC to reach Docker bridge
+/// subnets routed from macOS.
+///
+/// Docker creates `DOCKER-USER` only after it starts. Installing this rule
+/// before dockerd is ineffective, and inserting directly into `FORWARD` is
+/// unstable because Docker prepends its own chains on startup. The matching
+/// daemon option `allow-direct-routing` removes Docker's earlier raw-table
+/// per-container drops; this rule then bypasses its unpublished-port drop.
+fn direct_routing_rule<'a>(bridge_iface: &'a str, network: &'a str) -> [&'a str; 7] {
+    [
+        "DOCKER-USER",
+        "-i",
+        bridge_iface,
+        "-d",
+        network,
+        "-j",
+        "ACCEPT",
+    ]
+}
+
+async fn ensure_direct_container_routing() -> Result<()> {
+    let _guard = direct_routing_lock().lock().await;
+    let network = container_network().map_err(anyhow::Error::msg)?;
+    let Some(bridge_iface) = crate::init::detect_bridge_interface() else {
+        tracing::debug!("no bridge NIC found; skipping direct container routing rule");
+        return Ok(());
+    };
+    let network = network.to_string();
+
+    let rule = direct_routing_rule(&bridge_iface, &network);
+    let check = Command::new("/sbin/iptables")
+        .args(["-w", "2", "-C"])
+        .args(rule)
+        .output()
+        .await
+        .context("checking DOCKER-USER rule")?;
+    if check.status.success() {
+        return Ok(());
+    }
+    if check.status.code() != Some(1) {
+        bail!(
+            "iptables check failed: {}",
+            String::from_utf8_lossy(&check.stderr).trim()
+        );
+    }
+
+    let install = Command::new("/sbin/iptables")
+        .args(["-w", "2", "-I"])
+        .args(rule)
+        .output()
+        .await
+        .context("installing DOCKER-USER rule")?;
+    if !install.status.success() {
+        bail!(
+            "iptables failed: {}",
+            String::from_utf8_lossy(&install.stderr).trim()
+        );
+    }
+
+    tracing::info!(
+        interface = bridge_iface,
+        subnet = network,
+        "direct container routing rule installed"
+    );
+    Ok(())
+}
+
+fn direct_routing_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Restores the direct-routing firewall rule if Docker recreates its chains.
+pub(super) async fn direct_container_routing_loop() {
+    let mut ticker = tokio::time::interval(DIRECT_ROUTING_RECONCILE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Initial runtime setup owns the readiness gate and first installation.
+    // Delay this fallback's first check to avoid duplicating startup probes.
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        if !probe_docker_api_ready(DOCKER_API_UNIX_SOCKET).await {
+            continue;
+        }
+        if let Err(error) = ensure_direct_container_routing().await {
+            tracing::warn!(%error, "failed to reconcile direct container routing rule");
+        }
+    }
 }
 
 pub(super) fn runtime_path_env(runtime_bin_dir: &Path) -> String {
@@ -256,7 +376,7 @@ async fn ensure_dockerd_ready(runtime_bin_dir: &Path, notes: &mut Vec<String>) {
 }
 
 async fn collect_runtime_status() -> RuntimeStatusResponse {
-    use arcbox_protocol::agent::ServiceStatus;
+    use arcbox_connect::v1::ServiceStatus;
 
     let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
     // Two-level check: socket connectable (fast) + HTTP API probe (strong).
@@ -296,6 +416,7 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
                     .find(|p| Path::new(p).exists())
                     .unwrap_or(&CONTAINERD_SOCKET_CANDIDATES[0])
             ),
+            ..Default::default()
         }
     } else {
         let socket_paths = CONTAINERD_SOCKET_CANDIDATES
@@ -307,6 +428,7 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
             name: "containerd".to_string(),
             status: SERVICE_NOT_READY.to_string(),
             detail: format!("no reachable socket found; checked: {}", socket_paths),
+            ..Default::default()
         }
     });
 
@@ -320,6 +442,7 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
         endpoint: format!("vsock:{}", docker_api_vsock_port()),
         detail,
         services,
+        ..Default::default()
     }
 }
 
@@ -339,7 +462,7 @@ impl DockerProbe {
         self.api_ok
     }
 
-    fn service_status(&self) -> arcbox_protocol::agent::ServiceStatus {
+    fn service_status(&self) -> arcbox_connect::v1::ServiceStatus {
         let status = if self.ready() {
             SERVICE_READY
         } else if self.socket_ok {
@@ -368,10 +491,11 @@ impl DockerProbe {
             format!("socket missing: {}", DOCKER_API_UNIX_SOCKET)
         };
 
-        arcbox_protocol::agent::ServiceStatus {
+        arcbox_connect::v1::ServiceStatus {
             name: "dockerd".to_string(),
             status: status.to_string(),
             detail,
+            ..Default::default()
         }
     }
 
@@ -403,21 +527,6 @@ impl DockerProbe {
 fn runtime_start_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn detect_runtime_bin_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
-    if missing_runtime_binaries_at(&dir).is_empty() {
-        Some(dir)
-    } else {
-        None
-    }
-}
-
-fn runtime_missing_detail() -> String {
-    let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
-    let missing = missing_runtime_binaries_at(&dir);
-    runtime_missing_detail_from(&missing)
 }
 
 fn runtime_missing_detail_from(missing: &[&'static str]) -> String {
@@ -518,6 +627,20 @@ pub(super) fn ensure_runtime_prerequisites() -> Vec<String> {
         notes.push(format!("ip_forward failed({})", e));
     } else {
         notes.push("enabled ip_forward".to_string());
+    }
+
+    // Expedite RCU grace periods. Every container start's `runc create`
+    // (and network-namespace teardown) calls synchronize_rcu; on the
+    // non-expedited guest kernel each grace period parks runc ~70 ms in
+    // uninterruptible sleep (`__wait_rcu_gp`), which is the dominant
+    // runc-create cost — profiled at ~88 ms → ~10 ms with this set, an 8x
+    // cut (ABX-496). Expedited grace periods use IPIs (µs, not ms); the
+    // trade is more IPIs under RCU load, the right call for a
+    // container/build runtime with heavy netns churn.
+    if let Err(e) = std::fs::write("/sys/kernel/rcu_expedited", b"1\n") {
+        notes.push(format!("rcu_expedited failed({e})"));
+    } else {
+        notes.push("enabled rcu_expedited".to_string());
     }
 
     // Load overlay module (needed for Docker's overlay2 storage driver).
@@ -624,69 +747,80 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
     }
 }
 
-async fn try_start_bundled_runtime() -> String {
+async fn try_start_bundled_runtime() -> Result<String, String> {
     let _guard = runtime_start_lock().lock().await;
+    let mut notes = Vec::new();
 
-    // Whenever dockerd is up its data mount exists, so the NFS export can be
-    // (re)established on warm boots too — set it up before the early return.
+    // Prepare /run and the other mounts needed by runtime materialization.
+    let prereq_notes = ensure_runtime_prerequisites();
+    if !prereq_notes.is_empty() {
+        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
+    }
+    notes.extend(prereq_notes);
+
+    match ensure_local_runtime().await {
+        Ok(note) => notes.push(note),
+        Err(error) => return Err(format!("local runtime setup failed: {error}")),
+    }
     if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
-        let mut notes = vec!["docker socket already ready".to_string()];
-        setup_nfs_export(&mut notes);
-        return notes.join("; ");
+        notes.push("docker socket already ready".to_string());
+        return Ok(notes.join("; "));
     }
 
-    let Some(runtime_bin_dir) = detect_runtime_bin_dir() else {
-        return runtime_missing_detail();
-    };
+    let runtime_bin_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+    let missing = missing_runtime_binaries_at(&runtime_bin_dir);
+    if !missing.is_empty() {
+        return Err(runtime_missing_detail_from(&missing));
+    }
 
     tracing::info!(
         runtime_bin_dir = %runtime_bin_dir.display(),
         "starting bundled runtime"
     );
 
-    let mut notes = Vec::new();
-
-    // Ensure kernel/filesystem prerequisites before spawning daemons.
-    let prereq_notes = ensure_runtime_prerequisites();
-    if !prereq_notes.is_empty() {
-        tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
-    }
-    notes.extend(prereq_notes);
-    match ensure_data_mount() {
+    // Bind the fsync-hot metadata dirs onto the ext4 volume before the
+    // daemons open their boltdb files. A hard error means the volume exists
+    // but is unusable — starting dockerd against the stale shadowed btrfs
+    // state would fork it, so abort instead.
+    match super::metadata_volume::ensure_metadata_mount() {
         Ok(note) => notes.push(note),
-        Err(e) => return format!("data volume setup failed: {}", e),
+        Err(e) => return Err(format!("metadata volume setup failed: {e}")),
     }
-
-    // The docker data mount now exists; export it read-only over NFS.
-    setup_nfs_export(&mut notes);
 
     ensure_shared_runtime_dirs(&mut notes);
 
     if !ensure_containerd_ready(&runtime_bin_dir, &mut notes).await {
-        return notes.join("; ");
+        return Err(notes.join("; "));
     }
 
     ensure_dockerd_ready(&runtime_bin_dir, &mut notes).await;
 
-    notes.join("; ")
+    Ok(notes.join("; "))
 }
 
-/// Establishes the read-only NFSv3 export of the docker data mount, best-effort.
+/// Brings up the read-only NFS export of the docker data mount so the host
+/// can browse it at `~/ArcBox`.
 ///
-/// The export is an auxiliary feature (host `~/ArcBox` browsing); its failure
-/// must never block the container runtime, so errors are logged, not returned.
-fn setup_nfs_export(notes: &mut Vec<String>) {
-    match crate::nfs::ensure_docker_export() {
-        Ok(export_notes) => notes.extend(export_notes),
-        Err(e) => tracing::warn!(error = %e, "nfs export setup failed (non-fatal)"),
-    }
+/// Called on demand by the host daemon (`EnsureNfsExportRequest`), which only
+/// sends it when the mount is enabled — so a `--no-mount-nfs` daemon leaves
+/// the guest with no nfsd at all. Ensures the docker data mount exists first
+/// (idempotent), so it is safe to call at any point after the agent is up;
+/// the runtime-start lock serializes it against the startup path's own
+/// data-mount setup.
+pub(super) async fn ensure_nfs_export() -> Result<Vec<String>, String> {
+    let _guard = runtime_start_lock().lock().await;
+
+    let mut notes = vec![ensure_data_mount()?];
+    notes.extend(crate::nfs::ensure_docker_export()?);
+    Ok(notes)
 }
 
 #[cfg(test)]
 mod tests {
+    use arcbox_constants::container_network::ContainerNetwork;
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
 
-    use super::{DockerProbe, shared_containerd_config};
+    use super::{DockerProbe, direct_routing_rule, shared_containerd_config};
 
     #[test]
     fn shared_containerd_config_uses_k3s_cni_paths() {
@@ -694,6 +828,28 @@ mod tests {
         assert!(config.contains("bin_dir = \"/var/lib/rancher/k3s/data/cni\""));
         assert!(config.contains("conf_dir = \"/var/lib/rancher/k3s/agent/etc/cni/net.d\""));
         assert!(config.contains("max_conf_num = 1"));
+    }
+
+    #[test]
+    fn cmdline_container_network_drives_the_firewall_destination() {
+        let network = ContainerNetwork::from_kernel_cmdline(
+            "root=/dev/vda arcbox.container_network=10.80.0.0/20",
+        )
+        .unwrap()
+        .to_string();
+
+        assert_eq!(
+            direct_routing_rule("eth0", &network),
+            [
+                "DOCKER-USER",
+                "-i",
+                "eth0",
+                "-d",
+                "10.80.0.0/20",
+                "-j",
+                "ACCEPT"
+            ]
+        );
     }
 
     fn probe(socket_exists: bool, socket_ok: bool, api_ok: bool) -> DockerProbe {

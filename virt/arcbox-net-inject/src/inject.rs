@@ -215,12 +215,13 @@ impl RxInjectThread {
             return;
         }
 
-        // Prune closed connections from previous iteration. `dead` is NOT
-        // set here: after a clean EOF the bridge entry must survive so the
-        // guest's ACK/FIN and half-close writes still hit
-        // try_fast_path_intercept (parity with the non-inline path); only
-        // the error path marks `dead` (ABX-431).
-        inline_conns.retain(|c| !c.host_eof);
+        // Prune connections closed on the previous iteration (clean host EOF)
+        // and any the bridge cancelled by setting `dead` — a guest FIN/RST tears
+        // the bridge entry down and signals here so this reader drops the conn
+        // (and its cloned fd) instead of holding it once its window freezes.
+        // A clean EOF does NOT set `dead`: the bridge entry must survive for the
+        // guest's close handshake (parity with the non-inline path).
+        inline_conns.retain(|c| !c.host_eof && !c.dead.load(std::sync::atomic::Ordering::Relaxed));
 
         // Fair-share pass: each conn gets at most PER_CONN_READS `readv`
         // calls per outer iteration. Each call can span up to MAX_MERGE
@@ -251,6 +252,17 @@ impl RxInjectThread {
                     break;
                 }
                 if per_conn >= PER_CONN_READS {
+                    break;
+                }
+
+                // Never send beyond the guest's advertised receive window:
+                // outside that budget the guest kernel drops what it can't
+                // buffer, and this path has no retransmission to repair the
+                // gap — the flow would wedge permanently (2026-07-19). A
+                // window-limited conn is revisited next pass, once the
+                // guest's ACKs (via the datapath intercept) reopen it.
+                let budget = conn.send_budget() as usize;
+                if budget == 0 {
                     break;
                 }
 
@@ -335,8 +347,16 @@ impl RxInjectThread {
                     // Placeholder — overwritten below for slots < count.
                     IoSliceMut::new(&mut [])
                 });
+                // Clamp iovec capacities to the window budget so a single
+                // readv can never pull more than the guest may receive. The
+                // clamped capacities also drive the per-descriptor byte
+                // distribution below — readv fills iovs in order at exactly
+                // these sizes.
+                let mut iov_caps = [0usize; MAX_MERGE];
+                let mut budget_left = budget;
+                let mut iov_count = 0usize;
                 for i in 0..count {
-                    let (start, cap) = if i == 0 {
+                    let (start, full_cap) = if i == 0 {
                         (
                             inline_conn::TOTAL_HDR_LEN,
                             desc_lens[i] - inline_conn::TOTAL_HDR_LEN,
@@ -344,6 +364,12 @@ impl RxInjectThread {
                     } else {
                         (0, desc_lens[i])
                     };
+                    let cap = full_cap.min(budget_left);
+                    if cap == 0 {
+                        break;
+                    }
+                    budget_left -= cap;
+                    iov_caps[i] = cap;
                     // SAFETY: desc_ptrs[i] points into the VM-lifetime
                     // guest mmap (bounds checked by gpa_to_offset above).
                     // The buffer is device-owned until we advance used_idx,
@@ -351,9 +377,10 @@ impl RxInjectThread {
                     let slice =
                         unsafe { std::slice::from_raw_parts_mut(desc_ptrs[i].add(start), cap) };
                     iovs[i] = IoSliceMut::new(slice);
+                    iov_count = i + 1;
                 }
 
-                let read_result = conn.stream.read_vectored(&mut iovs[..count]);
+                let read_result = conn.stream.read_vectored(&mut iovs[..iov_count]);
                 match read_result {
                     Ok(0) => {
                         tracing::debug!(
@@ -387,16 +414,11 @@ impl RxInjectThread {
                         let mut remaining = n;
                         let mut num_used = 0usize;
                         let mut per_desc_len = [0usize; MAX_MERGE];
-                        for i in 0..count {
+                        for i in 0..iov_count {
                             if remaining == 0 {
                                 break;
                             }
-                            let cap = if i == 0 {
-                                desc_lens[i] - inline_conn::TOTAL_HDR_LEN
-                            } else {
-                                desc_lens[i]
-                            };
-                            let filled = remaining.min(cap);
+                            let filled = remaining.min(iov_caps[i]);
                             per_desc_len[i] = filled;
                             remaining -= filled;
                             num_used = i + 1;
@@ -603,6 +625,8 @@ mod tests {
             guest_port: 50000,
             our_seq: Arc::new(AtomicU32::new(1000)),
             last_ack: Arc::new(AtomicU32::new(2000)),
+            guest_acked: Arc::new(AtomicU32::new(1000)),
+            guest_window: Arc::new(AtomicU32::new(u32::MAX)),
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             host_eof: false,

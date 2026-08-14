@@ -8,6 +8,7 @@ use arcbox_constants::ports::AGENT_PORT;
 use super::disk::fstrim_loop;
 use super::proxy::{run_docker_api_proxy, run_kubernetes_api_proxy};
 use super::rpc::handle_connection;
+use super::runtime::direct_container_routing_loop;
 use super::sandbox::sandbox_service;
 use super::vsock::{bind_vsock_listener_with_retry, is_peer_closed_error};
 
@@ -32,11 +33,6 @@ impl Agent {
         // rather than on the first sandbox request.
         let _ = sandbox_service();
 
-        // Flush sandbox DNAT rules left over from a previous agent process: the
-        // in-memory forward table starts empty, so any tagged rule still in the
-        // kernel is an orphan whose sandbox the crash-recovery sweep destroyed.
-        super::port_forward::flush_orphan_rules().await;
-
         // Drop half-written rootfs build artifacts from a previous crash.
         crate::rootfs_builder::sweep_stale_tmp().await;
 
@@ -57,6 +53,10 @@ impl Agent {
         // Periodic fstrim to reclaim sparse file space on the host.
         tokio::spawn(fstrim_loop());
 
+        // Docker recreates its firewall chains on restart. Keep the direct
+        // host-to-container rule present after the initial readiness gate.
+        tokio::spawn(direct_container_routing_loop());
+
         let mut listener = bind_vsock_listener_with_retry(AGENT_PORT, "agent rpc listener").await?;
 
         tracing::info!("Agent listening on vsock port {}", AGENT_PORT);
@@ -72,10 +72,13 @@ impl Agent {
                             // surfaces as BrokenPipe / ConnectionReset /
                             // UnexpectedEof. Log at warn — the daemon will
                             // reopen on its next poll iteration.
+                            // `{:#}` prints the whole context chain — the
+                            // top context alone hides which message the
+                            // connection was carrying when it died.
                             if is_peer_closed_error(&e) {
-                                tracing::warn!("Connection closed by peer: {}", e);
+                                tracing::warn!("Connection closed by peer: {e:#}");
                             } else {
-                                tracing::error!("Connection error: {}", e);
+                                tracing::error!("Connection error: {e:#}");
                             }
                         }
                     });

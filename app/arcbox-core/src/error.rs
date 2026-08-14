@@ -40,6 +40,16 @@ pub enum CoreError {
         message: String,
     },
 
+    /// Guest-agent transport error.
+    #[error("{context}: {source}")]
+    Transport {
+        /// Transport operation that failed.
+        context: &'static str,
+        /// Original transport error.
+        #[source]
+        source: arcbox_transport::error::TransportError,
+    },
+
     /// Persistence deserialization error.
     #[error("persistence error: {0}")]
     Persistence(#[from] toml::de::Error),
@@ -117,5 +127,44 @@ impl CoreError {
 impl From<std::io::Error> for CoreError {
     fn from(err: std::io::Error) -> Self {
         Self::Common(CommonError::from(err))
+    }
+}
+
+impl From<arcbox_transport::error::TransportError> for CoreError {
+    fn from(source: arcbox_transport::error::TransportError) -> Self {
+        Self::Transport {
+            context: "guest-agent transport failed",
+            source,
+        }
+    }
+}
+
+// The engine-layer errors map variant-for-variant, so `is_not_found()` and
+// friends keep answering the same through either type.
+impl From<arcbox_engine::EngineError> for CoreError {
+    fn from(err: arcbox_engine::EngineError) -> Self {
+        use arcbox_engine::EngineError as E;
+        match err {
+            E::Common(c) => Self::Common(c),
+            E::Vmm(e) => Self::Vmm(e),
+            E::Snapshot(e) => Self::Snapshot(e),
+            E::Vm(msg) => Self::Vm(msg),
+            E::Machine(msg) => Self::Machine(msg),
+            E::Agent { code, message } => Self::Agent { code, message },
+            E::Transport { context, source } => Self::Transport { context, source },
+            E::Net(e) => Self::Net(e),
+            E::Image(img) => Self::from(img),
+            E::Persistence(e) => Self::Persistence(e),
+            E::LockPoisoned => Self::LockPoisoned,
+        }
+    }
+}
+
+impl From<arcbox_image::ImageError> for CoreError {
+    fn from(err: arcbox_image::ImageError) -> Self {
+        match err {
+            arcbox_image::ImageError::Common(c) => Self::Common(c),
+            arcbox_image::ImageError::Image(msg) => Self::Image(msg),
+        }
     }
 }

@@ -265,10 +265,17 @@ impl GuestDnsServer {
     /// Forwards a query to the gateway DNS forwarder over UDP.
     async fn forward_to_gateway(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        sock.send_to(data, GATEWAY).await?;
+        // Connect so the kernel accepts only the gateway's reply (recv on an
+        // unconnected UDP socket takes a datagram from ANY local sender), and
+        // verify the reply echoes the query's transaction id.
+        sock.connect(GATEWAY).await?;
+        sock.send(data).await?;
 
         let mut buf = [0u8; MAX_PACKET];
         let len = tokio::time::timeout(FORWARD_TIMEOUT, sock.recv(&mut buf)).await??;
+        if len < 12 || data.get(0..2) != buf.get(0..2) {
+            anyhow::bail!("gateway DNS reply failed validation");
+        }
         Ok(buf[..len].to_vec())
     }
 }

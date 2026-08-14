@@ -1,6 +1,8 @@
-pub(super) const KUBERNETES_HOST_ENDPOINT: &str = "https://127.0.0.1:16443";
+pub(super) fn host_endpoint(port: u16) -> String {
+    format!("https://127.0.0.1:{port}")
+}
 
-pub(super) fn rewrite_kubeconfig_server(kubeconfig: &str) -> String {
+pub(super) fn rewrite_kubeconfig(kubeconfig: &str, endpoint: &str, context_name: &str) -> String {
     kubeconfig
         .lines()
         .map(|line| {
@@ -9,13 +11,15 @@ pub(super) fn rewrite_kubeconfig_server(kubeconfig: &str) -> String {
 
             match trimmed {
                 _ if trimmed.starts_with("server:") => {
-                    format!("{indent}server: {KUBERNETES_HOST_ENDPOINT}")
+                    format!("{indent}server: {endpoint}")
                 }
-                "name: default" => format!("{indent}name: arcbox"),
-                "- name: default" => format!("{indent}- name: arcbox"),
-                "cluster: default" => format!("{indent}cluster: arcbox"),
-                "user: default" => format!("{indent}user: arcbox"),
-                "current-context: default" => format!("{indent}current-context: arcbox"),
+                "name: default" => format!("{indent}name: {context_name}"),
+                "- name: default" => format!("{indent}- name: {context_name}"),
+                "cluster: default" => format!("{indent}cluster: {context_name}"),
+                "user: default" => format!("{indent}user: {context_name}"),
+                "current-context: default" => {
+                    format!("{indent}current-context: {context_name}")
+                }
                 _ => line.to_string(),
             }
         })

@@ -84,6 +84,8 @@ impl TapConfig {
 /// # Example
 ///
 /// ```no_run
+/// // `recv`/`send` arrive through the backend trait, not inherently.
+/// use arcbox_net::backend::NetworkBackend;
 /// use arcbox_net::linux::{LinuxTap, TapConfig};
 ///
 /// let config = TapConfig::new()
@@ -112,10 +114,13 @@ pub struct LinuxTap {
     vnet_hdr: bool,
 }
 
-// ioctl constants
-const TUNSETIFF: libc::c_ulong = 0x400454ca;
-const TUNSETOFFLOAD: libc::c_ulong = 0x400454d0;
-const TUNSETVNETHDRSZ: libc::c_ulong = 0x400454d8;
+// ioctl constants. `libc::Ioctl` is the request type `libc::ioctl` actually
+// takes (`c_ulong` on glibc, `c_int` on musl) — declaring the constants at
+// that type means the call sites need no cast, so a future constant can't
+// silently truncate the way an `as _` on a wider type could.
+const TUNSETIFF: libc::Ioctl = 0x400454ca;
+const TUNSETOFFLOAD: libc::Ioctl = 0x400454d0;
+const TUNSETVNETHDRSZ: libc::Ioctl = 0x400454d8;
 
 // TUN/TAP flags
 const IFF_TAP: libc::c_short = 0x0002;
@@ -379,7 +384,7 @@ impl LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)
@@ -400,7 +405,7 @@ impl LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)
@@ -431,7 +436,7 @@ impl NetworkBackend for LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)
@@ -445,7 +450,7 @@ impl NetworkBackend for LinuxTap {
             if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(0);
             }
-            return Err(NetError::Io(err));
+            return Err(NetError::Common(err.into()));
         }
 
         Ok(ret as usize)

@@ -139,7 +139,7 @@ message MacosMachineInfo {
 // characteristics come from the published manifest, not the request.
 message MacosImagePullRequest {
     // Image reference: a stream name with an optional pinned version,
-    // e.g. "tahoe-base" or "tahoe-base@2026.07.02".
+    // e.g. "tahoe-base" or "tahoe-base@2026.07.03".
     string reference = 1;
     // Manifest override (URL or daemon-local path); bypasses the published
     // index. Intended for development and pinning escapes.
@@ -199,7 +199,7 @@ message MacosImageSummary {
     int64 created = 5;
     // Source (manifest location), if known.
     string source = 6;
-    // Published version label (e.g. "2026.07.02"), if pulled.
+    // Published version label (e.g. "2026.07.03"), if pulled.
     string version = 7;
     // Guest macOS product version (e.g. "26.5"), if known.
     string os_version = 8;

@@ -1,0 +1,24 @@
+# Every proto compiled into arcbox-connect's surface, one per line, relative
+# to arcbox-protocol/proto. Read by build.rs and by refresh.sh, so the two
+# cannot disagree about what the committed descriptor covers.
+#
+# The daemon's own surface (CORE-68) shares one `arcbox.v1` package, so message
+# generation is all-or-nothing here even though the services move onto Connect
+# one at a time. `common.proto` must be listed explicitly: it defines this
+# package's hand-rolled `Timestamp` and `Mount`, which are NOT the well-known
+# types.
+common.proto
+machine.proto
+macos.proto
+container.proto
+image.proto
+agent.proto
+api.proto
+kubernetes.proto
+stats.proto
+arcbox/sandbox/v1/sandbox.proto
+arcbox/sandbox/v1/process.proto
+arcbox/sandbox/v1/filesystem.proto
+arcbox/sandbox/v1/snapshot.proto
+arcbox/sandbox/v1/template.proto
+arcbox/sandbox/v1/errors.proto

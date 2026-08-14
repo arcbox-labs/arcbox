@@ -13,7 +13,10 @@ jobs:
   # Basic API tests that don't require VM
   api-compatibility:
     name: Docker API Compatibility
-    runs-on: macos-26  # Apple Silicon runner
+    # GitHub-hosted, so no Virtualization.framework — fine for this job,
+    # which is the VM-free half. The comment above explains why the whole
+    # workflow stays dispatch-only until a self-hosted runner exists.
+    runs-on: macos-26
     timeout-minutes: 30
 
     steps:

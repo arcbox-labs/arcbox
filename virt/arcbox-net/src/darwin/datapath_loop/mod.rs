@@ -244,6 +244,22 @@ impl NetworkDatapath {
         let mut maintenance = tokio::time::interval(Duration::from_secs(30));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Wakes the loop when a pending handshake's host connect resolves,
+        // so the SYN-ACK goes out immediately (an idle loop otherwise sits
+        // in select! until the next guest frame or the 1 s tick — that tick
+        // dominated fresh-connection latency at ~2 s per sequential fetch).
+        let handshake_waker = std::sync::Arc::new(tokio::sync::Notify::new());
+        tcp_bridge.set_handshake_waker(handshake_waker.clone());
+
+        // Fast poll cadence while fast-path connections exist: their host
+        // sockets have no readiness registration (they are polled), so
+        // without this an idle connection's first response bytes wait for
+        // the next guest frame or the 1 s tick. 20 ms bounds first-byte
+        // latency at negligible idle cost (50 polls/s only while flows
+        // are open); sustained transfers self-sustain via guest ACK frames.
+        let mut fastpath_tick = tokio::time::interval(Duration::from_millis(20));
+        fastpath_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         tracing::info!("Network datapath started (TCP shim + socket proxy mode)");
 
         loop {
@@ -264,7 +280,7 @@ impl NetworkDatapath {
                 // receive buffer on a macOS AF_UNIX datagram socket.
                 writable = guest_async.writable(), if awaits_writable => {
                     let mut guard = writable?;
-                    guest_tx.drain(guest_raw_fd);
+                    guest_tx.flush(guest_raw_fd);
                     if guest_tx.awaits_writable() {
                         // Still blocked: clear readiness so the next poll
                         // waits for a fresh writability edge.
@@ -277,7 +293,7 @@ impl NetworkDatapath {
                 // EAGAIN, where a missed writability edge would otherwise
                 // wedge all guest-bound traffic permanently.
                 _ = nobufs_retry.tick(), if awaits_retry => {
-                    guest_tx.drain(guest_raw_fd);
+                    guest_tx.flush(guest_raw_fd);
                 }
 
                 // Guest → Host: read frames, classify, and dispatch.
@@ -309,7 +325,7 @@ impl NetworkDatapath {
                         tcp_bridge.try_fast_path_intercept(frame_data)
                     });
                     for ack in fast_acks {
-                        guest_tx.send(guest_raw_fd, &ack, DeliveryClass::Reliable);
+                        guest_tx.send(ack, DeliveryClass::Reliable);
                     }
 
                     // Handshake intercept: complete in-progress shim handshakes
@@ -320,12 +336,12 @@ impl NetworkDatapath {
                         tcp_bridge.try_complete_handshake(frame_data)
                     });
                     for reply in hs_replies {
-                        guest_tx.send(guest_raw_fd, &reply, DeliveryClass::Reliable);
+                        guest_tx.send(reply, DeliveryClass::Reliable);
                     }
 
                     // Flush ARP replies produced inline by the classifier.
                     for reply in device.take_arp_replies() {
-                        guest_tx.send(guest_raw_fd, &reply, DeliveryClass::Lossy);
+                        guest_tx.send(reply, DeliveryClass::Lossy);
                     }
 
                     // Discard any TCP frames left in the rx queue that didn't
@@ -339,7 +355,6 @@ impl NetworkDatapath {
                         handle_intercepted_frame(
                             intercepted_frame,
                             &mut guest_tx,
-                            guest_raw_fd,
                             &mut egress,
                             &mut dhcp_server,
                             &dns_forwarder,
@@ -361,7 +376,7 @@ impl NetworkDatapath {
                     let gmac = guest_mac.unwrap_or([0xFF; 6]);
                     for syn in &gated_syns {
                         if let Some(rst) = tcp_bridge.handle_outbound_syn(&syn.frame, gateway_mac, gmac) {
-                            guest_tx.send(guest_raw_fd, &rst, DeliveryClass::Reliable);
+                            guest_tx.send(rst, DeliveryClass::Reliable);
                         }
                     }
 
@@ -371,7 +386,7 @@ impl NetworkDatapath {
                 // Always poll — the bounded channel (256) provides natural backpressure
                 // to spawned tasks. Gating on backlog depth starved DNS replies.
                 Some(reply_frame) = reply_rx.recv() => {
-                    guest_tx.send(guest_raw_fd, &reply_frame, DeliveryClass::Lossy);
+                    guest_tx.send(reply_frame, DeliveryClass::Lossy);
                 }
 
                 // Inbound commands from InboundListenerManager.
@@ -417,6 +432,15 @@ impl NetworkDatapath {
                     egress.maintenance();
                     guest_tx.log_stats(rx_frames);
                 }
+
+                // A pending handshake's host connect resolved — fall through
+                // so poll_handshakes() in the common tail emits the SYN-ACK
+                // right away.
+                () = handshake_waker.notified() => {}
+
+                // Bounded first-byte latency for polled fast-path sockets;
+                // the common tail's poll_fast_path() does the actual work.
+                _ = fastpath_tick.tick(), if tcp_bridge.fast_path_count() > 0 => {}
             }
 
             // ── Common tail: run on every iteration regardless of which
@@ -428,7 +452,7 @@ impl NetworkDatapath {
             //    active-open (ActiveOpen), and retransmits under loss.
             let hs_frames = tcp_bridge.poll_handshakes();
             for frame in hs_frames {
-                guest_tx.send(guest_raw_fd, &frame, DeliveryClass::Reliable);
+                guest_tx.send(frame, DeliveryClass::Reliable);
             }
 
             // 1.5. Drain inbound listener commands so `cmd_rx.recv()` cannot be
@@ -442,23 +466,35 @@ impl NetworkDatapath {
                 guest_mac,
             );
 
-            // 2. Poll fast-path host streams for inbound data and inject
+            // 2. Flush everything queued so far (this iteration's ACKs,
+            //    handshake frames and intercept replies) in one batched
+            //    write. This must precede the gate below: `has_backlog` only
+            //    means backpressure once the frames have been offered to the
+            //    guest FD — before a flush it is merely "produced this
+            //    iteration", which would gate the poll on every pass.
+            guest_tx.flush(guest_raw_fd);
+
+            // 3. Poll fast-path host streams for inbound data and inject
             //    constructed frames directly to guest — but only when no
             //    backlog is pending. Skipping the poll leaves host-socket
             //    data in the host kernel's receive buffer, closing the
             //    host-side TCP window so the remote sender throttles instead
-            //    of the datapath dropping frames (lossless backpressure; the
-            //    shim has no retransmission, so a dropped data frame would
-            //    stall the connection permanently).
+            //    of the datapath dropping frames (lossless backpressure —
+            //    preferable even though the bridge can retransmit, since
+            //    retransmission costs a round trip per loss).
             if guest_tx.has_backlog() {
                 guest_tx.stats.gated_polls += 1;
             } else {
                 for frame in tcp_bridge.poll_fast_path() {
-                    guest_tx.send(guest_raw_fd, &frame, DeliveryClass::Reliable);
+                    guest_tx.send(frame, DeliveryClass::Reliable);
                 }
             }
 
-            drain_reply_rx(&mut reply_rx, &mut guest_tx, guest_raw_fd);
+            // 4. Second flush: the fast-path frames and proxy replies queued
+            //    since the flush above. Frames therefore never wait for a
+            //    later loop iteration to reach the guest.
+            drain_reply_rx(&mut reply_rx, &mut guest_tx);
+            guest_tx.flush(guest_raw_fd);
 
             // Yield to the tokio runtime so spawned tasks (e.g. host relay
             // read/write) get a chance to run on this worker thread. Without

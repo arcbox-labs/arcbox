@@ -28,35 +28,32 @@
 //!           ▼            ▼
 //!      arcbox-vmm   arcbox-fs
 //! ```
-pub mod agent_client;
-pub mod boot_assets;
 #[cfg(target_os = "macos")]
 pub mod bridge_discovery;
 pub mod config;
 pub mod container_backend;
 pub mod error;
-pub mod event;
-pub mod machine;
-pub mod machine_image;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod migration;
-pub mod persistence;
-pub mod remote_image;
 #[cfg(target_os = "macos")]
 pub mod route_reconciler;
 pub mod runtime;
 pub mod stats_hub;
-pub mod trace;
-pub mod vm;
-pub mod vm_lifecycle;
 
-pub use agent_client::{AgentClient, ExecSessionInput, WriteFileChunk};
-pub use arcbox_vmm::{DeviceDebug, QueueDebug, VmBackend};
-pub use boot_assets::{
+// Image management and the engine core moved to the engine layer
+// (arcbox-image, arcbox-engine); the module paths and crate-root items
+// below are compatibility re-exports.
+pub use arcbox_engine::{agent_client, event, machine, persistence, trace, vm, vm_lifecycle};
+pub use arcbox_image::{boot_assets, machine_image, remote_image};
+
+pub use arcbox_computer::NestedVirtCapability;
+pub use arcbox_engine::agent_client::{AgentClient, ExecSessionInput, WriteFileChunk};
+pub use arcbox_image::boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
     PreparePhase, boot_asset_version,
 };
+pub use arcbox_vmm::{DeviceDebug, QueueDebug, VmBackend};
 pub use config::{Config, ContainerRuntimeConfig};
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;
@@ -69,7 +66,9 @@ pub use macos::{
 #[cfg(feature = "macos-ipsw-install")]
 pub use macos::{PullPhase, PullSource};
 pub use migration::MigrationManager;
-pub use runtime::{Runtime, SandboxPortExposure};
+pub use runtime::{
+    InitProgress, Runtime, SandboxPortExposure, SandboxPortMapping, SandboxPortProtocol,
+};
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
 pub use vm_lifecycle::{
     ActivityScope, DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig,

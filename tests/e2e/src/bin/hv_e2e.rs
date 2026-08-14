@@ -603,7 +603,7 @@ impl DaxFixture {
     }
 }
 
-fn get_system_info(vmm: &Vmm) -> Result<arcbox_protocol::SystemInfo, String> {
+fn get_system_info(vmm: &Vmm) -> Result<arcbox_connect::v1::SystemInfo, String> {
     let fd = vmm
         .connect_vsock(AGENT_PORT)
         .map_err(|e| format!("connect_vsock: {e}"))?;

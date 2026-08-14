@@ -123,9 +123,10 @@ async fn brew_uninstall() -> Result<()> {
     // 4. Remove `/usr/local/bin/docker*` via the helper. The helper plist
     //    survives this hook (its full removal belongs to `sudo abctl _uninstall`),
     //    so its launchd-activated socket is still reachable here. Best-effort:
-    //    if the helper was never installed (app never launched), the connect
-    //    fails and we leave nothing to clean up anyway. The helper's `cli_unlink`
-    //    is gated on `is_arcbox_owned`, so foreign symlinks are left alone.
+    //    a missing or incompatible helper makes the checked connection fail;
+    //    the full sudo uninstall removes any remaining owned links directly.
+    //    The helper's `cli_unlink` is gated on `is_arcbox_owned`, so foreign
+    //    symlinks are left alone.
     if let Ok(client) = arcbox_helper::client::Client::connect().await {
         for name in DOCKER_CLI_TOOLS {
             let _ = client.cli_unlink(name).await;

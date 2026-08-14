@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             "--version" | "-V" => {
-                eprintln!("arcbox-helper {}", env!("CARGO_PKG_VERSION"));
+                println!("arcbox-helper {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--idle-exit" => idle_exit = true,
@@ -33,8 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Helper runs as root — write logs to /var/log/arcbox/helper.log.
+    // Debug E2E (`ARCBOX_HELPER_TEST_ROOT`) relocates the log dir under the
+    // sandbox so the real binary can start without root.
+    let log_dir = server::fs_root::resolve(arcbox_constants::paths::privileged_log::HELPER_LOG_DIR);
+    let _ = std::fs::create_dir_all(&log_dir);
     let log_guard = arcbox_logging::init(arcbox_logging::LogConfig {
-        log_dir: std::path::PathBuf::from(arcbox_constants::paths::privileged_log::HELPER_LOG_DIR),
+        log_dir,
         file_name: arcbox_constants::paths::privileged_log::HELPER_LOG.to_string(),
         default_filter: "arcbox_helper=info".to_string(),
         foreground: true, // Also log to stderr (captured by launchd).

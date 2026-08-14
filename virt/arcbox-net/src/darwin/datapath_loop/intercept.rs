@@ -1,5 +1,4 @@
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::fd::RawFd;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -20,7 +19,6 @@ use super::guest_tx::{DeliveryClass, GuestTx};
 pub(super) fn handle_intercepted_frame(
     intercepted: &crate::darwin::classifier::InterceptedFrame,
     guest_tx: &mut GuestTx,
-    guest_fd: RawFd,
     egress: &mut HostEgress,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &DnsForwarder,
@@ -38,7 +36,6 @@ pub(super) fn handle_intercepted_frame(
             handle_dhcp(
                 frame,
                 guest_tx,
-                guest_fd,
                 dhcp_server,
                 gateway_ip,
                 gateway_mac,
@@ -100,7 +97,6 @@ pub(super) fn process_inbound_cmd(
 fn handle_dhcp(
     frame: &[u8],
     guest_tx: &mut GuestTx,
-    guest_fd: RawFd,
     dhcp_server: &mut DhcpServer,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
@@ -132,7 +128,7 @@ fn handle_dhcp(
             );
             for reply_frame in reply_frames {
                 tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
-                guest_tx.send(guest_fd, &reply_frame, DeliveryClass::Lossy);
+                guest_tx.send(reply_frame, DeliveryClass::Lossy);
             }
         }
         Ok(None) => {
@@ -283,18 +279,20 @@ async fn forward_dns_async(data: &[u8], upstream: &[SocketAddr]) -> Result<Vec<u
     }
     let query_id = [data[0], data[1]];
 
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| format!("bind failed: {e}"))?;
-
     for addr in upstream {
-        if socket.send_to(data, addr).await.is_err() {
+        // A connected socket makes the kernel drop datagrams from anyone but
+        // this upstream — a 16-bit txid alone is guessable by an off-path
+        // attacker flooding the ephemeral port, so the source filter matters.
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("bind failed: {e}"))?;
+        if socket.connect(addr).await.is_err() || socket.send(data).await.is_err() {
             continue;
         }
 
         let mut buf = [0u8; 4096];
-        match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _))) if len >= 2 && buf[0] == query_id[0] && buf[1] == query_id[1] => {
+        match tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf)).await {
+            Ok(Ok(len)) if len >= 2 && buf[0] == query_id[0] && buf[1] == query_id[1] => {
                 return Ok(buf[..len].to_vec());
             }
             _ => {}

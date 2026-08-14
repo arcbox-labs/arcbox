@@ -6,15 +6,16 @@
 //! reconnect keeps running, and its terminal event is forwarded to whichever
 //! stream is live instead of being lost into the dropped connection's channel.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
 use arcbox_fleet_proto::v1::{
-    Attach, AttachRequest, Capability, Heartbeat, HostTelemetry, attach_request, attach_response,
+    Attach, AttachRequest, Heartbeat, HostTelemetry, attach_request, attach_response,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -22,9 +23,10 @@ use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tracing::{info, warn};
 
+use crate::backends::Backends;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
-use crate::docker;
+use crate::handover::{Handover, Reason};
 use crate::host;
 use crate::runner::RunnerSupervisor;
 use crate::state::AgentState;
@@ -99,6 +101,17 @@ fn is_unauthenticated(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Why one connection's serve loop ended without an error.
+enum StreamEnd {
+    /// The gateway closed the stream; reconnect after backoff.
+    Closed,
+    /// The backend registry changed, so the capability set this stream
+    /// declared is stale — re-attach immediately (no backoff): the gateway
+    /// rewrites the machine's capability pools from each `Attach`
+    /// handshake, so the reconnect is what propagates the change.
+    Reattach,
+}
+
 /// Convert a gateway-facing telemetry reading into its control-plane
 /// counterpart. A plain function, not `From`: both `HostTelemetry` types
 /// are generated in other crates, so Rust's orphan rule blocks implementing
@@ -122,21 +135,17 @@ fn telemetry_to_control(t: &HostTelemetry) -> control_proto::HostTelemetry {
 /// its own task.
 pub fn spawn_supervisor(
     config: &AgentConfig,
-    docker: Option<docker::DockerRunner>,
-    vm: Option<crate::vm::VmRunner>,
-    interop: Option<crate::interop::InteropRunner>,
-    capabilities: Vec<Capability>,
+    backends: Arc<Backends>,
     state: AgentState,
+    handover: Arc<Handover>,
 ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
     let (egress_tx, egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
     let supervisor = RunnerSupervisor::new(
         egress_tx,
         config.runner_script.clone(),
-        docker,
-        vm,
-        interop,
-        capabilities,
+        backends,
         state,
+        handover,
     );
     (supervisor, egress_rx)
 }
@@ -152,27 +161,28 @@ pub fn spawn_supervisor(
 #[allow(
     clippy::too_many_arguments,
     reason = "the reconnect loop genuinely needs all of: endpoint config, credential, the \
-              persistent supervisor, the cross-reconnect egress queue, advertised \
-              capabilities, the shutdown token, and the observable state handle"
+              persistent supervisor, the cross-reconnect egress queue, the backend \
+              registry, the shutdown token, the observable state handle, and the handover \
+              a pushed self-update records itself on"
 )]
 pub async fn run(
     config: AgentConfig,
     credential: Credential,
     supervisor: RunnerSupervisor,
     mut egress_rx: mpsc::Receiver<AttachRequest>,
-    capabilities: Vec<Capability>,
+    backends: Arc<Backends>,
     shutdown: CancellationToken,
     state: AgentState,
+    handover: Arc<Handover>,
 ) -> Result<()> {
     let mut backoff = INITIAL_BACKOFF;
+    // Activation notifications; each connection marks the current value
+    // seen before it snapshots the capability set it declares.
+    let mut backends_rx = backends.subscribe();
     // An event pulled from the egress queue but not yet delivered when the
     // connection dropped; re-sent first on the next connection so a terminal
     // event is never lost to a closed stream.
     let mut pending: Option<AttachRequest> = None;
-    // Whether the supervisor is draining for a self-update. Spans reconnects
-    // so a successful re-attach (the pin moved back to this build) can undo
-    // exactly the update drain and nothing else.
-    let mut drained_for_update = false;
 
     // Attachment-scoped: resend unacked verdicts across reconnects within this
     // attachment, exiting when `shutdown` fires. Tied to the attachment rather
@@ -190,10 +200,11 @@ pub async fn run(
             &mut egress_rx,
             &mut pending,
             &mut backoff,
-            &capabilities,
+            &backends,
+            &mut backends_rx,
             &shutdown,
             &state,
-            &mut drained_for_update,
+            &handover,
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -202,7 +213,11 @@ pub async fn run(
             break;
         }
         match outcome {
-            Ok(()) => info!("attach stream closed by gateway; reconnecting"),
+            Ok(StreamEnd::Reattach) => {
+                info!("backend registry changed; re-attaching with the fresh capability set");
+                continue;
+            }
+            Ok(StreamEnd::Closed) => info!("attach stream closed by gateway; reconnecting"),
             Err(e) if is_unauthenticated(&e) => {
                 // The gateway definitively rejected the credential — the
                 // machine was decommissioned server-side (RUN-40), whether
@@ -251,15 +266,25 @@ pub async fn run(
                 // running (a mid-stream drain that lost its connection, or a
                 // reconnect that got version-rejected). Never kill them for
                 // an update.
-                supervisor.drain_for_update();
-                drained_for_update = true;
+                handover.request(Reason::Update);
+                // Off-stream, so no ack can arrive: waiting one out would only
+                // delay the swap by the full grace on every version refusal.
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => break,
-                    () = supervisor.drained_of_jobs() => {}
+                    () = supervisor.quiesce(Duration::ZERO) => {}
                 }
-                // Returns only on failure; success replaces this process.
-                let error = update::apply_and_exec(&config, &payload).await;
+                let error = match update::apply(&config, &payload).await {
+                    Ok(managed) => {
+                        // The swap is done; committing brings the process down
+                        // through this same loop's shutdown so runners are torn
+                        // down and the log buffer flushed before `main` execs
+                        // the new image.
+                        handover.commit(managed);
+                        break;
+                    }
+                    Err(error) => error,
+                };
                 if error
                     .chain()
                     .any(|c| c.downcast_ref::<update::UnmanagedBinary>().is_some())
@@ -291,7 +316,10 @@ pub async fn run(
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 
-    info!("shutdown signal received; stopping runners");
+    // Reached on a shutdown (signal, unenroll, operator restart) and on a
+    // staged self-update alike — the swap goes out through the same teardown
+    // so no runner is left orphaned by the exec that follows.
+    info!("attachment ending; stopping runners");
     supervisor.shutdown(SHUTDOWN_GRACE).await;
     // The loop only exits once `shutdown` is cancelled, so the resend task has
     // already broken out of its own loop; await it so it's fully reaped before
@@ -324,11 +352,12 @@ async fn connect_and_serve(
     egress_rx: &mut mpsc::Receiver<AttachRequest>,
     pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
-    capabilities: &[Capability],
+    backends: &Backends,
+    backends_rx: &mut watch::Receiver<()>,
     shutdown: &CancellationToken,
     state: &AgentState,
-    drained_for_update: &mut bool,
-) -> Result<()> {
+    handover: &Arc<Handover>,
+) -> Result<StreamEnd> {
     // The desired (`target`) gateway, not `config.gateway` directly —
     // `AgentSupervisor` seeds it from config, and an `Enroll` gateway
     // override can have moved it from there. It cannot move while this
@@ -339,20 +368,29 @@ async fn connect_and_serve(
     let gateway = state.gateway_target();
     let (req_tx, req_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
 
+    // Mark the current registry generation seen BEFORE snapshotting the
+    // capability set: an activation racing this window still trips the
+    // re-attach arm below, which is harmless — the set it re-declares is
+    // already fresh. The reverse order could declare a stale set and eat
+    // the notification.
+    backends_rx.mark_unchanged();
+    let capabilities = backends.capabilities();
+
     // Send `Attach` as the very first outbound message, buffered on `req_tx`
     // before the gRPC call runs. Three reasons: it's the handshake message
     // the gateway checks agent_version against; it declares the capabilities
-    // and host facts that are constant for this process's lifetime (so
-    // Heartbeat can carry only what actually changes); and it satisfies the
-    // PLAT-34 "speak first" property — the gateway (or a proxy in front)
-    // will not release its response headers until it sees the client say
-    // something, and if the client waits for the response before sending
-    // anything the whole stream idle-times-out. The mpsc buffer holds the
-    // message until tonic drains it once the stream opens.
+    // and host facts for this connection (the gateway treats them as
+    // per-attachment declarative state and Heartbeat carries only what
+    // changes mid-stream — a capability change re-attaches instead); and it
+    // satisfies the PLAT-34 "speak first" property — the gateway (or a
+    // proxy in front) will not release its response headers until it sees
+    // the client say something, and if the client waits for the response
+    // before sending anything the whole stream idle-times-out. The mpsc
+    // buffer holds the message until tonic drains it once the stream opens.
     let attach_msg = AttachRequest {
         msg: Some(attach_request::Msg::Attach(Attach {
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-            capabilities: capabilities.to_vec(),
+            capabilities,
             host_info_json: host::host_info_json(),
             host_os: host::host_os(),
             host_arch: host::host_arch(),
@@ -391,7 +429,7 @@ async fn connect_and_serve(
     };
     let mut inbound = tokio::select! {
         biased;
-        () = shutdown.cancelled() => return Ok(()),
+        () = shutdown.cancelled() => return Ok(StreamEnd::Closed),
         result = connect => result?,
     };
 
@@ -408,10 +446,7 @@ async fn connect_and_serve(
             // A drain begun for an update that never happened (the pin moved
             // back to this build before the swap) is moot once the gateway
             // accepts this build again.
-            if *drained_for_update {
-                supervisor.resume_after_moot_update();
-                *drained_for_update = false;
-            }
+            handover.update_became_moot();
         }
         Some(attach_response::Msg::AttachRejected(update)) => {
             return Err(anyhow::Error::new(AgentUpdateRequired::from(update)));
@@ -439,18 +474,37 @@ async fn connect_and_serve(
     }
 
     // A mid-stream update pushed on a HeartbeatAck. The stream stays live
-    // while the supervisor drains — cancels keep arriving and verdicts keep
-    // delivering — and only once everything is settled does the loop leave
-    // with `AgentUpdateRequired`, handing the swap to the reconnect loop.
+    // while the supervisor quiesces — cancels keep arriving and verdicts keep
+    // delivering, which is why the ack grace is worth paying here — and only
+    // then does the loop leave with `AgentUpdateRequired`, handing the swap to
+    // the reconnect loop.
     let mut pending_update: Option<AgentUpdateRequired> = None;
+    // Built once and polled across iterations, not rebuilt per `select!` pass:
+    // a fresh future each time round would restart the ack grace every time
+    // any other branch fired, and a stream carrying heartbeats never goes
+    // quiet for that long. Futures are lazy, so the grace starts on the first
+    // poll — which the guard below defers until an update is actually pending.
+    let mut quiescing = std::pin::pin!(supervisor.quiesce(crate::runner::VERDICT_ACK_GRACE));
 
     loop {
         tokio::select! {
-            () = shutdown.cancelled() => break Ok(()),
-            () = supervisor.settled(), if pending_update.is_some() => {
+            () = shutdown.cancelled() => break Ok(StreamEnd::Closed),
+            () = &mut quiescing, if pending_update.is_some() => {
                 break Err(anyhow::Error::new(
                     pending_update.take().expect("guarded by is_some"),
                 ));
+            }
+            // A backend activated: leave cleanly so the reconnect declares
+            // the fresh capability set. In-flight jobs survive (they live
+            // in the supervisor), and a pending mid-stream update is safe
+            // to abandon — the next handshake re-derives it (AttachRejected
+            // or a re-pushed HeartbeatAck). Err means the registry dropped,
+            // which only happens at process teardown.
+            result = backends_rx.changed() => {
+                break Ok(match result {
+                    Ok(()) => StreamEnd::Reattach,
+                    Err(_) => StreamEnd::Closed,
+                });
             }
             event = egress_rx.recv() => match event {
                 Some(msg) => {
@@ -462,7 +516,7 @@ async fn connect_and_serve(
                 }
                 // The supervisor holds the only egress sender, so this cannot
                 // happen while the agent runs; treat it as a clean shutdown.
-                None => break Ok(()),
+                None => break Ok(StreamEnd::Closed),
             },
             message = inbound.message() => match message {
                 Ok(Some(message)) => {
@@ -476,15 +530,14 @@ async fn connect_and_serve(
                                 current = env!("CARGO_PKG_VERSION"),
                                 "gateway pushed an update; draining before the swap"
                             );
-                            supervisor.drain_for_update();
-                            *drained_for_update = true;
+                            handover.request(Reason::Update);
                             pending_update = Some(AgentUpdateRequired::from(update.clone()));
                         }
                         continue;
                     }
                     dispatch(supervisor, message.msg);
                 }
-                Ok(None) => break Ok(()),
+                Ok(None) => break Ok(StreamEnd::Closed),
                 Err(status) => break Err(anyhow::Error::from(status)),
             },
         }
@@ -564,8 +617,9 @@ fn spawn_verdict_resend(
 /// Heartbeats are connection-scoped: the task is spawned per connection and
 /// aborted when it drops, so a momentary disconnect does not leave stale
 /// heartbeats queued for the next stream. Capability set and host facts are
-/// declared once per stream in the `Attach` handshake (they're constant for
-/// the process lifetime), so this loop carries only what actually changes.
+/// declared once per stream in the `Attach` handshake (a capability change
+/// re-attaches instead — see [`StreamEnd::Reattach`]), so this loop carries
+/// only what actually changes mid-stream.
 fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
     state: AgentState,
@@ -688,17 +742,24 @@ mod tests {
             machine_id: "fltm_parked".to_owned(),
             machine_token: "flt_revoked".to_owned(),
         };
-        let (supervisor, egress_rx) =
-            spawn_supervisor(&config, None, None, None, Vec::new(), state.clone());
+        let backends = Backends::fixed(Vec::new(), state.clone());
+        let handover = Handover::new(state.clone());
+        let (supervisor, egress_rx) = spawn_supervisor(
+            &config,
+            Arc::clone(&backends),
+            state.clone(),
+            Arc::clone(&handover),
+        );
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(run(
             config,
             credential,
             supervisor,
             egress_rx,
-            Vec::new(),
+            backends,
             shutdown.clone(),
             state.clone(),
+            handover,
         ));
 
         // The loop must reach the parked state rather than retry-looping.
@@ -813,16 +874,9 @@ mod tests {
             gateway: gateway.clone(),
             ..seed()
         });
-        let (events, _rx) = mpsc::channel(1);
-        let supervisor = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            AgentState::new(&seed()),
-        );
+        let supervisor = supervisor();
+        let backends = Backends::fixed(Vec::new(), AgentState::new(&seed()));
+        let mut backends_rx = backends.subscribe();
         let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
         let mut pending = None;
         let mut backoff = INITIAL_BACKOFF;
@@ -837,7 +891,7 @@ mod tests {
         // A generous-but-bounded deadline distinguishes "worked" from
         // "deadlocked with the mock" without depending on any real network
         // timeout.
-        let mut drained_for_update = false;
+        let handover = Handover::new(state.clone());
         tokio::time::timeout(
             Duration::from_secs(3),
             connect_and_serve(
@@ -847,10 +901,11 @@ mod tests {
                 &mut egress_rx,
                 &mut pending,
                 &mut backoff,
-                &[],
+                &backends,
+                &mut backends_rx,
                 &shutdown,
                 &state,
-                &mut drained_for_update,
+                &handover,
             ),
         )
         .await
@@ -863,24 +918,168 @@ mod tests {
         );
     }
 
+    /// A gateway that accepts every `Attach`, records each handshake's
+    /// capability set, and holds the stream open (draining inbound so
+    /// heartbeats don't backpressure) until the client leaves.
+    struct RecordingGateway {
+        attaches: Arc<tokio::sync::Mutex<Vec<Vec<arcbox_fleet_proto::v1::Capability>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayService
+        for RecordingGateway
+    {
+        async fn enroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::EnrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::EnrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        type AttachStream = tokio_stream::wrappers::ReceiverStream<
+            Result<arcbox_fleet_proto::v1::AttachResponse, tonic::Status>,
+        >;
+
+        async fn attach(
+            &self,
+            request: Request<tonic::Streaming<AttachRequest>>,
+        ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+            let mut inbound = request.into_inner();
+            let first = inbound
+                .message()
+                .await
+                .map_err(|e| tonic::Status::internal(e.to_string()))?
+                .ok_or_else(|| tonic::Status::internal("closed before Attach"))?;
+            let Some(attach_request::Msg::Attach(attach)) = first.msg else {
+                return Err(tonic::Status::internal("first message was not Attach"));
+            };
+            self.attaches.lock().await.push(attach.capabilities);
+
+            let (tx, rx) = mpsc::channel(4);
+            let _ = tx
+                .send(Ok(arcbox_fleet_proto::v1::AttachResponse {
+                    msg: Some(attach_response::Msg::AttachAccepted(
+                        arcbox_fleet_proto::v1::AttachAccepted {},
+                    )),
+                }))
+                .await;
+            tokio::spawn(async move {
+                // Keep the response stream open while draining heartbeats;
+                // dropping `tx` when the client hangs up closes it.
+                let _hold = tx;
+                while let Ok(Some(_)) = inbound.message().await {}
+            });
+            Ok(tonic::Response::new(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+        }
+
+        async fn unenroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::UnenrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::UnenrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    /// The re-attach contract end to end: a backend activating mid-stream
+    /// must make the attach loop leave its live stream and re-attach, with
+    /// the fresh handshake declaring the grown capability set — that
+    /// reconnect is what propagates a capability change to the gateway.
+    #[tokio::test]
+    async fn backend_activation_reattaches_with_fresh_capabilities() {
+        use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
+
+        let attaches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetGatewayServiceServer::new(RecordingGateway {
+                    attaches: Arc::clone(&attaches),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        let state = AgentState::new(&PersistedSettings {
+            gateway: gateway.clone(),
+            ..seed()
+        });
+        let config = AgentConfig {
+            gateway,
+            ..config()
+        };
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let handover = Handover::new(state.clone());
+        let (supervisor, egress_rx) = spawn_supervisor(
+            &config,
+            Arc::clone(&backends),
+            state.clone(),
+            Arc::clone(&handover),
+        );
+        let shutdown = CancellationToken::new();
+        let run_task = tokio::spawn(run(
+            config,
+            credential(),
+            supervisor,
+            egress_rx,
+            Arc::clone(&backends),
+            shutdown.clone(),
+            state,
+            handover,
+        ));
+
+        async fn wait_for_attaches(
+            attaches: &tokio::sync::Mutex<Vec<Vec<arcbox_fleet_proto::v1::Capability>>>,
+            n: usize,
+        ) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while attaches.lock().await.len() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("gateway never saw {n} Attach handshakes"));
+        }
+
+        // First attach declares the empty startup set.
+        wait_for_attaches(&attaches, 1).await;
+        assert!(attaches.lock().await[0].is_empty());
+
+        // Activate the VM backend mid-stream; the loop must re-attach and
+        // declare it.
+        let daemon = crate::mock_daemon::MockDaemon::spawn(&["tahoe-base"]).await;
+        let vm = crate::vm::VmRunner::new(&daemon.socket, "tahoe-base")
+            .await
+            .expect("probe against the mock daemon");
+        backends.activate_vm(vm);
+
+        wait_for_attaches(&attaches, 2).await;
+        let second = attaches.lock().await[1].clone();
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].backed_by,
+            arcbox_fleet_proto::v1::Backend::Vm as i32
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("attach loop exits on shutdown")
+            .expect("attach task must not panic")
+            .expect("clean exit");
+    }
+
     /// The verdict-resend loop is attachment-scoped: cancelling the shutdown
     /// token must reap it. Otherwise every unenroll/re-enroll cycle would
     /// leak a task holding a supervisor clone (DashMaps, egress sender, Docker
     /// handle) for the life of the process.
     #[tokio::test]
     async fn verdict_resend_task_exits_when_shutdown_fires() {
-        let (events, _rx) = mpsc::channel(1);
-        let supervisor = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            AgentState::new(&seed()),
-        );
         let shutdown = CancellationToken::new();
-        let handle = spawn_verdict_resend(supervisor, shutdown.clone());
+        let handle = spawn_verdict_resend(supervisor(), shutdown.clone());
 
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(1), handle)
@@ -917,6 +1116,21 @@ mod tests {
         }
     }
 
+    /// A minimal supervisor over an empty fixed-capability registry, with
+    /// its own observable state — for tests that only need the handle and
+    /// never route a verdict through it (the egress receiver is dropped).
+    fn supervisor() -> RunnerSupervisor {
+        let (events, _rx) = mpsc::channel(1);
+        let state = AgentState::new(&seed());
+        RunnerSupervisor::new(
+            events,
+            None,
+            Backends::fixed(Vec::new(), state.clone()),
+            state.clone(),
+            Handover::new(state),
+        )
+    }
+
     /// The connect + Attach-RPC handshake has no cancellation awareness of
     /// its own (see this fn's own doc in the non-test code above) — without
     /// racing it against `shutdown`, a reconnect attempt could complete the
@@ -926,16 +1140,9 @@ mod tests {
     #[tokio::test]
     async fn connect_and_serve_bails_out_immediately_when_already_cancelled() {
         let state = AgentState::new(&seed());
-        let (events, _rx) = mpsc::channel(1);
-        let supervisor = RunnerSupervisor::new(
-            events,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            AgentState::new(&seed()),
-        );
+        let supervisor = supervisor();
+        let backends = Backends::fixed(Vec::new(), AgentState::new(&seed()));
+        let mut backends_rx = backends.subscribe();
         let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
         let mut pending = None;
         let mut backoff = INITIAL_BACKOFF;
@@ -945,7 +1152,7 @@ mod tests {
         let config = config();
         let credential = credential();
 
-        let mut drained_for_update = false;
+        let handover = Handover::new(state.clone());
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             connect_and_serve(
@@ -955,10 +1162,11 @@ mod tests {
                 &mut egress_rx,
                 &mut pending,
                 &mut backoff,
-                &[],
+                &backends,
+                &mut backends_rx,
                 &shutdown,
                 &state,
-                &mut drained_for_update,
+                &handover,
             ),
         )
         .await

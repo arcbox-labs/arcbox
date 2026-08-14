@@ -1,0 +1,226 @@
+// Sandbox filesystem data plane.
+//
+// File transfer and path operations inside a running sandbox. **Data
+// plane**: the calls carry file bytes and address one specific sandbox,
+// so they are served by whatever is co-located with it rather than
+// routed through the control-plane entry point. See `sandbox.proto` for
+// the control plane.
+//
+// Every verb is a real RPC into the guest agent — never a shelled-out
+// `ls`/`stat` parse. The path verbs (CORE-62) are contract-only until
+// the guest side lands; whole-file read/write are live.
+
+syntax = "proto3";
+
+package arcbox.sandbox.v1;
+
+import "arcbox/sandbox/v1/sandbox.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// SandboxFilesystemService moves files in and out of a sandbox and
+// operates on its paths.
+service SandboxFilesystemService {
+    // Read a file from inside a sandbox as a stream of chunks.
+    // The final chunk has done == true. The sandbox must be alive
+    // (READY or RUNNING). Limited to 256 MiB per file. Servers may emit
+    // empty non-final chunks as keepalives.
+    rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+
+    // Write a file into a sandbox. The first message must carry `open`;
+    // subsequent messages stream `chunk` payloads, the last one with
+    // done == true. Limited to 256 MiB per file.
+    rpc WriteFile(stream WriteFileRequest) returns (google.protobuf.Empty);
+
+    // Return metadata for one path. Symlinks are reported, not followed.
+    rpc Stat(StatFileRequest) returns (FileStat);
+
+    // List a directory's entries, non-recursively. Every entry carries
+    // a full FileStat, so no per-entry Stat round-trips are needed.
+    rpc ListDir(ListDirRequest) returns (ListDirResponse);
+
+    // Create a directory, including missing parents (`mkdir -p`
+    // semantics — never the non-recursive trap). Succeeds when the
+    // directory already exists.
+    rpc MakeDir(MakeDirRequest) returns (google.protobuf.Empty);
+
+    // Remove a file, symlink, or directory. A non-empty directory
+    // requires `recursive`.
+    rpc Remove(RemoveEntryRequest) returns (google.protobuf.Empty);
+
+    // Rename / move a file or directory within the sandbox.
+    rpc Move(MoveEntryRequest) returns (google.protobuf.Empty);
+
+    // Stream filesystem events under a path — push-based, never a
+    // polling fallback. KeepAlive frames are interleaved while idle so
+    // proxies do not cut the connection; the stream ends only on
+    // cancellation or sandbox stop.
+    rpc WatchDir(WatchDirRequest) returns (stream WatchDirResponse);
+}
+
+// Request to read a file from a sandbox.
+message ReadFileRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute path inside the sandbox rootfs.
+    string path = 2;
+}
+
+// One chunk of file data in a ReadFile / WriteFile stream.
+message FileChunk {
+    // Raw bytes (may be empty on the final chunk, or on a keepalive).
+    bytes data = 1;
+    // True on the last chunk of the stream.
+    bool done = 2;
+}
+
+// Opens a WriteFile stream. Must be the first WriteFileRequest message.
+message WriteFileOpen {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute destination path inside the sandbox rootfs.
+    string path = 2;
+    // Unix permission bits for the created file (0 = 0644).
+    uint32 mode = 3;
+}
+
+// A single client message in a WriteFile stream.
+message WriteFileRequest {
+    oneof payload {
+        // Stream header — sandbox, path, and mode.
+        WriteFileOpen open = 1;
+        // File content chunk; the last one has done == true.
+        FileChunk chunk = 2;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path verbs (CORE-62)
+// ---------------------------------------------------------------------------
+
+// What kind of filesystem object a path is.
+enum FileKind {
+    FILE_KIND_UNSPECIFIED = 0;
+    // Regular file.
+    FILE_KIND_FILE = 1;
+    FILE_KIND_DIRECTORY = 2;
+    FILE_KIND_SYMLINK = 3;
+    // Device node, FIFO, or socket.
+    FILE_KIND_OTHER = 4;
+}
+
+// Metadata of one filesystem entry.
+message FileStat {
+    // Base name of the entry (the final path component).
+    string name = 1;
+    // Kind of entry (symlinks are reported as SYMLINK, not followed).
+    FileKind kind = 2;
+    // Size in bytes (regular files; 0 otherwise).
+    uint64 size = 3;
+    // Unix permission bits (the low 12 bits of st_mode).
+    uint32 mode = 4;
+    // Last modification time.
+    google.protobuf.Timestamp modified_at = 5;
+    // Owning user ID.
+    uint32 uid = 6;
+    // Owning group ID.
+    uint32 gid = 7;
+    // Symlink target (set only when kind == SYMLINK).
+    string symlink_target = 8;
+}
+
+// Request to stat a path.
+message StatFileRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute path inside the sandbox rootfs.
+    string path = 2;
+}
+
+// Request to list a directory.
+message ListDirRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute directory path inside the sandbox rootfs.
+    string path = 2;
+}
+
+// Response to ListDir.
+message ListDirResponse {
+    // Directory entries, each with full metadata.
+    repeated FileStat entries = 1;
+}
+
+// Request to create a directory.
+message MakeDirRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute directory path to create (missing parents are created).
+    string path = 2;
+    // Unix permission bits for created directories (0 = 0755).
+    uint32 mode = 3;
+}
+
+// Request to remove a filesystem entry.
+message RemoveEntryRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute path to remove.
+    string path = 2;
+    // Remove directories and their contents recursively. Without it a
+    // non-empty directory fails with FAILED_PRECONDITION.
+    bool recursive = 3;
+}
+
+// Request to rename / move a filesystem entry.
+message MoveEntryRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute source path.
+    string from_path = 2;
+    // Absolute destination path.
+    string to_path = 3;
+}
+
+// Request to watch a path for filesystem events.
+message WatchDirRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute path to watch (a directory).
+    string path = 2;
+    // Also watch subdirectories.
+    bool recursive = 3;
+}
+
+// Kind of a filesystem event.
+enum FsEventKind {
+    FS_EVENT_KIND_UNSPECIFIED = 0;
+    // An entry was created.
+    FS_EVENT_KIND_CREATED = 1;
+    // An entry's content or metadata changed.
+    FS_EVENT_KIND_MODIFIED = 2;
+    // An entry was removed.
+    FS_EVENT_KIND_REMOVED = 3;
+    // An entry was renamed within the watched tree.
+    FS_EVENT_KIND_RENAMED = 4;
+}
+
+// One filesystem event.
+message FsEvent {
+    // What happened.
+    FsEventKind kind = 1;
+    // Absolute path of the affected entry (the old path for RENAMED).
+    string path = 2;
+    // New absolute path (set only for RENAMED).
+    string renamed_to = 3;
+}
+
+// One frame of a WatchDir stream.
+message WatchDirResponse {
+    oneof payload {
+        // A filesystem event.
+        FsEvent event = 1;
+        // Idle-stream keepalive; carries no data.
+        KeepAlive keep_alive = 2;
+    }
+}

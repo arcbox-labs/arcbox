@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Once;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
 use crate::daemon::{DaemonConfig, DaemonHandle};
@@ -47,6 +47,9 @@ pub fn run_vz_scenario_with_log(
     scenario: impl FnOnce(&mut DaemonHandle, &Path, &mut RunMetrics) -> Result<()>,
 ) -> Result<()> {
     init_tracing();
+    // Diagnostic override for the daemon under test, e.g.
+    // ARCBOX_E2E_DAEMON_LOG="info,splicetcp::tcp_bridge=debug".
+    let rust_log = std::env::var("ARCBOX_E2E_DAEMON_LOG").unwrap_or_else(|_| rust_log.to_owned());
 
     let root = crate::repo_root();
     if !crate::env_flag("SKIP_BUILD") {
@@ -61,15 +64,6 @@ pub fn run_vz_scenario_with_log(
         .tempdir()?;
     stage_dev_boot_assets(&root, data_dir.path(), &version)?;
 
-    // Probe a free port for the daemon's host DNS service so this test can
-    // run alongside a developer's live daemon (fixed 5553) and parallel
-    // test runs. The bind is dropped before the daemon starts — a benign
-    // TOCTOU for a test harness.
-    let dns_port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .context("probing a free DNS port")?
-        .port();
-
     let mut daemon = DaemonHandle::spawn(DaemonConfig {
         binary: root.join("target/release/arcbox-daemon"),
         data_dir: data_dir.path().to_owned(),
@@ -77,8 +71,7 @@ pub fn run_vz_scenario_with_log(
         env: vec![
             ("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version),
             ("ARCBOX_VM_BACKEND".to_owned(), "vz".to_owned()),
-            ("ARCBOX_DNS_PORT".to_owned(), dns_port.to_string()),
-            ("RUST_LOG".to_owned(), rust_log.to_owned()),
+            ("RUST_LOG".to_owned(), rust_log),
         ],
     })?;
 

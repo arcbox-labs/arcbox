@@ -35,7 +35,7 @@ pub struct MacImageMeta {
     /// Stream the image was pulled from (e.g. `tahoe-base`), if pulled.
     #[serde(default)]
     pub stream: Option<String>,
-    /// Published version label (e.g. `2026.07.02`), if pulled.
+    /// Published version label (e.g. `2026.07.03`), if pulled.
     #[serde(default)]
     pub version: Option<String>,
     /// Guest macOS product version (e.g. `26.5`), if known.

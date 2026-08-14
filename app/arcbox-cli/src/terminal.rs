@@ -10,6 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+/// Returns whether ANSI styling should be emitted for a terminal stream.
+pub fn ansi_enabled(is_terminal: bool) -> bool {
+    ansi_enabled_with_override(is_terminal, std::env::var_os("NO_COLOR").is_some())
+}
+
+const fn ansi_enabled_with_override(is_terminal: bool, no_color: bool) -> bool {
+    is_terminal && !no_color
+}
+
 /// Terminal size (width x height).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -337,6 +346,13 @@ impl AttachConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ansi_requires_a_terminal_without_no_color() {
+        assert!(ansi_enabled_with_override(true, false));
+        assert!(!ansi_enabled_with_override(false, false));
+        assert!(!ansi_enabled_with_override(true, true));
+    }
 
     #[test]
     fn test_terminal_size_current() {

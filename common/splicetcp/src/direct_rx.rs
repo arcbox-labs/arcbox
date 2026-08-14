@@ -82,6 +82,12 @@ pub struct PromotedConn {
     /// Last ACK from guest (shared with the datapath via atomic so the
     /// inject thread and fast-path intercept stay in sync).
     pub last_ack: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Highest ACK the guest has sent for OUR stream, maintained by the
+    /// fast-path intercept. With `guest_window` it bounds how far ahead of
+    /// the guest this reader may send (`tcp_bridge::send_budget`).
+    pub guest_acked: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The guest's most recent advertised receive window, already scaled.
+    pub guest_window: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Host→guest byte counter, present only when a flow observer is installed —
     /// `None` ⇒ no accounting and no per-connection allocation. The inline inject
     /// path reads the host socket outside the bridge's `poll_fast_path`, so this
@@ -183,6 +189,8 @@ impl ConnSink for TokioFrameConnSink {
             peer_mss,
             our_seq,
             last_ack,
+            guest_acked,
+            guest_window,
             down_bytes,
             gw_mac,
             guest_mac,
@@ -200,6 +208,8 @@ impl ConnSink for TokioFrameConnSink {
             guest_port,
             our_seq,
             last_ack,
+            guest_acked,
+            guest_window,
             down_bytes,
             dead,
             gw_mac,
@@ -223,6 +233,8 @@ struct AsyncPromotedConn {
     guest_port: u16,
     our_seq: Arc<std::sync::atomic::AtomicU32>,
     last_ack: Arc<std::sync::atomic::AtomicU32>,
+    guest_acked: Arc<std::sync::atomic::AtomicU32>,
+    guest_window: Arc<std::sync::atomic::AtomicU32>,
     down_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
     dead: Arc<std::sync::atomic::AtomicBool>,
     gw_mac: [u8; 6],
@@ -244,7 +256,32 @@ async fn read_promoted_conn(
 ) {
     let mut buf = vec![0u8; 32 * 1024];
     loop {
-        match stream.read(&mut buf).await {
+        // The bridge sets `dead` when it tears the flow down (guest FIN/RST or
+        // a host error): stop and drop our cloned fd instead of spinning on a
+        // now-frozen send window.
+        if conn.dead.load(Ordering::Relaxed) {
+            return;
+        }
+        // Never read (hence send) beyond the guest's advertised receive
+        // window (capped at `HONORED_WINDOW_CAP`, 256 KiB) — see
+        // `tcp_bridge::send_budget`. When window-limited, the guest's next
+        // ACK reopens the budget; 1 ms polling bounds the wait, a
+        // ~256 MiB/s per-flow ceiling in that regime — ACK-driven wakeups
+        // take over long before it binds. Unread
+        // bytes stay in the host socket buffer (kernel backpressure).
+        let budget = crate::tcp_bridge::send_budget(
+            conn.our_seq.load(Ordering::Relaxed),
+            conn.guest_acked.load(Ordering::Relaxed),
+            conn.guest_window
+                .load(Ordering::Relaxed)
+                .min(crate::tcp_bridge::HONORED_WINDOW_CAP),
+        ) as usize;
+        if budget == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            continue;
+        }
+        let cap = budget.min(buf.len());
+        match stream.read(&mut buf[..cap]).await {
             Ok(0) => {
                 let seq_now = conn.our_seq.load(Ordering::Relaxed);
                 let fin = build_tcp_fin_frame(&TcpFrameParams {
@@ -300,8 +337,9 @@ async fn read_promoted_conn(
                 // let the guest mistake a truncated stream for a complete
                 // one — and never drop the upstream silently: without a
                 // guest-bound frame the guest socket stays ESTABLISHED
-                // forever (ABX-431).
-                tracing::debug!(
+                // forever (ABX-431). WARN: an abnormal flow termination must
+                // be visible in the daemon log (once per flow, no storm).
+                tracing::warn!(
                     "promoted conn {}:{} → {}:{} read error, RST to guest: {e}",
                     conn.remote_ip,
                     conn.remote_port,
@@ -363,6 +401,8 @@ mod tests {
             peer_mss: 1460,
             our_seq: our_seq.clone(),
             last_ack,
+            guest_acked: Arc::new(AtomicU32::new(1000)),
+            guest_window: Arc::new(AtomicU32::new(65535)),
             down_bytes: Some(down.clone()),
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
@@ -411,6 +451,8 @@ mod tests {
             peer_mss: 9000, // jumbo → the configured 4000 MTU drives sizing
             our_seq: our_seq.clone(),
             last_ack: Arc::new(AtomicU32::new(2000)),
+            guest_acked: Arc::new(AtomicU32::new(1000)),
+            guest_window: Arc::new(AtomicU32::new(65535)),
             down_bytes: None,
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
@@ -461,6 +503,8 @@ mod tests {
             peer_mss: 1460,
             our_seq: Arc::new(AtomicU32::new(1000)),
             last_ack: Arc::new(AtomicU32::new(2000)),
+            guest_acked: Arc::new(AtomicU32::new(1000)),
+            guest_window: Arc::new(AtomicU32::new(65535)),
             down_bytes: None,
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
@@ -520,6 +564,8 @@ mod tests {
             peer_mss: 1460,
             our_seq: Arc::new(AtomicU32::new(1000)),
             last_ack: Arc::new(AtomicU32::new(2000)),
+            guest_acked: Arc::new(AtomicU32::new(1000)),
+            guest_window: Arc::new(AtomicU32::new(65535)),
             down_bytes: None,
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
@@ -566,6 +612,8 @@ mod tests {
             peer_mss: 1460,
             our_seq: our_seq.clone(),
             last_ack: Arc::new(AtomicU32::new(2000)),
+            guest_acked: Arc::new(AtomicU32::new(1000)),
+            guest_window: Arc::new(AtomicU32::new(65535)),
             down_bytes: None,
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],

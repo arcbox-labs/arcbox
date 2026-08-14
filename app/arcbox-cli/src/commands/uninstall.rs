@@ -4,7 +4,7 @@
 //! CLI binary itself. Requires interactive confirmation and sudo for
 //! privileged operations.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use arcbox_constants::paths::{ArcboxProfile, DOCKER_CLI_TOOLS, HostLayout, privileged};
 use clap::Args;
 use std::io::Write;
@@ -23,8 +23,10 @@ pub struct UninstallArgs {
 }
 
 pub async fn execute(args: UninstallArgs) -> Result<()> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
     let profile = ArcboxProfile::from_env_or_default();
+    validate_uninstall_scope(profile)?;
+
+    let home = dirs::home_dir().context("cannot determine home directory")?;
     let daemon_label = profile.daemon_label();
     let docker_context = profile.docker_context_name();
     let data_dir = HostLayout::from_env_or_default().data_dir;
@@ -228,4 +230,25 @@ pub async fn execute(args: UninstallArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_uninstall_scope(profile: ArcboxProfile) -> Result<()> {
+    if profile == ArcboxProfile::Development {
+        bail!(
+            "Development instances must be removed by the Desktop app; refusing the machine-wide uninstall command."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_uninstall_scope;
+    use arcbox_constants::paths::ArcboxProfile;
+
+    #[test]
+    fn development_uninstall_is_rejected() {
+        assert!(validate_uninstall_scope(ArcboxProfile::Development).is_err());
+        assert!(validate_uninstall_scope(ArcboxProfile::Production).is_ok());
+    }
 }

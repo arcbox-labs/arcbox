@@ -16,6 +16,7 @@ arcbox-packet = { workspace = true }
 arcbox-proxy = { workspace = true }
 crossbeam-channel = "0.5"
 libc = { workspace = true }
+socket2 = "0.6"
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -29,5 +30,5 @@ tokio-frame-sink = []
 [lints]
 workspace = true
 
-[dev-dependencies]
-socket2 = "0.6"
+[target.'cfg(target_os = "macos")'.dependencies]
+arcbox-xnu-net.workspace = true

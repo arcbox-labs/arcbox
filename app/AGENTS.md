@@ -6,6 +6,8 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 `docs/daemon-lifecycle.md` (lock/handoff, residual-state tables) and
 `docs/data-directories.md` (filesystem paths) — point there, don't restate.
 
+`arcbox-cli` ships one binary, `abctl`. User-facing strings must name it.
+
 ## Startup & readiness contract
 
 - Startup is a phased, typed pipeline and the order is load-bearing — see
@@ -37,6 +39,63 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   restarts install the route outside the cold-start path that sets the flag
   directly, so without the bridge the flag goes stale until the next daemon
   restart.
+- **A `SetupStatus.Phase` value that nothing publishes is invisible as a
+  gap** — it simply never arrives, so a client waits forever or reports a
+  plausible zero. Declaring a phase in `api.proto` therefore obliges you to
+  publish it; the happy-path progression and which phases are conditional
+  live in the enum's own doc comment (`api.proto`) and
+  `docs/daemon-lifecycle.md`, and must be updated with any change. This
+  was CORE-67: `VM_STARTING`/`VM_READY`/`NETWORK_READY` sat declared and
+  unpublished, leaving the slowest stretch of startup silent.
+- **The VM phases are reported from inside `Runtime::init`, not derived
+  from pipeline order** (`InitProgress` → `SetupPhase` in
+  `startup/mod.rs::init_runtime`). WHY: `boot_runtime` is one stage that
+  stages guest binaries, boots the VM, waits for the agent, then waits for
+  dockerd. Publishing at the stage boundaries would bill the binary
+  download to `VM_STARTING` and make `VM_READY` mean "dockerd answered" —
+  the span ABX-309 budgets would measure the wrong thing. `init` reports
+  `SystemVmStarting` after the binaries are staged and `SystemVmReady` when
+  `vm_lifecycle.ensure_ready` returns (readiness level 2 below); the
+  dockerd wait lands in the `VM_READY → NETWORK_READY` window. `init`
+  reports nothing under `--no-linux-vm`, which is what keeps the VM pair
+  off the wire when no guest boots.
+- **`SetupState` streams every update, not the newest snapshot**
+  (`arcbox-api/src/system.rs`: a `watch` for `GetSetupStatus`, a `broadcast`
+  for `WatchSetupStatus`). WHY: `NETWORK_READY` and `READY` are published
+  ~300 µs apart with no await point between them, so a snapshot channel
+  hands a subscriber only `READY` whenever it does not get scheduled in
+  that window — indistinguishable from a phase that was never published,
+  and the exact bug CORE-67 set out to remove. The two halves are kept
+  atomic by opposite sides of one lock: `publish` broadcasts from inside
+  `send_modify`, holding the write lock, and `subscribe` takes the snapshot
+  and the receiver together under the read lock that write lock excludes.
+  Split either pair and you drop an update or replay one already folded
+  into the snapshot, walking a client's phase backwards. Regressions:
+  `back_to_back_phases_are_all_delivered`,
+  `the_snapshot_is_not_replayed_as_an_update`.
+- **A listener the phase promises is bound before `start_services` returns,
+  never inside its spawned task** (`DnsService::bind`, then
+  `DockerApiServer::bind` + `serve` — CORE-71). WHY: a task that binds and
+  only logs its error cannot fail startup, so the pipeline publishes
+  `NETWORK_READY` and `READY` for a daemon whose primary API no client can
+  reach. `NETWORK_READY` therefore covers whichever services this daemon
+  runs — `--no-linux-vm` reaches it with DNS alone — and the Kubernetes
+  proxy is the deliberate exception: a taken 16443 is tolerated, so it is
+  started here but not promised. Adding a listener means deciding which of
+  those two it is.
+- **`SetupStatus.vm_running` is owned by `services::vm_running_loop`**, which
+  mirrors `VmLifecycleState::is_ready` (readiness level 2 below) off
+  `Runtime::subscribe_system_vm_state`. WHY: it used to be set once by
+  cold-start recovery on a successful guest query and never cleared, so it
+  read `true` for the rest of the daemon's life after any stop (CORE-70). A
+  second writer re-introduces that class of drift — the loop owns both
+  edges. It is armed from `init_runtime` *before* `Runtime::init`, not from
+  `start_services`: the VM goes ready partway through `init`, so a later
+  start would report it down for the whole dockerd wait. And it is only as
+  good as the lifecycle state — an unmanaged guest crash leaves that
+  `Running` (ABX-414: no `HealthMonitor` loop), so the flag says "the daemon
+  believes the VM is up", not "the VM answered just now". Regression:
+  `vm_running_loop_follows_the_lifecycle_both_ways`.
 - Startup-cancellation invariant: the flock (`daemon_lock`) and
   `early_runtime` are held in `StartupHandles`, not only in pipeline-local
   context (`context.rs`, `main::run` keeps a clone). WHY: a signal can drop
@@ -54,7 +113,7 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 - Guest boots and daemon reaches READY, but every registry pull / TLS
   handshake fails certificate-validity checks. First: check the daemon log
   for `guest clock sync ping failed` (a warn, not an error);
-  `rg -n "sync_guest_clock" app/arcbox-core/src/vm_lifecycle/boot.rs`.
+  `rg -n "sync_guest_clock" engine/arcbox-engine/src/vm_lifecycle/boot.rs`.
   Likely cause: the HV backend has no RTC (ABX-416); the guest wall clock is
   pushed only by the best-effort post-readiness agent ping
   (`AgentPingRequest.timestamp_secs` → agent `clock_settime`). If that ping
@@ -97,12 +156,12 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 - `MachineManager::connect_agent` yields different transports by backend:
   blocking on the HV AF_UNIX socketpair, async on VZ AF_VSOCK and on Linux.
   Branch on `AgentClient::is_blocking()`
-  (`arcbox-core/src/agent_client.rs`); calling a `*_blocking` RPC on VZ (or
+  (`engine/arcbox-engine/src/agent_client.rs`); calling a `*_blocking` RPC on VZ (or
   an async RPC on HV) fails deterministically. `sync_guest_clock`
   (`vm_lifecycle/boot.rs`) is the reference pattern: `spawn_blocking` the
   connect, then dispatch `ping_blocking` vs `ping` on `is_blocking()`.
 
-## VM lifecycle internals (`arcbox-core/src/vm_lifecycle`)
+## VM lifecycle internals (`engine/arcbox-engine/src/vm_lifecycle`)
 
 - `VmLifecycleManager` is a thin facade over a single actor
   (`actor.rs`): mutations go through `Command` variants on an `mpsc`
@@ -118,6 +177,24 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   + large `docker.img` mount under CPU/I/O pressure). A tight 30s budget
   raced the cold-boot path into "timeout waiting for agent" loops — do not
   tighten it toward the <1.5s cold-boot target.
+- **The idle balloon never shrinks today: no macOS backend reclaims** —
+  the gate is `BalloonDeps::reclaim_capable` (`balloon/controller.rs`),
+  false on both backends, and it is load-bearing (measured 2026-07-29,
+  macOS 26.4; full evidence in `balloon/mod.rs` docs). VZ inflation
+  releases NOTHING host-side (15.35 GB inflated, daemon `phys_footprint`
+  byte-identical, pages *compressed as live data* under real host
+  pressure). HV inflates via `MADV_DONTNEED`, which Darwin treats as a
+  deactivation hint (calibrated footprint-inert; contents preserved).
+  Host footprint is NOT the configured `memory_mb` — VZ commits guest RAM
+  lazily, so the cost is the high-water mark of guest-*touched* pages
+  (measured 2026-08-01: a fresh idle 16 GB VM = ~718MB; the guest
+  allocating 3GB of tmpfs takes it to 3717MB and freeing it changes
+  nothing). With no reclaim path that mark is a one-way ratchet, and
+  `memory_mb` is a ceiling on the eventual cost rather than an upfront
+  charge. The only macOS levers are `memory_mb`, a VM restart, and the
+  macOS compressor. Do not flip a backend to reclaim-capable without a
+  measured host `phys_footprint` drop on inflate (HV path: switch the
+  device to `MADV_FREE_REUSABLE` first).
 - `set_backend` only changes the backend used on the next (re)boot; it does
   NOT stop or restart a running VM. To apply immediately the caller forces a
   recreate via `Runtime::switch_system_vm_backend`. The backend is seeded
@@ -140,6 +217,21 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   RPCs into a VM whose agent/dockerd is not up. The `MachineManager`
   `MachineState` lives outside the lifecycle actor on purpose (physical vs
   logical layering) — do not unify them.
+- **`restart_generation` reports departures, not arrivals.** It is bumped on
+  VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
+  `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
+  START of the gap where no guest exists. Under
+  `switch_system_vm_backend` it then races the reboot with the same
+  `DEFAULT_STARTUP_TIMEOUT_SECS` budget the boot itself gets; after a plain
+  stop with the daemon still alive, no guest is coming at all. Anything that
+  must act when the VM comes *up* watches
+  `VmLifecycleManager::subscribe_state` (`Runtime::subscribe_system_vm_state`)
+  instead: wait for `VmLifecycleState::is_ready`, do the work, then wait for
+  it to clear. Reference consumer: the `~/ArcBox` export reconcile
+  (`arcbox-daemon/src/nfs_mount.rs`), whose per-incarnation supervisor loop
+  also carries the companion rule — one pass's failure must be retried, not
+  propagated out of the loop, or every later incarnation inherits the broken
+  state (ABX-426).
 - Two startup timeouts cover SEQUENTIAL phases; don't conflate them.
   `DEFAULT_STARTUP_TIMEOUT_SECS = 90` (`mod.rs`) budgets VM boot → agent
   ready; `ContainerRuntimeConfig::startup_timeout_ms = 150_000`
@@ -156,8 +248,11 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 `mod.rs` holds only the read accessor). The Docker proxy compares it via
 the request path to detect a
 System VM restart (backend switch / recovery) and reset stale state
-(`arcbox-docker/src/proxy/state.rs`). When editing either side, keep in
-lockstep:
+(`arcbox-docker/src/proxy/state.rs`). Reading a stop-edge counter is correct
+*here* precisely because the proxy acts on its next request, which by
+definition arrives once the VM is back — do not copy the pattern into a task
+that must act at the restart itself (see "reports departures, not arrivals"
+above). When editing either side, keep in lockstep:
 
 - `reset_if_restarted` must drop the pooled connections BEFORE flipping
   cached readiness to `Unverified`. WHY: a concurrent verifier that sees
@@ -185,7 +280,7 @@ lockstep:
   `runtime/AGENTS.md` means by "the pull path elsewhere" — there is no host-side
   pull module to call; drive it through the Docker API proxy.
 
-## Boot-asset pin (`arcbox-core/src/boot_assets`)
+## Boot-asset pin (`engine/arcbox-image`)
 
 - `assets.lock` is embedded at COMPILE TIME
   (`include_str!("../../../../assets.lock")`, `lockfile.rs`): the daemon

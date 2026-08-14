@@ -255,8 +255,11 @@ pub struct DnsForwarder {
     config: DnsConfig,
     /// Shared local hostname mappings (hostname -> IP).
     local_hosts: Arc<LocalHostsTable>,
-    /// DNS cache (query -> response).
-    cache: HashMap<cache::DnsCacheKey, cache::CacheEntry>,
+    /// Response cache. Behind a `Mutex` (interior mutability) so `handle_query`
+    /// takes only `&self`; callers then hold a *read* lock on the surrounding
+    /// `RwLock<DnsForwarder>`, so a slow upstream forward never blocks the fast
+    /// local-resolution / cache-hit path.
+    cache: std::sync::Mutex<HashMap<cache::DnsCacheKey, cache::CacheEntry>>,
 }
 
 impl DnsForwarder {
@@ -266,7 +269,7 @@ impl DnsForwarder {
         Self {
             config,
             local_hosts: Arc::new(LocalHostsTable::new(HashMap::new())),
-            cache: HashMap::new(),
+            cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -280,7 +283,7 @@ impl DnsForwarder {
         Self {
             config,
             local_hosts,
-            cache: HashMap::new(),
+            cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -405,7 +408,7 @@ impl DnsForwarder {
     /// # Errors
     ///
     /// Returns an error if the query cannot be processed.
-    pub fn handle_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn handle_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         // Parse the query
         let query = DnsQuery::parse(data)?;
 
@@ -435,6 +438,30 @@ impl DnsForwarder {
         // Set response flags
         response[2] = 0x81; // QR=1, Opcode=0, AA=0, TC=0, RD=1
         response[3] = 0x80; // RA=1, Z=0, RCODE=0
+
+        // This builder emits only answer records — never authority or
+        // additional. Zero NSCOUNT and ARCOUNT (copied verbatim from the
+        // query header) so an EDNS query, which sets ARCOUNT=1 for its OPT
+        // pseudo-record, doesn't leave the response advertising a record we
+        // dropped — strict resolvers reject that as malformed. ANCOUNT is
+        // set per branch below. Mirrors `build_nxdomain_response`.
+        response[8..12].fill(0);
+
+        // Only answer with the address record the client actually asked for.
+        // A mismatched qtype — a different family (A vs AAAA), or MX/TXT/SRV/…
+        // — is NODATA (the name exists but has no record of that type), never
+        // an A/AAAA record mislabeled as the answer to the asked-for type.
+        let qtype_matches = matches!(
+            (query.qtype, ip),
+            (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::Aaaa, IpAddr::V6(_))
+        );
+        if !qtype_matches {
+            response[6] = 0x00; // ANCOUNT high
+            response[7] = 0x00; // ANCOUNT low — NODATA
+            response.extend_from_slice(&query.raw_question);
+            return Ok(response);
+        }
+
         response[6] = 0x00; // ANCOUNT high
         response[7] = 0x01; // ANCOUNT low
 
@@ -476,28 +503,38 @@ impl DnsForwarder {
     }
 
     /// Forwards a query to upstream servers.
-    fn forward_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// Each upstream gets a freshly `connect`ed socket so the kernel drops any
+    /// datagram not from that upstream, and the reply's transaction ID must
+    /// echo the query's — together closing the off-path cache-poisoning window
+    /// an unconnected `recv_from` (which accepted any sender's bytes) left open.
+    fn forward_query(&self, data: &[u8]) -> Result<Vec<u8>> {
         use std::net::UdpSocket;
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| NetError::Dns(format!("failed to bind socket: {}", e)))?;
-
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| NetError::Dns(format!("failed to set timeout: {}", e)))?;
+        // The query's transaction ID; a valid reply must echo it.
+        let query_id = data.get(0..2);
 
         for upstream in &self.config.upstream {
-            // Send query
-            if socket.send_to(data, upstream).is_err() {
+            let socket = UdpSocket::bind("0.0.0.0:0")
+                .map_err(|e| NetError::Dns(format!("failed to bind socket: {}", e)))?;
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|e| NetError::Dns(format!("failed to set timeout: {}", e)))?;
+
+            // connect() filters incoming datagrams to this upstream only.
+            if socket.connect(upstream).is_err() || socket.send(data).is_err() {
                 continue;
             }
 
-            // Receive response
-            let mut buf = [0u8; 512];
-            if let Ok((len, _)) = socket.recv_from(&mut buf) {
+            // Sized for EDNS0 replies (a 512-byte buffer silently truncated
+            // them). Reject anything without a full header echoing our txid.
+            let mut buf = vec![0u8; 65535];
+            if let Ok(len) = socket.recv(&mut buf) {
+                if len < 12 || Some(&buf[0..2]) != query_id {
+                    continue;
+                }
                 let response = buf[..len].to_vec();
 
-                // Cache the response (simplified)
                 if let Ok(query) = DnsQuery::parse(data) {
                     self.cache_response(&query, &response);
                 }
@@ -510,8 +547,8 @@ impl DnsForwarder {
     }
 
     /// Clears the DNS cache.
-    pub fn clear_cache(&mut self) {
-        self.cache.clear();
+    pub fn clear_cache(&self) {
+        self.cache.lock().expect("dns cache lock poisoned").clear();
     }
 }
 
@@ -708,6 +745,138 @@ mod tests {
         packet
     }
 
+    /// A one-shot fake upstream that answers a single query with a valid
+    /// response header (QDCOUNT=1) followed by the echoed question, so the
+    /// reply is protocol-valid rather than a bare truncated header. Echoes
+    /// the query's transaction id or corrupts it per `echo_txid`.
+    fn spawn_fake_upstream(echo_txid: bool) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        use std::net::UdpSocket;
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = sock.recv_from(&mut buf).unwrap();
+            let mut reply = if echo_txid {
+                vec![buf[0], buf[1]]
+            } else {
+                vec![buf[0] ^ 0xFF, buf[1] ^ 0xFF]
+            };
+            reply.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
+            // Echo the question section so QDCOUNT=1 is honest and the reply
+            // is a protocol-valid message, not a truncated header.
+            reply.extend_from_slice(&buf[12..len]);
+            sock.send_to(&reply, peer).unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn forward_query_accepts_matching_transaction_id() {
+        let (upstream, handle) = spawn_fake_upstream(true);
+        let config = DnsConfig {
+            upstream: vec![upstream],
+            ..DnsConfig::default()
+        };
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("example.com");
+        let reply = forwarder
+            .forward_query(&query)
+            .expect("a reply echoing the txid must be accepted");
+        handle.join().unwrap();
+        assert_eq!(&reply[0..2], &query[0..2], "reply carries the query's txid");
+    }
+
+    /// Regression (cache-poisoning): a reply whose transaction id does not
+    /// match the query must be rejected, never returned or cached.
+    #[test]
+    fn forward_query_rejects_mismatched_transaction_id() {
+        let (upstream, handle) = spawn_fake_upstream(false);
+        let config = DnsConfig {
+            upstream: vec![upstream],
+            ..DnsConfig::default()
+        };
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("example.com");
+        let result = forwarder.forward_query(&query);
+        handle.join().unwrap();
+        assert!(
+            result.is_err(),
+            "a reply with the wrong transaction id must be rejected"
+        );
+    }
+
+    /// A local-hostname reply must honor the query's QTYPE: an A query gets the
+    /// address record, but a mismatched type (e.g. MX) is NODATA, not an A
+    /// record mislabeled as an MX answer.
+    #[test]
+    fn local_response_honors_qtype() {
+        let forwarder = DnsForwarder::new(DnsConfig::default());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let a = build_test_query("myvm.arcbox.local");
+        let a_resp = forwarder
+            .build_local_response(&DnsQuery::parse(&a).unwrap(), ip)
+            .unwrap();
+        assert_eq!(
+            [a_resp[6], a_resp[7]],
+            [0x00, 0x01],
+            "an A query returns the address record"
+        );
+
+        // Same name, QTYPE = MX (15). QTYPE is the 4th/3rd-to-last byte.
+        let mut mx = build_test_query("myvm.arcbox.local");
+        let n = mx.len();
+        mx[n - 4] = 0x00;
+        mx[n - 3] = 0x0f;
+        let mx_resp = forwarder
+            .build_local_response(&DnsQuery::parse(&mx).unwrap(), ip)
+            .unwrap();
+        assert_eq!(
+            [mx_resp[6], mx_resp[7]],
+            [0x00, 0x00],
+            "an MX query on an A-only host is NODATA, not a mislabeled A record"
+        );
+    }
+
+    /// A local-hostname reply to an EDNS(0) query must not advertise section
+    /// records it doesn't carry: the query's ARCOUNT=1 (OPT pseudo-record) is
+    /// copied into the response header, but the builder emits no OPT record,
+    /// so NSCOUNT and ARCOUNT must be zeroed on both the answer and NODATA
+    /// paths or strict resolvers reject the reply as malformed.
+    #[test]
+    fn local_response_zeroes_section_counts_for_edns() {
+        let forwarder = DnsForwarder::new(DnsConfig::default());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Turn an A query into an EDNS query: ARCOUNT=1 + an OPT record.
+        let make_edns = |name: &str, qtype: u8| {
+            let mut q = build_test_query(name);
+            let n = q.len();
+            q[n - 4] = 0x00;
+            q[n - 3] = qtype; // QTYPE
+            q[11] = 0x01; // ARCOUNT = 1
+            // Minimal OPT pseudo-record: root name, TYPE=41, CLASS=4096, TTL=0, RDLEN=0.
+            q.extend_from_slice(&[
+                0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]);
+            q
+        };
+
+        for (label, qtype) in [("answer (A match)", 0x01u8), ("NODATA (MX)", 0x0f)] {
+            let q = make_edns("myvm.arcbox.local", qtype);
+            let resp = forwarder
+                .build_local_response(&DnsQuery::parse(&q).unwrap(), ip)
+                .unwrap();
+            assert_eq!(
+                &resp[8..12],
+                &[0x00, 0x00, 0x00, 0x00],
+                "{label}: NSCOUNT and ARCOUNT must be zero (no authority/additional records emitted)"
+            );
+        }
+    }
+
     fn build_test_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
         build_test_response_with_additional(query, ip, ttl, false)
     }
@@ -804,11 +973,11 @@ mod tests {
 
         let key =
             cache::DnsCacheKey::new(&parsed_query.name, parsed_query.qtype, parsed_query.qclass);
-        let entry = forwarder
-            .cache
-            .get_mut(&key)
-            .expect("response should be cached");
-        entry.cached_at -= Duration::from_secs(10);
+        {
+            let mut cache = forwarder.cache.lock().unwrap();
+            let entry = cache.get_mut(&key).expect("response should be cached");
+            entry.cached_at -= Duration::from_secs(10);
+        }
 
         let cached = forwarder
             .check_cache(&parsed_query)
@@ -835,10 +1004,8 @@ mod tests {
 
         let key =
             cache::DnsCacheKey::new(&parsed_query.name, parsed_query.qtype, parsed_query.qclass);
-        let entry = forwarder
-            .cache
-            .get(&key)
-            .expect("response should be cached");
+        let cache = forwarder.cache.lock().unwrap();
+        let entry = cache.get(&key).expect("response should be cached");
         assert_eq!(entry.ttl, Duration::from_secs(30));
     }
 

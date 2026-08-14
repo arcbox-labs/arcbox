@@ -33,7 +33,7 @@ impl TcpBridge {
         }
         let ihl = ((syn_frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
-        if l4_start + 20 > syn_frame.len() {
+        if ihl < 20 || l4_start + 20 > syn_frame.len() {
             return None;
         }
 
@@ -109,6 +109,22 @@ impl TcpBridge {
             dst_port,
             domain,
         });
+        // Wake the datapath loop the moment the connect resolves: on an
+        // idle loop nothing else fires until the next guest frame or the
+        // 1 s timer tick, and that tick otherwise dominates every fresh
+        // connection's latency (sequential fetches ran at ~2 s/request).
+        let result_rx = if let Some(waker) = &self.handshake_waker {
+            let waker = std::sync::Arc::clone(waker);
+            let (tx, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let value = result_rx.await.unwrap_or(None);
+                let _ = tx.send(value);
+                waker.notify_one();
+            });
+            rx
+        } else {
+            result_rx
+        };
 
         let our_isn = next_isn();
         self.handshake_conns.insert(
@@ -289,6 +305,47 @@ impl TcpBridge {
                     }
                 }
                 HandshakeRole::ActiveOpen => {
+                    // Stop driving the guest-side handshake only if the host
+                    // client that opened this inbound connection reset it — a
+                    // hard socket error on the non-blocking peek. A clean EOF
+                    // (peek Ok(0)) is NOT abandonment: the client half-closed
+                    // its write side but can still receive our response, so we
+                    // let the handshake complete and the established fast path
+                    // propagate the EOF as a FIN, exactly as it does after
+                    // promotion. Treating EOF as dead here broke protocols that
+                    // write-half-close to signal end-of-input.
+                    let host_reset = conn.host_stream.as_ref().is_some_and(|s| {
+                        let mut probe = [0u8; 1];
+                        match s.peek(&mut probe) {
+                            Ok(_) => false, // data or a clean EOF — peer is not gone
+                            Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+                        }
+                    });
+                    if host_reset {
+                        // If we already sent our SYN the guest may sit in
+                        // SYN-RECEIVED; clear it with an RST at seq = our_isn+1
+                        // (its RCV.NXT), which a RFC 5961 guest accepts —
+                        // `handshake_abort_rst`'s seq=0 is for the passive-open
+                        // (SYN-SENT) guest and would be dropped as out-of-window
+                        // here. With no SYN sent the guest has no state to clear.
+                        if conn.saved_frame.is_some() {
+                            out.push(crate::ethernet::build_tcp_rst_frame(
+                                &crate::ethernet::TcpFrameParams {
+                                    src_ip: key.dst_ip,
+                                    dst_ip: key.src_ip,
+                                    src_port: key.dst_port,
+                                    dst_port: key.src_port,
+                                    seq: conn.our_isn.wrapping_add(1),
+                                    ack: 0,
+                                    window: 0,
+                                    src_mac: conn.gw_mac,
+                                    dst_mac: conn.guest_mac,
+                                },
+                            ));
+                        }
+                        to_abort.push(*key);
+                        continue;
+                    }
                     if conn.saved_frame.is_none() {
                         let frame =
                             crate::ethernet::build_tcp_syn_frame(&crate::ethernet::SynParams {
@@ -346,7 +403,7 @@ impl TcpBridge {
         }
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
-        if l4_start + 20 > frame.len() {
+        if ihl < 20 || l4_start + 20 > frame.len() {
             return None;
         }
 
@@ -415,10 +472,11 @@ impl TcpBridge {
                 let our_seq = conn.our_isn.wrapping_add(1);
                 let last_ack = conn.peer_isn.wrapping_add(1);
                 let peer_mss = conn.peer_mss;
+                let peer_wscale = conn.peer_wscale;
                 let Some(stream) = conn.host_stream else {
                     return Some(Vec::new());
                 };
-                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss);
+                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss, peer_wscale);
                 Some(Vec::new())
             }
             HandshakeRole::ActiveOpen => {
@@ -471,10 +529,11 @@ impl TcpBridge {
                     });
 
                 let peer_mss = conn.peer_mss;
+                let peer_wscale = conn.peer_wscale;
                 let Some(stream) = conn.host_stream else {
                     return Some(vec![ack_frame]);
                 };
-                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss);
+                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss, peer_wscale);
                 Some(vec![ack_frame])
             }
         }

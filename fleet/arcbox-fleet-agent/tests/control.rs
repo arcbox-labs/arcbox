@@ -25,7 +25,7 @@ use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettings
 use arcbox_fleet_control_proto::v1::fleet_state_service_client::FleetStateServiceClient;
 use arcbox_fleet_control_proto::v1::{
     ConnectionState, DockerMode, DrainRequest, Enrollment, GetAgentInfoRequest, GetSettingsRequest,
-    GetStatusRequest, PrepareRequest, UpdateSettingsRequest, WatchRequest,
+    GetStatusRequest, PrepareRequest, RestartRequest, UpdateSettingsRequest, WatchRequest,
 };
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
@@ -85,19 +85,15 @@ fn wait_for_socket(child: &mut Child, socket_path: &Path) {
     }
 }
 
-#[tokio::test]
-async fn unenrolled_agent_reports_status_and_rejects_drain() {
-    let data_dir = std::env::temp_dir().join(format!("fleet-agent-control-{}", std::process::id()));
-    std::fs::create_dir_all(&data_dir).unwrap();
-    let socket_path = data_dir.join("agent.sock");
-
+/// Spawn `serve` against a scratch data dir and wait for its control socket.
+/// Forced to the file credential backend so this never touches the real OS
+/// keychain; nothing listens on the gateway, and the states these tests
+/// exercise never dial out to it.
+fn spawn_agent(data_dir: &Path) -> AgentProcess {
     let mut agent = AgentProcess(
         Command::new(env!("CARGO_BIN_EXE_arcbox-fleet-agent"))
             .arg("serve")
-            .env("ARCBOX_FLEET_DATA_DIR", &data_dir)
-            // Forced to the file backend so this never touches the real OS
-            // keychain; nothing listens on this gateway, but the Unenrolled
-            // state this test exercises never dials out to it.
+            .env("ARCBOX_FLEET_DATA_DIR", data_dir)
             .env("ARCBOX_FLEET_CREDENTIAL_STORE", "file")
             .env("ARCBOX_FLEET_GATEWAY", "http://127.0.0.1:1")
             .env("ARCBOX_FLEET_DOCKER", "false")
@@ -106,8 +102,17 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
             .spawn()
             .expect("spawn arcbox-fleet-agent"),
     );
+    wait_for_socket(&mut agent.0, &data_dir.join("agent.sock"));
+    agent
+}
 
-    wait_for_socket(&mut agent.0, &socket_path);
+#[tokio::test]
+async fn unenrolled_agent_reports_status_and_rejects_drain() {
+    let data_dir = std::env::temp_dir().join(format!("fleet-agent-control-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let socket_path = data_dir.join("agent.sock");
+
+    let agent = spawn_agent(&data_dir);
     let channel = connect(&socket_path).await;
     let mut client = FleetLifecycleServiceClient::new(channel.clone());
     let mut settings_client = FleetSettingsServiceClient::new(channel.clone());
@@ -119,6 +124,8 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
         .into_inner();
     assert_eq!(info.agent_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_version, 1);
+    assert!(info.features.iter().any(|f| f == "restart"), "{info:?}");
+    assert!(!info.instance_id.is_empty());
 
     let status = client
         .get_status(GetStatusRequest {})
@@ -341,6 +348,73 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
         .await
         .expect_err("Drain should fail while unenrolled");
     assert_eq!(drain_err.code(), tonic::Code::FailedPrecondition);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// `Restart` replaces the process image in place: the same OS process keeps
+/// running (nothing respawns it here — there is no service manager in the
+/// test), rebinds the control socket, and reports a fresh `instance_id`,
+/// which is the only signal a client has, since `exec` preserves the PID.
+#[tokio::test]
+async fn restart_reexecs_the_agent_in_place() {
+    let data_dir = std::env::temp_dir().join(format!("fleet-agent-restart-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let socket_path = data_dir.join("agent.sock");
+
+    let mut agent = spawn_agent(&data_dir);
+    let mut client = FleetLifecycleServiceClient::new(connect(&socket_path).await);
+    let before = client
+        .get_agent_info(GetAgentInfoRequest {})
+        .await
+        .expect("GetAgentInfo")
+        .into_inner()
+        .instance_id;
+
+    // Unenrolled, so nothing is in flight and the drain resolves at once.
+    // The response itself may be lost to the re-exec, which is the restart
+    // landing rather than a failure.
+    if let Err(status) = client.restart(RestartRequest { force: false }).await {
+        assert!(
+            matches!(
+                status.code(),
+                tonic::Code::Unknown | tonic::Code::Unavailable | tonic::Code::Cancelled
+            ),
+            "Restart must not be refused: {status}"
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        // Both the connect and the RPC can fail while the replacement image
+        // has not rebound the socket yet.
+        if let Ok(channel) = Endpoint::from_static("http://[::]:50051")
+            .connect_with_connector(TestUnixConnector(socket_path.clone()))
+            .await
+        {
+            let info = FleetLifecycleServiceClient::new(channel)
+                .get_agent_info(GetAgentInfoRequest {})
+                .await;
+            if let Ok(info) = info {
+                if info.into_inner().instance_id != before {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never came back with a new instance_id after Restart"
+        );
+        // The load-bearing pin: nothing respawned the agent, so the process
+        // that answers with a new instance_id below is the same one that was
+        // spawned — it re-exec'd rather than exiting and being replaced.
+        assert!(
+            matches!(agent.0.try_wait(), Ok(None)),
+            "the agent exited instead of re-execing"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&data_dir);

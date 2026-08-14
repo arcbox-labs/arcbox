@@ -5,7 +5,10 @@
 //! (arcbox-core, arcbox-daemon).
 
 pub mod client;
+pub mod error;
 pub mod validate;
+
+pub use error::HelperError;
 
 /// Unix socket path where the helper daemon listens.
 pub const HELPER_SOCKET: &str = arcbox_constants::paths::privileged::HELPER_SOCKET;
@@ -42,58 +45,67 @@ pub fn hosts_alias_installed(hosts_content: &str) -> bool {
 /// The tarpc service definition for privileged host mutations.
 ///
 /// All methods perform input validation server-side before executing
-/// any privileged operation. Results carry error strings on failure.
+/// any privileged operation. Failures use structured [`HelperError`]
+/// (bincode-stable; append variants only).
+///
+/// **Method order is append-only**: the bincode transport encodes the
+/// request enum's variant index, so inserting a method above shifts every
+/// later ordinal and an upgrade-window daemon talking to the previous
+/// helper misdecodes calls silently.
 #[tarpc::service]
 pub trait HelperService {
     /// Adds a host route for `subnet` via `iface`.
-    /// Idempotent: returns Ok if the route already exists.
-    async fn route_add(subnet: String, iface: String) -> Result<(), String>;
+    /// Returns `RouteConflict` without modifying an exact existing route.
+    async fn route_add(subnet: String, iface: String) -> Result<(), HelperError>;
 
     /// Removes the host route for `subnet`.
     /// Idempotent: returns Ok if the route is already absent.
-    async fn route_remove(subnet: String) -> Result<(), String>;
+    async fn route_remove(subnet: String) -> Result<(), HelperError>;
 
     /// Installs a DNS resolver file for `domain` pointing to `127.0.0.1:port`.
-    async fn dns_install(domain: String, port: u16) -> Result<(), String>;
+    async fn dns_install(domain: String, port: u16) -> Result<(), HelperError>;
 
     /// Removes the DNS resolver file for `domain`.
-    async fn dns_uninstall(domain: String) -> Result<(), String>;
+    async fn dns_uninstall(domain: String) -> Result<(), HelperError>;
 
     /// Checks if a DNS resolver file is installed for `domain`.
-    async fn dns_status(domain: String) -> Result<bool, String>;
+    async fn dns_status(domain: String) -> Result<bool, HelperError>;
 
     /// Creates `/var/run/docker.sock` symlink pointing to `target`.
-    async fn socket_link(target: String) -> Result<(), String>;
+    async fn socket_link(target: String) -> Result<(), HelperError>;
 
     /// Removes the `/var/run/docker.sock` symlink.
-    async fn socket_unlink() -> Result<(), String>;
+    async fn socket_unlink() -> Result<(), HelperError>;
 
     /// Creates `/usr/local/bin/{name}` symlink pointing to `target`.
     /// Used to expose Docker CLI tools from the app bundle.
-    async fn cli_link(name: String, target: String) -> Result<(), String>;
+    async fn cli_link(name: String, target: String) -> Result<(), HelperError>;
 
     /// Removes `/usr/local/bin/{name}` symlink if it points inside an ArcBox bundle.
-    async fn cli_unlink(name: String) -> Result<(), String>;
+    async fn cli_unlink(name: String) -> Result<(), HelperError>;
 
-    /// Returns the helper version string.
+    /// Returns the helper crate version string (`arcbox-helper <semver>`).
+    ///
+    /// This is the **independent** helper package version, not the arcbox
+    /// workspace version. Callers should parse it with
+    /// [`arcbox_constants::helper::parse_helper_version`].
     async fn version() -> String;
-
-    // New methods append ONLY: the bincode transport encodes the request
-    // enum's variant index, so inserting a method above shifts every later
-    // ordinal and an upgrade-window daemon talking to the previous helper
-    // (launchd keeps it until reinstall) misdecodes calls silently.
 
     /// Appends the fixed `127.0.0.1 ArcBox` alias to `/etc/hosts` so the
     /// guest-data NFS mount can use `ArcBox:/` as its source (Finder shows
     /// a mount by its source host name). Takes no arguments — the helper
     /// never writes caller-controlled hosts entries.
-    async fn hosts_alias_install() -> Result<(), String>;
+    async fn hosts_alias_install() -> Result<(), HelperError>;
 
     /// Removes the ArcBox alias line from `/etc/hosts`.
-    async fn hosts_alias_uninstall() -> Result<(), String>;
+    async fn hosts_alias_uninstall() -> Result<(), HelperError>;
 
     /// Checks whether the ArcBox `/etc/hosts` alias is installed.
-    async fn hosts_alias_status() -> Result<bool, String>;
+    async fn hosts_alias_status() -> Result<bool, HelperError>;
+
+    /// Removes an exact direct route only when it still belongs to `iface`.
+    /// Idempotent when the route is absent; refuses to delete a foreign route.
+    async fn route_remove_if_owned(subnet: String, iface: String) -> Result<bool, HelperError>;
 }
 
 /// Low-level connect — use [`client::Client::connect()`] instead.

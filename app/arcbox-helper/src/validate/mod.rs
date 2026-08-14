@@ -271,4 +271,42 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn is_arcbox_owned_agrees_with_cli_target_for_valid_paths() {
+        let paths = [
+            "/Applications/ArcBox.app/Contents/MacOS/xbin/docker",
+            "/Users/test/Apps/ArcBox.app/Contents/MacOS/xbin/docker-compose",
+        ];
+        for p in paths {
+            assert!(
+                p.parse::<CliTarget>().is_ok(),
+                "CliTarget should accept {p}"
+            );
+            assert!(
+                arcbox_constants::paths::is_arcbox_owned(std::path::Path::new(p)),
+                "is_arcbox_owned should accept {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_arcbox_owned_agrees_with_cli_target_for_invalid_paths() {
+        let paths = [
+            "Contents/MacOS/xbin/docker",
+            "/usr/local/bin/docker",
+            "/Applications/ArcBox.app/Contents/MacOS/xbin/../../evil",
+            "/tmp/evil.app/Contents/MacOS/xbin/docker",
+        ];
+        for p in paths {
+            assert!(
+                p.parse::<CliTarget>().is_err(),
+                "CliTarget should reject {p}"
+            );
+            assert!(
+                !arcbox_constants::paths::is_arcbox_owned(std::path::Path::new(p)),
+                "is_arcbox_owned should reject {p}"
+            );
+        }
+    }
 }

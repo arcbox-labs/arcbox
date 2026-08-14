@@ -6,6 +6,8 @@
 //! Note: Some tests require a valid kernel to run. They will be skipped
 //! if the kernel is not available.
 
+// Darwin vCPU execution end-to-end: nothing here can run off macOS.
+#![cfg(target_os = "macos")]
 #![allow(clippy::expect_fun_call)]
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::unnecessary_cast)]

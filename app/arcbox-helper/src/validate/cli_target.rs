@@ -1,9 +1,11 @@
 use std::path::Component;
 use std::str::FromStr;
 
+use arcbox_constants::paths::is_arcbox_owned;
+
 /// A validated CLI symlink target path inside an app bundle.
 ///
-/// Guarantees:
+/// Guarantees match [`is_arcbox_owned`]:
 /// - Absolute path under `/Applications/` or `/Users/`
 /// - Contains `.app/Contents/MacOS/xbin/` structure
 /// - No `..` path traversal
@@ -22,35 +24,26 @@ impl FromStr for CliTarget {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let path = std::path::Path::new(s);
 
+        // Fast path: shared ownership predicate is the source of truth.
+        if is_arcbox_owned(path) {
+            return Ok(Self(s.to_owned()));
+        }
+
+        // Detailed errors only on the reject path (kept for RPC messages).
         if !path.is_absolute() {
             return Err(format!("CLI target '{s}' must be an absolute path"));
         }
-
         if path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(format!("CLI target '{s}' contains '..' path traversal"));
         }
-
-        let components: Vec<_> = path.components().collect();
-        let has_valid_app_structure = components.windows(4).any(|w| {
-            matches!(&w[0], Component::Normal(name) if name.to_string_lossy().ends_with(".app"))
-                && w[1] == Component::Normal("Contents".as_ref())
-                && w[2] == Component::Normal("MacOS".as_ref())
-                && w[3] == Component::Normal("xbin".as_ref())
-        });
-
-        if !has_valid_app_structure {
-            return Err(format!(
-                "CLI target '{s}' must be inside an .app bundle's Contents/MacOS/xbin/"
-            ));
-        }
-
         if !s.starts_with("/Applications/") && !s.starts_with("/Users/") {
             return Err(format!(
                 "CLI target '{s}' must be under /Applications/ or /Users/"
             ));
         }
-
-        Ok(Self(s.to_owned()))
+        Err(format!(
+            "CLI target '{s}' must be inside an .app bundle's Contents/MacOS/xbin/"
+        ))
     }
 }
 

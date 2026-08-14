@@ -14,16 +14,16 @@
 # and the [boot] bump.
 
 [boot]
-version = "0.6.9"
+version = "0.8.4"
 cdn = "https://boot.arcboxcdn.com"
-manifest_sha256 = "866ba781cd69fa85028683a27b5a4d8a8d81f2e96f34948e67930b0e1a746ef8"
+manifest_sha256 = "fc32a0b6d1c1051a0eeea81d714f38cdfc108000f883a8d6c261cce993c2af89"
 
 [[tools]]
 name = "docker"
 group = "docker"
-version = "29.6.1"
-arch.arm64.sha256 = "2e38a0fc5e90520f32bfa4b951984f4684e46042ef855ed2c6a98f015e4284ba"
-arch.x86_64.sha256 = "4dd10d89a3481de4903a791f6ea84f30fc18b892e9ae8b8035b4d1ddd9351e73"
+version = "29.6.2"
+arch.arm64.sha256 = "86f86ad4b2119ec55aa50224f15ceb4c94a198f8ae153bb32318d7da589749da"
+arch.x86_64.sha256 = "9a72a1c1a331885aadf7948e3da8e3c5c88c5e813474bb82dce7cc72450487bf"
 
 [[tools]]
 name = "docker-buildx"
@@ -56,6 +56,6 @@ arch.x86_64.sha256 = "eb3cc921de1aed02348821f4a653705a33b012b6a1da7466e577673c5c
 [[tools]]
 name = "kubectl"
 group = "kubernetes"
-version = "1.36.2"
-arch.arm64.sha256 = "4408c85c83fd3a31adaa555bdf3c7a6c81f74b19449a9060ba31ab91926f023d"
-arch.x86_64.sha256 = "ce6c5e55cd17559e87e4fb5e73ebbbc2511bcf2b695d7a40c1b1461a9817d4b3"
+version = "1.36.3"
+arch.arm64.sha256 = "fc8582acde13869a606730a79379d6515f30c68afcced0b5ac8789d5d002b7d6"
+arch.x86_64.sha256 = "158b3b46cf74e8b6bd9b1d7cd30f665e3efb2bc1ec3c843ec925bcfdd2930de0"

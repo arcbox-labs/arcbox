@@ -1,0 +1,36 @@
+[package]
+name = "arcbox-snapshot"
+description = "Snapshot, copy-on-write rootfs, and template catalogs for ArcBox computers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-atomic-file.workspace = true
+arcbox-error = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# Exposes `CowTestProbe` and `CowManager::new_with_test_probe` so a consumer
+# can assert on setup/teardown calls without a real device-mapper. Off by
+# default; `arcbox-vm` turns it on in its dev-dependencies. The seam used to
+# be `#[cfg(test)]`, which stopped reaching its caller once that caller lived
+# in another crate.
+test-probe = []
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+
+[lints]
+workspace = true

@@ -2,7 +2,7 @@
 name = "arcbox-fleet-agent"
 publish = false
 description = "Cross-platform Fleet runner agent: enrolls, attaches to the gateway, and runs GitHub Actions jobs"
-version = "0.1.2" # x-release-please-version
+version = "0.1.3" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -38,8 +38,6 @@ command-group = { version = "5.0.1", features = ["with-tokio"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 bollard = "0.21.0"
 hyper-util = "0.1"
-arcbox-grpc.workspace = true
-arcbox-protocol.workspace = true
 arcbox-constants.workspace = true
 russh = { version = "0.62.1", default-features = false, features = ["aws-lc-rs", "flate2"] }
 thiserror.workspace = true
@@ -47,6 +45,9 @@ plist = "1.10.0"
 libc.workspace = true
 sha2.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+uuid = { workspace = true }
+arcbox-connect.workspace = true
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1", features = ["client"] }
 
 [lints]
 workspace = true
@@ -55,4 +56,7 @@ workspace = true
 keyring = "4"
 
 [dev-dependencies]
+arcbox-grpc.workspace = true
+arcbox-protocol.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

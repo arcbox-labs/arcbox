@@ -9,6 +9,17 @@
 //!    the process.
 //! 5. Sends a final `MSG_EXIT` frame when the process terminates.
 //!
+//! Once the exec (52) and file I/O (53) listeners are both bound, the agent
+//! dials out to host port 51 (`READY_PORT`) and writes one byte — the
+//! host's cold-boot readiness event.
+//!
+//! The agent also owns its wall clock: once at startup and again on every
+//! accepted exec connection (rate-limited to one attempt per second) it
+//! re-syncs `CLOCK_REALTIME` from the hypervisor via `ptp_kvm` (see
+//! [`ptp`]), so a restored snapshot regains correct time before any
+//! workload command runs, without waiting for the host's `MSG_CLOCK_SYNC`
+//! RPC (CORE-80).
+//!
 //! ## Frame format
 //!
 //! ```text
@@ -23,13 +34,348 @@
 //! | 0x04 | Host→Agent  | empty — stdin EOF                |
 //! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]` — clock sync |
 //! | 0x06 | Host→Agent  | JSON `NetReconfigCommand` — re-address eth0 |
+//! | 0x07 | Host→Agent  | `[i32 LE signal]` — signal the workload's process group |
 //! | 0x10 | Agent→Host  | raw stdout bytes                 |
 //! | 0x11 | Agent→Host  | raw stderr bytes                 |
-//! | 0x12 | Agent→Host  | `[i32 LE exit_code]`             |
+//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` — signal 0 = normal exit. Net-reconfig replies append six `u32 LE` micros (addr/netmask/delrt/addrt ioctls, resolv write, whole handler); legacy agents send only the 4-byte code. Readers key on payload length. |
 //!
 //! This binary requires Linux — it uses AF_VSOCK, accept4, openpty, and fork,
 //! none of which are available on other platforms.  The workspace compiles the
 //! crate everywhere, but the implementation is gated on `target_os = "linux"`.
+
+/// Guest-clock self-sync from the hypervisor via the `ptp_kvm` PTP clock.
+///
+/// `/dev/ptp0` is the kernel's `ptp_kvm` device: reading it issues the SMCCC
+/// vendor-hyp `PTP_KVM` call, answered directly by the L1 KVM with the host
+/// `CLOCK_REALTIME` — no VMM device, no vsock round-trip, nesting-safe.
+/// `PTP_SYS_OFFSET` brackets each PHC read between two guest system-clock
+/// reads, so the tightest bracket bounds the measurement error.
+///
+/// Struct layouts and the ioctl encoding mirror `<linux/ptp_clock.h>`. The
+/// offset math is portable and unit-tested on every host; the ioctl half is
+/// Linux-only.
+#[cfg(any(target_os = "linux", test))]
+mod ptp {
+    /// `struct ptp_clock_time` (`<linux/ptp_clock.h>`).
+    #[derive(Debug, Clone, Copy)]
+    #[repr(C)]
+    pub struct PtpClockTime {
+        pub sec: i64,
+        pub nsec: u32,
+        #[allow(dead_code, reason = "kernel ABI reserved padding, never read")]
+        pub reserved: u32,
+    }
+
+    /// `PTP_MAX_SAMPLES` (`<linux/ptp_clock.h>`) — the kernel rejects
+    /// `n_samples` above it with `EINVAL`.
+    pub const PTP_MAX_SAMPLES: usize = 25;
+
+    /// `struct ptp_sys_offset` (`<linux/ptp_clock.h>`).
+    #[repr(C)]
+    pub struct PtpSysOffset {
+        pub n_samples: u32,
+        #[allow(dead_code, reason = "kernel ABI reserved padding, never read")]
+        pub rsv: [u32; 3],
+        pub ts: [PtpClockTime; 2 * PTP_MAX_SAMPLES + 1],
+    }
+
+    /// ABI pin: `PTP_SYS_OFFSET` encodes the struct size, so a layout drift
+    /// would silently turn it into a different (unknown) ioctl number.
+    const _: () = assert!(std::mem::size_of::<PtpSysOffset>() == 832);
+
+    /// `PTP_SYS_OFFSET` = `_IOW('=', 5, struct ptp_sys_offset)` in the
+    /// asm-generic ioctl encoding (which arm64 uses):
+    /// `dir(write = 1) << 30 | size << 16 | type << 8 | nr`. The kernel
+    /// copies the filled struct back despite the `_IOW` label — a historical
+    /// quirk of the PTP ABI.
+    pub const PTP_SYS_OFFSET: u32 =
+        (1 << 30) | ((std::mem::size_of::<PtpSysOffset>() as u32) << 16) | ((b'=' as u32) << 8) | 5;
+
+    /// Samples per `PTP_SYS_OFFSET` call: enough that one preempted bracket
+    /// never decides the offset, while the ioctl stays microseconds-cheap.
+    #[cfg(target_os = "linux")]
+    pub const N_SAMPLES: u32 = 5;
+
+    /// Step the clock only when the measured skew exceeds this (100 ms).
+    /// Restore skew is seconds to days; anything smaller is normal drift the
+    /// sync must not fight.
+    pub const STEP_THRESHOLD_NS: i128 = 100_000_000;
+
+    const NANOS_PER_SEC: i128 = 1_000_000_000;
+
+    fn ns(t: PtpClockTime) -> i128 {
+        i128::from(t.sec) * NANOS_PER_SEC + i128::from(t.nsec)
+    }
+
+    /// Whether a measured guest→host offset warrants stepping the clock.
+    pub fn should_step(offset_ns: i128) -> bool {
+        offset_ns.abs() > STEP_THRESHOLD_NS
+    }
+
+    /// The offset to add to the guest `CLOCK_REALTIME` to land on the host
+    /// clock, from a filled `PTP_SYS_OFFSET` sample array.
+    ///
+    /// The kernel fills `2 * n_samples + 1` entries — `sys, phc, sys, phc,
+    /// …, sys` — bracketing every PHC read (under `ptp_kvm`: the host
+    /// `CLOCK_REALTIME`) between two guest system-clock reads, adjacent
+    /// samples sharing a boundary. The sample with the tightest bracket
+    /// carries the least scheduling noise; its offset is measured against
+    /// the bracket midpoint. Brackets that run backwards (the guest clock
+    /// was stepped mid-call) are discarded. `None` when no usable sample
+    /// exists.
+    pub fn realtime_offset_ns(ts: &[PtpClockTime], n_samples: u32) -> Option<i128> {
+        let n = n_samples as usize;
+        let filled = ts.get(..n.checked_mul(2)?.checked_add(1)?)?;
+        (0..n)
+            .map(|i| {
+                let before = ns(filled[2 * i]);
+                let phc = ns(filled[2 * i + 1]);
+                let after = ns(filled[2 * i + 2]);
+                (after - before, phc - i128::midpoint(before, after))
+            })
+            .filter(|&(bracket, _)| bracket >= 0)
+            .min_by_key(|&(bracket, _)| bracket)
+            .map(|(_, offset)| offset)
+    }
+
+    /// Outcome of one successful `/dev/ptp0` sample.
+    #[cfg(target_os = "linux")]
+    pub enum SyncOutcome {
+        /// Skew exceeded the threshold; `CLOCK_REALTIME` was stepped.
+        Stepped { offset_ns: i128 },
+        /// Skew within the threshold; the clock was left alone.
+        InSync { offset_ns: i128 },
+    }
+
+    /// One self-sync: sample `/dev/ptp0` and step `CLOCK_REALTIME` when the
+    /// skew exceeds [`STEP_THRESHOLD_NS`].
+    ///
+    /// `ptp_kvm` is the microVM kernel's only PTP clock, so it is always
+    /// index 0; a missing `/dev/ptp0` (kernel without ptp_kvm) is an error
+    /// the caller logs and ignores — such a guest keeps exactly the
+    /// host-driven `MSG_CLOCK_SYNC` semantics it has today.
+    #[cfg(target_os = "linux")]
+    pub fn sync_clock_from_ptp() -> Result<SyncOutcome, String> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // SAFETY: plain open(2) on a static C string; result checked below.
+        let raw = unsafe { libc::open(c"/dev/ptp0".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if raw < 0 {
+            return Err(format!(
+                "open /dev/ptp0: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: raw is a freshly opened, owned fd.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // SAFETY: PtpSysOffset is POD; n_samples set below, rest zeroed.
+        let mut req: PtpSysOffset = unsafe { std::mem::zeroed() };
+        req.n_samples = N_SAMPLES;
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "the PTP_SYS_OFFSET request number fits musl's c_int ioctl request type"
+        )]
+        let request = PTP_SYS_OFFSET as libc::Ioctl;
+        // SAFETY: fd is a valid chardev fd; req is a properly sized, live
+        // ptp_sys_offset the kernel reads, fills, and copies back.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), request, &raw mut req) } < 0 {
+            return Err(format!(
+                "PTP_SYS_OFFSET: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let offset_ns = realtime_offset_ns(&req.ts, req.n_samples)
+            .ok_or_else(|| "PTP_SYS_OFFSET returned no usable sample".to_owned())?;
+        if !should_step(offset_ns) {
+            return Ok(SyncOutcome::InSync { offset_ns });
+        }
+
+        // Step relative to the CURRENT clock: both clocks tick at the same
+        // rate, so the microseconds elapsed since the ioctl cancel out.
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid out-pointer to a live timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut now) } != 0 {
+            return Err(format!(
+                "clock_gettime: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let target_ns =
+            i128::from(now.tv_sec) * NANOS_PER_SEC + i128::from(now.tv_nsec) + offset_ns;
+        let ts = libc::timespec {
+            // Inferred field type: naming libc::time_t is deprecated on musl.
+            tv_sec: target_ns
+                .div_euclid(NANOS_PER_SEC)
+                .try_into()
+                .map_err(|_| format!("target wall time out of range: {target_ns} ns"))?,
+            // rem_euclid of a positive modulus is in [0, 1e9): lossless.
+            tv_nsec: target_ns.rem_euclid(NANOS_PER_SEC) as libc::c_long,
+        };
+        // SAFETY: clock_settime requires CAP_SYS_TIME; vm-agent is guest
+        // root (the same contract MSG_CLOCK_SYNC's handler relies on). A
+        // negative target is rejected by the kernel with EINVAL.
+        if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts) } != 0 {
+            return Err(format!(
+                "clock_settime: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(SyncOutcome::Stepped { offset_ns })
+    }
+
+    /// Accept-path sync: measure the offset on every accepted connection.
+    ///
+    /// A restored guest wakes with `CLOCK_REALTIME` still at its snapshot
+    /// value, and its first post-resume interaction is an accepted
+    /// connection — exec or file — so running this before the handler
+    /// spawns guarantees correct wall time before any workload command or
+    /// file mtime. There is deliberately NO time-based rate limit: any
+    /// last-attempt timestamp survives inside the snapshot (Firecracker
+    /// resumes `CLOCK_MONOTONIC`), so a window-based skip can suppress
+    /// exactly the first post-restore accept that matters most. The
+    /// measurement is cheap enough to run per accept (one open + one
+    /// `PTP_SYS_OFFSET` ioctl, tens of µs nested) and is naturally bounded
+    /// by connection traffic.
+    ///
+    /// Concurrency and failure are still bounded: a busy flag lets one
+    /// accept sync while racers skip, and the first error latches the
+    /// module off — a guest without `ptp_kvm` fails permanently
+    /// (`/dev/ptp0` never appears at runtime), and it keeps exactly the
+    /// host-driven `MSG_CLOCK_SYNC` semantics it has today, with one
+    /// diagnostic line instead of one per accept. Within-threshold
+    /// outcomes are deliberately NOT logged: /dev/console is the FC serial
+    /// device (byte-by-byte nested MMIO exits).
+    #[cfg(target_os = "linux")]
+    pub fn sync_on_accept() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static DISABLED: AtomicBool = AtomicBool::new(false);
+        static BUSY: AtomicBool = AtomicBool::new(false);
+
+        if DISABLED.load(Ordering::Relaxed)
+            || BUSY
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+
+        match sync_clock_from_ptp() {
+            Ok(SyncOutcome::Stepped { offset_ns }) => eprintln!(
+                "vm-agent: ptp clock sync: stepped CLOCK_REALTIME by {} ms",
+                offset_ns / 1_000_000
+            ),
+            Ok(SyncOutcome::InSync { .. }) => {}
+            Err(e) => {
+                DISABLED.store(true, Ordering::Relaxed);
+                eprintln!("vm-agent: ptp clock sync: {e}; disabling ptp sync");
+            }
+        }
+        BUSY.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn t(sec: i64, nsec: u32) -> PtpClockTime {
+            PtpClockTime {
+                sec,
+                nsec,
+                reserved: 0,
+            }
+        }
+
+        #[test]
+        fn tightest_bracket_wins() {
+            // Sample 0: 10 ms bracket, says +5 s. Sample 1: 1.5 µs bracket,
+            // says ~+2 s — the tight bracket must decide.
+            let ts = [
+                t(100, 0),
+                t(105, 5_000_000),
+                t(100, 10_000_000),
+                t(102, 10_000_500),
+                t(100, 10_001_500),
+            ];
+            assert_eq!(realtime_offset_ns(&ts, 2), Some(1_999_999_750));
+        }
+
+        #[test]
+        fn guest_ahead_of_host_yields_a_negative_offset() {
+            // Guest at 200 s, host (PHC) at 100 s, 2 ns bracket.
+            let ts = [t(200, 0), t(100, 0), t(200, 2)];
+            assert_eq!(realtime_offset_ns(&ts, 1), Some(-100_000_000_001));
+        }
+
+        #[test]
+        fn backwards_bracket_is_discarded() {
+            // Sample 0's bracket runs backwards (clock stepped mid-call) and
+            // would win a naive min; sample 1 must be picked instead.
+            let ts = [t(500, 0), t(100, 0), t(10, 0), t(60, 0), t(10, 1000)];
+            assert_eq!(realtime_offset_ns(&ts, 2), Some(49_999_999_500));
+        }
+
+        #[test]
+        fn no_usable_sample_yields_none() {
+            // All brackets backwards.
+            assert_eq!(
+                realtime_offset_ns(&[t(500, 0), t(100, 0), t(10, 0)], 1),
+                None
+            );
+            // Kernel filled fewer entries than 2 * n + 1.
+            assert_eq!(realtime_offset_ns(&[t(1, 0); 5], 3), None);
+            // Zero samples.
+            assert_eq!(realtime_offset_ns(&[t(1, 0); 1], 0), None);
+            // Hostile sample count never indexes out of bounds.
+            assert_eq!(realtime_offset_ns(&[t(1, 0); 3], u32::MAX), None);
+        }
+
+        #[test]
+        fn extreme_timestamps_do_not_overflow() {
+            let edge = t(i64::MAX, 999_999_999);
+            assert_eq!(realtime_offset_ns(&[edge, edge, edge], 1), Some(0));
+        }
+
+        #[test]
+        fn threshold_is_exclusive_and_sign_agnostic() {
+            assert!(!should_step(0));
+            assert!(!should_step(STEP_THRESHOLD_NS));
+            assert!(!should_step(-STEP_THRESHOLD_NS));
+            assert!(should_step(STEP_THRESHOLD_NS + 1));
+            assert!(should_step(-(STEP_THRESHOLD_NS + 1)));
+        }
+
+        #[test]
+        fn offset_reads_through_the_full_abi_struct() {
+            // Mirrors the real call path: the kernel-filled struct's ts
+            // array and echoed n_samples feed the offset derivation.
+            let mut req = PtpSysOffset {
+                n_samples: 1,
+                rsv: [0; 3],
+                ts: [t(0, 0); 2 * PTP_MAX_SAMPLES + 1],
+            };
+            req.ts[0] = t(10, 0);
+            req.ts[1] = t(20, 0);
+            req.ts[2] = t(10, 2);
+            assert_eq!(
+                realtime_offset_ns(&req.ts, req.n_samples),
+                Some(9_999_999_999)
+            );
+        }
+
+        #[test]
+        fn ioctl_request_matches_the_kernel_abi() {
+            // _IOW('=', 5, struct ptp_sys_offset) with sizeof == 832 on
+            // asm-generic platforms (arm64 among them).
+            assert_eq!(PTP_SYS_OFFSET, 0x4340_3d05);
+        }
+    }
+}
 
 // =============================================================================
 // Linux implementation
@@ -41,7 +387,7 @@ mod agent {
     use std::io::{Read, Write};
     use std::os::unix::io::RawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
     use std::thread;
 
     use serde::Deserialize;
@@ -59,6 +405,7 @@ mod agent {
     const MSG_EOF: u8 = 0x04;
     const MSG_CLOCK_SYNC: u8 = 0x05;
     const MSG_NET_RECONFIG: u8 = 0x06;
+    const MSG_SIGNAL: u8 = 0x07;
     const MSG_STDOUT: u8 = 0x10;
     const MSG_STDERR: u8 = 0x11;
     const MSG_EXIT: u8 = 0x12;
@@ -66,9 +413,18 @@ mod agent {
     // File I/O channel (vsock:53) — imported from the shared proto module.
     use arcbox_vm::boot_proto::{KernelIpParam, NetReconfigCommand};
     use arcbox_vm::file_io::proto::{
-        FILE_ACK, FILE_DATA, FILE_DONE, FILE_ERR, FILE_PORT, FILE_READ_REQ, FILE_WRITE_REQ,
-        MAX_FILE_SIZE,
+        ERR_NOT_A_DIRECTORY, ERR_NOT_EMPTY, ERR_NOT_FOUND, FILE_ACK, FILE_DATA, FILE_DONE,
+        FILE_ERR, FILE_EVENT, FILE_LIST, FILE_LIST_REQ, FILE_MKDIR_REQ, FILE_MOVE_REQ, FILE_PORT,
+        FILE_READ_REQ, FILE_REMOVE_REQ, FILE_STAT, FILE_STAT_REQ, FILE_WATCH_REQ, FILE_WRITE_REQ,
+        FileStatDto, KIND_DIR, KIND_FILE, KIND_OTHER, KIND_SYMLINK, ListDirReq, MAX_FILE_SIZE,
+        MakeDirReq, MoveReq, RemoveReq, StatReq, WatchReq,
     };
+    use arcbox_vm::file_watch::{
+        IN_CREATE, IN_MOVED_TO, WATCH_MASK, has_overflow, has_unpaired_move_from, map_events,
+        parse_event_buffer,
+    };
+    // Readiness dial-out port — shared with the host-side boot gate.
+    use arcbox_vm::vsock::{MSG_WAIT_PORT, READY_PORT};
 
     const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -211,6 +567,7 @@ mod agent {
         match msg_type {
             MSG_CLOCK_SYNC => handle_clock_sync(conn, &payload),
             MSG_NET_RECONFIG => handle_net_reconfig(conn, &payload),
+            MSG_WAIT_PORT => handle_wait_port(conn, &payload),
             MSG_START => {
                 let start: StartCommand = match serde_json::from_slice(&payload) {
                     Ok(s) => s,
@@ -229,6 +586,42 @@ mod agent {
                 eprintln!("agent: unexpected frame type 0x{other:02x} on exec port");
             }
         }
+    }
+
+    /// Watch the guest's own TCP listen table until `req.port` has a
+    /// listener or the deadline elapses. Answers `MSG_EXIT` with 0
+    /// (listening) or 1 (deadline). Reading `/proc/net/tcp{,6}` in-process
+    /// keeps the wait free of connect probes that would perturb the
+    /// workload with spurious accepted connections.
+    fn handle_wait_port(mut conn: VsockStream, payload: &[u8]) {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let req: arcbox_vm::vsock::WaitPortReq = match serde_json::from_slice(payload) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("agent: parse WaitPortReq: {e}");
+                let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
+                return;
+            }
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(req.timeout_ms);
+        let code = loop {
+            let listening = [
+                std::fs::read_to_string("/proc/net/tcp").unwrap_or_default(),
+                std::fs::read_to_string("/proc/net/tcp6").unwrap_or_default(),
+            ]
+            .iter()
+            .any(|table| arcbox_vm::listen_table::any_listener_on_port(table, req.port));
+            if listening {
+                break 0i32;
+            }
+            if std::time::Instant::now() >= deadline {
+                break 1i32;
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
+        let _ = write_frame(&mut conn, MSG_EXIT, &code.to_le_bytes());
     }
 
     fn handle_clock_sync(mut conn: VsockStream, payload: &[u8]) {
@@ -272,23 +665,44 @@ mod agent {
             }
         };
 
-        if let Err(e) = net_reconfig::apply(&cmd) {
-            eprintln!("agent: net reconfig failed: {e}");
-            let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
-            return;
-        }
+        let handler_started = std::time::Instant::now();
+        let steps = match net_reconfig::apply(&cmd) {
+            Ok(steps) => steps,
+            Err(e) => {
+                eprintln!("agent: net reconfig failed: {e}");
+                let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
+                return;
+            }
+        };
 
         // Repoint DNS at the new gateway, mirroring the boot-time setup_dns.
+        let resolv_started = std::time::Instant::now();
         let content = format!("nameserver {}\n", cmd.gateway);
         if let Err(e) = std::fs::write("/etc/resolv.conf", &content) {
             eprintln!("agent: net reconfig: failed to write /etc/resolv.conf: {e}");
         }
+        let clamp = |d: std::time::Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX);
+        let resolv_us = clamp(resolv_started.elapsed());
+        let handler_us = clamp(handler_started.elapsed());
 
+        // Exit payload: [i32 code][i32 signal] plus six u32 micros (four
+        // per-ioctl, resolv write, whole handler) so the host can attribute
+        // reconfig latency. Hosts read the first 4 bytes only, so the
+        // extension is backward compatible.
+        let mut payload = [0u8; 32];
+        let timings = steps.iter().copied().chain([resolv_us, handler_us]);
+        for (slot, ms) in payload[8..].chunks_exact_mut(4).zip(timings) {
+            slot.copy_from_slice(&ms.to_le_bytes());
+        }
+        let _ = write_frame(&mut conn, MSG_EXIT, &payload);
+
+        // Console logging goes AFTER the response: /dev/console is the FC
+        // serial device, written byte-by-byte through nested MMIO exits —
+        // putting it before the reply held the restore RPC hostage to it.
         eprintln!(
             "agent: reconfigured eth0 to {}/{} via {}",
             cmd.ip, cmd.netmask, cmd.gateway
         );
-        let _ = write_frame(&mut conn, MSG_EXIT, &0i32.to_le_bytes());
     }
 
     /// eth0 re-addressing via raw `ioctl(2)`, self-contained so it works on
@@ -353,7 +767,19 @@ mod agent {
         }
 
         /// Set eth0's address + netmask and replace the default route.
-        pub fn apply(cmd: &NetReconfigCommand) -> Result<(), String> {
+        ///
+        /// Returns per-step micros `[addr, netmask, delrt, addrt]` so the
+        /// host can attribute reconfig latency (CORE-75 diagnostics).
+        pub fn apply(cmd: &NetReconfigCommand) -> Result<[u32; 4], String> {
+            let mut steps = [0u32; 4];
+            let mut mark = std::time::Instant::now();
+            // Microseconds: the ioctls land well under a millisecond each,
+            // and u32 micros still spans ~71 minutes.
+            let mut lap = |slot: &mut u32| {
+                *slot = u32::try_from(mark.elapsed().as_micros()).unwrap_or(u32::MAX);
+                mark = std::time::Instant::now();
+            };
+
             // SAFETY: plain socket(2) call; result checked below.
             let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
             if raw < 0 {
@@ -365,10 +791,12 @@ mod agent {
             let mut req = ifreq_with_addr(sockaddr_in(cmd.ip));
             ioctl(&fd, libc::SIOCSIFADDR, (&raw mut req).cast())
                 .map_err(|e| format!("SIOCSIFADDR: {e}"))?;
+            lap(&mut steps[0]);
 
             let mut req = ifreq_with_addr(sockaddr_in(cmd.netmask));
             ioctl(&fd, libc::SIOCSIFNETMASK, (&raw mut req).cast())
                 .map_err(|e| format!("SIOCSIFNETMASK: {e}"))?;
+            lap(&mut steps[1]);
 
             // The kernel flushes routes through the interface when its
             // primary address changes, but don't rely on that implicit
@@ -384,6 +812,7 @@ mod agent {
                     eprintln!("agent: net reconfig: SIOCDELRT stale default: {e}");
                 }
             }
+            lap(&mut steps[2]);
 
             // Add the default route via the new gateway.
             // SAFETY: rtentry is POD; fields set below, rest zeroed.
@@ -394,8 +823,9 @@ mod agent {
             route.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
             ioctl(&fd, libc::SIOCADDRT, (&raw mut route).cast())
                 .map_err(|e| format!("SIOCADDRT default via {}: {e}", cmd.gateway))?;
+            lap(&mut steps[3]);
 
-            Ok(())
+            Ok(steps)
         }
     }
 
@@ -422,6 +852,12 @@ mod agent {
         match msg_type {
             FILE_WRITE_REQ => handle_file_write(conn, &payload),
             FILE_READ_REQ => handle_file_read(conn, &payload),
+            FILE_STAT_REQ => handle_file_stat(conn, &payload),
+            FILE_LIST_REQ => handle_file_list(conn, &payload),
+            FILE_MKDIR_REQ => handle_file_mkdir(conn, &payload),
+            FILE_REMOVE_REQ => handle_file_remove(conn, &payload),
+            FILE_MOVE_REQ => handle_file_move(conn, &payload),
+            FILE_WATCH_REQ => handle_file_watch(conn, &payload),
             other => eprintln!("agent: file: unexpected frame type 0x{other:02x}"),
         }
     }
@@ -487,7 +923,8 @@ mod agent {
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            let _ = write_frame(&mut conn, FILE_ERR, format!("create dirs: {e}").as_bytes());
+            let msg = path_err_payload("create dirs", &req.path, &e);
+            let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
             return;
         }
 
@@ -508,7 +945,8 @@ mod agent {
                 let _ = write_frame(&mut conn, FILE_ACK, &[]);
             }
             Err(e) => {
-                let _ = write_frame(&mut conn, FILE_ERR, format!("write file: {e}").as_bytes());
+                let msg = path_err_payload("write", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
             }
         }
     }
@@ -529,7 +967,8 @@ mod agent {
         let data = match std::fs::read(&req.path) {
             Ok(d) => d,
             Err(e) => {
-                let _ = write_frame(&mut conn, FILE_ERR, format!("read file: {e}").as_bytes());
+                let msg = path_err_payload("read", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
                 return;
             }
         };
@@ -540,6 +979,367 @@ mod agent {
             }
         }
         let _ = write_frame(&mut conn, FILE_DONE, &[]);
+    }
+
+    /// Decode a JSON request payload, answering `FILE_ERR` on parse failure.
+    fn parse_file_req<T: serde::de::DeserializeOwned>(
+        conn: &mut VsockStream,
+        payload: &[u8],
+    ) -> Option<T> {
+        match serde_json::from_slice(payload) {
+            Ok(req) => Some(req),
+            Err(e) => {
+                let _ = write_frame(conn, FILE_ERR, format!("parse request: {e}").as_bytes());
+                None
+            }
+        }
+    }
+
+    /// Format a file-op failure with the machine-readable errno prefix the
+    /// host maps onto typed errors (`arcbox_vm::file_io::decode_file_err`).
+    fn path_err_payload(op: &str, path: &str, e: &std::io::Error) -> String {
+        match e.raw_os_error() {
+            Some(libc::ENOENT) => format!("{ERR_NOT_FOUND}{path}"),
+            Some(libc::ENOTDIR) => format!("{ERR_NOT_A_DIRECTORY}{path}"),
+            Some(libc::ENOTEMPTY) => format!("{ERR_NOT_EMPTY}{path}"),
+            _ => format!("{op} '{path}': {e}"),
+        }
+    }
+
+    /// Stat one path without following symlinks (the wire contract reports
+    /// symlinks as symlinks, `mode` as the low 12 bits of `st_mode`).
+    fn stat_dto(path: &std::path::Path) -> std::io::Result<FileStatDto> {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::symlink_metadata(path)?;
+        let ft = md.file_type();
+        let (kind, symlink_target) = if ft.is_symlink() {
+            let target = std::fs::read_link(path)
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (KIND_SYMLINK, target)
+        } else if ft.is_dir() {
+            (KIND_DIR, String::new())
+        } else if ft.is_file() {
+            (KIND_FILE, String::new())
+        } else {
+            (KIND_OTHER, String::new())
+        };
+        Ok(FileStatDto {
+            name: path.file_name().map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+            kind: kind.to_owned(),
+            size: if ft.is_file() { md.len() } else { 0 },
+            mode: md.mode() & 0o7777,
+            mtime_secs: md.mtime(),
+            mtime_nanos: u32::try_from(md.mtime_nsec()).unwrap_or(0),
+            uid: md.uid(),
+            gid: md.gid(),
+            symlink_target,
+        })
+    }
+
+    fn handle_file_stat(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<StatReq>(&mut conn, header_payload) else {
+            return;
+        };
+        match stat_dto(std::path::Path::new(&req.path))
+            .map_err(|e| path_err_payload("stat", &req.path, &e))
+            .and_then(|dto| serde_json::to_vec(&dto).map_err(|e| format!("encode stat: {e}")))
+        {
+            Ok(body) => {
+                let _ = write_frame(&mut conn, FILE_STAT, &body);
+            }
+            Err(msg) => {
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_list(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<ListDirReq>(&mut conn, header_payload) else {
+            return;
+        };
+        let listing = || -> std::io::Result<Vec<FileStatDto>> {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(&req.path)? {
+                let entry = entry?;
+                match stat_dto(&entry.path()) {
+                    Ok(dto) => entries.push(dto),
+                    // An entry deleted between readdir and stat is not an
+                    // error for the listing — skip it. Anything else
+                    // (EACCES, I/O) fails the listing rather than silently
+                    // truncating it.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(entries)
+        };
+        match listing()
+            .map_err(|e| path_err_payload("list", &req.path, &e))
+            .and_then(|list| serde_json::to_vec(&list).map_err(|e| format!("encode listing: {e}")))
+        {
+            Ok(body) => {
+                let _ = write_frame(&mut conn, FILE_LIST, &body);
+            }
+            Err(msg) => {
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_mkdir(mut conn: VsockStream, header_payload: &[u8]) {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let Some(req) = parse_file_req::<MakeDirReq>(&mut conn, header_payload) else {
+            return;
+        };
+        // Recursive create is idempotent: an existing directory succeeds.
+        // `0` means "agent default", mirroring the write handler's `0o644`.
+        let mode = if req.mode == 0 { 0o755 } else { req.mode };
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(mode)
+            .create(&req.path)
+        {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, FILE_ACK, &[]);
+            }
+            Err(e) => {
+                let msg = path_err_payload("mkdir", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_remove(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<RemoveReq>(&mut conn, header_payload) else {
+            return;
+        };
+        let path = std::path::Path::new(&req.path);
+        // Symlink-aware: a symlink to a directory is removed as a link,
+        // never followed into.
+        let result = std::fs::symlink_metadata(path).and_then(|md| {
+            if md.file_type().is_dir() {
+                if req.recursive {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    std::fs::remove_dir(path)
+                }
+            } else {
+                std::fs::remove_file(path)
+            }
+        });
+        match result {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, FILE_ACK, &[]);
+            }
+            Err(e) => {
+                let msg = path_err_payload("remove", &req.path, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_move(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<MoveReq>(&mut conn, header_payload) else {
+            return;
+        };
+        match std::fs::rename(&req.from, &req.to) {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, FILE_ACK, &[]);
+            }
+            Err(e) => {
+                let msg = path_err_payload("rename", &req.from, &e);
+                let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            }
+        }
+    }
+
+    /// Add an inotify watch on `dir` (and its subtree when `recursive`).
+    /// Per-child errors during the walk are ignored — entries can vanish
+    /// while walking — but the root watch itself must succeed.
+    fn add_watch_tree(
+        ifd: RawFd,
+        dir: &std::path::Path,
+        recursive: bool,
+        watches: &mut HashMap<i32, String>,
+    ) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
+        // SAFETY: ifd is a live inotify fd; c_path is a valid NUL-terminated
+        // string outliving the call.
+        let wd = unsafe { libc::inotify_add_watch(ifd, c_path.as_ptr(), WATCH_MASK) };
+        if wd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        watches.insert(wd, dir.to_string_lossy().into_owned());
+        if recursive && let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    let _ = add_watch_tree(ifd, &entry.path(), true, watches);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How long a batch ending in an unpaired `IN_MOVED_FROM` waits for the
+    /// matching `IN_MOVED_TO` before mapping the batch as-is.
+    const RENAME_PAIR_GRACE_MS: libc::c_int = 5;
+
+    /// True when `fd` becomes readable within `timeout_ms`.
+    fn poll_readable(fd: RawFd, timeout_ms: libc::c_int) -> bool {
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: fds points at one initialized pollfd entry.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+        n > 0 && fds[0].revents & libc::POLLIN != 0
+    }
+
+    /// Stream inotify events for a directory until either side closes the
+    /// connection: the host closing it is the cancellation signal; sandbox
+    /// teardown kills this process, closing it from this side (the host
+    /// reads that EOF as the clean end of the watch).
+    fn handle_file_watch(mut conn: VsockStream, header_payload: &[u8]) {
+        let Some(req) = parse_file_req::<WatchReq>(&mut conn, header_payload) else {
+            return;
+        };
+
+        // SAFETY: plain inotify_init1 call; result checked below.
+        let ifd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        if ifd < 0 {
+            let e = std::io::Error::last_os_error();
+            let _ = write_frame(&mut conn, FILE_ERR, format!("inotify_init: {e}").as_bytes());
+            return;
+        }
+        struct InotifyFd(RawFd);
+        impl Drop for InotifyFd {
+            fn drop(&mut self) {
+                // SAFETY: the fd is owned by this guard and closed once.
+                unsafe { libc::close(self.0) };
+            }
+        }
+        let _ifd_guard = InotifyFd(ifd);
+
+        let mut watches: HashMap<i32, String> = HashMap::new();
+        if let Err(e) = add_watch_tree(
+            ifd,
+            std::path::Path::new(&req.path),
+            req.recursive,
+            &mut watches,
+        ) {
+            let msg = path_err_payload("watch", &req.path, &e);
+            let _ = write_frame(&mut conn, FILE_ERR, msg.as_bytes());
+            return;
+        }
+        if write_frame(&mut conn, FILE_ACK, &[]).is_err() {
+            return;
+        }
+
+        let mut buf = [0u8; 16384];
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: ifd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: conn.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: fds points at two initialized pollfd entries.
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if n < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            // Any readiness on the host connection means it closed — the
+            // host never sends further frames on a watch connection.
+            if fds[1].revents != 0 {
+                return;
+            }
+            if fds[0].revents == 0 {
+                continue;
+            }
+            // SAFETY: buf is a valid writable buffer; ifd is a live inotify fd.
+            let len =
+                unsafe { libc::read(ifd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if len <= 0 {
+                return;
+            }
+            let mut raw = parse_event_buffer(&buf[..len as usize]);
+            // A rename's FROM/TO halves usually share one read; when the
+            // batch carries an unpaired FROM (its TO still in flight, or
+            // split off by the buffer, possibly with concurrent events
+            // interleaved after it), give the queue one bounded chance to
+            // complete the pair before mapping. A still-unpaired half
+            // degrades to removed/created, which is also what a move across
+            // the watch boundary legitimately looks like.
+            if has_unpaired_move_from(&raw) && poll_readable(ifd, RENAME_PAIR_GRACE_MS) {
+                // SAFETY: buf is a valid writable buffer; ifd is a live
+                // inotify fd (the earlier batch is already parsed and owned).
+                let more =
+                    unsafe { libc::read(ifd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+                if more > 0 {
+                    raw.extend(parse_event_buffer(&buf[..more as usize]));
+                }
+            }
+            // The kernel dropped an unknown number of events: the consumer's
+            // view can no longer be kept consistent, so fail the stream
+            // rather than silently streaming a wrong one.
+            if has_overflow(&raw) {
+                let _ = write_frame(
+                    &mut conn,
+                    FILE_ERR,
+                    b"watch overflowed: the kernel dropped events; re-list and re-watch",
+                );
+                return;
+            }
+            // Recursive watches follow directories created or moved into the
+            // tree. Best-effort: events inside a new directory that fire
+            // before its watch lands are unobserved (the inotify recursion
+            // gap).
+            if req.recursive {
+                for event in &raw {
+                    if event.is_dir()
+                        && event.mask & (IN_CREATE | IN_MOVED_TO) != 0
+                        && let Some(dir) = watches.get(&event.wd)
+                    {
+                        let child = std::path::Path::new(dir).join(&event.name);
+                        let _ = add_watch_tree(ifd, &child, true, &mut watches);
+                    }
+                }
+            }
+            let events = map_events(&raw, |wd| watches.get(&wd).cloned());
+            // Prune after mapping: a removal event still needs its wd→path
+            // resolution for the batch it arrived in.
+            for event in &raw {
+                if event.mask & arcbox_vm::file_watch::IN_IGNORED != 0 {
+                    watches.remove(&event.wd);
+                }
+            }
+            for event in events {
+                let Ok(body) = serde_json::to_vec(&event) else {
+                    continue;
+                };
+                if write_frame(&mut conn, FILE_EVENT, &body).is_err() {
+                    return; // host went away mid-write
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -575,9 +1375,54 @@ mod agent {
     /// sender; reparented orphans are simply reaped and dropped. Handlers must
     /// therefore never call `waitpid`/`Child::wait` themselves — that would race
     /// the reaper and either lose an exit code or double-reap.
-    fn reap_registry() -> &'static Mutex<HashMap<libc::pid_t, mpsc::Sender<i32>>> {
-        static REGISTRY: OnceLock<Mutex<HashMap<libc::pid_t, mpsc::Sender<i32>>>> = OnceLock::new();
+    /// How a reaped workload terminated: a normal exit code or a fatal signal.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WaitOutcome {
+        Exited(i32),
+        Signaled(i32),
+    }
+
+    /// Encode the `MSG_EXIT` payload: `[i32 LE code][i32 LE signal]`.
+    ///
+    /// The code slot keeps the shell convention (`128 + signal` for signal
+    /// deaths) so a reader that parses only the first 4 bytes sees the same
+    /// value the pre-signal protocol carried.
+    fn exit_payload(outcome: WaitOutcome) -> [u8; 8] {
+        let (code, signal) = match outcome {
+            WaitOutcome::Exited(code) => (code, 0),
+            WaitOutcome::Signaled(signal) => (128 + signal, signal),
+        };
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&code.to_le_bytes());
+        buf[4..].copy_from_slice(&signal.to_le_bytes());
+        buf
+    }
+
+    fn reap_registry() -> &'static Mutex<HashMap<libc::pid_t, mpsc::Sender<WaitOutcome>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<libc::pid_t, mpsc::Sender<WaitOutcome>>>> =
+            OnceLock::new();
         REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Wakes the reaper out of its no-children park when a spawn registers a
+    /// child (paired with the [`reap_registry`] mutex).
+    fn reap_wakeup() -> &'static Condvar {
+        static WAKEUP: OnceLock<Condvar> = OnceLock::new();
+        WAKEUP.get_or_init(Condvar::new)
+    }
+
+    /// Register a spawned child for reaping AND wake the parked reaper.
+    ///
+    /// The single entry point for both spawn paths: an insert without the
+    /// wakeup would strand that child's exit for up to the reaper's park
+    /// timeout, so the two steps must never be separated.
+    fn register_child(
+        registry: &mut HashMap<libc::pid_t, mpsc::Sender<WaitOutcome>>,
+        pid: libc::pid_t,
+        exit_tx: mpsc::Sender<WaitOutcome>,
+    ) {
+        registry.insert(pid, exit_tx);
+        reap_wakeup().notify_all();
     }
 
     /// Narrow a `std::process::Child::id()` (u32) to a `pid_t`. Linux pids are
@@ -587,14 +1432,40 @@ mod agent {
         id as libc::pid_t
     }
 
-    /// Map a raw `wait` status to an exit code (128 + signal when killed).
-    fn wait_status_to_code(status: libc::c_int) -> Option<i32> {
+    /// Map a raw `wait` status to a termination outcome.
+    fn wait_status_to_outcome(status: libc::c_int) -> Option<WaitOutcome> {
         if libc::WIFEXITED(status) {
-            Some(libc::WEXITSTATUS(status))
+            Some(WaitOutcome::Exited(libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
-            Some(128 + libc::WTERMSIG(status))
+            Some(WaitOutcome::Signaled(libc::WTERMSIG(status)))
         } else {
             None // stopped / continued — not a termination
+        }
+    }
+
+    /// Deliver a host-requested signal to the workload's process group.
+    ///
+    /// Both exec paths `setsid` the child, so its pgid equals its pid; the
+    /// group kill reaches descendants, matching `kill_if_alive` semantics.
+    fn deliver_signal(pid: libc::pid_t, payload: &[u8]) {
+        let Some(bytes) = payload.get(..4) else {
+            eprintln!(
+                "agent: MSG_SIGNAL payload too short ({} bytes)",
+                payload.len()
+            );
+            return;
+        };
+        let signal = i32::from_le_bytes(bytes.try_into().unwrap());
+        if !(1..=64).contains(&signal) {
+            eprintln!("agent: MSG_SIGNAL rejected out-of-range signal {signal}");
+            return;
+        }
+        // SAFETY: signal 0 on the leader only probes liveness; the group kill
+        // targets the setsid'd process group led by `pid`.
+        unsafe {
+            if libc::kill(pid, 0) == 0 {
+                let _ = libc::kill(-pid, signal);
+            }
         }
     }
 
@@ -607,19 +1478,31 @@ mod agent {
                 // SAFETY: waitpid with a valid status pointer; -1 waits on any child.
                 let pid = unsafe { libc::waitpid(-1, &raw mut status, 0) };
                 if pid <= 0 {
-                    // ECHILD (no children yet) or EINTR — back off briefly so we
-                    // don't spin while the guest is idle.
-                    thread::sleep(std::time::Duration::from_millis(50));
+                    // ECHILD (no children) or EINTR. Park until a spawn
+                    // registers a child instead of polling: the old 50 ms
+                    // backoff put a flat ~50 ms floor under every short
+                    // execution whose child spawned and exited inside one
+                    // sleep. ECHILD means zero children of any kind — an
+                    // orphan can only be reparented to us while we still have
+                    // children, and then waitpid blocks rather than failing —
+                    // so a registry insert is the only way a child appears.
+                    // The timeout is a belt-and-braces bound, not a poll.
+                    let guard = reap_registry().lock().unwrap();
+                    let _ = reap_wakeup()
+                        .wait_timeout_while(guard, std::time::Duration::from_millis(500), |r| {
+                            r.is_empty()
+                        })
+                        .unwrap();
                     continue;
                 }
-                let Some(code) = wait_status_to_code(status) else {
+                let Some(outcome) = wait_status_to_outcome(status) else {
                     continue;
                 };
                 // Drop the registry lock before sending so a handler's recv
                 // never contends with it.
                 let waiter = reap_registry().lock().unwrap().remove(&pid);
                 if let Some(tx) = waiter {
-                    let _ = tx.send(code);
+                    let _ = tx.send(outcome);
                 }
                 // Otherwise a reparented orphan: reaped above, nothing to route.
             }
@@ -678,12 +1561,12 @@ mod agent {
         // Spawn and register for reaping under one lock: if the child exits
         // immediately, the reaper blocks on the registry lock until the insert
         // below completes, so its exit code is never lost as an "orphan".
-        let (exit_tx, exit_rx) = mpsc::channel::<i32>();
+        let (exit_tx, exit_rx) = mpsc::channel::<WaitOutcome>();
         let mut child = {
             let mut registry = reap_registry().lock().unwrap();
             match cmd.spawn() {
                 Ok(c) => {
-                    registry.insert(as_pid(c.id()), exit_tx);
+                    register_child(&mut registry, as_pid(c.id()), exit_tx);
                     c
                 }
                 Err(e) => {
@@ -696,7 +1579,7 @@ mod agent {
         };
         let child_pid = as_pid(child.id());
 
-        let mut child_stdin = child.stdin.take().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
         let child_stdout = child.stdout.take().unwrap();
         let child_stderr = child.stderr.take().unwrap();
 
@@ -735,46 +1618,63 @@ mod agent {
             spawn_timeout_killer(child_pid, start.timeout_seconds);
         }
 
-        // Read stdin frames from the host and forward to the child.
+        // Input loop on its own thread, mirroring the TTY path: the exit
+        // report below must never be gated on host input, and the session must
+        // keep accepting MSG_SIGNAL after a clean stdin EOF. Reporting the exit
+        // from the input loop (the old shape) deadlocked any session whose
+        // process exited while the host was still holding stdin open.
         // SAFETY: dup gives us a second fd for reading while the Arc owns the write fd.
         let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
-        let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
-        let mut host_disconnected = false;
-        loop {
-            match read_frame(&mut reader) {
-                Ok((MSG_STDIN, data)) => {
-                    if child_stdin.write_all(&data).is_err() {
-                        break;
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exited_in_loop = Arc::clone(&exited);
+        let t_input = thread::spawn(move || {
+            // SAFETY: read_fd is a fresh dup owned by this thread.
+            let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
+            let mut stdin = Some(child_stdin);
+            loop {
+                match read_frame(&mut reader) {
+                    Ok((MSG_STDIN, data)) => {
+                        if let Some(ref mut s) = stdin
+                            && s.write_all(&data).is_err()
+                        {
+                            stdin = None;
+                        }
                     }
+                    Ok((MSG_EOF, _)) => {
+                        // Clean stdin EOF: close the child's stdin but keep the
+                        // loop alive for signal frames.
+                        stdin = None;
+                    }
+                    Ok((MSG_SIGNAL, data)) => deliver_signal(child_pid, &data),
+                    Err(_) => {
+                        // Read shutdown after exit is routine teardown; a real
+                        // host disconnect must not leave the workload headless.
+                        if !exited_in_loop.load(Ordering::Relaxed) {
+                            kill_if_alive(child_pid);
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
                 }
-                Ok((MSG_EOF, _)) => {
-                    // Clean stdin EOF: stop forwarding but let the process run to
-                    // completion (its output still flows back).
-                    drop(child_stdin);
-                    break;
-                }
-                Err(_) => {
-                    // Host connection gone: don't leave the workload running
-                    // headless — kill it and let the reaper collect it.
-                    host_disconnected = true;
-                    break;
-                }
-                Ok(_) => {}
             }
-        }
-        if host_disconnected {
-            kill_if_alive(child_pid);
-        }
+        });
 
         let _ = t_stdout.join();
         let _ = t_stderr.join();
-        // The reaper owns waitpid; block on the routed exit code.
-        let exit_code = exit_rx.recv().unwrap_or(-1);
+        // The reaper owns waitpid; block on the routed exit outcome.
+        let outcome = exit_rx.recv().unwrap_or(WaitOutcome::Exited(-1));
         let _ = write_frame(
             &mut *writer.lock().unwrap(),
             MSG_EXIT,
-            &exit_code.to_le_bytes(),
+            &exit_payload(outcome),
         );
+        exited.store(true, Ordering::Relaxed);
+        // Unblock the input thread's read so the session tears down without
+        // depending on the host noticing first.
+        // SAFETY: read_fd stays open until t_input drops its VsockStream;
+        // shutting down the read half only wakes the blocked read.
+        unsafe { libc::shutdown(read_fd, libc::SHUT_RD) };
+        let _ = t_input.join();
     }
 
     /// SIGKILL `pid` after `timeout_seconds`, if it is still alive.
@@ -846,7 +1746,7 @@ mod agent {
         // Hold the reap registry lock across fork + register so the single
         // reaper thread can't route (and discard) the child's exit status
         // before it is registered below.
-        let (exit_tx, exit_rx) = mpsc::channel::<i32>();
+        let (exit_tx, exit_rx) = mpsc::channel::<WaitOutcome>();
         let mut registry = reap_registry().lock().unwrap();
         match unsafe { fork() } {
             Err(e) => {
@@ -922,7 +1822,7 @@ mod agent {
 
             Ok(ForkResult::Parent { child }) => {
                 let child_pid = child.as_raw();
-                registry.insert(child_pid, exit_tx);
+                register_child(&mut registry, child_pid, exit_tx);
                 drop(registry); // release before the (long-lived) session loop
 
                 if start.timeout_seconds > 0 {
@@ -931,6 +1831,9 @@ mod agent {
 
                 drop(slave);
                 let writer: Arc<Mutex<VsockStream>> = Arc::new(Mutex::new(conn));
+
+                let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
+                let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
 
                 let w_read = Arc::clone(&writer);
                 let t_pty = thread::spawn(move || {
@@ -949,10 +1852,29 @@ mod agent {
                             }
                         }
                     }
-                });
 
-                let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
-                let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
+                    // The master read only ends when every slave fd is closed,
+                    // i.e. the session's processes are gone. Report the status
+                    // here rather than after the input loop: that loop is parked
+                    // in read_frame waiting for host frames, and the host is
+                    // waiting for this status, so leaving it until then
+                    // deadlocked every interactive session that exited on its
+                    // own (^D at a shell, an agent quitting on ^C) until the
+                    // client gave up or was killed.
+                    let outcome = exit_rx.recv().unwrap_or(WaitOutcome::Exited(-1));
+                    let _ = write_frame(
+                        &mut *w_read.lock().unwrap(),
+                        MSG_EXIT,
+                        &exit_payload(outcome),
+                    );
+
+                    // Unblock the input loop so the session tears down without
+                    // depending on the client noticing first.
+                    // SAFETY: read_fd is a live dup of the connection owned by
+                    // the input loop; shutting down its read half makes a
+                    // blocked read return instead of waiting for host input.
+                    unsafe { libc::shutdown(read_fd, libc::SHUT_RD) };
+                });
                 // SAFETY: master_fd is valid; File takes ownership for writes.
                 let mut master_writer = unsafe { std::fs::File::from_raw_fd(master_fd) };
 
@@ -971,6 +1893,7 @@ mod agent {
                             // SAFETY: master_fd is valid.
                             unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize) };
                         }
+                        Ok((MSG_SIGNAL, data)) => deliver_signal(child_pid, &data),
                         Ok((MSG_EOF, _)) => break,
                         Err(_) => {
                             // Host gone: kill the session's process group leader
@@ -982,15 +1905,9 @@ mod agent {
                     }
                 }
 
+                // The PTY thread owns reporting the exit status (see above), so
+                // joining it is all that is left.
                 let _ = t_pty.join();
-
-                // The reaper owns waitpid; block on the routed exit code.
-                let exit_code = exit_rx.recv().unwrap_or(-1);
-                let _ = write_frame(
-                    &mut *writer.lock().unwrap(),
-                    MSG_EXIT,
-                    &exit_code.to_le_bytes(),
-                );
             }
         }
     }
@@ -1025,6 +1942,17 @@ mod agent {
                 "devpts",
                 libc::MS_NOSUID | libc::MS_NOEXEC,
                 "newinstance,ptmxmode=0666",
+            ),
+            // /etc/resolv.conf is a symlink into /run so DNS rewrites (boot
+            // setup_dns, post-restore net reconfig) stay off the CoW block
+            // device — a first ext4 write costs a ~30 ms synchronous
+            // dm-snapshot exception through the nested I/O stack (CORE-75).
+            (
+                "/run",
+                "tmpfs",
+                "tmpfs",
+                libc::MS_NOSUID | libc::MS_NODEV,
+                "mode=0755",
             ),
         ];
 
@@ -1131,6 +2059,22 @@ mod agent {
     pub fn run() {
         mount_filesystems();
         setup_dns();
+        // Set the wall clock from the hypervisor before anything can care:
+        // /dev/ptp0 needs no host RPC, so a guest whose kernel lacks
+        // RTC_HCTOSYS still boots with correct time. Verbose on purpose —
+        // once per boot, and the offset line is the hardware-validation
+        // signal for the ptp path.
+        match crate::ptp::sync_clock_from_ptp() {
+            Ok(crate::ptp::SyncOutcome::Stepped { offset_ns }) => eprintln!(
+                "vm-agent: ptp clock sync: stepped CLOCK_REALTIME by {} ms at startup",
+                offset_ns / 1_000_000
+            ),
+            Ok(crate::ptp::SyncOutcome::InSync { offset_ns }) => eprintln!(
+                "vm-agent: ptp clock sync: in sync at startup (offset {} us)",
+                offset_ns / 1_000
+            ),
+            Err(e) => eprintln!("vm-agent: ptp clock sync at startup: {e}"),
+        }
         // This process is guest PID 1: start the reaper so exiting workloads and
         // reparented double-fork orphans are collected instead of zombifying.
         start_reaper();
@@ -1138,15 +2082,23 @@ mod agent {
         let exec_fd = create_vsock_listener(AGENT_PORT);
         let file_fd = create_vsock_listener(FILE_PORT);
 
+        // Both listeners are bound and mounts/DNS are done: tell the host.
+        // The dial-out is the cold-boot readiness event the host gates on.
+        signal_ready();
+
         // Shared counters for bounding active connection threads.
         let file_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let exec_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
-        // File I/O listener thread.
+        // File I/O listener thread. The clock re-check runs here too:
+        // staging files before running anything is the natural sandbox
+        // order, and without it a restored guest would stamp uploads with
+        // snapshot-era mtimes.
         let file_active_clone = Arc::clone(&file_active);
         thread::spawn(move || {
             loop {
                 let conn_fd = accept_connection(file_fd);
+                crate::ptp::sync_on_accept();
                 spawn_bounded(&file_active_clone, "file", conn_fd, handle_file_connection);
             }
         });
@@ -1154,7 +2106,61 @@ mod agent {
         // Exec listener (main thread).
         loop {
             let conn_fd = accept_connection(exec_fd);
+            // A restored guest wakes with CLOCK_REALTIME still at its
+            // snapshot value, and the first post-resume interaction is
+            // always an accepted connection: re-check the clock before the
+            // handler can spawn a workload (µs when in sync).
+            crate::ptp::sync_on_accept();
             spawn_bounded(&exec_active, "exec", conn_fd, handle_connection);
+        }
+    }
+
+    /// Dial the host's readiness listener: connect `AF_VSOCK` to the host
+    /// (CID 2) on `READY_PORT`, write one byte, close. Firecracker forwards
+    /// the connect to the Unix socket the host pre-bound before starting
+    /// this VM — the accept there is the boot readiness event.
+    ///
+    /// Best-effort by design: under an OLD host without the listener,
+    /// Firecracker resets the connect (`ECONNRESET`-class error), and the
+    /// agent must keep serving — readiness detection then falls back to
+    /// that host's own connect polling.
+    fn signal_ready() {
+        // SAFETY: plain socket(2) call; result checked below.
+        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            eprintln!(
+                "vm-agent: ready dial-out: socket: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // SAFETY: fd is a freshly opened, owned socket fd.
+        let mut stream = unsafe { VsockStream::from_raw_fd(fd) };
+
+        let addr = libc::sockaddr_vm {
+            svm_family: libc::AF_VSOCK as libc::sa_family_t,
+            svm_reserved1: 0,
+            svm_port: READY_PORT,
+            svm_cid: libc::VMADDR_CID_HOST,
+            ..unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: addr is a fully initialized sockaddr_vm; fd is a live socket.
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                (&raw const addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            eprintln!(
+                "vm-agent: ready dial-out failed (old host without a listener?): {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        if let Err(e) = stream.write_all(&[0u8]) {
+            eprintln!("vm-agent: ready dial-out write: {e}");
         }
     }
 
@@ -1215,22 +2221,124 @@ mod agent {
         #[test]
         fn normal_exit_decodes_to_its_code() {
             // Linux wait status encodes a normal exit as `code << 8`.
-            assert_eq!(wait_status_to_code(0), Some(0));
-            assert_eq!(wait_status_to_code(42 << 8), Some(42));
-            assert_eq!(wait_status_to_code(127 << 8), Some(127));
+            assert_eq!(wait_status_to_outcome(0), Some(WaitOutcome::Exited(0)));
+            assert_eq!(
+                wait_status_to_outcome(42 << 8),
+                Some(WaitOutcome::Exited(42))
+            );
+            assert_eq!(
+                wait_status_to_outcome(127 << 8),
+                Some(WaitOutcome::Exited(127))
+            );
         }
 
         #[test]
-        fn signal_death_maps_to_128_plus_signal() {
+        fn signal_death_keeps_the_signal() {
             // A process killed by signal N has N in the low 7 status bits.
             assert_eq!(
-                wait_status_to_code(libc::SIGKILL),
-                Some(128 + libc::SIGKILL)
+                wait_status_to_outcome(libc::SIGKILL),
+                Some(WaitOutcome::Signaled(libc::SIGKILL))
             );
             assert_eq!(
-                wait_status_to_code(libc::SIGTERM),
-                Some(128 + libc::SIGTERM)
+                wait_status_to_outcome(libc::SIGTERM),
+                Some(WaitOutcome::Signaled(libc::SIGTERM))
             );
+        }
+
+        #[test]
+        fn exit_payload_encodes_code_and_signal_slots() {
+            let normal = exit_payload(WaitOutcome::Exited(42));
+            assert_eq!(i32::from_le_bytes(normal[..4].try_into().unwrap()), 42);
+            assert_eq!(i32::from_le_bytes(normal[4..].try_into().unwrap()), 0);
+
+            // Signal deaths keep the shell convention in the code slot so a
+            // 4-byte legacy reader sees the value the old protocol carried.
+            let killed = exit_payload(WaitOutcome::Signaled(9));
+            assert_eq!(i32::from_le_bytes(killed[..4].try_into().unwrap()), 137);
+            assert_eq!(i32::from_le_bytes(killed[4..].try_into().unwrap()), 9);
+        }
+
+        /// Wrap one end of a socketpair as the handler's connection; drive
+        /// frames from the returned test end.
+        fn conn_pair() -> (VsockStream, std::os::unix::net::UnixStream) {
+            use std::os::fd::IntoRawFd as _;
+            let (theirs, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+            // SAFETY: into_raw_fd transfers ownership of an open socket fd;
+            // VsockStream closes it on drop.
+            let conn = unsafe { VsockStream::from_raw_fd(theirs.into_raw_fd()) };
+            (conn, ours)
+        }
+
+        fn path_req(path: &std::path::Path) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({ "path": path })).unwrap()
+        }
+
+        #[test]
+        fn read_of_missing_path_is_classified() {
+            let (conn, mut host) = conn_pair();
+            handle_file_read(conn, br#"{"path":"/definitely/missing"}"#);
+            let (ty, payload) = read_frame(&mut host).unwrap();
+            assert_eq!(ty, FILE_ERR);
+            assert_eq!(
+                std::str::from_utf8(&payload).unwrap(),
+                "ENOENT: /definitely/missing"
+            );
+        }
+
+        #[test]
+        fn read_of_a_directory_reports_the_fallback_message() {
+            let dir = tempfile::tempdir().unwrap();
+            let (conn, mut host) = conn_pair();
+            handle_file_read(conn, &path_req(dir.path()));
+            let (ty, payload) = read_frame(&mut host).unwrap();
+            assert_eq!(ty, FILE_ERR);
+            let msg = std::str::from_utf8(&payload).unwrap();
+            assert!(msg.starts_with("read '"), "unexpected payload: {msg}");
+        }
+
+        #[test]
+        fn mkdir_mode_zero_defaults_to_the_agent_default() {
+            use std::os::unix::fs::MetadataExt as _;
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("made");
+            let req = serde_json::to_vec(&MakeDirReq {
+                path: target.to_str().unwrap().to_owned(),
+                mode: 0,
+            })
+            .unwrap();
+            let (conn, mut host) = conn_pair();
+            handle_file_mkdir(conn, &req);
+            let (ty, _) = read_frame(&mut host).unwrap();
+            assert_eq!(ty, FILE_ACK);
+            // The exact bits depend on the process umask; the bug this pins
+            // down produced a mode-0000 directory.
+            let mode = std::fs::metadata(&target).unwrap().mode() & 0o7777;
+            assert_eq!(mode & 0o700, 0o700, "mode 0 must fall back, got {mode:o}");
+        }
+
+        #[test]
+        fn list_fails_rather_than_truncates_on_unreadable_entry() {
+            // Root bypasses DAC, so the permission denial cannot be staged.
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("a.txt"), b"x").unwrap();
+            // r-- : the entry names still list, but per-entry stat is denied.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+            let (conn, mut host) = conn_pair();
+            handle_file_list(conn, &path_req(&root));
+            let (ty, payload) = read_frame(&mut host).unwrap();
+            // Restore access so the tempdir can be removed.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(ty, FILE_ERR);
+            let msg = std::str::from_utf8(&payload).unwrap();
+            assert!(msg.starts_with("list '"), "unexpected payload: {msg}");
         }
     }
 }

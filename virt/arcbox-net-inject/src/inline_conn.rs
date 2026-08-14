@@ -41,6 +41,13 @@ pub struct InlineConn {
     pub our_seq: Arc<AtomicU32>,
     /// Last ACK from guest (shared with datapath loop via atomic).
     pub last_ack: Arc<AtomicU32>,
+    /// Highest ACK the guest has sent for OUR stream, maintained by the
+    /// datapath's fast-path intercept. With `guest_window` it bounds how
+    /// far ahead of the guest this thread may send.
+    pub guest_acked: Arc<AtomicU32>,
+    /// The guest's most recent advertised receive window, already scaled
+    /// by its SYN window-scale option.
+    pub guest_window: Arc<AtomicU32>,
     /// Gateway MAC for Ethernet source.
     pub gw_mac: [u8; 6],
     /// Guest MAC for Ethernet destination.
@@ -57,6 +64,35 @@ pub struct InlineConn {
 
 // SAFETY: TcpStream is Send, all other fields are Send+Sync.
 unsafe impl Send for InlineConn {}
+
+/// Cap on the guest window this thread honors — bounds the burst a flow
+/// can throw at the guest-internal bridge/veth backlog. Keep in sync with
+/// `splicetcp::tcp_bridge::HONORED_WINDOW_CAP` (this crate must not
+/// depend on splicetcp).
+const HONORED_WINDOW_CAP: u32 = 256 * 1024;
+
+impl InlineConn {
+    /// Bytes this thread may still send without exceeding the guest's
+    /// advertised receive window: `window − (sent − acked)`, wrap-safe.
+    /// Within the budget the guest kernel guarantees buffering, and the
+    /// inject path is lossless — so staying inside it means no gap can
+    /// form that this retransmission-free path could never repair.
+    /// (Mirrors `splicetcp::tcp_bridge::send_budget`.)
+    pub fn send_budget(&self) -> u32 {
+        let sent = self.our_seq.load(Ordering::Relaxed);
+        let acked = self.guest_acked.load(Ordering::Relaxed);
+        let window = self
+            .guest_window
+            .load(Ordering::Relaxed)
+            .min(HONORED_WINDOW_CAP);
+        let in_flight = sent.wrapping_sub(acked);
+        if in_flight >= 0x8000_0000 {
+            // Transiently stale snapshot from racing atomics.
+            return window;
+        }
+        window.saturating_sub(in_flight)
+    }
+}
 
 /// Writes 66 bytes of headers (12 virtio-net + 54 Eth/IP/TCP) directly
 /// into a guest descriptor buffer. Returns the number of header bytes

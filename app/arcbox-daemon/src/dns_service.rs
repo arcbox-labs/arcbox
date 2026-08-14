@@ -1,7 +1,7 @@
-//! Async UDP DNS server for `*.arcbox.local` resolution.
+//! Async UDP DNS server for the runtime's configured local domain.
 //!
 //! Listens on `127.0.0.1:{port}` and resolves container hostnames registered
-//! via [`NetworkManager`]. Queries for unregistered `*.arcbox.local` names
+//! via [`NetworkManager`]. Queries for unregistered names in that domain
 //! get an NXDOMAIN response; all other queries are forwarded to upstream DNS.
 
 use anyhow::{Context, Result};
@@ -26,12 +26,28 @@ impl DnsService {
         let socket = UdpSocket::bind(&addr)
             .await
             .with_context(|| format!("DNS service failed to bind {addr}"))?;
+        let actual_addr = socket
+            .local_addr()
+            .context("Failed to read DNS service address")?;
 
-        tracing::info!(%addr, "DNS service bound");
+        tracing::info!(%actual_addr, "DNS service bound");
         Ok(Self {
             network_manager,
             socket,
         })
+    }
+
+    /// Returns the actual UDP port selected by the bound socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket address cannot be queried.
+    pub fn host_port(&self) -> Result<u16> {
+        Ok(self
+            .socket
+            .local_addr()
+            .context("Failed to read DNS service address")?
+            .port())
     }
 
     /// Runs the DNS event loop. Only called after [`Self::bind`] succeeds.
@@ -52,7 +68,7 @@ impl DnsService {
                 }
             };
 
-            // Fast path: local resolution or NXDOMAIN for *.arcbox.local.
+            // Fast path: local resolution or NXDOMAIN for the configured domain.
             // Operates on a borrowed slice to avoid allocation.
             if let Some(response) = self
                 .network_manager
@@ -162,7 +178,7 @@ mod tests {
 
         // Bind server on random port via DnsService::bind.
         let service = DnsService::bind(Arc::clone(&nm), 0).await.unwrap();
-        let server_addr = service.socket.local_addr().unwrap();
+        let server_addr = ("127.0.0.1", service.host_port().unwrap());
 
         let server_handle =
             tokio::spawn(async move { service.run(CancellationToken::new()).await });
@@ -202,7 +218,7 @@ mod tests {
         // Don't register anything — query should get NXDOMAIN.
 
         let service = DnsService::bind(Arc::clone(&nm), 0).await.unwrap();
-        let server_addr = service.socket.local_addr().unwrap();
+        let server_addr = ("127.0.0.1", service.host_port().unwrap());
 
         let server_handle =
             tokio::spawn(async move { service.run(CancellationToken::new()).await });

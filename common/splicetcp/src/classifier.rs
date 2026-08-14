@@ -315,6 +315,13 @@ impl FrameClassifier {
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
 
+        // Reject a malformed IPv4 header: version must be 4 and IHL ≥ 20. A
+        // smaller IHL collapses l4_start into the IP header, so the 'TCP'
+        // fields below would be read from attacker-controlled header bytes.
+        if ihl < 20 || (frame[ip_start] >> 4) != 4 {
+            return;
+        }
+
         // A fragment (MF set or nonzero offset) carries at most a partial L4
         // datagram, and downstream consumers parse one datagram per frame —
         // reassemble first (ABX-429). A completed datagram re-enters here
@@ -448,10 +455,17 @@ fn learn_guest_mac(mac: [u8; 6], guest_mac: &mut Option<[u8; 6]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only `fd_source_drain_reads_and_classifies` below needs raw-fd
+    // plumbing and `FdFrameSource`, which is macOS-only; gate that import
+    // and its helpers with it rather than the whole test module, since
+    // every other test here exercises platform-neutral classifier logic.
+    #[cfg(target_os = "macos")]
     use std::os::fd::{FromRawFd, RawFd};
 
+    #[cfg(target_os = "macos")]
     use crate::frame_source::{FdFrameSource, FrameSource};
 
+    #[cfg(target_os = "macos")]
     fn socketpair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
         use std::os::fd::OwnedFd;
         let mut fds: [i32; 2] = [0; 2];
@@ -462,6 +476,7 @@ mod tests {
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
     }
 
+    #[cfg(target_os = "macos")]
     fn set_nonblocking(fd: RawFd) {
         // SAFETY: fcntl on a valid fd.
         unsafe {
@@ -471,6 +486,7 @@ mod tests {
     }
 
     /// Writes raw bytes to an FD.
+    #[cfg(target_os = "macos")]
     fn fd_write_raw(fd: RawFd, data: &[u8]) {
         // SAFETY: writing from valid buffer to valid fd.
         unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
@@ -568,6 +584,81 @@ mod tests {
             1,
             "ArpResponder should have produced a reply"
         );
+    }
+
+    /// Builds a minimal IPv6 TCP SYN frame (EtherType 0x86DD). The datapath
+    /// is IPv4-only by design (`classify_frame` drops non-0x0800/0x0806
+    /// EtherTypes; the utun shim likewise drops first-nibble-6 packets), so
+    /// this exists purely to characterize that drop.
+    fn make_ipv6_tcp_syn_frame() -> Vec<u8> {
+        // ETH(14) + IPv6(40) + TCP(20).
+        let mut frame = vec![0u8; ETH_HEADER_LEN + 40 + 20];
+        let guest_mac = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        frame[0..6].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        frame[6..12].copy_from_slice(&guest_mac);
+        frame[12..14].copy_from_slice(&0x86DDu16.to_be_bytes()); // IPv6
+        let ip = ETH_HEADER_LEN;
+        frame[ip] = 0x60; // version = 6
+        frame[ip + 4..ip + 6].copy_from_slice(&20u16.to_be_bytes()); // payload length
+        frame[ip + 6] = PROTO_TCP; // next header
+        frame[ip + 7] = 64; // hop limit
+        // src ::1, dst 2606:4700:4700::1111 (a real public v6 resolver shape).
+        frame[ip + 8..ip + 24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        frame[ip + 24..ip + 40].copy_from_slice(&[
+            0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
+        ]);
+        // TCP SYN.
+        let l4 = ip + 40;
+        frame[l4 + 2..l4 + 4].copy_from_slice(&443u16.to_be_bytes()); // dst port
+        frame[l4 + 12] = 0x50; // data offset
+        frame[l4 + 13] = 0x02; // SYN
+        frame
+    }
+
+    /// IPv6 is intentionally unsupported: an IPv6 frame must be dropped
+    /// whole — never queued for TCP, intercept, or ARP handling. This pins
+    /// the documented limitation so a future half-implementation (parsing
+    /// v6 far enough to queue it, then mishandling it) is caught, and
+    /// asserts the drop is a clean no-op (no panic, no state mutation).
+    #[test]
+    fn classify_ipv6_is_dropped_whole() {
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
+        device.set_gateway_mac([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01]);
+        let mut guest_mac = None;
+
+        device.classify_frame(&make_ipv6_tcp_syn_frame(), &mut guest_mac);
+
+        assert!(
+            device.rx_queue.is_empty(),
+            "IPv6 must not reach the TCP rx queue"
+        );
+        assert!(
+            device.intercepted.is_empty(),
+            "IPv6 must not be intercepted"
+        );
+        assert!(device.gated_syns.is_empty(), "IPv6 SYN must not be gated");
+        assert!(
+            device.pending_arp_replies.is_empty(),
+            "IPv6 must not trigger an ARP reply"
+        );
+    }
+
+    /// A truncated IPv6 frame (header claims more than is present) must also
+    /// drop cleanly — the EtherType arm rejects it before any length-trusting
+    /// parse, so a malformed v6 frame can never index out of bounds.
+    #[test]
+    fn classify_truncated_ipv6_does_not_panic() {
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut guest_mac = None;
+
+        let mut frame = make_ipv6_tcp_syn_frame();
+        frame.truncate(ETH_HEADER_LEN + 8); // cut mid-IPv6-header
+        device.classify_frame(&frame, &mut guest_mac);
+
+        assert!(device.rx_queue.is_empty());
+        assert!(device.intercepted.is_empty());
     }
 
     #[test]
@@ -733,6 +824,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn fd_source_drain_reads_and_classifies() {
         use std::os::fd::AsRawFd;
         let (host_fd, guest_fd) = socketpair();

@@ -1,0 +1,19 @@
+[package]
+name = "arcbox-atomic-file"
+description = "Atomic file replacement with a durable rename, reporting the two failure modes apart"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

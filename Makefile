@@ -29,7 +29,7 @@ endif
         build-fleet-agent fleet-proto-sync \
         test check fmt clean \
         setup-boot-assets sign sign-daemon sign-all verify run-daemon \
-        run-helper install-helper reload-helper
+        run-helper install-helper reload-helper test-helper
 
 ## ── Build ──────────────────────────────────────────────
 
@@ -58,6 +58,14 @@ build-fleet-agent:
 # Refresh the vendored Fleet proto from the published BSR module.
 fleet-proto-sync:
 	buf export buf.build/arcboxlabs/fleet -o fleet/arcbox-fleet-proto/proto
+
+# arcbox-connect generates from a committed descriptor set, because its .proto
+# sources live in arcbox-protocol and cargo cannot package another package's
+# directory. Run this after editing any proto it compiles — its build script
+# fails until you do. This is the only step that needs protoc; building the
+# crate does not.
+refresh-connect-descriptor:
+	rpc/arcbox-connect/descriptor/refresh.sh
 
 ## ── Quality ────────────────────────────────────────────
 
@@ -141,20 +149,34 @@ HELPER_SOCKET ?= /tmp/arcbox-helper.sock
 run-helper: build-helper
 	sudo ARCBOX_HELPER_SOCKET=$(HELPER_SOCKET) $(TARGET_DIR)/arcbox-helper
 
-# Install the helper into launchd (production-like). Requires sudo.
-install-helper: build-helper
-	sudo install -o root -g wheel -m 755 $(TARGET_DIR)/arcbox-helper /usr/local/libexec/arcbox-helper
+# Install the authenticated release helper into the world-connectable launchd
+# socket. Debug helpers skip peer authentication and must only use run-helper's
+# user-controlled development socket.
+install-helper:
+	$(MAKE) build-helper PROFILE=release
+	sudo install -o root -g wheel -m 755 target/release/arcbox-helper /usr/local/libexec/arcbox-helper
 	sudo cp bundle/com.arcboxlabs.desktop.helper.plist /Library/LaunchDaemons/
 	-sudo launchctl bootout system/com.arcboxlabs.desktop.helper 2>/dev/null
 	sudo launchctl bootstrap system /Library/LaunchDaemons/com.arcboxlabs.desktop.helper.plist
 	@echo "✓ arcbox-helper installed and registered with launchd"
 
-# Rebuild and hot-reload the helper in launchd (bootout → copy → bootstrap).
-reload-helper: build-helper
+# Rebuild and hot-reload the authenticated release helper.
+reload-helper:
+	$(MAKE) build-helper PROFILE=release
 	-sudo launchctl bootout system/com.arcboxlabs.desktop.helper 2>/dev/null
-	sudo cp $(TARGET_DIR)/arcbox-helper /usr/local/libexec/arcbox-helper
+	sudo cp target/release/arcbox-helper /usr/local/libexec/arcbox-helper
 	sudo launchctl bootstrap system /Library/LaunchDaemons/com.arcboxlabs.desktop.helper.plist
 	@echo "✓ arcbox-helper reloaded"
+
+# Full helper regression suite (no root): unit + mock tarpc + real-binary E2E.
+# E2E uses ARCBOX_HELPER_TEST_ROOT sandbox (debug builds only).
+test-helper:
+	cargo test -p arcbox-constants --features std --lib helper::
+	cargo test -p arcbox-constants --features std --lib is_arcbox_owned
+	cargo test -p arcbox-helper --lib
+	cargo test -p arcbox-helper --bins
+	cargo test -p arcbox-helper --tests
+	cargo clippy -p arcbox-helper -- -D warnings
 
 ## ── Cleanup ───────────────────────────────────────────
 

@@ -36,6 +36,7 @@ splicetcp.workspace = true
 hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+arcbox-xnu-net.workspace = true
 arcbox-vmnet = { workspace = true }
 
 [dev-dependencies]

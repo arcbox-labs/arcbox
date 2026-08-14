@@ -18,6 +18,6 @@
 - `Ipv4Net` is `Copy` (5 bytes) — always pass by value, never `&Ipv4Net`
 - `unsafe` blocks require `// Safety:` comments explaining the invariant
 - `sockaddr` module is `pub(crate)` — public API uses `Ipv4Net`, not raw libc types
-- EEXIST → RTM_CHANGE retry logic lives in `send_change()` (single source of truth)
+- EEXIST replacement must delete then add; XNU's `RTM_CHANGE` cannot clear a conflicting route's `RTF_GATEWAY` flag
 - Error type: `Result<(), String>` to match helper's tarpc interface; `Ipv4NetError` for construction
 - Follow root `CLAUDE.md` for all general conventions (clippy, fmt, English comments, no section dividers)

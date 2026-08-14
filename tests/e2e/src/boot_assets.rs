@@ -268,7 +268,7 @@ fn verify_nfs_export(ctx: &TestContext) -> Result<()> {
 }
 
 /// Waits until the daemon's NFS mount is populated with docker's data root.
-fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
+pub fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if mount_dir.join("volumes").is_dir() || mount_dir.join("overlay2").is_dir() {
@@ -287,7 +287,7 @@ fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
 
 /// Reads `path`, retrying briefly while the just-written file propagates
 /// through the NFS attribute cache.
-fn read_file_with_retry(path: &Path, timeout: Duration) -> Result<String> {
+pub fn read_file_with_retry(path: &Path, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
         match fs::read_to_string(path) {
@@ -408,7 +408,7 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
     // Seed the guest runtime binaries from an installed ArcBox so a bare test
     // daemon boots without reaching the CDN. Best-effort: prepare_binaries
     // downloads anything still missing.
-    stage_runtime_binaries(&data_dir.join("runtime/bin"));
+    stage_runtime_binaries(data_dir, version);
 
     // Then pre-seed runtime binaries staged in boot-assets/dev/runtime-bin
     // (put there by hand or by `boot-assets sync-binaries` in the sibling
@@ -444,17 +444,51 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
     Ok(())
 }
 
-/// Copies every guest runtime binary from the installed ArcBox's data dir into
-/// the test data dir, so the daemon's binary prepare finds them locally instead
-/// of downloading. Best-effort — anything still missing or version-mismatched
+/// Copies runtime binaries from the installed ArcBox's data dir into the test
+/// data dir, so the daemon's binary prepare finds them locally instead of
+/// downloading. Best-effort — anything still missing or version-mismatched
 /// falls back to the daemon's own download.
-fn stage_runtime_binaries(dest_dir: &Path) {
-    let src_dir = arcbox_constants::paths::ArcboxProfile::Production
+///
+/// **Two destinations, and they are not interchangeable.** Host tools
+/// (`docker`, `docker-compose`, …) live in the unversioned
+/// `<data_dir>/runtime/bin`, but the *guest* binaries (`dockerd`,
+/// `containerd`, `k3s`, `FEX`, …) are generation-scoped: `Runtime::init`
+/// prepares them into `<data_dir>/runtime/<boot version>/bin`. Seeding only
+/// the unversioned directory leaves the guest set entirely un-seeded, and
+/// every run re-downloads ~250 MB from the CDN — which silently turns each
+/// test's readiness budget into a bandwidth test.
+fn stage_runtime_binaries(data_dir: &Path, version: &str) {
+    let installed = arcbox_constants::paths::ArcboxProfile::Production
         .default_data_dir()
-        .join("runtime/bin");
-    let Ok(entries) = fs::read_dir(&src_dir) else {
+        .join("runtime");
+
+    stage_binary_dir(&installed.join("bin"), &data_dir.join("runtime/bin"));
+
+    // Prefer this generation's installed copy; fall back to the unversioned
+    // directory, which older installs used for guest binaries too. Either
+    // way the daemon checksum-verifies what it finds, so a stale file costs
+    // a re-download rather than a bad boot.
+    let versioned = installed.join(version).join("bin");
+    let guest_src = if versioned.is_dir() {
+        versioned
+    } else {
+        installed.join("bin")
+    };
+    stage_binary_dir(
+        &guest_src,
+        &data_dir.join("runtime").join(version).join("bin"),
+    );
+}
+
+/// Copies every regular file in `src_dir` into `dest_dir`, warning per file.
+fn stage_binary_dir(src_dir: &Path, dest_dir: &Path) {
+    let Ok(entries) = fs::read_dir(src_dir) else {
         return;
     };
+    if let Err(error) = fs::create_dir_all(dest_dir) {
+        warn!(dir = %dest_dir.display(), %error, "failed to create runtime binary dir");
+        return;
+    }
     for entry in entries.flatten() {
         let src = entry.path();
         if src.is_file() {

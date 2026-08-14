@@ -10,7 +10,25 @@
 //! No congestion control, retransmission, reordering, or TIME_WAIT state
 //! is implemented here — both endpoints (guest Linux kernel, host macOS
 //! kernel) own their own TCP stacks end-to-end; any state machine work in
-//! the middle would be duplication.
+//! the middle would be duplication. Two sender-side disciplines make that
+//! stance sound (2026-07-19, found by the network-workload e2e):
+//!
+//! - **Upload (guest→host)**: a segment is ACKed only for the bytes
+//!   actually written, in order, to the host socket. Anything the socket
+//!   didn't take (`WouldBlock`, short write) or that arrived beyond the
+//!   contiguous cursor stays un-ACKed and the guest sees dup-ACKs — its
+//!   own fast-retransmit/RTO machinery repairs the stream. ACKing past
+//!   unwritten bytes is how uploads silently lost data.
+//! - **Download (host→guest)**: the shim is the *sender-side* TCP for this
+//!   direction, and the path beyond guest `eth0` (bridge → veth → container
+//!   netns backlog) drops frames under burst like any real network — so it
+//!   keeps the two sender duties a real stack cannot delegate: it never
+//!   sends beyond the guest's advertised receive window (tracked from its
+//!   ACKs, scaled by its SYN wscale, capped at [`HONORED_WINDOW_CAP`]),
+//!   and it buffers in-flight bytes for retransmission (triple-dup-ACK
+//!   fast retransmit, RTO backoff otherwise). Without these, one dropped
+//!   frame wedged a flow forever and window overrun made that routine
+//!   under concurrency.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -60,10 +78,69 @@ const HANDSHAKE_MAX_RETRANSMITS: u8 = 3;
 /// connects while they were still legitimately pending (ABX-431).
 const HANDSHAKE_TOTAL_TTL: std::time::Duration = std::time::Duration::from_secs(7);
 
+/// Idle deadline for a half-closed flow (guest sent FIN, host write side shut
+/// but not yet EOF'd). The clock is refreshed on every host→guest byte, so an
+/// actively streaming half-open never trips it; it only fires when the upstream
+/// keeps its write side open with nothing to send — the FIN_WAIT2-leak the
+/// non-inline half-close would otherwise hold forever. 120 s (2× Linux's
+/// default `tcp_fin_timeout`) is generous enough not to truncate a slow but
+/// live response while still bounding a hostile guest's accumulated entries.
+const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Give-up deadline for a flow whose guest has gone silent while the shim is
+/// actively soliciting a response — retransmitting unACKed data or a FIN, or
+/// persist-probing a closed receive window. A live guest answers every
+/// solicit (a retransmit elicits at least a dup-ACK; a persist probe elicits
+/// a window-bearing ACK per RFC 793 §3.9), so five minutes of unanswered
+/// soliciting means the guest endpoint is gone (container netns torn down,
+/// VM wedged) and the entry would otherwise retransmit forever and leak its
+/// host fd plus up to [`HONORED_WINDOW_CAP`] of retransmission buffer. Both
+/// clocks must be stale: five minutes of *continuous soliciting* AND five
+/// minutes since the last guest frame — a long-idle flow whose upstream
+/// wakes up starts the soliciting clock fresh at the wake-up, so its guest
+/// gets the full deadline to answer. Deliberately generous so a
+/// paused-then-resumed VM (see `arcbox-vz` pause / sandbox checkpoint)
+/// keeps its in-flight flows across any reasonable pause. Purely idle flows
+/// (nothing in flight, window open) are never reaped — matching real TCP,
+/// which keeps quiescent connections indefinitely.
+const DEAD_FLOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// TCP keepalive for the host-side (upstream) leg of every fast-path flow.
+/// Without it a silently dead upstream — a default-route flap, a crashed
+/// system proxy, a NAT timeout — never surfaces on the socket: reads stay
+/// `WouldBlock` forever and the guest leg sits ESTABLISHED with empty queues
+/// until the guest app gives up (observed in prod: `apk` hung 23+ minutes).
+/// With keepalive the kernel probes an idle upstream and turns its death
+/// into a read error, which `poll_fast_path` / the inline owners already
+/// propagate as a guest RST. Idle 60 s + 4 probes × 15 s ⇒ a dead upstream
+/// is detected within ~2 minutes of its last byte.
+const UPSTREAM_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+const UPSTREAM_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const UPSTREAM_KEEPALIVE_RETRIES: u32 = 4;
+
 /// Window scale we advertise to the guest. Shift by 7 = 128× scaling,
 /// giving an effective receive window of 65535 × 128 = 8 MiB. Sufficient
 /// for any VM→Host BDP on a local loopback link.
 const SHIM_WSCALE: u8 = 7;
+
+/// Upper bound on parked out-of-order upload bytes per flow, and on how far
+/// past `last_ack` a parked segment may start. The [`SHIM_WSCALE`] window
+/// invites the guest to keep up to 8 MiB in flight, so a single lost frame
+/// can put megabytes of valid data behind a hole; parking is capped below
+/// the full window to bound memory. Segments past either cap fall back to
+/// drop-and-dup-ACK, which the guest repairs by retransmitting.
+const OOO_REASSEMBLY_CAP: usize = 4 * 1024 * 1024;
+
+/// Upper bound on the *number* of parked out-of-order segments per flow.
+/// [`OOO_REASSEMBLY_CAP`] alone bounds only payload bytes, so a guest could
+/// otherwise park millions of 1-byte segments — exhausting memory in
+/// per-segment `Vec`/allocator overhead and driving quadratic insert/scan
+/// work on the datapath thread. A real out-of-order burst is at most one
+/// window's worth of MSS-sized segments accumulated over a sub-millisecond
+/// local RTT (a few hundred); 4096 clears that by a wide margin while
+/// capping the adversarial case. Segments past this fall back to
+/// drop-and-dup-ACK like the byte cap.
+const OOO_MAX_SEGMENTS: usize = 4096;
 
 /// MSS we advertise in handshake frames to the guest. 1460 is the standard
 /// Ethernet MSS (1500 MTU − 40 bytes IP+TCP). Host→guest large frames with
@@ -74,6 +151,24 @@ const SHIM_MSS: u16 = 1460;
 /// IPv4 minimum (576-byte MTU − 40), so it is always safe to send; it also
 /// guards against a missing or malformed MSS option collapsing segments to 0.
 pub(crate) const TCP_MIN_MSS: u16 = 536;
+
+/// Cap on the guest receive window the download path honors. Bounds both
+/// the per-flow retransmission buffer and the burst a single flow can
+/// inject toward the guest's bridge/veth backlog. 256 KiB sustains
+/// multi-GB/s at sub-millisecond local RTTs.
+pub(crate) const HONORED_WINDOW_CAP: u32 = 256 * 1024;
+
+/// Initial retransmission timeout for unACKed download bytes; doubles per
+/// retransmission up to [`MAX_RTO`]. Local RTTs are sub-millisecond, so
+/// 200 ms only ever fires on actual loss, not reordering.
+pub(crate) const INITIAL_RTO: std::time::Duration = std::time::Duration::from_millis(200);
+pub(crate) const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Delay before the first zero-window persist probe once the guest closes its
+/// receive window with nothing in flight. After one probe byte is in flight the
+/// RTO retransmit path (INITIAL_RTO→MAX_RTO backoff) keeps probing on its own.
+pub(crate) const ZERO_WINDOW_PERSIST_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
 
 /// Fixed segment size the GSO/inline injection paths let the guest re-segment
 /// at (the `gso_size` stamped by `arcbox-net-inject`'s `write_inline_headers`
@@ -201,6 +296,14 @@ pub struct TcpBridge {
     /// TCP handshakes being synthesized. Each entry is promoted to
     /// `fast_path_conns` once the 3-way completes.
     handshake_conns: HashMap<SynFlowKey, HandshakeConn>,
+    /// Notified when a pending handshake's async host connect resolves, so
+    /// the datapath loop can emit the SYN-ACK immediately instead of
+    /// waiting for the next guest frame or timer tick (an idle loop
+    /// otherwise adds up to a full tick of connect latency).
+    handshake_waker: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Silence deadline before a soliciting flow is declared dead
+    /// ([`DEAD_FLOW_TIMEOUT`]; overridable in tests).
+    dead_flow_timeout: std::time::Duration,
 }
 
 /// A TCP connection promoted to the fast path — bypasses any TCP state
@@ -232,10 +335,82 @@ pub(super) struct FastPathConn {
     /// path the guest can forward them over (e.g. a 1500-MTU docker bridge
     /// behind a 4000-MTU `eth0`). See `poll_fast_path`.
     peer_mss: u16,
+    /// Window-scale shift the guest advertised in its SYN / SYN-ACK
+    /// (0 when it offered none — scaling is then off per RFC 7323).
+    guest_wscale: u8,
+    /// Highest ACK the guest has sent for OUR stream. Shared with the
+    /// inline inject thread — the "sent and acknowledged" cursor of
+    /// download flow control.
+    guest_acked: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Receive window from the guest's most recent ACK, already scaled by
+    /// `guest_wscale`. Together with `guest_acked` it bounds host→guest
+    /// in-flight bytes (see [`send_budget`]).
+    guest_window: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Upload-path recovery counters (reported at flow close): segments
+    /// the host socket wouldn't take, segments it took partially, and
+    /// segments that arrived beyond the contiguous cursor. All three
+    /// recover via guest retransmission; they quantify backpressure, not loss.
+    up_would_block: u64,
+    up_short_writes: u64,
+    up_out_of_order: u64,
+    /// Upload segments that arrived beyond the contiguous cursor, parked
+    /// until the hole before them fills: `(guest_seq, payload)`, ordered by
+    /// wrapping distance from `last_ack`. Parking turns one lost frame into
+    /// one guest retransmission; dropping (the pre-2026-07 behavior) made
+    /// recovery go-back-N across the whole 8 MiB advertised window, which
+    /// collapsed docker-bridge uploads to tens of Mbit/s. A deque so the
+    /// drain pops contiguous segments off the front in O(1); a real burst
+    /// arrives in ascending order (append to back), so keeping it ordered is
+    /// cheap. Bounded by [`OOO_REASSEMBLY_CAP`] and [`OOO_MAX_SEGMENTS`].
+    ooo_segs: std::collections::VecDeque<(u32, Vec<u8>)>,
+    /// Total payload bytes parked in `ooo_segs`; bounded by
+    /// [`OOO_REASSEMBLY_CAP`].
+    ooo_bytes: usize,
+    /// OOO segments discarded because a reassembly cap was exceeded
+    /// (recovered by guest retransmission, exactly as before parking existed).
+    up_ooo_dropped: u64,
+    /// True while the flow sits at a zero send budget — transition
+    /// logging only, so a stuck window is visible in the daemon log
+    /// without per-poll noise.
+    window_stalled: bool,
+    /// When the window first closed with nothing in flight, for the
+    /// zero-window persist timer. `None` while the window is open. (The RTO
+    /// `last_progress` clock can't be reused: it is reset every idle poll.)
+    window_stalled_at: Option<StdInstant>,
+    /// Sender-side retransmission buffer: every download byte from
+    /// `retransmit_seq` (== the last drained `guest_acked`) up to `our_seq`,
+    /// bounded by [`HONORED_WINDOW_CAP`]. Non-inline flows only.
+    retransmit_buf: std::collections::VecDeque<u8>,
+    /// Sequence number of `retransmit_buf[0]`.
+    retransmit_seq: u32,
+    /// Last time `guest_acked` advanced (RTO clock, armed while in flight).
+    last_progress: StdInstant,
+    /// Current retransmission timeout (backs off per retransmission).
+    rto: std::time::Duration,
+    /// Consecutive duplicate ACKs at the same `guest_acked` while data is
+    /// in flight — three trigger fast retransmit.
+    dup_acks: u8,
+    /// Set by the intercept when the dup-ACK threshold fires; consumed by
+    /// the next poll pass.
+    fast_retransmit: bool,
+    /// Sequence number of our FIN when `host_eof` (the FIN needs
+    /// retransmission too — a lost FIN wedges the close the same way).
+    fin_seq: Option<u32>,
+    /// Download retransmissions performed (diagnostics, logged at close).
+    retransmits: u64,
     /// Read buffer for host → guest data (reused across polls).
     read_buf: Vec<u8>,
     /// True if host stream has reached EOF.
     host_eof: bool,
+    /// `Some(t)` once the guest half-closed (sent an in-order FIN) while the
+    /// host side was still open: the poll path shuts the upstream's write side,
+    /// keeps relaying host→guest until the host EOFs, then reaps once its own
+    /// FIN is ACKed. Only set on the non-inline path (inline flows full-close).
+    /// `t` is the FIN_WAIT2 clock — set at the FIN and refreshed on every
+    /// host→guest byte; if it goes idle for [`HALF_CLOSE_TIMEOUT`] the entry is
+    /// reaped so a peer that keeps its write side open forever (or a guest that
+    /// silently drops FIN_WAIT2) can't leak the bridge entry and host fd.
+    guest_fin_at: Option<StdInstant>,
     /// True if the socket has been cloned to the inline inject thread.
     /// poll_fast_path() skips connections with this flag — the inject
     /// thread reads directly from the cloned socket.
@@ -253,6 +428,18 @@ pub(super) struct FastPathConn {
     /// unset so the entry survives for the guest's close handshake. `Some`
     /// only when `inline_owned` (ABX-431).
     dead: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Last time any guest frame for this flow reached
+    /// `try_fast_path_intercept` — the flow's sign of life. While the shim is
+    /// soliciting a response (data/FIN in flight, or a closed window being
+    /// persist-probed) and this goes stale past [`DEAD_FLOW_TIMEOUT`], the
+    /// guest endpoint is gone and the flow is RST-reaped instead of
+    /// retransmitting forever.
+    last_guest_activity: StdInstant,
+    /// When the current uninterrupted stretch of soliciting began; `None`
+    /// while quiescent. The reap deadline runs against this too, so a
+    /// long-idle flow whose upstream wakes up is measured from the wake-up —
+    /// not from its (legitimately ancient) last guest frame.
+    soliciting_since: Option<StdInstant>,
 }
 
 impl FastPathConn {
@@ -263,6 +450,116 @@ impl FastPathConn {
             shared.store(ack, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    /// Parks an upload segment that arrived beyond the contiguous cursor
+    /// (caller guarantees `seq` is strictly ahead of `last_ack`).
+    /// Deduplicates same-seq arrivals and enforces [`OOO_REASSEMBLY_CAP`]
+    /// on both total parked bytes and how far past the cursor a segment
+    /// may start. Parking never ACKs: `last_ack` still advances only over
+    /// bytes actually written to the host socket, in
+    /// [`Self::drain_parked_segments`].
+    pub(super) fn buffer_ooo_segment(&mut self, seq: u32, payload: &[u8]) {
+        let base = self.last_ack;
+        let rel = seq.wrapping_sub(base) as usize;
+        let idx = self
+            .ooo_segs
+            .partition_point(|(s, _)| (s.wrapping_sub(base) as usize) < rel);
+        let replaces_existing = matches!(self.ooo_segs.get(idx), Some((s, _)) if *s == seq);
+        if rel.saturating_add(payload.len()) > OOO_REASSEMBLY_CAP
+            || self.ooo_bytes.saturating_add(payload.len()) > OOO_REASSEMBLY_CAP
+            // A new distinct segment past the count cap is dropped; an
+            // in-place replacement of a parked seq does not grow the count.
+            || (!replaces_existing && self.ooo_segs.len() >= OOO_MAX_SEGMENTS)
+        {
+            self.up_ooo_dropped += 1;
+            return;
+        }
+        if replaces_existing {
+            // Same start seq already parked: keep whichever is longer (a
+            // retransmit may carry more data), never write the shorter twice.
+            if self.ooo_segs[idx].1.len() >= payload.len() {
+                return;
+            }
+            if let Some((_, old)) = self.ooo_segs.remove(idx) {
+                self.ooo_bytes -= old.len();
+            }
+        }
+        self.ooo_bytes += payload.len();
+        self.ooo_segs.insert(idx, (seq, payload.to_vec()));
+    }
+
+    /// Writes parked out-of-order segments that the advanced `last_ack` now
+    /// reaches, in sequence order, with the same partial-take semantics as
+    /// the in-order path: the cursor advances only over bytes the host
+    /// socket accepted. Stops at the first remaining hole, `WouldBlock`, or
+    /// short take — whatever stays parked is re-driven by the guest's
+    /// retransmission machinery (an arriving retransmit re-enters this
+    /// drain). A hard write error propagates for the caller's RST teardown.
+    pub(super) fn drain_parked_segments(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        while let Some(&(seq, ref data)) = self.ooo_segs.front() {
+            let len = data.len();
+            let seg_end = seq.wrapping_add(len as u32);
+            let extends = seg_end.wrapping_sub(self.last_ack);
+            if extends == 0 || extends >= 0x8000_0000 {
+                // Fully at/behind the cursor: a retransmit landed in-order
+                // first and already covered these bytes.
+                if let Some((_, old)) = self.ooo_segs.pop_front() {
+                    self.ooo_bytes -= old.len();
+                }
+                continue;
+            }
+            let overlap = self.last_ack.wrapping_sub(seq);
+            if overlap >= 0x8000_0000 {
+                break; // a hole still precedes the first parked segment
+            }
+            let start = overlap as usize;
+            let take = match self.stream.write(&self.ooo_segs[0].1[start..]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.up_would_block += 1;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    // Peer closed — drain at the TCP layer like the in-order
+                    // path so the guest stops retransmitting.
+                    self.set_last_ack(seg_end);
+                    if let Some((_, old)) = self.ooo_segs.pop_front() {
+                        self.ooo_bytes -= old.len();
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            self.up_bytes += take as u64;
+            let new_ack = self.last_ack.wrapping_add(take as u32);
+            self.set_last_ack(new_ack);
+            if take < len - start {
+                self.up_short_writes += 1;
+                break; // remainder stays parked; overlap math resumes here
+            }
+            if let Some((_, old)) = self.ooo_segs.pop_front() {
+                self.ooo_bytes -= old.len();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bytes the shim may still send host→guest without exceeding the guest's
+/// advertised receive window: `window − (sent − acked)`, wrap-safe.
+///
+/// The guest kernel guarantees buffering only inside this budget; staying
+/// inside it (on a lossless local link) is what lets the shim carry no
+/// retransmission machinery at all.
+pub(crate) fn send_budget(our_seq: u32, guest_acked: u32, guest_window: u32) -> u32 {
+    let in_flight = our_seq.wrapping_sub(guest_acked);
+    if in_flight >= 0x8000_0000 {
+        // Transiently stale snapshot ("acked ahead of sent") from racing
+        // atomics — treat as nothing in flight rather than stalling.
+        return guest_window;
+    }
+    guest_window.saturating_sub(in_flight)
 }
 
 impl TcpBridge {
@@ -284,7 +581,21 @@ impl TcpBridge {
             conn_sink: None,
             observer: None,
             handshake_conns: HashMap::new(),
+            handshake_waker: None,
+            dead_flow_timeout: DEAD_FLOW_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_dead_flow_timeout(&mut self, timeout: std::time::Duration) {
+        self.dead_flow_timeout = timeout;
+    }
+
+    /// Installs a waker notified whenever an async host connect for a
+    /// pending handshake resolves. Must be set from within a Tokio runtime
+    /// context (`handle_outbound_syn` spawns the forwarding task).
+    pub fn set_handshake_waker(&mut self, waker: std::sync::Arc<tokio::sync::Notify>) {
+        self.handshake_waker = Some(waker);
     }
 
     /// Enables large frame mode (no MSS segmentation).
@@ -345,7 +656,7 @@ pub(super) fn build_rst_from_syn(syn_frame: &[u8], gateway_mac: [u8; 6]) -> Opti
 
     let ihl = ((syn_frame[ip_start] & 0x0F) as usize) * 4;
     let l4_start = ip_start + ihl;
-    if l4_start + 20 > syn_frame.len() {
+    if ihl < 20 || l4_start + 20 > syn_frame.len() {
         return None;
     }
 

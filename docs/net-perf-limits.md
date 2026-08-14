@@ -167,7 +167,7 @@ EVENT_IDX is the direct target of the signature and already scaffolded; it shoul
 
 ```bash
 # Start a clean daemon.
-arcbox daemon start
+abctl daemon start
 
 # Run an iperf3 server in a guest container.
 docker run -d --rm --name iperf3-srv -p 5201:5201 networkstatic/iperf3 -s

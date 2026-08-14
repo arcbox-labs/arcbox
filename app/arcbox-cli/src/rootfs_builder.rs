@@ -1,33 +1,20 @@
-//! Resolve Docker images to guest-visible overlay2 layer paths.
+//! Resolve `--from-*` flags to sandbox template references.
 //!
-//! For `--from-dockerfile`, runs `docker build` via the ArcBox Docker context
-//! (proxied to guest dockerd), then inspects the image to get the overlay2
-//! layer directory. For `--from-image`, inspects an existing image directly.
+//! For `--from-dockerfile` (and the built-in templates) this runs
+//! `docker build` via the ArcBox Docker context, which is proxied to the
+//! guest's dockerd — so the built image already lives where the sandbox
+//! needs it. For `--from-image` an existing image is used as-is.
 //!
-//! The returned path is a guest-internal filesystem path (under Docker's
-//! overlay2 storage) that the guest agent passes to `oci2rootfs` for ext4
-//! conversion.
+//! Either way the CLI hands the daemon nothing but `docker:<ref>`: the image
+//! export, the OCI layout staging, and the ext4 conversion all happen inside
+//! the VM (CORE-54). Nothing here needs a guest-visible host path, which is
+//! why the old `~/Library/Caches/arcbox/sandbox-oci` staging is gone.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-
-/// Docker context name used for ArcBox Docker API.
-const DOCKER_CONTEXT: &str = "arcbox";
-
-/// Check if a file has a valid ext4 superblock magic.
-pub fn has_ext4_magic(path: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 2];
-    file.seek(SeekFrom::Start(0x438)).is_ok()
-        && file.read_exact(&mut magic).is_ok()
-        && magic == [0x53, 0xEF]
-}
 
 /// Check if a file looks like a Dockerfile (first non-comment line starts with FROM).
 pub fn looks_like_dockerfile(path: &Path) -> bool {
@@ -43,8 +30,7 @@ pub fn looks_like_dockerfile(path: &Path) -> bool {
         .is_some_and(|line| line.trim().to_ascii_uppercase().starts_with("FROM "))
 }
 
-/// Build a Docker image from a Dockerfile and return its guest-visible
-/// overlay2 layer directory path.
+/// Build a Docker image from a Dockerfile and return its template reference.
 pub async fn resolve_from_dockerfile(dockerfile_path: &str) -> Result<String> {
     let dockerfile = Path::new(dockerfile_path);
     if !dockerfile.exists() {
@@ -60,28 +46,69 @@ pub async fn resolve_from_dockerfile(dockerfile_path: &str) -> Result<String> {
     let content = tokio::fs::read(dockerfile)
         .await
         .context("failed to read Dockerfile")?;
-    let hash = cache_key(&content);
-    let tag = format!("arcbox-sandbox:{hash}");
+    let context_dir = dockerfile.parent().unwrap_or_else(|| Path::new("."));
 
-    let context_dir = dockerfile
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_string_lossy()
-        .to_string();
+    build_and_resolve(&content, dockerfile, context_dir).await
+}
 
-    // docker build
+/// Build an in-memory Dockerfile and return its template reference.
+///
+/// Used for the built-in templates ([`crate::templates`]), which have no file
+/// on disk. The Dockerfile is written into a private temp directory that also
+/// serves as the (empty) build context, so a template must not `COPY` local
+/// paths.
+pub async fn resolve_from_dockerfile_contents(contents: &[u8]) -> Result<String> {
+    let context = tempfile::TempDir::new().context("failed to create image build directory")?;
+    let dockerfile = context.path().join("Dockerfile");
+    tokio::fs::write(&dockerfile, contents)
+        .await
+        .context("failed to stage Dockerfile")?;
+
+    build_and_resolve(contents, &dockerfile, context.path()).await
+}
+
+/// Return the template reference for an existing Docker image.
+///
+/// The image is resolved inside the VM, so this only has to verify that the
+/// reference exists in the guest's image store — catching a typo here rather
+/// than as an opaque create failure.
+pub async fn resolve_from_image(image_ref: &str) -> Result<String> {
+    let context = crate::runtime_selection::docker_context_name()?;
+    let output = Command::new("docker")
+        .args(["--context", &context, "image", "inspect", image_ref])
+        .output()
+        .await
+        .context("failed to spawn docker image inspect")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("image {image_ref} is not available to ArcBox:\n{stderr}");
+    }
+    Ok(template_ref(image_ref))
+}
+
+/// Wrap a Docker image reference as a sandbox template reference.
+fn template_ref(image_ref: &str) -> String {
+    format!("docker:{image_ref}")
+}
+
+/// Shared `docker build` step: tag by content hash, then reference the tag.
+///
+/// The tag is derived from the Dockerfile contents, so an unchanged
+/// Dockerfile resolves to the same image — and therefore the same guest-side
+/// ext4 — on every run.
+async fn build_and_resolve(
+    contents: &[u8],
+    dockerfile: &Path,
+    context_dir: &Path,
+) -> Result<String> {
+    let tag = format!("arcbox-sandbox:{}", cache_key(contents));
+    let context = crate::runtime_selection::docker_context_name()?;
+
     eprintln!("Building Docker image...");
     let output = Command::new("docker")
-        .args([
-            "--context",
-            DOCKER_CONTEXT,
-            "build",
-            "-t",
-            &tag,
-            "-f",
-            dockerfile_path,
-            &context_dir,
-        ])
+        .args(["--context", &context, "build", "-t", &tag, "-f"])
+        .arg(dockerfile)
+        .arg(context_dir)
         .output()
         .await
         .context("failed to spawn docker build")?;
@@ -90,59 +117,22 @@ pub async fn resolve_from_dockerfile(dockerfile_path: &str) -> Result<String> {
         bail!("docker build failed:\n{stderr}");
     }
 
-    inspect_layer_path(&tag).await
+    Ok(template_ref(&tag))
 }
 
-/// Get the guest-visible overlay2 layer directory for an existing Docker image.
-pub async fn resolve_from_image(image_ref: &str) -> Result<String> {
-    inspect_layer_path(image_ref).await
+/// Short, filesystem-safe content key.
+fn cache_key(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_prefix(&digest, 16)
 }
 
-/// Query the overlay2 layer directory for an image via `docker inspect`.
-///
-/// Returns the chain-id directory (parent of UpperDir) so that `oci2rootfs`
-/// can resolve the full layer chain.
-async fn inspect_layer_path(image_ref: &str) -> Result<String> {
-    let output = Command::new("docker")
-        .args([
-            "--context",
-            DOCKER_CONTEXT,
-            "inspect",
-            "--format",
-            "{{.GraphDriver.Data.UpperDir}}",
-            image_ref,
-        ])
-        .output()
-        .await
-        .context("failed to spawn docker inspect")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("docker inspect failed (is the image present?):\n{stderr}");
-    }
-
-    let upper_dir = String::from_utf8(output.stdout)
-        .context("docker inspect returned non-UTF-8 output")?
-        .trim()
-        .to_string();
-
-    if upper_dir.is_empty() {
-        bail!("docker inspect returned empty UpperDir for {image_ref}");
-    }
-
-    // oci2rootfs expects the chain-id directory (contains diff/, link, lower),
-    // not the diff/ subdirectory itself.
-    let layer_dir = upper_dir
-        .strip_suffix("/diff")
-        .unwrap_or(&upper_dir)
-        .to_string();
-
-    Ok(layer_dir)
-}
-
-/// Full SHA-256 hex digest of content.
-fn cache_key(content: &[u8]) -> String {
-    let hash = Sha256::digest(content);
-    hex::encode(hash)
+/// Lowercase hex of the first `bytes` of `digest`.
+fn hex_prefix(digest: &[u8], bytes: usize) -> String {
+    use std::fmt::Write as _;
+    digest.iter().take(bytes).fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[cfg(test)]
@@ -150,40 +140,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cache_key_deterministic() {
-        let a = cache_key(b"FROM ubuntu:22.04\nRUN apt-get update");
-        let b = cache_key(b"FROM ubuntu:22.04\nRUN apt-get update");
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 64); // full SHA-256
-    }
-
-    #[test]
-    fn test_cache_key_different() {
-        let a = cache_key(b"FROM ubuntu:22.04");
-        let b = cache_key(b"FROM alpine:3.21");
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn test_looks_like_dockerfile() {
         let dir = tempfile::TempDir::new().unwrap();
+
         let df = dir.path().join("Dockerfile");
-
-        std::fs::write(&df, "FROM ubuntu:22.04\nRUN echo hi").unwrap();
+        std::fs::write(&df, "FROM alpine\nRUN echo hi\n").unwrap();
         assert!(looks_like_dockerfile(&df));
 
-        std::fs::write(&df, "# comment\nFROM alpine").unwrap();
+        let df = dir.path().join("Dockerfile.comment");
+        std::fs::write(&df, "# a comment\n\nfrom alpine\n").unwrap();
         assert!(looks_like_dockerfile(&df));
 
-        std::fs::write(&df, "not a dockerfile").unwrap();
+        let df = dir.path().join("not-a-dockerfile");
+        std::fs::write(&df, "hello world\n").unwrap();
         assert!(!looks_like_dockerfile(&df));
 
-        std::fs::write(&df, "").unwrap();
+        let df = dir.path().join("missing");
         assert!(!looks_like_dockerfile(&df));
     }
 
     #[test]
-    fn test_has_ext4_magic_nonexistent() {
-        assert!(!has_ext4_magic(Path::new("/nonexistent")));
+    fn template_refs_are_prefixed() {
+        assert_eq!(template_ref("alpine:3.20"), "docker:alpine:3.20");
+        assert_eq!(
+            template_ref("ghcr.io/org/img@sha256:ab"),
+            "docker:ghcr.io/org/img@sha256:ab"
+        );
+    }
+
+    #[test]
+    fn cache_key_is_stable_and_content_derived() {
+        let a = cache_key(b"FROM alpine\n");
+        assert_eq!(a, cache_key(b"FROM alpine\n"));
+        assert_ne!(a, cache_key(b"FROM debian\n"));
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

@@ -26,13 +26,17 @@ macOS virtualization support (plus a local Docker CLI for the daemon-level test)
   boot-assets scenario and the `hv_e2e` probe capture it automatically on
   failure, while the VM is still alive.
 
-## Parallel daemons: one data dir per daemon
+## Parallel daemon control planes: one data dir per daemon
 
-Everything a daemon contends on — flock, gRPC/Docker sockets, logs, machine
-state — derives from `--data-dir` (`HostLayout`), so daemons with distinct data
-dirs run side by side. That is the isolation contract for parallel fix work:
+Persistent state — flock, gRPC/Docker sockets, logs, and machines — derives
+from `--data-dir` (`HostLayout`). The harness also requests kernel-assigned
+DNS and Kubernetes ports, so daemon control planes with distinct data dirs run
+side by side. That is the isolation contract for parallel fix work:
 **one worktree/agent = one data dir**, and the harness enforces it —
 `DaemonHandle::spawn` refuses a data dir inside `~/.arcbox` or `~/.arcbox-dev`.
+
+The container CIDR and host route are not isolated by the harness. Never run
+multiple VM-booting harness daemons, or one beside a live ArcBox daemon.
 
 Three host-global resources are *not* covered by the data dir. Tests must not
 touch them:
@@ -133,5 +137,12 @@ Environment variables read by the tests:
 - `ARCBOX_E2E_METRICS_DIR` / `ARCBOX_E2E_RUN_LABEL` — archive per-run phase
   timings as `<label>.metrics.json` in the given directory (set automatically
   by `cargo xtask e2e`). Runs also write `metrics.json` into their data dir.
+- `ARCBOX_E2E_IPERF_IMAGE=<ref>` — guest iperf3 image for the
+  `network_iperf` throughput matrix (default `networkstatic/iperf3:latest`).
+- `ARCBOX_E2E_IPERF_MIN_GBPS=<f64>` — `network_iperf` gate floor. Unset (or
+  0) gates on liveness only (VZ throughput is too run-to-run variable for an
+  automated target); set it on a quiet machine to enforce a real per-host
+  throughput floor. A present-but-invalid value fails the test rather than
+  silently disabling the gate.
 
 Tracing is controlled with `RUST_LOG`; it defaults to `info` when unset.

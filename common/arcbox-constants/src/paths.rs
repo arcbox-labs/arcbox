@@ -32,9 +32,15 @@ pub const K3S_CNI_CONF_DIR: &str = "/var/lib/rancher/k3s/agent/etc/cni/net.d";
 /// K3s-managed CNI plugin directory used by current releases.
 pub const K3S_CNI_BIN_DIR: &str = "/var/lib/rancher/k3s/data/cni";
 
-/// Directory where runtime binaries (containerd, dockerd, runc, …) are
-/// accessed via VirtioFS live execution.
-pub const ARCBOX_RUNTIME_BIN_DIR: &str = "/arcbox/runtime/bin";
+/// Stable guest-local runtime root.
+///
+/// The guest atomically points this symlink at the active generation on the
+/// persistent Btrfs data disk.
+pub const ARCBOX_RUNTIME_DIR: &str = "/run/arcbox/runtime";
+
+/// Directory where guest runtime binaries (containerd, dockerd, runc, …) are
+/// executed from the persistent Btrfs data disk.
+pub const ARCBOX_RUNTIME_BIN_DIR: &str = "/run/arcbox/runtime/bin";
 
 /// Host-side privileged paths (require root to write).
 pub mod privileged {
@@ -172,13 +178,46 @@ pub const DOCKER_CLI_PLUGINS: &[&str] = &["docker-buildx", "docker-compose"];
 /// Used by multiple subsystems (privileged helper, brew hooks, setup install)
 /// to decide whether an existing `/usr/local/bin/` symlink can be safely replaced.
 ///
+/// Single source of truth for the path shape also enforced by the helper's
+/// `CliTarget` parser: absolute, under `/Applications/` or `/Users/`, contains
+/// `.app/Contents/MacOS/xbin/`, no `..`. Kept in this crate so callers do not
+/// need to depend on the helper.
+///
 /// Gated on the `std` feature: it takes a `std::path::Path`, so it is
 /// unavailable (and unusable) in `no_std` builds.
 #[cfg(feature = "std")]
 pub fn is_arcbox_owned(target: &std::path::Path) -> bool {
-    target
-        .to_string_lossy()
-        .contains(".app/Contents/MacOS/xbin/")
+    use std::path::Component;
+
+    if !target.is_absolute()
+        || target
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        return false;
+    }
+
+    let bytes = target.as_os_str().as_encoded_bytes();
+    let under_apps_or_users = bytes.starts_with(b"/Applications/") || bytes.starts_with(b"/Users/");
+    if !under_apps_or_users {
+        return false;
+    }
+
+    has_app_xbin_structure(target)
+}
+
+/// `true` when some component window is `.app/Contents/MacOS/xbin`.
+#[cfg(feature = "std")]
+fn has_app_xbin_structure(target: &std::path::Path) -> bool {
+    use std::path::Component;
+
+    let components: Vec<_> = target.components().collect();
+    components.windows(4).any(|w| {
+        matches!(&w[0], Component::Normal(name) if name.as_encoded_bytes().ends_with(b".app"))
+            && w[1] == Component::Normal("Contents".as_ref())
+            && w[2] == Component::Normal("MacOS".as_ref())
+            && w[3] == Component::Normal("xbin".as_ref())
+    })
 }
 
 /// Host-side subdirectory names within the profile data directory.
@@ -325,8 +364,23 @@ pub mod privileged_log {
 
 /// Guest-side subdirectory names within `/arcbox/`.
 pub mod guest {
+    /// Mount point of the host data directory inside the guest.
+    ///
+    /// The `arcbox` VirtioFS tag is mounted here, so a host path under the
+    /// data directory is visible to the guest at the same relative path
+    /// below this prefix.
+    pub const MOUNT: &str = "/arcbox";
+
     /// Log directory inside the VirtioFS mount.
     pub const LOG: &str = "log";
+
+    /// Host-built artifacts the guest reads back.
+    ///
+    /// Currently unused: the sandbox image staging that lived here moved
+    /// into the guest when templates replaced host rootfs paths (CORE-54).
+    /// Kept as the agreed name for this seam so a future host-staged
+    /// artifact does not invent a second one.
+    pub const CACHE: &str = "cache";
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -356,6 +410,33 @@ mod tests {
             layout.daemon_log,
             PathBuf::from("/tmp/arcbox/log/daemon.log")
         );
+    }
+
+    #[test]
+    fn is_arcbox_owned_matches_cli_target_rules() {
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Applications/ArcBox.app/Contents/MacOS/xbin/docker"
+        )));
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Users/alice/Apps/ArcBox.app/Contents/MacOS/xbin/docker-compose"
+        )));
+        // Relative / traversal / wrong prefix — must not count as ours.
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "Contents/MacOS/xbin/docker"
+        )));
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "/Applications/ArcBox.app/Contents/MacOS/xbin/../../evil"
+        )));
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "/tmp/evil.app/Contents/MacOS/xbin/docker"
+        )));
+        assert!(!is_arcbox_owned(std::path::Path::new(
+            "/usr/local/bin/docker"
+        )));
+        // Nested .app/xbin (same rule as CliTarget) is still owned.
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Users/evil/not-really.app/Contents/MacOS/xbin/nested.app/Contents/MacOS/xbin/docker"
+        )));
     }
 
     #[test]

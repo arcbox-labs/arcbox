@@ -2,33 +2,22 @@
 //!
 //! Disposable, single-purpose macOS VMs: pull a pre-baked base image once,
 //! then copy-on-write clone it to boot clean, throwaway guests. This is a
-//! distinct noun from `arcbox machine` (Linux) and talks to its own
+//! distinct noun from `abctl machine` (Linux) and talks to its own
 //! `MacosService`.
 
 use anyhow::{Context, Result};
-use arcbox_grpc::v1::macos_service_client::MacosServiceClient;
-use arcbox_protocol::v1::{
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::MacosServiceClient;
+use arcbox_connect::v1::{
     CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImagePullRequest,
     MacosImageRemoveRequest, MacosImageResolveRequest, RemoveMacosMachineRequest,
     StartMacosMachineRequest, StopMacosMachineRequest,
 };
 use clap::{Args, Subcommand};
-use tonic::transport::{Channel, Endpoint};
 
-use super::machine::UnixConnector;
-
-async fn macos_client() -> Result<MacosServiceClient<Channel>> {
-    let socket_path = super::resolve_grpc_socket_path();
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-    Ok(MacosServiceClient::new(channel))
+fn macos_client() -> MacosServiceClient<connectrpc::client::SharedHttp2Connection> {
+    let (transport, config) = crate::connect::daemon(&super::resolve_grpc_socket_path());
+    MacosServiceClient::new(transport, config)
 }
 
 fn title_case(state: &str) -> String {
@@ -104,7 +93,7 @@ pub struct RemoveArgs {
 /// macOS base image commands.
 #[derive(Subcommand)]
 pub enum ImageCommands {
-    /// Pull a published base image (e.g. tahoe-base or tahoe-base@2026.07.02)
+    /// Pull a published base image (e.g. tahoe-base or tahoe-base@2026.07.03)
     Pull(SourceArgs),
     /// Resolve a reference against the published index without downloading:
     /// what version a pull would land, and what is installed locally
@@ -122,7 +111,7 @@ pub enum ImageCommands {
 #[derive(Args)]
 pub struct SourceArgs {
     /// Image reference: stream name with optional pinned version
-    /// (e.g. "tahoe-base" or "tahoe-base@2026.07.02").
+    /// (e.g. "tahoe-base" or "tahoe-base@2026.07.03").
     #[arg(required_unless_present = "manifest", conflicts_with = "manifest")]
     pub reference: Option<String>,
     /// Use a manifest directly (URL or daemon-local path), bypassing the
@@ -151,16 +140,17 @@ pub async fn execute(cmd: MacosCommands) -> Result<()> {
 }
 
 async fn execute_ip(args: IpArgs) -> Result<()> {
-    let mut client = macos_client().await?;
+    let client = macos_client();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.wait.into());
     loop {
-        let info = client
-            .inspect(tonic::Request::new(InspectMacosMachineRequest {
+        let info: pb::MacosMachineInfo = client
+            .inspect(InspectMacosMachineRequest {
                 name: args.name.clone(),
-            }))
+                ..Default::default()
+            })
             .await
             .context("Failed to inspect macOS guest")?
-            .into_inner();
+            .into_owned();
         if !info.ip_address.is_empty() {
             println!("{}", info.ip_address);
             return Ok(());
@@ -178,14 +168,15 @@ async fn execute_ip(args: IpArgs) -> Result<()> {
 }
 
 async fn execute_create(args: CreateArgs) -> Result<()> {
-    let mut client = macos_client().await?;
+    let client = macos_client();
     client
-        .create(tonic::Request::new(CreateMacosMachineRequest {
+        .create(CreateMacosMachineRequest {
             name: args.name.clone(),
             image: args.image.clone(),
             cpus: args.cpus,
             memory_mib: args.memory,
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to create macOS guest")?;
 
@@ -197,17 +188,18 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
     println!("  Memory: {} MiB", args.memory);
     println!();
     println!("To start it, run:");
-    println!("  arcbox macos start {}", args.name);
+    println!("  abctl macos start {}", args.name);
     Ok(())
 }
 
 async fn execute_start(args: NameArgs) -> Result<()> {
-    let mut client = macos_client().await?;
+    let client = macos_client();
     println!("Starting macOS guest '{}'...", args.name);
     client
-        .start(tonic::Request::new(StartMacosMachineRequest {
+        .start(StartMacosMachineRequest {
             name: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to start macOS guest")?;
     println!("macOS guest '{}' started", args.name);
@@ -215,12 +207,13 @@ async fn execute_start(args: NameArgs) -> Result<()> {
 }
 
 async fn execute_stop(args: NameArgs) -> Result<()> {
-    let mut client = macos_client().await?;
+    let client = macos_client();
     println!("Stopping macOS guest '{}'...", args.name);
     client
-        .stop(tonic::Request::new(StopMacosMachineRequest {
+        .stop(StopMacosMachineRequest {
             name: args.name.clone(),
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to stop macOS guest")?;
     println!("macOS guest '{}' stopped", args.name);
@@ -228,12 +221,13 @@ async fn execute_stop(args: NameArgs) -> Result<()> {
 }
 
 async fn execute_remove(args: RemoveArgs) -> Result<()> {
-    let mut client = macos_client().await?;
+    let client = macos_client();
     client
-        .remove(tonic::Request::new(RemoveMacosMachineRequest {
+        .remove(RemoveMacosMachineRequest {
             name: args.name.clone(),
             force: args.force,
-        }))
+            ..Default::default()
+        })
         .await
         .context("Failed to remove macOS guest")?;
     println!("macOS guest '{}' removed", args.name);
@@ -241,19 +235,19 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
 }
 
 async fn execute_list() -> Result<()> {
-    let mut client = macos_client().await?;
+    let client = macos_client();
     let machines = client
-        .list(tonic::Request::new(Empty {}))
+        .list(Empty::default())
         .await
         .context("Failed to list macOS guests")?
-        .into_inner()
+        .into_owned()
         .machines;
 
     if machines.is_empty() {
         println!("No macOS guests found.");
         println!();
         println!("To create one, run:");
-        println!("  arcbox macos create <name> --image <base>");
+        println!("  abctl macos create <name> --image <base>");
         return Ok(());
     }
 
@@ -279,31 +273,32 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
         ImageCommands::Pull(args) => {
             use std::io::Write as _;
 
-            let mut client = macos_client().await?;
+            let client = macos_client();
             let what = args
                 .reference
                 .clone()
                 .or_else(|| args.manifest.clone())
                 .unwrap_or_default();
             let mut stream = client
-                .image_pull(tonic::Request::new(MacosImagePullRequest {
+                .image_pull(MacosImagePullRequest {
                     reference: args.reference.unwrap_or_default(),
                     manifest_url: args.manifest.unwrap_or_default(),
-                }))
+                    ..Default::default()
+                })
                 .await
-                .context("Failed to pull macOS image")?
-                .into_inner();
+                .context("Failed to pull macOS image")?;
 
             let mut last_stage = String::new();
             let mut landed = None;
-            while let Some(event) = stream
-                .message()
+            while let Some(item) = stream
+                .message::<pb::MacosImagePullEvent>()
                 .await
                 .context("Failed to pull macOS image")?
             {
+                let event = item.to_owned_message();
                 // The terminal event carries the landed image instead of
                 // progress; report it as the outcome, not as a stage line.
-                if let Some(image) = event.image {
+                if let Some(image) = event.image.into_option() {
                     landed = Some(image);
                     continue;
                 }
@@ -322,15 +317,16 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
             Ok(())
         }
         ImageCommands::Resolve(args) => {
-            let mut client = macos_client().await?;
-            let info = client
-                .image_resolve(tonic::Request::new(MacosImageResolveRequest {
+            let client = macos_client();
+            let info: pb::MacosImageResolveResponse = client
+                .image_resolve(MacosImageResolveRequest {
                     reference: args.reference.unwrap_or_default(),
                     manifest_url: args.manifest.unwrap_or_default(),
-                }))
+                    ..Default::default()
+                })
                 .await
                 .context("Failed to resolve macOS image")?
-                .into_inner();
+                .into_owned();
             println!("{}@{}", info.name, info.version);
             println!("os: macOS {}", info.os_version);
             println!(
@@ -347,19 +343,19 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
             Ok(())
         }
         ImageCommands::List => {
-            let mut client = macos_client().await?;
+            let client = macos_client();
             let images = client
-                .image_list(tonic::Request::new(Empty {}))
+                .image_list(Empty::default())
                 .await
                 .context("Failed to list macOS images")?
-                .into_inner()
+                .into_owned()
                 .images;
 
             if images.is_empty() {
                 println!("No macOS images found.");
                 println!();
                 println!("To pull one, run:");
-                println!("  arcbox macos image pull tahoe-base");
+                println!("  abctl macos image pull tahoe-base");
                 return Ok(());
             }
 
@@ -391,11 +387,12 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
             Ok(())
         }
         ImageCommands::Remove(args) => {
-            let mut client = macos_client().await?;
+            let client = macos_client();
             client
-                .image_remove(tonic::Request::new(MacosImageRemoveRequest {
+                .image_remove(MacosImageRemoveRequest {
                     name: args.name.clone(),
-                }))
+                    ..Default::default()
+                })
                 .await
                 .context("Failed to remove macOS image")?;
             println!("macOS image '{}' removed", args.name);

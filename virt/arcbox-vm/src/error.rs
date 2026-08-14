@@ -19,6 +19,12 @@ pub enum VmmError {
         actual: String,
     },
 
+    /// The sandbox is paused. Distinct from [`Self::WrongState`] so callers
+    /// (the daemon's transparent auto-resume, CORE-21) can recognise
+    /// "paused" machine-readably instead of parsing state strings.
+    #[error("sandbox '{0}' is paused")]
+    Paused(String),
+
     /// I/O error (file system, sockets, etc.).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -55,6 +61,69 @@ pub enum VmmError {
     #[error("vsock error: {0}")]
     Vsock(String),
 
+    /// A path inside a sandbox does not exist. The message shape is a
+    /// contract: the daemon's error classifier keys on the "path not
+    /// found:" prefix to attach the `FILE_NOT_FOUND` registry code.
+    #[error("path not found: {0}")]
+    PathNotFound(String),
+
+    /// A directory operation addressed a non-directory path.
+    #[error("not a directory: {0}")]
+    NotADirectory(String),
+
+    /// Refused to remove a non-empty directory without `recursive`
+    /// (`FAILED_PRECONDITION` per the filesystem contract).
+    #[error("directory not empty: {0}")]
+    DirectoryNotEmpty(String),
+
+    /// A catalog template reference did not resolve. The message shape is a
+    /// contract: the daemon's classifier keys on the "template not found:"
+    /// prefix to attach the `TEMPLATE_NOT_FOUND` registry code (CORE-107).
+    #[error("template not found: {0}")]
+    TemplateNotFound(String),
+
+    /// Publishing would repoint an existing immutable template version at
+    /// different content (409 on the daemon surface).
+    #[error("template version already exists: {0}")]
+    TemplateVersionExists(String),
+
+    /// A required precondition does not hold and retrying the same request
+    /// never helps (`FAILED_PRECONDITION` on the daemon surface).
+    #[error("failed precondition: {0}")]
+    FailedPrecondition(String),
+
+    /// A bounded wait elapsed before the awaited condition held
+    /// (`DEADLINE_EXCEEDED` on the daemon surface).
+    #[error("deadline exceeded: {0}")]
+    DeadlineExceeded(String),
+
+    /// A retryable operation whose durable result could not be confirmed.
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
+
+    /// The operation's side effects committed — the sandbox exists and is
+    /// running — but the acknowledging record's durability is unconfirmed.
+    /// Distinct from [`VmmError::Unavailable`] so callers with a fallback
+    /// (warm create) can tell "nothing happened, retry freely" from "it
+    /// happened, do NOT re-execute".
+    #[error("sandbox {id} committed, but ACK durability is unconfirmed: {detail}")]
+    AckUnconfirmed {
+        /// The sandbox whose operation committed.
+        id: String,
+        /// The underlying durability failure.
+        detail: String,
+    },
+
+    /// A stdin write starts past the accepted byte count — the caller must
+    /// resume from `accepted` (its offsets have a gap).
+    #[error("stdin offset {offset} is past the {accepted} accepted bytes")]
+    StdinGap {
+        /// Bytes accepted so far — the offset the next write must start at.
+        accepted: u64,
+        /// The rejected write's offset.
+        offset: u64,
+    },
+
     /// Generic catch-all error.
     #[error("{0}")]
     Other(String),
@@ -62,6 +131,49 @@ pub enum VmmError {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, VmmError>;
+
+/// Variant-for-variant, so a snapshot or template failure keeps the exact
+/// shape callers already match on — the daemon maps `TemplateNotFound`
+/// and `TemplateVersionExists` onto their own wire codes, and folding
+/// either into a generic error would change the surface.
+impl From<arcbox_snapshot::SnapshotError> for VmmError {
+    fn from(err: arcbox_snapshot::SnapshotError) -> Self {
+        use arcbox_error::CommonError;
+        use arcbox_snapshot::SnapshotError as S;
+        match err {
+            S::Common(CommonError::Io(io)) => Self::Io(io),
+            S::Common(CommonError::Config(msg)) => Self::Config(msg),
+            S::Common(CommonError::NotFound(msg)) => Self::NotFound(msg),
+            S::Common(CommonError::AlreadyExists(msg)) => Self::AlreadyExists(msg),
+            S::Common(other) => Self::Other(other.to_string()),
+            S::Snapshot(msg) => Self::Snapshot(msg),
+            S::DeviceMapper(msg) => Self::DeviceMapper(msg),
+            S::TemplateNotFound(msg) => Self::TemplateNotFound(msg),
+            S::TemplateVersionExists(msg) => Self::TemplateVersionExists(msg),
+            S::FailedPrecondition(msg) => Self::FailedPrecondition(msg),
+            S::Unavailable(msg) => Self::Unavailable(msg),
+        }
+    }
+}
+
+/// A durable write that never landed is an I/O failure; one that landed
+/// without a confirmed rename is [`VmmError::Unavailable`] — the caller
+/// may retry, and the retry is safe because the write is idempotent.
+///
+/// Callers that can do better than this (the sandbox record store keeps
+/// the record and warns) match on [`AtomicWriteError`] themselves instead
+/// of going through here.
+impl From<arcbox_atomic_file::AtomicWriteError> for VmmError {
+    fn from(err: arcbox_atomic_file::AtomicWriteError) -> Self {
+        use arcbox_atomic_file::AtomicWriteError;
+        match err {
+            AtomicWriteError::NotCommitted { source, .. } => Self::Io(source),
+            error @ AtomicWriteError::DurabilityUncertain { .. } => {
+                Self::Unavailable(error.to_string())
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

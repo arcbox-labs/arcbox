@@ -586,39 +586,11 @@ exit 0
     /// (socketpair datapath), while the bridge NIC is reachable from the host
     /// for inbound container traffic.
     fn configure_bridge_nic() {
-        // Find the bridge NIC: it's the non-loopback interface that is NOT
-        // the primary interface. The primary interface was already configured
-        // by configure_primary_interface_dhcp() and has an IP in 10.0.2.0/24.
-        let primary = detect_primary_interface();
-        let entries = match fs::read_dir("/sys/class/net") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut bridge_iface: Option<String> = None;
-        for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            // Skip loopback, virtual, and the primary interface.
-            if name == "lo"
-                || name.starts_with("dummy")
-                || name.starts_with("veth")
-                || name.starts_with("br-")
-                || name.starts_with("docker")
-                || name.starts_with("vmtap")
-                || name.starts_with("sit")
-                || primary.as_deref() == Some(&name)
-            {
-                continue;
-            }
-            bridge_iface = Some(name);
-            break;
-        }
-
-        let Some(bridge_iface) = bridge_iface.as_deref() else {
+        let Some(bridge_iface) = detect_bridge_interface() else {
             tracing::debug!("no bridge NIC found");
             return;
         };
+        let bridge_iface = bridge_iface.as_str();
 
         // Bring up the interface.
         run_init_cmd(
@@ -681,28 +653,25 @@ exit 0
         } else {
             tracing::info!(interface = bridge_iface, "proxy ARP enabled");
         }
+    }
 
-        // Add iptables FORWARD rules for the bridge NIC so container
-        // traffic can flow through.
-        run_iptables(
-            &["-I", "FORWARD", "-i", bridge_iface, "-j", "ACCEPT"],
-            "FORWARD accept from bridge NIC",
-        );
-        run_iptables(
-            &[
-                "-I",
-                "FORWARD",
-                "-o",
-                bridge_iface,
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "RELATED,ESTABLISHED",
-                "-j",
-                "ACCEPT",
-            ],
-            "FORWARD accept established to bridge NIC",
-        );
+    /// Finds the bridge NIC: the non-loopback physical interface that is not
+    /// the primary 10.0.2.0/24 interface.
+    pub fn detect_bridge_interface() -> Option<String> {
+        let primary = detect_primary_interface();
+        let entries = fs::read_dir("/sys/class/net").ok()?;
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !is_uplink_interface(&name) || primary.as_deref() == Some(&name) {
+                continue;
+            }
+            candidates.push(name);
+        }
+        candidates.sort();
+        candidates.into_iter().next()
     }
 
     /// Install iptables FORWARD rules for sandbox networking.
@@ -715,9 +684,26 @@ exit 0
     /// The subnet is read from the VMM config (default `172.20.0.0/16`).
     /// Uses `-I` (insert at chain top) so rules take effect even when
     /// Docker sets the default FORWARD policy to DROP.
+    ///
+    /// Invariant-addressed sandboxes (CORE-81) traverse FORWARD with the
+    /// fixed guest IP on the sandbox side — DNAT to it happens in PREROUTING
+    /// (before the filter) and SNAT off it in POSTROUTING (after) — so that
+    /// address needs its own accept pair; the subnet rules keep covering
+    /// legacy sandboxes.
+    ///
+    /// The mangle pair makes the deliberate sandbox-to-sandbox isolation
+    /// explicit: traffic from any sandbox TAP toward the pool is dropped
+    /// before it can be marked or DNAT'd (the per-TAP invariant NAT would
+    /// otherwise misattribute it), except toward the pool gateway, which
+    /// legacy guests use for DNS. These run at System VM boot, so the
+    /// per-TAP `invariant::translation_rules` (appended with `-A`) always
+    /// sit below them. Expose companions (`port_forward.rs`) instead
+    /// PREPEND above these — safe because `MARK` is non-terminating, so a
+    /// marked packet still falls through to the DROP.
     fn setup_sandbox_forwarding() {
         let config = crate::config::load();
         let subnet = &config.network.cidr;
+        let guest_ip = format!("{}/32", arcbox_vm::network::invariant::GUEST_IP);
 
         run_iptables(
             &["-I", "FORWARD", "-d", subnet, "-j", "ACCEPT"],
@@ -726,6 +712,47 @@ exit 0
         run_iptables(
             &["-I", "FORWARD", "-s", subnet, "-j", "ACCEPT"],
             "FORWARD accept from sandbox subnet",
+        );
+        run_iptables(
+            &["-I", "FORWARD", "-d", &guest_ip, "-j", "ACCEPT"],
+            "FORWARD accept to invariant sandbox address",
+        );
+        run_iptables(
+            &["-I", "FORWARD", "-s", &guest_ip, "-j", "ACCEPT"],
+            "FORWARD accept from invariant sandbox address",
+        );
+
+        // Insert DROP first so the gateway ACCEPT lands above it.
+        let gateway = format!("{}/32", config.network.gateway);
+        run_iptables(
+            &[
+                "-t",
+                "mangle",
+                "-I",
+                "PREROUTING",
+                "-i",
+                "vmtap+",
+                "-d",
+                subnet,
+                "-j",
+                "DROP",
+            ],
+            "isolate sandbox-to-sandbox pool traffic",
+        );
+        run_iptables(
+            &[
+                "-t",
+                "mangle",
+                "-I",
+                "PREROUTING",
+                "-i",
+                "vmtap+",
+                "-d",
+                &gateway,
+                "-j",
+                "ACCEPT",
+            ],
+            "allow sandbox traffic to the pool gateway",
         );
 
         tracing::info!(subnet, "sandbox forwarding rules installed");
@@ -807,19 +834,19 @@ exit 0
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            // Skip loopback and virtual interfaces that are not real NICs.
-            if name == "lo"
-                || name.starts_with("dummy")
-                || name.starts_with("veth")
-                || name.starts_with("br-")
-                || name.starts_with("docker")
-            {
+            if !is_uplink_interface(&name) {
                 continue;
             }
             candidates.push(name);
         }
         candidates.sort();
         candidates.into_iter().next()
+    }
+
+    /// Physical NICs use the kernel's predictable Ethernet prefixes; virtual
+    /// interfaces such as docker0, cni0, flannel.1, and veth* do not.
+    fn is_uplink_interface(name: &str) -> bool {
+        name.starts_with("eth") || name.starts_with("en")
     }
 
     fn write_etc_resolv_conf() {
@@ -833,7 +860,7 @@ exit 0
         }
     }
 
-    /// Writes Docker daemon configuration (DNS + default ulimits).
+    /// Writes Docker daemon configuration (DNS, direct routing, and ulimits).
     ///
     /// Containers get their DNS from the Docker daemon config, NOT from the
     /// guest's /etc/resolv.conf. We point them to 10.0.2.1 (the gateway)
@@ -844,7 +871,14 @@ exit 0
     /// Docker's own heuristics pick a lower value.
     fn write_docker_daemon_config() {
         mkdir_p("/etc/docker");
-        let content = super::docker_daemon_json();
+        let network = match crate::agent::container_network() {
+            Ok(network) => network,
+            Err(error) => {
+                tracing::error!(%error, "refusing to write Docker config for invalid container network");
+                return;
+            }
+        };
+        let content = super::docker_daemon_json(network);
         if let Err(e) = std::fs::write("/etc/docker/daemon.json", &content) {
             tracing::warn!(error = %e, "failed to write /etc/docker/daemon.json");
         }
@@ -906,9 +940,9 @@ const NOFILE_LIMIT: u64 = 1_048_576;
 
 /// Returns the Docker daemon.json content as a string.
 ///
-/// Extracted as a pure function so the output contract (DNS + default
-/// ulimits + containerd image store) is testable independently of the
-/// filesystem and platform.
+/// Extracted as a pure function so the output contract (DNS, direct routing,
+/// default ulimits, and containerd image store) is testable independently of
+/// the filesystem and platform.
 ///
 /// `containerd-snapshotter` stays explicitly `true` even though dockerd ≥ 29
 /// defaults to the containerd image store: without the explicit flag, dockerd
@@ -917,9 +951,20 @@ const NOFILE_LIMIT: u64 = 1_048_576;
 /// with stale overlay2 remnants back to the legacy store. dockerd 29 logs a
 /// benign "no longer needed" warning for it.
 #[cfg(any(target_os = "linux", test))]
-fn docker_daemon_json() -> String {
+fn docker_daemon_json(network: arcbox_constants::container_network::ContainerNetwork) -> String {
+    let bridge = format!(
+        "{}/{}",
+        network.docker_bridge_gateway(),
+        network.docker_network_prefix()
+    );
     serde_json::json!({
         "dns": ["10.0.2.1"],
+        "allow-direct-routing": true,
+        "bip": bridge,
+        "default-address-pools": [{
+            "base": network.to_string(),
+            "size": network.docker_network_prefix()
+        }],
         "default-ulimits": {
             "nofile": { "Name": "nofile", "Soft": NOFILE_LIMIT, "Hard": NOFILE_LIMIT }
         },
@@ -930,6 +975,8 @@ fn docker_daemon_json() -> String {
     .to_string()
 }
 
+#[cfg(target_os = "linux")]
+pub use platform::detect_bridge_interface;
 #[cfg(target_os = "linux")]
 pub use platform::{init_system, machine_init};
 
@@ -992,9 +1039,13 @@ fn report_missing_mounts(
 mod tests {
     use super::*;
 
+    fn default_daemon_json() -> String {
+        docker_daemon_json(arcbox_constants::container_network::ContainerNetwork::default())
+    }
+
     #[test]
     fn daemon_json_contains_nofile_ulimit() {
-        let json = docker_daemon_json();
+        let json = default_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let nofile = &v["default-ulimits"]["nofile"];
         assert_eq!(nofile["Soft"], 1048576);
@@ -1004,16 +1055,47 @@ mod tests {
 
     #[test]
     fn daemon_json_contains_dns() {
-        let json = docker_daemon_json();
+        let json = default_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["dns"][0], "10.0.2.1");
     }
 
     #[test]
+    fn daemon_json_allows_direct_container_routing() {
+        let json = default_daemon_json();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["allow-direct-routing"], true);
+    }
+
+    #[test]
+    fn daemon_json_preserves_the_production_docker_bridge() {
+        let json = default_daemon_json();
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(value["bip"], "172.17.0.1/16");
+        assert_eq!(value["default-address-pools"][0]["base"], "172.16.0.0/12");
+        assert_eq!(value["default-address-pools"][0]["size"], 16);
+    }
+
+    #[test]
     fn daemon_json_enables_containerd_snapshotter() {
-        let json = docker_daemon_json();
+        let json = default_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["features"]["containerd-snapshotter"], true);
+    }
+
+    #[test]
+    fn daemon_json_uses_the_selected_container_pool() {
+        let network = arcbox_constants::container_network::ContainerNetwork::from_kernel_cmdline(
+            "root=/dev/vda arcbox.container_network=10.80.0.0/20",
+        )
+        .unwrap();
+        let json = docker_daemon_json(network);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(value["bip"], "10.80.1.1/24");
+        assert_eq!(value["default-address-pools"][0]["base"], "10.80.0.0/20");
+        assert_eq!(value["default-address-pools"][0]["size"], 24);
     }
 
     #[test]

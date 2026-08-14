@@ -86,6 +86,18 @@ files above.
   release wraps past bounds checks — both are bugs; tests must cover
   near-`u64::MAX` inputs.
 
+## vmnet relay (bridge NIC, `arcbox-vmnet`)
+
+- The vmnet → guest read path is **event-driven** via
+  `vmnet_interface_set_event_callback` (ABX-517) — do not reintroduce a
+  polling/blocking read thread; the deleted 1 kHz poll cost ~half of the
+  daemon's idle CPU and its cancel-then-join teardown could hang
+  `Runtime::drop`. The callback context is owned by the handler block
+  (copy retains, dispose releases) and must never be freed manually;
+  `Vmnet::clear_event_callback` — called from both `Vmnet::stop` and the
+  relay's exit path, idempotent — is what breaks the
+  interface → block → ctx → `Arc<Vmnet>` cycle. Keep both call sites.
+
 ## Debugging — failure signature → first commands → likely cause
 
 Triage rule first: **re-run the same scenario under
@@ -104,7 +116,7 @@ readiness (nothing to snapshot, nothing on `WatchSetupStatus`), not as a
 readiness signal.
 
 - **Interactive serial shell into a hung HV guest.** On the custom-HV
-  backend, `resolve_desired_boot` (`app/arcbox-core/src/vm_lifecycle/boot.rs`,
+  backend, `resolve_desired_boot` (`engine/arcbox-engine/src/vm_lifecycle/boot.rs`,
   the `DEBUG_CONSOLE_KEY` block) always appends
   `arcbox.debug_console=<data_dir>/run/console.sock` to the kernel cmdline;
   the guest rcS spawns a root shell keyed on the same token
@@ -187,6 +199,14 @@ Counters") or it falsifies the metrics.
   build.rs landmines. VZ has no Rust-side ObjC interop anymore; fix VZ bugs
   there.
 
+- `docs/fs-perf-limits.md` — the settled VirtioFS story: the per-op
+  cross-vCPU IPI mechanism, the kernel `fuse-spin-wait` fix (+58%
+  metadata_stat), everything ruled out en route (dax was never active on
+  VZ; idle=poll, sched features, kernel version all measured), and the
+  measurement discipline (same-context/same-day pairing; only the
+  in-process trio is ratio-safe). Read this before any "make file I/O
+  faster" work. VZ runs Apple's virtio-fs device — the custom VirtioFS
+  is HV-only and still unmeasured.
 - `docs/net-perf-limits.md` — the settled multi-flow Host→VM ceiling
   (~10–12 Gbps combined vs ~22–29 Gbps single-flow) and its root cause
   (per-IRQ host-side cost: `hv_vcpus_exit` / `hv_gic_set_spi` /

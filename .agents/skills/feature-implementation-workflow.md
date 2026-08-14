@@ -164,7 +164,7 @@ jobs:
       - name: Cross-compile agent
         run: cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl
       - name: Sign binary
-        run: codesign --entitlements bundle/arcbox.entitlements --force -s - target/release/arcbox
+        run: codesign --entitlements bundle/arcbox.entitlements --force -s - target/release/abctl
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
 
@@ -201,10 +201,10 @@ Use this workflow when E2E traffic reaches remote services but TLS handshakes fa
 
 ```bash
 # Start daemon with debug logging
-RUST_LOG=debug ./target/debug/arcbox daemon start --foreground
+RUST_LOG=debug ./target/debug/abctl daemon start --foreground
 
 # Optional: include byte-level ingress->host write verification
-RUST_LOG=debug ARCBOX_TCP_BYTE_TRACE=1 ./target/debug/arcbox daemon start --foreground
+RUST_LOG=debug ARCBOX_TCP_BYTE_TRACE=1 ./target/debug/abctl daemon start --foreground
 ```
 
 Run the failing E2E workload in another terminal (for example image pulls or repeated HTTPS requests).
@@ -348,10 +348,10 @@ cargo test -p arcbox-image -- test_name
 cargo test -p arcbox-e2e -- --ignored --nocapture
 
 # Start daemon with debug logging
-RUST_LOG=debug ./target/debug/arcbox daemon start --foreground
+RUST_LOG=debug ./target/debug/abctl daemon start --foreground
 
 # Start daemon with TCP byte-stream verification
-RUST_LOG=debug ARCBOX_TCP_BYTE_TRACE=1 ./target/debug/arcbox daemon start --foreground
+RUST_LOG=debug ARCBOX_TCP_BYTE_TRACE=1 ./target/debug/abctl daemon start --foreground
 
 # Focused TCP/TLS regression tests
 cargo test -p arcbox-net test_tcp_ack_padding_is_not_forwarded_as_payload -- --nocapture

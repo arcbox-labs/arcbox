@@ -1,6 +1,12 @@
 use super::*;
+use serde::{Deserialize, Serialize};
 
 pub type SandboxId = String;
+
+pub(super) struct SandboxBootTask {
+    pub(super) resource_handoff: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub(super) handle: tokio::task::JoinHandle<()>,
+}
 
 // State
 
@@ -19,6 +25,12 @@ pub enum SandboxState {
     Stopped,
     /// Unrecoverable error occurred.
     Failed,
+    /// `Pause` called; checkpointing state, then releasing the VM.
+    Pausing,
+    /// Checkpointed to disk with runtime resources released; the record,
+    /// checkpoint, and disk overlay survive under the same id until
+    /// `Resume` or `Remove` (CORE-21).
+    Paused,
 }
 
 impl std::fmt::Display for SandboxState {
@@ -30,21 +42,53 @@ impl std::fmt::Display for SandboxState {
             Self::Stopping => write!(f, "stopping"),
             Self::Stopped => write!(f, "stopped"),
             Self::Failed => write!(f, "failed"),
+            Self::Pausing => write!(f, "pausing"),
+            Self::Paused => write!(f, "paused"),
         }
     }
 }
 
 // Spec types (input to SandboxManager methods)
 
+/// What happens when a sandbox's idle timeout expires (CORE-21).
+///
+/// Mirrors `arcbox.sandbox.v1.IdleAction`; `UNSPECIFIED` resolves to the
+/// daemon default ([`IdleAction::Kill`]) at the service boundary, so this
+/// type only carries effective policies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleAction {
+    /// Destroy the sandbox and release all resources (Remove semantics).
+    #[default]
+    Kill,
+    /// Checkpoint to disk under the same id and release the VM.
+    Pause,
+}
+
+/// A partial lifecycle update applied by `SetLifecycle` (CORE-60).
+///
+/// `None` fields are left unchanged, so each knob can be adjusted
+/// independently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LifecycleUpdate {
+    /// Replace the hard maximum lifetime: expire this many seconds from
+    /// now (`Some(0)` removes the limit).
+    pub ttl_seconds: Option<u32>,
+    /// Replace the idle timeout (`Some(0)` disables idle detection).
+    pub idle_timeout_seconds: Option<u32>,
+    /// Replace the idle policy.
+    pub on_idle: Option<IdleAction>,
+}
+
 /// Network configuration supplied at sandbox creation time.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxNetworkSpec {
     /// `"tap"` (default) or `"none"`.
     pub mode: String,
 }
 
 /// A single bind-mount into the sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxMountSpec {
     pub source: String,
     pub target: String,
@@ -58,7 +102,8 @@ pub struct SandboxMountSpec {
 /// once the sandbox is ready, through the same path as `Run`.
 /// `mounts`, `image`, and `ssh_public_key` are validated at the service
 /// boundary (see the guest agent's `SandboxService::create`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SandboxSpec {
     /// Caller-supplied ID; auto-generated (UUID) when `None` or empty.
     pub id: Option<String>,
@@ -74,8 +119,6 @@ pub struct SandboxSpec {
     pub vcpus: u32,
     /// Memory in MiB (0 = daemon default).
     pub memory_mib: u64,
-    /// OCI image reference (empty = use rootfs directly; reserved for future use).
-    pub image: String,
     /// Initial command launched automatically after boot (empty = none).
     pub cmd: Vec<String>,
     /// Environment variables for the initial command.
@@ -92,6 +135,33 @@ pub struct SandboxSpec {
     pub ttl_seconds: u32,
     /// SSH public key injected via MMDS (None = no SSH setup).
     pub ssh_public_key: Option<String>,
+    /// Apply [`Self::on_idle`] after this many seconds without a running
+    /// execution (0 = no idle detection). Re-armed on every `Ready` edge;
+    /// file activity does NOT re-arm (CORE-21).
+    pub idle_timeout_seconds: u32,
+    /// What to do when the idle timeout expires.
+    pub on_idle: IdleAction,
+    /// The catalog template's pre-warmed snapshot, when the create resolved
+    /// one (CORE-107). A boot-recipe input like `rootfs`: the create path
+    /// restores it instead of cold-booting when eligible, and it rides the
+    /// journaled effective spec so crash replay keeps working. `None` for
+    /// non-catalog templates and warm-less catalog entries.
+    pub template_warm: Option<TemplateWarmRef>,
+    /// The catalog template's readiness probe (CORE-107): READY is withheld
+    /// until it passes; expiry fails the boot. `None` = ready on
+    /// exec-acceptance. Filled from the resolved template, never the request.
+    pub ready_probe: Option<crate::template_catalog::ReadyProbeSpec>,
+}
+
+/// A template's pre-warmed boot-to-ready snapshot, threaded through
+/// [`SandboxSpec`] (CORE-107).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateWarmRef {
+    /// Snapshot id in the snapshot catalog.
+    pub snapshot_id: String,
+    /// Capture-time geometry; restore is eligible only on an exact match.
+    pub vcpus: u32,
+    pub memory_mib: u64,
 }
 
 /// Parameters to restore a sandbox from a checkpoint.
@@ -115,12 +185,18 @@ pub struct RestoreSandboxSpec {
 pub struct SandboxInstance {
     /// Unique identifier.
     pub id: SandboxId,
+    /// Durable lifecycle record generation.
+    pub(super) record_generation: Option<Uuid>,
     /// User-supplied labels.
     pub labels: HashMap<String, String>,
     /// Original creation spec.
     pub spec: SandboxSpec,
     /// Current lifecycle state.
     pub state: SandboxState,
+    /// Serializes Stop/Remove and failure cleanup for this generation.
+    pub(super) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
+    /// In-flight boot, retained until Remove can cancel and join it.
+    pub(super) boot_task: Option<SandboxBootTask>,
     /// Handle to the Firecracker process.
     pub process: Option<fc_sdk::FirecrackerProcess>,
     /// Post-boot API handle (present once the VM has booted).
@@ -138,16 +214,34 @@ pub struct SandboxInstance {
     pub ready_at: Option<DateTime<Utc>>,
     /// When the last workload exited.
     pub last_exited_at: Option<DateTime<Utc>>,
-    /// Exit code of the last workload.
-    pub last_exit_code: Option<i32>,
+    /// How the last workload terminated.
+    pub last_exit_status: Option<ExitStatus>,
     /// Human-readable error (only set when state == `Failed`).
     pub error: Option<String>,
     /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
     pub cow_handle: Option<CowHandle>,
-    /// For restored sandboxes only: the original sandbox's vm_dir, recreated
-    /// so the vmstate-recorded `rootfs.link` symlink (and FC vsock socket)
-    /// resolve correctly.  Removed alongside the sandbox.
-    pub restore_origin_dir: Option<PathBuf>,
+    /// When this sandbox adopted a pre-warmed restore slot's resources
+    /// (CORE-78), the slot id (`pool-<uuid>`) its jailer chroot and dm/CoW
+    /// names are keyed by. `None` for resources created under the
+    /// sandbox's own id.
+    ///
+    /// Cleared by pause: releasing a paused sandbox renames its retained
+    /// overlay to the sandbox-id path and destroys the slot chroot, so a
+    /// resumed sandbox owns everything under its own id again.
+    pub(super) pool_slot_id: Option<String>,
+    /// Whether this guest runs the fixed invariant network identity
+    /// (CORE-81). Set by the create path when the boot bakes the invariant
+    /// `ip=` parameter, and inherited from [`crate::snapshot::SnapshotMeta`]
+    /// on restore so chained checkpoints record the guest's actual addressing.
+    pub(super) net_invariant: bool,
+    /// When the sandbox reached `Paused` (None otherwise).
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Catalog id of the internal pause checkpoint (state == `Paused` only).
+    pub pause_snapshot_id: Option<String>,
+    /// When the hard maximum lifetime fires (None = no limit). Seeded from
+    /// `spec.ttl_seconds` at creation; replaced from-now by `SetLifecycle`
+    /// (CORE-60).
+    pub ttl_deadline: Option<DateTime<Utc>>,
 }
 
 impl SandboxInstance {
@@ -157,11 +251,34 @@ impl SandboxInstance {
         network: Option<NetworkAllocation>,
         vm_dir: PathBuf,
     ) -> Self {
+        Self::new_inner(id, spec, network, vm_dir, None)
+    }
+
+    pub(super) fn new_with_generation(
+        id: SandboxId,
+        spec: SandboxSpec,
+        network: Option<NetworkAllocation>,
+        vm_dir: PathBuf,
+        generation: Uuid,
+    ) -> Self {
+        Self::new_inner(id, spec, network, vm_dir, Some(generation))
+    }
+
+    fn new_inner(
+        id: SandboxId,
+        spec: SandboxSpec,
+        network: Option<NetworkAllocation>,
+        vm_dir: PathBuf,
+        record_generation: Option<Uuid>,
+    ) -> Self {
         Self {
             id,
+            record_generation,
             labels: spec.labels.clone(),
             spec,
             state: SandboxState::Starting,
+            cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            boot_task: None,
             process: None,
             vm: None,
             network,
@@ -170,10 +287,14 @@ impl SandboxInstance {
             created_at: Utc::now(),
             ready_at: None,
             last_exited_at: None,
-            last_exit_code: None,
+            last_exit_status: None,
             error: None,
             cow_handle: None,
-            restore_origin_dir: None,
+            pool_slot_id: None,
+            net_invariant: false,
+            paused_at: None,
+            pause_snapshot_id: None,
+            ttl_deadline: None,
         }
     }
 
@@ -193,6 +314,10 @@ pub struct SandboxSummary {
     /// Allocated IP address (empty when network mode is `"none"`).
     pub ip_address: String,
     pub created_at: DateTime<Utc>,
+    /// When the sandbox reached `Paused` (None otherwise).
+    pub paused_at: Option<DateTime<Utc>>,
+    /// On-disk footprint of retained pause state (checkpoint + overlay).
+    pub storage_bytes: u64,
 }
 
 /// Detailed sandbox state for `Inspect`.
@@ -206,8 +331,18 @@ pub struct SandboxInfo {
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub last_exited_at: Option<DateTime<Utc>>,
-    pub last_exit_code: Option<i32>,
+    pub last_exit_status: Option<ExitStatus>,
     pub error: Option<String>,
+    /// When the sandbox reached `Paused` (None otherwise).
+    pub paused_at: Option<DateTime<Utc>>,
+    /// On-disk footprint of retained pause state (checkpoint + overlay).
+    pub storage_bytes: u64,
+    /// When the hard maximum lifetime fires (None = no limit).
+    pub ttl_deadline: Option<DateTime<Utc>>,
+    /// Idle timeout in seconds (0 = no idle detection).
+    pub idle_timeout_seconds: u32,
+    /// Action applied when the idle timeout expires.
+    pub on_idle: IdleAction,
 }
 
 /// Network details within `SandboxInfo`.
@@ -219,12 +354,31 @@ pub struct SandboxNetworkInfo {
 
 // Events
 
+/// The `action` values a [`SandboxEvent`] carries, in lifecycle order.
+///
+/// `action` stays a `String` on the event (it crosses the API as one), but
+/// every emit site and match in this crate goes through these constants, so
+/// renaming or adding an action is a change here — not a grep for string
+/// literals whose miss surfaces as silently skipped teardown handling.
+pub mod action {
+    pub const CREATED: &str = "created";
+    pub const READY: &str = "ready";
+    pub const RUNNING: &str = "running";
+    pub const IDLE: &str = "idle";
+    pub const STOPPING: &str = "stopping";
+    pub const STOPPED: &str = "stopped";
+    pub const FAILED: &str = "failed";
+    pub const REMOVED: &str = "removed";
+    pub const PAUSING: &str = "pausing";
+    pub const PAUSED: &str = "paused";
+    pub const RESUMED: &str = "resumed";
+}
+
 /// A sandbox lifecycle event broadcast to subscribers.
 #[derive(Debug, Clone)]
 pub struct SandboxEvent {
     pub sandbox_id: SandboxId,
-    /// Action: `"created"` | `"ready"` | `"running"` | `"idle"` |
-    ///         `"stopping"` | `"stopped"` | `"failed"` | `"removed"`
+    /// One of the [`action`] constants.
     pub action: String,
     /// Unix nanoseconds.
     pub timestamp_ns: i64,
@@ -245,6 +399,17 @@ impl SandboxEvent {
     pub(super) fn with_attr(mut self, key: &str, value: &str) -> Self {
         self.attributes.insert(key.to_owned(), value.to_owned());
         self
+    }
+
+    /// Whether this event marks the sandbox's teardown — nothing can run in
+    /// it afterwards. A new terminal action must be added here, or torn-down
+    /// sandboxes silently stop purging their executions.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.action.as_str(),
+            action::STOPPED | action::FAILED | action::REMOVED
+        )
     }
 }
 

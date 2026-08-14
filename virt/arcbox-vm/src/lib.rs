@@ -16,46 +16,55 @@
 //! | `arcbox-vmm` | host | boot + manage the guest VM | Virtualization.framework / KVM |
 //! | `arcbox-vm` | guest | nested sandbox microVMs | Firecracker (`fc-sdk`) |
 //!
-//! # Status: **frozen**
-//!
-//! New features should go into `arcbox-vmm` / `arcbox-hypervisor`.  This
-//! crate receives bug-fixes and sandbox-specific work only.
+//! It also ships the `vm-agent` binary, which becomes PID 1 *inside* each
+//! sandbox. That binary imports only this crate's protocol leaves
+//! (`boot_proto`, `file_io::proto`, `file_watch`, `vsock` constants,
+//! `listen_table`, `user_spec`) — never the manager. Keep it that way:
+//! it is cross-compiled to musl and staged into every sandbox rootfs.
 //!
 //! # Public API
 //!
 //! - [`SandboxManager`] — top-level sandbox orchestrator
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
 //! - [`NetworkManager`] — TAP lifecycle & IP allocation
-//! - [`SnapshotCatalog`] — checkpoint tracking
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
+//!
+//! Snapshot lineage — the checkpoint catalog, the copy-on-write rootfs
+//! manager, and the template catalog — lives in `arcbox-snapshot` in the
+//! engine layer. The `crate::{snapshot, snapshot_cow, template_catalog}`
+//! paths are re-exports of it so existing imports keep resolving; name
+//! `arcbox_snapshot` directly in new code.
 
 pub mod boot_proto;
 pub mod config;
 pub mod error;
 pub mod file_io;
+pub mod file_watch;
+pub mod listen_table;
 pub mod network;
 pub mod sandbox;
-pub mod snapshot;
-pub mod snapshot_cow;
 pub mod spawn;
-pub mod store;
 pub mod user_spec;
 pub mod vsock;
 
-// Keep the general VM manager available for internal tooling.
-pub mod instance;
-pub mod manager;
+// The snapshot lineage moved to the engine layer (arcbox-snapshot); these
+// paths stay so `arcbox-agent` and this crate's own modules keep compiling.
+pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
-pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, VmmConfig};
+pub use config::{
+    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
+};
 pub use error::{Result, VmmError};
-pub use network::{NetworkAllocation, NetworkManager};
+pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
+pub use sandbox::pause_reason;
 pub use sandbox::{
-    CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
-    SandboxManager, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec,
-    SandboxState, SandboxSummary,
+    CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
+    SandboxEvent, SandboxId, SandboxInfo, SandboxManager, SandboxMountSpec, SandboxNetworkIdentity,
+    SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
+    TemplateWarmRef,
+};
+pub use sandbox::{
+    ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
-pub use vsock::{ExecInputMsg, OutputChunk, StartCommand};
-
-// Re-export VmState for system_svc compatibility (internal use only).
-pub use instance::VmState;
+pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
