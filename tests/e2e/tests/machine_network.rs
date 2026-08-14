@@ -5,7 +5,7 @@
 //! TcpBridge as the System VM's: gateway/DNS `10.0.2.1`, guest `10.0.2.x`,
 //! egress via in-process host-socket proxying — no privileged helper, no
 //! host route, so it runs in the isolated e2e daemon
-//! (`virt/arcbox-vmm/src/vmm/darwin.rs`, `app/arcbox-core/src/machine.rs`).
+//! (`virt/arcbox-vmm/src/vmm/darwin.rs`, `engine/arcbox-engine/src/machine.rs`).
 //! The existing `machine.rs` test only asserts an agent-reported IP; it
 //! never drives a packet. This drives real traffic from inside the Machine
 //! over the `machines.exec` vsock channel (the Machine's `docker exec`).
@@ -22,7 +22,8 @@
 //! - **M5 SSH contract**: `ssh_info` is still `unimplemented` — pins the
 //!   documented gap so a future SSH feature flags this test to grow.
 //!
-//! Not covered, by architecture (documented in the plan, no active test):
+//! Not covered, by architecture (no active test; rationale in
+//! `../company/engineering/arcbox/plans/machine-network-e2e.md`):
 //! Machine↔Machine, Machine→container, Machine→System VM are isolated
 //! per-VM netstacks with no cross path today; host→Machine inbound/SSH does
 //! not exist.
@@ -57,7 +58,7 @@ const NET_BUDGET: Duration = Duration::from_secs(60);
 
 const MACHINE: &str = "e2e-net-alpine";
 /// The gateway/DNS IP a Machine's primary NIC always routes through
-/// (`darwin.rs` hardcodes it; `app/arcbox-api/src/grpc/machine.rs` documents
+/// (`darwin.rs` hardcodes it; `app/arcbox-api/src/connect/machine.rs` documents
 /// it as `NAT_GATEWAY`).
 const GATEWAY: &str = "10.0.2.1";
 /// M3 download size — enough to span many segments, small enough to stay
@@ -436,7 +437,7 @@ async fn m4_network_metadata(machines: &mut MachineServiceClient<Channel>) -> Re
     }
     // `ip_address` is characterized, NOT gated, and the weak check below is
     // deliberate: the field's producer is broken, so gating would pin the bug.
-    // `select_routable_ip` (`app/arcbox-core/src/machine.rs`) picks the first
+    // `select_routable_ip` (`engine/arcbox-engine/src/machine.rs`) picks the first
     // usable address out of `SystemInfo.ip_addresses`, which the guest agent
     // fills from `hostname -I` falling back to `hostname -i`
     // (`guest/arcbox-agent/src/agent/linux/system_info.rs`). Alpine ships
@@ -462,7 +463,7 @@ async fn m4_network_metadata(machines: &mut MachineServiceClient<Channel>) -> Re
             ip = %net.ip_address,
             "machine's reported IP is outside the datapath 10.0.2.0/24 (gateway 10.0.2.1, \
              guest 10.0.2.2) — busybox `hostname -i` resolved the guest hostname via DNS \
-             instead of enumerating interfaces; see the plan's finding"
+             instead of enumerating interfaces"
         );
     }
     Ok(())
