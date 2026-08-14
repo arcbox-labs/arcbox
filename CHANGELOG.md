@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.9](https://github.com/arcboxlabs/arcbox/compare/v0.6.8...v0.6.9) (2026-08-14)
+
+
+### Bug Fixes
+
+* **cli:** keep a development instance out of the global kube context ([#639](https://github.com/arcboxlabs/arcbox/issues/639)) ([f0af96a](https://github.com/arcboxlabs/arcbox/commit/f0af96a1f5789114a14c18a796513c9d21e64914))
+* **runtime:** close multi-dev isolation gaps ([#631](https://github.com/arcboxlabs/arcbox/issues/631)) ([0864b86](https://github.com/arcboxlabs/arcbox/commit/0864b866f13ec24a6b5143d290851ded53baf94c))
+* **runtime:** close multi-dev review gaps ([0864b86](https://github.com/arcboxlabs/arcbox/commit/0864b866f13ec24a6b5143d290851ded53baf94c))
+
+
+### Continuous Integration
+
+* **release:** give release-please a manual trigger ([#636](https://github.com/arcboxlabs/arcbox/issues/636)) ([34bc516](https://github.com/arcboxlabs/arcbox/commit/34bc516f9bfe47d7232a376f4598a7a0c664be8d))
+
+
+### Miscellaneous Chores
+
+* **master:** release fleet-agent 0.1.4 ([#638](https://github.com/arcboxlabs/arcbox/issues/638)) ([eef7c1a](https://github.com/arcboxlabs/arcbox/commit/eef7c1a4cb3db36d36b7665d8bde298ce3b51067))
+
 ## [0.6.8](https://github.com/arcboxlabs/arcbox/compare/v0.6.7...v0.6.8) (2026-08-14)
 
 
