@@ -73,7 +73,10 @@ jobs:
     if: github.event_name == 'push' || inputs.publish_crates
     needs: version
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Mostly spent asleep: crates.io allows about one update per minute to an
+    # existing crate, so a ~50-member workspace cannot finish faster than the
+    # registry lets it. 45 minutes was under that floor.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -108,14 +111,28 @@ jobs:
         # dependency order, waiting for the index between uploads. --no-verify:
         # see the note above (crates that embed out-of-tree workspace files).
         #
-        # crates.io rate-limits bulk updates to existing crates (HTTP 429 after
-        # a burst), and the workspace has ~50 members. Cargo does not skip versions
-        # already uploaded by a partial pass, so add each one to the exclusion
-        # list before resuming. Only rate limits are retried; other errors fail
-        # immediately.
+        # crates.io limits updates to EXISTING crates to a burst and then about
+        # one per minute, and this workspace has ~50 members — so a release is
+        # always going to spend most of an hour waiting, and the retry loop is
+        # load-bearing rather than a safety net. Cargo cannot resume a partial
+        # publish, so two things keep the loop from going quadratic:
+        #
+        # Every crate this attempt got onto the index is excluded from the next
+        # one, harvested from cargo's own `Uploaded` lines and from the
+        # `already exists` error. Discovering them one-per-pass instead (each
+        # costing a full ~50-crate packaging run) is what made v0.6.8 and
+        # v0.6.9 exhaust their budget with three crates still unpublished.
+        #
+        # And the wait comes from the server: the 429 body carries `Please try
+        # again after <date>`. A flat sleep either overshoots it or wakes too
+        # early and burns an attempt — v0.6.9's log has a retry sleeping 60s
+        # against a limit that had 4 seconds left on it.
+        #
+        # Only rate limits are retried; any other error fails immediately.
         run: |
           excludes=(--exclude arcbox-hv)
           rate_limit_attempts=0
+          max_attempts=60
 
           while true; do
             set +e
@@ -129,25 +146,48 @@ jobs:
               exit 0
             fi
 
-            if [[ $output =~ crate[[:space:]]+([^@[:space:]]+)@[^[:space:]]+[[:space:]]+already[[:space:]]+exists[[:space:]]+on[[:space:]]+crates\.io[[:space:]]+index ]]; then
-              crate=${BASH_REMATCH[1]}
+            # Harvest everything now on the index, so the next attempt packages
+            # strictly less than this one did.
+            harvested=0
+            while read -r crate; do
+              [[ -n $crate ]] || continue
               excludes+=(--exclude "$crate")
-              echo "::notice::$crate is already published; resuming with remaining workspace crates"
+              harvested=$(( harvested + 1 ))
+              echo "::notice::$crate is on the index; excluded from the next attempt"
+            done < <(printf '%s\n' "$output" |
+              sed -n -E 's/^[[:space:]]*(Uploaded|error: crate) ([^ @]+)[ @].*/\2/p' |
+              sort -u)
+
+            if [[ $output == *"429"* ]]; then
+              ((rate_limit_attempts += 1))
+              if (( rate_limit_attempts >= max_attempts )); then
+                echo "::error::crates.io publish did not complete after $rate_limit_attempts rate-limit retries"
+                exit 1
+              fi
+
+              # Sleep until the server says the next update is allowed. Clamped
+              # so a malformed or stale date cannot stall or spin the job.
+              retry_after=$(printf '%s\n' "$output" |
+                sed -n -E 's/.*Please try again after ([^)]*GMT).*/\1/p' | tail -1)
+              delay=60
+              if [[ -n $retry_after ]] && target=$(date -u -d "$retry_after" +%s 2>/dev/null); then
+                delay=$(( target - $(date -u +%s) + 5 ))
+              fi
+              (( delay < 5 )) && delay=5
+              (( delay > 300 )) && delay=300
+
+              echo "::notice::crates.io rate-limited; retrying in ${delay}s ($rate_limit_attempts/$max_attempts)"
+              sleep "$delay"
               continue
             fi
 
-            if [[ $output != *"429"* ]]; then
-              echo "::error::crates.io publish failed with a non-rate-limit error"
-              exit "$status"
+            if (( harvested > 0 )); then
+              echo "::notice::resuming with the remaining workspace crates"
+              continue
             fi
 
-            ((rate_limit_attempts += 1))
-            if (( rate_limit_attempts >= 20 )); then
-              echo "::error::crates.io publish did not complete after $rate_limit_attempts rate-limit retries"
-              exit 1
-            fi
-            echo "::notice::crates.io rate-limited; retrying in 60s ($rate_limit_attempts/20)"
-            sleep 60
+            echo "::error::crates.io publish failed with a non-rate-limit error"
+            exit "$status"
           done
 
   # ==========================================================================
