@@ -250,12 +250,21 @@ enum CurrentContextFix<'a> {
 /// covers all three shapes (no user kubeconfig, one without a
 /// current-context, one with) and never asks kubectl to unset a key that is
 /// not there.
+///
+/// It also only ever undoes a selection that landed on `managed`. Nothing
+/// locks `~/.kube/config` — kubectl's own writes are unlocked
+/// read-modify-write — so a `kubectl config use-context` racing this window
+/// would otherwise be read as the merge's doing and reverted. Requiring
+/// `after == managed` leaves any concurrent switch to some other context
+/// alone; the residual race is a switch *to* the managed context during the
+/// window, which is indistinguishable from the merge causing it.
 fn current_context_restore<'a>(
     owns_global: bool,
+    managed: &str,
     before: Option<&'a str>,
     after: Option<&str>,
 ) -> CurrentContextFix<'a> {
-    if owns_global || before == after {
+    if owns_global || before == after || after != Some(managed) {
         CurrentContextFix::Keep
     } else {
         before.map_or(CurrentContextFix::Clear, CurrentContextFix::Restore)
@@ -263,9 +272,9 @@ fn current_context_restore<'a>(
 }
 
 /// Applies [`current_context_restore`] after a merge.
-async fn restore_current_context(home: &Path, before: Option<&str>) -> Result<()> {
+async fn restore_current_context(home: &Path, managed: &str, before: Option<&str>) -> Result<()> {
     let after = current_context(home).await?;
-    match current_context_restore(false, before, after.as_deref()) {
+    match current_context_restore(false, managed, before, after.as_deref()) {
         CurrentContextFix::Keep => Ok(()),
         CurrentContextFix::Restore(previous) => set_current_context(home, previous).await,
         CurrentContextFix::Clear => unset_current_context(home).await,
@@ -390,7 +399,7 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
     } else if !owns_current_context {
         // The refresh merges too, so it can activate the development context
         // on a host with no user kubeconfig exactly like `enable` can.
-        restore_current_context(home, current_context.as_deref()).await?;
+        restore_current_context(home, &managed_context, current_context.as_deref()).await?;
     }
     save_state(
         home,
@@ -538,7 +547,7 @@ async fn execute_enable() -> Result<()> {
     if owns_current_context {
         set_current_context(&home, &managed_context).await?;
     } else {
-        restore_current_context(&home, previous_context.as_deref()).await?;
+        restore_current_context(&home, &managed_context, previous_context.as_deref()).await?;
     }
 
     save_state(
@@ -662,27 +671,47 @@ mod tests {
         // No user kubeconfig: the merge created one pointing at the managed
         // context, so it has to be cleared rather than left pointing there.
         assert_eq!(
-            current_context_restore(false, None, Some("arcbox-dev")),
+            current_context_restore(false, "arcbox-dev", None, Some("arcbox-dev")),
             CurrentContextFix::Clear
         );
         // A user context the merge displaced goes back.
         assert_eq!(
-            current_context_restore(false, Some("docker-desktop"), Some("arcbox-dev")),
+            current_context_restore(
+                false,
+                "arcbox-dev",
+                Some("docker-desktop"),
+                Some("arcbox-dev")
+            ),
             CurrentContextFix::Restore("docker-desktop")
         );
         // The merge left it alone — including the case where the user had
         // deliberately selected the managed context themselves.
         assert_eq!(
-            current_context_restore(false, Some("arcbox-dev"), Some("arcbox-dev")),
+            current_context_restore(false, "arcbox-dev", Some("arcbox-dev"), Some("arcbox-dev")),
             CurrentContextFix::Keep
         );
         assert_eq!(
-            current_context_restore(false, None, None),
+            current_context_restore(false, "arcbox-dev", None, None),
             CurrentContextFix::Keep
         );
         // Production owns the selection and sets it explicitly.
         assert_eq!(
-            current_context_restore(true, None, Some("arcbox")),
+            current_context_restore(true, "arcbox", None, Some("arcbox")),
+            CurrentContextFix::Keep
+        );
+    }
+
+    /// Nothing locks `~/.kube/config`, so a `kubectl config use-context`
+    /// landing inside the merge window must not be read as the merge's doing.
+    /// Only a selection that ended up on the managed context is undone.
+    #[test]
+    fn a_concurrent_switch_elsewhere_is_left_alone() {
+        assert_eq!(
+            current_context_restore(false, "arcbox-dev", Some("minikube"), Some("kind-local")),
+            CurrentContextFix::Keep
+        );
+        assert_eq!(
+            current_context_restore(false, "arcbox-dev", None, Some("kind-local")),
             CurrentContextFix::Keep
         );
     }
