@@ -7,49 +7,66 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::future::Future;
+use std::io::{self, IsTerminal};
 
 use anyhow::{Context, Result, bail};
-use arcbox_grpc::v1::stats_service_client::StatsServiceClient;
-use arcbox_protocol::v1::{ContainerStats, MachineStats, StatsWatchRequest};
+use arcbox_cli::terminal::RawModeGuard;
+use arcbox_connect::v1 as pb;
+use arcbox_connect::v1::StatsServiceClient;
+use arcbox_connect::v1::{ContainerStats, MachineStats};
 use clap::Args;
-use tonic::transport::Endpoint;
+use tokio::io::AsyncReadExt;
 
 use super::OutputFormat;
-use super::machine::UnixConnector;
+use crate::connect;
 
 /// Arguments for `abctl top`.
 #[derive(Debug, Args)]
 pub struct TopArgs {
-    /// Print a single computed sample and exit (implied by --format json).
+    /// Print one computed sample and exit (also used for non-interactive output).
     #[arg(long)]
     pub once: bool,
 }
 
 pub async fn execute(args: TopArgs, format: OutputFormat) -> Result<()> {
-    let socket_path = super::resolve_grpc_socket_path();
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(UnixConnector::new(socket_path.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to ArcBox gRPC daemon at {}",
-                socket_path.display()
-            )
-        })?;
-    let mut client = StatsServiceClient::new(channel);
+    let (transport, config) = connect::daemon(&super::resolve_grpc_socket_path());
+    let client = StatsServiceClient::new(transport, config);
     let mut stream = client
-        .watch(StatsWatchRequest {
+        .watch(pb::StatsWatchRequest {
             machine_id: String::new(),
+            ..Default::default()
         })
         .await
-        .context("subscribing to machine stats")?
-        .into_inner();
+        .context("subscribing to machine stats")?;
 
-    let once = args.once || matches!(format, OutputFormat::Json | OutputFormat::Quiet);
+    let mode = TopMode::new(
+        args.once,
+        format,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    );
+    let _raw_mode = matches!(mode, TopMode::Live)
+        .then(RawModeGuard::new)
+        .transpose()?;
+    let quit = wait_for_quit(tokio::io::stdin(), tokio::signal::ctrl_c());
+    tokio::pin!(quit);
     let mut previous: Option<MachineStats> = None;
     loop {
-        let sample = match stream.message().await? {
-            Some(sample) => sample,
+        let message = if matches!(mode, TopMode::Live) {
+            tokio::select! {
+                biased;
+                result = &mut quit => {
+                    result?;
+                    return Ok(());
+                }
+                message = stream.message::<pb::MachineStats>() => message?,
+            }
+        } else {
+            stream.message::<pb::MachineStats>().await?
+        };
+        let sample: MachineStats = match message {
+            Some(item) => item.to_owned_message(),
             None => bail!("stats stream ended (daemon shutting down?)"),
         };
         // Compute against the prior sample (if any) before it becomes the
@@ -69,17 +86,72 @@ pub async fn execute(args: TopArgs, format: OutputFormat) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&computed)?);
             }
             OutputFormat::Table => {
-                if !args.once {
-                    // Clear screen and home the cursor between frames.
-                    print!("\x1b[2J\x1b[H");
-                }
-                print!("{}", computed.render());
+                write_table(&mut io::stdout().lock(), &computed, mode)?;
             }
         }
-        if once {
+        if matches!(mode, TopMode::Snapshot) {
             return Ok(());
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopMode {
+    Snapshot,
+    Live,
+}
+
+impl TopMode {
+    fn new(once: bool, format: OutputFormat, stdin_tty: bool, stdout_tty: bool) -> Self {
+        if once
+            || !stdin_tty
+            || !stdout_tty
+            || matches!(format, OutputFormat::Json | OutputFormat::Quiet)
+        {
+            Self::Snapshot
+        } else {
+            Self::Live
+        }
+    }
+}
+
+async fn wait_for_quit<R, F>(mut input: R, interrupt: F) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: Future<Output = io::Result<()>>,
+{
+    let mut key = [0];
+    tokio::pin!(interrupt);
+    loop {
+        tokio::select! {
+            biased;
+            read = input.read(&mut key) => match read.context("reading terminal input")? {
+                0 => return Ok(()),
+                _ if matches!(key[0], b'q' | b'Q' | b'\x03') => return Ok(()),
+                _ => {}
+            },
+            result = &mut interrupt => {
+                result.context("waiting for Ctrl-C")?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn write_table(
+    output: &mut impl io::Write,
+    stats: &ComputedStats,
+    mode: TopMode,
+) -> io::Result<()> {
+    if matches!(mode, TopMode::Live) {
+        output.write_all(b"\x1b[2J\x1b[H")?;
+        // Raw mode clears OPOST, so bare newlines would stair-step the table.
+        output.write_all(stats.render().replace('\n', "\r\n").as_bytes())?;
+        output.write_all(b"\r\nq quit | Ctrl-C quit\r\n")?;
+    } else {
+        output.write_all(stats.render().as_bytes())?;
+    }
+    output.flush()
 }
 
 /// Rates and gauges derived from two consecutive samples.
@@ -285,7 +357,7 @@ fn truncate(s: &str, width: usize) -> String {
 }
 
 /// Binary-scaled human size ("3.2 GiB").
-fn fmt_bytes(bytes: u64) -> String {
+pub(super) fn fmt_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -319,6 +391,7 @@ mod tests {
             net_rx_bytes: 3000,
             net_tx_bytes: 4000,
             containers: vec![],
+            ..Default::default()
         }
     }
 
@@ -334,6 +407,7 @@ mod tests {
             pids: 3,
             net_rx_bytes: 0,
             net_tx_bytes: 0,
+            ..Default::default()
         }
     }
 
@@ -424,5 +498,86 @@ mod tests {
 
         let c = ComputedStats::from_delta(&prev, &cur).unwrap();
         assert_eq!(c.containers[0].name, "0a1b2c3d4e5f");
+    }
+
+    #[test]
+    fn live_mode_requires_interactive_table_io() {
+        assert_eq!(
+            TopMode::new(false, OutputFormat::Table, true, true),
+            TopMode::Live
+        );
+        assert_eq!(
+            TopMode::new(true, OutputFormat::Table, true, true),
+            TopMode::Snapshot
+        );
+        assert_eq!(
+            TopMode::new(false, OutputFormat::Table, false, true),
+            TopMode::Snapshot
+        );
+        assert_eq!(
+            TopMode::new(false, OutputFormat::Table, true, false),
+            TopMode::Snapshot
+        );
+        assert_eq!(
+            TopMode::new(false, OutputFormat::Json, true, true),
+            TopMode::Snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn q_exits_the_input_loop_cleanly() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(8);
+        writer.write_all(b"xq").await.unwrap();
+
+        wait_for_quit(reader, std::future::pending()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_exits_the_input_loop_cleanly() {
+        let (_writer, reader) = tokio::io::duplex(1);
+
+        wait_for_quit(reader, std::future::ready(Ok::<(), std::io::Error>(())))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn snapshot_table_has_no_terminal_control_bytes() {
+        let stats =
+            ComputedStats::from_delta(&sample(10_000, 100, 1000), &sample(12_000, 150, 1200))
+                .unwrap();
+        let mut output = Vec::new();
+
+        write_table(&mut output, &stats, TopMode::Snapshot).unwrap();
+
+        assert_eq!(output, stats.render().as_bytes());
+        assert!(!output.contains(&0x1b));
+        assert!(!output.contains(&b'\r'));
+        assert!(!String::from_utf8(output).unwrap().contains("q quit"));
+    }
+
+    #[test]
+    fn live_table_exposes_controls() {
+        let stats =
+            ComputedStats::from_delta(&sample(10_000, 100, 1000), &sample(12_000, 150, 1200))
+                .unwrap();
+        let mut output = Vec::new();
+
+        write_table(&mut output, &stats, TopMode::Live).unwrap();
+
+        assert!(output.starts_with(b"\x1b[2J\x1b[H"));
+        assert!(
+            output
+                .windows(b"\r\nq quit | Ctrl-C quit\r\n".len())
+                .any(|bytes| bytes == b"\r\nq quit | Ctrl-C quit\r\n")
+        );
+        assert!(
+            output
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte != b'\n' || index > 0 && output[index - 1] == b'\r')
+        );
     }
 }

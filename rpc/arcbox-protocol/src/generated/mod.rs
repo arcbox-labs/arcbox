@@ -20,9 +20,15 @@
 #[path = "arcbox.v1.rs"]
 pub mod arcbox_v1;
 
-/// All protocol buffer types from the `sandbox.v1` package.
+/// All protocol buffer types from the `arcbox.sandbox.v1` package.
 ///
-/// This module includes types from:
-/// - `sandbox.proto` - Sandbox (microVM) lifecycle, run/exec, and snapshot management
-#[path = "sandbox.v1.rs"]
-pub mod sandbox_v1;
+/// prost emits one module per package, so the proto files that make up
+/// the sandbox API land here together:
+/// - `sandbox.proto` - control plane: lifecycle, events, published ports
+/// - `process.proto` - data plane: the execution (exec) family
+/// - `filesystem.proto` - data plane: file transfer and path verbs
+/// - `snapshot.proto` - checkpoint / restore
+/// - `template.proto` - the template catalog (CORE-21)
+/// - `errors.proto` - the error-code registry (`ErrorInfo` detail)
+#[path = "arcbox.sandbox.v1.rs"]
+pub mod arcbox_sandbox_v1;

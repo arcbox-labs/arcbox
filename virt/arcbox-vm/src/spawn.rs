@@ -8,6 +8,9 @@ use fc_sdk::process::{FirecrackerProcessBuilder, JailerProcessBuilder};
 use crate::config::{FirecrackerConfig, JailerConfig};
 use crate::error::{Result, VmmError};
 
+// Match fc-sdk 0.2.3 while keeping ArcBox's boot handoff bound stable across upgrades.
+const DEFAULT_SOCKET_TIMEOUT_SECS: u64 = 5;
+
 /// Configure and spawn a Firecracker process via the Jailer.
 ///
 /// Returns the spawned process. The caller can query `process.socket_path()`
@@ -36,9 +39,11 @@ pub async fn spawn_jailer(
     for limit in &jc.resource_limits {
         jb = jb.resource_limit(limit);
     }
-    if let Some(secs) = fc_cfg.socket_timeout_secs {
-        jb = jb.socket_timeout(Duration::from_secs(secs));
-    }
+    jb = jb.socket_timeout(Duration::from_secs(
+        fc_cfg
+            .socket_timeout_secs
+            .unwrap_or(DEFAULT_SOCKET_TIMEOUT_SECS),
+    ));
     jb.spawn()
         .await
         .map_err(|e| VmmError::Process(e.to_string()))
@@ -69,9 +74,11 @@ pub async fn spawn_direct(
     if let Some(size) = fc_cfg.mmds_size_limit {
         fb = fb.mmds_size_limit(size);
     }
-    if let Some(secs) = fc_cfg.socket_timeout_secs {
-        fb = fb.socket_timeout(Duration::from_secs(secs));
-    }
+    fb = fb.socket_timeout(Duration::from_secs(
+        fc_cfg
+            .socket_timeout_secs
+            .unwrap_or(DEFAULT_SOCKET_TIMEOUT_SECS),
+    ));
     tracing::debug!(
         id,
         socket = %socket_path.display(),

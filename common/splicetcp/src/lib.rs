@@ -34,7 +34,9 @@ pub mod tcp_bridge;
 pub mod utun;
 
 pub use egress::{DefaultEgress, EgressConn, EgressResolver, FlowKey, FlowMeta, FlowObserver};
-pub use frame_source::{FdFrameSource, FrameSource};
+#[cfg(target_os = "macos")]
+pub use frame_source::FdFrameSource;
+pub use frame_source::FrameSource;
 
 // `tcp_bridge` and `classifier` reference `crate::ethernet::*` pervasively;
 // re-export `arcbox-packet`'s ethernet module here so those paths resolve

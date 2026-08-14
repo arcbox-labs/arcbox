@@ -80,7 +80,7 @@ impl DarwinHypervisor {
             supported_archs,
             max_vcpus: max_vcpus as u32,
             max_memory,
-            nested_virt: arcbox_vz::GenericPlatform::is_nested_virt_supported(),
+            nested_virt: crate::capability::host_nested_virt().supported,
             rosetta,
         }
     }

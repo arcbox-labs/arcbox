@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arcbox_api::{SetupPhase, SetupState};
-use arcbox_core::BootAssetProvider;
+use arcbox_core::{BootAssetProvider, Config};
 use tracing::info;
 
 /// Assets reconciled into the daemon data directory for this startup.
@@ -38,18 +38,19 @@ pub(super) enum PreparedAgent {
 /// binaries. Network/download fallback then fills any missing boot assets, and
 /// the boot-cache agent is staged only if the bundle did not provide one.
 pub(super) async fn prepare(
-    data_dir: &Path,
+    config: &Config,
     setup_state: &Arc<SetupState>,
 ) -> Result<PreparedAssets> {
-    let seed_data_dir = data_dir.to_path_buf();
+    let data_dir = &config.data_dir;
+    let seed_data_dir = data_dir.clone();
     let bundle_seed = tokio::task::spawn_blocking(move || seed_from_bundle(&seed_data_dir))
         .await
         .context("bundle seed task panicked")?
         .context("bundle seed failed")?;
 
-    ensure_boot_assets(data_dir, setup_state).await?;
+    ensure_boot_assets(config, setup_state).await?;
 
-    let fallback_data_dir = data_dir.to_path_buf();
+    let fallback_data_dir = data_dir.clone();
     let agent = tokio::task::spawn_blocking(move || {
         ensure_agent_binary_fallback(&fallback_data_dir, bundle_seed)
     })
@@ -96,6 +97,8 @@ pub fn find_bundle_contents() -> Option<PathBuf> {
 /// ```text
 /// Contents/Resources/assets/{version}/  → ~/.arcbox/boot/{version}/
 /// Contents/Resources/runtime/           → ~/.arcbox/runtime/
+///   bin/                                → host Docker CLI tools
+///   {version}/{bin,kernel}/             → guest runtime transport source
 /// Contents/Resources/bin/arcbox-agent   → ~/.arcbox/bin/arcbox-agent
 /// Contents/Resources/bin/vm-agent      → ~/.arcbox/bin/vm-agent
 /// ```
@@ -320,12 +323,11 @@ fn walkdir(root: &Path) -> impl Iterator<Item = std::io::Result<(PathBuf, bool)>
 /// Downloads kernel and rootfs if not already cached. Sets the setup phase to
 /// `DownloadingAssets` while the download is in progress.
 pub(super) async fn ensure_boot_assets(
-    data_dir: &Path,
+    config: &Config,
     setup_state: &Arc<SetupState>,
 ) -> Result<()> {
-    let cache_dir = data_dir.join("boot");
-    let provider =
-        BootAssetProvider::new(cache_dir).context("Failed to create boot asset provider")?;
+    let provider = BootAssetProvider::with_config(config.boot_asset_config())
+        .context("Failed to create boot asset provider")?;
 
     if provider.is_cached() {
         tracing::debug!("Boot assets already cached");

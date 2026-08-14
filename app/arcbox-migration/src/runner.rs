@@ -32,6 +32,33 @@ impl std::fmt::Debug for DockerCliRunner {
     }
 }
 
+/// Outcome of transferring one image between two daemons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageTransfer {
+    /// Bytes streamed from `docker save` into `docker load`.
+    pub bytes: u64,
+    /// The ID the target assigned, reported only when the archive carried no
+    /// tags.
+    ///
+    /// Daemons backed by different image stores reassign IDs on load, so for
+    /// an untagged image this is the only reference that resolves afterwards.
+    pub loaded_image_id: Option<String>,
+}
+
+/// Extracts the target-assigned ID from `docker load` output.
+///
+/// `docker load` prints `Loaded image: <tag>` per tag, and falls back to
+/// `Loaded image ID: <id>` only when the archive has none. `--quiet`
+/// suppresses progress but keeps these summary lines.
+fn parse_loaded_image_id(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Loaded image ID:")
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    })
+}
+
 /// Network creation options supported by the CLI transport.
 #[derive(Debug, Clone)]
 pub struct CreateNetworkOptions {
@@ -116,10 +143,46 @@ impl DockerCliRunner {
         self.status(["container", "stop", "--time", "30", id]).await
     }
 
+    /// Starts a container.
+    pub async fn start_container(&self, id: &str) -> Result<()> {
+        self.status(["container", "start", id]).await
+    }
+
     /// Removes a container forcibly.
     pub async fn remove_container(&self, id: &str) -> Result<()> {
         self.status(["container", "rm", "--force", "--volumes", id])
             .await
+    }
+
+    /// Clears a helper container left behind by an interrupted run.
+    ///
+    /// A run whose daemon died mid-copy strands its helper, and
+    /// `docker create --name` refuses a duplicate — which would wedge the retry
+    /// the user is certain to attempt, since a failed migration leaves them no
+    /// other way to get their data across. Clearing the name first makes the
+    /// volume copy idempotent.
+    ///
+    /// Existence is checked rather than the removal being forced blindly, so a
+    /// genuine removal failure still surfaces instead of being swallowed as
+    /// "nothing was there". `remove_container` passes `--volumes`, which reaps
+    /// only *anonymous* volumes, so the named volume being migrated is never at
+    /// risk.
+    pub async fn remove_stale_helper(&self, name: &str) -> Result<()> {
+        if !self.container_exists(name).await {
+            return Ok(());
+        }
+        self.remove_container(name).await
+    }
+
+    /// Whether a container with this name exists, running or not.
+    async fn container_exists(&self, name: &str) -> bool {
+        self.command()
+            .args(["container", "inspect", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
     }
 
     /// Removes a volume.
@@ -263,34 +326,99 @@ impl DockerCliRunner {
         wait_for_success(child, "docker image import").await
     }
 
-    /// Saves an image to a tempfile.
-    pub async fn save_image(&self, reference: &str) -> Result<tempfile::NamedTempFile> {
-        let file = tempfile::NamedTempFile::new()?;
-        let path = file.path().to_path_buf();
-        self.status_owned(vec![
-            "image".to_string(),
-            "save".to_string(),
-            "--output".to_string(),
-            path.to_string_lossy().to_string(),
-            reference.to_string(),
-        ])
-        .await?;
-        Ok(file)
-    }
+    /// Streams `docker save` on this daemon straight into `docker load` on
+    /// `target`.
+    ///
+    /// `references` must list every tag to preserve: `docker save` keeps all
+    /// tags of an image only for arguments given without a tag, so naming a
+    /// single `repo:tag` silently drops that image's other tags.
+    pub async fn pipe_save_into(
+        &self,
+        target: &Self,
+        references: &[String],
+    ) -> Result<ImageTransfer> {
+        if references.is_empty() {
+            return Err(MigrationError::InvalidPlan(
+                "image plan has no export references".into(),
+            ));
+        }
 
-    /// Loads an image from a tempfile.
-    pub async fn load_image(&self, path: &Path) -> Result<()> {
-        self.status_owned(vec![
-            "image".to_string(),
-            "load".to_string(),
-            "--quiet".to_string(),
-            "--input".to_string(),
-            path.to_string_lossy().to_string(),
-        ])
-        .await
+        let mut save = self
+            .command()
+            .args(["image", "save"])
+            .args(references)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut load = target
+            .command()
+            .args(["image", "load", "--quiet"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let mut save_stdout = save
+            .stdout
+            .take()
+            .ok_or_else(|| MigrationError::Docker("docker save stdout missing".into()))?;
+        let mut load_stdin = load
+            .stdin
+            .take()
+            .ok_or_else(|| MigrationError::Docker("docker load stdin missing".into()))?;
+
+        let copy_task = tokio::spawn(async move {
+            let copied = tokio::io::copy(&mut save_stdout, &mut load_stdin).await?;
+            load_stdin.shutdown().await?;
+            Ok::<u64, std::io::Error>(copied)
+        });
+        // Drain every remaining pipe concurrently to prevent buffer deadlocks.
+        let save_stderr = tokio::spawn(take_stderr(save.stderr.take()));
+        let load_stderr = tokio::spawn(take_stderr(load.stderr.take()));
+        let load_stdout = tokio::spawn(take_pipe(load.stdout.take(), "docker load stdout"));
+
+        let save_status = save.wait().await?;
+        let load_status = load.wait().await?;
+        let copied = copy_task
+            .await
+            .map_err(|e| MigrationError::Docker(format!("docker save copy task failed: {e}")))?;
+        let save_stderr = save_stderr.await.map_err(|e| {
+            MigrationError::Docker(format!("docker save stderr task failed: {e}"))
+        })??;
+        let load_stderr = load_stderr.await.map_err(|e| {
+            MigrationError::Docker(format!("docker load stderr task failed: {e}"))
+        })??;
+        let load_stdout = load_stdout.await.map_err(|e| {
+            MigrationError::Docker(format!("docker load stdout task failed: {e}"))
+        })??;
+
+        // Report the producing side first: a `docker load` failure is usually a
+        // downstream symptom of `docker save` dying mid-stream.
+        if !save_status.success() {
+            return Err(MigrationError::Docker(format!(
+                "docker image save failed: {}",
+                save_stderr.trim()
+            )));
+        }
+        if !load_status.success() {
+            return Err(MigrationError::Docker(format!(
+                "docker image load failed: {}",
+                load_stderr.trim()
+            )));
+        }
+        Ok(ImageTransfer {
+            bytes: copied?,
+            loaded_image_id: parse_loaded_image_id(&load_stdout),
+        })
     }
 
     /// Streams a container path into a tempfile via `docker cp`.
+    ///
+    /// `--archive` asks for source ownership explicitly. Note it is belt and
+    /// braces here, not a fix: the `-` stream forms already round-trip uid/gid
+    /// (measured 2026-08-01 — a `1000:1000` volume file survived a migration
+    /// on a build without this flag). The documented "ownership is set at the
+    /// destination" rule applies to path-to-path copies, not to tar streams.
     pub async fn copy_from_container(
         &self,
         container: &str,
@@ -303,6 +431,7 @@ impl DockerCliRunner {
             .args([
                 "container",
                 "cp",
+                "--archive",
                 &format!("{container}:{source_path}"),
                 "-",
             ])
@@ -336,6 +465,9 @@ impl DockerCliRunner {
     }
 
     /// Streams a tar archive tempfile into a container via `docker cp`.
+    ///
+    /// See [`Self::copy_from_container`] for what `--archive` does and does
+    /// not buy here.
     pub async fn copy_to_container(
         &self,
         source_archive: &Path,
@@ -347,6 +479,7 @@ impl DockerCliRunner {
             .args([
                 "container",
                 "cp",
+                "--archive",
                 "-",
                 &format!("{container}:{target_path}"),
             ])
@@ -501,12 +634,19 @@ async fn wait_for_success(mut child: Child, context: &str) -> Result<()> {
     }
 }
 
-async fn take_stderr(stderr: Option<tokio::process::ChildStderr>) -> Result<String> {
-    let mut stderr =
-        stderr.ok_or_else(|| MigrationError::Docker("docker stderr pipe missing".into()))?;
+/// Reads a child pipe to end of stream as lossy UTF-8.
+async fn take_pipe<R>(pipe: Option<R>, what: &'static str) -> Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    let mut pipe = pipe.ok_or_else(|| MigrationError::Docker(format!("{what} pipe missing")))?;
     let mut buf = Vec::new();
-    stderr.read_to_end(&mut buf).await?;
+    pipe.read_to_end(&mut buf).await?;
     Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+async fn take_stderr(stderr: Option<tokio::process::ChildStderr>) -> Result<String> {
+    take_pipe(stderr, "docker stderr").await
 }
 
 fn resolve_docker_binary() -> Option<PathBuf> {
@@ -542,7 +682,27 @@ fn empty_tar_bytes() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_tar_bytes, find_in_path};
+    use super::{empty_tar_bytes, find_in_path, parse_loaded_image_id};
+
+    #[test]
+    fn untagged_load_reports_the_assigned_id() {
+        // Verbatim `docker load --quiet` output for a tagless archive.
+        let stdout = "Loaded image ID: sha256:1c8e3d999f27cb62d9714d9226751e16bacab4227\n";
+        assert_eq!(
+            parse_loaded_image_id(stdout).as_deref(),
+            Some("sha256:1c8e3d999f27cb62d9714d9226751e16bacab4227")
+        );
+    }
+
+    #[test]
+    fn tagged_load_reports_no_id_to_remap() {
+        // Tagged archives print `Loaded image:` instead; containers reference
+        // those by tag, so there is nothing to rewrite.
+        let stdout = "Loaded image: myapp:dev\nLoaded image: myapp:latest\n";
+        assert_eq!(parse_loaded_image_id(stdout), None);
+        assert_eq!(parse_loaded_image_id(""), None);
+        assert_eq!(parse_loaded_image_id("Loaded image ID:   \n"), None);
+    }
 
     #[test]
     fn empty_tar_has_two_zero_blocks() {

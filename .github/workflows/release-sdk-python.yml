@@ -1,0 +1,168 @@
+name: SDK Python Release
+
+# Publishes arcbox (the Python SDK) to PyPI on its own cadence,
+# independent of the main arcbox release train — mirrors
+# release-sdk-typescript.yml. The tag is minted by release-please when
+# the sdk-python component's release PR merges (see
+# release-please-config.json).
+#
+# Publishing uses PyPI trusted publishing (OIDC): no token — the job's
+# id-token permission mints a workflow-scoped credential, and the upload
+# carries PEP 740 attestations. Unlike
+# npm, PyPI supports PENDING trusted publishers, so the publisher is
+# registered before the first upload and CI performs the first publish —
+# no local bootstrap: see sdk/python/README.md "Releasing".
+
+on:
+  push:
+    tags:
+      - 'sdk-python-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. sdk-python-v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish arcbox to PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Required for PyPI trusted publishing: lets the job mint the OIDC
+      # token PyPI exchanges for a publish credential.
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdk/python
+
+    steps:
+      - name: Determine tag
+        id: tag
+        working-directory: .
+        # The dispatch input arrives through the environment, never spliced
+        # into the script body: template expansion happens before bash runs,
+        # so a `case` guard on an already-interpolated string cannot protect
+        # the assignment itself. This job holds `id-token: write`.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            sdk-python-v*) ;;
+            *)
+              echo "::error::tag '$TAG' does not match sdk-python-v*"
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#sdk-python-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG (PyPI version $VERSION)"
+
+      # Check out the tag being released, not the dispatching ref — a
+      # workflow_dispatch from master must still publish the tag's tree,
+      # or the published distribution would not match the release.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          # This job mints a publish credential; never leave the repo token
+          # persisted on disk beside it.
+          persist-credentials: false
+
+      # uv pinned to the same range as pyproject.toml's uv_build
+      # requirement; uv sync provisions the interpreter pinned by
+      # sdk/python/.python-version.
+      - name: Setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '>=0.12.1,<0.13'
+          # No cache restore: a publish job must resolve from the lockfile
+          # alone, not from a cache another workflow could have poisoned.
+          enable-cache: false
+
+      - name: Verify tag matches pyproject.toml
+        run: |
+          PKG_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$PKG_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "::error::pyproject.toml version ($PKG_VERSION) != tag version (${{ steps.tag.outputs.version }})"
+            exit 1
+          fi
+
+      # Idempotency: a re-dispatch (or a re-delivered tag event) must not
+      # fail on an already-published release — PyPI rejects re-uploading
+      # a version, so skip cleanly instead (same lesson as the npm and
+      # crates.io publish paths).
+      - name: Check PyPI for existing version
+        id: registry
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/arcbox/${{ steps.tag.outputs.version }}/json")
+          if [ "$STATUS" = "200" ]; then
+            echo "::notice::arcbox ${{ steps.tag.outputs.version }} already on PyPI; skipping publish"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --locked is load-bearing: it is the only check that the resolved
+      # dependency set the gates run against is the one the published wheel
+      # declares. release-please bumps pyproject.toml without touching the
+      # root entry in uv.lock, which would make this fail — so the release
+      # PR job refreshes uv.lock the same way it already refreshes
+      # Cargo.lock (`release-please.yml`, "Update lockfiles on release
+      # PRs"). Relaxing this to --frozen instead would let an unlocked
+      # dependency edit ship: gates green against the old resolution, wheel
+      # declaring the new constraint. The Rust half of this repo made that
+      # trade once and reverted it.
+      - name: Install dependencies
+        if: steps.registry.outputs.published != 'true'
+        run: uv sync --locked
+
+      - name: Lint
+        if: steps.registry.outputs.published != 'true'
+        run: uv run ruff check .
+
+      - name: Format check
+        if: steps.registry.outputs.published != 'true'
+        run: uv run ruff format --check .
+
+      - name: Typecheck
+        if: steps.registry.outputs.published != 'true'
+        run: uv run pyright
+
+      - name: Sync-tree lockstep check
+        if: steps.registry.outputs.published != 'true'
+        run: uv run python scripts/gen_sync.py --check
+
+      - name: Test
+        if: steps.registry.outputs.published != 'true'
+        run: uv run pytest
+
+      - name: Build
+        if: steps.registry.outputs.published != 'true'
+        run: uv build
+
+      # pypa/gh-action-pypi-publish rather than `uv publish`: both publish
+      # through the same OIDC trusted-publisher exchange, but uv emits no
+      # PEP 740 attestations ("attestations must be created separately
+      # before publishing", astral-sh/uv#15618) while this action signs the
+      # distributions by default. Without it the two SDKs would ship
+      # materially different supply-chain guarantees — npm trusted
+      # publishing attaches provenance to @arcbox/sandbox automatically.
+      # Pinned by commit: it runs in the job that mints publish credentials.
+      - name: Publish to PyPI
+        if: steps.registry.outputs.published != 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: sdk/python/dist

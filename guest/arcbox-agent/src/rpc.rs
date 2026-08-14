@@ -6,25 +6,24 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
+use buffa::Message;
 use bytes::{Buf, BufMut, BytesMut};
-use prost::Message;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub use arcbox_constants::wire::MessageType;
-use arcbox_protocol::Empty;
-use arcbox_protocol::agent::{
-    ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
-    EnsureNfsExportRequest, EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse,
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest, MmapReadFileResponse,
-    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
-    WatchReadinessRequest, WatchStatsRequest,
+use arcbox_connect::v1::{
+    AgentPingRequest as PingRequest, AgentPingResponse as PingResponse, ContainerFsPathsRequest,
+    ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse, Empty, EnsureNfsExportRequest,
+    EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse, KubernetesDeleteRequest,
+    KubernetesDeleteResponse, KubernetesKubeconfigRequest, KubernetesKubeconfigResponse,
+    KubernetesStartRequest, KubernetesStartResponse, KubernetesStatusRequest,
+    KubernetesStatusResponse, KubernetesStopRequest, KubernetesStopResponse, MemoryPressureEvent,
+    MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved,
+    ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+    RuntimeStatusResponse, ShutdownRequest, ShutdownResponse, SystemInfo,
+    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
+pub use arcbox_constants::wire::MessageType;
 
 /// Agent version string.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -279,11 +278,17 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     }
     buf.extend_from_slice(payload);
 
+    // Name the frame in the error: on a torn-down connection the resulting
+    // "Connection closed by peer" warn must say which response/stream write
+    // was lost, or the failure cannot be attributed (CORE-82).
     writer
         .write_all(&buf)
         .await
-        .context("failed to write message")?;
-    writer.flush().await.context("failed to flush")?;
+        .with_context(|| format!("failed to write {msg_type:?} message"))?;
+    writer
+        .flush()
+        .await
+        .with_context(|| format!("failed to flush {msg_type:?} message"))?;
 
     Ok(())
 }
@@ -302,72 +307,72 @@ pub async fn write_response<W: AsyncWrite + Unpin>(
 pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest> {
     match msg_type {
         MessageType::PingRequest => {
-            let req = PingRequest::decode(payload)?;
+            let req = PingRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::Ping(req))
         }
         MessageType::GetSystemInfoRequest => Ok(RpcRequest::GetSystemInfo),
         MessageType::EnsureRuntimeRequest => {
-            let req = RuntimeEnsureRequest::decode(payload)?;
+            let req = RuntimeEnsureRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::EnsureRuntime(req))
         }
         MessageType::RuntimeStatusRequest => {
-            let req = RuntimeStatusRequest::decode(payload)?;
+            let req = RuntimeStatusRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::RuntimeStatus(req))
         }
         MessageType::KubernetesStartRequest => {
-            let req = KubernetesStartRequest::decode(payload)?;
+            let req = KubernetesStartRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::StartKubernetes(req))
         }
         MessageType::KubernetesStopRequest => {
-            let req = KubernetesStopRequest::decode(payload)?;
+            let req = KubernetesStopRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::StopKubernetes(req))
         }
         MessageType::KubernetesDeleteRequest => {
-            let req = KubernetesDeleteRequest::decode(payload)?;
+            let req = KubernetesDeleteRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::DeleteKubernetes(req))
         }
         MessageType::KubernetesStatusRequest => {
-            let req = KubernetesStatusRequest::decode(payload)?;
+            let req = KubernetesStatusRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::KubernetesStatus(req))
         }
         MessageType::KubernetesKubeconfigRequest => {
-            let req = KubernetesKubeconfigRequest::decode(payload)?;
+            let req = KubernetesKubeconfigRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::KubernetesKubeconfig(req))
         }
         MessageType::ShutdownRequest => {
-            let req = ShutdownRequest::decode(payload)?;
+            let req = ShutdownRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::Shutdown(req))
         }
         MessageType::MmapReadFileRequest => {
-            let req = MmapReadFileRequest::decode(payload)?;
+            let req = MmapReadFileRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::MmapReadFile(req))
         }
         MessageType::DiskTrimRequest => {
-            let req = DiskTrimRequest::decode(payload)?;
+            let req = DiskTrimRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::DiskTrim(req))
         }
         MessageType::ContainerFsPathsRequest => {
-            let req = ContainerFsPathsRequest::decode(payload)?;
+            let req = ContainerFsPathsRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::ContainerFsPaths(req))
         }
         MessageType::ImageFsPathsRequest => {
-            let req = ImageFsPathsRequest::decode(payload)?;
+            let req = ImageFsPathsRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::ImageFsPaths(req))
         }
         MessageType::EnsureNfsExportRequest => {
-            let req = EnsureNfsExportRequest::decode(payload)?;
+            let req = EnsureNfsExportRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::EnsureNfsExport(req))
         }
         MessageType::WatchReadinessRequest => {
-            let req = WatchReadinessRequest::decode(payload)?;
+            let req = WatchReadinessRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::WatchReadiness(req))
         }
         MessageType::WatchMemoryPressureRequest => {
-            let req = WatchMemoryPressureRequest::decode(payload)?;
+            let req = WatchMemoryPressureRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::WatchMemoryPressure(req))
         }
         MessageType::WatchStatsRequest => {
-            let req = WatchStatsRequest::decode(payload)?;
+            let req = WatchStatsRequest::decode_from_slice(payload)?;
             Ok(RpcRequest::WatchStats(req))
         }
         MessageType::KillAgentRequest => Ok(RpcRequest::KillAgent),
@@ -446,7 +451,7 @@ mod tests {
     fn test_parse_request_ping() {
         let req = PingRequest {
             message: "ping".to_string(),
-            timestamp_secs: 0,
+            ..Default::default()
         };
         let payload = req.encode_to_vec();
 
@@ -461,6 +466,7 @@ mod tests {
     fn test_parse_request_shutdown() {
         let req = ShutdownRequest {
             timeout_seconds: 10,
+            ..Default::default()
         };
         let payload = req.encode_to_vec();
 

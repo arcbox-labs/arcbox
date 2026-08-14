@@ -16,21 +16,12 @@ path = "src/lib.rs"
 name = "abctl"
 path = "src/main.rs"
 
-[[bin]]
-name = "arcbox"
-path = "src/bin/arcbox_placeholder.rs"
-
 [dependencies]
 arcbox-core = { workspace = true }
 arcbox-docker = { workspace = true }
-arcbox-grpc = { workspace = true }
-arcbox-protocol = { workspace = true }
 arcbox-constants = { workspace = true }
 arcbox-docker-tools = { workspace = true }
 arcbox-asset = { workspace = true }
-
-tonic = { workspace = true }
-hyper-util = "0.1"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }
@@ -46,13 +37,20 @@ libc = { workspace = true }
 humantime = "2.3.0"
 sha2 = "0.10"
 hex = "0.4"
-tokio-stream.workspace = true
 arcbox-helper.workspace = true
 chrono.workspace = true
 tar = "0.4.46"
 tempfile = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+arcbox-connect.workspace = true
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1", features = ["client"] }
+buffa = { version = "0.9.1", features = ["json"] }
+tower.workspace = true
+buffa-types = { version = "0.9.1", features = ["json"] }
+anstream = { version = "1.0.0", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
 macos-resolver = { workspace = true }
 
 [features]

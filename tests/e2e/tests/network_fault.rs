@@ -1,4 +1,4 @@
-//! Network-fault e2e — Phase 1 of internal-docs/plans/network-fault-e2e.md.
+//! Network-fault e2e — Phase 1 of ../company/engineering/arcbox/plans/network-fault-e2e.md.
 //!
 //! The incident (2026-07-19): a container download hung 23+ minutes on a
 //! guest-side TCP flow left `ESTABLISHED` (empty queues) after its upstream

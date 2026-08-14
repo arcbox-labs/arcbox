@@ -157,6 +157,36 @@ impl VmBackend {
             _ => None,
         }
     }
+
+    /// Whether this backend can run a nested guest at all.
+    ///
+    /// A property of the backend, independent of the host: the custom HV
+    /// VMM exposes no `/dev/kvm` to its guest, so nothing inside can boot
+    /// a VM however capable the hardware is. Callers still have to check
+    /// the hardware separately
+    /// ([`arcbox_hypervisor::host_nested_virt`]) — this only rules a
+    /// backend out.
+    ///
+    /// Only macOS backends make this distinction — `VmBackend` selects
+    /// between Apple's two frameworks, and `Vmm::initialize` on Linux
+    /// (`vmm/linux.rs`) always boots through KVM regardless of this field,
+    /// so it is not even that platform's backend selector. Off macOS every
+    /// variant defers entirely to the hardware probe, matching what the
+    /// field actually controls there: nothing.
+    #[must_use]
+    pub const fn supports_nested_virt(self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            match self {
+                Self::Hv => false,
+                Self::Vz => true,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
 }
 
 /// VMM state.

@@ -10,8 +10,8 @@ use crate::header::NetPacket;
 // Linux kernel `TUNSETOFFLOAD` / `TUNSETVNETHDRSZ` ioctl numbers and the
 // `TUN_F_*` flag bits. See `<linux/if_tun.h>` — we encode them inline rather
 // than pulling in another crate because only the TAP backend needs them.
-const TUNSETOFFLOAD: libc::c_ulong = 0x400454d0;
-const TUNSETVNETHDRSZ: libc::c_ulong = 0x400454d8;
+const TUNSETOFFLOAD: libc::Ioctl = 0x400454d0;
+const TUNSETVNETHDRSZ: libc::Ioctl = 0x400454d8;
 
 const TUN_F_CSUM: u32 = 0x01;
 const TUN_F_TSO4: u32 = 0x02;
@@ -71,7 +71,7 @@ impl TapBackend {
         }
 
         // Create TAP device
-        const TUNSETIFF: libc::c_ulong = 0x400454ca;
+        const TUNSETIFF: libc::Ioctl = 0x400454ca;
         // SAFETY: ioctl reads `&ifr` for the duration of the call; on failure
         // we close the fd we just opened.
         let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };

@@ -54,7 +54,7 @@ non-obvious invariants and failure signatures.
   (`.github/workflows/release.yml`). arcbox consumes a new release by bumping
   BOTH `[boot] version` and `manifest_sha256` in `assets.lock`, which is
   `include_str!`-embedded into the daemon at COMPILE time
-  (`app/arcbox-core/src/boot_assets/lockfile.rs`) — editing `assets.lock`
+  (`engine/arcbox-image/src/boot_assets/lockfile.rs`) — editing `assets.lock`
   without rebuilding the daemon changes nothing.
 - **Guest wall clock comes from the Ping handler.** HV exposes no RTC (ABX-416),
   so `handle_ping` calls `sync_clock_from_host(req.timestamp_secs)` →
@@ -94,7 +94,7 @@ non-obvious invariants and failure signatures.
   copies the **newest-mtime** agent across those three locations, so a fresh
   build that wasn't re-staged loses to an old binary from another tree (ABX-385
   field-skew class). Wrong-version agents now surface as the handshake rejection
-  (`app/arcbox-core/src/agent_client.rs`).
+  (`engine/arcbox-engine/src/agent_client.rs`).
 - **"engine ready" then intermittent 500/EOF on first API calls** →
   read `~/.arcbox/log/agent.log`, grep for `DockerProbe` / `/_ping`. Cause:
   readiness gated on socket rather than the `/_ping` probe (ABX-408 regression).
@@ -124,13 +124,34 @@ Every link below must change together; missing one fails as an opaque
    (or a streaming handler like `handle_watch_readiness`, which holds the
    connection open and emits a sequence of `ReadinessEvent` frames rather than a
    single response — mirror that shape for new streaming RPCs).
-5. `app/arcbox-core/src/agent_client.rs` — the host caller.
+5. `engine/arcbox-engine/src/agent_client.rs` — the host caller.
 
 The full set above is for a **new message type**. Adding a *field* to an
 already-wired message (e.g. a new `AgentPingRequest` field) touches only 1, the
 generated file, the guest handler (4), and the host caller (5): the
 `MessageType` variant (2) and the `rpc.rs` parse/`message_type`/`encode_payload`
 arms (3) already exist — do not duplicate them.
+
+**EXCEPTION — the sandbox family (every `MessageType` for which
+`is_sandbox_request()` is true: the `Sandbox*` types incl. the
+`SandboxTemplate*` catalog types, plus `WatchSandboxCleanupRequest`)**
+replaces steps 3 and 4: `MessageType::is_sandbox_request()` routes the
+whole family to `handle_sandbox_message` (`agent/linux/sandbox.rs`)
+*before* the `rpc.rs` codec — do not add `rpc.rs` arms for it. Step 1's
+proto file splits by audience: public sandbox API messages live in the
+`arcbox/sandbox/v1` protos (all three build-script arrays, see
+`rpc/AGENTS.md`); host↔guest-internal control frames
+(`SandboxPortForwardRequest`, `SandboxCleanupTicket`,
+`SandboxResumeCommand`, …) stay in `agent.proto` — never expose an
+internal frame through the public schema. A new sandbox-family message
+needs: the proto (in the right file per that split), the `MessageType`
+variant + `is_sandbox_request()` arm, a `handle_sandbox_message` dispatch
+arm, and the `AgentClient` method. `MachineExecRequest` is the one other
+codec bypass: dispatched by name before `parse_request`
+(`agent/linux/rpc.rs`), so it has no `rpc.rs` arms either. Streaming
+alone does not waive step 3 — `WatchReadiness`/`WatchStats`/
+`WatchMemoryPressure` stream too and keep their codec arms (step 4's
+`handle_watch_readiness` pattern).
 
 Then run the `buf` breaking check, decide whether the change alters existing
 message *meaning* (if so, bump `AGENT_PROTOCOL_VERSION`), and add a test on the

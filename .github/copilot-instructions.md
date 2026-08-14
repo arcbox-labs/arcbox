@@ -13,7 +13,7 @@ ArcBox is a pure-Rust, high-performance container and VM runtime targeting macOS
 **Key layers (bottom-up):**
 
 ```text
-arcbox (CLI)
+abctl (CLI)
     ↓ gRPC over Unix socket
 arcbox-daemon
     ↓

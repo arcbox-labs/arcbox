@@ -1,9 +1,11 @@
 //! ArcBox daemon — orchestrates VM, networking, and API services.
 
 mod context;
+mod control_plane;
 mod dns_service;
 mod kubernetes_proxy;
 mod nfs_mount;
+mod power;
 mod recovery;
 mod self_setup;
 mod services;
@@ -14,6 +16,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arcbox_api::SetupState;
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::paths::ArcboxProfile;
 use arcbox_logging::LogConfig;
 use clap::Parser;
@@ -37,6 +40,32 @@ pub struct DaemonArgs {
     /// Data directory for ArcBox.
     #[arg(long)]
     pub data_dir: Option<std::path::PathBuf>,
+
+    /// DNS suffix served by this daemon (default: arcbox.local).
+    #[arg(long)]
+    pub dns_domain: Option<arcbox_helper::validate::Domain>,
+
+    /// Host UDP port for DNS; 0 asks the OS to allocate one (default: 5553).
+    #[arg(long)]
+    pub dns_port: Option<u16>,
+
+    /// Install `/etc/resolver/<dns-domain>` for this explicitly isolated
+    /// instance. Canonical production DNS is installed automatically.
+    #[arg(long)]
+    pub install_dns_resolver: bool,
+
+    /// Host TCP port for the Kubernetes API proxy; 0 asks the OS to allocate one
+    /// (default: 16443).
+    #[arg(long)]
+    pub kubernetes_port: Option<u16>,
+
+    /// Name written into the Kubernetes kubeconfig (default: profile context).
+    #[arg(long)]
+    pub kubernetes_context: Option<String>,
+
+    /// Private IPv4 pool used by this instance's container networks.
+    #[arg(long)]
+    pub container_cidr: Option<ContainerNetwork>,
 
     /// Custom kernel path for VM boot.
     #[arg(long)]
@@ -67,6 +96,10 @@ pub struct DaemonArgs {
 
 fn main() -> Result<()> {
     let args = DaemonArgs::parse();
+    let profile = args
+        .profile
+        .unwrap_or_else(ArcboxProfile::from_env_or_default);
+    validate_docker_integration(profile, args.docker_integration)?;
 
     let _sentry_guard = sentry::init(sentry::ClientOptions {
         dsn: sentry_dsn().and_then(|s| s.parse().ok()),
@@ -78,9 +111,6 @@ fn main() -> Result<()> {
         ..Default::default()
     });
 
-    let profile = args
-        .profile
-        .unwrap_or_else(ArcboxProfile::from_env_or_default);
     let data_dir = startup::resolve_data_dir(profile, args.data_dir.as_ref());
     let log_guard = arcbox_logging::init_with_sentry(LogConfig {
         log_dir: data_dir.join(arcbox_constants::paths::host::LOG),
@@ -119,6 +149,14 @@ fn main() -> Result<()> {
     result
 }
 
+fn validate_docker_integration(profile: ArcboxProfile, enabled: bool) -> Result<()> {
+    anyhow::ensure!(
+        !enabled || profile == ArcboxProfile::Production,
+        "--docker-integration is production-only because it changes the global Docker current context; use the development instance's Docker context explicitly"
+    );
+    Ok(())
+}
+
 fn sentry_dsn() -> Option<String> {
     std::env::var("ARCBOX_DAEMON_SENTRY_DSN")
         .or_else(|_| std::env::var("SENTRY_DSN"))
@@ -149,6 +187,7 @@ async fn run(args: DaemonArgs) -> Result<()> {
                 // with no clients it only delays the error exit.
                 handles.setup_state.set_failed(&format!("{e:#}"));
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                shutdown::abort_failed_startup(&handles).await;
                 return Err(e);
             }
         },
@@ -178,4 +217,16 @@ async fn start(args: DaemonArgs, handles: context::StartupHandles) -> Result<sta
         .await?
         .mark_ready()
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn development_cannot_mutate_the_global_docker_context() {
+        assert!(validate_docker_integration(ArcboxProfile::Development, true).is_err());
+        assert!(validate_docker_integration(ArcboxProfile::Development, false).is_ok());
+        assert!(validate_docker_integration(ArcboxProfile::Production, true).is_ok());
+    }
 }

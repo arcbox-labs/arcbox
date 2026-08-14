@@ -57,12 +57,18 @@ impl DockerApiServer {
         &self.config.socket_path
     }
 
-    /// Runs the server.
+    /// Binds the Docker API socket, returning the listener to serve on.
+    ///
+    /// Separate from [`Self::serve`] so a caller that spawns the serving task
+    /// can still fail startup on a bind error: the daemon's Docker socket is
+    /// its primary API, and a background task that only logs the failure
+    /// leaves clients hitting connection-refused against a daemon that
+    /// reported itself ready.
     ///
     /// # Errors
     ///
-    /// Returns an error if the server fails to start.
-    pub async fn run(&self, shutdown: CancellationToken) -> Result<()> {
+    /// Returns an error if the socket cannot be bound.
+    pub fn bind(&self) -> Result<UnixListener> {
         // Remove existing socket
         let _ = std::fs::remove_file(&self.config.socket_path);
 
@@ -80,6 +86,20 @@ impl DockerApiServer {
         );
         tracing::info!("Docker API backend: smart proxy to guest dockerd");
 
+        Ok(listener)
+    }
+
+    /// Serves on an already-bound listener until `shutdown` is cancelled.
+    ///
+    /// There is deliberately no `bind`-and-serve convenience wrapper: it
+    /// would only be useful from a spawned task, which is exactly the shape
+    /// that swallows the bind error and lets startup report READY for a
+    /// daemon nobody can reach (CORE-71).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serving fails.
+    pub async fn serve(&self, listener: UnixListener, shutdown: CancellationToken) -> Result<()> {
         self.run_native_http(listener, shutdown).await
     }
 }

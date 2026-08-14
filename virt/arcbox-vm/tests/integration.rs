@@ -22,11 +22,14 @@ fn snapshot_catalog_persists_across_instances() {
         std::fs::write(pending.dir().join("vmstate"), b"vmstate").unwrap();
         pending
             .commit(SnapshotDraft {
+                labels: std::collections::HashMap::new(),
                 name: Some("checkpoint-1".into()),
                 snapshot_type: SnapshotType::Full,
                 parent_id: None,
                 kernel_path: None,
                 rootfs_path: None,
+                net_invariant: false,
+                geometry: None,
             })
             .unwrap()
             .id

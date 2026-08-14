@@ -311,6 +311,106 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    use super::IcmpProxy;
+    use crate::egress::ETH_HEADER_LEN;
+
+    const GW_MAC: [u8; 6] = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+    const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
+    /// Distinctive so a reply carrying the kernel's rewritten value is
+    /// unmistakable rather than coincidentally equal.
+    const ECHO_ID: [u8; 2] = [0x5A, 0xC3];
+    const ECHO_SEQ: [u8; 2] = [0x00, 0x07];
+
+    /// Ethernet + IPv4 + ICMP echo request addressed to `dst`.
+    fn echo_request_frame(dst: Ipv4Addr) -> Vec<u8> {
+        let mut icmp = vec![
+            8,
+            0, // type 8 (echo request), code 0
+            0,
+            0, // checksum, filled in below
+            ECHO_ID[0],
+            ECHO_ID[1],
+            ECHO_SEQ[0],
+            ECHO_SEQ[1],
+        ];
+        icmp.extend_from_slice(b"arcbox-icmp-probe");
+        let checksum = super::internet_checksum(&icmp);
+        icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        let total_len = (20 + icmp.len()) as u16;
+        let mut frame = Vec::with_capacity(ETH_HEADER_LEN + total_len as usize);
+        frame.extend_from_slice(&GW_MAC); // dst MAC (the gateway)
+        frame.extend_from_slice(&GUEST_MAC); // src MAC
+        frame.extend_from_slice(&[0x08, 0x00]); // EtherType IPv4
+
+        frame.extend_from_slice(&[0x45, 0x00]); // v4, IHL 5, DSCP 0
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00, 0x40, 0x00]); // id, flags/frag
+        frame.extend_from_slice(&[64, 1]); // TTL, protocol ICMP
+        frame.extend_from_slice(&[0x00, 0x00]); // header checksum (unchecked here)
+        frame.extend_from_slice(&GUEST_IP.octets());
+        frame.extend_from_slice(&dst.octets());
+        frame.extend_from_slice(&icmp);
+        frame
+    }
+
+    /// An echo request proxied to loopback comes back as an echo reply that
+    /// still carries the guest's own identifier and sequence.
+    ///
+    /// `test_icmp_identifier_restore` covers the patch arithmetic on a
+    /// hand-built packet; nothing exercised the socket path that makes the
+    /// patch necessary in the first place. macOS `SOCK_DGRAM`+`IPPROTO_ICMP`
+    /// rewrites the identifier with a kernel-internal socket id, so a reply
+    /// arriving with `ECHO_ID` intact is the whole point.
+    ///
+    /// Needs an ICMP datagram socket, which is unprivileged on macOS — and
+    /// the only CI job that runs tests is `runs-on: macos-26`, a full VM, so
+    /// this runs there like any other test. If that job ever moves somewhere
+    /// the socket is denied, `IcmpProxy` self-disables and never replies,
+    /// which surfaces here as the 10 s timeout below; re-gate it then, with
+    /// a reason that matches the CI of the day.
+    #[tokio::test]
+    async fn echo_request_round_trips_with_the_guest_identifier() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let proxy = IcmpProxy::new(tx, GW_MAC);
+
+        let frame = echo_request_frame(Ipv4Addr::LOCALHOST);
+        proxy.proxy_icmp(&frame, GUEST_MAC, CancellationToken::new());
+
+        let reply = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an echo reply should arrive within 10s")
+            .expect("reply channel stayed open");
+
+        let ip_start = ETH_HEADER_LEN;
+        let ihl = ((reply[ip_start] & 0x0F) as usize) * 4;
+        let icmp = &reply[ip_start + ihl..];
+
+        assert_eq!(icmp[0], 0, "reply must be ICMP type 0 (echo reply)");
+        assert_eq!(
+            &icmp[4..6],
+            &ECHO_ID,
+            "the guest's identifier must be restored, not the kernel's rewritten one"
+        );
+        assert_eq!(
+            &icmp[6..8],
+            &ECHO_SEQ,
+            "the sequence number must survive the round trip"
+        );
+        assert_eq!(
+            &reply[..6],
+            &GUEST_MAC,
+            "the reply frame must be addressed back to the guest"
+        );
+    }
+
     /// Verifies that the ICMP identifier restoration logic patches Echo Reply
     /// (type 0) packets but leaves other ICMP types untouched.
     #[test]

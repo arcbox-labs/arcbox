@@ -484,3 +484,90 @@ message EnsureNfsExportResponse {
     // threads started).
     repeated string notes = 1;
 }
+
+// --- Sandbox port forwarding (host↔guest vsock only) ---
+//
+// These are host↔guest wire messages, not part of the sandbox product API:
+// the daemon asks the guest agent to install or remove a DNAT rule while
+// serving `arcbox.sandbox.v1.SandboxService.ExposePort`. They live here,
+// with the other agent wire payloads, so nothing vsock-only ships in the
+// published sandbox contract (CORE-57).
+
+// Transport protocol of a forwarded sandbox port.
+//
+// Deliberately separate from `arcbox.sandbox.v1.PortProtocol`: the public
+// contract must not be imported by the internal wire, or the two evolve
+// together by accident.
+enum SandboxPortProtocol {
+    SANDBOX_PORT_PROTOCOL_UNSPECIFIED = 0;
+    SANDBOX_PORT_PROTOCOL_TCP = 1;
+    SANDBOX_PORT_PROTOCOL_UDP = 2;
+}
+
+// Ask the guest agent to DNAT a reserved guest port to a sandbox port.
+message SandboxPortForwardRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Destination port inside the sandbox.
+    uint32 sandbox_port = 2;
+    // Transport protocol (UNSPECIFIED = TCP).
+    SandboxPortProtocol protocol = 3;
+}
+
+// Guest agent's answer: the allocated reserved-range guest port.
+message SandboxPortForwardResponse {
+    // Guest port now DNATed to the sandbox.
+    uint32 guest_port = 1;
+}
+
+// Ask the guest agent to remove a DNAT mapping.
+message SandboxPortForwardRemoveRequest {
+    // Sandbox ID.
+    string id = 1;
+    // The sandbox port previously forwarded.
+    uint32 sandbox_port = 2;
+    // Transport protocol (UNSPECIFIED = TCP).
+    SandboxPortProtocol protocol = 3;
+}
+
+// Durable ticket identifying one sandbox generation whose host and guest
+// forwarding state must be removed before its IP/relay ports can be reused.
+message SandboxCleanupTicket {
+    string id = 1;
+    string token = 2;
+    // True for the process-generation startup barrier. The host must clear
+    // all stale sandbox listeners before acknowledging this ticket.
+    bool startup = 3;
+}
+
+// Stop/Remove response. Network-disabled sandboxes have no cleanup ticket;
+// a present ticket always names a durable quarantine marker.
+message SandboxCleanupResponse {
+    SandboxCleanupTicket ticket = 1;
+}
+
+// Opens the internal stream of pending sandbox cleanup tickets. The guest
+// first replays its durable snapshot, then streams new terminal generations.
+message WatchSandboxCleanupRequest {}
+
+// Ask the guest agent to resume a paused sandbox in place (CORE-21).
+//
+// Internal wire message rather than the public ResumeSandboxRequest: the
+// daemon decides *why* a resume runs (an explicit Resume call vs its own
+// transparent auto-resume on a data-plane RPC), and the guest surfaces that
+// verbatim as the RESUMED event's "reason" attribute — the visibility the
+// contract promises for automation.
+message SandboxResumeCommand {
+    // Sandbox ID.
+    string id = 1;
+    // "resume" (explicit) or "auto_resume" (daemon-side transparent resume).
+    // Empty is treated as "resume".
+    string reason = 2;
+}
+
+// Guest agent's answer to a resume: the fresh network identity.
+message SandboxResumeResponse {
+    // IP address of the resumed sandbox's new allocation (empty when the
+    // sandbox has no network). The daemon re-registers host DNS from it.
+    string ip_address = 1;
+}

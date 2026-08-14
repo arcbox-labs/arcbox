@@ -30,9 +30,18 @@ const STARTUP_ABORT_GRACE: Duration = Duration::from_secs(10);
 
 /// Waits for a shutdown signal, drains services, and cleans up.
 pub async fn run(ctx: DaemonContext, mut handles: ServiceHandles) -> Result<()> {
-    wait_for_signal().await;
+    tokio::select! {
+        () = wait_for_signal() => {}
+        () = ctx.shutdown.cancelled() => {
+            warn!("internal safety condition requested daemon shutdown");
+        }
+    }
     println!("Shutting down guest VM... (press Ctrl+C again to force quit)");
     info!("Shutdown signal received, draining connections...");
+
+    // Keep the NFS proxy and guest alive until macOS has detached the mount.
+    // Cutting either connection first triggers its interrupted-server alert.
+    crate::nfs_mount::cleanup(&ctx).await;
     ctx.shutdown.cancel();
 
     drain(&mut handles).await;
@@ -123,9 +132,20 @@ async fn cleanup(ctx: &DaemonContext) {
         }
     }
 
-    crate::nfs_mount::cleanup(ctx);
+    // Retry if shutdown raced a mount that was still being established.
+    crate::nfs_mount::cleanup(ctx).await;
+
+    cleanup_container_route(ctx.container_network_lease_slot.get()).await;
 
     remove_sockets(ctx);
+}
+
+async fn cleanup_container_route(lease: Option<&crate::startup::ContainerNetworkLease>) {
+    if let Some(lease) = lease
+        && let Err(error) = lease.cleanup_route().await
+    {
+        warn!(%error, "failed to remove isolated container route");
+    }
 }
 
 fn remove_sockets(ctx: &DaemonContext) {
@@ -173,6 +193,8 @@ pub async fn interrupt_startup(handles: &StartupHandles) -> Result<()> {
     };
     let forced = stop_runtime(Arc::clone(runtime), Some(STARTUP_ABORT_GRACE)).await;
 
+    cleanup_container_route(handles.container_network_lease.get()).await;
+
     info!("ArcBox daemon stopped");
 
     if forced {
@@ -183,6 +205,21 @@ pub async fn interrupt_startup(handles: &StartupHandles) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Force-cleans a runtime after the startup pipeline itself returns an error.
+///
+/// There is no healthy service to preserve at this point. A forced stop avoids
+/// leaving Virtualization.framework helpers or disk holders behind while still
+/// letting the original startup error reach the caller.
+pub async fn abort_failed_startup(handles: &StartupHandles) {
+    handles.shutdown.cancel();
+    if let Some(runtime) = handles.early_runtime.get() {
+        if let Err(error) = runtime.shutdown_force().await {
+            warn!(%error, "failed to force-clean runtime after startup error");
+        }
+    }
+    cleanup_container_route(handles.container_network_lease.get()).await;
 }
 
 pub async fn wait_for_signal() {

@@ -67,8 +67,12 @@ pub struct MigrationPlan {
     pub networks: Vec<NetworkPlan>,
     /// Containers that will be recreated in ArcBox.
     pub containers: Vec<ContainerPlan>,
-    /// Resources that are out of scope for v1.
+    /// Resources that are out of scope for v1. Blocking: execution refuses to
+    /// start while any are present.
     pub unsupported_resources: Vec<String>,
+    /// Advisory problems that do not block execution but will likely surprise
+    /// the user (for example, a bind mount whose source is missing).
+    pub warnings: Vec<String>,
     /// Replace actions that require confirmation.
     pub replacements: ReplacementSummary,
     /// Source volume blockers caused by running containers.
@@ -80,12 +84,24 @@ pub struct MigrationPlan {
 pub struct ImagePlan {
     /// Source image identifier.
     pub image_id: String,
-    /// Image reference used for export.
-    pub export_reference: String,
+    /// Every reference passed to `docker save`. Listing all tags is what keeps
+    /// them: `docker save` preserves an image's other tags only when the
+    /// argument omits a tag, so exporting one `repo:tag` drops the rest.
+    pub export_references: Vec<String>,
     /// Repo tags preserved by the source daemon.
     pub repo_tags: Vec<String>,
     /// Repo tags that will overwrite an existing ArcBox tag.
     pub replace_tags: Vec<String>,
+}
+
+impl ImagePlan {
+    /// Returns the reference used when a container refers to this image.
+    #[must_use]
+    pub fn primary_reference(&self) -> &str {
+        self.export_references
+            .first()
+            .map_or(self.image_id.as_str(), String::as_str)
+    }
 }
 
 /// Source volume transfer description.
@@ -145,10 +161,15 @@ pub struct ContainerPlan {
     pub extra_networks: Vec<ContainerNetworkAttachment>,
     /// Whether the target container will be replaced.
     pub replace_existing: bool,
+    /// Whether the container was running on the source, and so should be
+    /// started once the migration finishes.
+    pub was_running: bool,
+    /// Source creation timestamp, used to recreate in the original order.
+    pub created: String,
 }
 
 /// Container creation spec translated from inspect output.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerSpec {
     /// Hostname.
     pub hostname: Option<String>,
@@ -186,8 +207,45 @@ pub struct ContainerSpec {
     pub extra_hosts: Vec<String>,
     /// Auto-remove on exit.
     pub auto_remove: bool,
-    /// Primary network attached during create.
-    pub primary_network: Option<ContainerNetworkAttachment>,
+    /// Memory limit in bytes, when one is set.
+    pub memory: Option<i64>,
+    /// CPU quota in units of 10^-9 CPUs, when one is set.
+    pub nano_cpus: Option<i64>,
+    /// Added Linux capabilities.
+    pub cap_add: Vec<String>,
+    /// Network the container joins at create time.
+    pub network_mode: NetworkModeSpec,
+}
+
+/// The network a container joins at create time, from `HostConfig.NetworkMode`.
+///
+/// `container:<name|id>` is deliberately absent: it is rejected during planning
+/// rather than modelled, because reproducing it would require resolving the
+/// peer container and ordering creation around it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkModeSpec {
+    /// The default bridge network; no `--network` flag is emitted.
+    #[default]
+    Default,
+    /// Host networking.
+    Host,
+    /// No networking.
+    None,
+    /// A user-defined network that is part of this migration.
+    Named(ContainerNetworkAttachment),
+}
+
+impl NetworkModeSpec {
+    /// Returns whether this mode shares another namespace, which bars the
+    /// container from joining any further network.
+    ///
+    /// Docker rejects that combination outright ("container sharing network
+    /// namespace with another container or host cannot be connected to any
+    /// other network"), so additional attachments must be skipped.
+    #[must_use]
+    pub const fn forbids_extra_networks(&self) -> bool {
+        matches!(self, Self::Host)
+    }
 }
 
 /// Supported mount definitions.

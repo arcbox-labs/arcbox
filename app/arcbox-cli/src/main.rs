@@ -1,14 +1,18 @@
 //! ArcBox CLI - High-performance container and VM runtime.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
+use std::io::IsTerminal as _;
+use std::process::ExitCode;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
+mod connect;
+mod error;
 
 use commands::{Cli, Commands};
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     // Sentry must be initialized before the tokio runtime so that spawned
     // threads inherit the Hub from the main thread.
     // When SENTRY_DSN is unset, this is a no-op with zero overhead.
@@ -28,6 +32,18 @@ fn main() -> Result<()> {
     });
 
     let cli = Cli::parse();
+    let debug = cli.debug;
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}", crate::error::render(&error, debug));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    cli.validate_output_format()?;
 
     // Set ARCBOX_SOCKET env var if --socket was provided.
     // This makes it available to gRPC socket resolution in machine commands.
@@ -37,12 +53,66 @@ fn main() -> Result<()> {
         unsafe {
             std::env::set_var("ARCBOX_SOCKET", socket.as_os_str());
         }
+        if let Some(data_dir) = arcbox_cli::runtime_selection::data_dir_from_docker_socket(socket) {
+            let development_instance =
+                arcbox_cli::runtime_selection::is_development_instance(&data_dir);
+            let selected_profile = cli.profile.or_else(|| {
+                std::env::var(arcbox_constants::env::PROFILE)
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            });
+            if development_instance
+                && selected_profile.is_some_and(|profile| {
+                    profile != arcbox_constants::paths::ArcboxProfile::Development
+                })
+            {
+                bail!(
+                    "--socket selects an isolated development instance, but the selected profile is production"
+                );
+            }
+            if let Some(configured) = std::env::var_os(arcbox_constants::env::DATA_DIR) {
+                if std::path::Path::new(&configured) != data_dir {
+                    bail!(
+                        "--socket selects {}, but {} selects {}",
+                        data_dir.display(),
+                        arcbox_constants::env::DATA_DIR,
+                        std::path::Path::new(&configured).display()
+                    );
+                }
+            } else {
+                // SAFETY: startup is still single-threaded.
+                unsafe {
+                    std::env::set_var(arcbox_constants::env::DATA_DIR, &data_dir);
+                }
+            }
+            if development_instance && selected_profile.is_none() {
+                // SAFETY: startup is still single-threaded.
+                unsafe {
+                    std::env::set_var(
+                        arcbox_constants::env::PROFILE,
+                        arcbox_constants::paths::ArcboxProfile::Development.as_str(),
+                    );
+                }
+            }
+        }
     }
     if let Some(profile) = cli.profile {
         // SAFETY: This is called at the start of main(), before any threads are spawned,
         // and we're the only ones modifying this environment variable.
         unsafe {
             std::env::set_var(arcbox_constants::env::PROFILE, profile.as_str());
+        }
+    }
+    if std::env::var_os(arcbox_constants::env::DOCKER_CONTEXT).is_none() {
+        let profile = arcbox_constants::paths::ArcboxProfile::from_env_or_default();
+        let data_dir = arcbox_constants::paths::HostLayout::from_env_or_default().data_dir;
+        if let Some(context) =
+            arcbox_cli::runtime_selection::docker_context_name_for(profile, &data_dir)
+        {
+            // SAFETY: startup is still single-threaded.
+            unsafe {
+                std::env::set_var(arcbox_constants::env::DOCKER_CONTEXT, context);
+            }
         }
     }
 
@@ -57,7 +127,13 @@ fn main() -> Result<()> {
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(arcbox_cli::terminal::ansi_enabled(
+                    std::io::stderr().is_terminal(),
+                )),
+        )
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -79,13 +155,13 @@ fn main() -> Result<()> {
             Commands::Kubernetes(cmd) => commands::kubernetes::execute(cmd).await,
             Commands::System(cmd) => commands::system::execute(cmd).await,
             Commands::Boot(cmd) => commands::boot::execute(cmd, cli.format).await,
-            Commands::Disk(cmd) => commands::disk::execute(cmd).await,
+            Commands::Disk(cmd) => commands::disk::execute(cmd, cli.format).await,
             #[cfg(target_os = "macos")]
-            Commands::Dns(cmd) => commands::dns::execute(cmd).await,
+            Commands::Dns(cmd) => commands::dns::execute(cmd, cli.format).await,
             Commands::Daemon(args) => commands::daemon::execute(args).await,
             Commands::Logs(args) => commands::logs::execute(args).await,
             Commands::Setup(cmd) => commands::setup::execute(cmd, cli.format).await,
-            Commands::Doctor => commands::doctor::execute().await,
+            Commands::Doctor => commands::doctor::execute(cli.format).await,
             Commands::Top(args) => commands::top::execute(args, cli.format).await,
             #[cfg(target_os = "macos")]
             Commands::Install(args) => commands::install::execute(args).await,
@@ -94,7 +170,7 @@ fn main() -> Result<()> {
             #[cfg(target_os = "macos")]
             Commands::Internal(cmd) => commands::internal::execute(cmd).await,
             Commands::Info => execute_info().await,
-            Commands::Version => commands::version::execute().await,
+            Commands::Version => commands::version::execute(cli.format).await,
         }
     });
 

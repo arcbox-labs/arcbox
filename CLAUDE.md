@@ -12,15 +12,18 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 |--------|--------|----------|
 | Cold boot | <1.5s | ~2s |
 | Warm boot | <500ms | <1s |
-| Idle memory | <150MB (HV backend)¹ | ~200MB |
+| Idle memory | <150MB¹ | ~200MB |
 | Idle CPU | <0.05% | <0.1% |
 | File I/O | ≥100% of the best competitor guest² | 75-95% (vs native, their claim) |
 | Network throughput | >50 Gbps | ~45 Gbps |
 
-¹ Physically unreachable on VZ: host footprint pins at the configured
-  `memory_mb` from boot and ballooning cannot return it (evidence in
-  `app/arcbox-core/src/vm_lifecycle/balloon/mod.rs`). The VZ memory story
-  is right-sizing `memory_mb`.
+¹ Host cost is the high-water mark of guest-*touched* pages, not the
+  configured `memory_mb`: a fresh idle 16 GB VZ VM measured ~718MB of
+  host `phys_footprint` (2026-08-01). But no macOS backend reclaims, so
+  that mark is a one-way ratchet — the guest freeing 3GB leaves the host
+  paying for it forever. Only HV can ever release it (VZ guest RAM lives
+  in Apple's XPC process, unreachable by `madvise`). Evidence in
+  `engine/arcbox-engine/src/vm_lifecycle/balloon/mod.rs`.
 ² Same-context comparison (container vs container, same-day pairing).
   Cache-hot native is not a valid denominator for FUSE metadata —
   methodology and current numbers in `docs/fs-perf-limits.md`.
@@ -37,6 +40,8 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `virt/` — Virtualization.framework bindings, cross-platform hypervisor traits, VMM, VirtIO devices, VirtioFS, networking (NAT/DHCP/DNS)
 - `rpc/` — protobuf definitions, gRPC services, vsock/unix transport
 - `runtime/` — container state, OCI image/runtime
+- `engine/` — embeddable, daemon-free engine library (boot assets, machine images, VM/machine lifecycle, agent client; growing per the architecture charter in the company repo)
+- `computer/` — agent-computer domain layer: transport-free sandbox protocols behind the `SandboxHost` seam
 - `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`abctl`, not `arcbox`), daemon binary (`arcbox-daemon`), facade crate
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — test resources and fixture build scripts
@@ -52,6 +57,8 @@ govern, and are imported here:
 @virt/arcbox-vmm/AGENTS.md
 @virt/arcbox-vz/AGENTS.md
 @virt/arcbox-virtio-blk/AGENTS.md
+@engine/AGENTS.md
+@computer/AGENTS.md
 @app/AGENTS.md
 @guest/AGENTS.md
 @rpc/AGENTS.md
@@ -109,6 +116,47 @@ When asked to plan, the plan must be fully resolved before implementation begins
 - Use `cargo add` / `cargo remove` for dependency changes, not manual Cargo.toml edits.
 - PR merges are squash-only (merge commits are disabled on the repo). For stacked PRs, merge the base PR first — and expect GitHub to close the stacked PR when the base branch is deleted; recovery is: re-push the old base ref, reopen the PR, retarget it to master, delete the ref again, then close/reopen once more to trigger CI (pushes made while a PR is closed fire no events).
 - Review-bot findings (pullfrog/Codex/Greptile) get verified against the code first, then either fixed with a reply + thread resolution, or refuted with evidence in the reply. Never resolve a thread silently.
+
+## Releasing (the ordering is the contract)
+
+A release runs: merge the release PR → release-please creates the tag **and a
+draft GitHub release** → the tag push starts `Release Build` →
+`package-and-release` attaches the tarball and *then* publishes → the
+arcbox-desktop bump is announced. Each arrow is load-bearing; changing one
+without the others reintroduces a failure already paid for.
+
+- **The release stays a draft until its assets exist.** `release-please-config.json`
+  sets `draft` + `force-tag-creation`. v0.6.4 published the moment its tag was
+  cut, its macOS build then timed out, and the assetless release sat at the top
+  of the releases page — and told arcbox-desktop to bump to it, whose DMG build
+  failed eight hours later on a missing protoc, three layers from the cause.
+- **`force-tag-creation` is not optional alongside `draft`.** GitHub withholds
+  the git tag for a draft release, and `Release Build` triggers on tag pushes;
+  without it nothing builds at all.
+- **`draft` belongs on the root package only.** `fleet`, `sdk/typescript` and
+  `sdk/python` publish from other workflows and would sit as drafts forever.
+  Their tags carry component prefixes, so they never trigger `Release Build`.
+- **Publishing uses the app token, not `GITHUB_TOKEN`.** A draft created by one
+  integration cannot be modified by another — arcbox-desktop spent a release
+  cycle discovering that as a 403 on the update, *after* finding the draft.
+  Keep that token narrowed to this repo and to contents.
+- **`update-desktop` waits for the assets and is not gated on the trigger.**
+  `workflow_dispatch` is how a half-finished release is recovered, which is the
+  case that job exists for; gating on `push` would re-attach assets there and
+  leave desktop un-bumped in silence. The guard that replaces it is a
+  *newest-release* check, not a trigger check: the dispatch `tag` is free-form
+  and flows straight into the bump, so recovering a superseded tag would
+  propose moving desktop's `arcbox.version` **backwards**. A redundant bump is
+  cheap; a downgrade is not. Do not remove that check believing the worst case
+  is a no-op.
+- **The release cache is written from master, never from a tag.** A tag cannot
+  read another tag's caches, so no release can warm the next one. `ci.yml`
+  writes `macOS-cargo-release-*`; `Release Build` restores only, and must not
+  fall back to CI's `macOS-cargo-` debug cache — that fallback made the build
+  look cached while it recompiled the whole graph.
+- **A red release run is not evidence of a missing artifact, and green is not
+  evidence of a present one.** Check `gh release view <tag> --json assets`
+  before concluding anything about a release.
 
 ## Licensing
 

@@ -1,0 +1,70 @@
+[project]
+name = "arcbox"
+version = "0.1.2"
+description = "ArcBox Sandbox SDK for Python — run isolated microVM sandboxes on your Mac"
+readme = "README.md"
+authors = [{ name = "ArcBox, Inc." }]
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.28.1",
+    "msgspec>=0.21.1",
+    "protobuf>=7.35.1",
+]
+
+[project.urls]
+Repository = "https://github.com/arcboxlabs/arcbox"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["src/arcbox/_gen"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# The sync tree is a mechanical unasync mirror: `async for … yield` has
+# no `yield from` form, so its transform cannot satisfy UP028.
+# gen_sync.py mirrors this ignore for its scratch directory, which sits
+# outside the project root where this pattern cannot anchor.
+"src/arcbox/_sync/*" = ["UP028"]
+"src/arcbox/e2b/_sync/*" = ["UP028"]
+
+[tool.pyright]
+include = ["src", "tests", "scripts"]
+exclude = ["src/arcbox/_gen", ".venv"]
+typeCheckingMode = "strict"
+
+# The codegen scripts drive tools that ship no type information
+# (grpcio-tools' protoc entry point, unasync); only the unknown-type
+# diagnostics that follow from those imports are relaxed there.
+[[tool.pyright.executionEnvironments]]
+root = "scripts"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ty.src]
+include = ["src", "tests", "scripts"]
+exclude = ["src/arcbox/_gen"]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.14.2",
+    "grpcio-tools>=1.83.0",
+    "pyrefly>=1.2.0",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "ruff>=0.16.1",
+    "ty>=0.0.65",
+    "unasync>=0.6.0",
+]

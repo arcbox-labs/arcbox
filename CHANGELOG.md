@@ -5,6 +5,421 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7](https://github.com/arcboxlabs/arcbox/compare/v0.6.6...v0.6.7) (2026-08-14)
+
+
+### Features
+
+* **runtime:** isolate development instances ([#613](https://github.com/arcboxlabs/arcbox/issues/613)) ([9d1856e](https://github.com/arcboxlabs/arcbox/commit/9d1856e7e1564ffcdca186da86761ca2c6e57ff3))
+
+
+### Bug Fixes
+
+* **ci:** unbreak the crates.io publish, and make the Rust SDK publishable ([#627](https://github.com/arcboxlabs/arcbox/issues/627)) ([1911fd7](https://github.com/arcboxlabs/arcbox/commit/1911fd769fd23615461cd14d4aee3de9262cad91))
+* **vmm:** repair the Linux arm, and gate engine/computer on it (restructure phase 5 debt) ([#625](https://github.com/arcboxlabs/arcbox/issues/625)) ([c49da74](https://github.com/arcboxlabs/arcbox/commit/c49da74e4e4b097f810ef80f4da4767be8b92c6f))
+
+
+### Code Refactoring
+
+* **computer:** close the P3 capability deviation, and clear arcbox-vm's dead weight (restructure phase 4a) ([#626](https://github.com/arcboxlabs/arcbox/issues/626)) ([939a4f5](https://github.com/arcboxlabs/arcbox/commit/939a4f52f4cccde4cc70bff216798a84af0b13cc))
+* **engine:** extract arcbox-snapshot, and give the durable-write primitive a crate (restructure phase 4a) ([#630](https://github.com/arcboxlabs/arcbox/issues/630)) ([1bc215f](https://github.com/arcboxlabs/arcbox/commit/1bc215fcf60b506ec1fa52852cd1991e620b3bd0))
+
+
+### Tests
+
+* **splicetcp:** size the partial-take tests against the granted socket buffer ([#629](https://github.com/arcboxlabs/arcbox/issues/629)) ([2daf9f9](https://github.com/arcboxlabs/arcbox/commit/2daf9f9758138946492eba150fc4bcb93814d72c))
+
+## [0.6.6](https://github.com/arcboxlabs/arcbox/compare/v0.6.5...v0.6.6) (2026-08-13)
+
+
+### Bug Fixes
+
+* **hypervisor:** make the KVM backend compile on Linux again ([#624](https://github.com/arcboxlabs/arcbox/issues/624)) ([a4f61cc](https://github.com/arcboxlabs/arcbox/commit/a4f61ccf518d5e59b55ef80f26a01c8f41fc39b2))
+* **net:** make the Linux half of the net stack compile again ([#622](https://github.com/arcboxlabs/arcbox/issues/622)) ([6390b42](https://github.com/arcboxlabs/arcbox/commit/6390b4256c842d46572825b8fd85b3c6df860bd4))
+
+
+### Code Refactoring
+
+* **computer:** open the computer layer — sandbox protocols behind the SandboxHost seam (restructure phase 3) ([#623](https://github.com/arcboxlabs/arcbox/issues/623)) ([b92a424](https://github.com/arcboxlabs/arcbox/commit/b92a42434a787ff3f5358abb2862adbf2302f133))
+* **engine:** extract arcbox-engine from arcbox-core (restructure phase 2) ([#621](https://github.com/arcboxlabs/arcbox/issues/621)) ([0aa48c9](https://github.com/arcboxlabs/arcbox/commit/0aa48c9e2e4ed6cc806341f180dd4e7889bb54dd))
+* **engine:** extract arcbox-image from arcbox-core (restructure phase 1) ([#620](https://github.com/arcboxlabs/arcbox/issues/620)) ([e76b67e](https://github.com/arcboxlabs/arcbox/commit/e76b67e7f3fe73f0b760d44b6ea9d76427d6b7c1))
+
+
+### Tests
+
+* **e2e:** cover the TTY, user, unexpose, and rejection contracts (CORE-18) ([#614](https://github.com/arcboxlabs/arcbox/issues/614)) ([5709e4f](https://github.com/arcboxlabs/arcbox/commit/5709e4f3184874bab1c137212b9419ef6f5983a7))
+
+
+### Documentation
+
+* move internal-docs to the private company repo ([#619](https://github.com/arcboxlabs/arcbox/issues/619)) ([648b6f6](https://github.com/arcboxlabs/arcbox/commit/648b6f622f5be896083362bc565eaf867470aaff))
+* **rpc:** the template catalog is served, not contract-only ([#617](https://github.com/arcboxlabs/arcbox/issues/617)) ([e4c55e1](https://github.com/arcboxlabs/arcbox/commit/e4c55e1418ff806d623bbbe036a37a077187d81d))
+
+
+### Build System
+
+* adopt arcbox-connectrpc, and make arcbox-connect publishable ([#618](https://github.com/arcboxlabs/arcbox/issues/618)) ([78fc6fd](https://github.com/arcboxlabs/arcbox/commit/78fc6fd297a2a052fd87a6d9f2926e1cdc2699c6))
+
+
+### Continuous Integration
+
+* **release:** make release runs mean something ([#611](https://github.com/arcboxlabs/arcbox/issues/611)) ([8d2bbe1](https://github.com/arcboxlabs/arcbox/commit/8d2bbe1fb8c598448f817363b82b01c3eb0d955b))
+
+
+### Miscellaneous Chores
+
+* **master:** release sdk-python 0.1.2 ([#580](https://github.com/arcboxlabs/arcbox/issues/580)) ([26b9a1e](https://github.com/arcboxlabs/arcbox/commit/26b9a1e4c28f173af760d2f7051b62dfd59d40f0))
+* **master:** release sdk-typescript 0.1.2 ([#581](https://github.com/arcboxlabs/arcbox/issues/581)) ([fd52f52](https://github.com/arcboxlabs/arcbox/commit/fd52f52886870e4d16fdaa105f57d9b1ec6927fc))
+
+## [0.6.5](https://github.com/arcboxlabs/arcbox/compare/v0.6.4...v0.6.5) (2026-08-11)
+
+
+### Features
+
+* **cli:** template catalog verbs and the presets rename (CORE-107) ([#602](https://github.com/arcboxlabs/arcbox/issues/602)) ([518cd46](https://github.com/arcboxlabs/arcbox/commit/518cd46cde5291bf4b5b7be8eed7950d0d2767a5))
+* **sandbox:** enforce template ready probes on boot and warm restore (CORE-107) ([#600](https://github.com/arcboxlabs/arcbox/issues/600)) ([3f01be9](https://github.com/arcboxlabs/arcbox/commit/3f01be960c25e5b20678c895e5253249ea08ecc4))
+* **sandbox:** implement snapshot promotion into templates (CORE-107) ([#595](https://github.com/arcboxlabs/arcbox/issues/595)) ([9bf0ae8](https://github.com/arcboxlabs/arcbox/commit/9bf0ae8d90ed874c01848f4b2913cd54c107ff16))
+* **sandbox:** prewarm builds and template warm-restore on create (CORE-107) ([#599](https://github.com/arcboxlabs/arcbox/issues/599)) ([898f645](https://github.com/arcboxlabs/arcbox/commit/898f645ab58b463fabb9c7b9d0f20f4d4e7dcdeb))
+* **sandbox:** resolve catalog templates in Create with pinned keys and default merge (CORE-107) ([#597](https://github.com/arcboxlabs/arcbox/issues/597)) ([1b42544](https://github.com/arcboxlabs/arcbox/commit/1b425446125aeebc529cda81cdf622740ddc0afa))
+* **sdk:** arcbox — the native Rust SDK, phase 1 (lifecycle core) ([#603](https://github.com/arcboxlabs/arcbox/issues/603)) ([90f9fa8](https://github.com/arcboxlabs/arcbox/commit/90f9fa8d3beedd65ba06385d89dc45d66b0a0a68))
+* **sdk:** commands surface for the Rust SDK ([#606](https://github.com/arcboxlabs/arcbox/issues/606)) ([9b55a70](https://github.com/arcboxlabs/arcbox/commit/9b55a70b53ceb576e3b35e58173cd3ef0685aa7b))
+* **sdk:** files, ports, snapshots and events for the Rust SDK ([#608](https://github.com/arcboxlabs/arcbox/issues/608)) ([86bc3c6](https://github.com/arcboxlabs/arcbox/commit/86bc3c6fe24fb25b23014635109cc5a50457e651))
+
+
+### Bug Fixes
+
+* **sandbox:** PATH-resolve the TAP-delete ip binary; prove caller-less cleanup releases host resources (CORE-19/20) ([#612](https://github.com/arcboxlabs/arcbox/issues/612)) ([5b5adfe](https://github.com/arcboxlabs/arcbox/commit/5b5adfe764938195ee163be954f4096c2afab23d))
+
+
+### Performance Improvements
+
+* **vmnet:** event-driven relay read path, drop the 1 kHz poll thread ([#596](https://github.com/arcboxlabs/arcbox/issues/596)) ([9f05e30](https://github.com/arcboxlabs/arcbox/commit/9f05e309bdb6153de6bcb4a7dabd1f62d04ba781))
+
+
+### Tests
+
+* **e2e:** template catalog scenario + the four bugs it caught; docs + proto freeze (CORE-107) ([#607](https://github.com/arcboxlabs/arcbox/issues/607)) ([6ccb5aa](https://github.com/arcboxlabs/arcbox/commit/6ccb5aa74fbd4d9db07c9045daab7e7611a46b34))
+
+
+### Documentation
+
+* **agents:** sync AGENTS.md with the shipped template catalog (CORE-107) ([#610](https://github.com/arcboxlabs/arcbox/issues/610)) ([17334a9](https://github.com/arcboxlabs/arcbox/commit/17334a9e7be7440c1900c8ad5097adf38bac8269))
+
+
+### Continuous Integration
+
+* hand the desktop bump to arcbox-desktop ([#601](https://github.com/arcboxlabs/arcbox/issues/601)) ([fa11e85](https://github.com/arcboxlabs/arcbox/commit/fa11e8591673eecff2d559aaf2d09cfb26784e1d))
+
+
+### Miscellaneous Chores
+
+* **cli:** retire the arcbox rename shim ([#554](https://github.com/arcboxlabs/arcbox/issues/554)) ([95b1edf](https://github.com/arcboxlabs/arcbox/commit/95b1edfcb872ccbac31c97406568ad074cfbb1d4))
+
+## [0.6.4](https://github.com/arcboxlabs/arcbox/compare/v0.6.3...v0.6.4) (2026-08-10)
+
+
+### Features
+
+* **agent:** serve sandbox pause/resume over vsock (CORE-21) ([43de608](https://github.com/arcboxlabs/arcbox/commit/43de60802524f49c7a8e441e00d93d73020caa16))
+* **api:** classify agent errors into the sandbox error registry (CORE-58) ([072c937](https://github.com/arcboxlabs/arcbox/commit/072c9376ec492eb122aa4ec906b8ad87e275f323))
+* **api:** list sandbox exposed ports (CORE-102) ([#585](https://github.com/arcboxlabs/arcbox/issues/585)) ([e40e57a](https://github.com/arcboxlabs/arcbox/commit/e40e57af1005bdfe5f339abd22c511ad24f3bf81))
+* **api:** real GetCapabilities + nested-virt fail-fast on Create (CORE-13) ([cb5ed3c](https://github.com/arcboxlabs/arcbox/commit/cb5ed3c3d02987ffdc8c3609677cd36b50f67aa3))
+* **api:** real Pause/Resume + daemon-side transparent auto-resume (CORE-21) ([0f1a782](https://github.com/arcboxlabs/arcbox/commit/0f1a78234d510a4c754acd51049c5dd82bd4462a))
+* **core:** AgentClient pause/resume RPCs (CORE-21) ([1874e39](https://github.com/arcboxlabs/arcbox/commit/1874e39e5d54d3b8e13ef4ad46282453c435b82d))
+* **e2e:** idle auto-pause + SetLifecycle + capabilities scenario; docs (CORE-21/60/13) ([90216b2](https://github.com/arcboxlabs/arcbox/commit/90216b25b82b434251db57aa6ea3473edfe61ddb))
+* **e2e:** pause / auto-resume / explicit-resume scenario (CORE-21) ([fdae9b5](https://github.com/arcboxlabs/arcbox/commit/fdae9b5d083b7d70bee92ddc60632fcd0a47da23))
+* **rpc:** pause/resume vsock wire types (CORE-21) ([bea2938](https://github.com/arcboxlabs/arcbox/commit/bea2938115c82342e0c9f8894ae589f1f52a4d24))
+* **sandbox:** implement template Build from a docker_ref source (CORE-107) ([#593](https://github.com/arcboxlabs/arcbox/issues/593)) ([a7db0d4](https://github.com/arcboxlabs/arcbox/commit/a7db0d44f2450e746ba692ad791585ace47c905b))
+* **sandbox:** implement template Build from inline Dockerfile content (CORE-107) ([#594](https://github.com/arcboxlabs/arcbox/issues/594)) ([fd3bb9f](https://github.com/arcboxlabs/arcbox/commit/fd3bb9f22055cd13a9933b8675d1bc887c7b8955))
+* **sandbox:** implement the filesystem verbs and process-plane queries (CORE-62) ([#582](https://github.com/arcboxlabs/arcbox/issues/582)) ([cad4fee](https://github.com/arcboxlabs/arcbox/commit/cad4fee2785bf0aae61df077ccb83792cb2a6be0))
+* **sandbox:** network-identity-invariant snapshots ([#562](https://github.com/arcboxlabs/arcbox/issues/562)) ([4149fb1](https://github.com/arcboxlabs/arcbox/commit/4149fb1b4bfd021399398a98173348981f7114bf))
+* **sandbox:** serve eligible creates from warm template snapshots ([#569](https://github.com/arcboxlabs/arcbox/issues/569)) ([d23c12b](https://github.com/arcboxlabs/arcbox/commit/d23c12b8b4c8c9a238e6ac6d2d4baa725e508fa2))
+* **sandbox:** template catalog store with GC pins (CORE-107) ([#590](https://github.com/arcboxlabs/arcbox/issues/590)) ([82c8b65](https://github.com/arcboxlabs/arcbox/commit/82c8b651dfca672853bc2235cf4715163212f8db))
+* **sandbox:** wire SetLifecycle end to end (CORE-60) ([ecdf7d2](https://github.com/arcboxlabs/arcbox/commit/ecdf7d21f5d89d09f7e8114c2160a0742e4657f4))
+* **sandbox:** wire the template catalog RPCs end to end (CORE-107) ([#592](https://github.com/arcboxlabs/arcbox/issues/592)) ([a92fb13](https://github.com/arcboxlabs/arcbox/commit/a92fb136ef5ff0e64c437bd28fcbf887d624ecf7))
+* **vm:** idle detection + on_idle policy and re-armable TTL deadlines (CORE-21/60) ([d5b2dff](https://github.com/arcboxlabs/arcbox/commit/d5b2dff5b81c9fcd4e5d7a7e06b57d91283b6935))
+* **vm:** sandbox pause/resume on the same id (CORE-21) ([a244ce2](https://github.com/arcboxlabs/arcbox/commit/a244ce256df775fe1f6827037bab6e5eba37ddb6))
+
+
+### Bug Fixes
+
+* **agent:** disambiguate exec ENOENT failures ([62aa0c4](https://github.com/arcboxlabs/arcbox/commit/62aa0c491e4fe044f8a0c7de7724ddf0122cc3c7))
+* **ci:** harden the SDK publish jobs against the review findings ([ef4e411](https://github.com/arcboxlabs/arcbox/commit/ef4e4112d4ba087b2f3283af58e76f3599328934))
+* **ci:** install with --frozen so a release tag's version bump is not fatal ([76ae8ee](https://github.com/arcboxlabs/arcbox/commit/76ae8ee0d9c97202b800ddb24ab075740b138fc7))
+* **ci:** pin the publish jobs' actions and drop their cache/credential surface ([2fb3528](https://github.com/arcboxlabs/arcbox/commit/2fb3528e2b52bc5472eac82151293a13d013ed7a))
+* **cli:** clarify component and boot versions ([134da85](https://github.com/arcboxlabs/arcbox/commit/134da85966e5a1a6ba33f4d5aa94b54e8d0b8257))
+* **cli:** classify machine and sandbox failures ([9256795](https://github.com/arcboxlabs/arcbox/commit/925679513221ae4dcac0e825155073a959fecb73))
+* **cli:** complete debug guidance fallbacks ([052d392](https://github.com/arcboxlabs/arcbox/commit/052d392dc319307a0c919e9ebeb7d77ee48bdf2e))
+* **cli:** preserve raw-mode output and debug guidance ([28591dd](https://github.com/arcboxlabs/arcbox/commit/28591dd00f87ab804de086fd55885b72886ffaa8))
+* **cli:** render actionable command failures ([85abe57](https://github.com/arcboxlabs/arcbox/commit/85abe57c84a025681fc8a8ef879e4ae8dd3b30d9))
+* **cli:** resolve CORE-91/92/93/94/95/98 production audit findings ([#577](https://github.com/arcboxlabs/arcbox/issues/577)) ([56567d1](https://github.com/arcboxlabs/arcbox/commit/56567d12034b6519666f0a639a223bc6edc24194))
+* **cli:** restore top controls and sanitize ANSI ([dc37582](https://github.com/arcboxlabs/arcbox/commit/dc375825e62e7025f55da16f38bbeace4bf4669f))
+* **e2e:** apply the cold-download READY budget to the sdk_py harness too ([277a1dd](https://github.com/arcboxlabs/arcbox/commit/277a1dd224f2b2a163670d9aae80ad525960ec1a))
+* **e2e:** apply the cold-download READY budget to the sdk_ts harness too ([9984dcf](https://github.com/arcboxlabs/arcbox/commit/9984dcf518209b4d2c9a520f3df8d0363973e5ec))
+* **e2e:** budget the sandbox smoke's cold runtime-binary download ([8b5dfad](https://github.com/arcboxlabs/arcbox/commit/8b5dfadba4815428c4a0adb4815332ea9ccda2a0))
+* **e2e:** drop the stray doc bullet from the sdk_ts READY budget comment ([d856408](https://github.com/arcboxlabs/arcbox/commit/d85640812fadb1330f25d608fd84291b88d19d67))
+* **e2e:** seed guest runtime binaries into the generation directory ([4b2041b](https://github.com/arcboxlabs/arcbox/commit/4b2041bb873b4f2a74343275ff89ea09e81eefa7))
+* **exec:** preserve actionable resource errors ([63fc728](https://github.com/arcboxlabs/arcbox/commit/63fc728ced56a1642fb9044530a4908d69bf43a0))
+* **release:** resume partial crates.io publishes ([#548](https://github.com/arcboxlabs/arcbox/issues/548)) ([34a5e64](https://github.com/arcboxlabs/arcbox/commit/34a5e641aa91e5f47a63e92efdef0b0d53c4b7cd))
+* **sandbox:** abort resume when the Resuming commit is not durable ([01dd386](https://github.com/arcboxlabs/arcbox/commit/01dd38659c5a1125f331c8dde13d2d27fdc06dc5))
+* **sandbox:** address the lifecycle-knobs review findings ([5bcd4cb](https://github.com/arcboxlabs/arcbox/commit/5bcd4cbd987c574b8ee169f2a258d01fbe40ac2b))
+* **sandbox:** classify file read/write errors on the file channel ([#586](https://github.com/arcboxlabs/arcbox/issues/586)) ([b79304a](https://github.com/arcboxlabs/arcbox/commit/b79304a5b525e5e5421af34d3f606e679f72e8c7))
+* **sandbox:** close the idle-pause -&gt; resume network-finalization race ([45cd0e6](https://github.com/arcboxlabs/arcbox/commit/45cd0e6241abc81244939cc65c862ba60461c934))
+* **sandbox:** fix the TAP-teardown race and surface swallowed RPC failures ([#567](https://github.com/arcboxlabs/arcbox/issues/567)) ([49d7119](https://github.com/arcboxlabs/arcbox/commit/49d711934e6c5928d02a5380b33c2ea656493975))
+* **sandbox:** keep paused_at stable across failed resumes; prove the resumed TAP ([4036c21](https://github.com/arcboxlabs/arcbox/commit/4036c21aa21ffd953991a5521f44af4219cecf4d))
+* **sandbox:** survive the pause-commit-to-journal-clear crash window ([4189097](https://github.com/arcboxlabs/arcbox/commit/4189097ae56beda443c4ac9bd33e8091ee3ab683))
+* **vm:** gate dm-snapshot CoW on device-mapper usability, not binary existence ([253a55e](https://github.com/arcboxlabs/arcbox/commit/253a55e1e6167f1eba851ce1889ccbbbafa9d052))
+
+
+### Performance Improvements
+
+* **net:** batch guest-bound frame writes with sendmsg_x (ABX-313) ([943d9cd](https://github.com/arcboxlabs/arcbox/commit/943d9cd0cfd458282b6482ccfe6b9a036ab78279))
+* **sandbox:** cold-start probe + restore fast path round 1 ([#555](https://github.com/arcboxlabs/arcbox/issues/555)) ([1b4b766](https://github.com/arcboxlabs/arcbox/commit/1b4b766906262f7ffa86acb8977a633f014464c2))
+* **sandbox:** eBPF TCX datapath for invariant sandbox NAT ([#566](https://github.com/arcboxlabs/arcbox/issues/566)) ([46ef5a3](https://github.com/arcboxlabs/arcbox/commit/46ef5a369ca6dec1ab681dcb22380b507e4cc85d))
+* **sandbox:** gate READY on agent vsock readiness and back off the connect poll ([#559](https://github.com/arcboxlabs/arcbox/issues/559)) ([6d8ab5f](https://github.com/arcboxlabs/arcbox/commit/6d8ab5f0b62af86bb53866a0fc0fd4dd5fbf6b95))
+* **sandbox:** make boot readiness an event via guest vsock dial-out ([#560](https://github.com/arcboxlabs/arcbox/issues/560)) ([b8b7631](https://github.com/arcboxlabs/arcbox/commit/b8b7631b60eb9927ec8aeb91490e43e8d596abaf))
+* **sandbox:** pre-warm restore slots behind an LRU snapshot pool ([#561](https://github.com/arcboxlabs/arcbox/issues/561)) ([6a08111](https://github.com/arcboxlabs/arcbox/commit/6a081119530efeca260cf0d8f253f482ec07c87f))
+* **sandbox:** quiet microVM console + reconfig latency attribution + resolv on tmpfs (round 2) ([#558](https://github.com/arcboxlabs/arcbox/issues/558)) ([72f0e74](https://github.com/arcboxlabs/arcbox/commit/72f0e745d05b99d1ce775f13a9d9e0b5feabe33b))
+* **sandbox:** self-sync the guest clock from ptp_kvm, off the restore path ([#568](https://github.com/arcboxlabs/arcbox/issues/568)) ([21c5232](https://github.com/arcboxlabs/arcbox/commit/21c52321b8fcaf9a4e228884ceb11ebcd1eddd65))
+* **splicetcp:** batch guest-to-host frame reads with recvmsg_x (ABX-313) ([48413aa](https://github.com/arcboxlabs/arcbox/commit/48413aaa042c6d827cdb9c95e84ab0f47e086d99))
+* **xnu-net:** iterator send API and live sysctl batch caps ([693b29b](https://github.com/arcboxlabs/arcbox/commit/693b29b8f48019131ddd82fa760275557aae2860))
+
+
+### Tests
+
+* **agent:** cover missing working directory ([2cd0810](https://github.com/arcboxlabs/arcbox/commit/2cd0810ef06ab7d770778cae3764c2510f957fcc))
+* **e2e:** sdk_py harness — Python SDK hello world vs isolated daemon ([e5189b2](https://github.com/arcboxlabs/arcbox/commit/e5189b252833e43e43c4e7c5d6d9ab8f5274066d))
+* **sandbox:** cover the terminal-state TTL guard and the List storage path ([9089f48](https://github.com/arcboxlabs/arcbox/commit/9089f48b6ef2a4d7e33bbcbad706ae84a63d5bff))
+
+
+### Documentation
+
+* **common:** record the batch-I/O contract the datapath now depends on ([f8e427b](https://github.com/arcboxlabs/arcbox/commit/f8e427b97eb6bff3405b2007c2dfe4729c8546fd))
+* **sandbox:** pause/resume semantics + resolve the Pause-from-RUNNING ambiguity ([7efe0d5](https://github.com/arcboxlabs/arcbox/commit/7efe0d55d07a368f15cd7bfec328075db8c22591))
+* **sdk:** mark the PyPI publish workflow pending and record the bootstrap caveats ([d240b92](https://github.com/arcboxlabs/arcbox/commit/d240b92b1e4277f7c41f1dd30f89a608e5c7eb05))
+* **xnu-net:** pin XNU's silent recv truncation ([93bcf7d](https://github.com/arcboxlabs/arcbox/commit/93bcf7d0235ab9401534ec66c028e65cb38cf33b))
+
+
+### Build System
+
+* **sdk:** register @arcbox/sandbox as a release-please component ([d36184a](https://github.com/arcboxlabs/arcbox/commit/d36184a2f35f742b2f0f2a5e6df1143b87ea718e))
+* **sdk:** register arcbox (Python) as a release-please component ([3b44845](https://github.com/arcboxlabs/arcbox/commit/3b44845028754de220e5a94bae54096daf6cddcf))
+
+
+### Continuous Integration
+
+* hash-pin actions and harden ci.yml per zizmor ([88d6220](https://github.com/arcboxlabs/arcbox/commit/88d62200ed5a10798848e8e7a412c4cd8856fb96))
+* **sdk:** gate the TypeScript and Python SDKs on every PR ([f1cda25](https://github.com/arcboxlabs/arcbox/commit/f1cda25ff028a6a9cdb8ac898d58455faf1a6776))
+* **sdk:** mirror the release uv build in the Python PR gate ([89a9323](https://github.com/arcboxlabs/arcbox/commit/89a932388e575e4d7afda43ebb07791c6e96951a))
+* **sdk:** pin the PR gate's uv to the release toolchain range ([a7f5d51](https://github.com/arcboxlabs/arcbox/commit/a7f5d51c35f74c72750913080ecdb46f590ab3ed))
+* **sdk:** publish @arcbox/sandbox to npm on the sdk-typescript tag ([bf9af74](https://github.com/arcboxlabs/arcbox/commit/bf9af74c1268b8e8296f2a2d496d72567c7b7754))
+* **sdk:** publish arcbox (Python) to PyPI on the sdk-python tag ([cf33b8c](https://github.com/arcboxlabs/arcbox/commit/cf33b8c91732dd1288fe480d383a3881f75916a5))
+
+
+### Miscellaneous Chores
+
+* **assets:** pin boot assets 0.8.4 with the two-arch microvm kernel ([#572](https://github.com/arcboxlabs/arcbox/issues/572)) ([50e59cd](https://github.com/arcboxlabs/arcbox/commit/50e59cddb176a2b6b6e4a992e8a6dfa445a12c5b))
+* **master:** release sdk-python 0.1.1 ([05e7cf5](https://github.com/arcboxlabs/arcbox/commit/05e7cf532bedfe84c948f8bed9db46019656ae43))
+* **master:** release sdk-typescript 0.1.1 ([79f6170](https://github.com/arcboxlabs/arcbox/commit/79f61709db4fcf26b478d0d4bdeb7a1e0c252b96))
+
+## [0.6.3](https://github.com/arcboxlabs/arcbox/compare/v0.6.2...v0.6.3) (2026-08-03)
+
+
+### Features
+
+* **rpc:** add the sandbox error registry (errors.proto) ([b3103c5](https://github.com/arcboxlabs/arcbox/commit/b3103c540e2ef64cff4b0bbd9186998092ff5dde))
+* **rpc:** execution discovery and port readiness on the process plane ([3c8dec6](https://github.com/arcboxlabs/arcbox/commit/3c8dec63081f927368f19ab15e97d4382fde594e))
+* **rpc:** filesystem path verbs (CORE-62) ([5f14b73](https://github.com/arcboxlabs/arcbox/commit/5f14b73207a41d14bb0c1f1b4364a4a563646e19))
+* **rpc:** first-class template catalog (template.proto, CORE-21) ([7505f3b](https://github.com/arcboxlabs/arcbox/commit/7505f3ba225fdedcf42e1100d7de3d04d1f3ccd2))
+* **rpc:** sandbox lifecycle — pause/resume, dual-knob timeouts, capabilities ([b081e99](https://github.com/arcboxlabs/arcbox/commit/b081e99e1c6c96b94e3fc7b88be03e8f92dd02ac))
+* **runtime:** materialize guest runtime on Btrfs ([#529](https://github.com/arcboxlabs/arcbox/issues/529)) ([9315eb8](https://github.com/arcboxlabs/arcbox/commit/9315eb87554b8afa2884bdd0f165332a027d505b))
+* **sdk:** ArcBox entry point and Sandbox handle ([fbf6ce4](https://github.com/arcboxlabs/arcbox/commit/fbf6ce4ecd99b5bd7082c0317e5526a8f98a6410))
+* **sdk:** commands and files data-plane namespaces ([038b674](https://github.com/arcboxlabs/arcbox/commit/038b6741e501940435a69210fc33cb91f09e9c74))
+* **sdk:** generate sandbox_v1 wire types via buf + protoc-gen-es ([2ec52ee](https://github.com/arcboxlabs/arcbox/commit/2ec52eed2fb47c6d1ba5507f6a34a0e512d0c149))
+* **sdk:** hello-world e2e gate and README ([e85bf73](https://github.com/arcboxlabs/arcbox/commit/e85bf73023830c18da9b0d7a78eb23c9d94c72e2))
+* **sdk:** scaffold @arcbox/sandbox package tooling ([5aa3134](https://github.com/arcboxlabs/arcbox/commit/5aa3134bd21d2e447e5ff1478f6c956e33bcf1b1))
+* **sdk:** UDS Connect transport and typed error mapping ([9241860](https://github.com/arcboxlabs/arcbox/commit/9241860d1e8f2cfeb5fc02f25d6d5e3f852e2e30))
+
+
+### Bug Fixes
+
+* **migration:** make a migrated dev environment actually run, add --dry-run ([#520](https://github.com/arcboxlabs/arcbox/issues/520)) ([02d5692](https://github.com/arcboxlabs/arcbox/commit/02d569265286c923106410f124bb4178c78250ee))
+* **rpc:** give SetLifecycle.on_idle explicit presence ([2e50089](https://github.com/arcboxlabs/arcbox/commit/2e50089744b5f0fdc552a31e885484107a1dd22b))
+* **rpc:** make template default cmd/env suppressible in Create ([2a438f9](https://github.com/arcboxlabs/arcbox/commit/2a438f9ce17c4583ee2a3959e8b9fc2307a42ce0))
+* **sdk:** clean up on failed create and widen the dispose not-found gate ([8aae4de](https://github.com/arcboxlabs/arcbox/commit/8aae4ded91afae0536ed96741f1b1931851afe50))
+* **sdk:** honor ARCBOX_PROFILE when resolving the default socket ([31cf8e5](https://github.com/arcboxlabs/arcbox/commit/31cf8e5626cdc6cbdc723cf3a02e7de83bf151b0))
+* **sdk:** include node types explicitly so the build config compiles ([18798cb](https://github.com/arcboxlabs/arcbox/commit/18798cba124759bc6c6da7423e072a4ba09806be))
+* **sdk:** report retained-output truncation and deadline the signal RPC ([b0d05cf](https://github.com/arcboxlabs/arcbox/commit/b0d05cfae622ee22437355ff36df912ad49c4136))
+* **sdk:** resolve the writeBytes default mode SDK-side ([2ca4c8c](https://github.com/arcboxlabs/arcbox/commit/2ca4c8c2a4b31fc4e394473e1219aeb8c1f8fa21))
+
+
+### Code Refactoring
+
+* **sdk:** resolve the sukka lint findings in handwritten code ([1611b15](https://github.com/arcboxlabs/arcbox/commit/1611b156622036045a2e97a10bc18712be41273a))
+
+
+### Tests
+
+* **e2e:** harness hook for SDK e2e ([1fcbf27](https://github.com/arcboxlabs/arcbox/commit/1fcbf27a5d18f4fb46c9d025c135099f19dd4a8f))
+
+
+### Documentation
+
+* **rpc:** pin the limits override contract's zero-subfield semantics ([dc92556](https://github.com/arcboxlabs/arcbox/commit/dc9255664415f54a0c17ba77afde85c68a3fe06d))
+* **sandbox:** carry the limits zero-subfield semantics into the API doc ([a94d9ab](https://github.com/arcboxlabs/arcbox/commit/a94d9ab922028d1a15e024ff6234dfd4699b4e2e))
+* **sandbox:** reflect the CORE-58 phase 1 contract additions ([34b4477](https://github.com/arcboxlabs/arcbox/commit/34b4477e8313d3c57654b6ac10c25cc96501205d))
+* **sandbox:** untangle the limits aside from the override enumeration ([b8d4057](https://github.com/arcboxlabs/arcbox/commit/b8d4057eab4c78fe98cdc5dd22057d6f049a8575))
+
+
+### Styles
+
+* **sdk:** apply the biome formatter ([6c2aff2](https://github.com/arcboxlabs/arcbox/commit/6c2aff2dbde4b39ccbe3157c290a5160d4dd84bd))
+
+
+### Miscellaneous Chores
+
+* **sdk:** build with bunchee instead of tsc ([4a6fae7](https://github.com/arcboxlabs/arcbox/commit/4a6fae7fb0c64c3b2a46cbe516bce7af3adfb3af))
+* **sdk:** swap prettier and typescript-eslint for biome and sukka ([4aab59f](https://github.com/arcboxlabs/arcbox/commit/4aab59f571c93be2a5c1fc5e477dd7f8de433d42))
+
+## [0.6.2](https://github.com/arcboxlabs/arcbox/compare/v0.6.1...v0.6.2) (2026-08-03)
+
+
+### Features
+
+* **sandbox:** establish durable lifecycle records ([#538](https://github.com/arcboxlabs/arcbox/issues/538)) ([876c47c](https://github.com/arcboxlabs/arcbox/commit/876c47c62626d4a78286c0a085cf96b4d155e635))
+
+
+### Bug Fixes
+
+* **sandbox:** make create retries idempotent ([#536](https://github.com/arcboxlabs/arcbox/issues/536)) ([3c44f06](https://github.com/arcboxlabs/arcbox/commit/3c44f06bde1324fdf145f255b28504702e50cfb6))
+
+
+### Code Refactoring
+
+* **rpc,daemon,fleet:** prost becomes test support only (CORE-73 follow-up) ([#540](https://github.com/arcboxlabs/arcbox/issues/540)) ([3b24286](https://github.com/arcboxlabs/arcbox/commit/3b242865e2e8f7ef51f29f9dbff07726f0acd2fa))
+
+## [0.6.1](https://github.com/arcboxlabs/arcbox/compare/v0.6.0...v0.6.1) (2026-08-03)
+
+
+### Reverts
+
+* **rpc:** roll the agent protocol back to 1 ([#537](https://github.com/arcboxlabs/arcbox/issues/537)) ([3502023](https://github.com/arcboxlabs/arcbox/commit/3502023d997ed9324fee4981168978e8b858edad))
+
+## [0.6.0](https://github.com/arcboxlabs/arcbox/compare/v0.5.5...v0.6.0) (2026-08-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **api:** retire tonic from the daemon (CORE-68)
+* **sandbox:** addressable executions, template-only API, plane split (CORE-54/55/56/57) ([#519](https://github.com/arcboxlabs/arcbox/issues/519))
+
+### Features
+
+* **agent:** gate the guest NFS export behind a host request (ABX-426) ([#512](https://github.com/arcboxlabs/arcbox/issues/512)) ([0330cc4](https://github.com/arcboxlabs/arcbox/commit/0330cc4bffda28e9e0d8808dd4d2cfd9cad7b774))
+* **api:** serve the sandbox control plane over Connect (CORE-53) ([99e1758](https://github.com/arcboxlabs/arcbox/commit/99e175825ecc1a6a8baddb2bf81f70ec82ec0e1c))
+* **daemon:** publish VM_STARTING/VM_READY/NETWORK_READY (CORE-67) ([8d52b12](https://github.com/arcboxlabs/arcbox/commit/8d52b129ee07843a86b73909a876a2701425493f))
+* **daemon:** serve reflection from the Connect stack (CORE-53) ([1eeff6b](https://github.com/arcboxlabs/arcbox/commit/1eeff6b4a17d63dbf59386ec702089079811be5f))
+* **daemon:** serve the sandbox API over Connect, gRPC, and gRPC-Web (CORE-53) ([33a9d5e](https://github.com/arcboxlabs/arcbox/commit/33a9d5ee3e9a92a7e50fcec70cb61d038b874321))
+* **daemon:** show ~/ArcBox files as owned by the browsing user (ABX-427) ([#515](https://github.com/arcboxlabs/arcbox/issues/515)) ([d3b17d2](https://github.com/arcboxlabs/arcbox/commit/d3b17d29f1808e9a5a02a638eb06262424889fcf))
+* **rpc:** generate the sandbox Connect surface with connectrpc + buffa (CORE-53) ([0c11969](https://github.com/arcboxlabs/arcbox/commit/0c11969db587038f61c202090c096ef589be1444))
+* **sandbox:** addressable executions, template-only API, plane split (CORE-54/55/56/57) ([#519](https://github.com/arcboxlabs/arcbox/issues/519)) ([f014052](https://github.com/arcboxlabs/arcbox/commit/f014052962bd5450dbaff3700b61e5847f046ddb))
+
+
+### Bug Fixes
+
+* **api,daemon:** fail the exec pump toward EOF and gate the macOS assertion ([2fc781f](https://github.com/arcboxlabs/arcbox/commit/2fc781f4898fd4c2f80504a5fa22a3e50072b402))
+* **api:** stream every setup-status update, not the newest snapshot ([b7bb651](https://github.com/arcboxlabs/arcbox/commit/b7bb65118d8252109d1ec2c233ac1d763c888d92))
+* **daemon,api:** pin the h2 stream cap and tidy test-only dependencies ([7b93edc](https://github.com/arcboxlabs/arcbox/commit/7b93edc6bb01c104773b133dc45bed591ea0d015))
+* **daemon:** arm the vm_running mirror before init, and stop over-promising ([01747dc](https://github.com/arcboxlabs/arcbox/commit/01747dcb2242b85f94ebea210dc971698178bd3e))
+* **daemon:** bound NFS unmount time ([da06aed](https://github.com/arcboxlabs/arcbox/commit/da06aed2b224173bb1d0ea7ad7630e1eaa2aa472))
+* **daemon:** make vm_running track the VM and a docker.sock bind fail startup ([03a09f9](https://github.com/arcboxlabs/arcbox/commit/03a09f9840a2c327a621bf17ebe7bfd8816384b7))
+* **daemon:** unmount NFS before shutdown ([8b868ae](https://github.com/arcboxlabs/arcbox/commit/8b868aee0c7c1583a6e089d3407634658b386c7d))
+* **helper:** use async fn syntax in the fs e2e test ([c8cdc1a](https://github.com/arcboxlabs/arcbox/commit/c8cdc1a37f768347495688d396d77287994afdb2))
+* **rpc:** build the Connect descriptor set with protoc compat flags ([57e3837](https://github.com/arcboxlabs/arcbox/commit/57e38372d9f5d61215c3b25c3d00acfaa136a8eb))
+
+
+### Code Refactoring
+
+* **agent:** port the guest agent to buffa message types ([8e4a37c](https://github.com/arcboxlabs/arcbox/commit/8e4a37ce27925666b6df9083cef383bc4d6040df))
+* **api,core:** retire tonic and the prost deps from the API layer ([b4b6f65](https://github.com/arcboxlabs/arcbox/commit/b4b6f65b9b679d96d119afedc334d2c8446173f0))
+* **api:** generate the daemon surface with buffa and move Icon (CORE-68) ([2e9d670](https://github.com/arcboxlabs/arcbox/commit/2e9d670f7c09b83a5ecfbeeccbfd56ffb2671029))
+* **api:** move Kubernetes and Migration onto Connect (CORE-68) ([d6fc295](https://github.com/arcboxlabs/arcbox/commit/d6fc295f8fc7080d5a3df377170a43363dadc96f))
+* **api:** move Machine onto Connect (CORE-68) ([f6db17f](https://github.com/arcboxlabs/arcbox/commit/f6db17f24c7d9cbd46c59a4a0e82e6bbbff0794e))
+* **api:** move Stats and System onto Connect (CORE-68) ([4f84914](https://github.com/arcboxlabs/arcbox/commit/4f849143303ac6ca26d15dca5bcd4b3721ce6493))
+* **api:** retire tonic from the daemon (CORE-68) ([016fd01](https://github.com/arcboxlabs/arcbox/commit/016fd0102b06e247b09d256aee2a5d1545ab799c))
+* **api:** single-type the machine and macos services on buffa ([86dd726](https://github.com/arcboxlabs/arcbox/commit/86dd7263b5b6b050dfe68be736c0e483ff06c353))
+* **cli,docker,transport:** drop the dead arcbox-protocol deps ([57b88c4](https://github.com/arcboxlabs/arcbox/commit/57b88c471230f6d64fbe4efe3aaac6b7414fde2f))
+* **cli:** drive interactive exec through a split Connect bidi stream (CORE-68) ([3b4d125](https://github.com/arcboxlabs/arcbox/commit/3b4d12593cc29fac037d9ca259488c8b3af3466d))
+* **cli:** machine and macos commands on buffa types ([ff21b22](https://github.com/arcboxlabs/arcbox/commit/ff21b220998111930cee04ce7dfcd8e8c66bbae6))
+* **cli:** move machine, system, migrate, and disk onto Connect (CORE-68) ([badd54a](https://github.com/arcboxlabs/arcbox/commit/badd54addbd15cc3ba8035b71fb1b7bd13b3c540))
+* **cli:** move the remaining clients onto Connect (CORE-68) ([166d9e5](https://github.com/arcboxlabs/arcbox/commit/166d9e59bad7227084be4a2b22dad7584f8c1ab5))
+* **cli:** sandbox and agent commands on buffa, delete the prost seam ([dbb24f2](https://github.com/arcboxlabs/arcbox/commit/dbb24f277cda309f4bfbf2deeac4c02a7acd3947))
+* **cli:** start moving clients onto Connect (CORE-68) ([72857e7](https://github.com/arcboxlabs/arcbox/commit/72857e7abfbcf75cf26dfa63eb13718792ddb0c8))
+* **cli:** system, disk, and kubernetes commands on buffa types ([e2b96f5](https://github.com/arcboxlabs/arcbox/commit/e2b96f5f263ffb5d3461abd1a3bf0b11bc3eca9c))
+* **cli:** top and migrate commands on buffa types ([230b9bd](https://github.com/arcboxlabs/arcbox/commit/230b9bd69e5d6b2643dd112d9c3b0f5076d023df))
+* **core,api:** port machine exec and stats to buffa end-to-end ([d2b4529](https://github.com/arcboxlabs/arcbox/commit/d2b452940b1b9ca3e294030aae159aa70ed7378f))
+* **core,api:** port the kubernetes surface to buffa ([e7ef45c](https://github.com/arcboxlabs/arcbox/commit/e7ef45cc26ba2e29d9548345362089eb44e203b3))
+* **core,api:** port the sandbox surface to buffa end-to-end ([2ba9f94](https://github.com/arcboxlabs/arcbox/commit/2ba9f943e8a85647179ba8223fb99eafe4e448ec))
+* **core,api:** single-type system, migration, and the setup state on buffa ([225f9cc](https://github.com/arcboxlabs/arcbox/commit/225f9cc35ec0225ad5f12682aa0f09bff2108acd))
+* **core:** fold the split arcbox_connect imports into one block ([5941358](https://github.com/arcboxlabs/arcbox/commit/5941358fc6e9e521c36bcfc18de9cc2cce386015))
+* **core:** port the host agent channel to buffa message types ([3c25982](https://github.com/arcboxlabs/arcbox/commit/3c25982b2d8eb92522636f575e3d8ddf13f0f1e5))
+* **docker:** drop the bind-and-serve wrapper that has no callers ([1c6d33d](https://github.com/arcboxlabs/arcbox/commit/1c6d33d592ffc9c65a840f7801c2c90b805f0a6b))
+* **rpc,e2e:** decouple persisted JSON from generated proto types ([55d68b2](https://github.com/arcboxlabs/arcbox/commit/55d68b23e7aa99a4443a2b25778a18274586d9e5))
+
+
+### Tests
+
+* **core:** pin the no-Linux-VM contract for init's milestones ([cd810ce](https://github.com/arcboxlabs/arcbox/commit/cd810cee1e7dd96fc3c6478b5c0a603432ad10e5))
+* **daemon:** prove one endpoint answers all three wire formats (CORE-53) ([2997db4](https://github.com/arcboxlabs/arcbox/commit/2997db4be26a90f1de82f55394f229babacb521a))
+* **docker,proxy:** address review — drop the port TOCTOU, assert whole targets ([89a12c7](https://github.com/arcboxlabs/arcbox/commit/89a12c755d695269ec9bded0051d8a43f12d62aa))
+* **docker:** assert requests reach dockerd unaltered ([34aaf8e](https://github.com/arcboxlabs/arcbox/commit/34aaf8e4ef39d4d2b97c631d8cc46cde64037958))
+* **e2e:** add the smoke suite ([95d914b](https://github.com/arcboxlabs/arcbox/commit/95d914b1d84813e15f5e6238b566856da01a0350))
+* **e2e:** add VirtioFS host-guest consistency checks ([930f697](https://github.com/arcboxlabs/arcbox/commit/930f697f05865fff09eaa2161ccaa2f16a5465c8))
+* **e2e:** assert a plain JSON POST reaches the live sandbox API (CORE-53) ([90d3521](https://github.com/arcboxlabs/arcbox/commit/90d35215ac82bc1ff68976d98cbe6b70bd43b1fa))
+* **e2e:** calibrate the boot budget and require both of its marks ([b068366](https://github.com/arcboxlabs/arcbox/commit/b06836633a91d529b46385269db3a22f3b01cd30))
+* **e2e:** drive an interactive abctl PTY session end to end ([#527](https://github.com/arcboxlabs/arcbox/issues/527)) ([5c31677](https://github.com/arcboxlabs/arcbox/commit/5c31677a7609699784ee46c4e97f19b916cd3550))
+* **e2e:** expose setup-phase timings from the readiness stream ([3f2ac46](https://github.com/arcboxlabs/arcbox/commit/3f2ac4600a76241e2235a73f1084f0de4664a1ed))
+* **e2e:** fix two defects in the daemon lock suite found in review ([44d06ff](https://github.com/arcboxlabs/arcbox/commit/44d06ffbfa9e60ef53d280329e2c387e9b460b47))
+* **e2e:** iperf3 throughput matrix (finds container-upload collapse + inbound gap) ([#461](https://github.com/arcboxlabs/arcbox/issues/461)) ([b816c7b](https://github.com/arcboxlabs/arcbox/commit/b816c7b79434645cf9c5e332c13203dd621ba954))
+* **e2e:** IPv6-drop characterization + content-integrity coverage ([#462](https://github.com/arcboxlabs/arcbox/issues/462)) ([ea08fb3](https://github.com/arcboxlabs/arcbox/commit/ea08fb38b54a595a64b4968047ed7a94740437d1))
+* **e2e:** pin the daemon lock lifecycle contract ([bc5037e](https://github.com/arcboxlabs/arcbox/commit/bc5037eb92db102e8177a4c6e06b85022b804994))
+* **proxy:** cover the inbound accept path and the ICMP round trip ([0b6f376](https://github.com/arcboxlabs/arcbox/commit/0b6f3765486994938f33596fdc78f28bd027736a))
+* **proxy:** run the ICMP round trip in CI instead of ignoring it ([8e8bfc0](https://github.com/arcboxlabs/arcbox/commit/8e8bfc0388f68db31326bdb1cb504b9e02cf39d5))
+
+
+### Documentation
+
+* **app:** correct which lock side makes SetupState::subscribe atomic ([95edb17](https://github.com/arcboxlabs/arcbox/commit/95edb17d238c3481d30adefaad83c0c03b0a5b63))
+* **app:** record that restart_generation reports departures, not arrivals ([706c832](https://github.com/arcboxlabs/arcbox/commit/706c8320362b7480964dbdad86476da83d86cf97))
+* **balloon:** host cost is the guest-touched high-water mark, not memory_mb ([4a3c274](https://github.com/arcboxlabs/arcbox/commit/4a3c27484faee7269ed12ad05c482dc72d5b20d7))
+* **claude:** revise File I/O and idle-memory perf targets per measured reality ([68c3afd](https://github.com/arcboxlabs/arcbox/commit/68c3afddbb904c7c15756242f688cb178075fd92))
+* **cli:** update stale `arcbox` invocations to `abctl` ([#510](https://github.com/arcboxlabs/arcbox/issues/510)) ([dd786da](https://github.com/arcboxlabs/arcbox/commit/dd786dae4aaa34321802d0871c908ed291e52963))
+* **daemon:** correct shutdown budget ([ee4d4f8](https://github.com/arcboxlabs/arcbox/commit/ee4d4f8da18a27f5107fdf3dbcec3e17e587a8ac))
+* **daemon:** make NETWORK_READY's description true in VM-host-only mode ([e02e0b2](https://github.com/arcboxlabs/arcbox/commit/e02e0b2cab4dcdd77bec2cc6a2c9bc1e7fbf8390))
+* **readme:** cover the shipped feature surface ([#516](https://github.com/arcboxlabs/arcbox/issues/516)) ([2727072](https://github.com/arcboxlabs/arcbox/commit/272707275b7e1fb19b5deaf43cb42bf84757710c))
+* **rpc,api:** true up the codec-boundary comments for this stage ([d8b0b62](https://github.com/arcboxlabs/arcbox/commit/d8b0b623d258375af71cdd39dbcb565843d0e527))
+* **rpc,guest:** record the buffa single-type end state (CORE-73 B5) ([0589998](https://github.com/arcboxlabs/arcbox/commit/058999812fc3143823e18a6ef729c6885a2d6446))
+* **rpc:** arcbox-connect now also feeds the guest agent's vsock frames ([0e3f816](https://github.com/arcboxlabs/arcbox/commit/0e3f816d3613e56b1ca548ada47790bfb3b06e75))
+* **rpc:** fix the checklist cross-references the bots caught ([8ffc626](https://github.com/arcboxlabs/arcbox/commit/8ffc626f1010773a52fb3f6f594d2c6eb721bd6d))
+* **rpc:** name reflection's descriptor set as the daemon's prost remnant ([bc0c03a](https://github.com/arcboxlabs/arcbox/commit/bc0c03ab0e573b318cab89d73383f770a17b4f3c))
+* **rpc:** name the fleet prost consumer and the vsock wiring boundary ([ecf11af](https://github.com/arcboxlabs/arcbox/commit/ecf11af40c4f1f35205ace5b547511589bc8c58a))
+* **rpc:** record the Connect surface in the agent handbook (CORE-53) ([0212859](https://github.com/arcboxlabs/arcbox/commit/0212859881f7f9b64386717908b644d9cce865c4))
+* **rpc:** stop declaring the router's own add_service dead ([e3f8912](https://github.com/arcboxlabs/arcbox/commit/e3f89129512b612c6f16521fe5943c961344f5ca))
+* **rpc:** true up the build script's host-codec claim ([6834c5a](https://github.com/arcboxlabs/arcbox/commit/6834c5a1beaeb32d7cddbf24f8bd98265fd03916))
+* **rpc:** update arcbox-grpc's WKT comment to the post-serde rationale ([9a4df4c](https://github.com/arcboxlabs/arcbox/commit/9a4df4c89895676067585f9ff6ea6cb39fdc06f3))
+* settled VirtioFS performance record (fs-perf-limits, CORE-48) ([#517](https://github.com/arcboxlabs/arcbox/issues/517)) ([dd17f42](https://github.com/arcboxlabs/arcbox/commit/dd17f4286a852dd61772c5c5debd689f4caf1aee))
+* **test,ci:** correct two claims this suite's audit disproved ([6eddac7](https://github.com/arcboxlabs/arcbox/commit/6eddac716770334ae75120f5f6468ec19c064309))
+
+
+### Build System
+
+* **proto:** declare the sandbox package as a publishable buf module (CORE-53) ([d681cb0](https://github.com/arcboxlabs/arcbox/commit/d681cb08d59d0d02b3f82fb8cb3e76f9453e84c4))
+
+
+### Continuous Integration
+
+* **proto:** exempt the WKT image files the module split stops materializing ([1f511b8](https://github.com/arcboxlabs/arcbox/commit/1f511b8d96e53a666969a557bb039b577ea98bc2))
+
 ## [0.5.5](https://github.com/arcboxlabs/arcbox/compare/v0.5.4...v0.5.5) (2026-07-31)
 
 

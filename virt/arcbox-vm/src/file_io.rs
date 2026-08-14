@@ -5,14 +5,36 @@
 //! Frame format is identical to the exec channel: `[u8 type][u32 LE len][payload]`.
 //! One vsock connection per operation; vm-agent closes after sending the final frame.
 //!
-//! | Hex  | Name             | Direction      | Payload                          |
-//! |------|------------------|----------------|----------------------------------|
-//! | 0x20 | `FILE_WRITE_REQ` | Host → Agent   | JSON `{"path": str, "mode": u32}`|
-//! | 0x21 | `FILE_DATA`      | bidirectional  | raw bytes (one chunk)            |
-//! | 0x22 | `FILE_DONE`      | bidirectional  | empty — end of data stream       |
-//! | 0x23 | `FILE_READ_REQ`  | Host → Agent   | JSON `{"path": str}`             |
-//! | 0x30 | `FILE_ACK`       | Agent → Host   | empty — write succeeded          |
-//! | 0x31 | `FILE_ERR`       | Agent → Host   | UTF-8 error message              |
+//! | Hex  | Name              | Direction      | Payload                          |
+//! |------|-------------------|----------------|----------------------------------|
+//! | 0x20 | `FILE_WRITE_REQ`  | Host → Agent   | JSON `{"path": str, "mode": u32}`|
+//! | 0x21 | `FILE_DATA`       | bidirectional  | raw bytes (one chunk)            |
+//! | 0x22 | `FILE_DONE`       | bidirectional  | empty — end of data stream       |
+//! | 0x23 | `FILE_READ_REQ`   | Host → Agent   | JSON `{"path": str}`             |
+//! | 0x24 | `FILE_STAT_REQ`   | Host → Agent   | JSON [`proto::StatReq`]          |
+//! | 0x25 | `FILE_LIST_REQ`   | Host → Agent   | JSON [`proto::ListDirReq`]       |
+//! | 0x26 | `FILE_MKDIR_REQ`  | Host → Agent   | JSON [`proto::MakeDirReq`]       |
+//! | 0x27 | `FILE_REMOVE_REQ` | Host → Agent   | JSON [`proto::RemoveReq`]        |
+//! | 0x28 | `FILE_MOVE_REQ`   | Host → Agent   | JSON [`proto::MoveReq`]          |
+//! | 0x29 | `FILE_WATCH_REQ`  | Host → Agent   | JSON [`proto::WatchReq`]         |
+//! | 0x30 | `FILE_ACK`        | Agent → Host   | empty — operation succeeded      |
+//! | 0x31 | `FILE_ERR`        | Agent → Host   | UTF-8 error message              |
+//! | 0x32 | `FILE_STAT`       | Agent → Host   | JSON [`proto::FileStatDto`]      |
+//! | 0x33 | `FILE_LIST`       | Agent → Host   | JSON `[FileStatDto, ...]`        |
+//! | 0x34 | `FILE_EVENT`      | Agent → Host   | JSON [`proto::FsEventDto`]       |
+//!
+//! ## Path-verb flows (CORE-62)
+//!
+//! Stat/List answer one data frame; MakeDir/Remove/Move answer `FILE_ACK`.
+//! Watch answers `FILE_ACK` once the inotify watch is established, then
+//! streams `FILE_EVENT` frames until either side closes the connection —
+//! the host closing it is the cancellation signal, the agent side closing
+//! it (sandbox stop) is the clean end of the stream.
+//!
+//! `FILE_ERR` payloads carry a machine-readable errno prefix
+//! (`ERR_NOT_FOUND` and friends) on every verb — the path verbs and the
+//! read/write flows alike — so the host maps them onto typed
+//! [`VmmError`] variants instead of a blanket vsock error.
 //!
 //! ## Write flow
 //! ```text
@@ -35,6 +57,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Serialize;
+use tokio::io::AsyncReadExt as _;
+use tokio::net::UnixStream;
 
 use crate::error::{Result, VmmError};
 use crate::vsock::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
@@ -46,6 +70,8 @@ const FILE_IO_TIMEOUT: Duration = Duration::from_mins(1);
 /// guest vm-agent binary.  The vm-agent should import these from
 /// `arcbox_vm::file_io::proto` instead of duplicating numeric values.
 pub mod proto {
+    use serde::{Deserialize, Serialize};
+
     /// Guest-side vsock port for file I/O.
     pub const FILE_PORT: u32 = 53;
 
@@ -54,16 +80,118 @@ pub mod proto {
     pub const FILE_DATA: u8 = 0x21;
     pub const FILE_DONE: u8 = 0x22;
     pub const FILE_READ_REQ: u8 = 0x23;
+    pub const FILE_STAT_REQ: u8 = 0x24;
+    pub const FILE_LIST_REQ: u8 = 0x25;
+    pub const FILE_MKDIR_REQ: u8 = 0x26;
+    pub const FILE_REMOVE_REQ: u8 = 0x27;
+    pub const FILE_MOVE_REQ: u8 = 0x28;
+    pub const FILE_WATCH_REQ: u8 = 0x29;
     pub const FILE_ACK: u8 = 0x30;
     pub const FILE_ERR: u8 = 0x31;
+    pub const FILE_STAT: u8 = 0x32;
+    pub const FILE_LIST: u8 = 0x33;
+    pub const FILE_EVENT: u8 = 0x34;
 
     /// Maximum total file size for file I/O operations (256 MiB).
     pub const MAX_FILE_SIZE: usize = 256 * 1024 * 1024;
+
+    // Machine-readable errno prefixes on `FILE_ERR` payloads for the path
+    // verbs. The remainder of the payload is the affected path; the host
+    // maps each prefix onto a typed `VmmError` (see `decode_file_err`).
+    pub const ERR_NOT_FOUND: &str = "ENOENT: ";
+    pub const ERR_NOT_A_DIRECTORY: &str = "ENOTDIR: ";
+    pub const ERR_NOT_EMPTY: &str = "ENOTEMPTY: ";
+
+    // `FileStatDto.kind` vocabulary.
+    pub const KIND_FILE: &str = "file";
+    pub const KIND_DIR: &str = "dir";
+    pub const KIND_SYMLINK: &str = "symlink";
+    pub const KIND_OTHER: &str = "other";
+
+    // `FsEventDto.kind` vocabulary.
+    pub const EVENT_CREATED: &str = "created";
+    pub const EVENT_MODIFIED: &str = "modified";
+    pub const EVENT_REMOVED: &str = "removed";
+    pub const EVENT_RENAMED: &str = "renamed";
+
+    /// `FILE_STAT_REQ` payload.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct StatReq {
+        pub path: String,
+    }
+
+    /// `FILE_LIST_REQ` payload.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct ListDirReq {
+        pub path: String,
+    }
+
+    /// `FILE_MKDIR_REQ` payload. `mode` carries the Unix permission bits
+    /// for created directories; `0` defaults to `0o755` on the agent side.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct MakeDirReq {
+        pub path: String,
+        pub mode: u32,
+    }
+
+    /// `FILE_REMOVE_REQ` payload.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct RemoveReq {
+        pub path: String,
+        pub recursive: bool,
+    }
+
+    /// `FILE_MOVE_REQ` payload.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct MoveReq {
+        pub from: String,
+        pub to: String,
+    }
+
+    /// `FILE_WATCH_REQ` payload.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct WatchReq {
+        pub path: String,
+        pub recursive: bool,
+    }
+
+    /// Metadata of one filesystem entry (`FILE_STAT` / `FILE_LIST` payload).
+    ///
+    /// Mirrors `arcbox.sandbox.v1.FileStat`: symlinks are reported, never
+    /// followed; `mode` is the low 12 bits of `st_mode`; `size` is 0 for
+    /// non-regular files.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FileStatDto {
+        pub name: String,
+        pub kind: String,
+        pub size: u64,
+        pub mode: u32,
+        pub mtime_secs: i64,
+        pub mtime_nanos: u32,
+        pub uid: u32,
+        pub gid: u32,
+        #[serde(default)]
+        pub symlink_target: String,
+    }
+
+    /// One filesystem event (`FILE_EVENT` payload). Mirrors
+    /// `arcbox.sandbox.v1.FsEvent`: `path` is the old path for renames,
+    /// with `renamed_to` set only then.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FsEventDto {
+        pub kind: String,
+        pub path: String,
+        #[serde(default)]
+        pub renamed_to: String,
+    }
 }
 
 pub use proto::FILE_PORT;
 use proto::{
-    FILE_ACK, FILE_DATA, FILE_DONE, FILE_ERR, FILE_READ_REQ, FILE_WRITE_REQ, MAX_FILE_SIZE,
+    FILE_ACK, FILE_DATA, FILE_DONE, FILE_ERR, FILE_EVENT, FILE_LIST, FILE_LIST_REQ, FILE_MKDIR_REQ,
+    FILE_MOVE_REQ, FILE_READ_REQ, FILE_REMOVE_REQ, FILE_STAT, FILE_STAT_REQ, FILE_WATCH_REQ,
+    FILE_WRITE_REQ, FileStatDto, FsEventDto, ListDirReq, MAX_FILE_SIZE, MakeDirReq, MoveReq,
+    RemoveReq, StatReq, WatchReq,
 };
 
 #[derive(Serialize)]
@@ -124,9 +252,7 @@ async fn write_file_inner(uds_path: &Path, path: &str, mode: u32, data: &[u8]) -
 
     match resp_type {
         FILE_ACK => Ok(()),
-        FILE_ERR => Err(VmmError::Vsock(
-            String::from_utf8_lossy(&payload).into_owned(),
-        )),
+        FILE_ERR => Err(decode_file_err(&payload)),
         other => Err(VmmError::Vsock(format!(
             "file write: unexpected response type 0x{other:02x}"
         ))),
@@ -165,11 +291,7 @@ async fn read_file_inner(uds_path: &Path, path: &str) -> Result<Vec<u8>> {
                 }
             }
             FILE_DONE => return Ok(buf),
-            FILE_ERR => {
-                return Err(VmmError::Vsock(
-                    String::from_utf8_lossy(&payload).into_owned(),
-                ));
-            }
+            FILE_ERR => return Err(decode_file_err(&payload)),
             other => {
                 return Err(VmmError::Vsock(format!(
                     "file read: unexpected frame type 0x{other:02x}"
@@ -177,6 +299,194 @@ async fn read_file_inner(uds_path: &Path, path: &str) -> Result<Vec<u8>> {
             }
         }
     }
+}
+
+/// Map a `FILE_ERR` payload onto a typed error.
+///
+/// Every verb — path verbs and read/write alike — carries the errno
+/// prefixes from [`proto`]; anything else (including all errors from old
+/// vm-agents) stays a vsock error.
+fn decode_file_err(payload: &[u8]) -> VmmError {
+    let text = String::from_utf8_lossy(payload).into_owned();
+    if let Some(path) = text.strip_prefix(proto::ERR_NOT_FOUND) {
+        VmmError::PathNotFound(path.to_owned())
+    } else if let Some(path) = text.strip_prefix(proto::ERR_NOT_A_DIRECTORY) {
+        VmmError::NotADirectory(path.to_owned())
+    } else if let Some(path) = text.strip_prefix(proto::ERR_NOT_EMPTY) {
+        VmmError::DirectoryNotEmpty(path.to_owned())
+    } else {
+        VmmError::Vsock(text)
+    }
+}
+
+/// One request frame, one response frame. Returns the response payload when
+/// the type matches `ok_type`; decodes `FILE_ERR` into a typed error.
+async fn unary_file_op(
+    uds_path: &Path,
+    req_type: u8,
+    req: &(impl Serialize + Sync),
+    ok_type: u8,
+) -> Result<Vec<u8>> {
+    let payload =
+        serde_json::to_vec(req).map_err(|e| VmmError::Vsock(format!("serialize request: {e}")))?;
+    let op = async {
+        let mut stream = connect_to_port(uds_path, FILE_PORT).await?;
+        write_frame(&mut stream, req_type, &payload)
+            .await
+            .map_err(|e| VmmError::Vsock(format!("write request 0x{req_type:02x}: {e}")))?;
+        let (resp_type, resp) = read_frame(&mut stream)
+            .await
+            .map_err(|e| VmmError::Vsock(format!("read response: {e}")))?;
+        match resp_type {
+            t if t == ok_type => Ok(resp),
+            FILE_ERR => Err(decode_file_err(&resp)),
+            other => Err(VmmError::Vsock(format!(
+                "unexpected response type 0x{other:02x}"
+            ))),
+        }
+    };
+    tokio::time::timeout(FILE_IO_TIMEOUT, op)
+        .await
+        .map_err(|_| VmmError::Vsock("file operation timed out".into()))?
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T> {
+    serde_json::from_slice(payload)
+        .map_err(|e| VmmError::Vsock(format!("malformed agent response: {e}")))
+}
+
+/// Stat one path inside the sandbox (symlinks reported, not followed).
+pub async fn stat_file(uds_path: &Path, path: &str) -> Result<FileStatDto> {
+    let req = StatReq {
+        path: path.to_owned(),
+    };
+    let payload = unary_file_op(uds_path, FILE_STAT_REQ, &req, FILE_STAT).await?;
+    parse_json(&payload)
+}
+
+/// List a directory inside the sandbox, non-recursively, entries sorted by
+/// name with full metadata.
+pub async fn list_dir(uds_path: &Path, path: &str) -> Result<Vec<FileStatDto>> {
+    let req = ListDirReq {
+        path: path.to_owned(),
+    };
+    let payload = unary_file_op(uds_path, FILE_LIST_REQ, &req, FILE_LIST).await?;
+    parse_json(&payload)
+}
+
+/// Create a directory (and missing parents) inside the sandbox. Succeeds
+/// when the directory already exists. `mode` is the Unix permission bits;
+/// `0` defaults to `0o755` on the agent side.
+pub async fn make_dir(uds_path: &Path, path: &str, mode: u32) -> Result<()> {
+    let req = MakeDirReq {
+        path: path.to_owned(),
+        mode,
+    };
+    unary_file_op(uds_path, FILE_MKDIR_REQ, &req, FILE_ACK).await?;
+    Ok(())
+}
+
+/// Remove a file, symlink, or directory inside the sandbox. A non-empty
+/// directory requires `recursive` and fails with
+/// [`VmmError::DirectoryNotEmpty`] otherwise.
+pub async fn remove_entry(uds_path: &Path, path: &str, recursive: bool) -> Result<()> {
+    let req = RemoveReq {
+        path: path.to_owned(),
+        recursive,
+    };
+    unary_file_op(uds_path, FILE_REMOVE_REQ, &req, FILE_ACK).await?;
+    Ok(())
+}
+
+/// Rename / move an entry within the sandbox.
+pub async fn move_entry(uds_path: &Path, from: &str, to: &str) -> Result<()> {
+    let req = MoveReq {
+        from: from.to_owned(),
+        to: to.to_owned(),
+    };
+    unary_file_op(uds_path, FILE_MOVE_REQ, &req, FILE_ACK).await?;
+    Ok(())
+}
+
+/// A live directory watch over the sandbox's vsock file channel.
+///
+/// The connection streams `FILE_EVENT` frames until either side closes it.
+/// Dropping this closes the connection, which is the cancellation signal
+/// the vm-agent tears its inotify watch down on.
+#[derive(Debug)]
+pub struct DirWatch {
+    stream: UnixStream,
+}
+
+impl DirWatch {
+    /// Next filesystem event. `Ok(None)` is the clean end of the stream —
+    /// the vm-agent side closed the connection (sandbox stopped).
+    pub async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
+        // Read the frame-type byte manually: a clean EOF is only clean at a
+        // frame boundary, which `read_frame`'s `read_exact` cannot express.
+        let mut ty = [0u8; 1];
+        let n = self
+            .stream
+            .read(&mut ty)
+            .await
+            .map_err(|e| VmmError::Vsock(format!("watch read: {e}")))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let len = self
+            .stream
+            .read_u32_le()
+            .await
+            .map_err(|e| VmmError::Vsock(format!("watch read: {e}")))? as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(VmmError::Vsock(format!("watch frame too large: {len}")));
+        }
+        let mut payload = vec![0u8; len];
+        if len > 0 {
+            self.stream
+                .read_exact(&mut payload)
+                .await
+                .map_err(|e| VmmError::Vsock(format!("watch read: {e}")))?;
+        }
+        match ty[0] {
+            FILE_EVENT => Ok(Some(parse_json(&payload)?)),
+            FILE_ERR => Err(decode_file_err(&payload)),
+            other => Err(VmmError::Vsock(format!(
+                "unexpected watch frame type 0x{other:02x}"
+            ))),
+        }
+    }
+}
+
+/// Open a directory watch inside the sandbox. The setup handshake (connect,
+/// request, `FILE_ACK`) is bounded by [`FILE_IO_TIMEOUT`]; the returned
+/// stream itself is long-lived and unbounded.
+pub async fn watch_dir(uds_path: &Path, path: &str, recursive: bool) -> Result<DirWatch> {
+    let req = WatchReq {
+        path: path.to_owned(),
+        recursive,
+    };
+    let payload = serde_json::to_vec(&req)
+        .map_err(|e| VmmError::Vsock(format!("serialize WatchReq: {e}")))?;
+    let setup = async {
+        let mut stream = connect_to_port(uds_path, FILE_PORT).await?;
+        write_frame(&mut stream, FILE_WATCH_REQ, &payload)
+            .await
+            .map_err(|e| VmmError::Vsock(format!("write FILE_WATCH_REQ: {e}")))?;
+        let (resp_type, resp) = read_frame(&mut stream)
+            .await
+            .map_err(|e| VmmError::Vsock(format!("read watch ack: {e}")))?;
+        match resp_type {
+            FILE_ACK => Ok(DirWatch { stream }),
+            FILE_ERR => Err(decode_file_err(&resp)),
+            other => Err(VmmError::Vsock(format!(
+                "unexpected watch ack type 0x{other:02x}"
+            ))),
+        }
+    };
+    tokio::time::timeout(FILE_IO_TIMEOUT, setup)
+        .await
+        .map_err(|_| VmmError::Vsock("watch setup timed out".into()))?
 }
 
 #[cfg(test)]
@@ -362,5 +672,177 @@ mod tests {
         assert_eq!(std::str::from_utf8(&payload).unwrap(), "no such file");
 
         agent_handle.await.unwrap();
+    }
+
+    #[test]
+    fn file_err_prefixes_decode_to_typed_errors() {
+        assert!(matches!(
+            decode_file_err(b"ENOENT: /a/b"),
+            VmmError::PathNotFound(p) if p == "/a/b"
+        ));
+        assert!(matches!(
+            decode_file_err(b"ENOTDIR: /a/file"),
+            VmmError::NotADirectory(p) if p == "/a/file"
+        ));
+        assert!(matches!(
+            decode_file_err(b"ENOTEMPTY: /a/dir"),
+            VmmError::DirectoryNotEmpty(p) if p == "/a/dir"
+        ));
+        // Old-agent / free-form errors stay vsock errors.
+        assert!(matches!(
+            decode_file_err(b"read file: boom"),
+            VmmError::Vsock(m) if m == "read file: boom"
+        ));
+    }
+
+    /// Bind a mock Firecracker vsock UDS: accept one connection, answer the
+    /// `CONNECT {port}` handshake, then hand the stream to `script`.
+    async fn mock_vsock_server<F, Fut>(script: F) -> (tempfile::TempDir, std::path::PathBuf)
+    where
+        F: FnOnce(UnixStream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Consume "CONNECT {port}\n".
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).await.unwrap();
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            use tokio::io::AsyncWriteExt as _;
+            stream.write_all(b"OK 53\n").await.unwrap();
+            script(stream).await;
+        });
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn stat_file_round_trips_the_dto() {
+        let dto = FileStatDto {
+            name: "b".into(),
+            kind: proto::KIND_FILE.into(),
+            size: 42,
+            mode: 0o644,
+            mtime_secs: 1_700_000_000,
+            mtime_nanos: 5,
+            uid: 0,
+            gid: 0,
+            symlink_target: String::new(),
+        };
+        let expected = dto.clone();
+        let (_dir, path) = mock_vsock_server(move |mut stream| async move {
+            let (ty, payload) = async_read_frame(&mut stream).await.unwrap();
+            assert_eq!(ty, FILE_STAT_REQ);
+            let req: StatReq = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(req.path, "/a/b");
+            let body = serde_json::to_vec(&dto).unwrap();
+            async_write_frame(&mut stream, FILE_STAT, &body)
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let got = stat_file(&path, "/a/b").await.unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn remove_entry_surfaces_directory_not_empty() {
+        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+            let (ty, _) = async_read_frame(&mut stream).await.unwrap();
+            assert_eq!(ty, FILE_REMOVE_REQ);
+            async_write_frame(&mut stream, FILE_ERR, b"ENOTEMPTY: /full")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let err = remove_entry(&path, "/full", false).await.unwrap_err();
+        assert!(matches!(err, VmmError::DirectoryNotEmpty(p) if p == "/full"));
+    }
+
+    #[tokio::test]
+    async fn read_file_error_is_classified() {
+        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+            let _ = async_read_frame(&mut stream).await.unwrap();
+            async_write_frame(&mut stream, FILE_ERR, b"ENOENT: /missing")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let err = read_file(&path, "/missing").await.unwrap_err();
+        assert!(matches!(err, VmmError::PathNotFound(p) if p == "/missing"));
+    }
+
+    #[tokio::test]
+    async fn write_file_error_is_classified() {
+        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+            // Consume WRITE_REQ, then the data frames until DONE.
+            let _ = async_read_frame(&mut stream).await.unwrap();
+            loop {
+                let (ty, _) = async_read_frame(&mut stream).await.unwrap();
+                if ty == FILE_DONE {
+                    break;
+                }
+            }
+            async_write_frame(&mut stream, FILE_ERR, b"ENOTDIR: /plain.txt/sub")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let err = write_file(&path, "/plain.txt/sub", 0, b"x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VmmError::NotADirectory(p) if p == "/plain.txt/sub"));
+    }
+
+    #[tokio::test]
+    async fn watch_dir_streams_events_until_clean_eof() {
+        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+            let (ty, payload) = async_read_frame(&mut stream).await.unwrap();
+            assert_eq!(ty, FILE_WATCH_REQ);
+            let req: WatchReq = serde_json::from_slice(&payload).unwrap();
+            assert!(req.recursive);
+            async_write_frame(&mut stream, FILE_ACK, &[]).await.unwrap();
+            let event = FsEventDto {
+                kind: proto::EVENT_CREATED.into(),
+                path: "/w/new".into(),
+                renamed_to: String::new(),
+            };
+            let body = serde_json::to_vec(&event).unwrap();
+            async_write_frame(&mut stream, FILE_EVENT, &body)
+                .await
+                .unwrap();
+            // Dropping the stream is the clean end (sandbox stopped).
+        })
+        .await;
+
+        let mut watch = watch_dir(&path, "/w", true).await.unwrap();
+        let event = watch.next_event().await.unwrap().unwrap();
+        assert_eq!(event.kind, proto::EVENT_CREATED);
+        assert_eq!(event.path, "/w/new");
+        assert!(watch.next_event().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_dir_setup_error_is_typed() {
+        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+            let _ = async_read_frame(&mut stream).await.unwrap();
+            async_write_frame(&mut stream, FILE_ERR, b"ENOENT: /missing")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let err = watch_dir(&path, "/missing", false).await.unwrap_err();
+        assert!(matches!(err, VmmError::PathNotFound(p) if p == "/missing"));
     }
 }

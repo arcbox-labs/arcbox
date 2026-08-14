@@ -5,7 +5,7 @@
 //! volume and bind-mounts them back over their canonical paths. This module
 //! owns the on-disk state machine — copy, retire, mountpoint stub — and is
 //! kept free of mount syscalls so every crash window stays unit-testable on
-//! any host. Design: internal-docs/plans/ext4-metadata-volume.md.
+//! any host. Design: ../company/engineering/arcbox/plans/ext4-metadata-volume.md.
 
 use std::fs;
 use std::io;
