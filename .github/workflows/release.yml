@@ -57,9 +57,16 @@ jobs:
   # green by the CI build job, so the per-crate verify build is redundant safety
   # here, not new coverage. cargo still resolves the dependency graph and uploads
   # in dependency order via a local temp registry, so unpublished inter-deps
-  # resolve. arcbox-hv and arcbox-helper have their own release cadences and may
-  # already exist at their pinned versions, so exclude them from the coordinated
-  # workspace publish. Platform-agnostic (no compilation happens), so it runs on
+  # resolve. arcbox-hv is excluded: it releases on its own cadence, usually
+  # already exists at its pinned version, and depends on no workspace crate, so
+  # it can always be published by itself. arcbox-helper is NOT excluded even
+  # though its cadence is equally manual — it depends on arcbox-constants /
+  # -logging / -route at the workspace version, so a standalone publish of it
+  # cannot resolve until those are on the registry, and those go up in this
+  # pass. Excluding it deadlocked the publish the moment its pin moved ahead of
+  # crates.io (#613 bumped it to 1.1.0): arcbox-core requires `arcbox-helper
+  # ^1.1.0`, which then existed in neither the registry nor the temp one.
+  # Platform-agnostic (no compilation happens), so it runs on
   # ubuntu. Manual binary rebuilds only republish when explicitly requested.
   publish-crates:
     name: Publish crates to crates.io
@@ -107,7 +114,7 @@ jobs:
         # list before resuming. Only rate limits are retried; other errors fail
         # immediately.
         run: |
-          excludes=(--exclude arcbox-hv --exclude arcbox-helper)
+          excludes=(--exclude arcbox-hv)
           rate_limit_attempts=0
 
           while true; do

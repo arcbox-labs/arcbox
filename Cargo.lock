@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox"
-version = "0.1.0"
+version = "0.6.6"
 dependencies = [
  "arcbox-connect",
  "arcbox-connectrpc",

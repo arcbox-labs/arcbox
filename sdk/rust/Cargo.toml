@@ -1,19 +1,20 @@
 [package]
 name = "arcbox"
 description = "ArcBox Sandbox SDK for Rust — run isolated microVM sandboxes on your Mac"
-version = "0.1.0"
+# The workspace version, not a cadence of its own: crates.io already carries
+# `arcbox` 0.6.3 from the runtime facade this SDK replaced, so any version
+# below that publishes fine and is then never selected by `cargo add arcbox`.
+# Riding the workspace also keeps the SDK in the one coordinated
+# `cargo publish --workspace` that ships arcbox-connect, its own dependency.
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-# Still unpublishable, but no longer because of connectrpc: that now resolves
-# from the registry as arcbox-connectrpc. What `cargo publish` stops on is
-# `arcbox-connect` below — a path dependency with no version, which cannot get
-# one until arcbox-connect 0.6.5 is on crates.io.
 
 [dependencies]
-arcbox-connect = { path = "../../rpc/arcbox-connect" }
+arcbox-connect.workspace = true
 base64 = "0.22.1"
 buffa = { version = "0.9.1", features = ["json"] }
 buffa-types = { version = "0.9.1", features = ["json"] }
