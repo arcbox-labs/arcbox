@@ -362,27 +362,34 @@ async fn container_route_guard(
         }
 
         let runtime_for_bridge = Arc::clone(&runtime);
-        let bridge = match tokio::task::spawn_blocking(move || {
+        let resolution = match tokio::task::spawn_blocking(move || {
             resolve_container_bridge(&runtime_for_bridge)
         })
         .await
         {
-            Ok(bridge) => bridge,
+            Ok(resolution) => resolution,
             Err(error) => {
                 tracing::warn!(%error, "container bridge resolution task failed");
-                None
+                BridgeResolution::Inconclusive
             }
         };
-        let Some(bridge) = bridge else {
-            if active.take().is_some()
-                && let Some(lease) = container_network_lease.get()
-                && let Err(error) = lease.cleanup_route().await
-            {
-                tracing::warn!(%error, "failed to remove stopped VM container route");
+        let bridge = match resolution {
+            BridgeResolution::Found(bridge) => bridge,
+            BridgeResolution::Absent => {
+                if active.take().is_some()
+                    && let Some(lease) = container_network_lease.get()
+                    && let Err(error) = lease.cleanup_route().await
+                {
+                    tracing::warn!(%error, "failed to remove stopped VM container route");
+                }
+                setup_state.set_route_installed(false);
+                consecutive_failures = 0;
+                continue;
             }
-            setup_state.set_route_installed(false);
-            consecutive_failures = 0;
-            continue;
+            BridgeResolution::Inconclusive => {
+                tracing::debug!("container bridge discovery inconclusive; keeping route state");
+                continue;
+            }
         };
 
         let current_mode = active
@@ -590,8 +597,9 @@ async fn ensure_isolated_container_route(
     )
     .await
     .with_context(|| format!("failed to install isolated container route {container_network}"))?;
-    let bridge = resolve_container_bridge(runtime)
-        .with_context(|| format!("container bridge is not ready for {container_network}"))?;
+    let BridgeResolution::Found(bridge) = resolve_container_bridge(runtime) else {
+        anyhow::bail!("container bridge is not ready for {container_network}");
+    };
     container_network_lease
         .get()
         .context("isolated container network lease is missing")?
@@ -600,48 +608,82 @@ async fn ensure_isolated_container_route(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "vmnet"))]
-fn resolve_container_bridge(runtime: &Runtime) -> Option<String> {
-    let machine = runtime
-        .machine_manager()
-        .get(arcbox_core::DEFAULT_MACHINE_NAME)?;
-    if !matches!(
-        machine.state,
-        arcbox_core::machine::MachineState::Starting | arcbox_core::machine::MachineState::Running
-    ) {
-        return None;
-    }
-    use arcbox_core::bridge_discovery::MachineBridgeExt as _;
-    if let Some(bridge) = runtime
-        .machine_manager()
-        .vmnet_bridge_name(arcbox_core::DEFAULT_MACHINE_NAME)
-    {
-        return Some(bridge);
-    }
+/// What one bridge-resolution attempt established.
+///
+/// The distinction the route guard turns on: only the machine record can say
+/// authoritatively that no container route should exist. Discovery itself
+/// cannot, because it finds the bridge by looking the guest MAC up in each
+/// bridge's forwarding table (`ifbridge::find_bridge_by_mac` → `list_fdb`),
+/// and FDB entries age out when the guest goes quiet (20 min by default on
+/// macOS). Reading that silence as "the bridge is gone" tears down a healthy
+/// route on an idle VM.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum BridgeResolution {
+    /// The bridge the container route must target.
+    Found(String),
+    /// No System VM is running, so no container route should exist.
+    Absent,
+    /// Discovery could not answer. Keep whatever route state is in place.
+    Inconclusive,
+}
 
-    // The binary may include vmnet support while this signed daemon is using
-    // VZ NAT (notably development builds without com.apple.vm.networking).
-    let mac = runtime
+/// Classifies a bridge lookup against the machine's own state.
+///
+/// `discover` is lazy so a stopped VM costs no forwarding-table walk.
+#[cfg(target_os = "macos")]
+fn classify_bridge(
+    machine_state: Option<arcbox_core::machine::MachineState>,
+    discover: impl FnOnce() -> Option<String>,
+) -> BridgeResolution {
+    let running = matches!(
+        machine_state,
+        Some(
+            arcbox_core::machine::MachineState::Starting
+                | arcbox_core::machine::MachineState::Running
+        )
+    );
+    if !running {
+        return BridgeResolution::Absent;
+    }
+    discover().map_or(BridgeResolution::Inconclusive, BridgeResolution::Found)
+}
+
+#[cfg(target_os = "macos")]
+fn system_vm_state(runtime: &Runtime) -> Option<arcbox_core::machine::MachineState> {
+    runtime
         .machine_manager()
-        .bridge_mac(arcbox_core::DEFAULT_MACHINE_NAME)?;
-    arcbox_core::bridge_discovery::resolve_bridge_by_mac(&mac).map(|bridge| bridge.name)
+        .get(arcbox_core::DEFAULT_MACHINE_NAME)
+        .map(|machine| machine.state)
+}
+
+#[cfg(all(target_os = "macos", feature = "vmnet"))]
+fn resolve_container_bridge(runtime: &Runtime) -> BridgeResolution {
+    classify_bridge(system_vm_state(runtime), || {
+        use arcbox_core::bridge_discovery::MachineBridgeExt as _;
+        runtime
+            .machine_manager()
+            .vmnet_bridge_name(arcbox_core::DEFAULT_MACHINE_NAME)
+            .or_else(|| {
+                // The binary may include vmnet support while this signed daemon
+                // is using VZ NAT (notably development builds without
+                // com.apple.vm.networking).
+                let mac = runtime
+                    .machine_manager()
+                    .bridge_mac(arcbox_core::DEFAULT_MACHINE_NAME)?;
+                arcbox_core::bridge_discovery::resolve_bridge_by_mac(&mac).map(|bridge| bridge.name)
+            })
+    })
 }
 
 #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
-fn resolve_container_bridge(runtime: &Runtime) -> Option<String> {
-    let machine = runtime
-        .machine_manager()
-        .get(arcbox_core::DEFAULT_MACHINE_NAME)?;
-    if !matches!(
-        machine.state,
-        arcbox_core::machine::MachineState::Starting | arcbox_core::machine::MachineState::Running
-    ) {
-        return None;
-    }
-    let mac = runtime
-        .machine_manager()
-        .bridge_mac(arcbox_core::DEFAULT_MACHINE_NAME)?;
-    arcbox_core::bridge_discovery::resolve_bridge_by_mac(&mac).map(|bridge| bridge.name)
+fn resolve_container_bridge(runtime: &Runtime) -> BridgeResolution {
+    classify_bridge(system_vm_state(runtime), || {
+        let mac = runtime
+            .machine_manager()
+            .bridge_mac(arcbox_core::DEFAULT_MACHINE_NAME)?;
+        arcbox_core::bridge_discovery::resolve_bridge_by_mac(&mac).map(|bridge| bridge.name)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -696,6 +738,59 @@ mod tests {
     use arcbox_core::event::{Event, EventBus};
 
     use super::*;
+
+    /// The regression this enum exists for: the bridge is found by looking the
+    /// guest MAC up in bridge forwarding tables, which forget an idle guest
+    /// after ~20 minutes. A running VM plus a silent FDB must not read as
+    /// "no route should exist" — that tears down a healthy route and drops
+    /// `route_installed`, sending the desktop back to localhost.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_vm_with_no_fdb_entry_is_inconclusive_not_absent() {
+        use arcbox_core::machine::MachineState;
+
+        for state in [MachineState::Starting, MachineState::Running] {
+            assert_eq!(
+                classify_bridge(Some(state), || None),
+                BridgeResolution::Inconclusive,
+                "{state:?} with a silent FDB"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_the_machine_record_can_say_no_bridge_should_exist() {
+        use arcbox_core::machine::MachineState;
+
+        // No machine record, and a stopped one, are both authoritative — even
+        // if a stale FDB entry still names a bridge.
+        assert_eq!(
+            classify_bridge(None, || Some("bridge100".to_string())),
+            BridgeResolution::Absent
+        );
+        assert_eq!(
+            classify_bridge(Some(MachineState::Stopped), || Some(
+                "bridge100".to_string()
+            )),
+            BridgeResolution::Absent
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stopped_vm_costs_no_forwarding_table_walk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use arcbox_core::machine::MachineState;
+
+        let walks = AtomicUsize::new(0);
+        let _ = classify_bridge(Some(MachineState::Stopped), || {
+            walks.fetch_add(1, Ordering::Relaxed);
+            None
+        });
+        assert_eq!(walks.load(Ordering::Relaxed), 0);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
