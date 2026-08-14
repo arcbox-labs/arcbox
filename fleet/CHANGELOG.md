@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.1.4](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.3...fleet-agent-v0.1.4) (2026-08-14)
+
+
+### Features
+
+* **fleet:** add the restart CLI subcommand ([bc71299](https://github.com/arcboxlabs/arcbox/commit/bc712993a455ec9a2b3df1ec8ef7bdb46aaa2ec8))
+* **fleet:** enrich host_info_json (chip, hostname, boot time, pid, disks, LAN IPs) ([#457](https://github.com/arcboxlabs/arcbox/issues/457)) ([8c43f95](https://github.com/arcboxlabs/arcbox/commit/8c43f95e204b9bac63edf0aadb462137676fc996))
+* **fleet:** restart the agent process in place ([c8649a5](https://github.com/arcboxlabs/arcbox/commit/c8649a5ae9dd219874ec86fe479d79d6d484fe56))
+
+
+### Bug Fixes
+
+* **fleet:** compute the draining flag under the watch write lock ([732b05a](https://github.com/arcboxlabs/arcbox/commit/732b05a05ead862e4c85afd7a0c1699c1c80ba12))
+* **fleet:** derive the draining flag from one reason cell ([4c1ef9e](https://github.com/arcboxlabs/arcbox/commit/4c1ef9ec013ceecf764b73b1e1f6b88b1d80f562))
+* **fleet:** keep a restart from swallowing a termination signal ([32d8133](https://github.com/arcboxlabs/arcbox/commit/32d813359c03b3a7ce01d356cb8308f64b147fba))
+* **fleet:** self-update on a version-refused control-plane enroll ([#500](https://github.com/arcboxlabs/arcbox/issues/500)) ([01f4990](https://github.com/arcboxlabs/arcbox/commit/01f4990d508b361b64536d4cdbd054d8a2e1386c))
+
+
+### Code Refactoring
+
+* **fleet:** exec only from main ([6ddb60f](https://github.com/arcboxlabs/arcbox/commit/6ddb60fa7824b34fb347dcb387e75fc6c35f863e))
+* **fleet:** give the handover one owner ([f35f58e](https://github.com/arcboxlabs/arcbox/commit/f35f58ef4d96658ed9777ada5d3c8f1ef31a2d6b))
+* **fleet:** one quiesce primitive for handover waits ([50a5777](https://github.com/arcboxlabs/arcbox/commit/50a57775f3158a50ccf0d8d76445932b634c4d22))
+* **rpc,daemon,fleet:** prost becomes test support only (CORE-73 follow-up) ([#540](https://github.com/arcboxlabs/arcbox/issues/540)) ([3b24286](https://github.com/arcboxlabs/arcbox/commit/3b242865e2e8f7ef51f29f9dbff07726f0acd2fa))
+
+
+### Build System
+
+* adopt arcbox-connectrpc, and make arcbox-connect publishable ([#618](https://github.com/arcboxlabs/arcbox/issues/618)) ([78fc6fd](https://github.com/arcboxlabs/arcbox/commit/78fc6fd297a2a052fd87a6d9f2926e1cdc2699c6))
+
 ## [0.1.3](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.2...fleet-agent-v0.1.3) (2026-07-21)
 
 
