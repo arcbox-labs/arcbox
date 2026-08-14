@@ -53,10 +53,17 @@ jobs:
       - name: Update lockfiles on release PRs
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           git config --global user.name "arcbox-labs[bot]"
           git config --global user.email "254083426+arcbox-labs[bot]@users.noreply.github.com"
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?base=${GITHUB_REF_NAME}&state=open&per_page=100" |
+          # Filter on the default branch, not the ref this run started from.
+          # release-please takes no `target-branch`, so it always builds its
+          # PRs against the default branch — but a `workflow_dispatch` can run
+          # from any ref, and `GITHUB_REF_NAME` would then match no PR at all.
+          # The step would find nothing, skip silently, and leave the release
+          # PR with a stale lockfile that fails --locked at tag time.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?base=${DEFAULT_BRANCH}&state=open&per_page=100" |
           jq -c '.[]
             | select(any(.labels[]; .name == "autorelease: pending"))
             | {number, headRefName: .head.ref}' |
