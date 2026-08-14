@@ -49,13 +49,55 @@ pub fn mem_mib() -> u64 {
     sys.total_memory() / 1024 / 1024
 }
 
-/// Free-form host facts as a JSON string (OS version, kernel, arch).
+/// Free-form host facts as a JSON string. Descriptive only — nothing here
+/// influences placement (that's [`telemetry`]). Fields are best-effort and
+/// may be `null` on platforms sysinfo doesn't populate them for.
 pub fn host_info_json() -> String {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_all();
+    let cpu_model = sys.cpus().first().map(|c| c.brand().to_string());
+
+    let disks = sysinfo::Disks::new_with_refreshed_list()
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.name().to_string_lossy(),
+                "mount_point": d.mount_point().display().to_string(),
+                "file_system": d.file_system().to_string_lossy(),
+                "total_bytes": d.total_space(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
+
+    let lan_ips = sysinfo::Networks::new_with_refreshed_list()
+        .iter()
+        .flat_map(|(iface, data)| {
+            data.ip_networks()
+                .iter()
+                .filter(|net| !net.addr.is_loopback() && !net.addr.is_unspecified())
+                .map(move |net| {
+                    serde_json::json!({
+                        "interface": iface,
+                        "ip": net.addr.to_string(),
+                        "prefix": net.prefix,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+
     let info = serde_json::json!({
         "os": sysinfo::System::name(),
         "os_version": sysinfo::System::long_os_version(),
         "kernel": sysinfo::System::kernel_version(),
         "arch": std::env::consts::ARCH,
+        "cpu_model": cpu_model,
+        "hostname": hostname,
+        "boot_time_unix": sysinfo::System::boot_time(),
+        "agent_pid": std::process::id(),
+        "disks": disks,
+        "lan_ips": lan_ips,
     });
     info.to_string()
 }
