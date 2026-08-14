@@ -1,18 +1,15 @@
-use arcbox_api::IconService;
-use arcbox_api::grpc::IconServiceImpl;
-use arcbox_protocol::v1::GetImageIconRequest;
-use tonic::Request;
+//! Icon resolution against the live registries.
+//!
+//! Exercises `IconServiceImpl::resolve` rather than the RPC method: the
+//! behaviour under test is the lookup, and going through the method would
+//! only add a request envelope to build.
+
+use arcbox_api::IconServiceImpl;
 
 #[tokio::test]
 async fn get_icon_for_official_image() {
     let svc = IconServiceImpl::new();
-    let resp = svc
-        .get_image_icon(Request::new(GetImageIconRequest {
-            fqin: "nginx".to_string(),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = svc.resolve("nginx").await.unwrap();
 
     assert!(!resp.url.is_empty(), "expected icon URL for nginx");
     assert_eq!(resp.source, "docker_official_image");
@@ -21,13 +18,7 @@ async fn get_icon_for_official_image() {
 #[tokio::test]
 async fn get_icon_for_dockerhub_org() {
     let svc = IconServiceImpl::new();
-    let resp = svc
-        .get_image_icon(Request::new(GetImageIconRequest {
-            fqin: "localstack/localstack".to_string(),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = svc.resolve("localstack/localstack").await.unwrap();
 
     assert!(!resp.url.is_empty(), "expected icon URL for localstack");
     assert!(
@@ -40,13 +31,7 @@ async fn get_icon_for_dockerhub_org() {
 #[tokio::test]
 async fn get_icon_for_ghcr() {
     let svc = IconServiceImpl::new();
-    let resp = svc
-        .get_image_icon(Request::new(GetImageIconRequest {
-            fqin: "ghcr.io/astral-sh/uv".to_string(),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = svc.resolve("ghcr.io/astral-sh/uv").await.unwrap();
 
     assert!(!resp.url.is_empty(), "expected icon URL for ghcr image");
     assert_eq!(resp.source, "ghcr_avatar");
@@ -56,12 +41,9 @@ async fn get_icon_for_ghcr() {
 async fn get_icon_not_found() {
     let svc = IconServiceImpl::new();
     let resp = svc
-        .get_image_icon(Request::new(GetImageIconRequest {
-            fqin: "registry.example.com/nonexistent/image".to_string(),
-        }))
+        .resolve("registry.example.com/nonexistent/image")
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap();
 
     assert!(resp.url.is_empty());
     assert_eq!(resp.source, "not_found");

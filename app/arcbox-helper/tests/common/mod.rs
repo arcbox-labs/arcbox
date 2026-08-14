@@ -38,6 +38,17 @@ impl HelperService for MockHelperServer {
         Ok(())
     }
 
+    async fn route_remove_if_owned(
+        self,
+        _: tarpc::context::Context,
+        subnet: String,
+        iface: String,
+    ) -> Result<bool, HelperError> {
+        validate::validate_subnet(&subnet).map_err(HelperError::validation)?;
+        validate::validate_iface(&iface).map_err(HelperError::validation)?;
+        Ok(true)
+    }
+
     async fn dns_install(
         self,
         _: tarpc::context::Context,

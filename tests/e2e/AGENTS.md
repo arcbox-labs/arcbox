@@ -69,11 +69,14 @@ run fails, and which paths must change together.
    per-run logs/metrics, records preserved dirs). Never hand-loop
    `cargo test` for stress runs.
 
-- This ladder proves liveness, not datapath throughput — there is no
-  automated throughput target. Prove an RX/TX regression fixed (iperf
-  zero -> baseline restored) with the manual reproducer in
-  `docs/net-perf-limits.md`, checked against that doc's baseline on both
-  HV and VZ. Auto-forensics don't help a datapath failure
+- This ladder proves liveness, not datapath throughput. The `network_iperf`
+  test now records the full iperf3 throughput matrix programmatically
+  (`../company/engineering/arcbox/plans/network-iperf-matrix.md`), but by default gates on
+  liveness only — VZ throughput is too run-to-run variable for an automated
+  Gbps target, so a real floor is opt-in (`ARCBOX_E2E_IPERF_MIN_GBPS`).
+  Prove an RX/TX regression fixed (iperf zero -> baseline restored) with
+  that test or the manual reproducer in `docs/net-perf-limits.md`, checked
+  against the doc's baseline on both HV and VZ. Auto-forensics don't help a datapath failure
   (`virtio-debug.json` is HV-only queue/boot state) — preserve the
   scenario's own evidence (assigned `docker port`/inspect, host connect
   result) into the kept data dir.

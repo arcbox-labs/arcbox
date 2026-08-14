@@ -6,8 +6,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::MissedTickBehavior;
 
+use arcbox_connect::v1::DiskTrimResponse;
 use arcbox_constants::paths::{CONTAINERD_DATA_MOUNT_POINT, DOCKER_DATA_MOUNT_POINT};
-use arcbox_protocol::agent::DiskTrimResponse;
 
 use crate::rpc::{ErrorResponse, RpcResponse};
 
@@ -80,7 +80,10 @@ async fn run_fstrim_now() -> Result<String, String> {
 /// summary string the caller would have to parse.
 pub(super) async fn handle_disk_trim() -> RpcResponse {
     match run_fstrim_now().await {
-        Ok(result) => RpcResponse::DiskTrim(DiskTrimResponse { result }),
+        Ok(result) => RpcResponse::DiskTrim(DiskTrimResponse {
+            result,
+            ..Default::default()
+        }),
         Err(summary) => RpcResponse::Error(ErrorResponse::new(
             500,
             format!("disk trim failed: {summary}"),

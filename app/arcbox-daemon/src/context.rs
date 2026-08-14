@@ -15,16 +15,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arcbox_api::{SetupState, SharedRuntime};
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use tokio_util::sync::CancellationToken;
 
-use crate::startup::DaemonLock;
+use crate::startup::{ContainerNetworkLease, DaemonLock};
 
 /// Daemon lock shared between the startup pipeline and `main`.
 ///
 /// Filled by the lease phase; kept alive by [`StartupHandles`] so the
 /// flock survives the startup future being dropped on a signal.
 pub type SharedDaemonLock = Arc<std::sync::OnceLock<Arc<DaemonLock>>>;
+
+/// Isolated container-network lease shared with the startup interrupt path.
+pub type SharedContainerNetworkLease = Arc<std::sync::OnceLock<ContainerNetworkLease>>;
 
 /// Handles created before the startup pipeline runs and shared with it.
 ///
@@ -47,6 +51,8 @@ pub struct StartupHandles {
     /// context) so the exclusive flock lives until process exit even when
     /// the startup future is cancelled mid-flight.
     pub daemon_lock: SharedDaemonLock,
+    /// Filled before an isolated VM boots and held through shutdown cleanup.
+    pub container_network_lease: SharedContainerNetworkLease,
 }
 
 impl StartupHandles {
@@ -57,6 +63,7 @@ impl StartupHandles {
             setup_state,
             shutdown: CancellationToken::new(),
             daemon_lock: Arc::new(std::sync::OnceLock::new()),
+            container_network_lease: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -79,10 +86,19 @@ pub struct EarlyContext {
     pub shutdown: CancellationToken,
     /// Empty slot the lease phase publishes the acquired lock into.
     pub daemon_lock_slot: SharedDaemonLock,
+    /// Slot filled once the selected non-default container CIDR is known.
+    pub container_network_lease_slot: SharedContainerNetworkLease,
     pub dns_domain: String,
+    /// Requested DNS port; 0 lets the bound service choose an ephemeral port.
     pub dns_port: u16,
+    /// Explicit authorization for a non-canonical resolver domain mutation.
+    pub install_dns_resolver: bool,
+    /// Explicit Kubernetes proxy port; 0 lets the bound service choose one.
+    /// `None` preserves the canonical best-effort 16443 listener.
+    pub kubernetes_port: Option<u16>,
+    pub kubernetes_context: String,
     pub docker_integration: bool,
-    /// Mount the guest docker data export at `~/ArcBox` once ready.
+    /// Mount the guest Docker data export at the configured host directory once ready.
     pub mount_nfs: bool,
     pub vm_args: VmArgs,
 }
@@ -99,17 +115,25 @@ pub struct DaemonContext {
     /// `StartupHandles` holds a sibling clone so a cancelled startup
     /// future cannot release it early.
     pub daemon_lock: Arc<DaemonLock>,
-    /// Shared with gRPC services. Empty after `acquire_lock`, filled by `init_runtime`.
+    /// Shared with gRPC services. Filled after runtime service endpoints bind.
     pub shared_runtime: SharedRuntime,
     /// Filled by `init_runtime` right after runtime construction, before
     /// the VM boots. Diagnostics only (`GetVirtioDebug`).
     pub early_runtime: SharedRuntime,
     pub setup_state: Arc<SetupState>,
     pub shutdown: CancellationToken,
+    /// Holds the same-user CIDR lease until shutdown cleanup completes.
+    pub container_network_lease_slot: SharedContainerNetworkLease,
     pub dns_domain: String,
+    /// Requested DNS port; the actual bound port lives in [`ServiceHandles`].
     pub dns_port: u16,
+    /// Explicit authorization for a non-canonical resolver domain mutation.
+    pub install_dns_resolver: bool,
+    /// Explicit Kubernetes proxy port; `None` uses best-effort port 16443.
+    pub kubernetes_port: Option<u16>,
+    pub kubernetes_context: String,
     pub docker_integration: bool,
-    /// Mount the guest docker data export at `~/ArcBox` once ready.
+    /// Mount the guest Docker data export at the configured host directory once ready.
     pub mount_nfs: bool,
     pub vm_args: VmArgs,
 }
@@ -117,6 +141,7 @@ pub struct DaemonContext {
 /// VM-related CLI arguments, deferred until `init_runtime`.
 pub struct VmArgs {
     pub guest_docker_vsock_port: Option<u32>,
+    pub container_cidr: Option<ContainerNetwork>,
     pub kernel: Option<PathBuf>,
     /// `--no-linux-vm`: forces `config.vm.autostart = false` in `init_runtime`.
     pub no_linux_vm: bool,
@@ -125,6 +150,8 @@ pub struct VmArgs {
 /// Handles to spawned services for drain-on-shutdown.
 pub struct ServiceHandles {
     pub dns: tokio::task::JoinHandle<()>,
+    /// Actual UDP port selected by the bound DNS socket.
+    pub dns_port: u16,
     /// Docker API server task; `None` in VM-host-only mode.
     pub docker: Option<tokio::task::JoinHandle<()>>,
     pub grpc: tokio::task::JoinHandle<()>,

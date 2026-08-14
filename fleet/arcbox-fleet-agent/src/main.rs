@@ -16,8 +16,8 @@
 //! `quick enroll` (the socketless headless/farm path) and does nothing else.
 //! `serve` additionally exposes the local control-plane API on `agent.sock`,
 //! and does not require a credential up front — `enroll`/`drain`/`resume`/
-//! `unenroll` can drive it from another invocation of this CLI, or from the
-//! desktop app, while it runs.
+//! `unenroll`/`restart` can drive it from another invocation of this CLI, or
+//! from the desktop app, while it runs.
 
 // The local control-plane API (agent.sock) is a Unix domain socket with no
 // Windows equivalent implemented, so this crate targets macOS and Linux
@@ -34,20 +34,25 @@ mod credentials;
 mod docker;
 mod enroll;
 mod fsutil;
+mod handover;
 mod host;
 mod interop;
 #[cfg(test)]
 mod mock_daemon;
+mod reexec;
 mod runner;
+mod serve;
 #[cfg(target_os = "macos")]
 mod service;
 mod settings;
+mod shutdown;
 mod state;
 mod update;
 mod vm;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
@@ -56,12 +61,12 @@ use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecyc
 use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
 use arcbox_logging::LogConfig;
 use clap::{Args, Parser, Subcommand};
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::backends::Backends;
 use crate::config::{AgentConfig, DockerMode, VmMode};
 use crate::docker::DockerRunner;
+use crate::handover::{Handover, Outcome};
 use crate::interop::InteropRunner;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
@@ -101,6 +106,16 @@ enum Command {
     /// credential; the server keeps the machine record, so a fresh `enroll`
     /// joins as a new machine.
     Unenroll,
+    /// Restart the running agent in place: it stops accepting new offers,
+    /// waits for in-flight jobs, then re-execs itself — same PID, so a
+    /// launchd job is undisturbed. Unavailable under `quick run`, which
+    /// serves no control socket.
+    Restart {
+        /// Don't wait for in-flight jobs: cancel them, tearing down their
+        /// runner process groups and containers, and restart now.
+        #[arg(long)]
+        force: bool,
+    },
     /// Get or update the running agent's live-settable configuration.
     #[command(subcommand)]
     Settings(SettingsCommand),
@@ -220,7 +235,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = AgentConfig::from_env()?;
 
-    let _log_guard = arcbox_logging::init(LogConfig {
+    let log_guard = arcbox_logging::init(LogConfig {
         log_dir: config.data_dir.join("log"),
         file_name: "fleet-agent.log".to_string(),
         default_filter: "info".to_string(),
@@ -233,25 +248,54 @@ fn main() -> Result<()> {
         .build()
         .context("building tokio runtime")?;
 
-    runtime.block_on(run(cli.command, config))
+    let Outcome::Exec(binary) = runtime.block_on(run(cli.command, config))? else {
+        return Ok(());
+    };
+    // The one exec site in the process. `exec` runs no destructors, so
+    // everything that needs draining has to be dropped here: the runtime's
+    // worker threads first, then the logging guard that flushes the
+    // non-blocking writer.
+    drop(runtime);
+    drop(log_guard);
+    Err(reexec::exec(&binary))
 }
 
-async fn run(command: Command, config: AgentConfig) -> Result<()> {
+/// Dispatch the parsed subcommand.
+///
+/// Three of these arms can end by replacing this process image — `serve` (an
+/// operator `Restart` or a gateway-pushed self-update), `quick run` (the same
+/// push), and the two self-update entry points. None of them exec: they name
+/// the image and return it here, so [`main`] runs the teardown first.
+async fn run(command: Command, config: AgentConfig) -> Result<Outcome> {
     match command {
+        Command::Serve => serve::serve(config).await,
         Command::Enroll(EnrollArgs { token_file, token }) => {
             let token = resolve_enrollment_token(token_file, token)?;
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetLifecycleServiceClient::new(channel);
-            let response = client
-                .enroll(control_proto::EnrollRequest {
-                    enrollment_token: token,
-                    control_plane: String::new(),
-                })
-                .await
-                .context("Enroll RPC failed")?
-                .into_inner();
-            println!("enrolled (machine_id={})", response.machine_id);
-            Ok(())
+            let request = control_proto::EnrollRequest {
+                enrollment_token: token,
+                control_plane: String::new(),
+            };
+            let machine_id = match client.enroll(request.clone()).await {
+                Ok(response) => response.into_inner().machine_id,
+                // A gateway that pins a different build refuses the
+                // enrollment, and the agent self-updates and re-execs on the
+                // spot — so a connection that drops mid-call is the expected
+                // shape of "it updated", not a failure to report.
+                Err(status) if is_connection_lost(&status) => {
+                    println!(
+                        "agent restarted mid-enroll (a version refusal self-updates in place); \
+                         waiting for it to come back"
+                    );
+                    resume_enroll_after_restart(&config, request).await?
+                }
+                Err(status) => {
+                    return Err(anyhow::Error::new(status).context("Enroll RPC failed"));
+                }
+            };
+            println!("enrolled (machine_id={machine_id})");
+            Ok(Outcome::Exit)
         }
         Command::Quick(QuickCommand::Enroll(EnrollArgs { token_file, token })) => {
             let token = resolve_enrollment_token(token_file, token)?;
@@ -277,8 +321,12 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                             expected = %payload.expected_version,
                             "gateway requires a different build; self-updating before enrolling"
                         );
-                        let update_error = update::apply_and_exec(&config, &payload).await;
-                        warn!(error = %update_error, "self-update failed");
+                        match update::apply(&config, &payload).await {
+                            Ok(managed) => return Ok(Outcome::Exec(managed)),
+                            Err(update_error) => {
+                                warn!(error = %update_error, "self-update failed");
+                            }
+                        }
                     }
                     return Err(error);
                 }
@@ -286,7 +334,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             config
                 .credential_store_for(&seed.gateway)
                 .store(&credential)?;
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Quick(QuickCommand::Run) => {
             let settings_store = SettingsStore::new(config.settings_path());
@@ -302,8 +350,15 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             info!(machine_id = %credential.machine_id, "starting fleet agent");
 
             // `attach::run` stops accepting work and tears down in-flight
-            // runners once this fires.
-            let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
+            // runners once this fires. No control socket here, so a
+            // gateway-pushed self-update is the only thing that can record a
+            // handover — an operator `Restart` needs `serve`.
+            let handover = Handover::new(agent_state.clone());
+            shutdown::arm(
+                Arc::clone(&handover),
+                "termination signal received; draining runners",
+            );
+            let shutdown = handover.shutdown().clone();
             backends::spawn_vm_reprobe(
                 &backends,
                 agent_state.clone(),
@@ -312,8 +367,12 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 shutdown.clone(),
             );
 
-            let (supervisor, egress_rx) =
-                attach::spawn_supervisor(&config, Arc::clone(&backends), agent_state.clone());
+            let (supervisor, egress_rx) = attach::spawn_supervisor(
+                &config,
+                Arc::clone(&backends),
+                agent_state.clone(),
+                Arc::clone(&handover),
+            );
             attach::run(
                 config,
                 credential,
@@ -322,8 +381,10 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 backends,
                 shutdown,
                 agent_state,
+                Arc::clone(&handover),
             )
-            .await
+            .await?;
+            Ok(handover.outcome())
         }
         Command::Quick(QuickCommand::Unenroll) => {
             let settings_store = SettingsStore::new(config.settings_path());
@@ -334,51 +395,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 .context("not enrolled")?;
             enroll::unenroll_and_clear(&config, &seed.gateway, &credential).await?;
             println!("unenrolled");
-            Ok(())
-        }
-        Command::Serve => {
-            let settings_store = SettingsStore::new(config.settings_path());
-            let seed = load_or_seed_settings(&settings_store, &config)?;
-            let agent_state = AgentState::new(&seed);
-            let backends = init_backends(&config, &seed, agent_state.clone()).await?;
-            let socket_path = config.control_socket_path();
-
-            // Cascades to every attach task's child token, so runners still
-            // drain on SIGTERM even though `Unenroll` can also cancel one
-            // independently.
-            let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
-            backends::spawn_vm_reprobe(
-                &backends,
-                agent_state.clone(),
-                seed.vm_mode,
-                config.vm.daemon_socket.clone(),
-                shutdown.clone(),
-            );
-
-            let supervisor = Arc::new(
-                control::AgentSupervisor::new(
-                    config,
-                    backends,
-                    shutdown.clone(),
-                    agent_state.clone(),
-                    settings_store.clone(),
-                )
-                .await?,
-            );
-            let reconciler = supervisor.spawn_participation_reconciler(shutdown.clone());
-            control::serve(
-                &socket_path,
-                Arc::clone(&supervisor),
-                agent_state,
-                settings_store,
-                shutdown,
-            )
-            .await?;
-            // The control server has stopped accepting connections; give any
-            // live attach task its own shutdown grace before the process exits.
-            supervisor.join().await;
-            let _ = reconciler.await;
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Status => {
             let channel = control::client::connect_default(&config).await?;
@@ -413,7 +430,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 }
                 control_proto::ConnectionState::Unspecified => println!("unknown state"),
             }
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Drain => {
             let channel = control::client::connect_default(&config).await?;
@@ -423,7 +440,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 .await
                 .context("Drain RPC failed")?;
             println!("draining");
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Resume => {
             let channel = control::client::connect_default(&config).await?;
@@ -433,7 +450,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 .await
                 .context("Resume RPC failed")?;
             println!("resumed");
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Unenroll => {
             let channel = control::client::connect_default(&config).await?;
@@ -443,8 +460,9 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 .await
                 .context("Unenroll RPC failed")?;
             println!("unenrolled");
-            Ok(())
+            Ok(Outcome::Exit)
         }
+        Command::Restart { force } => restart(&config, force).await.map(|()| Outcome::Exit),
         Command::Settings(SettingsCommand::Get) => {
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetSettingsServiceClient::new(channel);
@@ -458,7 +476,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     .settings
                     .context("GetSettings response missing settings")?,
             );
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Settings(SettingsCommand::Set {
             load_ceiling,
@@ -505,7 +523,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     .settings
                     .context("UpdateSettings response missing settings")?,
             );
-            Ok(())
+            Ok(Outcome::Exit)
         }
         Command::Prepare { kinds } => {
             let kinds = kinds
@@ -522,30 +540,34 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             while let Some(event) = stream.message().await.context("prepare failed")? {
                 print_prepare_event(&event);
             }
-            Ok(())
+            Ok(Outcome::Exit)
         }
-        Command::Quick(QuickCommand::InstallService) => install_service(&config),
-        Command::Quick(QuickCommand::UninstallService) => uninstall_service(),
+        Command::Quick(QuickCommand::InstallService) => {
+            install_service(&config).map(|()| Outcome::Exit)
+        }
+        Command::Quick(QuickCommand::UninstallService) => {
+            uninstall_service().map(|()| Outcome::Exit)
+        }
         Command::Quick(QuickCommand::SelfUpdate) => self_update(&config).await,
     }
 }
 
 /// Manual self-update: resolve `latest.json` on the CDN, compare against
-/// `CARGO_PKG_VERSION`, and hand off to [`update::apply_and_exec`] when
-/// a newer build exists. Returns `Ok(())` on the already-latest no-op;
-/// the update path only returns on failure (success re-execs).
-async fn self_update(config: &AgentConfig) -> Result<()> {
+/// `CARGO_PKG_VERSION`, and swap in the newer build when there is one.
+/// [`Outcome::Exit`] on the already-latest no-op, otherwise the freshly
+/// installed binary for [`main`] to exec into.
+async fn self_update(config: &AgentConfig) -> Result<Outcome> {
     let payload = update::resolve_latest(&host::host_os(), &host::host_arch()).await?;
     if payload.expected_version == env!("CARGO_PKG_VERSION") {
         println!("already at latest ({})", payload.expected_version);
-        return Ok(());
+        return Ok(Outcome::Exit);
     }
     info!(
         current = env!("CARGO_PKG_VERSION"),
         expected = %payload.expected_version,
         "self-updating from CDN's latest"
     );
-    Err(update::apply_and_exec(config, &payload).await)
+    Ok(Outcome::Exec(update::apply(config, &payload).await?))
 }
 
 /// macOS: install the LaunchAgent via [`service::install`]. Other Unix
@@ -578,52 +600,6 @@ fn uninstall_service() -> Result<()> {
     )
 }
 
-/// Build a `CancellationToken` cancelled on the first termination signal
-/// (see [`shutdown_signal`]), logging `message` when it fires. Shared by
-/// `quick run` and `serve`, whose shutdown trigger is otherwise identical.
-fn spawn_shutdown_signal(message: &'static str) -> CancellationToken {
-    let shutdown = CancellationToken::new();
-    let signal_token = shutdown.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        info!("{message}");
-        signal_token.cancel();
-    });
-    shutdown
-}
-
-/// Resolve when the process receives a termination signal: Ctrl-C, or
-/// SIGTERM (e.g. a service-manager stop) — every supported target (macOS,
-/// Linux) is Unix, so SIGTERM handling is unconditional. If a listener
-/// cannot be installed, that signal simply never fires rather than aborting
-/// startup.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            warn!(error = %e, "failed to listen for Ctrl-C; ignoring");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to listen for SIGTERM; ignoring");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
-    }
-}
-
 /// Resolve the enrollment token from its chosen source: a file, an explicit
 /// `--token`, or stdin when neither is given (the two flags are mutually
 /// exclusive). Surrounding whitespace — a trailing newline from a file or
@@ -647,6 +623,249 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
         anyhow::bail!("enrollment token is empty");
     }
     Ok(token)
+}
+
+/// How long the CLI waits for an agent that is replacing its process image
+/// to answer again: `enroll` when a version refusal self-updates mid-call,
+/// and `restart` for the re-exec it asked for. It covers the exec and the
+/// control-socket rebind, but deliberately not the replacement's full
+/// startup — which re-runs the backend probes, including a runner-image pull
+/// per candidate arch — so callers report an unreachable agent as "restarting,
+/// not yet serving" rather than a failure.
+const RESTART_WAIT: Duration = Duration::from_secs(30);
+/// Gap between reconnect attempts inside [`RESTART_WAIT`].
+const RESTART_POLL: Duration = Duration::from_millis(250);
+
+/// Whether the RPC failed because the connection went away rather than
+/// because the agent chose to answer that way. `Enroll`'s own refusals all
+/// carry a specific code (`InvalidArgument` for an empty token,
+/// `FailedPrecondition` for a state or operator-action refusal, `Internal`
+/// for a fault), so only transport-level codes reach the resume path.
+fn is_connection_lost(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unknown | tonic::Code::Unavailable | tonic::Code::Cancelled
+    )
+}
+
+/// What a post-restart `GetStatus` says to do about the enrollment this CLI
+/// still owes its caller.
+#[derive(Debug, PartialEq, Eq)]
+enum PostRestart {
+    /// Definitively not enrolled — replay the enrollment.
+    Replay,
+    /// Enrolled, with the id to report.
+    Enrolled(String),
+    /// Enrolled-ish but no machine id yet: `AgentSupervisor::enroll`
+    /// publishes `Attaching` with an empty id for the whole of its gateway
+    /// round-trip, and `status` reports that as `Enrolled`. So this is
+    /// somebody else's `Enroll` still in flight — it may yet fail and leave
+    /// the agent unenrolled. Neither answer is known; look again.
+    InProgress,
+    /// A state this build does not model.
+    Unknown,
+}
+
+/// Classify a post-restart status. Split out as a pure function because it
+/// carries the whole double-enroll argument: `Replay` may only be returned
+/// when the agent is *definitively* unenrolled, never while an enrollment is
+/// merely unresolved.
+fn post_restart(state: control_proto::ConnectionState, machine_id: &str) -> PostRestart {
+    use control_proto::ConnectionState;
+    match state {
+        ConnectionState::Unenrolled => PostRestart::Replay,
+        ConnectionState::Unspecified => PostRestart::Unknown,
+        _ if machine_id.is_empty() => PostRestart::InProgress,
+        _ => PostRestart::Enrolled(machine_id.to_owned()),
+    }
+}
+
+/// One attempt at reading the restarting agent's enrollment. `Err` is a
+/// retryable "not back yet": no socket, or a socket whose server is still
+/// coming up.
+async fn poll_post_restart(
+    config: &AgentConfig,
+) -> Result<(
+    FleetLifecycleServiceClient<tonic::transport::Channel>,
+    PostRestart,
+)> {
+    let mut client =
+        FleetLifecycleServiceClient::new(control::client::connect_default(config).await?);
+    let status = client
+        .get_status(control_proto::GetStatusRequest {})
+        .await
+        .context("GetStatus RPC failed after the agent restarted")?
+        .into_inner();
+    let state = control_proto::ConnectionState::try_from(status.state)
+        .unwrap_or(control_proto::ConnectionState::Unspecified);
+    Ok((client, post_restart(state, &status.machine_id)))
+}
+
+/// Finish an `Enroll` whose connection dropped because the agent
+/// self-updated and re-exec'd. Polls until the replacement process has
+/// rebound the control socket *and* reports a settled enrollment, then
+/// replays the enrollment — the join token is multi-use, so replaying it is
+/// safe. Guarded by [`post_restart`]: the replay happens only while the
+/// agent is definitively unenrolled, so an enrollment that did land — or one
+/// another caller is still driving — can never enroll the machine twice.
+async fn resume_enroll_after_restart(
+    config: &AgentConfig,
+    request: control_proto::EnrollRequest,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + RESTART_WAIT;
+    let mut client = loop {
+        // Every arm that doesn't resolve the enrollment yields the reason to
+        // report if the deadline expires while we keep waiting on it.
+        let waiting_on = match poll_post_restart(config).await {
+            Ok((client, PostRestart::Replay)) => break client,
+            Ok((_, PostRestart::Enrolled(machine_id))) => return Ok(machine_id),
+            Ok((_, PostRestart::Unknown)) => {
+                anyhow::bail!("agent reported an unknown state after restarting")
+            }
+            Ok((_, PostRestart::InProgress)) => {
+                anyhow::anyhow!("another enrollment is still in progress")
+            }
+            Err(error) => error,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                waiting_on.context("the agent never came back ready to enroll after restarting")
+            );
+        }
+        tokio::time::sleep(RESTART_POLL).await;
+    };
+
+    let info = client
+        .get_agent_info(control_proto::GetAgentInfoRequest {})
+        .await
+        .context("GetAgentInfo RPC failed after the agent restarted")?
+        .into_inner();
+    println!(
+        "agent is back on {}; finishing enrollment",
+        info.agent_version
+    );
+    Ok(client
+        .enroll(request)
+        .await
+        .context("Enroll RPC failed after the agent self-updated")?
+        .into_inner()
+        .machine_id)
+}
+
+/// Restart the running agent, then wait for the replacement process image to
+/// answer on the control socket.
+///
+/// A graceful restart waits, unbounded, for in-flight jobs — so a wait that
+/// runs past [`RESTART_WAIT`] is reported as "still draining" and is not an
+/// error, whereas `--force` restarts promptly or not at all.
+async fn restart(config: &AgentConfig, force: bool) -> Result<()> {
+    let mut client =
+        FleetLifecycleServiceClient::new(control::client::connect_default(config).await?);
+    let before = client
+        .get_agent_info(control_proto::GetAgentInfoRequest {})
+        .await
+        .context("GetAgentInfo RPC failed")?
+        .into_inner();
+    // The capability handshake, not a version comparison: an agent without
+    // it would answer `Unimplemented` and leave nothing to wait for.
+    if !before.features.iter().any(|f| f == "restart") {
+        anyhow::bail!(
+            "the running agent ({}) does not support `restart`; restart it through its service \
+             manager (`launchctl kickstart -k gui/$UID/com.arcboxlabs.fleet.agent` on macOS)",
+            before.agent_version
+        );
+    }
+
+    match client
+        .restart(control_proto::RestartRequest { force })
+        .await
+    {
+        Ok(_) => {}
+        // The re-exec can replace the process before the response flushes;
+        // that is the restart landing, not a failure to report.
+        Err(status) if is_connection_lost(&status) => {}
+        Err(status) => return Err(anyhow::Error::new(status).context("Restart RPC failed")),
+    }
+
+    match wait_for_restart(config, &before.instance_id).await {
+        Restarted::NewInstance(version) => {
+            println!("agent restarted (version {version})");
+            Ok(())
+        }
+        // The old image stopped answering, so the restart did happen; the
+        // replacement is still working through its startup probes (which pull
+        // the runner image per arch before binding the socket). Reporting
+        // this as a failure would send the operator back to the service
+        // manager for a restart that worked.
+        Restarted::NotServingYet => {
+            println!("agent restarted; still starting up (it has not rebound its control socket)");
+            Ok(())
+        }
+        Restarted::SameInstance if force => anyhow::bail!(
+            "the agent did not restart within {}s",
+            RESTART_WAIT.as_secs()
+        ),
+        Restarted::SameInstance => {
+            println!(
+                "restart requested; the agent is still finishing in-flight jobs and restarts \
+                 once the last one releases"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// What [`wait_for_restart`] saw before it gave up waiting.
+#[derive(Debug, PartialEq, Eq)]
+enum Restarted {
+    /// The replacement image is serving, with its version.
+    NewInstance(String),
+    /// The old image never stopped answering: it is still waiting to be
+    /// replaced (in-flight jobs), or the restart never took.
+    SameInstance,
+    /// The old image is gone — the restart landed — but nothing answers on
+    /// the socket yet.
+    NotServingYet,
+}
+
+/// Poll the control socket until it answers from a process image other than
+/// `previous`, or [`RESTART_WAIT`] expires.
+///
+/// The two ways of running out of time are not the same event, so they are
+/// reported apart: an agent that kept answering as `previous` has not
+/// restarted, while one that stopped answering has — only its replacement is
+/// not serving yet. Collapsing them would make a slow-starting replacement
+/// indistinguishable from a restart that never happened.
+async fn wait_for_restart(config: &AgentConfig, previous: &str) -> Restarted {
+    let deadline = tokio::time::Instant::now() + RESTART_WAIT;
+    let mut previous_answered = false;
+    loop {
+        if let Ok(channel) = control::client::connect_default(config).await {
+            let info = FleetLifecycleServiceClient::new(channel)
+                .get_agent_info(control_proto::GetAgentInfoRequest {})
+                .await;
+            if let Ok(info) = info {
+                let info = info.into_inner();
+                if info.instance_id == previous {
+                    previous_answered = true;
+                } else {
+                    return Restarted::NewInstance(info.agent_version);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Keyed on the *last* observation, not on whether the old image
+            // was ever seen: it answering early and going silent later is the
+            // restart in progress.
+            return if previous_answered {
+                Restarted::SameInstance
+            } else {
+                Restarted::NotServingYet
+            };
+        }
+        previous_answered = false;
+        tokio::time::sleep(RESTART_POLL).await;
+    }
 }
 
 /// Run the startup probes and assemble the backend registry: any
@@ -925,5 +1144,71 @@ mod tests {
             resolve_enrollment_token(Some(path.clone()), Some("ignored".to_owned())).unwrap();
         assert_eq!(token, "flt_from_file");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Only a lost connection may trigger the resume path. A deliberate
+    /// refusal reaching it would replay an enrollment the agent already
+    /// answered.
+    #[test]
+    fn only_transport_failures_count_as_a_lost_connection() {
+        for code in [
+            tonic::Code::Unknown,
+            tonic::Code::Unavailable,
+            tonic::Code::Cancelled,
+        ] {
+            assert!(
+                is_connection_lost(&tonic::Status::new(code, "")),
+                "{code:?}"
+            );
+        }
+        for code in [
+            tonic::Code::FailedPrecondition,
+            tonic::Code::InvalidArgument,
+            tonic::Code::Internal,
+        ] {
+            assert!(
+                !is_connection_lost(&tonic::Status::new(code, "")),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// The double-enroll guard. `Replay` is only ever correct when the agent
+    /// is definitively unenrolled — an enrolled state reports its id, and an
+    /// enrollment still in flight (`Attaching`, which `status` reports as
+    /// `Enrolled` with no id yet) is unresolved, not a licence to replay.
+    #[test]
+    fn post_restart_replays_only_a_definitely_unenrolled_agent() {
+        use control_proto::ConnectionState;
+
+        assert_eq!(
+            post_restart(ConnectionState::Unenrolled, ""),
+            PostRestart::Replay
+        );
+        assert_eq!(
+            post_restart(ConnectionState::Enrolled, "fltm_test"),
+            PostRestart::Enrolled("fltm_test".to_owned())
+        );
+        // Another caller's Enroll is mid-round-trip: no id published yet.
+        assert_eq!(
+            post_restart(ConnectionState::Enrolled, ""),
+            PostRestart::InProgress
+        );
+        assert_eq!(
+            post_restart(ConnectionState::Unspecified, ""),
+            PostRestart::Unknown
+        );
+        // Every other enrolled-ish state reports its machine, never replays.
+        for state in [
+            ConnectionState::Draining,
+            ConnectionState::Detached,
+            ConnectionState::CredentialRejected,
+        ] {
+            assert_eq!(
+                post_restart(state, "fltm_test"),
+                PostRestart::Enrolled("fltm_test".to_owned()),
+                "{state:?}"
+            );
+        }
     }
 }

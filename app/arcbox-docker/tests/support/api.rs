@@ -31,7 +31,7 @@ pub async fn create_test_runtime() -> (Arc<Runtime>, Arc<VsockConnector>, TempDi
         Runtime::with_vm_lifecycle_config(config, vm_lifecycle_config)
             .expect("Failed to create runtime"),
     );
-    runtime.init().await.expect("Failed to init runtime");
+    runtime.init(|_| {}).await.expect("Failed to init runtime");
     let connector = Arc::new(VsockConnector::new(Arc::clone(&runtime)));
     (runtime, connector, tmp_dir)
 }

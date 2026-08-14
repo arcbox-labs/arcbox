@@ -1,0 +1,153 @@
+name: SDK TypeScript Release
+
+# Publishes @arcbox/sandbox to npm on its own cadence, independent of the
+# main arcbox release train — mirrors release-fleet-agent.yml. The tag is
+# minted by release-please when the sdk-typescript component's release PR
+# merges (see release-please-config.json).
+#
+# Publishing uses npm trusted publishing (OIDC): no NPM_TOKEN secret, no
+# registry-url wiring — the job's id-token permission lets npm mint a
+# workflow-scoped credential, and provenance attestations are generated
+# automatically. One-time bootstrap (first publish is local, then the
+# Trusted Publisher is configured on npmjs.com pointing at this workflow
+# file): see sdk/typescript/README.md "Releasing".
+
+on:
+  push:
+    tags:
+      - 'sdk-typescript-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. sdk-typescript-v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish @arcbox/sandbox to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Required for npm trusted publishing: lets the job mint the OIDC
+      # token npm exchanges for a publish credential.
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdk/typescript
+
+    steps:
+      - name: Determine tag
+        id: tag
+        working-directory: .
+        # The dispatch input arrives through the environment, never spliced
+        # into the script body: template expansion happens before bash runs,
+        # so a `case` guard on an already-interpolated string cannot protect
+        # the assignment itself. This job holds `id-token: write`.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            sdk-typescript-v*) ;;
+            *)
+              echo "::error::tag '$TAG' does not match sdk-typescript-v*"
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#sdk-typescript-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG (npm version $VERSION)"
+
+      # Check out the tag being released, not the dispatching ref — a
+      # workflow_dispatch from master must still publish the tag's tree,
+      # or the published package would not match the release.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          # This job mints a publish credential; never leave the repo token
+          # persisted on disk beside it.
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0  # zizmor: ignore[cache-poisoning] -- setup-node caching is opt-in via the cache input, which this step does not set
+        with:
+          node-version: 22
+          # No cache restore: a publish job must build from the lockfile
+          # alone, not from a cache another workflow could have poisoned.
+
+      # Trusted publishing requires npm >= 11.5.1 (Node 22 bundles 10.x).
+      - name: Update npm for trusted publishing
+        run: |
+          npm install -g npm@11.5.1
+          npm --version
+
+      - name: Verify tag matches package.json
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PKG_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "::error::package.json version ($PKG_VERSION) != tag version (${{ steps.tag.outputs.version }})"
+            exit 1
+          fi
+
+      # Idempotency: a re-dispatch (or a re-delivered tag event) must not
+      # fail on an already-published release — npm rejects republishing a
+      # version, so skip cleanly instead (same lesson as the crates.io
+      # publish retry in release.yml).
+      - name: Check registry for existing version
+        id: registry
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://registry.npmjs.org/@arcbox%2fsandbox/${{ steps.tag.outputs.version }}")
+          if [ "$STATUS" = "200" ]; then
+            echo "::notice::@arcbox/sandbox@${{ steps.tag.outputs.version }} already on the registry; skipping publish"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.registry.outputs.published != 'true'
+        run: npm ci
+
+      - name: Lint
+        if: steps.registry.outputs.published != 'true'
+        run: npm run lint
+
+      - name: Format check
+        if: steps.registry.outputs.published != 'true'
+        run: npm run format:check
+
+      - name: Typecheck
+        if: steps.registry.outputs.published != 'true'
+        run: npm run typecheck
+
+      - name: Test
+        if: steps.registry.outputs.published != 'true'
+        run: npm test
+
+      - name: Build
+        if: steps.registry.outputs.published != 'true'
+        run: npm run build:publish
+
+      # No --provenance: trusted publishing generates provenance
+      # attestations by default. No NODE_AUTH_TOKEN: OIDC replaces it.
+      # --ignore-scripts so the tarball is the artifact the steps above
+      # built and tested. package.json's prepublishOnly re-runs
+      # `rm -rf dist && bunchee` plus the whole suite inside publish, which
+      # would discard the validated dist/ and ship a rebuild nothing
+      # checked — the gate-then-build-then-publish shape only means
+      # something if the published bytes are the gated bytes.
+      - name: Publish to npm
+        if: steps.registry.outputs.published != 'true'
+        run: npm publish --access public --ignore-scripts

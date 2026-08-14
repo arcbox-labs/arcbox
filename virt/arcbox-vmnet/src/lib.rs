@@ -5,8 +5,9 @@
 //!   XPC, and the Objective-C block ABI required by `vmnet_start_interface`.
 //! - A high-level [`Vmnet`] interface for creating shared (NAT), host-only,
 //!   and bridged virtual network interfaces.
-//! - A [`VmnetRelay`] that bridges vmnet's blocking read/write API to a
-//!   `socketpair` consumed by `VZFileHandleNetworkDeviceAttachment`.
+//! - A [`VmnetRelay`] that bridges vmnet to a `socketpair` consumed by
+//!   `VZFileHandleNetworkDeviceAttachment`: reads are event-driven via
+//!   `vmnet_interface_set_event_callback`, writes are async on the fd.
 //!
 //! # Operating modes
 //!

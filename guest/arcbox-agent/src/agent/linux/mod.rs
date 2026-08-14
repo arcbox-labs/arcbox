@@ -10,14 +10,17 @@ mod disk;
 mod kubernetes;
 mod machine_exec;
 mod memory_pressure;
+mod metadata_volume;
 mod port_forward;
 mod probe;
 mod proxy;
 mod rpc;
 mod runtime;
+mod runtime_cache;
 mod sandbox;
 mod stats;
 mod system_info;
 mod vsock;
 
 pub use agent::Agent;
+pub use cmdline::container_network;

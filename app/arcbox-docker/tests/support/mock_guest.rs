@@ -80,6 +80,9 @@ pub struct MockGuest {
     pub cancel: CancellationToken,
     /// Body received on the most recent upgrade request (if any).
     last_upgrade_body: Arc<Mutex<Option<Bytes>>>,
+    /// Request target of the most recent request, exactly as it arrived —
+    /// path *and* query, before any version-prefix stripping.
+    last_request_uri: Arc<Mutex<Option<String>>>,
 }
 
 impl MockGuest {
@@ -87,6 +90,16 @@ impl MockGuest {
     #[allow(dead_code)] // used by the proxy_integration suite only
     pub async fn last_upgrade_body(&self) -> Option<Bytes> {
         self.last_upgrade_body.lock().await.clone()
+    }
+
+    /// Returns the request target of the most recent request.
+    ///
+    /// Recorded verbatim so a test can assert what the proxy actually put on
+    /// the wire — a query string that arrives re-encoded or truncated is
+    /// invisible to body-echo assertions but changes what dockerd does.
+    #[allow(dead_code)] // used by the api_request_forwarding suite only
+    pub async fn last_request_uri(&self) -> Option<String> {
+        self.last_request_uri.lock().await.clone()
     }
 }
 
@@ -105,6 +118,8 @@ pub async fn start_with_routes(dir: &Path, routes: Vec<MockRoute>) -> MockGuest 
     let token = cancel.clone();
     let last_upgrade_body: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
     let body_slot = Arc::clone(&last_upgrade_body);
+    let last_request_uri: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let uri_slot = Arc::clone(&last_request_uri);
     let routes = Arc::new(routes);
 
     tokio::spawn(async move {
@@ -118,13 +133,15 @@ pub async fn start_with_routes(dir: &Path, routes: Vec<MockRoute>) -> MockGuest 
             };
 
             let slot = Arc::clone(&body_slot);
+            let uris = Arc::clone(&uri_slot);
             let routes = Arc::clone(&routes);
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let svc = service_fn(move |req| {
                     let slot = Arc::clone(&slot);
+                    let uris = Arc::clone(&uris);
                     let routes = Arc::clone(&routes);
-                    handle(req, slot, routes)
+                    handle(req, slot, uris, routes)
                 });
                 let _ = http1::Builder::new()
                     .serve_connection(io, svc)
@@ -138,6 +155,7 @@ pub async fn start_with_routes(dir: &Path, routes: Vec<MockRoute>) -> MockGuest 
         socket_path,
         cancel,
         last_upgrade_body,
+        last_request_uri,
     }
 }
 
@@ -169,8 +187,14 @@ fn strip_version_prefix(path: &str) -> &str {
 async fn handle(
     mut req: Request<Incoming>,
     upgrade_body_slot: Arc<Mutex<Option<Bytes>>>,
+    request_uri_slot: Arc<Mutex<Option<String>>>,
     routes: Arc<Vec<MockRoute>>,
 ) -> std::result::Result<Response<http_body_util::Full<Bytes>>, hyper::Error> {
+    // Recorded before anything else, and before version stripping, so a test
+    // sees exactly what the proxy sent — including the query string, which
+    // no canned route matches on.
+    *request_uri_slot.lock().await = Some(req.uri().to_string());
+
     // Canned routes take precedence over echo behavior.
     let path = strip_version_prefix(req.uri().path()).to_owned();
     if let Some(route) = routes

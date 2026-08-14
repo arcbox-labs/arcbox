@@ -57,6 +57,7 @@ Defined in `app/arcbox-core/src/config.rs`.
 | `data/machines/` | Virtual machine data | daemon |
 | `data/volumes/` | Named volumes | daemon |
 | `data/docker.img` | Docker persistent disk image (Btrfs) | daemon |
+| `data/docker-meta.img` | Docker metadata disk image (ext4, fsync-hot boltdb state); paired with `docker.img` — back up or move the two together | daemon |
 
 ### 1.4 `boot/` — Boot Asset Cache
 
@@ -72,21 +73,25 @@ Assets are version-keyed. The daemon downloads them on first launch if not
 already cached. When running inside the Desktop app bundle, they are seeded
 from `Contents/Resources/assets/{version}/` to avoid a network round-trip.
 
-### 1.5 `runtime/` — Guest Runtime Binaries
+### 1.5 `runtime/` — Runtime Binaries
 
 | Path | Purpose | Creator |
 |------|---------|---------|
-| `runtime/bin/` | dockerd, containerd, runc, etc. | daemon (bundle seed) |
+| `runtime/bin/` | Host Docker CLI tools | daemon (bundle seed) |
+| `runtime/{version}/bin/` | Guest dockerd, containerd, runc, etc. | daemon (bundle seed) |
+| `runtime/{version}/kernel/` | Sandbox guest kernel | daemon (bundle seed) |
 
 Seeded from `Contents/Resources/runtime/` when running inside the app bundle.
-Exposed to the guest VM via VirtioFS at `/arcbox/runtime/bin`.
+Each guest generation is exposed via VirtioFS at
+`/arcbox/runtime/{version}/` as a transport source. The agent verifies each
+manifest entry and materializes it onto the guest Btrfs data disk before
+execution.
 
 ### 1.6 `bin/` — User Executables
 
 | Path | Purpose | Creator |
 |------|---------|---------|
 | `bin/abctl` | CLI symlink | cli (`abctl setup install`) |
-| `bin/arcbox` | Compatibility symlink → abctl | cli (`abctl setup install`) |
 | `bin/arcbox-daemon` | Fallback daemon binary path | cli |
 | `bin/arcbox-agent` | Guest agent binary | daemon (bundle seed / boot cache) |
 | `bin/vm-agent` | Sandbox microVM init binary (guest sees `/arcbox/bin/vm-agent`) | daemon (bundle seed / boot cache) |
@@ -234,7 +239,7 @@ These paths exist inside the Linux VM, not on the macOS host. Defined in
 |------------|----------------|--------------|---------|
 | `/arcbox` | `~/.arcbox/` | `arcbox` | ArcBox data sharing |
 | `/arcbox/log/` | `~/.arcbox/log/` | — | Guest logs visible from host |
-| `/arcbox/runtime/bin` | `~/.arcbox/runtime/bin` | — | Runtime binaries |
+| `/arcbox/runtime/{version}/` | `~/.arcbox/runtime/{version}/` | — | Runtime transport source (never executed directly) |
 | `/Users` | `/Users` | `users` | macOS home directory passthrough |
 
 Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
@@ -248,15 +253,41 @@ Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
 | `/var/run/docker.sock` | dockerd API socket | agent (dockerd) |
 | `/run/containerd/containerd.sock` | containerd gRPC socket | agent (containerd) |
 | `/run/arcbox/data` | Btrfs temporary mount point | agent |
+| `/run/arcbox/data/runtime/{generation}` | Verified runtime generation persisted on Btrfs | agent |
+| `/run/arcbox/runtime` | Stable symlink to the active Btrfs runtime generation | agent |
 | `/run/arcbox/vmm.sock` | Guest VMM gRPC socket | agent |
-| `/var/lib/arcbox/sandboxes` | Firecracker sandbox data | agent |
+| `/var/lib/arcbox/sandbox` | Persistent Btrfs `@sandboxes` subvolume | agent |
+| `/var/lib/arcbox/sandbox/sandboxes` | Firecracker runtime files and crash-cleanup journals | agent |
+| `/var/lib/arcbox/sandbox/sandbox-records` | Durable Sandbox lifecycle records | agent |
+| `/var/lib/arcbox/sandbox/snapshots` | Sandbox checkpoint catalog and data | agent |
+| `/var/lib/arcbox/sandbox/cow` | Sandbox dm-snapshot CoW files | agent |
+| `/var/lib/arcbox/sandbox/template-catalog` | Template catalog metadata, one JSON per template name (artifacts live in the rootfs cache / snapshot catalog) | agent |
 | `/var/lib/arcbox/sandbox/rootfs.ext4` | Default sandbox rootfs (busybox + vm-agent, auto-built) | agent |
-| `/var/lib/arcbox/sandbox/rootfs-<hash>.ext4` | Converted overlay2 rootfs cache | agent |
+| `/var/lib/arcbox/sandbox/rootfs-<layer>-<agent>.ext4` | Converted image rootfs cache, keyed on the source layer and the injected `vm-agent`; superseded entries are swept on the next conversion unless a snapshot still needs them as its dm-snapshot origin | agent |
 | `/var/lib/arcbox/jailer` | Firecracker jailer chroots | agent |
-| `/arcbox/runtime/bin/{firecracker,jailer}` | Firecracker binaries (boot manifest, via VirtioFS) | host daemon |
-| `/arcbox/runtime/kernel/vmlinux` | Sandbox guest kernel (boot manifest, via VirtioFS) | host daemon |
+| `/run/arcbox/runtime/bin/{firecracker,jailer}` | Firecracker binaries in the active Btrfs runtime generation | agent |
+| `/run/arcbox/runtime/kernel/vmlinux` | Sandbox guest kernel in the active Btrfs runtime generation | agent |
 | `/arcbox/bin/vm-agent` | Sandbox init binary, staged next to `arcbox-agent` (via VirtioFS) | host daemon |
 | `/etc/arcbox/vmm.toml` | Optional guest VMM config override (not shipped; built-in defaults apply) | admin (manual) |
+
+Sandbox lifecycle metadata survives an `arcbox-agent` restart. Live
+Firecracker processes are not re-adopted yet: startup first tears down their
+runtime resources, then exposes the affected Sandbox as `Failed`. Create and
+Restore share the same durable lifecycle and request-replay model; TTL timers
+remain process-local in this first persistence phase. Restore requires jailer
+isolation; direct mode is rejected because Firecracker snapshots embed shared
+origin paths that cannot safely support concurrent clones.
+
+Create and Restore retries are durable only when the caller supplies `id`.
+An empty ID asks the agent to generate a fresh UUID and is intentionally not
+retry-idempotent; clients that may retry must generate and retain the ID before
+the first call. Remove is intentionally different in this phase: a request
+deletes whichever generation owns the ID when it executes, because the public
+Remove API does not yet carry an expected generation or idempotency key.
+
+An in-place agent upgrade that still has legacy
+`/var/lib/arcbox/sandboxes/*` runtime directories is rejected until the guest restarts,
+so the new persistent namespace cannot collide with an old live runtime.
 
 ---
 
@@ -283,5 +314,5 @@ older installations. They can be safely deleted.
 | **cli** (`abctl`) | `~/.arcbox/{bin,shell,completions}/`, Docker context, LaunchAgent registration, shell profile injection |
 | **helper** (root) | `/etc/resolver/`, `/usr/local/bin/` symlinks, `/var/run/docker.sock` symlink |
 | **desktop** | SMAppService LaunchAgent registration, `~/.arcbox/run/` directory creation, helper install trigger |
-| **agent** (guest) | `/arcbox/` mount, `/var/lib/{docker,containerd}/`, guest sockets, Btrfs subvolumes |
+| **agent** (guest) | `/arcbox/` transport mount, `/run/arcbox/data/runtime/`, `/var/lib/{docker,containerd}/`, guest sockets, Btrfs subvolumes |
 | **launchd** | `/var/run/arcbox-helper.sock` (socket-activation), helper service lifecycle |

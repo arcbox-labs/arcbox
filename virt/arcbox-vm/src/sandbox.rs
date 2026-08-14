@@ -26,26 +26,40 @@ use crate::boot_proto::KernelIpParam;
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
-use crate::snapshot::SnapshotCatalog;
+use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager};
 use crate::spawn::{spawn_direct, spawn_jailer};
-use crate::vsock::{self, ExecInputMsg, OutputChunk, StartCommand};
+use crate::template_catalog::TemplateCatalog;
+use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 
 mod boot;
 mod checkpoint;
 mod cleanup;
+mod execution;
+mod files;
 mod lifecycle;
+mod pause;
+mod persistence;
+mod pool;
 mod reconcile;
+mod templates;
+mod timers;
 mod types;
+mod warm;
 mod workload;
 
+pub use execution::{
+    ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
+};
+pub use pause::reason as pause_reason;
 pub use types::{
-    CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId, SandboxInfo,
-    SandboxInstance, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec,
-    SandboxState, SandboxSummary,
+    CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
+    SandboxEvent, SandboxId, SandboxInfo, SandboxInstance, SandboxMountSpec, SandboxNetworkInfo,
+    SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary, TemplateWarmRef,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+type ReconcileResult = std::result::Result<(), Arc<str>>;
 
 /// Shared registry of live sandbox instances.
 pub(crate) type InstanceMap = Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>;
@@ -53,31 +67,48 @@ pub(crate) type InstanceMap = Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxIns
 /// Manages the full lifecycle of multiple sandbox microVMs.
 pub struct SandboxManager {
     instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
+    records: Arc<persistence::SandboxRecordStore>,
     network: Arc<NetworkManager>,
     snapshots: Arc<SnapshotCatalog>,
+    /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
+    templates: Arc<TemplateCatalog>,
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
-    /// Flips to `true` once the startup orphan sweep has finished. Create and
-    /// restore gate on it so a re-created same-id sandbox can never race the
-    /// sweep (see [`SandboxManager::await_reconcile`]).
-    reconcile_done: tokio::sync::watch::Receiver<bool>,
+    /// Pre-warmed restore slots (CORE-78); see `pool.rs`.
+    pool: Arc<pool::SlotPool>,
+    /// Warm template snapshot bookkeeping (CORE-77); see `warm.rs`.
+    warm: Arc<warm::WarmCache>,
+    /// Addressable executions (CORE-55); see `execution.rs`.
+    executions: Arc<execution::ExecutionRegistry>,
+    /// Publishes the startup reconciliation result. Lifecycle and read APIs
+    /// gate on it so callers never observe partial recovered state.
+    reconcile_done: tokio::sync::watch::Receiver<Option<ReconcileResult>>,
+    /// Per-sandbox TTL / idle expiry timers (CORE-21/60); see `timers.rs`.
+    timers: timers::LifecycleTimers,
+    /// Weak self-handle set by [`Self::into_shared`]; idle timers need it to
+    /// reach the pause/remove flows from a detached task.
+    self_handle: std::sync::OnceLock<std::sync::Weak<Self>>,
 }
 
 impl SandboxManager {
     /// Create a new manager from the given configuration.
     pub fn new(config: VmmConfig) -> Result<Self> {
-        let network = Arc::new(NetworkManager::new(
+        let records = Arc::new(persistence::SandboxRecordStore::new(Path::new(
+            &config.firecracker.data_dir,
+        ))?);
+        drop(records.load_all()?);
+        let network = Arc::new(NetworkManager::with_quarantine_dir(
             &config.network.cidr,
             &config.network.gateway,
             config.network.dns.clone(),
+            Path::new(&config.firecracker.data_dir).join("sandbox-network-quarantine"),
+            config.firecracker.sandbox_datapath,
         )?);
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
+        let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let cow_manager = Arc::new(
-            CowManager::new(&config.firecracker.data_dir)
-                .map_err(|e| VmmError::Config(format!("CowManager init: {e}")))?,
-        );
+        let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir)?);
 
         // Ensure the jailer chroot base directory exists.
         if let Some(ref jc) = config.firecracker.jailer {
@@ -93,28 +124,98 @@ impl SandboxManager {
         // same-id sandbox can't have its deterministically-named resources torn
         // down mid-flight. Only meaningful inside a tokio runtime; sync
         // constructions (unit tests) have no previous instance to reconcile.
-        let (reconcile_tx, reconcile_done) = tokio::sync::watch::channel(false);
+        let (reconcile_tx, reconcile_done) = tokio::sync::watch::channel(None);
+        let executions = Arc::new(execution::ExecutionRegistry::default());
+        let instances = Arc::new(RwLock::new(HashMap::new()));
         if tokio::runtime::Handle::try_current().is_ok() {
             let config = Arc::clone(&config);
             let network = Arc::clone(&network);
             let cow_manager = Arc::clone(&cow_manager);
+            let snapshots = Arc::clone(&snapshots);
+            let records = Arc::clone(&records);
+            let instances = Arc::clone(&instances);
             tokio::spawn(async move {
-                reconcile::sweep_orphans(&config, &network, &cow_manager).await;
-                let _ = reconcile_tx.send(true);
+                let result = async {
+                    let swept = reconcile::sweep_orphans(
+                        &config,
+                        &network,
+                        &cow_manager,
+                        &snapshots,
+                        &records,
+                    )
+                    .await?;
+                    let inactive = reconcile::normalize_durable_records(
+                        &records,
+                        Path::new(&config.firecracker.data_dir),
+                        Some(&swept.ids),
+                    )?;
+                    reconcile::finalize_sweep(swept).await?;
+                    network.mark_reconciled();
+                    Ok::<_, VmmError>(inactive)
+                }
+                .await
+                .map(|inactive| {
+                    let mut map = instances.write().unwrap();
+                    map.extend(
+                        inactive
+                            .into_iter()
+                            .map(|instance| (instance.id.clone(), Arc::new(Mutex::new(instance)))),
+                    );
+                })
+                .map_err(|error| Arc::<str>::from(error.to_string()));
+                let _ = reconcile_tx.send(Some(result));
             });
+            // Executions die with their sandbox; purge on terminal events so
+            // every teardown path (stop / remove / TTL / boot failure) is
+            // covered without threading the registry through each of them.
+            execution::spawn_teardown_purge(Arc::clone(&executions), events_tx.subscribe());
         } else {
-            let _ = reconcile_tx.send(true);
+            let inactive = reconcile::normalize_durable_records(
+                &records,
+                Path::new(&config.firecracker.data_dir),
+                None,
+            )?;
+            network.mark_reconciled();
+            instances.write().unwrap().extend(
+                inactive
+                    .into_iter()
+                    .map(|instance| (instance.id.clone(), Arc::new(Mutex::new(instance)))),
+            );
+            let _ = reconcile_tx.send(Some(Ok(())));
         }
 
         Ok(Self {
-            instances: Arc::new(RwLock::new(HashMap::new())),
+            instances,
+            records,
             network,
             snapshots,
+            templates,
             config,
             events_tx,
             cow_manager,
+            pool: Arc::new(pool::SlotPool::default()),
+            warm: Arc::new(warm::WarmCache::default()),
+            executions,
             reconcile_done,
+            timers: timers::LifecycleTimers::default(),
+            self_handle: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wrap the manager in an `Arc` and start the lifecycle monitor that
+    /// arms/cancels the idle and TTL timers off the event stream.
+    ///
+    /// Production embedders (the guest agent's `SandboxService`) must use
+    /// this; a plain [`Self::new`] manager never fires idle timers (unit
+    /// tests exercising unrelated surfaces rely on that inertness).
+    #[must_use]
+    pub fn into_shared(self) -> Arc<Self> {
+        let manager = Arc::new(self);
+        let _ = manager.self_handle.set(Arc::downgrade(&manager));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            timers::spawn_lifecycle_monitor(&manager);
+        }
+        manager
     }
 
     /// Wait until the startup orphan sweep has completed.
@@ -126,10 +227,151 @@ impl SandboxManager {
     /// — would have its live device destroyed or a live template detached.
     /// Gating create/restore on the sweep removes that class entirely; it runs
     /// once, so after completion this returns immediately.
-    pub(super) async fn await_reconcile(&self) {
+    pub(super) async fn await_reconcile(&self) -> Result<()> {
         let mut rx = self.reconcile_done.clone();
-        let _ = rx.wait_for(|&done| done).await;
+        let result = rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|error| VmmError::Other(format!("sandbox reconciliation stopped: {error}")))?
+            .clone()
+            .expect("wait_for returned only after reconciliation completed");
+        result.map_err(|error| {
+            VmmError::Other(format!(
+                "sandbox durable-state reconciliation failed: {error}"
+            ))
+        })
     }
+
+    fn check_reconcile(&self) -> Result<()> {
+        let result = self.reconcile_done.borrow().clone();
+        match result {
+            None => Err(VmmError::Other(
+                "sandbox durable-state reconciliation is still running".into(),
+            )),
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => Err(VmmError::Other(format!(
+                "sandbox durable-state reconciliation failed: {error}"
+            ))),
+        }
+    }
+
+    /// Return sandbox IDs whose inactive network allocation still awaits host
+    /// forwarding cleanup.
+    pub async fn pending_network_cleanups(&self) -> Result<Vec<(String, String)>> {
+        self.await_reconcile().await?;
+        Ok(self.network.pending_quarantines())
+    }
+
+    /// Validate one exact pending host-cleanup ticket.
+    pub async fn validate_network_cleanup(
+        &self,
+        id: &str,
+        token: &str,
+    ) -> Result<NetworkAllocation> {
+        self.await_reconcile().await?;
+        self.network.validate_quarantine(id, token)
+    }
+
+    /// Recycle one exact inactive sandbox generation after forwarding cleanup.
+    pub async fn finalize_network_cleanup(&self, id: &str, token: &str) -> Result<()> {
+        self.await_reconcile().await?;
+        self.network.finalize_quarantine(id, token)
+    }
+
+    /// Reject allocation/exposure until startup cleanup replay is finalized.
+    pub fn ensure_startup_cleanup_complete(&self) -> Result<()> {
+        self.network.ensure_startup_cleanup_complete()
+    }
+
+    /// Wait until the current agent generation's startup cleanup is complete.
+    pub async fn wait_startup_cleanup_complete(&self) {
+        self.network.wait_startup_cleanup_complete().await;
+    }
+
+    /// Opaque ticket for the host cleanup pass required after agent startup.
+    pub async fn startup_cleanup_token(&self) -> Result<Option<String>> {
+        self.await_reconcile().await?;
+        Ok(self.network.startup_cleanup_token())
+    }
+
+    /// Validate the current process-generation startup cleanup ticket.
+    pub async fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
+        self.await_reconcile().await?;
+        self.network.validate_startup_cleanup(token)
+    }
+
+    /// Release the startup gate once host listeners and legacy DNAT are gone.
+    pub async fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
+        self.await_reconcile().await?;
+        self.network.finalize_startup_cleanup(token)
+    }
+
+    /// Return the active generation's network identity: the external pool IP
+    /// (what DNS, expose, and the API report), its opaque cleanup token, and
+    /// how expose DNAT must target the sandbox (CORE-81/CORE-83).
+    pub fn sandbox_network_identity(&self, id: &str) -> Result<SandboxNetworkIdentity> {
+        self.ensure_startup_cleanup_complete()?;
+        let instance = self.get_instance(&id.to_owned())?;
+        let instance = instance.lock().unwrap();
+        let allocation = instance
+            .network
+            .as_ref()
+            .ok_or_else(|| VmmError::WrongState {
+                id: id.to_owned(),
+                expected: "sandbox with an active network allocation".into(),
+                actual: instance.state.to_string(),
+            })?;
+        Ok(SandboxNetworkIdentity {
+            ip: allocation.ip_address,
+            cleanup_token: allocation.cleanup_token.clone(),
+            expose: self
+                .network
+                .expose_target(&allocation.tap_name, instance.net_invariant),
+        })
+    }
+}
+
+/// A sandbox's network identity as seen by forwarding and DNS consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxNetworkIdentity {
+    /// External pool IP — the address the rest of the system keeps using.
+    pub ip: std::net::Ipv4Addr,
+    /// Opaque generation token carried through host cleanup finalization.
+    pub cleanup_token: String,
+    /// How expose DNAT must target this sandbox, decided by the datapath
+    /// actually applied to its TAP (CORE-81/CORE-83).
+    pub expose: crate::network::ExposeTarget,
+}
+
+/// Stock sandbox id budget: what [`max_sandbox_id_len`] computes for the
+/// guest config (`/var/lib/arcbox/jailer` + `firecracker`), kept as the
+/// fallback when no jailer is configured — direct mode has no jailer
+/// socket, but ids still become path components everywhere else.
+const STOCK_MAX_ID_LEN: usize = 44;
+
+/// Longest sandbox id the configured jailer layout leaves room for: the
+/// jailer API socket
+/// `{chroot_base}/{fc_basename}/{id}/root/run/firecracker.socket` must fit
+/// AF_UNIX's 107-byte `sun_path`. An oversized id otherwise fails as an
+/// opaque "timed out waiting for socket": fc-sdk's readiness probe is a
+/// `connect()`, which ENAMETOOLONGs on every attempt even though
+/// Firecracker is up and bound inside the chroot (caught by the CORE-107
+/// prewarm e2e, whose 51-char builder id overflowed the stock budget by
+/// 7 bytes). Computed from the config so a longer chroot base or binary
+/// name tightens the budget instead of silently reintroducing the
+/// timeout.
+pub(super) fn max_sandbox_id_len(config: &VmmConfig) -> usize {
+    const SUN_PATH: usize = 107;
+    const TAIL: usize = "/root/run/firecracker.socket".len();
+    let Some(jc) = &config.firecracker.jailer else {
+        return STOCK_MAX_ID_LEN;
+    };
+    // Mirrors spawn_jailer / checkpoint_impl: fc-sdk's default chroot base.
+    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+    let exec = Path::new(&config.firecracker.binary)
+        .file_name()
+        .map_or(0, |name| name.len());
+    SUN_PATH.saturating_sub(base.len() + 1 + exec + 1 + TAIL)
 }
 
 /// Validate a caller-supplied sandbox or snapshot id.
@@ -138,6 +380,13 @@ impl SandboxManager {
 /// fragments, so they are restricted to `[A-Za-z0-9_-]`. This rejects path
 /// traversal (`/`, `\`, `..`), NUL, whitespace, and anything the jailer would
 /// otherwise reject much later with an opaque boot failure.
+///
+/// Deliberately NO length cap here: this also runs against persisted
+/// records (reconcile, record loads) — where rejecting one legacy
+/// over-long id would abort a whole sweep — and against snapshot /
+/// execution ids that never enter the jailer path. The jailer budget is
+/// enforced only where a sandbox id enters the system:
+/// [`validate_new_sandbox_id`].
 pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(VmmError::Config(format!("{kind} must not be empty")));
@@ -151,6 +400,20 @@ pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Validate a sandbox id at request ingress (create / restore), where the
+/// id becomes a jailer identity — [`validate_id`] plus the
+/// [`max_sandbox_id_len`] socket-path budget.
+pub(super) fn validate_new_sandbox_id(id: &str, config: &VmmConfig) -> Result<()> {
+    let max = max_sandbox_id_len(config);
+    if id.len() > max {
+        return Err(VmmError::Config(format!(
+            "invalid sandbox id {id:?}: at most {max} characters \
+             (the jailer socket path must fit the AF_UNIX limit)"
+        )));
+    }
+    validate_id("sandbox id", id)
 }
 
 /// Atomically reserve `id` in the instance map with a placeholder instance.
@@ -173,12 +436,35 @@ pub(super) fn reserve_id(
     if map.contains_key(id) {
         return Err(VmmError::AlreadyExists(id.clone()));
     }
-    map.insert(id.clone(), Arc::new(Mutex::new(placeholder)));
+    let instance = Arc::new(Mutex::new(placeholder));
+    map.insert(id.clone(), Arc::clone(&instance));
     Ok(IdReservation {
         instances: Arc::clone(instances),
         id: id.clone(),
+        instance,
         committed: false,
     })
+}
+
+pub(super) fn ensure_current_instance(
+    instances: &InstanceMap,
+    id: &str,
+    expected: &Arc<Mutex<SandboxInstance>>,
+) -> Result<()> {
+    if instances
+        .read()
+        .unwrap()
+        .get(id)
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        Ok(())
+    } else {
+        Err(VmmError::WrongState {
+            id: id.to_owned(),
+            expected: "the sandbox generation selected by this operation".into(),
+            actual: "a newer generation now owns this sandbox ID".into(),
+        })
+    }
 }
 
 /// RAII reservation returned by [`reserve_id`]. Drops the placeholder from the
@@ -186,18 +472,14 @@ pub(super) fn reserve_id(
 pub(super) struct IdReservation {
     instances: InstanceMap,
     id: SandboxId,
+    instance: Arc<Mutex<SandboxInstance>>,
     committed: bool,
 }
 
 impl IdReservation {
     /// The reserved instance `Arc`, for populating it in place on success.
     pub(super) fn instance(&self) -> Arc<Mutex<SandboxInstance>> {
-        self.instances
-            .read()
-            .unwrap()
-            .get(&self.id)
-            .cloned()
-            .expect("reserved instance is present until commit/drop")
+        Arc::clone(&self.instance)
     }
 
     /// Keep the reservation: the instance is now fully initialized.
@@ -209,7 +491,13 @@ impl IdReservation {
 impl Drop for IdReservation {
     fn drop(&mut self) {
         if !self.committed {
-            self.instances.write().unwrap().remove(&self.id);
+            let mut map = self.instances.write().unwrap();
+            if map
+                .get(&self.id)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.instance))
+            {
+                map.remove(&self.id);
+            }
         }
     }
 }
@@ -245,6 +533,39 @@ mod tests {
         for ok in ["sandbox1", "a-b_c", "0f3e9d16-1234", "A_B-9"] {
             assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
         }
+        // A 36-char UUID fits; anything past the jailer socket budget must
+        // fail fast at ingress instead of surfacing as an fc-sdk connect
+        // timeout. The generic validator stays uncapped — it also runs
+        // against persisted records and non-jailer (snapshot/execution)
+        // ids, where a legacy over-long id must not become fatal.
+        let mut config = VmmConfig::default();
+        config.firecracker.binary = "/usr/local/bin/firecracker".into();
+        config.firecracker.jailer = Some(crate::config::JailerConfig {
+            binary: "/usr/local/bin/jailer".into(),
+            uid: 0,
+            gid: 0,
+            chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
+            netns: None,
+            new_pid_ns: false,
+            cgroup_version: None,
+            parent_cgroup: None,
+            resource_limits: Vec::new(),
+        });
+        // The stock guest layout leaves exactly 44 bytes for the id.
+        assert_eq!(max_sandbox_id_len(&config), 44);
+        assert!(validate_new_sandbox_id(&"a".repeat(44), &config).is_ok());
+        assert!(validate_new_sandbox_id(&"a".repeat(45), &config).is_err());
+        // A longer chroot base tightens the budget instead of silently
+        // reintroducing the connect timeout.
+        config
+            .firecracker
+            .jailer
+            .as_mut()
+            .expect("jailer set above")
+            .chroot_base_dir = Some(format!("/var/lib/arcbox/jailer/{}", "x".repeat(10)));
+        assert_eq!(max_sandbox_id_len(&config), 33);
+        assert!(validate_new_sandbox_id(&"a".repeat(34), &config).is_err());
+        assert!(validate_id("id", &"a".repeat(60)).is_ok());
         for bad in ["", "..", ".", "a/b", "a\\b", "a b", "a.b", "a\0b", "../etc"] {
             assert!(
                 validate_id("id", bad).is_err(),
@@ -265,5 +586,22 @@ mod tests {
         // The id is free to reserve again after an unwound restore.
         let again = reserve_id(&instances, &"tmp".to_owned(), placeholder("tmp"));
         assert!(again.is_ok());
+    }
+
+    #[test]
+    fn stale_reservation_does_not_remove_a_replacement() {
+        let instances: InstanceMap = Arc::new(RwLock::new(HashMap::new()));
+        let reservation = reserve_id(&instances, &"same".to_owned(), placeholder("same")).unwrap();
+        let replacement = Arc::new(Mutex::new(placeholder("same")));
+        instances
+            .write()
+            .unwrap()
+            .insert("same".to_owned(), Arc::clone(&replacement));
+
+        assert!(ensure_current_instance(&instances, "same", &reservation.instance).is_err());
+        drop(reservation);
+
+        let current = instances.read().unwrap()["same"].clone();
+        assert!(Arc::ptr_eq(&current, &replacement));
     }
 }

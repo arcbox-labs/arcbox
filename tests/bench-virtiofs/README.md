@@ -38,7 +38,23 @@ cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
 # Native baseline (run against a local directory)
 cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
     --all --platform native --target /tmp/bench --format json > native.json
+
+# Hermetic run: exclude the network-dependent macros (npm/git). An entry
+# that matches no benchmark is a hard error, so a rename cannot silently
+# re-include them.
+cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
+    --all --skip npm_install,git_clone --target /arcbox
+
+# random_read_4k engine is explicit (default: the in-process buffered
+# reader). The fio/O_DIRECT engine is opt-in, errors when fio is absent,
+# and reports under `random_read_4k_fio` so numbers from different
+# engines can never be joined by name.
+cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
+    --benchmark random_read_4k --random-read-engine fio --target /arcbox
 ```
+
+Guest-vs-native comparison methodology (which ratios are meaningful, the
+same-context rule, and current numbers) lives in `docs/fs-perf-limits.md`.
 
 ## Benchmarks
 
@@ -62,10 +78,18 @@ cargo run --manifest-path tests/bench-virtiofs/Cargo.toml --release -- \
 | `rm_rf` | `rm -rf` of a 5000-file directory tree | wall time |
 | `find_recursive` | `find -name "*.ts"` over 2000 files | wall time |
 
-## Performance Targets
+## Performance Targets (legacy — do not gate on these)
 
-These are the minimum acceptable performance levels as a percentage of
-native macOS filesystem performance:
+> **Superseded by `docs/fs-perf-limits.md`.** These percent-of-native
+> targets (and the same table printed by `--list`; the binary's runtime
+> check is inert — nothing populates `percent_of_native`) predate the
+> CORE-48 methodology work, which showed that
+> cache-hot native is not a valid denominator for FUSE metadata and that
+> only the in-process trio (`metadata_stat`, `create_delete`,
+> `negative_lookup`) is ratio-safe at all. The table is kept verbatim
+> until the perf-target policy revision (proposed alongside
+> fs-perf-limits.md) is approved; until then, treat competitor-guest
+> same-context comparisons as the bar and never use these rows as gates.
 
 | Benchmark | Target |
 |-----------|--------|

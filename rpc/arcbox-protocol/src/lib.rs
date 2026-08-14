@@ -38,7 +38,12 @@ mod generated;
 pub use generated::arcbox_v1 as v1;
 
 // Re-export the sandbox.v1 generated module.
-pub use generated::sandbox_v1;
+pub use generated::arcbox_sandbox_v1 as sandbox_v1;
+
+// Well-known types (google.protobuf.Timestamp / Empty) are generated against
+// pbjson-types (see build.rs); re-export the crate so consumers construct
+// them without a direct dependency.
+pub use pbjson_types;
 
 /// Common types (from common.proto).
 ///
@@ -94,16 +99,16 @@ pub mod image {
 pub mod agent {
     pub use super::v1::{
         AgentPingRequest, AgentPingResponse, ContainerFsPathsRequest, ContainerFsPathsResponse,
-        ContainerStats, DiskTrimRequest, DiskTrimResponse, ImageFsPathsRequest,
-        ImageFsPathsResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
-        KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
-        KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-        KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
-        MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved,
-        ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
-        RuntimeStatusResponse, ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo,
-        WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
-        memory_pressure_event, readiness_event,
+        ContainerStats, DiskTrimRequest, DiskTrimResponse, EnsureNfsExportRequest,
+        EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse,
+        KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+        KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+        KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+        KubernetesStopResponse, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
+        MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
+        RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+        ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
+        WatchReadinessRequest, WatchStatsRequest, memory_pressure_event, readiness_event,
     };
 
     // Backward compatibility type aliases (short names without Agent prefix).
@@ -148,7 +153,12 @@ pub mod api {
 
     // Migration service types
     pub use super::v1::{
-        PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+        MigrationContainerMount, MigrationContainerNetworkAttachment, MigrationContainerPlan,
+        MigrationContainerSpec, MigrationImagePlan, MigrationMountType, MigrationNetworkIpam,
+        MigrationNetworkMode, MigrationNetworkPlan, MigrationPlan, MigrationPortPublish,
+        MigrationReplacementSummary, MigrationRestartPolicy, MigrationRunningVolumeBlocker,
+        MigrationSourceInfo, MigrationVolumePlan, PrepareMigrationRequest,
+        PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
     };
 
     // Shell/interactive session types
@@ -220,7 +230,12 @@ pub use v1::{
 
 // API types - Migration
 pub use v1::{
-    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+    MigrationContainerMount, MigrationContainerNetworkAttachment, MigrationContainerPlan,
+    MigrationContainerSpec, MigrationImagePlan, MigrationMountType, MigrationNetworkIpam,
+    MigrationNetworkMode, MigrationNetworkPlan, MigrationPlan, MigrationPortPublish,
+    MigrationReplacementSummary, MigrationRestartPolicy, MigrationRunningVolumeBlocker,
+    MigrationSourceInfo, MigrationVolumePlan, PrepareMigrationRequest, PrepareMigrationResponse,
+    RunMigrationEvent, RunMigrationRequest,
 };
 
 // API types - Shell

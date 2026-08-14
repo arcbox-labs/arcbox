@@ -52,8 +52,10 @@ pub mod port_bindings;
 pub mod proxy;
 pub mod routing;
 pub mod server;
+mod system_disk_usage;
 pub mod trace;
 
 pub use context::{ContextStatus, DockerContextManager};
 pub use error::{DockerError, Result};
 pub use server::{DockerApiServer, ServerConfig};
+pub use system_disk_usage::{DockerReclaimableSpace, query_reclaimable_space};

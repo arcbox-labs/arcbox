@@ -1,0 +1,655 @@
+// Sandbox control plane.
+//
+// A sandbox is a short-lived, strongly-isolated microVM bound to a single
+// workload (function, task, or container). Unlike MachineService VMs, a
+// sandbox is decoupled from its workload: an execution exiting does NOT
+// destroy the sandbox — it transitions back to READY and continues accepting
+// executions until an explicit Stop/Remove or TTL expiry.
+//
+// This file is the **control plane**: creating, inspecting, listing, and
+// destroying sandboxes, plus their lifecycle events and published ports.
+// These calls address a fleet — in cloud deployments they are served by a
+// multi-tenant front door that knows which node holds which sandbox.
+//
+// The **data plane** — the calls that touch a running sandbox's processes and
+// files — lives in `process.proto` and `filesystem.proto`, so it can be
+// served by whatever is co-located with the sandbox itself (the local daemon,
+// or the node agent in a cloud deployment) without routing bulk stdio and
+// file bytes through the control-plane entry point. `snapshot.proto` carries
+// checkpoint/restore.
+//
+// Shared primitives (enums, resource limits, exit status, keepalive) live
+// here because the control plane defines the sandbox resource itself; the
+// data-plane files import this one.
+
+syntax = "proto3";
+
+package arcbox.sandbox.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// SandboxService manages sandbox lifecycle. Control plane.
+service SandboxService {
+    // Create a sandbox and return immediately with state STARTING.
+    // Subscribe to Events or poll Inspect to wait for state READY.
+    rpc Create(CreateSandboxRequest) returns (CreateSandboxResponse);
+
+    // Stop a sandbox gracefully (waits for any active execution to exit,
+    // then shuts down the VM).
+    rpc Stop(StopSandboxRequest) returns (google.protobuf.Empty);
+
+    // Forcibly destroy a sandbox and release all resources immediately.
+    rpc Remove(RemoveSandboxRequest) returns (google.protobuf.Empty);
+
+    // Pause a sandbox: checkpoint it to disk under the same ID, then
+    // release its runtime resources (VM, network) while retaining the
+    // checkpoint and the disk overlay — memory AND disk state survive.
+    // The record survives as PAUSED and Resume restores it in place — the
+    // origin VM is gone by construction, which sidesteps the direct-mode
+    // relocation constraint documented in `snapshot.proto` (CORE-21).
+    // Returns once the sandbox reaches PAUSED; requires READY (no active
+    // execution — see the state machine below for why RUNNING cannot
+    // pause). Trades RAM for disk: a paused sandbox keeps paying
+    // `storage_bytes` until removed.
+    rpc Pause(PauseSandboxRequest) returns (google.protobuf.Empty);
+
+    // Resume a PAUSED sandbox in place under the same ID; returns once
+    // it is READY again. Explicit resume is for control-plane callers:
+    // data-plane RPCs (executions, files) targeting a PAUSED sandbox
+    // resume it transparently before proceeding, so clients see a
+    // latency blip rather than an error. Callers that want the honest
+    // state machine instead set the reserved `x-arcbox-no-auto-resume`
+    // request header and receive SANDBOX_PAUSED (`errors.proto`).
+    // Inspect and List never resume.
+    //
+    // Resuming re-allocates networking: the sandbox comes back with a
+    // fresh IP (its DNS name follows), and port exposures dropped at
+    // pause time must be re-established with ExposePort.
+    rpc Resume(ResumeSandboxRequest) returns (google.protobuf.Empty);
+
+    // Replace a sandbox's lifecycle deadlines: the hard maximum lifetime
+    // (`ttl_seconds`, re-armed from now — CORE-60) and/or the idle
+    // timeout and its policy. Fields left unset are unchanged.
+    rpc SetLifecycle(SetLifecycleRequest) returns (google.protobuf.Empty);
+
+    // Report what this daemon can do: version, sandbox protocol level,
+    // feature flags, and whether nested virtualization is available.
+    // Serves the SDK's lazy version handshake and the fail-fast
+    // capability check (CORE-13): creating a sandbox on an unsupported
+    // host fails immediately with NESTED_VIRT_UNSUPPORTED instead of a
+    // boot that wedges.
+    rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+
+    // Return the current state and metadata of a sandbox.
+    rpc Inspect(InspectSandboxRequest) returns (SandboxInfo);
+
+    // List sandboxes, optionally filtered by state or labels. Paginated.
+    rpc List(ListSandboxesRequest) returns (ListSandboxesResponse);
+
+    // Subscribe to sandbox lifecycle events. KeepAlive frames are
+    // interleaved while idle so proxies do not cut the connection.
+    rpc Events(SandboxEventsRequest) returns (stream WatchEventsResponse);
+
+    // Expose a sandbox port on the host. The guest installs a DNAT rule from
+    // a reserved guest port (40000-49999) to the sandbox, and the daemon
+    // binds a host listener forwarding into the guest. Removed automatically
+    // on Stop/Remove.
+    rpc ExposePort(ExposePortRequest) returns (ExposePortResponse);
+
+    // List the daemon's current host listeners for one sandbox. Returns
+    // NOT_FOUND when the sandbox does not exist and UNAVAILABLE while its
+    // state cannot be verified.
+    rpc ListExposedPorts(ListExposedPortsRequest) returns (ListExposedPortsResponse);
+
+    // Remove a previously exposed port mapping.
+    rpc UnexposePort(UnexposePortRequest) returns (google.protobuf.Empty);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// Lifecycle state of a sandbox.
+//
+// State machine:
+//
+//   STARTING ──► READY ──► RUNNING ──► READY  (execution exited, sandbox alive)
+//                  │          │
+//                  ├──────────┴──► STOPPING ──► STOPPED
+//                  │
+//                  ├──► PAUSING ──► PAUSED ──(Resume)──► STARTING  (same ID)
+//                  │          │
+//                  └──────────┴──► FAILED  (error reason set)
+//
+// PAUSING branches from READY only: pausing means checkpointing a quiescent
+// sandbox, and a RUNNING one has a live execution whose host-side session
+// cannot survive the VM being checkpointed and killed — finish or stop the
+// execution first (the idle detector pauses on the READY edge for the same
+// reason). Every other non-terminal state can also reach FAILED.
+enum SandboxState {
+    SANDBOX_STATE_UNSPECIFIED = 0;
+    // Firecracker process spawned; VM still booting.
+    SANDBOX_STATE_STARTING = 1;
+    // VM booted and accepting executions (or the last execution exited).
+    SANDBOX_STATE_READY = 2;
+    // An execution is currently running inside the VM.
+    SANDBOX_STATE_RUNNING = 3;
+    // Stop called; draining the workload and shutting down the VM.
+    SANDBOX_STATE_STOPPING = 4;
+    // VM has shut down cleanly.
+    SANDBOX_STATE_STOPPED = 5;
+    // Unrecoverable error occurred.
+    SANDBOX_STATE_FAILED = 6;
+    // Pause in progress: checkpointing state, then releasing the VM.
+    SANDBOX_STATE_PAUSING = 7;
+    // Checkpointed to disk; runtime resources released. The record and
+    // snapshot survive under the same ID until Resume or Remove.
+    SANDBOX_STATE_PAUSED = 8;
+}
+
+// Kind of a sandbox lifecycle event.
+enum SandboxEventKind {
+    SANDBOX_EVENT_KIND_UNSPECIFIED = 0;
+    // Sandbox record created, VM booting.
+    SANDBOX_EVENT_KIND_CREATED = 1;
+    // VM booted, sandbox accepting executions.
+    SANDBOX_EVENT_KIND_READY = 2;
+    // An execution started.
+    SANDBOX_EVENT_KIND_RUNNING = 3;
+    // The active execution exited; sandbox back to READY. Attributes carry
+    // "exit_code" (shell convention) and "signal" when killed by one, or
+    // "error" when the session broke before an exit was observed.
+    SANDBOX_EVENT_KIND_IDLE = 4;
+    // Stop called, draining the workload.
+    SANDBOX_EVENT_KIND_STOPPING = 5;
+    // VM shut down.
+    SANDBOX_EVENT_KIND_STOPPED = 6;
+    // Unrecoverable error; attributes carry "error".
+    SANDBOX_EVENT_KIND_FAILED = 7;
+    // Sandbox deleted.
+    SANDBOX_EVENT_KIND_REMOVED = 8;
+    // Pause started — whether client-driven (Pause) or automated (idle
+    // timeout with a PAUSE policy); automation must be visible, so the
+    // idle detector emits the same events. Attributes carry "reason"
+    // ("pause" or "idle_timeout").
+    SANDBOX_EVENT_KIND_PAUSING = 9;
+    // Checkpoint complete; runtime resources released.
+    SANDBOX_EVENT_KIND_PAUSED = 10;
+    // Resume completed — explicit or transparent (a data-plane call to a
+    // paused sandbox); sandbox READY again under the same ID. Attributes
+    // carry "reason" ("resume" or "auto_resume").
+    SANDBOX_EVENT_KIND_RESUMED = 11;
+}
+
+// What the daemon does when a sandbox's idle timeout expires.
+enum IdleAction {
+    // Daemon default (currently KILL; auto-pause is opt-in).
+    IDLE_ACTION_UNSPECIFIED = 0;
+    // Destroy the sandbox and release all resources (Remove semantics).
+    IDLE_ACTION_KILL = 1;
+    // Pause: checkpoint to disk under the same ID and release the VM.
+    // Trades RAM for disk — the sandbox reports `storage_bytes` until
+    // resumed or removed.
+    IDLE_ACTION_PAUSE = 2;
+}
+
+// Sandbox network mode.
+enum NetworkMode {
+    // Daemon default (currently ENABLED).
+    NETWORK_MODE_UNSPECIFIED = 0;
+    // Networked sandbox with an IP from the sandbox pool.
+    NETWORK_MODE_ENABLED = 1;
+    // No network device.
+    NETWORK_MODE_NONE = 2;
+}
+
+// Transport protocol of an exposed port.
+enum PortProtocol {
+    // Defaults to TCP.
+    PORT_PROTOCOL_UNSPECIFIED = 0;
+    PORT_PROTOCOL_TCP = 1;
+    PORT_PROTOCOL_UDP = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Shared primitives
+// ---------------------------------------------------------------------------
+
+// Network configuration for a sandbox.
+message NetworkSpec {
+    // Network mode (UNSPECIFIED = daemon default).
+    NetworkMode mode = 1;
+}
+
+// A single bind mount into the sandbox.
+message Mount {
+    // Source path on the host.
+    string source = 1;
+    // Target path inside the sandbox.
+    string target = 2;
+    // Mount read-only.
+    bool readonly = 3;
+}
+
+// CPU and memory resource limits.
+message ResourceLimits {
+    // Number of vCPUs (0 = daemon default).
+    uint32 vcpus = 1;
+    // Memory in MiB (0 = daemon default).
+    uint64 memory_mib = 2;
+}
+
+// How a process terminated: a normal exit code or death by signal.
+// Exactly one is set once the execution has exited.
+message ExitStatus {
+    oneof status {
+        // The process exited normally with this code.
+        int32 code = 1;
+        // The process was killed by this POSIX signal.
+        int32 signal = 2;
+    }
+}
+
+// An empty frame keeping an otherwise idle stream alive through proxies and
+// load balancers.
+message KeepAlive {}
+
+// ---------------------------------------------------------------------------
+// CreateSandbox
+// ---------------------------------------------------------------------------
+
+// Request to create a sandbox.
+message CreateSandboxRequest {
+    // Caller-supplied unique ID for durable retry idempotency.
+    // If empty the daemon generates a fresh UUID for every attempt.
+    string id = 1;
+
+    // Arbitrary key-value metadata (used for filtering in List / Events).
+    map<string, string> labels = 2;
+
+    // 3-5 carried host kernel/rootfs/boot_args paths and 7 an OCI image
+    // reference; all replaced by `template` (CORE-54). Do not reuse.
+    reserved 3, 4, 5, 7;
+    reserved "kernel", "rootfs", "boot_args", "image";
+
+    // --- Resources ---
+    // Unset = the template's default limits, if any, else daemon
+    // defaults. Set = replaces the template default wholesale: a zero
+    // subfield (vcpus, memory_mib) inside a set message means the DAEMON
+    // default for that resource — the template's value does not shine
+    // through per-field. Precision costs message presence, which the
+    // subfields (plain proto3 scalars) do not have.
+    ResourceLimits limits = 6;
+
+    // --- Initial workload (optional) ---
+    // Initial command launched automatically after boot.
+    // Empty = inherit the template's default cmd, if any; otherwise the
+    // sandbox enters READY without running anything. Non-empty =
+    // replaces the template default.
+    // When this process exits the sandbox transitions back to READY
+    // (NOT destroyed) and continues accepting executions.
+    repeated string cmd = 8;
+    // Suppress the template's default cmd: enter READY without running
+    // anything even when the template defines one. proto3 repeated
+    // fields cannot express "explicitly empty", so this flag carries the
+    // presence `cmd` cannot. Rejected with INVALID_ARGUMENT alongside a
+    // non-empty `cmd`.
+    bool no_default_cmd = 20;
+    // Environment variables for the initial command, merged over the
+    // template's default env (per key, this request wins).
+    map<string, string> env = 9;
+    // Start the initial command from exactly `env`, discarding the
+    // template's default env instead of merging over it (the map
+    // counterpart of `no_default_cmd`; to unset a single default key,
+    // set this and supply the full desired map).
+    bool no_default_env = 21;
+    // Working directory for the initial command.
+    string working_dir = 10;
+    // User to run the initial command as.
+    string user = 11;
+
+    // --- Filesystem ---
+    // NOT supported in Sandbox V1: a non-empty list is rejected with
+    // FAILED_PRECONDITION. Copy files in with WriteFile / `sandbox cp`.
+    repeated Mount mounts = 12;
+
+    // --- Network ---
+    NetworkSpec network = 13;
+
+    // --- Lifecycle ---
+    // Two independent lifecycle knobs exist; never conflate them:
+    // `ttl_seconds` is the hard maximum lifetime, `idle_timeout_seconds`
+    // reacts to inactivity.
+    //
+    // Hard maximum lifetime in seconds (0 = no limit). On expiry the
+    // sandbox is always destroyed — pausing does not apply. The deadline
+    // starts at creation and is not reset by workload activity;
+    // SetLifecycle replaces it with a fresh deadline from now (CORE-60).
+    uint32 ttl_seconds = 14;
+
+    // --- Provisioning ---
+    // NOT supported in Sandbox V1: a set value is rejected with
+    // FAILED_PRECONDITION. Use executions for interactive access.
+    optional string ssh_public_key = 15;
+
+    reserved 16;
+
+    // Reference to what boots inside the sandbox:
+    //   ""               — the built-in minimal template (busybox + init)
+    //   "docker:<ref>"   — a local Docker image reference, resolved and
+    //                      converted inside the VM
+    //   "name[:version]" — a template from the catalog (`template.proto`,
+    //                      CORE-21); a bare name resolves to the newest
+    //                      published version. Template defaults apply
+    //                      per the override rules on the fields above.
+    // Cloud mode resolves names against the tenant's template registry.
+    // Anything else is rejected with INVALID_ARGUMENT.
+    string template = 17;
+
+    // Apply `on_idle` after this many seconds without a running
+    // execution (0 = no idle detection). Re-armed every time the
+    // workload goes idle; distinct from `ttl_seconds`, which caps total
+    // lifetime regardless of activity (CORE-21).
+    uint32 idle_timeout_seconds = 18;
+
+    // What to do when the idle timeout expires (UNSPECIFIED = the
+    // daemon default, currently KILL).
+    IdleAction on_idle = 19;
+}
+
+// Response to CreateSandbox.
+// Returned immediately; the sandbox may still be booting (state STARTING).
+message CreateSandboxResponse {
+    // Assigned or caller-supplied sandbox ID.
+    string id = 1;
+    // IP address pre-allocated for the sandbox (empty when network mode is
+    // NONE). Available even while state is STARTING.
+    string ip_address = 2;
+    // State at time of response: always STARTING.
+    SandboxState state = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Stop / Remove
+// ---------------------------------------------------------------------------
+
+// Request to stop a sandbox gracefully.
+message StopSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Seconds to wait for any active execution to exit before force-killing
+    // the VM (0 = daemon default of 30 s).
+    uint32 timeout_seconds = 2;
+}
+
+// Request to forcibly remove a sandbox.
+message RemoveSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Force removal even if the sandbox is in RUNNING state.
+    bool force = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Pause / Resume / lifecycle
+// ---------------------------------------------------------------------------
+
+// Request to pause a sandbox.
+message PauseSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+}
+
+// Request to resume a paused sandbox.
+message ResumeSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+}
+
+// Request to replace a sandbox's lifecycle deadlines. Absent fields are
+// left unchanged, so each knob can be adjusted independently.
+message SetLifecycleRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Replace the hard maximum lifetime: expire this many seconds from
+    // now (0 = remove the limit).
+    optional uint32 ttl_seconds = 2;
+    // Replace the idle timeout (0 = disable idle detection).
+    optional uint32 idle_timeout_seconds = 3;
+    // Replace the idle policy (absent = leave unchanged; UNSPECIFIED =
+    // restore the daemon default).
+    optional IdleAction on_idle = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+// Request for the daemon's sandbox capabilities.
+message GetCapabilitiesRequest {}
+
+// What this daemon can do. SDKs fetch it lazily once per process and
+// fail fast with an actionable error instead of probing per call.
+message GetCapabilitiesResponse {
+    // Daemon version string (informational).
+    string daemon_version = 1;
+    // Sandbox API protocol level. SDKs compare it against their floor
+    // and raise a mismatch error with an upgrade suggestion
+    // (PROTOCOL_MISMATCH in `errors.proto`) instead of sprinkling
+    // version checks at call sites.
+    uint32 protocol = 2;
+    // Named feature flags for capabilities that postdate `protocol`.
+    repeated string features = 3;
+    // Whether this host can run sandboxes at all (CORE-13).
+    NestedVirtCapability nested_virt = 4;
+}
+
+// Nested-virtualization support on this host.
+message NestedVirtCapability {
+    // True when sandboxes can run (M3+ hardware, VZ backend).
+    bool supported = 1;
+    // Why not, when unsupported — the daemon's authoritative reason
+    // (chip generation vs backend), surfaced verbatim in
+    // NESTED_VIRT_UNSUPPORTED errors.
+    string reason = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Inspect / List
+// ---------------------------------------------------------------------------
+
+// Request to inspect a sandbox.
+message InspectSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+}
+
+// Full sandbox state. See SandboxState for the state machine.
+message SandboxInfo {
+    // Sandbox ID.
+    string id = 1;
+    // Lifecycle state.
+    SandboxState state = 2;
+    // User-supplied labels.
+    map<string, string> labels = 3;
+    // Effective resource limits.
+    ResourceLimits limits = 4;
+    // Network information.
+    SandboxNetwork network = 5;
+    // Creation time.
+    google.protobuf.Timestamp created_at = 6;
+    // When the sandbox first became READY (unset if not yet).
+    google.protobuf.Timestamp ready_at = 7;
+    // When the last execution exited (unset if none has run).
+    google.protobuf.Timestamp last_exited_at = 8;
+    // How the last execution terminated (unset if none has run, or when the
+    // last execution ended without an observed exit).
+    ExitStatus last_exit_status = 9;
+    // Human-readable error message (only set when state == FAILED).
+    string error = 10;
+    // Template reference the sandbox was created from (as passed to
+    // Create; empty = the built-in minimal template).
+    string template = 11;
+    // When the hard maximum lifetime fires (unset = no limit). Replaced
+    // by SetLifecycle.
+    google.protobuf.Timestamp ttl_deadline = 12;
+    // Idle timeout in seconds (0 = no idle detection).
+    uint32 idle_timeout_seconds = 13;
+    // Action applied when the idle timeout expires.
+    IdleAction on_idle = 14;
+    // When the sandbox reached PAUSED (unset unless paused).
+    google.protobuf.Timestamp paused_at = 15;
+    // When the sandbox reached FAILED (unset otherwise; `error` carries
+    // the reason).
+    google.protobuf.Timestamp failed_at = 16;
+    // On-disk footprint of the sandbox's retained state (checkpoint +
+    // disk overlay). Paused sandboxes keep paying this until removed.
+    uint64 storage_bytes = 17;
+}
+
+// Network details of a sandbox.
+message SandboxNetwork {
+    // Assigned IP address.
+    string ip_address = 1;
+    // Gateway address.
+    string gateway = 2;
+    // 3 carried the host TAP interface name (CORE-54). Do not reuse.
+    reserved 3;
+    reserved "tap_name";
+}
+
+// Request to list sandboxes.
+message ListSandboxesRequest {
+    // Filter by state (UNSPECIFIED = all states).
+    SandboxState state = 1;
+    // Filter by labels (all key-value pairs must match).
+    map<string, string> labels = 2;
+    // Maximum entries per page (0 = server default of 100; capped at 1000).
+    uint32 page_size = 3;
+    // Continuation token from a previous response (empty = first page).
+    string page_token = 4;
+}
+
+// Response to ListSandboxes.
+message ListSandboxesResponse {
+    repeated SandboxSummary sandboxes = 1;
+    // Token for the next page; empty when this is the last page.
+    string next_page_token = 2;
+}
+
+// Lightweight sandbox summary for List.
+//
+// Carries the state timestamps and retention cost so a listing shows
+// lifecycle truth without an Inspect per row.
+message SandboxSummary {
+    // Sandbox ID.
+    string id = 1;
+    // Lifecycle state.
+    SandboxState state = 2;
+    // Labels.
+    map<string, string> labels = 3;
+    // IP address.
+    string ip_address = 4;
+    // Creation time.
+    google.protobuf.Timestamp created_at = 5;
+    // When the sandbox first became READY (unset if not yet).
+    google.protobuf.Timestamp ready_at = 6;
+    // When the sandbox reached PAUSED (unset unless paused).
+    google.protobuf.Timestamp paused_at = 7;
+    // When the sandbox reached FAILED (unset otherwise).
+    google.protobuf.Timestamp failed_at = 8;
+    // On-disk footprint of retained state; nonzero for paused sandboxes.
+    uint64 storage_bytes = 9;
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+// Request to subscribe to sandbox lifecycle events.
+message SandboxEventsRequest {
+    // Filter by sandbox ID (empty = all sandboxes).
+    string sandbox_id = 1;
+    // Filter by event kind (UNSPECIFIED = all kinds).
+    SandboxEventKind kind = 2;
+}
+
+// One frame of an Events stream.
+message WatchEventsResponse {
+    oneof payload {
+        // A lifecycle event.
+        SandboxEvent event = 1;
+        // Idle-stream keepalive; carries no data.
+        KeepAlive keep_alive = 2;
+    }
+}
+
+// A sandbox lifecycle event.
+message SandboxEvent {
+    // Sandbox ID.
+    string sandbox_id = 1;
+    // What happened; see SandboxEventKind for per-kind attributes.
+    SandboxEventKind kind = 2;
+    // When it happened.
+    google.protobuf.Timestamp time = 3;
+    // Additional context (e.g. "exit_code" / "signal" on IDLE,
+    // "error" on FAILED).
+    map<string, string> attributes = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Port exposure
+// ---------------------------------------------------------------------------
+
+// Request to expose a sandbox port on the host.
+message ExposePortRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Port the workload listens on inside the sandbox.
+    uint32 sandbox_port = 2;
+    // Host port to bind (0 = reuse the allocated guest relay port).
+    uint32 host_port = 3;
+    // Transport protocol (UNSPECIFIED = TCP).
+    PortProtocol protocol = 4;
+}
+
+// Response to ExposePort.
+message ExposePortResponse {
+    // Host port the service is reachable on (via loopback).
+    uint32 host_port = 1;
+    // Reserved-range guest port carrying the DNAT relay.
+    uint32 guest_port = 2;
+}
+
+// Request to list a sandbox's current exposed ports.
+message ListExposedPortsRequest {
+    // Sandbox ID.
+    string id = 1;
+}
+
+// One host listener currently owned by a sandbox.
+message ExposedPort {
+    // Port the workload listens on inside the sandbox.
+    uint32 sandbox_port = 1;
+    // Loopback host port where the service is reachable.
+    uint32 host_port = 2;
+    // Transport protocol.
+    PortProtocol protocol = 3;
+}
+
+// Response to ListExposedPorts.
+message ListExposedPortsResponse {
+    // Current mappings, ordered by sandbox port, protocol, then host port.
+    repeated ExposedPort ports = 1;
+}
+
+// Request to remove an exposed port mapping.
+message UnexposePortRequest {
+    // Sandbox ID.
+    string id = 1;
+    // The sandbox port previously passed to ExposePort.
+    uint32 sandbox_port = 2;
+    // Transport protocol (UNSPECIFIED = TCP).
+    PortProtocol protocol = 3;
+}

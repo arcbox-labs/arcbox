@@ -1,11 +1,13 @@
 //! Btrfs data volume detection, format, and bind-mount setup.
 //!
-//! On first boot the data device is formatted as Btrfs with five subvolumes
-//! (`@docker`, `@containerd`, `@k3s`, `@kubelet`, `@cni`), each bind-mounted
-//! to its canonical path. Metadata-heavy directories get `NOCOW` to avoid
-//! Btrfs + APFS double write amplification.
+//! On first boot the data device is formatted as Btrfs with dedicated
+//! subvolumes for container runtimes, Kubernetes, and sandboxes, each
+//! bind-mounted to its canonical path. The fsync-hot boltdb metadata is NOT
+//! kept here — it lives on the ext4 metadata volume (`metadata_volume.rs`);
+//! btrfs holds the bulk, compression-friendly data.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use arcbox_constants::paths::{
@@ -14,6 +16,7 @@ use arcbox_constants::paths::{
 };
 
 use super::cmdline::docker_data_device;
+use crate::config::SANDBOX_DATA_DIR;
 
 /// Btrfs primary superblock magic `_BHRfS_M` at absolute disk offset
 /// `0x10040` (superblock starts at `0x10000`, magic at internal offset `0x40`).
@@ -27,7 +30,26 @@ const BTRFS_TOTAL_BYTES_OFFSET: u64 = 0x10070;
 ///
 /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
 /// while EROFS root is read-only and cannot host dynamic mountpoints.
-const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
+pub(super) const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
+const LEGACY_SANDBOX_RUNTIME_DIR: &str = "/var/lib/arcbox/sandboxes";
+
+const DATA_SUBVOLUME_MOUNTS: [(&str, &str); 6] = [
+    ("@docker", DOCKER_DATA_MOUNT_POINT),
+    ("@containerd", CONTAINERD_DATA_MOUNT_POINT),
+    ("@k3s", K3S_DATA_MOUNT_POINT),
+    ("@kubelet", KUBELET_DATA_MOUNT_POINT),
+    ("@cni", CNI_DATA_MOUNT_POINT),
+    ("@sandboxes", SANDBOX_DATA_DIR),
+];
+
+static DATA_MOUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn data_mounts_ready(mut is_mounted: impl FnMut(&str) -> bool) -> bool {
+    is_mounted(BTRFS_TEMP_MOUNT)
+        && DATA_SUBVOLUME_MOUNTS
+            .iter()
+            .all(|(_, target)| is_mounted(target))
+}
 
 fn has_btrfs_superblock(device: &str) -> bool {
     let mut file = match std::fs::File::open(device) {
@@ -119,18 +141,24 @@ fn ensure_btrfs_format(device: &str) -> Result<String, String> {
 /// - `/var/lib/rancher/k3s` — bind mount of `@k3s` subvolume
 /// - `/var/lib/kubelet` — bind mount of `@kubelet` subvolume
 /// - `/var/lib/cni` — bind mount of `@cni` subvolume
+/// - `/var/lib/arcbox/sandbox` — bind mount of `@sandboxes` subvolume
 ///
 /// Returns `Ok(notes)` on success or `Err(reason)` if the data volume
-/// could not be set up. Callers must abort runtime startup on error —
-/// running containerd/dockerd without persistent storage is unsafe.
+/// could not be set up. Callers must abort service startup on error —
+/// running a stateful workload without persistent storage is unsafe.
+fn secure_sandbox_data_dir() -> Result<(), String> {
+    std::fs::set_permissions(SANDBOX_DATA_DIR, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure {SANDBOX_DATA_DIR}: {error}"))
+}
+
 pub(super) fn ensure_data_mount() -> Result<String, String> {
+    let _guard = DATA_MOUNT_LOCK
+        .lock()
+        .map_err(|_| "data volume setup lock poisoned".to_string())?;
+
     // Already fully set up?
-    if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
-        && crate::mount::is_mounted(CONTAINERD_DATA_MOUNT_POINT)
-        && crate::mount::is_mounted(K3S_DATA_MOUNT_POINT)
-        && crate::mount::is_mounted(KUBELET_DATA_MOUNT_POINT)
-        && crate::mount::is_mounted(CNI_DATA_MOUNT_POINT)
-    {
+    if data_mounts_ready(crate::mount::is_mounted) {
+        secure_sandbox_data_dir()?;
         return Ok("data subvolumes already mounted".to_string());
     }
 
@@ -212,7 +240,7 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
     }
 
     // Step 3: Create subvolumes if missing.
-    for subvol in ["@docker", "@containerd", "@k3s", "@kubelet", "@cni"] {
+    for (subvol, _) in DATA_SUBVOLUME_MOUNTS {
         let subvol_path = format!("{}/{}", BTRFS_TEMP_MOUNT, subvol);
         if Path::new(&subvol_path).exists() {
             continue;
@@ -225,13 +253,7 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
     }
 
     // Step 4: Bind mount subvolumes to final paths.
-    for (subvol, target) in [
-        ("@docker", DOCKER_DATA_MOUNT_POINT),
-        ("@containerd", CONTAINERD_DATA_MOUNT_POINT),
-        ("@k3s", K3S_DATA_MOUNT_POINT),
-        ("@kubelet", KUBELET_DATA_MOUNT_POINT),
-        ("@cni", CNI_DATA_MOUNT_POINT),
-    ] {
+    for (subvol, target) in DATA_SUBVOLUME_MOUNTS {
         if crate::mount::is_mounted(target) {
             continue;
         }
@@ -247,11 +269,6 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
             .status()
         {
             Ok(s) if s.success() => {
-                // Disable Btrfs COW on metadata-heavy subdirectories.
-                // BoltDB (containerd/dockerd) does frequent fdatasync on
-                // small pages. Without NOCOW, each write triggers Btrfs
-                // copy-on-write + APFS COW on the host = double amplification.
-                disable_cow_on_metadata_dirs(target);
                 notes.push(format!("mounted {} -> {}", subvol, target));
             }
             Ok(s) => {
@@ -265,6 +282,7 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
             Err(e) => return Err(format!("mount exec failed: {}", e)),
         }
     }
+    secure_sandbox_data_dir()?;
 
     if notes.is_empty() {
         Ok("data subvolumes already mounted".to_string())
@@ -273,63 +291,28 @@ pub(super) fn ensure_data_mount() -> Result<String, String> {
     }
 }
 
-/// Disables Btrfs COW (sets NOCOW attribute) on metadata-heavy subdirectories.
-///
-/// BoltDB and other metadata stores do frequent fdatasync on small pages.
-/// Btrfs COW amplifies each write (copy 16KB metadata page + update B-tree),
-/// and the host's APFS does another COW on top — double write amplification.
-/// NOCOW converts these to in-place overwrites at the Btrfs layer.
-fn disable_cow_on_metadata_dirs(mount_point: &str) {
-    // FS_IOC_SETFLAGS = _IOW('f', 2, long)
-    // FS_NOCOW_FL = 0x00800000
-    const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
-
-    // Subdirectories that contain BoltDB or other fsync-heavy metadata.
-    // The NOCOW attribute is inherited by new files created in these dirs.
-    let metadata_subdirs = [
-        "io.containerd.metadata.v1.bolt",
-        "io.containerd.snapshotter.v1.overlayfs",
-        "containerd",
-        "network",
-        "builder",
-        "buildkit",
-        "image",
-        "trust",
-    ];
-
-    for subdir in &metadata_subdirs {
-        let path = format!("{}/{}", mount_point, subdir);
-        let _ = std::fs::create_dir_all(&path);
-
-        let Ok(cpath) = std::ffi::CString::new(path.as_str()) else {
-            continue;
-        };
-        // SAFETY: valid path, O_RDONLY | O_DIRECTORY.
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-        if fd < 0 {
-            continue;
+pub(super) fn ensure_no_legacy_live_sandboxes() -> Result<(), String> {
+    let entries = match std::fs::read_dir(LEGACY_SANDBOX_RUNTIME_DIR) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!("inspect legacy sandbox runtime directory: {error}"));
         }
-
-        let mut flags: libc::c_long = 0;
-        // Get current flags, then set NOCOW.
-        // SAFETY: FS_IOC_GETFLAGS/SETFLAGS on a valid directory fd.
-        // NOTE: `libc::Ioctl` differs per target — `c_ulong` on
-        // Linux GNU, `c_int` on Linux musl. Using the typedef keeps
-        // the cast right for whichever target we cross-compile to.
-        unsafe {
-            #[allow(clippy::cast_possible_wrap)]
-            let get_flags = 0x8008_6601u32 as libc::Ioctl; // FS_IOC_GETFLAGS
-            #[allow(clippy::cast_possible_wrap)]
-            let set_flags = 0x4008_6602u32 as libc::Ioctl; // FS_IOC_SETFLAGS
-            if libc::ioctl(fd, get_flags, &mut flags) == 0 {
-                flags |= FS_NOCOW_FL;
-                if libc::ioctl(fd, set_flags, &flags) == 0 {
-                    tracing::debug!("set NOCOW on {}", path);
-                }
-            }
-            libc::close(fd);
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("inspect legacy sandbox runtime: {error}"))?;
+        if entry
+            .file_type()
+            .map_err(|error| format!("inspect legacy sandbox runtime entry: {error}"))?
+            .is_dir()
+        {
+            return Err(
+                "legacy live Sandbox state requires a guest restart before enabling persistent Sandbox storage"
+                    .into(),
+            );
         }
     }
+    Ok(())
 }
 
 // BTRFS_IOC_SUBVOL_CREATE = _IOW(0x94, 14, struct btrfs_ioctl_vol_args)
@@ -369,7 +352,7 @@ fn btrfs_resize_max(mount_point: &str) -> Result<String, String> {
     let args = build_resize_args(1, "max")?;
 
     // SAFETY: valid fd from File::open, args buffer matches kernel struct layout.
-    unsafe { btrfs_ioc_resize(dir.as_raw_fd(), &args) }
+    unsafe { btrfs_ioc_resize(dir.as_raw_fd(), &raw const args) }
         .map_err(|e| format!("BTRFS_IOC_RESIZE max on {}: {}", mount_point, e))?;
 
     tracing::info!(mount_point, "btrfs resize max succeeded");
@@ -405,7 +388,7 @@ fn btrfs_create_subvolume(path: &str) -> Result<(), String> {
 
     // SAFETY: valid fd from File::open, args buffer is 4096 bytes matching
     // the kernel struct btrfs_ioctl_vol_args layout.
-    unsafe { btrfs_ioc_subvol_create(parent_dir.as_raw_fd(), &args) }
+    unsafe { btrfs_ioc_subvol_create(parent_dir.as_raw_fd(), &raw const args) }
         .map_err(|e| format!("BTRFS_IOC_SUBVOL_CREATE: {}", e))?;
 
     tracing::info!("created Btrfs subvolume {}", path);
@@ -414,7 +397,8 @@ fn btrfs_create_subvolume(path: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_resize_args;
+    use super::{build_resize_args, data_mounts_ready};
+    use crate::config::SANDBOX_DATA_DIR;
 
     #[test]
     fn resize_args_layout_matches_kernel_struct() {
@@ -432,5 +416,11 @@ mod tests {
     fn resize_args_rejects_oversized_token() {
         let huge = "x".repeat(4088);
         assert!(build_resize_args(1, &huge).is_err());
+    }
+
+    #[test]
+    fn sandbox_mount_is_required_for_data_readiness() {
+        assert!(!data_mounts_ready(|target| target != SANDBOX_DATA_DIR));
+        assert!(data_mounts_ready(|_| true));
     }
 }

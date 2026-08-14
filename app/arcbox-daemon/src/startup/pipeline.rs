@@ -144,11 +144,21 @@ impl RuntimeBooted {
         let linux_vm = self.runtime.config().vm.autostart;
         let handles = record_startup_phase("start_runtime_services", async {
             let handles = services::start_services(&self.ctx, &self.runtime, self.grpc).await?;
-            recovery::run(&self.ctx, &self.runtime).await;
+            recovery::run(&self.ctx, &self.runtime, handles.dns_port).await?;
+            if linux_vm {
+                services::enable_docker_integration(&self.ctx);
+            }
             crate::nfs_mount::spawn(&self.ctx, &self.runtime);
             Ok(handles)
         })
         .await?;
+        // DNS and, with a Linux VM, Docker are bound before `start_services`
+        // returns. An explicitly requested Kubernetes endpoint is also required;
+        // the canonical best-effort 16443 listener may remain unavailable. An
+        // explicitly requested DNS resolver is installed before this phase.
+        self.ctx
+            .setup_state
+            .set_phase(SetupPhase::NetworkReady, "Network services ready");
         Ok(RuntimeServicesStarted {
             ctx: self.ctx,
             handles,
@@ -178,11 +188,11 @@ impl RuntimeServicesStarted {
                 println!("  Docker API: {}", self.ctx.layout.docker_socket.display());
             }
             println!("  gRPC API:   {}", self.ctx.layout.grpc_socket.display());
-            println!("  DNS:        127.0.0.1:{}", self.ctx.dns_port);
+            println!("  DNS:        127.0.0.1:{}", self.handles.dns_port);
             println!("  Data:       {}", self.ctx.layout.data_dir.display());
             println!();
             if self.linux_vm {
-                println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
+                println!("Use 'abctl docker enable' to configure Docker CLI integration.");
             } else {
                 println!(
                     "Running as a VM host only (--no-linux-vm): Docker and Kubernetes are disabled."
@@ -204,7 +214,7 @@ impl RuntimeServicesStarted {
 fn check_resolver_installed(domain: &str) {
     let resolver = FileResolver::new("arcbox");
     if !resolver.is_registered(domain) {
-        println!("Hint: Run 'sudo arcbox dns install' to enable *.{domain} DNS resolution.");
+        println!("Hint: Run 'sudo abctl dns install' to enable *.{domain} DNS resolution.");
     }
 }
 

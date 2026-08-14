@@ -304,11 +304,21 @@ pub enum InboundProtocol {
     Udp,
 }
 
+/// Identifies a rule by the host address and the port the caller *asked* for.
+///
+/// Deliberately the requested port, not the bound one, so `remove_rule` can
+/// undo an `add_rule` with the same arguments the caller passed in.
+type ListenerKey = (Ipv4Addr, u16, InboundProtocol);
+
+/// A live listener: its task, its cancellation token, and the port it actually
+/// bound — which differs from the key's port only when the caller passed 0.
+type ListenerEntry = (JoinHandle<()>, CancellationToken, u16);
+
 /// Manages host-side listeners that accept incoming connections / datagrams
 /// and send `InboundCommand` messages to the datapath.
 pub struct InboundListenerManager {
     cmd_tx: mpsc::Sender<InboundCommand>,
-    listeners: HashMap<(Ipv4Addr, u16, InboundProtocol), (JoinHandle<()>, CancellationToken)>,
+    listeners: HashMap<ListenerKey, ListenerEntry>,
 }
 
 impl InboundListenerManager {
@@ -323,6 +333,11 @@ impl InboundListenerManager {
 
     /// Adds a forwarding rule and spawns a listener task.
     ///
+    /// Returns the port actually bound. That equals `host_port` unless the
+    /// caller passed 0 to let the OS choose, in which case it is the only way
+    /// to learn where the listener ended up — binding 0 and then probing for
+    /// the port separately would race anything else on the machine.
+    ///
     /// # Errors
     ///
     /// Returns an error if the listener cannot bind.
@@ -332,72 +347,85 @@ impl InboundListenerManager {
         host_port: u16,
         container_port: u16,
         protocol: InboundProtocol,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u16> {
         let key = (host_ip, host_port, protocol);
         if self.listeners.contains_key(&key) {
-            return Ok(()); // Already listening.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("inbound listener already exists on {host_ip}:{host_port}"),
+            ));
         }
 
         let cancel = CancellationToken::new();
         let cmd_tx = self.cmd_tx.clone();
 
-        let handle = match protocol {
+        let (handle, bound_port) = match protocol {
             InboundProtocol::Tcp => {
                 let listener =
                     TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(host_ip, host_port)))
                         .await?;
+                let bound = listener.local_addr()?.port();
                 tracing::info!(
                     "Inbound listener: TCP {}:{} → container :{}",
                     host_ip,
-                    host_port,
+                    bound,
                     container_port,
                 );
                 let cancel_clone = cancel.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     tcp_listener_task(listener, container_port, cmd_tx, cancel_clone).await;
-                })
+                });
+                (handle, bound)
             }
             InboundProtocol::Udp => {
                 let socket =
                     UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(host_ip, host_port))).await?;
+                let bound = socket.local_addr()?.port();
                 tracing::info!(
                     "Inbound listener: UDP {}:{} → container :{}",
                     host_ip,
-                    host_port,
+                    bound,
                     container_port,
                 );
                 let cancel_clone = cancel.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     udp_listener_task(socket, container_port, cmd_tx, cancel_clone).await;
-                })
+                });
+                (handle, bound)
             }
         };
 
-        self.listeners.insert(key, (handle, cancel));
-        Ok(())
+        self.listeners.insert(key, (handle, cancel, bound_port));
+        Ok(bound_port)
     }
 
-    /// Removes a forwarding rule and stops its listener.
-    pub fn remove_rule(&mut self, host_ip: Ipv4Addr, host_port: u16, protocol: InboundProtocol) {
+    /// Removes a forwarding rule and waits until its listener has dropped the
+    /// bound socket.
+    pub async fn remove_rule(
+        &mut self,
+        host_ip: Ipv4Addr,
+        host_port: u16,
+        protocol: InboundProtocol,
+    ) {
         let key = (host_ip, host_port, protocol);
-        if let Some((handle, cancel)) = self.listeners.remove(&key) {
+        if let Some((handle, cancel, bound)) = self.listeners.remove(&key) {
             cancel.cancel();
             handle.abort();
+            let _ = handle.await;
             tracing::debug!(
                 "Inbound listener removed: {:?} {}:{}",
                 protocol,
                 host_ip,
-                host_port
+                bound
             );
         }
     }
 
     /// Stops all listeners.
-    pub fn stop_all(&mut self) {
-        for ((ip, port, proto), (handle, cancel)) in self.listeners.drain() {
-            cancel.cancel();
-            handle.abort();
-            tracing::debug!("Inbound listener stopped: {:?} {}:{}", proto, ip, port);
+    pub async fn stop_all(&mut self) {
+        let keys: Vec<_> = self.listeners.keys().copied().collect();
+        for (ip, port, protocol) in keys {
+            self.remove_rule(ip, port, protocol).await;
         }
     }
 }
@@ -536,6 +564,8 @@ fn create_udp_reply_flow(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     const GW_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 1);
@@ -655,10 +685,98 @@ mod tests {
             .expect("should bind to port 0 (OS-assigned)");
 
         // Remove it.
-        manager.remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp);
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp)
+            .await;
 
         // The cmd_rx channel should still be valid (no panic).
         assert!(cmd_rx.try_recv().is_err(), "no commands expected yet");
+    }
+
+    /// A real host connection to a registered rule produces `TcpAccepted`
+    /// carrying the container port the rule was created with.
+    ///
+    /// `listener_manager_add_and_remove_rule` only exercises the manager's
+    /// bookkeeping — it never connects, so nothing proved the listener task
+    /// actually accepts and reports. The relay's job ends here: SYN
+    /// generation toward the guest belongs to `splicetcp`'s active open.
+    ///
+    /// Binds port 0 and uses the port `add_rule` reports. Probing for a free
+    /// port and then binding it would race anything else on the machine into
+    /// the gap.
+    #[tokio::test]
+    async fn host_connection_produces_a_tcp_accepted_command() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+
+        let host_port = manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 8080, InboundProtocol::Tcp)
+            .await
+            .expect("rule should bind an OS-assigned port");
+        assert_ne!(host_port, 0, "add_rule must report the port it bound");
+
+        let _client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+            .await
+            .expect("host should be able to connect to a registered rule");
+
+        let cmd = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("a TcpAccepted command should arrive within 5s")
+            .expect("command channel stayed open");
+
+        match cmd {
+            InboundCommand::TcpAccepted {
+                host_port: got_host,
+                container_port,
+                ..
+            } => {
+                assert_eq!(got_host, host_port, "command reports the wrong host port");
+                assert_eq!(
+                    container_port, 8080,
+                    "command must carry the container port the rule was created with"
+                );
+            }
+            // Named rather than `{:?}`-formatted: deriving Debug on the
+            // command type (it carries a TcpStream) to serve a panic message
+            // would widen production surface for a test's benefit.
+            InboundCommand::UdpReceived { .. } => {
+                panic!("a TCP rule produced UdpReceived instead of TcpAccepted")
+            }
+        }
+    }
+
+    /// Removing a rule closes its listener, so a later connect is refused
+    /// rather than hanging or silently succeeding against a stale listener.
+    #[tokio::test]
+    async fn removing_a_rule_closes_the_listener() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+
+        let host_port = manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 8080, InboundProtocol::Tcp)
+            .await
+            .expect("rule should bind an OS-assigned port");
+        tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+            .await
+            .expect("connect should succeed while the rule exists");
+
+        // Keyed by the port that was *requested*, hence 0 rather than the
+        // bound port — see the `listeners` field comment.
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp)
+            .await;
+
+        // `remove_rule` waits for the listener task to drop its socket.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).await {
+                Err(_) => break,
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    panic!("port {host_port} still accepts connections after remove_rule")
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
     }
 
     #[tokio::test]
@@ -675,7 +793,7 @@ mod tests {
             .await
             .unwrap();
 
-        manager.stop_all();
+        manager.stop_all().await;
         // After stop_all, the internal map should be empty. Since we can't
         // inspect it directly, adding the same rule again should succeed (no
         // duplicate key).
@@ -683,6 +801,44 @@ mod tests {
             .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_manager_rejects_duplicate_host_endpoint() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+
+        let error = manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 81, InboundProtocol::Tcp)
+            .await
+            .expect_err("the existing listener must not be reused for another destination");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(manager.listeners.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn listener_remove_waits_until_socket_is_reusable() {
+        let reservation = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, port, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, port, InboundProtocol::Tcp)
+            .await;
+
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .expect("remove_rule must release the socket before returning");
     }
 
     #[tokio::test]
@@ -701,7 +857,9 @@ mod tests {
             .unwrap();
 
         // Remove only the localhost rule; re-adding it should succeed (not a dup).
-        manager.remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp);
+        manager
+            .remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp)
+            .await;
         manager
             .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
             .await

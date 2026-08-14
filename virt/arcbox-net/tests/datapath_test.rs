@@ -3,8 +3,17 @@
 //! These tests exercise the full `NetworkDatapath` event loop by creating a
 //! socketpair mock in place of the real VZ framework guest FD. L2 Ethernet
 //! frames are injected through the "guest" end and responses are read back,
-//! verifying DHCP, DNS, frame classification, and TCP SYN gating without
-//! requiring a VM, root privileges, or code signing.
+//! without requiring a VM, root privileges, or code signing.
+//!
+//! Covered here: the DHCP discover/offer/request/ack cycle, and frame
+//! classification for ARP, TCP SYN, ICMP, and DHCP.
+//!
+//! Not covered here, despite living in this file's setup: a `DnsForwarder` is
+//! constructed and handed to the datapath so it can be built, but no test
+//! exercises resolution — that coverage is in `arcbox_net::dns`'s own unit
+//! tests and in `dns_shared_table.rs`. Likewise the SYN *gate* itself lives in
+//! `splicetcp` and is tested there; this file only asserts that a SYN is
+//! classified as one.
 
 #![cfg(target_os = "macos")]
 

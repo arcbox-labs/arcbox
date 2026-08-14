@@ -1,0 +1,307 @@
+// Sandbox process data plane (CORE-55).
+//
+// An execution is an addressable, resumable process inside a sandbox. It
+// survives any client connection: output is offset-addressed per channel, so
+// a client that loses its AttachExecution stream re-attaches at its last
+// offsets and re-reads without loss; stdin writes are offset-idempotent, so
+// a retried WriteStdin never double-feeds the process. Signals, TTY resize,
+// and exit status go through the execution id, never through a stream.
+//
+// This is **data plane**: every call here touches a specific running
+// sandbox, and carries the process's stdio. It is served by whatever is
+// co-located with the sandbox — the local daemon, or the node agent in a
+// cloud deployment — so bulk stdio never transits the control-plane entry
+// point. See `sandbox.proto` for the control plane.
+
+syntax = "proto3";
+
+package arcbox.sandbox.v1;
+
+import "arcbox/sandbox/v1/sandbox.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// SandboxProcessService runs and drives processes inside a sandbox.
+service SandboxProcessService {
+    // Start an execution inside a READY sandbox and return its identity.
+    // Retrying with the same execution_id and command is idempotent: the
+    // existing execution is returned instead of a second process starting,
+    // including while the first start is still in flight.
+    rpc StartExecution(StartExecutionRequest) returns (Execution);
+
+    // Stream an execution's output from the given per-channel offsets.
+    // Buffered output replays first (from the earliest retained byte when
+    // retention already dropped the requested offset — chunk offsets expose
+    // the gap), then live output follows. The stream ends with an Exited
+    // event. KeepAlive frames are interleaved while idle so proxies do not
+    // cut the connection. Multiple concurrent attaches are allowed.
+    rpc AttachExecution(AttachExecutionRequest) returns (stream ExecutionEvent);
+
+    // Write stdin bytes at an absolute offset (offset-idempotent).
+    // Bytes below the accepted count are deduplicated; an offset past the
+    // accepted count fails with OUT_OF_RANGE carrying the resume point.
+    rpc WriteStdin(WriteStdinRequest) returns (StdinStatus);
+
+    // Client-streaming variant of WriteStdin for high-volume stdin. Frames
+    // follow the same offset semantics; the final status is returned once.
+    rpc StreamStdin(stream WriteStdinRequest) returns (StdinStatus);
+
+    // Report how many stdin bytes the server has accepted — the offset a
+    // client must resume from after a lost WriteStdin response.
+    rpc GetStdinStatus(GetStdinStatusRequest) returns (StdinStatus);
+
+    // Deliver a POSIX signal to a running execution's process group,
+    // without holding any stream.
+    rpc SignalExecution(SignalExecutionRequest) returns (google.protobuf.Empty);
+
+    // Resize a TTY execution's terminal.
+    rpc ResizeExecutionTty(ResizeExecutionTtyRequest) returns (google.protobuf.Empty);
+
+    // Wait until an execution exits or the timeout elapses, then return its
+    // state (a zero timeout polls). The exit status distinguishes a normal
+    // exit code from death by signal.
+    rpc WaitExecution(WaitExecutionRequest) returns (Execution);
+
+    // List a sandbox's executions, running and exited, so a client can
+    // rediscover processes it no longer holds handles to — after losing
+    // its connection, or across an auto-pause/resume cycle. Executions
+    // are retained for the life of their sandbox.
+    rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
+
+    // Wait until something inside the sandbox listens on the given TCP
+    // port, or fail with DEADLINE_EXCEEDED when the timeout elapses. The
+    // guest agent watches the listen table directly — clients never
+    // poll with shelled-out probes.
+    rpc WaitForPort(WaitForPortRequest) returns (google.protobuf.Empty);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// Lifecycle state of an execution.
+enum ExecutionState {
+    EXECUTION_STATE_UNSPECIFIED = 0;
+    EXECUTION_STATE_RUNNING = 1;
+    EXECUTION_STATE_EXITED = 2;
+}
+
+// Stdio channel of an execution output chunk. Offsets are tracked per
+// channel. A TTY execution produces one merged stream on PTY (stdout and
+// stderr are indistinguishable once a terminal is allocated); non-TTY
+// executions produce STDOUT and STDERR.
+enum StdioChannel {
+    STDIO_CHANNEL_UNSPECIFIED = 0;
+    STDIO_CHANNEL_STDOUT = 1;
+    STDIO_CHANNEL_STDERR = 2;
+    STDIO_CHANNEL_PTY = 3;
+}
+
+// Deliverable POSIX signals. Values match the POSIX signal numbers.
+enum Signal {
+    SIGNAL_UNSPECIFIED = 0;
+    SIGNAL_SIGHUP = 1;
+    SIGNAL_SIGINT = 2;
+    SIGNAL_SIGQUIT = 3;
+    SIGNAL_SIGKILL = 9;
+    SIGNAL_SIGUSR1 = 10;
+    SIGNAL_SIGUSR2 = 12;
+    SIGNAL_SIGTERM = 15;
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// Terminal size for TTY executions.
+message TerminalSize {
+    // Terminal width in columns.
+    uint32 width = 1;
+    // Terminal height in rows.
+    uint32 height = 2;
+}
+
+// The state of an execution — the resource all execution RPCs address.
+message Execution {
+    // Execution ID, unique within its sandbox.
+    string id = 1;
+    // Owning sandbox.
+    string sandbox_id = 2;
+    // Current state.
+    ExecutionState state = 3;
+    // Whether the process runs on a pseudo-TTY.
+    bool tty = 4;
+    // When the process was dispatched.
+    google.protobuf.Timestamp started_at = 5;
+    // When the process terminated (unset while running).
+    google.protobuf.Timestamp exited_at = 6;
+    // How the process terminated. Unset while running, and also when the
+    // execution ended without an observed exit (see `error`).
+    ExitStatus exit_status = 7;
+    // Set when the execution ended without an observed exit (e.g. the
+    // sandbox stopped or the in-guest session broke).
+    string error = 8;
+    // Total bytes produced on stdout/PTY so far (monotonic; the high-water
+    // offset for AttachExecution resume).
+    uint64 stdout_len = 9;
+    // Total bytes produced on stderr so far.
+    uint64 stderr_len = 10;
+    // Stdin acceptance state.
+    StdinStatus stdin = 11;
+}
+
+// Request to start an execution.
+message StartExecutionRequest {
+    // Target sandbox. Must be READY.
+    string sandbox_id = 1;
+    // Caller-supplied execution ID (unique within the sandbox) making the
+    // start idempotent across retries. Empty = server generates a UUID.
+    string execution_id = 2;
+    // Command and arguments.
+    repeated string cmd = 3;
+    // Environment variable overrides.
+    map<string, string> env = 4;
+    // Working directory (empty = rootfs default).
+    string working_dir = 5;
+    // User to run as (empty = rootfs default).
+    string user = 6;
+    // Allocate a pseudo-TTY. Output then arrives on the PTY channel and
+    // stdin cannot be closed via `eof` (send Ctrl-D instead).
+    bool tty = 7;
+    // Initial terminal size (only meaningful when tty == true).
+    TerminalSize tty_size = 8;
+    // Kill the process after this many seconds (0 = no timeout).
+    uint32 timeout_seconds = 9;
+    // Keep stdin open for WriteStdin. When false the process starts with
+    // stdin already at EOF (run semantics).
+    bool stdin = 10;
+}
+
+// Request to attach to an execution's output.
+message AttachExecutionRequest {
+    // Owning sandbox.
+    string sandbox_id = 1;
+    // Execution to attach to.
+    string execution_id = 2;
+    // Resume offset for the stdout/PTY channel (0 = from the beginning of
+    // the retained buffer).
+    uint64 stdout_offset = 3;
+    // Resume offset for the stderr channel.
+    uint64 stderr_offset = 4;
+}
+
+// One frame of an AttachExecution stream.
+message ExecutionEvent {
+    oneof event {
+        // First frame of every attach: the execution's current state.
+        ExecutionStarted started = 1;
+        // A chunk of process output.
+        ExecutionOutput output = 2;
+        // Final frame: the execution terminated.
+        ExecutionExited exited = 3;
+        // Idle-stream keepalive; carries no data.
+        KeepAlive keep_alive = 4;
+    }
+}
+
+// Attach preamble carrying the execution's state at attach time.
+message ExecutionStarted {
+    Execution execution = 1;
+}
+
+// An offset-addressed chunk of execution output.
+message ExecutionOutput {
+    // Source channel (PTY for tty executions, STDOUT/STDERR otherwise).
+    StdioChannel channel = 1;
+    // Absolute offset of data[0] within the channel's byte stream. May be
+    // greater than the requested resume offset when retention already
+    // dropped older bytes — the jump is the client's signal of a gap.
+    uint64 offset = 2;
+    // Raw output bytes.
+    bytes data = 3;
+}
+
+// Final frame of an attach stream: the execution's terminal state,
+// including exit_status / error and the final channel lengths.
+message ExecutionExited {
+    Execution execution = 1;
+}
+
+// Request to write stdin bytes at an absolute offset.
+message WriteStdinRequest {
+    // Owning sandbox.
+    string sandbox_id = 1;
+    // Target execution.
+    string execution_id = 2;
+    // Absolute offset of data[0] within the stdin byte stream. Bytes below
+    // the server's accepted count are deduplicated (idempotent retry); an
+    // offset above it fails with OUT_OF_RANGE.
+    uint64 offset = 3;
+    // Bytes to feed to the process's stdin.
+    bytes data = 4;
+    // Close stdin after this write. Rejected for TTY executions — send
+    // Ctrl-D (0x04) as data instead.
+    bool eof = 5;
+}
+
+// Stdin acceptance state.
+message StdinStatus {
+    // Bytes accepted and forwarded so far — the offset the next
+    // WriteStdin must start at.
+    uint64 bytes_written = 1;
+    // Whether stdin has been closed.
+    bool closed = 2;
+}
+
+// Request for the current stdin acceptance state.
+message GetStdinStatusRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+}
+
+// Request to signal a running execution.
+message SignalExecutionRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+    // Signal to deliver to the process group.
+    Signal signal = 3;
+}
+
+// Request to resize a TTY execution's terminal.
+message ResizeExecutionTtyRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+    TerminalSize size = 3;
+}
+
+// Request to wait for an execution to exit.
+message WaitExecutionRequest {
+    string sandbox_id = 1;
+    string execution_id = 2;
+    // Give up after this many seconds and return the current state
+    // (0 = return immediately — a poll).
+    uint32 timeout_seconds = 3;
+}
+
+// Request to list a sandbox's executions.
+message ListExecutionsRequest {
+    // Sandbox whose executions to list.
+    string sandbox_id = 1;
+}
+
+// Response to ListExecutions.
+message ListExecutionsResponse {
+    // Every retained execution, running and exited.
+    repeated Execution executions = 1;
+}
+
+// Request to wait for a listening TCP port inside a sandbox.
+message WaitForPortRequest {
+    // Sandbox to watch.
+    string sandbox_id = 1;
+    // TCP port a workload is expected to listen on.
+    uint32 port = 2;
+    // Give up after this many seconds with DEADLINE_EXCEEDED
+    // (0 = daemon default of 30 s).
+    uint32 timeout_seconds = 3;
+}

@@ -5,6 +5,7 @@
 use super::*;
 
 use crate::device::DeviceTreeEntry;
+use crate::irq::{Gsi, IrqTriggerCallback};
 #[cfg(target_arch = "aarch64")]
 use arcbox_hypervisor::GuestAddress;
 use arcbox_hypervisor::VirtioDeviceConfig;
@@ -18,12 +19,15 @@ use crate::fdt::{FdtConfig, generate_fdt};
 impl Vmm {
     /// Linux-specific initialization using KVM.
     pub(super) fn initialize_linux(&mut self) -> Result<()> {
-        use arcbox_hypervisor::linux::KvmVm;
+        use arcbox_hypervisor::linux::{KvmHypervisor, KvmVm};
         use arcbox_hypervisor::traits::{Hypervisor, VirtualMachine};
         use std::sync::Mutex;
 
-        // Create hypervisor and VM
-        let hypervisor = arcbox_hypervisor::create_hypervisor()?;
+        // Named concretely rather than through `create_hypervisor()`: the
+        // code below needs `KvmVm`'s inherent `virtio_devices()` and stores
+        // the VM in `Vmm::linux_vm`, neither of which the erased
+        // `impl Hypervisor` return type can satisfy.
+        let hypervisor = KvmHypervisor::new()?;
         let vm_config = self.config.to_vm_config();
 
         tracing::debug!("Platform capabilities: {:?}", hypervisor.capabilities());

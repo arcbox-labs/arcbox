@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arcbox_constants::paths::HostLayout;
+use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_docker::DockerContextManager;
 use arcbox_docker_tools::{HostToolManager, ToolGroup, parse_tools_for_group};
 use clap::Subcommand;
@@ -23,8 +23,9 @@ const LOCK_TOML: &str = include_str!("../../../../assets.lock");
 pub enum DockerCommands {
     /// Enable Docker CLI integration
     ///
-    /// Creates an 'arcbox' Docker context and sets it as the default.
-    /// After enabling, all `docker` commands will use ArcBox.
+    /// Creates or updates the selected ArcBox Docker context.
+    /// Production also sets it as the default; development leaves the global
+    /// default unchanged.
     Enable,
 
     /// Disable Docker CLI integration
@@ -49,7 +50,10 @@ pub async fn execute(cmd: DockerCommands, format: OutputFormat) -> Result<()> {
     match cmd {
         DockerCommands::Enable => {
             let manager = context_manager()?;
-            execute_enable(&manager)
+            execute_enable(
+                &manager,
+                ArcboxProfile::from_env_or_default() == ArcboxProfile::Production,
+            )
         }
         DockerCommands::Disable => {
             let manager = context_manager()?;
@@ -65,9 +69,9 @@ pub async fn execute(cmd: DockerCommands, format: OutputFormat) -> Result<()> {
 }
 
 pub(super) fn context_manager() -> Result<DockerContextManager> {
-    let profile = arcbox_constants::paths::ArcboxProfile::from_env_or_default();
     let socket = arcbox_constants::paths::HostLayout::from_env_or_default().docker_socket;
-    DockerContextManager::new_with_context_name(socket, profile.docker_context_name())
+    let context = arcbox_cli::runtime_selection::docker_context_name()?;
+    DockerContextManager::new_with_context_name(socket, context)
         .context("Failed to initialize Docker context manager")
 }
 
@@ -75,7 +79,7 @@ pub(super) fn context_manager() -> Result<DockerContextManager> {
 // Setup — NDJSON progress
 // =============================================================================
 
-/// NDJSON progress line for `arcbox docker setup --format json`.
+/// NDJSON progress line for `abctl docker setup --format json`.
 #[derive(Serialize, Default)]
 struct SetupProgress {
     phase: String,
@@ -371,7 +375,19 @@ async fn create_or_update_symlink(target: &Path, link: &Path) -> Result<()> {
 // =============================================================================
 
 /// Enables Docker CLI integration.
-fn execute_enable(manager: &DockerContextManager) -> Result<()> {
+fn execute_enable(manager: &DockerContextManager, set_default: bool) -> Result<()> {
+    if !set_default {
+        manager
+            .create_context()
+            .context("Failed to create Docker context")?;
+        println!("Docker context '{}' is ready.", manager.context_name());
+        println!(
+            "Use it explicitly: docker --context {} ps",
+            manager.context_name()
+        );
+        return Ok(());
+    }
+
     // Check if already enabled.
     if manager.context_exists() && manager.is_default()? {
         println!("Docker integration is already enabled.");
@@ -388,7 +404,7 @@ fn execute_enable(manager: &DockerContextManager) -> Result<()> {
     println!("  docker ps");
     println!("  docker run alpine echo hello");
     println!();
-    println!("To disable, run: arcbox docker disable");
+    println!("To disable, run: abctl docker disable");
 
     // Warn if socket doesn't exist.
     if !manager.socket_path().exists() {
@@ -449,9 +465,30 @@ fn execute_status(manager: &DockerContextManager) {
         println!("        Start the ArcBox daemon to use docker commands");
     } else if status.context_exists {
         println!("Status: Context exists but not default");
-        println!("        Run 'arcbox docker enable' to activate");
+        println!("        Run 'abctl docker enable' to activate");
     } else {
         println!("Status: Not configured");
-        println!("        Run 'arcbox docker enable' to set up");
+        println!("        Run 'abctl docker enable' to set up");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_enable;
+    use arcbox_docker::DockerContextManager;
+
+    #[test]
+    fn development_enable_does_not_change_the_global_default() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = DockerContextManager::with_context_name_and_config_dir(
+            root.path().join("run/docker.sock"),
+            "arcbox-dev-worktree-1",
+            root.path().join("docker-config"),
+        );
+
+        execute_enable(&manager, false).unwrap();
+
+        assert!(manager.context_exists());
+        assert_eq!(manager.current_context().unwrap(), None);
     }
 }

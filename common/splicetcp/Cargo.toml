@@ -29,3 +29,6 @@ tokio-frame-sink = []
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+arcbox-xnu-net.workspace = true

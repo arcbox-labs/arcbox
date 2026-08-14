@@ -162,6 +162,39 @@ coverage: the near-`u64::MAX` ring-address snapshot regression in
   lands (ABX-416). Anything time-sensitive before agent-up sees the kernel
   default epoch — TLS cert validation in particular fails.
 
+## The Linux arm is a CI gate now — keep macOS-only code gated
+
+This crate is the platform seam `engine/arcbox-engine` reaches macOS
+through, so the engine and computer layers compile on Linux only if this
+one does. All three are in CI's `linux-engine` job: the GNU step checks
+`arcbox-vmm`, `arcbox-engine`, `arcbox-computer`; the musl step checks
+`arcbox-vmm` alone, because the other two reach `ring`/`zstd-sys` through
+`arcbox-image` and the runner has no musl C cross-compiler.
+
+Consequences for edits here:
+
+- A new module that touches `arcbox_hv` (or any Hypervisor.framework
+  symbol) needs `#[cfg(target_os = "macos")]` on its `lib.rs` declaration.
+  `arcbox-hv` compiles to an EMPTY crate off macOS/aarch64, so an ungated
+  consumer fails with `cannot find X in arcbox_hv` — not a missing
+  dependency. `dax`, `console_rx_worker`, `net_rx_worker`, and
+  `vsock_rx_worker` are all gated for this reason.
+- A capability only one backend implements gets a `#[cfg(not(...))]`
+  counterpart on `Vmm` that RETURNS `VmmError::Unsupported`, rather than a
+  gate the engine layer has to mirror. `set_balloon_target` is the
+  reference: the platform difference stops here, and `vm_lifecycle`'s
+  balloon controller stays platform-free.
+- Local repro (this host's nix toolchain ships no linux-gnu std, so musl
+  is the only local Linux target):
+  `cargo check --target aarch64-unknown-linux-musl -p arcbox-vmm --all-targets`.
+  Use aarch64, not x86_64 — two errors once lived inside a
+  `#[cfg(target_arch = "aarch64")]` block in `vmm/linux.rs`.
+
+`vmm/linux.rs` names `KvmHypervisor`/`KvmVm` concretely instead of going
+through `arcbox_hypervisor::create_hypervisor()`: it needs `KvmVm`'s
+inherent `virtio_devices()` and stores the VM in `Vmm::linux_vm`, neither
+of which the erased `impl Hypervisor` return type provides.
+
 ## Validation
 
 Follow the ladder in `virt/AGENTS.md`, cheapest first: crate unit tests →

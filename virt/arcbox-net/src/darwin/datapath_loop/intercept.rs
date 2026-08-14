@@ -1,5 +1,4 @@
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::fd::RawFd;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -20,7 +19,6 @@ use super::guest_tx::{DeliveryClass, GuestTx};
 pub(super) fn handle_intercepted_frame(
     intercepted: &crate::darwin::classifier::InterceptedFrame,
     guest_tx: &mut GuestTx,
-    guest_fd: RawFd,
     egress: &mut HostEgress,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &DnsForwarder,
@@ -38,7 +36,6 @@ pub(super) fn handle_intercepted_frame(
             handle_dhcp(
                 frame,
                 guest_tx,
-                guest_fd,
                 dhcp_server,
                 gateway_ip,
                 gateway_mac,
@@ -100,7 +97,6 @@ pub(super) fn process_inbound_cmd(
 fn handle_dhcp(
     frame: &[u8],
     guest_tx: &mut GuestTx,
-    guest_fd: RawFd,
     dhcp_server: &mut DhcpServer,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
@@ -132,7 +128,7 @@ fn handle_dhcp(
             );
             for reply_frame in reply_frames {
                 tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
-                guest_tx.send(guest_fd, &reply_frame, DeliveryClass::Lossy);
+                guest_tx.send(reply_frame, DeliveryClass::Lossy);
             }
         }
         Ok(None) => {

@@ -1,5 +1,5 @@
 //! Network-workload e2e — Phase 1 (W2–W4) of
-//! internal-docs/plans/network-workload-e2e.md.
+//! ../company/engineering/arcbox/plans/network-workload-e2e.md.
 //!
 //! Where `network_fault` injects faults, this suite drives the datapath with
 //! the traffic shapes a developer generates daily and asserts they behave:
@@ -22,6 +22,10 @@
 //! - **W14 docker build**: context upload over vsock, RUN-step networking
 //!   through the datapath, layer commits; byte-exactness asserted inside
 //!   the build via `RUN test $(wc -c ...)` steps.
+//! - **W15/W16 integrity**: content, not just completion — a known-pattern
+//!   download and a urandom upload are SHA-256'd end to end and compared,
+//!   catching corruption/reorder/truncation that byte-count checks miss
+//!   (the shape the silent-upload-loss bug produced).
 //!
 //! All scenarios share one booted daemon (boot dominates the runtime) and
 //! run inside a long-lived workbench container whose netns the zombie sweep
@@ -42,7 +46,7 @@ use arcbox_e2e::docker::{docker_ignore, docker_output, ensure_image};
 use arcbox_e2e::metrics::RunMetrics;
 use arcbox_e2e::net_fixtures::{
     GUEST_GATEWAY_IP, SinkPause, assert_no_established_flows, daemon_log_cursor, spawn_blob_server,
-    spawn_slow_sink,
+    spawn_hashing_sink, spawn_pattern_server, spawn_slow_sink,
 };
 use arcbox_e2e::scenario::run_vz_scenario_with_log;
 
@@ -104,6 +108,12 @@ const BUILD_TAG: &str = "net-workload-build:latest";
 /// frozen flow (the 2026-07-19 incident shape) fails.
 const SWEEP_GRACE: Duration = Duration::from_secs(10);
 
+/// Integrity payload size: large enough to span many segments/retransmits
+/// so a reordering/truncation/duplication bug actually shows up in the
+/// SHA-256, small enough to stay quick.
+const INTEGRITY_BYTES: usize = 32 * 1024 * 1024;
+const INTEGRITY_DEADLINE: Duration = Duration::from_secs(120);
+
 #[test]
 #[ignore = "boots a VZ System VM through a real daemon; run on the e2e runner"]
 fn net_workload_egress_suite() -> Result<()> {
@@ -129,7 +139,7 @@ fn net_workload_egress_suite() -> Result<()> {
             // every workload below.
             let log = daemon_log_cursor(data_dir);
 
-            let scenarios: [(&str, ScenarioFn); 7] = [
+            let scenarios: [(&str, ScenarioFn); 9] = [
                 ("upload_steady", upload_steady),
                 ("upload_paused_reader", upload_paused_reader),
                 ("burst_single_container", burst_single_container),
@@ -137,6 +147,8 @@ fn net_workload_egress_suite() -> Result<()> {
                 ("churn_sequential", churn_sequential),
                 ("parallel_large_downloads", parallel_large_downloads),
                 ("docker_build_network", docker_build_network),
+                ("download_integrity", download_integrity),
+                ("upload_integrity", upload_integrity),
             ];
             // Diagnostic filter: run only the named scenario, e.g.
             // ARCBOX_E2E_WORKLOAD_ONLY=burst_single_container.
@@ -572,4 +584,79 @@ fn docker_build_network(data_dir: &Path, metrics: &mut RunMetrics, image: &str) 
     })();
     docker_ignore(data_dir, &["rmi".into(), "-f".into(), BUILD_TAG.into()]);
     result
+}
+
+/// W15: download **integrity** — content, not just completion. The
+/// byte-count checks elsewhere would pass on a stream that arrived the
+/// right length but reordered/duplicated/corrupted (the shape the
+/// silent-upload-loss bug produced on the other direction). The container
+/// pipes a known-pattern download straight through `sha256sum` and we
+/// compare to the server's hash of the exact bytes it served — end to end
+/// through the download retransmission + reassembly path.
+fn download_integrity(data_dir: &Path, _metrics: &mut RunMetrics, _image: &str) -> Result<()> {
+    let server = spawn_pattern_server(INTEGRITY_BYTES, 0xABCD_1234)?;
+    let url = format!("http://{GUEST_GATEWAY_IP}:{}/blob", server.port());
+    let script = format!("wget -q -O - '{url}' | sha256sum | cut -d' ' -f1");
+    let out = docker_output(
+        data_dir,
+        &["exec", BENCH, "sh", "-c", &script],
+        INTEGRITY_DEADLINE + Duration::from_secs(60),
+    )
+    .context("download_integrity: in-container hashed download")?;
+    let got = out.trim();
+    if got != server.sha256() {
+        bail!(
+            "download_integrity: sha256 mismatch — served {}, guest received {got} \
+             (content corrupted in transit despite completing)",
+            server.sha256()
+        );
+    }
+    assert_no_established_flows(data_dir, BENCH, server.port(), SWEEP_GRACE)
+}
+
+/// W16: upload **integrity** — the direction the silent-data-loss bug hit.
+/// The container hashes exactly what it sends (a urandom payload → temp
+/// file → sha256sum → nc), and the host sink hashes exactly what it
+/// receives; the two must match. A source-file hash + sink hash computed
+/// independently at runtime catches any corruption without a predetermined
+/// pattern.
+fn upload_integrity(data_dir: &Path, _metrics: &mut RunMetrics, _image: &str) -> Result<()> {
+    let sink = spawn_hashing_sink(INTEGRITY_BYTES)?;
+    let mib = INTEGRITY_BYTES / (1024 * 1024);
+    // Materialize the payload once, hash it, then stream it — so the
+    // client-side hash is of the exact bytes handed to nc.
+    let script = format!(
+        "dd if=/dev/urandom of=/tmp/up.bin bs=1M count={mib} 2>/dev/null; \
+         sha256sum /tmp/up.bin | cut -d' ' -f1; \
+         nc {GUEST_GATEWAY_IP} {} < /tmp/up.bin; rm -f /tmp/up.bin",
+        sink.port()
+    );
+    let started = Instant::now();
+    let out = docker_output(
+        data_dir,
+        &["exec", BENCH, "sh", "-c", &script],
+        INTEGRITY_DEADLINE + Duration::from_secs(60),
+    )
+    .context("upload_integrity: in-container hashed upload")?;
+    let sent_sha = out
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|h| h.len() == 64)
+        .with_context(|| format!("upload_integrity: no client sha in output {out:?}"))?;
+    let report = sink.wait_complete(INTEGRITY_DEADLINE.saturating_sub(started.elapsed()))?;
+    if report.received != INTEGRITY_BYTES {
+        bail!(
+            "upload_integrity: sink received {} of {INTEGRITY_BYTES} bytes",
+            report.received
+        );
+    }
+    if report.sha256 != sent_sha {
+        bail!(
+            "upload_integrity: sha256 mismatch — client sent {sent_sha}, sink received {} \
+             (upload corrupted in transit despite arriving full-length)",
+            report.sha256
+        );
+    }
+    assert_no_established_flows(data_dir, BENCH, sink.port(), SWEEP_GRACE)
 }

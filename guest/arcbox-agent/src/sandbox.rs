@@ -1,52 +1,33 @@
 //! Sandbox service for the guest agent.
 //!
 //! Wraps [`SandboxManager`] from `arcbox-vm` and translates between the
-//! `sandbox_v1` protobuf types (from `arcbox-protocol`) and the native Rust
-//! types used by `arcbox-vm`.
+//! `sandbox_v1` protobuf types (from `arcbox-connect`) and the native Rust
+//! types used by `arcbox-vm`. Lifecycle CRUD lives here; executions, events,
+//! file I/O, and snapshots live in the submodules.
 
-use std::sync::Arc;
+mod convert;
+mod events;
+mod execution;
+mod files;
+mod snapshots;
+mod template;
+mod templates;
 
-use arcbox_constants::wire::MessageType;
-use arcbox_protocol::sandbox_v1;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+
+use arcbox_connect::sandbox_v1;
 use arcbox_vm::{
-    CheckpointInfo, CheckpointSummary, ExecInputMsg, RestoreSandboxSpec,
-    SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxManager, SandboxMountSpec,
-    SandboxNetworkSpec, SandboxSpec, SandboxSummary, VmmConfig,
+    SandboxManager, SandboxMountSpec, SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig,
+    VmmError,
 };
-use prost::Message;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use buffa::Message;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+use crate::create_registry::{CreateRegistry, Reserve as CreateReserve};
 use crate::error::SandboxError;
-use crate::rpc::{ErrorResponse, read_message, write_message};
 
-/// Drain a single trailing `SandboxExecInput` frame after exec completes.
-///
-/// The client may send a final EOF frame after the command exits.  We read
-/// it here using the framing protocol so we only discard complete frames.
-/// Only `SandboxExecInput` frames are discarded; any other message type
-/// causes an immediate return.
-///
-/// This is safe because exec sessions are one-shot: the host consumes its
-/// `AgentClient` via `into_split()`, so the vsock connection is never
-/// reused for subsequent requests.
-async fn drain_trailing_input<S: AsyncRead + Unpin>(stream: &mut S) {
-    use tokio::time::{Duration, timeout};
-    let _ = timeout(Duration::from_millis(100), async {
-        if let Ok((msg_type, _, _)) = read_message(stream).await {
-            if msg_type != MessageType::SandboxExecInput
-                && msg_type != MessageType::SandboxExecResize
-            {
-                tracing::warn!(?msg_type, "unexpected trailing message after exec");
-            }
-        }
-    })
-    .await;
-}
-
-// =============================================================================
-// SandboxService
-// =============================================================================
+const STARTUP_CLEANUP_ID: &str = "$startup";
 
 /// Verify the nested-virtualization prerequisite for sandboxes.
 ///
@@ -77,96 +58,288 @@ pub fn probe_kvm() -> Result<(), String> {
 /// Thin wrapper around [`SandboxManager`] for use in the agent's RPC layer.
 pub struct SandboxService {
     manager: Arc<SandboxManager>,
+    creates: Arc<CreateRegistry>,
+    operations: SandboxOperationLocks,
+    /// Template names with a Build in flight; a second Build on a busy name
+    /// errors instead of silently queueing behind a long conversion
+    /// (CORE-107). See `templates.rs`.
+    template_builds: Mutex<std::collections::HashSet<String>>,
     /// Default rootfs image path; auto-built on first use when missing.
     default_rootfs: String,
 }
 
+#[derive(Default)]
+struct SandboxOperationLocks {
+    entries: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+}
+
+impl SandboxOperationLocks {
+    async fn lock(&self, id: &str) -> Option<OwnedMutexGuard<()>> {
+        if id.is_empty() {
+            return None;
+        }
+        let lock = {
+            let mut entries = self.entries.lock().unwrap();
+            entries.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = entries.get(id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                entries.insert(id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        Some(lock.lock_owned().await)
+    }
+}
+
 impl SandboxService {
+    pub(crate) async fn lock_operation(&self, id: &str) -> Option<OwnedMutexGuard<()>> {
+        self.operations.lock(id).await
+    }
+
+    pub(crate) fn is_terminal_or_absent(&self, id: &str) -> bool {
+        match self.manager.inspect_sandbox(&id.to_owned()) {
+            Ok(info) => matches!(info.state, SandboxState::Stopped | SandboxState::Failed),
+            Err(VmmError::NotFound(_)) => true,
+            Err(_) => false,
+        }
+    }
+
     /// Create a new [`SandboxService`] from the given config.
     pub fn new(config: VmmConfig) -> anyhow::Result<Self> {
         let default_rootfs = config.defaults.rootfs.clone();
-        let manager = SandboxManager::new(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // `into_shared` starts the lifecycle monitor driving the idle/TTL
+        // expiry timers (CORE-21/60).
+        let manager = SandboxManager::new(config)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_shared();
+        let creates = Arc::new(CreateRegistry::default());
         Ok(Self {
-            manager: Arc::new(manager),
+            manager,
+            creates,
+            operations: SandboxOperationLocks::default(),
+            template_builds: Mutex::new(std::collections::HashSet::new()),
             default_rootfs,
         })
     }
 
-    // =========================================================================
-    // CRUD
-    // =========================================================================
-
     /// Create a sandbox.
     ///
-    /// When the rootfs path points to a directory (overlay2 layer), the agent
-    /// converts it to ext4 via the `oci2rootfs` library and injects `vm-agent`
-    /// before booting. Ext4 images are used directly. An empty rootfs selects
-    /// the default busybox + vm-agent image, auto-built on first use.
+    /// The request names what boots with an opaque template reference; the
+    /// boot recipe (kernel, rootfs, cmdline) is resolved here and never
+    /// crosses the API (CORE-54). A `docker:<ref>` template is exported from
+    /// the guest's own dockerd, converted to ext4 via the `oci2rootfs`
+    /// library, and gets `vm-agent` injected before booting; the empty
+    /// template selects the built-in busybox image, built on first use.
     pub async fn create(
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
-        let req = sandbox_v1::CreateSandboxRequest::decode(payload)
+        let mut request = sandbox_v1::CreateSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let mut spec = proto_to_spec(req);
+        if create_uses_network(&request) {
+            self.manager.wait_startup_cleanup_complete().await;
+        }
+        // Catalog resolution runs BEFORE both idempotency layers: the pinned
+        // canonical ref (`name:version@digest`) is substituted into the
+        // request itself, so the durable create key AND the in-process
+        // registry (which compares whole requests) both diverge on a retry
+        // after a Publish changed what the reference means — instead of
+        // silently replaying the old content. Template defaults are folded
+        // in here too, so the key hashes the effective workload and the
+        // `no_default_*` flags need no key-domain change.
+        let source = self.resolve_template_source(&mut request)?;
+        let _operation = self.operations.lock(&request.id).await;
+        let create_key = crate::create_key::create_key(&request);
+        if request.id.is_empty() {
+            return self.create_once(request, source, &create_key).await;
+        }
+
+        let id = request.id.clone();
+        loop {
+            self.clear_stale_completed_create(&id);
+            match self.creates.reserve(&request).map_err(|_| {
+                SandboxError::AlreadyExists(format!(
+                    "sandbox '{id}' (id reused for a different create request)"
+                ))
+            })? {
+                CreateReserve::Existing(response) => return Ok(response),
+                CreateReserve::Slot(slot) => {
+                    let response = self.create_once(request, source, &create_key).await?;
+                    slot.commit(&response);
+                    return Ok(response);
+                }
+                CreateReserve::AwaitPending(mut done) => {
+                    let _ = done.changed().await;
+                }
+            }
+        }
+    }
+
+    /// Classify `request.template` and, for catalog references, pin and
+    /// default-merge the request in place (see `create` for why this happens
+    /// before the idempotency layers).
+    fn resolve_template_source(
+        &self,
+        request: &mut sandbox_v1::CreateSandboxRequest,
+    ) -> Result<templates::TemplateSource, SandboxError> {
+        match template::Template::parse(&request.template) {
+            Ok(template::Template::Default) => return Ok(templates::TemplateSource::Default),
+            Ok(template::Template::DockerImage(image)) => {
+                return Ok(templates::TemplateSource::DockerImage(image));
+            }
+            // Not one of the two local forms — a catalog-shaped reference,
+            // whose grammar and existence the catalog itself decides.
+            Err(_) => {}
+        }
+        let resolved = self
+            .manager
+            .get_template(request.template.trim())
+            .map_err(SandboxError::from)?;
+        templates::validate_template_overrides(request)?;
+        request.template = resolved.canonical_ref();
+        templates::merge_template_defaults(request, &resolved.entry.defaults);
+        Ok(templates::TemplateSource::Catalog(resolved))
+    }
+
+    async fn create_once(
+        &self,
+        request: sandbox_v1::CreateSandboxRequest,
+        source: templates::TemplateSource,
+        create_key: &str,
+    ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
+        if !request.id.is_empty()
+            && let Some((id, ip_address)) = self
+                .manager
+                .replay_sandbox_create(&request.id, create_key)
+                .await
+                .map_err(SandboxError::from)?
+        {
+            return Ok(sandbox_v1::CreateSandboxResponse {
+                id,
+                ip_address,
+                state: sandbox_v1::SandboxState::Starting.into(),
+                ..Default::default()
+            });
+        }
+
+        let mut spec = proto_to_spec(request);
 
         // V1 contract: reject declared-but-unimplemented spec fields
         // explicitly instead of silently ignoring them.
         if !spec.mounts.is_empty() {
             return Err(SandboxError::Unsupported(
                 "mounts are not supported in Sandbox V1; copy files in with \
-                 WriteFile (`arcbox sandbox cp`) instead"
+                 WriteFile (`abctl sandbox cp`) instead"
                     .into(),
             ));
         }
         if spec.ssh_public_key.is_some() {
             return Err(SandboxError::Unsupported(
-                "ssh_public_key is not supported in Sandbox V1; use Exec for \
-                 interactive access"
-                    .into(),
-            ));
-        }
-        if !spec.image.is_empty() {
-            return Err(SandboxError::Unsupported(
-                "registry image pull is not supported in Sandbox V1; build the \
-                 rootfs from a local Docker image with `arcbox sandbox create \
-                 --from-image` instead"
+                "ssh_public_key is not supported in Sandbox V1; use executions \
+                 for interactive access"
                     .into(),
             ));
         }
 
-        if spec.rootfs.is_empty() {
-            // Default rootfs: build the busybox + vm-agent image on first use
-            // (rebuilt when the staged vm-agent is newer than the image).
-            crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
-                .await
-                .map_err(|e| SandboxError::Internal(format!("default rootfs: {e}")))?;
-            spec.rootfs.clone_from(&self.default_rootfs);
-        } else if std::path::Path::new(&spec.rootfs).is_dir() {
-            // Directory → overlay2 layer needing conversion.
-            let ext4_path = crate::rootfs_builder::convert_layer_to_rootfs(&spec.rootfs)
-                .await
-                .map_err(|e| SandboxError::Internal(format!("rootfs build failed: {e}")))?;
-            spec.rootfs = ext4_path;
+        spec.rootfs = self.resolve_template(&source).await?;
+        if let templates::TemplateSource::Catalog(resolved) = &source {
+            // The template's pre-warmed snapshot rides the spec so the
+            // manager can restore instead of cold-booting when eligible.
+            spec.template_warm =
+                resolved
+                    .entry
+                    .warm
+                    .as_ref()
+                    .map(|warm| arcbox_vm::TemplateWarmRef {
+                        snapshot_id: warm.snapshot_id.clone(),
+                        vcpus: warm.vcpus,
+                        memory_mib: warm.memory_mib,
+                    });
+            spec.ready_probe = resolved.entry.defaults.ready_probe.clone();
         }
 
         let (id, ip_address) = self
             .manager
-            .create_sandbox(spec)
+            .create_sandbox_keyed(spec, create_key)
             .await
             .map_err(SandboxError::from)?;
         register_sandbox_dns(&id, &ip_address);
         Ok(sandbox_v1::CreateSandboxResponse {
             id,
             ip_address,
-            state: "starting".into(),
+            state: sandbox_v1::SandboxState::Starting.into(),
+            ..Default::default()
         })
+    }
+
+    /// Resolve a template source to the guest path of a bootable ext4 rootfs.
+    async fn resolve_template(
+        &self,
+        source: &templates::TemplateSource,
+    ) -> Result<String, SandboxError> {
+        match source {
+            templates::TemplateSource::Default => {
+                // Built on first use, and rebuilt when the staged vm-agent is
+                // newer than the cached image.
+                crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
+                    .await
+                    .map_err(|e| SandboxError::Internal(format!("default template: {e}")))?;
+                Ok(self.default_rootfs.clone())
+            }
+            templates::TemplateSource::DockerImage(image) => {
+                let layout = template::export_docker_image(image)
+                    .await
+                    .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))?;
+                // Pass the images snapshots depend on so the conversion's
+                // cache sweep leaves them alone — a restore has no way to
+                // rebuild its dm-snapshot origin.
+                let pinned = self
+                    .manager
+                    .pinned_rootfs_paths()
+                    .map_err(SandboxError::from)?;
+                crate::rootfs_builder::convert_layer_to_rootfs(&layout, &pinned)
+                    .await
+                    .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))
+            }
+            templates::TemplateSource::Catalog(resolved) => {
+                let path = &resolved.entry.rootfs_path;
+                if !std::path::Path::new(path).is_file() {
+                    // Distinguish the caller-visible race — a concurrent
+                    // Delete unpinned the rootfs and a build's sweep
+                    // reclaimed it — from genuine pin corruption. Neither is
+                    // a rebuild trigger.
+                    return Err(match self.manager.get_template(&resolved.name) {
+                        Err(VmmError::TemplateNotFound(_)) => {
+                            SandboxError::from(VmmError::TemplateNotFound(format!(
+                                "{} (deleted while this create was resolving it)",
+                                resolved.name
+                            )))
+                        }
+                        _ => SandboxError::Internal(format!(
+                            "template {} rootfs {path} is missing; the catalog pin failed",
+                            resolved.name
+                        )),
+                    });
+                }
+                Ok(path.clone())
+            }
+        }
     }
 
     /// Stop a sandbox.
     pub async fn stop(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::StopSandboxRequest::decode(payload)
+        let req = sandbox_v1::StopSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let _operation = self.operations.lock(&req.id).await;
+        self.stop_request(req).await
+    }
+
+    pub(crate) async fn stop_request(
+        &self,
+        req: sandbox_v1::StopSandboxRequest,
+    ) -> Result<(), SandboxError> {
         self.manager
             .stop_sandbox(&req.id, req.timeout_seconds)
             .await
@@ -175,632 +348,266 @@ impl SandboxService {
         Ok(())
     }
 
-    /// Remove a sandbox.
-    pub async fn remove(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::RemoveSandboxRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+    /// Pause a sandbox: checkpoint, then release its VM while keeping the
+    /// record and disk under the same id (CORE-21). The sandbox's DNS entry
+    /// is dropped with its released IP; Resume re-registers the fresh one.
+    pub(crate) async fn pause_request(
+        &self,
+        req: sandbox_v1::PauseSandboxRequest,
+    ) -> Result<(), SandboxError> {
         self.manager
-            .remove_sandbox(&req.id, req.force)
+            .pause_sandbox(&req.id)
             .await
             .map_err(SandboxError::from)?;
         deregister_sandbox_dns(&req.id);
         Ok(())
     }
 
+    /// Resume a paused sandbox in place and re-register its fresh IP.
+    ///
+    /// The wire reason is constrained to the two values the contract
+    /// documents; anything else (including empty) reads as an explicit
+    /// resume rather than injecting arbitrary event attributes.
+    pub(crate) async fn resume_request(
+        &self,
+        req: arcbox_connect::v1::SandboxResumeCommand,
+    ) -> Result<arcbox_connect::v1::SandboxResumeResponse, SandboxError> {
+        let reason = if req.reason == arcbox_vm::pause_reason::AUTO_RESUME {
+            arcbox_vm::pause_reason::AUTO_RESUME
+        } else {
+            arcbox_vm::pause_reason::RESUME
+        };
+        let ip_address = self
+            .manager
+            .resume_sandbox(&req.id, reason)
+            .await
+            .map_err(SandboxError::from)?;
+        if !ip_address.is_empty() {
+            register_sandbox_dns(&req.id, &ip_address);
+        }
+        Ok(arcbox_connect::v1::SandboxResumeResponse {
+            ip_address,
+            ..Default::default()
+        })
+    }
+
+    /// Replace a sandbox's lifecycle deadlines (CORE-60): TTL re-armed from
+    /// now, idle timeout/policy replaced. Absent fields are unchanged; an
+    /// explicit `UNSPECIFIED` policy restores the daemon default (KILL).
+    pub(crate) async fn set_lifecycle_request(
+        &self,
+        req: sandbox_v1::SetLifecycleRequest,
+    ) -> Result<(), SandboxError> {
+        let update = arcbox_vm::LifecycleUpdate {
+            ttl_seconds: req.ttl_seconds,
+            idle_timeout_seconds: req.idle_timeout_seconds,
+            on_idle: req
+                .on_idle
+                .map(|value| idle_action_to_spec(value.as_known().unwrap_or_default())),
+        };
+        self.manager
+            .set_sandbox_lifecycle(&req.id, update)
+            .await
+            .map_err(SandboxError::from)
+    }
+
+    /// Remove a sandbox.
+    pub async fn remove(&self, payload: &[u8]) -> Result<(), SandboxError> {
+        let req = sandbox_v1::RemoveSandboxRequest::decode_from_slice(payload)
+            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+        let _operation = self.operations.lock(&req.id).await;
+        self.remove_request(req).await
+    }
+
+    pub(crate) async fn remove_request(
+        &self,
+        req: sandbox_v1::RemoveSandboxRequest,
+    ) -> Result<(), SandboxError> {
+        self.manager
+            .remove_sandbox(&req.id, req.force)
+            .await
+            .map_err(SandboxError::from)?;
+        deregister_sandbox_dns(&req.id);
+        self.clear_stale_completed_create(&req.id);
+        Ok(())
+    }
+
     /// Inspect a sandbox.
     pub fn inspect(&self, payload: &[u8]) -> Result<sandbox_v1::SandboxInfo, SandboxError> {
-        let req = sandbox_v1::InspectSandboxRequest::decode(payload)
+        let req = sandbox_v1::InspectSandboxRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let info = self
             .manager
             .inspect_sandbox(&req.id)
             .map_err(SandboxError::from)?;
-        Ok(vm_info_to_proto(info))
+        Ok(convert::info_to_proto(info))
     }
 
-    /// List sandboxes.
+    /// List sandboxes (id-ordered, paginated).
     pub fn list(&self, payload: &[u8]) -> Result<sandbox_v1::ListSandboxesResponse, SandboxError> {
-        let req = sandbox_v1::ListSandboxesRequest::decode(payload)
+        let req = sandbox_v1::ListSandboxesRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let state_filter = if req.state.is_empty() {
-            None
-        } else {
-            Some(req.state.as_str())
-        };
-        let summaries = self.manager.list_sandboxes(state_filter, &req.labels);
-        Ok(sandbox_v1::ListSandboxesResponse {
-            sandboxes: summaries.into_iter().map(vm_summary_to_proto).collect(),
-        })
-    }
-
-    // =========================================================================
-    // Workload
-    // =========================================================================
-
-    /// Run a command in a sandbox.  Returns a channel of encoded [`RunOutput`] payloads.
-    pub async fn run(
-        &self,
-        payload: &[u8],
-    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, SandboxError> {
-        let req = sandbox_v1::RunRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let tty_size = None; // RunRequest has no tty_size field; use default.
-
-        let mut rx = self
-            .manager
-            .run_in_sandbox(
-                &req.id,
-                req.cmd,
-                req.env,
-                req.working_dir,
-                req.user,
-                req.tty,
-                tty_size,
-                req.timeout_seconds,
-            )
-            .await
-            .map_err(SandboxError::from)?;
-
-        let (tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
-                let chunk = match result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // Encode an exit chunk carrying the error.
-                        let done_msg = sandbox_v1::RunOutput {
-                            stream: "exit".into(),
-                            data: Vec::new(),
-                            exit_code: 1,
-                            done: true,
-                        };
-                        tracing::warn!(error = %e, "run_in_sandbox stream error");
-                        let _ = tx.send(done_msg.encode_to_vec());
-                        break;
-                    }
-                };
-                let is_done = chunk.stream == "exit";
-                let msg = sandbox_v1::RunOutput {
-                    stream: chunk.stream,
-                    data: chunk.data,
-                    exit_code: chunk.exit_code,
-                    done: is_done,
-                };
-                if tx.send(msg.encode_to_vec()).is_err() {
-                    break;
-                }
-                if is_done {
-                    break;
-                }
-            }
-        });
-
-        Ok(out_rx)
-    }
-
-    /// Start an interactive exec session.
-    ///
-    /// Returns `(input_sender, output_receiver)`:
-    /// - Send [`ExecInputMsg`]s into `input_sender` to forward stdin / EOF to
-    ///   the running process.
-    /// - Read pre-encoded [`sandbox_v1::ExecOutput`] payloads from
-    ///   `output_receiver`.  The final payload has `done == true`.
-    pub async fn exec(
-        &self,
-        payload: &[u8],
-    ) -> Result<(mpsc::Sender<ExecInputMsg>, mpsc::UnboundedReceiver<Vec<u8>>), SandboxError> {
-        let req = sandbox_v1::ExecRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
-
-        let tty_size = req
-            .tty_size
-            .map(|s| {
-                let width = u16::try_from(s.width)
-                    .map_err(|_| SandboxError::Decode(format!("invalid tty width {}", s.width)))?;
-                let height = u16::try_from(s.height).map_err(|_| {
-                    SandboxError::Decode(format!("invalid tty height {}", s.height))
-                })?;
-                Ok::<_, SandboxError>((width, height))
-            })
-            .transpose()?;
-
-        let (in_tx, mut out_rx) = self
-            .manager
-            .exec_in_sandbox(
-                &req.id,
-                req.cmd,
-                req.env,
-                req.working_dir,
-                req.user,
-                req.tty,
-                tty_size,
-                req.timeout_seconds,
-            )
-            .await
-            .map_err(SandboxError::from)?;
-
-        let (tx, out_stream_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        tokio::spawn(async move {
-            while let Some(result) = out_rx.recv().await {
-                let chunk = match result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let done_msg = sandbox_v1::ExecOutput {
-                            stream: "exit".into(),
-                            data: Vec::new(),
-                            exit_code: 1,
-                            done: true,
-                        };
-                        tracing::warn!(error = %e, "exec_in_sandbox stream error");
-                        let _ = tx.send(done_msg.encode_to_vec());
-                        break;
-                    }
-                };
-                let is_done = chunk.stream == "exit";
-                let msg = sandbox_v1::ExecOutput {
-                    stream: chunk.stream,
-                    data: chunk.data,
-                    exit_code: chunk.exit_code,
-                    done: is_done,
-                };
-                if tx.send(msg.encode_to_vec()).is_err() {
-                    break;
-                }
-                if is_done {
-                    break;
-                }
-            }
-        });
-
-        Ok((in_tx, out_stream_rx))
-    }
-
-    /// Bridge a `SandboxExecRequest` between the host vsock stream and the
-    /// vm-agent.
-    ///
-    /// The host sends [`MessageType::SandboxExecInput`] frames carrying raw
-    /// stdin bytes; an empty payload signals EOF on stdin.  The agent forwards
-    /// [`MessageType::SandboxExecOutput`] frames (stdout / stderr / exit) back
-    /// to the host until the process terminates.
-    pub async fn handle_exec<S>(
-        &self,
-        stream: &mut S,
-        trace_id: &str,
-        payload: &[u8],
-    ) -> anyhow::Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
-        let (in_tx, mut out_rx) = match self.exec(payload).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                let err = ErrorResponse::new(e.status_code(), e.to_string());
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                return Ok(());
-            }
-        };
-
-        // Split the stream so reads and writes operate independently.
-        // The input reader may be cancelled mid-frame by tokio::select!
-        // when the output side finishes first; this is safe because this
-        // connection is not reused for subsequent requests.
-        {
-            let (mut rh, mut wh) = tokio::io::split(&mut *stream);
-
-            let input_fut = async {
-                loop {
-                    match read_message(&mut rh).await {
-                        Err(_) => {
-                            let _ = in_tx.send(ExecInputMsg::Eof).await;
-                            break;
-                        }
-                        Ok((MessageType::SandboxExecInput, _, data)) => {
-                            let msg = if data.is_empty() {
-                                ExecInputMsg::Eof
-                            } else {
-                                ExecInputMsg::Stdin(data)
-                            };
-                            if in_tx.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok((MessageType::SandboxExecResize, _, data)) => {
-                            let Ok(size) = sandbox_v1::TerminalSize::decode(data.as_slice()) else {
-                                break;
-                            };
-                            let msg = ExecInputMsg::Resize {
-                                width: u16::try_from(size.width).unwrap_or(u16::MAX),
-                                height: u16::try_from(size.height).unwrap_or(u16::MAX),
-                            };
-                            if in_tx.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(_) => break,
-                    }
-                }
-            };
-
-            let trace_id_owned = trace_id.to_owned();
-            let output_fut = async {
-                while let Some(encoded) = out_rx.recv().await {
-                    let done =
-                        sandbox_v1::ExecOutput::decode(encoded.as_slice()).is_ok_and(|m| m.done);
-                    write_message(
-                        &mut wh,
-                        MessageType::SandboxExecOutput,
-                        &trace_id_owned,
-                        &encoded,
-                    )
-                    .await?;
-                    if done {
-                        break;
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            };
-
-            tokio::pin!(input_fut);
-            tokio::pin!(output_fut);
-
-            // Run both concurrently.  When output finishes (process exited),
-            // the input reader is cancelled — this is safe because the host
-            // consumes its AgentClient (via into_split) for exec sessions, so
-            // this vsock connection is never reused for further requests.
-            tokio::select! {
-                () = &mut input_fut => {
-                    // Host disconnected first; drain remaining output.
-                    output_fut.await?;
-                }
-                result = &mut output_fut => {
-                    result?;
-                }
-            }
-        }
-        // Split halves are dropped here; `stream` is usable again.
-        drain_trailing_input(stream).await;
-
-        Ok(())
-    }
-
-    /// Stream `SandboxRunOutput` frames from [`SandboxService::run`].
-    pub async fn handle_run<S>(
-        &self,
-        stream: &mut S,
-        trace_id: &str,
-        payload: &[u8],
-    ) -> anyhow::Result<()>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        let mut rx = match self.run(payload).await {
-            Ok(r) => r,
-            Err(e) => {
-                let err = ErrorResponse::new(e.status_code(), e.to_string());
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                return Ok(());
-            }
-        };
-
-        while let Some(encoded) = rx.recv().await {
-            write_message(stream, MessageType::SandboxRunOutput, trace_id, &encoded).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Stream `SandboxEvent` frames from [`SandboxService::subscribe_events`].
-    pub async fn handle_events<S>(
-        &self,
-        stream: &mut S,
-        trace_id: &str,
-        payload: &[u8],
-    ) -> anyhow::Result<()>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        let mut rx = match self.subscribe_events(payload) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = ErrorResponse::new(e.status_code(), e.to_string());
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                return Ok(());
-            }
-        };
-
-        while let Some(encoded) = rx.recv().await {
-            write_message(stream, MessageType::SandboxEvent, trace_id, &encoded).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Subscribe to sandbox lifecycle events.  Returns a channel of encoded
-    /// [`SandboxEvent`] payloads.
-    pub fn subscribe_events(
-        &self,
-        payload: &[u8],
-    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, SandboxError> {
-        let req = sandbox_v1::SandboxEventsRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let filter_id = req.id.clone();
-        let filter_action = req.action;
-
-        let mut bcast_rx = self.manager.subscribe_events();
-        let (tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        tokio::spawn(async move {
-            loop {
-                match bcast_rx.recv().await {
-                    Ok(event) => {
-                        // Apply filters.
-                        if !filter_id.is_empty() && event.sandbox_id != filter_id {
-                            continue;
-                        }
-                        if !filter_action.is_empty() && event.action != filter_action {
-                            continue;
-                        }
-                        let msg = vm_event_to_proto(event);
-                        if tx.send(msg.encode_to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "sandbox events receiver lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(out_rx)
-    }
-
-    // =========================================================================
-    // File I/O
-    // =========================================================================
-
-    /// Stream a file out of a sandbox as `SandboxFileData` frames.
-    ///
-    /// The final frame carries `done == true`. Errors (missing sandbox,
-    /// missing file, wrong state) are reported as a single `Error` frame.
-    pub async fn handle_read_file<S>(
-        &self,
-        stream: &mut S,
-        trace_id: &str,
-        payload: &[u8],
-    ) -> anyhow::Result<()>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        let req = match sandbox_v1::ReadFileRequest::decode(payload) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = ErrorResponse::new(400, format!("decode error: {e}"));
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                return Ok(());
-            }
-        };
-
-        let data = match self.manager.read_sandbox_file(&req.id, &req.path).await {
-            Ok(d) => d,
-            Err(e) => {
-                let e = SandboxError::from(e);
-                let err = ErrorResponse::new(e.status_code(), e.to_string());
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                return Ok(());
-            }
-        };
-
-        const CHUNK_SIZE: usize = 1024 * 1024;
-        for chunk in data.chunks(CHUNK_SIZE) {
-            let msg = sandbox_v1::FileChunk {
-                data: chunk.to_vec(),
-                done: false,
-            };
-            write_message(
-                stream,
-                MessageType::SandboxFileData,
-                trace_id,
-                &msg.encode_to_vec(),
-            )
-            .await?;
-        }
-        let done = sandbox_v1::FileChunk {
-            data: Vec::new(),
-            done: true,
-        };
-        write_message(
-            stream,
-            MessageType::SandboxFileData,
-            trace_id,
-            &done.encode_to_vec(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Receive a `SandboxFileChunk` stream and store it inside the sandbox.
-    ///
-    /// The open payload was already parsed by the dispatcher frame; chunk
-    /// frames follow on the same connection until `done == true`, then a
-    /// `SandboxFileWriteResponse` (or `Error`) frame answers.
-    pub async fn handle_write_file<S>(
-        &self,
-        stream: &mut S,
-        trace_id: &str,
-        payload: &[u8],
-    ) -> anyhow::Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
-        let open = match sandbox_v1::WriteFileOpen::decode(payload) {
-            Ok(o) => o,
-            Err(e) => {
-                let err = ErrorResponse::new(400, format!("decode error: {e}"));
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                return Ok(());
-            }
-        };
-
-        let max = arcbox_vm::file_io::proto::MAX_FILE_SIZE;
-        let mut data = Vec::new();
-        loop {
-            match read_message(stream).await {
-                Ok((MessageType::SandboxFileChunk, _, frame)) => {
-                    let chunk = match sandbox_v1::FileChunk::decode(frame.as_slice()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let err = ErrorResponse::new(400, format!("decode error: {e}"));
-                            write_message(stream, MessageType::Error, trace_id, &err.encode())
-                                .await?;
-                            return Ok(());
-                        }
-                    };
-                    if data.len() + chunk.data.len() > max {
-                        let err = ErrorResponse::new(
-                            400,
-                            format!("file exceeds the {max}-byte write limit"),
-                        );
-                        write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                        return Ok(());
-                    }
-                    data.extend_from_slice(&chunk.data);
-                    if chunk.done {
-                        break;
-                    }
-                }
-                Ok((other, _, _)) => {
-                    let err = ErrorResponse::new(
-                        400,
-                        format!("unexpected frame during write: {other:?}"),
-                    );
-                    write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "write stream ended before done chunk");
-                    return Ok(());
-                }
-            }
-        }
-
-        let mode = if open.mode == 0 { 0o644 } else { open.mode };
-        match self
-            .manager
-            .write_sandbox_file(&open.id, &open.path, mode, &data)
-            .await
-        {
-            Ok(()) => {
-                write_message(stream, MessageType::SandboxFileWriteResponse, trace_id, &[]).await?;
-            }
-            Err(e) => {
-                let e = SandboxError::from(e);
-                let err = ErrorResponse::new(e.status_code(), e.to_string());
-                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
-            }
-        }
-        Ok(())
-    }
-
-    // =========================================================================
-    // Snapshots
-    // =========================================================================
-
-    /// Checkpoint a sandbox.
-    pub async fn checkpoint(
-        &self,
-        payload: &[u8],
-    ) -> Result<sandbox_v1::CheckpointResponse, SandboxError> {
-        let req = sandbox_v1::CheckpointRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let info = self
-            .manager
-            .checkpoint_sandbox(&req.sandbox_id, req.name)
-            .await
-            .map_err(SandboxError::from)?;
-        Ok(checkpoint_to_proto(info))
-    }
-
-    /// Restore a sandbox from a snapshot.
-    pub async fn restore(
-        &self,
-        payload: &[u8],
-    ) -> Result<sandbox_v1::RestoreResponse, SandboxError> {
-        let req = sandbox_v1::RestoreRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let spec = RestoreSandboxSpec {
-            id: if req.id.is_empty() {
-                None
-            } else {
-                Some(req.id)
-            },
-            snapshot_id: req.snapshot_id,
-            labels: req.labels,
-            network_override: req.network_override,
-            ttl_seconds: req.ttl_seconds,
-        };
-        let (id, ip_address) = self
-            .manager
-            .restore_sandbox(spec)
-            .await
-            .map_err(SandboxError::from)?;
-        register_sandbox_dns(&id, &ip_address);
-        Ok(sandbox_v1::RestoreResponse { id, ip_address })
-    }
-
-    /// List snapshots.
-    pub fn list_snapshots(
-        &self,
-        payload: &[u8],
-    ) -> Result<sandbox_v1::ListSnapshotsResponse, SandboxError> {
-        let req = sandbox_v1::ListSnapshotsRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let filter = if req.sandbox_id.is_empty() {
-            None
-        } else {
-            Some(req.sandbox_id.as_str())
-        };
+        let state_filter = convert::state_filter(req.state.as_known().unwrap_or_default());
+        let labels: std::collections::HashMap<String, String> = req.labels.into_iter().collect();
         let summaries = self
             .manager
-            .list_checkpoints(filter)
+            .list_sandboxes(state_filter, &labels)
             .map_err(SandboxError::from)?;
-        Ok(sandbox_v1::ListSnapshotsResponse {
-            snapshots: summaries
-                .into_iter()
-                .map(checkpoint_summary_to_proto)
-                .collect(),
+        let (page, next_page_token) =
+            convert::paginate(summaries, |s| &s.id, req.page_size, &req.page_token);
+        Ok(sandbox_v1::ListSandboxesResponse {
+            sandboxes: page.into_iter().map(convert::summary_to_proto).collect(),
+            next_page_token,
+            ..Default::default()
         })
     }
 
-    /// Return the IP address of a sandbox, or an error if not found.
-    pub fn sandbox_ip(&self, sandbox_id: &str) -> Result<std::net::Ipv4Addr, SandboxError> {
-        let info = self
-            .manager
-            .inspect_sandbox(&sandbox_id.to_string())
-            .map_err(SandboxError::from)?;
-        info.network
-            .and_then(|n| n.ip_address.parse().ok())
-            .ok_or_else(|| {
-                SandboxError::Internal(format!("sandbox '{sandbox_id}' has no network allocation"))
-            })
+    /// Return the active generation's network identity (external pool IP,
+    /// cleanup token, and addressing mode).
+    pub(crate) fn sandbox_network_identity(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<arcbox_vm::SandboxNetworkIdentity, SandboxError> {
+        self.manager
+            .sandbox_network_identity(sandbox_id)
+            .map_err(SandboxError::from)
     }
 
-    /// Delete a snapshot.
-    pub fn delete_snapshot(&self, payload: &[u8]) -> Result<(), SandboxError> {
-        let req = sandbox_v1::DeleteSnapshotRequest::decode(payload)
-            .map_err(|e| SandboxError::Decode(e.to_string()))?;
+    pub(crate) async fn wait_startup_cleanup_complete(&self) {
+        self.manager.wait_startup_cleanup_complete().await;
+    }
+
+    /// Return the durable cleanup ticket for a terminal generation, if its
+    /// sandbox had networking enabled.
+    pub(crate) async fn pending_cleanup_ticket(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<arcbox_connect::v1::SandboxCleanupTicket>, SandboxError> {
+        Ok(self
+            .manager
+            .pending_network_cleanups()
+            .await
+            .map_err(SandboxError::from)?
+            .into_iter()
+            .find_map(|(id, token)| {
+                (id == sandbox_id).then_some(arcbox_connect::v1::SandboxCleanupTicket {
+                    id,
+                    token,
+                    startup: false,
+                    ..Default::default()
+                })
+            }))
+    }
+
+    /// Snapshot every durable cleanup generation after startup reconciliation.
+    pub(crate) async fn pending_cleanup_tickets(
+        &self,
+    ) -> Result<Vec<arcbox_connect::v1::SandboxCleanupTicket>, SandboxError> {
+        let mut tickets = self
+            .manager
+            .pending_network_cleanups()
+            .await
+            .map_err(SandboxError::from)?
+            .into_iter()
+            .map(|(id, token)| arcbox_connect::v1::SandboxCleanupTicket {
+                id,
+                token,
+                startup: false,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        if let Some(token) = self
+            .manager
+            .startup_cleanup_token()
+            .await
+            .map_err(SandboxError::from)?
+        {
+            tickets.push(arcbox_connect::v1::SandboxCleanupTicket {
+                id: STARTUP_CLEANUP_ID.into(),
+                token,
+                startup: true,
+                ..Default::default()
+            });
+        }
+        Ok(tickets)
+    }
+
+    /// Validate one exact cleanup generation before host-side deletion.
+    pub(crate) async fn prepare_cleanup(
+        &self,
+        ticket: &arcbox_connect::v1::SandboxCleanupTicket,
+    ) -> Result<std::net::Ipv4Addr, SandboxError> {
+        if ticket.startup {
+            if ticket.id != STARTUP_CLEANUP_ID {
+                return Err(SandboxError::Decode(
+                    "invalid sandbox startup cleanup ticket".into(),
+                ));
+            }
+            self.manager
+                .validate_startup_cleanup(&ticket.token)
+                .await
+                .map_err(SandboxError::from)?;
+            return Ok(std::net::Ipv4Addr::UNSPECIFIED);
+        }
         self.manager
-            .delete_checkpoint(&req.snapshot_id)
+            .validate_network_cleanup(&ticket.id, &ticket.token)
+            .await
+            .map(|allocation| allocation.ip_address)
             .map_err(SandboxError::from)
+    }
+
+    /// Revalidate and recycle one exact generation after guest DNAT cleanup.
+    pub(crate) async fn finalize_cleanup(
+        &self,
+        ticket: &arcbox_connect::v1::SandboxCleanupTicket,
+    ) -> Result<(), SandboxError> {
+        if ticket.startup {
+            if ticket.id != STARTUP_CLEANUP_ID {
+                return Err(SandboxError::Decode(
+                    "invalid sandbox startup cleanup ticket".into(),
+                ));
+            }
+            return self
+                .manager
+                .finalize_startup_cleanup(&ticket.token)
+                .await
+                .map_err(SandboxError::from);
+        }
+        self.manager
+            .finalize_network_cleanup(&ticket.id, &ticket.token)
+            .await
+            .map_err(SandboxError::from)?;
+        deregister_sandbox_dns(&ticket.id);
+        Ok(())
+    }
+
+    pub(crate) fn clear_stale_completed_create(&self, id: &str) {
+        self.creates.clear_completed_if(id, || {
+            completed_create_is_stale(
+                self.manager
+                    .inspect_sandbox(&id.to_owned())
+                    .map(|info| info.state),
+            )
+        });
     }
 }
 
-// =============================================================================
-// DNS registration helpers
-// =============================================================================
+fn completed_create_is_stale(state: Result<SandboxState, VmmError>) -> bool {
+    match state {
+        Ok(SandboxState::Stopped | SandboxState::Failed) | Err(VmmError::NotFound(_)) => true,
+        // A paused sandbox is logically alive: the same-id create replay
+        // must keep answering until it is actually removed.
+        Ok(
+            SandboxState::Starting
+            | SandboxState::Ready
+            | SandboxState::Running
+            | SandboxState::Stopping
+            | SandboxState::Pausing
+            | SandboxState::Paused,
+        )
+        | Err(_) => false,
+    }
+}
 
 /// Register a sandbox in the guest DNS server registry.
 fn register_sandbox_dns(id: &str, ip: &str) {
@@ -822,29 +629,32 @@ fn deregister_sandbox_dns(id: &str) {
     }
 }
 
-// =============================================================================
-// Conversion helpers
-// =============================================================================
-
 /// Convert a `CreateSandboxRequest` proto to a [`SandboxSpec`].
 fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
-    let limits = req.limits.unwrap_or_default();
-    let network = req.network.unwrap_or_default();
+    // An unset `limits`/`network` field derefs to the default instance, and
+    // an unknown wire value falls back to UNSPECIFIED — the proto3 defaults.
+    let (vcpus, memory_mib) = (req.limits.vcpus, req.limits.memory_mib);
+    let mode = match req.network.mode.as_known().unwrap_or_default() {
+        sandbox_v1::NetworkMode::None => "none",
+        // UNSPECIFIED defaults to a networked sandbox.
+        sandbox_v1::NetworkMode::Enabled | sandbox_v1::NetworkMode::Unspecified => "tap",
+    };
     SandboxSpec {
         id: if req.id.is_empty() {
             None
         } else {
             Some(req.id)
         },
-        labels: req.labels,
-        kernel: req.kernel,
-        rootfs: req.rootfs,
-        boot_args: req.boot_args,
-        vcpus: limits.vcpus,
-        memory_mib: limits.memory_mib,
-        image: req.image,
+        labels: req.labels.into_iter().collect(),
+        // Boot recipe fields are resolved from the template, never from the
+        // request (CORE-54); the manager fills kernel/boot_args defaults.
+        kernel: String::new(),
+        rootfs: String::new(),
+        boot_args: String::new(),
+        vcpus,
+        memory_mib,
         cmd: req.cmd,
-        env: req.env,
+        env: req.env.into_iter().collect(),
         working_dir: req.working_dir,
         user: req.user,
         mounts: req
@@ -856,75 +666,73 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
                 readonly: m.readonly,
             })
             .collect(),
-        network: SandboxNetworkSpec { mode: network.mode },
+        network: SandboxNetworkSpec { mode: mode.into() },
         ttl_seconds: req.ttl_seconds,
         ssh_public_key: req.ssh_public_key,
+        idle_timeout_seconds: req.idle_timeout_seconds,
+        on_idle: idle_action_to_spec(req.on_idle.as_known().unwrap_or_default()),
+        // Filled by create_once from the resolved catalog entry; a request
+        // never names a snapshot or a probe directly (CORE-54).
+        template_warm: None,
+        ready_probe: None,
     }
 }
 
-/// Convert a [`SandboxInfo`] to `sandbox_v1::SandboxInfo`.
-fn vm_info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
-    let network = info.network.map(|n| sandbox_v1::SandboxNetwork {
-        ip_address: n.ip_address,
-        gateway: n.gateway,
-        tap_name: n.tap_name,
-    });
-    let limits = sandbox_v1::ResourceLimits {
-        vcpus: info.vcpus,
-        memory_mib: info.memory_mib,
-    };
-    sandbox_v1::SandboxInfo {
-        id: info.id,
-        state: info.state.to_string(),
-        labels: info.labels,
-        limits: Some(limits),
-        network,
-        created_at: info.created_at.timestamp(),
-        ready_at: info.ready_at.map_or(0, |t| t.timestamp()),
-        last_exited_at: info.last_exited_at.map_or(0, |t| t.timestamp()),
-        last_exit_code: info.last_exit_code.unwrap_or(0),
-        error: info.error.unwrap_or_default(),
+/// Map the wire idle policy onto the manager's; `UNSPECIFIED` (and unknown
+/// future values) resolve to the daemon default, KILL.
+fn idle_action_to_spec(action: sandbox_v1::IdleAction) -> arcbox_vm::IdleAction {
+    match action {
+        sandbox_v1::IdleAction::Pause => arcbox_vm::IdleAction::Pause,
+        sandbox_v1::IdleAction::Kill | sandbox_v1::IdleAction::Unspecified => {
+            arcbox_vm::IdleAction::Kill
+        }
     }
 }
 
-/// Convert a [`SandboxSummary`] to `sandbox_v1::SandboxSummary`.
-fn vm_summary_to_proto(s: SandboxSummary) -> sandbox_v1::SandboxSummary {
-    sandbox_v1::SandboxSummary {
-        id: s.id,
-        state: s.state.to_string(),
-        labels: s.labels,
-        ip_address: s.ip_address,
-        created_at: s.created_at.timestamp(),
-    }
+fn create_uses_network(request: &sandbox_v1::CreateSandboxRequest) -> bool {
+    !matches!(
+        request.network.mode.as_known().unwrap_or_default(),
+        sandbox_v1::NetworkMode::None
+    )
 }
 
-/// Convert a [`VmSandboxEvent`] to `sandbox_v1::SandboxEvent`.
-pub fn vm_event_to_proto(e: VmSandboxEvent) -> sandbox_v1::SandboxEvent {
-    sandbox_v1::SandboxEvent {
-        sandbox_id: e.sandbox_id,
-        action: e.action,
-        timestamp: e.timestamp_ns,
-        attributes: e.attributes,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Convert a [`CheckpointInfo`] to `sandbox_v1::CheckpointResponse`.
-fn checkpoint_to_proto(info: CheckpointInfo) -> sandbox_v1::CheckpointResponse {
-    sandbox_v1::CheckpointResponse {
-        snapshot_id: info.snapshot_id,
-        snapshot_dir: info.snapshot_dir,
-        created_at: info.created_at,
+    #[test]
+    fn only_networked_create_waits_for_startup_cleanup() {
+        assert!(create_uses_network(
+            &sandbox_v1::CreateSandboxRequest::default()
+        ));
+        assert!(!create_uses_network(&sandbox_v1::CreateSandboxRequest {
+            network: sandbox_v1::NetworkSpec {
+                mode: sandbox_v1::NetworkMode::None.into(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        }));
     }
-}
 
-/// Convert a [`CheckpointSummary`] to `sandbox_v1::SnapshotSummary`.
-fn checkpoint_summary_to_proto(s: CheckpointSummary) -> sandbox_v1::SnapshotSummary {
-    sandbox_v1::SnapshotSummary {
-        id: s.id,
-        sandbox_id: s.sandbox_id,
-        name: s.name,
-        labels: s.labels,
-        snapshot_dir: s.snapshot_dir,
-        created_at: s.created_at,
+    #[test]
+    fn completed_create_is_stale_only_after_terminal_or_removed_state() {
+        for state in [
+            SandboxState::Starting,
+            SandboxState::Ready,
+            SandboxState::Running,
+            SandboxState::Stopping,
+        ] {
+            assert!(!completed_create_is_stale(Ok(state)));
+        }
+        for state in [SandboxState::Stopped, SandboxState::Failed] {
+            assert!(completed_create_is_stale(Ok(state)));
+        }
+        assert!(completed_create_is_stale(Err(VmmError::NotFound(
+            "removed".into()
+        ))));
+        assert!(!completed_create_is_stale(Err(VmmError::Config(
+            "inspect failed".into()
+        ))));
     }
 }

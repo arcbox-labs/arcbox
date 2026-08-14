@@ -9,6 +9,8 @@
 use anyhow::Result;
 
 pub mod ensure_runtime;
+#[cfg(any(target_os = "linux", test))]
+mod exec_error;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -18,6 +20,8 @@ mod stub;
 
 #[cfg(target_os = "linux")]
 pub use linux::Agent;
+#[cfg(target_os = "linux")]
+pub use linux::container_network;
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::Agent;
