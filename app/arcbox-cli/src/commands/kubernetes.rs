@@ -226,6 +226,84 @@ async fn merge_managed_kubeconfig(home: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What the global current-context owes after a kubeconfig merge.
+#[derive(Debug, PartialEq, Eq)]
+enum CurrentContextFix<'a> {
+    /// The merge left the selection where it was.
+    Keep,
+    /// Put back the selection the merge displaced.
+    Restore(&'a str),
+    /// The merge created a selection where the user had none.
+    Clear,
+}
+
+/// Decides [`CurrentContextFix`] for a profile that may not own the selection.
+///
+/// Not writing the current-context is not the same as not changing it.
+/// `merge_managed_kubeconfig` copies the managed kubeconfig verbatim when the
+/// user has none, and that file carries `current-context: <managed>`
+/// (`rewrite_kubeconfig` puts it there); the merge path inherits it too,
+/// because `kubectl config view --flatten` takes the current-context from the
+/// first file that sets one. So a development instance activates its own
+/// context globally just by writing the file — the very thing skipping
+/// `set_current_context` was meant to prevent. Comparing before against after
+/// covers all three shapes (no user kubeconfig, one without a
+/// current-context, one with) and never asks kubectl to unset a key that is
+/// not there.
+///
+/// It also only ever undoes a selection that landed on `managed`. Nothing
+/// locks `~/.kube/config` — kubectl's own writes are unlocked
+/// read-modify-write — so a `kubectl config use-context` racing this window
+/// would otherwise be read as the merge's doing and reverted. Requiring
+/// `after == managed` leaves any concurrent switch to some other context
+/// alone; the residual race is a switch *to* the managed context during the
+/// window, which is indistinguishable from the merge causing it.
+fn current_context_restore<'a>(
+    owns_global: bool,
+    managed: &str,
+    before: Option<&'a str>,
+    after: Option<&str>,
+) -> CurrentContextFix<'a> {
+    if owns_global || before == after || after != Some(managed) {
+        CurrentContextFix::Keep
+    } else {
+        before.map_or(CurrentContextFix::Clear, CurrentContextFix::Restore)
+    }
+}
+
+/// Applies [`current_context_restore`] after a merge.
+async fn restore_current_context(home: &Path, managed: &str, before: Option<&str>) -> Result<()> {
+    let after = current_context(home).await?;
+    match current_context_restore(false, managed, before, after.as_deref()) {
+        CurrentContextFix::Keep => Ok(()),
+        CurrentContextFix::Restore(previous) => set_current_context(home, previous).await,
+        CurrentContextFix::Clear => unset_current_context(home).await,
+    }
+}
+
+async fn unset_current_context(home: &Path) -> Result<()> {
+    let kubectl = kubectl_bin(home);
+    let kubeconfig = user_kubeconfig_path(home);
+    let output = tokio::process::Command::new(&kubectl)
+        .arg("config")
+        .arg("unset")
+        .arg("current-context")
+        .arg("--kubeconfig")
+        .arg(&kubeconfig)
+        .output()
+        .await
+        .context("failed to clear the current kube context")?;
+
+    if !output.status.success() {
+        bail!(
+            "kubectl config unset current-context failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
 async fn set_current_context(home: &Path, context: &str) -> Result<()> {
     let kubectl = kubectl_bin(home);
     let kubeconfig = user_kubeconfig_path(home);
@@ -306,7 +384,8 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
     }
 
     let current_context = current_context(home).await?;
-    let restore_managed_context = owns_global_current_context(ArcboxProfile::from_env_or_default())
+    let owns_current_context = owns_global_current_context(ArcboxProfile::from_env_or_default());
+    let restore_managed_context = owns_current_context
         && should_restore_managed_context(
             current_context.as_deref(),
             state.managed_context.as_deref(),
@@ -317,6 +396,10 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
     merge_managed_kubeconfig(home).await?;
     if restore_managed_context {
         set_current_context(home, &managed_context).await?;
+    } else if !owns_current_context {
+        // The refresh merges too, so it can activate the development context
+        // on a host with no user kubeconfig exactly like `enable` can.
+        restore_current_context(home, &managed_context, current_context.as_deref()).await?;
     }
     save_state(
         home,
@@ -454,16 +537,17 @@ async fn execute_enable() -> Result<()> {
     install_kubernetes_tools(&home).await?;
 
     let owns_current_context = owns_global_current_context(ArcboxProfile::from_env_or_default());
-    let previous_context = if owns_current_context {
-        current_context(&home).await?
-    } else {
-        None
-    };
+    // Read unconditionally: a profile that does not own the global
+    // current-context still has to know what it was, to put it back after the
+    // merge writes one (see `current_context_restore`).
+    let previous_context = current_context(&home).await?;
     let managed_context = refresh_managed_kubeconfig(&home).await?;
     delete_context_entries(&home, &managed_context).await?;
     merge_managed_kubeconfig(&home).await?;
     if owns_current_context {
         set_current_context(&home, &managed_context).await?;
+    } else {
+        restore_current_context(&home, &managed_context, previous_context.as_deref()).await?;
     }
 
     save_state(
@@ -531,7 +615,8 @@ async fn execute_kubeconfig() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        owns_global_current_context, resolve_managed_context_name, should_restore_managed_context,
+        CurrentContextFix, current_context_restore, owns_global_current_context,
+        resolve_managed_context_name, should_restore_managed_context,
     };
     use arcbox_constants::paths::ArcboxProfile;
 
@@ -575,5 +660,59 @@ mod tests {
     fn only_production_owns_the_global_current_context() {
         assert!(owns_global_current_context(ArcboxProfile::Production));
         assert!(!owns_global_current_context(ArcboxProfile::Development));
+    }
+
+    /// The merge writes a `current-context` whether or not `enable` asks it
+    /// to — verbatim when the user had no kubeconfig, inherited from the
+    /// managed file when their own set none. A profile that does not own the
+    /// global selection has to put back what was there, including "nothing".
+    #[test]
+    fn a_foreign_profile_puts_the_current_context_back() {
+        // No user kubeconfig: the merge created one pointing at the managed
+        // context, so it has to be cleared rather than left pointing there.
+        assert_eq!(
+            current_context_restore(false, "arcbox-dev", None, Some("arcbox-dev")),
+            CurrentContextFix::Clear
+        );
+        // A user context the merge displaced goes back.
+        assert_eq!(
+            current_context_restore(
+                false,
+                "arcbox-dev",
+                Some("docker-desktop"),
+                Some("arcbox-dev")
+            ),
+            CurrentContextFix::Restore("docker-desktop")
+        );
+        // The merge left it alone — including the case where the user had
+        // deliberately selected the managed context themselves.
+        assert_eq!(
+            current_context_restore(false, "arcbox-dev", Some("arcbox-dev"), Some("arcbox-dev")),
+            CurrentContextFix::Keep
+        );
+        assert_eq!(
+            current_context_restore(false, "arcbox-dev", None, None),
+            CurrentContextFix::Keep
+        );
+        // Production owns the selection and sets it explicitly.
+        assert_eq!(
+            current_context_restore(true, "arcbox", None, Some("arcbox")),
+            CurrentContextFix::Keep
+        );
+    }
+
+    /// Nothing locks `~/.kube/config`, so a `kubectl config use-context`
+    /// landing inside the merge window must not be read as the merge's doing.
+    /// Only a selection that ended up on the managed context is undone.
+    #[test]
+    fn a_concurrent_switch_elsewhere_is_left_alone() {
+        assert_eq!(
+            current_context_restore(false, "arcbox-dev", Some("minikube"), Some("kind-local")),
+            CurrentContextFix::Keep
+        );
+        assert_eq!(
+            current_context_restore(false, "arcbox-dev", None, Some("kind-local")),
+            CurrentContextFix::Keep
+        );
     }
 }
