@@ -13,8 +13,8 @@ pub fn checksum_fold(mut sum: u32) -> u16 {
     !sum as u16
 }
 
-/// Length at which SIMD `checksum_add` is used. Short headers stay scalar
-/// so setup cost does not dominate.
+/// Longest buffer that stays on the scalar loop — `checksum_add` uses SIMD
+/// only above this length, so setup cost does not dominate short headers.
 const SIMD_THRESHOLD: usize = 64;
 
 /// Calculates the ones' complement sum of 16-bit words.
