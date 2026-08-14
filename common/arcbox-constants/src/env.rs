@@ -7,6 +7,9 @@ pub const PROFILE: &str = "ARCBOX_PROFILE";
 /// Environment variable for overriding the host data directory.
 pub const DATA_DIR: &str = "ARCBOX_DATA_DIR";
 
+/// Environment variable for selecting an instance-owned Docker context.
+pub const DOCKER_CONTEXT: &str = "ARCBOX_DOCKER_CONTEXT";
+
 /// Environment variable for overriding guest Docker API vsock port.
 pub const GUEST_DOCKER_VSOCK_PORT: &str = "ARCBOX_GUEST_DOCKER_VSOCK_PORT";
 

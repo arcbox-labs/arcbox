@@ -88,12 +88,10 @@ impl HelperFixture {
         }
     }
 
-    fn client(&self) -> impl std::future::Future<Output = Client> + '_ {
-        async move {
-            Client::connect_to(self.sock.to_str().unwrap())
-                .await
-                .expect("connect")
-        }
+    async fn client(&self) -> Client {
+        Client::connect_to(self.sock.to_str().unwrap())
+            .await
+            .expect("connect")
     }
 
     fn bin_dir(&self) -> PathBuf {

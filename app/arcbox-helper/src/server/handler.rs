@@ -36,6 +36,17 @@ impl HelperService for HelperServer {
         mutations::route::remove(&subnet)
     }
 
+    async fn route_remove_if_owned(
+        self,
+        _: tarpc::context::Context,
+        subnet: String,
+        iface: String,
+    ) -> Result<bool, HelperError> {
+        let subnet: Subnet = subnet.parse().map_err(HelperError::validation)?;
+        let iface: BridgeIface = iface.parse().map_err(HelperError::validation)?;
+        mutations::route::remove_if_owned(&subnet, &iface)
+    }
+
     async fn dns_install(
         self,
         _: tarpc::context::Context,

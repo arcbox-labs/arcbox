@@ -24,11 +24,13 @@ prepare_assets           Seed/download boot assets               variable
     │                    ASSETS_READY.
     │
 boot_runtime             Construct Runtime, boot the System VM   variable
-    │                    Emits no phase of its own; VM/network
-    │                    progress surfaces as SetupStatus infra
-    │                    flags, not phases (see below).
+    │                    Reported as VM_STARTING → VM_READY,
+    │                    published from inside Runtime::init so
+    │                    the span covers the guest boot alone.
     │
-start_runtime_services   DNS, Docker API, recovery               ~instant
+start_runtime_services   DNS, Docker API, critical recovery      ~instant
+    │                    Then optional production Docker context;
+    │                    reported as NETWORK_READY.
     │
 mark_ready               SetupPhase::Ready
 ```
@@ -41,19 +43,46 @@ startup failure.
 
 ### Phase enum caveats
 
-- The observable progression is `INITIALIZING → [CLEANING_UP] →
-  DOWNLOADING_ASSETS → ASSETS_READY → READY` (or `FAILED`). The
-  `VM_STARTING` / `VM_READY` / `NETWORK_READY` / `DEGRADED` values in
-  `SetupStatus.Phase` are reserved but currently never emitted — do not
-  wait on them.
+- The observable progression is `INITIALIZING → [CLEANING_UP →
+  INITIALIZING] → [DOWNLOADING_ASSETS] → ASSETS_READY → [VM_STARTING →
+  VM_READY] → NETWORK_READY → READY` (or `FAILED`). Bracketed phases are
+  conditional; the VM pair is skipped entirely by a `--no-linux-vm`
+  daemon, which boots no guest. `DEGRADED` is reserved and never emitted.
+- A phase the daemon had already left before a client subscribed is never
+  observed. Treat a missing phase as unknown, not as zero elapsed and not
+  as a reason to keep waiting — the stream never replays it. Once
+  subscribed, though, no transition is dropped: `WatchSetupStatus` streams
+  every update rather than the newest snapshot, because `NETWORK_READY` and
+  `READY` are published ~300 µs apart with no await point between them and
+  a snapshot channel would collapse them (see `SetupState` in
+  `arcbox-api/src/system.rs`).
+- `NETWORK_READY` covers whichever host services this daemon promises. A
+  `--no-linux-vm` daemon reaches it with DNS alone. DNS, Docker, and an
+  explicitly requested Kubernetes proxy are *bound* by then; a bind failure
+  becomes `FAILED`. The canonical best-effort port 16443 remains the exception:
+  a conflict leaves Kubernetes RPCs unavailable without failing startup.
+- A non-default container CIDR is reconciled before runtime services start;
+  an existing route owned by another interface fails startup. The canonical
+  production CIDR keeps its existing background recovery behavior.
+- `--docker-integration` is production-only. Its global Docker context switch
+  runs after startup-critical recovery, so a resolver failure cannot leave a
+  dead ArcBox context selected.
 - Enum ordinal ≠ progression order (`DOWNLOADING_ASSETS = 8` occurs before
   `READY = 6`). Clients must match on the value, never compare ordinals.
   New phases are appended with the next free number regardless of where
   they sit in the progression — values are additive-only.
-- VM / route / DNS progress during and after `boot_runtime` is carried by
-  the boolean `SetupStatus` fields (`vm_running`, `route_installed`,
-  `dns_resolver_installed`, …), set by recovery and `route_status_loop`,
-  not by phase transitions.
+- Phases mark the transitions; the boolean `SetupStatus` fields
+  (`vm_running`, `route_installed`, `dns_resolver_installed`, …) carry the
+  state that outlives startup, including work `recovery::run` spawns in
+  the background and anything `route_status_loop` reconciles afterwards.
+  A client wanting "is the route up *now*" reads the flag, not a phase.
+  `vm_running` and `route_installed` both track the VM across restarts —
+  `services::vm_running_loop` mirrors `VmLifecycleState::is_ready`, and
+  `route_status_loop` mirrors the route events — so both fall on a
+  lifecycle-managed stop and rise again on the next boot rather than
+  reporting one cold-start observation forever. Neither is a liveness probe:
+  a guest that dies without the lifecycle noticing leaves `vm_running` true,
+  because crash detection is unimplemented (ABX-414).
 
 ### Why gRPC starts before resource cleanup
 
@@ -168,7 +197,7 @@ When the daemon is killed without graceful shutdown:
 | File | State | Next startup |
 |------|-------|-------------|
 | `daemon.lock` | exists, old PID, **lock released** | `try_flock` succeeds instantly |
-| `docker.sock` | **stale** | `DockerApiServer::run` removes before bind |
+| `docker.sock` | **stale** | `DockerApiServer::bind` removes before bind |
 | `arcbox.sock` | **stale** | `start_grpc` removes before bind |
 | disk images | **possibly held by XPC helpers** | `wait_for_resources` waits up to 10 s |
 | VM | non-graceful termination | Virtualization.framework cleans up |
@@ -203,7 +232,7 @@ centrally during startup — each server removes and rebinds independently:
 | Socket | Owner | Cleanup |
 |--------|-------|---------|
 | `arcbox.sock` | `services::start_grpc` | `remove_file` before `UnixListener::bind` |
-| `docker.sock` | `DockerApiServer::run` | `remove_file` before `UnixListener::bind` |
+| `docker.sock` | `DockerApiServer::bind` | `remove_file` before `UnixListener::bind` |
 
 This avoids race conditions where a centralized cleanup could delete a
 socket that another component has already bound.

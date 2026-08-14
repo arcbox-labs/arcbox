@@ -1324,6 +1324,28 @@ async fn upload_ooo_reassembly_across_seq_wraparound() {
     assert!(got[100..].iter().all(|&b| b == 0xBB));
 }
 
+/// A byte count that safely exceeds the combined one-shot capacity of a
+/// shrunken sender's `SO_SNDBUF` and receiver's `SO_RCVBUF` — derived from
+/// what the OS actually granted (`granted_send`/`granted_recv`), not from
+/// what a test requested. Linux doubles a `SO_SNDBUF`/`SO_RCVBUF` request
+/// and enforces its own floor (`net.core.wmem_min`/`rmem_min`), so a 4 KiB
+/// request can yield well more than 4 KiB back; macOS mostly honors the
+/// request as-is. On a loopback socket a single non-blocking write can be
+/// satisfied out of BOTH buffers — the receiver's kernel can accept and ACK
+/// bytes within the same syscall, before user space ever calls `read` — so
+/// `granted_send + granted_recv` is the real one-shot ceiling a
+/// partial-take test must outrun, on any platform. Capped well under the
+/// 65,495-byte payload a synthetic frame's u16 IP total-length field allows.
+fn guaranteed_oversized(granted_send: usize, granted_recv: usize) -> usize {
+    let capacity = granted_send + granted_recv;
+    let oversized = (capacity * 3).min(60_000);
+    assert!(
+        oversized > capacity,
+        "granted socket buffers ({capacity} bytes) leave no margin under the frame-size cap"
+    );
+    oversized
+}
+
 /// Property: draining parked segments obeys the same contract as in-order
 /// writes — the ACK never covers bytes the host socket did not take, and
 /// retransmitting from the cursor eventually delivers every byte exactly
@@ -1340,13 +1362,19 @@ async fn upload_ooo_drain_respects_host_writable() {
     let connect = tokio::net::TcpStream::connect(addr);
     let (client, accepted) = tokio::join!(connect, listener.accept());
     let std_client = client.unwrap().into_std().unwrap();
-    socket2::SockRef::from(&std_client)
-        .set_send_buffer_size(4096)
-        .unwrap();
+    // The requested size is not what lands: Linux doubles it and applies
+    // its own floor, so read back what the OS actually granted below.
+    let granted_send = {
+        let sock = socket2::SockRef::from(&std_client);
+        sock.set_send_buffer_size(4096).unwrap();
+        sock.send_buffer_size().unwrap()
+    };
     let (accepted, _) = accepted.unwrap();
-    socket2::SockRef::from(&accepted)
-        .set_recv_buffer_size(4096)
-        .unwrap();
+    let granted_recv = {
+        let sock = socket2::SockRef::from(&accepted);
+        sock.set_recv_buffer_size(4096).unwrap();
+        sock.recv_buffer_size().unwrap()
+    };
 
     let dst_ip = Ipv4Addr::new(198, 18, 30, 103);
     let key = SynFlowKey {
@@ -1366,9 +1394,11 @@ async fn upload_ooo_drain_respects_host_writable() {
     // Position-dependent pattern (251 is prime, so no aliasing if a chunk
     // were duplicated or skipped).
     const HOLE: usize = 100;
-    const PARKED: usize = 16 * 1024;
-    const TOTAL: usize = HOLE + PARKED;
-    let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+    // The parked segment must outrun what the OS actually granted above —
+    // see `guaranteed_oversized`.
+    let parked_len = guaranteed_oversized(granted_send, granted_recv);
+    let total = HOLE + parked_len;
+    let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
     let base: u32 = 2000;
 
     // Park far more than the shrunken socket can take, then fill the hole:
@@ -1402,9 +1432,9 @@ async fn upload_ooo_drain_respects_host_writable() {
         "the in-order fill itself must be ACKed"
     );
     assert!(
-        first_advance < TOTAL,
-        "4 KiB socket buffers cannot take all {TOTAL} bytes at once — \
-         the test must exercise the drain's partial-take stop"
+        first_advance < total,
+        "granted socket buffers ({granted_send}+{granted_recv} bytes) cannot take all \
+         {total} bytes at once — the test must exercise the drain's partial-take stop"
     );
 
     // Retransmit from the cursor (the guest's recovery) until everything
@@ -1430,23 +1460,23 @@ async fn upload_ooo_drain_respects_host_writable() {
             }
         }
         let offset = cursor.wrapping_sub(base) as usize;
-        if offset >= TOTAL {
+        if offset >= total {
             break;
         }
-        let chunk = &payload[offset..(offset + 8 * 1024).min(TOTAL)];
+        let chunk = &payload[offset..(offset + 8 * 1024).min(total)];
         let seg = make_guest_segment((40035, dst_ip, 443), cursor, 1000, 65535, 0x18, chunk);
         let reply = bridge.try_fast_path_intercept(&seg).expect("intercepted");
         let acked = tcp_ack_of(&reply);
         // The ACK may leap past this chunk (the drain flushes parked bytes
         // behind it) but never past bytes that were never offered.
         assert!(
-            acked.wrapping_sub(base) as usize <= TOTAL,
+            acked.wrapping_sub(base) as usize <= total,
             "ACK beyond the offered bytes"
         );
         cursor = acked;
     }
-    assert_eq!(cursor.wrapping_sub(base) as usize, TOTAL);
-    assert_eq!(server_received, TOTAL);
+    assert_eq!(cursor.wrapping_sub(base) as usize, total);
+    assert_eq!(server_received, total);
 }
 
 /// A FIN whose sequence position lies beyond the cursor (its stream still
@@ -1666,14 +1696,19 @@ async fn upload_ack_never_exceeds_host_writable() {
     let (client, accepted) = tokio::join!(connect, listener.accept());
     let std_client = client.unwrap().into_std().unwrap();
     // Shrink both socket buffers so segments outrun what the kernel will
-    // take and the write path must report partial/zero takes.
-    socket2::SockRef::from(&std_client)
-        .set_send_buffer_size(4096)
-        .unwrap();
+    // take and the write path must report partial/zero takes. The
+    // requested size is not what lands: read back the actual grant below.
+    let granted_send = {
+        let sock = socket2::SockRef::from(&std_client);
+        sock.set_send_buffer_size(4096).unwrap();
+        sock.send_buffer_size().unwrap()
+    };
     let (accepted, _) = accepted.unwrap();
-    socket2::SockRef::from(&accepted)
-        .set_recv_buffer_size(4096)
-        .unwrap();
+    let granted_recv = {
+        let sock = socket2::SockRef::from(&accepted);
+        sock.set_recv_buffer_size(4096).unwrap();
+        sock.recv_buffer_size().unwrap()
+    };
 
     let dst_ip = Ipv4Addr::new(198, 18, 30, 98);
     let key = SynFlowKey {
@@ -1690,10 +1725,12 @@ async fn upload_ack_never_exceeds_host_writable() {
         .set_read_timeout(Some(std::time::Duration::from_millis(500)))
         .unwrap();
 
-    // Segments stay MTU-plausible (an IP packet's total length is u16);
-    // the volume, not the segment size, is what outruns the buffers.
-    const SEGMENT: usize = 8 * 1024;
-    let payload = vec![0xCC; 256 * 1024];
+    // Segments stay MTU-plausible (an IP packet's total length is u16) and
+    // safely outrun whatever the OS actually granted above — see
+    // `guaranteed_oversized`. The payload is a generous multiple of that so
+    // the loop below exercises many iterations, not just one.
+    let chunk_size = guaranteed_oversized(granted_send, granted_recv);
+    let payload = vec![0xCC; chunk_size * 8];
     let base: u32 = 2000;
     let mut cursor: u32 = base;
     let mut server_received = 0usize;
@@ -1705,7 +1742,7 @@ async fn upload_ack_never_exceeds_host_writable() {
         if offset >= payload.len() {
             break;
         }
-        let chunk = &payload[offset..(offset + SEGMENT).min(payload.len())];
+        let chunk = &payload[offset..(offset + chunk_size).min(payload.len())];
         let segment = make_guest_segment((40023, dst_ip, 443), cursor, 1000, 65535, 0x18, chunk);
         let reply = bridge
             .try_fast_path_intercept(&segment)
@@ -1740,7 +1777,8 @@ async fn upload_ack_never_exceeds_host_writable() {
     assert_eq!(server_received, payload.len());
     assert!(
         short_takes > 0,
-        "test must actually exercise the partial-take path (send buffer 4 KiB, payload 64 KiB)"
+        "test must actually exercise the partial-take path (granted buffers \
+         {granted_send}+{granted_recv} bytes, segment {chunk_size} bytes)"
     );
 }
 

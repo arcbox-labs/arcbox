@@ -171,6 +171,8 @@ impl PassthroughFs {
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     #[cfg(target_os = "linux")]
     pub fn fallocate(&self, handle: u64, mode: u32, offset: u64, length: u64) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+
         let handles = self
             .handles
             .read()

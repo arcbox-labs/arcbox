@@ -57,6 +57,26 @@ fn if_nametoindex(name: &str) -> Option<u32> {
     if idx == 0 { None } else { Some(idx) }
 }
 
+/// Recomposes the engine's vmnet interface MAC with host bridge discovery.
+///
+/// The engine exposes only the MAC of the vmnet shared interface
+/// (`vmnet_interface_mac`); mapping it to the host bridge the system
+/// created around it is host-side knowledge, so the composition lives
+/// here, next to `resolve_bridge_by_mac`.
+#[cfg(feature = "vmnet")]
+pub trait MachineBridgeExt {
+    /// Returns the host bridge interface name for the machine's vmnet NIC.
+    fn vmnet_bridge_name(&self, name: &str) -> Option<String>;
+}
+
+#[cfg(feature = "vmnet")]
+impl MachineBridgeExt for arcbox_engine::machine::MachineManager {
+    fn vmnet_bridge_name(&self, name: &str) -> Option<String> {
+        let mac = self.vmnet_interface_mac(name)?;
+        resolve_bridge_by_mac(&mac).map(|bridge| bridge.name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

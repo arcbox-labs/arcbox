@@ -9,10 +9,6 @@ jobs:
   release-please:
     name: Release Please
     runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -28,14 +24,25 @@ jobs:
           manifest-file: .release-please-manifest.json
           token: ${{ steps.app-token.outputs.token }}
 
-      # Regenerate Cargo.lock on every open release PR so its release tag
-      # can build with --locked. The release-please `prs` output only
+      # uv, for the sdk/python lockfile refresh in the next step. Pinned so
+      # the job that pushes to release branches fetches nothing mutable.
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+
+      # Regenerate the lockfiles on every open release PR so its release tag
+      # can build with --locked. Two of them: Cargo.lock carries every
+      # workspace member's version, and sdk/python/uv.lock carries the root
+      # `arcbox` version that release-please bumps in pyproject.toml.
+      # Neither updater touches its own lockfile, so without this the tagged
+      # tree is rejected by --locked and the release never reaches publish.
+      # The release-please `prs` output only
       # includes PRs created or updated during the current run. Discovery
       # must use the REST list endpoint with client-side label filtering:
       # a label-filtered `gh pr list` routes through the eventually
       # consistent search API and misses PRs release-please created
       # seconds earlier in this same run.
-      - name: Update Cargo.lock on release PRs
+      - name: Update lockfiles on release PRs
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -48,18 +55,21 @@ jobs:
           while read -r pr; do
             PR_BRANCH=$(jq -r '.headRefName' <<< "$pr")
             PR_NUMBER=$(jq -r '.number' <<< "$pr")
-            echo "::group::Update Cargo.lock for PR #${PR_NUMBER} (${PR_BRANCH})"
+            echo "::group::Update lockfiles for PR #${PR_NUMBER} (${PR_BRANCH})"
             workdir=$(mktemp -d)
             git clone --depth 1 --branch "$PR_BRANCH" \
               "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$workdir"
             (
               cd "$workdir"
               cargo update --workspace
-              if git diff --quiet Cargo.lock; then
-                echo "Cargo.lock already up to date"
+              # Plain `uv lock` (never --upgrade): with no dependency edits
+              # it rewrites only the root version line release-please moved.
+              (cd sdk/python && uv lock)
+              if git diff --quiet Cargo.lock sdk/python/uv.lock; then
+                echo "lockfiles already up to date"
               else
-                git add Cargo.lock
-                git commit -m "chore: update Cargo.lock for release"
+                git add Cargo.lock sdk/python/uv.lock
+                git commit -m "chore: update lockfiles for release"
                 git push
               fi
             )
@@ -67,50 +77,7 @@ jobs:
             echo "::endgroup::"
           done
 
-  # Update arcbox-desktop version file when a new release is created.
-  update-desktop:
-    name: Update arcbox-desktop
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          repositories: arcbox-desktop
-
-      - name: Update arcbox-desktop version
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          BRANCH="chore/bump-arcbox-${TAG}"
-
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/arcboxlabs/arcbox-desktop.git" \
-            /tmp/arcbox-desktop
-          cd /tmp/arcbox-desktop
-          git config user.name "arcbox-labs[bot]"
-          git config user.email "254083426+arcbox-labs[bot]@users.noreply.github.com"
-
-          CURRENT=$(cat arcbox.version | tr -d '[:space:]')
-          if [ "$CURRENT" = "$TAG" ]; then
-            echo "arcbox-desktop already at $TAG, skipping."
-            exit 0
-          fi
-
-          git checkout -b "$BRANCH"
-          echo "$TAG" > arcbox.version
-          git add arcbox.version
-          git commit -m "chore: bump arcbox version to ${TAG}"
-          git push origin "$BRANCH"
-
-          gh pr create \
-            --repo arcboxlabs/arcbox-desktop \
-            --base master \
-            --head "$BRANCH" \
-            --title "chore: bump arcbox version to ${TAG}" \
-            --body "Automated update from [arcbox ${TAG}](https://github.com/arcboxlabs/arcbox/releases/tag/${TAG})."
+  # The arcbox-desktop bump used to be dispatched from here, on release_created.
+  # It now lives in Release Build's `update-desktop`, which waits for the
+  # binaries to be attached — a tag alone is not something desktop can build
+  # against. See that job for why.

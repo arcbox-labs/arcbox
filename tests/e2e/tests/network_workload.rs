@@ -1,5 +1,5 @@
 //! Network-workload e2e — Phase 1 (W2–W4) of
-//! internal-docs/plans/network-workload-e2e.md.
+//! ../company/engineering/arcbox/plans/network-workload-e2e.md.
 //!
 //! Where `network_fault` injects faults, this suite drives the datapath with
 //! the traffic shapes a developer generates daily and asserts they behave:

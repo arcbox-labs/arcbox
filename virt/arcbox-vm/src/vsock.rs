@@ -10,6 +10,10 @@
 //! 3. Read until `'\n'` — the response is `"OK {host_ephemeral_port}\n"`.
 //! 4. The socket is now a bidirectional pipe to the guest's vsock port.
 //!
+//! In the other direction, a guest-initiated connect to host port `P` is
+//! forwarded by Firecracker to a host Unix socket at `{uds_path}_{P}`; the
+//! boot readiness gate pre-listens there (see [`ReadyListener`]).
+//!
 //! ## Frame format
 //!
 //! Every message (in both directions) is:
@@ -18,28 +22,37 @@
 //! [u8: msg_type][u32 LE: payload_len][payload_len bytes: payload]
 //! ```
 //!
-//! | Type | Direction   | Payload                          |
-//! |------|-------------|----------------------------------|
-//! | 0x01 | Host→Agent  | JSON-encoded `StartCommand`      |
-//! | 0x02 | Host→Agent  | raw stdin bytes                  |
-//! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`  |
-//! | 0x04 | Host→Agent  | empty — signals stdin EOF        |
-//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]`    |
-//! | 0x10 | Agent→Host  | raw stdout bytes                 |
-//! | 0x11 | Agent→Host  | raw stderr bytes                 |
-//! | 0x12 | Agent→Host  | `[i32 LE exit_code]`             |
+//! | Type | Direction   | Payload                                    |
+//! |------|-------------|--------------------------------------------|
+//! | 0x01 | Host→Agent  | JSON-encoded `StartCommand`                |
+//! | 0x02 | Host→Agent  | raw stdin bytes                            |
+//! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`            |
+//! | 0x04 | Host→Agent  | empty — signals stdin EOF                  |
+//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]`              |
+//! | 0x07 | Host→Agent  | `[i32 LE signal]` — deliver to workload    |
+//! | 0x10 | Agent→Host  | raw stdout bytes                           |
+//! | 0x11 | Agent→Host  | raw stderr bytes                           |
+//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` (signal 0 = normal exit; old agents send only the 4-byte code). Net-reconfig replies append six `u32 LE` micros — see [`ReconfigTimings`]. Readers key on payload length. |
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::{Result, VmmError};
+
+/// Host-side port the guest agent dials once it is fully serving.
+///
+/// Firecracker hybrid vsock forwards a guest-initiated connect to host port
+/// `P` onto the host Unix socket at `{uds_path}_{P}`, so a pre-bound
+/// [`ReadyListener`]'s `accept()` IS the "vm-agent is up" event — no
+/// connect polling involved.
+pub const READY_PORT: u32 = 51;
 
 /// Guest-side vsock port the agent listens on (exec channel).
 pub const AGENT_PORT: u32 = 52;
@@ -49,12 +62,21 @@ const MSG_START: u8 = 0x01;
 const MSG_STDIN: u8 = 0x02;
 const MSG_RESIZE: u8 = 0x03;
 const MSG_EOF: u8 = 0x04;
-/// Synchronise the guest clock to the host after snapshot restore.
+/// Synchronise the guest clock to the host (after snapshot restore, and as
+/// the cold-boot agent-readiness gate).
 /// Payload: `[i64 LE unix_seconds][u32 LE nanos]` (12 bytes).
 pub(crate) const MSG_CLOCK_SYNC: u8 = 0x05;
 /// Re-address the guest network after a fresh-network snapshot restore.
 /// Payload: JSON [`NetReconfigCommand`](crate::boot_proto::NetReconfigCommand).
 pub(crate) const MSG_NET_RECONFIG: u8 = 0x06;
+/// Deliver a POSIX signal to the workload's process group.
+/// Payload: `[i32 LE signal]` (4 bytes). Old vm-agents ignore unknown frame
+/// types, so sending this to a pre-signal agent is a silent no-op.
+const MSG_SIGNAL: u8 = 0x07;
+/// Wait until the guest's TCP listen table has a listener on a port.
+/// Payload: JSON [`WaitPortReq`]; answered with `MSG_EXIT` carrying `0`
+/// (listening) or `1` (deadline elapsed).
+pub const MSG_WAIT_PORT: u8 = 0x08;
 
 // Frame type constants — Agent → Host (exec channel).
 const MSG_STDOUT: u8 = 0x10;
@@ -68,15 +90,56 @@ pub(crate) const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 // Public types
 // =============================================================================
 
+/// How a guest workload terminated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitStatus {
+    /// The process exited normally with this code.
+    Code(i32),
+    /// The process was killed by this POSIX signal.
+    Signaled(i32),
+}
+
+impl ExitStatus {
+    /// Shell-convention scalar: the exit code itself, or `128 + signal` for a
+    /// signal death. For consumers that can only carry one integer.
+    #[must_use]
+    pub const fn conventional_code(self) -> i32 {
+        match self {
+            Self::Code(code) => code,
+            Self::Signaled(signal) => 128 + signal,
+        }
+    }
+
+    /// Decode a `MSG_EXIT` payload.
+    ///
+    /// New agents send `[i32 LE code][i32 LE signal]`; agents from before the
+    /// signal extension (e.g. inside restored snapshots) send only the 4-byte
+    /// code, in which case a signal death arrives collapsed as `128 + signal`.
+    fn from_exit_payload(payload: &[u8]) -> Self {
+        if payload.len() >= 8 {
+            let signal = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            if signal != 0 {
+                return Self::Signaled(signal);
+            }
+        }
+        let code = if payload.len() >= 4 {
+            i32::from_le_bytes(payload[..4].try_into().unwrap())
+        } else {
+            0
+        };
+        Self::Code(code)
+    }
+}
+
 /// A chunk of output emitted by a guest process.
 #[derive(Debug, Clone)]
-pub struct OutputChunk {
-    /// `"stdout"`, `"stderr"`, or `"exit"`.
-    pub stream: String,
-    /// Raw bytes (empty when `stream == "exit"`).
-    pub data: Vec<u8>,
-    /// Exit code — only meaningful when `stream == "exit"`.
-    pub exit_code: i32,
+pub enum OutputChunk {
+    /// Bytes from the process's stdout (the merged PTY stream for `tty` sessions).
+    Stdout(Vec<u8>),
+    /// Bytes from the process's stderr (never emitted for `tty` sessions).
+    Stderr(Vec<u8>),
+    /// The process terminated. Always the final chunk of a session.
+    Exit(ExitStatus),
 }
 
 /// A message the host sends to the guest during an exec/run session.
@@ -86,6 +149,8 @@ pub enum ExecInputMsg {
     Stdin(Vec<u8>),
     /// Resize the pseudo-TTY.
     Resize { width: u16, height: u16 },
+    /// Deliver a POSIX signal to the workload's process group.
+    Signal(i32),
     /// Signal EOF on the process's stdin.
     Eof,
 }
@@ -103,14 +168,40 @@ pub struct StartCommand {
     pub timeout_seconds: u32,
 }
 
+/// `MSG_WAIT_PORT` payload, shared with the vm-agent binary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitPortReq {
+    /// TCP port a workload is expected to listen on.
+    pub port: u16,
+    /// Give up after this long (0 = check once and answer immediately).
+    pub timeout_ms: u64,
+}
+
+/// Outcome of a guest listen-table wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortWait {
+    /// A listener on the port exists.
+    Listening,
+    /// The deadline elapsed with no listener.
+    Deadline,
+}
+
 // =============================================================================
 // Internal helpers
 // =============================================================================
 
 /// How long to wait for the guest agent to start accepting vsock connections.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Interval between vsock connection attempts while the guest is still booting.
-const AGENT_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// First retry delay of the vsock connect backoff; doubles per attempt.
+const AGENT_READY_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
+/// Ceiling for the vsock connect retry backoff.
+const AGENT_READY_MAX_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Next delay of the exponential connect backoff: double, capped at
+/// [`AGENT_READY_MAX_BACKOFF`].
+fn next_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(AGENT_READY_MAX_BACKOFF)
+}
 
 /// Open a host-initiated vsock connection to the guest agent (port 52).
 ///
@@ -129,6 +220,7 @@ async fn connect_to_agent(uds_path: &Path) -> Result<UnixStream> {
 /// port-forward modules which operate on different vsock ports.
 pub(crate) async fn connect_to_port(uds_path: &Path, port: u32) -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + AGENT_READY_TIMEOUT;
+    let mut backoff = AGENT_READY_INITIAL_BACKOFF;
     loop {
         match try_vsock_handshake(uds_path, port).await {
             Ok(stream) => return Ok(stream),
@@ -142,7 +234,8 @@ pub(crate) async fn connect_to_port(uds_path: &Path, port: u32) -> Result<UnixSt
                 AGENT_READY_TIMEOUT.as_secs(),
             )));
         }
-        tokio::time::sleep(AGENT_READY_POLL_INTERVAL).await;
+        tokio::time::sleep(backoff).await;
+        backoff = next_backoff(backoff);
     }
 }
 
@@ -186,6 +279,78 @@ async fn try_vsock_handshake(uds_path: &Path, port: u32) -> Result<UnixStream> {
         )));
     }
     Ok(stream)
+}
+
+/// Derive the host Unix-socket path Firecracker forwards guest-initiated
+/// [`READY_PORT`] connections to: `{uds_path}_{READY_PORT}`.
+///
+/// The suffix convention is Firecracker's hybrid-vsock contract ("a guest
+/// connection to port 52 will get forwarded to `./v.sock_52`", FC
+/// docs/vsock.md). FC resolves the path against its own filesystem view,
+/// which matches the host view here: in jailer mode both are the same file
+/// under the chroot root, in direct mode the same absolute path.
+fn ready_socket_path(uds_path: &Path) -> PathBuf {
+    let mut path = uds_path.as_os_str().to_owned();
+    path.push(format!("_{READY_PORT}"));
+    PathBuf::from(path)
+}
+
+/// Pre-bound listener for the guest agent's readiness dial-out.
+///
+/// Must be bound BEFORE Firecracker `InstanceStart`: FC forwards the guest's
+/// connect only to an already-listening socket and resets the guest
+/// otherwise, losing the event. The socket file is per-boot; dropping the
+/// listener removes it.
+pub(crate) struct ReadyListener {
+    listener: UnixListener,
+    path: PathBuf,
+}
+
+impl ReadyListener {
+    /// Bind the readiness socket for `uds_path`, replacing any stale socket
+    /// file left behind by a previous boot of the same VM directory.
+    pub(crate) fn bind(uds_path: &Path) -> Result<Self> {
+        let path = ready_socket_path(uds_path);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(VmmError::Vsock(format!(
+                "remove stale ready socket {}: {e}",
+                path.display()
+            )));
+        }
+        let listener = UnixListener::bind(&path)
+            .map_err(|e| VmmError::Vsock(format!("bind ready socket {}: {e}", path.display())))?;
+        Ok(Self { listener, path })
+    }
+
+    /// The bound socket path (so jailer boots can grant FC connect access).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Wait for the guest's dial-out: `accept()` one connection and read
+    /// (and discard) its single byte. Completion is the readiness event.
+    pub(crate) async fn wait(&self) -> Result<()> {
+        let (mut stream, _) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|e| VmmError::Vsock(format!("accept on ready socket: {e}")))?;
+        let mut byte = [0u8; 1];
+        stream
+            .read(&mut byte)
+            .await
+            .map_err(|e| VmmError::Vsock(format!("read ready byte: {e}")))?;
+        Ok(())
+    }
+}
+
+impl Drop for ReadyListener {
+    fn drop(&mut self) {
+        // The socket file is meaningful only to the boot that bound it.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Write a single frame to any `AsyncWrite`.
@@ -239,29 +404,11 @@ async fn drain_output<R: AsyncReadExt + Unpin>(
         match read_frame(&mut read_half).await {
             Ok((msg_type, payload)) => {
                 let chunk = match msg_type {
-                    MSG_STDOUT => OutputChunk {
-                        stream: "stdout".into(),
-                        data: payload,
-                        exit_code: 0,
-                    },
-                    MSG_STDERR => OutputChunk {
-                        stream: "stderr".into(),
-                        data: payload,
-                        exit_code: 0,
-                    },
+                    MSG_STDOUT => OutputChunk::Stdout(payload),
+                    MSG_STDERR => OutputChunk::Stderr(payload),
                     MSG_EXIT => {
-                        let code = if payload.len() >= 4 {
-                            i32::from_le_bytes(payload[..4].try_into().unwrap())
-                        } else {
-                            0
-                        };
-                        let _ = tx
-                            .send(Ok(OutputChunk {
-                                stream: "exit".into(),
-                                data: vec![],
-                                exit_code: code,
-                            }))
-                            .await;
+                        let status = ExitStatus::from_exit_payload(&payload);
+                        let _ = tx.send(Ok(OutputChunk::Exit(status))).await;
                         break;
                     }
                     other => {
@@ -361,6 +508,9 @@ pub async fn exec(
                     buf[2..].copy_from_slice(&height.to_le_bytes());
                     write_frame(&mut write_half, MSG_RESIZE, &buf).await
                 }
+                ExecInputMsg::Signal(signal) => {
+                    write_frame(&mut write_half, MSG_SIGNAL, &signal.to_le_bytes()).await
+                }
                 ExecInputMsg::Eof => write_frame(&mut write_half, MSG_EOF, &[]).await,
             };
             if result.is_err() {
@@ -381,14 +531,36 @@ pub async fn exec(
 // sync_clock() — synchronise guest clock after snapshot restore
 // =============================================================================
 
+/// Outcome of a completed clock-sync round trip.
+///
+/// Both variants prove liveness — the agent accepted the connection, parsed
+/// the frame, and replied — which is what the boot readiness gate needs.
+/// Only [`ClockSync::Synced`] means the guest wall clock was actually set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockSync {
+    /// The agent set the clock.
+    Synced,
+    /// The agent answered but could not set the clock (e.g. `clock_settime`
+    /// failed); it carries the agent-reported exit code.
+    AgentError(i32),
+}
+
 /// Synchronise the guest clock to the current host time.
 ///
 /// Sends [`MSG_CLOCK_SYNC`] to the exec channel (vsock port 52) and waits for
-/// `MSG_EXIT(0)`.  Should be called immediately after `restore_sandbox()`
-/// completes so the guest does not run with a stale timestamp from snapshot
-/// creation time.
-pub async fn sync_clock(uds_path: &Path) -> Result<()> {
+/// `MSG_EXIT`.  Called immediately after `restore_sandbox()` completes so
+/// the guest does not run with a stale timestamp from snapshot creation time,
+/// and by the cold-boot path as the agent-readiness gate. `Err` means the
+/// round trip itself failed (connect, transport, malformed reply); an agent
+/// that answered-but-failed is `Ok(ClockSync::AgentError)` so callers can
+/// separate liveness from the clock side effect.
+pub async fn sync_clock(uds_path: &Path) -> Result<ClockSync> {
+    // Split connect vs frame RTT: on a just-resumed guest these have very
+    // different causes (vsock handshake vs guest-side processing), and the
+    // CORE-75 settle-window investigation needs them attributable.
+    let started = std::time::Instant::now();
     let mut stream = connect_to_agent(uds_path).await?;
+    let connected = std::time::Instant::now();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -398,7 +570,13 @@ pub async fn sync_clock(uds_path: &Path) -> Result<()> {
         .map_err(|e| VmmError::Vsock(format!("unix timestamp overflow: {e}")))?;
     let nanos = now.subsec_nanos();
 
-    sync_clock_on_stream(&mut stream, secs, nanos).await
+    let result = sync_clock_on_stream(&mut stream, secs, nanos).await;
+    info!(
+        connect_ms = connected.duration_since(started).as_millis() as u64,
+        rpc_ms = connected.elapsed().as_millis() as u64,
+        "clock sync"
+    );
+    result
 }
 
 /// Send a clock-sync frame and validate the agent response.
@@ -409,7 +587,7 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
     stream: &mut S,
     secs: i64,
     nanos: u32,
-) -> Result<()> {
+) -> Result<ClockSync> {
     let mut payload = [0u8; 12];
     payload[..8].copy_from_slice(&secs.to_le_bytes());
     payload[8..].copy_from_slice(&nanos.to_le_bytes());
@@ -436,11 +614,9 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
     }
     let code = i32::from_le_bytes(payload[..4].try_into().unwrap());
     if code != 0 {
-        return Err(VmmError::Vsock(format!(
-            "clock sync: agent returned exit code {code}"
-        )));
+        return Ok(ClockSync::AgentError(code));
     }
-    Ok(())
+    Ok(ClockSync::Synced)
 }
 
 /// Re-address the guest network after a fresh-network snapshot restore.
@@ -453,8 +629,16 @@ pub async fn reconfigure_network(
     uds_path: &Path,
     cmd: &crate::boot_proto::NetReconfigCommand,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     let mut stream = connect_to_agent(uds_path).await?;
-    net_reconfig_on_stream(&mut stream, cmd).await
+    let connected = std::time::Instant::now();
+    let result = net_reconfig_on_stream(&mut stream, cmd).await;
+    info!(
+        connect_ms = connected.duration_since(started).as_millis() as u64,
+        rpc_ms = connected.elapsed().as_millis() as u64,
+        "net reconfig"
+    );
+    result
 }
 
 /// Send a net-reconfig frame and validate the agent response.
@@ -494,7 +678,98 @@ async fn net_reconfig_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWri
             "net reconfig: agent returned exit code {code}"
         )));
     }
+    if let Some(t) = ReconfigTimings::parse(&payload) {
+        info!(
+            addr_us = t.steps[0],
+            netmask_us = t.steps[1],
+            delrt_us = t.steps[2],
+            addrt_us = t.steps[3],
+            resolv_us = t.resolv,
+            handler_us = t.handler,
+            "net reconfig guest split"
+        );
+    }
     Ok(())
+}
+
+/// Wait until the guest's TCP listen table has a listener on `port`.
+///
+/// Sends [`MSG_WAIT_PORT`] to the exec channel; the vm-agent watches
+/// `/proc/net/tcp{,6}` in-process (never a connect probe) and answers when
+/// the listener appears or `timeout` elapses. The host-side read deadline
+/// adds slack on top of the guest's own budget so a live guest always
+/// answers first.
+pub async fn wait_for_port(uds_path: &Path, port: u16, timeout: Duration) -> Result<PortWait> {
+    let mut stream = connect_to_agent(uds_path).await?;
+    wait_for_port_on_stream(&mut stream, port, timeout).await
+}
+
+/// Send a wait-port frame and decode the agent's verdict.
+///
+/// Extracted from [`wait_for_port`] so the wire protocol can be tested with
+/// `tokio::io::duplex` without needing a real vsock connection.
+async fn wait_for_port_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    port: u16,
+    timeout: Duration,
+) -> Result<PortWait> {
+    let req = WaitPortReq {
+        port,
+        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+    };
+    let payload = serde_json::to_vec(&req)
+        .map_err(|e| VmmError::Vsock(format!("encode WaitPortReq: {e}")))?;
+    write_frame(stream, MSG_WAIT_PORT, &payload)
+        .await
+        .map_err(|e| VmmError::Vsock(format!("write MSG_WAIT_PORT: {e}")))?;
+
+    let read_deadline = timeout + Duration::from_secs(5);
+    let (msg_type, payload) = tokio::time::timeout(read_deadline, read_frame(stream))
+        .await
+        .map_err(|_| VmmError::Vsock("wait for port: timed out waiting for response".into()))?
+        .map_err(|e| VmmError::Vsock(format!("read wait-port response: {e}")))?;
+
+    if msg_type != MSG_EXIT {
+        return Err(VmmError::Vsock(format!(
+            "wait for port: unexpected response type 0x{msg_type:02x}"
+        )));
+    }
+    if payload.len() < 4 {
+        return Err(VmmError::Vsock(format!(
+            "wait for port: payload too short ({} bytes, expected 4)",
+            payload.len()
+        )));
+    }
+    match i32::from_le_bytes(payload[..4].try_into().unwrap()) {
+        0 => Ok(PortWait::Listening),
+        1 => Ok(PortWait::Deadline),
+        code => Err(VmmError::Vsock(format!(
+            "wait for port: agent returned exit code {code}"
+        ))),
+    }
+}
+
+/// Guest-side timing breakdown a net-reconfig `MSG_EXIT` reply may carry:
+/// six `u32 LE` microsecond values (four per-ioctl, resolv.conf write, whole
+/// handler) appended after the `[code][signal]` header — CORE-75 latency
+/// attribution. Absent from legacy agents; readers key on payload length.
+#[derive(Debug, PartialEq, Eq)]
+struct ReconfigTimings {
+    steps: [u32; 4],
+    resolv: u32,
+    handler: u32,
+}
+
+impl ReconfigTimings {
+    fn parse(payload: &[u8]) -> Option<Self> {
+        let extra = payload.get(8..32)?;
+        let at = |i: usize| u32::from_le_bytes(extra[i * 4..i * 4 + 4].try_into().unwrap());
+        Some(Self {
+            steps: [at(0), at(1), at(2), at(3)],
+            resolv: at(4),
+            handler: at(5),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +783,48 @@ mod tests {
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(payload);
         buf
+    }
+
+    #[test]
+    fn ready_socket_path_appends_the_port_suffix() {
+        // Pins the Firecracker hybrid-vsock naming contract AND the port
+        // value: the guest dials 51, so the host must listen at `..._51`.
+        assert_eq!(
+            ready_socket_path(Path::new("/vm/dir/firecracker.vsock")),
+            Path::new("/vm/dir/firecracker.vsock_51")
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_listener_accepts_the_dial_out_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let uds = dir.path().join("fc.vsock");
+        // A stale socket file from a previous boot must not fail the bind.
+        std::fs::write(ready_socket_path(&uds), b"stale").unwrap();
+
+        let listener = ReadyListener::bind(&uds).unwrap();
+        let dial_path = listener.path().to_owned();
+        let dial = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&dial_path).await.unwrap();
+            stream.write_all(&[0u8]).await.unwrap();
+        });
+        listener.wait().await.unwrap();
+        dial.await.unwrap();
+
+        let path = listener.path().to_owned();
+        drop(listener);
+        assert!(!path.exists(), "drop must remove the per-boot socket file");
+    }
+
+    #[test]
+    fn connect_backoff_doubles_up_to_the_cap() {
+        let mut delays = Vec::new();
+        let mut backoff = AGENT_READY_INITIAL_BACKOFF;
+        for _ in 0..10 {
+            delays.push(backoff.as_millis());
+            backoff = next_backoff(backoff);
+        }
+        assert_eq!(delays, [2, 4, 8, 16, 32, 64, 128, 200, 200, 200]);
     }
 
     #[tokio::test]
@@ -541,6 +858,46 @@ mod tests {
         assert_eq!(msg_type, MSG_EXIT);
         let decoded = i32::from_le_bytes(payload[..4].try_into().unwrap());
         assert_eq!(decoded, 42);
+    }
+
+    #[test]
+    fn exit_payload_decodes_legacy_and_signal_forms() {
+        // Legacy 4-byte form (old vm-agent): always a plain code.
+        assert_eq!(
+            ExitStatus::from_exit_payload(&7i32.to_le_bytes()),
+            ExitStatus::Code(7)
+        );
+        // 8-byte form, signal 0: a normal exit — even for code 137, which the
+        // legacy form could not distinguish from a SIGKILL death.
+        let mut normal_137 = Vec::new();
+        normal_137.extend_from_slice(&137i32.to_le_bytes());
+        normal_137.extend_from_slice(&0i32.to_le_bytes());
+        assert_eq!(
+            ExitStatus::from_exit_payload(&normal_137),
+            ExitStatus::Code(137)
+        );
+        // 8-byte form, signal set: a signal death.
+        let mut sigkill = Vec::new();
+        sigkill.extend_from_slice(&137i32.to_le_bytes());
+        sigkill.extend_from_slice(&9i32.to_le_bytes());
+        assert_eq!(
+            ExitStatus::from_exit_payload(&sigkill),
+            ExitStatus::Signaled(9)
+        );
+        assert_eq!(ExitStatus::Signaled(9).conventional_code(), 137);
+        // Truncated payload degrades to code 0 (matches the old lenient parse).
+        assert_eq!(ExitStatus::from_exit_payload(&[1, 2]), ExitStatus::Code(0));
+    }
+
+    #[tokio::test]
+    async fn signal_frame_round_trips() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        write_frame(&mut a, MSG_SIGNAL, &15i32.to_le_bytes())
+            .await
+            .unwrap();
+        let (msg_type, payload) = read_frame(&mut b).await.unwrap();
+        assert_eq!(msg_type, MSG_SIGNAL);
+        assert_eq!(i32::from_le_bytes(payload[..4].try_into().unwrap()), 15);
     }
 
     #[tokio::test]
@@ -621,11 +978,12 @@ mod tests {
         });
 
         let result = sync_clock_on_stream(&mut host, 1_700_000_000, 123_456_789).await;
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ClockSync::Synced);
         agent_handle.await.unwrap();
     }
 
-    /// Agent returns a non-zero exit code.
+    /// Agent answers with a non-zero exit code: liveness proven, clock not
+    /// set — `Ok(AgentError)`, not `Err`, so the boot gate can pass on it.
     #[tokio::test]
     async fn test_sync_clock_agent_error() {
         let (mut agent, mut host) = tokio::io::duplex(256);
@@ -638,9 +996,7 @@ mod tests {
         });
 
         let result = sync_clock_on_stream(&mut host, 1_700_000_000, 0).await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("exit code -1"), "unexpected error: {msg}");
+        assert_eq!(result.unwrap(), ClockSync::AgentError(-1));
         agent_handle.await.unwrap();
     }
 
@@ -733,6 +1089,43 @@ mod tests {
             msg.contains("agent returned exit code -1"),
             "unexpected error: {msg}"
         );
+        agent_handle.await.unwrap();
+    }
+
+    /// The extended 32-byte reply parses in the exact layout the agent
+    /// writes: `[code][signal]` then six u32 LE micros. A reply with an
+    /// extended payload must also still pass the success path end to end.
+    #[tokio::test]
+    async fn test_net_reconfig_timing_payload() {
+        // Layout mirror of vm-agent's handle_net_reconfig response builder.
+        let mut payload = [0u8; 32];
+        for (slot, us) in payload[8..]
+            .chunks_exact_mut(4)
+            .zip([1_u32, 2, 3, 4, 30_000, 40_000])
+        {
+            slot.copy_from_slice(&us.to_le_bytes());
+        }
+
+        assert_eq!(
+            ReconfigTimings::parse(&payload),
+            Some(ReconfigTimings {
+                steps: [1, 2, 3, 4],
+                resolv: 30_000,
+                handler: 40_000,
+            })
+        );
+        // Legacy shapes carry no timings.
+        assert_eq!(ReconfigTimings::parse(&0i32.to_le_bytes()), None);
+        assert_eq!(ReconfigTimings::parse(&[0u8; 8]), None);
+
+        let (mut agent, mut host) = tokio::io::duplex(1024);
+        let agent_handle = tokio::spawn(async move {
+            let _ = read_frame(&mut agent).await.unwrap();
+            write_frame(&mut agent, MSG_EXIT, &payload).await.unwrap();
+        });
+        net_reconfig_on_stream(&mut host, &reconfig_cmd())
+            .await
+            .expect("extended payload must still count as success");
         agent_handle.await.unwrap();
     }
 }

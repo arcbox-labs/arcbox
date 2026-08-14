@@ -25,9 +25,10 @@ jobs:
     # compare against the branch's previous state on origin.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Fetch base branch for comparison
         env:
@@ -35,7 +36,7 @@ jobs:
         run: git fetch origin "$BASE_REF:refs/remotes/origin/$BASE_REF" || true
 
       - name: Install buf
-        uses: bufbuild/buf-action@v1
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
         with:
           setup_only: true
 
@@ -53,10 +54,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        # The `toolchain` input selects the toolchain (not the action ref),
+        # so the SHA pin does not freeze the Rust version.
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
         with:
           toolchain: stable
 
@@ -64,7 +69,7 @@ jobs:
         run: brew install protobuf
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/bin/
@@ -109,6 +114,91 @@ jobs:
       - name: Smoke test arcbox helper
         run: ./target/debug/arcbox-helper --help
 
+  # The engine layer and the net stack under it promise platform
+  # neutrality (architecture charter, company repo; engine/AGENTS.md: "every
+  # crate must compile and pass unit tests on Linux as well as macOS"): this
+  # job keeps darwin-only deps target-gated so a Linux host build never rots
+  # again. `--all-targets` on the check step is load-bearing: a plain
+  # `cargo check` skips test targets, so a macOS-only symbol reintroduced
+  # into a `#[cfg(test)]` module (as happened once already) would pass while
+  # still breaking `cargo test` on Linux — `--all-targets` builds the
+  # `lib test` target and type-checks it.
+  #
+  # The test step covers the two things `--all-targets` still cannot: it
+  # RUNS the tests (a Linux/macOS behavioral difference type-checks fine),
+  # and it compiles DOCTESTS, which no `cargo check` invocation ever does.
+  # That second gap was not theoretical: `LinuxTap`'s doctest had been
+  # calling a trait method without importing the trait since the Linux arm
+  # was revived, and only this step caught it. Every KVM-touching test in
+  # `arcbox-hypervisor` is already `#[ignore]`d ("Requires /dev/kvm", not
+  # available on this runner); the netlink/tap tests in `arcbox-net`
+  # self-skip at runtime when not root.
+  #
+  # A second step repeats the *check* (not the tests — a musl-arm64 test
+  # binary can't run on this x86_64 runner) on aarch64-unknown-linux-musl
+  # (the real cross-compile target, see root CLAUDE.md "Guest Agent
+  # Cross-Compilation") because gnu/musl and x86_64/aarch64 each pick
+  # different concrete types for a few libc primitives (e.g. `c_char`'s
+  # signedness is arch-, not libc-, driven) that the gnu-only steps can't
+  # exercise. The musl step drops every crate whose graph reaches `ring` —
+  # arcbox-image, plus arcbox-engine and arcbox-computer above it — because
+  # ring's build script needs a musl C cross-compiler this runner doesn't
+  # have. Scoped to the crates that make the platform-neutrality promise —
+  # the workspace as a whole still contains macOS-only crates (arcbox-vz,
+  # arcbox-vmnet). Extend all three -p lists as further engine/computer
+  # crates land.
+  linux-engine:
+    name: Linux engine-layer check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-musl
+
+      # arcbox-engine and arcbox-computer depend on arcbox-connect, whose
+      # build.rs shells out to `protoc` directly (rpc/arcbox-connect/build.rs)
+      # rather than a vendored binary. The musl step below never touches
+      # those two crates, so this only gates the gnu step, but installing it
+      # once up front is simpler than conditioning on the target.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-linux-engine-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-linux-engine-
+
+      - name: Check engine-layer crates on Linux
+        run: cargo check --all-targets -p arcbox-atomic-file -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-snapshot -p arcbox-engine -p arcbox-computer
+
+      # `--no-fail-fast` so one red run reports every broken crate rather
+      # than stopping at the first, which otherwise hides later failures
+      # behind a fix-and-rerun loop.
+      - name: Test engine-layer crates on Linux
+        run: cargo test --no-fail-fast -p arcbox-atomic-file -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-snapshot -p arcbox-engine -p arcbox-computer
+
+      - name: Check engine-layer crates on aarch64-unknown-linux-musl
+        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-atomic-file -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-snapshot
+
   # Pure proto-contract analysis — no Rust toolchain, no build. Runs in
   # parallel with `ci` on a cheap Linux runner. The desktop and agent
   # ship/self-update independently, so the control-plane wire contract must
@@ -122,22 +212,260 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up buf
-        uses: bufbuild/buf-setup-action@v1
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           github_token: ${{ github.token }}
 
       # Self-bootstrapping: inert until the proto first lands on the base
       # branch, so it never blocks the PR that introduces it.
       - name: Check for breaking changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          base="${{ github.base_ref }}"
           module=fleet/arcbox-fleet-control-proto
-          git fetch --depth=1 origin "$base"
+          git fetch --depth=1 origin "$BASE_REF"
           if git cat-file -e "FETCH_HEAD:$module/buf.yaml" 2>/dev/null; then
             buf breaking "$module" --against ".git#ref=FETCH_HEAD,subdir=$module"
           else
-            echo "control-plane proto not yet on '$base'; breaking check inactive"
+            echo "control-plane proto not yet on '$BASE_REF'; breaking check inactive"
           fi
+
+  # The published SDKs live outside the cargo workspace, so the main `ci`
+  # job never touches them. These run the same gates as the release
+  # workflows (release-sdk-typescript.yml / release-sdk-python.yml), so a
+  # PR cannot land a change that would only fail at publish time. No path
+  # filter, matching this workflow's other jobs — both suites finish in
+  # about a minute.
+  sdk-typescript:
+    name: SDK TypeScript
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdk/typescript
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  sdk-python:
+    name: SDK Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdk/python
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # uv pinned to the same range as pyproject.toml's uv_build
+      # requirement and the publish gate (release-sdk-python.yml), so PR
+      # validation and release run the same toolchain.
+      - name: Setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '>=0.12.1,<0.13'
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Typecheck
+        run: uv run pyright
+
+      - name: Check sync-tree lockstep
+        run: uv run python scripts/gen_sync.py --check
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Build
+        run: uv build
+
+  # ==========================================================================
+  # Prove the workspace still packages for crates.io.
+  #
+  # `Release Build`'s publish step is the only other place this runs, and it
+  # runs after the tag is cut — so a member whose manifest cannot package
+  # doesn't fail a PR, it fails a release, and the whole coordinated publish
+  # aborts before uploading anything. That is how v0.6.5 and v0.6.6 shipped
+  # binaries with not one crate reaching the registry: sdk/rust joined the
+  # workspace carrying a path dependency with no version, and the job had been
+  # red ever since.
+  #
+  # Same command as the release, minus the upload. --no-verify because four
+  # crates embed files from outside their own package directory (see the
+  # publish step for the list); --locked because the release publishes locked
+  # and a lockfile behind the manifests fails there too. No compilation, no
+  # token, ~1 minute.
+  # ==========================================================================
+  publish-dry-run:
+    name: crates.io packaging check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+
+      # arcbox-hv keeps its own release cadence and the release excludes it;
+      # mirror the exclusion so the two commands stay one command.
+      - name: Dry-run the coordinated workspace publish
+        run: |
+          cargo publish --workspace \
+            --exclude arcbox-hv \
+            --no-verify --locked --dry-run
+
+  # ==========================================================================
+  # Warm the release-profile cache that Release Build restores.
+  #
+  # The release job runs on a tag, and a tag can only read caches from its own
+  # ref or the default branch — never another tag's. So no matter how many
+  # releases run, none of them can warm the next one; the cache has to be
+  # written from master. Until it was, every release compiled ~300 dependency
+  # crates from scratch (the `macOS-cargo-` fallback it landed on is CI's debug
+  # cache above, which shares only the registry download with a release build).
+  # That is what timed out on v0.6.4 and published a release with no assets.
+  #
+  # Keyed on Cargo.lock alone, so this does real work only when dependencies
+  # move: the probe below turns every other master push into a ~30-second
+  # no-op. macOS runners bill at 10x, and a per-commit key would also thrash
+  # the repo's 10 GB cache budget — these entries run to several GB. The cost
+  # is that workspace members are not in the cache and still compile at
+  # release time; the release step's timeout accounts for that.
+  # ==========================================================================
+  warm-release-cache:
+    name: Warm release cache
+    if: github.event_name == 'push' && github.ref_name == 'master'
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Two steps, because the two cases want opposite things.
+      #
+      # Nothing moved: this must cost nothing. `lookup-only` answers "is the
+      # exact entry there?" without downloading it, and every step below skips
+      # — the usual master push stays a ~30-second no-op on a runner billed at
+      # 10x.
+      #
+      # Cargo.lock moved: a cold build is ~300 crates. The prefix restore below
+      # lands the nearest previous entry so the build is incremental instead.
+      # That case is not rare — the release PR runs `cargo update --workspace`,
+      # so every release moves the lockfile and the exact key with it, and the
+      # release build is precisely the one this exists to warm.
+      #
+      # The union of an old target/ and a new build does grow the saved entry,
+      # since cargo prunes nothing. Confining the restore to the miss path is
+      # what bounds it: a run that changed nothing neither downloads nor saves.
+      - name: Look for an exact entry
+        id: probe
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          lookup-only: true
+
+      - name: Restore the nearest entry
+        id: restore
+        if: steps.probe.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Setup Rust
+        if: steps.probe.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+
+      - name: Install Protobuf compiler
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: brew install protobuf
+
+      # The same three packages Release Build compiles, so the dependency
+      # graph in the cache is exactly the one it needs.
+      - name: Build release binaries
+        if: steps.probe.outputs.cache-hit != 'true'
+        env:
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          echo "Restored from: ${MATCHED:-nothing (cold build)}"
+          cargo build --release --locked -p arcbox-cli -p arcbox-daemon -p arcbox-helper
+
+      # Paths and key repeated verbatim from the probe above: workflow files
+      # cannot factor them out, and cache/save must agree with cache/restore
+      # exactly or the release job matches nothing.
+      - name: Save release build cache
+        if: steps.probe.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}

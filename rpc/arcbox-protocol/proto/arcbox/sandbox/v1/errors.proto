@@ -1,0 +1,88 @@
+// Sandbox error registry (CORE-58).
+//
+// One machine-readable error code registry for the whole sandbox surface.
+// `ErrorInfo` rides as a Connect error detail on every daemon error, so
+// SDKs derive their exception hierarchies from this single enum — one
+// registry, per-language mappings generated from it, zero drift.
+//
+// `suggestion` is an actionable, human/LLM-readable fix ("run `abctl
+// daemon start`") that agent frameworks surface directly; `context`
+// carries structured facts about the failure (which timeout fired, the
+// limit that was exceeded, the state that was observed) so messages can
+// be rendered SDK-side in the caller's own parameter vocabulary.
+//
+// This file defines the contract only; daemon handlers attach `ErrorInfo`
+// in a follow-up phase (CORE-58).
+
+syntax = "proto3";
+
+package arcbox.sandbox.v1;
+
+// Machine-readable cause of a sandbox API error.
+//
+// Values are append-only: SDKs map unknown codes to their base error
+// class, so retiring or renumbering a value silently reclassifies errors
+// for older clients.
+enum ErrorCode {
+    ERROR_CODE_UNSPECIFIED = 0;
+    // The addressed sandbox does not exist.
+    ERROR_CODE_SANDBOX_NOT_FOUND = 1;
+    // The addressed template does not exist.
+    ERROR_CODE_TEMPLATE_NOT_FOUND = 2;
+    // The addressed execution does not exist.
+    ERROR_CODE_EXECUTION_NOT_FOUND = 3;
+    // The addressed path does not exist inside the sandbox.
+    ERROR_CODE_FILE_NOT_FOUND = 4;
+    // The sandbox is PAUSED and this call did not resume it. Data-plane
+    // calls resume a paused sandbox transparently (CORE-21), so this
+    // surfaces only where resume does not apply: on control-plane calls,
+    // or when the caller opted out of transparent resume (the reserved
+    // `x-arcbox-no-auto-resume` header — see sandbox.proto `Resume`).
+    ERROR_CODE_SANDBOX_PAUSED = 5;
+    // The sandbox exists but is not READY for this operation
+    // (e.g. still STARTING).
+    ERROR_CODE_SANDBOX_NOT_READY = 6;
+    // The sandbox is in FAILED state; context carries the failure reason.
+    ERROR_CODE_SANDBOX_FAILED = 7;
+    // The sandbox's hard maximum lifetime (`ttl_seconds`) expired and the
+    // daemon destroyed it.
+    ERROR_CODE_TTL_EXPIRED = 8;
+    // A per-command timeout fired and the process group was killed.
+    ERROR_CODE_COMMAND_TIMEOUT = 9;
+    // This host cannot run sandboxes (no nested virtualization).
+    // See SandboxService.GetCapabilities (CORE-13 fail-fast).
+    ERROR_CODE_NESTED_VIRT_UNSUPPORTED = 10;
+    // The template reference could not be resolved or is malformed.
+    ERROR_CODE_TEMPLATE_INVALID = 11;
+    // A file transfer exceeded the per-file size cap; context carries
+    // the limit.
+    ERROR_CODE_FILE_TOO_LARGE = 12;
+    // Stdin was already closed for this execution.
+    ERROR_CODE_STDIN_CLOSED = 13;
+    // The operation requires a TTY execution (e.g. terminal resize).
+    ERROR_CODE_TTY_REQUIRED = 14;
+    // The requested host port is already bound.
+    ERROR_CODE_PORT_IN_USE = 15;
+    // Authentication is required. Reserved for the remote tier (CORE-63).
+    ERROR_CODE_AUTH_REQUIRED = 16;
+    // The client and daemon protocol levels are incompatible; the
+    // suggestion names which side to upgrade.
+    ERROR_CODE_PROTOCOL_MISMATCH = 17;
+    // The host is out of a resource (memory, disk, sandbox slots).
+    ERROR_CODE_RESOURCE_EXHAUSTED_HOST = 18;
+}
+
+// Structured detail attached to sandbox API errors.
+//
+// Carried as a Connect error detail; the transport status code stays the
+// coarse routing signal while this message carries the precise cause.
+message ErrorInfo {
+    // Machine-readable cause.
+    ErrorCode code = 1;
+    // Actionable fix, phrased for direct display ("run `abctl daemon
+    // start`"). Agent frameworks surface this to the LLM verbatim.
+    string suggestion = 2;
+    // Structured facts about the failure: which timeout knob fired, the
+    // limit that was exceeded, the state that was observed, and so on.
+    map<string, string> context = 3;
+}

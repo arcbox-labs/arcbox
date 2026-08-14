@@ -40,3 +40,27 @@ async fn route_remove_valid() {
     let (client, _dir) = common::setup().await;
     client.route_remove("172.16.0.0/12").await.unwrap();
 }
+
+#[tokio::test]
+async fn route_remove_if_owned_validates_both_inputs() {
+    let (client, _dir) = common::setup().await;
+
+    assert!(
+        client
+            .route_remove_if_owned("10.64.0.0/20", "bridge100")
+            .await
+            .unwrap()
+    );
+    assert!(
+        client
+            .route_remove_if_owned("8.8.8.0/24", "bridge100")
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .route_remove_if_owned("10.64.0.0/20", "eth0")
+            .await
+            .is_err()
+    );
+}

@@ -7,27 +7,31 @@
 //! 2. `/etc/arcbox/vmm.toml`
 //! 3. Built-in guest defaults
 
+use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, ARCBOX_RUNTIME_DIR};
 use arcbox_vm::VmmConfig;
 use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
+
+/// Persistent Btrfs mount that owns sandbox images, snapshots, and VM state.
+pub const SANDBOX_DATA_DIR: &str = "/var/lib/arcbox/sandbox";
 
 /// Guest-specific VMM configuration defaults.
 ///
 /// These differ from [`VmmConfig::default()`] which targets the host-side
 /// daemon. Paths follow the guest view of host assets:
 ///
-/// - Boot-manifest binaries (firecracker, jailer) download to
-///   `~/.arcbox/runtime/bin` and vmlinux to `~/.arcbox/runtime/kernel`
-///   (`install_dir = "kernel"`); the data dir is VirtioFS-mounted at
-///   `/arcbox`, so the guest sees `/arcbox/runtime/{bin,kernel}`.
+/// - Boot-manifest binaries are materialized onto the guest Btrfs data disk
+///   before the sandbox service can use them.
 /// - The default sandbox rootfs is auto-built by the agent (busybox +
 ///   vm-agent, see `rootfs_builder::ensure_default_rootfs`) on the writable
 ///   btrfs data volume.
 fn guest_defaults() -> VmmConfig {
+    let runtime_bin = std::path::Path::new(ARCBOX_RUNTIME_BIN_DIR);
+    let runtime_root = std::path::Path::new(ARCBOX_RUNTIME_DIR);
     VmmConfig {
         firecracker: FirecrackerConfig {
-            binary: "/arcbox/runtime/bin/firecracker".into(),
+            binary: runtime_bin.join("firecracker").to_string_lossy().into(),
             jailer: Some(arcbox_vm::config::JailerConfig {
-                binary: "/arcbox/runtime/bin/jailer".into(),
+                binary: runtime_bin.join("jailer").to_string_lossy().into(),
                 uid: 0,
                 gid: 0,
                 chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
@@ -37,13 +41,16 @@ fn guest_defaults() -> VmmConfig {
                 parent_cgroup: None,
                 resource_limits: vec![],
             }),
-            data_dir: "/var/lib/arcbox".into(),
+            data_dir: SANDBOX_DATA_DIR.into(),
             log_level: None,
             no_seccomp: false,
             seccomp_filter: None,
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: None,
+            sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
+            pool_size: 1,
+            warm_create: true,
         },
         network: NetworkConfig {
             cidr: "172.20.0.0/16".into(),
@@ -57,9 +64,12 @@ fn guest_defaults() -> VmmConfig {
         defaults: DefaultVmConfig {
             vcpus: 1,
             memory_mib: 512,
-            kernel: "/arcbox/runtime/kernel/vmlinux".into(),
-            rootfs: "/var/lib/arcbox/sandbox/rootfs.ext4".into(),
-            boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/vm-agent".into(),
+            kernel: runtime_root.join("kernel/vmlinux").to_string_lossy().into(),
+            rootfs: format!("{SANDBOX_DATA_DIR}/rootfs.ext4"),
+            // `quiet`: every boot printk is a serial MMIO exit, doubled by
+            // nesting — silencing the console measurably shortens the cold
+            // kernel boot (CORE-75/CORE-79).
+            boot_args: "console=ttyS0 quiet reboot=k panic=1 pci=off init=/sbin/vm-agent".into(),
         },
     }
 }
@@ -104,4 +114,17 @@ pub fn load() -> VmmConfig {
     // 3. Built-in guest defaults.
     tracing::debug!("using built-in guest VMM config defaults");
     guest_defaults()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SANDBOX_DATA_DIR, guest_defaults};
+
+    #[test]
+    fn defaults_keep_sandbox_state_on_its_data_mount() {
+        let config = guest_defaults();
+
+        assert_eq!(config.firecracker.data_dir, SANDBOX_DATA_DIR);
+        assert!(std::path::Path::new(&config.defaults.rootfs).starts_with(SANDBOX_DATA_DIR));
+    }
 }

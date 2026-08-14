@@ -128,9 +128,18 @@ API and the desktop app.
 ### Migrate from Docker Desktop or OrbStack
 
 ```bash
-abctl migrate from docker-desktop
+abctl migrate from orbstack --dry-run   # show the plan, change nothing
 abctl migrate from orbstack
+abctl migrate from docker-desktop
 ```
+
+Images (with every tag), named volumes, user-defined bridge networks and
+containers come across, and containers that were running on the source are
+started again at the end — pass `--no-start` to leave them stopped. Add
+`--json` to `--dry-run` for the machine-readable plan.
+
+Containers using `--network container:<id>` are reported as blocking and must
+be removed from the source, or migrated by hand, before the run proceeds.
 
 ## Sandboxes and coding agents
 

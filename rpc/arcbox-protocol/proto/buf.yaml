@@ -1,0 +1,28 @@
+# Config for the CI breaking-change gate (ci.yml "proto" job), which runs
+# `buf breaking` against the PR's base branch with this file's rules.
+#
+# Two modules, split by audience. The sandbox package is the product's
+# public contract and is published to the registry so SDK authors consume
+# it by reference instead of vendoring a file out of this repo (CORE-53);
+# everything else is the daemon's internal surface and is deliberately
+# NOT published.
+version: v2
+modules:
+  # Internal: machine, kubernetes, migration, stats, and the host↔guest
+  # agent wire. Local-only, so it carries no registry name.
+  - path: .
+    excludes:
+      - arcbox/sandbox/v1
+  # Public: the sandbox API. Self-contained — it imports only well-known
+  # types and its own package.
+  - path: .
+    name: buf.build/arcboxlabs/sandbox
+    includes:
+      - arcbox/sandbox/v1
+# No exemptions: the sandbox API shipped in the public SDKs (npm
+# `@arcbox/sandbox`, PyPI `arcbox`) with the CORE-107 template catalog as
+# its final surface, so `arcbox.sandbox.v1` is additive-only from here —
+# like every other proto in the repository.
+breaking:
+  use:
+    - FILE

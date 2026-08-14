@@ -9,6 +9,7 @@ authors.workspace = true
 description = "Shared logic for migrating Docker objects (images, containers, networks) from Docker Desktop or OrbStack into ArcBox."
 
 [dependencies]
+chrono.workspace = true
 dirs.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

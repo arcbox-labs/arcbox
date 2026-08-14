@@ -36,6 +36,7 @@ macro_rules! kvm_iow {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! kvm_iowr {
     ($nr:expr, $ty:ty) => {
         nix::request_code_readwrite!(KVMIO, $nr, std::mem::size_of::<$ty>())
@@ -71,7 +72,9 @@ pub const KVM_GET_REGS: nix::sys::ioctl::ioctl_num_type = kvm_ior!(0x81, KvmRegs
 pub const KVM_SET_REGS: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x82, KvmRegs);
 pub const KVM_GET_SREGS: nix::sys::ioctl::ioctl_num_type = kvm_ior!(0x83, KvmSregs);
 pub const KVM_SET_SREGS: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x84, KvmSregs);
+#[cfg(target_arch = "x86_64")]
 pub const KVM_SET_CPUID2: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x90, KvmCpuid2);
+#[cfg(target_arch = "x86_64")]
 pub const KVM_GET_CPUID2: nix::sys::ioctl::ioctl_num_type = kvm_iowr!(0x91, KvmCpuid2);
 
 // ARM64-specific ioctls

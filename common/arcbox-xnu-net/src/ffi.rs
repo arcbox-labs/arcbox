@@ -44,6 +44,35 @@ pub mod darwin {
         }
     }
 
+    /// Reads an integer `kern.ipc.max{send,recv}msgx` sysctl and clamps it to
+    /// [`MAX_BATCH`](crate::MAX_BATCH).
+    ///
+    /// Both sysctls default to 256 but are tunable **down**, and a batch call
+    /// with `cnt` above the live value fails outright with `EINVAL` instead of
+    /// degrading to a shorter batch — so the value has to be read, not assumed.
+    /// An unreadable or nonsensical sysctl falls back to 1, which is always
+    /// legal and reduces batching to the unbatched syscall rate.
+    pub fn sysctl_batch_cap(name: &std::ffi::CStr) -> usize {
+        let mut value: c_int = 0;
+        let mut len = std::mem::size_of::<c_int>();
+        // SAFETY: `name` is a valid NUL-terminated C string; `value`/`len` are
+        // a correctly sized out-parameter pair; the new-value pointer is null
+        // (read-only query).
+        let ret = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&raw mut value).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret != 0 || value <= 0 {
+            return 1;
+        }
+        (value as usize).min(crate::MAX_BATCH)
+    }
+
     // Symbols exported from libsystem_kernel.dylib. No syscall numbers needed.
     unsafe extern "C" {
         /// Receive up to `cnt` datagrams in a single syscall.

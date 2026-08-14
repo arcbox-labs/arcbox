@@ -9,17 +9,39 @@
 
 use std::time::Duration;
 
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_helper::client::{Client, ClientError};
 use arcbox_helper::error::HelperError;
-use arcbox_route::{Ipv4Net, RouteInfo};
+use arcbox_route::{Ipv4Net, RouteEntry, RouteInfo};
 
 use crate::bridge_discovery;
 
-/// Preferred route covering the complete container address range.
-pub const CONTAINER_SUBNET: &str = "172.16.0.0/12";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContainerRoutes {
+    network: ContainerNetwork,
+    preferred: Ipv4Net,
+    split: [Ipv4Net; 2],
+}
 
-/// More-specific routes used when another network service owns the exact `/12`.
-pub const CONTAINER_SPLIT_SUBNETS: [&str; 2] = ["172.16.0.0/13", "172.24.0.0/13"];
+impl From<ContainerNetwork> for ContainerRoutes {
+    fn from(network: ContainerNetwork) -> Self {
+        let preferred = Ipv4Net::new(network.addr(), network.prefix())
+            .expect("ContainerNetwork is always a valid Ipv4Net");
+        let split_prefix = network.prefix() + 1;
+        let upper_addr =
+            std::net::Ipv4Addr::from(u32::from(network.addr()) + (1_u32 << (32 - split_prefix)));
+        Self {
+            network,
+            preferred,
+            split: [
+                Ipv4Net::new(network.addr(), split_prefix)
+                    .expect("the lower half of a ContainerNetwork is always valid"),
+                Ipv4Net::new(upper_addr, split_prefix)
+                    .expect("the upper half of a ContainerNetwork is always valid"),
+            ],
+        }
+    }
+}
 
 /// Maximum retry attempts for transient route installation failures.
 const MAX_ROUTE_ATTEMPTS: u32 = 5;
@@ -30,7 +52,7 @@ const ROUTE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Errors from route installation.
 ///
 /// All variants are retryable — the caller decides whether to retry via
-/// [`ensure_route_with_retry`].
+/// [`ensure_route_with_retry_for_network`].
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
     /// Bridge MAC not found in kernel FDB. Retryable — the bridge/FDB may
@@ -48,6 +70,14 @@ pub enum RouteError {
     RouteConflict {
         /// Exact subnet ArcBox left untouched.
         subnet: String,
+    },
+    /// A custom container pool overlaps a route owned outside this instance.
+    #[error("container network {network} overlaps external route {route}")]
+    RouteOverlap {
+        /// Container pool requested by this instance.
+        network: ContainerNetwork,
+        /// Existing route that overlaps the container pool.
+        route: Ipv4Net,
     },
 }
 
@@ -74,9 +104,9 @@ fn route_matches_bridge(route: Option<&RouteInfo>, bridge_ifindex: u16) -> bool 
 /// Container route shape maintained for the current VM lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteMode {
-    /// One exact `/12` interface route through the ArcBox bridge.
+    /// One exact route for the complete container pool.
     Preferred,
-    /// Two more-specific `/13` routes, leaving an external `/12` untouched.
+    /// Two equal child routes, leaving an external preferred route untouched.
     SplitFallback,
 }
 
@@ -94,15 +124,6 @@ struct RouteSnapshot {
 }
 
 impl RouteSnapshot {
-    fn is_healthy(self) -> bool {
-        (self.preferred == ExactRouteState::Owned
-            && !self.split.contains(&ExactRouteState::External))
-            || self
-                .split
-                .iter()
-                .all(|state| *state == ExactRouteState::Owned)
-    }
-
     fn initial_mode(self) -> RouteMode {
         if self
             .split
@@ -127,7 +148,7 @@ enum ReconcileAction {
     Healthy(RouteMode),
     AddPreferred,
     EnsureSplit,
-    Conflict(&'static str),
+    Conflict(usize),
 }
 
 fn plan_reconciliation(mode: RouteMode, snapshot: RouteSnapshot) -> ReconcileAction {
@@ -136,7 +157,7 @@ fn plan_reconciliation(mode: RouteMode, snapshot: RouteSnapshot) -> ReconcileAct
         .iter()
         .position(|state| *state == ExactRouteState::External)
     {
-        return ReconcileAction::Conflict(CONTAINER_SPLIT_SUBNETS[index]);
+        return ReconcileAction::Conflict(index);
     }
     if mode == RouteMode::SplitFallback {
         return if snapshot
@@ -156,10 +177,8 @@ fn plan_reconciliation(mode: RouteMode, snapshot: RouteSnapshot) -> ReconcileAct
     }
 }
 
-fn parse_network(value: &str) -> Result<Ipv4Net, RouteError> {
-    value.parse().map_err(|error| {
-        RouteError::RouteFailed(format!("invalid container network {value}: {error}"))
-    })
+fn isolated_preferred_route_conflicts(routes: ContainerRoutes, snapshot: RouteSnapshot) -> bool {
+    routes.network != ContainerNetwork::default() && snapshot.preferred == ExactRouteState::External
 }
 
 fn classify_route(route: Option<&RouteInfo>, bridge_ifindex: u16) -> ExactRouteState {
@@ -170,14 +189,46 @@ fn classify_route(route: Option<&RouteInfo>, bridge_ifindex: u16) -> ExactRouteS
     }
 }
 
-fn inspect_routes_sync(bridge_name: &str) -> Result<RouteSnapshot, RouteError> {
+fn external_overlap(
+    entries: &[RouteEntry],
+    preferred: Ipv4Net,
+    managed: [Ipv4Net; 3],
+    bridge_ifindex: u16,
+) -> Option<Ipv4Net> {
+    entries.iter().find_map(|entry| {
+        if !entry.network.overlaps(preferred)
+            || managed.contains(&entry.network)
+                && route_matches_bridge(Some(&entry.info), bridge_ifindex)
+        {
+            None
+        } else {
+            Some(entry.network)
+        }
+    })
+}
+
+fn inspect_routes_sync(
+    bridge_name: &str,
+    routes: ContainerRoutes,
+) -> Result<RouteSnapshot, RouteError> {
     let bridge_ifindex =
         arcbox_route::interface_index(bridge_name).map_err(|_| RouteError::BridgeNotReady)?;
-    let preferred = parse_network(CONTAINER_SUBNET)?;
-    let split = [
-        parse_network(CONTAINER_SPLIT_SUBNETS[0])?,
-        parse_network(CONTAINER_SPLIT_SUBNETS[1])?,
-    ];
+    let preferred = routes.preferred;
+    let split = routes.split;
+    if routes.network != ContainerNetwork::default() {
+        let entries = arcbox_route::overlapping(preferred).map_err(RouteError::RouteFailed)?;
+        if let Some(route) = external_overlap(
+            &entries,
+            preferred,
+            [preferred, split[0], split[1]],
+            bridge_ifindex,
+        ) {
+            return Err(RouteError::RouteOverlap {
+                network: routes.network,
+                route,
+            });
+        }
+    }
     let query = |network| {
         arcbox_route::get(network)
             .map(|route| classify_route(route.as_ref(), bridge_ifindex))
@@ -189,15 +240,23 @@ fn inspect_routes_sync(bridge_name: &str) -> Result<RouteSnapshot, RouteError> {
     })
 }
 
-async fn inspect_routes(bridge_name: &str) -> Result<RouteSnapshot, RouteError> {
+async fn inspect_routes(
+    bridge_name: &str,
+    routes: ContainerRoutes,
+) -> Result<RouteSnapshot, RouteError> {
     let bridge_name = bridge_name.to_string();
-    tokio::task::spawn_blocking(move || inspect_routes_sync(&bridge_name))
+    tokio::task::spawn_blocking(move || inspect_routes_sync(&bridge_name, routes))
         .await
         .map_err(|error| RouteError::RouteFailed(format!("route check task failed: {error}")))?
 }
 
-async fn add_route(client: &Client, subnet: &str, bridge_name: &str) -> Result<bool, RouteError> {
-    match client.route_add(subnet, bridge_name).await {
+async fn add_route(
+    client: &Client,
+    subnet: Ipv4Net,
+    bridge_name: &str,
+) -> Result<bool, RouteError> {
+    let subnet = subnet.to_string();
+    match client.route_add(&subnet, bridge_name).await {
         Ok(()) => Ok(true),
         Err(ClientError::Helper(HelperError::RouteConflict { .. })) => Ok(false),
         Err(error) => Err(error.into()),
@@ -206,6 +265,7 @@ async fn add_route(client: &Client, subnet: &str, bridge_name: &str) -> Result<b
 
 async fn ensure_split_routes(
     bridge_name: &str,
+    routes: ContainerRoutes,
     mut snapshot: RouteSnapshot,
 ) -> Result<(), RouteError> {
     if let Some(index) = snapshot
@@ -214,7 +274,7 @@ async fn ensure_split_routes(
         .position(|state| *state == ExactRouteState::External)
     {
         return Err(RouteError::RouteConflict {
-            subnet: CONTAINER_SPLIT_SUBNETS[index].to_string(),
+            subnet: routes.split[index].to_string(),
         });
     }
     if snapshot
@@ -226,7 +286,7 @@ async fn ensure_split_routes(
     }
 
     let client = Client::connect().await?;
-    for (index, subnet) in CONTAINER_SPLIT_SUBNETS.iter().enumerate() {
+    for (index, subnet) in routes.split.into_iter().enumerate() {
         if snapshot.split[index] == ExactRouteState::Owned {
             continue;
         }
@@ -235,10 +295,10 @@ async fn ensure_split_routes(
             continue;
         }
 
-        snapshot = inspect_routes(bridge_name).await?;
+        snapshot = inspect_routes(bridge_name, routes).await?;
         if snapshot.split[index] != ExactRouteState::Owned {
             return Err(RouteError::RouteConflict {
-                subnet: (*subnet).to_string(),
+                subnet: subnet.to_string(),
             });
         }
     }
@@ -247,36 +307,52 @@ async fn ensure_split_routes(
 
 async fn reconcile_with_snapshot(
     bridge_name: &str,
+    routes: ContainerRoutes,
     mode: RouteMode,
     mut snapshot: RouteSnapshot,
 ) -> Result<RouteMode, RouteError> {
+    if isolated_preferred_route_conflicts(routes, snapshot) {
+        return Err(RouteError::RouteConflict {
+            subnet: routes.preferred.to_string(),
+        });
+    }
     match plan_reconciliation(mode, snapshot) {
         ReconcileAction::Healthy(mode) => return Ok(mode),
-        ReconcileAction::Conflict(subnet) => {
+        ReconcileAction::Conflict(index) => {
             return Err(RouteError::RouteConflict {
-                subnet: subnet.to_string(),
+                subnet: routes.split[index].to_string(),
             });
         }
         ReconcileAction::EnsureSplit => {}
         ReconcileAction::AddPreferred => {
             let client = Client::connect().await?;
-            if add_route(&client, CONTAINER_SUBNET, bridge_name).await? {
+            if add_route(&client, routes.preferred, bridge_name).await? {
+                if routes.network != ContainerNetwork::default() {
+                    // Close the useful part of the check/add race. Route changes
+                    // after this point are caught by the daemon route watcher.
+                    inspect_routes(bridge_name, routes).await?;
+                }
                 return Ok(RouteMode::Preferred);
             }
             // Another service won the add race. Re-query before deciding: an
             // ArcBox route added by a concurrent reconciler is already good.
-            snapshot = inspect_routes(bridge_name).await?;
+            snapshot = inspect_routes(bridge_name, routes).await?;
             if snapshot.preferred == ExactRouteState::Owned {
                 return Ok(RouteMode::Preferred);
+            }
+            if isolated_preferred_route_conflicts(routes, snapshot) {
+                return Err(RouteError::RouteConflict {
+                    subnet: routes.preferred.to_string(),
+                });
             }
         }
     }
 
-    ensure_split_routes(bridge_name, snapshot).await?;
+    ensure_split_routes(bridge_name, routes, snapshot).await?;
     tracing::info!(
-        preferred = CONTAINER_SUBNET,
-        lower = CONTAINER_SPLIT_SUBNETS[0],
-        upper = CONTAINER_SPLIT_SUBNETS[1],
+        preferred = %routes.preferred,
+        lower = %routes.split[0],
+        upper = %routes.split[1],
         bridge = bridge_name,
         "external container route detected; switched to sticky split fallback"
     );
@@ -284,37 +360,24 @@ async fn reconcile_with_snapshot(
 }
 
 /// Reconciles the container routes while preserving a sticky lifecycle mode.
-pub async fn reconcile_route_for_bridge(
+pub async fn reconcile_route_for_bridge_with_network(
     bridge_name: &str,
+    network: ContainerNetwork,
     mode: RouteMode,
 ) -> Result<RouteMode, RouteError> {
-    let snapshot = inspect_routes(bridge_name).await?;
-    reconcile_with_snapshot(bridge_name, mode, snapshot).await
+    let routes = ContainerRoutes::from(network);
+    let snapshot = inspect_routes(bridge_name, routes).await?;
+    reconcile_with_snapshot(bridge_name, routes, mode, snapshot).await
 }
 
 /// Detects the route shape left by this VM lifecycle and reconciles it.
-pub async fn initialize_route_for_bridge(bridge_name: &str) -> Result<RouteMode, RouteError> {
-    let snapshot = inspect_routes(bridge_name).await?;
-    reconcile_with_snapshot(bridge_name, snapshot.initial_mode(), snapshot).await
-}
-
-/// Checks whether the container subnet is an interface route through `bridge_name`.
-///
-/// The routing query is unprivileged but blocking, so it runs outside the async
-/// executor. A route through the expected interface still fails the check when
-/// `RTF_GATEWAY` remains set, which is the invalid state produced when a VPN's
-/// gateway route is changed in place.
-pub async fn container_route_matches_bridge(bridge_name: &str) -> Result<bool, RouteError> {
-    Ok(container_route_mode(bridge_name).await?.is_some())
-}
-
-/// Returns the healthy route shape currently installed through `bridge_name`.
-pub async fn container_route_mode(bridge_name: &str) -> Result<Option<RouteMode>, RouteError> {
-    let snapshot = inspect_routes(bridge_name).await?;
-    if !snapshot.is_healthy() {
-        return Ok(None);
-    }
-    Ok(Some(snapshot.initial_mode()))
+pub async fn initialize_route_for_bridge_with_network(
+    bridge_name: &str,
+    network: ContainerNetwork,
+) -> Result<RouteMode, RouteError> {
+    let routes = ContainerRoutes::from(network);
+    let snapshot = inspect_routes(bridge_name, routes).await?;
+    reconcile_with_snapshot(bridge_name, routes, snapshot.initial_mode(), snapshot).await
 }
 
 /// Performs one route installation attempt through a known bridge interface.
@@ -322,8 +385,13 @@ pub async fn container_route_mode(bridge_name: &str) -> Result<Option<RouteMode>
 /// Callers that need retries own the retry cadence. Keeping this operation
 /// single-shot prevents a continuous route guard from blocking inside a nested
 /// retry loop when another network service replaces the route.
-pub async fn repair_route_for_bridge(bridge_name: &str) -> Result<(), RouteError> {
-    initialize_route_for_bridge(bridge_name).await.map(|_| ())
+pub async fn repair_route_for_bridge_with_network(
+    bridge_name: &str,
+    network: ContainerNetwork,
+) -> Result<(), RouteError> {
+    initialize_route_for_bridge_with_network(bridge_name, network)
+        .await
+        .map(|_| ())
 }
 
 /// Ensures the container subnet route points to the correct bridge.
@@ -332,7 +400,7 @@ pub async fn repair_route_for_bridge(bridge_name: &str) -> Result<(), RouteError
 /// 2. Calls helper via tarpc to add the route
 ///
 /// Called on: VM ready, VM recovery, daemon cold-start reconcile.
-async fn ensure_route(bridge_mac: &str) -> Result<(), RouteError> {
+async fn ensure_route(bridge_mac: &str, network: ContainerNetwork) -> Result<(), RouteError> {
     // Step 1: Resolve MAC → bridge via kernel FDB (typed API, no text parsing).
     let mac = bridge_mac.to_string();
     let bridge = tokio::task::spawn_blocking(move || bridge_discovery::resolve_bridge_by_mac(&mac))
@@ -341,7 +409,7 @@ async fn ensure_route(bridge_mac: &str) -> Result<(), RouteError> {
         .ok_or(RouteError::BridgeNotReady)?;
 
     // Step 2: Tell helper to add the route.
-    repair_route_for_bridge(&bridge.name).await?;
+    repair_route_for_bridge_with_network(&bridge.name, network).await?;
 
     tracing::info!(
         bridge = %bridge.name,
@@ -351,15 +419,18 @@ async fn ensure_route(bridge_mac: &str) -> Result<(), RouteError> {
     Ok(())
 }
 
-/// Ensures the container subnet route with automatic retry on transient failures.
+/// Ensures the selected container address-pool route with transient retries.
 ///
 /// All [`RouteError`] variants are treated as retryable. Retries up to 5 times
 /// with 2-second intervals (~10s total). This covers:
 /// - Bridge FDB not yet populated after VM start (~1-2s to learn MAC)
 /// - Helper daemon not yet started by launchd (first connection)
-pub async fn ensure_route_with_retry(bridge_mac: &str) -> Result<(), RouteError> {
+pub async fn ensure_route_with_retry_for_network(
+    bridge_mac: &str,
+    network: ContainerNetwork,
+) -> Result<(), RouteError> {
     for attempt in 1..=MAX_ROUTE_ATTEMPTS {
-        match ensure_route(bridge_mac).await {
+        match ensure_route(bridge_mac, network).await {
             Ok(()) => return Ok(()),
             Err(ref e) if attempt < MAX_ROUTE_ATTEMPTS => {
                 tracing::debug!(
@@ -383,14 +454,17 @@ pub async fn ensure_route_with_retry(bridge_mac: &str) -> Result<(), RouteError>
     unreachable!()
 }
 
-/// Ensures the container subnet route using a known bridge interface name.
+/// Ensures the selected container address-pool route through a known bridge.
 ///
 /// When vmnet.framework creates the bridge, we know the interface immediately —
 /// no need to scan the kernel FDB. Only retries for helper readiness.
 #[cfg(all(feature = "vmnet", target_os = "macos"))]
-pub async fn ensure_route_for_bridge(bridge_name: &str) -> Result<(), RouteError> {
+pub async fn ensure_route_for_bridge_with_network(
+    bridge_name: &str,
+    network: ContainerNetwork,
+) -> Result<(), RouteError> {
     for attempt in 1..=2 {
-        match repair_route_for_bridge(bridge_name).await {
+        match repair_route_for_bridge_with_network(bridge_name, network).await {
             Ok(()) => {
                 tracing::info!(
                     bridge = bridge_name,
@@ -406,6 +480,71 @@ pub async fn ensure_route_for_bridge(bridge_name: &str) -> Result<(), RouteError
         }
     }
     unreachable!()
+}
+
+/// Builds the composer-side route hook for a machine's lifecycle.
+///
+/// The lifecycle engine fires it after the VM starts; it resolves the
+/// bridge (vmnet interface name, or a kernel-FDB scan by MAC) and installs
+/// the container-subnet route, publishing `ContainerRouteInstalled` on
+/// success. Non-blocking: route failures never gate VM readiness.
+///
+/// `machine_name` is keyed to whichever lifecycle installs the hook — today
+/// that is always the System VM (`Runtime::new` passes
+/// [`crate::vm_lifecycle::DEFAULT_MACHINE_NAME`]), but a future per-role
+/// lifecycle built via `VmLifecycleManager::for_machine` must pass its own
+/// name so bridge lookup and the published event stay keyed on the right
+/// machine.
+pub fn system_vm_route_hook(
+    machine_manager: &std::sync::Arc<crate::machine::MachineManager>,
+    event_bus: &crate::event::EventBus,
+    machine_name: &str,
+) -> crate::vm_lifecycle::RouteHook {
+    let mm = std::sync::Arc::clone(machine_manager);
+    let bus = event_bus.clone();
+    let machine_name = machine_name.to_string();
+    let network = ContainerNetwork::default();
+    crate::vm_lifecycle::RouteHook::new(std::sync::Arc::new(move || {
+        #[cfg(feature = "vmnet")]
+        {
+            // vmnet path: bridge name is known instantly, only need
+            // helper retry (1-2 attempts for XPC readiness).
+            use crate::bridge_discovery::MachineBridgeExt as _;
+            if let Some(bridge) = mm.vmnet_bridge_name(&machine_name) {
+                let bus = bus.clone();
+                let name = machine_name.clone();
+                drop(tokio::spawn(async move {
+                    match ensure_route_for_bridge_with_network(&bridge, network).await {
+                        Ok(()) => {
+                            bus.publish(crate::event::Event::ContainerRouteInstalled { name });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to install container route (vmnet)");
+                        }
+                    }
+                }));
+            }
+        }
+        #[cfg(not(feature = "vmnet"))]
+        {
+            // Discover the bridge by scanning the kernel FDB (retries up
+            // to ~10s for FDB learning).
+            if let Some(mac) = mm.bridge_mac(&machine_name) {
+                let bus = bus.clone();
+                let name = machine_name.clone();
+                drop(tokio::spawn(async move {
+                    match ensure_route_with_retry_for_network(&mac, network).await {
+                        Ok(()) => {
+                            bus.publish(crate::event::Event::ContainerRouteInstalled { name });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to install container route");
+                        }
+                    }
+                }));
+            }
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -451,7 +590,6 @@ mod tests {
         };
 
         assert_eq!(snapshot.initial_mode(), RouteMode::SplitFallback);
-        assert!(!snapshot.is_healthy());
     }
 
     #[test]
@@ -462,7 +600,6 @@ mod tests {
         };
 
         assert_eq!(snapshot.initial_mode(), RouteMode::SplitFallback);
-        assert!(snapshot.is_healthy());
     }
 
     #[test]
@@ -473,17 +610,6 @@ mod tests {
         };
 
         assert_eq!(snapshot.initial_mode(), RouteMode::Preferred);
-        assert!(snapshot.is_healthy());
-    }
-
-    #[test]
-    fn external_more_specific_route_makes_preferred_shape_unhealthy() {
-        let snapshot = RouteSnapshot {
-            preferred: ExactRouteState::Owned,
-            split: [ExactRouteState::External, ExactRouteState::Missing],
-        };
-
-        assert!(!snapshot.is_healthy());
     }
 
     #[test]
@@ -513,6 +639,91 @@ mod tests {
     }
 
     #[test]
+    fn isolated_pool_never_steals_an_external_preferred_route() {
+        let routes = ContainerRoutes::from("10.64.32.0/20".parse::<ContainerNetwork>().unwrap());
+        let snapshot = RouteSnapshot {
+            preferred: ExactRouteState::External,
+            split: [ExactRouteState::Missing; 2],
+        };
+
+        assert!(isolated_preferred_route_conflicts(routes, snapshot));
+        assert!(!isolated_preferred_route_conflicts(
+            ContainerRoutes::from(ContainerNetwork::default()),
+            snapshot
+        ));
+    }
+
+    #[test]
+    fn smallest_pool_derives_valid_route_halves() {
+        let routes = ContainerRoutes::from("192.168.100.0/24".parse::<ContainerNetwork>().unwrap());
+
+        assert_eq!(routes.split[0], "192.168.100.0/25".parse().unwrap());
+        assert_eq!(routes.split[1], "192.168.100.128/25".parse().unwrap());
+    }
+
+    #[test]
+    fn isolated_pool_rejects_covering_and_contained_external_routes() {
+        let routes = ContainerRoutes::from("10.64.32.0/20".parse::<ContainerNetwork>().unwrap());
+        let preferred = routes.preferred;
+        let managed = [preferred, routes.split[0], routes.split[1]];
+        let owned = RouteInfo {
+            ifindex: 26,
+            flags: libc::RTF_UP | libc::RTF_STATIC,
+        };
+        let external = RouteInfo {
+            ifindex: 7,
+            flags: libc::RTF_UP | libc::RTF_GATEWAY,
+        };
+
+        assert_eq!(
+            external_overlap(
+                &[RouteEntry {
+                    network: "10.64.0.0/16".parse().unwrap(),
+                    info: external,
+                }],
+                preferred,
+                managed,
+                26,
+            ),
+            Some("10.64.0.0/16".parse().unwrap())
+        );
+        assert_eq!(
+            external_overlap(
+                &[RouteEntry {
+                    network: "10.64.35.0/24".parse().unwrap(),
+                    info: external,
+                }],
+                preferred,
+                managed,
+                26,
+            ),
+            Some("10.64.35.0/24".parse().unwrap())
+        );
+        assert_eq!(
+            external_overlap(
+                &[
+                    RouteEntry {
+                        network: managed[0],
+                        info: owned,
+                    },
+                    RouteEntry {
+                        network: managed[1],
+                        info: owned,
+                    },
+                    RouteEntry {
+                        network: "10.64.48.0/20".parse().unwrap(),
+                        info: external,
+                    },
+                ],
+                preferred,
+                managed,
+                26,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn split_mode_never_reverts_to_preferred() {
         let snapshot = RouteSnapshot {
             preferred: ExactRouteState::Missing,
@@ -534,7 +745,7 @@ mod tests {
 
         assert_eq!(
             plan_reconciliation(RouteMode::SplitFallback, snapshot),
-            ReconcileAction::Conflict("172.24.0.0/13")
+            ReconcileAction::Conflict(1)
         );
     }
 }

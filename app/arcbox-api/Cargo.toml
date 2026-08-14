@@ -12,22 +12,29 @@ authors.workspace = true
 arcbox-constants = { workspace = true }
 chrono = { workspace = true }
 arcbox-core = { workspace = true }
-arcbox-protocol = { workspace = true }
-arcbox-grpc = { workspace = true }
 arcbox-docker = { workspace = true }
 arcbox-error = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 dimicon = { version = "0.2.0", features = ["devicon", "simpleicon"] }
+bytes.workspace = true
+arcbox-connect.workspace = true
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1" }
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
+arcbox-transport.workspace = true
+arcbox-image.workspace = true
+arcbox-engine.workspace = true
+arcbox-computer.workspace = true
 
 [dev-dependencies]
+base64 = "0.22.1"
+http = "1.5.0"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

@@ -1,6 +1,8 @@
 //! In-process network origins and sinks for the network workload and fault
-//! suites (`internal-docs/plans/network-workload-e2e.md`,
-//! `internal-docs/plans/network-fault-e2e.md`).
+//! suites.
+//!
+//! Plans: `../company/engineering/arcbox/plans/network-workload-e2e.md`,
+//! `../company/engineering/arcbox/plans/network-fault-e2e.md`.
 //!
 //! Everything binds `127.0.0.1:0` and runs until the process exits; guests
 //! reach a fixture at `10.0.2.1:<port>` via the TcpBridge gateway→loopback

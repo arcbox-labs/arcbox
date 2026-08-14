@@ -102,6 +102,10 @@ pub trait HelperService {
 
     /// Checks whether the ArcBox `/etc/hosts` alias is installed.
     async fn hosts_alias_status() -> Result<bool, HelperError>;
+
+    /// Removes an exact direct route only when it still belongs to `iface`.
+    /// Idempotent when the route is absent; refuses to delete a foreign route.
+    async fn route_remove_if_owned(subnet: String, iface: String) -> Result<bool, HelperError>;
 }
 
 /// Low-level connect — use [`client::Client::connect()`] instead.

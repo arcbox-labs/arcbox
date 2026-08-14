@@ -1,0 +1,21 @@
+[package]
+name = "arcbox-connect"
+description = "Connect RPC surface for the ArcBox sandbox API (connectrpc + buffa)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
+connectrpc = { package = "arcbox-connectrpc", version = "0.9.0-arcbox.1" }
+serde = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+connectrpc-build = { package = "arcbox-connectrpc-build", version = "0.9.0-arcbox.1" }
+# Only to detect that the committed descriptor no longer matches the .proto
+# sources; see the build script.
+sha2 = { workspace = true }

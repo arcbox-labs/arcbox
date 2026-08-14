@@ -6,7 +6,7 @@
 //! same virtio-blk stack — so the hot metadata moves to ext4 while bulk data
 //! (layers, blobs, volumes) stays on the compressed btrfs data volume. The
 //! crash-safe migration state machine lives in `crate::metadata_migrate`;
-//! design and failure policy: internal-docs/plans/ext4-metadata-volume.md.
+//! design and failure policy: ../company/engineering/arcbox/plans/ext4-metadata-volume.md.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;

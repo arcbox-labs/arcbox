@@ -1,0 +1,101 @@
+/**
+ * @arcbox/sandbox — run isolated microVM sandboxes on the local ArcBox
+ * daemon (and, later, a remote tier) over the Connect protocol.
+ *
+ * Public surface only: everything under `src/gen/` is generated wire
+ * code and is deliberately NOT exported — public shapes are hand-written
+ * and mapped at the transport boundary.
+ */
+
+export { ArcBox, Sandbox } from "./sandbox";
+export type {
+  CheckpointOptions,
+  ConnectSandboxOptions,
+  CreateSandboxOptions,
+  LifecycleUpdate,
+  ListSandboxesOptions,
+  ListSnapshotsOptions,
+  RestoreOptions,
+} from "./sandbox";
+
+export { CommandHandle, CommandResult, Commands } from "./commands";
+export type {
+  CommandInfo,
+  CommandOutput,
+  CommandState,
+  PtySize,
+  RunOptions,
+  SignalName,
+  StdinStatus,
+  WaitForLogOptions,
+} from "./commands";
+
+export { Ports } from "./ports";
+export type {
+  ExposePortOptions,
+  UnexposePortOptions,
+  WaitForPortOptions,
+} from "./ports";
+
+export { Files, MAX_FILE_BYTES } from "./files";
+export type {
+  FileKind,
+  FileStat,
+  FsEvent,
+  FsEventKind,
+  MkdirOptions,
+  RemoveOptions,
+  WatchOptions,
+  WriteOptions,
+} from "./files";
+
+export { Template } from "./templates";
+export type {
+  BuildTemplateOptions,
+  ListTemplatesOptions,
+  ReadyProbe,
+  TemplateConnectOptions,
+  TemplateDefaults,
+  TemplateSource,
+} from "./templates";
+
+export type { ConnectionOptions } from "./connection";
+
+export type {
+  Capabilities,
+  ExposedPort,
+  IdlePolicy,
+  NestedVirtCapability,
+  PortProtocol,
+  SandboxEvent,
+  SandboxEventKind,
+  SandboxInfo,
+  SandboxState,
+  SandboxSummary,
+  Snapshot,
+  TemplateInfo,
+} from "./types";
+
+export {
+  ArcBoxError,
+  AuthenticationError,
+  CapabilityError,
+  CommandFailedError,
+  CommandNotFoundError,
+  CommandTimeoutError,
+  ConnectionFailedError,
+  ConnectionLostError,
+  FileNotFoundError,
+  FileTooLargeError,
+  InvalidArgumentError,
+  NotFoundError,
+  ProtocolMismatchError,
+  RequestTimeoutError,
+  SandboxDiedError,
+  SandboxNotFoundError,
+  SandboxStateError,
+  SandboxTtlError,
+  TemplateNotFoundError,
+  TimeoutError,
+} from "./errors";
+export type { ArcBoxErrorOptions, CommandFailure } from "./errors";

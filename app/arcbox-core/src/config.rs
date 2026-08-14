@@ -25,16 +25,15 @@
 //! subnet = "10.0.2.0/24"
 //! dns = ["8.8.8.8", "8.8.4.4"]
 //!
-//! [docker]
-//! socket_path = "~/.arcbox/run/docker.sock"
-//!
 //! [container]
 //! guest_docker_vsock_port = 2375
+//! cidr = "172.16.0.0/12"
 //!
 //! [logging]
 //! level = "info"
 //! ```
 
+use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
 use figment::{
@@ -48,6 +47,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Runtime profile selected by the daemon.
+    #[serde(skip)]
+    pub profile: ArcboxProfile,
     /// Data directory.
     pub data_dir: PathBuf,
     /// Default VM configuration.
@@ -78,6 +80,7 @@ impl Config {
     pub fn for_profile(profile: ArcboxProfile) -> Self {
         let layout = HostLayout::for_profile(profile);
         Self {
+            profile,
             data_dir: layout.data_dir,
             vm: VmDefaults::default(),
             machine: MachineDefaults::default(),
@@ -109,13 +112,15 @@ impl Config {
     /// Explicit `ARCBOX_*` environment values and config file values override
     /// profile defaults.
     pub fn load_for_profile(profile: ArcboxProfile) -> Result<Self, Box<figment::Error>> {
-        Figment::new()
+        let mut config: Self = Figment::new()
             .merge(Serialized::defaults(Self::for_profile(profile)))
             .merge(Toml::file(system_config_path()))
             .merge(Toml::file(user_config_path()))
             .merge(Env::prefixed("ARCBOX_").split("_"))
             .extract()
-            .map_err(Box::new)
+            .map_err(Box::new)?;
+        config.profile = profile;
+        Ok(config)
     }
 
     /// Loads configuration from a specific file.
@@ -130,6 +135,14 @@ impl Config {
             .merge(Env::prefixed("ARCBOX_").split("_"))
             .extract()
             .map_err(Box::new)
+    }
+
+    /// Returns the boot-asset policy selected by this runtime configuration.
+    #[must_use]
+    pub fn boot_asset_config(&self) -> crate::boot_assets::BootAssetConfig {
+        crate::boot_assets::BootAssetConfig::with_cache_dir(self.data_dir.join("boot"))
+            .with_custom_kernel(self.vm.kernel_path.clone())
+            .with_unpinned_manifest_allowed(self.profile == ArcboxProfile::Development)
     }
 
     /// Returns the path to the persistent data directory (`data/`).
@@ -183,7 +196,7 @@ impl Config {
     /// Returns the path to the Docker metadata image (`data/docker-meta.img`).
     ///
     /// Paired with [`Self::docker_img_path`]: the ext4 volume carrying the
-    /// fsync-hot boltdb metadata (see internal-docs/plans/ext4-metadata-volume.md).
+    /// fsync-hot boltdb metadata (see ../company/engineering/arcbox/plans/ext4-metadata-volume.md).
     #[must_use]
     pub fn docker_meta_img_path(&self) -> PathBuf {
         self.data_subdir().join("docker-meta.img")
@@ -301,7 +314,9 @@ impl Default for NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockerConfig {
-    /// Unix socket path for Docker API.
+    /// Unix socket path for Docker API clients.
+    ///
+    /// Daemon startup replaces configured values with its resolved host layout.
     pub socket_path: PathBuf,
     /// Enable Docker API.
     pub enabled: bool,
@@ -328,6 +343,13 @@ impl DockerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContainerRuntimeConfig {
+    /// Private address pool shared by Docker, guest firewall rules, and the
+    /// host route to this runtime's bridge.
+    #[serde(
+        serialize_with = "serialize_container_network",
+        deserialize_with = "deserialize_container_network"
+    )]
+    pub cidr: ContainerNetwork,
     /// Guest dockerd API vsock port.
     pub guest_docker_vsock_port: u32,
     /// Backend startup timeout in milliseconds.
@@ -344,10 +366,36 @@ pub struct ContainerRuntimeConfig {
 impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
+            cidr: ContainerNetwork::default(),
             guest_docker_vsock_port: DOCKER_API_VSOCK_PORT,
             startup_timeout_ms: 150_000,
         }
     }
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde serialize_with requires a shared reference"
+)]
+fn serialize_container_network<S>(
+    network: &ContainerNetwork,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_str(network)
+}
+
+fn deserialize_container_network<'de, D>(deserializer: D) -> Result<ContainerNetwork, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(D::Error::custom)
 }
 
 /// Logging configuration.
@@ -409,6 +457,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
+        assert_eq!(config.profile, ArcboxProfile::Production);
         assert_eq!(config.vm.cpus, arcbox_hypervisor::default_vm_cpu_count());
         // Default memory is half of host RAM, clamped to [512, 16384] MB.
         let expected_mb = arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024);
@@ -417,10 +466,23 @@ mod tests {
         assert!(config.vm.memory_mb <= 16384);
         assert_eq!(config.machine.disk_gb, 50);
         assert!(config.docker.enabled);
+        assert_eq!(config.container.cidr.to_string(), "172.16.0.0/12");
         assert_eq!(
             config.container.guest_docker_vsock_port,
             DOCKER_API_VSOCK_PORT
         );
+    }
+
+    #[test]
+    fn boot_asset_policy_preserves_profile_and_custom_kernel() {
+        let mut config = Config::for_profile(ArcboxProfile::Development);
+        config.vm.kernel_path = Some(PathBuf::from("/custom/kernel"));
+
+        let boot = config.boot_asset_config();
+
+        assert!(boot.allow_unpinned_manifest);
+        assert_eq!(boot.custom_kernel, config.vm.kernel_path);
+        assert_eq!(boot.cache_dir, config.data_dir.join("boot"));
     }
 
     #[test]
@@ -457,6 +519,36 @@ mod tests {
             .extract()
             .expect("config with vm.backend");
         assert_eq!(config.vm.backend, arcbox_vmm::VmBackend::Hv);
+    }
+
+    #[test]
+    fn container_cidr_is_validated_while_loading_config() {
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[container]\ncidr = \"10.80.0.0/20\""))
+            .extract()
+            .expect("valid container address pool");
+        assert_eq!(config.container.cidr.to_string(), "10.80.0.0/20");
+
+        let invalid = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[container]\ncidr = \"10.80.1.0/20\""))
+            .extract::<Config>();
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err, reason = "figment::Jail closure signature")]
+    fn container_cidr_parses_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ARCBOX_CONTAINER_CIDR", "10.96.0.0/16");
+            let config: Config = Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Env::prefixed("ARCBOX_").split("_"))
+                .extract()?;
+            assert_eq!(config.container.cidr.to_string(), "10.96.0.0/16");
+            Ok(())
+        });
     }
 
     #[test]

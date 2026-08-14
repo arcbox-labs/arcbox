@@ -1,0 +1,520 @@
+//! Host-side runtime migration manager.
+
+mod dto;
+
+use crate::error::{CoreError, Result};
+use arcbox_connect::v1::{
+    PrepareMigrationRequest, PrepareMigrationResponse, RunMigrationEvent, RunMigrationRequest,
+};
+use arcbox_migration::{
+    DockerCliRunner, MigrationError, MigrationExecutor, MigrationExecutorOptions, MigrationPlanner,
+    MigrationProgress, SourceConfig, SourceKind, resolve_source,
+};
+use dto::ToWire;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::sync::RwLock;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+struct PreparedMigration {
+    source: SourceConfig,
+    plan: arcbox_migration::MigrationPlan,
+}
+
+/// Host-side migration manager.
+#[derive(Debug)]
+pub struct MigrationManager {
+    target_socket: PathBuf,
+    prepared: RwLock<HashMap<String, PreparedMigration>>,
+}
+
+impl MigrationManager {
+    /// Creates a migration manager for the target Docker socket.
+    #[must_use]
+    pub fn new(target_socket: PathBuf) -> Self {
+        Self {
+            target_socket,
+            prepared: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Prepares a migration plan.
+    pub async fn prepare_migration(
+        &self,
+        request: PrepareMigrationRequest,
+    ) -> Result<PrepareMigrationResponse> {
+        let source_kind = parse_source_kind(&request.source_kind)?;
+        let source = resolve_source(
+            source_kind,
+            non_empty_path(request.source_socket_path.as_str()),
+        )
+        .map_err(map_migration_error)?;
+        let target_runner =
+            DockerCliRunner::new(self.target_socket.clone()).map_err(map_migration_error)?;
+        let planner = MigrationPlanner::new(target_runner);
+        let plan = planner
+            .plan(source.clone())
+            .await
+            .map_err(map_migration_error)?;
+
+        // Unsupported resources are reported rather than raised here: the
+        // executor already refuses to run a plan that has any, and callers
+        // inspecting a plan need to see *why* it is blocked.
+        //
+        // Nothing is stored unless the plan can actually be run: `run_migration`
+        // is the only thing that removes entries, so storing a plan no caller
+        // will ever run would retain it for the life of the daemon. That covers
+        // both a dry run and a plan the executor would refuse anyway.
+        let runnable = !request.dry_run && plan.unsupported_resources.is_empty();
+        let plan_id = if runnable {
+            let plan_id = Uuid::new_v4().to_string();
+            self.prepared.write().await.insert(
+                plan_id.clone(),
+                PreparedMigration {
+                    source,
+                    plan: plan.clone(),
+                },
+            );
+            plan_id
+        } else {
+            String::new()
+        };
+
+        let mut warnings = Vec::new();
+        warnings.extend(plan.blockers.iter().map(|blocker| {
+            format!(
+                "volume '{}' is attached to running source containers: {}",
+                blocker.volume_name,
+                blocker.containers.join(", ")
+            )
+        }));
+        warnings.extend(plan.warnings.iter().cloned());
+
+        Ok(PrepareMigrationResponse {
+            plan_id,
+            source_kind: plan.source.kind.as_str().to_string(),
+            source_socket_path: plan.source.socket_path.to_string_lossy().to_string(),
+            image_count: u32::try_from(plan.images.len()).unwrap_or(u32::MAX),
+            volume_count: u32::try_from(plan.volumes.len()).unwrap_or(u32::MAX),
+            network_count: u32::try_from(plan.networks.len()).unwrap_or(u32::MAX),
+            container_count: u32::try_from(plan.containers.len()).unwrap_or(u32::MAX),
+            // Only indicates actual ArcBox resource replacements; blockers
+            // are surfaced via `warnings`.
+            replacements_required: !plan.replacements.is_empty(),
+            warnings,
+            // Only for an explicit dry run: the plan embeds each container's
+            // environment verbatim, so it is not worth shipping on a prepare
+            // whose caller is about to run the migration anyway.
+            plan: request
+                .dry_run
+                .then(|| plan.to_wire())
+                .map_or_else(Default::default, Into::into),
+            unsupported_resources: plan.unsupported_resources.clone(),
+            ..Default::default()
+        })
+    }
+
+    /// Runs a prepared migration plan.
+    pub async fn run_migration(
+        &self,
+        request: RunMigrationRequest,
+    ) -> Result<UnboundedReceiver<Result<RunMigrationEvent>>> {
+        let prepared = self
+            .prepared
+            .read()
+            .await
+            .get(&request.plan_id)
+            .cloned()
+            .ok_or_else(|| CoreError::not_found(format!("migration plan {}", request.plan_id)))?;
+
+        let requires_confirmation =
+            !prepared.plan.replacements.is_empty() || !prepared.plan.blockers.is_empty();
+        if requires_confirmation && !request.allow_replacements {
+            return Err(CoreError::invalid_state(
+                "migration requires confirmation for replacement or stopping source containers",
+            ));
+        }
+
+        let target_runner =
+            DockerCliRunner::new(self.target_socket.clone()).map_err(map_migration_error)?;
+        let executor = MigrationExecutor::new(target_runner);
+        let options = MigrationExecutorOptions {
+            confirm_replace: request.allow_replacements,
+            confirm_stop_source_containers: request.allow_replacements,
+            start_containers: !request.skip_start,
+        };
+        let plan_id = request.plan_id.clone();
+        let prepared = self
+            .prepared
+            .write()
+            .await
+            .remove(&request.plan_id)
+            .ok_or_else(|| CoreError::not_found(format!("migration plan {}", request.plan_id)))?;
+        let source = prepared.source;
+        let plan = prepared.plan;
+        let (tx, rx) = unbounded_channel();
+
+        tokio::spawn(async move {
+            let mut emit = |progress: MigrationProgress| {
+                // Intermediate events: done=false, success is not meaningful
+                // yet so we leave it as true (not-failed-yet) to avoid
+                // misleading clients that check `success` without gating on
+                // `done`.
+                let event = progress_to_event(&plan_id, progress, false, true);
+                let _ = tx.send(Ok(event));
+            };
+
+            match executor.execute(source, &plan, options, &mut emit).await {
+                Ok(outcome) => {
+                    let detail = if outcome.warnings.is_empty() {
+                        "migration completed".to_string()
+                    } else {
+                        format!(
+                            "migration completed with {} warning(s)",
+                            outcome.warnings.len()
+                        )
+                    };
+                    let mut event = progress_to_event(
+                        &plan_id,
+                        MigrationProgress {
+                            stage: arcbox_migration::MigrationStage::Complete,
+                            detail,
+                            resource_type: None,
+                            resource_name: None,
+                            current: None,
+                            total: None,
+                        },
+                        true,
+                        true,
+                    );
+                    event.warnings = outcome.warnings;
+                    let _ = tx.send(Ok(event));
+                }
+                Err(error) => {
+                    let _ = tx.send(Ok(progress_to_event(
+                        &plan_id,
+                        MigrationProgress {
+                            stage: arcbox_migration::MigrationStage::Complete,
+                            detail: error.to_string(),
+                            resource_type: None,
+                            resource_name: None,
+                            current: None,
+                            total: None,
+                        },
+                        true,
+                        false,
+                    )));
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+}
+
+fn parse_source_kind(value: &str) -> Result<SourceKind> {
+    match value {
+        "docker-desktop" => Ok(SourceKind::DockerDesktop),
+        "orbstack" => Ok(SourceKind::OrbStack),
+        other => Err(CoreError::config(format!(
+            "unsupported migration source '{}'",
+            other
+        ))),
+    }
+}
+
+fn non_empty_path(value: &str) -> Option<PathBuf> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn progress_to_event(
+    plan_id: &str,
+    progress: MigrationProgress,
+    done: bool,
+    success: bool,
+) -> RunMigrationEvent {
+    RunMigrationEvent {
+        plan_id: plan_id.to_string(),
+        phase: progress.stage.as_str().to_string(),
+        resource: progress.resource_name.unwrap_or_default(),
+        message: progress.detail,
+        completed: progress.current.unwrap_or(0),
+        total: progress.total.unwrap_or(0),
+        done,
+        success,
+        // Only the terminal event carries warnings; the caller fills them in.
+        warnings: Vec::new(),
+        ..Default::default()
+    }
+}
+
+fn map_migration_error(error: MigrationError) -> CoreError {
+    match error {
+        MigrationError::MissingSource { .. }
+        | MigrationError::UnsupportedSource(_)
+        | MigrationError::UnsupportedResource(_)
+        | MigrationError::InvalidPlan(_) => CoreError::config(error.to_string()),
+        MigrationError::Blocked(_) => CoreError::invalid_state(error.to_string()),
+        MigrationError::Docker(_) => CoreError::Machine(error.to_string()),
+        MigrationError::Io(io_error) => io_error.into(),
+        MigrationError::SerdeJson(error) => CoreError::Machine(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcbox_migration::{MigrationPlan, ReplacementSummary, SourceInfo};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    /// Serializes the tests that repoint `PATH` at a `docker` stand-in.
+    ///
+    /// A tokio mutex so it can be held across the awaits it guards; `PATH` is
+    /// process-global, so releasing it earlier would let concurrent tests
+    /// observe each other's shim.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Installs an executable `docker` in `dir` and points `PATH` at it.
+    ///
+    /// Returns the previous `PATH` so the caller can restore it.
+    fn install_docker_shim(dir: &Path, script: &str) -> Option<std::ffi::OsString> {
+        let docker_path = dir.join("docker");
+        std::fs::write(&docker_path, script).unwrap();
+        let mut permissions = std::fs::metadata(&docker_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker_path, permissions).unwrap();
+
+        let previous = std::env::var_os("PATH");
+        // SAFETY: env mutation in tests is serialized by ENV_LOCK.
+        unsafe { std::env::set_var("PATH", dir) };
+        previous
+    }
+
+    fn restore_path(previous: Option<std::ffi::OsString>) {
+        // SAFETY: env mutation in tests is serialized by ENV_LOCK.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// A `docker` that reports a reachable but completely empty daemon.
+    ///
+    /// Every listing comes back empty, so `inspect_many` short-circuits and
+    /// planning only ever needs a real answer for `docker info`.
+    const EMPTY_DAEMON_SHIM: &str = r#"#!/bin/sh
+case "$*" in
+  *"info --format"*)
+    echo '{"Name":"orbstack","ServerVersion":"29.0","OperatingSystem":"OrbStack","Architecture":"aarch64"}'
+    ;;
+esac
+exit 0
+"#;
+
+    const FAILING_SHIM: &str = "#!/bin/sh\nexit 1\n";
+
+    /// Builds a prepare request against a source socket that exists.
+    fn prepare_request(socket: &Path, dry_run: bool) -> PrepareMigrationRequest {
+        PrepareMigrationRequest {
+            source_kind: "orbstack".to_string(),
+            source_socket_path: socket.to_string_lossy().into_owned(),
+            allow_replacements: true,
+            dry_run,
+            ..Default::default()
+        }
+    }
+
+    fn sample_plan() -> MigrationPlan {
+        MigrationPlan {
+            source: SourceInfo {
+                kind: SourceKind::DockerDesktop,
+                socket_path: PathBuf::from("/tmp/docker.sock"),
+                daemon_name: "docker-desktop".to_string(),
+                server_version: "29.0".to_string(),
+                operating_system: "Docker Desktop".to_string(),
+                architecture: "aarch64".to_string(),
+            },
+            helper_image: "arcbox-migration-helper:latest".to_string(),
+            images: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            containers: Vec::new(),
+            unsupported_resources: Vec::new(),
+            warnings: Vec::new(),
+            replacements: ReplacementSummary {
+                containers: vec!["conflict".to_string()],
+                ..Default::default()
+            },
+            blockers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_migration_keeps_plan_when_confirmation_is_missing() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        let plan_id = "test-plan".to_string();
+        manager.prepared.write().await.insert(
+            plan_id.clone(),
+            PreparedMigration {
+                source: SourceConfig {
+                    kind: SourceKind::DockerDesktop,
+                    socket_path: PathBuf::from("/tmp/docker.sock"),
+                },
+                plan: sample_plan(),
+            },
+        );
+
+        let error = manager
+            .run_migration(RunMigrationRequest {
+                plan_id: plan_id.clone(),
+                allow_replacements: false,
+                skip_start: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires confirmation"));
+        assert!(manager.prepared.read().await.contains_key(&plan_id));
+    }
+
+    #[tokio::test]
+    async fn run_migration_removes_plan_after_starting() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        let plan_id = "test-plan".to_string();
+        manager.prepared.write().await.insert(
+            plan_id.clone(),
+            PreparedMigration {
+                source: SourceConfig {
+                    kind: SourceKind::DockerDesktop,
+                    socket_path: PathBuf::from("/tmp/docker.sock"),
+                },
+                plan: MigrationPlan {
+                    replacements: ReplacementSummary::default(),
+                    ..sample_plan()
+                },
+            },
+        );
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
+
+        let _ = manager
+            .run_migration(RunMigrationRequest {
+                plan_id: plan_id.clone(),
+                allow_replacements: true,
+                skip_start: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        restore_path(previous_path);
+
+        assert!(!manager.prepared.read().await.contains_key(&plan_id));
+    }
+
+    #[tokio::test]
+    async fn unsupported_resources_fail_the_run_rather_than_the_prepare() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        let plan_id = "test-plan".to_string();
+        manager.prepared.write().await.insert(
+            plan_id.clone(),
+            PreparedMigration {
+                source: SourceConfig {
+                    kind: SourceKind::DockerDesktop,
+                    socket_path: PathBuf::from("/tmp/docker.sock"),
+                },
+                plan: MigrationPlan {
+                    replacements: ReplacementSummary::default(),
+                    unsupported_resources: vec!["container 'vpn-client' shares".to_string()],
+                    ..sample_plan()
+                },
+            },
+        );
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
+
+        let mut events = manager
+            .run_migration(RunMigrationRequest {
+                plan_id,
+                allow_replacements: true,
+                skip_start: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let event = events.recv().await.unwrap().unwrap();
+
+        restore_path(previous_path);
+
+        assert!(event.done);
+        assert!(!event.success);
+        assert!(event.message.contains("unsupported resources"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_the_plan_without_storing_it() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), EMPTY_DAEMON_SHIM);
+        let socket = temp_dir.path().join("docker.sock");
+        std::fs::write(&socket, "").unwrap();
+
+        let manager = MigrationManager::new(temp_dir.path().join("arcbox-docker.sock"));
+        let response = manager
+            .prepare_migration(prepare_request(&socket, true))
+            .await;
+
+        restore_path(previous_path);
+        let response = response.unwrap();
+
+        assert!(response.plan_id.is_empty(), "a dry run issues no plan id");
+        let plan = response.plan.expect("a dry run ships the plan");
+        assert!(
+            plan.source.is_set(),
+            "the plan's source is always projected"
+        );
+        assert!(
+            manager.prepared.read().await.is_empty(),
+            "a dry run must not accumulate plans in the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_prepare_stores_the_plan_and_issues_an_id() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), EMPTY_DAEMON_SHIM);
+        let socket = temp_dir.path().join("docker.sock");
+        std::fs::write(&socket, "").unwrap();
+
+        let manager = MigrationManager::new(temp_dir.path().join("arcbox-docker.sock"));
+        let response = manager
+            .prepare_migration(prepare_request(&socket, false))
+            .await;
+
+        restore_path(previous_path);
+        let response = response.unwrap();
+
+        assert!(!response.plan_id.is_empty());
+        assert_eq!(manager.prepared.read().await.len(), 1);
+        // The plan embeds container environments; it ships only when a caller
+        // explicitly asked to inspect it.
+        assert!(
+            response.plan.is_unset(),
+            "a runnable prepare must not ship the plan payload"
+        );
+    }
+}

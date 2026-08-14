@@ -126,16 +126,18 @@ impl PortForwarder {
 
     /// Stops all port forwarding.
     pub async fn stop(&mut self) {
-        if !self.running {
-            return;
-        }
-
         let mut active = self.active.write().await;
-        for (addr, forwarder) in active.drain() {
-            // Send shutdown signal (ignore if receiver dropped).
-            let _ = forwarder.shutdown_tx.send(()).await;
-            // Abort the task if it doesn't shutdown gracefully.
+        let addresses: Vec<_> = active.keys().cloned().collect();
+        for addr in addresses {
+            let Some(forwarder) = active.get_mut(&addr) else {
+                continue;
+            };
+            let _ = forwarder.shutdown_tx.try_send(());
             forwarder.handle.abort();
+            // Keep the authoritative entry until the task has actually
+            // dropped its bound socket. Cancellation leaves it retryable.
+            let _ = (&mut forwarder.handle).await;
+            active.remove(&addr);
             tracing::debug!("Stopped forwarder for {}", addr);
         }
 
@@ -147,16 +149,15 @@ impl PortForwarder {
     async fn start_forwarder(&self, rule: PortForwardRule) -> Result<()> {
         let key = rule.host_addr.to_string();
 
-        // Check if already active.
-        {
-            let active = self.active.read().await;
-            if active.contains_key(&key) {
-                return Ok(());
-            }
+        // Hold the authority lock through bind. Cancellation before bind
+        // completion drops the local socket; after spawn there is no await
+        // before the handle is recorded.
+        let mut active_guard = self.active.write().await;
+        if active_guard.contains_key(&key) {
+            return Ok(());
         }
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let active = Arc::clone(&self.active);
 
         let handle = match rule.protocol {
             Protocol::Tcp => {
@@ -193,8 +194,6 @@ impl PortForwarder {
             }
         };
 
-        // Store active forwarder.
-        let mut active_guard = active.write().await;
         active_guard.insert(
             key,
             ActiveForwarder {
@@ -225,9 +224,11 @@ impl PortForwarder {
 
         // Stop the forwarder.
         let mut active = self.active.write().await;
-        if let Some(forwarder) = active.remove(&key) {
-            let _ = forwarder.shutdown_tx.send(()).await;
+        if let Some(forwarder) = active.get_mut(&key) {
+            let _ = forwarder.shutdown_tx.try_send(());
             forwarder.handle.abort();
+            let _ = (&mut forwarder.handle).await;
+            active.remove(&key);
         }
 
         // Remove the rule.
@@ -428,5 +429,39 @@ mod tests {
         let forwarder = PortForwarder::new();
         assert!(!forwarder.is_running());
         assert_eq!(forwarder.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_drains_listeners_after_partial_start_failure() {
+        let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let mut forwarder = PortForwarder::new();
+        let guest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80));
+        forwarder.add_rule(PortForwardRule::tcp(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            guest,
+        ));
+        forwarder.add_rule(PortForwardRule::tcp(occupied_addr, guest));
+
+        assert!(forwarder.start().await.is_err());
+        assert!(!forwarder.is_running());
+        assert_eq!(forwarder.active_count().await, 1);
+        forwarder.stop().await;
+        assert_eq!(forwarder.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_waits_until_the_bound_socket_is_reusable() {
+        let reservation = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let host = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let mut forwarder = PortForwarder::new();
+        let guest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80));
+        forwarder.add_rule(PortForwardRule::tcp(host, guest));
+        forwarder.start().await.unwrap();
+        forwarder.stop().await;
+
+        std::net::TcpListener::bind(host).expect("stop must release the socket before returning");
     }
 }

@@ -3,7 +3,7 @@ use crate::config::ContainerRuntimeConfig;
 use crate::error::{CoreError, Result};
 use crate::machine::MachineManager;
 use crate::vm_lifecycle::VmLifecycleManager;
-use arcbox_protocol::agent::readiness_event::Kind;
+use arcbox_connect::v1::readiness_event::Kind;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ impl GuestDockerBackend {
             .watch_readiness(true, timeout, &crate::trace::current_trace_id())
             .await
         {
-            Ok(event) if Kind::try_from(event.kind) == Ok(Kind::RuntimeReady) => {
+            Ok(event) if event.kind == Kind::RuntimeReady => {
                 validate_reported_vsock_endpoint(&event.endpoint, port)?;
                 tracing::debug!(port, "guest docker runtime is ready");
                 Ok(())

@@ -344,6 +344,7 @@ impl Vmm {
             hv_console_worker: None,
             #[cfg(target_os = "macos")]
             hv_net_fd: None,
+            #[cfg(target_os = "macos")]
             hv_bridge_net_fd: None,
             #[cfg(target_os = "macos")]
             hv_blk_devices: Vec::new(),
@@ -643,6 +644,22 @@ impl Vmm {
     #[must_use]
     pub const fn has_balloon(&self) -> bool {
         self.config.balloon
+    }
+
+    /// Sets the balloon's target memory size.
+    ///
+    /// Only the macOS backends carry a balloon device today (the real
+    /// implementation lives in `darwin.rs`); elsewhere this reports the
+    /// gap rather than pretending the target was applied. Callers drive
+    /// it through the lifecycle balloon controller, whose
+    /// `reclaim_capable` gate keeps it unreached in practice.
+    ///
+    /// # Errors
+    ///
+    /// Always, on platforms with no balloon backend.
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_balloon_target(&self, _target_bytes: u64) -> Result<()> {
+        Err(VmmError::Unsupported("balloon target control".to_string()))
     }
 
     /// Returns a snapshot of DAX counters for the given VirtioFS share
