@@ -59,6 +59,12 @@ This cuts both ways: `virtio_debug` and `hv_reboot` pin **hv**, so
 `--backend vz` on them is exactly as wrong as `--backend hv` on a vz-pinned
 target. `--backend both` conflicts with any pin.
 
+Only an **explicit** `--backend` can conflict. The flag carries no clap
+default, because a default is indistinguishable from a typed value and would
+make `cargo xtask e2e --test virtio_debug` bail on a backend nobody asked
+for; unset adopts the target's own pin, and falls back to vz for targets that
+pin nothing.
+
 `pinned_backend` (`commands/e2e.rs`) derives this from the sources rather
 than from a list, deliberately: the set changes whenever someone adds a
 target, and a list goes stale exactly when a new target needs the guard
