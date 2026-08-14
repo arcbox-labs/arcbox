@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.8](https://github.com/arcboxlabs/arcbox/compare/v0.6.7...v0.6.8) (2026-08-14)
+
+
+### Performance Improvements
+
+* **packet:** wire SIMD Internet checksum for long payloads ([#492](https://github.com/arcboxlabs/arcbox/issues/492)) ([19172b2](https://github.com/arcboxlabs/arcbox/commit/19172b2974f32f85bd3dfb1cb69cad199842c2ad))
+
+
+### Tests
+
+* **e2e:** docker build e2e suite — real-world matrix, scenarios D1–D5 + D9–D10 ([#495](https://github.com/arcboxlabs/arcbox/issues/495)) ([369ee2b](https://github.com/arcboxlabs/arcbox/commit/369ee2bc2d138cc4fb6e398d4db882bf71ad530e))
+* **e2e:** Machine networking — first exercise of the network plane ([#467](https://github.com/arcboxlabs/arcbox/issues/467)) ([6aa437d](https://github.com/arcboxlabs/arcbox/commit/6aa437d8a1945cb9c5d800c620260aa28481c6b4))
+
+
+### Continuous Integration
+
+* **tools:** keep the toolchain bump to one pull request ([#632](https://github.com/arcboxlabs/arcbox/issues/632)) ([b6ffcec](https://github.com/arcboxlabs/arcbox/commit/b6ffcec09ccf31987d4d7c40e8597bd2aedaadb3))
+
+
+### Miscellaneous Chores
+
+* **master:** release sdk-typescript 0.1.3 ([#615](https://github.com/arcboxlabs/arcbox/issues/615)) ([3e64ec4](https://github.com/arcboxlabs/arcbox/commit/3e64ec4fa89218be7d6513166eef1283ef6f6fc8))
+* **tools:** bump buildx to 0.36.1 and compose to 5.4.0 ([#635](https://github.com/arcboxlabs/arcbox/issues/635)) ([89f3207](https://github.com/arcboxlabs/arcbox/commit/89f32079dcc7fb66c5dde44f03aa85354ad6a688))
+
 ## [0.6.7](https://github.com/arcboxlabs/arcbox/compare/v0.6.6...v0.6.7) (2026-08-14)
 
 
