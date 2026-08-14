@@ -330,7 +330,18 @@ async fn reconcile_with_snapshot(
                 if routes.network != ContainerNetwork::default() {
                     // Close the useful part of the check/add race. Route changes
                     // after this point are caught by the daemon route watcher.
-                    inspect_routes(bridge_name, routes).await?;
+                    if let Err(error) = inspect_routes(bridge_name, routes).await {
+                        let cleanup = client
+                            .route_remove_if_owned(&routes.preferred.to_string(), bridge_name)
+                            .await;
+                        if let Err(cleanup) = cleanup {
+                            return Err(RouteError::RouteFailed(format!(
+                                "{error}; failed to roll back added route {}: {cleanup}",
+                                routes.preferred
+                            )));
+                        }
+                        return Err(error);
+                    }
                 }
                 return Ok(RouteMode::Preferred);
             }
@@ -499,11 +510,11 @@ pub fn system_vm_route_hook(
     machine_manager: &std::sync::Arc<crate::machine::MachineManager>,
     event_bus: &crate::event::EventBus,
     machine_name: &str,
+    network: ContainerNetwork,
 ) -> crate::vm_lifecycle::RouteHook {
     let mm = std::sync::Arc::clone(machine_manager);
     let bus = event_bus.clone();
     let machine_name = machine_name.to_string();
-    let network = ContainerNetwork::default();
     crate::vm_lifecycle::RouteHook::new(std::sync::Arc::new(move || {
         #[cfg(feature = "vmnet")]
         {

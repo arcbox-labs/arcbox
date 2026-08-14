@@ -43,7 +43,8 @@ abctl docker disable            # Reset to default context
 
 # Native Kubernetes integration
 abctl k8s start                  # Start the ArcBox Kubernetes cluster
-abctl k8s enable                 # Install kubectl + activate ArcBox kube context
+abctl k8s enable                 # Install kubectl + add the ArcBox kube context
+# Development contexts are not activated globally; select one with kubectl config use-context.
 kubectl get nodes
 
 # Run containers through Docker CLI

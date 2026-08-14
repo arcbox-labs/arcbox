@@ -235,6 +235,7 @@ impl Runtime {
                 &machine_manager,
                 &event_bus,
                 crate::vm_lifecycle::DEFAULT_MACHINE_NAME,
+                config.container.cidr,
             ));
         }
 

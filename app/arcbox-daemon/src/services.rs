@@ -307,26 +307,35 @@ async fn container_route_guard(
     let mut ticker = tokio::time::interval(ROUTE_POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut watcher = open_route_watcher();
+    // Custom routes stay daemon-owned for lease cleanup, so VM arrival edges
+    // trigger the same retrying route setup instead of a detached core hook.
+    let mut vm_state = runtime.subscribe_system_vm_state();
     let mut active: Option<(String, RouteMode)> = None;
     let mut consecutive_failures = 0u32;
 
     loop {
-        let route_event = tokio::select! {
+        let (route_event, vm_became_ready) = tokio::select! {
             () = shutdown.cancelled() => break,
-            _ = ticker.tick() => false,
+            _ = ticker.tick() => (false, false),
+            changed = vm_state.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                (false, vm_state.borrow().is_ready())
+            }
             event = next_managed_route_event(watcher.as_ref(), container_network) => {
                 match event {
-                    Ok(()) => true,
+                    Ok(()) => (true, false),
                     Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {
                         tracing::debug!(
                             "route event queue overflowed; reconciling current state"
                         );
-                        true
+                        (true, false)
                     }
                     Err(error) => {
                         tracing::warn!(%error, "route event watcher failed; polling remains active");
                         watcher = None;
-                        false
+                        (false, false)
                     }
                 }
             }
@@ -342,6 +351,14 @@ async fn container_route_guard(
             }
         } else if watcher.is_none() {
             watcher = open_route_watcher();
+        }
+
+        if vm_became_ready
+            && let Err(error) =
+                ensure_isolated_container_route(&runtime, &setup_state, &container_network_lease)
+                    .await
+        {
+            tracing::debug!(%error, "container route was not ready on the VM arrival edge");
         }
 
         let runtime_for_bridge = Arc::clone(&runtime);
@@ -411,7 +428,7 @@ async fn container_route_guard(
                     );
                 }
             }
-            Err(error) if is_route_ownership_conflict(&error) => {
+            Err(error) if is_route_ownership_conflict(&error, container_network) => {
                 if let Some(lease) = container_network_lease.get()
                     && let Err(cleanup_error) = lease.cleanup_route().await
                 {
@@ -441,12 +458,16 @@ async fn container_route_guard(
 }
 
 #[cfg(target_os = "macos")]
-fn is_route_ownership_conflict(error: &arcbox_core::route_reconciler::RouteError) -> bool {
-    matches!(
-        error,
-        arcbox_core::route_reconciler::RouteError::RouteConflict { .. }
-            | arcbox_core::route_reconciler::RouteError::RouteOverlap { .. }
-    )
+fn is_route_ownership_conflict(
+    error: &arcbox_core::route_reconciler::RouteError,
+    network: ContainerNetwork,
+) -> bool {
+    network != ContainerNetwork::default()
+        && matches!(
+            error,
+            arcbox_core::route_reconciler::RouteError::RouteConflict { .. }
+                | arcbox_core::route_reconciler::RouteError::RouteOverlap { .. }
+        )
 }
 
 #[cfg(target_os = "macos")]
@@ -695,17 +716,28 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn every_route_ownership_conflict_is_fatal() {
+    fn only_isolated_route_ownership_conflicts_are_fatal() {
         use arcbox_core::route_reconciler::RouteError;
 
-        assert!(is_route_ownership_conflict(&RouteError::RouteConflict {
-            subnet: "10.64.32.0/20".into(),
-        }));
-        assert!(is_route_ownership_conflict(&RouteError::RouteOverlap {
-            network: "10.64.32.0/20".parse().unwrap(),
+        let isolated: ContainerNetwork = "10.64.32.0/20".parse().unwrap();
+        let conflict = RouteError::RouteConflict {
+            subnet: isolated.to_string(),
+        };
+        let overlap = RouteError::RouteOverlap {
+            network: isolated,
             route: "10.64.0.0/16".parse().unwrap(),
-        }));
-        assert!(!is_route_ownership_conflict(&RouteError::BridgeNotReady));
+        };
+
+        assert!(is_route_ownership_conflict(&conflict, isolated));
+        assert!(is_route_ownership_conflict(&overlap, isolated));
+        assert!(!is_route_ownership_conflict(
+            &conflict,
+            ContainerNetwork::default()
+        ));
+        assert!(!is_route_ownership_conflict(
+            &RouteError::BridgeNotReady,
+            isolated
+        ));
     }
 
     /// Polls until `route_installed` matches `want` or times out.
