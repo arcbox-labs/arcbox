@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - master
+  # A release PR that goes stale has no other way back. release-please only
+  # rewrites a component's PR when that component gets new commits, so one
+  # release PR merging can leave a sibling conflicted on
+  # `.release-please-manifest.json` with nothing to un-stick it — the fix is
+  # to close the stale PR and have release-please rebuild it, which without
+  # this needs an unrelated push to master to happen first. `release.yml`
+  # carries the same escape hatch for the same reason.
+  workflow_dispatch:
 
 jobs:
   release-please:
