@@ -21,9 +21,9 @@ manifest_sha256 = "fc32a0b6d1c1051a0eeea81d714f38cdfc108000f883a8d6c261cce993c2a
 [[tools]]
 name = "docker"
 group = "docker"
-version = "29.6.2"
-arch.arm64.sha256 = "86f86ad4b2119ec55aa50224f15ceb4c94a198f8ae153bb32318d7da589749da"
-arch.x86_64.sha256 = "9a72a1c1a331885aadf7948e3da8e3c5c88c5e813474bb82dce7cc72450487bf"
+version = "29.7.2"
+arch.arm64.sha256 = "b8683ed19d1f06048a496f9b8429e2c71d0b088d475b7487c054ea3666c02a3c"
+arch.x86_64.sha256 = "fb1f1aa7ac7af4364165b9eadfda92e96c8ced508fca74f53079719891367438"
 
 [[tools]]
 name = "docker-buildx"
