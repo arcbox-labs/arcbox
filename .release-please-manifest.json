@@ -1,6 +1,6 @@
 {
   ".": "0.6.7",
   "fleet": "0.1.3",
-  "sdk/typescript": "0.1.2",
+  "sdk/typescript": "0.1.3",
   "sdk/python": "0.1.2"
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/arcboxlabs/arcbox/compare/sdk-typescript-v0.1.2...sdk-typescript-v0.1.3) (2026-08-14)
+
+
+### Documentation
+
+* **rpc:** the template catalog is served, not contract-only ([#617](https://github.com/arcboxlabs/arcbox/issues/617)) ([e4c55e1](https://github.com/arcboxlabs/arcbox/commit/e4c55e1418ff806d623bbbe036a37a077187d81d))
+
 ## [0.1.2](https://github.com/arcboxlabs/arcbox/compare/sdk-typescript-v0.1.1...sdk-typescript-v0.1.2) (2026-08-11)
 
 
