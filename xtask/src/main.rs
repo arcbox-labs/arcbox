@@ -29,8 +29,12 @@ enum Command {
 #[derive(Args)]
 struct E2eArgs {
     /// System VM backend(s) for the daemon under test.
-    #[arg(long, value_enum, default_value = "vz")]
-    backend: E2eBackend,
+    ///
+    /// Unset is not the same as `--backend vz`: a target that pins its own
+    /// backend adopts that pin, and only an explicit request can conflict
+    /// with one. Defaults to vz for targets that pin nothing.
+    #[arg(long, value_enum)]
+    backend: Option<E2eBackend>,
     /// Repetitions per backend.
     #[arg(long, default_value_t = 1)]
     repeat: u32,

@@ -34,6 +34,9 @@ Current recipe ↔ self-build mapping (keep both columns identical):
 | `hv_vmm`         | `cargo build --release -p arcbox-e2e --bin hv_e2e`| `hv_vmm.rs` (same)                           |
 | `stats_watch`    | release daemon + musl `arcbox-agent`              | `stats_watch.rs` (same)                      |
 | `sandbox`        | release cli+daemon + musl `arcbox-agent`/`arcbox-vm` bins | `sandbox.rs::build_binaries` (same)   |
+| `egress_throughput` | `cargo build --release -p arcbox-daemon`       | `scenario.rs::run_vz_scenario_with_log` (same) |
+| `docker_build`   | same as above                                     | `scenario.rs::run_vz_scenario_with_log` (same) |
+| `docker_build_external` | same as above                              | `scenario.rs::run_vz_scenario_with_log` (same) |
 | `virtio_debug`   | none (self-builds)                                | `cargo build --release -p arcbox-daemon` (RELEASE only) |
 | `daemon_failure` | none (self-builds)                                | `cargo build -p arcbox-daemon` (**DEBUG**)   |
 | anything else    | none — fallback notice, no `SKIP_BUILD`           | its own build                                |
@@ -42,6 +45,37 @@ Note `virtio_debug` and `daemon_failure` deliberately have NO recipe and
 their profiles differ (release vs debug daemon). If you ever add a recipe
 for either, it must reproduce that exact profile.
 
+## `xtask e2e` — `--backend` cannot move a pinned target
+
+Most e2e targets hardcode `ARCBOX_VM_BACKEND` and stamp that backend into
+their metrics, so the runner's `--backend` env has no effect on them. Only a
+few (`boot_assets`, `backend_matrix`) actually read it. The runner therefore
+**errors** when the requested backend conflicts with a pinned one. WHY: the
+alternative is a run archived under the wrong backend's label — the same
+ghost-debugging class as a mismatched `SKIP_BUILD` recipe, and it silently
+corrupts any HV↔VZ oracle comparison read from the artifacts.
+
+This cuts both ways: `virtio_debug` and `hv_reboot` pin **hv**, so
+`--backend vz` on them is exactly as wrong as `--backend hv` on a vz-pinned
+target. `--backend both` conflicts with any pin.
+
+Only an **explicit** `--backend` can conflict. The flag carries no clap
+default, because a default is indistinguishable from a typed value and would
+make `cargo xtask e2e --test virtio_debug` bail on a backend nobody asked
+for; unset adopts the target's own pin, and falls back to vz for targets that
+pin nothing.
+
+`pinned_backend` (`commands/e2e.rs`) derives this from the sources rather
+than from a list, deliberately: the set changes whenever someone adds a
+target, and a list goes stale exactly when a new target needs the guard
+most. It scans the target's own source for a line carrying both
+`ARCBOX_VM_BACKEND` and a `"vz"`/`"hv"` literal, then the `arcbox_e2e`
+modules it imports — one level of indirection, which is where
+`scenario::run_vz_scenario*` and the `sandbox` harness keep their pin. A
+line that merely reads the variable carries no literal and is correctly
+ignored. Nothing to keep in lockstep; the unit tests in that file pin the
+shapes.
+
 ### Extending — adding a new e2e target (lockstep set)
 1. The test must gate its build on `arcbox_e2e::env_flag("SKIP_BUILD")`,
    or `xtask e2e` cannot prebuild it and it rebuilds every repeat.
@@ -49,6 +83,11 @@ for either, it must reproduce that exact profile.
    or accept the self-build fallback — never a half-match.
 3. If you add a recipe, verify the packages AND profile match the test's
    own `cargo build` line character-for-character.
+4. Nothing to do for the backend pin — `pinned_backend` reads it off the
+   sources, so a new target gets the `--backend` guard for free as long as
+   it pins the way every existing one does (an `ARCBOX_VM_BACKEND` line with
+   a `"vz"`/`"hv"` literal, in the target or in an `arcbox_e2e` module it
+   imports).
 
 ## `xtask e2e` — forensics linkage (fragile string/env coupling)
 
