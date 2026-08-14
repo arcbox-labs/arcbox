@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7](https://github.com/arcboxlabs/arcbox/compare/v0.6.6...v0.6.7) (2026-08-14)
+
+
+### Features
+
+* **runtime:** isolate development instances ([#613](https://github.com/arcboxlabs/arcbox/issues/613)) ([9d1856e](https://github.com/arcboxlabs/arcbox/commit/9d1856e7e1564ffcdca186da86761ca2c6e57ff3))
+
+
+### Bug Fixes
+
+* **ci:** unbreak the crates.io publish, and make the Rust SDK publishable ([#627](https://github.com/arcboxlabs/arcbox/issues/627)) ([1911fd7](https://github.com/arcboxlabs/arcbox/commit/1911fd769fd23615461cd14d4aee3de9262cad91))
+* **vmm:** repair the Linux arm, and gate engine/computer on it (restructure phase 5 debt) ([#625](https://github.com/arcboxlabs/arcbox/issues/625)) ([c49da74](https://github.com/arcboxlabs/arcbox/commit/c49da74e4e4b097f810ef80f4da4767be8b92c6f))
+
+
+### Code Refactoring
+
+* **computer:** close the P3 capability deviation, and clear arcbox-vm's dead weight (restructure phase 4a) ([#626](https://github.com/arcboxlabs/arcbox/issues/626)) ([939a4f5](https://github.com/arcboxlabs/arcbox/commit/939a4f52f4cccde4cc70bff216798a84af0b13cc))
+* **engine:** extract arcbox-snapshot, and give the durable-write primitive a crate (restructure phase 4a) ([#630](https://github.com/arcboxlabs/arcbox/issues/630)) ([1bc215f](https://github.com/arcboxlabs/arcbox/commit/1bc215fcf60b506ec1fa52852cd1991e620b3bd0))
+
+
+### Tests
+
+* **splicetcp:** size the partial-take tests against the granted socket buffer ([#629](https://github.com/arcboxlabs/arcbox/issues/629)) ([2daf9f9](https://github.com/arcboxlabs/arcbox/commit/2daf9f9758138946492eba150fc4bcb93814d72c))
+
 ## [0.6.6](https://github.com/arcboxlabs/arcbox/compare/v0.6.5...v0.6.6) (2026-08-13)
 
 
