@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fleet-agent"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "arcbox-connect",
