@@ -151,10 +151,15 @@ pub(super) enum EntryDecision {
 /// Computes the idle balloon target for the observed guest usage:
 /// used memory plus [`IDLE_BALLOON_HEADROOM`], clamped to
 /// [`IDLE_BALLOON_FLOOR`] and the full configured size.
+///
+/// The floor is itself capped at `full`: a machine configured below
+/// [`IDLE_BALLOON_FLOOR`] would otherwise make this `clamp(min > max)`,
+/// which panics — inside the lifecycle actor, so it takes the daemon down
+/// on that machine's first idle transition.
 pub(super) fn idle_target(stats: GuestStats, full: u64) -> u64 {
     let used = stats.total.saturating_sub(stats.available);
     used.saturating_add(IDLE_BALLOON_HEADROOM)
-        .clamp(IDLE_BALLOON_FLOOR, full)
+        .clamp(IDLE_BALLOON_FLOOR.min(full), full)
 }
 
 /// Decides the balloon move when the VM enters idle.
@@ -216,6 +221,14 @@ mod tests {
         // Guest uses almost everything: no shrink beyond full.
         let t = idle_target(stats(FULL, 128 * MIB), FULL);
         assert_eq!(t, FULL);
+    }
+
+    /// A machine smaller than the floor must not turn the clamp into
+    /// `clamp(min > max)` — that panic lands in the lifecycle actor.
+    #[test]
+    fn idle_target_on_a_machine_below_the_floor_does_not_panic() {
+        let tiny = 128 * MIB;
+        assert_eq!(idle_target(stats(tiny, tiny), tiny), tiny);
     }
 
     #[test]
