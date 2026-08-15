@@ -16,32 +16,36 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arcbox_virtio::{GuestMemWriter, QueueConfig, SplitQueue};
+use arcbox_virtio_core::{GuestMemWriter, QueueConfig, SplitQueue};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
+use crate::coalesce::{BATCH_SIZE, CoalescePolicy};
 use crate::inline_conn::{self, InlineConn};
 use crate::irq::IrqHandle;
 use crate::queue;
-
-/// Maximum frames to inject per batch before checking interrupt thresholds.
-///
-/// At line-rate (~9 Gbps, 500k fps), a batch of 64 frames means the inject
-/// thread fires IRQ ~8000 times/second. Each IRQ entails an MMIO trap and
-/// guest-side RX soft-irq processing. Raising to 256 cuts IRQ rate to
-/// ~2000/s while the 50 µs `COALESCE_TIMEOUT` still bounds latency.
-const BATCH_SIZE: usize = 256;
-
-/// Interrupt coalescing timeout.
-///
-/// With GSO on the RX path the average frame size is ~30 KiB, so at
-/// 10 Gbps we're at ~37 kfps — a 50 µs timeout only batches ~2 frames
-/// before firing an IRQ, so the `BATCH_SIZE` ceiling is never reached.
-/// 200 µs raises the effective batch to ~7 frames without noticeably
-/// hurting ACK latency (Linux NAPI poll is typically 200 µs anyway).
-const COALESCE_TIMEOUT: Duration = Duration::from_micros(200);
+use crate::stats::InjectStats;
 
 /// Backoff duration when RX descriptors are exhausted.
 const DESCRIPTOR_BACKOFF: Duration = Duration::from_micros(100);
+
+/// Arguments for [`RxInjectThread::finish_batch`].
+struct FinishBatch<'a> {
+    queue: &'a SplitQueue,
+    /// Used entries published this gather. This is the descriptor budget
+    /// (`BATCH_SIZE`, `inline_cap`) and what the guest sees in the used ring.
+    batch: u16,
+    /// Frames delivered this gather. Diverges from `batch` on the inline
+    /// path, where one `readv` publishes up to `MAX_MERGE` used entries for a
+    /// single GSO frame — so this, not `batch`, is what a *rate* is computed
+    /// from.
+    packets: u16,
+    fire: bool,
+    window_budget_us: u32,
+    filled_early: bool,
+    allow_adapt: bool,
+    policy: &'a mut CoalescePolicy,
+    stats: &'a mut InjectStats,
+}
 
 /// Context for the RX injection thread.
 pub struct RxInjectThread {
@@ -94,6 +98,11 @@ impl RxInjectThread {
         let mut inline_conns: Vec<InlineConn> = Vec::new();
         // Whether any push since the last flush requested an interrupt.
         let mut fire = false;
+        let mut policy = CoalescePolicy::new();
+        let mut stats = InjectStats::default();
+        // After descriptor exhaustion, skip adapt on the next empty gather so
+        // a storm does not immediately shrink the window (more IRQs).
+        let mut skip_idle_adapt = false;
 
         loop {
             if !self.running.load(Ordering::Relaxed) {
@@ -113,25 +122,33 @@ impl RxInjectThread {
             }
 
             let mut batch = 0u16;
+
+            let mut packets = 0u16;
             let loop_start = Instant::now();
+            let window_budget_us = policy.window_us();
+            let window = Duration::from_micros(u64::from(window_budget_us));
 
             // Phase 2: Poll inline connections (direct socket -> guest buffer).
             if !inline_conns.is_empty() {
-                self.poll_inline_conns(&mut queue, &mut inline_conns, &mut batch, &mut fire);
+                self.poll_inline_conns(
+                    &mut queue,
+                    &mut inline_conns,
+                    &mut batch,
+                    &mut packets,
+                    &mut fire,
+                );
             }
 
             // Phase 3: Drain channel frames (classifier / DHCP / DNS / ARP).
-            // Use the remaining coalescing timeout after inline polling.
-            let elapsed = loop_start.elapsed();
-            let remaining = COALESCE_TIMEOUT.saturating_sub(elapsed);
-
+            // Recompute remaining each iteration so the window is a real deadline.
             while (batch as usize) < BATCH_SIZE {
+                let remaining = window.saturating_sub(loop_start.elapsed());
                 // Use the remaining timeout for the first recv, then zero
                 // for subsequent ones to drain without blocking.
                 let timeout = if batch == 0 && inline_conns.is_empty() {
                     // No inline conns and nothing batched yet — block for
-                    // the full coalescing timeout.
-                    COALESCE_TIMEOUT
+                    // the full coalescing window (or what's left of it).
+                    remaining
                 } else if remaining.is_zero() {
                     // Timeout already consumed by inline polling — try_recv only.
                     Duration::ZERO
@@ -144,9 +161,26 @@ impl RxInjectThread {
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => {
                         tracing::info!("rx-inject: channel disconnected, shutting down");
-                        if batch > 0 {
-                            self.flush_interrupt(&queue, fire);
-                        }
+                        let filled_early = (batch as usize) >= BATCH_SIZE;
+                        self.finish_batch(FinishBatch {
+                            queue: &queue,
+                            batch,
+                            packets,
+                            fire,
+                            window_budget_us,
+                            filled_early,
+                            allow_adapt: true,
+                            policy: &mut policy,
+                            stats: &mut stats,
+                        });
+                        tracing::info!(
+                            frames = stats.frames_injected(),
+                            flushes = stats.flushes(),
+                            irqs_fired = stats.irqs_fired(),
+                            window_us_max = stats.window_us_max(),
+                            "rx-inject thread stopped (channel disconnected, {} inline conns)",
+                            inline_conns.len(),
+                        );
                         return;
                     }
                 };
@@ -154,13 +188,27 @@ impl RxInjectThread {
                 if let Some(notify) = queue::inject_one_frame(&mut queue, &frame) {
                     fire |= notify;
                     batch += 1;
+                    packets += 1;
                 } else {
-                    // Descriptor exhaustion: flush interrupt so guest can
-                    // process and repost, then backoff.
+                    // Descriptor exhaustion: flush so guest can repost, then
+                    // backoff. Do not adapt the window (storms neither expand
+                    // nor shrink latency budget).
                     if batch > 0 {
-                        self.flush_interrupt(&queue, fire);
+                        self.finish_batch(FinishBatch {
+                            queue: &queue,
+                            batch,
+                            packets,
+                            fire,
+                            window_budget_us,
+                            filled_early: false,
+                            allow_adapt: false,
+                            policy: &mut policy,
+                            stats: &mut stats,
+                        });
                         fire = false;
                         batch = 0;
+                        packets = 0;
+                        skip_idle_adapt = true;
                     }
                     std::thread::sleep(DESCRIPTOR_BACKOFF);
 
@@ -168,26 +216,70 @@ impl RxInjectThread {
                     if let Some(notify) = queue::inject_one_frame(&mut queue, &frame) {
                         fire |= notify;
                         batch += 1;
+                        packets += 1;
                     }
                     // If still fails, frame is lost (TCP retransmit recovers).
                 }
             }
 
-            if batch > 0 {
-                self.flush_interrupt(&queue, fire);
-                fire = false;
-            }
+            // Normal end of gather: timeout or BATCH full. Empty idle still
+            // observes so the window can decay after load — except right after
+            // descriptor exhaustion (skip_idle_adapt).
+            let filled_early = (batch as usize) >= BATCH_SIZE;
+            let allow_adapt = if batch == 0 && skip_idle_adapt {
+                skip_idle_adapt = false;
+                false
+            } else {
+                if batch > 0 {
+                    skip_idle_adapt = false;
+                }
+                true
+            };
+            self.finish_batch(FinishBatch {
+                queue: &queue,
+                batch,
+                packets,
+                fire,
+                window_budget_us,
+                filled_early,
+                allow_adapt,
+                policy: &mut policy,
+                stats: &mut stats,
+            });
+            fire = false;
         }
 
-        // Final flush on shutdown.
-        if fire {
-            self.flush_interrupt(&queue, fire);
-        }
+        // Every loop iteration ends in finish_batch (which flushes when
+        // batch > 0), so no trailing flush is needed on exit.
 
         tracing::info!(
+            frames = stats.frames_injected(),
+            flushes = stats.flushes(),
+            irqs_fired = stats.irqs_fired(),
+            window_us_max = stats.window_us_max(),
             "rx-inject thread stopped ({} inline conns remaining)",
             inline_conns.len(),
         );
+    }
+
+    /// Flush (if any work), update coalesce policy, and emit interval stats.
+    ///
+    /// Used for normal timeout/BATCH completion, descriptor exhaustion,
+    /// channel disconnect, and empty idle ticks (`batch == 0`).
+    fn finish_batch(&self, f: FinishBatch<'_>) {
+        if f.batch > 0 {
+            self.flush_interrupt(f.queue, f.fire);
+            f.stats
+                .on_flush(f.batch, f.packets, f.fire, f.window_budget_us);
+        }
+        // Always observe (incl. batch == 0 idle) so the window can decay.
+        // Rate comes from `packets`, not `batch`: an inline GSO frame spans up
+        // to MAX_MERGE used entries, and feeding those to the classifier reads
+        // one packet as a multi-flow burst.
+        f.policy
+            .observe(f.packets, f.window_budget_us, f.filled_early, f.allow_adapt);
+        f.stats.sync_from_policy(f.policy, f.window_budget_us);
+        f.stats.maybe_log();
     }
 
     /// Polls all active inline connections, reading from host sockets
@@ -209,6 +301,7 @@ impl RxInjectThread {
         queue: &mut SplitQueue,
         inline_conns: &mut Vec<InlineConn>,
         batch: &mut u16,
+        packets: &mut u16,
         fire: &mut bool,
     ) {
         if queue.size() == 0 {
@@ -416,6 +509,7 @@ impl RxInjectThread {
                         *fire |=
                             queue.push_used(head_indices[0], inline_conn::TOTAL_HDR_LEN as u32);
                         *batch += 1;
+                        *packets += 1;
                         break;
                     }
                     Ok(n) => {
@@ -495,6 +589,8 @@ impl RxInjectThread {
                         *fire |= queue.push_used_batch(&completions[..num_used]);
 
                         *batch += num_used as u16;
+                        // One frame, however many buffers it spanned.
+                        *packets += 1;
                         per_conn += 1;
                         // Continue — try another readv on this conn.
                     }
@@ -532,6 +628,7 @@ impl RxInjectThread {
                         *fire |=
                             queue.push_used(head_indices[0], inline_conn::TOTAL_HDR_LEN as u32);
                         *batch += 1;
+                        *packets += 1;
                         break;
                     }
                 }
@@ -743,8 +840,14 @@ mod tests {
         wait_buffered(&reader, payload.len());
 
         let mut conns = vec![inline_conn(reader)];
-        let (mut batch, mut fire) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch, &mut fire);
+        let (mut batch, mut packets_batch, mut fire) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch,
+            &mut packets_batch,
+            &mut fire,
+        );
 
         // 500 bytes over caps [34, 200, 300] -> per-desc [34, 200, 266].
         assert_eq!(batch, 3);
@@ -787,8 +890,14 @@ mod tests {
         }
 
         // Nothing more buffered: a second poll consumes nothing.
-        let (mut batch2, mut fire2) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        let (mut batch2, mut packets_batch2, mut fire2) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch2,
+            &mut packets_batch2,
+            &mut fire2,
+        );
         assert_eq!(batch2, 0);
         assert!(!fire2);
         assert_eq!(ram.used_idx(), 3);
@@ -823,8 +932,14 @@ mod tests {
         }
 
         let mut conns = vec![inline_conn(reader)];
-        let (mut batch, mut fire) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch, &mut fire);
+        let (mut batch, mut packets_batch, mut fire) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch,
+            &mut packets_batch,
+            &mut fire,
+        );
 
         assert!(conns[0].host_eof);
         assert_eq!(batch, 1);
@@ -852,8 +967,14 @@ mod tests {
         // alive so the guest's ACK/FIN and half-close writes still reach
         // try_fast_path_intercept (only the error path sets `dead`).
         let dead = Arc::clone(&conns[0].dead);
-        let (mut batch2, mut fire2) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        let (mut batch2, mut packets_batch2, mut fire2) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch2,
+            &mut packets_batch2,
+            &mut fire2,
+        );
         assert!(conns.is_empty(), "EOF conn is pruned from the inject set");
         assert!(!dead.load(Ordering::Relaxed), "clean EOF must not set dead");
     }
@@ -896,8 +1017,14 @@ mod tests {
 
         let mut conns = vec![inline_conn(reader)];
         let dead = Arc::clone(&conns[0].dead);
-        let (mut batch, mut fire) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch, &mut fire);
+        let (mut batch, mut packets_batch, mut fire) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch,
+            &mut packets_batch,
+            &mut fire,
+        );
 
         assert!(conns[0].host_eof);
         assert_eq!(batch, 1);
@@ -925,8 +1052,14 @@ mod tests {
         // EOF, which keeps the bridge entry alive for the guest's close
         // handshake); the next poll's prune pass drops it.
         assert!(dead.load(Ordering::Relaxed), "bridge reap flag must be set");
-        let (mut batch2, mut fire2) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        let (mut batch2, mut packets_batch2, mut fire2) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch2,
+            &mut packets_batch2,
+            &mut fire2,
+        );
         assert!(conns.is_empty(), "errored conn must be pruned");
     }
 }
