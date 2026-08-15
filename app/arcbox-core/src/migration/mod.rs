@@ -13,8 +13,9 @@ use arcbox_migration::{
 use dto::ToWire;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -38,45 +39,98 @@ impl From<&RunMigrationRequest> for MigrationRunOptions {
     }
 }
 
+/// Buffered progress events per attached client. A migration emits one per
+/// resource; the margin covers a client that stalls briefly without losing the
+/// stage it stalled on.
+const EVENT_BUFFER: usize = 256;
+
+/// One run's event history, in the two shapes its two readers need.
+///
+/// A reattaching client needs the *latest* event; a live client needs *every*
+/// event. Those cannot be the same channel — this is the `SetupState` lesson
+/// (CORE-67, see `app/AGENTS.md`) in a second place: a snapshot channel
+/// coalesces whenever the reader has not been scheduled, and the executor emits
+/// its last per-resource progress and the terminal event with no await between
+/// them, so the progress a UI exists to show is exactly what gets dropped.
+///
+/// So: `latest` retains, `updates` delivers, and [`MigrationRun::publish`]
+/// writes both under one lock while [`MigrationRun::subscribe`] takes both
+/// under the matching read lock. Split either pair and a client either misses
+/// an update or replays one already folded into its snapshot.
 #[derive(Debug, Clone)]
 struct MigrationRun {
     options: MigrationRunOptions,
-    events: watch::Sender<Option<RunMigrationEvent>>,
+    latest: Arc<std::sync::RwLock<Option<RunMigrationEvent>>>,
+    updates: broadcast::Sender<RunMigrationEvent>,
 }
 
 impl MigrationRun {
+    fn new(options: MigrationRunOptions) -> Self {
+        Self {
+            options,
+            latest: Arc::new(std::sync::RwLock::new(None)),
+            updates: broadcast::channel(EVENT_BUFFER).0,
+        }
+    }
+
+    /// Whether this run has yet to reach a terminal event.
     fn is_active(&self) -> bool {
-        self.events
-            .borrow()
+        self.latest
+            .read()
+            .expect("migration run state is never held across a panic")
             .as_ref()
             .is_none_or(|event| !event.done)
     }
 
+    /// Publishes one event. Synchronous because the executor's progress
+    /// callback is: the lock is held for a clone and a send, never across an
+    /// await.
     fn publish(&self, event: RunMigrationEvent) {
-        self.events.send_replace(Some(event));
+        let mut latest = self
+            .latest
+            .write()
+            .expect("migration run state is never held across a panic");
+        // Fails only when nobody is attached, which is the common case.
+        let _ = self.updates.send(event.clone());
+        *latest = Some(event);
     }
 
     fn subscribe(&self) -> UnboundedReceiver<Result<RunMigrationEvent>> {
-        let mut events = self.events.subscribe();
+        let (snapshot, mut updates) = {
+            let latest = self
+                .latest
+                .read()
+                .expect("migration run state is never held across a panic");
+            (latest.clone(), self.updates.subscribe())
+        };
         let (tx, rx) = unbounded_channel();
 
         tokio::spawn(async move {
-            loop {
-                let latest = events.borrow_and_update().clone();
-                if let Some(event) = latest {
-                    let done = event.done;
-                    if tx.send(Ok(event)).is_err() || done {
-                        break;
-                    }
+            // The snapshot is this client's starting point: for a finished run
+            // it is the terminal event and the stream ends on it; for a live
+            // one it is the stage the run has reached, and `updates` carries
+            // the rest without gaps.
+            if let Some(event) = snapshot {
+                let done = event.done;
+                if tx.send(Ok(event)).is_err() || done {
+                    return;
                 }
-
-                tokio::select! {
-                    () = tx.closed() => break,
-                    changed = events.changed() => {
-                        if changed.is_err() {
-                            break;
+            }
+            loop {
+                match updates.recv().await {
+                    Ok(event) => {
+                        let done = event.done;
+                        if tx.send(Ok(event)).is_err() || done {
+                            return;
                         }
                     }
+                    // A client that stalled past the buffer loses the oldest
+                    // events rather than the stream: progress is advisory, and
+                    // the terminal event is what it cannot afford to miss.
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        tracing::warn!(dropped, "migration client fell behind its event stream");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
@@ -240,11 +294,7 @@ impl MigrationManager {
             let prepared = prepared_plans.remove(&request.plan_id).ok_or_else(|| {
                 CoreError::not_found(format!("migration plan {}", request.plan_id))
             })?;
-            let (events, _) = watch::channel(None);
-            let run = MigrationRun {
-                options: run_options,
-                events,
-            };
+            let run = MigrationRun::new(run_options);
             // ponytail: retain tiny terminal snapshots for the daemon lifetime;
             // add bounded durable history if migration volume makes this material.
             runs.insert(plan_id.clone(), run.clone());
@@ -471,6 +521,70 @@ exit 0
         panic!("migration stream ended without a terminal event");
     }
 
+    fn event(message: &str, done: bool) -> RunMigrationEvent {
+        RunMigrationEvent {
+            plan_id: "test-plan".to_string(),
+            message: message.to_string(),
+            done,
+            success: true,
+            ..Default::default()
+        }
+    }
+
+    /// An attached client must see every event, not the newest snapshot. The
+    /// executor emits its last per-resource progress and the terminal event
+    /// with no await between them, so a coalescing channel drops precisely the
+    /// progress a migration UI exists to show. Same failure as CORE-67's
+    /// `SetupState`, one layer down.
+    #[tokio::test]
+    async fn an_attached_client_sees_every_event_not_the_latest() {
+        let run = MigrationRun::new(MigrationRunOptions {
+            allow_replacements: true,
+            skip_start: false,
+        });
+        let mut events = run.subscribe();
+
+        // Published back to back, with no await for the subscriber to be
+        // scheduled in between — the shape that coalesces.
+        run.publish(event("copying volume 1", false));
+        run.publish(event("copying volume 2", false));
+        run.publish(event("migration completed", true));
+
+        let mut seen = Vec::new();
+        while let Some(received) = events.recv().await {
+            seen.push(received.unwrap().message);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "copying volume 1",
+                "copying volume 2",
+                "migration completed"
+            ]
+        );
+    }
+
+    /// A client attaching mid-run starts from where the run has reached and
+    /// then follows it live — without replaying what the snapshot already
+    /// carried.
+    #[tokio::test]
+    async fn a_late_client_starts_from_the_snapshot_and_then_follows() {
+        let run = MigrationRun::new(MigrationRunOptions {
+            allow_replacements: true,
+            skip_start: false,
+        });
+        run.publish(event("copying volume 1", false));
+
+        let mut events = run.subscribe();
+        run.publish(event("migration completed", true));
+
+        let mut seen = Vec::new();
+        while let Some(received) = events.recv().await {
+            seen.push(received.unwrap().message);
+        }
+        assert_eq!(seen, vec!["copying volume 1", "migration completed"]);
+    }
+
     #[tokio::test]
     async fn run_migration_keeps_plan_when_confirmation_is_missing() {
         let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
@@ -625,16 +739,12 @@ exit 0
     #[tokio::test]
     async fn concurrent_plan_is_rejected_without_being_consumed() {
         let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
-        let (events, _) = watch::channel(None);
         manager.runs.write().await.insert(
             "active-plan".to_string(),
-            MigrationRun {
-                options: MigrationRunOptions {
-                    allow_replacements: true,
-                    skip_start: false,
-                },
-                events,
-            },
+            MigrationRun::new(MigrationRunOptions {
+                allow_replacements: true,
+                skip_start: false,
+            }),
         );
         manager.prepared.write().await.insert(
             "next-plan".to_string(),
