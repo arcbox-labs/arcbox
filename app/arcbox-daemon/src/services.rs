@@ -373,9 +373,12 @@ async fn container_route_guard(
                 BridgeResolution::Inconclusive
             }
         };
-        let bridge = match resolution {
-            BridgeResolution::Found(bridge) => bridge,
-            BridgeResolution::Absent => {
+        let bridge = match route_action(
+            resolution,
+            active.as_ref().map(|(bridge, _)| bridge.as_str()),
+        ) {
+            RouteAction::Reconcile(bridge) => bridge,
+            RouteAction::TearDown => {
                 if active.take().is_some()
                     && let Some(lease) = container_network_lease.get()
                     && let Err(error) = lease.cleanup_route().await
@@ -386,7 +389,7 @@ async fn container_route_guard(
                 consecutive_failures = 0;
                 continue;
             }
-            BridgeResolution::Inconclusive => {
+            RouteAction::Wait => {
                 tracing::debug!("container bridge discovery inconclusive; keeping route state");
                 continue;
             }
@@ -628,6 +631,37 @@ enum BridgeResolution {
     Inconclusive,
 }
 
+/// What the route guard does with one resolution attempt.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum RouteAction {
+    /// Reconcile the container route against this bridge.
+    Reconcile(String),
+    /// Remove the route and report it uninstalled.
+    TearDown,
+    /// Leave the route and its reported state alone until the next attempt.
+    Wait,
+}
+
+/// Decides the guard's move from a resolution and the bridge it last acted on.
+///
+/// An inconclusive lookup falls back to the remembered bridge rather than
+/// skipping the tick: this loop is woken by managed-route events, so the case
+/// where discovery is stale is *also* the case where a route may have just been
+/// deleted. Skipping there would leave the route unrepaired while
+/// `route_installed` still reported `true`. With no bridge ever resolved there
+/// is nothing to reconcile against, and waiting is all that is left.
+#[cfg(target_os = "macos")]
+fn route_action(resolution: BridgeResolution, active: Option<&str>) -> RouteAction {
+    match resolution {
+        BridgeResolution::Found(bridge) => RouteAction::Reconcile(bridge),
+        BridgeResolution::Absent => RouteAction::TearDown,
+        BridgeResolution::Inconclusive => active.map_or(RouteAction::Wait, |bridge| {
+            RouteAction::Reconcile(bridge.to_string())
+        }),
+    }
+}
+
 /// Classifies a bridge lookup against the machine's own state.
 ///
 /// `discover` is lazy so a stopped VM costs no forwarding-table walk.
@@ -774,6 +808,35 @@ mod tests {
                 "bridge100".to_string()
             )),
             BridgeResolution::Absent
+        );
+    }
+
+    /// The loop is woken by managed-route events, so "discovery is stale" and
+    /// "a route was just deleted" are the same tick. Falling back to the
+    /// remembered bridge is what repairs it; skipping would leave the route
+    /// gone while `route_installed` still said true.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_inconclusive_lookup_still_reconciles_the_remembered_bridge() {
+        assert_eq!(
+            route_action(BridgeResolution::Inconclusive, Some("bridge100")),
+            RouteAction::Reconcile("bridge100".to_string())
+        );
+        // Nothing resolved yet: there is no bridge to reconcile against.
+        assert_eq!(
+            route_action(BridgeResolution::Inconclusive, None),
+            RouteAction::Wait
+        );
+    }
+
+    /// A stopped VM tears the route down even if the guard still remembers the
+    /// bridge it last used — that memory must not outlive the machine.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_absent_machine_tears_down_despite_a_remembered_bridge() {
+        assert_eq!(
+            route_action(BridgeResolution::Absent, Some("bridge100")),
+            RouteAction::TearDown
         );
     }
 
