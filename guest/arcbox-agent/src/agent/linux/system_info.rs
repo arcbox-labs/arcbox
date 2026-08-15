@@ -6,6 +6,20 @@ use arcbox_connect::v1::SystemInfo;
 
 use crate::rpc::RpcResponse;
 
+/// Whether the distro's own init is still running its boot sequence.
+///
+/// Reads the sentinel `machine_init` arranged for (see [`crate::boot_done`]);
+/// it does not inspect the init system's runtime state, which is an
+/// implementation detail that reports "settled" both before that init starts
+/// and after it finishes.
+///
+/// "No hook installed" means no signal is coming — an image whose init we do
+/// not recognize, or an install that failed — and readiness must not block on
+/// a signal nothing will send.
+fn distro_init_pending() -> bool {
+    crate::boot_done::hook_installed() && !crate::boot_done::boot_complete()
+}
+
 /// Handles a GetSystemInfo request.
 pub(super) async fn handle_get_system_info() -> RpcResponse {
     let info = collect_system_info();
@@ -117,6 +131,8 @@ fn collect_system_info() -> SystemInfo {
             break;
         }
     }
+
+    info.distro_init_pending = distro_init_pending();
 
     info
 }

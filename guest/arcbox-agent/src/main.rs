@@ -11,6 +11,10 @@ use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod agent;
+// The guest's boot-completion sentinel: written by a hook `machine_init`
+// installs, read by the readiness probe. Compiled everywhere so the sentinel
+// logic stays unit-testable on hosts.
+mod boot_done;
 mod init;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod runtime_materialize;
