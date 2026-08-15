@@ -1,9 +1,18 @@
 //! Parser for the `[[tools]]` section of `assets.lock`.
 //!
-//! These tool entries pin both the **host-side CLI** binaries (installed to
-//! `~/.arcbox/runtime/bin/`) and the **guest-side daemon** binaries (exposed
-//! via VirtioFS to the VM). A single lockfile ensures the Docker CLI and guest
-//! dockerd are always at the same version — no version-skew concerns on upgrade.
+//! These entries pin **host-side macOS binaries only**, installed to
+//! `~/.arcbox/runtime/bin/`. Every URL in [`crate::registry`] resolves to a
+//! darwin artifact (`download.docker.com/mac/...`, `*.darwin-arm64`,
+//! `bin/darwin/...`), so nothing here can run in the Linux guest.
+//!
+//! The guest's `dockerd`/`containerd`/`runc` come from the boot manifest
+//! pinned under `[boot]`, which the daemon stages into the generation-scoped
+//! `<data_dir>/runtime/<boot version>/bin`. **The host CLI and the guest
+//! daemon are therefore two independent pins and can skew**: bumping the
+//! `docker` tool here does not move guest dockerd, and vice versa. The Docker
+//! CLI negotiates down to an older daemon's API, so a skew is tolerable, but
+//! it is neither prevented nor detected — keep the two in step by hand when
+//! bumping either (`assets.lock`'s own header says the same).
 
 use std::collections::HashMap;
 
