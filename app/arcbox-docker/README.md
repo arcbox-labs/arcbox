@@ -203,7 +203,10 @@ This keeps the ownership boundary clear:
 
 ## API Version
 
-- **Host route compatibility:** `/v1.24` through `/v1.43` plus unversioned routes
+- **Host route compatibility:** any `/v{major}.{minor}` prefix, plus unversioned
+  routes. `strip_api_version_prefix` removes the prefix before route matching
+  and forwards the original URI, so there is no supported range to maintain
+  here — guest `dockerd` does the negotiating. The bundled CLI sends `v1.52`.
 - **Version payload source:** `/version` and related system metadata are reported by guest `dockerd`
 
 ## Testing

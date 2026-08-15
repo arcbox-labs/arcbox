@@ -7,9 +7,14 @@
 //!
 //! ## Compatibility
 //!
-//! Host routing supports Docker Engine API compatibility paths `v1.24..v1.43`
-//! (plus unversioned endpoints). Request handling is split between local
-//! `ArcBox` handlers and pass-through proxying to guest `dockerd`.
+//! Host routing accepts **any** `/v{major}.{minor}` path prefix (plus
+//! unversioned endpoints): [`api::strip_api_version_prefix`] removes the
+//! prefix before route matching and stashes the original URI so proxy
+//! handlers forward it verbatim, which leaves version negotiation to guest
+//! `dockerd`. There is no supported-range check here, so no list to keep in
+//! step with the Docker version in `assets.lock` — the CLI bundled today
+//! speaks `v1.52`. Request handling is split between local `ArcBox` handlers
+//! and pass-through proxying to guest `dockerd`.
 //!
 //! Supported operation groups include:
 //!
