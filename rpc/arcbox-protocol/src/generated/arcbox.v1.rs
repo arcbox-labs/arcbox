@@ -2973,6 +2973,21 @@ pub struct SystemInfo {
     /// Guest IP addresses (excluding loopback).
     #[prost(string, repeated, tag = "11")]
     pub ip_addresses: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Whether the guest distro's own init is still running its boot sequence.
+    ///
+    /// A Machine runs an upstream distro image whose init starts *after* the
+    /// agent, and typically reconfigures the network from scratch — flushing
+    /// the interface the boot shim already configured. Readiness must wait for
+    /// that to settle, so the host gates on this rather than on the agent
+    /// merely answering (CORE-66).
+    ///
+    /// Phrased as "pending" so the proto3 default is the safe one: an agent
+    /// predating this field decodes it as false and the host proceeds exactly
+    /// as it did before, instead of waiting out the readiness timeout on a
+    /// signal the agent never sends. Only a recognized init that is known to
+    /// still be starting sets it true.
+    #[prost(bool, tag = "12")]
+    pub distro_init_pending: bool,
 }
 /// Request to ensure runtime services are available.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
