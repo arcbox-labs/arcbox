@@ -1,8 +1,10 @@
 # ArcBox asset lock — pins versions and checksums for reproducible builds.
 #
 # The [[tools]] section pins third-party and internal binaries:
-#   - group "docker"/"kubernetes": downloaded to ~/.arcbox/runtime/bin/ and
-#     exposed to the VM via VirtioFS. Used by both host CLI and guest daemon.
+#   - group "docker"/"kubernetes": macOS binaries downloaded to
+#     ~/.arcbox/runtime/bin/. The whole data dir is a VirtioFS share, so the
+#     guest can see them, but they are darwin artifacts and only the host
+#     CLI ever runs them.
 #   - group "desktop": host-only binaries embedded in the app bundle
 #     (e.g. pstramp for PTY session isolation).
 #
@@ -14,16 +16,16 @@
 # and the [boot] bump.
 
 [boot]
-version = "0.8.4"
+version = "0.8.5"
 cdn = "https://boot.arcboxcdn.com"
-manifest_sha256 = "fc32a0b6d1c1051a0eeea81d714f38cdfc108000f883a8d6c261cce993c2af89"
+manifest_sha256 = "e47078a5e84a0dbd80fea92c3355329a62edf80ccfdd075d56dd4e6583a7e28f"
 
 [[tools]]
 name = "docker"
 group = "docker"
-version = "29.6.2"
-arch.arm64.sha256 = "86f86ad4b2119ec55aa50224f15ceb4c94a198f8ae153bb32318d7da589749da"
-arch.x86_64.sha256 = "9a72a1c1a331885aadf7948e3da8e3c5c88c5e813474bb82dce7cc72450487bf"
+version = "29.7.2"
+arch.arm64.sha256 = "b8683ed19d1f06048a496f9b8429e2c71d0b088d475b7487c054ea3666c02a3c"
+arch.x86_64.sha256 = "fb1f1aa7ac7af4364165b9eadfda92e96c8ced508fca74f53079719891367438"
 
 [[tools]]
 name = "docker-buildx"
