@@ -1407,6 +1407,27 @@ impl MachineManager {
     }
 }
 
+/// The readiness verdict for one `SystemInfo` snapshot: `None` means "not
+/// ready yet, retry".
+///
+/// An agent that answers is not yet a usable machine. The distro's own init
+/// starts *after* the agent (the boot shim backgrounds the agent, then
+/// `exec`s `/sbin/init`) and typically reconfigures the network from
+/// scratch, flushing the interface the shim configured — measured on alpine
+/// as a ~20 ms window with no routes at all, about 100 ms after `Start`
+/// would otherwise have returned. Waiting for the guest's init to settle is
+/// what makes readiness mean "usable" rather than "the agent is alive"
+/// (CORE-66).
+fn readiness_ip(info: &arcbox_connect::v1::SystemInfo, name: &str, attempt: u32) -> Option<String> {
+    if info.distro_init_pending {
+        tracing::trace!(
+            "Machine '{name}' distro init still starting (attempt {attempt}); not ready",
+        );
+        return None;
+    }
+    select_routable_ip(&info.ip_addresses)
+}
+
 /// One readiness attempt over the blocking (HV) transport: ping, protocol
 /// check, then IP discovery. `Ok(None)` means "not ready yet, retry";
 /// a protocol mismatch is fatal so stale agents fail machine start loudly
@@ -1431,7 +1452,7 @@ fn probe_ip_blocking(
         attempt,
     );
     match agent.get_system_info_blocking() {
-        Ok(info) => Ok(select_routable_ip(&info.ip_addresses)),
+        Ok(info) => Ok(readiness_ip(&info, name, attempt)),
         Err(e) => {
             tracing::trace!(
                 "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
@@ -1464,7 +1485,7 @@ async fn probe_ip_async(
         attempt,
     );
     match agent.get_system_info().await {
-        Ok(info) => Ok(select_routable_ip(&info.ip_addresses)),
+        Ok(info) => Ok(readiness_ip(&info, name, attempt)),
         Err(e) => {
             tracing::trace!(
                 "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
