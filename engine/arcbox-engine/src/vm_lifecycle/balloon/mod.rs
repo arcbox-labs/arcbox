@@ -42,6 +42,51 @@
 //!   (`com.apple.Virtualization.VirtualMachine`) on VZ, not the daemon —
 //!   guest RAM lives there, which is also why VZ can never be made
 //!   reclaim-capable: that memory is not ours to `madvise`.
+//!
+//! # Before re-enabling the host-driven descent, read this
+//!
+//! The descent below (probe → stage a target → watch guest pressure) is
+//! dormant, not merely unused, and two independent attempts to tune it
+//! (2026-07-21, 2026-07-31) were abandoned for the same reason: **it has
+//! no backend to serve.** VZ can never be reclaim-capable (above). HV
+//! already advertises `VIRTIO_BALLOON_F_REPORTING` and its guest kernel
+//! enables page reporting, so an HV guest hands back free ranges *on its
+//! own, continuously* — the host side only has to release them, and today
+//! it `madvise(MADV_DONTNEED)`s, which is footprint-inert on Darwin
+//! (`virt/arcbox-virtio-balloon/src/lib.rs`). So the work that would make
+//! HV reclaim is `MADV_FREE_REUSABLE` on the reporting path, and once
+//! that lands the guest is already driving; a host-side idle descent is
+//! the wrong shape for it, not a missing piece. Delete this machinery
+//! before you tune it.
+//!
+//! If a descent is nevertheless the answer for some future backend, both
+//! measured failure modes must be designed out first:
+//!
+//! - **`used + IDLE_BALLOON_HEADROOM` degenerates in exactly the idle case
+//!   it exists for.** An idle guest has `MemAvailable ≈ total`, so
+//!   `used ≈ 0` and the target collapses onto [`IDLE_BALLOON_FLOOR`] — an
+//!   unconditional constant, which is what the invariant above forbids.
+//!   Measured 2026-07-29 (VZ, 16 GB, before the gate closed): the descent
+//!   asked the guest for 15.8 GB of its 15.96 GB available, pinned
+//!   `MemAvailable` at literally 0 for ~98 s, pressure-restored, and
+//!   repeated every ~8.5 min — ~2.8 cores averaged while "idle", with every
+//!   running container an OOM candidate inside each zero-available window.
+//!   A target that cannot walk the guest to the edge needs two floors, not
+//!   one: a working reserve above `used` (~1 GiB) *and* a cap on how much
+//!   of the observed slack a single entry may take (~half). A reclaim too
+//!   small to repay its guest-side cost (~512 MB) should not happen at all.
+//! - **On a memory-pressured host the descent oscillates, and macOS gives
+//!   no signal to gate on.** Inflation churns guest pages through exhausted
+//!   host swap and stalls, the guest floods `Out of puff!`, the pressure
+//!   watch times out, the controller fails open (restore + note activity),
+//!   and the 5-minute idle timeout starts the cycle again. Measured
+//!   2026-07-21: an idle 16 GiB System VM on a host at 113/128 GiB with swap
+//!   full oscillated every 5 minutes for over an hour — 5477 `Out of puff`
+//!   lines in one daemon log — while `kern.memorystatus_vm_pressure_level`
+//!   read *normal* throughout. A host-pressure gate is therefore not
+//!   available; the only signal-agnostic answer measured was backing off on
+//!   consecutive fail-opens (10 min, doubling to an hour) and clearing the
+//!   streak when a shrink holds.
 
 pub(super) mod controller;
 
@@ -106,10 +151,15 @@ pub(super) enum EntryDecision {
 /// Computes the idle balloon target for the observed guest usage:
 /// used memory plus [`IDLE_BALLOON_HEADROOM`], clamped to
 /// [`IDLE_BALLOON_FLOOR`] and the full configured size.
+///
+/// The floor is itself capped at `full`: a machine configured below
+/// [`IDLE_BALLOON_FLOOR`] would otherwise make this `clamp(min > max)`,
+/// which panics — inside the lifecycle actor, so it takes the daemon down
+/// on that machine's first idle transition.
 pub(super) fn idle_target(stats: GuestStats, full: u64) -> u64 {
     let used = stats.total.saturating_sub(stats.available);
     used.saturating_add(IDLE_BALLOON_HEADROOM)
-        .clamp(IDLE_BALLOON_FLOOR, full)
+        .clamp(IDLE_BALLOON_FLOOR.min(full), full)
 }
 
 /// Decides the balloon move when the VM enters idle.
@@ -171,6 +221,14 @@ mod tests {
         // Guest uses almost everything: no shrink beyond full.
         let t = idle_target(stats(FULL, 128 * MIB), FULL);
         assert_eq!(t, FULL);
+    }
+
+    /// A machine smaller than the floor must not turn the clamp into
+    /// `clamp(min > max)` — that panic lands in the lifecycle actor.
+    #[test]
+    fn idle_target_on_a_machine_below_the_floor_does_not_panic() {
+        let tiny = 128 * MIB;
+        assert_eq!(idle_target(stats(tiny, tiny), tiny), tiny);
     }
 
     #[test]
