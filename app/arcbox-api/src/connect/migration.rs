@@ -69,7 +69,7 @@ impl pb::MigrationService for MigrationServiceImpl {
         fn stream_event(
             result: arcbox_core::Result<pb::RunMigrationEvent>,
         ) -> Result<pb::RunMigrationEvent, ConnectError> {
-            result.map_err(|e| ConnectError::internal(e.to_string()))
+            result.map_err(|error| ConnectError::from(ApiError::from(error)))
         }
         let stream = UnboundedReceiverStream::new(receiver).map(stream_event);
 

@@ -13,8 +13,9 @@ use arcbox_migration::{
 use dto::ToWire;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::RwLock;
+use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -23,11 +24,128 @@ struct PreparedMigration {
     plan: arcbox_migration::MigrationPlan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MigrationRunOptions {
+    allow_replacements: bool,
+    skip_start: bool,
+}
+
+impl From<&RunMigrationRequest> for MigrationRunOptions {
+    fn from(request: &RunMigrationRequest) -> Self {
+        Self {
+            allow_replacements: request.allow_replacements,
+            skip_start: request.skip_start,
+        }
+    }
+}
+
+/// Buffered progress events per attached client. A migration emits one per
+/// resource; the margin covers a client that stalls briefly without losing the
+/// stage it stalled on.
+const EVENT_BUFFER: usize = 256;
+
+/// One run's event history, in the two shapes its two readers need.
+///
+/// A reattaching client needs the *latest* event; a live client needs *every*
+/// event. Those cannot be the same channel — this is the `SetupState` lesson
+/// (CORE-67, see `app/AGENTS.md`) in a second place: a snapshot channel
+/// coalesces whenever the reader has not been scheduled, and the executor emits
+/// its last per-resource progress and the terminal event with no await between
+/// them, so the progress a UI exists to show is exactly what gets dropped.
+///
+/// So: `latest` retains, `updates` delivers, and [`MigrationRun::publish`]
+/// writes both under one lock while [`MigrationRun::subscribe`] takes both
+/// under the matching read lock. Split either pair and a client either misses
+/// an update or replays one already folded into its snapshot.
+#[derive(Debug, Clone)]
+struct MigrationRun {
+    options: MigrationRunOptions,
+    latest: Arc<std::sync::RwLock<Option<RunMigrationEvent>>>,
+    updates: broadcast::Sender<RunMigrationEvent>,
+}
+
+impl MigrationRun {
+    fn new(options: MigrationRunOptions) -> Self {
+        Self {
+            options,
+            latest: Arc::new(std::sync::RwLock::new(None)),
+            updates: broadcast::channel(EVENT_BUFFER).0,
+        }
+    }
+
+    /// Whether this run has yet to reach a terminal event.
+    fn is_active(&self) -> bool {
+        self.latest
+            .read()
+            .expect("migration run state is never held across a panic")
+            .as_ref()
+            .is_none_or(|event| !event.done)
+    }
+
+    /// Publishes one event. Synchronous because the executor's progress
+    /// callback is: the lock is held for a clone and a send, never across an
+    /// await.
+    fn publish(&self, event: RunMigrationEvent) {
+        let mut latest = self
+            .latest
+            .write()
+            .expect("migration run state is never held across a panic");
+        // Fails only when nobody is attached, which is the common case.
+        let _ = self.updates.send(event.clone());
+        *latest = Some(event);
+    }
+
+    fn subscribe(&self) -> UnboundedReceiver<Result<RunMigrationEvent>> {
+        let (snapshot, mut updates) = {
+            let latest = self
+                .latest
+                .read()
+                .expect("migration run state is never held across a panic");
+            (latest.clone(), self.updates.subscribe())
+        };
+        let (tx, rx) = unbounded_channel();
+
+        tokio::spawn(async move {
+            // The snapshot is this client's starting point: for a finished run
+            // it is the terminal event and the stream ends on it; for a live
+            // one it is the stage the run has reached, and `updates` carries
+            // the rest without gaps.
+            if let Some(event) = snapshot {
+                let done = event.done;
+                if tx.send(Ok(event)).is_err() || done {
+                    return;
+                }
+            }
+            loop {
+                match updates.recv().await {
+                    Ok(event) => {
+                        let done = event.done;
+                        if tx.send(Ok(event)).is_err() || done {
+                            return;
+                        }
+                    }
+                    // A client that stalled past the buffer loses the oldest
+                    // events rather than the stream: progress is advisory, and
+                    // the terminal event is what it cannot afford to miss.
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        tracing::warn!(dropped, "migration client fell behind its event stream");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        rx
+    }
+}
+
 /// Host-side migration manager.
 #[derive(Debug)]
 pub struct MigrationManager {
     target_socket: PathBuf,
     prepared: RwLock<HashMap<String, PreparedMigration>>,
+    runs: RwLock<HashMap<String, MigrationRun>>,
+    run_start: Mutex<()>,
 }
 
 impl MigrationManager {
@@ -37,6 +155,8 @@ impl MigrationManager {
         Self {
             target_socket,
             prepared: RwLock::new(HashMap::new()),
+            runs: RwLock::new(HashMap::new()),
+            run_start: Mutex::new(()),
         }
     }
 
@@ -121,6 +241,26 @@ impl MigrationManager {
         &self,
         request: RunMigrationRequest,
     ) -> Result<UnboundedReceiver<Result<RunMigrationEvent>>> {
+        let _start = self.run_start.lock().await;
+        let run_options = MigrationRunOptions::from(&request);
+
+        let existing = self.runs.read().await.get(&request.plan_id).cloned();
+        if let Some(run) = existing {
+            if run.options != run_options {
+                return Err(CoreError::invalid_state(format!(
+                    "migration {} is already running with different options",
+                    request.plan_id
+                )));
+            }
+            return Ok(run.subscribe());
+        }
+
+        if self.runs.read().await.values().any(MigrationRun::is_active) {
+            return Err(CoreError::invalid_state(
+                "another migration is already running",
+            ));
+        }
+
         let prepared = self
             .prepared
             .read()
@@ -140,21 +280,29 @@ impl MigrationManager {
         let target_runner =
             DockerCliRunner::new(self.target_socket.clone()).map_err(map_migration_error)?;
         let executor = MigrationExecutor::new(target_runner);
-        let options = MigrationExecutorOptions {
+        let executor_options = MigrationExecutorOptions {
             confirm_replace: request.allow_replacements,
             confirm_stop_source_containers: request.allow_replacements,
             start_containers: !request.skip_start,
         };
         let plan_id = request.plan_id.clone();
-        let prepared = self
-            .prepared
-            .write()
-            .await
-            .remove(&request.plan_id)
-            .ok_or_else(|| CoreError::not_found(format!("migration plan {}", request.plan_id)))?;
+        // Consume the plan and publish its run without a cancellation point
+        // between the two state transitions.
+        let (prepared, run) = {
+            let (mut prepared_plans, mut runs) =
+                tokio::join!(self.prepared.write(), self.runs.write());
+            let prepared = prepared_plans.remove(&request.plan_id).ok_or_else(|| {
+                CoreError::not_found(format!("migration plan {}", request.plan_id))
+            })?;
+            let run = MigrationRun::new(run_options);
+            // ponytail: retain tiny terminal snapshots for the daemon lifetime;
+            // add bounded durable history if migration volume makes this material.
+            runs.insert(plan_id.clone(), run.clone());
+            (prepared, run)
+        };
         let source = prepared.source;
         let plan = prepared.plan;
-        let (tx, rx) = unbounded_channel();
+        let receiver = run.subscribe();
 
         tokio::spawn(async move {
             let mut emit = |progress: MigrationProgress| {
@@ -163,10 +311,13 @@ impl MigrationManager {
                 // misleading clients that check `success` without gating on
                 // `done`.
                 let event = progress_to_event(&plan_id, progress, false, true);
-                let _ = tx.send(Ok(event));
+                run.publish(event);
             };
 
-            match executor.execute(source, &plan, options, &mut emit).await {
+            match executor
+                .execute(source, &plan, executor_options, &mut emit)
+                .await
+            {
                 Ok(outcome) => {
                     let detail = if outcome.warnings.is_empty() {
                         "migration completed".to_string()
@@ -190,10 +341,10 @@ impl MigrationManager {
                         true,
                     );
                     event.warnings = outcome.warnings;
-                    let _ = tx.send(Ok(event));
+                    run.publish(event);
                 }
                 Err(error) => {
-                    let _ = tx.send(Ok(progress_to_event(
+                    run.publish(progress_to_event(
                         &plan_id,
                         MigrationProgress {
                             stage: arcbox_migration::MigrationStage::Complete,
@@ -205,12 +356,12 @@ impl MigrationManager {
                         },
                         true,
                         false,
-                    )));
+                    ));
                 }
             }
         });
 
-        Ok(rx)
+        Ok(receiver)
     }
 }
 
@@ -358,6 +509,82 @@ exit 0
         }
     }
 
+    async fn terminal_event(
+        events: &mut UnboundedReceiver<Result<RunMigrationEvent>>,
+    ) -> RunMigrationEvent {
+        while let Some(event) = events.recv().await {
+            let event = event.unwrap();
+            if event.done {
+                return event;
+            }
+        }
+        panic!("migration stream ended without a terminal event");
+    }
+
+    fn event(message: &str, done: bool) -> RunMigrationEvent {
+        RunMigrationEvent {
+            plan_id: "test-plan".to_string(),
+            message: message.to_string(),
+            done,
+            success: true,
+            ..Default::default()
+        }
+    }
+
+    /// An attached client must see every event, not the newest snapshot. The
+    /// executor emits its last per-resource progress and the terminal event
+    /// with no await between them, so a coalescing channel drops precisely the
+    /// progress a migration UI exists to show. Same failure as CORE-67's
+    /// `SetupState`, one layer down.
+    #[tokio::test]
+    async fn an_attached_client_sees_every_event_not_the_latest() {
+        let run = MigrationRun::new(MigrationRunOptions {
+            allow_replacements: true,
+            skip_start: false,
+        });
+        let mut events = run.subscribe();
+
+        // Published back to back, with no await for the subscriber to be
+        // scheduled in between — the shape that coalesces.
+        run.publish(event("copying volume 1", false));
+        run.publish(event("copying volume 2", false));
+        run.publish(event("migration completed", true));
+
+        let mut seen = Vec::new();
+        while let Some(received) = events.recv().await {
+            seen.push(received.unwrap().message);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "copying volume 1",
+                "copying volume 2",
+                "migration completed"
+            ]
+        );
+    }
+
+    /// A client attaching mid-run starts from where the run has reached and
+    /// then follows it live — without replaying what the snapshot already
+    /// carried.
+    #[tokio::test]
+    async fn a_late_client_starts_from_the_snapshot_and_then_follows() {
+        let run = MigrationRun::new(MigrationRunOptions {
+            allow_replacements: true,
+            skip_start: false,
+        });
+        run.publish(event("copying volume 1", false));
+
+        let mut events = run.subscribe();
+        run.publish(event("migration completed", true));
+
+        let mut seen = Vec::new();
+        while let Some(received) = events.recv().await {
+            seen.push(received.unwrap().message);
+        }
+        assert_eq!(seen, vec!["copying volume 1", "migration completed"]);
+    }
+
     #[tokio::test]
     async fn run_migration_keeps_plan_when_confirmation_is_missing() {
         let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
@@ -423,12 +650,11 @@ exit 0
         assert!(!manager.prepared.read().await.contains_key(&plan_id));
     }
 
-    #[tokio::test]
-    async fn unsupported_resources_fail_the_run_rather_than_the_prepare() {
-        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
-        let plan_id = "test-plan".to_string();
+    /// Stores a prepared plan that the executor will reject, so a run reaches
+    /// a terminal failure without touching a real Docker socket.
+    async fn prepare_unsupported(manager: &MigrationManager, plan_id: &str, unsupported: &str) {
         manager.prepared.write().await.insert(
-            plan_id.clone(),
+            plan_id.to_string(),
             PreparedMigration {
                 source: SourceConfig {
                     kind: SourceKind::DockerDesktop,
@@ -436,32 +662,116 @@ exit 0
                 },
                 plan: MigrationPlan {
                     replacements: ReplacementSummary::default(),
-                    unsupported_resources: vec!["container 'vpn-client' shares".to_string()],
+                    unsupported_resources: vec![unsupported.to_string()],
                     ..sample_plan()
                 },
             },
         );
+    }
+
+    fn run_request(plan_id: &str) -> RunMigrationRequest {
+        RunMigrationRequest {
+            plan_id: plan_id.to_string(),
+            allow_replacements: true,
+            skip_start: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_resources_fail_the_run_rather_than_the_prepare() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        prepare_unsupported(&manager, "test-plan", "container 'vpn-client' shares").await;
 
         let _env_lock = ENV_LOCK.lock().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
 
         let mut events = manager
-            .run_migration(RunMigrationRequest {
-                plan_id,
-                allow_replacements: true,
-                skip_start: false,
-                ..Default::default()
-            })
+            .run_migration(run_request("test-plan"))
             .await
             .unwrap();
-        let event = events.recv().await.unwrap().unwrap();
+        let event = terminal_event(&mut events).await;
 
         restore_path(previous_path);
 
         assert!(event.done);
         assert!(!event.success);
         assert!(event.message.contains("unsupported resources"));
+    }
+
+    /// A client that lost its stream must be able to reattach and learn how the
+    /// run ended — including after an unrelated migration has come and gone,
+    /// which is what makes this a per-plan record rather than a "last run" slot.
+    #[tokio::test]
+    async fn terminal_result_survives_a_later_migration() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        prepare_unsupported(&manager, "test-plan", "container 'vpn-client' shares").await;
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
+
+        let mut events = manager
+            .run_migration(run_request("test-plan"))
+            .await
+            .unwrap();
+        let event = terminal_event(&mut events).await;
+
+        prepare_unsupported(&manager, "next-plan", "another unsupported resource").await;
+        let mut next_events = manager
+            .run_migration(run_request("next-plan"))
+            .await
+            .unwrap();
+        terminal_event(&mut next_events).await;
+
+        let mut reattached = manager
+            .run_migration(run_request("test-plan"))
+            .await
+            .unwrap();
+        let replayed = terminal_event(&mut reattached).await;
+
+        restore_path(previous_path);
+
+        assert_eq!(replayed, event);
+    }
+
+    #[tokio::test]
+    async fn concurrent_plan_is_rejected_without_being_consumed() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        manager.runs.write().await.insert(
+            "active-plan".to_string(),
+            MigrationRun::new(MigrationRunOptions {
+                allow_replacements: true,
+                skip_start: false,
+            }),
+        );
+        manager.prepared.write().await.insert(
+            "next-plan".to_string(),
+            PreparedMigration {
+                source: SourceConfig {
+                    kind: SourceKind::DockerDesktop,
+                    socket_path: PathBuf::from("/tmp/docker.sock"),
+                },
+                plan: MigrationPlan {
+                    replacements: ReplacementSummary::default(),
+                    ..sample_plan()
+                },
+            },
+        );
+
+        let error = manager
+            .run_migration(RunMigrationRequest {
+                plan_id: "next-plan".to_string(),
+                allow_replacements: true,
+                skip_start: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("another migration"));
+        assert!(manager.prepared.read().await.contains_key("next-plan"));
     }
 
     #[tokio::test]

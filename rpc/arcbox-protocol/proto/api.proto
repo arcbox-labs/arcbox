@@ -609,7 +609,9 @@ service MigrationService {
     // Prepares a migration plan for a supported external runtime.
     rpc PrepareMigration(PrepareMigrationRequest) returns (PrepareMigrationResponse);
 
-    // Runs a prepared migration plan and streams execution progress.
+    // Runs a prepared migration plan and streams execution progress. Repeating
+    // the same request attaches to the existing run and replays its latest
+    // progress or terminal result.
     rpc RunMigration(RunMigrationRequest) returns (stream RunMigrationEvent);
 }
 
