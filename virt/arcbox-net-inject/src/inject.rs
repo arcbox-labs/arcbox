@@ -31,7 +31,14 @@ const DESCRIPTOR_BACKOFF: Duration = Duration::from_micros(100);
 /// Arguments for [`RxInjectThread::finish_batch`].
 struct FinishBatch<'a> {
     queue: &'a SplitQueue,
+    /// Used entries published this gather. This is the descriptor budget
+    /// (`BATCH_SIZE`, `inline_cap`) and what the guest sees in the used ring.
     batch: u16,
+    /// Frames delivered this gather. Diverges from `batch` on the inline
+    /// path, where one `readv` publishes up to `MAX_MERGE` used entries for a
+    /// single GSO frame — so this, not `batch`, is what a *rate* is computed
+    /// from.
+    packets: u16,
     fire: bool,
     window_budget_us: u32,
     filled_early: bool,
@@ -115,13 +122,21 @@ impl RxInjectThread {
             }
 
             let mut batch = 0u16;
+
+            let mut packets = 0u16;
             let loop_start = Instant::now();
             let window_budget_us = policy.window_us();
             let window = Duration::from_micros(u64::from(window_budget_us));
 
             // Phase 2: Poll inline connections (direct socket -> guest buffer).
             if !inline_conns.is_empty() {
-                self.poll_inline_conns(&mut queue, &mut inline_conns, &mut batch, &mut fire);
+                self.poll_inline_conns(
+                    &mut queue,
+                    &mut inline_conns,
+                    &mut batch,
+                    &mut packets,
+                    &mut fire,
+                );
             }
 
             // Phase 3: Drain channel frames (classifier / DHCP / DNS / ARP).
@@ -150,6 +165,7 @@ impl RxInjectThread {
                         self.finish_batch(FinishBatch {
                             queue: &queue,
                             batch,
+                            packets,
                             fire,
                             window_budget_us,
                             filled_early,
@@ -172,6 +188,7 @@ impl RxInjectThread {
                 if let Some(notify) = queue::inject_one_frame(&mut queue, &frame) {
                     fire |= notify;
                     batch += 1;
+                    packets += 1;
                 } else {
                     // Descriptor exhaustion: flush so guest can repost, then
                     // backoff. Do not adapt the window (storms neither expand
@@ -180,6 +197,7 @@ impl RxInjectThread {
                         self.finish_batch(FinishBatch {
                             queue: &queue,
                             batch,
+                            packets,
                             fire,
                             window_budget_us,
                             filled_early: false,
@@ -189,6 +207,7 @@ impl RxInjectThread {
                         });
                         fire = false;
                         batch = 0;
+                        packets = 0;
                         skip_idle_adapt = true;
                     }
                     std::thread::sleep(DESCRIPTOR_BACKOFF);
@@ -197,6 +216,7 @@ impl RxInjectThread {
                     if let Some(notify) = queue::inject_one_frame(&mut queue, &frame) {
                         fire |= notify;
                         batch += 1;
+                        packets += 1;
                     }
                     // If still fails, frame is lost (TCP retransmit recovers).
                 }
@@ -218,6 +238,7 @@ impl RxInjectThread {
             self.finish_batch(FinishBatch {
                 queue: &queue,
                 batch,
+                packets,
                 fire,
                 window_budget_us,
                 filled_early,
@@ -248,11 +269,15 @@ impl RxInjectThread {
     fn finish_batch(&self, f: FinishBatch<'_>) {
         if f.batch > 0 {
             self.flush_interrupt(f.queue, f.fire);
-            f.stats.on_flush(f.batch, f.fire, f.window_budget_us);
+            f.stats
+                .on_flush(f.batch, f.packets, f.fire, f.window_budget_us);
         }
         // Always observe (incl. batch == 0 idle) so the window can decay.
+        // Rate comes from `packets`, not `batch`: an inline GSO frame spans up
+        // to MAX_MERGE used entries, and feeding those to the classifier reads
+        // one packet as a multi-flow burst.
         f.policy
-            .observe(f.batch, f.window_budget_us, f.filled_early, f.allow_adapt);
+            .observe(f.packets, f.window_budget_us, f.filled_early, f.allow_adapt);
         f.stats.sync_from_policy(f.policy, f.window_budget_us);
         f.stats.maybe_log();
     }
@@ -276,6 +301,7 @@ impl RxInjectThread {
         queue: &mut SplitQueue,
         inline_conns: &mut Vec<InlineConn>,
         batch: &mut u16,
+        packets: &mut u16,
         fire: &mut bool,
     ) {
         if queue.size() == 0 {
@@ -483,6 +509,7 @@ impl RxInjectThread {
                         *fire |=
                             queue.push_used(head_indices[0], inline_conn::TOTAL_HDR_LEN as u32);
                         *batch += 1;
+                        *packets += 1;
                         break;
                     }
                     Ok(n) => {
@@ -562,6 +589,8 @@ impl RxInjectThread {
                         *fire |= queue.push_used_batch(&completions[..num_used]);
 
                         *batch += num_used as u16;
+                        // One frame, however many buffers it spanned.
+                        *packets += 1;
                         per_conn += 1;
                         // Continue — try another readv on this conn.
                     }
@@ -599,6 +628,7 @@ impl RxInjectThread {
                         *fire |=
                             queue.push_used(head_indices[0], inline_conn::TOTAL_HDR_LEN as u32);
                         *batch += 1;
+                        *packets += 1;
                         break;
                     }
                 }
@@ -810,8 +840,14 @@ mod tests {
         wait_buffered(&reader, payload.len());
 
         let mut conns = vec![inline_conn(reader)];
-        let (mut batch, mut fire) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch, &mut fire);
+        let (mut batch, mut packets_batch, mut fire) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch,
+            &mut packets_batch,
+            &mut fire,
+        );
 
         // 500 bytes over caps [34, 200, 300] -> per-desc [34, 200, 266].
         assert_eq!(batch, 3);
@@ -854,8 +890,14 @@ mod tests {
         }
 
         // Nothing more buffered: a second poll consumes nothing.
-        let (mut batch2, mut fire2) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        let (mut batch2, mut packets_batch2, mut fire2) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch2,
+            &mut packets_batch2,
+            &mut fire2,
+        );
         assert_eq!(batch2, 0);
         assert!(!fire2);
         assert_eq!(ram.used_idx(), 3);
@@ -890,8 +932,14 @@ mod tests {
         }
 
         let mut conns = vec![inline_conn(reader)];
-        let (mut batch, mut fire) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch, &mut fire);
+        let (mut batch, mut packets_batch, mut fire) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch,
+            &mut packets_batch,
+            &mut fire,
+        );
 
         assert!(conns[0].host_eof);
         assert_eq!(batch, 1);
@@ -919,8 +967,14 @@ mod tests {
         // alive so the guest's ACK/FIN and half-close writes still reach
         // try_fast_path_intercept (only the error path sets `dead`).
         let dead = Arc::clone(&conns[0].dead);
-        let (mut batch2, mut fire2) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        let (mut batch2, mut packets_batch2, mut fire2) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch2,
+            &mut packets_batch2,
+            &mut fire2,
+        );
         assert!(conns.is_empty(), "EOF conn is pruned from the inject set");
         assert!(!dead.load(Ordering::Relaxed), "clean EOF must not set dead");
     }
@@ -963,8 +1017,14 @@ mod tests {
 
         let mut conns = vec![inline_conn(reader)];
         let dead = Arc::clone(&conns[0].dead);
-        let (mut batch, mut fire) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch, &mut fire);
+        let (mut batch, mut packets_batch, mut fire) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch,
+            &mut packets_batch,
+            &mut fire,
+        );
 
         assert!(conns[0].host_eof);
         assert_eq!(batch, 1);
@@ -992,8 +1052,14 @@ mod tests {
         // EOF, which keeps the bridge entry alive for the guest's close
         // handshake); the next poll's prune pass drops it.
         assert!(dead.load(Ordering::Relaxed), "bridge reap flag must be set");
-        let (mut batch2, mut fire2) = (0u16, false);
-        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        let (mut batch2, mut packets_batch2, mut fire2) = (0u16, 0u16, false);
+        thread.poll_inline_conns(
+            &mut queue,
+            &mut conns,
+            &mut batch2,
+            &mut packets_batch2,
+            &mut fire2,
+        );
         assert!(conns.is_empty(), "errored conn must be pruned");
     }
 }

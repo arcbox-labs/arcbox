@@ -7,16 +7,25 @@
 #![allow(clippy::while_float)]
 
 use arcbox_net_inject::coalesce::{
-    BATCH_SIZE, CoalescePolicy, EXPAND_MIN_FPS, QUIET_MAX_BATCH, WINDOW_DEFAULT_US, WINDOW_MAX_US,
+    BATCH_SIZE, CoalescePolicy, EXPAND_MIN_FPS, QUIET_MAX_PACKETS, WINDOW_DEFAULT_US, WINDOW_MAX_US,
 };
 
-fn gather_once(window_us: u32, frames_per_sec: f64) -> (u16, f64, bool) {
+/// One gather: how many *frames* arrived, how far time advanced, and whether
+/// the descriptor budget filled before the window elapsed.
+///
+/// `entries_per_frame` is what separates the two RX paths. The channel path
+/// publishes one used entry per frame (1). The inline path publishes one per
+/// 4 KiB buffer a `readv` consumed, up to `MAX_MERGE` (16) for a single GSO
+/// frame — so it exhausts `BATCH_SIZE` after 16 frames rather than 256, while
+/// still having delivered only 16 packets.
+fn gather_once(window_us: u32, frames_per_sec: f64, entries_per_frame: u16) -> (u16, f64, bool) {
     if frames_per_sec <= 0.0 {
         return (0, f64::from(window_us) / 1_000_000.0, false);
     }
+    let frame_budget = BATCH_SIZE as f64 / f64::from(entries_per_frame.max(1));
     let frames_in_window = frames_per_sec * f64::from(window_us) / 1_000_000.0;
-    if frames_in_window >= BATCH_SIZE as f64 {
-        let batch = BATCH_SIZE as u16;
+    if frames_in_window >= frame_budget {
+        let batch = frame_budget.floor() as u16;
         let advance = f64::from(batch) / frames_per_sec;
         (batch, advance, true)
     } else {
@@ -28,6 +37,9 @@ fn gather_once(window_us: u32, frames_per_sec: f64) -> (u16, f64, bool) {
 struct Run {
     label: &'static str,
     frames_per_sec: f64,
+    /// Used entries each frame publishes: 1 on the channel path, up to
+    /// `MAX_MERGE` on the inline path.
+    entries_per_frame: u16,
     duration_s: f64,
     adaptive: bool,
 }
@@ -57,7 +69,8 @@ fn simulate(run: &Run) -> ResultRow {
         } else {
             WINDOW_DEFAULT_US
         };
-        let (batch, advance, filled_early) = gather_once(window_us, run.frames_per_sec);
+        let (batch, advance, filled_early) =
+            gather_once(window_us, run.frames_per_sec, run.entries_per_frame);
         frames += u64::from(batch);
         if batch > 0 {
             flushes += 1;
@@ -96,19 +109,24 @@ fn simulate(run: &Run) -> ResultRow {
 }
 
 fn main() {
+    // (label, frames/s, used entries per frame)
     let scenarios = [
-        ("P1 GSO ~10 Gbps", 37_000.0),
-        ("P1 GSO ~22 Gbps", 80_000.0),
-        ("P2 multi-flow ~same bits as 10G", 74_000.0),
-        ("P2 multi-flow saturated", 120_000.0),
-        ("small-packet stress 500k fps", 500_000.0),
-        ("idle / very light 100 fps", 100.0),
+        ("P1 GSO ~10 Gbps", 37_000.0, 1),
+        ("P1 GSO ~22 Gbps", 80_000.0, 1),
+        // Same single stream delivered inline, where one GSO frame spans up to
+        // MAX_MERGE buffers. The window must still hold: the classifier reads
+        // frames, not the used entries they happen to occupy.
+        ("P1 GSO ~10 Gbps (inline, 16 buf/frame)", 37_000.0, 16),
+        ("P2 multi-flow ~same bits as 10G", 74_000.0, 1),
+        ("P2 multi-flow saturated", 120_000.0, 1),
+        ("small-packet stress 500k fps", 500_000.0, 1),
+        ("idle / very light 100 fps", 100.0, 1),
     ];
 
     let duration_s = 1.0;
     println!("# Coalesce mechanism model (no VM)");
     println!(
-        "duration={duration_s}s BATCH={BATCH_SIZE} default={WINDOW_DEFAULT_US}µs max={WINDOW_MAX_US}µs expand_min_fps={EXPAND_MIN_FPS} quiet_max_batch={QUIET_MAX_BATCH}"
+        "duration={duration_s}s BATCH={BATCH_SIZE} default={WINDOW_DEFAULT_US}µs max={WINDOW_MAX_US}µs expand_min_fps={EXPAND_MIN_FPS} quiet_max_packets={QUIET_MAX_PACKETS}"
     );
     println!(
         "Note: 'irqs' here = non-empty flushes with EVENT_IDX off; production can suppress further."
@@ -120,16 +138,18 @@ fn main() {
     );
     println!("{}", "-".repeat(110));
 
-    for (label, fps) in scenarios {
+    for (label, fps, entries_per_frame) in scenarios {
         let fixed = simulate(&Run {
             label,
             frames_per_sec: fps,
+            entries_per_frame,
             duration_s,
             adaptive: false,
         });
         let adapt = simulate(&Run {
             label,
             frames_per_sec: fps,
+            entries_per_frame,
             duration_s,
             adaptive: true,
         });

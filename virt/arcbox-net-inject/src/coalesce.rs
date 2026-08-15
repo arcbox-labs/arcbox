@@ -13,7 +13,7 @@
 //!
 //! - **Expand** when the gather hit [`BATCH_SIZE`] early, or implied fps
 //!   ≥ [`EXPAND_MIN_FPS`] (multi-flow / high frame-rate).
-//! - **Shrink** when idle/very light (`batch` < [`QUIET_MAX_BATCH`]), or
+//! - **Shrink** when idle/very light (`packets` < [`QUIET_MAX_PACKETS`]), or
 //!   when the window is elevated above default and fps has fallen below
 //!   multi-flow (so single-stream after a burst can decay).
 //! - **Hold** for cold single-stream GSO near the default window.
@@ -36,8 +36,11 @@ pub const WINDOW_MAX_US: u32 = 800;
 /// and into multi-flow territory.
 pub const EXPAND_MIN_FPS: u64 = 60_000;
 
-/// Batches strictly below this always shrink (idle / near-empty timeout).
-pub const QUIET_MAX_BATCH: u16 = 4;
+/// Gathers carrying strictly fewer frames than this always shrink.
+///
+/// Counted in frames, not used entries: one inline GSO frame spans up to
+/// `MAX_MERGE` entries and must not read as a burst.
+pub const QUIET_MAX_PACKETS: u16 = 4;
 
 /// Adaptive gather window for one inject loop iteration.
 #[derive(Debug, Clone)]
@@ -92,7 +95,7 @@ impl CoalescePolicy {
     ///   also pass false — see inject loop)
     pub fn observe(
         &mut self,
-        batch: u16,
+        packets: u16,
         window_budget_us: u32,
         filled_early: bool,
         allow_adapt: bool,
@@ -101,12 +104,12 @@ impl CoalescePolicy {
             return;
         }
 
-        let rate = implied_fps(batch, window_budget_us);
+        let rate = implied_fps(packets, window_budget_us);
         let busy = filled_early || rate >= EXPAND_MIN_FPS;
         // Idle / near-empty always decays. If the window was raised by a
         // multi-flow burst and fps has dropped below multi-flow, decay so a
         // following single stream does not sit at the 800 µs cap.
-        let quiet = batch < QUIET_MAX_BATCH
+        let quiet = packets < QUIET_MAX_PACKETS
             || (self.window_us > WINDOW_DEFAULT_US && rate < EXPAND_MIN_FPS);
 
         if busy {

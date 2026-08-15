@@ -61,10 +61,14 @@ impl InjectStats {
     ///
     /// `window_us` is the gather budget that applied to this batch (not the
     /// post-observe value).
-    pub fn on_flush(&mut self, batch: u16, fired: bool, window_us: u32) {
+    /// `batch` is used entries published, `packets` the frames they carried.
+    /// They differ on the inline path, where one GSO frame spans up to
+    /// `MAX_MERGE` entries — so `batch_sum` measures descriptor pressure and
+    /// `frames_injected` counts frames, rather than both reporting the former.
+    pub fn on_flush(&mut self, batch: u16, packets: u16, fired: bool, window_us: u32) {
         self.flushes += 1;
         self.batch_sum += u64::from(batch);
-        self.frames_injected += u64::from(batch);
+        self.frames_injected += u64::from(packets);
         if fired {
             self.irqs_fired += 1;
         } else {
