@@ -10,7 +10,8 @@ async fn test_versioned_api() {
     let (runtime, connector, _tmp) = create_test_runtime().await;
     let app = create_router(runtime, connector);
 
-    // Test v1.43 (current)
+    // Any /v{major}.{minor} prefix is accepted; this one is an arbitrary
+    // sample, not a supported ceiling.
     let response = app
         .oneshot(
             Request::builder()
@@ -29,7 +30,7 @@ async fn test_older_api_version() {
     let (runtime, connector, _tmp) = create_test_runtime().await;
     let app = create_router(runtime, connector);
 
-    // Test v1.24 (minimum supported)
+    // A far older prefix, to show the parser has no floor either.
     let response = app
         .oneshot(
             Request::builder()
