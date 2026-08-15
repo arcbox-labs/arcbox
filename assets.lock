@@ -1,8 +1,10 @@
 # ArcBox asset lock — pins versions and checksums for reproducible builds.
 #
 # The [[tools]] section pins third-party and internal binaries:
-#   - group "docker"/"kubernetes": downloaded to ~/.arcbox/runtime/bin/ and
-#     exposed to the VM via VirtioFS. Used by both host CLI and guest daemon.
+#   - group "docker"/"kubernetes": macOS binaries downloaded to
+#     ~/.arcbox/runtime/bin/. The whole data dir is a VirtioFS share, so the
+#     guest can see them, but they are darwin artifacts and only the host
+#     CLI ever runs them.
 #   - group "desktop": host-only binaries embedded in the app bundle
 #     (e.g. pstramp for PTY session isolation).
 #
@@ -14,9 +16,9 @@
 # and the [boot] bump.
 
 [boot]
-version = "0.8.4"
+version = "0.8.5"
 cdn = "https://boot.arcboxcdn.com"
-manifest_sha256 = "fc32a0b6d1c1051a0eeea81d714f38cdfc108000f883a8d6c261cce993c2af89"
+manifest_sha256 = "e47078a5e84a0dbd80fea92c3355329a62edf80ccfdd075d56dd4e6583a7e28f"
 
 [[tools]]
 name = "docker"
