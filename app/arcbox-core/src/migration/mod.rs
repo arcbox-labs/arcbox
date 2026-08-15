@@ -536,12 +536,11 @@ exit 0
         assert!(!manager.prepared.read().await.contains_key(&plan_id));
     }
 
-    #[tokio::test]
-    async fn terminal_result_survives_a_later_migration() {
-        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
-        let plan_id = "test-plan".to_string();
+    /// Stores a prepared plan that the executor will reject, so a run reaches
+    /// a terminal failure without touching a real Docker socket.
+    async fn prepare_unsupported(manager: &MigrationManager, plan_id: &str, unsupported: &str) {
         manager.prepared.write().await.insert(
-            plan_id.clone(),
+            plan_id.to_string(),
             PreparedMigration {
                 source: SourceConfig {
                     kind: SourceKind::DockerDesktop,
@@ -549,59 +548,77 @@ exit 0
                 },
                 plan: MigrationPlan {
                     replacements: ReplacementSummary::default(),
-                    unsupported_resources: vec!["container 'vpn-client' shares".to_string()],
+                    unsupported_resources: vec![unsupported.to_string()],
                     ..sample_plan()
                 },
             },
         );
+    }
+
+    fn run_request(plan_id: &str) -> RunMigrationRequest {
+        RunMigrationRequest {
+            plan_id: plan_id.to_string(),
+            allow_replacements: true,
+            skip_start: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_resources_fail_the_run_rather_than_the_prepare() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        prepare_unsupported(&manager, "test-plan", "container 'vpn-client' shares").await;
 
         let _env_lock = ENV_LOCK.lock().await;
         let temp_dir = tempfile::tempdir().unwrap();
         let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
 
-        let request = RunMigrationRequest {
-            plan_id,
-            allow_replacements: true,
-            skip_start: false,
-            ..Default::default()
-        };
-        let mut events = manager.run_migration(request.clone()).await.unwrap();
-        let event = terminal_event(&mut events).await;
-
-        let next_plan_id = "next-plan".to_string();
-        manager.prepared.write().await.insert(
-            next_plan_id.clone(),
-            PreparedMigration {
-                source: SourceConfig {
-                    kind: SourceKind::DockerDesktop,
-                    socket_path: PathBuf::from("/tmp/docker.sock"),
-                },
-                plan: MigrationPlan {
-                    replacements: ReplacementSummary::default(),
-                    unsupported_resources: vec!["another unsupported resource".to_string()],
-                    ..sample_plan()
-                },
-            },
-        );
-        let mut next_events = manager
-            .run_migration(RunMigrationRequest {
-                plan_id: next_plan_id,
-                allow_replacements: true,
-                skip_start: false,
-                ..Default::default()
-            })
+        let mut events = manager
+            .run_migration(run_request("test-plan"))
             .await
             .unwrap();
-        terminal_event(&mut next_events).await;
-
-        let mut reattached = manager.run_migration(request).await.unwrap();
-        let replayed = terminal_event(&mut reattached).await;
+        let event = terminal_event(&mut events).await;
 
         restore_path(previous_path);
 
         assert!(event.done);
         assert!(!event.success);
         assert!(event.message.contains("unsupported resources"));
+    }
+
+    /// A client that lost its stream must be able to reattach and learn how the
+    /// run ended — including after an unrelated migration has come and gone,
+    /// which is what makes this a per-plan record rather than a "last run" slot.
+    #[tokio::test]
+    async fn terminal_result_survives_a_later_migration() {
+        let manager = MigrationManager::new(PathBuf::from("/tmp/arcbox-docker.sock"));
+        prepare_unsupported(&manager, "test-plan", "container 'vpn-client' shares").await;
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_path = install_docker_shim(temp_dir.path(), FAILING_SHIM);
+
+        let mut events = manager
+            .run_migration(run_request("test-plan"))
+            .await
+            .unwrap();
+        let event = terminal_event(&mut events).await;
+
+        prepare_unsupported(&manager, "next-plan", "another unsupported resource").await;
+        let mut next_events = manager
+            .run_migration(run_request("next-plan"))
+            .await
+            .unwrap();
+        terminal_event(&mut next_events).await;
+
+        let mut reattached = manager
+            .run_migration(run_request("test-plan"))
+            .await
+            .unwrap();
+        let replayed = terminal_event(&mut reattached).await;
+
+        restore_path(previous_path);
+
         assert_eq!(replayed, event);
     }
 
