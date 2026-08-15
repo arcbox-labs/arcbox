@@ -22,6 +22,17 @@ const ETH_IP_TCP_HDR_LEN: usize = 54;
 /// Virtio-net header (12 bytes) + Ethernet+IP+TCP headers (54 bytes).
 pub const TOTAL_HDR_LEN: usize = 12 + ETH_IP_TCP_HDR_LEN;
 
+/// Retransmission ring shared with the TCP bridge: `(seq of buf[0], unACKed
+/// sent bytes, FIN seq once sent)`.
+///
+/// The inject thread tees every payload it sends into `buf` (and records the
+/// FIN position); the bridge's `poll_fast_path` drains the ACKed prefix and
+/// re-emits on dup-ACK/RTO. A tuple of std types only so this crate and
+/// `splicetcp` can share the same ring without depending on each other (the
+/// same pattern as the shared seq atomics). Must stay layout-identical to
+/// `splicetcp::direct_rx::RetxRing`.
+pub type RetxRing = Arc<std::sync::Mutex<(u32, std::collections::VecDeque<u8>, Option<u32>)>>;
+
 /// A promoted fast-path TCP connection owned by the inject thread.
 /// The socket lives here — reads go directly to guest memory.
 pub struct InlineConn {
@@ -60,6 +71,10 @@ pub struct InlineConn {
     /// (ABX-431). After a clean EOF the flag stays unset — the entry
     /// survives for the guest's close handshake.
     pub dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Retransmission ring shared with the bridge — this thread tees every
+    /// sent payload (and the FIN position) into it; the bridge drains and
+    /// re-emits. See [`RetxRing`].
+    pub retx: RetxRing,
 }
 
 // SAFETY: TcpStream is Send, all other fields are Send+Sync.
@@ -74,9 +89,10 @@ const HONORED_WINDOW_CAP: u32 = 256 * 1024;
 impl InlineConn {
     /// Bytes this thread may still send without exceeding the guest's
     /// advertised receive window: `window − (sent − acked)`, wrap-safe.
-    /// Within the budget the guest kernel guarantees buffering, and the
-    /// inject path is lossless — so staying inside it means no gap can
-    /// form that this retransmission-free path could never repair.
+    /// The window bounds the burst and the shared retransmission ring
+    /// ([`RetxRing`]) — the inject path is lossless only to guest eth0;
+    /// the guest-internal bridge → veth → container backlog drops under
+    /// burst, and the bridge repairs those from the ring.
     /// (Mirrors `splicetcp::tcp_bridge::send_budget`.)
     pub fn send_budget(&self) -> u32 {
         let sent = self.our_seq.load(Ordering::Relaxed);

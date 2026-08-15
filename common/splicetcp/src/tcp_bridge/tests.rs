@@ -1810,8 +1810,12 @@ async fn poll_fast_path_respects_guest_window() {
 
     accepted.write_all(&vec![0xDD; 100_000]).await.unwrap();
 
-    async fn drain(bridge: &mut TcpBridge) -> usize {
-        let mut sent = 0usize;
+    /// Highest sequence-space coverage the bridge has emitted past `base`.
+    /// Coverage, not a byte total: on a slow machine the 200 ms RTO can fire
+    /// mid-drain and retransmit in-window bytes — which does not violate the
+    /// window and must not fail the assertion.
+    async fn drain(bridge: &mut TcpBridge, base: u32) -> usize {
+        let mut covered = 0usize;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut idle = 0;
         while std::time::Instant::now() < deadline && idle < 10 {
@@ -1821,16 +1825,19 @@ async fn poll_fast_path_respects_guest_window() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             } else {
                 idle = 0;
-                sent += batch
-                    .iter()
-                    .map(|f| f.len().saturating_sub(ETH_HEADER_LEN + 40))
-                    .sum::<usize>();
+                for f in &batch {
+                    let payload = f.len().saturating_sub(ETH_HEADER_LEN + 40);
+                    let end = tcp_seq_of(f)
+                        .wrapping_add(payload as u32)
+                        .wrapping_sub(base);
+                    covered = covered.max(end as usize);
+                }
             }
         }
-        sent
+        covered
     }
 
-    let first = drain(&mut bridge).await;
+    let first = drain(&mut bridge, 1).await;
     assert!(
         first <= 65535,
         "no guest ACK yet: at most one unscaled window may be sent, got {first}"
@@ -1844,7 +1851,7 @@ async fn poll_fast_path_respects_guest_window() {
     let ack = make_guest_segment((40024, dst_ip, 443), 1, 1 + first as u32, 65535, 0x10, &[]);
     bridge.try_fast_path_intercept(&ack).expect("intercepted");
 
-    let second = drain(&mut bridge).await;
+    let second = drain(&mut bridge, 1 + first as u32).await;
     assert!(second > 0, "an opening ACK must release more data");
     assert!(
         second <= 65535,
@@ -2649,5 +2656,206 @@ async fn long_idle_flow_survives_upstream_wakeup() {
         bridge.fast_path_count(),
         1,
         "a freshly woken flow must survive until the guest had its full deadline"
+    );
+}
+
+// -------- Inline sender-side loss recovery (shared retransmission ring) ----
+// The inline owners tee every sent payload into a ring shared with the
+// bridge; poll_fast_path drains it on ACK progress and re-emits on
+// dup-ACK/RTO — without this a single frame lost past guest eth0 wedged
+// an inline flow forever (issue #486).
+
+struct CaptureSink(std::sync::Mutex<Option<crate::direct_rx::PromotedConn>>);
+impl crate::direct_rx::ConnSink for CaptureSink {
+    fn send_conn(&self, conn: crate::direct_rx::PromotedConn) -> bool {
+        *self.0.lock().unwrap() = Some(conn);
+        true
+    }
+}
+
+/// Promotes an inline flow and returns the bridge plus the captured owner
+/// half (whose ring/atomics the test drives in the owner's stead).
+async fn inline_fixture(
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+) -> (TcpBridge, crate::direct_rx::PromotedConn, SynFlowKey) {
+    let sink = std::sync::Arc::new(CaptureSink(std::sync::Mutex::new(None)));
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    bridge.set_conn_sink(std::sync::Arc::clone(&sink) as _);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let _accepted = accepted.unwrap();
+
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port,
+        dst_ip,
+        dst_port: 443,
+    };
+    // peer_mss ≥ GSO_SEGMENT_MSS → inline-owned.
+    bridge.promote_to_fast_path(
+        key,
+        client.unwrap().into_std().unwrap(),
+        1000,
+        2000,
+        9000,
+        None,
+    );
+    let promoted = sink.0.lock().unwrap().take().expect("inline conn");
+    (bridge, promoted, key)
+}
+
+/// Simulates the inline owner sending `payload`: tee into the ring and
+/// advance the shared send cursor, exactly as inject.rs / direct_rx.rs do.
+fn owner_sends(promoted: &crate::direct_rx::PromotedConn, payload: &[u8]) {
+    promoted.retx.lock().unwrap().1.extend(payload);
+    promoted
+        .our_seq
+        .fetch_add(payload.len() as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn backdate_rto_clock(bridge: &mut TcpBridge, key: &SynFlowKey) {
+    bridge.fast_path_conns.get_mut(key).unwrap().last_progress = std::time::Instant::now()
+        .checked_sub(super::MAX_RTO)
+        .expect("test clock underflow");
+}
+
+fn tcp_payload_len(frame: &[u8]) -> usize {
+    frame.len() - (ETH_HEADER_LEN + 20 + 20)
+}
+
+/// An inline flow whose guest never ACKs must have its teed bytes re-emitted
+/// from the shared ring after the RTO — the wedge #486 describes.
+#[tokio::test]
+async fn inline_rto_retransmits_from_shared_ring() {
+    let (mut bridge, promoted, key) = inline_fixture(40110, Ipv4Addr::new(198, 18, 30, 150)).await;
+
+    owner_sends(&promoted, b"lost-inline-payload");
+    assert!(
+        bridge.poll_fast_path().is_empty(),
+        "no retransmission before the RTO fires"
+    );
+
+    backdate_rto_clock(&mut bridge, &key);
+    let frames = bridge.poll_fast_path();
+    assert_eq!(frames.len(), 1, "one retransmission after the RTO");
+    assert_eq!(tcp_seq_of(&frames[0]), 1000, "resent from the unACKed base");
+    assert_eq!(
+        tcp_payload_len(&frames[0]),
+        b"lost-inline-payload".len(),
+        "the full unACKed payload is resent"
+    );
+}
+
+/// Three duplicate ACKs from the guest must trigger an immediate inline
+/// fast retransmit, without waiting out the RTO.
+#[tokio::test]
+async fn inline_triple_dup_ack_fast_retransmits() {
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 151);
+    let (mut bridge, promoted, _key) = inline_fixture(40111, dst_ip).await;
+
+    owner_sends(&promoted, b"hole-behind-this-data");
+
+    // Three dup-ACKs at the promoted cursor (ack=1000, unchanged window).
+    for _ in 0..3 {
+        let dup = make_guest_segment((40111, dst_ip, 443), 2000, 1000, 65535, 0x10, &[]);
+        bridge.try_fast_path_intercept(&dup);
+    }
+
+    let frames = bridge.poll_fast_path();
+    assert_eq!(frames.len(), 1, "fast retransmit fires without an RTO wait");
+    assert_eq!(tcp_seq_of(&frames[0]), 1000);
+}
+
+/// A guest ACK must drain the ring; a fully ACKed flow retransmits nothing
+/// even after an RTO's worth of silence.
+#[tokio::test]
+async fn inline_ack_drains_ring_and_stops_retransmit() {
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 152);
+    let (mut bridge, promoted, key) = inline_fixture(40112, dst_ip).await;
+
+    owner_sends(&promoted, b"delivered");
+    let acked_to = 1000 + b"delivered".len() as u32;
+    let ack = make_guest_segment((40112, dst_ip, 443), 2000, acked_to, 65535, 0x10, &[]);
+    bridge.try_fast_path_intercept(&ack);
+
+    backdate_rto_clock(&mut bridge, &key);
+    assert!(
+        bridge.poll_fast_path().is_empty(),
+        "a fully ACKed inline flow must not retransmit"
+    );
+    let ring = promoted.retx.lock().unwrap();
+    assert!(ring.1.is_empty(), "the ACKed prefix must be drained");
+    assert_eq!(ring.0, acked_to, "ring base advances to the ack point");
+}
+
+/// A lost inline FIN must be retransmitted from its recorded position, and
+/// stop once the guest ACKs past it.
+#[tokio::test]
+async fn inline_lost_fin_is_retransmitted() {
+    let dst_ip = Ipv4Addr::new(198, 18, 30, 153);
+    let (mut bridge, promoted, key) = inline_fixture(40113, dst_ip).await;
+
+    // Owner sends data + FIN (as inject.rs does at EOF).
+    owner_sends(&promoted, b"tail");
+    let fin_seq = 1000 + b"tail".len() as u32;
+    promoted.retx.lock().unwrap().2 = Some(fin_seq);
+    promoted
+        .our_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Guest ACKs the data but never sees the FIN.
+    let ack = make_guest_segment((40113, dst_ip, 443), 2000, fin_seq, 65535, 0x10, &[]);
+    bridge.try_fast_path_intercept(&ack);
+    // First poll drains the ACKed data and restarts the RTO clock for the
+    // still-unACKed FIN; only then can the timeout be simulated.
+    assert!(bridge.poll_fast_path().is_empty());
+
+    backdate_rto_clock(&mut bridge, &key);
+    let frames = bridge.poll_fast_path();
+    assert_eq!(frames.len(), 1, "the lost FIN is re-emitted");
+    assert_ne!(
+        tcp_flags_of(&frames[0]) & 0x01,
+        0,
+        "the retransmission is a FIN"
+    );
+    assert_eq!(tcp_seq_of(&frames[0]), fin_seq);
+
+    // ACK past the FIN ends the recovery.
+    let fin_ack = make_guest_segment((40113, dst_ip, 443), 2000, fin_seq + 1, 65535, 0x10, &[]);
+    bridge.try_fast_path_intercept(&fin_ack);
+    backdate_rto_clock(&mut bridge, &key);
+    assert!(
+        bridge.poll_fast_path().is_empty(),
+        "an ACKed FIN must not be retransmitted"
+    );
+}
+
+/// A ring that momentarily runs ahead of SND.NXT (the owner tees while a
+/// racing bridge poll fires) must never cause bytes beyond `sent` to be
+/// retransmitted — the guest would ACK them and the intercept would reject
+/// that ACK as beyond `our_seq`.
+#[tokio::test]
+async fn inline_retransmit_never_exceeds_sent() {
+    let (mut bridge, promoted, key) = inline_fixture(40114, Ipv4Addr::new(198, 18, 30, 154)).await;
+
+    // Simulate the transient: 100 bytes teed, only 40 of sequence space
+    // committed so far.
+    promoted.retx.lock().unwrap().1.extend([0xAA; 100]);
+    promoted
+        .our_seq
+        .fetch_add(40, std::sync::atomic::Ordering::Relaxed);
+
+    backdate_rto_clock(&mut bridge, &key);
+    let frames = bridge.poll_fast_path();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        tcp_payload_len(&frames[0]),
+        40,
+        "retransmission is clamped to the committed sequence space"
     );
 }
