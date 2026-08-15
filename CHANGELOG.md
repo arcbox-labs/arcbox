@@ -10,26 +10,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### ⚠ BREAKING CHANGES
 
-* **machine:** `MachineService.Start` now blocks for the distro's boot rather than the VM's. Measured ~2.2s on alpine/openrc and ~14s on ubuntu/systemd, against ~0.5s before. A caller with its own timeout tuned to the old behaviour — anything under ~15s — will now time out on a boot that is proceeding normally. Raise it, and keep it: the 60s readiness budget is checked between probes, so a guest that stalls mid-answer holds the call open past it. Nothing else about the call changes: same request, same response, same errors.
+**`MachineService.Start` returns when the machine is usable, not when its agent
+first answers** ([#645](https://github.com/arcboxlabs/arcbox/issues/645), [#646](https://github.com/arcboxlabs/arcbox/issues/646))
 
-### Features
+A machine's own init starts *after* the agent does, and reconfigures the network
+from scratch — so `Start` used to return into a window where the interface had
+just been flushed, and an operation issued there failed with `ENETUNREACH`.
+`Start` now waits for that init to settle.
 
-* **machine:** Start returns when the machine is usable (cut 0.7.0) ([#646](https://github.com/arcboxlabs/arcbox/issues/646)) ([9cc27dd](https://github.com/arcboxlabs/arcbox/commit/9cc27dd18ee92fcbf903b364711b562ed006d0e1))
+The call therefore costs what the guest's boot costs:
+
+| image | before | after |
+|---|---|---|
+| alpine / openrc | ~0.5s | ~2.2s |
+| ubuntu / systemd | ~0.5s | ~14s |
+
+**If you impose your own timeout on `Start`, raise it above ~15s — and keep
+it.** The 60s readiness budget is checked between probes, so it bounds the retry
+loop rather than any one probe: a guest that accepts the connection and then
+stalls mid-answer holds the call open past it. Nothing else changes — same
+request, same response, same errors.
+
+Where an image ships an init we do not recognize (neither systemd nor openrc),
+the boot-completion hook cannot be installed. `Start` then falls back to the
+previous behaviour rather than waiting out a signal that will never arrive, and
+the window above is still reachable on those images.
 
 
 ### Bug Fixes
 
-* **balloon:** retire the idle-descent debt (CORE-45) ([#642](https://github.com/arcboxlabs/arcbox/issues/642)) ([f172cae](https://github.com/arcboxlabs/arcbox/commit/f172cae9966ce0fa558c8e850164f314387c4ab2))
-* **ci:** make the crates.io publish survive the registry's own rate limit ([#640](https://github.com/arcboxlabs/arcbox/issues/640)) ([f35114a](https://github.com/arcboxlabs/arcbox/commit/f35114a5ae35f6ada2e95f212a7fce626edf2684))
-* **machine:** wait for the distro's own init before reporting a Machine ready (CORE-66) ([#645](https://github.com/arcboxlabs/arcbox/issues/645)) ([75161b1](https://github.com/arcboxlabs/arcbox/commit/75161b1e0efa528f65116bad35ab037dcdd75702))
-* **migration:** make runs idempotently reattachable ([#575](https://github.com/arcboxlabs/arcbox/issues/575)) ([466d6a8](https://github.com/arcboxlabs/arcbox/commit/466d6a860166fbf42d39b3c5ee50e07916553b74))
-* **net:** give inline fast-path flows sender-side retransmission ([#489](https://github.com/arcboxlabs/arcbox/issues/489)) ([8cb164b](https://github.com/arcboxlabs/arcbox/commit/8cb164b3f32b701ce0a7c752dd7dc8f122df7f1b))
-* **net:** stop an aged-out FDB entry from tearing down a healthy container route ([#643](https://github.com/arcboxlabs/arcbox/issues/643)) ([7ef3d00](https://github.com/arcboxlabs/arcbox/commit/7ef3d0028bfcb669a8ed29d2ca9d1bb0cafca067))
+* **net:** container routing no longer breaks after an idle guest goes quiet. The
+  route was resolved by looking the guest up in the host bridge's forwarding
+  table, and that entry ages out after ~20 minutes of silence — which was read
+  as "the bridge is gone" and tore down a healthy route ([#643](https://github.com/arcboxlabs/arcbox/issues/643)) ([7ef3d00](https://github.com/arcboxlabs/arcbox/commit/7ef3d0028bfcb669a8ed29d2ca9d1bb0cafca067))
+* **net:** inline fast-path flows retransmit from the sender side, so a dropped
+  segment recovers instead of stalling the connection ([#489](https://github.com/arcboxlabs/arcbox/issues/489)) ([8cb164b](https://github.com/arcboxlabs/arcbox/commit/8cb164b3f32b701ce0a7c752dd7dc8f122df7f1b))
+* **migration:** a migration can be reattached to after its progress stream
+  breaks. Repeating the request replays the run's latest progress or its final
+  result instead of starting duplicate work ([#575](https://github.com/arcboxlabs/arcbox/issues/575)) ([466d6a8](https://github.com/arcboxlabs/arcbox/commit/466d6a860166fbf42d39b3c5ee50e07916553b74))
 
 
 ### Performance Improvements
 
-* **net-inject:** fewer guest IRQs under multi-flow load ([#491](https://github.com/arcboxlabs/arcbox/issues/491)) ([3b1a473](https://github.com/arcboxlabs/arcbox/commit/3b1a473231a42cc3dbc37c8784529f517147612a))
+* **net:** fewer guest interrupts under multi-flow load — the RX coalescing
+  window now adapts to the observed frame rate ([#491](https://github.com/arcboxlabs/arcbox/issues/491)) ([3b1a473](https://github.com/arcboxlabs/arcbox/commit/3b1a473231a42cc3dbc37c8784529f517147612a))
+
+
+### Internal
+
+No user-visible effect; listed for traceability.
+
+* **balloon:** retire the idle-descent debt — the path never ran on macOS, where
+  no backend returns ballooned memory to the host (CORE-45) ([#642](https://github.com/arcboxlabs/arcbox/issues/642)) ([f172cae](https://github.com/arcboxlabs/arcbox/commit/f172cae9966ce0fa558c8e850164f314387c4ab2))
+* **ci:** make the crates.io publish survive the registry's own rate limit ([#640](https://github.com/arcboxlabs/arcbox/issues/640)) ([f35114a](https://github.com/arcboxlabs/arcbox/commit/f35114a5ae35f6ada2e95f212a7fce626edf2684))
 
 ## [0.6.9](https://github.com/arcboxlabs/arcbox/compare/v0.6.8...v0.6.9) (2026-08-14)
 
