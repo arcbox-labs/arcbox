@@ -259,13 +259,32 @@ impl Layout {
     }
 }
 
+/// Writes the hook body, staged then renamed.
+///
+/// The final path must never hold a partial file: [`Layout::hook_installed`]
+/// keys on its existence, so a truncated body or a service left non-executable
+/// would still read as "a sentinel is coming" — and readiness would wait out
+/// its full 60 s timeout instead of falling back to not waiting at all, which
+/// is the expensive half of the failure space this module is built to avoid.
+/// Staging makes that state unreachable rather than merely unlikely: the mode
+/// is set before the rename, and the rename is atomic.
 fn write_file(path: &Path, body: &str, mode: u32) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = fs::File::create(path)?;
+    let staged = path.with_extension("arcbox-tmp");
+    let result = stage(&staged, body, mode).and_then(|()| fs::rename(&staged, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
+fn stage(staged: &Path, body: &str, mode: u32) -> std::io::Result<()> {
+    let mut file = fs::File::create(staged)?;
     file.write_all(body.as_bytes())?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    file.sync_all()?;
+    fs::set_permissions(staged, fs::Permissions::from_mode(mode))
 }
 
 #[cfg(test)]
@@ -344,6 +363,24 @@ mod tests {
         touch(&layout, "/etc/systemd/system/multi-user.target.wants");
 
         assert!(!layout.install_systemd());
+        assert!(!layout.path(SYSTEMD_UNIT).exists());
+        assert!(!layout.hook_installed());
+    }
+
+    /// A write that cannot complete must leave nothing at the destination.
+    /// `hook_installed` keys on existence, so a partial hook would promise a
+    /// sentinel it can never write, and readiness would burn its full timeout
+    /// instead of falling back to not waiting.
+    #[test]
+    fn a_failed_write_leaves_no_hook_behind() {
+        let (_dir, layout) = image();
+        touch(&layout, "/usr/lib/systemd/systemd");
+        // A directory where the staged file must go, so `File::create` fails
+        // partway through what would otherwise be a successful install.
+        let staged = layout.path(SYSTEMD_UNIT).with_extension("arcbox-tmp");
+        fs::create_dir_all(&staged).expect("mkdir");
+
+        assert!(!layout.install());
         assert!(!layout.path(SYSTEMD_UNIT).exists());
         assert!(!layout.hook_installed());
     }
