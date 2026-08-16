@@ -30,6 +30,8 @@
 //! - [`SandboxManager`] — top-level sandbox orchestrator
 //! - [`SandboxEnvironment`] — the environment-specific components a
 //!   composer supplies (block tooling today; more seams follow)
+//! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
+//!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
 //! - [`NetworkManager`] — TAP lifecycle & IP allocation
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
@@ -63,6 +65,7 @@ pub use config::{
 pub use environment::SandboxEnvironment;
 pub use error::{Result, VmmError};
 pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
+pub use rootfs::{RootfsBuilder, RootfsPaths};
 pub use sandbox::pause_reason;
 pub use sandbox::{
     CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,

@@ -3,7 +3,7 @@
 //! Decode → manager → encode glue over the catalog surface on
 //! [`SandboxManager`](arcbox_vm::SandboxManager), plus the Build
 //! orchestrator, which drives the existing rootfs pipeline (`template.rs`
-//! export + `arcbox_vm::rootfs` conversion) and registers the result as the
+//! export + `RootfsBuilder` conversion) and registers the result as the
 //! catalog draft. `template.rs` (singular) is the
 //! `CreateSandboxRequest.template` reference parser and docker exporter.
 
@@ -297,9 +297,11 @@ impl SandboxService {
             .manager
             .pinned_rootfs_paths()
             .map_err(SandboxError::from)?;
-        let rootfs = arcbox_vm::rootfs::convert_layer_to_rootfs(&layout, &pinned)
+        let rootfs = self
+            .rootfs
+            .convert_layer_to_rootfs(&layout, &pinned)
             .await
-            .map_err(|e| SandboxError::Internal(format!("template build {image}: {e:#}")))?;
+            .map_err(|e| SandboxError::Internal(format!("template build {image}: {e}")))?;
         // The cache file stem (`rootfs-<layer>-<agent>`) is content-derived —
         // layer diff IDs plus the injected vm-agent — which makes it the
         // digest's source identity: stable across rebuilds, changed by

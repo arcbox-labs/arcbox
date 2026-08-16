@@ -4,37 +4,89 @@
 //! `arcbox-ext4` stack (no external binary, no mount, no root required for
 //! the ext4 write itself):
 //!
-//! - [`convert_layer_to_rootfs`] — convert a host-staged OCI image layout (or
-//!   a Docker overlay2 layer directory) to ext4, then inject `/sbin/vm-agent`
-//!   via loop mount. Cached ext4 images are reused to avoid redundant
-//!   conversions.
-//! - [`ensure_default_rootfs`] — build the default busybox + vm-agent image
-//!   used when `CreateSandboxRequest` supplies no rootfs. Rebuilt when the
+//! - [`RootfsBuilder::convert_layer_to_rootfs`] — convert a staged OCI image
+//!   layout (or a Docker overlay2 layer directory) to ext4, then inject
+//!   `/sbin/vm-agent` through a loop mount. Cached ext4 images are reused to
+//!   avoid redundant conversions.
+//! - [`RootfsBuilder::ensure_default_rootfs`] — build the default busybox +
+//!   vm-agent image used when a create supplies no rootfs. Rebuilt when the
 //!   source binaries are newer than the cached image.
+//!
+//! The rootfs convention the boot protocol relies on — the agent binary at
+//! `/sbin/vm-agent` (and `/sbin/init` pointing at it), `/etc/resolv.conf`
+//! symlinked into the `/run` tmpfs — is enforced only by the guest failing to
+//! boot, so it is implemented once, here, with the agent binary source and
+//! the output location supplied by the composer through [`RootfsPaths`].
 
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use arcbox_ext4::constants::file_mode;
 use arcbox_ext4::{FormatOptions, Formatter};
+use arcbox_snapshot::snapshot_cow::BlockTools;
 use tokio::process::Command;
 use uuid::Uuid;
 
-/// Path to the `vm-agent` binary (host `~/.arcbox/bin` via VirtioFS).
-const VM_AGENT_BIN: &str = "/arcbox/bin/vm-agent";
-
-/// Static busybox shipped in the guest EROFS rootfs.
-const GUEST_BUSYBOX: &str = "/bin/busybox";
-
-/// Directory for generated rootfs images (btrfs data volume, writable).
-const ROOTFS_CACHE_DIR: &str = "/var/lib/arcbox/sandbox";
+use crate::error::VmmError;
 
 /// Capacity of the default busybox rootfs image. The image file is written
 /// sparsely; per-sandbox writes land in the dm-snapshot COW overlay, so this
 /// bounds a sandbox's writable space, not host disk use.
 const DEFAULT_ROOTFS_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Where the rootfs builder finds its inputs and keeps its outputs.
+#[derive(Debug, Clone)]
+pub struct RootfsPaths {
+    /// The `vm-agent` binary injected into every image at `/sbin/vm-agent`.
+    pub vm_agent: PathBuf,
+    /// Directory the generated ext4 images (and their `.ext4.tmp` build
+    /// files) live in.
+    pub cache_dir: PathBuf,
+    /// Static busybox that becomes the default rootfs's userland
+    /// (`/bin/busybox` plus one applet symlink per `busybox --list` entry).
+    pub busybox: PathBuf,
+}
+
+/// Builds sandbox rootfs images; see the module docs.
+pub struct RootfsBuilder {
+    paths: RootfsPaths,
+    /// Loop-device attach/detach for the `vm-agent` injection mount.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "the injection loop mount is Linux-only; other platforms never attach"
+        )
+    )]
+    block_tools: Arc<dyn BlockTools>,
+    /// Serializes default-rootfs builds so concurrent creates don't each
+    /// rebuild the 512 MiB image. The atomic rename already prevents
+    /// corruption; this only avoids the redundant work.
+    build_lock: tokio::sync::Mutex<()>,
+}
+
+impl RootfsBuilder {
+    /// A builder over `paths`, mounting through `block_tools`.
+    pub fn new(paths: RootfsPaths, block_tools: Arc<dyn BlockTools>) -> Self {
+        Self {
+            paths,
+            block_tools,
+            build_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The paths this builder was composed with.
+    pub fn paths(&self) -> &RootfsPaths {
+        &self.paths
+    }
+}
+
+fn rootfs_err(error: anyhow::Error) -> VmmError {
+    VmmError::Rootfs(format!("{error:#}"))
+}
 
 /// Check if a file has a valid ext4 superblock magic (0x53EF at offset 0x438).
 pub fn has_ext4_magic(path: &Path) -> bool {
@@ -60,106 +112,123 @@ fn is_oci_layout(dir: &Path) -> bool {
     dir.join(OCI_LAYOUT_MARKER).is_file()
 }
 
-/// Convert an image source directory to a bootable ext4 rootfs.
-///
-/// `layer_path` is a guest-visible directory: either an OCI image layout
-/// staged by the host CLI (the `--from-image` / `--from-dockerfile` path) or a
-/// Docker overlay2 chain-id directory (e.g.
-/// `/var/lib/docker/overlay2/<chain-id>`).
-///
-/// `pinned` are images that must survive the superseded-image sweep because a
-/// snapshot still needs them as its dm-snapshot origin
-/// (`SandboxManager::pinned_rootfs_paths`).
-///
-/// Returns the path to the generated (or cached) ext4 image.
-pub async fn convert_layer_to_rootfs(
-    layer_path: &str,
-    pinned: &BTreeSet<PathBuf>,
-) -> Result<String> {
-    if !Path::new(layer_path).exists() {
-        bail!("layer path not found: {layer_path}");
+impl RootfsBuilder {
+    /// Convert an image source directory to a bootable ext4 rootfs.
+    ///
+    /// `layer_path` is a directory: either an OCI image layout staged by the
+    /// host CLI (the `--from-image` / `--from-dockerfile` path) or a Docker
+    /// overlay2 chain-id directory (e.g. `/var/lib/docker/overlay2/<chain-id>`).
+    ///
+    /// `pinned` are images that must survive the superseded-image sweep
+    /// because a snapshot still needs them as its dm-snapshot origin
+    /// (`SandboxManager::pinned_rootfs_paths`).
+    ///
+    /// Returns the path to the generated (or cached) ext4 image.
+    pub async fn convert_layer_to_rootfs(
+        &self,
+        layer_path: &str,
+        pinned: &BTreeSet<PathBuf>,
+    ) -> crate::error::Result<String> {
+        self.convert_layer(layer_path, pinned)
+            .await
+            .map_err(rootfs_err)
     }
 
-    // The cached image has two ingredients, so the key names both: the layer
-    // (whose directory name carries the image digest for either source kind,
-    // making the path a stable identifier) and the `vm-agent` binary injected
-    // below. Keying on the layer alone meant a newer agent never reached an
-    // already-converted image — the sandbox kept booting the old init with no
-    // sign anything was stale.
-    let layer_key = path_hash(layer_path);
-    let agent_key = vm_agent_key().await?;
-    let ext4_path = format!("{ROOTFS_CACHE_DIR}/rootfs-{layer_key}-{agent_key}.ext4");
+    async fn convert_layer(&self, layer_path: &str, pinned: &BTreeSet<PathBuf>) -> Result<String> {
+        if !Path::new(layer_path).exists() {
+            bail!("layer path not found: {layer_path}");
+        }
 
-    // Check cache.
-    if Path::new(&ext4_path).exists() && has_ext4_magic(Path::new(&ext4_path)) {
-        tracing::info!(path = %ext4_path, "using cached rootfs");
-        return Ok(ext4_path);
+        // The cached image has two ingredients, so the key names both: the layer
+        // (whose directory name carries the image digest for either source kind,
+        // making the path a stable identifier) and the `vm-agent` binary injected
+        // below. Keying on the layer alone meant a newer agent never reached an
+        // already-converted image — the sandbox kept booting the old init with no
+        // sign anything was stale.
+        let layer_key = path_hash(layer_path);
+        let agent_key = self.vm_agent_key().await?;
+        let cache_dir = &self.paths.cache_dir;
+        let ext4_path = cache_dir
+            .join(format!("rootfs-{layer_key}-{agent_key}.ext4"))
+            .to_string_lossy()
+            .into_owned();
+
+        // Check cache.
+        if Path::new(&ext4_path).exists() && has_ext4_magic(Path::new(&ext4_path)) {
+            tracing::info!(path = %ext4_path, "using cached rootfs");
+            return Ok(ext4_path);
+        }
+
+        tokio::fs::create_dir_all(cache_dir)
+            .await
+            .context("failed to create rootfs cache dir")?;
+
+        let req_id = Uuid::new_v4().to_string();
+        let ext4_tmp = cache_dir
+            .join(format!(".rootfs-{req_id}.ext4.tmp"))
+            .to_string_lossy()
+            .into_owned();
+
+        // Convert via the oci2rootfs library (blocking CPU/IO work).
+        tracing::info!(layer = %layer_path, ext4 = %ext4_path, "converting image layer to ext4");
+        {
+            let layer = layer_path.to_owned();
+            let out = ext4_tmp.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let converter = oci2rootfs::Converter::new(&out);
+                if is_oci_layout(Path::new(&layer)) {
+                    let source = oci2rootfs::OciLayoutSource::open(&layer)
+                        .context("failed to open OCI image layout")?;
+                    converter
+                        .convert(source)
+                        .context("OCI layout → ext4 conversion failed")?;
+                } else {
+                    let source = oci2rootfs::Overlay2Source::open(&layer)
+                        .context("failed to open overlay2 layer")?;
+                    converter
+                        .convert(source)
+                        .context("overlay2 → ext4 conversion failed")?;
+                }
+                Ok(())
+            })
+            .await
+            .context("conversion task panicked")??;
+        }
+
+        // Inject vm-agent.
+        tracing::info!("injecting vm-agent into rootfs");
+        if let Err(e) = self.inject_vm_agent(&ext4_tmp, &req_id).await {
+            let _ = tokio::fs::remove_file(&ext4_tmp).await;
+            return Err(e);
+        }
+
+        // Atomic rename into cache.
+        tokio::fs::rename(&ext4_tmp, &ext4_path)
+            .await
+            .context("failed to rename ext4 into cache")?;
+
+        sweep_superseded(cache_dir, &layer_key, &agent_key, pinned).await;
+
+        tracing::info!(path = %ext4_path, "rootfs ready");
+        Ok(ext4_path)
     }
 
-    tokio::fs::create_dir_all(ROOTFS_CACHE_DIR)
-        .await
-        .context("failed to create rootfs cache dir")?;
-
-    let req_id = Uuid::new_v4().to_string();
-    let ext4_tmp = format!("{ROOTFS_CACHE_DIR}/.rootfs-{req_id}.ext4.tmp");
-
-    // Convert via the oci2rootfs library (blocking CPU/IO work).
-    tracing::info!(layer = %layer_path, ext4 = %ext4_path, "converting image layer to ext4");
-    {
-        let layer = layer_path.to_owned();
-        let out = ext4_tmp.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let converter = oci2rootfs::Converter::new(&out);
-            if is_oci_layout(Path::new(&layer)) {
-                let source = oci2rootfs::OciLayoutSource::open(&layer)
-                    .context("failed to open OCI image layout")?;
-                converter
-                    .convert(source)
-                    .context("OCI layout → ext4 conversion failed")?;
-            } else {
-                let source = oci2rootfs::Overlay2Source::open(&layer)
-                    .context("failed to open overlay2 layer")?;
-                converter
-                    .convert(source)
-                    .context("overlay2 → ext4 conversion failed")?;
-            }
-            Ok(())
-        })
-        .await
-        .context("conversion task panicked")??;
+    /// Content key for the `vm-agent` binary that gets injected into every
+    /// image.
+    ///
+    /// Content rather than mtime: this binary is copied into place by
+    /// installers and by hand during development, so an older build can
+    /// easily carry a newer timestamp — which an mtime check would read as
+    /// fresh and then bake in.
+    async fn vm_agent_key(&self) -> Result<String> {
+        use std::hash::Hasher;
+        let bytes = tokio::fs::read(&self.paths.vm_agent)
+            .await
+            .with_context(|| format!("failed to read {}", self.paths.vm_agent.display()))?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(&bytes);
+        Ok(format!("{:016x}", hasher.finish()))
     }
-
-    // Inject vm-agent.
-    tracing::info!("injecting vm-agent into rootfs");
-    if let Err(e) = inject_vm_agent(&ext4_tmp, &req_id).await {
-        let _ = tokio::fs::remove_file(&ext4_tmp).await;
-        return Err(e);
-    }
-
-    // Atomic rename into cache.
-    tokio::fs::rename(&ext4_tmp, &ext4_path)
-        .await
-        .context("failed to rename ext4 into cache")?;
-
-    sweep_superseded(Path::new(ROOTFS_CACHE_DIR), &layer_key, &agent_key, pinned).await;
-
-    tracing::info!(path = %ext4_path, "rootfs ready");
-    Ok(ext4_path)
-}
-
-/// Content key for the `vm-agent` binary that gets injected into every image.
-///
-/// Content rather than mtime: this binary is copied into place by installers and
-/// by hand during development, so an older build can easily carry a newer
-/// timestamp — which an mtime check would read as fresh and then bake in.
-async fn vm_agent_key() -> Result<String> {
-    use std::hash::Hasher;
-    let bytes = tokio::fs::read(VM_AGENT_BIN)
-        .await
-        .with_context(|| format!("failed to read {VM_AGENT_BIN}"))?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(&bytes);
-    Ok(format!("{:016x}", hasher.finish()))
 }
 
 /// Delete images for `layer_key` built against a different `vm-agent`.
@@ -223,107 +292,130 @@ fn is_superseded_image(name: &str, layer_key: &str, agent_key: &str) -> bool {
     layer == layer_key && agent != agent_key
 }
 
-/// Ensure the default busybox + vm-agent rootfs exists at `path` and is
-/// newer than its source binaries. Returns without touching the image when
-/// it is already up to date.
-/// Serializes default-rootfs builds so concurrent `create` requests don't each
-/// rebuild the 512 MiB image. The atomic rename already prevents corruption;
-/// this only avoids the redundant work.
-fn build_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-/// Remove leftover `*.ext4.tmp` build artifacts from the rootfs cache dir.
-///
-/// A rootfs build that crashed or panicked leaves a `.default-<uuid>.ext4.tmp`
-/// or `.rootfs-<id>.ext4.tmp` (each up to the image size) with no owner; sweep
-/// them at agent startup so repeated failures don't accrue disk usage.
-pub async fn sweep_stale_tmp() {
-    let Ok(mut entries) = tokio::fs::read_dir(ROOTFS_CACHE_DIR).await else {
-        return;
-    };
-    let mut removed = 0usize;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name().to_string_lossy().ends_with(".ext4.tmp")
-            && tokio::fs::remove_file(entry.path()).await.is_ok()
-        {
-            removed += 1;
+impl RootfsBuilder {
+    /// Remove leftover `*.ext4.tmp` build artifacts from the rootfs cache dir.
+    ///
+    /// A rootfs build that crashed or panicked leaves a `.default-<uuid>.ext4.tmp`
+    /// or `.rootfs-<id>.ext4.tmp` (each up to the image size) with no owner;
+    /// sweep them at startup so repeated failures don't accrue disk usage.
+    pub async fn sweep_stale_tmp(&self) {
+        let Ok(mut entries) = tokio::fs::read_dir(&self.paths.cache_dir).await else {
+            return;
+        };
+        let mut removed = 0usize;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name().to_string_lossy().ends_with(".ext4.tmp")
+                && tokio::fs::remove_file(entry.path()).await.is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "swept stale rootfs build artifacts");
         }
     }
-    if removed > 0 {
-        tracing::info!(removed, "swept stale rootfs build artifacts");
-    }
-}
 
-pub async fn ensure_default_rootfs(path: &str) -> Result<()> {
-    let image = Path::new(path);
-    if is_default_rootfs_fresh(image) {
-        return Ok(());
+    /// Ensure the default busybox + vm-agent rootfs exists at `path` and is
+    /// newer than its source binaries. Returns without touching the image
+    /// when it is already up to date.
+    pub async fn ensure_default_rootfs(&self, path: &str) -> crate::error::Result<()> {
+        self.ensure_default(path).await.map_err(rootfs_err)
     }
 
-    // Single-flight: a concurrent create for the same default image waits here,
-    // then the re-check lets it reuse the just-built image instead of
-    // redundantly rebuilding 512 MiB.
-    let _build = build_lock().lock().await;
-    if is_default_rootfs_fresh(image) {
-        return Ok(());
-    }
+    async fn ensure_default(&self, path: &str) -> Result<()> {
+        let image = Path::new(path);
+        if self.is_default_rootfs_fresh(image) {
+            return Ok(());
+        }
 
-    if !Path::new(VM_AGENT_BIN).exists() {
-        bail!(
-            "vm-agent not found at {VM_AGENT_BIN}; it is staged by the host \
-             daemon next to arcbox-agent"
-        );
-    }
+        // Single-flight: a concurrent create for the same default image waits here,
+        // then the re-check lets it reuse the just-built image instead of
+        // redundantly rebuilding 512 MiB.
+        let _build = self.build_lock.lock().await;
+        if self.is_default_rootfs_fresh(image) {
+            return Ok(());
+        }
 
-    let applets = busybox_applets().await?;
+        if !self.paths.vm_agent.exists() {
+            bail!(
+                "vm-agent not found at {}; it is staged by the host daemon next to arcbox-agent",
+                self.paths.vm_agent.display()
+            );
+        }
 
-    let parent = image
-        .parent()
-        .with_context(|| format!("default rootfs path has no parent: {path}"))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .context("failed to create default rootfs dir")?;
+        let applets = self.busybox_applets().await?;
 
-    let tmp = parent.join(format!(".default-{}.ext4.tmp", Uuid::new_v4()));
-    let spec = DefaultRootfsSpec {
-        busybox: GUEST_BUSYBOX.into(),
-        vm_agent: VM_AGENT_BIN.into(),
-        applets,
-        size: DEFAULT_ROOTFS_SIZE,
-    };
-
-    tracing::info!(path, "building default sandbox rootfs");
-    {
-        let tmp = tmp.clone();
-        tokio::task::spawn_blocking(move || build_default_rootfs(&spec, &tmp))
+        let parent = image
+            .parent()
+            .with_context(|| format!("default rootfs path has no parent: {path}"))?;
+        tokio::fs::create_dir_all(parent)
             .await
-            .context("default rootfs build task panicked")??;
+            .context("failed to create default rootfs dir")?;
+
+        let tmp = parent.join(format!(".default-{}.ext4.tmp", Uuid::new_v4()));
+        let spec = DefaultRootfsSpec {
+            busybox: self.paths.busybox.clone(),
+            vm_agent: self.paths.vm_agent.clone(),
+            applets,
+            size: DEFAULT_ROOTFS_SIZE,
+        };
+
+        tracing::info!(path, "building default sandbox rootfs");
+        {
+            let tmp = tmp.clone();
+            tokio::task::spawn_blocking(move || build_default_rootfs(&spec, &tmp))
+                .await
+                .context("default rootfs build task panicked")??;
+        }
+
+        tokio::fs::rename(&tmp, image)
+            .await
+            .context("failed to move default rootfs into place")?;
+        tracing::info!(path, "default sandbox rootfs ready");
+        Ok(())
     }
 
-    tokio::fs::rename(&tmp, image)
-        .await
-        .context("failed to move default rootfs into place")?;
-    tracing::info!(path, "default sandbox rootfs ready");
-    Ok(())
+    /// True when the default rootfs image can be used as-is (no rebuild
+    /// needed).
+    ///
+    /// A valid ext4 image is fresh unless a build source (busybox or
+    /// vm-agent) is **present and newer** than it. A *missing* source is not
+    /// staleness: we cannot rebuild from an absent binary, so an existing
+    /// valid image — e.g. a caller-supplied default rootfs, or the production
+    /// image on a host without the dev build sources — is kept rather than
+    /// clobbered.
+    fn is_default_rootfs_fresh(&self, image: &Path) -> bool {
+        is_fresh_against(image, &[&self.paths.busybox, &self.paths.vm_agent])
+    }
+
+    /// List busybox applets via `busybox --list`.
+    async fn busybox_applets(&self) -> Result<Vec<String>> {
+        let output = Command::new(&self.paths.busybox)
+            .arg("--list")
+            .output()
+            .await
+            .with_context(|| format!("failed to run {} --list", self.paths.busybox.display()))?;
+        if !output.status.success() {
+            bail!("busybox --list failed with {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
 }
 
-/// True when the default rootfs image can be used as-is (no rebuild needed).
-///
-/// A valid ext4 image is fresh unless a build source (busybox or vm-agent)
-/// is **present and newer** than it. A *missing* source is not staleness: we
-/// cannot rebuild from an absent binary, so an existing valid image — e.g. a
-/// caller-supplied default rootfs, or the production image on a host without
-/// the dev build sources — is kept rather than clobbered.
-fn is_default_rootfs_fresh(image: &Path) -> bool {
+/// [`RootfsBuilder::is_default_rootfs_fresh`] over explicit sources.
+fn is_fresh_against(image: &Path, sources: &[&Path]) -> bool {
     if !has_ext4_magic(image) {
         return false;
     }
     let Ok(image_mtime) = image.metadata().and_then(|m| m.modified()) else {
         return false;
     };
-    for source in [GUEST_BUSYBOX, VM_AGENT_BIN] {
+    for source in sources {
         // Only a source that exists AND is newer forces a rebuild.
         if let Ok(mtime) = std::fs::metadata(source).and_then(|m| m.modified())
             && mtime > image_mtime
@@ -469,84 +561,105 @@ fn build_default_rootfs(spec: &DefaultRootfsSpec, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// List busybox applets via `busybox --list`.
-async fn busybox_applets() -> Result<Vec<String>> {
-    let output = Command::new(GUEST_BUSYBOX)
-        .arg("--list")
-        .output()
-        .await
-        .with_context(|| format!("failed to run {GUEST_BUSYBOX} --list"))?;
-    if !output.status.success() {
-        bail!("busybox --list failed with {}", output.status);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
+impl RootfsBuilder {
+    /// Inject vm-agent into an ext4 image through a loop mount.
+    ///
+    /// The image is attached as a loop device through the composer's
+    /// [`BlockTools`] and mounted with `mount(2)`; nothing here shells out.
+    #[cfg(target_os = "linux")]
+    async fn inject_vm_agent(&self, ext4_path: &str, req_id: &str) -> Result<()> {
+        use nix::mount::{MsFlags, mount, umount};
 
-/// Inject vm-agent into an ext4 image via loop mount.
-async fn inject_vm_agent(ext4_path: &str, req_id: &str) -> Result<()> {
-    if !Path::new(VM_AGENT_BIN).exists() {
-        bail!("vm-agent not found at {VM_AGENT_BIN}");
-    }
+        if !self.paths.vm_agent.exists() {
+            bail!("vm-agent not found at {}", self.paths.vm_agent.display());
+        }
 
-    let mount_dir = format!("/tmp/arcbox-inject-{req_id}");
-    tokio::fs::create_dir_all(&mount_dir).await?;
+        let mount_dir = std::env::temp_dir().join(format!("arcbox-inject-{req_id}"));
+        tokio::fs::create_dir_all(&mount_dir).await?;
 
-    // Mount.
-    let status = Command::new(GUEST_BUSYBOX)
-        .args(["mount", "-o", "loop", ext4_path, &mount_dir])
-        .status()
-        .await
-        .context("failed to mount ext4 for vm-agent injection")?;
-    if !status.success() {
-        let _ = tokio::fs::remove_dir(&mount_dir).await;
-        bail!("mount -o loop failed");
-    }
+        // Attach + mount.
+        let loop_dev = {
+            let tools = Arc::clone(&self.block_tools);
+            let image = PathBuf::from(ext4_path);
+            tokio::task::spawn_blocking(move || tools.attach_loop(&image, false))
+                .await
+                .context("loop attach task panicked")?
+                .context("failed to attach ext4 image for vm-agent injection")?
+        };
+        let mounted = mount(
+            Some(loop_dev.as_str()),
+            &mount_dir,
+            Some("ext4"),
+            MsFlags::empty(),
+            None::<&str>,
+        );
+        if let Err(e) = mounted {
+            self.detach_quietly(&loop_dev).await;
+            let _ = tokio::fs::remove_dir(&mount_dir).await;
+            bail!("mount {loop_dev} for vm-agent injection: {e}");
+        }
 
-    // Create /sbin and copy vm-agent.
-    let sbin = format!("{mount_dir}/sbin");
-    tokio::fs::create_dir_all(&sbin)
-        .await
-        .context("failed to create /sbin in rootfs")?;
-    let dest = format!("{sbin}/vm-agent");
-    let copy_result = tokio::fs::copy(VM_AGENT_BIN, &dest).await;
+        // Create /sbin and copy vm-agent, mode 755.
+        let sbin = mount_dir.join("sbin");
+        let dest = sbin.join("vm-agent");
+        let copy_result = async {
+            tokio::fs::create_dir_all(&sbin)
+                .await
+                .context("failed to create /sbin in rootfs")?;
+            tokio::fs::copy(&self.paths.vm_agent, &dest)
+                .await
+                .context("failed to copy vm-agent into rootfs")?;
+            tokio::fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .await
+                .context("failed to chmod vm-agent in rootfs")?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
 
-    // chmod 755.
-    if copy_result.is_ok() {
-        let _ = Command::new(GUEST_BUSYBOX)
-            .args(["chmod", "755", &dest])
-            .status()
-            .await;
-    }
-
-    // Point resolv.conf at tmpfs, mirroring the default template: DNS
-    // rewrites must stay off the CoW block device (CORE-75). Rewriting is
-    // safe for Docker images — Docker itself never ships meaningful
-    // resolv.conf content (it bind-mounts one at run time).
-    if copy_result.is_ok() {
-        let etc = format!("{mount_dir}/etc");
-        if tokio::fs::create_dir_all(&etc).await.is_ok() {
-            let resolv = format!("{etc}/resolv.conf");
-            let _ = tokio::fs::remove_file(&resolv).await;
-            if let Err(e) = tokio::fs::symlink("../run/resolv.conf", &resolv).await {
-                tracing::warn!(error = %e, "resolv.conf symlink failed; DNS rewrites will hit the CoW device");
+        // Point resolv.conf at tmpfs, mirroring the default template: DNS
+        // rewrites must stay off the CoW block device (CORE-75). Rewriting
+        // is safe for Docker images — Docker itself never ships meaningful
+        // resolv.conf content (it bind-mounts one at run time).
+        if copy_result.is_ok() {
+            let etc = mount_dir.join("etc");
+            if tokio::fs::create_dir_all(&etc).await.is_ok() {
+                let resolv = etc.join("resolv.conf");
+                let _ = tokio::fs::remove_file(&resolv).await;
+                if let Err(e) = tokio::fs::symlink("../run/resolv.conf", &resolv).await {
+                    tracing::warn!(error = %e, "resolv.conf symlink failed; DNS rewrites will hit the CoW device");
+                }
             }
         }
+
+        // Always unmount, detach, and clean up, even on failure.
+        if let Err(e) = umount(&mount_dir) {
+            tracing::warn!(error = %e, dir = %mount_dir.display(), "umount after vm-agent injection failed");
+        }
+        self.detach_quietly(&loop_dev).await;
+        let _ = tokio::fs::remove_dir(&mount_dir).await;
+
+        copy_result
     }
 
-    // Always unmount and cleanup, even on failure.
-    let _ = Command::new(GUEST_BUSYBOX)
-        .args(["umount", &mount_dir])
-        .status()
-        .await;
-    let _ = tokio::fs::remove_dir(&mount_dir).await;
+    /// Loop mounts are a Linux operation; the builder compiles elsewhere but
+    /// cannot inject.
+    #[cfg(not(target_os = "linux"))]
+    async fn inject_vm_agent(&self, _ext4_path: &str, _req_id: &str) -> Result<()> {
+        bail!("vm-agent injection needs a Linux loop mount")
+    }
 
-    copy_result.context("failed to copy vm-agent into rootfs")?;
-    Ok(())
+    #[cfg(target_os = "linux")]
+    async fn detach_quietly(&self, loop_dev: &str) {
+        let tools = Arc::clone(&self.block_tools);
+        let dev = loop_dev.to_owned();
+        match tokio::task::spawn_blocking(move || tools.detach_loop(&dev)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, dev = %loop_dev, "loop detach after injection failed");
+            }
+            Err(e) => tracing::warn!(error = %e, "loop detach task panicked"),
+        }
+    }
 }
 
 /// Derive a stable cache key from the layer path.
@@ -721,13 +834,21 @@ mod tests {
         build_default_rootfs(&spec, &image).unwrap();
         assert!(has_ext4_magic(&image));
 
-        // GUEST_BUSYBOX / VM_AGENT_BIN are absolute guest paths that do not
-        // exist in the host test environment, so this exercises the
-        // missing-source branch directly.
+        // Sources that do not exist exercise the missing-source branch
+        // directly.
+        let absent = dir.path().join("absent");
         assert!(
-            is_default_rootfs_fresh(&image),
+            is_fresh_against(&image, &[&absent, &absent]),
             "a valid image with absent build sources must be reused, not rebuilt"
         );
-        assert!(!is_default_rootfs_fresh(&dir.path().join("missing.ext4")));
+        assert!(!is_fresh_against(
+            &dir.path().join("missing.ext4"),
+            &[&absent]
+        ));
+        // A source that exists and is newer than the image forces a rebuild.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = dir.path().join("newer-agent");
+        std::fs::write(&newer, b"stub").unwrap();
+        assert!(!is_fresh_against(&image, &[&newer]));
     }
 }

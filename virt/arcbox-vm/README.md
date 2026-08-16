@@ -28,8 +28,12 @@ file-channel frames — is [`arcbox-vm-proto`](../arcbox-vm-proto). This
 crate and the agent each depend on the proto crate and never on each
 other, so the agent stays a small static musl binary no matter what the
 manager pulls in. `boot_proto` and `file_io::proto` stay reachable here as
-re-exports. `arcbox-agent`'s `rootfs_builder` stages the binary into every
-sandbox rootfs.
+re-exports. `RootfsBuilder` (this crate) stages the binary into every
+sandbox rootfs at `/sbin/vm-agent` — OCI/overlay2 → ext4 conversion plus
+the default busybox image, with the agent binary source, the cache
+directory, and the busybox supplied by the composer as `RootfsPaths`. The
+rootfs convention the boot protocol relies on is therefore implemented
+once, here.
 
 ## Usage
 
