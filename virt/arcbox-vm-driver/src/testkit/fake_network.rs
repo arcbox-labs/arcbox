@@ -91,6 +91,27 @@ impl Ledger {
     fn lowest_free_host(&self) -> Option<u16> {
         (FIRST_HOST..u16::MAX).find(|n| !self.used.contains(n))
     }
+
+    /// The error for a lease that is not the VM's current one — an older
+    /// generation, or one whose address has since been handed to another VM.
+    fn stale(&self, lease: &NetworkLease) -> Error {
+        let other_holder = self
+            .active
+            .iter()
+            .chain(self.quarantined.iter())
+            .find(|(vm, held)| **vm != lease.vm && held.ip == lease.ip)
+            .map(|(vm, _)| vm);
+        match other_holder {
+            Some(vm) => Error::Network(format!(
+                "vm {} lease {} is stale: {} is now held by vm {vm}",
+                lease.vm, lease.cleanup_token, lease.ip
+            )),
+            None => Error::Network(format!(
+                "vm {} lease {} is not its current lease",
+                lease.vm, lease.cleanup_token
+            )),
+        }
+    }
 }
 
 fn host_number(ip: IpAddr) -> Result<u16> {
@@ -160,6 +181,7 @@ impl GuestNetwork for FakeNetwork {
 
     async fn quarantine(&self, lease: NetworkLease) -> Result<()> {
         let mut ledger = lock(&self.ledger);
+        let host = host_number(lease.ip)?;
         if let Some(existing) = ledger.quarantined.get(&lease.vm) {
             if existing.cleanup_token == lease.cleanup_token {
                 return Ok(());
@@ -169,20 +191,46 @@ impl GuestNetwork for FakeNetwork {
                 lease.vm
             )));
         }
-        // A lease replayed from a durable record after a crash is quarantined
-        // even if this process never handed it out.
-        ledger.used.insert(host_number(lease.ip)?);
-        ledger.active.remove(&lease.vm);
+        match ledger.active.get(&lease.vm) {
+            Some(current) if *current == lease => {
+                ledger.active.remove(&lease.vm);
+            }
+            Some(_) => return Err(ledger.stale(&lease)),
+            // A lease replayed from a durable record after a crash is
+            // quarantined even if this process never handed it out — unless
+            // its address has since gone to another VM, which makes the
+            // record stale rather than orphaned.
+            None => {
+                if ledger.used.contains(&host) {
+                    return Err(ledger.stale(&lease));
+                }
+                ledger.used.insert(host);
+            }
+        }
         ledger.quarantined.insert(lease.vm.clone(), lease);
         Ok(())
     }
 
     async fn release(&self, lease: NetworkLease) -> Result<()> {
         let mut ledger = lock(&self.ledger);
-        ledger.active.remove(&lease.vm);
-        ledger.quarantined.remove(&lease.vm);
-        ledger.used.remove(&host_number(lease.ip)?);
-        Ok(())
+        let host = host_number(lease.ip)?;
+        let current = ledger
+            .active
+            .get(&lease.vm)
+            .or_else(|| ledger.quarantined.get(&lease.vm));
+        match current {
+            Some(current) if *current == lease => {
+                ledger.active.remove(&lease.vm);
+                ledger.quarantined.remove(&lease.vm);
+                ledger.used.remove(&host);
+                Ok(())
+            }
+            Some(_) => Err(ledger.stale(&lease)),
+            // Nothing held for this VM: releasing again is a no-op, unless
+            // the address now belongs to someone else.
+            None if ledger.used.contains(&host) => Err(ledger.stale(&lease)),
+            None => Ok(()),
+        }
     }
 
     fn identity(&self, lease: &NetworkLease) -> NetworkIdentity {
@@ -349,6 +397,56 @@ mod tests {
         assert!(reconcile.pending_cleanups().await.is_empty());
         let c = net.reserve(&id("c"), policy()).await.unwrap();
         assert_eq!(c.ip, a.ip);
+    }
+
+    #[tokio::test]
+    async fn stale_leases_neither_free_nor_quarantine_a_reassigned_address() {
+        let net = FakeNetwork::new();
+        let a1 = net.reserve(&id("a"), policy()).await.unwrap();
+        net.release(a1.clone()).await.unwrap();
+        // Releasing what is already released is a no-op...
+        net.release(a1.clone()).await.unwrap();
+        // ...until the address belongs to someone else.
+        let second = net.reserve(&id("b"), policy()).await.unwrap();
+        assert_eq!(second.ip, a1.ip);
+        assert!(net.release(a1.clone()).await.is_err());
+        assert!(net.quarantine(a1.clone()).await.is_err());
+        // The new holder keeps it: nobody else gets that address.
+        let third = net.reserve(&id("c"), policy()).await.unwrap();
+        assert_ne!(third.ip, second.ip);
+
+        // A VM's older generation cannot touch its current lease either.
+        let a2 = net.reserve(&id("a"), policy()).await.unwrap();
+        assert!(net.release(a1.clone()).await.is_err());
+        assert!(net.quarantine(a1).await.is_err());
+        assert!(net.activate(&a2, AttachMode::Invariant).await.is_ok());
+
+        // A quarantined lease is released only by itself.
+        net.quarantine(a2.clone()).await.unwrap();
+        let mut forged = a2.clone();
+        forged.cleanup_token = "forged".into();
+        assert!(net.release(forged).await.is_err());
+        net.release(a2.clone()).await.unwrap();
+        assert!(net.reconcile().unwrap().pending_cleanups().await.is_empty());
+        let reused = net.reserve(&id("d"), policy()).await.unwrap();
+        assert_eq!(reused.ip, a2.ip);
+
+        // A durable-record replay of an address nobody holds still lands in
+        // quarantine and pins the address until its token finalizes it.
+        let mut replayed = reused.clone();
+        replayed.vm = id("ghost");
+        replayed.ip = "10.200.0.5".parse().unwrap(); // the lowest free host
+        replayed.cleanup_token = "ghost-1".into();
+        net.quarantine(replayed.clone()).await.unwrap();
+        let next = net.reserve(&id("e"), policy()).await.unwrap();
+        assert_eq!(next.ip, "10.200.0.6".parse::<IpAddr>().unwrap());
+        let reconcile = net.reconcile().unwrap();
+        reconcile
+            .finalize_cleanup(&id("ghost"), "ghost-1")
+            .await
+            .unwrap();
+        let unpinned = net.reserve(&id("f"), policy()).await.unwrap();
+        assert_eq!(unpinned.ip, replayed.ip);
     }
 
     #[tokio::test]
