@@ -24,10 +24,11 @@ use uuid::Uuid;
 
 use crate::boot_proto::KernelIpParam;
 use crate::config::VmmConfig;
+use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
-use crate::snapshot_cow::{CowHandle, CowManager};
+use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::spawn::{spawn_direct, spawn_jailer};
 use crate::template_catalog::TemplateCatalog;
 use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
@@ -92,8 +93,15 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    /// Create a new manager from the given configuration.
+    /// Create a new manager from the given configuration, in the reference
+    /// environment ([`SandboxEnvironment::default`]).
     pub fn new(config: VmmConfig) -> Result<Self> {
+        Self::with_environment(config, SandboxEnvironment::default())
+    }
+
+    /// Create a new manager from the given configuration, with the
+    /// environment-specific components the composer supplies.
+    pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
         let records = Arc::new(persistence::SandboxRecordStore::new(Path::new(
             &config.firecracker.data_dir,
         ))?);
@@ -108,7 +116,10 @@ impl SandboxManager {
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir)?);
+        let cow_manager = Arc::new(CowManager::new(CowOptions {
+            block_tools: environment.block_tools,
+            ..CowOptions::new(&config.firecracker.data_dir)
+        })?);
 
         // Ensure the jailer chroot base directory exists.
         if let Some(ref jc) = config.firecracker.jailer {

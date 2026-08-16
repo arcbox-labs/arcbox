@@ -5,28 +5,29 @@
 //! The template image is shared read-only across all sandboxes that
 //! use the same rootfs; only written blocks consume disk space.
 //!
-//! Requires `CONFIG_DM_SNAPSHOT=y` in the guest kernel and the `dmsetup`
-//! binary at one of `DMSETUP_CANDIDATES` (private).  `PATH` is not searched — the
-//! guest does not have a meaningful one.
+//! Requires `CONFIG_DM_SNAPSHOT=y` in the kernel, a `dmsetup` binary at one
+//! of [`CowOptions::dmsetup_candidates`], and loop-device tooling supplied
+//! through the [`BlockTools`] seam ([`BusyboxBlockTools`] is the reference:
+//! the System VM's busybox applets). `PATH` is never searched — the guest
+//! does not have a meaningful one.
 
 use std::collections::HashMap;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 #[cfg(any(test, feature = "test-probe"))]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use crate::error::{Result, SnapshotError};
 
+mod block_tools;
 mod persistence;
 
+pub use block_tools::{BlockTools, BusyboxBlockTools, device_major_minor, mknod_blkdev};
 use persistence::{
     SetupOrphan, clear_owner_marker, loop_backs_path, loop_devices_for_backing_sync,
     remove_file_durable,
@@ -36,13 +37,10 @@ use persistence::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Busybox binary (used for `losetup` and `blockdev` applets).
-const BUSYBOX: &str = "/bin/busybox";
-
-/// Candidate paths for the `dmsetup` binary.  The first existing entry
-/// wins.  `/sbin/dmsetup` covers stock Debian/Alpine; `/usr/sbin/dmsetup`
-/// covers usrmerged distros; `/arcbox/bin/dmsetup` is the guest's bundled
-/// copy.
+/// Reference search list for the `dmsetup` binary.  The first existing,
+/// working entry wins.  `/sbin/dmsetup` covers stock Debian/Alpine;
+/// `/usr/sbin/dmsetup` covers usrmerged distros; `/arcbox/bin/dmsetup` is
+/// the System VM's bundled copy.
 const DMSETUP_CANDIDATES: &[&str] = &["/arcbox/bin/dmsetup", "/usr/sbin/dmsetup", "/sbin/dmsetup"];
 
 /// dm-snapshot chunk size in 512-byte sectors (4096 bytes = 8 sectors).
@@ -156,6 +154,34 @@ impl CowTestProbe {
     }
 }
 
+/// What a [`CowManager`] needs from its environment.
+///
+/// [`CowOptions::new`] fills in the reference environment — the System
+/// VM's userland — so today's callers pass a data directory and nothing
+/// else; a composer on a different userland overrides the fields it owns.
+pub struct CowOptions {
+    /// Data directory; COW files live under `{data_dir}/cow/`.
+    pub data_dir: PathBuf,
+    /// Loop-device and block-size operations.
+    pub block_tools: Arc<dyn BlockTools>,
+    /// Where to look for `dmsetup`. The first entry that exists and answers
+    /// `dmsetup version` is used; none usable degrades the manager to
+    /// copy-mode fallback (every setup fails with an actionable error).
+    pub dmsetup_candidates: Vec<PathBuf>,
+}
+
+impl CowOptions {
+    /// The reference environment: busybox at [`BusyboxBlockTools::DEFAULT_PATH`]
+    /// and the System VM's `dmsetup` search list.
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            block_tools: Arc::new(BusyboxBlockTools::default()),
+            dmsetup_candidates: DMSETUP_CANDIDATES.iter().map(PathBuf::from).collect(),
+        }
+    }
+}
+
 /// Manages template loop devices and per-sandbox dm-snapshot lifecycle.
 pub struct CowManager {
     templates: Mutex<HashMap<PathBuf, TemplateEntry>>,
@@ -167,7 +193,8 @@ pub struct CowManager {
     /// the kernel via `losetup --show`.)
     losetup_lock: AsyncMutex<()>,
     cow_dir: PathBuf,
-    dmsetup_bin: Option<String>,
+    tools: Arc<dyn BlockTools>,
+    dmsetup_bin: Option<PathBuf>,
     #[cfg(any(test, feature = "test-probe"))]
     test_probe: Option<Arc<CowTestProbe>>,
 }
@@ -177,11 +204,14 @@ pub struct CowManager {
 // ---------------------------------------------------------------------------
 
 impl CowManager {
-    /// Create a new manager.  `data_dir` is the Firecracker data directory
-    /// (e.g. `/var/lib/firecracker-vmm`); COW files are stored under
+    /// Create a new manager over `options`; COW files are stored under
     /// `{data_dir}/cow/`.
-    pub fn new(data_dir: &str) -> Result<Self> {
-        let data_dir = PathBuf::from(data_dir);
+    pub fn new(options: CowOptions) -> Result<Self> {
+        let CowOptions {
+            data_dir,
+            block_tools,
+            dmsetup_candidates,
+        } = options;
         let cow_dir = data_dir.join("cow");
         let marker_dir = cow_dir.join(TEMPLATE_LOOP_DIR);
         std::fs::create_dir_all(&marker_dir)?;
@@ -197,16 +227,15 @@ impl CowManager {
         // talk to the driver (unprivileged dev host, CI runner) can never have
         // created dm snapshots either, so it degrades to the same copy-mode
         // fallback as a missing binary instead of failing every dm command.
-        let dmsetup_bin = DMSETUP_CANDIDATES
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .map(|s| (*s).to_string())
-            .filter(|bin| {
-                Command::new(bin)
+        // Every candidate gets the same test: an existing-but-broken entry
+        // earlier in the list must not shadow a working one later.
+        let dmsetup_bin = dmsetup_candidates.into_iter().find(|bin| {
+            bin.exists()
+                && Command::new(bin)
                     .arg("version")
                     .output()
                     .is_ok_and(|out| out.status.success())
-            });
+        });
 
         if dmsetup_bin.is_none() {
             warn!("dmsetup not found or unusable; dm-snapshot CoW will be unavailable");
@@ -217,6 +246,7 @@ impl CowManager {
             setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir,
+            tools: block_tools,
             dmsetup_bin,
             #[cfg(any(test, feature = "test-probe"))]
             test_probe: None,
@@ -224,10 +254,31 @@ impl CowManager {
     }
 
     #[cfg(any(test, feature = "test-probe"))]
-    pub fn new_with_test_probe(data_dir: &str, probe: Arc<CowTestProbe>) -> Result<Self> {
-        let mut manager = Self::new(data_dir)?;
+    pub fn new_with_test_probe(options: CowOptions, probe: Arc<CowTestProbe>) -> Result<Self> {
+        let mut manager = Self::new(options)?;
         manager.test_probe = Some(probe);
         Ok(manager)
+    }
+
+    /// [`BlockTools::attach_loop`] on a blocking thread.
+    pub(super) async fn attach_loop(&self, backing: &Path, read_only: bool) -> Result<String> {
+        let tools = Arc::clone(&self.tools);
+        let backing = backing.to_path_buf();
+        run_blocking(move || tools.attach_loop(&backing, read_only)).await
+    }
+
+    /// [`BlockTools::detach_loop`] on a blocking thread.
+    pub(super) async fn detach_loop(&self, device: &str) -> Result<()> {
+        let tools = Arc::clone(&self.tools);
+        let device = device.to_owned();
+        run_blocking(move || tools.detach_loop(&device)).await
+    }
+
+    /// [`BlockTools::device_sectors`] on a blocking thread.
+    pub(super) async fn device_sectors(&self, device: &str) -> Result<u64> {
+        let tools = Arc::clone(&self.tools);
+        let device = device.to_owned();
+        run_blocking(move || tools.device_sectors(&device)).await
     }
 
     /// Create a dm-snapshot for `sandbox_id` using `rootfs_path` as template.
@@ -337,7 +388,7 @@ impl CowManager {
             // Genuinely first to attach — do the work and publish the entry
             // before releasing the lock.
             let pending = self.write_template_pending(sandbox_id, &template)?;
-            let loop_dev = match losetup_attach(BUSYBOX, Path::new(rootfs_path), true).await {
+            let loop_dev = match self.attach_loop(Path::new(rootfs_path), true).await {
                 Ok(loop_dev) => loop_dev,
                 Err(error) => {
                     return Err(self
@@ -359,7 +410,7 @@ impl CowManager {
                     )
                     .await);
             }
-            let sectors = match blockdev_getsz(BUSYBOX, &loop_dev).await {
+            let sectors = match self.device_sectors(&loop_dev).await {
                 Ok(sectors) => sectors,
                 Err(error) => {
                     return Err(self
@@ -453,7 +504,7 @@ impl CowManager {
         // --- 3. Attach COW file as a loop device ----------------------------
         let cow_loop_result = {
             let losetup_guard = self.losetup_lock.lock().await;
-            let result = losetup_attach(BUSYBOX, &cow_file, false).await;
+            let result = self.attach_loop(&cow_file, false).await;
             drop(losetup_guard);
             result
         };
@@ -538,7 +589,7 @@ impl CowManager {
 
         // 2. Detach COW loop device.
         let loop_detached = if loop_backs_path(&handle.cow_loop, &handle.cow_file)? {
-            match losetup_detach(BUSYBOX, &handle.cow_loop).await {
+            match self.detach_loop(&handle.cow_loop).await {
                 Ok(()) => true,
                 Err(error) => {
                     failures.push(format!("detach {}: {error}", handle.cow_loop));
@@ -614,7 +665,7 @@ impl CowManager {
         }
         if failures.is_empty()
             && loop_backs_path(&handle.cow_loop, &handle.cow_file)?
-            && let Err(error) = losetup_detach(BUSYBOX, &handle.cow_loop).await
+            && let Err(error) = self.detach_loop(&handle.cow_loop).await
         {
             failures.push(format!("detach {}: {error}", handle.cow_loop));
         }
@@ -639,7 +690,7 @@ impl CowManager {
             return Ok(());
         }
         for loop_device in loop_devices_for_backing_sync(&cow_file)? {
-            losetup_detach(BUSYBOX, &loop_device).await?;
+            self.detach_loop(&loop_device).await?;
         }
         remove_file_durable(&cow_file)?;
         Ok(())
@@ -649,6 +700,15 @@ impl CowManager {
 // ---------------------------------------------------------------------------
 // Shell helpers
 // ---------------------------------------------------------------------------
+
+/// Run a blocking block-tools operation on a blocking thread.
+async fn run_blocking<T: Send + 'static>(
+    op: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|e| SnapshotError::DeviceMapper(format!("spawn_blocking join: {e}")))?
+}
 
 /// Run a synchronous [`Command`] on a blocking thread.
 ///
@@ -663,79 +723,8 @@ async fn run_cmd(mut cmd: Command) -> Result<std::process::Output> {
         .map_err(|e| SnapshotError::DeviceMapper(format!("command spawn: {e}")))
 }
 
-/// Attach a file as a loop device.  Returns the device path (e.g. `/dev/loop0`).
-///
-/// Uses the atomic `losetup -f --show` form so the kernel allocates and
-/// attaches in a single `LOOP_CTL_GET_FREE`+`LOOP_SET_FD` call, avoiding
-/// the TOCTOU window of separate `-f` then `attach` invocations against
-/// other processes that might claim the same slot.  Supported by busybox
-/// >= 1.21 and util-linux >= 2.20.
-async fn losetup_attach(bin: &str, path: &Path, read_only: bool) -> Result<String> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| SnapshotError::DeviceMapper("non-UTF-8 path".into()))?;
-
-    let mut cmd = Command::new(bin);
-    if read_only {
-        cmd.args(["losetup", "-r", "-f", "--show", path_str]);
-    } else {
-        cmd.args(["losetup", "-f", "--show", path_str]);
-    }
-    let output = run_cmd(cmd).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SnapshotError::DeviceMapper(format!(
-            "losetup attach {}: {stderr}",
-            path.display()
-        )));
-    }
-    let dev = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if dev.is_empty() {
-        return Err(SnapshotError::DeviceMapper(
-            "losetup --show returned empty device path".into(),
-        ));
-    }
-    Ok(dev)
-}
-
-/// Detach a loop device.
-async fn losetup_detach(bin: &str, dev: &str) -> Result<()> {
-    let mut cmd = Command::new(bin);
-    cmd.args(["losetup", "-d", dev]);
-
-    let output = run_cmd(cmd).await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SnapshotError::DeviceMapper(format!(
-            "losetup -d {dev}: {stderr}"
-        )));
-    }
-    Ok(())
-}
-
-/// Get the size of a block device in 512-byte sectors.
-async fn blockdev_getsz(bin: &str, dev: &str) -> Result<u64> {
-    let mut cmd = Command::new(bin);
-    cmd.args(["blockdev", "--getsz", dev]);
-
-    let output = run_cmd(cmd).await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SnapshotError::DeviceMapper(format!(
-            "blockdev --getsz {dev}: {stderr}"
-        )));
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .map_err(|e| SnapshotError::DeviceMapper(format!("blockdev parse: {e}")))
-}
-
 /// Create a dm-snapshot device via `dmsetup create`.
-async fn dmsetup_create(bin: &str, name: &str, table: &str) -> Result<()> {
+async fn dmsetup_create(bin: &Path, name: &str, table: &str) -> Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(["create", name, "--table", table]);
 
@@ -751,7 +740,7 @@ async fn dmsetup_create(bin: &str, name: &str, table: &str) -> Result<()> {
 }
 
 /// Remove a dm device via `dmsetup remove`.
-async fn dmsetup_remove(bin: &str, name: &str) -> Result<()> {
+async fn dmsetup_remove(bin: &Path, name: &str) -> Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(["remove", name]);
 
@@ -828,58 +817,6 @@ async fn create_sparse_file(
     })?
 }
 
-/// Get the `(major, minor)` device numbers for a block device.
-///
-/// Uses `busybox stat -c '%t %T'` which prints major and minor in hex.
-pub async fn device_major_minor(path: &str) -> Result<(u32, u32)> {
-    let mut cmd = Command::new(BUSYBOX);
-    cmd.args(["stat", "-c", "%t %T", path]);
-    let output = run_cmd(cmd).await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SnapshotError::DeviceMapper(format!(
-            "stat {path}: {stderr}"
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parts: Vec<&str> = stdout.split_whitespace().collect();
-    if parts.len() != 2 {
-        return Err(SnapshotError::DeviceMapper(format!(
-            "unexpected stat output for {path}: {stdout}"
-        )));
-    }
-    let major = u32::from_str_radix(parts[0], 16)
-        .map_err(|e| SnapshotError::DeviceMapper(format!("parse major: {e}")))?;
-    let minor = u32::from_str_radix(parts[1], 16)
-        .map_err(|e| SnapshotError::DeviceMapper(format!("parse minor: {e}")))?;
-    Ok((major, minor))
-}
-
-/// Create a block device node at `node_path` pointing to `(major, minor)`.
-pub async fn mknod_blkdev(node_path: &Path, major: u32, minor: u32) -> Result<()> {
-    let path_str = node_path
-        .to_str()
-        .ok_or_else(|| SnapshotError::DeviceMapper("non-UTF-8 node path".into()))?;
-    let mut cmd = Command::new(BUSYBOX);
-    cmd.args([
-        "mknod",
-        path_str,
-        "b",
-        &major.to_string(),
-        &minor.to_string(),
-    ]);
-    let output = run_cmd(cmd).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SnapshotError::DeviceMapper(format!(
-            "mknod {path_str}: {stderr}"
-        )));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -936,6 +873,7 @@ mod tests {
             setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
+            tools: Arc::new(BusyboxBlockTools::default()),
             dmsetup_bin: None,
             test_probe: None,
         };
@@ -966,6 +904,7 @@ mod tests {
             setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
+            tools: Arc::new(BusyboxBlockTools::default()),
             dmsetup_bin: None,
             test_probe: None,
         };
@@ -996,6 +935,7 @@ mod tests {
             setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
+            tools: Arc::new(BusyboxBlockTools::default()),
             dmsetup_bin: None,
             test_probe: None,
         };
@@ -1030,6 +970,7 @@ mod tests {
             setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir: tmp.path().to_path_buf(),
+            tools: Arc::new(BusyboxBlockTools::default()),
             dmsetup_bin: Some("/not-used".into()),
             test_probe: None,
         };
@@ -1056,6 +997,7 @@ mod tests {
             setup_orphans: Mutex::new(HashMap::new()),
             losetup_lock: AsyncMutex::new(()),
             cow_dir: PathBuf::from("/tmp"),
+            tools: Arc::new(BusyboxBlockTools::default()),
             dmsetup_bin: None,
             test_probe: None,
         };

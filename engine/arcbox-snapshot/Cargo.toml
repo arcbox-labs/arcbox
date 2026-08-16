@@ -12,6 +12,7 @@ authors.workspace = true
 arcbox-atomic-file.workspace = true
 arcbox-error = { workspace = true }
 chrono = { workspace = true }
+nix = { workspace = true, features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

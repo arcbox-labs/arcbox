@@ -766,7 +766,7 @@ pub(super) async fn stage_rootfs_device_for_jailer(
     tokio::fs::create_dir_all(chroot_root)
         .await
         .map_err(VmmError::Io)?;
-    let (major, minor) = crate::snapshot_cow::device_major_minor(dm_device).await?;
+    let (major, minor) = crate::snapshot_cow::device_major_minor(dm_device)?;
     let node_path = chroot_root.join("rootfs.ext4");
     // Remove any leftover entry from a previous crash so mknod can succeed
     // (and so we never end up writing into a stale device node).
@@ -775,7 +775,7 @@ pub(super) async fn stage_rootfs_device_for_jailer(
     {
         return Err(VmmError::Io(e));
     }
-    crate::snapshot_cow::mknod_blkdev(&node_path, major, minor).await?;
+    crate::snapshot_cow::mknod_blkdev(&node_path, major, minor)?;
     chown(
         &node_path,
         Some(Uid::from_raw(uid)),

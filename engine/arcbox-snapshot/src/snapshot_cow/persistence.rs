@@ -6,8 +6,8 @@ use std::process::Command;
 use tracing::{debug, warn};
 
 use super::{
-    BUSYBOX, CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
-    TEMPLATE_PENDING_PREFIX, dmsetup_remove, losetup_detach,
+    CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
+    TEMPLATE_PENDING_PREFIX, dmsetup_remove,
 };
 use crate::error::{Result, SnapshotError};
 
@@ -77,7 +77,7 @@ impl CowManager {
                     continue;
                 }
                 for loop_device in loop_devices_for_backing_sync(&path)? {
-                    run_sync_checked(Command::new(BUSYBOX).args(["losetup", "-d", &loop_device]))?;
+                    self.tools.detach_loop(&loop_device)?;
                 }
                 debug!(file = %path.display(), "removing stale cow file");
                 remove_file_durable(&path)?;
@@ -196,7 +196,7 @@ impl CowManager {
             }
             if loop_basename.starts_with(TEMPLATE_PENDING_PREFIX) {
                 for loop_device in loop_devices_for_backing_sync(Path::new(&expected_backing))? {
-                    run_sync_checked(Command::new(BUSYBOX).args(["losetup", "-d", &loop_device]))?;
+                    self.tools.detach_loop(&loop_device)?;
                 }
                 clear_owner_marker(&marker_path)?;
                 continue;
@@ -212,7 +212,7 @@ impl CowManager {
                 && actual_backing.as_deref() == Some(expected_backing.as_str())
             {
                 debug!(dev = %dev, "detaching stale template loop");
-                run_sync_checked(Command::new(BUSYBOX).args(["losetup", "-d", &dev]))?;
+                self.tools.detach_loop(&dev)?;
             } else {
                 debug!(
                     dev = %dev,
@@ -263,7 +263,7 @@ impl CowManager {
                 orphan.cow_loop = Some(loop_device.to_owned());
                 false
             }
-            (true, Some(loop_device)) => match losetup_detach(BUSYBOX, loop_device).await {
+            (true, Some(loop_device)) => match self.detach_loop(loop_device).await {
                 Ok(()) => true,
                 Err(cleanup) => {
                     failures.push(cleanup.to_string());
@@ -313,7 +313,7 @@ impl CowManager {
         if let (Some(cow_loop), Some(cow_file)) = (&orphan.cow_loop, &orphan.cow_file)
             && loop_backs_path(cow_loop, cow_file)?
         {
-            losetup_detach(BUSYBOX, cow_loop).await?;
+            self.detach_loop(cow_loop).await?;
         }
         if let Some(cow_file) = &orphan.cow_file {
             remove_file_durable(cow_file)?;
@@ -372,7 +372,7 @@ impl CowManager {
     }
 
     async fn detach_template_loop(&self, loop_device: &str) -> Result<()> {
-        losetup_detach(BUSYBOX, loop_device).await?;
+        self.detach_loop(loop_device).await?;
         if let Some(marker) = self.template_marker_path(loop_device)
             && let Err(error) = clear_owner_marker(&marker)
         {

@@ -431,7 +431,7 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
 mod tests {
     use super::*;
     use crate::sandbox::persistence::{ProvisionIntent, SandboxPhase, SandboxProvisionOutcome};
-    use crate::snapshot_cow::CowTestProbe;
+    use crate::snapshot_cow::{CowOptions, CowTestProbe};
     use std::os::unix::fs::PermissionsExt;
 
     fn instance(id: &str) -> Arc<Mutex<SandboxInstance>> {
@@ -522,7 +522,8 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+            let cow_manager =
+                Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
             let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
                 &config.firecracker.data_dir,
             ));
@@ -659,7 +660,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+        let cow_manager =
+            Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
         let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
             &config.firecracker.data_dir,
         ));
@@ -719,7 +721,7 @@ mod tests {
         let cow_probe = Arc::new(CowTestProbe::default());
         manager.cow_manager = Arc::new(
             CowManager::new_with_test_probe(
-                manager.config.firecracker.data_dir.as_str(),
+                CowOptions::new(&manager.config.firecracker.data_dir),
                 Arc::clone(&cow_probe),
             )
             .unwrap(),
@@ -862,7 +864,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+        let cow_manager =
+            Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
 
         release_runtime_resources("job", &arc, &network, &config, &cow_manager)
             .await
@@ -910,7 +913,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir).unwrap());
+        let cow_manager =
+            Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
         let records = Arc::new(SandboxRecordStore::new(data_dir.path()).unwrap());
         let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
             &config.firecracker.data_dir,
