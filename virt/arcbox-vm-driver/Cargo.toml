@@ -8,11 +8,11 @@ repository.workspace = true
 description       = "The VM driver port: the vocabulary of a VM on this host — spec, driver/handle traits, capabilities, guest-network port — that VMM adapters implement and orchestrators consume."
 
 [dependencies]
+async-trait.workspace = true
 serde.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

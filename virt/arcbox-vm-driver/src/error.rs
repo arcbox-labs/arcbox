@@ -4,6 +4,7 @@
 //! something says so through a capability accessor returning `None`, never
 //! through an error at call time.
 
+use crate::capability::CheckpointFormat;
 use crate::driver::VmState;
 use crate::spec::VmId;
 
@@ -30,9 +31,14 @@ pub enum Error {
         expected: &'static str,
     },
 
+    /// A restore was asked of a checkpoint another driver (or another
+    /// version of this one) wrote.
+    #[error("checkpoint format {0} is not one this driver wrote")]
+    ForeignCheckpoint(CheckpointFormat),
+
     /// The adapter itself failed: process spawn, API call, file staging.
     ///
-    /// `driver` is the adapter's `VmDriver::name`; `source` carries
+    /// `driver` is the adapter's [`crate::VmDriver::name`]; `source` carries
     /// the underlying error when there is one worth chaining.
     #[error("driver `{driver}`: {message}")]
     Driver {

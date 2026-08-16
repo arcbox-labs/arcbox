@@ -1219,9 +1219,11 @@ dependencies = [
 name = "arcbox-vm-driver"
 version = "0.7.0"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

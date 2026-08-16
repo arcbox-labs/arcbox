@@ -11,16 +11,22 @@
 //! # What is here
 //!
 //! - [`spec`] — the serializable per-VM shape: [`VmSpec`] and its parts.
-//! - [`driver`] — the handle vocabulary: [`VmState`], [`VmEvent`],
-//!   [`ExitStatus`], [`ShutdownMode`], the durable [`VmRecord`], and
-//!   [`DriverCapabilities`], what a driver claims it can do.
+//! - [`driver`] — the port: [`VmDriver`] boots a spec into a [`VmHandle`],
+//!   whose mandatory surface is identify (`id`/`record`), observe
+//!   (`state`/`events`), and stop (`shutdown`); plus the handle vocabulary
+//!   ([`VmState`], [`VmEvent`], [`ExitStatus`], [`ShutdownMode`],
+//!   [`VmRecord`]) and [`DriverCapabilities`], what a driver claims.
+//! - [`capability`] — everything optional, one trait each: [`Vsock`],
+//!   [`VsockListen`], [`Checkpoint`], [`Adopt`]/[`Detach`], [`Balloon`],
+//!   [`Console`], [`DebugSnapshot`]. A handle exposes each through an
+//!   `Option<&dyn Cap>` accessor, `Some` only when the driver can and the
+//!   spec asked; `capabilities()` must agree with the accessors.
 //! - [`error`] — the one [`Error`] every port method speaks. There is no
 //!   `Unsupported` variant: what a driver cannot do is a capability
 //!   accessor returning `None`, never an error at call time.
 //!
-//! The driver and handle traits, the capability traits, the guest-network
-//! port, and the `testkit` feature (fake driver, fake network, contract
-//! test-kit) land in the sibling modules.
+//! The guest-network port and the `testkit` feature (fake driver, fake
+//! network, contract test-kit) land in the sibling modules.
 //!
 //! # Rules the crate is held to
 //!
@@ -35,13 +41,19 @@
 
 #![warn(missing_docs)]
 
+pub mod capability;
 pub mod driver;
 pub mod error;
 pub mod spec;
 
+pub use capability::{
+    Adopt, AfterCheckpoint, Balloon, BalloonStats, Checkpoint, CheckpointFormat, CheckpointImage,
+    CheckpointKind, CheckpointOptions, Console, DebugSnapshot, Detach, Vsock, VsockListen,
+    VsockListener,
+};
 pub use driver::{
     DriverCapabilities, ExitStatus, IoMode, NestedVirt, ProcessRecord, RestoreSpec, ShutdownMode,
-    VmEvent, VmRecord, VmState, VsockConn,
+    VmDriver, VmEvent, VmHandle, VmRecord, VmState, VsockConn,
 };
 pub use error::{Error, Result};
 pub use spec::{
