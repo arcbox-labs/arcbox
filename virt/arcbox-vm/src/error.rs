@@ -37,6 +37,11 @@ pub enum VmmError {
     #[error("fc-sdk error: {0}")]
     Sdk(#[from] fc_sdk::Error),
 
+    /// The VM driver — the port's adapter, or a capability reached through
+    /// it — failed.
+    #[error("driver error: {0}")]
+    Driver(#[from] arcbox_vm_driver::Error),
+
     /// Network-related error (TAP creation, IP allocation, etc.).
     #[error("network error: {0}")]
     Network(String),

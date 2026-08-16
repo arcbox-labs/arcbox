@@ -10,12 +10,14 @@ description       = "Sandbox orchestration over Firecracker microVMs: boot, exec
 [dependencies]
 arcbox-atomic-file.workspace = true
 arcbox-vm-proto.workspace = true
+arcbox-vm-driver.workspace = true
 arcbox-error.workspace = true
 arcbox-snapshot.workspace = true
 fc-sdk.workspace       = true
 tokio.workspace        = true
 thiserror.workspace    = true
 anyhow.workspace       = true
+async-trait.workspace  = true
 serde.workspace        = true
 serde_json.workspace   = true
 uuid.workspace         = true
