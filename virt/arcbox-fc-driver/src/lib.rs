@@ -26,6 +26,10 @@
 //!   `{uds}_{port}` listener for guest dial-outs.
 //! - [`process`] — the VMM process guard: one waiter task reaps the
 //!   child and publishes its exit; kill, wait, and detach never race it.
+//! - [`api`] — the few Firecracker API calls a running VM needs, over the
+//!   raw client (pause, resume, snapshot, ctrl-alt-del).
+//! - [`listener`] — the port's `VsockListener` over a `{uds}_{port}`
+//!   socket, failing once the VM is gone.
 //!
 //! The remaining modules — the spec renderer, jail staging, process
 //! spawning and ownership, the vsock handshake, the prepared VM, the
@@ -44,9 +48,11 @@
 
 #![warn(missing_docs)]
 
+pub mod api;
 pub mod config;
 pub mod error;
 pub mod jail;
+pub mod listener;
 pub mod process;
 pub mod render;
 pub mod spawn;

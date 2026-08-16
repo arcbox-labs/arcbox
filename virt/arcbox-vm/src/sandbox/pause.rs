@@ -28,7 +28,7 @@
 //! onwards every resource is keyed by the sandbox id again and resume,
 //! reconciliation, and `Remove` all see one naming scheme.
 
-use super::checkpoint::{CheckpointRequest, checkpoint_impl, move_file};
+use super::checkpoint::{CheckpointRequest, checkpoint_impl};
 use super::persistence::SandboxTransition;
 use super::types::action;
 use super::*;

@@ -92,6 +92,25 @@ pub fn vsock_uds_path(chroot_root: &Path) -> PathBuf {
 /// Where the vsock Unix socket lives from inside the jail.
 pub const VSOCK_UDS_IN_JAIL: &str = "/run/firecracker.vsock";
 
+/// Move a file even when source and destination sit on different mounts.
+///
+/// The jailer chroot is its own vfsmount (bind + pivot_root), so a plain
+/// `rename(2)` out of it fails with `EXDEV` regardless of the underlying
+/// filesystem; fall back to copy + remove in that case.
+pub async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(from, to).await {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            tokio::fs::copy(from, to).await?;
+            // fsync the destination before removing the source: a crash between
+            // the copy and the remove must not leave a zero-length/partial
+            // snapshot file registered in the catalog.
+            tokio::fs::File::open(to).await?.sync_all().await?;
+            tokio::fs::remove_file(from).await
+        }
+        other => other,
+    }
+}
+
 /// Stage a read-only file into a jailer chroot: hard-link when possible,
 /// copy otherwise.
 ///
