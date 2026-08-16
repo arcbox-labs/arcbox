@@ -343,7 +343,13 @@ async fn stage_slot(
     std::fs::create_dir_all(cr.join("run")).map_err(VmmError::Io)?;
     let vsock_path = cr.join("run/firecracker.vsock");
 
-    let process = spawn_jailer(jc, fc_cfg, slot_id).await?;
+    let process = spawn_jailer(
+        &FcDriverConfig::from(fc_cfg),
+        &IsolationSpec::try_from(jc)?,
+        slot_id,
+    )
+    .await
+    .map_err(VmmError::from)?;
     #[allow(
         clippy::cast_possible_wrap,
         reason = "Firecracker pid fits platform pid_t"

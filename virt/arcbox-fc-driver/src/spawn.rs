@@ -1,63 +1,66 @@
 //! Firecracker process spawn helpers — shared between `manager` and `sandbox`.
 
 use std::path::Path;
-use std::time::Duration;
 
+use arcbox_vm_driver::{Error, IsolationSpec, Result};
 use fc_sdk::process::{FirecrackerProcessBuilder, JailerProcessBuilder};
 
-use crate::config::{FirecrackerConfig, JailerConfig};
-use crate::error::{Result, VmmError};
-
-// Match fc-sdk 0.2.3 while keeping ArcBox's boot handoff bound stable across upgrades.
-const DEFAULT_SOCKET_TIMEOUT_SECS: u64 = 5;
+use crate::config::FcDriverConfig;
+use crate::error::FcError;
 
 /// Configure and spawn a Firecracker process via the Jailer.
 ///
 /// Returns the spawned process. The caller can query `process.socket_path()`
 /// to obtain the API socket inside the chroot.
 pub async fn spawn_jailer(
-    jc: &JailerConfig,
-    fc_cfg: &FirecrackerConfig,
+    fc_cfg: &FcDriverConfig,
+    isolation: &IsolationSpec,
     id: &str,
 ) -> Result<fc_sdk::FirecrackerProcess> {
-    let mut jb = JailerProcessBuilder::new(&jc.binary, &fc_cfg.binary, id, jc.uid, jc.gid);
-    if let Some(ref base) = jc.chroot_base_dir {
-        jb = jb.chroot_base_dir(base);
+    let IsolationSpec::Jailer {
+        uid,
+        gid,
+        chroot_base,
+        netns,
+        new_pid_ns,
+        cgroup,
+    } = isolation
+    else {
+        return Err(Error::InvalidSpec(
+            "a jailer spawn needs IsolationSpec::Jailer".into(),
+        ));
+    };
+    let jailer = fc_cfg.jailer_binary.as_deref().ok_or(FcError::NoJailer)?;
+    let mut jb = JailerProcessBuilder::new(jailer, &fc_cfg.firecracker_binary, id, *uid, *gid);
+    jb = jb.chroot_base_dir(chroot_base);
+    if let Some(ns) = netns {
+        jb = jb.netns(ns.display().to_string());
     }
-    if let Some(ref ns) = jc.netns {
-        jb = jb.netns(ns);
-    }
-    if jc.new_pid_ns {
+    if *new_pid_ns {
         jb = jb.new_pid_ns(true);
     }
-    if let Some(ref ver) = jc.cgroup_version {
-        jb = jb.cgroup_version(ver);
+    if let Some(cg) = cgroup {
+        jb = jb.cgroup_version(cg.version.to_string());
+        if let Some(parent) = &cg.parent {
+            jb = jb.parent_cgroup(parent);
+        }
     }
-    if let Some(ref parent) = jc.parent_cgroup {
-        jb = jb.parent_cgroup(parent);
-    }
-    for limit in &jc.resource_limits {
+    for limit in &fc_cfg.resource_limits {
         jb = jb.resource_limit(limit);
     }
-    jb = jb.socket_timeout(Duration::from_secs(
-        fc_cfg
-            .socket_timeout_secs
-            .unwrap_or(DEFAULT_SOCKET_TIMEOUT_SECS),
-    ));
-    jb.spawn()
-        .await
-        .map_err(|e| VmmError::Process(e.to_string()))
+    jb = jb.socket_timeout(fc_cfg.socket_timeout);
+    jb.spawn().await.map_err(|e| Error::from(FcError::Spawn(e)))
 }
 
 /// Configure and spawn a Firecracker process directly (no Jailer).
 pub async fn spawn_direct(
-    fc_cfg: &FirecrackerConfig,
+    fc_cfg: &FcDriverConfig,
     id: &str,
     socket_path: &Path,
     log_path: &Path,
     metrics_path: &Path,
 ) -> Result<fc_sdk::FirecrackerProcess> {
-    let mut fb = FirecrackerProcessBuilder::new(&fc_cfg.binary, socket_path).id(id);
+    let mut fb = FirecrackerProcessBuilder::new(&fc_cfg.firecracker_binary, socket_path).id(id);
     fb = fb.log_path(log_path).metrics_path(metrics_path);
     if let Some(ref level) = fc_cfg.log_level {
         fb = fb.log_level(level);
@@ -74,20 +77,14 @@ pub async fn spawn_direct(
     if let Some(size) = fc_cfg.mmds_size_limit {
         fb = fb.mmds_size_limit(size);
     }
-    fb = fb.socket_timeout(Duration::from_secs(
-        fc_cfg
-            .socket_timeout_secs
-            .unwrap_or(DEFAULT_SOCKET_TIMEOUT_SECS),
-    ));
+    fb = fb.socket_timeout(fc_cfg.socket_timeout);
     tracing::debug!(
         id,
         socket = %socket_path.display(),
         log = %log_path.display(),
         metrics = %metrics_path.display(),
-        binary = %fc_cfg.binary,
+        binary = %fc_cfg.firecracker_binary.display(),
         "spawning firecracker (direct mode)"
     );
-    fb.spawn()
-        .await
-        .map_err(|e| VmmError::Process(e.to_string()))
+    fb.spawn().await.map_err(|e| Error::from(FcError::Spawn(e)))
 }

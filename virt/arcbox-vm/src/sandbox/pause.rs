@@ -595,7 +595,12 @@ impl SandboxManager {
             std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
             let vsock_path = cr.join("run/firecracker.vsock");
             let _ = std::fs::remove_file(&vsock_path);
-            let spawned = spawn_jailer(jailer, fc_cfg, id).await?;
+            let spawned = spawn_jailer(
+                &FcDriverConfig::from(fc_cfg),
+                &IsolationSpec::try_from(jailer)?,
+                id,
+            )
+            .await?;
             #[allow(
                 clippy::cast_possible_wrap,
                 reason = "Firecracker pid fits platform pid_t"

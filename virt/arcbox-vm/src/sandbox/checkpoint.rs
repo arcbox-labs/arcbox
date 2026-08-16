@@ -681,7 +681,12 @@ impl SandboxManager {
                     let vsock_path = cr.join("run/firecracker.vsock");
                     let _ = std::fs::remove_file(&vsock_path);
 
-                    let proc = spawn_jailer(jailer, fc_cfg, &new_id).await?;
+                    let proc = spawn_jailer(
+                        &FcDriverConfig::from(fc_cfg),
+                        &IsolationSpec::try_from(jailer)?,
+                        &new_id,
+                    )
+                    .await?;
                     Ok((proc, vsock_path))
                 }
                 .await;

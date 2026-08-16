@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use arcbox_fc_driver::FcDriverConfig;
+use arcbox_fc_driver::spawn::{spawn_direct, spawn_jailer};
+use arcbox_vm_driver::IsolationSpec;
 use chrono::{DateTime, Utc};
 use fc_sdk::VmBuilder;
 use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
@@ -29,7 +32,6 @@ use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
-use crate::spawn::{spawn_direct, spawn_jailer};
 use crate::template_catalog::TemplateCatalog;
 use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 

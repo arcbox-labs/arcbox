@@ -49,7 +49,6 @@ pub mod file_io;
 pub mod network;
 pub mod rootfs;
 pub mod sandbox;
-pub mod spawn;
 pub mod vsock;
 
 /// Boot-parameter vocabulary shared with `vm-agent` (`arcbox_vm_proto::boot`).

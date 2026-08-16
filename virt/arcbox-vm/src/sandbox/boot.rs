@@ -999,11 +999,15 @@ async fn do_boot(
     }
 
     // Spawn the Firecracker process (direct or via Jailer).
-    let process_result = if let Some(ref jc) = fc_cfg.jailer {
-        spawn_jailer(jc, fc_cfg, id).await
-    } else {
-        spawn_direct(fc_cfg, id, &socket_path, &log_path, &metrics_path).await
-    };
+    let process_result: Result<fc_sdk::FirecrackerProcess> = async {
+        let driver_config = FcDriverConfig::from(fc_cfg);
+        Ok(if let Some(ref jc) = fc_cfg.jailer {
+            spawn_jailer(&driver_config, &IsolationSpec::try_from(jc)?, id).await?
+        } else {
+            spawn_direct(&driver_config, id, &socket_path, &log_path, &metrics_path).await?
+        })
+    }
+    .await;
     let process = match process_result {
         Ok(process) => process,
         Err(error) => {

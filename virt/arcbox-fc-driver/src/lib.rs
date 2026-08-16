@@ -13,6 +13,7 @@
 //!   seccomp, log level, the API-socket wait, jailer resource limits.
 //! - [`error`] — [`FcError`], the adapter's typed failures, folded into the
 //!   port's `Error::Driver` at the boundary.
+//! - [`spawn`] — the `firecracker` / `jailer` process spawn.
 //!
 //! The remaining modules — the spec renderer, jail staging, process
 //! spawning and ownership, the vsock handshake, the prepared VM, the
@@ -33,6 +34,7 @@
 
 pub mod config;
 pub mod error;
+pub mod spawn;
 
 pub use config::FcDriverConfig;
 pub use error::FcError;
