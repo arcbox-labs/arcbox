@@ -36,6 +36,9 @@
 //!   and detach capabilities.
 //! - [`prepared`] — [`FcPrepared`], the port's `PreparedVm`: a spawned
 //!   VMM waiting for a spec, listeners bound before the guest starts.
+//! - [`discover`] — finding a Firecracker that outlived the process which
+//!   booted it: the recorded pid while it is still a Firecracker, else a
+//!   `/proc` scan by `--id`, `--api-sock`, or jail root.
 //!
 //! Design: company repo `engineering/arcbox/architecture/vm-stack-redesign.md`
 //! (Adapters → `virt/arcbox-fc-driver`; D-VM1, D-VM9).
@@ -53,6 +56,7 @@
 
 pub mod api;
 pub mod config;
+pub mod discover;
 pub mod error;
 pub mod handle;
 pub mod jail;
