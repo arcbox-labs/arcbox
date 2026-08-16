@@ -62,9 +62,17 @@ fn a_running_containers_filesystem_is_readable_from_the_host() -> Result<()> {
         args: vec![],
         env: vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version)],
     })?;
-    daemon
-        .wait_ready_blocking(READY_TIMEOUT)
-        .context("daemon not ready")?;
+    // Readiness failures need the same forensics as scenario failures: the
+    // daemon log explaining why boot stalled lives in the data dir, and `?`
+    // here would drop it (tests/e2e/AGENTS.md).
+    if let Err(error) = daemon.wait_ready_blocking(READY_TIMEOUT) {
+        let kept = data_dir.keep();
+        drop(daemon);
+        bail!(
+            "daemon not ready: {error:#} (data dir preserved at {})",
+            kept.display()
+        );
+    }
 
     let result = scenario(data_dir.path());
     if result.is_err() {
