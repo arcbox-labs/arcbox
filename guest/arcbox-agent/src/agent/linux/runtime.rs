@@ -274,9 +274,47 @@ pub(super) fn ensure_shared_runtime_dirs(notes: &mut Vec<String>) {
     }
 }
 
+/// Overlay mount options every container rootfs is mounted with.
+///
+/// `nfs_export=on` is what lets the in-kernel nfsd encode file handles for an
+/// overlay mount, which is the precondition for browsing a *running*
+/// container's filesystem through `~/ArcBox` (ABX-424). Committed layers are
+/// already visible there; the merged view a live container sees is not, and
+/// without this the kernel cannot name its inodes to a client.
+///
+/// `index=on` is not optional alongside it: the kernel rejects
+/// `index=off,nfs_export=on` outright on a read-write mount, and a container
+/// rootfs is read-write. Until arcboxlabs/boot-assets#52 that rejection is
+/// exactly what we got — the stock overlay snapshotter appended `index=off`
+/// after whatever the config asked for, so `index=on` here produced
+/// `index=on,nfs_export=on,index=off`, last-wins, `EINVAL` on every mount.
+/// The patched containerd in boot bundle 0.8.6 is what makes this line take
+/// effect rather than break the guest.
+///
+/// The cost is one `trusted.overlay.origin` xattr per copy-up; in exchange
+/// `index=on` stops copy-up from breaking hard links, which is a fix in its
+/// own right. It also forbids reusing an upperdir across overlay mounts —
+/// harmless here, since every snapshot owns its upper.
+///
+/// A no-upper overlay would additionally need `redirect_dir=nofollow`, which
+/// is why it is absent: containerd only reaches the overlay mount path (the
+/// only place these options are appended) for active snapshots, which always
+/// carry an upperdir, and for multi-parent views — and nothing in ArcBox
+/// mounts one of those. `image_snapshot_paths` reads a view's mount *spec*
+/// and removes it without ever mounting. Add the option here if that changes.
+const OVERLAY_MOUNT_OPTIONS: &str = r#"["index=on", "nfs_export=on"]"#;
+
 pub(super) fn shared_containerd_config() -> String {
     format!(
-        "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".cni]\n  bin_dir = \"{K3S_CNI_BIN_DIR}\"\n  conf_dir = \"{K3S_CNI_CONF_DIR}\"\n  max_conf_num = 1\n"
+        "version = 2\n\
+         \n\
+         [plugins.\"io.containerd.grpc.v1.cri\".cni]\n\
+         \x20 bin_dir = \"{K3S_CNI_BIN_DIR}\"\n\
+         \x20 conf_dir = \"{K3S_CNI_CONF_DIR}\"\n\
+         \x20 max_conf_num = 1\n\
+         \n\
+         [plugins.\"io.containerd.snapshotter.v1.overlayfs\"]\n\
+         \x20 mount_options = {OVERLAY_MOUNT_OPTIONS}\n"
     )
 }
 
@@ -828,6 +866,45 @@ mod tests {
         assert!(config.contains("bin_dir = \"/var/lib/rancher/k3s/data/cni\""));
         assert!(config.contains("conf_dir = \"/var/lib/rancher/k3s/agent/etc/cni/net.d\""));
         assert!(config.contains("max_conf_num = 1"));
+    }
+
+    /// containerd refuses to start on a malformed config, and it does so
+    /// during guest bring-up where the symptom is a readiness timeout rather
+    /// than a parse error. Parsing here is cheap; reading the boot log to
+    /// discover a stray quote is not.
+    #[test]
+    fn shared_containerd_config_is_valid_toml() {
+        let parsed: toml::Value = shared_containerd_config()
+            .parse()
+            .expect("containerd config must be valid TOML");
+        assert_eq!(parsed["version"].as_integer(), Some(2));
+    }
+
+    /// The two options travel together by kernel rule, not by preference:
+    /// `index=off,nfs_export=on` is rejected outright on a read-write mount,
+    /// and a container rootfs is one. Dropping `index=on` while keeping
+    /// `nfs_export=on` would fail every container's overlay mount with
+    /// EINVAL — the failure boot-assets#52's containerd patch exists to
+    /// remove.
+    #[test]
+    fn overlay_mount_options_keep_nfs_export_and_index_together() {
+        let parsed: toml::Value = shared_containerd_config().parse().unwrap();
+        let options = parsed["plugins"]["io.containerd.snapshotter.v1.overlayfs"]["mount_options"]
+            .as_array()
+            .expect("overlayfs snapshotter must declare mount_options")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+
+        assert!(options.contains(&"nfs_export=on".to_owned()));
+        assert!(
+            options.contains(&"index=on".to_owned()),
+            "nfs_export=on without index=on is rejected by the kernel: {options:?}"
+        );
+        assert!(
+            !options.iter().any(|option| option == "index=off"),
+            "index=off would conflict with nfs_export=on: {options:?}"
+        );
     }
 
     #[test]

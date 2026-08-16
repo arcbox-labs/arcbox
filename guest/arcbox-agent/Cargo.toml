@@ -63,6 +63,7 @@ hyper-util = { version = "0.1.20", features = ["tokio"] }
 [dev-dependencies]
 arcbox-computer-runtime.workspace = true
 tempfile = "3"
+toml.workspace = true
 
 [features]
 default = []

@@ -232,6 +232,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tokio-vsock",
+ "toml 0.8.23",
  "tonic",
  "tonic-prost",
  "tower",
