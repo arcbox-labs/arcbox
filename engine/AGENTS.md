@@ -16,6 +16,13 @@ The restructure plan and its locked decisions live in the company repo:
   the `virt/arcbox-hypervisor` trait layer.
 - **Platform-neutral**: every crate must compile and pass unit tests on
   Linux as well as macOS.
+- **Mechanically checked**: `cargo xtask check-layers` (CI `linux-engine`
+  job) fails on a direct edge from `engine/` into `app/`, a macOS-only
+  crate (the list above plus `arcbox-hv`), a VMM adapter, or `arcbox-vmm` /
+  `arcbox-hypervisor` — the last two are today's grandfathered edges
+  (`arcbox-engine -> arcbox-vmm` / `arcbox-hypervisor`, until
+  vm-stack-redesign R4); rules and exceptions live in
+  `xtask/src/commands/check_layers/rules.rs`.
 - **Own your errors**: each crate defines its own `thiserror` type built
   on `arcbox_error::CommonError`; `arcbox-core` converts via `From` (see
   `CoreError`'s `From<ImageError>`), so `is_not_found()`-style predicates
