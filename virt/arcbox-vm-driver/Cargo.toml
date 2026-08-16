@@ -10,12 +10,13 @@ description       = "The VM driver port: the vocabulary of a VM on this host —
 [features]
 # Fakes and the contract test-kit: `FakeDriver`, `FakeNetwork`,
 # `driver_contract!`. Off by default so production builds carry none of it.
-testkit = []
+testkit = ["dep:tempfile"]
 
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 

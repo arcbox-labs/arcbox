@@ -4,15 +4,20 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 
+use super::fake_driver::Knobs;
 use super::lock;
 use crate::capability::{
-    Balloon, BalloonStats, Console, DebugSnapshot, Vsock, VsockListen, VsockListener,
+    AfterCheckpoint, Balloon, BalloonStats, Checkpoint, CheckpointFormat, CheckpointImage,
+    CheckpointKind, CheckpointOptions, Console, DebugSnapshot, Detach, Vsock, VsockListen,
+    VsockListener,
 };
 use crate::driver::{
     DriverCapabilities, ExitStatus, IoMode, ShutdownMode, VmEvent, VmHandle, VmRecord, VmState,
@@ -24,13 +29,28 @@ use crate::spec::{ConsoleSpec, VmId, VmSpec};
 /// What `shutdown(Kill)` and a killing `Drop` report.
 const SIGKILL: i32 = 9;
 
+/// The on-disk format the fake writes and the only one it restores.
+pub(super) const CHECKPOINT_FORMAT: &str = "fake/v1";
+
+/// The contents of a fake checkpoint's `checkpoint.json`.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct CheckpointFile {
+    pub(super) format: CheckpointFormat,
+    pub(super) kind: CheckpointKind,
+    pub(super) spec: VmSpec,
+    pub(super) balloon_target_bytes: u64,
+}
+
 /// The VM's shared state; the driver's registry and every handle to the VM
 /// hold an `Arc` of it.
 pub(super) struct VmInner {
     spec: VmSpec,
     record: VmRecord,
     caps: DriverCapabilities,
+    knobs: Arc<Knobs>,
     state: Mutex<VmState>,
+    /// A live, non-detached handle exists.
+    owned: AtomicBool,
     events: broadcast::Sender<VmEvent>,
     /// Guest-initiated connections waiting for a host `accept`, per port.
     inbound: Mutex<HashMap<u32, VecDeque<UnixStream>>>,
@@ -45,6 +65,7 @@ impl VmInner {
         spec: VmSpec,
         record: VmRecord,
         caps: DriverCapabilities,
+        knobs: Arc<Knobs>,
         balloon_target_bytes: u64,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(16);
@@ -52,7 +73,9 @@ impl VmInner {
             spec,
             record,
             caps,
+            knobs,
             state: Mutex::new(VmState::Running),
+            owned: AtomicBool::new(false),
             events,
             inbound: Mutex::new(HashMap::new()),
             wake: Notify::new(),
@@ -67,6 +90,10 @@ impl VmInner {
 
     pub(super) fn state(&self) -> VmState {
         *lock(&self.state)
+    }
+
+    pub(super) fn is_owned(&self) -> bool {
+        self.owned.load(Ordering::Acquire)
     }
 
     /// Moves to `Exited(status)` and returns the status the VM ended with:
@@ -123,15 +150,25 @@ impl VmInner {
 
 /// A [`VmHandle`] onto a fake VM.
 ///
-/// Dropping it kills the VM; the driver's registry forgets exited VMs on
-/// its next lookup.
+/// Dropping it kills the VM unless it was detached; the driver's registry
+/// forgets exited VMs on its next lookup.
 pub struct FakeVm {
     vm: Arc<VmInner>,
+    checkpointer: Checkpointer,
+    ownership: Ownership,
 }
 
 impl FakeVm {
     pub(super) fn new(vm: Arc<VmInner>) -> Self {
-        Self { vm }
+        vm.owned.store(true, Ordering::Release);
+        Self {
+            checkpointer: Checkpointer(Arc::clone(&vm)),
+            ownership: Ownership {
+                vm: Arc::clone(&vm),
+                detached: AtomicBool::new(false),
+            },
+            vm,
+        }
     }
 
     fn has_vsock(&self) -> bool {
@@ -141,7 +178,9 @@ impl FakeVm {
 
 impl Drop for FakeVm {
     fn drop(&mut self) {
-        self.vm.exit(ExitStatus::signaled(SIGKILL));
+        if !self.ownership.detached.load(Ordering::Acquire) {
+            self.vm.exit(ExitStatus::signaled(SIGKILL));
+        }
     }
 }
 
@@ -175,8 +214,16 @@ impl VmHandle for FakeVm {
         (self.vm.caps.vsock && self.has_vsock()).then_some(self)
     }
 
+    fn checkpoint(&self) -> Option<&dyn Checkpoint> {
+        self.vm.caps.checkpoint.then_some(&self.checkpointer)
+    }
+
     fn vsock_listener(&self) -> Option<&dyn VsockListen> {
         (self.vm.caps.vsock_listen && self.has_vsock()).then_some(self)
+    }
+
+    fn detach(&self) -> Option<&dyn Detach> {
+        self.vm.caps.adopt.then_some(&self.ownership)
     }
 
     fn balloon(&self) -> Option<&dyn Balloon> {
@@ -260,6 +307,72 @@ impl VsockListener for FakeListener {
     }
 }
 
+/// The `Checkpoint` capability, on its own type so its `checkpoint` method
+/// does not shadow the handle's accessor of the same name.
+struct Checkpointer(Arc<VmInner>);
+
+#[async_trait]
+impl Checkpoint for Checkpointer {
+    async fn checkpoint(&self, dst: &Path, opts: CheckpointOptions) -> Result<CheckpointImage> {
+        let vm = &self.0;
+        vm.require_alive()?;
+        if opts.kind == CheckpointKind::Diff && !vm.caps.diff_checkpoint {
+            return Err(Error::Driver {
+                driver: "fake",
+                message: "diff checkpoints are not enabled on this fake".into(),
+                source: None,
+            });
+        }
+        if vm.knobs.fail_checkpoint_once.swap(false, Ordering::AcqRel) {
+            return Err(Error::Driver {
+                driver: "fake",
+                message: "scripted checkpoint failure".into(),
+                source: None,
+            });
+        }
+        let file = CheckpointFile {
+            format: CheckpointFormat::new(CHECKPOINT_FORMAT),
+            kind: opts.kind,
+            spec: vm.spec.clone(),
+            balloon_target_bytes: vm.balloon_target_bytes.load(Ordering::Acquire),
+        };
+        let json = serde_json::to_vec_pretty(&file).map_err(std::io::Error::from)?;
+        tokio::fs::create_dir_all(dst).await?;
+        tokio::fs::write(dst.join("checkpoint.json"), json).await?;
+        {
+            let mut state = lock(&vm.state);
+            if !matches!(*state, VmState::Exited(_)) {
+                *state = match opts.after {
+                    AfterCheckpoint::Resume => VmState::Running,
+                    AfterCheckpoint::HoldQuiesced => VmState::Quiesced,
+                };
+            }
+        }
+        Ok(CheckpointImage {
+            dir: dst.to_path_buf(),
+            format: file.format,
+            kind: opts.kind,
+        })
+    }
+}
+
+/// The `Detach` capability, on its own type so its `detach` method does not
+/// shadow the handle's accessor of the same name.
+struct Ownership {
+    vm: Arc<VmInner>,
+    detached: AtomicBool,
+}
+
+#[async_trait]
+impl Detach for Ownership {
+    async fn detach(&self) -> Result<VmRecord> {
+        self.vm.require_alive()?;
+        self.detached.store(true, Ordering::Release);
+        self.vm.owned.store(false, Ordering::Release);
+        Ok(self.vm.record.clone())
+    }
+}
+
 #[async_trait]
 impl Balloon for FakeVm {
     async fn set_target(&self, bytes: u64) -> Result<()> {
@@ -288,14 +401,14 @@ impl Console for FakeVm {
 
 impl DebugSnapshot for FakeVm {
     fn snapshot(&self) -> serde_json::Value {
-        let inbound_ports: Vec<u32> = lock(&self.vm.inbound).keys().copied().collect();
+        let listeners: Vec<u32> = lock(&self.vm.inbound).keys().copied().collect();
         serde_json::json!({
             "driver": "fake",
             "id": self.vm.id().as_str(),
             "state": self.vm.state().to_string(),
             "balloon_target_bytes": self.vm.balloon_target_bytes.load(Ordering::Acquire),
             "console_pending_bytes": lock(&self.vm.console).len(),
-            "inbound_ports": inbound_ports,
+            "inbound_ports": listeners,
         })
     }
 }

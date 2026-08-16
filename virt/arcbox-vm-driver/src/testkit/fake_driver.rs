@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use super::fake_vm::{FakeVm, VmInner};
+use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, VmInner};
 use super::lock;
 use crate::capability::{Adopt, CheckpointImage};
 use crate::driver::{
@@ -16,26 +17,40 @@ use crate::driver::{
 use crate::error::{Error, Result};
 use crate::spec::{VmId, VmSpec};
 
+/// Scripted failures, armed once and consumed by the next matching call.
+#[derive(Debug, Default)]
+pub(super) struct Knobs {
+    pub(super) fail_boot_once: AtomicBool,
+    pub(super) fail_checkpoint_once: AtomicBool,
+}
+
 /// An in-memory VM driver.
 ///
-/// VMs are a real state machine (`Running` → `Exited` on shutdown, kill, or
-/// drop) with an events broadcast. `Vsock::dial` returns one end of a
-/// socketpair whose other end echoes; `VsockListen` accepts what
-/// [`FakeDriver::guest_dial`] pushes; `Console` returns what
-/// [`FakeDriver::push_console`] pushed; `Balloon` and `DebugSnapshot` report
-/// the VM's own state. [`FakeDriver::builder`] narrows the claimed
-/// capabilities — the accessors follow the claims, so the contract can be
-/// run against a reduced set.
+/// VMs are a real state machine (`Running` → `Quiesced` under
+/// `HoldQuiesced` → `Exited` on shutdown, kill, or drop) with an events
+/// broadcast, and every capability is implemented: `Vsock::dial` returns
+/// one end of a socketpair whose other end echoes; `VsockListen` accepts
+/// what [`FakeDriver::guest_dial`] pushes; `Checkpoint` writes a
+/// `checkpoint.json` that `restore` reads back; `Adopt`/`Detach` go through
+/// the driver's registry; `Console` returns what
+/// [`FakeDriver::push_console`] pushed. [`FakeDriver::builder`] scripts
+/// failures and narrows the claimed capabilities — the accessors follow
+/// the claims, so the contract can be run against a reduced set.
 ///
-/// The driver's name is `"fake"`.
+/// The driver's name is `"fake"`; its checkpoint format is `"fake/v1"`.
 #[derive(Clone)]
 pub struct FakeDriver {
     inner: Arc<DriverInner>,
+    adopter: Adopter,
 }
+
+/// The driver's name, as `VmDriver::name` reports it.
+const NAME: &str = "fake";
 
 struct DriverInner {
     caps: DriverCapabilities,
-    /// Every VM booted and not yet seen exited.
+    knobs: Arc<Knobs>,
+    /// Every VM booted or restored and not yet seen exited.
     vms: Mutex<HashMap<VmId, Arc<VmInner>>>,
 }
 
@@ -43,6 +58,7 @@ struct DriverInner {
 #[derive(Debug)]
 pub struct FakeDriverBuilder {
     caps: DriverCapabilities,
+    knobs: Knobs,
 }
 
 impl FakeDriverBuilder {
@@ -52,36 +68,56 @@ impl FakeDriverBuilder {
         self
     }
 
+    /// The next `boot` fails with [`Error::Driver`].
+    pub fn fail_boot_once(self) -> Self {
+        self.knobs.fail_boot_once.store(true, Ordering::Release);
+        self
+    }
+
+    /// The next `Checkpoint::checkpoint` on any VM fails with
+    /// [`Error::Driver`].
+    pub fn fail_checkpoint_once(self) -> Self {
+        self.knobs
+            .fail_checkpoint_once
+            .store(true, Ordering::Release);
+        self
+    }
+
     /// Builds the driver.
     pub fn build(self) -> FakeDriver {
+        let inner = Arc::new(DriverInner {
+            caps: self.caps,
+            knobs: Arc::new(self.knobs),
+            vms: Mutex::new(HashMap::new()),
+        });
         FakeDriver {
-            inner: Arc::new(DriverInner {
-                caps: self.caps,
-                vms: Mutex::new(HashMap::new()),
-            }),
+            adopter: Adopter(Arc::clone(&inner)),
+            inner,
         }
     }
 }
 
 impl FakeDriver {
-    /// A driver claiming every capability it implements.
+    /// A driver claiming every capability, with no scripted failures.
     pub fn new() -> Self {
         Self::builder().build()
     }
 
-    /// A driver to configure; starts from every implemented capability
-    /// claimed.
+    /// A driver to configure; starts from every capability claimed.
     pub fn builder() -> FakeDriverBuilder {
         FakeDriverBuilder {
             caps: DriverCapabilities {
                 vsock: true,
                 vsock_listen: true,
+                checkpoint: true,
+                diff_checkpoint: true,
+                adopt: true,
                 balloon: true,
                 console: true,
                 debug: true,
                 nested_virt: NestedVirt::unsupported("the fake driver runs no hypervisor"),
-                ..DriverCapabilities::default()
             },
+            knobs: Knobs::default(),
         }
     }
 
@@ -103,7 +139,12 @@ impl FakeDriver {
         Ok(())
     }
 
-    fn register(&self, spec: VmSpec, runtime_dir: &Path) -> Result<Box<dyn VmHandle>> {
+    fn register(
+        &self,
+        spec: VmSpec,
+        runtime_dir: &Path,
+        balloon_target_bytes: u64,
+    ) -> Result<Box<dyn VmHandle>> {
         let mut vms = lock(&self.inner.vms);
         if let Some(existing) = vms.get(&spec.id) {
             match existing.state() {
@@ -119,12 +160,17 @@ impl FakeDriver {
         }
         let record = VmRecord {
             id: spec.id.clone(),
-            driver: self.name().to_owned(),
+            driver: NAME.to_owned(),
             runtime_dir: runtime_dir.to_path_buf(),
             process: None,
         };
-        let balloon_target_bytes = u64::from(spec.memory_mib) << 20;
-        let vm = VmInner::new(spec, record, self.inner.caps.clone(), balloon_target_bytes);
+        let vm = VmInner::new(
+            spec,
+            record,
+            self.inner.caps.clone(),
+            Arc::clone(&self.inner.knobs),
+            balloon_target_bytes,
+        );
         vms.insert(vm.id().clone(), Arc::clone(&vm));
         Ok(Box::new(FakeVm::new(vm)))
     }
@@ -154,7 +200,7 @@ impl DriverInner {
 #[async_trait]
 impl VmDriver for FakeDriver {
     fn name(&self) -> &'static str {
-        "fake"
+        NAME
     }
 
     fn capabilities(&self) -> DriverCapabilities {
@@ -163,214 +209,72 @@ impl VmDriver for FakeDriver {
 
     async fn boot(&self, spec: VmSpec, runtime_dir: &Path) -> Result<Box<dyn VmHandle>> {
         spec.validate()?;
-        self.register(spec, runtime_dir)
+        if self
+            .inner
+            .knobs
+            .fail_boot_once
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(Error::Driver {
+                driver: NAME,
+                message: "scripted boot failure".into(),
+                source: None,
+            });
+        }
+        let balloon_target_bytes = u64::from(spec.memory_mib) << 20;
+        self.register(spec, runtime_dir, balloon_target_bytes)
     }
 
     async fn restore(
         &self,
         image: &CheckpointImage,
-        _spec: RestoreSpec,
-        _runtime_dir: &Path,
+        spec: RestoreSpec,
+        runtime_dir: &Path,
     ) -> Result<Box<dyn VmHandle>> {
-        Err(Error::ForeignCheckpoint(image.format.clone()))
+        if !self.inner.caps.checkpoint || image.format.as_str() != CHECKPOINT_FORMAT {
+            return Err(Error::ForeignCheckpoint(image.format.clone()));
+        }
+        let bytes = tokio::fs::read(image.dir.join("checkpoint.json")).await?;
+        let file: CheckpointFile = serde_json::from_slice(&bytes).map_err(std::io::Error::from)?;
+        if file.format.as_str() != CHECKPOINT_FORMAT {
+            return Err(Error::ForeignCheckpoint(file.format));
+        }
+        let mut vm_spec = file.spec;
+        vm_spec.id = spec.id;
+        vm_spec.nics = spec.nics;
+        vm_spec.isolation = spec.isolation;
+        vm_spec.validate()?;
+        self.register(vm_spec, runtime_dir, file.balloon_target_bytes)
     }
 
     fn adopt(&self) -> Option<&dyn Adopt> {
-        None
+        self.inner.caps.adopt.then_some(&self.adopter)
+    }
+}
+
+/// The `Adopt` capability, on its own type so its `adopt` method does not
+/// shadow the driver's accessor of the same name.
+#[derive(Clone)]
+struct Adopter(Arc<DriverInner>);
+
+#[async_trait]
+impl Adopt for Adopter {
+    async fn adopt(&self, record: &VmRecord) -> Result<Option<Box<dyn VmHandle>>> {
+        let vm = match self.0.live(&record.id) {
+            Ok(vm) => vm,
+            Err(Error::NotFound(_)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        if vm.is_owned() {
+            return Err(Error::Driver {
+                driver: NAME,
+                message: format!("vm {} is still owned by a live handle", record.id),
+                source: None,
+            });
+        }
+        Ok(Some(Box::new(FakeVm::new(vm))))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use std::io::{Read as _, Write as _};
-
-    use super::*;
-    use crate::driver::{ExitStatus, IoMode, ShutdownMode, VmEvent};
-    use crate::spec::{BootSpec, ConsoleSpec, VsockSpec};
-
-    fn spec(id: &str) -> VmSpec {
-        VmSpec {
-            id: VmId::new(id).unwrap(),
-            cpus: 1,
-            memory_mib: 64,
-            boot: BootSpec::Kernel {
-                image: "/fake/vmlinux".into(),
-                cmdline: String::new(),
-                initrd: None,
-            },
-            disks: vec![],
-            nics: vec![],
-            vsock: None,
-            shares: vec![],
-            console: Default::default(),
-            balloon: false,
-            entropy: false,
-            dirty_tracking: false,
-            isolation: Default::default(),
-        }
-    }
-
-    /// A spec asking for every device the fake implements.
-    fn full_spec(id: &str) -> VmSpec {
-        VmSpec {
-            vsock: Some(VsockSpec { guest_cid: 3 }),
-            console: ConsoleSpec::File("/fake/console.log".into()),
-            balloon: true,
-            ..spec(id)
-        }
-    }
-
-    #[tokio::test]
-    async fn shutdown_is_idempotent_and_reports_the_first_status() {
-        let driver = FakeDriver::new();
-        let vm = driver
-            .boot(spec("vm-1"), Path::new("/run/vm-1"))
-            .await
-            .unwrap();
-        let graceful = ShutdownMode::Graceful {
-            timeout: Duration::from_secs(1),
-        };
-        assert_eq!(vm.shutdown(graceful).await.unwrap(), ExitStatus::exited(0));
-        assert_eq!(
-            vm.shutdown(ShutdownMode::Kill).await.unwrap(),
-            ExitStatus::exited(0)
-        );
-        assert_eq!(vm.state(), VmState::Exited(ExitStatus::exited(0)));
-    }
-
-    #[tokio::test]
-    async fn dropping_the_handle_kills_the_vm_and_frees_the_id() {
-        let driver = FakeDriver::new();
-        let vm = driver
-            .boot(spec("vm-1"), Path::new("/run/vm-1"))
-            .await
-            .unwrap();
-        let mut events = vm.events();
-        drop(vm);
-        assert_eq!(
-            events.try_recv().unwrap(),
-            VmEvent::Exited(ExitStatus::signaled(9))
-        );
-        // The id is free again: the exited entry is pruned on the way in.
-        driver
-            .boot(spec("vm-1"), Path::new("/run/vm-1"))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_live_id_cannot_be_booted_twice() {
-        let driver = FakeDriver::new();
-        let _vm = driver
-            .boot(spec("vm-1"), Path::new("/run/vm-1"))
-            .await
-            .unwrap();
-        let Err(err) = driver.boot(spec("vm-1"), Path::new("/run/vm-1")).await else {
-            panic!("second boot of a live id succeeded");
-        };
-        assert!(
-            matches!(
-                err,
-                Error::WrongState {
-                    state: VmState::Running,
-                    ..
-                }
-            ),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn accessors_follow_the_spec_and_the_claims() {
-        let driver = FakeDriver::new();
-        let bare = driver
-            .boot(spec("bare"), Path::new("/run/bare"))
-            .await
-            .unwrap();
-        assert!(bare.vsock().is_none() && bare.vsock_listener().is_none());
-        assert!(bare.balloon().is_none() && bare.console().is_none());
-        assert!(bare.debug().is_some());
-
-        let full = driver
-            .boot(full_spec("full"), Path::new("/run/full"))
-            .await
-            .unwrap();
-        assert!(full.vsock().is_some() && full.vsock_listener().is_some());
-        assert!(full.balloon().is_some() && full.console().is_some());
-
-        let narrow = FakeDriver::builder()
-            .capabilities(DriverCapabilities::default())
-            .build();
-        let vm = narrow
-            .boot(full_spec("narrow"), Path::new("/run/narrow"))
-            .await
-            .unwrap();
-        assert!(vm.vsock().is_none() && vm.debug().is_none() && vm.balloon().is_none());
-    }
-
-    #[tokio::test]
-    async fn dial_reaches_an_echoing_guest() {
-        let driver = FakeDriver::new();
-        let vm = driver
-            .boot(full_spec("vm-1"), Path::new("/run/vm-1"))
-            .await
-            .unwrap();
-        let conn = vm.vsock().unwrap().dial(1024).await.unwrap();
-        assert_eq!(conn.mode, IoMode::Async);
-        let mut stream = UnixStream::from(conn.fd);
-        stream.write_all(b"ping").unwrap();
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"ping");
-
-        vm.shutdown(ShutdownMode::Kill).await.unwrap();
-        assert!(matches!(
-            vm.vsock().unwrap().dial(1024).await,
-            Err(Error::WrongState { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn guest_dial_is_accepted_by_the_listener_in_order() {
-        let driver = FakeDriver::new();
-        let vm = driver
-            .boot(full_spec("vm-1"), Path::new("/run/vm-1"))
-            .await
-            .unwrap();
-        // Pushed before `listen`: the queue is per port, not per listener.
-        let mut early = driver.guest_dial(vm.id(), 7).unwrap();
-        early.write_all(b"early").unwrap();
-        let mut listener = vm.vsock_listener().unwrap().listen(7).await.unwrap();
-        let mut first = UnixStream::from(listener.accept().await.unwrap().fd);
-        let mut buf = [0u8; 5];
-        first.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"early");
-
-        let accept = tokio::spawn(async move { listener.accept().await.map(|c| c.mode) });
-        tokio::task::yield_now().await;
-        let _late = driver.guest_dial(vm.id(), 7).unwrap();
-        assert_eq!(accept.await.unwrap().unwrap(), IoMode::Async);
-
-        vm.shutdown(ShutdownMode::Kill).await.unwrap();
-        assert!(matches!(
-            driver.guest_dial(vm.id(), 7),
-            Err(Error::NotFound(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn console_hands_out_pushed_bytes_once() {
-        let driver = FakeDriver::new();
-        let vm = driver
-            .boot(full_spec("vm-1"), Path::new("/run/vm-1"))
-            .await
-            .unwrap();
-        driver.push_console(vm.id(), b"hello world").unwrap();
-        let console = vm.console().unwrap();
-        assert_eq!(console.read_output(5).await.unwrap(), b"hello");
-        assert_eq!(console.read_output(64).await.unwrap(), b" world");
-        assert!(console.read_output(64).await.unwrap().is_empty());
-    }
-}
+mod tests;

@@ -1,12 +1,11 @@
 //! Fakes and the contract test-kit (feature `testkit`).
 //!
 //! - [`FakeDriver`] — an in-memory [`VmDriver`](crate::VmDriver) with a
-//!   real state machine, events, and the live capabilities (vsock both
-//!   ways, balloon, console, debug). Runtime unit tests drive their real
-//!   actors and state machines against it on any host, no KVM required.
+//!   real state machine, events, every capability, and scripted failures.
+//!   Runtime unit tests drive their real actors and state machines against
+//!   it on any host, no KVM required.
 //!
-//! Checkpoint/restore and adopt/detach, the fake network, and the contract
-//! test-kit land in the sibling modules.
+//! The fake network and the contract test-kit land in the sibling modules.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
