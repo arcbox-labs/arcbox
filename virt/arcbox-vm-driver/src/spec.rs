@@ -6,9 +6,10 @@
 //! into a Firecracker API payload, a Virtualization.framework configuration,
 //! or an in-process VMM's config without the orchestrator knowing which.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,10 @@ impl<'de> Deserialize<'de> for MacAddr {
 }
 
 /// Everything a driver needs to boot one VM.
+///
+/// Validate with [`VmSpec::validate`] before handing it to a driver; drivers
+/// validate again at `VmDriver::boot`, so an orchestrator that
+/// forgets still gets [`Error::InvalidSpec`] rather than a half-built VM.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VmSpec {
     /// The VM's identity.
@@ -201,6 +206,64 @@ pub struct VmSpec {
     pub isolation: IsolationSpec,
 }
 
+impl VmSpec {
+    /// Checks the invariants no driver can repair.
+    ///
+    /// CPU and memory are at least 1; disk ids and NIC ids are non-empty
+    /// and unique; at most one disk is the root; every MAC is a non-nil
+    /// unicast address; every boot path is non-empty.
+    pub fn validate(&self) -> Result<()> {
+        if self.cpus == 0 {
+            return Err(Error::InvalidSpec("cpus must be at least 1".into()));
+        }
+        if self.memory_mib == 0 {
+            return Err(Error::InvalidSpec("memory_mib must be at least 1".into()));
+        }
+        self.boot.validate()?;
+        let mut disk_ids = HashSet::new();
+        for disk in &self.disks {
+            if disk.id.is_empty() {
+                return Err(Error::InvalidSpec("disk id must not be empty".into()));
+            }
+            if !disk_ids.insert(disk.id.as_str()) {
+                return Err(Error::InvalidSpec(format!(
+                    "duplicate disk id `{}`",
+                    disk.id
+                )));
+            }
+            require_path("disk path", &disk.path)?;
+        }
+        if self.disks.iter().filter(|d| d.root).count() > 1 {
+            return Err(Error::InvalidSpec(
+                "more than one disk is marked root".into(),
+            ));
+        }
+        let mut nic_ids = HashSet::new();
+        for nic in &self.nics {
+            if nic.id.is_empty() {
+                return Err(Error::InvalidSpec("nic id must not be empty".into()));
+            }
+            if !nic_ids.insert(nic.id.as_str()) {
+                return Err(Error::InvalidSpec(format!("duplicate nic id `{}`", nic.id)));
+            }
+            if nic.mac.is_nil() || !nic.mac.is_unicast() {
+                return Err(Error::InvalidSpec(format!(
+                    "nic `{}` mac {} is not a unicast address",
+                    nic.id, nic.mac
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn require_path(what: &str, path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(Error::InvalidSpec(format!("{what} must not be empty")));
+    }
+    Ok(())
+}
+
 /// How the guest starts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -229,6 +292,22 @@ pub enum BootSpec {
         /// The opaque machine-identifier blob.
         machine_id: Vec<u8>,
     },
+}
+
+impl BootSpec {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Kernel { image, initrd, .. } => {
+                require_path("kernel image", image)?;
+                if let Some(initrd) = initrd {
+                    require_path("initrd", initrd)?;
+                }
+                Ok(())
+            }
+            Self::Firmware { image } => require_path("firmware image", image),
+            Self::MacOs { aux_storage, .. } => require_path("aux storage", aux_storage),
+        }
+    }
 }
 
 /// One block device.
@@ -408,6 +487,13 @@ mod tests {
         }
     }
 
+    fn invalid(spec: &VmSpec) -> String {
+        match spec.validate() {
+            Err(Error::InvalidSpec(msg)) => msg,
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
     #[test]
     fn vm_id_accepts_the_documented_alphabet_and_nothing_else() {
         assert!(VmId::new("a.b_c-D9").is_ok());
@@ -455,6 +541,87 @@ mod tests {
         assert!(!MacAddr::new([0x01, 0, 0x5e, 0, 0, 1]).is_unicast());
         assert!(MacAddr::new([0; 6]).is_nil());
         assert!(!mac(1).is_nil());
+    }
+
+    #[test]
+    fn a_well_formed_spec_validates() {
+        spec().validate().unwrap();
+    }
+
+    #[test]
+    fn zero_cpus_or_memory_are_rejected() {
+        let mut s = spec();
+        s.cpus = 0;
+        assert!(invalid(&s).contains("cpus"));
+        let mut s = spec();
+        s.memory_mib = 0;
+        assert!(invalid(&s).contains("memory_mib"));
+    }
+
+    #[test]
+    fn disk_ids_must_be_unique_and_root_is_singular() {
+        let mut s = spec();
+        s.disks.push(s.disks[0].clone());
+        assert!(invalid(&s).contains("duplicate disk id"));
+        let mut s = spec();
+        let mut second = s.disks[0].clone();
+        second.id = "data".into();
+        s.disks.push(second);
+        assert!(invalid(&s).contains("root"));
+        let mut s = spec();
+        s.disks[0].id.clear();
+        assert!(invalid(&s).contains("disk id"));
+        let mut s = spec();
+        s.disks[0].path = PathBuf::new();
+        assert!(invalid(&s).contains("disk path"));
+    }
+
+    #[test]
+    fn nic_ids_must_be_unique_and_macs_unicast() {
+        let mut s = spec();
+        let mut second = s.nics[0].clone();
+        second.mac = mac(2);
+        s.nics.push(second);
+        assert!(invalid(&s).contains("duplicate nic id"));
+        let mut s = spec();
+        s.nics[0].mac = MacAddr::new([0x01, 0, 0, 0, 0, 1]);
+        assert!(invalid(&s).contains("unicast"));
+        let mut s = spec();
+        s.nics[0].mac = MacAddr::new([0; 6]);
+        assert!(invalid(&s).contains("unicast"));
+        let mut s = spec();
+        s.nics[0].id.clear();
+        assert!(invalid(&s).contains("nic id"));
+    }
+
+    #[test]
+    fn boot_paths_must_be_non_empty() {
+        let mut s = spec();
+        s.boot = BootSpec::Kernel {
+            image: PathBuf::new(),
+            cmdline: String::new(),
+            initrd: None,
+        };
+        assert!(invalid(&s).contains("kernel image"));
+        let mut s = spec();
+        s.boot = BootSpec::Kernel {
+            image: "/boot/vmlinux".into(),
+            cmdline: String::new(),
+            initrd: Some(PathBuf::new()),
+        };
+        assert!(invalid(&s).contains("initrd"));
+        let mut s = spec();
+        s.boot = BootSpec::Firmware {
+            image: PathBuf::new(),
+        };
+        assert!(invalid(&s).contains("firmware image"));
+        let mut s = spec();
+        s.boot = BootSpec::MacOs {
+            aux_storage: PathBuf::new(),
+            hardware_model: vec![],
+            machine_id: vec![],
+        };
+        assert!(invalid(&s).contains("aux storage"));
     }
 
     #[test]
