@@ -852,21 +852,30 @@ mod tests {
 
     #[tokio::test]
     async fn connect_fails_fast_on_any_other_error() {
-        let finals = [
-            arcbox_vm_driver::Error::Io(std::io::ErrorKind::BrokenPipe.into()),
-            arcbox_vm_driver::Error::WrongState {
-                id: arcbox_vm_driver::VmId::new("vm").unwrap(),
-                state: arcbox_vm_driver::VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
-                expected: "running",
-            },
+        // Each final error keeps its native shape through the conversion:
+        // an I/O failure stays `Io`, a driver `WrongState` stays
+        // `WrongState` (the guest agent maps that to 412, not 500).
+        type Native = fn(&VmmError) -> bool;
+        let finals: [(arcbox_vm_driver::Error, Native); 2] = [
+            (
+                arcbox_vm_driver::Error::Io(std::io::ErrorKind::BrokenPipe.into()),
+                |err| matches!(err, VmmError::Io(_)),
+            ),
+            (
+                arcbox_vm_driver::Error::WrongState {
+                    id: arcbox_vm_driver::VmId::new("vm").unwrap(),
+                    state: arcbox_vm_driver::VmState::Exited(
+                        arcbox_vm_driver::ExitStatus::signaled(9),
+                    ),
+                    expected: "running",
+                },
+                |err| matches!(err, VmmError::WrongState { expected, actual, .. } if expected == "running" && actual.starts_with("exited")),
+            ),
         ];
-        for error in finals {
+        for (error, native) in finals {
             let vsock = ScriptedVsock::new([Err(error), Ok(IoMode::Async)]);
             let err = connect_to_port(&vsock, AGENT_PORT).await.unwrap_err();
-            assert!(
-                matches!(err, VmmError::Driver(_)),
-                "unexpected error: {err}"
-            );
+            assert!(native(&err), "unexpected error: {err}");
             assert_eq!(vsock.dials(), 1, "a final error must not be retried");
         }
     }
