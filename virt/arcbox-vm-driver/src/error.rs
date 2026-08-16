@@ -4,6 +4,7 @@
 //! something says so through a capability accessor returning `None`, never
 //! through an error at call time.
 
+use crate::driver::VmState;
 use crate::spec::VmId;
 
 /// Errors raised by drivers, handles, and the guest-network port.
@@ -16,6 +17,18 @@ pub enum Error {
     /// No VM with this id is known to the driver or network.
     #[error("vm {0} not found")]
     NotFound(VmId),
+
+    /// The VM is in a state the operation cannot act on (dialing an exited
+    /// VM, checkpointing one that already exited).
+    #[error("vm {id} is {state}; expected {expected}")]
+    WrongState {
+        /// The VM.
+        id: VmId,
+        /// Where it actually is.
+        state: VmState,
+        /// What the operation needed, e.g. `"running"`.
+        expected: &'static str,
+    },
 
     /// The adapter itself failed: process spawn, API call, file staging.
     ///

@@ -11,6 +11,9 @@
 //! # What is here
 //!
 //! - [`spec`] — the serializable per-VM shape: [`VmSpec`] and its parts.
+//! - [`driver`] — the handle vocabulary: [`VmState`], [`VmEvent`],
+//!   [`ExitStatus`], [`ShutdownMode`], the durable [`VmRecord`], and
+//!   [`DriverCapabilities`], what a driver claims it can do.
 //! - [`error`] — the one [`Error`] every port method speaks. There is no
 //!   `Unsupported` variant: what a driver cannot do is a capability
 //!   accessor returning `None`, never an error at call time.
@@ -32,9 +35,14 @@
 
 #![warn(missing_docs)]
 
+pub mod driver;
 pub mod error;
 pub mod spec;
 
+pub use driver::{
+    DriverCapabilities, ExitStatus, IoMode, NestedVirt, ProcessRecord, RestoreSpec, ShutdownMode,
+    VmEvent, VmRecord, VmState, VsockConn,
+};
 pub use error::{Error, Result};
 pub use spec::{
     BootSpec, CacheMode, CgroupSpec, ConsoleSpec, DiskSpec, IsolationSpec, MacAddr, NicAttachment,
