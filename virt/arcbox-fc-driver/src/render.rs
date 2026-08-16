@@ -1,34 +1,33 @@
 //! From the port's specs to what Firecracker is told.
 //!
 //! Two pure decisions live here and nowhere else: which API payloads a
-//! [`VmSpec`] becomes, and which path Firecracker sees for every host
-//! file. Without a jail, paths pass through verbatim. Under the
+//! [`VmSpec`] / [`RestoreSpec`] becomes, and which path Firecracker sees for
+//! every host file. Without a jail, paths pass through verbatim. Under the
 //! jailer, Firecracker is chrooted into
 //! `{chroot_base}/{firecracker binary name}/{id}/root` and every path it
 //! is told is chroot-relative: a host path already under the jail is passed
 //! as `/` + its relative part; anything else is staged in first — the
 //! kernel to `/vmlinux`, a disk `id` to `/{id}.ext4`, a checkpoint to
 //! `/snapshots/{image dir name}/{vmstate,mem}` — and named by where it
-//! landed. [`VmLayout`] is that map; [`fc_config`] uses it to produce a
-//! boot plan (the restore renderer follows), and [`jail::apply`] executes
-//! the staging half.
+//! landed. [`VmLayout`] is that map; [`fc_config`] and [`fc_restore`] use it
+//! to produce plans, and [`jail::apply`] executes the staging half.
 
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use arcbox_vm_driver::{
-    BootSpec, CacheMode, ConsoleSpec, DiskSpec, Error, IsolationSpec, NicAttachment, NicSpec,
-    Result, VmId, VmSpec,
+    BootSpec, CacheMode, CheckpointImage, CheckpointKind, ConsoleSpec, DiskSpec, Error,
+    IsolationSpec, NicAttachment, NicSpec, RestoreSpec, Result, VmId, VmSpec,
 };
 use fc_sdk::types::{
     BootSource, Drive, DriveCacheType, DriveIoEngine, EntropyDevice, MachineConfiguration,
-    NetworkInterface, Vsock,
+    NetworkInterface, NetworkOverride, SnapshotLoadParams, Vsock,
 };
 
-use crate::NAME;
 use crate::config::FcDriverConfig;
 use crate::error::FcError;
 use crate::jail;
+use crate::{CHECKPOINT_FORMAT, NAME};
 
 mod plan;
 #[cfg(test)]
@@ -252,6 +251,80 @@ pub fn fc_config(spec: &VmSpec, config: &FcDriverConfig, runtime_dir: &Path) -> 
         vsock_host_uds: vsock.is_some().then(|| layout.vsock_host_uds()),
         vsock,
         entropy: spec.entropy.then_some(EntropyDevice { rate_limiter: None }),
+    })
+}
+
+/// Renders a restore of `image` under `spec`: the files a jail needs
+/// staged, and the `PUT /snapshot/load` payload with the image's NICs
+/// retargeted onto `spec.nics`.
+///
+/// Refuses a format this driver did not write
+/// ([`Error::ForeignCheckpoint`]) and a diff image ([`Error::InvalidSpec`]).
+/// The disks in `spec` are staged into the jail at `/{id}.ext4`, the path
+/// a checkpoint of this driver recorded for them; without a jail
+/// Firecracker reopens the recorded host paths itself and the caller must
+/// have put the disks there.
+pub fn fc_restore(
+    image: &CheckpointImage,
+    spec: &RestoreSpec,
+    config: &FcDriverConfig,
+    runtime_dir: &Path,
+) -> Result<FcRestorePlan> {
+    if image.format.as_str() != CHECKPOINT_FORMAT {
+        return Err(Error::ForeignCheckpoint(image.format.clone()));
+    }
+    if image.kind != CheckpointKind::Full {
+        return Err(unsupported("diff checkpoints are not restored"));
+    }
+    let layout = VmLayout::new(&spec.id, &spec.isolation, config, runtime_dir)?;
+    let name = image
+        .dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Error::InvalidSpec(format!(
+                "checkpoint dir {} has no usable name",
+                image.dir.display()
+            ))
+        })?;
+    let mut stage = Vec::new();
+    let snapshot_path = layout.place(
+        &image.dir.join("vmstate"),
+        &format!("snapshots/{name}/vmstate"),
+        StageKind::LinkOrCopy,
+        &mut stage,
+    )?;
+    let mem_file_path = layout.place(
+        &image.dir.join("mem"),
+        &format!("snapshots/{name}/mem"),
+        StageKind::LinkOrCopy,
+        &mut stage,
+    )?;
+    for disk in &spec.disks {
+        drive(&layout, disk, &mut stage)?;
+    }
+    let network_overrides = spec
+        .nics
+        .iter()
+        .map(|nic| {
+            Ok(NetworkOverride {
+                iface_id: nic.id.clone(),
+                host_dev_name: tap_name(nic)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(FcRestorePlan {
+        stage,
+        load: SnapshotLoadParams {
+            snapshot_path,
+            mem_file_path: Some(mem_file_path),
+            mem_backend: None,
+            enable_diff_snapshots: None,
+            track_dirty_pages: None,
+            resume_vm: Some(true),
+            network_overrides,
+        },
+        vsock_host_uds: layout.vsock_host_uds(),
     })
 }
 

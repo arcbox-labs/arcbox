@@ -3,8 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use arcbox_vm_driver::{
-    BootSpec, CacheMode, ConsoleSpec, DiskSpec, Error, IsolationSpec, MacAddr, NicAttachment,
-    NicSpec, ShareSpec, VmId, VmSpec, VsockSpec,
+    BootSpec, CacheMode, CheckpointFormat, CheckpointImage, CheckpointKind, ConsoleSpec, DiskSpec,
+    Error, IsolationSpec, MacAddr, NicAttachment, NicSpec, RestoreSpec, ShareSpec, VmId, VmSpec,
+    VsockSpec,
 };
 use fc_sdk::types::{DriveCacheType, DriveIoEngine};
 
@@ -367,4 +368,135 @@ fn what_firecracker_cannot_do_is_refused_before_anything_runs() {
     assert!(base(|s| s.nics[0].attachment = NicAttachment::HostNat).contains("TAP"));
     // Spec validation runs first.
     assert!(base(|s| s.cpus = 0).contains("cpus"));
+}
+
+fn image(dir: &Path) -> CheckpointImage {
+    CheckpointImage {
+        dir: dir.to_path_buf(),
+        format: CheckpointFormat::new(CHECKPOINT_FORMAT),
+        kind: CheckpointKind::Full,
+    }
+}
+
+fn restore_spec(id: &str, isolation: IsolationSpec, rootfs: PathBuf) -> RestoreSpec {
+    let s = spec(id, isolation, rootfs);
+    RestoreSpec {
+        id: s.id,
+        nics: s.nics,
+        disks: s.disks,
+        isolation: s.isolation,
+    }
+}
+
+#[test]
+fn restore_loads_the_image_and_retargets_nics_onto_the_new_taps() {
+    let plan = fc_restore(
+        &image(Path::new("/snaps/abc")),
+        &restore_spec(
+            "box2",
+            IsolationSpec::None,
+            "/run/vms/box2/rootfs.link".into(),
+        ),
+        &config(),
+        Path::new("/run/vms/box2"),
+    )
+    .unwrap();
+    assert!(plan.stage.is_empty());
+    assert_eq!(plan.load.snapshot_path, "/snaps/abc/vmstate");
+    assert_eq!(plan.load.mem_file_path.as_deref(), Some("/snaps/abc/mem"));
+    assert_eq!(plan.load.resume_vm, Some(true));
+    assert_eq!(plan.load.network_overrides.len(), 1);
+    assert_eq!(plan.load.network_overrides[0].iface_id, "eth0");
+    assert_eq!(plan.load.network_overrides[0].host_dev_name, "tap7");
+    assert_eq!(
+        plan.vsock_host_uds,
+        Path::new("/run/vms/box2/firecracker.vsock")
+    );
+}
+
+#[test]
+fn restore_stages_the_image_and_disks_into_a_jail_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("jail");
+    let root = base.join("firecracker/box2/root");
+    let rootfs = dir.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"disk").unwrap();
+    let plan = fc_restore(
+        &image(Path::new("/snaps/abc")),
+        &restore_spec("box2", jailed(&base), rootfs.clone()),
+        &config(),
+        Path::new("/run/vms/box2"),
+    )
+    .unwrap();
+    assert_eq!(plan.load.snapshot_path, "/snapshots/abc/vmstate");
+    assert_eq!(
+        plan.load.mem_file_path.as_deref(),
+        Some("/snapshots/abc/mem")
+    );
+    assert_eq!(
+        plan.stage,
+        vec![
+            StagePlan {
+                src: "/snaps/abc/vmstate".into(),
+                dst: root.join("snapshots/abc/vmstate"),
+                kind: StageKind::LinkOrCopy,
+            },
+            StagePlan {
+                src: "/snaps/abc/mem".into(),
+                dst: root.join("snapshots/abc/mem"),
+                kind: StageKind::LinkOrCopy,
+            },
+            StagePlan {
+                src: rootfs,
+                dst: root.join("rootfs.ext4"),
+                kind: StageKind::Copy,
+            },
+        ]
+    );
+    assert_eq!(plan.vsock_host_uds, root.join("run/firecracker.vsock"));
+
+    // An image the caller already staged into the jail is loaded in place.
+    let staged = root.join("snapshots/abc");
+    let plan = fc_restore(
+        &image(&staged),
+        &restore_spec("box2", jailed(&base), root.join("rootfs.ext4")),
+        &config(),
+        Path::new("/run/vms/box2"),
+    )
+    .unwrap();
+    assert!(plan.stage.is_empty());
+    assert_eq!(plan.load.snapshot_path, "/snapshots/abc/vmstate");
+}
+
+#[test]
+fn restore_refuses_foreign_and_diff_images() {
+    let mut foreign = image(Path::new("/snaps/abc"));
+    foreign.format = CheckpointFormat::new("fake/v1");
+    let spec = restore_spec("box2", IsolationSpec::None, "/x".into());
+    match fc_restore(&foreign, &spec, &config(), Path::new("/run/vms/box2")) {
+        Err(Error::ForeignCheckpoint(format)) => assert_eq!(format.as_str(), "fake/v1"),
+        other => panic!("expected ForeignCheckpoint, got {other:?}"),
+    }
+    let mut diff = image(Path::new("/snaps/abc"));
+    diff.kind = CheckpointKind::Diff;
+    assert!(
+        invalid(fc_restore(
+            &diff,
+            &spec,
+            &config(),
+            Path::new("/run/vms/box2")
+        ))
+        .contains("diff")
+    );
+    let mut spec = spec;
+    spec.nics[0].attachment = NicAttachment::HostNat;
+    assert!(
+        invalid(fc_restore(
+            &image(Path::new("/snaps/abc")),
+            &spec,
+            &config(),
+            Path::new("/run/vms/box2")
+        ))
+        .contains("TAP")
+    );
 }
