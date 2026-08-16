@@ -23,22 +23,13 @@
 //!
 //! ## Frame format
 //!
-//! ```text
-//! [u8: msg_type][u32 LE: payload_len][payload_len bytes]
-//! ```
-//!
-//! | Type | Direction   | Payload                          |
-//! |------|-------------|----------------------------------|
-//! | 0x01 | Host→Agent  | JSON `StartCommand`              |
-//! | 0x02 | Host→Agent  | raw stdin bytes                  |
-//! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`  |
-//! | 0x04 | Host→Agent  | empty — stdin EOF                |
-//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]` — clock sync |
-//! | 0x06 | Host→Agent  | JSON `NetReconfigCommand` — re-address eth0 |
-//! | 0x07 | Host→Agent  | `[i32 LE signal]` — signal the workload's process group |
-//! | 0x10 | Agent→Host  | raw stdout bytes                 |
-//! | 0x11 | Agent→Host  | raw stderr bytes                 |
-//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` — signal 0 = normal exit. Net-reconfig replies append six `u32 LE` micros (addr/netmask/delrt/addrt ioctls, resolv write, whole handler); legacy agents send only the 4-byte code. Readers key on payload length. |
+//! The wire vocabulary — frame layout, every opcode on the exec channel
+//! (52) and the file channel (53), and the JSON payload types — is
+//! `arcbox_vm_proto::exec` / `arcbox_vm_proto::file`; that crate's tables
+//! are authoritative and this binary imports the constants from it. The
+//! net-reconfig reply appends six `u32 LE` micros (addr/netmask/delrt/addrt
+//! ioctls, resolv write, whole handler) to the `MSG_EXIT` payload; the host
+//! keys on payload length, so legacy agents' 4-byte replies still decode.
 //!
 //! This binary requires Linux — it uses AF_VSOCK, accept4, openpty, and fork,
 //! none of which are available on other platforms.  The workspace compiles the
