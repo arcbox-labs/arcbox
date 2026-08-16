@@ -17,10 +17,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::capability::{
-    Adopt, Balloon, Checkpoint, CheckpointImage, Console, DebugSnapshot, Detach, Vsock, VsockListen,
+    Adopt, Balloon, Checkpoint, CheckpointImage, Console, DebugSnapshot, Detach, Prepare, Vsock,
+    VsockListen,
 };
 use crate::error::Result;
-use crate::spec::{IsolationSpec, NicSpec, VmId, VmSpec};
+use crate::spec::{DiskSpec, IsolationSpec, NicSpec, VmId, VmSpec};
 
 /// A VMM adapter: boots specs into handles.
 ///
@@ -59,6 +60,13 @@ pub trait VmDriver: Send + Sync {
     /// them (external-process VMMs). `Some` iff
     /// [`DriverCapabilities::adopt`].
     fn adopt(&self) -> Option<&dyn Adopt>;
+
+    /// The prepare capability: spawn the VMM ahead of a boot. `Some` iff
+    /// [`DriverCapabilities::prepare`]; [`boot`](Self::boot) and
+    /// [`restore`](Self::restore) behave exactly like prepare-then-boot.
+    fn prepare(&self) -> Option<&dyn Prepare> {
+        None
+    }
 }
 
 /// A running (or just-exited) VM.
@@ -157,6 +165,8 @@ pub struct DriverCapabilities {
     /// VMs outlive this process and can be adopted back ([`Adopt`] /
     /// [`Detach`]).
     pub adopt: bool,
+    /// The VMM can be spawned ahead of a boot ([`Prepare`]).
+    pub prepare: bool,
     /// Handles expose a memory balloon.
     pub balloon: bool,
     /// Handles expose the guest console output.
@@ -343,6 +353,11 @@ pub struct RestoreSpec {
     /// lands on fresh host attachments).
     #[serde(default)]
     pub nics: Vec<NicSpec>,
+    /// The disks the image references — the same ids — at their host paths
+    /// for *this* restore: a restored VM's rootfs is a fresh copy-on-write
+    /// device, never the path recorded at checkpoint time.
+    #[serde(default)]
+    pub disks: Vec<DiskSpec>,
     /// How the restored VMM process is confined.
     #[serde(default)]
     pub isolation: IsolationSpec,

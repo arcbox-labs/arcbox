@@ -34,6 +34,7 @@ that the flags and the accessors agree.
 | `VsockListen` | `handle.vsock_listener()` | accept guest-initiated vsock connections |
 | `Checkpoint` | `handle.checkpoint()` | capture to disk; `Resume` or `HoldQuiesced` afterwards |
 | `Adopt` / `Detach` | `driver.adopt()` / `handle.detach()` | VMs that outlive the process (external VMMs) |
+| `Prepare` | `driver.prepare()` | spawn the VMM ahead of a boot: pid journaled and READY listener bound before the guest starts; `boot` is exactly prepare-then-boot |
 | `Balloon` | `handle.balloon()` | set/read the memory balloon |
 | `Console` | `handle.console()` | read guest console output |
 | `DebugSnapshot` | `handle.debug()` | driver-specific JSON for post-mortems |

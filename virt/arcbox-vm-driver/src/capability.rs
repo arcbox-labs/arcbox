@@ -13,16 +13,85 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::driver::{VmHandle, VmRecord, VsockConn};
+use crate::driver::{ExitStatus, RestoreSpec, VmHandle, VmRecord, VsockConn};
 use crate::error::Result;
+use crate::spec::{IsolationSpec, VmId, VmSpec};
 
 /// Dial a vsock port inside the guest.
 #[async_trait]
 pub trait Vsock: Send + Sync {
     /// Connects to `port` in the guest and returns the stream.
     ///
-    /// Fails with [`crate::Error::WrongState`] when the VM is not running.
+    /// Fails with [`crate::Error::WrongState`] when the VM is not running,
+    /// and with [`crate::Error::Io`] of kind
+    /// [`ConnectionRefused`](std::io::ErrorKind::ConnectionRefused) when
+    /// the guest has no listener on `port` yet — the one outcome a caller
+    /// retries on; every other error is final.
     async fn dial(&self, port: u32) -> Result<VsockConn>;
+}
+
+/// Spawn the VMM before there is a guest to boot.
+///
+/// External-process VMMs pay for the process spawn, the jailer setup, and
+/// the API socket up front. A warm pool prepares its slots long before a
+/// boot is asked for, journals the pid before any guest runs, and binds the
+/// READY vsock listener while nothing can race it. The split is invisible
+/// to a plain boot: `VmDriver::boot(spec, dir)` MUST behave exactly like
+/// `prepare(&spec.id, &spec.isolation, dir)` followed by
+/// [`PreparedVm::boot`] with `spec`, and `restore` likewise — the contract
+/// asserts it. Present iff [`crate::DriverCapabilities::prepare`].
+#[async_trait]
+pub trait Prepare: Send + Sync {
+    /// Spawns the VMM process for `id` under `isolation`, with
+    /// `runtime_dir` as its private scratch space, without booting a guest.
+    async fn prepare(
+        &self,
+        id: &VmId,
+        isolation: &IsolationSpec,
+        runtime_dir: &Path,
+    ) -> Result<Box<dyn PreparedVm>>;
+}
+
+/// A spawned VMM waiting for a spec.
+///
+/// Dropping it kills the process unless a `boot` or `restore` succeeded,
+/// after which the returned handle owns it.
+#[async_trait]
+pub trait PreparedVm: Send + Sync {
+    /// The VM's identity.
+    fn id(&self) -> &VmId;
+
+    /// The durable record — pid and API socket are already known, and the
+    /// handle that `boot`/`restore` returns reports this same record.
+    fn record(&self) -> VmRecord;
+
+    /// `true` while the VMM process is up. Never signals a reaped pid: once
+    /// this answers `false` it stays `false`.
+    fn alive(&self) -> bool;
+
+    /// Bind a vsock listener now; it is live before the guest starts, so a
+    /// dial-out the guest makes at boot cannot be missed. `Some` iff
+    /// [`crate::DriverCapabilities::vsock_listen`].
+    fn vsock_listener(&self) -> Option<&dyn VsockListen> {
+        None
+    }
+
+    /// Boots `spec` on this process. `spec.id` and `spec.isolation` must
+    /// equal what `prepare` was given ([`crate::Error::InvalidSpec`]
+    /// otherwise); the handle shares this process. At most one `boot` or
+    /// `restore` succeeds per prepared VM.
+    async fn boot(&self, spec: VmSpec) -> Result<Box<dyn VmHandle>>;
+
+    /// Boots a checkpoint on this process; the same rules as [`boot`](Self::boot).
+    async fn restore(
+        &self,
+        image: &CheckpointImage,
+        spec: RestoreSpec,
+    ) -> Result<Box<dyn VmHandle>>;
+
+    /// Kills and reaps the process now. Idempotent, and valid after a boot
+    /// too (it kills that VM); the status is how the process ended.
+    async fn discard(&self) -> Result<ExitStatus>;
 }
 
 /// Accept vsock connections the guest initiates (the READY dial-out).

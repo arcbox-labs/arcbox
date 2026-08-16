@@ -1,6 +1,6 @@
 //! An in-memory [`VmDriver`] for tests that need a VM without a hypervisor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,6 +112,7 @@ impl FakeDriver {
                 checkpoint: true,
                 diff_checkpoint: true,
                 adopt: true,
+                prepare: false,
                 balloon: true,
                 console: true,
                 debug: true,
@@ -239,9 +240,17 @@ impl VmDriver for FakeDriver {
         if file.format.as_str() != CHECKPOINT_FORMAT {
             return Err(Error::ForeignCheckpoint(file.format));
         }
+        let image_disks: BTreeSet<&str> = file.spec.disks.iter().map(|d| d.id.as_str()).collect();
+        let given_disks: BTreeSet<&str> = spec.disks.iter().map(|d| d.id.as_str()).collect();
+        if image_disks != given_disks {
+            return Err(Error::InvalidSpec(format!(
+                "restore disks {given_disks:?} must name exactly the image's disks {image_disks:?}"
+            )));
+        }
         let mut vm_spec = file.spec;
         vm_spec.id = spec.id;
         vm_spec.nics = spec.nics;
+        vm_spec.disks = spec.disks;
         vm_spec.isolation = spec.isolation;
         vm_spec.validate()?;
         self.register(vm_spec, runtime_dir, file.balloon_target_bytes)

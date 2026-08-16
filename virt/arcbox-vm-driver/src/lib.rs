@@ -17,10 +17,11 @@
 //!   ([`VmState`], [`VmEvent`], [`ExitStatus`], [`ShutdownMode`],
 //!   [`VmRecord`]) and [`DriverCapabilities`], what a driver claims.
 //! - [`capability`] — everything optional, one trait each: [`Vsock`],
-//!   [`VsockListen`], [`Checkpoint`], [`Adopt`]/[`Detach`], [`Balloon`],
-//!   [`Console`], [`DebugSnapshot`]. A handle exposes each through an
-//!   `Option<&dyn Cap>` accessor, `Some` only when the driver can and the
-//!   spec asked; `capabilities()` must agree with the accessors.
+//!   [`VsockListen`], [`Checkpoint`], [`Adopt`]/[`Detach`], [`Prepare`],
+//!   [`Balloon`], [`Console`], [`DebugSnapshot`]. A handle (or the driver,
+//!   for `Adopt` and `Prepare`) exposes each through an `Option<&dyn Cap>`
+//!   accessor, `Some` only when the driver can and the spec asked;
+//!   `capabilities()` must agree with the accessors.
 //! - [`net`] — the second port: [`net::GuestNetwork`] plans and builds
 //!   what a NIC is attached to and hands the driver a [`NicSpec`];
 //!   [`net::NetworkReconcile`] is its token-guarded cleanup protocol.
@@ -55,8 +56,8 @@ pub mod testkit;
 
 pub use capability::{
     Adopt, AfterCheckpoint, Balloon, BalloonStats, Checkpoint, CheckpointFormat, CheckpointImage,
-    CheckpointKind, CheckpointOptions, Console, DebugSnapshot, Detach, Vsock, VsockListen,
-    VsockListener,
+    CheckpointKind, CheckpointOptions, Console, DebugSnapshot, Detach, Prepare, PreparedVm, Vsock,
+    VsockListen, VsockListener,
 };
 pub use driver::{
     DriverCapabilities, ExitStatus, IoMode, NestedVirt, ProcessRecord, RestoreSpec, ShutdownMode,

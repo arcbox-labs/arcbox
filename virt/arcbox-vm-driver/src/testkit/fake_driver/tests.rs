@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::*;
 use crate::capability::{AfterCheckpoint, CheckpointFormat, CheckpointKind, CheckpointOptions};
 use crate::driver::{ExitStatus, IoMode, ShutdownMode, VmEvent};
-use crate::spec::{BootSpec, ConsoleSpec, IsolationSpec, VsockSpec};
+use crate::spec::{BootSpec, ConsoleSpec, DiskSpec, IsolationSpec, VsockSpec};
 
 fn spec(id: &str) -> VmSpec {
     VmSpec {
@@ -196,6 +196,7 @@ fn restore_spec(id: &str) -> RestoreSpec {
     RestoreSpec {
         id: VmId::new(id).unwrap(),
         nics: vec![],
+        disks: vec![],
         isolation: IsolationSpec::None,
     }
 }
@@ -249,6 +250,51 @@ async fn checkpoint_writes_an_image_restore_reads_back_with_overrides() {
             .target_bytes,
         8 << 20
     );
+}
+
+#[tokio::test]
+async fn restore_must_name_exactly_the_images_disks() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    let mut with_disk = full_spec("vm-1");
+    with_disk.disks.push(DiskSpec {
+        id: "rootfs".into(),
+        path: dir.path().join("rootfs.ext4"),
+        read_only: false,
+        root: true,
+        cache: Default::default(),
+    });
+    let vm = driver.boot(with_disk, dir.path()).await.unwrap();
+    let hold = CheckpointOptions {
+        after: AfterCheckpoint::HoldQuiesced,
+        kind: CheckpointKind::Full,
+    };
+    let image = vm
+        .checkpoint()
+        .unwrap()
+        .checkpoint(&dir.path().join("ckpt"), hold)
+        .await
+        .unwrap();
+    vm.shutdown(ShutdownMode::Kill).await.unwrap();
+
+    // No disks named: refused; the image has one.
+    let Err(err) = driver
+        .restore(&image, restore_spec("vm-2"), dir.path())
+        .await
+    else {
+        panic!("restore without the image's disks succeeded");
+    };
+    assert!(matches!(err, Error::InvalidSpec(_)), "{err}");
+
+    let mut renamed = restore_spec("vm-2");
+    renamed.disks.push(DiskSpec {
+        id: "rootfs".into(),
+        path: dir.path().join("rootfs.restored"),
+        read_only: false,
+        root: true,
+        cache: Default::default(),
+    });
+    driver.restore(&image, renamed, dir.path()).await.unwrap();
 }
 
 #[tokio::test]
