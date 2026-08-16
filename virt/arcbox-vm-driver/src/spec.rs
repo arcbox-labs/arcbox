@@ -390,6 +390,13 @@ pub enum NicAttachment {
     /// The number is a *borrowed* descriptor: the caller keeps it open for the
     /// duration of `VmDriver::boot`, and the driver duplicates it if
     /// the VMM needs it beyond that call.
+    ///
+    /// It is meaningful only in the process that opened it, so a spec
+    /// carrying this variant is process-local: it serializes (the number is
+    /// just data), but it is not what goes into a durable record or a TOML
+    /// file — an orchestrator persists the VM's identity as
+    /// [`VmRecord`](crate::driver::VmRecord) and re-derives the attachment
+    /// when it builds the next spec.
     FileHandle {
         /// The raw descriptor number, valid in the calling process.
         fd: RawFd,
