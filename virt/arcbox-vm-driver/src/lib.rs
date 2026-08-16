@@ -29,8 +29,8 @@
 //!   accessor returning `None`, never an error at call time.
 //!
 //! - `testkit` (feature) — the fakes and the contract test-kit: a
-//!   `FakeDriver` for runtime unit tests on any host, and the checks every
-//!   adapter must pass.
+//!   `FakeDriver` and `FakeNetwork` for runtime unit tests on any host, and
+//!   `driver_contract!`, the checks every adapter must pass.
 //!
 //! # Rules the crate is held to
 //!

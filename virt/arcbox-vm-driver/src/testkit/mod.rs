@@ -9,14 +9,18 @@
 //!   handing out `10.200.0.0/16` leases with a quarantine ledger and the
 //!   [`NetworkReconcile`](crate::net::NetworkReconcile) token protocol.
 //!
-//! The contract test-kit lands in the sibling module.
+//! - [`contract`] — the checks every adapter must pass, packaged as the
+//!   [`driver_contract!`](crate::driver_contract) macro over a
+//!   [`ContractHarness`].
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+pub mod contract;
 pub mod fake_driver;
 pub mod fake_network;
 mod fake_vm;
 
+pub use contract::ContractHarness;
 pub use fake_driver::{FakeDriver, FakeDriverBuilder};
 pub use fake_network::FakeNetwork;
 pub use fake_vm::FakeVm;
