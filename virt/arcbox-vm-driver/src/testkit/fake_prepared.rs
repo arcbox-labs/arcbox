@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -47,9 +47,7 @@ impl Preparer {
             isolation: isolation.clone(),
             inbound: Inbound::new(id.clone()),
             record,
-            booted: Mutex::new(None),
-            ended: Mutex::new(None),
-            consumed: AtomicBool::new(false),
+            phase: Mutex::new(Phase::Prepared),
         }
     }
 }
@@ -73,35 +71,36 @@ pub(super) struct PreparedFake {
     isolation: IsolationSpec,
     inbound: Arc<Inbound>,
     record: VmRecord,
-    /// The VM booted on this process, once there is one.
-    booted: Mutex<Option<Arc<VmInner>>>,
-    /// Set by `discard` (or a killing `Drop`) before any boot.
-    ended: Mutex<Option<ExitStatus>>,
-    /// A boot or restore succeeded; the handle owns the process now.
-    consumed: AtomicBool,
+    /// One lock for the whole life of the process, so a `boot` racing a
+    /// `discard` cannot both pass: whichever takes the lock first decides.
+    phase: Mutex<Phase>,
+}
+
+/// Where a prepared process is in its life.
+enum Phase {
+    /// Spawned, no guest yet; `Drop` kills it.
+    Prepared,
+    /// A boot or restore succeeded; the VM's handle owns the process now.
+    Booted(Arc<VmInner>),
+    /// Killed before any boot.
+    Discarded(ExitStatus),
 }
 
 impl PreparedFake {
-    fn ended(&self) -> Option<ExitStatus> {
-        *lock(&self.ended)
-    }
-
-    fn require_unused(&self) -> Result<()> {
-        if let Some(status) = self.ended() {
-            return Err(Error::WrongState {
-                id: self.record.id.clone(),
-                state: VmState::Exited(status),
-                expected: "a prepared vm that was not discarded",
-            });
-        }
-        if let Some(vm) = lock(&self.booted).as_ref() {
-            return Err(Error::WrongState {
+    fn require_unused(&self, phase: &Phase) -> Result<()> {
+        match phase {
+            Phase::Prepared => Ok(()),
+            Phase::Booted(vm) => Err(Error::WrongState {
                 id: self.record.id.clone(),
                 state: vm.state(),
                 expected: "a prepared vm that was not booted yet",
-            });
+            }),
+            Phase::Discarded(status) => Err(Error::WrongState {
+                id: self.record.id.clone(),
+                state: VmState::Exited(*status),
+                expected: "a prepared vm that was not discarded",
+            }),
         }
-        Ok(())
     }
 
     fn require_same_identity(&self, id: &VmId, isolation: &IsolationSpec) -> Result<()> {
@@ -123,7 +122,8 @@ impl PreparedFake {
     fn launch(&self, spec: VmSpec, balloon_target_bytes: u64) -> Result<Box<dyn VmHandle>> {
         self.require_same_identity(&spec.id, &spec.isolation)?;
         spec.validate()?;
-        self.require_unused()?;
+        let mut phase = lock(&self.phase);
+        self.require_unused(&phase)?;
         if self
             .driver
             .knobs
@@ -142,16 +142,21 @@ impl PreparedFake {
             balloon_target_bytes,
             Arc::clone(&self.inbound),
         )?;
-        *lock(&self.booted) = Some(Arc::clone(&vm));
-        self.consumed.store(true, Ordering::Release);
+        *phase = Phase::Booted(Arc::clone(&vm));
         Ok(Box::new(FakeVm::new(vm)))
     }
 
-    fn kill(&self) -> ExitStatus {
-        let booted = lock(&self.booted).clone();
-        let status = match booted {
-            Some(vm) => vm.exit(ExitStatus::signaled(SIGKILL)),
-            None => *lock(&self.ended).get_or_insert(ExitStatus::signaled(SIGKILL)),
+    /// Kills whatever `phase` says is running: the booted VM, or the bare
+    /// process itself.
+    fn kill(&self, phase: &mut Phase) -> ExitStatus {
+        let status = match phase {
+            Phase::Booted(vm) => vm.exit(ExitStatus::signaled(SIGKILL)),
+            Phase::Discarded(status) => *status,
+            Phase::Prepared => {
+                let status = ExitStatus::signaled(SIGKILL);
+                *phase = Phase::Discarded(status);
+                status
+            }
         };
         self.inbound.close(status);
         status
@@ -160,8 +165,9 @@ impl PreparedFake {
 
 impl Drop for PreparedFake {
     fn drop(&mut self) {
-        if !self.consumed.load(Ordering::Acquire) {
-            self.kill();
+        let mut phase = lock(&self.phase);
+        if matches!(*phase, Phase::Prepared) {
+            self.kill(&mut phase);
         }
     }
 }
@@ -177,9 +183,10 @@ impl PreparedVm for PreparedFake {
     }
 
     fn alive(&self) -> bool {
-        match lock(&self.booted).as_ref() {
-            Some(vm) => !matches!(vm.state(), VmState::Exited(_)),
-            None => self.ended().is_none(),
+        match &*lock(&self.phase) {
+            Phase::Prepared => true,
+            Phase::Booted(vm) => !matches!(vm.state(), VmState::Exited(_)),
+            Phase::Discarded(_) => false,
         }
     }
 
@@ -221,14 +228,22 @@ impl PreparedVm for PreparedFake {
     }
 
     async fn discard(&self) -> Result<ExitStatus> {
-        Ok(self.kill())
+        Ok(self.kill(&mut lock(&self.phase)))
     }
 }
 
 #[async_trait]
 impl VsockListen for PreparedFake {
     async fn listen(&self, port: u32) -> Result<Box<dyn VsockListener>> {
-        if let Some(status) = self.ended() {
+        let exited = match &*lock(&self.phase) {
+            Phase::Prepared => None,
+            Phase::Booted(vm) => match vm.state() {
+                VmState::Exited(status) => Some(status),
+                VmState::Running | VmState::Quiesced => None,
+            },
+            Phase::Discarded(status) => Some(*status),
+        };
+        if let Some(status) = exited {
             return Err(Error::WrongState {
                 id: self.record.id.clone(),
                 state: VmState::Exited(status),

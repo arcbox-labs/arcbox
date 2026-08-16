@@ -374,3 +374,49 @@ async fn scripted_failures_fire_once() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_discarded_prepared_vm_refuses_listeners_before_and_after_its_boot() {
+    let driver = FakeDriver::new();
+    let prepare = driver.prepare().unwrap();
+
+    // Discarded before any boot: listen, boot and alive all say so.
+    let spec = full_spec("vm-1");
+    let prepared = prepare
+        .prepare(&spec.id, &spec.isolation, Path::new("/run/vm-1"))
+        .await
+        .unwrap();
+    prepared.discard().await.unwrap();
+    assert!(!prepared.alive());
+    assert!(matches!(
+        prepared.vsock_listener().unwrap().listen(7).await.err(),
+        Some(Error::WrongState { .. })
+    ));
+    assert!(matches!(
+        prepared.boot(spec).await.err(),
+        Some(Error::WrongState { .. })
+    ));
+
+    // Discarded after a boot: the same answers, and the handle agrees.
+    let spec = full_spec("vm-2");
+    let prepared = prepare
+        .prepare(&spec.id, &spec.isolation, Path::new("/run/vm-2"))
+        .await
+        .unwrap();
+    let vm = prepared.boot(spec.clone()).await.unwrap();
+    let status = prepared.discard().await.unwrap();
+    assert_eq!(vm.state(), VmState::Exited(status));
+    assert!(!prepared.alive());
+    assert!(matches!(
+        prepared.vsock_listener().unwrap().listen(7).await.err(),
+        Some(Error::WrongState { .. })
+    ));
+    assert!(matches!(
+        vm.vsock_listener().unwrap().listen(7).await.err(),
+        Some(Error::WrongState { .. })
+    ));
+    assert!(matches!(
+        prepared.boot(spec).await.err(),
+        Some(Error::WrongState { .. })
+    ));
+}
