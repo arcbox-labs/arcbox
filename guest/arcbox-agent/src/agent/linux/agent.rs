@@ -34,7 +34,9 @@ impl Agent {
         let _ = sandbox_service();
 
         // Drop half-written rootfs build artifacts from a previous crash.
-        crate::rootfs_builder::sweep_stale_tmp().await;
+        crate::sandbox::rootfs_builder(&arcbox_vm::SandboxEnvironment::default())
+            .sweep_stale_tmp()
+            .await;
 
         // Start guest-side Docker API proxy (vsock -> unix socket).
         tokio::spawn(async {

@@ -49,6 +49,11 @@ pub enum VmmError {
     #[error("device-mapper error: {0}")]
     DeviceMapper(String),
 
+    /// Building a sandbox rootfs image (OCI/overlay2 → ext4, vm-agent
+    /// injection, the default busybox image) failed.
+    #[error("rootfs error: {0}")]
+    Rootfs(String),
+
     /// Process lifecycle error.
     #[error("process error: {0}")]
     Process(String),

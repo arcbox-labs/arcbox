@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arcbox_connect::sandbox_v1;
 use arcbox_vm::{
-    SandboxManager, SandboxMountSpec, SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig,
-    VmmError,
+    RootfsBuilder, RootfsPaths, SandboxEnvironment, SandboxManager, SandboxMountSpec,
+    SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig, VmmError,
 };
 use buffa::Message;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -66,6 +66,33 @@ pub struct SandboxService {
     template_builds: Mutex<std::collections::HashSet<String>>,
     /// Default rootfs image path; auto-built on first use when missing.
     default_rootfs: String,
+    /// Builds template rootfs images and the default image, from the guest's
+    /// staged `vm-agent` and busybox into the writable data volume.
+    rootfs: RootfsBuilder,
+}
+
+/// The `vm-agent` binary as the host daemon stages it (host `~/.arcbox/bin`
+/// via VirtioFS).
+const VM_AGENT_BIN: &str = "/arcbox/bin/vm-agent";
+
+/// Static busybox shipped in the guest EROFS rootfs.
+const GUEST_BUSYBOX: &str = "/bin/busybox";
+
+/// Directory for generated rootfs images (btrfs data volume, writable).
+const ROOTFS_CACHE_DIR: &str = "/var/lib/arcbox/sandbox";
+
+/// The rootfs builder over the System VM's layout. Standalone so the
+/// startup sweep of half-written images can run whether or not the sandbox
+/// service comes up.
+pub fn rootfs_builder(environment: &SandboxEnvironment) -> RootfsBuilder {
+    RootfsBuilder::new(
+        RootfsPaths {
+            vm_agent: VM_AGENT_BIN.into(),
+            cache_dir: ROOTFS_CACHE_DIR.into(),
+            busybox: GUEST_BUSYBOX.into(),
+        },
+        Arc::clone(&environment.block_tools),
+    )
 }
 
 #[derive(Default)]
@@ -109,9 +136,13 @@ impl SandboxService {
     /// Create a new [`SandboxService`] from the given config.
     pub fn new(config: VmmConfig) -> anyhow::Result<Self> {
         let default_rootfs = config.defaults.rootfs.clone();
+        // The System VM is the reference environment; the rootfs builder
+        // shares its block tooling so both mount through the same busybox.
+        let environment = SandboxEnvironment::default();
+        let rootfs = rootfs_builder(&environment);
         // `into_shared` starts the lifecycle monitor driving the idle/TTL
         // expiry timers (CORE-21/60).
-        let manager = SandboxManager::new(config)
+        let manager = SandboxManager::with_environment(config, environment)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .into_shared();
         let creates = Arc::new(CreateRegistry::default());
@@ -121,6 +152,7 @@ impl SandboxService {
             operations: SandboxOperationLocks::default(),
             template_builds: Mutex::new(std::collections::HashSet::new()),
             default_rootfs,
+            rootfs,
         })
     }
 
@@ -283,7 +315,8 @@ impl SandboxService {
             templates::TemplateSource::Default => {
                 // Built on first use, and rebuilt when the staged vm-agent is
                 // newer than the cached image.
-                crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
+                self.rootfs
+                    .ensure_default_rootfs(&self.default_rootfs)
                     .await
                     .map_err(|e| SandboxError::Internal(format!("default template: {e}")))?;
                 Ok(self.default_rootfs.clone())
@@ -299,9 +332,10 @@ impl SandboxService {
                     .manager
                     .pinned_rootfs_paths()
                     .map_err(SandboxError::from)?;
-                crate::rootfs_builder::convert_layer_to_rootfs(&layout, &pinned)
+                self.rootfs
+                    .convert_layer_to_rootfs(&layout, &pinned)
                     .await
-                    .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))
+                    .map_err(|e| SandboxError::Internal(format!("template {image}: {e}")))
             }
             templates::TemplateSource::Catalog(resolved) => {
                 let path = &resolved.entry.rootfs_path;

@@ -67,8 +67,6 @@ mod volume_icon;
 #[cfg(target_os = "linux")]
 mod config;
 #[cfg(target_os = "linux")]
-mod rootfs_builder;
-#[cfg(target_os = "linux")]
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod sandbox_cleanup_watch;

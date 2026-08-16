@@ -22,7 +22,7 @@ pub const SANDBOX_DATA_DIR: &str = "/var/lib/arcbox/sandbox";
 /// - Boot-manifest binaries are materialized onto the guest Btrfs data disk
 ///   before the sandbox service can use them.
 /// - The default sandbox rootfs is auto-built by the agent (busybox +
-///   vm-agent, see `rootfs_builder::ensure_default_rootfs`) on the writable
+///   vm-agent, see `RootfsBuilder::ensure_default_rootfs`) on the writable
 ///   btrfs data volume.
 fn guest_defaults() -> VmmConfig {
     let runtime_bin = std::path::Path::new(ARCBOX_RUNTIME_BIN_DIR);

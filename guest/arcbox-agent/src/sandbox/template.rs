@@ -158,7 +158,7 @@ async fn stage_layout(image_ref: &str, archive: &Path, staged: &Path) -> Result<
 /// on a later hit, so it must be stable across toolchains (`DefaultHasher`
 /// is not — its algorithm is unspecified per release) and collision-resistant
 /// against attacker-chosen layer content. SHA-256 with a 16-byte hex prefix,
-/// matching the host-side rootfs cache key (`rootfs_builder::cache_key`).
+/// matching the host-side rootfs cache key (`RootfsBuilder`'s `rootfs-<layer>-<agent>` stem).
 async fn image_content_key(image_ref: &str) -> Result<String> {
     let inspect = docker::inspect_image(image_ref).await?;
     let layers = inspect
