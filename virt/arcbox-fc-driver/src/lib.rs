@@ -30,16 +30,15 @@
 //!   raw client (pause, resume, snapshot, ctrl-alt-del).
 //! - [`listener`] — the port's `VsockListener` over a `{uds}_{port}`
 //!   socket, failing once the VM is gone.
-//! - [`handle`] — [`FcHandle`](handle::FcHandle), the port's `VmHandle`
-//!   over a running VM: state and events from the guard, `Kill` and
-//!   `Graceful` shutdown, and the vsock, listen, checkpoint (pause →
-//!   snapshot → resume or hold), and detach capabilities.
+//! - [`handle`] — [`FcHandle`], the port's `VmHandle` over a running VM:
+//!   state and events from the guard, `Kill` and `Graceful` shutdown, and
+//!   the vsock, listen, checkpoint (pause → snapshot → resume or hold),
+//!   and detach capabilities.
+//! - [`prepared`] — [`FcPrepared`], the port's `PreparedVm`: a spawned
+//!   VMM waiting for a spec, listeners bound before the guest starts.
 //!
-//! The remaining modules — the spec renderer, jail staging, process
-//! spawning and ownership, the vsock handshake, the prepared VM, the
-//! handle, and the driver itself — land one at a time as their code is
-//! moved out of `arcbox-vm` (design: company repo
-//! `engineering/arcbox/architecture/vm-stack-redesign.md`, D-VM1 / D-VM9).
+//! Design: company repo `engineering/arcbox/architecture/vm-stack-redesign.md`
+//! (Adapters → `virt/arcbox-fc-driver`; D-VM1, D-VM9).
 //!
 //! # Rules the crate is held to
 //!
@@ -58,6 +57,7 @@ pub mod error;
 pub mod handle;
 pub mod jail;
 pub mod listener;
+pub mod prepared;
 pub mod process;
 pub mod render;
 pub mod spawn;
@@ -65,6 +65,8 @@ pub mod vsock;
 
 pub use config::FcDriverConfig;
 pub use error::FcError;
+pub use handle::FcHandle;
+pub use prepared::FcPrepared;
 
 /// The driver's name.
 ///

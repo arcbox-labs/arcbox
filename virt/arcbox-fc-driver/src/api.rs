@@ -6,7 +6,8 @@
 
 use fc_sdk::Client;
 use fc_sdk::types::{
-    InstanceActionInfoActionType, SnapshotCreateParams, SnapshotCreateParamsSnapshotType, VmState,
+    FullVmConfiguration, InstanceActionInfoActionType, InstanceInfo, SnapshotCreateParams,
+    SnapshotCreateParamsSnapshotType, VmState,
 };
 
 use crate::error::{FcError, Result};
@@ -58,4 +59,25 @@ pub async fn create_snapshot(client: &Client, vmstate: &str, mem: &str) -> Resul
         .await
         .map_err(|e| FcError::Api(e.into()))?;
     Ok(())
+}
+
+/// `GET /` — the instance's state (`Running` / `Paused`) among other things.
+pub async fn describe(client: &Client) -> Result<InstanceInfo> {
+    let info = client
+        .describe_instance()
+        .send()
+        .await
+        .map_err(|e| FcError::Api(e.into()))?;
+    Ok(info.into_inner())
+}
+
+/// `GET /vm/config` — the full configuration, including which devices the
+/// VM (booted or restored) actually has.
+pub async fn vm_config(client: &Client) -> Result<FullVmConfiguration> {
+    let config = client
+        .get_export_vm_config()
+        .send()
+        .await
+        .map_err(|e| FcError::Api(e.into()))?;
+    Ok(config.into_inner())
 }
