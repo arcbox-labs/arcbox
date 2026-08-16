@@ -61,6 +61,7 @@ fn direct_layout_names_the_runtime_dir_sockets_and_passes_paths_verbatim() {
     );
     let plan = layout.spawn_plan();
     assert_eq!(plan.api_socket, Path::new("/run/vms/box/firecracker.sock"));
+    assert_eq!(plan.vsock_uds, Path::new("/run/vms/box/firecracker.vsock"));
     let SpawnMode::Direct { log, metrics } = plan.mode else {
         panic!("direct spawn");
     };
@@ -97,6 +98,7 @@ fn jailer_layout_relativizes_inside_paths_and_stages_outside_ones() {
     );
     let plan = layout.spawn_plan();
     assert_eq!(plan.api_socket, root.join("run/firecracker.socket"));
+    assert_eq!(plan.vsock_uds, root.join("run/firecracker.vsock"));
     let SpawnMode::Jailer {
         isolation,
         jail_root,

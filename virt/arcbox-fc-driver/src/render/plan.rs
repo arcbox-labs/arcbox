@@ -16,6 +16,9 @@ pub struct SpawnPlan {
     pub id: VmId,
     /// The API socket the spawned process answers on, as the host sees it.
     pub api_socket: PathBuf,
+    /// The vsock Unix socket the VM will bind, as the host sees it; a stale
+    /// one from an earlier VM in the same place is cleared before the spawn.
+    pub vsock_uds: PathBuf,
     /// Direct or jailed.
     pub mode: SpawnMode,
 }

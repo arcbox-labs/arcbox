@@ -154,6 +154,7 @@ impl VmLayout {
         SpawnPlan {
             id: self.id.clone(),
             api_socket: self.api_socket(),
+            vsock_uds: self.vsock_host_uds(),
             mode,
         }
     }

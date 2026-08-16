@@ -8,39 +8,35 @@ use fc_sdk::process::{FirecrackerProcessBuilder, JailerProcessBuilder};
 
 use crate::config::FcDriverConfig;
 use crate::error::FcError;
-use crate::jail;
 use crate::render::{SpawnMode, SpawnPlan};
 
 /// Spawn the process a plan describes and wait for its API socket.
 ///
-/// Direct mode pre-creates the log and metrics files (some Firecracker
-/// builds expect `--log-path`/`--metrics-path` targets to exist). Jailer
-/// mode pre-creates `{jail}/run` and clears a stale vsock socket there, so
-/// a restore can bind its vsock device where the plan says.
+/// The vsock socket's directory (`{runtime_dir}`, or `{jail}/run`) is
+/// created and a stale socket from an earlier VM in the same place is
+/// cleared first, so the device can bind where the plan says. Direct mode
+/// also pre-creates the log and metrics files (some Firecracker builds
+/// expect `--log-path`/`--metrics-path` targets to exist).
 pub async fn spawn(
     plan: &SpawnPlan,
     fc_cfg: &FcDriverConfig,
 ) -> Result<fc_sdk::FirecrackerProcess> {
+    if let Some(parent) = plan.vsock_uds.parent() {
+        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+    }
+    if let Err(e) = std::fs::remove_file(&plan.vsock_uds)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::Io(e));
+    }
     match &plan.mode {
         SpawnMode::Direct { log, metrics } => {
             for target in [log, metrics] {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(Error::Io)?;
-                }
                 std::fs::File::create(target).map_err(Error::Io)?;
             }
             spawn_direct(fc_cfg, plan.id.as_str(), &plan.api_socket, log, metrics).await
         }
-        SpawnMode::Jailer {
-            isolation,
-            jail_root,
-        } => {
-            std::fs::create_dir_all(jail_root.join("run")).map_err(Error::Io)?;
-            if let Err(e) = std::fs::remove_file(jail::vsock_uds_path(jail_root))
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(Error::Io(e));
-            }
+        SpawnMode::Jailer { isolation, .. } => {
             spawn_jailer(fc_cfg, isolation, plan.id.as_str()).await
         }
     }
