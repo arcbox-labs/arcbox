@@ -1216,6 +1216,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-vm-driver"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "arcbox-vm-proto"
 version = "0.7.0"
 dependencies = [
