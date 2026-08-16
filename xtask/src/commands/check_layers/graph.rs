@@ -117,6 +117,16 @@ pub enum Target<'a> {
     External(&'a str),
 }
 
+impl Target<'_> {
+    /// The package name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Member(member) => &member.name,
+            Self::External(name) => name,
+        }
+    }
+}
+
 /// The direct-dependency graph of the workspace members.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Graph {
