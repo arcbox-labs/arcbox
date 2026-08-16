@@ -32,12 +32,10 @@
 //! [`arcbox_vm_proto::exec`], re-exported here; the net-reconfig timing
 //! suffix on `MSG_EXIT` is decoded by [`ReconfigTimings`].
 
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
-use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -51,6 +49,9 @@ pub(crate) use arcbox_vm_proto::exec::{MAX_FRAME_SIZE, MSG_CLOCK_SYNC, MSG_NET_R
 use arcbox_vm_proto::exec::{
     MSG_EOF, MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_START, MSG_STDERR, MSG_STDIN, MSG_STDOUT,
 };
+
+mod uds;
+pub use uds::UdsVsock;
 
 // =============================================================================
 // Public types
@@ -208,38 +209,6 @@ fn into_unix_stream(conn: VsockConn) -> Result<UnixStream> {
             "vsock connection requires blocking I/O, which the guest-agent client cannot drive"
                 .into(),
         )),
-    }
-}
-
-/// Transitional [`Vsock`] over Firecracker's hybrid-vsock Unix socket.
-///
-/// Dials by running the `CONNECT {port}` handshake on the wrapped
-/// `uds_path` (see the module docs). Firecracker closes the proxied
-/// connection without an `OK` when the guest has no listener on the port
-/// yet; that is the port's `ConnectionRefused`, so callers retry it. Goes
-/// away once the Firecracker driver's handle exposes [`Vsock`] itself.
-pub struct UdsVsock(pub PathBuf);
-
-#[async_trait]
-impl Vsock for UdsVsock {
-    async fn dial(&self, port: u32) -> arcbox_vm_driver::Result<VsockConn> {
-        match try_vsock_handshake(&self.0, port).await {
-            Ok(stream) => Ok(VsockConn {
-                fd: OwnedFd::from(stream.into_std()?),
-                mode: IoMode::Async,
-            }),
-            Err(VmmError::Vsock(message)) if message.contains("connection closed") => {
-                Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, message).into())
-            }
-            Err(error) => Err(arcbox_vm_driver::Error::Driver {
-                driver: "firecracker",
-                message: match error {
-                    VmmError::Vsock(message) => message,
-                    other => other.to_string(),
-                },
-                source: None,
-            }),
-        }
     }
 }
 
@@ -778,6 +747,10 @@ impl ReconfigTimings {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::OwnedFd;
+
+    use async_trait::async_trait;
+
     use super::*;
 
     /// Build a raw frame byte-by-byte for use in read tests.
