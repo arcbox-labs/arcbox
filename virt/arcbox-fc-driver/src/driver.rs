@@ -1,0 +1,257 @@
+//! [`FcDriver`]: the port's [`VmDriver`] for Firecracker, with `Prepare`
+//! and `Adopt`.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use arcbox_vm_driver::{
+    Adopt, CheckpointImage, DriverCapabilities, Error, IsolationSpec, NestedVirt, Prepare,
+    PreparedVm, RestoreSpec, Result, VmDriver, VmHandle, VmId, VmRecord, VmSpec,
+};
+use async_trait::async_trait;
+
+use crate::config::FcDriverConfig;
+use crate::handle::FcHandle;
+use crate::prepared::FcPrepared;
+use crate::process::FcProcess;
+use crate::render::VmLayout;
+use crate::{CHECKPOINT_FORMAT, NAME, api, discover};
+
+/// The Firecracker adapter.
+///
+/// `boot` and `restore` are exactly prepare-then-boot / prepare-then-restore
+/// on a fresh [`FcPrepared`]; a failure on the way drops the prepared VM,
+/// which kills the process it spawned.
+pub struct FcDriver {
+    config: Arc<FcDriverConfig>,
+}
+
+impl FcDriver {
+    /// A driver over `config`.
+    pub fn new(config: FcDriverConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+        }
+    }
+
+    /// The node-wide config this driver runs with.
+    pub fn config(&self) -> &FcDriverConfig {
+        &self.config
+    }
+
+    async fn prepare_vm(
+        &self,
+        id: &VmId,
+        isolation: &IsolationSpec,
+        runtime_dir: &Path,
+    ) -> Result<FcPrepared> {
+        FcPrepared::spawn(Arc::clone(&self.config), id, isolation, runtime_dir).await
+    }
+}
+
+#[async_trait]
+impl VmDriver for FcDriver {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            vsock: true,
+            vsock_listen: true,
+            checkpoint: true,
+            diff_checkpoint: false,
+            adopt: true,
+            prepare: true,
+            balloon: false,
+            console: false,
+            debug: false,
+            nested_virt: nested_virt(),
+        }
+    }
+
+    async fn boot(&self, spec: VmSpec, runtime_dir: &Path) -> Result<Box<dyn VmHandle>> {
+        spec.validate()?;
+        let prepared = self
+            .prepare_vm(&spec.id, &spec.isolation, runtime_dir)
+            .await?;
+        prepared.boot(spec).await
+    }
+
+    async fn restore(
+        &self,
+        image: &CheckpointImage,
+        spec: RestoreSpec,
+        runtime_dir: &Path,
+    ) -> Result<Box<dyn VmHandle>> {
+        // Refuse a foreign image before spawning anything.
+        if image.format.as_str() != CHECKPOINT_FORMAT {
+            return Err(Error::ForeignCheckpoint(image.format.clone()));
+        }
+        let prepared = self
+            .prepare_vm(&spec.id, &spec.isolation, runtime_dir)
+            .await?;
+        prepared.restore(image, spec).await
+    }
+
+    fn adopt(&self) -> Option<&dyn Adopt> {
+        Some(self)
+    }
+
+    fn prepare(&self) -> Option<&dyn Prepare> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Prepare for FcDriver {
+    async fn prepare(
+        &self,
+        id: &VmId,
+        isolation: &IsolationSpec,
+        runtime_dir: &Path,
+    ) -> Result<Box<dyn PreparedVm>> {
+        Ok(Box::new(self.prepare_vm(id, isolation, runtime_dir).await?))
+    }
+}
+
+#[async_trait]
+impl Adopt for FcDriver {
+    /// Finds the VMM `record` names — the recorded pid when it is still a
+    /// Firecracker, else a `/proc` scan by `--id`, `--api-sock`, or a
+    /// jail root ending in `{firecracker binary name}/{id}/root` — and
+    /// rebuilds a handle over it: the API is reconnected, the VM's devices
+    /// and paused state are read back, and its exit is tracked by probing.
+    async fn adopt(&self, record: &VmRecord) -> Result<Option<Box<dyn VmHandle>>> {
+        let Some(found) = discover::find(&self.config, record) else {
+            return Ok(None);
+        };
+        let client = fc_sdk::connection::connect(&found.api_socket);
+        let info = api::describe(&client).await?;
+        let devices = api::vm_config(&client).await?;
+        let layout = VmLayout::new(
+            &record.id,
+            &found.isolation,
+            &self.config,
+            &record.runtime_dir,
+        )?;
+        let vsock_uds = devices.vsock.map(|vsock| {
+            layout.jail().map_or_else(
+                || vsock.uds_path.clone().into(),
+                |jail| jail.root.join(vsock.uds_path.trim_start_matches('/')),
+            )
+        });
+        let process = Arc::new(FcProcess::adopt(found.pid, found.api_socket));
+        let quiesced = matches!(info.state, fc_sdk::types::InstanceInfoState::Paused);
+        Ok(Some(Box::new(FcHandle::new(
+            process,
+            client,
+            layout,
+            record.clone(),
+            vsock_uds,
+            quiesced,
+        ))))
+    }
+}
+
+/// Whether guests may run their own hypervisor: KVM's `nested` module
+/// parameter on Linux; nowhere else, since Firecracker needs KVM.
+fn nested_virt() -> NestedVirt {
+    #[cfg(target_os = "linux")]
+    {
+        for module in ["kvm_intel", "kvm_amd"] {
+            let path = format!("/sys/module/{module}/parameters/nested");
+            if let Ok(value) = std::fs::read_to_string(&path) {
+                let value = value.trim();
+                return if value == "Y" || value == "1" {
+                    NestedVirt::supported()
+                } else {
+                    NestedVirt::unsupported(format!("{path} is {value}"))
+                };
+            }
+        }
+        NestedVirt::unsupported(
+            "no /sys/module/kvm_{intel,amd}/parameters/nested: kvm not loaded, or not an x86 host",
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        NestedVirt::unsupported("Firecracker needs Linux KVM")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arcbox_vm_driver::{
+        BootSpec, CheckpointFormat, CheckpointKind, ConsoleSpec, IsolationSpec,
+    };
+
+    use super::*;
+
+    /// A driver whose binary does not exist: anything that reaches a spawn
+    /// fails loudly, so these tests prove what is refused before one.
+    fn driver() -> FcDriver {
+        FcDriver::new(FcDriverConfig::new(
+            "/nonexistent/arcbox-fc-driver/firecracker",
+        ))
+    }
+
+    #[test]
+    fn capabilities_name_what_this_adapter_claims() {
+        let driver = driver();
+        assert_eq!(driver.name(), "firecracker");
+        let caps = driver.capabilities();
+        assert!(caps.vsock && caps.vsock_listen && caps.checkpoint);
+        assert!(caps.adopt && caps.prepare);
+        assert!(!caps.diff_checkpoint && !caps.balloon && !caps.console && !caps.debug);
+        assert!(VmDriver::adopt(&driver).is_some() && VmDriver::prepare(&driver).is_some());
+    }
+
+    #[tokio::test]
+    async fn invalid_specs_and_foreign_images_are_refused_before_a_spawn() {
+        let driver = driver();
+        let dir = tempfile::tempdir().unwrap();
+        let spec = VmSpec {
+            id: VmId::new("box").unwrap(),
+            cpus: 0,
+            memory_mib: 128,
+            boot: BootSpec::Kernel {
+                image: "/vmlinux".into(),
+                cmdline: String::new(),
+                initrd: None,
+            },
+            disks: vec![],
+            nics: vec![],
+            vsock: None,
+            shares: vec![],
+            console: ConsoleSpec::Off,
+            balloon: false,
+            entropy: false,
+            dirty_tracking: false,
+            isolation: IsolationSpec::None,
+        };
+        assert!(matches!(
+            driver.boot(spec, dir.path()).await,
+            Err(Error::InvalidSpec(_))
+        ));
+        let image = CheckpointImage {
+            dir: dir.path().to_path_buf(),
+            format: CheckpointFormat::new("other/v1"),
+            kind: CheckpointKind::Full,
+        };
+        let restore = RestoreSpec {
+            id: VmId::new("box").unwrap(),
+            nics: vec![],
+            disks: vec![],
+            isolation: IsolationSpec::None,
+        };
+        assert!(matches!(
+            driver.restore(&image, restore, dir.path()).await,
+            Err(Error::ForeignCheckpoint(_))
+        ));
+        assert!(
+            !dir.path().join("firecracker.log").exists(),
+            "nothing was spawned"
+        );
+    }
+}

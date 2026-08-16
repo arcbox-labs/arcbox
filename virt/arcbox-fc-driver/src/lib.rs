@@ -39,6 +39,8 @@
 //! - [`discover`] — finding a Firecracker that outlived the process which
 //!   booted it: the recorded pid while it is still a Firecracker, else a
 //!   `/proc` scan by `--id`, `--api-sock`, or jail root.
+//! - [`driver`] — [`FcDriver`], the port's `VmDriver` with `Prepare` and
+//!   `Adopt`; `boot`/`restore` are prepare-then-boot/restore.
 //!
 //! Design: company repo `engineering/arcbox/architecture/vm-stack-redesign.md`
 //! (Adapters → `virt/arcbox-fc-driver`; D-VM1, D-VM9).
@@ -57,6 +59,7 @@
 pub mod api;
 pub mod config;
 pub mod discover;
+pub mod driver;
 pub mod error;
 pub mod handle;
 pub mod jail;
@@ -68,6 +71,7 @@ pub mod spawn;
 pub mod vsock;
 
 pub use config::FcDriverConfig;
+pub use driver::FcDriver;
 pub use error::FcError;
 pub use handle::FcHandle;
 pub use prepared::FcPrepared;
