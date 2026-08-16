@@ -86,23 +86,30 @@ impl IptablesLegacy {
     /// Run one iptables verb on a rule. `tolerate_missing` treats exit
     /// status 1 — iptables-legacy's "no matching rule" — as success so
     /// teardown is idempotent; other failures (usage errors, the xtables
-    /// lock timing out) still propagate.
-    fn run(&self, rule: &XtRule, verb: &str, tolerate_missing: bool) -> Result<()> {
+    /// lock timing out) still propagate. The failure is the bare
+    /// diagnostic text: callers wrap it into [`VmmError::Network`] once,
+    /// so a collected teardown report carries one prefix, not one per rule.
+    fn run(
+        &self,
+        rule: &XtRule,
+        verb: &str,
+        tolerate_missing: bool,
+    ) -> std::result::Result<(), String> {
         let output = std::process::Command::new(&self.iptables)
             .args(["-w", "2", "-t", rule.table, verb, rule.chain])
             .args(&rule.spec)
             .output()
-            .map_err(|e| VmmError::Network(format!("run {}: {e}", self.iptables.display())))?;
+            .map_err(|e| format!("run {}: {e}", self.iptables.display()))?;
         if output.status.success() || (tolerate_missing && output.status.code() == Some(1)) {
             return Ok(());
         }
-        Err(VmmError::Network(format!(
+        Err(format!(
             "iptables -t {} {verb} {} {}: {}",
             rule.table,
             rule.chain,
             rule.spec.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
-        )))
+        ))
     }
 }
 
@@ -115,7 +122,7 @@ impl Default for IptablesLegacy {
 impl PacketFilter for IptablesLegacy {
     fn install_translation(&self, tap: &str, pool_ip: Ipv4Addr) -> Result<()> {
         for rule in translation_rules(tap, pool_ip) {
-            self.run(&rule, "-A", false)?;
+            self.run(&rule, "-A", false).map_err(VmmError::Network)?;
         }
         Ok(())
     }
@@ -123,8 +130,8 @@ impl PacketFilter for IptablesLegacy {
     fn remove_translation(&self, tap: &str, pool_ip: Ipv4Addr) -> Result<()> {
         let mut failures = Vec::new();
         for rule in translation_rules(tap, pool_ip) {
-            if let Err(error) = self.run(&rule, "-D", true) {
-                failures.push(error.to_string());
+            if let Err(failure) = self.run(&rule, "-D", true) {
+                failures.push(failure);
             }
         }
         if failures.is_empty() {
