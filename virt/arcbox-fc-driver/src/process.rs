@@ -343,3 +343,118 @@ fn probe_alive(pid: u32) -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain `tokio` child stands in for Firecracker.
+    struct Child(tokio::process::Child);
+
+    impl Vmm for Child {
+        fn pid(&self) -> Option<u32> {
+            self.0.id()
+        }
+
+        async fn wait(&mut self) -> ExitStatus {
+            self.0.wait().await.map_or(UNKNOWN_EXIT, Into::into)
+        }
+
+        fn release(self) {
+            drop(self.0);
+        }
+    }
+
+    fn spawn(program: &str, args: &[&str]) -> FcProcess {
+        let child = tokio::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .expect("spawn test child");
+        FcProcess::spawn(Child(child), PathBuf::from("/tmp/api.sock")).unwrap()
+    }
+
+    fn pid_exists(pid: u32) -> bool {
+        #[allow(clippy::cast_possible_wrap, reason = "test pid")]
+        kill(Pid::from_raw(pid as i32), None).is_ok()
+    }
+
+    #[tokio::test]
+    async fn exit_is_published_once_and_alive_flips_for_good() {
+        let process = spawn("sh", &["-c", "exit 3"]);
+        let mut events = process.events();
+        let status = process
+            .wait(Duration::from_secs(10))
+            .await
+            .expect("the child exits");
+        assert_eq!(status, ExitStatus::exited(3));
+        assert!(!process.alive());
+        assert_eq!(process.exit_status(), Some(status));
+        assert_eq!(events.recv().await.unwrap(), VmEvent::Exited(status));
+        assert!(events.try_recv().is_err(), "Exited is delivered once");
+        // Killing an exited process just reports the recorded status.
+        assert_eq!(process.kill().await.unwrap(), status);
+    }
+
+    #[tokio::test]
+    async fn kill_reaps_and_reports_the_signal() {
+        let process = spawn("sleep", &["30"]);
+        assert!(process.alive());
+        let status = process.kill().await.unwrap();
+        assert_eq!(status, ExitStatus::signaled(9));
+        assert!(!process.alive());
+        assert_eq!(process.kill().await.unwrap(), status);
+        assert!(!pid_exists(process.pid()), "the child was reaped");
+    }
+
+    #[tokio::test]
+    async fn detach_releases_the_child_without_killing_it() {
+        let process = spawn("sleep", &["30"]);
+        let pid = process.pid();
+        process.detach();
+        assert!(process.is_detached());
+        // Give the waiter a chance to release.
+        tokio::task::yield_now().await;
+        drop(process);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(pid_exists(pid), "a detached child keeps running");
+        #[allow(clippy::cast_possible_wrap, reason = "test pid")]
+        kill(Pid::from_raw(pid as i32), Signal::SIGKILL).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_adopted_process_is_tracked_by_probing() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let process = FcProcess::adopt(child.id().unwrap(), PathBuf::from("/tmp/api.sock"));
+        assert!(process.alive());
+        assert!(!process.is_detached());
+        // Killed out from under us and reaped by its real parent, the probe
+        // sees it gone and records an unknown exit — once.
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        let mut events = process.events();
+        assert_eq!(process.exit_status(), Some(UNKNOWN_EXIT));
+        assert!(!process.alive());
+        assert_eq!(events.try_recv().unwrap(), VmEvent::Exited(UNKNOWN_EXIT));
+        assert_eq!(process.exit_status(), Some(UNKNOWN_EXIT));
+        assert!(events.try_recv().is_err(), "the exit is recorded once");
+        assert_eq!(process.kill().await.unwrap(), UNKNOWN_EXIT);
+    }
+
+    #[tokio::test]
+    async fn adopted_kill_signals_and_waits_for_the_pid_to_vanish() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let process = FcProcess::adopt(child.id().unwrap(), PathBuf::from("/tmp/api.sock"));
+        // The real parent reaps once the signal lands.
+        let reaper = tokio::spawn(async move { child.wait().await.unwrap() });
+        assert_eq!(process.kill().await.unwrap(), UNKNOWN_EXIT);
+        assert!(!process.alive());
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(reaper.await.unwrap().signal(), Some(9));
+    }
+}
