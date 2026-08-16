@@ -18,7 +18,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
 use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle};
 use arcbox_e2e::docker::docker_output;
@@ -34,6 +34,16 @@ fn container_rootfs_is_mounted_with_nfs_exportable_options() -> Result<()> {
         let shell = xshell::Shell::new()?;
         shell.change_dir(&root);
         xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
+        // The subject of this test is config the *guest agent* writes, and
+        // `stage_dev_boot_assets` stages whichever agent has the newest mtime
+        // across the dev tree, the musl target and ~/.arcbox/bin. Without
+        // building it here, a machine holding any older agent can boot one
+        // that predates the change entirely (ABX-385 class).
+        xshell::cmd!(
+            shell,
+            "cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release"
+        )
+        .run()?;
     }
 
     let version = resolve_boot_version(&root)?;
@@ -48,9 +58,17 @@ fn container_rootfs_is_mounted_with_nfs_exportable_options() -> Result<()> {
         args: vec![],
         env: vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version)],
     })?;
-    daemon
-        .wait_ready_blocking(READY_TIMEOUT)
-        .context("daemon not ready")?;
+    // Readiness failures need the same forensics as scenario failures: the
+    // daemon log explaining why boot stalled lives in the data dir, and `?`
+    // here would drop it (tests/e2e/AGENTS.md).
+    if let Err(error) = daemon.wait_ready_blocking(READY_TIMEOUT) {
+        let kept = data_dir.keep();
+        drop(daemon);
+        bail!(
+            "daemon not ready: {error:#} (data dir preserved at {})",
+            kept.display()
+        );
+    }
 
     let result = scenario(data_dir.path());
     if result.is_err() {
@@ -100,14 +118,22 @@ fn scenario(data_dir: &Path) -> Result<()> {
         bail!("no overlay mount in the guest's /proc/mounts:\n{mounts}");
     }
 
-    for option in ["index=on", "nfs_export=on"] {
-        if !overlay_lines.iter().any(|line| line.contains(option)) {
-            bail!(
-                "no overlay mount carries {option}; the snapshotter's configured \
-                 mount_options did not reach the kernel:\n{}",
-                overlay_lines.join("\n")
-            );
-        }
+    // Both options on *one* mount. Scanning for each independently would pass
+    // when one mount carries `index=on` and a different one carries
+    // `nfs_export=on` — never checking the pairing this exists to guarantee.
+    // It also masks the sharpest signature there is: a mount with `index=on`
+    // and no `nfs_export=on` is what the kernel leaves behind when it drops
+    // nfs_export on its own.
+    let paired = overlay_lines
+        .iter()
+        .any(|line| line.contains("index=on") && line.contains("nfs_export=on"));
+    if !paired {
+        bail!(
+            "no single overlay mount carries both index=on and nfs_export=on; \
+             the snapshotter's configured mount_options did not reach the kernel \
+             intact:\n{}",
+            overlay_lines.join("\n")
+        );
     }
 
     let _ = docker_output(data_dir, &["rm", "-f", "ovl-probe"], DOCKER_TIMEOUT);
