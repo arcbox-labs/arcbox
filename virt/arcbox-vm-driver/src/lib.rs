@@ -21,12 +21,15 @@
 //!   [`Console`], [`DebugSnapshot`]. A handle exposes each through an
 //!   `Option<&dyn Cap>` accessor, `Some` only when the driver can and the
 //!   spec asked; `capabilities()` must agree with the accessors.
+//! - [`net`] — the second port: [`net::GuestNetwork`] plans and builds
+//!   what a NIC is attached to and hands the driver a [`NicSpec`];
+//!   [`net::NetworkReconcile`] is its token-guarded cleanup protocol.
 //! - [`error`] — the one [`Error`] every port method speaks. There is no
 //!   `Unsupported` variant: what a driver cannot do is a capability
 //!   accessor returning `None`, never an error at call time.
 //!
-//! The guest-network port and the `testkit` feature (fake driver, fake
-//! network, contract test-kit) land in the sibling modules.
+//! The `testkit` feature (fake driver, fake network, contract test-kit)
+//! lands in the sibling module.
 //!
 //! # Rules the crate is held to
 //!
@@ -44,6 +47,7 @@
 pub mod capability;
 pub mod driver;
 pub mod error;
+pub mod net;
 pub mod spec;
 
 pub use capability::{
