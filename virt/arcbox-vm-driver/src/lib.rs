@@ -28,8 +28,9 @@
 //!   `Unsupported` variant: what a driver cannot do is a capability
 //!   accessor returning `None`, never an error at call time.
 //!
-//! The `testkit` feature (fake driver, fake network, contract test-kit)
-//! lands in the sibling module.
+//! - `testkit` (feature) — the fakes and the contract test-kit: a
+//!   `FakeDriver` for runtime unit tests on any host, and the checks every
+//!   adapter must pass.
 //!
 //! # Rules the crate is held to
 //!
@@ -49,6 +50,8 @@ pub mod driver;
 pub mod error;
 pub mod net;
 pub mod spec;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 pub use capability::{
     Adopt, AfterCheckpoint, Balloon, BalloonStats, Checkpoint, CheckpointFormat, CheckpointImage,
