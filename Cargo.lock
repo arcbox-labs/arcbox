@@ -729,6 +729,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-fc-driver"
+version = "0.7.0"
+dependencies = [
+ "arcbox-vm-driver",
+ "arcbox-vm-proto",
+ "async-trait",
+ "fc-sdk",
+ "nix 0.29.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "arcbox-fleet-agent"
 version = "0.1.4"
 dependencies = [

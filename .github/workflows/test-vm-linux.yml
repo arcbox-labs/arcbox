@@ -7,6 +7,8 @@ on:
       - "guest/arcbox-agent/**"
       - "virt/arcbox-vm/**"
       - "virt/arcbox-vm-proto/**"
+      - "virt/arcbox-vm-driver/**"
+      - "virt/arcbox-fc-driver/**"
       - "virt/arcbox-vm-agent/**"
       # The snapshot catalog and the device-mapper CoW manager moved out of
       # arcbox-vm; this suite is still the only one that drives dmsetup and
@@ -24,6 +26,8 @@ on:
       - "guest/arcbox-agent/**"
       - "virt/arcbox-vm/**"
       - "virt/arcbox-vm-proto/**"
+      - "virt/arcbox-vm-driver/**"
+      - "virt/arcbox-fc-driver/**"
       - "virt/arcbox-vm-agent/**"
       # The snapshot catalog and the device-mapper CoW manager moved out of
       # arcbox-vm; this suite is still the only one that drives dmsetup and
@@ -73,15 +77,15 @@ jobs:
           restore-keys: linux-cargo-
 
       - name: Check formatting
-        run: cargo fmt -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-agent -p arcbox-snapshot --check
+        run: cargo fmt -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-vm-agent -p arcbox-snapshot --check
 
       - name: Clippy
-        run: cargo clippy -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-agent -p arcbox-snapshot -- -D warnings
+        run: cargo clippy -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-vm-agent -p arcbox-snapshot -- -D warnings
 
       - name: Unit tests
         # --bins covers the vm-agent guest handlers, whose tests are
         # target_os = "linux" and never run under the macOS workspace job.
-        run: cargo test --lib --bins -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-agent -p arcbox-snapshot
+        run: cargo test --lib --bins -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-vm-agent -p arcbox-snapshot
 
   # ---------------------------------------------------------------------------
   # Job 2: integration tests — requires root (TAP interface creation)
