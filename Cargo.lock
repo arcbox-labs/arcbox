@@ -1203,6 +1203,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-vm-agent"
+version = "0.7.0"
+dependencies = [
+ "arcbox-vm-proto",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "arcbox-vm-proto"
 version = "0.7.0"
 dependencies = [

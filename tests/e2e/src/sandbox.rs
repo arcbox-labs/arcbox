@@ -85,7 +85,7 @@ pub fn build_binaries() -> Result<()> {
     .run()?;
     xshell::cmd!(
         shell,
-        "cargo build --release -p arcbox-agent -p arcbox-vm --bins --target aarch64-unknown-linux-musl"
+        "cargo build --release -p arcbox-agent -p arcbox-vm-agent --bins --target aarch64-unknown-linux-musl"
     )
     .run()?;
     Ok(())

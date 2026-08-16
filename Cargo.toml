@@ -38,6 +38,7 @@ members = [
     "virt/arcbox-virtio-balloon",
     "virt/arcbox-vm",
     "virt/arcbox-vm-proto",
+    "virt/arcbox-vm-agent",
     "virt/arcbox-fs",
     "virt/arcbox-net",
     "virt/arcbox-net-virtio",

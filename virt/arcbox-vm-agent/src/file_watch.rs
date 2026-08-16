@@ -1,13 +1,14 @@
 //! Inotify event-buffer parsing and mapping to sandbox filesystem events.
 //!
-//! The vm-agent's directory watch (`FILE_WATCH_REQ`, see [`crate::file_io`])
+//! The vm-agent's directory watch (`FILE_WATCH_REQ`, see
+//! [`arcbox_vm_proto::file`])
 //! reads raw `inotify(7)` event buffers inside the guest. Everything that
 //! does not need a syscall lives here so it compiles and is unit-tested on
 //! every host platform: the fixed 16-byte event header layout, the mask
 //! constants, and the cookie-based rename pairing that turns kernel
 //! `IN_MOVED_FROM`/`IN_MOVED_TO` pairs into single `renamed` events.
 
-use crate::file_io::proto::{
+use arcbox_vm_proto::file::{
     EVENT_CREATED, EVENT_MODIFIED, EVENT_REMOVED, EVENT_RENAMED, FsEventDto,
 };
 
