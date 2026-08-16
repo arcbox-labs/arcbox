@@ -66,9 +66,7 @@ fn scenario(data_dir: &Path) -> Result<()> {
 
     docker_output(
         data_dir,
-        &[
-            "run", "-d", "--name", "ovl-probe", &image, "sleep", "300",
-        ],
+        &["run", "-d", "--name", "ovl-probe", &image, "sleep", "300"],
         DOCKER_TIMEOUT,
     )?;
 
