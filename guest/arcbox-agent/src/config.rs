@@ -51,6 +51,7 @@ fn guest_defaults() -> VmmConfig {
             sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
             pool_size: 1,
             warm_create: true,
+            dmsetup_candidates: Some(guest_dmsetup_candidates()),
         },
         network: NetworkConfig {
             cidr: "172.20.0.0/16".into(),
@@ -74,6 +75,33 @@ fn guest_defaults() -> VmmConfig {
     }
 }
 
+/// The host-shared `dmsetup` copy (`/arcbox/bin`, the VirtioFS share the
+/// staged `vm-agent` also lives on).
+const GUEST_DMSETUP: &str = "/arcbox/bin/dmsetup";
+
+/// Where the guest looks for `dmsetup`: the host-shared copy first, then
+/// the stock locations. The library's own default is the stock list alone;
+/// the guest-specific entry is this composer's to add.
+fn guest_dmsetup_candidates() -> Vec<String> {
+    vec![
+        GUEST_DMSETUP.into(),
+        "/usr/sbin/dmsetup".into(),
+        "/sbin/dmsetup".into(),
+    ]
+}
+
+/// Apply the guest's environment facts on top of a config loaded from a
+/// file: a config that does not mention `dmsetup_candidates` — every one
+/// written before the field existed — gets the search order the guest has
+/// always used, host-shared copy first. A config that spells the list out
+/// is taken as written, including `[]` to run without CoW.
+fn with_guest_environment(mut cfg: VmmConfig) -> VmmConfig {
+    cfg.firecracker
+        .dmsetup_candidates
+        .get_or_insert_with(guest_dmsetup_candidates);
+    cfg
+}
+
 /// Load the VMM configuration for the guest agent.
 ///
 /// Priority: `ARCBOX_VMM_CONFIG` env var → `/etc/arcbox/vmm.toml` → guest defaults.
@@ -84,7 +112,7 @@ pub fn load() -> VmmConfig {
             match VmmConfig::from_file(&path) {
                 Ok(cfg) => {
                     tracing::info!(path, "loaded VMM config from ARCBOX_VMM_CONFIG");
-                    return cfg;
+                    return with_guest_environment(cfg);
                 }
                 Err(e) => {
                     tracing::warn!(path, error = %e, "failed to load ARCBOX_VMM_CONFIG, falling through");
@@ -99,7 +127,7 @@ pub fn load() -> VmmConfig {
         match VmmConfig::from_file(GUEST_CONFIG_PATH) {
             Ok(cfg) => {
                 tracing::info!(path = GUEST_CONFIG_PATH, "loaded VMM config");
-                return cfg;
+                return with_guest_environment(cfg);
             }
             Err(e) => {
                 tracing::warn!(
@@ -118,7 +146,10 @@ pub fn load() -> VmmConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{SANDBOX_DATA_DIR, guest_defaults};
+    use super::{
+        GUEST_DMSETUP, SANDBOX_DATA_DIR, guest_defaults, guest_dmsetup_candidates,
+        with_guest_environment,
+    };
 
     #[test]
     fn defaults_keep_sandbox_state_on_its_data_mount() {
@@ -126,5 +157,50 @@ mod tests {
 
         assert_eq!(config.firecracker.data_dir, SANDBOX_DATA_DIR);
         assert!(std::path::Path::new(&config.defaults.rootfs).starts_with(SANDBOX_DATA_DIR));
+    }
+
+    /// The order is the behaviour: the host-shared copy is tried before the
+    /// stock locations, exactly as the snapshot crate's built-in list did
+    /// before it became configuration. Reordering would not fail — CoW would
+    /// silently degrade to a full rootfs copy per sandbox.
+    #[test]
+    fn dmsetup_search_starts_with_the_host_shared_copy() {
+        assert_eq!(
+            guest_defaults().firecracker.dmsetup_candidates.as_deref(),
+            Some(
+                &[
+                    GUEST_DMSETUP.to_string(),
+                    "/usr/sbin/dmsetup".to_string(),
+                    "/sbin/dmsetup".to_string()
+                ][..]
+            )
+        );
+    }
+
+    /// A config file that does not mention `dmsetup_candidates` gets the
+    /// guest's own search order; one that spells it out is left alone,
+    /// including the empty list that switches CoW off.
+    #[test]
+    fn file_configs_without_the_field_gain_the_guest_search_order() {
+        let mut cfg = guest_defaults();
+        cfg.firecracker.dmsetup_candidates = None;
+        let cfg = with_guest_environment(cfg);
+        assert_eq!(
+            cfg.firecracker.dmsetup_candidates,
+            Some(guest_dmsetup_candidates())
+        );
+
+        let mut cfg = guest_defaults();
+        cfg.firecracker.dmsetup_candidates = Some(vec!["/opt/dm/dmsetup".into()]);
+        let cfg = with_guest_environment(cfg);
+        assert_eq!(
+            cfg.firecracker.dmsetup_candidates.as_deref(),
+            Some(&["/opt/dm/dmsetup".to_string()][..])
+        );
+
+        let mut cfg = guest_defaults();
+        cfg.firecracker.dmsetup_candidates = Some(Vec::new());
+        let cfg = with_guest_environment(cfg);
+        assert_eq!(cfg.firecracker.dmsetup_candidates.as_deref(), Some(&[][..]));
     }
 }

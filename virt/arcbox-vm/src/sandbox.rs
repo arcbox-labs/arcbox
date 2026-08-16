@@ -117,10 +117,12 @@ impl SandboxManager {
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let cow_manager = Arc::new(CowManager::new(CowOptions {
-            block_tools: environment.block_tools,
-            ..CowOptions::new(&config.firecracker.data_dir)
-        })?);
+        let mut cow_options = CowOptions::new(&config.firecracker.data_dir);
+        cow_options.block_tools = environment.block_tools;
+        if let Some(candidates) = &config.firecracker.dmsetup_candidates {
+            cow_options.dmsetup_candidates = candidates.iter().map(PathBuf::from).collect();
+        }
+        let cow_manager = Arc::new(CowManager::new(cow_options)?);
 
         // Ensure the jailer chroot base directory exists.
         if let Some(ref jc) = config.firecracker.jailer {

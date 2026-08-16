@@ -64,6 +64,8 @@ fn try_config(data_dir: &str) -> Option<VmmConfig> {
             pool_size: 0,
             // Direct mode is warm-ineligible anyway; keep it explicit.
             warm_create: false,
+            // The stock-distro search list, i.e. the library's own default.
+            dmsetup_candidates: None,
         },
         network: NetworkConfig {
             cidr: "172.99.0.0/24".into(),
