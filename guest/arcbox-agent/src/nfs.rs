@@ -52,8 +52,15 @@ mod platform {
     const NFSD_MOUNTPOINT: &str = "/proc/fs/nfsd";
     const NFS_STATE_DIR: &str = "/var/lib/nfs";
     const EXPORTS_PATH: &str = "/etc/exports";
+    /// Watched for mount-table changes; also the table the live export
+    /// entries are derived from, so the two can never disagree.
+    const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
     const NETCONFIG_PATH: &str = "/etc/netconfig";
     const NFSD_THREADS: &str = "4";
+
+    /// Guards the single mount-table watcher against repeated
+    /// `ensure_docker_export` calls.
+    static WATCHER_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Minimal libtirpc netconfig. The guest rootfs ships none, and without it
     /// `rpc.mountd` logs "No V2 or V3 listeners created" and serves nothing;
@@ -143,8 +150,10 @@ local      tpi_cots_ord  -     loopback  -       -       -
             Err(e) => tracing::warn!(error = %e, "nfs export: volume icon install failed"),
         }
 
-        write_exports(&cfg).map_err(|e| format!("write {} failed({e})", cfg.exports_path))?;
-        refresh_exports()?;
+        // Renders any already-running containers too: on a warm restart
+        // the mount table is populated before this runs, and waiting for
+        // the next mount change would leave them invisible until one.
+        reconcile_exports(&cfg)?;
         notes.push("refreshed exportfs".to_string());
 
         ensure_netconfig()?;
@@ -156,6 +165,13 @@ local      tpi_cots_ord  -     loopback  -       -       -
 
         ensure_nfsd_threads(&cfg)?;
         notes.push(format!("ensured nfsd threads={}", cfg.threads));
+
+        // Once: this runs again on every EnsureNfsExport, and a thread
+        // per call would pile up watchers that all rewrite the same file.
+        if !WATCHER_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            spawn_export_watcher();
+            notes.push("armed live-export watcher".to_string());
+        }
 
         tracing::info!(
             export_ready = export_ready(),
@@ -252,10 +268,6 @@ local      tpi_cots_ord  -     loopback  -       -       -
             ));
         }
         Ok(())
-    }
-
-    fn write_exports(cfg: &ExportConfig<'_>) -> io::Result<()> {
-        fs::write(cfg.exports_path, render_exports(cfg))
     }
 
     fn refresh_exports() -> Result<(), String> {
@@ -461,12 +473,106 @@ local      tpi_cots_ord  -     loopback  -       -       -
     ///   restarts, and marks the NFSv4 pseudo-root. The containerd child
     ///   export gets its own fixed `fsid=1` — it is a separate btrfs
     ///   subvolume, and nfsd cannot derive a stable id for those on its own.
-    fn render_exports(cfg: &ExportConfig<'_>) -> String {
+    ///
+    /// Running containers add one entry each, because NFSv4 does not cross
+    /// into an unexported child mount and `crossmnt` — which would — is
+    /// banned. Their fsids are derived from the mountpoint rather than
+    /// allocated, so nothing has to be remembered across an agent restart or
+    /// reconciled against container churn.
+    fn render_exports(cfg: &ExportConfig<'_>, live: &[String]) -> String {
         const OPTS: &str = "no_subtree_check,insecure,all_squash,anonuid=0,anongid=0";
-        let docker = format!("{} 127.0.0.1/32(ro,fsid=0,{OPTS})\n", cfg.export_docker);
-        match cfg.export_containerd {
-            Some(child) => format!("{docker}{child} 127.0.0.1/32(ro,fsid=1,{OPTS})\n"),
-            None => docker,
+        let mut rendered = format!("{} 127.0.0.1/32(ro,fsid=0,{OPTS})\n", cfg.export_docker);
+        if let Some(child) = cfg.export_containerd {
+            rendered.push_str(&format!("{child} 127.0.0.1/32(ro,fsid=1,{OPTS})\n"));
+        }
+        for mountpoint in live {
+            let fsid = crate::live_exports::fsid_for(mountpoint);
+            rendered.push_str(&format!(
+                "{mountpoint} 127.0.0.1/32(ro,fsid={fsid},{OPTS})\n"
+            ));
+        }
+        rendered
+    }
+
+    /// Current container rootfs overlays, or none if the mount table is
+    /// unreadable.
+    ///
+    /// A failure here degrades the live view rather than the export: the
+    /// static docker and containerd exports still render, so `~/ArcBox` keeps
+    /// working and only running containers go missing from it.
+    fn live_rootfs_exports() -> Vec<String> {
+        match fs::read_to_string(MOUNTINFO_PATH) {
+            Ok(mountinfo) => crate::live_exports::rootfs_mountpoints(&mountinfo),
+            Err(e) => {
+                tracing::warn!(error = %e, path = MOUNTINFO_PATH, "nfs export: cannot read mount table");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Rewrites `/etc/exports` from the current mount table and reloads it.
+    fn reconcile_exports(cfg: &ExportConfig<'_>) -> Result<(), String> {
+        let live = live_rootfs_exports();
+        fs::write(cfg.exports_path, render_exports(cfg, &live))
+            .map_err(|e| format!("write {} failed({e})", cfg.exports_path))?;
+        refresh_exports()?;
+        tracing::debug!(containers = live.len(), "nfs export: reconciled");
+        Ok(())
+    }
+
+    /// Keeps the per-container entries in step with the mount table, for the
+    /// life of the agent.
+    ///
+    /// Blocks in `poll()` rather than polling on a timer: the guest is idle
+    /// most of the time and this repo has already paid once for a busy
+    /// watcher (ABX-517's 1 kHz vmnet poll cost about half the daemon's idle
+    /// CPU). `/proc/self/mountinfo` reports mount-table changes as `POLLPRI`,
+    /// so an idle guest wakes this thread exactly never.
+    ///
+    /// Departures need no urgency and no ordering: an export entry does not
+    /// pin its mount, so dockerd can unmount a container's rootfs while it is
+    /// still exported. A stale entry is therefore cosmetic until the next
+    /// change wakes us.
+    fn spawn_export_watcher() {
+        std::thread::spawn(move || {
+            let file = match fs::File::open(MOUNTINFO_PATH) {
+                Ok(file) => file,
+                Err(e) => {
+                    tracing::warn!(error = %e, "nfs export: live view disabled, cannot watch mounts");
+                    return;
+                }
+            };
+
+            loop {
+                if let Err(e) = wait_for_mount_change(&file) {
+                    tracing::warn!(error = %e, "nfs export: mount watch failed, live view stops here");
+                    return;
+                }
+                if let Err(e) = reconcile_exports(&ExportConfig::default()) {
+                    // Keep watching: a transient exportfs failure should not
+                    // cost every later container its entry.
+                    tracing::warn!(error = %e, "nfs export: reconcile failed");
+                }
+            }
+        });
+    }
+
+    /// Blocks until the mount table changes.
+    fn wait_for_mount_change(file: &fs::File) -> Result<(), String> {
+        use std::os::fd::AsFd;
+
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        // POLLPRI is how procfs signals a mount-table change; POLLERR arrives
+        // with it. A revents of neither means a spurious wake, which is
+        // harmless — the caller just reconciles against an unchanged table.
+        let mut fds = [PollFd::new(file.as_fd(), PollFlags::POLLPRI)];
+        loop {
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => return Ok(()),
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(format!("poll({MOUNTINFO_PATH}) failed({e})")),
+            }
         }
     }
 
@@ -505,7 +611,7 @@ local      tpi_cots_ord  -     loopback  -       -       -
 
         #[test]
         fn render_exports_is_readonly_and_localhost_only() {
-            let rendered = render_exports(&ExportConfig::default());
+            let rendered = render_exports(&ExportConfig::default(), &[]);
             assert!(rendered.starts_with("/run/arcbox/nfs-export/docker 127.0.0.1/32("));
             assert!(rendered.contains("ro,"));
             assert!(rendered.contains("fsid=0"));
@@ -518,7 +624,7 @@ local      tpi_cots_ord  -     loopback  -       -       -
 
         #[test]
         fn containerd_child_export_is_inside_the_v4_root_with_its_own_fsid() {
-            let rendered = render_exports(&ExportConfig::default());
+            let rendered = render_exports(&ExportConfig::default(), &[]);
             let child = rendered
                 .lines()
                 .nth(1)
@@ -536,7 +642,7 @@ local      tpi_cots_ord  -     loopback  -       -       -
                 export_containerd: None,
                 ..ExportConfig::default()
             };
-            let rendered = render_exports(&cfg);
+            let rendered = render_exports(&cfg, &[]);
             assert_eq!(rendered.lines().count(), 1);
             assert!(!rendered.contains("containerd"));
         }

@@ -22,7 +22,7 @@ tracing-appender = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nix = { workspace = true, features = ["mount", "process", "resource", "sched", "signal", "feature", "term", "ioctl"] }
+nix = { workspace = true, features = ["mount", "process", "resource", "sched", "signal", "feature", "term", "ioctl", "poll"] }
 libc = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true }
