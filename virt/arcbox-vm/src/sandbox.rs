@@ -112,6 +112,7 @@ impl SandboxManager {
             config.network.dns.clone(),
             Path::new(&config.firecracker.data_dir).join("sandbox-network-quarantine"),
             config.firecracker.sandbox_datapath,
+            environment.packet_filter,
         )?);
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
