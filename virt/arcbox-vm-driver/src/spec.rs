@@ -209,9 +209,10 @@ pub struct VmSpec {
 impl VmSpec {
     /// Checks the invariants no driver can repair.
     ///
-    /// CPU and memory are at least 1; disk ids and NIC ids are non-empty
-    /// and unique; at most one disk is the root; every MAC is a non-nil
-    /// unicast address; every boot path is non-empty.
+    /// CPU and memory are at least 1; disk ids, NIC ids and share tags are
+    /// non-empty and unique; at most one disk is the root; every MAC is a
+    /// non-nil unicast address; every boot, disk and share path is
+    /// non-empty; the vsock guest CID is 3 or above.
     pub fn validate(&self) -> Result<()> {
         if self.cpus == 0 {
             return Err(Error::InvalidSpec("cpus must be at least 1".into()));
@@ -252,6 +253,28 @@ impl VmSpec {
                     nic.id, nic.mac
                 )));
             }
+        }
+        if let Some(vsock) = &self.vsock
+            && vsock.guest_cid < VsockSpec::FIRST_GUEST_CID
+        {
+            return Err(Error::InvalidSpec(format!(
+                "vsock guest_cid {} is reserved; use {} or above",
+                vsock.guest_cid,
+                VsockSpec::FIRST_GUEST_CID
+            )));
+        }
+        let mut share_tags = HashSet::new();
+        for share in &self.shares {
+            if share.tag.is_empty() {
+                return Err(Error::InvalidSpec("share tag must not be empty".into()));
+            }
+            if !share_tags.insert(share.tag.as_str()) {
+                return Err(Error::InvalidSpec(format!(
+                    "duplicate share tag `{}`",
+                    share.tag
+                )));
+            }
+            require_path("share host path", &share.host_path)?;
         }
         Ok(())
     }
@@ -381,8 +404,14 @@ pub enum NicAttachment {
 /// The vsock device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VsockSpec {
-    /// The guest's context id (3 or above; 2 is the host).
+    /// The guest's context id: [`Self::FIRST_GUEST_CID`] or above (0 and 1
+    /// are reserved, 2 is the host).
     pub guest_cid: u32,
+}
+
+impl VsockSpec {
+    /// The lowest context id a guest may take.
+    pub const FIRST_GUEST_CID: u32 = 3;
 }
 
 /// One shared host directory (virtiofs).
@@ -592,6 +621,47 @@ mod tests {
         let mut s = spec();
         s.nics[0].id.clear();
         assert!(invalid(&s).contains("nic id"));
+    }
+
+    #[test]
+    fn vsock_guest_cid_must_not_be_reserved() {
+        for cid in 0..VsockSpec::FIRST_GUEST_CID {
+            let mut s = spec();
+            s.vsock = Some(VsockSpec { guest_cid: cid });
+            assert!(invalid(&s).contains("guest_cid"), "cid {cid} accepted");
+        }
+        let mut s = spec();
+        s.vsock = Some(VsockSpec {
+            guest_cid: VsockSpec::FIRST_GUEST_CID,
+        });
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn share_tags_must_be_unique_and_paths_non_empty() {
+        let share = ShareSpec {
+            tag: "data".into(),
+            host_path: "/srv/data".into(),
+            read_only: false,
+        };
+        let mut s = spec();
+        s.shares = vec![share.clone(), share.clone()];
+        assert!(invalid(&s).contains("duplicate share tag"));
+        let mut s = spec();
+        s.shares = vec![ShareSpec {
+            tag: String::new(),
+            ..share.clone()
+        }];
+        assert!(invalid(&s).contains("share tag"));
+        let mut s = spec();
+        s.shares = vec![ShareSpec {
+            host_path: PathBuf::new(),
+            ..share.clone()
+        }];
+        assert!(invalid(&s).contains("share host path"));
+        let mut s = spec();
+        s.shares = vec![share];
+        s.validate().unwrap();
     }
 
     #[test]
