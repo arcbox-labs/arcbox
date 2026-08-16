@@ -20,11 +20,14 @@ catalog, no engine, no orchestrator.
 |--------|------|
 | `config` | `FcDriverConfig` — binaries, seccomp, log level, API-socket wait, jailer resource limits |
 | `error` | `FcError`, folded into the port's `Error::Driver { driver: "firecracker", .. }` |
-| `render` | `VmSpec` → `FcPlan`, `RestoreSpec` → `FcRestorePlan`; every path Firecracker sees, and the jailer's relativity, is decided here |
-| `jail` | chroot layout and staging (link-or-copy, copy, block-device node), `apply` for a rendered plan |
+| `render` | `VmLayout` (every path Firecracker sees, and the jailer's relativity), `VmSpec` → `FcPlan`, `RestoreSpec` → `FcRestorePlan` |
+| `jail` | chroot layout and staging (link-or-copy, copy, block-device node), `apply` for a rendered plan, `move_file` out of a jail |
 | `spawn` | `firecracker` / `jailer` process spawn from a `SpawnPlan` |
 | `vsock` | the `CONNECT <port>` handshake and the `{uds}_{port}` listener |
-| `process` | the process guard: waiter task, exit watch, kill / graceful shutdown, detach |
+| `process` | the process guard: waiter task, exit watch + event, kill / wait, detach |
+| `api` | pause, resume, snapshot, ctrl-alt-del, describe, vm-config over the raw client |
+| `listener` | the port's `VsockListener` over a `{uds}_{port}` socket |
+| `discover` | finding a Firecracker that outlived its booter (recorded pid, `/proc` scan) |
 | `prepared` | `FcPrepared: PreparedVm` — a spawned VMM waiting for a spec |
 | `handle` | `FcHandle: VmHandle + Vsock + VsockListen + Checkpoint + Detach` |
 | `driver` | `FcDriver: VmDriver + Prepare + Adopt` |

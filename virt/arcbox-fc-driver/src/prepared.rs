@@ -47,6 +47,11 @@ impl FcPrepared {
         tokio::fs::create_dir_all(runtime_dir).await?;
         let plan = layout.spawn_plan();
         let child = spawn::spawn(&plan, &config).await?;
+        debug_assert_eq!(
+            child.socket_path(),
+            plan.api_socket,
+            "the layout and fc-sdk agree on the API socket"
+        );
         let process = Arc::new(FcProcess::spawn(child, plan.api_socket.clone())?);
         let record = VmRecord {
             id: id.clone(),
