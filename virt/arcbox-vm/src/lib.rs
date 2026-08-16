@@ -25,6 +25,8 @@
 //! # Public API
 //!
 //! - [`SandboxManager`] — top-level sandbox orchestrator
+//! - [`SandboxEnvironment`] — the environment-specific components a
+//!   composer supplies (block tooling today; more seams follow)
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
 //! - [`NetworkManager`] — TAP lifecycle & IP allocation
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
@@ -37,6 +39,7 @@
 
 pub mod boot_proto;
 pub mod config;
+pub mod environment;
 pub mod error;
 pub mod file_io;
 pub mod file_watch;
@@ -54,6 +57,7 @@ pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
 };
+pub use environment::SandboxEnvironment;
 pub use error::{Result, VmmError};
 pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
 pub use sandbox::pause_reason;

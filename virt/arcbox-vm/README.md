@@ -48,6 +48,17 @@ programmatically; `[firecracker]`, `[network]`, and `[defaults]` are the
 sections that matter, and `[firecracker.jailer]` opts into jailer mode.
 See `config.rs` for the fields.
 
+What the stack needs from its *environment* — the pieces that differ
+between the System VM's busybox userland and a stock distro — is a
+separate input, `SandboxEnvironment`. `SandboxManager::new(config)` uses
+the reference environment (the System VM's); a composer on another host
+overrides the members it owns and calls
+`SandboxManager::with_environment(config, env)`. Today that is the
+loop-device tooling behind `arcbox_snapshot::snapshot_cow::BlockTools`
+(`BusyboxBlockTools` is the reference; a `util-linux` or ioctl
+implementation is a consumer's few dozen lines); the packet-filter and
+path seams follow.
+
 ## Build and test
 
 ```bash
