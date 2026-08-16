@@ -37,6 +37,7 @@ members = [
     "virt/arcbox-virtio-vsock",
     "virt/arcbox-virtio-balloon",
     "virt/arcbox-vm",
+    "virt/arcbox-vm-proto",
     "virt/arcbox-fs",
     "virt/arcbox-net",
     "virt/arcbox-net-virtio",
@@ -266,6 +267,7 @@ arcbox-virtio-rng = { version = "0.7.0", path = "virt/arcbox-virtio-rng" } # x-r
 arcbox-virtio-vsock = { version = "0.7.0", path = "virt/arcbox-virtio-vsock" } # x-release-please-version
 arcbox-virtio-balloon = { version = "0.7.0", path = "virt/arcbox-virtio-balloon" } # x-release-please-version
 arcbox-vm = { version = "0.7.0", path = "virt/arcbox-vm" } # x-release-please-version
+arcbox-vm-proto = { version = "0.7.0", path = "virt/arcbox-vm-proto" } # x-release-please-version
 arcbox-fs = { version = "0.7.0", path = "virt/arcbox-fs" } # x-release-please-version
 arcbox-net = { version = "0.7.0", path = "virt/arcbox-net" } # x-release-please-version
 arcbox-vmnet = { version = "0.7.0", path = "virt/arcbox-vmnet" } # x-release-please-version

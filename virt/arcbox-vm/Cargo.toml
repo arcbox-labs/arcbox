@@ -13,6 +13,7 @@ path = "src/bin/vm-agent.rs"
 
 [dependencies]
 arcbox-atomic-file.workspace = true
+arcbox-vm-proto.workspace = true
 arcbox-error.workspace = true
 arcbox-snapshot.workspace = true
 fc-sdk.workspace       = true

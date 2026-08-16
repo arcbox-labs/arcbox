@@ -17,10 +17,12 @@
 //! | `arcbox-vm` | guest | nested sandbox microVMs | Firecracker (`fc-sdk`) |
 //!
 //! It also ships the `vm-agent` binary, which becomes PID 1 *inside* each
-//! sandbox. That binary imports only this crate's protocol leaves
-//! (`boot_proto`, `file_io::proto`, `file_watch`, `vsock` constants,
-//! `listen_table`, `user_spec`) — never the manager. Keep it that way:
-//! it is cross-compiled to musl and staged into every sandbox rootfs.
+//! sandbox. The wire vocabulary the two sides share (boot parameters, exec
+//! and file frames) lives in `arcbox-vm-proto`, re-exported here as
+//! `boot_proto` and `file_io::proto`; the binary imports that crate plus
+//! this crate's guest-only leaves (`file_watch`, `listen_table`,
+//! `user_spec`) — never the manager. Keep it that way: it is
+//! cross-compiled to musl and staged into every sandbox rootfs.
 //!
 //! # Public API
 //!
@@ -35,7 +37,6 @@
 //! paths are re-exports of it so existing imports keep resolving; name
 //! `arcbox_snapshot` directly in new code.
 
-pub mod boot_proto;
 pub mod config;
 pub mod error;
 pub mod file_io;
@@ -46,6 +47,9 @@ pub mod sandbox;
 pub mod spawn;
 pub mod user_spec;
 pub mod vsock;
+
+/// Boot-parameter vocabulary shared with `vm-agent` (`arcbox_vm_proto::boot`).
+pub use arcbox_vm_proto::boot as boot_proto;
 
 // The snapshot lineage moved to the engine layer (arcbox-snapshot); these
 // paths stay so `arcbox-agent` and this crate's own modules keep compiling.

@@ -1,57 +1,12 @@
-//! Host-side file I/O over a dedicated vsock port (FILE_PORT = 53).
+//! Host-side file I/O client over the file channel (`FILE_PORT` = 53).
 //!
-//! ## Protocol
-//!
-//! Frame format is identical to the exec channel: `[u8 type][u32 LE len][payload]`.
-//! One vsock connection per operation; vm-agent closes after sending the final frame.
-//!
-//! | Hex  | Name              | Direction      | Payload                          |
-//! |------|-------------------|----------------|----------------------------------|
-//! | 0x20 | `FILE_WRITE_REQ`  | Host → Agent   | JSON `{"path": str, "mode": u32}`|
-//! | 0x21 | `FILE_DATA`       | bidirectional  | raw bytes (one chunk)            |
-//! | 0x22 | `FILE_DONE`       | bidirectional  | empty — end of data stream       |
-//! | 0x23 | `FILE_READ_REQ`   | Host → Agent   | JSON `{"path": str}`             |
-//! | 0x24 | `FILE_STAT_REQ`   | Host → Agent   | JSON [`proto::StatReq`]          |
-//! | 0x25 | `FILE_LIST_REQ`   | Host → Agent   | JSON [`proto::ListDirReq`]       |
-//! | 0x26 | `FILE_MKDIR_REQ`  | Host → Agent   | JSON [`proto::MakeDirReq`]       |
-//! | 0x27 | `FILE_REMOVE_REQ` | Host → Agent   | JSON [`proto::RemoveReq`]        |
-//! | 0x28 | `FILE_MOVE_REQ`   | Host → Agent   | JSON [`proto::MoveReq`]          |
-//! | 0x29 | `FILE_WATCH_REQ`  | Host → Agent   | JSON [`proto::WatchReq`]         |
-//! | 0x30 | `FILE_ACK`        | Agent → Host   | empty — operation succeeded      |
-//! | 0x31 | `FILE_ERR`        | Agent → Host   | UTF-8 error message              |
-//! | 0x32 | `FILE_STAT`       | Agent → Host   | JSON [`proto::FileStatDto`]      |
-//! | 0x33 | `FILE_LIST`       | Agent → Host   | JSON `[FileStatDto, ...]`        |
-//! | 0x34 | `FILE_EVENT`      | Agent → Host   | JSON [`proto::FsEventDto`]       |
-//!
-//! ## Path-verb flows (CORE-62)
-//!
-//! Stat/List answer one data frame; MakeDir/Remove/Move answer `FILE_ACK`.
-//! Watch answers `FILE_ACK` once the inotify watch is established, then
-//! streams `FILE_EVENT` frames until either side closes the connection —
-//! the host closing it is the cancellation signal, the agent side closing
-//! it (sandbox stop) is the clean end of the stream.
-//!
-//! `FILE_ERR` payloads carry a machine-readable errno prefix
-//! (`ERR_NOT_FOUND` and friends) on every verb — the path verbs and the
-//! read/write flows alike — so the host maps them onto typed
-//! [`VmmError`] variants instead of a blanket vsock error.
-//!
-//! ## Write flow
-//! ```text
-//! Host  →  FILE_WRITE_REQ  {path, mode}
-//! Host  →  FILE_DATA       [chunk 1..N]
-//! Host  →  FILE_DONE
-//!           ←  FILE_ACK  (success)
-//!           ←  FILE_ERR  (failure)
-//! ```
-//!
-//! ## Read flow
-//! ```text
-//! Host  →  FILE_READ_REQ  {path}
-//!           ←  FILE_DATA  [chunk 1..N]
-//!           ←  FILE_DONE  (success — all bytes sent)
-//!           ←  FILE_ERR   (failure)
-//! ```
+//! The wire vocabulary — frame opcodes, request payloads, the stat/event
+//! DTOs, and the per-verb flows — is [`arcbox_vm_proto::file`], re-exported
+//! here as [`proto`] so `arcbox_vm::file_io::proto` keeps resolving for
+//! every consumer. This module is the tokio client the manager drives:
+//! one vsock connection per operation, timeouts, and the mapping of the
+//! agent's errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`]
+//! variants (`decode_file_err`).
 
 use std::path::Path;
 use std::time::Duration;
@@ -66,125 +21,8 @@ use crate::vsock::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
 /// Per-operation timeout for file I/O over vsock.
 const FILE_IO_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// File I/O protocol constants shared between the host-side client and the
-/// guest vm-agent binary.  The vm-agent should import these from
-/// `arcbox_vm::file_io::proto` instead of duplicating numeric values.
-pub mod proto {
-    use serde::{Deserialize, Serialize};
-
-    /// Guest-side vsock port for file I/O.
-    pub const FILE_PORT: u32 = 53;
-
-    // Frame type constants.
-    pub const FILE_WRITE_REQ: u8 = 0x20;
-    pub const FILE_DATA: u8 = 0x21;
-    pub const FILE_DONE: u8 = 0x22;
-    pub const FILE_READ_REQ: u8 = 0x23;
-    pub const FILE_STAT_REQ: u8 = 0x24;
-    pub const FILE_LIST_REQ: u8 = 0x25;
-    pub const FILE_MKDIR_REQ: u8 = 0x26;
-    pub const FILE_REMOVE_REQ: u8 = 0x27;
-    pub const FILE_MOVE_REQ: u8 = 0x28;
-    pub const FILE_WATCH_REQ: u8 = 0x29;
-    pub const FILE_ACK: u8 = 0x30;
-    pub const FILE_ERR: u8 = 0x31;
-    pub const FILE_STAT: u8 = 0x32;
-    pub const FILE_LIST: u8 = 0x33;
-    pub const FILE_EVENT: u8 = 0x34;
-
-    /// Maximum total file size for file I/O operations (256 MiB).
-    pub const MAX_FILE_SIZE: usize = 256 * 1024 * 1024;
-
-    // Machine-readable errno prefixes on `FILE_ERR` payloads for the path
-    // verbs. The remainder of the payload is the affected path; the host
-    // maps each prefix onto a typed `VmmError` (see `decode_file_err`).
-    pub const ERR_NOT_FOUND: &str = "ENOENT: ";
-    pub const ERR_NOT_A_DIRECTORY: &str = "ENOTDIR: ";
-    pub const ERR_NOT_EMPTY: &str = "ENOTEMPTY: ";
-
-    // `FileStatDto.kind` vocabulary.
-    pub const KIND_FILE: &str = "file";
-    pub const KIND_DIR: &str = "dir";
-    pub const KIND_SYMLINK: &str = "symlink";
-    pub const KIND_OTHER: &str = "other";
-
-    // `FsEventDto.kind` vocabulary.
-    pub const EVENT_CREATED: &str = "created";
-    pub const EVENT_MODIFIED: &str = "modified";
-    pub const EVENT_REMOVED: &str = "removed";
-    pub const EVENT_RENAMED: &str = "renamed";
-
-    /// `FILE_STAT_REQ` payload.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct StatReq {
-        pub path: String,
-    }
-
-    /// `FILE_LIST_REQ` payload.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct ListDirReq {
-        pub path: String,
-    }
-
-    /// `FILE_MKDIR_REQ` payload. `mode` carries the Unix permission bits
-    /// for created directories; `0` defaults to `0o755` on the agent side.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct MakeDirReq {
-        pub path: String,
-        pub mode: u32,
-    }
-
-    /// `FILE_REMOVE_REQ` payload.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct RemoveReq {
-        pub path: String,
-        pub recursive: bool,
-    }
-
-    /// `FILE_MOVE_REQ` payload.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct MoveReq {
-        pub from: String,
-        pub to: String,
-    }
-
-    /// `FILE_WATCH_REQ` payload.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct WatchReq {
-        pub path: String,
-        pub recursive: bool,
-    }
-
-    /// Metadata of one filesystem entry (`FILE_STAT` / `FILE_LIST` payload).
-    ///
-    /// Mirrors `arcbox.sandbox.v1.FileStat`: symlinks are reported, never
-    /// followed; `mode` is the low 12 bits of `st_mode`; `size` is 0 for
-    /// non-regular files.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FileStatDto {
-        pub name: String,
-        pub kind: String,
-        pub size: u64,
-        pub mode: u32,
-        pub mtime_secs: i64,
-        pub mtime_nanos: u32,
-        pub uid: u32,
-        pub gid: u32,
-        #[serde(default)]
-        pub symlink_target: String,
-    }
-
-    /// One filesystem event (`FILE_EVENT` payload). Mirrors
-    /// `arcbox.sandbox.v1.FsEvent`: `path` is the old path for renames,
-    /// with `renamed_to` set only then.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FsEventDto {
-        pub kind: String,
-        pub path: String,
-        #[serde(default)]
-        pub renamed_to: String,
-    }
-}
+/// The file-channel wire vocabulary, shared with `vm-agent`.
+pub use arcbox_vm_proto::file as proto;
 
 pub use proto::FILE_PORT;
 use proto::{
