@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arcbox_fc_driver::FcDriverConfig;
+use arcbox_fc_driver::jail::{
+    SnapshotFiles, chroot_root, link_or_copy_for_jailer, stage_kernel_for_jailer,
+    stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
+};
 use arcbox_fc_driver::spawn::{spawn_direct, spawn_jailer};
 use arcbox_vm_driver::IsolationSpec;
 use chrono::{DateTime, Utc};

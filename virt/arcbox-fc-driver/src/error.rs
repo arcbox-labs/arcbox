@@ -39,6 +39,53 @@ pub enum FcError {
         source: nix::Error,
     },
 
+    /// A path that should name a block device could not be inspected.
+    #[error("stat {path}: {source}")]
+    Stat {
+        /// The path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A disk to mirror as a device node is not a block device.
+    #[error("{path} is not a block device")]
+    NotBlockDevice {
+        /// The path.
+        path: PathBuf,
+    },
+
+    /// A block device carries a major or minor number outside `u32` — a
+    /// corrupt node, not something to truncate.
+    #[error("{path}: {what} {value} out of range")]
+    BadDeviceNumber {
+        /// The device node.
+        path: PathBuf,
+        /// `"major"` or `"minor"`.
+        what: &'static str,
+        /// The offending value.
+        value: u64,
+    },
+
+    /// A block-device node could not be created in the jail.
+    #[error("mknod {path}: {source}")]
+    Mknod {
+        /// The node being created.
+        path: PathBuf,
+        /// The underlying errno.
+        #[source]
+        source: nix::Error,
+    },
+
+    /// An operation this host cannot perform: block-device nodes and the
+    /// jailer exist on Linux only.
+    #[error("{what}: Linux-only")]
+    LinuxOnly {
+        /// What was asked for.
+        what: String,
+    },
+
     /// Signalling the VMM process failed.
     #[error("kill firecracker {pid}: {source}")]
     Kill {

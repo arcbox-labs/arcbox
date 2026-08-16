@@ -13,6 +13,8 @@
 //!   seccomp, log level, the API-socket wait, jailer resource limits.
 //! - [`error`] — [`FcError`], the adapter's typed failures, folded into the
 //!   port's `Error::Driver` at the boundary.
+//! - [`jail`] — the jailer's chroot layout and how host files are staged
+//!   into it (link-or-copy, copy, block-device node).
 //! - [`spawn`] — the `firecracker` / `jailer` process spawn.
 //!
 //! The remaining modules — the spec renderer, jail staging, process
@@ -34,6 +36,7 @@
 
 pub mod config;
 pub mod error;
+pub mod jail;
 pub mod spawn;
 
 pub use config::FcDriverConfig;

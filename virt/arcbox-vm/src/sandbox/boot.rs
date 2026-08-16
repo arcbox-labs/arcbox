@@ -646,143 +646,6 @@ pub(super) async fn run_initial_cmd(
     }
 }
 
-/// Compute the host-side absolute path to the jailer chroot root directory.
-///
-/// Returns `{chroot_base_dir}/{fc_binary_filename}/{id}/root`.
-pub(super) fn chroot_root(fc_binary: &str, chroot_base_dir: &str, id: &str) -> PathBuf {
-    let exec_name = Path::new(fc_binary)
-        .file_name()
-        .expect("fc_binary must have a filename")
-        .to_string_lossy();
-    PathBuf::from(chroot_base_dir)
-        .join(exec_name.as_ref())
-        .join(id)
-        .join("root")
-}
-
-/// Stage a read-only file into a jailer chroot: hard-link when possible,
-/// copy otherwise.
-///
-/// A hard link shares the inode with the source, so it is only safe for
-/// files FC never writes — the kernel image, a snapshot vmstate, and a
-/// snapshot mem file (mapped MAP_PRIVATE on load). Do NOT use it for the
-/// rootfs copy fallback: FC writes guest blocks into that file. Linking is
-/// also reserved for the root jailer (uid/gid 0), because chown on a link
-/// would mutate the shared source inode; a non-root jailer gets a private
-/// copy with its own ownership.
-pub(super) async fn link_or_copy_for_jailer(
-    src: &Path,
-    dst: &Path,
-    uid: u32,
-    gid: u32,
-) -> Result<()> {
-    // Remove a stale entry first: hard_link fails on an existing dst, and a
-    // leftover from a previous run must not survive by accident.
-    if let Err(e) = tokio::fs::remove_file(dst).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(VmmError::Io(e));
-    }
-    if uid == 0 && gid == 0 {
-        match tokio::fs::hard_link(src, dst).await {
-            Ok(()) => return Ok(()),
-            // Cross-device (EXDEV) or filesystem quirk. warn, not debug: the
-            // copy fallback silently forfeits the restore fast path, and at
-            // default log levels a misplaced chroot base would only ever be
-            // rediscovered by re-measuring.
-            Err(e) => {
-                warn!(src = %src.display(), dst = %dst.display(), error = %e,
-                    "hard link failed; falling back to copy");
-            }
-        }
-    }
-    tokio::fs::copy(src, dst).await.map_err(VmmError::Io)?;
-    chown(dst, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
-        .map_err(|e| VmmError::Process(format!("chown {}: {e}", dst.display())))?;
-    Ok(())
-}
-
-/// Stage the kernel into the jailer chroot (link or copy).
-///
-/// Returns the chroot-relative kernel path (e.g. `"/vmlinux"`).
-pub(super) async fn stage_kernel_for_jailer(
-    chroot_root: &Path,
-    kernel_src: &str,
-    uid: u32,
-    gid: u32,
-) -> Result<String> {
-    tokio::fs::create_dir_all(chroot_root)
-        .await
-        .map_err(VmmError::Io)?;
-    let kernel_dst = chroot_root.join("vmlinux");
-    link_or_copy_for_jailer(Path::new(kernel_src), &kernel_dst, uid, gid).await?;
-    Ok("/vmlinux".to_string())
-}
-
-/// Copy rootfs into the jailer chroot and set ownership.
-///
-/// Returns the chroot-relative rootfs path (e.g. `"/rootfs.ext4"`).
-pub(super) async fn stage_rootfs_copy_for_jailer(
-    chroot_root: &Path,
-    rootfs_src: &str,
-    uid: u32,
-    gid: u32,
-) -> Result<String> {
-    tokio::fs::create_dir_all(chroot_root)
-        .await
-        .map_err(VmmError::Io)?;
-    let rootfs_dst = chroot_root.join("rootfs.ext4");
-    // Remove any stale entry — a previous crash or a failed mknod-then-chown
-    // fallback may have left a block device node here, in which case
-    // `tokio::fs::copy` would write into the device instead of replacing it.
-    if let Err(e) = tokio::fs::remove_file(&rootfs_dst).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(VmmError::Io(e));
-    }
-    tokio::fs::copy(rootfs_src, &rootfs_dst)
-        .await
-        .map_err(VmmError::Io)?;
-    chown(
-        &rootfs_dst,
-        Some(Uid::from_raw(uid)),
-        Some(Gid::from_raw(gid)),
-    )
-    .map_err(|e| VmmError::Process(format!("chown rootfs: {e}")))?;
-    Ok("/rootfs.ext4".to_string())
-}
-
-/// Create a block device node in the jailer chroot pointing to a dm device.
-///
-/// Returns the chroot-relative rootfs path (`"/rootfs.ext4"`).
-pub(super) async fn stage_rootfs_device_for_jailer(
-    chroot_root: &Path,
-    dm_device: &str,
-    uid: u32,
-    gid: u32,
-) -> Result<String> {
-    tokio::fs::create_dir_all(chroot_root)
-        .await
-        .map_err(VmmError::Io)?;
-    let (major, minor) = crate::snapshot_cow::device_major_minor(dm_device)?;
-    let node_path = chroot_root.join("rootfs.ext4");
-    // Remove any leftover entry from a previous crash so mknod can succeed
-    // (and so we never end up writing into a stale device node).
-    if let Err(e) = tokio::fs::remove_file(&node_path).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(VmmError::Io(e));
-    }
-    crate::snapshot_cow::mknod_blkdev(&node_path, major, minor)?;
-    chown(
-        &node_path,
-        Some(Uid::from_raw(uid)),
-        Some(Gid::from_raw(gid)),
-    )
-    .map_err(|e| VmmError::Process(format!("chown rootfs device: {e}")))?;
-    Ok("/rootfs.ext4".to_string())
-}
-
 /// A failed restore-staging step, carrying whichever CoW resources were
 /// acquired before the failure so the caller can roll them back.
 pub(super) struct StageError {
@@ -827,7 +690,7 @@ pub(super) async fn stage_rootfs_cow_or_copy(
                     journal(None).map_err(|error| fail(error, None))?;
                     stage_rootfs_copy_for_jailer(chroot, rootfs, uid, gid)
                         .await
-                        .map_err(|error| fail(error, None))?;
+                        .map_err(|error| fail(error.into(), None))?;
                     Ok(None)
                 }
             }
@@ -841,46 +704,10 @@ pub(super) async fn stage_rootfs_cow_or_copy(
             );
             stage_rootfs_copy_for_jailer(chroot, rootfs, uid, gid)
                 .await
-                .map_err(|error| fail(error, None))?;
+                .map_err(|error| fail(error.into(), None))?;
             Ok(None)
         }
     }
-}
-
-/// Stage a snapshot's vmstate/mem into `{chroot}/snapshots/{snapshot_id}`
-/// via [`link_or_copy_for_jailer`] and return their chroot-relative paths
-/// `(vmstate, mem)` for `SnapshotLoadParams`.
-pub(super) async fn stage_snapshot_files(
-    chroot: &Path,
-    snapshot: &crate::snapshot::SnapshotMeta,
-    uid: u32,
-    gid: u32,
-) -> Result<(String, Option<String>)> {
-    let snap_in_chroot = chroot.join("snapshots").join(&snapshot.id);
-    std::fs::create_dir_all(&snap_in_chroot).map_err(VmmError::Io)?;
-    chown(
-        &snap_in_chroot,
-        Some(Uid::from_raw(uid)),
-        Some(Gid::from_raw(gid)),
-    )
-    .map_err(|e| VmmError::Process(format!("chown snap dir: {e}")))?;
-
-    link_or_copy_for_jailer(
-        &snapshot.vmstate_path,
-        &snap_in_chroot.join("vmstate"),
-        uid,
-        gid,
-    )
-    .await?;
-    let mem = if let Some(ref mf) = snapshot.mem_path
-        && mf.exists()
-    {
-        link_or_copy_for_jailer(mf, &snap_in_chroot.join("mem"), uid, gid).await?;
-        Some(format!("/snapshots/{}/mem", snapshot.id))
-    } else {
-        None
-    };
-    Ok((format!("/snapshots/{}/vmstate", snapshot.id), mem))
 }
 
 /// Create a stable `{vm_dir}/rootfs.link` symlink pointing at the dm-snapshot

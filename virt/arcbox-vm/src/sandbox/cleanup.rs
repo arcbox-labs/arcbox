@@ -1,4 +1,3 @@
-use super::boot::chroot_root;
 use super::persistence::{SandboxRecordStore, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
@@ -840,16 +839,8 @@ mod tests {
             parent_cgroup: None,
             resource_limits: vec![],
         });
-        let slot_chroot = chroot_root(
-            &config.firecracker.binary,
-            &chroot_base.to_string_lossy(),
-            "pool-slot",
-        );
-        let sandbox_chroot = chroot_root(
-            &config.firecracker.binary,
-            &chroot_base.to_string_lossy(),
-            "job",
-        );
+        let slot_chroot = chroot_root(&config.firecracker.binary, &chroot_base, "pool-slot");
+        let sandbox_chroot = chroot_root(&config.firecracker.binary, &chroot_base, "job");
         std::fs::create_dir_all(&slot_chroot).unwrap();
         std::fs::create_dir_all(&sandbox_chroot).unwrap();
 

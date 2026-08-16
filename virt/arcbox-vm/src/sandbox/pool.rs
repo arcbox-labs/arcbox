@@ -13,10 +13,7 @@
 //! LoadSnapshot time binds a claimed slot to its TAP, which keeps slots
 //! network-agnostic (the seam CORE-81 builds on).
 
-use super::boot::{
-    StageError, chroot_root, kill_and_reap_fc_checked, stage_kernel_for_jailer,
-    stage_rootfs_cow_or_copy, stage_snapshot_files,
-};
+use super::boot::{StageError, kill_and_reap_fc_checked, stage_rootfs_cow_or_copy};
 use super::reconcile::{self, POOL_SLOT_PREFIX, SandboxStateRecord};
 use super::*;
 use crate::config::JailerConfig;
@@ -372,7 +369,7 @@ async fn stage_slot(
 
     if let Some(kernel) = snapshot.kernel_path.as_deref() {
         if let Err(error) = stage_kernel_for_jailer(&cr, kernel, jc.uid, jc.gid).await {
-            return Err(carry(error, Some(process), None));
+            return Err(carry(error.into(), Some(process), None));
         }
     }
 
@@ -389,11 +386,16 @@ async fn stage_slot(
         }
     }
 
-    match stage_snapshot_files(&cr, snapshot, jc.uid, jc.gid).await {
+    let files = SnapshotFiles {
+        id: &snapshot.id,
+        vmstate: &snapshot.vmstate_path,
+        mem: snapshot.mem_path.as_deref(),
+    };
+    match stage_snapshot_files(&cr, &files, jc.uid, jc.gid).await {
         Ok((vmstate_path, mem_path)) => {
             Ok((process, cow_handle, vmstate_path, mem_path, vsock_path))
         }
-        Err(error) => Err(carry(error, Some(process), cow_handle)),
+        Err(error) => Err(carry(error.into(), Some(process), cow_handle)),
     }
 }
 

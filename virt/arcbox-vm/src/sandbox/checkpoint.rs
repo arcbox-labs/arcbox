@@ -1,7 +1,4 @@
-use super::boot::{
-    StageError, chroot_root, stage_kernel_for_jailer, stage_rootfs_cow_or_copy,
-    stage_snapshot_files,
-};
+use super::boot::{StageError, stage_rootfs_cow_or_copy};
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::pool::PreparedSlot;
 use super::types::action;
@@ -773,7 +770,14 @@ impl SandboxManager {
                     // FC (mem is mapped MAP_PRIVATE on load), so the root jailer
                     // hard-links them instead of copying — the mem file is the
                     // sandbox's full memory size (CORE-75).
-                    stage_snapshot_files(&cr, &snap_meta, jc.uid, jc.gid).await
+                    let files = SnapshotFiles {
+                        id: &snap_meta.id,
+                        vmstate: &snap_meta.vmstate_path,
+                        mem: snap_meta.mem_path.as_deref(),
+                    };
+                    stage_snapshot_files(&cr, &files, jc.uid, jc.gid)
+                        .await
+                        .map_err(VmmError::from)
                 }
                 .await;
 
