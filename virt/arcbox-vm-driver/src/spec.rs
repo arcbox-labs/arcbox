@@ -2,11 +2,13 @@
 //!
 //! Everything here is data. Node-wide knobs — VMM binary paths, seccomp,
 //! jailer defaults, MTU — are the adapter's own `DriverConfig`; a
-//! `VmSpec` says only what *this* VM is made of, so the same spec renders
+//! [`VmSpec`] says only what *this* VM is made of, so the same spec renders
 //! into a Firecracker API payload, a Virtualization.framework configuration,
 //! or an in-process VMM's config without the orchestrator knowing which.
 
 use std::fmt;
+use std::os::fd::RawFd;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -159,12 +161,251 @@ impl<'de> Deserialize<'de> for MacAddr {
     }
 }
 
+/// Everything a driver needs to boot one VM.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VmSpec {
+    /// The VM's identity.
+    pub id: VmId,
+    /// Virtual CPU count, at least 1.
+    pub cpus: u32,
+    /// Guest memory in MiB, at least 1.
+    pub memory_mib: u32,
+    /// How the guest starts.
+    pub boot: BootSpec,
+    /// Block devices, in bus order.
+    #[serde(default)]
+    pub disks: Vec<DiskSpec>,
+    /// Network interfaces, in bus order.
+    #[serde(default)]
+    pub nics: Vec<NicSpec>,
+    /// The vsock device, when the guest should have one.
+    #[serde(default)]
+    pub vsock: Option<VsockSpec>,
+    /// Shared host directories (virtiofs).
+    #[serde(default)]
+    pub shares: Vec<ShareSpec>,
+    /// Where the guest console goes.
+    #[serde(default)]
+    pub console: ConsoleSpec,
+    /// Attach a memory balloon.
+    #[serde(default)]
+    pub balloon: bool,
+    /// Attach an entropy (virtio-rng) device.
+    #[serde(default)]
+    pub entropy: bool,
+    /// Track dirty pages so a checkpoint can be incremental.
+    #[serde(default)]
+    pub dirty_tracking: bool,
+    /// How the VMM process is confined.
+    #[serde(default)]
+    pub isolation: IsolationSpec,
+}
+
+/// How the guest starts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BootSpec {
+    /// Direct kernel boot.
+    Kernel {
+        /// The kernel image (vmlinux / Image).
+        image: PathBuf,
+        /// The kernel command line, verbatim.
+        cmdline: String,
+        /// An optional initial ramdisk.
+        initrd: Option<PathBuf>,
+    },
+    /// Firmware (UEFI) boot; the firmware finds the OS on the disks.
+    Firmware {
+        /// The firmware image.
+        image: PathBuf,
+    },
+    /// A macOS guest under Virtualization.framework.
+    MacOs {
+        /// The auxiliary storage (NVRAM) file.
+        aux_storage: PathBuf,
+        /// The opaque hardware-model blob the guest was installed for.
+        hardware_model: Vec<u8>,
+        /// The opaque machine-identifier blob.
+        machine_id: Vec<u8>,
+    },
+}
+
+/// One block device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskSpec {
+    /// Unique within the spec; drivers use it as the device's name.
+    pub id: String,
+    /// The backing file on the host.
+    pub path: PathBuf,
+    /// Expose the disk read-only.
+    #[serde(default)]
+    pub read_only: bool,
+    /// This disk holds the root filesystem (at most one per spec).
+    #[serde(default)]
+    pub root: bool,
+    /// Host-side write caching.
+    #[serde(default)]
+    pub cache: CacheMode,
+}
+
+/// Host-side write caching for a disk (Firecracker's `DriveCacheType`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheMode {
+    /// Writes complete when the host has them in memory (today's value).
+    #[default]
+    Unsafe,
+    /// Writes complete when the host has flushed them.
+    Writeback,
+}
+
+/// One network interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NicSpec {
+    /// Unique within the spec; drivers use it as the device's name.
+    pub id: String,
+    /// The guest-visible MAC address.
+    pub mac: MacAddr,
+    /// What the host side of the interface is plugged into.
+    pub attachment: NicAttachment,
+}
+
+/// The host side of a NIC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum NicAttachment {
+    /// A Linux TAP device the guest network created.
+    Tap {
+        /// The interface name (`tap12`).
+        name: String,
+    },
+    /// The VMM's own NAT (Virtualization.framework's `NAT` attachment).
+    HostNat,
+    /// A host socket the VMM reads and writes Ethernet frames on.
+    ///
+    /// The number is a *borrowed* descriptor: the caller keeps it open for the
+    /// duration of `VmDriver::boot`, and the driver duplicates it if
+    /// the VMM needs it beyond that call.
+    FileHandle {
+        /// The raw descriptor number, valid in the calling process.
+        fd: RawFd,
+    },
+    /// A host bridge interface (vmnet bridged mode, a Linux bridge).
+    Bridge {
+        /// The host interface to bridge onto.
+        interface: String,
+    },
+}
+
+/// The vsock device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VsockSpec {
+    /// The guest's context id (3 or above; 2 is the host).
+    pub guest_cid: u32,
+}
+
+/// One shared host directory (virtiofs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareSpec {
+    /// The mount tag the guest sees.
+    pub tag: String,
+    /// The host directory.
+    pub host_path: PathBuf,
+    /// Export read-only.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Where the guest console goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ConsoleSpec {
+    /// No console device.
+    #[default]
+    Off,
+    /// Append console output to a file.
+    File(PathBuf),
+    /// Serve the console on a Unix socket.
+    Socket(PathBuf),
+}
+
+/// How the VMM process is confined.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IsolationSpec {
+    /// Run the VMM as the caller, unconfined.
+    #[default]
+    None,
+    /// Run under a jailer (Firecracker's `jailer`, or an equivalent).
+    Jailer {
+        /// The uid the VMM drops to.
+        uid: u32,
+        /// The gid the VMM drops to.
+        gid: u32,
+        /// The directory the per-VM chroot is created under.
+        chroot_base: PathBuf,
+        /// A network namespace to enter (`/var/run/netns/<name>`).
+        netns: Option<PathBuf>,
+        /// Start the VMM in a fresh PID namespace.
+        new_pid_ns: bool,
+        /// Cgroup placement.
+        cgroup: Option<CgroupSpec>,
+    },
+}
+
+/// Cgroup placement for a jailed VMM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CgroupSpec {
+    /// The cgroup hierarchy version (1 or 2).
+    pub version: u8,
+    /// The parent cgroup, relative to the hierarchy root.
+    pub parent: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mac(n: u8) -> MacAddr {
         MacAddr::new([0x02, 0, 0, 0, 0, n])
+    }
+
+    fn spec() -> VmSpec {
+        VmSpec {
+            id: VmId::new("vm-1").unwrap(),
+            cpus: 2,
+            memory_mib: 512,
+            boot: BootSpec::Kernel {
+                image: "/boot/vmlinux".into(),
+                cmdline: "console=ttyS0".into(),
+                initrd: None,
+            },
+            disks: vec![DiskSpec {
+                id: "rootfs".into(),
+                path: "/img/rootfs.ext4".into(),
+                read_only: false,
+                root: true,
+                cache: CacheMode::default(),
+            }],
+            nics: vec![NicSpec {
+                id: "eth0".into(),
+                mac: mac(1),
+                attachment: NicAttachment::Tap {
+                    name: "tap0".into(),
+                },
+            }],
+            vsock: Some(VsockSpec { guest_cid: 3 }),
+            shares: vec![],
+            console: ConsoleSpec::Off,
+            balloon: false,
+            entropy: true,
+            dirty_tracking: false,
+            isolation: IsolationSpec::None,
+        }
     }
 
     #[test]
@@ -214,5 +455,44 @@ mod tests {
         assert!(!MacAddr::new([0x01, 0, 0x5e, 0, 0, 1]).is_unicast());
         assert!(MacAddr::new([0; 6]).is_nil());
         assert!(!mac(1).is_nil());
+    }
+
+    #[test]
+    fn spec_round_trips_through_json_with_defaults_filled() {
+        let mut s = spec();
+        s.isolation = IsolationSpec::Jailer {
+            uid: 1000,
+            gid: 1000,
+            chroot_base: "/srv/jailer".into(),
+            netns: None,
+            new_pid_ns: true,
+            cgroup: Some(CgroupSpec {
+                version: 2,
+                parent: Some("arcbox".into()),
+            }),
+        };
+        s.console = ConsoleSpec::File("/tmp/console.log".into());
+        s.nics.push(NicSpec {
+            id: "eth1".into(),
+            mac: mac(3),
+            attachment: NicAttachment::FileHandle { fd: 7 },
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: VmSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+
+        // A minimal document — only the required fields — decodes with the
+        // documented defaults, which is what a hand-written TOML relies on.
+        let minimal = serde_json::json!({
+            "id": "vm-2",
+            "cpus": 1,
+            "memory_mib": 128,
+            "boot": { "firmware": { "image": "/fw/OVMF.fd" } },
+        });
+        let s: VmSpec = serde_json::from_value(minimal).unwrap();
+        assert_eq!(s.console, ConsoleSpec::Off);
+        assert_eq!(s.isolation, IsolationSpec::None);
+        assert!(s.disks.is_empty() && s.nics.is_empty() && s.vsock.is_none());
+        assert!(!s.balloon && !s.entropy && !s.dirty_tracking);
     }
 }

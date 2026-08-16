@@ -10,20 +10,19 @@
 //!
 //! # What is here
 //!
-//! - [`spec`] — the serializable per-VM shape, starting with the identity
-//!   vocabulary: [`VmId`] and [`MacAddr`].
+//! - [`spec`] — the serializable per-VM shape: [`VmSpec`] and its parts.
 //! - [`error`] — the one [`Error`] every port method speaks. There is no
 //!   `Unsupported` variant: what a driver cannot do is a capability
 //!   accessor returning `None`, never an error at call time.
 //!
-//! The full `VmSpec`, the driver and handle traits, the capability traits,
-//! the guest-network port, and the `testkit` feature (fake driver, fake
-//! network, contract test-kit) land in the sibling modules.
+//! The driver and handle traits, the capability traits, the guest-network
+//! port, and the `testkit` feature (fake driver, fake network, contract
+//! test-kit) land in the sibling modules.
 //!
 //! # Rules the crate is held to
 //!
 //! - No `arcbox-*` dependency, ever: the port sits below every adapter.
-//! - Data is `serde`; behavior is a trait object. A VM spec can be
+//! - Data is `serde`; behavior is a trait object. A [`VmSpec`] can be
 //!   written in a TOML file; a driver cannot.
 //! - Node-wide knobs (binary paths, seccomp, jailer defaults) are the
 //!   adapter's own config, not part of the spec.
@@ -37,4 +36,7 @@ pub mod error;
 pub mod spec;
 
 pub use error::{Error, Result};
-pub use spec::{MacAddr, VmId};
+pub use spec::{
+    BootSpec, CacheMode, CgroupSpec, ConsoleSpec, DiskSpec, IsolationSpec, MacAddr, NicAttachment,
+    NicSpec, ShareSpec, VmId, VmSpec, VsockSpec,
+};

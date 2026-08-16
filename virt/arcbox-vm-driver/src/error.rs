@@ -9,7 +9,7 @@ use crate::spec::VmId;
 /// Errors raised by drivers, handles, and the guest-network port.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A `VmSpec` (or a piece of it) failed validation.
+    /// A [`crate::VmSpec`] (or a piece of it) failed validation.
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
 
