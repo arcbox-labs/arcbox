@@ -105,6 +105,9 @@ pub(super) async fn boot_sandbox(
                 return;
             }
 
+            let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
+                Arc::new(vsock::UdsVsock(vsock_uds_path.clone()));
+
             // The guest clock still needs setting on cold boot (no RTC — the
             // guest wakes at the kernel default epoch), but it must not delay
             // readiness either: the agent is already accepting executions, so
@@ -115,11 +118,11 @@ pub(super) async fn boot_sandbox(
             // retires once ptp is proven in production.
             {
                 let id = id.clone();
-                let vsock_uds_path = vsock_uds_path.clone();
+                let vsock = Arc::clone(&vsock);
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         CLOCK_SYNC_TIMEOUT,
-                        vsock::sync_clock(&vsock::UdsVsock(vsock_uds_path)),
+                        vsock::sync_clock(vsock.as_ref()),
                     )
                     .await
                     {
@@ -228,10 +231,10 @@ pub(super) async fn boot_sandbox(
             let cmd_started = if spec.cmd.is_empty() {
                 false
             } else {
-                run_initial_cmd(&id, spec.clone(), &vsock_uds_path, &instances, &events_tx).await
+                run_initial_cmd(&id, spec.clone(), vsock.as_ref(), &instances, &events_tx).await
             };
             if let Some(probe) = spec.ready_probe.clone()
-                && let Err(probe_error) = run_ready_probe(&probe, &vsock_uds_path).await
+                && let Err(probe_error) = run_ready_probe(&probe, vsock.as_ref()).await
             {
                 let message = format!("ready probe failed: {probe_error}");
                 fail_started_boot(
@@ -289,7 +292,7 @@ pub(super) async fn boot_sandbox(
             // second failure is final — warned, the sandbox stays Ready,
             // the caller can still Run/Exec.
             if !cmd_started && !spec.cmd.is_empty() {
-                let _ = run_initial_cmd(&id, spec, &vsock_uds_path, &instances, &events_tx).await;
+                let _ = run_initial_cmd(&id, spec, vsock.as_ref(), &instances, &events_tx).await;
             }
         }
         Err(mut failure) => {
@@ -490,7 +493,7 @@ const READY_PROBE_RETRY_MS: u64 = 500;
 /// until it exits 0 or the deadline elapses.
 pub(super) async fn run_ready_probe(
     probe: &crate::template_catalog::ReadyProbeSpec,
-    vsock_uds_path: &Path,
+    vsock: &dyn arcbox_vm_driver::Vsock,
 ) -> Result<()> {
     use crate::template_catalog::ReadyProbeSpec;
     let effective = |timeout_seconds: u32| {
@@ -504,20 +507,12 @@ pub(super) async fn run_ready_probe(
         ReadyProbeSpec::Port {
             port,
             timeout_seconds,
-        } => {
-            match vsock::wait_for_port(
-                &vsock::UdsVsock(vsock_uds_path.to_owned()),
-                *port,
-                effective(*timeout_seconds),
-            )
-            .await?
-            {
-                vsock::PortWait::Listening => Ok(()),
-                vsock::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
-                    "no listener on port {port} within the ready-probe deadline"
-                ))),
-            }
-        }
+        } => match vsock::wait_for_port(vsock, *port, effective(*timeout_seconds)).await? {
+            vsock::PortWait::Listening => Ok(()),
+            vsock::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+                "no listener on port {port} within the ready-probe deadline"
+            ))),
+        },
         ReadyProbeSpec::Command {
             cmd,
             timeout_seconds,
@@ -542,11 +537,8 @@ pub(super) async fn run_ready_probe(
                 // The guest kill timer has whole-second granularity; the
                 // host timeout enforces the exact remaining budget.
                 let budget_secs = u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX);
-                match tokio::time::timeout(
-                    remaining,
-                    run_probe_command(cmd, vsock_uds_path, budget_secs),
-                )
-                .await
+                match tokio::time::timeout(remaining, run_probe_command(cmd, vsock, budget_secs))
+                    .await
                 {
                     Ok(Ok(ExitStatus::Code(0))) => return Ok(()),
                     Ok(Ok(status)) => last_status = Some(format!("last exit: {status:?}")),
@@ -575,7 +567,7 @@ pub(super) async fn run_ready_probe(
 /// One probe attempt: run the command and wait for its exit status.
 async fn run_probe_command(
     cmd: &[String],
-    vsock_uds_path: &Path,
+    vsock: &dyn arcbox_vm_driver::Vsock,
     timeout_seconds: u32,
 ) -> Result<ExitStatus> {
     let start = StartCommand {
@@ -588,8 +580,7 @@ async fn run_probe_command(
         tty_height: 24,
         timeout_seconds,
     };
-    let (_input, mut output) =
-        vsock::exec(&vsock::UdsVsock(vsock_uds_path.to_owned()), start).await?;
+    let (_input, mut output) = vsock::exec(vsock, start).await?;
     while let Some(chunk) = output.recv().await {
         if let OutputChunk::Exit(status) = chunk? {
             return Ok(status);
@@ -619,7 +610,7 @@ async fn run_probe_command(
 pub(super) async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
-    vsock_uds_path: &Path,
+    vsock: &dyn arcbox_vm_driver::Vsock,
     instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) -> bool {
@@ -635,7 +626,7 @@ pub(super) async fn run_initial_cmd(
     };
     match super::workload::start_run_workload(
         id,
-        vsock_uds_path,
+        vsock,
         start,
         instances,
         events_tx,

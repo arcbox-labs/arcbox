@@ -829,6 +829,8 @@ impl SandboxManager {
         };
 
         let t_loaded = std::time::Instant::now();
+        let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
+            Arc::new(vsock::UdsVsock(actual_vsock_path.clone()));
 
         // Clock sync after restore is DETACHED, mirroring the cold-boot path
         // (boot.rs): vm-agent re-syncs itself from ptp_kvm (/dev/ptp0) on
@@ -840,11 +842,11 @@ impl SandboxManager {
         // restore RPC (CORE-80).
         {
             let id = new_id.clone();
-            let vsock_path = actual_vsock_path.clone();
+            let vsock = Arc::clone(&vsock);
             tokio::spawn(async move {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    vsock::sync_clock(&vsock::UdsVsock(vsock_path)),
+                    vsock::sync_clock(vsock.as_ref()),
                 )
                 .await
                 {
@@ -884,7 +886,7 @@ impl SandboxManager {
             };
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                vsock::reconfigure_network(&vsock::UdsVsock(actual_vsock_path.clone()), &cmd),
+                vsock::reconfigure_network(vsock.as_ref(), &cmd),
             )
             .await
             .map_err(|_| VmmError::Vsock("net reconfig after restore timed out".into()))
@@ -1017,7 +1019,7 @@ impl SandboxManager {
             super::boot::run_initial_cmd(
                 &new_id,
                 effective_spec.clone(),
-                &actual_vsock_path,
+                vsock.as_ref(),
                 &self.instances,
                 &self.events_tx,
             )
@@ -1027,7 +1029,7 @@ impl SandboxManager {
         };
         if warm_create
             && let Some(probe) = effective_spec.ready_probe.clone()
-            && let Err(probe_error) = super::boot::run_ready_probe(&probe, &actual_vsock_path).await
+            && let Err(probe_error) = super::boot::run_ready_probe(&probe, vsock.as_ref()).await
         {
             let message = format!("ready probe failed after restore: {probe_error}");
             if let Err(remove_error) = self.remove_sandbox(&new_id, true).await {
@@ -1080,7 +1082,7 @@ impl SandboxManager {
             let _ = super::boot::run_initial_cmd(
                 &new_id,
                 effective_spec,
-                &actual_vsock_path,
+                vsock.as_ref(),
                 &self.instances,
                 &self.events_tx,
             )
