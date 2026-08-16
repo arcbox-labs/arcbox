@@ -55,6 +55,10 @@ fn direct_layout_names_the_runtime_dir_sockets_and_passes_paths_verbatim() {
         layout.vsock_fc_uds().unwrap(),
         "/run/vms/box/firecracker.vsock"
     );
+    assert_eq!(
+        layout.vsock_host_view("/run/vms/other/firecracker.vsock"),
+        Path::new("/run/vms/other/firecracker.vsock")
+    );
     let plan = layout.spawn_plan();
     assert_eq!(plan.api_socket, Path::new("/run/vms/box/firecracker.sock"));
     let SpawnMode::Direct { log, metrics } = plan.mode else {
@@ -87,6 +91,10 @@ fn jailer_layout_relativizes_inside_paths_and_stages_outside_ones() {
     assert_eq!(layout.api_socket(), root.join("run/firecracker.socket"));
     assert_eq!(layout.vsock_host_uds(), root.join("run/firecracker.vsock"));
     assert_eq!(layout.vsock_fc_uds().unwrap(), "/run/firecracker.vsock");
+    assert_eq!(
+        layout.vsock_host_view("/run/firecracker.vsock"),
+        root.join("run/firecracker.vsock")
+    );
     let plan = layout.spawn_plan();
     assert_eq!(plan.api_socket, root.join("run/firecracker.socket"));
     let SpawnMode::Jailer {
@@ -408,10 +416,6 @@ fn restore_loads_the_image_and_retargets_nics_onto_the_new_taps() {
     assert_eq!(plan.load.network_overrides.len(), 1);
     assert_eq!(plan.load.network_overrides[0].iface_id, "eth0");
     assert_eq!(plan.load.network_overrides[0].host_dev_name, "tap7");
-    assert_eq!(
-        plan.vsock_host_uds,
-        Path::new("/run/vms/box2/firecracker.vsock")
-    );
 }
 
 #[test]
@@ -453,7 +457,6 @@ fn restore_stages_the_image_and_disks_into_a_jail_by_name() {
             },
         ]
     );
-    assert_eq!(plan.vsock_host_uds, root.join("run/firecracker.vsock"));
 
     // An image the caller already staged into the jail is loaded in place.
     let staged = root.join("snapshots/abc");

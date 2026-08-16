@@ -135,12 +135,9 @@ impl Adopt for FcDriver {
             &self.config,
             &record.runtime_dir,
         )?;
-        let vsock_uds = devices.vsock.map(|vsock| {
-            layout.jail().map_or_else(
-                || vsock.uds_path.clone().into(),
-                |jail| jail.root.join(vsock.uds_path.trim_start_matches('/')),
-            )
-        });
+        let vsock_uds = devices
+            .vsock
+            .map(|vsock| layout.vsock_host_view(&vsock.uds_path));
         let process = Arc::new(FcProcess::adopt(found.pid, found.api_socket));
         let quiesced = matches!(info.state, fc_sdk::types::InstanceInfoState::Paused);
         Ok(Some(Box::new(FcHandle::new(

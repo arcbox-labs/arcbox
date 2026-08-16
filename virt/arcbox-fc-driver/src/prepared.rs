@@ -183,11 +183,14 @@ impl PreparedVm for FcPrepared {
             .await
             .map_err(FcError::Api)?;
         let client = vm.into_client();
-        // The image, not the spec, decides which devices the VM has.
-        let has_vsock = api::vm_config(&client).await?.vsock.is_some();
-        Ok(Box::new(
-            self.handle(client, has_vsock.then_some(plan.vsock_host_uds)),
-        ))
+        // The image, not the spec, decides which devices the VM has — and
+        // Firecracker re-binds the vsock socket where the checkpoint
+        // recorded it, so the path is read back rather than assumed.
+        let vsock_uds = api::vm_config(&client)
+            .await?
+            .vsock
+            .map(|vsock| self.layout.vsock_host_view(&vsock.uds_path));
+        Ok(Box::new(self.handle(client, vsock_uds)))
     }
 
     async fn discard(&self) -> Result<ExitStatus> {

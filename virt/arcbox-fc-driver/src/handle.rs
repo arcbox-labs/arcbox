@@ -62,6 +62,15 @@ impl FcHandle {
         }
     }
 
+    /// Firecracker leaves its vsock Unix socket behind; once the process is
+    /// gone the file is ours to remove — a restore that re-binds the
+    /// recorded path (direct mode) must find it free.
+    fn unlink_vsock(&self) {
+        if let Some(uds) = &self.vsock_uds {
+            let _ = std::fs::remove_file(uds);
+        }
+    }
+
     fn require_state(&self, want: VmState, expected: &'static str) -> Result<()> {
         let state = self.state();
         if state == want {
@@ -91,6 +100,7 @@ impl Drop for FcHandle {
     fn drop(&mut self) {
         if !self.process.is_detached() {
             self.process.kill_now();
+            self.unlink_vsock();
         }
     }
 }
@@ -120,28 +130,32 @@ impl VmHandle for FcHandle {
     }
 
     async fn shutdown(&self, mode: ShutdownMode) -> Result<ExitStatus> {
-        match mode {
-            ShutdownMode::Kill => Ok(self.process.kill().await?),
-            ShutdownMode::Graceful { timeout } => {
-                if let Some(status) = self.process.exit_status() {
-                    return Ok(status);
+        let status = match mode {
+            ShutdownMode::Kill => self.process.kill().await?,
+            ShutdownMode::Graceful { timeout } => match self.process.exit_status() {
+                Some(status) => status,
+                None => {
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    // Ask the guest to shut down; errors are ignored — the
+                    // VM may already be gone.
+                    let _ = tokio::time::timeout(
+                        CTRL_ALT_DEL_TIMEOUT.min(timeout),
+                        api::send_ctrl_alt_del(&self.client),
+                    )
+                    .await;
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match self.process.wait(remaining).await {
+                        Some(status) => status,
+                        None => {
+                            tracing::warn!(vm = %self.record.id, "guest did not shut down in time; killing firecracker");
+                            self.process.kill().await?
+                        }
+                    }
                 }
-                let deadline = tokio::time::Instant::now() + timeout;
-                // Ask the guest to shut down; errors are ignored — the VM
-                // may already be gone.
-                let _ = tokio::time::timeout(
-                    CTRL_ALT_DEL_TIMEOUT.min(timeout),
-                    api::send_ctrl_alt_del(&self.client),
-                )
-                .await;
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if let Some(status) = self.process.wait(remaining).await {
-                    return Ok(status);
-                }
-                tracing::warn!(vm = %self.record.id, "guest did not shut down in time; killing firecracker");
-                Ok(self.process.kill().await?)
-            }
-        }
+            },
+        };
+        self.unlink_vsock();
+        Ok(status)
     }
 
     fn vsock(&self) -> Option<&dyn Vsock> {

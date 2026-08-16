@@ -121,6 +121,16 @@ impl VmLayout {
         }
     }
 
+    /// The host view of a vsock socket path Firecracker reports (`GET
+    /// /vm/config`, which is what a restored or adopted VM actually bound):
+    /// jail-relative under a jail, verbatim otherwise.
+    pub fn vsock_host_view(&self, fc_uds: &str) -> PathBuf {
+        match &self.jail {
+            Some(jail) => jail.root.join(fc_uds.trim_start_matches('/')),
+            None => PathBuf::from(fc_uds),
+        }
+    }
+
     /// The hybrid-vsock Unix socket, as Firecracker is told to bind it.
     pub fn vsock_fc_uds(&self) -> Result<String> {
         match &self.jail {
@@ -324,7 +334,6 @@ pub fn fc_restore(
             resume_vm: Some(true),
             network_overrides,
         },
-        vsock_host_uds: layout.vsock_host_uds(),
     })
 }
 

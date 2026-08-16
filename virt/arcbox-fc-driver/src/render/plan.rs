@@ -87,13 +87,15 @@ pub struct FcPlan {
 }
 
 /// Everything a restore needs after the process is up.
+///
+/// Which devices the restored VM has — a vsock, and where its Unix socket
+/// is bound — is the image's to say, not the plan's: Firecracker re-creates
+/// the vsock at the path the checkpoint recorded, so the driver reads it
+/// back from `GET /vm/config` after the load.
 #[derive(Debug, Clone)]
 pub struct FcRestorePlan {
     /// Files to stage into the jail first (empty without a jail).
     pub stage: Vec<StagePlan>,
     /// `PUT /snapshot/load`.
     pub load: SnapshotLoadParams,
-    /// The vsock Unix socket as the host dials it, should the image carry a
-    /// vsock device.
-    pub vsock_host_uds: PathBuf,
 }
