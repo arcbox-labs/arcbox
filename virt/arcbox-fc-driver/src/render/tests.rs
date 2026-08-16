@@ -2,7 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use arcbox_vm_driver::{IsolationSpec, VmId};
+use arcbox_vm_driver::{
+    BootSpec, CacheMode, ConsoleSpec, DiskSpec, Error, IsolationSpec, MacAddr, NicAttachment,
+    NicSpec, ShareSpec, VmId, VmSpec, VsockSpec,
+};
+use fc_sdk::types::{DriveCacheType, DriveIoEngine};
 
 use super::*;
 use crate::config::FcDriverConfig;
@@ -128,4 +132,239 @@ fn jailer_layout_relativizes_inside_paths_and_stages_outside_ones() {
             kind: StageKind::LinkOrCopy,
         }]
     );
+}
+
+fn spec(id: &str, isolation: IsolationSpec, rootfs: PathBuf) -> VmSpec {
+    VmSpec {
+        id: VmId::new(id).unwrap(),
+        cpus: 2,
+        memory_mib: 512,
+        boot: BootSpec::Kernel {
+            image: "/images/vmlinux".into(),
+            cmdline: "console=ttyS0 ip=1.2.3.4::1.2.3.1:255.255.255.0".into(),
+            initrd: None,
+        },
+        disks: vec![DiskSpec {
+            id: "rootfs".into(),
+            path: rootfs,
+            read_only: false,
+            root: true,
+            cache: CacheMode::Unsafe,
+        }],
+        nics: vec![NicSpec {
+            id: "eth0".into(),
+            mac: MacAddr::new([0x02, 0, 0, 0, 0, 1]),
+            attachment: NicAttachment::Tap {
+                name: "tap7".into(),
+            },
+        }],
+        vsock: Some(VsockSpec { guest_cid: 3 }),
+        shares: vec![],
+        console: ConsoleSpec::Off,
+        balloon: false,
+        entropy: false,
+        dirty_tracking: true,
+        isolation,
+    }
+}
+
+fn invalid(result: Result<impl std::fmt::Debug>) -> String {
+    match result {
+        Err(Error::InvalidSpec(msg)) => msg,
+        other => panic!("expected InvalidSpec, got {other:?}"),
+    }
+}
+
+#[test]
+fn direct_mode_passes_paths_verbatim() {
+    let plan = fc_config(
+        &spec("box", IsolationSpec::None, "/images/rootfs.ext4".into()),
+        &config(),
+        Path::new("/run/vms/box"),
+    )
+    .unwrap();
+    assert!(plan.stage.is_empty(), "nothing is staged without a jail");
+    assert_eq!(plan.boot_source.kernel_image_path, "/images/vmlinux");
+    assert_eq!(
+        plan.boot_source.boot_args.as_deref(),
+        Some("console=ttyS0 ip=1.2.3.4::1.2.3.1:255.255.255.0")
+    );
+    assert_eq!(
+        plan.drives[0].path_on_host.as_deref(),
+        Some("/images/rootfs.ext4")
+    );
+    let vsock = plan.vsock.unwrap();
+    assert_eq!(vsock.guest_cid, 3);
+    assert_eq!(vsock.uds_path, "/run/vms/box/firecracker.vsock");
+    assert_eq!(
+        plan.vsock_host_uds.as_deref(),
+        Some(Path::new("/run/vms/box/firecracker.vsock"))
+    );
+}
+
+#[test]
+fn machine_config_and_devices_follow_the_spec() {
+    let mut s = spec("box", IsolationSpec::None, "/images/rootfs.ext4".into());
+    s.entropy = true;
+    s.disks.push(DiskSpec {
+        id: "data".into(),
+        path: "/images/data.ext4".into(),
+        read_only: true,
+        root: false,
+        cache: CacheMode::Writeback,
+    });
+    let plan = fc_config(&s, &config(), Path::new("/run/vms/box")).unwrap();
+    assert_eq!(plan.machine.vcpu_count.get(), 2);
+    assert_eq!(plan.machine.mem_size_mib, 512);
+    assert!(!plan.machine.smt);
+    assert!(plan.machine.track_dirty_pages);
+    let root = &plan.drives[0];
+    assert!(root.is_root_device);
+    assert_eq!(root.is_read_only, Some(false));
+    assert!(matches!(root.cache_type, DriveCacheType::Unsafe));
+    assert!(matches!(root.io_engine, DriveIoEngine::Sync));
+    let data = &plan.drives[1];
+    assert_eq!(data.drive_id, "data");
+    assert!(!data.is_root_device);
+    assert_eq!(data.is_read_only, Some(true));
+    assert!(matches!(data.cache_type, DriveCacheType::Writeback));
+    let nic = &plan.nics[0];
+    assert_eq!(nic.iface_id, "eth0");
+    assert_eq!(nic.guest_mac.as_deref(), Some("02:00:00:00:00:01"));
+    assert_eq!(nic.host_dev_name, "tap7");
+    assert!(plan.entropy.is_some());
+
+    let mut s = spec("box", IsolationSpec::None, "/images/rootfs.ext4".into());
+    s.dirty_tracking = false;
+    s.vsock = None;
+    let plan = fc_config(&s, &config(), Path::new("/run/vms/box")).unwrap();
+    assert!(!plan.machine.track_dirty_pages);
+    assert!(plan.vsock.is_none() && plan.vsock_host_uds.is_none());
+    assert!(plan.entropy.is_none());
+}
+
+#[test]
+fn jailer_mode_stages_outside_files_and_relativizes_inside_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("jail");
+    let root = base.join("firecracker/box/root");
+    // A rootfs the caller already put in the jail (a mknod'ed dm device).
+    std::fs::create_dir_all(&root).unwrap();
+    let inside = root.join("rootfs.ext4");
+    std::fs::write(&inside, b"disk").unwrap();
+    let outside = dir.path().join("rootfs.ext4");
+    std::fs::write(&outside, b"disk").unwrap();
+
+    let plan = fc_config(
+        &spec("box", jailed(&base), inside),
+        &config(),
+        Path::new("/run/vms/box"),
+    )
+    .unwrap();
+    assert_eq!(plan.boot_source.kernel_image_path, "/vmlinux");
+    assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
+    assert_eq!(
+        plan.stage,
+        vec![StagePlan {
+            src: "/images/vmlinux".into(),
+            dst: root.join("vmlinux"),
+            kind: StageKind::LinkOrCopy,
+        }],
+        "the kernel is staged; the in-jail rootfs is not"
+    );
+    assert_eq!(plan.vsock.unwrap().uds_path, "/run/firecracker.vsock");
+    assert_eq!(
+        plan.vsock_host_uds.as_deref(),
+        Some(root.join("run/firecracker.vsock").as_path())
+    );
+
+    // A writable disk outside the jail is copied to /{id}.ext4; a read-only
+    // one is link-or-copied.
+    let mut s = spec("box", jailed(&base), outside.clone());
+    s.disks.push(DiskSpec {
+        id: "data".into(),
+        path: outside.clone(),
+        read_only: true,
+        root: false,
+        cache: CacheMode::Unsafe,
+    });
+    let plan = fc_config(&s, &config(), Path::new("/run/vms/box")).unwrap();
+    assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
+    assert_eq!(plan.drives[1].path_on_host.as_deref(), Some("/data.ext4"));
+    assert_eq!(
+        plan.stage[1..],
+        [
+            StagePlan {
+                src: outside.clone(),
+                dst: root.join("rootfs.ext4"),
+                kind: StageKind::Copy,
+            },
+            StagePlan {
+                src: outside,
+                dst: root.join("data.ext4"),
+                kind: StageKind::LinkOrCopy,
+            }
+        ]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn jailer_mode_mirrors_a_block_device_as_a_node() {
+    use std::os::unix::fs::FileTypeExt as _;
+    let Some(device) = std::fs::read_dir("/dev")
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|m| m.file_type().is_block_device())
+        })
+        .map(|entry| entry.path())
+    else {
+        eprintln!("no block device under /dev; skipping");
+        return;
+    };
+    let base = PathBuf::from("/srv/jailer");
+    let plan = fc_config(
+        &spec("box", jailed(&base), device.clone()),
+        &config(),
+        Path::new("/run/vms/box"),
+    )
+    .unwrap();
+    assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
+    assert!(plan.stage.contains(&StagePlan {
+        src: device,
+        dst: base.join("firecracker/box/root/rootfs.ext4"),
+        kind: StageKind::BlockNode,
+    }));
+}
+
+#[test]
+fn what_firecracker_cannot_do_is_refused_before_anything_runs() {
+    let base = |mutate: fn(&mut VmSpec)| {
+        let mut s = spec("box", IsolationSpec::None, "/images/rootfs.ext4".into());
+        mutate(&mut s);
+        invalid(fc_config(&s, &config(), Path::new("/run/vms/box")))
+    };
+    assert!(base(|s| s.console = ConsoleSpec::File("/tmp/c.log".into())).contains("console"));
+    assert!(base(|s| s.console = ConsoleSpec::Socket("/tmp/c.sock".into())).contains("console"));
+    assert!(
+        base(|s| s.shares.push(ShareSpec {
+            tag: "src".into(),
+            host_path: "/src".into(),
+            read_only: false,
+        }))
+        .contains("shares")
+    );
+    assert!(base(|s| s.balloon = true).contains("balloon"));
+    assert!(
+        base(|s| s.boot = BootSpec::Firmware {
+            image: "/fw/OVMF.fd".into()
+        })
+        .contains("kernel"),
+    );
+    assert!(base(|s| s.nics[0].attachment = NicAttachment::HostNat).contains("TAP"));
+    // Spec validation runs first.
+    assert!(base(|s| s.cpus = 0).contains("cpus"));
 }
