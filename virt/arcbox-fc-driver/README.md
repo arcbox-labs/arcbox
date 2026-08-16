@@ -64,5 +64,26 @@ and `mem`. Restoring anything else fails with `Error::ForeignCheckpoint`.
 Console files and sockets, virtiofs shares, and the balloon are refused
 with `Error::InvalidSpec` — the driver claims none of those capabilities.
 
+## Running the contract
+
+`tests/contract.rs` runs every check of the port's `driver_contract!`
+against a real Firecracker, directly and — when `FC_JAILER` is set —
+under the jailer as uid/gid 0 (production's shape). The tests are
+`#[ignore]`d and skip themselves without their assets; they need
+`/dev/kvm`, and the jailer needs root:
+
+```bash
+FC_BINARY=/tmp/fc-assets/firecracker FC_JAILER=/tmp/fc-assets/jailer \
+FC_KERNEL=/tmp/fc-assets/vmlinux FC_ROOTFS=/tmp/fc-assets/rootfs.ext4 \
+sudo -E cargo test --test contract -p arcbox-fc-driver -- --include-ignored --test-threads=1
+```
+
+`FC_ROOTFS` must carry `vm-agent` at `/sbin/vm-agent` (the harness boots
+`init=/sbin/vm-agent`, dial-polls its exec port to know the guest is up,
+and relies on its READY dial-out for the prepared-listener check). The
+`e2e` job of `.github/workflows/test-vm-linux.yml` runs exactly this after
+the sandbox manager's own e2e suite, on the assets `firecracker.sh
+install` and the S3 CI bucket put under `/tmp/fc-assets`.
+
 Design: company repo `engineering/arcbox/architecture/vm-stack-redesign.md`
 (Adapters → `virt/arcbox-fc-driver`; D-VM1, D-VM9).
