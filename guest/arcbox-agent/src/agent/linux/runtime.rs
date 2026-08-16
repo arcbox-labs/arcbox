@@ -282,26 +282,37 @@ pub(super) fn ensure_shared_runtime_dirs(notes: &mut Vec<String>) {
 /// already visible there; the merged view a live container sees is not, and
 /// without this the kernel cannot name its inodes to a client.
 ///
-/// `index=on` is not optional alongside it: the kernel rejects
-/// `index=off,nfs_export=on` outright on a read-write mount, and a container
-/// rootfs is read-write. Until arcboxlabs/boot-assets#52 that rejection is
-/// exactly what we got — the stock overlay snapshotter appended `index=off`
-/// after whatever the config asked for, so `index=on` here produced
-/// `index=on,nfs_export=on,index=off`, last-wins, `EINVAL` on every mount.
-/// The patched containerd in boot bundle 0.8.6 is what makes this line take
-/// effect rather than break the guest.
+/// `index=on` is spelled out rather than left to the kernel, because the
+/// kernel's handling of the pair is three-way and only one branch is loud
+/// (`ovl_fs_params_verify`, `fs/overlayfs/params.c`):
+///
+///  - **explicit `index=off` + explicit `nfs_export=on` → `EINVAL`.** This is
+///    our case, and until arcboxlabs/boot-assets#52 it is what we got: the
+///    stock overlay snapshotter appended `index=off` after whatever the config
+///    asked for, so the kernel saw `index=on,nfs_export=on,index=off`,
+///    last-wins, and refused every container's mount. The patched containerd
+///    in boot bundle 0.8.6 is what makes this line take effect rather than
+///    break the guest.
+///  - **`index` left unset → the kernel turns it on itself** and the mount
+///    succeeds. Harmless in isolation, but not a reason to trim `index=on`
+///    from this list: containerd decides whether to append its own `index=off`
+///    by looking at *these* options, so dropping it here puts us straight back
+///    in the first branch.
+///  - **no upper layer, with redirects followed → `nfs_export` is silently
+///    turned off** with only a `pr_info`. That is the one branch that fails
+///    quietly, and it is why a no-upper overlay would need
+///    `redirect_dir=nofollow`.
+///
+/// That last option is absent because nothing here mounts a no-upper overlay:
+/// containerd appends these options only on its overlay mount path, which it
+/// reaches for active snapshots (always with an upperdir) and for
+/// multi-parent views — and `image_snapshot_paths` reads a view's mount *spec*
+/// and removes it without ever mounting. Add it if that changes.
 ///
 /// The cost is one `trusted.overlay.origin` xattr per copy-up; in exchange
 /// `index=on` stops copy-up from breaking hard links, which is a fix in its
 /// own right. It also forbids reusing an upperdir across overlay mounts —
 /// harmless here, since every snapshot owns its upper.
-///
-/// A no-upper overlay would additionally need `redirect_dir=nofollow`, which
-/// is why it is absent: containerd only reaches the overlay mount path (the
-/// only place these options are appended) for active snapshots, which always
-/// carry an upperdir, and for multi-parent views — and nothing in ArcBox
-/// mounts one of those. `image_snapshot_paths` reads a view's mount *spec*
-/// and removes it without ever mounting. Add the option here if that changes.
 const OVERLAY_MOUNT_OPTIONS: &str = r#"["index=on", "nfs_export=on"]"#;
 
 pub(super) fn shared_containerd_config() -> String {
