@@ -227,15 +227,15 @@ impl CowManager {
         // talk to the driver (unprivileged dev host, CI runner) can never have
         // created dm snapshots either, so it degrades to the same copy-mode
         // fallback as a missing binary instead of failing every dm command.
-        let dmsetup_bin = dmsetup_candidates
-            .into_iter()
-            .find(|p| p.exists())
-            .filter(|bin| {
-                Command::new(bin)
+        // Every candidate gets the same test: an existing-but-broken entry
+        // earlier in the list must not shadow a working one later.
+        let dmsetup_bin = dmsetup_candidates.into_iter().find(|bin| {
+            bin.exists()
+                && Command::new(bin)
                     .arg("version")
                     .output()
                     .is_ok_and(|out| out.status.success())
-            });
+        });
 
         if dmsetup_bin.is_none() {
             warn!("dmsetup not found or unusable; dm-snapshot CoW will be unavailable");
