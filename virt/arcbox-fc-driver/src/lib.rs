@@ -13,9 +13,15 @@
 //!   seccomp, log level, the API-socket wait, jailer resource limits.
 //! - [`error`] — [`FcError`], the adapter's typed failures, folded into the
 //!   port's `Error::Driver` at the boundary.
+//! - [`render`] — [`VmSpec`](arcbox_vm_driver::VmSpec) → [`render::FcPlan`]
+//!   and [`RestoreSpec`](arcbox_vm_driver::RestoreSpec) →
+//!   [`render::FcRestorePlan`]: every path Firecracker sees, and the
+//!   jailer's chroot relativity, is decided there and nowhere else.
 //! - [`jail`] — the jailer's chroot layout and how host files are staged
-//!   into it (link-or-copy, copy, block-device node).
-//! - [`spawn`] — the `firecracker` / `jailer` process spawn.
+//!   into it (link-or-copy, copy, block-device node), including
+//!   [`jail::apply`] for a rendered plan.
+//! - [`spawn`] — the `firecracker` / `jailer` process spawn from a
+//!   [`render::SpawnPlan`].
 //! - [`vsock`] — the hybrid-vsock Unix-socket handshake and the
 //!   `{uds}_{port}` listener for guest dial-outs.
 //!
@@ -39,6 +45,7 @@
 pub mod config;
 pub mod error;
 pub mod jail;
+pub mod render;
 pub mod spawn;
 pub mod vsock;
 

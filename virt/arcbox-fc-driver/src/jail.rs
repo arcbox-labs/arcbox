@@ -15,8 +15,30 @@ use nix::unistd::{Gid, Uid, chown};
 use tracing::warn;
 
 use crate::error::FcError;
+use crate::render::{StageKind, StagePlan};
 
 pub mod blkdev;
+
+/// The jail a VM is confined to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jail {
+    /// The chroot root: `{chroot_base}/{firecracker binary name}/{id}/root`.
+    pub root: PathBuf,
+    /// The uid the VMM runs as.
+    pub uid: u32,
+    /// The gid the VMM runs as.
+    pub gid: u32,
+}
+
+impl Jail {
+    /// `host` as Firecracker sees it, when `host` is already inside the
+    /// jail: `/` + its path relative to the root.
+    pub fn view(&self, host: &Path) -> Option<String> {
+        host.strip_prefix(&self.root)
+            .ok()
+            .map(|rel| format!("/{}", rel.display()))
+    }
+}
 
 /// The jailer's own default chroot base, used when a config names none.
 pub const DEFAULT_CHROOT_BASE: &str = "/srv/jailer";
@@ -141,27 +163,29 @@ pub async fn stage_rootfs_copy_for_jailer(
         .await
         .map_err(Error::Io)?;
     let rootfs_dst = chroot_root.join("rootfs.ext4");
+    copy_for_jailer(rootfs_src.as_ref(), &rootfs_dst, uid, gid).await?;
+    Ok("/rootfs.ext4".to_string())
+}
+
+/// Stage a writable file into the jail as a private copy owned by the
+/// jailed uid/gid — never a hard link: FC writes guest blocks into it.
+pub async fn copy_for_jailer(src: &Path, dst: &Path, uid: u32, gid: u32) -> Result<()> {
     // Remove any stale entry — a previous crash or a failed mknod-then-chown
     // fallback may have left a block device node here, in which case
     // `tokio::fs::copy` would write into the device instead of replacing it.
-    if let Err(e) = tokio::fs::remove_file(&rootfs_dst).await
+    if let Err(e) = tokio::fs::remove_file(dst).await
         && e.kind() != std::io::ErrorKind::NotFound
     {
         return Err(Error::Io(e));
     }
-    tokio::fs::copy(rootfs_src, &rootfs_dst)
-        .await
-        .map_err(Error::Io)?;
-    chown(
-        &rootfs_dst,
-        Some(Uid::from_raw(uid)),
-        Some(Gid::from_raw(gid)),
-    )
-    .map_err(|source| FcError::Chown {
-        path: rootfs_dst,
-        source,
+    tokio::fs::copy(src, dst).await.map_err(Error::Io)?;
+    chown(dst, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(|source| {
+        FcError::Chown {
+            path: dst.to_path_buf(),
+            source,
+        }
     })?;
-    Ok("/rootfs.ext4".to_string())
+    Ok(())
 }
 
 /// Create a block device node in the jailer chroot pointing to a dm device.
@@ -176,26 +200,67 @@ pub async fn stage_rootfs_device_for_jailer(
     tokio::fs::create_dir_all(chroot_root)
         .await
         .map_err(Error::Io)?;
-    let (major, minor) = blkdev::device_major_minor(dm_device.as_ref())?;
     let node_path = chroot_root.join("rootfs.ext4");
+    mknod_for_jailer(dm_device.as_ref(), &node_path, uid, gid).await?;
+    Ok("/rootfs.ext4".to_string())
+}
+
+/// Mirror the block device at `device` into the jail as a device node at
+/// `node_path`, owned by the jailed uid/gid.
+pub async fn mknod_for_jailer(device: &Path, node_path: &Path, uid: u32, gid: u32) -> Result<()> {
+    let (major, minor) = blkdev::device_major_minor(device)?;
     // Remove any leftover entry from a previous crash so mknod can succeed
     // (and so we never end up writing into a stale device node).
-    if let Err(e) = tokio::fs::remove_file(&node_path).await
+    if let Err(e) = tokio::fs::remove_file(node_path).await
         && e.kind() != std::io::ErrorKind::NotFound
     {
         return Err(Error::Io(e));
     }
-    blkdev::mknod_blkdev(&node_path, major, minor)?;
+    blkdev::mknod_blkdev(node_path, major, minor)?;
     chown(
-        &node_path,
+        node_path,
         Some(Uid::from_raw(uid)),
         Some(Gid::from_raw(gid)),
     )
     .map_err(|source| FcError::Chown {
-        path: node_path,
+        path: node_path.to_path_buf(),
         source,
     })?;
-    Ok("/rootfs.ext4".to_string())
+    Ok(())
+}
+
+/// Execute a rendered staging plan into `jail`.
+///
+/// Creates each destination's parent (handing directories below the root
+/// to the jailed uid/gid, as Firecracker writes its own snapshots next to
+/// them), then link-or-copies, copies, or mknods each entry.
+pub async fn apply(jail: &Jail, plans: &[StagePlan]) -> Result<()> {
+    for plan in plans {
+        if let Some(parent) = plan.dst.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
+            if parent != jail.root {
+                chown(
+                    parent,
+                    Some(Uid::from_raw(jail.uid)),
+                    Some(Gid::from_raw(jail.gid)),
+                )
+                .map_err(|source| FcError::Chown {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+        }
+        match plan.kind {
+            StageKind::LinkOrCopy => {
+                link_or_copy_for_jailer(&plan.src, &plan.dst, jail.uid, jail.gid).await?;
+            }
+            StageKind::Copy => copy_for_jailer(&plan.src, &plan.dst, jail.uid, jail.gid).await?,
+            StageKind::BlockNode => {
+                mknod_for_jailer(&plan.src, &plan.dst, jail.uid, jail.gid).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Stage a snapshot's vmstate/mem into `{chroot}/snapshots/{snapshot_id}`
@@ -229,4 +294,88 @@ pub async fn stage_snapshot_files(
         None
     };
     Ok((format!("/snapshots/{}/vmstate", snapshot.id), mem))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chroot_root_and_sockets_follow_the_jailer_layout() {
+        let root = chroot_root("/opt/fc/firecracker", "/srv/jailer", "box");
+        assert_eq!(root, Path::new("/srv/jailer/firecracker/box/root"));
+        assert_eq!(
+            api_socket_path(&root),
+            Path::new("/srv/jailer/firecracker/box/root/run/firecracker.socket")
+        );
+        assert_eq!(
+            vsock_uds_path(&root),
+            Path::new("/srv/jailer/firecracker/box/root/run/firecracker.vsock")
+        );
+        let jail = Jail {
+            root: root.clone(),
+            uid: 0,
+            gid: 0,
+        };
+        assert_eq!(
+            jail.view(&root.join("snapshots/abc/vmstate")).as_deref(),
+            Some("/snapshots/abc/vmstate")
+        );
+        assert_eq!(jail.view(Path::new("/images/vmlinux")), None);
+    }
+
+    #[tokio::test]
+    async fn apply_stages_each_plan_under_its_parent_as_the_jail_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("vmlinux"), b"kernel").unwrap();
+        std::fs::write(src.join("rootfs.ext4"), b"disk").unwrap();
+        std::fs::write(src.join("vmstate"), b"state").unwrap();
+        let root = dir.path().join("jail/firecracker/box/root");
+        let jail = Jail {
+            root: root.clone(),
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+        };
+        // A stale entry at a destination is replaced, not written into.
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("rootfs.ext4"), b"stale").unwrap();
+
+        apply(
+            &jail,
+            &[
+                StagePlan {
+                    src: src.join("vmlinux"),
+                    dst: root.join("vmlinux"),
+                    kind: StageKind::LinkOrCopy,
+                },
+                StagePlan {
+                    src: src.join("rootfs.ext4"),
+                    dst: root.join("rootfs.ext4"),
+                    kind: StageKind::Copy,
+                },
+                StagePlan {
+                    src: src.join("vmstate"),
+                    dst: root.join("snapshots/abc/vmstate"),
+                    kind: StageKind::LinkOrCopy,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(root.join("vmlinux")).unwrap(), b"kernel");
+        assert_eq!(std::fs::read(root.join("rootfs.ext4")).unwrap(), b"disk");
+        assert_eq!(
+            std::fs::read(root.join("snapshots/abc/vmstate")).unwrap(),
+            b"state"
+        );
+        // A copy never shares the source inode, whoever the jail runs as.
+        use std::os::unix::fs::MetadataExt as _;
+        assert_ne!(
+            std::fs::metadata(src.join("rootfs.ext4")).unwrap().ino(),
+            std::fs::metadata(root.join("rootfs.ext4")).unwrap().ino()
+        );
+    }
 }
