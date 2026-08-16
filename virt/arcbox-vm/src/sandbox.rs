@@ -27,7 +27,7 @@ use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
-use crate::snapshot_cow::{CowHandle, CowManager};
+use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::spawn::{spawn_direct, spawn_jailer};
 use crate::template_catalog::TemplateCatalog;
 use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
@@ -108,7 +108,9 @@ impl SandboxManager {
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let cow_manager = Arc::new(CowManager::new(&config.firecracker.data_dir)?);
+        let cow_manager = Arc::new(CowManager::new(CowOptions::new(
+            &config.firecracker.data_dir,
+        ))?);
 
         // Ensure the jailer chroot base directory exists.
         if let Some(ref jc) = config.firecracker.jailer {
