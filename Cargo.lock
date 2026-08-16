@@ -1198,6 +1198,7 @@ dependencies = [
  "arcbox-atomic-file",
  "arcbox-error",
  "arcbox-ext4",
+ "arcbox-fc-driver",
  "arcbox-snapshot",
  "arcbox-vm-driver",
  "arcbox-vm-proto",
