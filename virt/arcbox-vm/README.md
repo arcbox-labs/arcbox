@@ -61,7 +61,11 @@ overrides the members it owns and calls
 `SandboxManager::with_environment(config, env)`. Today that is the
 loop-device tooling behind `arcbox_snapshot::snapshot_cow::BlockTools`
 (`BusyboxBlockTools` is the reference; a `util-linux` or ioctl
-implementation is a consumer's few dozen lines); the packet-filter and
+implementation is a consumer's few dozen lines) and the netfilter
+rendering of the identity-invariant translation behind
+`arcbox_vm::network::PacketFilter` (`IptablesLegacy` is the reference;
+a stock distro on the nft backend supplies an nftables one — legacy and
+nft rulesets are mutually invisible, so this is a seam, not a path); the
 path seams follow.
 
 ## Build and test

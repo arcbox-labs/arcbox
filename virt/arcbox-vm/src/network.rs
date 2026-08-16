@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 use crate::config::SandboxDatapath;
 use crate::error::{Result, VmmError};
+
+pub use packet_filter::{IptablesLegacy, PacketFilter};
 
 #[cfg_attr(
     not(target_os = "linux"),
@@ -28,6 +30,7 @@ mod ebpf;
     )
 )]
 pub mod invariant;
+pub mod packet_filter;
 mod quarantine;
 #[cfg_attr(
     not(target_os = "linux"),
@@ -172,6 +175,16 @@ pub struct NetworkManager {
     /// with that process) or is legacy — both tear down via the tolerant
     /// iptables removal and expose via the fwmark form.
     applied: Mutex<HashMap<String, AppliedDatapath>>,
+    /// How the iptables-datapath translation (and the eBPF fallback) is
+    /// expressed on this host; see [`packet_filter`].
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "consulted only by the Linux activation path; other platforms activate nothing"
+        )
+    )]
+    packet_filter: Arc<dyn PacketFilter>,
     /// Lazily loaded eBPF datapath state (CORE-83).
     #[cfg(target_os = "linux")]
     ebpf: Mutex<ebpf::Engine>,
@@ -182,19 +195,35 @@ impl NetworkManager {
     ///
     /// `cidr` must be in `a.b.c.d/n` notation (e.g. `"172.20.0.0/16"`).
     pub fn new(cidr: &str, gateway: &str, dns: Vec<String>) -> Result<Self> {
-        Self::new_inner(cidr, gateway, dns, None, SandboxDatapath::default())
+        Self::new_inner(
+            cidr,
+            gateway,
+            dns,
+            None,
+            SandboxDatapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
     }
 
     /// Create a manager that persists inactive allocations until host cleanup
-    /// is finalized, translating invariant TAPs via `datapath`.
+    /// is finalized, translating invariant TAPs via `datapath` and, where
+    /// that means netfilter rules, through `packet_filter`.
     pub(crate) fn with_quarantine_dir(
         cidr: &str,
         gateway: &str,
         dns: Vec<String>,
         quarantine_dir: PathBuf,
         datapath: SandboxDatapath,
+        packet_filter: Arc<dyn PacketFilter>,
     ) -> Result<Self> {
-        Self::new_inner(cidr, gateway, dns, Some(quarantine_dir), datapath)
+        Self::new_inner(
+            cidr,
+            gateway,
+            dns,
+            Some(quarantine_dir),
+            datapath,
+            packet_filter,
+        )
     }
 
     fn new_inner(
@@ -203,6 +232,7 @@ impl NetworkManager {
         dns: Vec<String>,
         quarantine_dir: Option<PathBuf>,
         datapath: SandboxDatapath,
+        packet_filter: Arc<dyn PacketFilter>,
     ) -> Result<Self> {
         let (base, prefix_len) = parse_cidr(cidr)?;
         if !(1..=30).contains(&prefix_len) {
@@ -250,6 +280,7 @@ impl NetworkManager {
             startup_reconciled: AtomicBool::new(!startup_barrier),
             datapath,
             applied: Mutex::new(HashMap::new()),
+            packet_filter,
             #[cfg(target_os = "linux")]
             ebpf: Mutex::new(ebpf::Engine::Unloaded),
         })
@@ -350,14 +381,22 @@ impl NetworkManager {
     fn install_translation(&self, allocation: &NetworkAllocation) -> Result<()> {
         let applied = match self.datapath {
             SandboxDatapath::Iptables => {
-                invariant::install(&allocation.tap_name, allocation.ip_address)?;
+                invariant::install(
+                    &*self.packet_filter,
+                    &allocation.tap_name,
+                    allocation.ip_address,
+                )?;
                 AppliedDatapath::Iptables
             }
             SandboxDatapath::Ebpf => match self.attach_ebpf(allocation) {
                 Ok(ebpf::Attach::Done) => AppliedDatapath::Ebpf,
                 // The load failure already warned once; stay quiet per TAP.
                 Ok(ebpf::Attach::EngineUnavailable) => {
-                    invariant::install(&allocation.tap_name, allocation.ip_address)?;
+                    invariant::install(
+                        &*self.packet_filter,
+                        &allocation.tap_name,
+                        allocation.ip_address,
+                    )?;
                     AppliedDatapath::Iptables
                 }
                 Err(error) => {
@@ -366,7 +405,11 @@ impl NetworkManager {
                         %error,
                         "eBPF TAP attach failed; using iptables NAT for this TAP"
                     );
-                    invariant::install(&allocation.tap_name, allocation.ip_address)?;
+                    invariant::install(
+                        &*self.packet_filter,
+                        &allocation.tap_name,
+                        allocation.ip_address,
+                    )?;
                     AppliedDatapath::Iptables
                 }
             },
@@ -421,7 +464,7 @@ impl NetworkManager {
             }
             return Ok(());
         }
-        invariant::remove(&alloc.tap_name, alloc.ip_address)
+        invariant::remove(&*self.packet_filter, &alloc.tap_name, alloc.ip_address)
     }
 
     /// How expose DNAT must target the sandbox behind `tap_name` (CORE-83).
@@ -1065,6 +1108,7 @@ mod tests {
                 vec![],
                 root.path().join("network-quarantine"),
                 SandboxDatapath::default(),
+                Arc::new(IptablesLegacy::default()),
             )
             .unwrap(),
         );
@@ -1098,6 +1142,7 @@ mod tests {
             vec![],
             quarantine.clone(),
             SandboxDatapath::default(),
+            Arc::new(IptablesLegacy::default()),
         )
         .unwrap();
         manager.mark_reconciled();
@@ -1113,6 +1158,7 @@ mod tests {
             vec![],
             quarantine,
             SandboxDatapath::default(),
+            Arc::new(IptablesLegacy::default()),
         )
         .unwrap();
         restarted.mark_reconciled();
@@ -1177,6 +1223,7 @@ mod tests {
                     vec![],
                     quarantine,
                     SandboxDatapath::default(),
+                    Arc::new(IptablesLegacy::default()),
                 )
                 .is_err()
             );
