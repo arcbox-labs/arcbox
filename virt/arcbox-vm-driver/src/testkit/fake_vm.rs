@@ -1,8 +1,6 @@
 //! The fake driver's VM: an in-memory state machine behind a real
 //! [`VmHandle`].
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,9 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::broadcast;
 
 use super::fake_driver::Knobs;
+use super::fake_vsock::{FakeListener, Inbound, echo_peer};
 use super::lock;
 use crate::capability::{
     AfterCheckpoint, Balloon, BalloonStats, Checkpoint, CheckpointFormat, CheckpointImage,
@@ -52,10 +51,9 @@ pub(super) struct VmInner {
     /// A live, non-detached handle exists.
     owned: AtomicBool,
     events: broadcast::Sender<VmEvent>,
-    /// Guest-initiated connections waiting for a host `accept`, per port.
-    inbound: Mutex<HashMap<u32, VecDeque<UnixStream>>>,
-    /// Woken on every `inbound` push and on exit.
-    wake: Notify,
+    /// Guest-initiated connections; shared with the prepared process the VM
+    /// was booted on, so listeners bound before boot keep working.
+    inbound: Arc<Inbound>,
     console: Mutex<Vec<u8>>,
     balloon_target_bytes: AtomicU64,
 }
@@ -67,6 +65,7 @@ impl VmInner {
         caps: DriverCapabilities,
         knobs: Arc<Knobs>,
         balloon_target_bytes: u64,
+        inbound: Arc<Inbound>,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(16);
         Arc::new(Self {
@@ -77,8 +76,7 @@ impl VmInner {
             state: Mutex::new(VmState::Running),
             owned: AtomicBool::new(false),
             events,
-            inbound: Mutex::new(HashMap::new()),
-            wake: Notify::new(),
+            inbound,
             console: Mutex::new(Vec::new()),
             balloon_target_bytes: AtomicU64::new(balloon_target_bytes),
         })
@@ -98,7 +96,7 @@ impl VmInner {
 
     /// Moves to `Exited(status)` and returns the status the VM ended with:
     /// `status`, or the earlier one if it had already exited.
-    fn exit(&self, status: ExitStatus) -> ExitStatus {
+    pub(super) fn exit(&self, status: ExitStatus) -> ExitStatus {
         {
             let mut state = lock(&self.state);
             if let VmState::Exited(earlier) = *state {
@@ -108,7 +106,7 @@ impl VmInner {
         }
         // A send error only means nobody is subscribed.
         let _ = self.events.send(VmEvent::Exited(status));
-        self.wake.notify_waiters();
+        self.inbound.close(status);
         status
     }
 
@@ -136,11 +134,7 @@ impl VmInner {
 
     /// A guest-side connection to host `port`; the host `accept`s it.
     pub(super) fn push_inbound(&self, port: u32, stream: UnixStream) {
-        lock(&self.inbound)
-            .entry(port)
-            .or_default()
-            .push_back(stream);
-        self.wake.notify_waiters();
+        self.inbound.push(port, stream);
     }
 
     pub(super) fn push_console(&self, bytes: &[u8]) {
@@ -244,28 +238,10 @@ impl Vsock for FakeVm {
     /// Any port answers: the guest side echoes every byte back.
     async fn dial(&self, _port: u32) -> Result<VsockConn> {
         self.vm.require_running()?;
-        let (host, guest) = UnixStream::pair()?;
-        std::thread::Builder::new()
-            .name("fake-vsock-echo".into())
-            .spawn(move || echo(guest))?;
         Ok(VsockConn {
-            fd: host.into(),
+            fd: echo_peer()?.into(),
             mode: IoMode::Async,
         })
-    }
-}
-
-fn echo(mut stream: UnixStream) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                if stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
-            }
-        }
     }
 }
 
@@ -274,36 +250,9 @@ impl VsockListen for FakeVm {
     async fn listen(&self, port: u32) -> Result<Box<dyn VsockListener>> {
         self.vm.require_alive()?;
         Ok(Box::new(FakeListener {
-            vm: Arc::clone(&self.vm),
+            inbound: Arc::clone(&self.vm.inbound),
             port,
         }))
-    }
-}
-
-struct FakeListener {
-    vm: Arc<VmInner>,
-    port: u32,
-}
-
-#[async_trait]
-impl VsockListener for FakeListener {
-    async fn accept(&mut self) -> Result<VsockConn> {
-        loop {
-            // Register for the wake-up before checking, so a push between the
-            // check and the await is not lost.
-            let woken = self.vm.wake.notified();
-            let next = lock(&self.vm.inbound)
-                .get_mut(&self.port)
-                .and_then(VecDeque::pop_front);
-            if let Some(stream) = next {
-                return Ok(VsockConn {
-                    fd: stream.into(),
-                    mode: IoMode::Async,
-                });
-            }
-            self.vm.require_alive()?;
-            woken.await;
-        }
     }
 }
 
@@ -401,14 +350,13 @@ impl Console for FakeVm {
 
 impl DebugSnapshot for FakeVm {
     fn snapshot(&self) -> serde_json::Value {
-        let listeners: Vec<u32> = lock(&self.vm.inbound).keys().copied().collect();
         serde_json::json!({
             "driver": "fake",
             "id": self.vm.id().as_str(),
             "state": self.vm.state().to_string(),
             "balloon_target_bytes": self.vm.balloon_target_bytes.load(Ordering::Acquire),
             "console_pending_bytes": lock(&self.vm.console).len(),
-            "inbound_ports": listeners,
+            "inbound_ports": self.vm.inbound.pending_ports(),
         })
     }
 }

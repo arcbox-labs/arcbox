@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, VmInner};
+use super::fake_vsock::Inbound;
 use super::lock;
 use crate::capability::{Adopt, CheckpointImage};
 use crate::driver::{
@@ -165,12 +166,14 @@ impl FakeDriver {
             runtime_dir: runtime_dir.to_path_buf(),
             process: None,
         };
+        let inbound = Inbound::new(spec.id.clone());
         let vm = VmInner::new(
             spec,
             record,
             self.inner.caps.clone(),
             Arc::clone(&self.inner.knobs),
             balloon_target_bytes,
+            inbound,
         );
         vms.insert(vm.id().clone(), Arc::clone(&vm));
         Ok(Box::new(FakeVm::new(vm)))

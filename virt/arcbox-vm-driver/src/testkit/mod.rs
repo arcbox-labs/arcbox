@@ -19,6 +19,7 @@ pub mod contract;
 pub mod fake_driver;
 pub mod fake_network;
 mod fake_vm;
+mod fake_vsock;
 
 pub use contract::{ContractHarness, FakeHarness};
 pub use fake_driver::{FakeDriver, FakeDriverBuilder};
