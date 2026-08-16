@@ -119,6 +119,12 @@ impl SandboxManager {
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let cow_manager = Arc::new(CowManager::new(CowOptions {
             block_tools: environment.block_tools,
+            dmsetup_candidates: config
+                .firecracker
+                .dmsetup_candidates
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             ..CowOptions::new(&config.firecracker.data_dir)
         })?);
 

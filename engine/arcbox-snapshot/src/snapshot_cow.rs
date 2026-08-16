@@ -38,10 +38,11 @@ use persistence::{
 // ---------------------------------------------------------------------------
 
 /// Reference search list for the `dmsetup` binary.  The first existing,
-/// working entry wins.  `/sbin/dmsetup` covers stock Debian/Alpine;
-/// `/usr/sbin/dmsetup` covers usrmerged distros; `/arcbox/bin/dmsetup` is
-/// the System VM's bundled copy.
-const DMSETUP_CANDIDATES: &[&str] = &["/arcbox/bin/dmsetup", "/usr/sbin/dmsetup", "/sbin/dmsetup"];
+/// working entry wins.  `/usr/sbin/dmsetup` covers usrmerged distros,
+/// `/sbin/dmsetup` stock Debian/Alpine.  A composer with a bundled copy
+/// (the System VM ships one under `/arcbox/bin`) lists it first through
+/// [`CowOptions::dmsetup_candidates`].
+const DMSETUP_CANDIDATES: &[&str] = &["/usr/sbin/dmsetup", "/sbin/dmsetup"];
 
 /// dm-snapshot chunk size in 512-byte sectors (4096 bytes = 8 sectors).
 const SNAPSHOT_CHUNK_SECTORS: u64 = 8;
@@ -172,7 +173,7 @@ pub struct CowOptions {
 
 impl CowOptions {
     /// The reference environment: busybox at [`BusyboxBlockTools::DEFAULT_PATH`]
-    /// and the System VM's `dmsetup` search list.
+    /// and the stock-distro `dmsetup` search list.
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),

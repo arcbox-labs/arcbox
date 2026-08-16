@@ -51,6 +51,13 @@ fn guest_defaults() -> VmmConfig {
             sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
             pool_size: 1,
             warm_create: true,
+            // The host-shared copy first (`/arcbox/bin`, the same VirtioFS
+            // share vm-agent is staged through), then the stock locations.
+            dmsetup_candidates: vec![
+                "/arcbox/bin/dmsetup".into(),
+                "/usr/sbin/dmsetup".into(),
+                "/sbin/dmsetup".into(),
+            ],
         },
         network: NetworkConfig {
             cidr: "172.20.0.0/16".into(),

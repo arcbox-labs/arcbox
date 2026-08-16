@@ -51,8 +51,11 @@ The restructure plan and its locked decisions live in the company repo:
     (the System VM's `/bin/busybox` applets); a consumer on a stock distro
     supplies its own — `util-linux` binaries or the loop ioctls — without
     forking the module. `stat`/`mknod` are syscalls, not applets, so they
-    have no seam. Adding a new host operation means adding a trait method,
-    never a hard-coded binary path.
+    have no seam. The crate's own `dmsetup` search list is the stock-distro
+    one; the System VM's `/arcbox/bin/dmsetup` comes from the guest
+    agent's `VmmConfig` (`firecracker.dmsetup_candidates`), not from here.
+    Adding a new host operation means adding a trait method, never a
+    hard-coded binary path.
   - `CowManager`'s test seam (`CowTestProbe`, `new_with_test_probe`) is
     behind the **`test-probe` feature**, not `#[cfg(test)]`: a
     `cfg(test)` item does not exist for another crate's tests, and its

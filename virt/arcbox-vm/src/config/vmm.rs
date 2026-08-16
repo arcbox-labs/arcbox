@@ -65,6 +65,13 @@ pub struct FirecrackerConfig {
     /// `false` restores plain cold boots for every create.
     #[serde(default = "default_warm_create")]
     pub warm_create: bool,
+    /// Where to look for the `dmsetup` binary that drives dm-snapshot CoW
+    /// rootfs images. The first entry that exists and answers
+    /// `dmsetup version` wins; none usable disables CoW (every sandbox
+    /// copies its rootfs). `PATH` is never searched. Defaults to the
+    /// stock-distro locations; a composer with a bundled copy lists it first.
+    #[serde(default = "default_dmsetup_candidates")]
+    pub dmsetup_candidates: Vec<String>,
 }
 
 fn default_pool_size() -> usize {
@@ -73,6 +80,10 @@ fn default_pool_size() -> usize {
 
 fn default_warm_create() -> bool {
     true
+}
+
+fn default_dmsetup_candidates() -> Vec<String> {
+    vec!["/usr/sbin/dmsetup".into(), "/sbin/dmsetup".into()]
 }
 
 /// How the pool-IP <-> fixed-guest-IP translation of an invariant sandbox TAP
@@ -138,6 +149,7 @@ impl Default for VmmConfig {
                 sandbox_datapath: SandboxDatapath::default(),
                 pool_size: default_pool_size(),
                 warm_create: default_warm_create(),
+                dmsetup_candidates: default_dmsetup_candidates(),
             },
             network: NetworkConfig {
                 cidr: "172.20.0.0/16".into(),
@@ -205,6 +217,29 @@ mod tests {
         )
         .unwrap();
         assert!(!cfg.warm_create);
+    }
+
+    #[test]
+    fn dmsetup_candidates_default_to_stock_paths_and_parse_a_custom_list() {
+        // A config written before the field existed still loads, with the
+        // stock-distro search list.
+        let cfg: FirecrackerConfig =
+            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
+                .unwrap();
+        assert_eq!(
+            cfg.dmsetup_candidates,
+            ["/usr/sbin/dmsetup", "/sbin/dmsetup"]
+        );
+        // A composer with a bundled copy lists it first.
+        let cfg: FirecrackerConfig = toml::from_str(
+            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n\
+             dmsetup_candidates = [\"/opt/arcbox/dmsetup\", \"/sbin/dmsetup\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.dmsetup_candidates,
+            ["/opt/arcbox/dmsetup", "/sbin/dmsetup"]
+        );
     }
 
     #[test]
