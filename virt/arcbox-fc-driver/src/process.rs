@@ -344,12 +344,14 @@ fn probe_alive(pid: u32) -> bool {
     }
 }
 
+/// Plain `tokio` children standing in for Firecracker in this crate's
+/// tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
 
     /// A plain `tokio` child stands in for Firecracker.
-    struct Child(tokio::process::Child);
+    pub struct Child(pub tokio::process::Child);
 
     impl Vmm for Child {
         fn pid(&self) -> Option<u32> {
@@ -365,7 +367,8 @@ mod tests {
         }
     }
 
-    fn spawn(program: &str, args: &[&str]) -> FcProcess {
+    /// An owned [`FcProcess`] over `program args`.
+    pub fn spawn(program: &str, args: &[&str]) -> FcProcess {
         let child = tokio::process::Command::new(program)
             .args(args)
             .spawn()
@@ -373,10 +376,17 @@ mod tests {
         FcProcess::spawn(Child(child), PathBuf::from("/tmp/api.sock")).unwrap()
     }
 
-    fn pid_exists(pid: u32) -> bool {
+    /// `true` while `pid` can be signalled.
+    pub fn pid_exists(pid: u32) -> bool {
         #[allow(clippy::cast_possible_wrap, reason = "test pid")]
         kill(Pid::from_raw(pid as i32), None).is_ok()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{pid_exists, spawn};
+    use super::*;
 
     #[tokio::test]
     async fn exit_is_published_once_and_alive_flips_for_good() {
