@@ -86,6 +86,43 @@ pub enum FcError {
         what: String,
     },
 
+    /// Connecting to Firecracker's hybrid-vsock Unix socket failed — the
+    /// socket is missing or the VMM is not accepting; final, unlike a guest
+    /// port with no listener yet.
+    #[error("connect to {uds}: {source}")]
+    VsockConnect {
+        /// The Unix socket.
+        uds: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The `CONNECT <port>` / `OK` handshake on the vsock Unix socket
+    /// failed or answered something other than `OK`.
+    #[error("vsock handshake on {uds}: {detail}")]
+    VsockHandshake {
+        /// The Unix socket.
+        uds: PathBuf,
+        /// What went wrong, in the handshake's terms.
+        detail: String,
+        /// The underlying I/O error, when there was one.
+        #[source]
+        source: Option<std::io::Error>,
+    },
+
+    /// A guest-dial-out listener socket could not be bound or accepted on.
+    #[error("{what} {path}: {source}")]
+    VsockListen {
+        /// The step that failed.
+        what: &'static str,
+        /// The listener socket.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Signalling the VMM process failed.
     #[error("kill firecracker {pid}: {source}")]
     Kill {

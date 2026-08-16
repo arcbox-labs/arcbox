@@ -3,7 +3,7 @@ use super::types::action;
 use super::*;
 use arcbox_snapshot::SnapshotError;
 
-type BootOutput = (Arc<fc_sdk::Vm>, PathBuf, vsock::ReadyListener);
+type BootOutput = (Arc<fc_sdk::Vm>, PathBuf, UdsListener);
 
 /// How long the readiness gate waits for vm-agent's dial-out (the guest
 /// connect to [`vsock::READY_PORT`]) before the boot is declared failed.
@@ -74,16 +74,19 @@ pub(super) async fn boot_sandbox(
             // (the vm-agent binary among them) rebuild the default template
             // and re-inject it into docker templates automatically, so a
             // guest always carries the agent from the same build as its host.
-            let agent_ready = match tokio::time::timeout(AGENT_GATE_TIMEOUT, ready_listener.wait())
-                .await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(VmmError::Vsock(format!("agent readiness gate: {error}"))),
-                Err(_) => Err(VmmError::Vsock(format!(
-                    "agent readiness gate: vm-agent did not dial the ready port within {}s",
-                    AGENT_GATE_TIMEOUT.as_secs()
-                ))),
-            };
+            let agent_ready =
+                match tokio::time::timeout(AGENT_GATE_TIMEOUT, vsock::wait_ready(&ready_listener))
+                    .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => {
+                        Err(VmmError::Vsock(format!("agent readiness gate: {error}")))
+                    }
+                    Err(_) => Err(VmmError::Vsock(format!(
+                        "agent readiness gate: vm-agent did not dial the ready port within {}s",
+                        AGENT_GATE_TIMEOUT.as_secs()
+                    ))),
+                };
             // The socket file is per-boot; the gate has consumed its one event.
             drop(ready_listener);
             if let Err(gate_error) = agent_ready {
@@ -1082,11 +1085,11 @@ async fn do_boot(
     // that guest-initiated connect to `{uds_path}_{READY_PORT}` only if
     // someone is already listening there — otherwise the guest is reset and
     // the one readiness event is lost.
-    let ready_listener = match vsock::ReadyListener::bind(&vsock_host_path) {
+    let ready_listener = match UdsListener::bind(&vsock_host_path, vsock::READY_PORT) {
         Ok(listener) => listener,
         Err(error) => {
             return Err(BootFailure {
-                error,
+                error: error.into(),
                 process: None,
                 cow_handle: None,
             });

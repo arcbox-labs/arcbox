@@ -20,6 +20,7 @@ use arcbox_fc_driver::jail::{
     stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
 };
 use arcbox_fc_driver::spawn::{spawn_direct, spawn_jailer};
+use arcbox_fc_driver::vsock::UdsListener;
 use arcbox_vm_driver::IsolationSpec;
 use chrono::{DateTime, Utc};
 use fc_sdk::VmBuilder;

@@ -16,6 +16,8 @@
 //! - [`jail`] — the jailer's chroot layout and how host files are staged
 //!   into it (link-or-copy, copy, block-device node).
 //! - [`spawn`] — the `firecracker` / `jailer` process spawn.
+//! - [`vsock`] — the hybrid-vsock Unix-socket handshake and the
+//!   `{uds}_{port}` listener for guest dial-outs.
 //!
 //! The remaining modules — the spec renderer, jail staging, process
 //! spawning and ownership, the vsock handshake, the prepared VM, the
@@ -38,6 +40,7 @@ pub mod config;
 pub mod error;
 pub mod jail;
 pub mod spawn;
+pub mod vsock;
 
 pub use config::FcDriverConfig;
 pub use error::FcError;
