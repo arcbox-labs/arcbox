@@ -62,20 +62,22 @@ pub struct RootfsBuilder {
         )
     )]
     block_tools: Arc<dyn BlockTools>,
-    /// Serializes default-rootfs builds so concurrent creates don't each
-    /// rebuild the 512 MiB image. The atomic rename already prevents
-    /// corruption; this only avoids the redundant work.
-    build_lock: tokio::sync::Mutex<()>,
+}
+
+/// Serializes default-rootfs builds so concurrent creates don't each rebuild
+/// the 512 MiB image. Process-wide, not per builder: two builders over the
+/// same paths (the service's and a startup sweep's) must not race each other
+/// either. The atomic rename already prevents corruption; this only avoids
+/// the redundant work.
+fn build_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 impl RootfsBuilder {
     /// A builder over `paths`, mounting through `block_tools`.
     pub fn new(paths: RootfsPaths, block_tools: Arc<dyn BlockTools>) -> Self {
-        Self {
-            paths,
-            block_tools,
-            build_lock: tokio::sync::Mutex::new(()),
-        }
+        Self { paths, block_tools }
     }
 
     /// The paths this builder was composed with.
@@ -331,7 +333,7 @@ impl RootfsBuilder {
         // Single-flight: a concurrent create for the same default image waits here,
         // then the re-check lets it reuse the just-built image instead of
         // redundantly rebuilding 512 MiB.
-        let _build = self.build_lock.lock().await;
+        let _build = build_lock().lock().await;
         if self.is_default_rootfs_fresh(image) {
             return Ok(());
         }
@@ -586,13 +588,22 @@ impl RootfsBuilder {
                 .context("loop attach task panicked")?
                 .context("failed to attach ext4 image for vm-agent injection")?
         };
-        let mounted = mount(
-            Some(loop_dev.as_str()),
-            &mount_dir,
-            Some("ext4"),
-            MsFlags::empty(),
-            None::<&str>,
-        );
+        // mount(2) can replay the ext4 journal; keep it off the executor.
+        let mounted = {
+            let dev = loop_dev.clone();
+            let dir = mount_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                mount(
+                    Some(dev.as_str()),
+                    &dir,
+                    Some("ext4"),
+                    MsFlags::empty(),
+                    None::<&str>,
+                )
+            })
+            .await
+            .context("mount task panicked")?
+        };
         if let Err(e) = mounted {
             self.detach_quietly(&loop_dev).await;
             let _ = tokio::fs::remove_dir(&mount_dir).await;
@@ -631,13 +642,25 @@ impl RootfsBuilder {
             }
         }
 
-        // Always unmount, detach, and clean up, even on failure.
-        if let Err(e) = umount(&mount_dir) {
-            tracing::warn!(error = %e, dir = %mount_dir.display(), "umount after vm-agent injection failed");
-        }
+        // Always unmount, detach, and clean up, even on failure. An image
+        // that could not be unmounted must not be published: it is still
+        // busy, and the caller's rename would cache a file another mount
+        // holds. The tmp file is the caller's to remove.
+        let unmounted = {
+            let dir = mount_dir.clone();
+            tokio::task::spawn_blocking(move || umount(&dir))
+                .await
+                .context("umount task panicked")?
+        };
         self.detach_quietly(&loop_dev).await;
         let _ = tokio::fs::remove_dir(&mount_dir).await;
 
+        if let Err(e) = unmounted {
+            bail!(
+                "umount {} after vm-agent injection: {e}",
+                mount_dir.display()
+            );
+        }
         copy_result
     }
 
