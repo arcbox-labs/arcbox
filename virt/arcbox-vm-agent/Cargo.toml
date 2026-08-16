@@ -1,0 +1,25 @@
+[package]
+name              = "arcbox-vm-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description       = "The vm-agent init that runs as PID 1 inside every ArcBox sandbox microVM: exec/file service over vsock, plus its guest-side helpers."
+
+[[bin]]
+name = "vm-agent"
+path = "src/main.rs"
+
+[dependencies]
+arcbox-vm-proto.workspace = true
+serde.workspace           = true
+serde_json.workspace      = true
+libc.workspace            = true
+nix                       = { workspace = true, features = ["process", "term"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

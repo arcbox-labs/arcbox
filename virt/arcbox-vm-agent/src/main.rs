@@ -2,7 +2,8 @@
 //!
 //! The agent listens on AF_VSOCK port 52.  For each connection it:
 //!
-//! 1. Reads an initial `MSG_START` frame carrying a JSON [`StartCommand`].
+//! 1. Reads an initial `MSG_START` frame carrying a JSON
+//!    [`StartCommand`](arcbox_vm_proto::exec::StartCommand).
 //! 2. Spawns the requested process (with pipes for non-TTY, with openpty for TTY).
 //! 3. Streams `MSG_STDOUT` / `MSG_STDERR` frames back to the host.
 //! 4. For interactive sessions, forwards `MSG_STDIN` / `MSG_RESIZE` frames to
@@ -16,28 +17,19 @@
 //! The agent also owns its wall clock: once at startup and again on every
 //! accepted exec connection (rate-limited to one attempt per second) it
 //! re-syncs `CLOCK_REALTIME` from the hypervisor via `ptp_kvm` (see
-//! [`ptp`]), so a restored snapshot regains correct time before any
+//! `ptp`), so a restored snapshot regains correct time before any
 //! workload command runs, without waiting for the host's `MSG_CLOCK_SYNC`
 //! RPC (CORE-80).
 //!
 //! ## Frame format
 //!
-//! ```text
-//! [u8: msg_type][u32 LE: payload_len][payload_len bytes]
-//! ```
-//!
-//! | Type | Direction   | Payload                          |
-//! |------|-------------|----------------------------------|
-//! | 0x01 | Host→Agent  | JSON `StartCommand`              |
-//! | 0x02 | Host→Agent  | raw stdin bytes                  |
-//! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`  |
-//! | 0x04 | Host→Agent  | empty — stdin EOF                |
-//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]` — clock sync |
-//! | 0x06 | Host→Agent  | JSON `NetReconfigCommand` — re-address eth0 |
-//! | 0x07 | Host→Agent  | `[i32 LE signal]` — signal the workload's process group |
-//! | 0x10 | Agent→Host  | raw stdout bytes                 |
-//! | 0x11 | Agent→Host  | raw stderr bytes                 |
-//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` — signal 0 = normal exit. Net-reconfig replies append six `u32 LE` micros (addr/netmask/delrt/addrt ioctls, resolv write, whole handler); legacy agents send only the 4-byte code. Readers key on payload length. |
+//! The wire vocabulary — frame layout, every opcode on the exec channel
+//! (52) and the file channel (53), and the JSON payload types — is
+//! `arcbox_vm_proto::exec` / `arcbox_vm_proto::file`; that crate's tables
+//! are authoritative and this binary imports the constants from it. The
+//! net-reconfig reply appends six `u32 LE` micros (addr/netmask/delrt/addrt
+//! ioctls, resolv write, whole handler) to the `MSG_EXIT` payload; the host
+//! keys on payload length, so legacy agents' 4-byte replies still decode.
 //!
 //! This binary requires Linux — it uses AF_VSOCK, accept4, openpty, and fork,
 //! none of which are available on other platforms.  The workspace compiles the
@@ -390,43 +382,29 @@ mod agent {
     use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
     use std::thread;
 
-    use serde::Deserialize;
-
     // -------------------------------------------------------------------------
-    // Protocol constants
+    // Protocol vocabulary — shared with the host through `arcbox-vm-proto`
     // -------------------------------------------------------------------------
 
-    pub const AGENT_PORT: u32 = 52;
-
-    // Exec channel (vsock:52) frame types.
-    const MSG_START: u8 = 0x01;
-    const MSG_STDIN: u8 = 0x02;
-    const MSG_RESIZE: u8 = 0x03;
-    const MSG_EOF: u8 = 0x04;
-    const MSG_CLOCK_SYNC: u8 = 0x05;
-    const MSG_NET_RECONFIG: u8 = 0x06;
-    const MSG_SIGNAL: u8 = 0x07;
-    const MSG_STDOUT: u8 = 0x10;
-    const MSG_STDERR: u8 = 0x11;
-    const MSG_EXIT: u8 = 0x12;
-
-    // File I/O channel (vsock:53) — imported from the shared proto module.
-    use arcbox_vm::boot_proto::{KernelIpParam, NetReconfigCommand};
-    use arcbox_vm::file_io::proto::{
+    use arcbox_vm_proto::boot::{KernelIpParam, NetReconfigCommand};
+    use arcbox_vm_proto::exec::{
+        AGENT_PORT, MAX_FRAME_SIZE, MSG_CLOCK_SYNC, MSG_EOF, MSG_EXIT, MSG_NET_RECONFIG,
+        MSG_RESIZE, MSG_SIGNAL, MSG_START, MSG_STDERR, MSG_STDIN, MSG_STDOUT, MSG_WAIT_PORT,
+        READY_PORT, StartCommand, WaitPortReq,
+    };
+    use arcbox_vm_proto::file::{
         ERR_NOT_A_DIRECTORY, ERR_NOT_EMPTY, ERR_NOT_FOUND, FILE_ACK, FILE_DATA, FILE_DONE,
         FILE_ERR, FILE_EVENT, FILE_LIST, FILE_LIST_REQ, FILE_MKDIR_REQ, FILE_MOVE_REQ, FILE_PORT,
         FILE_READ_REQ, FILE_REMOVE_REQ, FILE_STAT, FILE_STAT_REQ, FILE_WATCH_REQ, FILE_WRITE_REQ,
         FileStatDto, KIND_DIR, KIND_FILE, KIND_OTHER, KIND_SYMLINK, ListDirReq, MAX_FILE_SIZE,
         MakeDirReq, MoveReq, RemoveReq, StatReq, WatchReq,
     };
-    use arcbox_vm::file_watch::{
+
+    // Guest-side helpers from this crate's library half.
+    use arcbox_vm_agent::file_watch::{
         IN_CREATE, IN_MOVED_TO, WATCH_MASK, has_overflow, has_unpaired_move_from, map_events,
         parse_event_buffer,
     };
-    // Readiness dial-out port — shared with the host-side boot gate.
-    use arcbox_vm::vsock::{MSG_WAIT_PORT, READY_PORT};
-
-    const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
     /// Maximum number of concurrently active connection-handling threads.
     /// Prevents memory exhaustion during exec bursts (e.g. health checks).
@@ -434,36 +412,6 @@ mod agent {
 
     /// Stack size for connection-handling threads (1 MB instead of the default 8 MB).
     const THREAD_STACK_SIZE: usize = 1 << 20;
-
-    // -------------------------------------------------------------------------
-    // Protocol types
-    // -------------------------------------------------------------------------
-
-    #[derive(Debug, Deserialize)]
-    struct StartCommand {
-        cmd: Vec<String>,
-        #[serde(default)]
-        env: HashMap<String, String>,
-        #[serde(default)]
-        working_dir: String,
-        #[serde(default)]
-        user: String,
-        #[serde(default)]
-        tty: bool,
-        #[serde(default = "default_tty_width")]
-        tty_width: u16,
-        #[serde(default = "default_tty_height")]
-        tty_height: u16,
-        #[serde(default)]
-        timeout_seconds: u32,
-    }
-
-    fn default_tty_width() -> u16 {
-        80
-    }
-    fn default_tty_height() -> u16 {
-        24
-    }
 
     // -------------------------------------------------------------------------
     // Framed I/O over a raw socket fd
@@ -596,7 +544,7 @@ mod agent {
     fn handle_wait_port(mut conn: VsockStream, payload: &[u8]) {
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-        let req: arcbox_vm::vsock::WaitPortReq = match serde_json::from_slice(payload) {
+        let req: WaitPortReq = match serde_json::from_slice(payload) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("agent: parse WaitPortReq: {e}");
@@ -612,7 +560,7 @@ mod agent {
                 std::fs::read_to_string("/proc/net/tcp6").unwrap_or_default(),
             ]
             .iter()
-            .any(|table| arcbox_vm::listen_table::any_listener_on_port(table, req.port));
+            .any(|table| arcbox_vm_agent::listen_table::any_listener_on_port(table, req.port));
             if listening {
                 break 0i32;
             }
@@ -708,7 +656,7 @@ mod agent {
     /// eth0 re-addressing via raw `ioctl(2)`, self-contained so it works on
     /// any sandbox rootfs (no dependence on busybox `ip`/`route` applets).
     mod net_reconfig {
-        use arcbox_vm::boot_proto::NetReconfigCommand;
+        use arcbox_vm_proto::boot::NetReconfigCommand;
         use std::net::Ipv4Addr;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -1327,7 +1275,7 @@ mod agent {
             // Prune after mapping: a removal event still needs its wd→path
             // resolution for the batch it arrived in.
             for event in &raw {
-                if event.mask & arcbox_vm::file_watch::IN_IGNORED != 0 {
+                if event.mask & arcbox_vm_agent::file_watch::IN_IGNORED != 0 {
                     watches.remove(&event.wd);
                 }
             }
@@ -1349,10 +1297,10 @@ mod agent {
     /// Resolve `StartCommand.user` against the rootfs passwd/group files.
     fn resolve_start_user(
         user: &str,
-    ) -> Result<Option<arcbox_vm::user_spec::ResolvedUser>, String> {
+    ) -> Result<Option<arcbox_vm_agent::user_spec::ResolvedUser>, String> {
         let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
         let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
-        arcbox_vm::user_spec::resolve_user(user, &passwd, &group)
+        arcbox_vm_agent::user_spec::resolve_user(user, &passwd, &group)
     }
 
     /// Report a start failure to the host as a stderr chunk plus an exit

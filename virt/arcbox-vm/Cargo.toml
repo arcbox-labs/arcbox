@@ -5,14 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description       = "Guest-side sandbox orchestration over nested Firecracker microVMs; ships the in-sandbox vm-agent init."
-
-[[bin]]
-name = "vm-agent"
-path = "src/bin/vm-agent.rs"
+description       = "Sandbox orchestration over Firecracker microVMs: boot, exec, files, checkpoints, warm pools. The in-sandbox init is arcbox-vm-agent; the wire vocabulary is arcbox-vm-proto."
 
 [dependencies]
 arcbox-atomic-file.workspace = true
+arcbox-vm-proto.workspace = true
 arcbox-error.workspace = true
 arcbox-snapshot.workspace = true
 fc-sdk.workspace       = true

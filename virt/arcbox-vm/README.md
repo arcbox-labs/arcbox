@@ -13,18 +13,23 @@ different machine.
 host (macOS)              System VM (Linux)            sandbox (Firecracker)
 arcbox-daemon    ──vsock──►  arcbox-agent      ──vsock──►  vm-agent (PID 1)
   arcbox-vmm                   arcbox-vm                     workload
-                                 fc-sdk
+                                 fc-sdk                    (arcbox-vm-agent)
+                                        └── arcbox-vm-proto ──┘
 ```
 
 `arcbox-agent` is this crate's only consumer: it owns the `sandbox.v1`
 surface and the vsock transport, and calls `SandboxManager` underneath.
 There are no service implementations, no tonic, and no daemon here.
 
-The crate also ships the **`vm-agent`** binary — a separate, much smaller
-program that becomes PID 1 *inside* each sandbox. It imports only the
-protocol leaves (`boot_proto`, `file_io::proto`, `file_watch`, `vsock`
-constants, `listen_table`, `user_spec`), never the manager;
-`arcbox-agent`'s `rootfs_builder` stages it into every sandbox rootfs.
+The **`vm-agent`** binary that becomes PID 1 *inside* each sandbox is a
+separate crate, [`arcbox-vm-agent`](../arcbox-vm-agent); the wire
+vocabulary both sides share — boot parameters, exec-channel and
+file-channel frames — is [`arcbox-vm-proto`](../arcbox-vm-proto). This
+crate and the agent each depend on the proto crate and never on each
+other, so the agent stays a small static musl binary no matter what the
+manager pulls in. `boot_proto` and `file_io::proto` stay reachable here as
+re-exports. `arcbox-agent`'s `rootfs_builder` stages the binary into every
+sandbox rootfs.
 
 ## Usage
 
@@ -55,7 +60,7 @@ cargo test -p arcbox-vm                 # unit + integration, no Firecracker nee
 cargo clippy -p arcbox-vm -- -D warnings
 
 # vm-agent, as the release ships it (aarch64 musl; brew install FiloSottile/musl-cross/musl-cross)
-cargo build -p arcbox-vm --bin vm-agent --target aarch64-unknown-linux-musl --release
+cargo build -p arcbox-vm-agent --bin vm-agent --target aarch64-unknown-linux-musl --release
 ```
 
 Everything real — TAP creation, boot, checkpoint — needs Linux with

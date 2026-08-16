@@ -16,29 +16,14 @@
 //!
 //! ## Frame format
 //!
-//! Every message (in both directions) is:
-//!
-//! ```text
-//! [u8: msg_type][u32 LE: payload_len][payload_len bytes: payload]
-//! ```
-//!
-//! | Type | Direction   | Payload                                    |
-//! |------|-------------|--------------------------------------------|
-//! | 0x01 | Host→Agent  | JSON-encoded `StartCommand`                |
-//! | 0x02 | Host→Agent  | raw stdin bytes                            |
-//! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`            |
-//! | 0x04 | Host→Agent  | empty — signals stdin EOF                  |
-//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]`              |
-//! | 0x07 | Host→Agent  | `[i32 LE signal]` — deliver to workload    |
-//! | 0x10 | Agent→Host  | raw stdout bytes                           |
-//! | 0x11 | Agent→Host  | raw stderr bytes                           |
-//! | 0x12 | Agent→Host  | `[i32 LE code][i32 LE signal]` (signal 0 = normal exit; old agents send only the 4-byte code). Net-reconfig replies append six `u32 LE` micros — see [`ReconfigTimings`]. Readers key on payload length. |
+//! The opcodes, payload layouts, and the JSON DTOs ([`StartCommand`],
+//! [`WaitPortReq`]) are the exec-channel vocabulary in
+//! [`arcbox_vm_proto::exec`], re-exported here; the net-reconfig timing
+//! suffix on `MSG_EXIT` is decoded by [`ReconfigTimings`].
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -46,45 +31,12 @@ use tracing::{info, warn};
 
 use crate::error::{Result, VmmError};
 
-/// Host-side port the guest agent dials once it is fully serving.
-///
-/// Firecracker hybrid vsock forwards a guest-initiated connect to host port
-/// `P` onto the host Unix socket at `{uds_path}_{P}`, so a pre-bound
-/// [`ReadyListener`]'s `accept()` IS the "vm-agent is up" event — no
-/// connect polling involved.
-pub const READY_PORT: u32 = 51;
-
-/// Guest-side vsock port the agent listens on (exec channel).
-pub const AGENT_PORT: u32 = 52;
-
-// Frame type constants — Host → Agent (exec channel).
-const MSG_START: u8 = 0x01;
-const MSG_STDIN: u8 = 0x02;
-const MSG_RESIZE: u8 = 0x03;
-const MSG_EOF: u8 = 0x04;
-/// Synchronise the guest clock to the host (after snapshot restore, and as
-/// the cold-boot agent-readiness gate).
-/// Payload: `[i64 LE unix_seconds][u32 LE nanos]` (12 bytes).
-pub(crate) const MSG_CLOCK_SYNC: u8 = 0x05;
-/// Re-address the guest network after a fresh-network snapshot restore.
-/// Payload: JSON [`NetReconfigCommand`](crate::boot_proto::NetReconfigCommand).
-pub(crate) const MSG_NET_RECONFIG: u8 = 0x06;
-/// Deliver a POSIX signal to the workload's process group.
-/// Payload: `[i32 LE signal]` (4 bytes). Old vm-agents ignore unknown frame
-/// types, so sending this to a pre-signal agent is a silent no-op.
-const MSG_SIGNAL: u8 = 0x07;
-/// Wait until the guest's TCP listen table has a listener on a port.
-/// Payload: JSON [`WaitPortReq`]; answered with `MSG_EXIT` carrying `0`
-/// (listening) or `1` (deadline elapsed).
-pub const MSG_WAIT_PORT: u8 = 0x08;
-
-// Frame type constants — Agent → Host (exec channel).
-const MSG_STDOUT: u8 = 0x10;
-const MSG_STDERR: u8 = 0x11;
-const MSG_EXIT: u8 = 0x12;
-
-/// Maximum allowed frame payload size (16 MiB).
-pub(crate) const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+// Exec-channel vocabulary, shared with vm-agent through `arcbox-vm-proto`.
+pub use arcbox_vm_proto::exec::{AGENT_PORT, MSG_WAIT_PORT, READY_PORT, StartCommand, WaitPortReq};
+pub(crate) use arcbox_vm_proto::exec::{MAX_FRAME_SIZE, MSG_CLOCK_SYNC, MSG_NET_RECONFIG};
+use arcbox_vm_proto::exec::{
+    MSG_EOF, MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_START, MSG_STDERR, MSG_STDIN, MSG_STDOUT,
+};
 
 // =============================================================================
 // Public types
@@ -153,28 +105,6 @@ pub enum ExecInputMsg {
     Signal(i32),
     /// Signal EOF on the process's stdin.
     Eof,
-}
-
-/// Parameters forwarded to the guest agent as the session-start frame.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StartCommand {
-    pub cmd: Vec<String>,
-    pub env: HashMap<String, String>,
-    pub working_dir: String,
-    pub user: String,
-    pub tty: bool,
-    pub tty_width: u16,
-    pub tty_height: u16,
-    pub timeout_seconds: u32,
-}
-
-/// `MSG_WAIT_PORT` payload, shared with the vm-agent binary.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WaitPortReq {
-    /// TCP port a workload is expected to listen on.
-    pub port: u16,
-    /// Give up after this long (0 = check once and answer immediately).
-    pub timeout_ms: u64,
 }
 
 /// Outcome of a guest listen-table wait.
@@ -934,7 +864,7 @@ mod tests {
     fn test_start_command_json_serde() {
         let cmd = StartCommand {
             cmd: vec!["echo".into(), "hello".into()],
-            env: HashMap::new(),
+            env: std::collections::HashMap::new(),
             working_dir: "/tmp".into(),
             user: "root".into(),
             tty: false,

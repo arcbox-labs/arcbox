@@ -1,0 +1,17 @@
+[package]
+name              = "arcbox-vm-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description       = "Wire vocabulary shared by the arcbox-vm sandbox manager and the in-sandbox vm-agent init: boot parameters, exec-channel frames, file-channel frames."
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

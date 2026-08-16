@@ -6,6 +6,8 @@ on:
     paths:
       - "guest/arcbox-agent/**"
       - "virt/arcbox-vm/**"
+      - "virt/arcbox-vm-proto/**"
+      - "virt/arcbox-vm-agent/**"
       # The snapshot catalog and the device-mapper CoW manager moved out of
       # arcbox-vm; this suite is still the only one that drives dmsetup and
       # thin pools on real KVM, so it has to follow them.
@@ -21,6 +23,8 @@ on:
     paths:
       - "guest/arcbox-agent/**"
       - "virt/arcbox-vm/**"
+      - "virt/arcbox-vm-proto/**"
+      - "virt/arcbox-vm-agent/**"
       # The snapshot catalog and the device-mapper CoW manager moved out of
       # arcbox-vm; this suite is still the only one that drives dmsetup and
       # thin pools on real KVM, so it has to follow them.
@@ -69,15 +73,15 @@ jobs:
           restore-keys: linux-cargo-
 
       - name: Check formatting
-        run: cargo fmt -p arcbox-vm -p arcbox-snapshot --check
+        run: cargo fmt -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-agent -p arcbox-snapshot --check
 
       - name: Clippy
-        run: cargo clippy -p arcbox-vm -p arcbox-snapshot -- -D warnings
+        run: cargo clippy -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-agent -p arcbox-snapshot -- -D warnings
 
       - name: Unit tests
         # --bins covers the vm-agent guest handlers, whose tests are
         # target_os = "linux" and never run under the macOS workspace job.
-        run: cargo test --lib --bins -p arcbox-vm -p arcbox-snapshot
+        run: cargo test --lib --bins -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-agent -p arcbox-snapshot
 
   # ---------------------------------------------------------------------------
   # Job 2: integration tests — requires root (TAP interface creation)
@@ -190,7 +194,7 @@ jobs:
           curl -sL "$BASE/ubuntu-22.04.ext4"            -o /tmp/fc-assets/rootfs-base.ext4
 
       - name: Build vm-agent (Linux x86_64)
-        run: cargo build -p arcbox-vm --bin vm-agent --release
+        run: cargo build -p arcbox-vm-agent --bin vm-agent --release
 
       - name: Inject vm-agent into rootfs
         run: |
@@ -265,7 +269,7 @@ jobs:
 
       - name: Build binaries
         run: |
-          cargo build -p arcbox-vm --bin vm-agent --release
+          cargo build -p arcbox-vm-agent --bin vm-agent --release
           cargo test -p arcbox-agent --test sandbox_service_manager --no-run
 
       - name: Inject vm-agent into rootfs
