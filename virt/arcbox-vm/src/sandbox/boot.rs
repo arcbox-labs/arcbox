@@ -119,7 +119,7 @@ pub(super) async fn boot_sandbox(
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         CLOCK_SYNC_TIMEOUT,
-                        vsock::sync_clock(&vsock_uds_path),
+                        vsock::sync_clock(&vsock::UdsVsock(vsock_uds_path)),
                     )
                     .await
                     {
@@ -505,7 +505,13 @@ pub(super) async fn run_ready_probe(
             port,
             timeout_seconds,
         } => {
-            match vsock::wait_for_port(vsock_uds_path, *port, effective(*timeout_seconds)).await? {
+            match vsock::wait_for_port(
+                &vsock::UdsVsock(vsock_uds_path.to_owned()),
+                *port,
+                effective(*timeout_seconds),
+            )
+            .await?
+            {
                 vsock::PortWait::Listening => Ok(()),
                 vsock::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
                     "no listener on port {port} within the ready-probe deadline"
@@ -582,7 +588,8 @@ async fn run_probe_command(
         tty_height: 24,
         timeout_seconds,
     };
-    let (_input, mut output) = vsock::exec(vsock_uds_path, start).await?;
+    let (_input, mut output) =
+        vsock::exec(&vsock::UdsVsock(vsock_uds_path.to_owned()), start).await?;
     while let Some(chunk) = output.recv().await {
         if let OutputChunk::Exit(status) = chunk? {
             return Ok(status);

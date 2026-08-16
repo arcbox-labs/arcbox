@@ -704,7 +704,7 @@ impl SandboxManager {
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        vsock::sync_clock(&vsock_path),
+                        vsock::sync_clock(&vsock::UdsVsock(vsock_path)),
                     )
                     .await
                     {
@@ -733,7 +733,7 @@ impl SandboxManager {
                 };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    vsock::reconfigure_network(&vsock_path, &cmd),
+                    vsock::reconfigure_network(&vsock::UdsVsock(vsock_path.clone()), &cmd),
                 )
                 .await
                 .map_err(|_| VmmError::Vsock("net reconfig after resume timed out".into()))

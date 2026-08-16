@@ -721,7 +721,7 @@ impl SandboxManager {
         // racer never launches a process (same discipline as workload.rs).
         super::workload::claim_running(sandbox_id, &self.instances)?;
 
-        let (input_tx, output_rx) = match vsock::exec(&uds_path, start).await {
+        let (input_tx, output_rx) = match vsock::exec(&vsock::UdsVsock(uds_path), start).await {
             Ok(pair) => pair,
             Err(e) => {
                 super::workload::release_running(sandbox_id, &self.instances);
@@ -872,7 +872,7 @@ impl SandboxManager {
         timeout: Duration,
     ) -> Result<()> {
         let uds = self.require_alive_vsock(id)?;
-        match vsock::wait_for_port(&uds, port, timeout).await? {
+        match vsock::wait_for_port(&vsock::UdsVsock(uds), port, timeout).await? {
             crate::vsock::PortWait::Listening => Ok(()),
             crate::vsock::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
                 "no listener on port {port} in sandbox '{id}' within {}s",

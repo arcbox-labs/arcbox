@@ -4,13 +4,14 @@
 //! DTOs, and the per-verb flows — is [`arcbox_vm_proto::file`], re-exported
 //! here as [`proto`] so `arcbox_vm::file_io::proto` keeps resolving for
 //! every consumer. This module is the tokio client the manager drives:
-//! one vsock connection per operation, timeouts, and the mapping of the
-//! agent's errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`]
-//! variants (`decode_file_err`).
+//! one vsock connection per operation, dialed through the driver port's
+//! [`Vsock`] capability, timeouts, and the mapping of the agent's
+//! errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`] variants
+//! (`decode_file_err`).
 
-use std::path::Path;
 use std::time::Duration;
 
+use arcbox_vm_driver::Vsock;
 use serde::Serialize;
 use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
@@ -48,7 +49,7 @@ struct ReadReq<'a> {
 /// The guest agent creates any missing parent directories.  `mode` is the Unix
 /// file permission bits (e.g. `0o644`); `0` defaults to `0o644` on the agent
 /// side.
-pub async fn write_file(uds_path: &Path, path: &str, mode: u32, data: &[u8]) -> Result<()> {
+pub async fn write_file(vsock: &dyn Vsock, path: &str, mode: u32, data: &[u8]) -> Result<()> {
     if data.len() > MAX_FILE_SIZE {
         return Err(VmmError::Vsock(format!(
             "file too large ({} bytes, max {MAX_FILE_SIZE})",
@@ -56,16 +57,13 @@ pub async fn write_file(uds_path: &Path, path: &str, mode: u32, data: &[u8]) -> 
         )));
     }
 
-    tokio::time::timeout(
-        FILE_IO_TIMEOUT,
-        write_file_inner(uds_path, path, mode, data),
-    )
-    .await
-    .map_err(|_| VmmError::Vsock("file write: timed out".into()))?
+    tokio::time::timeout(FILE_IO_TIMEOUT, write_file_inner(vsock, path, mode, data))
+        .await
+        .map_err(|_| VmmError::Vsock("file write: timed out".into()))?
 }
 
-async fn write_file_inner(uds_path: &Path, path: &str, mode: u32, data: &[u8]) -> Result<()> {
-    let mut stream = connect_to_port(uds_path, FILE_PORT).await?;
+async fn write_file_inner(vsock: &dyn Vsock, path: &str, mode: u32, data: &[u8]) -> Result<()> {
+    let mut stream = connect_to_port(vsock, FILE_PORT).await?;
 
     let req = serde_json::to_vec(&WriteReq { path, mode })
         .map_err(|e| VmmError::Vsock(format!("serialize WriteReq: {e}")))?;
@@ -98,14 +96,14 @@ async fn write_file_inner(uds_path: &Path, path: &str, mode: u32, data: &[u8]) -
 }
 
 /// Read the file at `path` inside the sandbox and return its contents.
-pub async fn read_file(uds_path: &Path, path: &str) -> Result<Vec<u8>> {
-    tokio::time::timeout(FILE_IO_TIMEOUT, read_file_inner(uds_path, path))
+pub async fn read_file(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
+    tokio::time::timeout(FILE_IO_TIMEOUT, read_file_inner(vsock, path))
         .await
         .map_err(|_| VmmError::Vsock("file read: timed out".into()))?
 }
 
-async fn read_file_inner(uds_path: &Path, path: &str) -> Result<Vec<u8>> {
-    let mut stream = connect_to_port(uds_path, FILE_PORT).await?;
+async fn read_file_inner(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
+    let mut stream = connect_to_port(vsock, FILE_PORT).await?;
 
     let req = serde_json::to_vec(&ReadReq { path })
         .map_err(|e| VmmError::Vsock(format!("serialize ReadReq: {e}")))?;
@@ -160,7 +158,7 @@ fn decode_file_err(payload: &[u8]) -> VmmError {
 /// One request frame, one response frame. Returns the response payload when
 /// the type matches `ok_type`; decodes `FILE_ERR` into a typed error.
 async fn unary_file_op(
-    uds_path: &Path,
+    vsock: &dyn Vsock,
     req_type: u8,
     req: &(impl Serialize + Sync),
     ok_type: u8,
@@ -168,7 +166,7 @@ async fn unary_file_op(
     let payload =
         serde_json::to_vec(req).map_err(|e| VmmError::Vsock(format!("serialize request: {e}")))?;
     let op = async {
-        let mut stream = connect_to_port(uds_path, FILE_PORT).await?;
+        let mut stream = connect_to_port(vsock, FILE_PORT).await?;
         write_frame(&mut stream, req_type, &payload)
             .await
             .map_err(|e| VmmError::Vsock(format!("write request 0x{req_type:02x}: {e}")))?;
@@ -194,55 +192,55 @@ fn parse_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T> {
 }
 
 /// Stat one path inside the sandbox (symlinks reported, not followed).
-pub async fn stat_file(uds_path: &Path, path: &str) -> Result<FileStatDto> {
+pub async fn stat_file(vsock: &dyn Vsock, path: &str) -> Result<FileStatDto> {
     let req = StatReq {
         path: path.to_owned(),
     };
-    let payload = unary_file_op(uds_path, FILE_STAT_REQ, &req, FILE_STAT).await?;
+    let payload = unary_file_op(vsock, FILE_STAT_REQ, &req, FILE_STAT).await?;
     parse_json(&payload)
 }
 
 /// List a directory inside the sandbox, non-recursively, entries sorted by
 /// name with full metadata.
-pub async fn list_dir(uds_path: &Path, path: &str) -> Result<Vec<FileStatDto>> {
+pub async fn list_dir(vsock: &dyn Vsock, path: &str) -> Result<Vec<FileStatDto>> {
     let req = ListDirReq {
         path: path.to_owned(),
     };
-    let payload = unary_file_op(uds_path, FILE_LIST_REQ, &req, FILE_LIST).await?;
+    let payload = unary_file_op(vsock, FILE_LIST_REQ, &req, FILE_LIST).await?;
     parse_json(&payload)
 }
 
 /// Create a directory (and missing parents) inside the sandbox. Succeeds
 /// when the directory already exists. `mode` is the Unix permission bits;
 /// `0` defaults to `0o755` on the agent side.
-pub async fn make_dir(uds_path: &Path, path: &str, mode: u32) -> Result<()> {
+pub async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result<()> {
     let req = MakeDirReq {
         path: path.to_owned(),
         mode,
     };
-    unary_file_op(uds_path, FILE_MKDIR_REQ, &req, FILE_ACK).await?;
+    unary_file_op(vsock, FILE_MKDIR_REQ, &req, FILE_ACK).await?;
     Ok(())
 }
 
 /// Remove a file, symlink, or directory inside the sandbox. A non-empty
 /// directory requires `recursive` and fails with
 /// [`VmmError::DirectoryNotEmpty`] otherwise.
-pub async fn remove_entry(uds_path: &Path, path: &str, recursive: bool) -> Result<()> {
+pub async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<()> {
     let req = RemoveReq {
         path: path.to_owned(),
         recursive,
     };
-    unary_file_op(uds_path, FILE_REMOVE_REQ, &req, FILE_ACK).await?;
+    unary_file_op(vsock, FILE_REMOVE_REQ, &req, FILE_ACK).await?;
     Ok(())
 }
 
 /// Rename / move an entry within the sandbox.
-pub async fn move_entry(uds_path: &Path, from: &str, to: &str) -> Result<()> {
+pub async fn move_entry(vsock: &dyn Vsock, from: &str, to: &str) -> Result<()> {
     let req = MoveReq {
         from: from.to_owned(),
         to: to.to_owned(),
     };
-    unary_file_op(uds_path, FILE_MOVE_REQ, &req, FILE_ACK).await?;
+    unary_file_op(vsock, FILE_MOVE_REQ, &req, FILE_ACK).await?;
     Ok(())
 }
 
@@ -299,7 +297,7 @@ impl DirWatch {
 /// Open a directory watch inside the sandbox. The setup handshake (connect,
 /// request, `FILE_ACK`) is bounded by [`FILE_IO_TIMEOUT`]; the returned
 /// stream itself is long-lived and unbounded.
-pub async fn watch_dir(uds_path: &Path, path: &str, recursive: bool) -> Result<DirWatch> {
+pub async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<DirWatch> {
     let req = WatchReq {
         path: path.to_owned(),
         recursive,
@@ -307,7 +305,7 @@ pub async fn watch_dir(uds_path: &Path, path: &str, recursive: bool) -> Result<D
     let payload = serde_json::to_vec(&req)
         .map_err(|e| VmmError::Vsock(format!("serialize WatchReq: {e}")))?;
     let setup = async {
-        let mut stream = connect_to_port(uds_path, FILE_PORT).await?;
+        let mut stream = connect_to_port(vsock, FILE_PORT).await?;
         write_frame(&mut stream, FILE_WATCH_REQ, &payload)
             .await
             .map_err(|e| VmmError::Vsock(format!("write FILE_WATCH_REQ: {e}")))?;
@@ -330,7 +328,9 @@ pub async fn watch_dir(uds_path: &Path, path: &str, recursive: bool) -> Result<D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vsock::{read_frame as async_read_frame, write_frame as async_write_frame};
+    use crate::vsock::{
+        UdsVsock, read_frame as async_read_frame, write_frame as async_write_frame,
+    };
 
     #[test]
     fn test_write_req_serializes() {
@@ -534,8 +534,9 @@ mod tests {
     }
 
     /// Bind a mock Firecracker vsock UDS: accept one connection, answer the
-    /// `CONNECT {port}` handshake, then hand the stream to `script`.
-    async fn mock_vsock_server<F, Fut>(script: F) -> (tempfile::TempDir, std::path::PathBuf)
+    /// `CONNECT {port}` handshake, then hand the stream to `script`. The
+    /// returned [`UdsVsock`] dials it.
+    async fn mock_vsock_server<F, Fut>(script: F) -> (tempfile::TempDir, UdsVsock)
     where
         F: FnOnce(UnixStream) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send,
@@ -557,7 +558,7 @@ mod tests {
             stream.write_all(b"OK 53\n").await.unwrap();
             script(stream).await;
         });
-        (dir, path)
+        (dir, UdsVsock(path))
     }
 
     #[tokio::test]
@@ -574,7 +575,7 @@ mod tests {
             symlink_target: String::new(),
         };
         let expected = dto.clone();
-        let (_dir, path) = mock_vsock_server(move |mut stream| async move {
+        let (_dir, vsock) = mock_vsock_server(move |mut stream| async move {
             let (ty, payload) = async_read_frame(&mut stream).await.unwrap();
             assert_eq!(ty, FILE_STAT_REQ);
             let req: StatReq = serde_json::from_slice(&payload).unwrap();
@@ -586,13 +587,13 @@ mod tests {
         })
         .await;
 
-        let got = stat_file(&path, "/a/b").await.unwrap();
+        let got = stat_file(&vsock, "/a/b").await.unwrap();
         assert_eq!(got, expected);
     }
 
     #[tokio::test]
     async fn remove_entry_surfaces_directory_not_empty() {
-        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+        let (_dir, vsock) = mock_vsock_server(|mut stream| async move {
             let (ty, _) = async_read_frame(&mut stream).await.unwrap();
             assert_eq!(ty, FILE_REMOVE_REQ);
             async_write_frame(&mut stream, FILE_ERR, b"ENOTEMPTY: /full")
@@ -601,13 +602,13 @@ mod tests {
         })
         .await;
 
-        let err = remove_entry(&path, "/full", false).await.unwrap_err();
+        let err = remove_entry(&vsock, "/full", false).await.unwrap_err();
         assert!(matches!(err, VmmError::DirectoryNotEmpty(p) if p == "/full"));
     }
 
     #[tokio::test]
     async fn read_file_error_is_classified() {
-        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+        let (_dir, vsock) = mock_vsock_server(|mut stream| async move {
             let _ = async_read_frame(&mut stream).await.unwrap();
             async_write_frame(&mut stream, FILE_ERR, b"ENOENT: /missing")
                 .await
@@ -615,13 +616,13 @@ mod tests {
         })
         .await;
 
-        let err = read_file(&path, "/missing").await.unwrap_err();
+        let err = read_file(&vsock, "/missing").await.unwrap_err();
         assert!(matches!(err, VmmError::PathNotFound(p) if p == "/missing"));
     }
 
     #[tokio::test]
     async fn write_file_error_is_classified() {
-        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+        let (_dir, vsock) = mock_vsock_server(|mut stream| async move {
             // Consume WRITE_REQ, then the data frames until DONE.
             let _ = async_read_frame(&mut stream).await.unwrap();
             loop {
@@ -636,7 +637,7 @@ mod tests {
         })
         .await;
 
-        let err = write_file(&path, "/plain.txt/sub", 0, b"x")
+        let err = write_file(&vsock, "/plain.txt/sub", 0, b"x")
             .await
             .unwrap_err();
         assert!(matches!(err, VmmError::NotADirectory(p) if p == "/plain.txt/sub"));
@@ -644,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_dir_streams_events_until_clean_eof() {
-        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+        let (_dir, vsock) = mock_vsock_server(|mut stream| async move {
             let (ty, payload) = async_read_frame(&mut stream).await.unwrap();
             assert_eq!(ty, FILE_WATCH_REQ);
             let req: WatchReq = serde_json::from_slice(&payload).unwrap();
@@ -663,7 +664,7 @@ mod tests {
         })
         .await;
 
-        let mut watch = watch_dir(&path, "/w", true).await.unwrap();
+        let mut watch = watch_dir(&vsock, "/w", true).await.unwrap();
         let event = watch.next_event().await.unwrap().unwrap();
         assert_eq!(event.kind, proto::EVENT_CREATED);
         assert_eq!(event.path, "/w/new");
@@ -672,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_dir_setup_error_is_typed() {
-        let (_dir, path) = mock_vsock_server(|mut stream| async move {
+        let (_dir, vsock) = mock_vsock_server(|mut stream| async move {
             let _ = async_read_frame(&mut stream).await.unwrap();
             async_write_frame(&mut stream, FILE_ERR, b"ENOENT: /missing")
                 .await
@@ -680,7 +681,7 @@ mod tests {
         })
         .await;
 
-        let err = watch_dir(&path, "/missing", false).await.unwrap_err();
+        let err = watch_dir(&vsock, "/missing", false).await.unwrap_err();
         assert!(matches!(err, VmmError::PathNotFound(p) if p == "/missing"));
     }
 }
