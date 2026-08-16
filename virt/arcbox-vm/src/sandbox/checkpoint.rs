@@ -7,6 +7,11 @@ use super::pool::PreparedSlot;
 use super::types::action;
 use super::*;
 
+/// The image format this path writes — a Firecracker `vmstate` + `mem`
+/// pair — recorded on every catalog entry so a restore can tell which
+/// driver may read it.
+pub(super) const CHECKPOINT_FORMAT: &str = "firecracker/v1";
+
 /// Move a file even when source and destination sit on different mounts.
 ///
 /// The jailer chroot is its own vfsmount (bind + pivot_root), so a plain
@@ -226,6 +231,7 @@ pub(super) async fn checkpoint_impl(
         rootfs_path: Some(rootfs_path),
         net_invariant,
         geometry: Some(geometry),
+        format: CHECKPOINT_FORMAT.to_owned(),
     })?;
 
     let snap_dir_path = meta

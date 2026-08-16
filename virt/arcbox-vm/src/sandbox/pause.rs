@@ -1044,6 +1044,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: false,
                 geometry: None,
+                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap();
         let pending = manager.snapshots.begin("box").unwrap();
@@ -1058,6 +1059,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: false,
                 geometry: None,
+                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap();
 
@@ -1098,6 +1100,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: false,
                 geometry: None,
+                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap();
 
