@@ -39,6 +39,22 @@ use crate::error::{Result, VmmError};
 ///
 /// Methods are synchronous; the network manager calls them on the
 /// activation and teardown paths, which already run blocking netlink work.
+///
+/// Two obligations every implementation carries, because callers were
+/// built against them:
+///
+/// - **Pipeline placement.** The rules are *appended* to their chains, so
+///   they sit below whatever the composer installed at boot (the reference
+///   guest agent's isolation DROPs) and above nothing; per-sandbox expose
+///   companions are prepended above them by their own code. Rendering the
+///   same rules at another position changes the pipeline even when each
+///   rule is faithful.
+/// - **Failure shape.** `install_translation` fails fast on the first rule
+///   that does not apply, leaving the earlier ones in place — the caller
+///   then calls `remove_translation`, which must attempt every rule,
+///   tolerate ones that are already absent (partial installs, crash
+///   replays, legacy TAPs), and report the failures it could not clear
+///   together rather than stopping at the first.
 pub trait PacketFilter: Send + Sync {
     /// Install the translation for `tap` ↔ `pool_ip`.
     fn install_translation(&self, tap: &str, pool_ip: Ipv4Addr) -> Result<()>;
