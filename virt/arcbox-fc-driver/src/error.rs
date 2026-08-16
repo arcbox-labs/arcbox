@@ -123,6 +123,10 @@ pub enum FcError {
         source: std::io::Error,
     },
 
+    /// The spawn reported no pid, so nothing could own the process.
+    #[error("spawned firecracker reported no pid")]
+    NoPid,
+
     /// Signalling the VMM process failed.
     #[error("kill firecracker {pid}: {source}")]
     Kill {

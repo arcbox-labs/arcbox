@@ -24,6 +24,8 @@
 //!   [`render::SpawnPlan`].
 //! - [`vsock`] — the hybrid-vsock Unix-socket handshake and the
 //!   `{uds}_{port}` listener for guest dial-outs.
+//! - [`process`] — the VMM process guard: one waiter task reaps the
+//!   child and publishes its exit; kill, wait, and detach never race it.
 //!
 //! The remaining modules — the spec renderer, jail staging, process
 //! spawning and ownership, the vsock handshake, the prepared VM, the
@@ -45,6 +47,7 @@
 pub mod config;
 pub mod error;
 pub mod jail;
+pub mod process;
 pub mod render;
 pub mod spawn;
 pub mod vsock;
