@@ -45,6 +45,7 @@ pub mod environment;
 pub mod error;
 pub mod file_io;
 pub mod network;
+pub mod rootfs;
 pub mod sandbox;
 pub mod spawn;
 pub mod vsock;

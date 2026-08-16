@@ -283,7 +283,7 @@ impl SandboxService {
             templates::TemplateSource::Default => {
                 // Built on first use, and rebuilt when the staged vm-agent is
                 // newer than the cached image.
-                crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
+                arcbox_vm::rootfs::ensure_default_rootfs(&self.default_rootfs)
                     .await
                     .map_err(|e| SandboxError::Internal(format!("default template: {e}")))?;
                 Ok(self.default_rootfs.clone())
@@ -299,7 +299,7 @@ impl SandboxService {
                     .manager
                     .pinned_rootfs_paths()
                     .map_err(SandboxError::from)?;
-                crate::rootfs_builder::convert_layer_to_rootfs(&layout, &pinned)
+                arcbox_vm::rootfs::convert_layer_to_rootfs(&layout, &pinned)
                     .await
                     .map_err(|e| SandboxError::Internal(format!("template {image}: {e:#}")))
             }

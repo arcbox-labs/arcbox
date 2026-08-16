@@ -20,11 +20,13 @@ serde.workspace        = true
 serde_json.workspace   = true
 uuid.workspace         = true
 tracing.workspace      = true
-nix            = { workspace = true, features = ["process", "term", "signal"] }
+nix            = { workspace = true, features = ["process", "term", "signal", "mount"] }
 libc.workspace         = true
 chrono.workspace       = true
 toml.workspace         = true
 sha2.workspace         = true
+oci2rootfs = { version = "0.2.1", default-features = false }
+arcbox-ext4 = "0.1.2"
 
 [dev-dependencies]
 arcbox-snapshot = { workspace = true, features = ["test-probe"] }

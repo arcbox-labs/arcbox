@@ -18,7 +18,6 @@ pub mod dns_server;
 pub mod error;
 pub mod memory_pressure;
 pub mod metadata_migrate;
-pub mod rootfs_builder;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
 #[cfg(any(target_os = "linux", test))]
