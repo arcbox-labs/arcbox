@@ -1219,6 +1219,7 @@ dependencies = [
 name = "arcbox-vm-driver"
 version = "0.7.0"
 dependencies = [
+ "arcbox-vm-driver",
  "async-trait",
  "serde",
  "serde_json",

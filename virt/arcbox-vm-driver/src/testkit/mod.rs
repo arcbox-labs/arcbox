@@ -11,7 +11,7 @@
 //!
 //! - [`contract`] — the checks every adapter must pass, packaged as the
 //!   [`driver_contract!`](crate::driver_contract) macro over a
-//!   [`ContractHarness`].
+//!   [`ContractHarness`]; the fake passes them too (`tests/fake_contract.rs`).
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -20,7 +20,7 @@ pub mod fake_driver;
 pub mod fake_network;
 mod fake_vm;
 
-pub use contract::ContractHarness;
+pub use contract::{ContractHarness, FakeHarness};
 pub use fake_driver::{FakeDriver, FakeDriverBuilder};
 pub use fake_network::FakeNetwork;
 pub use fake_vm::FakeVm;

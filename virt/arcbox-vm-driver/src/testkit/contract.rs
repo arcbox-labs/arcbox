@@ -4,23 +4,29 @@
 //! its own (usually `#[ignore]`d, hardware-backed) test crate with a
 //! [`ContractHarness`] that knows how to build a spec for that VMM and how
 //! to tell when its guest is usable; the macro expands to one `#[tokio::test]`
-//! per check below.
+//! per check below. [`FakeHarness`] is the reference harness, and the fake
+//! passes the same checks (`tests/fake_contract.rs`).
 //!
 //! Each check is also a plain `pub async fn` here, so an adapter can run one
 //! of them by hand under a custom setup.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::FakeDriver;
 use crate::capability::{
     AfterCheckpoint, CheckpointFormat, CheckpointImage, CheckpointKind, CheckpointOptions,
 };
 use crate::driver::{RestoreSpec, ShutdownMode, VmDriver, VmEvent, VmHandle, VmState};
 use crate::error::Error;
-use crate::spec::{VmId, VmSpec};
+use crate::spec::{
+    BootSpec, CacheMode, ConsoleSpec, DiskSpec, MacAddr, NicAttachment, NicSpec, VmId, VmSpec,
+    VsockSpec,
+};
 
 /// How long a check waits for something the guest or VMM must do.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -45,6 +51,95 @@ pub trait ContractHarness: Send + Sync {
 
     /// Waits until the guest behind `handle` is usable. A no-op for the fake.
     async fn ready(&self, handle: &dyn VmHandle);
+}
+
+/// The reference harness: [`FakeDriver`] over temporary directories.
+pub struct FakeHarness {
+    driver: Arc<FakeDriver>,
+    root: tempfile::TempDir,
+    dirs: AtomicUsize,
+}
+
+impl FakeHarness {
+    /// A harness over `FakeDriver::new()`.
+    pub fn new() -> Self {
+        Self::with_driver(FakeDriver::new())
+    }
+
+    /// A harness over a configured fake — a reduced capability set, say.
+    pub fn with_driver(driver: FakeDriver) -> Self {
+        Self {
+            driver: Arc::new(driver),
+            root: tempfile::tempdir().expect("temporary directory for the fake harness"),
+            dirs: AtomicUsize::new(0),
+        }
+    }
+
+    /// The fake behind the harness, for pushing console bytes or guest
+    /// connections.
+    pub fn fake(&self) -> &FakeDriver {
+        &self.driver
+    }
+}
+
+impl Default for FakeHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ContractHarness for FakeHarness {
+    fn driver(&self) -> Arc<dyn VmDriver> {
+        self.driver.clone()
+    }
+
+    fn spec(&self, id: &VmId) -> VmSpec {
+        VmSpec {
+            id: id.clone(),
+            cpus: 1,
+            memory_mib: 128,
+            boot: BootSpec::Kernel {
+                image: "/fake/vmlinux".into(),
+                cmdline: "console=hvc0".into(),
+                initrd: None,
+            },
+            disks: vec![DiskSpec {
+                id: "rootfs".into(),
+                path: "/fake/rootfs.ext4".into(),
+                read_only: false,
+                root: true,
+                cache: CacheMode::Unsafe,
+            }],
+            nics: vec![NicSpec {
+                id: "eth0".into(),
+                mac: MacAddr::new([0x02, 0xfa, 0xce, 0, 0, 1]),
+                attachment: NicAttachment::Tap {
+                    name: "tap0".into(),
+                },
+            }],
+            vsock: Some(VsockSpec { guest_cid: 3 }),
+            shares: vec![],
+            console: ConsoleSpec::File(self.root.path().join(format!("{id}.console"))),
+            balloon: true,
+            entropy: true,
+            dirty_tracking: true,
+            isolation: Default::default(),
+        }
+    }
+
+    fn runtime_dir(&self) -> PathBuf {
+        let n = self.dirs.fetch_add(1, Ordering::Relaxed);
+        let dir = self.root.path().join(format!("vm{n}"));
+        std::fs::create_dir_all(&dir).expect("runtime dir under the harness root");
+        dir
+    }
+
+    fn dial_port(&self) -> Option<u32> {
+        Some(1024)
+    }
+
+    async fn ready(&self, _handle: &dyn VmHandle) {}
 }
 
 fn id(name: &str) -> VmId {

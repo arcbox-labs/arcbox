@@ -20,5 +20,15 @@ tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 
+# The crate's own tests always exercise the testkit (the fake passes the
+# contract): a path-only self dev-dependency turns the feature on for test
+# builds and is stripped at publish time.
+[dev-dependencies]
+arcbox-vm-driver = { path = ".", features = ["testkit"] }
+
+[[test]]
+name = "fake_contract"
+required-features = ["testkit"]
+
 [lints]
 workspace = true
