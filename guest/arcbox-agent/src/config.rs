@@ -51,7 +51,7 @@ fn guest_defaults() -> VmmConfig {
             sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
             pool_size: 1,
             warm_create: true,
-            dmsetup_candidates: guest_dmsetup_candidates(),
+            dmsetup_candidates: Some(guest_dmsetup_candidates()),
         },
         network: NetworkConfig {
             cidr: "172.20.0.0/16".into(),
@@ -91,16 +91,14 @@ fn guest_dmsetup_candidates() -> Vec<String> {
 }
 
 /// Apply the guest's environment facts on top of a config loaded from a
-/// file: a config written before `dmsetup_candidates` existed deserializes
-/// with the library's stock list, which does not know about the host-shared
-/// copy — the one the System VM actually has. Prepending keeps the search
-/// order the guest has always used without asking every config file to
-/// spell it out.
+/// file: a config that does not mention `dmsetup_candidates` — every one
+/// written before the field existed — gets the search order the guest has
+/// always used, host-shared copy first. A config that spells the list out
+/// is taken as written, including `[]` to run without CoW.
 fn with_guest_environment(mut cfg: VmmConfig) -> VmmConfig {
-    let candidates = &mut cfg.firecracker.dmsetup_candidates;
-    if !candidates.iter().any(|c| c == GUEST_DMSETUP) {
-        candidates.insert(0, GUEST_DMSETUP.into());
-    }
+    cfg.firecracker
+        .dmsetup_candidates
+        .get_or_insert_with(guest_dmsetup_candidates);
     cfg
 }
 
@@ -148,7 +146,10 @@ pub fn load() -> VmmConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{GUEST_DMSETUP, SANDBOX_DATA_DIR, guest_defaults, with_guest_environment};
+    use super::{
+        GUEST_DMSETUP, SANDBOX_DATA_DIR, guest_defaults, guest_dmsetup_candidates,
+        with_guest_environment,
+    };
 
     #[test]
     fn defaults_keep_sandbox_state_on_its_data_mount() {
@@ -165,24 +166,41 @@ mod tests {
     #[test]
     fn dmsetup_search_starts_with_the_host_shared_copy() {
         assert_eq!(
-            guest_defaults().firecracker.dmsetup_candidates,
-            [GUEST_DMSETUP, "/usr/sbin/dmsetup", "/sbin/dmsetup"]
+            guest_defaults().firecracker.dmsetup_candidates.as_deref(),
+            Some(
+                &[
+                    GUEST_DMSETUP.to_string(),
+                    "/usr/sbin/dmsetup".to_string(),
+                    "/sbin/dmsetup".to_string()
+                ][..]
+            )
         );
     }
 
-    /// A config file written before `dmsetup_candidates` existed loads with
-    /// the library's stock list; the guest must still find its own copy.
+    /// A config file that does not mention `dmsetup_candidates` gets the
+    /// guest's own search order; one that spells it out is left alone,
+    /// including the empty list that switches CoW off.
     #[test]
-    fn file_configs_gain_the_host_shared_dmsetup() {
+    fn file_configs_without_the_field_gain_the_guest_search_order() {
         let mut cfg = guest_defaults();
-        cfg.firecracker.dmsetup_candidates = vec!["/usr/sbin/dmsetup".into()];
+        cfg.firecracker.dmsetup_candidates = None;
         let cfg = with_guest_environment(cfg);
         assert_eq!(
             cfg.firecracker.dmsetup_candidates,
-            [GUEST_DMSETUP, "/usr/sbin/dmsetup"]
+            Some(guest_dmsetup_candidates())
         );
-        // Idempotent when the file already lists it, wherever it lists it.
+
+        let mut cfg = guest_defaults();
+        cfg.firecracker.dmsetup_candidates = Some(vec!["/opt/dm/dmsetup".into()]);
         let cfg = with_guest_environment(cfg);
-        assert_eq!(cfg.firecracker.dmsetup_candidates.len(), 2);
+        assert_eq!(
+            cfg.firecracker.dmsetup_candidates.as_deref(),
+            Some(&["/opt/dm/dmsetup".to_string()][..])
+        );
+
+        let mut cfg = guest_defaults();
+        cfg.firecracker.dmsetup_candidates = Some(Vec::new());
+        let cfg = with_guest_environment(cfg);
+        assert_eq!(cfg.firecracker.dmsetup_candidates.as_deref(), Some(&[][..]));
     }
 }

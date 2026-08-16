@@ -41,7 +41,7 @@ fn test_config() -> VmmConfig {
             // and pre-warm work regardless.
             pool_size: 0,
             warm_create: false,
-            dmsetup_candidates: vec!["/usr/sbin/dmsetup".into(), "/sbin/dmsetup".into()],
+            dmsetup_candidates: None,
         },
         network: NetworkConfig {
             cidr: "172.31.0.0/16".to_string(),
