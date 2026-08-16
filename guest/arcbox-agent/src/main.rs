@@ -19,6 +19,10 @@ mod agent;
 #[cfg(any(target_os = "linux", test))]
 mod boot_done;
 mod init;
+// Discovery half of the live-container NFS view. Pure parsing and
+// naming, gated like `boot_done` so the tests run on a host build too.
+#[cfg(any(target_os = "linux", test))]
+mod live_exports;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod runtime_materialize;
 mod supervisor;
