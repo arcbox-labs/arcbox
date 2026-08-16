@@ -14,6 +14,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Fail on any workspace dependency edge that breaks a layer rule.
+    CheckLayers(CheckLayersArgs),
     /// Development-only repository orchestration.
     Dev(DevArgs),
     /// Repeated e2e test runs with artifact capture.
@@ -24,6 +26,13 @@ enum Command {
     Macos(MacosArgs),
     /// Release metadata and artifact generation.
     Release(ReleaseArgs),
+}
+
+#[derive(Args)]
+struct CheckLayersArgs {
+    /// Also list every member-to-member edge and every grandfathered edge.
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Args)]
@@ -212,6 +221,7 @@ fn main() {
 
 fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::CheckLayers(args) => commands::check_layers::run(args),
         Command::Dev(args) => commands::dev::run(args),
         Command::E2e(args) => commands::e2e::run(args),
         Command::Idle(args) => commands::idle::run(args),
