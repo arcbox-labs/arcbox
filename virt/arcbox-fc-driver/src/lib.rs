@@ -30,6 +30,10 @@
 //!   raw client (pause, resume, snapshot, ctrl-alt-del).
 //! - [`listener`] — the port's `VsockListener` over a `{uds}_{port}`
 //!   socket, failing once the VM is gone.
+//! - [`handle`] — [`FcHandle`](handle::FcHandle), the port's `VmHandle`
+//!   over a running VM: state and events from the guard, `Kill` and
+//!   `Graceful` shutdown, and the vsock, listen, checkpoint (pause →
+//!   snapshot → resume or hold), and detach capabilities.
 //!
 //! The remaining modules — the spec renderer, jail staging, process
 //! spawning and ownership, the vsock handshake, the prepared VM, the
@@ -51,6 +55,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod handle;
 pub mod jail;
 pub mod listener;
 pub mod process;
