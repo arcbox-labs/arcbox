@@ -18,6 +18,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 pub mod contract;
 pub mod fake_driver;
 pub mod fake_network;
+mod fake_prepared;
 mod fake_vm;
 mod fake_vsock;
 

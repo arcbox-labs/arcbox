@@ -1,17 +1,18 @@
 //! An in-memory [`VmDriver`] for tests that need a VM without a hypervisor.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, VmInner};
+use super::fake_prepared::Preparer;
+use super::fake_vm::{FakeVm, VmInner};
 use super::fake_vsock::Inbound;
 use super::lock;
-use crate::capability::{Adopt, CheckpointImage};
+use crate::capability::{Adopt, CheckpointImage, Prepare, PreparedVm as _};
 use crate::driver::{
     DriverCapabilities, NestedVirt, RestoreSpec, VmDriver, VmHandle, VmRecord, VmState,
 };
@@ -33,24 +34,31 @@ pub(super) struct Knobs {
 /// one end of a socketpair whose other end echoes; `VsockListen` accepts
 /// what [`FakeDriver::guest_dial`] pushes; `Checkpoint` writes a
 /// `checkpoint.json` that `restore` reads back; `Adopt`/`Detach` go through
-/// the driver's registry; `Console` returns what
-/// [`FakeDriver::push_console`] pushed. [`FakeDriver::builder`] scripts
-/// failures and narrows the claimed capabilities — the accessors follow
-/// the claims, so the contract can be run against a reduced set.
+/// the driver's registry; `Prepare` hands out a process with a synthetic
+/// pid that `boot`/`restore` then run on — the driver's own `boot` is
+/// exactly that pair; `Console` returns what [`FakeDriver::push_console`]
+/// pushed. [`FakeDriver::builder`] scripts failures and narrows the claimed
+/// capabilities — the accessors follow the claims, so the contract can be
+/// run against a reduced set.
 ///
 /// The driver's name is `"fake"`; its checkpoint format is `"fake/v1"`.
 #[derive(Clone)]
 pub struct FakeDriver {
     inner: Arc<DriverInner>,
     adopter: Adopter,
+    preparer: Preparer,
 }
 
 /// The driver's name, as `VmDriver::name` reports it.
-const NAME: &str = "fake";
+pub(super) const NAME: &str = "fake";
 
-struct DriverInner {
-    caps: DriverCapabilities,
-    knobs: Arc<Knobs>,
+/// The first synthetic pid a prepared fake process gets.
+const FIRST_PID: u32 = 100_000;
+
+pub(super) struct DriverInner {
+    pub(super) caps: DriverCapabilities,
+    pub(super) knobs: Arc<Knobs>,
+    next_pid: AtomicU32,
     /// Every VM booted or restored and not yet seen exited.
     vms: Mutex<HashMap<VmId, Arc<VmInner>>>,
 }
@@ -89,10 +97,12 @@ impl FakeDriverBuilder {
         let inner = Arc::new(DriverInner {
             caps: self.caps,
             knobs: Arc::new(self.knobs),
+            next_pid: AtomicU32::new(FIRST_PID),
             vms: Mutex::new(HashMap::new()),
         });
         FakeDriver {
             adopter: Adopter(Arc::clone(&inner)),
+            preparer: Preparer(Arc::clone(&inner)),
             inner,
         }
     }
@@ -113,7 +123,7 @@ impl FakeDriver {
                 checkpoint: true,
                 diff_checkpoint: true,
                 adopt: true,
-                prepare: false,
+                prepare: true,
                 balloon: true,
                 console: true,
                 debug: true,
@@ -140,14 +150,28 @@ impl FakeDriver {
         self.inner.live(vm)?.push_console(bytes);
         Ok(())
     }
+}
 
-    fn register(
+impl Default for FakeDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DriverInner {
+    pub(super) fn next_pid(&self) -> u32 {
+        self.next_pid.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Enters a running VM into the registry; the id must not be live.
+    pub(super) fn register(
         &self,
         spec: VmSpec,
-        runtime_dir: &Path,
+        record: VmRecord,
         balloon_target_bytes: u64,
-    ) -> Result<Box<dyn VmHandle>> {
-        let mut vms = lock(&self.inner.vms);
+        inbound: Arc<Inbound>,
+    ) -> Result<Arc<VmInner>> {
+        let mut vms = lock(&self.vms);
         if let Some(existing) = vms.get(&spec.id) {
             match existing.state() {
                 VmState::Exited(_) => {}
@@ -160,33 +184,18 @@ impl FakeDriver {
                 }
             }
         }
-        let record = VmRecord {
-            id: spec.id.clone(),
-            driver: NAME.to_owned(),
-            runtime_dir: runtime_dir.to_path_buf(),
-            process: None,
-        };
-        let inbound = Inbound::new(spec.id.clone());
         let vm = VmInner::new(
             spec,
             record,
-            self.inner.caps.clone(),
-            Arc::clone(&self.inner.knobs),
+            self.caps.clone(),
+            Arc::clone(&self.knobs),
             balloon_target_bytes,
             inbound,
         );
         vms.insert(vm.id().clone(), Arc::clone(&vm));
-        Ok(Box::new(FakeVm::new(vm)))
+        Ok(vm)
     }
-}
 
-impl Default for FakeDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DriverInner {
     /// The VM if it has not exited; an exited entry is forgotten here.
     fn live(&self, id: &VmId) -> Result<Arc<VmInner>> {
         let mut vms = lock(&self.vms);
@@ -212,21 +221,10 @@ impl VmDriver for FakeDriver {
     }
 
     async fn boot(&self, spec: VmSpec, runtime_dir: &Path) -> Result<Box<dyn VmHandle>> {
-        spec.validate()?;
-        if self
-            .inner
-            .knobs
-            .fail_boot_once
-            .swap(false, Ordering::AcqRel)
-        {
-            return Err(Error::Driver {
-                driver: NAME,
-                message: "scripted boot failure".into(),
-                source: None,
-            });
-        }
-        let balloon_target_bytes = u64::from(spec.memory_mib) << 20;
-        self.register(spec, runtime_dir, balloon_target_bytes)
+        self.preparer
+            .prepare_sync(&spec.id, &spec.isolation, runtime_dir)
+            .boot(spec)
+            .await
     }
 
     async fn restore(
@@ -235,32 +233,18 @@ impl VmDriver for FakeDriver {
         spec: RestoreSpec,
         runtime_dir: &Path,
     ) -> Result<Box<dyn VmHandle>> {
-        if !self.inner.caps.checkpoint || image.format.as_str() != CHECKPOINT_FORMAT {
-            return Err(Error::ForeignCheckpoint(image.format.clone()));
-        }
-        let bytes = tokio::fs::read(image.dir.join("checkpoint.json")).await?;
-        let file: CheckpointFile = serde_json::from_slice(&bytes).map_err(std::io::Error::from)?;
-        if file.format.as_str() != CHECKPOINT_FORMAT {
-            return Err(Error::ForeignCheckpoint(file.format));
-        }
-        let image_disks: BTreeSet<&str> = file.spec.disks.iter().map(|d| d.id.as_str()).collect();
-        let given_disks: BTreeSet<&str> = spec.disks.iter().map(|d| d.id.as_str()).collect();
-        if image_disks != given_disks {
-            return Err(Error::InvalidSpec(format!(
-                "restore disks {given_disks:?} must name exactly the image's disks {image_disks:?}"
-            )));
-        }
-        let mut vm_spec = file.spec;
-        vm_spec.id = spec.id;
-        vm_spec.nics = spec.nics;
-        vm_spec.disks = spec.disks;
-        vm_spec.isolation = spec.isolation;
-        vm_spec.validate()?;
-        self.register(vm_spec, runtime_dir, file.balloon_target_bytes)
+        self.preparer
+            .prepare_sync(&spec.id, &spec.isolation, runtime_dir)
+            .restore(image, spec)
+            .await
     }
 
     fn adopt(&self) -> Option<&dyn Adopt> {
         self.inner.caps.adopt.then_some(&self.adopter)
+    }
+
+    fn prepare(&self) -> Option<&dyn Prepare> {
+        self.inner.caps.prepare.then_some(&self.preparer)
     }
 }
 
