@@ -28,7 +28,6 @@
 //! - [`error`] — the one [`Error`] every port method speaks. There is no
 //!   `Unsupported` variant: what a driver cannot do is a capability
 //!   accessor returning `None`, never an error at call time.
-//!
 //! - `testkit` (feature) — the fakes and the contract test-kit: a
 //!   `FakeDriver` and `FakeNetwork` for runtime unit tests on any host, and
 //!   `driver_contract!`, the checks every adapter must pass.
