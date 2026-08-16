@@ -212,7 +212,6 @@ pub async fn vsock_dial_reaches_the_guest(h: &dyn ContractHarness) {
         .await
         .expect("dial before the deadline")
         .expect("dial");
-    assert!(std::os::fd::AsRawFd::as_raw_fd(&conn.fd) >= 0);
     drop(conn);
     vm.shutdown(ShutdownMode::Kill).await.expect("kill");
 }
@@ -315,7 +314,13 @@ fn assert_same_capabilities(a: &dyn VmHandle, b: &dyn VmHandle) {
 /// the guest's boot-time dial-out is accepted, never missed.
 pub async fn prepared_listener_is_live_before_boot(h: &dyn ContractHarness) {
     let driver = h.driver();
-    let (Some(prepare), Some(port)) = (driver.prepare(), h.guest_dial_out_port()) else {
+    let Some(prepare) = driver.prepare() else {
+        assert!(!driver.capabilities().prepare);
+        return;
+    };
+    // A guest that makes no dial-out at boot has nothing for this check to
+    // catch; the harness says so by naming no port.
+    let Some(port) = h.guest_dial_out_port() else {
         return;
     };
     let spec = h.spec(&id("prep-listen"));
@@ -342,6 +347,7 @@ pub async fn prepared_listener_is_live_before_boot(h: &dyn ContractHarness) {
 pub async fn discard_kills_a_prepared_vm(h: &dyn ContractHarness) {
     let driver = h.driver();
     let Some(prepare) = driver.prepare() else {
+        assert!(!driver.capabilities().prepare);
         return;
     };
     let spec = h.spec(&id("prep-discard"));

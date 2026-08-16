@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use super::fake_driver::Knobs;
+use super::fake_driver::{Knobs, NAME};
 use super::fake_vsock::{FakeListener, Inbound, echo_peer};
 use super::lock;
 use crate::capability::{
@@ -267,14 +267,14 @@ impl Checkpoint for Checkpointer {
         vm.require_alive()?;
         if opts.kind == CheckpointKind::Diff && !vm.caps.diff_checkpoint {
             return Err(Error::Driver {
-                driver: "fake",
+                driver: NAME,
                 message: "diff checkpoints are not enabled on this fake".into(),
                 source: None,
             });
         }
         if vm.knobs.fail_checkpoint_once.swap(false, Ordering::AcqRel) {
             return Err(Error::Driver {
-                driver: "fake",
+                driver: NAME,
                 message: "scripted checkpoint failure".into(),
                 source: None,
             });
@@ -351,7 +351,7 @@ impl Console for FakeVm {
 impl DebugSnapshot for FakeVm {
     fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
-            "driver": "fake",
+            "driver": NAME,
             "id": self.vm.id().as_str(),
             "state": self.vm.state().to_string(),
             "balloon_target_bytes": self.vm.balloon_target_bytes.load(Ordering::Acquire),
