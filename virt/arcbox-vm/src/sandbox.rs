@@ -20,7 +20,8 @@ use arcbox_fc_driver::jail::{
 };
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::net::{
-    GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy, NetworkReconcile,
+    AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy,
+    NetworkReconcile,
 };
 use arcbox_vm_driver::{
     CheckpointFormat, CheckpointImage, CheckpointKind, IsolationSpec, NicSpec, Prepare, PreparedVm,

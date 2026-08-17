@@ -600,9 +600,9 @@ impl SandboxManager {
                 // NAT, no guest work); legacy snapshots keep the legacy TAP
                 // shape and are re-addressed over the reconfig RPC below.
                 let mode = if snap_meta.net_invariant {
-                    crate::network::TapMode::Invariant
+                    AttachMode::Invariant
                 } else {
-                    crate::network::TapMode::LegacySnapshot
+                    AttachMode::LegacySnapshot
                 };
                 nic = Some(self.network.activate(lease, mode).await?);
             }
@@ -925,9 +925,7 @@ impl SandboxManager {
             }
             // What to tell the guest is the network's answer for the mode
             // its interface was activated in, not the lease read raw.
-            let identity = self
-                .network
-                .identity(lease, crate::network::TapMode::LegacySnapshot);
+            let identity = self.network.identity(lease, AttachMode::LegacySnapshot);
             let cmd = crate::boot_proto::NetReconfigCommand {
                 ip: super::ipv4(identity.ip)?,
                 netmask: super::netmask(identity.prefix_len),

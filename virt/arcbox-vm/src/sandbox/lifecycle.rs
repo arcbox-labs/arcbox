@@ -353,11 +353,7 @@ impl SandboxManager {
             )?;
             super::reconcile::write_state_record(&vm_dir, &cleanup_record)?;
             if let Some(lease) = &lease {
-                nic = Some(
-                    self.network
-                        .activate(lease, crate::network::TapMode::Invariant)
-                        .await?,
-                );
+                nic = Some(self.network.activate(lease, AttachMode::Invariant).await?);
             }
 
             let outcome = SandboxProvisionOutcome {
@@ -438,9 +434,7 @@ impl SandboxManager {
         // What the guest is told over its NIC is the network's answer for
         // the mode it was activated in, not a constant of any one adapter.
         let attachment = lease.zip(nic).map(|(lease, nic)| {
-            let identity = self
-                .network
-                .identity(&lease, crate::network::TapMode::Invariant);
+            let identity = self.network.identity(&lease, AttachMode::Invariant);
             NetworkAttachment {
                 lease,
                 nic,

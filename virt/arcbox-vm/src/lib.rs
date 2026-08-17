@@ -61,8 +61,11 @@ pub mod vsock;
 pub use arcbox_vm_proto::boot as boot_proto;
 
 /// The sandbox TAP network lives in `arcbox-tap-net` (vm-stack-redesign
-/// R2); this path stays so the manager and `arcbox-agent` keep resolving
-/// `crate::network::*` until R2b moves them onto the driver port.
+/// R2). Sandboxes reach it through the driver port; this path stays for
+/// the two things that are not sandbox lifecycle — building the default
+/// adapter when a composer supplies none, and the System VM's own
+/// port-forward and init code, which still name `invariant` and
+/// `ExposeTarget` until R3 moves those calls to the composition root.
 pub use arcbox_tap_net as network;
 
 // The snapshot lineage moved to the engine layer (arcbox-snapshot); these

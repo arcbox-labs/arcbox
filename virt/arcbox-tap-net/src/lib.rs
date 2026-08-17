@@ -11,11 +11,12 @@
 //! D-VM6, R2). Everything that touches the kernel is Linux-only; the pool,
 //! the encoders, and the ledger compile and are unit-tested everywhere.
 //!
-//! Two surfaces, one state: [`TapNetwork`]'s inherent methods are what the
-//! sandbox manager calls today, and its [`GuestNetwork`] / [`NetworkReconcile`]
-//! impls ([`guest_network`]) are the same operations spoken in the port's
-//! vocabulary — a [`NetworkLease`] instead of a [`NetworkAllocation`], a
-//! [`NicSpec`] out of activation. R2b moves the manager onto the port.
+//! Two surfaces, one state: the [`GuestNetwork`] / [`NetworkReconcile`]
+//! impls ([`guest_network`]) are what every consumer reaches — a
+//! [`NetworkLease`] instead of a [`NetworkAllocation`], a [`NicSpec`] out
+//! of activation — and [`TapNetwork`]'s inherent methods are what they are
+//! written in. Only the constructors are called from outside now; the
+//! System VM composes this network and then speaks to it through the port.
 //!
 //! [`GuestNetwork`]: arcbox_vm_driver::net::GuestNetwork
 //! [`NetworkReconcile`]: arcbox_vm_driver::net::NetworkReconcile
@@ -91,13 +92,8 @@ pub enum Datapath {
     Iptables,
 }
 
-/// The name the sandbox manager gives [`AttachMode`] — the host-side
-/// addressing scheme applied when a TAP is materialized (see
-/// [`TapNetwork::activate`]). Kept until R2b moves the manager onto the port.
-pub type TapMode = AttachMode;
-
-/// The name this type had inside `arcbox-vm`; the sandbox manager keeps
-/// using it until R2b moves it onto the port.
+/// The name this type had inside `arcbox-vm`, kept so the System VM's
+/// composition still reads as it did.
 pub type NetworkManager = TapNetwork;
 
 /// The translation mechanism actually applied to an active TAP.
@@ -150,10 +146,10 @@ pub enum ExposeTarget {
 /// The TAP network: an IPv4 pool plus, per VM, a point-to-point TAP with
 /// its translation, and the quarantine ledger.
 ///
-/// Reached two ways — through the inherent methods below (the sandbox
-/// manager, until R2b) and through the `GuestNetwork` port
-/// ([`guest_network`]). Both share this one state, so a lease the port
-/// activated is a TAP the inherent `release_checked` tears down.
+/// Reached through the `GuestNetwork` port ([`guest_network`]), which is
+/// written in the inherent methods below. Both share this one state, so a
+/// lease the port activated is a TAP the inherent `release_checked` tears
+/// down.
 pub struct TapNetwork {
     /// Base IP from which the pool starts (host-octet 2 onwards).
     base: Ipv4Addr,

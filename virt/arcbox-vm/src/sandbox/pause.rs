@@ -616,9 +616,9 @@ impl SandboxManager {
                 // legacy one with the legacy TAP shape plus the reconfig RPC
                 // below (CORE-81).
                 let mode = if snap_meta.net_invariant {
-                    crate::network::TapMode::Invariant
+                    AttachMode::Invariant
                 } else {
-                    crate::network::TapMode::LegacySnapshot
+                    AttachMode::LegacySnapshot
                 };
                 nic = Some(self.network.activate(lease, mode).await?);
             }
@@ -741,7 +741,7 @@ impl SandboxManager {
             {
                 let identity = self
                     .network
-                    .identity(lease, crate::network::TapMode::LegacySnapshot);
+                    .identity(lease, AttachMode::LegacySnapshot);
                 let cmd = crate::boot_proto::NetReconfigCommand {
                     ip: super::ipv4(identity.ip)?,
                     netmask: super::netmask(identity.prefix_len),
