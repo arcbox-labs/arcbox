@@ -117,3 +117,92 @@ fn block_device_numbers_round_trip_through_mknod() {
         .status();
     result.unwrap();
 }
+
+/// `BusyboxBlockTools` against a real busybox: attach a sparse file, read
+/// the device's size, detach, and confirm the kernel saw each step. BusyBox's
+/// `losetup` has no long options, so the applet-driving code cannot be
+/// checked with util-linux — this is the one place the real thing runs.
+/// Skips without root or a busybox (`BUSYBOX`, else `/bin/busybox`); the
+/// `integration` job installs `busybox-static` for it.
+#[test]
+#[cfg(target_os = "linux")]
+fn busybox_block_tools_attach_report_and_detach() {
+    use arcbox_vm::snapshot_cow::{BlockTools as _, BusyboxBlockTools};
+
+    const IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+    if !common::is_root() {
+        eprintln!("SKIP busybox_block_tools_attach_report_and_detach — requires root");
+        return;
+    }
+    let busybox = std::env::var("BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
+    if !std::path::Path::new(&busybox).exists() {
+        eprintln!("SKIP busybox_block_tools_attach_report_and_detach — no busybox at {busybox}");
+        return;
+    }
+    let tools = BusyboxBlockTools::new(&busybox);
+    let dir = tempfile::tempdir().unwrap();
+    let backing = dir.path().join("backing.img");
+    std::fs::File::create(&backing)
+        .unwrap()
+        .set_len(IMAGE_BYTES)
+        .unwrap();
+
+    let device = tools.attach_loop(&backing, false).unwrap();
+
+    let sysfs_backing_file = {
+        let index = device
+            .strip_prefix("/dev/loop")
+            .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
+        index.map(|index| format!("/sys/block/loop{index}/loop/backing_file"))
+    };
+    let result = (|| -> Result<(), String> {
+        let sysfs_backing_file = sysfs_backing_file
+            .as_deref()
+            .ok_or_else(|| format!("attach returned {device}, not /dev/loopN"))?;
+        let reported = std::fs::read_to_string(sysfs_backing_file)
+            .map_err(|e| format!("sysfs backing_file for {device}: {e}"))?;
+        let expected = std::fs::canonicalize(&backing).map_err(|e| e.to_string())?;
+        if reported.trim() != expected.to_string_lossy() {
+            return Err(format!(
+                "{device} backs {:?}, expected {}",
+                reported.trim(),
+                expected.display()
+            ));
+        }
+        let sectors = tools.device_sectors(&device).map_err(|e| e.to_string())?;
+        if sectors != IMAGE_BYTES / 512 {
+            return Err(format!(
+                "{device} has {sectors} sectors, expected {}",
+                IMAGE_BYTES / 512
+            ));
+        }
+        Ok(())
+    })();
+
+    let detached = tools.detach_loop(&device);
+    result.unwrap();
+    detached.unwrap();
+
+    // `LOOP_CLR_FD` with another opener — udev's blkid probe of the freshly
+    // attached device, on a stock distro — only marks the device autoclear
+    // and lets the last close release it, so a detach that has "succeeded"
+    // can still show the backing file for a moment. Wait for the kernel to
+    // actually let go before asserting there is nothing left to detach.
+    let sysfs_backing_file = sysfs_backing_file.unwrap();
+    let released_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::path::Path::new(&sysfs_backing_file).exists() {
+        assert!(
+            std::time::Instant::now() < released_by,
+            "{device} still backs {} five seconds after detach",
+            std::fs::read_to_string(&sysfs_backing_file)
+                .unwrap_or_default()
+                .trim()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        tools.detach_loop(&device).is_err(),
+        "detaching the released {device} again should fail"
+    );
+}

@@ -190,8 +190,10 @@ pub struct CowManager {
     /// Serializes the cache-miss attach+insert window so two concurrent
     /// first-time setups for the same template converge on a single
     /// `TemplateEntry` instead of each attaching its own loop device and
-    /// leaking the loser.  (TOCTOU on `losetup -f` itself is handled by
-    /// the kernel via `losetup --show`.)
+    /// leaking the loser.  (The other race — a free loop device claimed by
+    /// another process between query and attach — is [`BlockTools`]'s to
+    /// handle; `BusyboxBlockTools` re-queries and retries, since busybox
+    /// has no atomic `losetup -f --show`.)
     losetup_lock: AsyncMutex<()>,
     cow_dir: PathBuf,
     tools: Arc<dyn BlockTools>,
@@ -740,10 +742,20 @@ async fn dmsetup_create(bin: &Path, name: &str, table: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove a dm device via `dmsetup remove`.
+/// Remove a dm device via `dmsetup remove --retry`.
+///
+/// The caller has already reaped the VM process, so its opener is gone, but
+/// on a host with udev that very close is what wakes the next one: the dm
+/// udev rules put an inotify `watch` on every dm node, a close-after-write
+/// re-triggers the blkid probe, and the probe holds the device open for a
+/// moment — right when the remove ioctl runs. `--retry` repeats the remove
+/// on `EBUSY` for a few seconds instead of failing on the first, which is
+/// libdevmapper's own answer to that race; a device that is genuinely still
+/// in use fails as before, only later. (Reconciliation at startup uses the
+/// same flag: `persistence.rs`.)
 async fn dmsetup_remove(bin: &Path, name: &str) -> Result<()> {
     let mut cmd = Command::new(bin);
-    cmd.args(["remove", name]);
+    cmd.args(["remove", "--retry", name]);
 
     let output = run_cmd(cmd).await?;
 

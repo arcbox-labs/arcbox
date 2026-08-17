@@ -9,12 +9,15 @@
 //! implementation. [`BusyboxBlockTools`] is the reference: the System VM's
 //! behaviour, unchanged.
 //!
-//! Device-node helpers that only need syscalls (`stat`, `mknod`) are plain
-//! functions here rather than trait methods: there is nothing environment
-//! specific about them once they stop shelling out.
+//! Device-node helpers that only need syscalls (`stat`, `mknod`) or a
+//! sysfs read are plain functions here rather than trait methods: there is
+//! nothing environment specific about them once they stop shelling out.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+use tracing::debug;
 
 use crate::error::{Result, SnapshotError};
 
@@ -26,8 +29,11 @@ use crate::error::{Result, SnapshotError};
 /// `Send + Sync`.
 pub trait BlockTools: Send + Sync {
     /// Attach `backing` as a loop device and return the device path
-    /// (`/dev/loopN`). Allocation and attach must be one atomic step against
-    /// concurrent callers (`losetup -f --show`, or `LOOP_CONFIGURE`).
+    /// (`/dev/loopN`). Must hold up against concurrent callers in other
+    /// processes: either allocate and attach in one atomic step
+    /// (`LOOP_CONFIGURE`, util-linux `losetup -f --show`) or, when the tool
+    /// cannot, query a free device, attach to it, and retry when another
+    /// process claimed it in between (what [`BusyboxBlockTools`] does).
     fn attach_loop(&self, backing: &Path, read_only: bool) -> Result<String>;
 
     /// Detach a loop device.
@@ -37,10 +43,27 @@ pub trait BlockTools: Send + Sync {
     fn device_sectors(&self, device: &str) -> Result<u64>;
 }
 
+/// How many free-device queries [`BusyboxBlockTools::attach_loop`] makes
+/// before giving up on a device that keeps being claimed underneath it.
+const ATTACH_ATTEMPTS: u32 = 8;
+
+/// Pause between those attempts — long enough for the competing attach to
+/// finish, short enough to be invisible next to the subprocess spawns.
+const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(5);
+
 /// [`BlockTools`] over busybox applets — the System VM's userland.
 ///
 /// Every operation runs `<busybox> <applet> …`; the applets are `losetup`
-/// (busybox ≥ 1.21 for `-f --show`) and `blockdev`.
+/// and `blockdev`. BusyBox's `losetup` has no long options at all
+/// (`util-linux/losetup.c`: `[-rP] [-o OFS] {-f|LOOPDEV} FILE`), so
+/// util-linux's atomic allocate-and-report form `-f --show` is an
+/// unrecognized-option error there, and `-f FILE` attaches without printing
+/// which device it used. Attaching is therefore two applet runs: `losetup
+/// -f` prints the first free device, then `losetup [-r] /dev/loopN FILE`
+/// attaches to exactly that device. Another process can claim the queried
+/// device in between (`mount -o loop`, a concurrent template build), in
+/// which case the attach fails and [`attach_loop`](BlockTools::attach_loop)
+/// re-queries and retries, up to [`ATTACH_ATTEMPTS`] times.
 #[derive(Debug, Clone)]
 pub struct BusyboxBlockTools {
     busybox: PathBuf,
@@ -69,6 +92,43 @@ impl BusyboxBlockTools {
                 ))
             })
     }
+
+    /// `losetup -f`: the first free loop device, as `/dev/loopN`.
+    fn next_free_loop(&self) -> Result<String> {
+        let output = self.run("losetup", &["-f"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SnapshotError::DeviceMapper(format!("losetup -f: {stderr}")));
+        }
+        parse_free_loop(&output.stdout)
+    }
+
+    /// Confirm the kernel agrees that `device` now backs `backing`.
+    ///
+    /// `/sys/block/loopN/loop/backing_file` is the kernel's own view of the
+    /// attachment (the resolved path of the file it holds open); busybox's
+    /// exit status only says its ioctls returned zero. No sysfs node — no
+    /// `/sys` mounted, an unusual kernel — leaves nothing to check and is
+    /// not a failure. A device that answers with a different file is
+    /// detached again so a failed attach leaks nothing.
+    fn verify_attached(&self, device: &str, backing: &Path) -> Result<()> {
+        let Some(actual) = loop_backing_file(device)? else {
+            return Ok(());
+        };
+        let matches = actual == backing.to_string_lossy()
+            || std::fs::canonicalize(backing).is_ok_and(|path| path.to_string_lossy() == actual);
+        if matches {
+            return Ok(());
+        }
+        let detach_note = match self.detach_loop(device) {
+            Ok(()) => String::new(),
+            Err(detach) => format!("; and detaching it again failed: {detach}"),
+        };
+        Err(SnapshotError::DeviceMapper(format!(
+            "{device} backs {actual}, not {}{detach_note}",
+            backing.display()
+        )))
+    }
 }
 
 impl Default for BusyboxBlockTools {
@@ -78,33 +138,52 @@ impl Default for BusyboxBlockTools {
 }
 
 impl BlockTools for BusyboxBlockTools {
-    /// Uses the atomic `losetup -f --show` form so the kernel allocates and
-    /// attaches in a single `LOOP_CTL_GET_FREE`+`LOOP_SET_FD` call, avoiding
-    /// the TOCTOU window of separate `-f` then `attach` invocations against
-    /// other processes that might claim the same slot.
+    /// `losetup -f`, then `losetup [-r] /dev/loopN FILE`, retried when the
+    /// queried device is claimed by someone else before the attach lands.
+    /// A lost race shows up either as the kernel's `EBUSY` from
+    /// `LOOP_CONFIGURE`/`LOOP_SET_FD` — busybox prints "Device or resource
+    /// busy" — or, when busybox notices the device is taken before it
+    /// issues the ioctl, as a failure with whatever stale errno text it had
+    /// on hand, so the classifier also asks sysfs whether the device gained
+    /// a backing file. Any other failure is reported with busybox's stderr.
     fn attach_loop(&self, backing: &Path, read_only: bool) -> Result<String> {
         let backing_str = backing
             .to_str()
             .ok_or_else(|| SnapshotError::DeviceMapper("non-UTF-8 path".into()))?;
-        let output = if read_only {
-            self.run("losetup", &["-r", "-f", "--show", backing_str])?
-        } else {
-            self.run("losetup", &["-f", "--show", backing_str])?
-        };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SnapshotError::DeviceMapper(format!(
-                "losetup attach {}: {stderr}",
-                backing.display()
-            )));
+        let mut last_loss = String::new();
+        for attempt in 1..=ATTACH_ATTEMPTS {
+            let device = self.next_free_loop()?;
+            let mut args = Vec::with_capacity(3);
+            if read_only {
+                args.push("-r");
+            }
+            args.extend([device.as_str(), backing_str]);
+            let output = self.run("losetup", &args)?;
+            if output.status.success() {
+                self.verify_attached(&device, backing)?;
+                return Ok(device);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if !(is_busy_message(&stderr, backing_str) || loop_backing_file(&device)?.is_some()) {
+                return Err(SnapshotError::DeviceMapper(format!(
+                    "losetup {device} {}: {stderr}",
+                    backing.display()
+                )));
+            }
+            debug!(
+                %device,
+                attempt,
+                %stderr,
+                "free loop device was claimed by another process; re-querying"
+            );
+            last_loss = format!("{device}: {stderr}");
+            std::thread::sleep(ATTACH_RETRY_DELAY);
         }
-        let dev = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if dev.is_empty() {
-            return Err(SnapshotError::DeviceMapper(
-                "losetup --show returned empty device path".into(),
-            ));
-        }
-        Ok(dev)
+        Err(SnapshotError::DeviceMapper(format!(
+            "losetup attach {}: another process claimed the free loop device on all \
+             {ATTACH_ATTEMPTS} attempts (last: {last_loss})",
+            backing.display()
+        )))
     }
 
     fn detach_loop(&self, device: &str) -> Result<()> {
@@ -130,6 +209,53 @@ impl BlockTools for BusyboxBlockTools {
             .trim()
             .parse::<u64>()
             .map_err(|e| SnapshotError::DeviceMapper(format!("blockdev parse: {e}")))
+    }
+}
+
+/// The device `losetup -f` printed: `/dev/loopN` plus a trailing newline,
+/// nothing else accepted — the name is reused verbatim as the attach target
+/// and as the sysfs node to verify against.
+fn parse_free_loop(stdout: &[u8]) -> Result<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let device = text.trim();
+    match device.strip_prefix("/dev/loop") {
+        Some(index) if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) => {
+            Ok(device.to_owned())
+        }
+        _ => Err(SnapshotError::DeviceMapper(format!(
+            "losetup -f printed {device:?}, not a /dev/loopN device"
+        ))),
+    }
+}
+
+/// Whether a failed attach's stderr names the lost-race error: the kernel's
+/// `EBUSY` from a device that was free a moment ago — "Device or resource
+/// busy" under glibc, "Resource busy" under musl, however the tool spells
+/// it. `losetup` echoes the backing path (`losetup: FILE: <reason>`, or
+/// just `losetup: FILE` when it died with errno 0), so that path is scrubbed
+/// first: a `busybox-…` template must not turn a permanent failure into a
+/// phantom race.
+fn is_busy_message(stderr: &str, backing: &str) -> bool {
+    stderr
+        .replace(backing, "")
+        .to_ascii_lowercase()
+        .contains("busy")
+}
+
+/// The file the kernel reports as backing loop device `device`
+/// (`/dev/loopN`), read from `/sys/block/loopN/loop/backing_file`: the
+/// resolved path of the file the device holds open.
+///
+/// `None` when the device is unattached or the sysfs node is absent — a
+/// host without sysfs, or a name that is not a loop device at all.
+pub(super) fn loop_backing_file(device: &str) -> Result<Option<String>> {
+    let Some(name) = Path::new(device).file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(format!("/sys/block/{name}/loop/backing_file")) {
+        Ok(path) => Ok(Some(path.trim().to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -234,5 +360,148 @@ mod tests {
         let tools = BusyboxBlockTools::new("/nonexistent/arcbox-busybox");
         let err = tools.detach_loop("/dev/loop0").unwrap_err();
         assert!(err.to_string().contains("spawn"), "{err}");
+    }
+
+    #[test]
+    fn free_loop_output_is_a_loop_device_with_the_newline_stripped() {
+        assert_eq!(parse_free_loop(b"/dev/loop3\n").unwrap(), "/dev/loop3");
+        assert_eq!(parse_free_loop(b"/dev/loop12").unwrap(), "/dev/loop12");
+        for garbage in [
+            &b""[..],
+            b"\n",
+            b"/dev/loop",
+            b"/dev/loopX",
+            b"loop3\n",
+            b"/dev/sda1\n",
+        ] {
+            let err = parse_free_loop(garbage).unwrap_err();
+            assert!(
+                err.to_string().contains("not a /dev/loopN"),
+                "{garbage:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn busy_classifier_reads_the_reason_not_the_echoed_path() {
+        let img = "/tmp/x.img";
+        assert!(is_busy_message(
+            "losetup: /tmp/x.img: Device or resource busy\n",
+            img
+        ));
+        assert!(is_busy_message("losetup: /tmp/x.img: Resource busy", img));
+        assert!(is_busy_message("losetup: /dev/loop3: EBUSY", img));
+        assert!(is_busy_message(
+            "losetup: /tmp/x.img: failed to set up loop device: Device or resource busy",
+            img
+        ));
+        assert!(!is_busy_message(
+            "losetup: /tmp/x.img: No such file or directory",
+            img
+        ));
+        assert!(!is_busy_message("", img));
+
+        let template = "/templates/busybox-1.36.ext4";
+        assert!(!is_busy_message(
+            "losetup: /templates/busybox-1.36.ext4: No such file or directory",
+            template
+        ));
+        assert!(!is_busy_message(
+            "losetup: /templates/busybox-1.36.ext4",
+            template
+        ));
+        assert!(is_busy_message(
+            "losetup: /templates/busybox-1.36.ext4: Resource busy",
+            template
+        ));
+    }
+
+    /// A busybox stand-in: a shell script that logs every invocation's
+    /// arguments to `calls` and runs `body` (a `case "$*"` over them). It
+    /// hands out `/dev/loop9999`, a device no host has, so the sysfs
+    /// verification finds nothing to compare and the script stays the only
+    /// authority on what happened.
+    fn fake_busybox(dir: &Path, body: &str) -> (BusyboxBlockTools, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let calls = dir.join("calls");
+        let script = dir.join("busybox");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n{body}\nesac\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (BusyboxBlockTools::new(script), calls)
+    }
+
+    fn attach_calls(calls: &Path) -> Vec<String> {
+        std::fs::read_to_string(calls)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("losetup /dev/loop") || line.starts_with("losetup -r"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn attach_queries_a_free_device_then_attaches_to_exactly_that_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, calls) = fake_busybox(
+            dir.path(),
+            "\"losetup -f\") echo /dev/loop9999 ;;\n\
+             \"losetup -r /dev/loop9999 \"*) exit 0 ;;\n\
+             *) echo \"unexpected: $*\" >&2; exit 2 ;;",
+        );
+        let backing = dir.path().join("template.ext4");
+        std::fs::write(&backing, b"").unwrap();
+
+        let device = tools.attach_loop(&backing, true).unwrap();
+
+        assert_eq!(device, "/dev/loop9999");
+        assert_eq!(
+            attach_calls(&calls),
+            [format!("losetup -r /dev/loop9999 {}", backing.display())]
+        );
+    }
+
+    #[test]
+    fn attach_retries_a_claimed_device_a_bounded_number_of_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, calls) = fake_busybox(
+            dir.path(),
+            "\"losetup -f\") echo /dev/loop9999 ;;\n\
+             *) echo \"losetup: $3: Device or resource busy\" >&2; exit 1 ;;",
+        );
+
+        let err = tools
+            .attach_loop(Path::new("/tmp/cow.img"), false)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("8 attempts"), "{err}");
+        assert_eq!(attach_calls(&calls).len(), 8);
+    }
+
+    #[test]
+    fn attach_reports_any_other_failure_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, calls) = fake_busybox(
+            dir.path(),
+            "\"losetup -f\") echo /dev/loop9999 ;;\n\
+             *) echo \"losetup: /tmp/cow.img: No such file or directory\" >&2; exit 1 ;;",
+        );
+
+        let err = tools
+            .attach_loop(Path::new("/tmp/cow.img"), false)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("No such file or directory"),
+            "{err}"
+        );
+        assert_eq!(attach_calls(&calls).len(), 1);
     }
 }
