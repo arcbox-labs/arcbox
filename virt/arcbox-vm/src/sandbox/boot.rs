@@ -1,5 +1,5 @@
 use super::record::{SandboxRecordStore, SandboxTransition};
-use super::spec::build_vm_spec;
+use super::spec::{build_vm_spec, nic_spec};
 use super::types::action;
 use super::*;
 use arcbox_snapshot::SnapshotError;
@@ -1082,8 +1082,9 @@ async fn do_boot(
     }
     .map_err(|error| failed(error.into()))?;
 
+    let nic = net_alloc.map(nic_spec).transpose().map_err(failed)?;
     let vm_spec =
-        build_vm_spec(id, spec, net_alloc, kernel_path, rootfs_path, isolation).map_err(failed)?;
+        build_vm_spec(id, spec, nic, kernel_path, rootfs_path, isolation).map_err(failed)?;
     let handle = prepared
         .boot(vm_spec)
         .await

@@ -687,7 +687,7 @@ impl SandboxManager {
             let restore = restore_spec(
                 id,
                 &cr,
-                net_alloc.as_ref(),
+                net_alloc.as_ref().map(super::spec::nic_spec).transpose()?,
                 IsolationSpec::try_from(jailer)?,
             )?;
             let handle: Arc<dyn VmHandle> = Arc::from(

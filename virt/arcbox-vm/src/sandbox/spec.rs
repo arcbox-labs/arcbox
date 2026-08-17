@@ -14,7 +14,6 @@ use arcbox_vm_driver::{
 
 use crate::boot_proto::KernelIpParam;
 use crate::error::{Result, VmmError};
-use crate::network::NetworkAllocation;
 use crate::sandbox::SandboxSpec;
 
 /// The boot recipe as the driver port sees it.
@@ -27,15 +26,19 @@ use crate::sandbox::SandboxSpec;
 /// network-agnostic and restore with zero guest-side work. The guest-side
 /// vm-agent parses the `ip=` parameter back via `KernelIpParam::from_str`
 /// to derive the DNS nameserver.
+///
+/// `nic` is what the guest network handed back when it activated this
+/// sandbox's lease — the one NIC a sandbox ever has, or none when the
+/// sandbox is networkless.
 pub(super) fn build_vm_spec(
     id: &str,
     spec: &SandboxSpec,
-    net_alloc: Option<&NetworkAllocation>,
+    nic: Option<NicSpec>,
     kernel: PathBuf,
     rootfs: PathBuf,
     isolation: IsolationSpec,
 ) -> Result<VmSpec> {
-    let cmdline = if net_alloc.is_some() && !spec.boot_args.contains("ip=") {
+    let cmdline = if nic.is_some() && !spec.boot_args.contains("ip=") {
         let ip_param = KernelIpParam {
             client: crate::network::invariant::GUEST_IP,
             gateway: crate::network::invariant::GUEST_GATEWAY,
@@ -60,7 +63,7 @@ pub(super) fn build_vm_spec(
             initrd: None,
         },
         disks: vec![rootfs_disk(rootfs)],
-        nics: net_alloc.map(nic_spec).transpose()?.into_iter().collect(),
+        nics: nic.into_iter().collect(),
         // CID 3 is the conventional guest CID; each VMM is isolated so the
         // same CID is safe across concurrent sandboxes.
         vsock: Some(VsockSpec { guest_cid: 3 }),
@@ -87,7 +90,7 @@ pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
 }
 
 /// The guest's one NIC, `eth0`, on the allocation's TAP with its MAC.
-pub(super) fn nic_spec(net: &NetworkAllocation) -> Result<NicSpec> {
+pub(super) fn nic_spec(net: &crate::network::NetworkAllocation) -> Result<NicSpec> {
     Ok(NicSpec {
         id: "eth0".into(),
         mac: net.mac_address.parse().map_err(VmmError::from)?,
@@ -98,17 +101,18 @@ pub(super) fn nic_spec(net: &NetworkAllocation) -> Result<NicSpec> {
 }
 
 /// What a restore may change about the checkpointed VM: its identity
-/// (`owner`, the id the jail is keyed by), the fresh TAP, and the disk it
-/// runs on — the rootfs staged into the owner's jail.
+/// (`owner`, the id the jail is keyed by), the fresh NIC the guest network
+/// activated, and the disk it runs on — the rootfs staged into the owner's
+/// jail.
 pub(super) fn restore_spec(
     owner: &str,
     chroot: &Path,
-    net_alloc: Option<&NetworkAllocation>,
+    nic: Option<NicSpec>,
     isolation: IsolationSpec,
 ) -> Result<RestoreSpec> {
     Ok(RestoreSpec {
         id: VmId::new(owner)?,
-        nics: net_alloc.map(nic_spec).transpose()?.into_iter().collect(),
+        nics: nic.into_iter().collect(),
         disks: vec![rootfs_disk(chroot.join("rootfs.ext4"))],
         isolation,
     })
@@ -118,15 +122,14 @@ pub(super) fn restore_spec(
 mod tests {
     use super::*;
 
-    fn allocation() -> NetworkAllocation {
-        NetworkAllocation {
-            tap_name: "vmtap0-7".into(),
-            ip_address: "172.20.0.7".parse().unwrap(),
-            prefix_len: 16,
-            gateway: "172.20.0.1".parse().unwrap(),
-            mac_address: "02:fc:00:00:00:07".into(),
-            dns_servers: vec![],
-            cleanup_token: String::new(),
+    /// The NIC a guest network hands back from activating a lease.
+    fn nic() -> NicSpec {
+        NicSpec {
+            id: "eth0".into(),
+            mac: "02:fc:00:00:00:07".parse().unwrap(),
+            attachment: NicAttachment::Tap {
+                name: "vmtap0-7".into(),
+            },
         }
     }
 
@@ -145,7 +148,7 @@ mod tests {
         let vm = build_vm_spec(
             "box",
             &spec,
-            Some(&allocation()),
+            Some(nic()),
             PathBuf::from("/jail/vmlinux"),
             PathBuf::from("/jail/rootfs.ext4"),
             IsolationSpec::None,
@@ -188,7 +191,7 @@ mod tests {
         let vm = build_vm_spec(
             "box",
             &pinned,
-            Some(&allocation()),
+            Some(nic()),
             "/k".into(),
             "/r".into(),
             IsolationSpec::None,
