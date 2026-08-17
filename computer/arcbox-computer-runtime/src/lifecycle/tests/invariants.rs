@@ -82,8 +82,10 @@ fn recovery_seeds_the_state_its_own_verdict_leaves_behind() {
 /// Drives a cold create through to `ready`, discarding effects.
 #[test]
 fn a_stop_only_acts_while_the_guest_serves() {
-    // `stop_sandbox` accepts Ready/Running/Stopping and answers WrongState
-    // everywhere else; the machine swallows the rest for the actor to answer.
+    // `stop_sandbox` accepts Ready/Running/Stopping (and retries idempotently
+    // from Stopped), answering WrongState elsewhere. Only the first two are a
+    // state change, so re-entering `stopping` emits nothing; everything else
+    // the machine swallows for the actor to answer.
     for node in explore() {
         let (mut sm, mut context) = reach(&node.path);
         let (state, effects) = step(
