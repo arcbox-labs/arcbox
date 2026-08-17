@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// The identity of a VM: non-empty, at most 64 characters, `[A-Za-z0-9._-]`.
+/// The identity of a VM: a plain name — non-empty, at most 64 characters,
+/// `[A-Za-z0-9._-]`, and not `.` or `..`.
 ///
 /// Drivers use it as a runtime-directory and socket-name component, which is
-/// what the character set protects.
+/// what the rule protects; [`DiskSpec::id`] is held to the same one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct VmId(String);
@@ -31,23 +32,7 @@ impl VmId {
     /// Validates `id` and wraps it.
     pub fn new(id: impl Into<String>) -> Result<Self> {
         let id = id.into();
-        if id.is_empty() {
-            return Err(Error::InvalidSpec("vm id must not be empty".into()));
-        }
-        if id.len() > Self::MAX_LEN {
-            return Err(Error::InvalidSpec(format!(
-                "vm id `{id}` exceeds {} characters",
-                Self::MAX_LEN
-            )));
-        }
-        if let Some(bad) = id
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-        {
-            return Err(Error::InvalidSpec(format!(
-                "vm id `{id}` contains `{bad}`; allowed: A-Z a-z 0-9 . _ -"
-            )));
-        }
+        require_plain_name("vm id", &id)?;
         Ok(Self(id))
     }
 
@@ -209,10 +194,11 @@ pub struct VmSpec {
 impl VmSpec {
     /// Checks the invariants no driver can repair.
     ///
-    /// CPU and memory are at least 1; disk ids, NIC ids and share tags are
-    /// non-empty and unique; at most one disk is the root; every MAC is a
-    /// non-nil unicast address; every boot, disk and share path is
-    /// non-empty; the vsock guest CID is 3 or above.
+    /// CPU and memory are at least 1; disk ids are plain names under the
+    /// [`VmId`] rule and unique; NIC ids and share tags are non-empty and
+    /// unique; at most one disk is the root; every MAC is a non-nil unicast
+    /// address; every boot, disk and share path is non-empty; the vsock
+    /// guest CID is 3 or above.
     pub fn validate(&self) -> Result<()> {
         if self.cpus == 0 {
             return Err(Error::InvalidSpec("cpus must be at least 1".into()));
@@ -223,9 +209,7 @@ impl VmSpec {
         self.boot.validate()?;
         let mut disk_ids = HashSet::new();
         for disk in &self.disks {
-            if disk.id.is_empty() {
-                return Err(Error::InvalidSpec("disk id must not be empty".into()));
-            }
+            require_plain_name("disk id", &disk.id)?;
             if !disk_ids.insert(disk.id.as_str()) {
                 return Err(Error::InvalidSpec(format!(
                     "duplicate disk id `{}`",
@@ -287,6 +271,35 @@ fn require_path(what: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The rule for anything a driver may turn into a path component, a socket
+/// name, or a URL segment: non-empty, at most [`VmId::MAX_LEN`] bytes,
+/// `[A-Za-z0-9._-]`, and not the `.` / `..` traversal names.
+fn require_plain_name(what: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidSpec(format!("{what} must not be empty")));
+    }
+    if name.len() > VmId::MAX_LEN {
+        return Err(Error::InvalidSpec(format!(
+            "{what} `{name}` exceeds {} characters",
+            VmId::MAX_LEN
+        )));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Err(Error::InvalidSpec(format!(
+            "{what} `{name}` contains `{bad}`; allowed: A-Z a-z 0-9 . _ -"
+        )));
+    }
+    if name == "." || name == ".." {
+        return Err(Error::InvalidSpec(format!(
+            "{what} `{name}` is a path traversal name"
+        )));
+    }
+    Ok(())
+}
+
 /// How the guest starts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -336,7 +349,9 @@ impl BootSpec {
 /// One block device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskSpec {
-    /// Unique within the spec; drivers use it as the device's name.
+    /// Unique within the spec; drivers use it as the device's name, and as
+    /// a file name or URL segment, so it is held to the [`VmId`] rule
+    /// (`[A-Za-z0-9._-]`, at most 64 characters, not `.` or `..`).
     pub id: String,
     /// The backing file on the host.
     pub path: PathBuf,
@@ -534,11 +549,24 @@ mod tests {
     fn vm_id_accepts_the_documented_alphabet_and_nothing_else() {
         assert!(VmId::new("a.b_c-D9").is_ok());
         assert!(VmId::new("x".repeat(VmId::MAX_LEN)).is_ok());
+        assert!(VmId::new(".hidden").is_ok());
+        assert!(VmId::new("...").is_ok());
         assert!(VmId::new("").is_err());
         assert!(VmId::new("x".repeat(VmId::MAX_LEN + 1)).is_err());
         assert!(VmId::new("has space").is_err());
         assert!(VmId::new("slash/y").is_err());
         assert!(VmId::new("ünïcode").is_err());
+    }
+
+    #[test]
+    fn vm_id_refuses_the_traversal_names() {
+        for bad in [".", ".."] {
+            match VmId::new(bad) {
+                Err(Error::InvalidSpec(msg)) => assert!(msg.contains("traversal"), "{msg}"),
+                other => panic!("`{bad}` gave {other:?}"),
+            }
+            assert!(serde_json::from_str::<VmId>(&format!("\"{bad}\"")).is_err());
+        }
     }
 
     #[test]
@@ -610,6 +638,24 @@ mod tests {
         let mut s = spec();
         s.disks[0].path = PathBuf::new();
         assert!(invalid(&s).contains("disk path"));
+    }
+
+    #[test]
+    fn disk_ids_are_plain_names() {
+        for bad in [
+            ".",
+            "..",
+            "a/b",
+            "has space",
+            "x".repeat(VmId::MAX_LEN + 1).as_str(),
+        ] {
+            let mut s = spec();
+            s.disks[0].id = bad.into();
+            assert!(invalid(&s).contains("disk id"), "`{bad}` accepted");
+        }
+        let mut s = spec();
+        s.disks[0].id = "root.fs_v2-a".into();
+        s.validate().unwrap();
     }
 
     #[test]
