@@ -115,21 +115,10 @@ fn default_warm_create() -> bool {
 }
 
 /// How the pool-IP <-> fixed-guest-IP translation of an invariant sandbox TAP
-/// (CORE-81) is applied host-side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SandboxDatapath {
-    /// Per-TAP TCX eBPF programs: two attach syscalls and one map update per
-    /// activation, stateless, O(1) per packet (CORE-83). Falls back to
-    /// [`Self::Iptables`] automatically when the BPF object cannot be loaded
-    /// or attached.
-    #[default]
-    Ebpf,
-    /// The CORE-81 iptables rule set (mark + DNAT/SNAT + fwmark fib rules);
-    /// conntrack-stateful and O(active sandboxes) per packet. Also the only
-    /// mechanism ever applied to legacy (non-invariant) TAPs.
-    Iptables,
-}
+/// (CORE-81) is applied host-side — the TAP network's own
+/// [`arcbox_tap_net::Datapath`], under the name this config has always
+/// used.
+pub use arcbox_tap_net::Datapath as SandboxDatapath;
 
 /// Network IP-pool settings for sandbox TAP interfaces.
 #[derive(Debug, Clone, Serialize, Deserialize)]

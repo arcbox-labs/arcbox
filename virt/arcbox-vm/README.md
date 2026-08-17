@@ -67,23 +67,32 @@ loop-device tooling behind `arcbox_snapshot::snapshot_cow::BlockTools`
 (`BusyboxBlockTools` is the reference; a `util-linux` or ioctl
 implementation is a consumer's few dozen lines) and the netfilter
 rendering of the identity-invariant translation behind
-`arcbox_vm::network::PacketFilter` (`IptablesLegacy` is the reference;
+`arcbox_tap_net::PacketFilter` (`IptablesLegacy` is the reference;
 a stock distro on the nft backend supplies an nftables one — legacy and
 nft rulesets are mutually invisible, so this is a seam, not a path); the
 path seams follow.
+
+The sandbox network itself — the IPv4 pool, the per-sandbox TAP, the
+invariant NAT (eBPF TCX or iptables), and the quarantine ledger — is
+[`arcbox-tap-net`](../arcbox-tap-net), the Linux adapter of the
+`arcbox-vm-driver` `GuestNetwork` port; `arcbox_vm::network` re-exports
+it and `NetworkManager` is an alias of its `TapNetwork` until the manager
+moves onto the port.
 
 ## Build and test
 
 ```bash
 cargo test -p arcbox-vm                 # unit + integration, no Firecracker needed
 cargo clippy -p arcbox-vm -- -D warnings
+cargo test -p arcbox-tap-net            # the TAP network (root-only TAP tests skip)
 
 # vm-agent, as the release ships it (aarch64 musl; brew install FiloSottile/musl-cross/musl-cross)
 cargo build -p arcbox-vm-agent --bin vm-agent --target aarch64-unknown-linux-musl --release
 ```
 
-Everything real — TAP creation, boot, checkpoint — needs Linux with
-`CAP_NET_ADMIN`, a `firecracker` binary, and (for jailer mode) root.
+Everything real — TAP creation (`arcbox-tap-net`), boot, checkpoint —
+needs Linux with `CAP_NET_ADMIN`, a `firecracker` binary, and (for jailer
+mode) root.
 `examples/sandbox-smoke.rs` is the end-to-end walkthrough;
 `.github/workflows/test-vm-linux.yml` runs the whole ladder on real KVM.
 
@@ -108,6 +117,7 @@ path in every sandbox's chroot.
 ├── kernels/vmlinux
 ├── images/*.ext4
 ├── sandboxes/{id}/               # firecracker.sock, .vsock, .log, .metrics
+├── sandbox-network-quarantine/   # arcbox-tap-net's ledger: {id}.json per quarantined address
 └── snapshots/{sandbox-id}/{snapshot-id}/
                                   # vmstate, mem, meta.json
 ```

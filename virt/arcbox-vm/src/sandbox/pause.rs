@@ -519,7 +519,7 @@ impl SandboxManager {
                 drop(inst);
                 if let Err(error) = self.network.quarantine_checked(id, &net) {
                     arc.lock().unwrap().network = Some(net);
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }

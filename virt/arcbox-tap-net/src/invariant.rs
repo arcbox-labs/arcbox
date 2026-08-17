@@ -82,6 +82,9 @@ pub const GUEST_GATEWAY: Ipv4Addr = Ipv4Addr::new(169, 254, 100, 1);
 /// the guest.
 pub const GUEST_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 252);
 
+/// [`GUEST_NETMASK`] as a prefix length.
+pub const GUEST_PREFIX_LEN: u8 = 30;
+
 /// Priority of the per-sandbox fwmark fib rules (before `main`, 32766).
 const FIB_RULE_PRIORITY: u32 = 8000;
 
@@ -150,7 +153,7 @@ pub(crate) fn remove(filter: &dyn PacketFilter, tap: &str, pool_ip: Ipv4Addr) ->
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(crate::error::VmmError::Network(format!(
+        Err(crate::error::TapNetError::Network(format!(
             "sandbox NAT teardown incomplete for {tap}: {}",
             failures.join("; ")
         )))
@@ -161,18 +164,19 @@ pub(crate) fn remove(filter: &dyn PacketFilter, tap: &str, pool_ip: Ipv4Addr) ->
 fn write_tap_sysctl(tap: &str, key: &str, value: &str) -> Result<()> {
     let path = format!("/proc/sys/net/ipv4/conf/{tap}/{key}");
     std::fs::write(&path, value)
-        .map_err(|e| crate::error::VmmError::Network(format!("write {path}: {e}")))
+        .map_err(|e| crate::error::TapNetError::Network(format!("write {path}: {e}")))
 }
 
 /// Resolve a TAP's interface index (also the eBPF datapath's map key).
 #[cfg(target_os = "linux")]
-pub(super) fn tap_ifindex(tap: &str) -> Result<u32> {
-    let name = std::ffi::CString::new(tap)
-        .map_err(|_| crate::error::VmmError::Network(format!("TAP name {tap:?} contains NUL")))?;
+pub fn tap_ifindex(tap: &str) -> Result<u32> {
+    let name = std::ffi::CString::new(tap).map_err(|_| {
+        crate::error::TapNetError::Network(format!("TAP name {tap:?} contains NUL"))
+    })?;
     // SAFETY: name is a valid NUL-terminated string.
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     if index == 0 {
-        return Err(crate::error::VmmError::Network(format!(
+        return Err(crate::error::TapNetError::Network(format!(
             "if_nametoindex {tap}: {}",
             std::io::Error::last_os_error()
         )));
@@ -188,7 +192,8 @@ mod tests {
     fn constants_form_one_point_to_point_link() {
         // /30: gateway and guest are the only hosts, in the same subnet.
         let mask = u32::from(GUEST_NETMASK);
-        assert_eq!(mask.count_ones(), 30);
+        assert_eq!(mask.count_ones(), u32::from(GUEST_PREFIX_LEN));
+        assert_eq!(mask.leading_ones(), u32::from(GUEST_PREFIX_LEN));
         assert_eq!(
             u32::from(GUEST_IP) & mask,
             u32::from(GUEST_GATEWAY) & mask,

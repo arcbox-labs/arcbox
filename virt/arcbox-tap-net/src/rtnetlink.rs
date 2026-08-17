@@ -110,7 +110,7 @@ fn fwmark_rule(msg_type: u16, flags: u16, mark: u32, table: u32, priority: u32) 
 ///
 /// `NLM_F_EXCL` makes a repeated add fail with `EEXIST` instead of stacking a
 /// duplicate rule; callers tolerate that errno for idempotency.
-pub(super) fn new_fwmark_rule(mark: u32, table: u32, priority: u32) -> Vec<u8> {
+pub fn new_fwmark_rule(mark: u32, table: u32, priority: u32) -> Vec<u8> {
     fwmark_rule(
         RTM_NEWRULE,
         NLM_F_CREATE | NLM_F_EXCL,
@@ -121,12 +121,12 @@ pub(super) fn new_fwmark_rule(mark: u32, table: u32, priority: u32) -> Vec<u8> {
 }
 
 /// `ip rule del fwmark <mark> lookup <table> pref <priority>`.
-pub(super) fn del_fwmark_rule(mark: u32, table: u32, priority: u32) -> Vec<u8> {
+pub fn del_fwmark_rule(mark: u32, table: u32, priority: u32) -> Vec<u8> {
     fwmark_rule(RTM_DELRULE, 0, mark, table, priority)
 }
 
 /// `ip route replace <dst>/32 dev <oif> table <table>` (onlink device route).
-pub(super) fn replace_link_route(dst: Ipv4Addr, oif: u32, table: u32) -> Vec<u8> {
+pub fn replace_link_route(dst: Ipv4Addr, oif: u32, table: u32) -> Vec<u8> {
     let mut header = [0u8; 12];
     header[0] = AF_INET;
     header[1] = 32; // dst_len
@@ -149,7 +149,7 @@ pub(super) fn replace_link_route(dst: Ipv4Addr, oif: u32, table: u32) -> Vec<u8>
 /// neighbor-resolution target is the fixed guest IP — which every invariant
 /// guest owns. `onlink` (`RTNH_F_ONLINK`) is required because no route covers
 /// the link-local gateway on the main table.
-pub(super) fn replace_gateway_route(dst: Ipv4Addr, gateway: Ipv4Addr, oif: u32) -> Vec<u8> {
+pub fn replace_gateway_route(dst: Ipv4Addr, gateway: Ipv4Addr, oif: u32) -> Vec<u8> {
     let mut header = [0u8; 12];
     header[0] = AF_INET;
     header[1] = 32; // dst_len
@@ -167,8 +167,8 @@ pub(super) fn replace_gateway_route(dst: Ipv4Addr, gateway: Ipv4Addr, oif: u32) 
 
 /// Send one request and wait for its ACK, tolerating the listed errnos.
 #[cfg(target_os = "linux")]
-pub(super) fn execute(message: &[u8], tolerated_errnos: &[i32]) -> crate::error::Result<()> {
-    use crate::error::VmmError;
+pub fn execute(message: &[u8], tolerated_errnos: &[i32]) -> crate::error::Result<()> {
+    use crate::error::TapNetError;
 
     // SAFETY: plain socket(2) call; result checked below.
     let fd = unsafe {
@@ -179,7 +179,7 @@ pub(super) fn execute(message: &[u8], tolerated_errnos: &[i32]) -> crate::error:
         )
     };
     if fd < 0 {
-        return Err(VmmError::Network(format!(
+        return Err(TapNetError::Network(format!(
             "netlink socket: {}",
             std::io::Error::last_os_error()
         )));
@@ -192,7 +192,7 @@ pub(super) fn execute(message: &[u8], tolerated_errnos: &[i32]) -> crate::error:
     // (destination defaults to the kernel, pid 0).
     let sent = unsafe { libc::send(raw, message.as_ptr().cast(), message.len(), 0) };
     if sent != message.len().cast_signed() {
-        return Err(VmmError::Network(format!(
+        return Err(TapNetError::Network(format!(
             "netlink send: {}",
             std::io::Error::last_os_error()
         )));
@@ -202,7 +202,7 @@ pub(super) fn execute(message: &[u8], tolerated_errnos: &[i32]) -> crate::error:
     // SAFETY: reply is a valid mutable buffer owned by this frame.
     let received = unsafe { libc::recv(raw, reply.as_mut_ptr().cast(), reply.len(), 0) };
     if received < 0 {
-        return Err(VmmError::Network(format!(
+        return Err(TapNetError::Network(format!(
             "netlink recv: {}",
             std::io::Error::last_os_error()
         )));
@@ -210,11 +210,11 @@ pub(super) fn execute(message: &[u8], tolerated_errnos: &[i32]) -> crate::error:
     match ack_errno(&reply[..received as usize]) {
         Ok(0) => Ok(()),
         Ok(errno) if tolerated_errnos.contains(&errno) => Ok(()),
-        Ok(errno) => Err(VmmError::Network(format!(
+        Ok(errno) => Err(TapNetError::Network(format!(
             "netlink request failed: {}",
             std::io::Error::from_raw_os_error(errno)
         ))),
-        Err(reason) => Err(VmmError::Network(format!("netlink reply: {reason}"))),
+        Err(reason) => Err(TapNetError::Network(format!("netlink reply: {reason}"))),
     }
 }
 

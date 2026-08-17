@@ -33,7 +33,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use super::invariant::{GUEST_IP, fwmark};
-use crate::error::{Result, VmmError};
+use crate::error::{Result, TapNetError};
 
 /// Installs and removes the per-TAP translation rules of one sandbox.
 ///
@@ -87,7 +87,7 @@ impl IptablesLegacy {
     /// status 1 — iptables-legacy's "no matching rule" — as success so
     /// teardown is idempotent; other failures (usage errors, the xtables
     /// lock timing out) still propagate. The failure is the bare
-    /// diagnostic text: callers wrap it into [`VmmError::Network`] once,
+    /// diagnostic text: callers wrap it into [`TapNetError::Network`] once,
     /// so a collected teardown report carries one prefix, not one per rule.
     fn run(
         &self,
@@ -122,7 +122,7 @@ impl Default for IptablesLegacy {
 impl PacketFilter for IptablesLegacy {
     fn install_translation(&self, tap: &str, pool_ip: Ipv4Addr) -> Result<()> {
         for rule in translation_rules(tap, pool_ip) {
-            self.run(&rule, "-A", false).map_err(VmmError::Network)?;
+            self.run(&rule, "-A", false).map_err(TapNetError::Network)?;
         }
         Ok(())
     }
@@ -137,7 +137,7 @@ impl PacketFilter for IptablesLegacy {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(VmmError::Network(failures.join("; ")))
+            Err(TapNetError::Network(failures.join("; ")))
         }
     }
 }

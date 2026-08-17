@@ -299,7 +299,7 @@ pub(super) async fn release_runtime_resources(
             drop(inst);
             if let Err(error) = network.quarantine_checked(id, &net) {
                 arc.lock().unwrap().network = Some(net);
-                return Err(error);
+                return Err(error.into());
             }
         }
     }

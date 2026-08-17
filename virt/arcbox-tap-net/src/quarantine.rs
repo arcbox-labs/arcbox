@@ -5,23 +5,20 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use arcbox_vm_driver::VmId;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
-use super::destroy_tap_checked;
-use super::{NetworkAllocation, NetworkManager, mac_from_vm_id, tap_name_from_ip};
-use crate::error::{Result, VmmError};
+use super::tap;
+use super::{NetworkAllocation, TapNetwork, mac_from_vm_id, tap_name_from_ip};
+use crate::error::{Result, TapNetError};
 
-impl NetworkManager {
+impl TapNetwork {
     /// Deactivate a sandbox TAP while retaining its IP until host forwarding
     /// cleanup is confirmed.
-    pub(crate) fn quarantine_checked(
-        &self,
-        sandbox_id: &str,
-        alloc: &NetworkAllocation,
-    ) -> Result<()> {
+    pub fn quarantine_checked(&self, sandbox_id: &str, alloc: &NetworkAllocation) -> Result<()> {
         let Some(dir) = self.quarantine_dir.as_deref() else {
             return self.release_checked(alloc);
         };
@@ -32,7 +29,7 @@ impl NetworkManager {
         let mut quarantined = self.quarantined.lock().unwrap();
         if let Some(existing) = quarantined.get(sandbox_id) {
             if !same_allocation(existing, alloc) {
-                return Err(VmmError::Unavailable(format!(
+                return Err(TapNetError::Unavailable(format!(
                     "sandbox {sandbox_id} has a different quarantined network allocation"
                 )));
             }
@@ -50,7 +47,8 @@ impl NetworkManager {
         #[cfg(target_os = "linux")]
         self.deactivate_translation(alloc)?;
         #[cfg(target_os = "linux")]
-        destroy_tap_checked(&alloc.tap_name)?;
+        tap::destroy_checked(&alloc.tap_name)?;
+        self.attached.lock().unwrap().remove(&alloc.tap_name);
         debug!(
             sandbox_id,
             tap = %alloc.tap_name,
@@ -61,21 +59,17 @@ impl NetworkManager {
     }
 
     /// Recycle a quarantined IP after guest DNAT and host listeners are gone.
-    pub(crate) fn validate_quarantine(
-        &self,
-        sandbox_id: &str,
-        token: &str,
-    ) -> Result<NetworkAllocation> {
+    pub fn validate_quarantine(&self, sandbox_id: &str, token: &str) -> Result<NetworkAllocation> {
         let quarantined = self.quarantined.lock().unwrap();
         let allocation = quarantined
             .get(sandbox_id)
-            .ok_or_else(|| VmmError::WrongState {
+            .ok_or_else(|| TapNetError::WrongState {
                 id: sandbox_id.to_owned(),
                 expected: "cleanup awaiting host finalization".into(),
                 actual: "no pending cleanup".into(),
             })?;
         if allocation.cleanup_token != token {
-            return Err(VmmError::WrongState {
+            return Err(TapNetError::WrongState {
                 id: sandbox_id.to_owned(),
                 expected: format!("cleanup token {}", allocation.cleanup_token),
                 actual: token.to_owned(),
@@ -85,17 +79,17 @@ impl NetworkManager {
     }
 
     /// Recycle one exact quarantined generation.
-    pub(crate) fn finalize_quarantine(&self, sandbox_id: &str, token: &str) -> Result<()> {
+    pub fn finalize_quarantine(&self, sandbox_id: &str, token: &str) -> Result<()> {
         let mut quarantined = self.quarantined.lock().unwrap();
         let Some(alloc) = quarantined.get(sandbox_id) else {
-            return Err(VmmError::WrongState {
+            return Err(TapNetError::WrongState {
                 id: sandbox_id.to_owned(),
                 expected: "cleanup awaiting host finalization".into(),
                 actual: "no pending cleanup".into(),
             });
         };
         if alloc.cleanup_token != token {
-            return Err(VmmError::WrongState {
+            return Err(TapNetError::WrongState {
                 id: sandbox_id.to_owned(),
                 expected: format!("cleanup token {}", alloc.cleanup_token),
                 actual: token.to_owned(),
@@ -103,7 +97,7 @@ impl NetworkManager {
         }
 
         #[cfg(target_os = "linux")]
-        destroy_tap_checked(&alloc.tap_name)?;
+        tap::destroy_checked(&alloc.tap_name)?;
         if let Some(dir) = self.quarantine_dir.as_deref() {
             remove_quarantine(dir, sandbox_id)?;
         }
@@ -119,7 +113,7 @@ impl NetworkManager {
     }
 
     /// IDs awaiting host-side forwarding cleanup.
-    pub(crate) fn pending_quarantines(&self) -> Vec<(String, String)> {
+    pub fn pending_quarantines(&self) -> Vec<(String, String)> {
         self.quarantined
             .lock()
             .unwrap()
@@ -128,23 +122,32 @@ impl NetworkManager {
             .collect()
     }
 
-    pub(crate) fn mark_reconciled(&self) {
+    /// Record that the owner has finished reconciling its own durable state
+    /// (replaying leftover VMs into quarantine). Startup-cleanup validation
+    /// refuses every token until then, so a host cannot finalize a sweep
+    /// whose quarantines are still being discovered.
+    pub fn mark_reconciled(&self) {
         self.startup_reconciled.store(true, Ordering::Release);
     }
 
-    pub(crate) fn startup_cleanup_token(&self) -> Option<String> {
+    /// The token gating this process generation's startup sweep, while the
+    /// host-side half of that sweep is still pending; `None` once the host
+    /// finalized it or when this manager keeps no ledger.
+    pub fn startup_cleanup_token(&self) -> Option<String> {
         (self.startup_barrier.load(Ordering::Acquire)
             && !self.startup_host_cleaned.load(Ordering::Acquire))
         .then(|| self.startup_token.clone())
     }
 
-    pub(crate) fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
+    /// Check that `token` names the pending startup cleanup of this process
+    /// generation and that reconciliation has finished.
+    pub fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
         if !self.startup_reconciled.load(Ordering::Acquire)
             || !self.startup_barrier.load(Ordering::Acquire)
             || self.startup_host_cleaned.load(Ordering::Acquire)
             || token != self.startup_token
         {
-            return Err(VmmError::WrongState {
+            return Err(TapNetError::WrongState {
                 id: "startup".into(),
                 expected: "current sandbox startup cleanup generation".into(),
                 actual: token.to_owned(),
@@ -153,10 +156,13 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub(crate) fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
+    /// Mark the startup sweep's host-side cleanup done and open the
+    /// allocation gate — refused while any per-VM quarantine is still
+    /// pending, since those addresses would otherwise be handed out again.
+    pub fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
         self.validate_startup_cleanup(token)?;
         if !self.quarantined.lock().unwrap().is_empty() {
-            return Err(VmmError::Unavailable(
+            return Err(TapNetError::Unavailable(
                 "sandbox cleanup generations remain pending".into(),
             ));
         }
@@ -166,7 +172,9 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub(crate) async fn wait_startup_cleanup_complete(&self) {
+    /// Wait until the startup gate is open: no startup cleanup and no
+    /// replayed quarantine of this generation is pending.
+    pub async fn wait_startup_cleanup_complete(&self) {
         let mut changed = self.startup_changed.subscribe();
         while self.startup_barrier.load(Ordering::Acquire) {
             changed
@@ -176,9 +184,12 @@ impl NetworkManager {
         }
     }
 
-    pub(crate) fn ensure_startup_cleanup_complete(&self) -> Result<()> {
+    /// Refuse with [`TapNetError::Unavailable`] while the startup gate is
+    /// closed; the non-blocking counterpart of
+    /// [`Self::wait_startup_cleanup_complete`].
+    pub fn ensure_startup_cleanup_complete(&self) -> Result<()> {
         if self.startup_barrier.load(Ordering::Acquire) {
-            return Err(VmmError::Unavailable(
+            return Err(TapNetError::Unavailable(
                 "sandbox startup cleanup is awaiting host finalization".into(),
             ));
         }
@@ -192,7 +203,7 @@ struct NetworkQuarantine {
     allocation: NetworkAllocation,
 }
 
-pub(super) fn load_quarantines(
+pub fn load_quarantines(
     dir: &Path,
     base: Ipv4Addr,
     prefix_len: u8,
@@ -203,12 +214,12 @@ pub(super) fn load_quarantines(
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     if !existed {
         let parent = dir.parent().ok_or_else(|| {
-            VmmError::Network(format!(
+            TapNetError::Network(format!(
                 "sandbox network quarantine directory has no parent: {}",
                 dir.display()
             ))
         })?;
-        // The sandbox data root is created durably before NetworkManager.
+        // The sandbox data root is created durably before TapNetwork.
         // Syncing that existing parent makes this new directory entry durable.
         std::fs::File::open(parent)?.sync_all()?;
     }
@@ -216,33 +227,40 @@ pub(super) fn load_quarantines(
     let mut tokens = HashSet::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() || entry.file_name().to_string_lossy().starts_with('.') {
+        if !entry.file_type()?.is_file() {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            return Err(VmmError::Network(format!(
-                "unexpected sandbox network quarantine file {}",
-                path.display()
-            )));
+        match path.extension().and_then(|value| value.to_str()) {
+            // A staging file (`.{id}-{uuid}.tmp`) a crash left mid-write. The
+            // skip is keyed on that shape, not on a leading dot: a `VmId` may
+            // start with one, and its marker `.{id}.json` must load.
+            Some("tmp") => continue,
+            Some("json") => {}
+            _ => {
+                return Err(TapNetError::Network(format!(
+                    "unexpected sandbox network quarantine file {}",
+                    path.display()
+                )));
+            }
         }
         let marker: NetworkQuarantine = serde_json::from_slice(&std::fs::read(&path)?)?;
-        validate_quarantine_id(&marker.id)?;
+        validate_id(&marker.id)?;
         if Uuid::parse_str(&marker.allocation.cleanup_token).is_err() {
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "sandbox network quarantine {} has an invalid cleanup token",
                 marker.id
             )));
         }
         validate_quarantine_allocation(&marker.id, &marker.allocation, base, prefix_len, gateway)?;
         if !tokens.insert(marker.allocation.cleanup_token.clone()) {
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "duplicate sandbox network quarantine token for {}",
                 marker.id
             )));
         }
         if path.file_stem().and_then(|value| value.to_str()) != Some(marker.id.as_str()) {
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "sandbox network quarantine filename does not match {}",
                 marker.id
             )));
@@ -251,7 +269,7 @@ pub(super) fn load_quarantines(
             .insert(marker.id.clone(), marker.allocation)
             .is_some()
         {
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "duplicate sandbox network quarantine {}",
                 marker.id
             )));
@@ -274,7 +292,7 @@ fn validate_quarantine_allocation(
     let ip = u32::from(allocation.ip_address);
     let broadcast = network | !mask;
     if ip & mask != network || ip <= network + 1 || ip == u32::from(gateway) || ip == broadcast {
-        return Err(VmmError::Network(format!(
+        return Err(TapNetError::Network(format!(
             "sandbox network quarantine {id} has non-allocatable IP {}",
             allocation.ip_address
         )));
@@ -282,9 +300,9 @@ fn validate_quarantine_allocation(
     if allocation.prefix_len != prefix_len
         || allocation.gateway != gateway
         || allocation.tap_name != tap_name_from_ip(allocation.ip_address)
-        || allocation.mac_address != mac_from_vm_id(id)
+        || allocation.mac_address != mac_from_vm_id(id).to_string()
     {
-        return Err(VmmError::Network(format!(
+        return Err(TapNetError::Network(format!(
             "sandbox network quarantine {id} metadata does not match the current network"
         )));
     }
@@ -303,12 +321,8 @@ fn same_allocation(existing: &NetworkAllocation, requested: &NetworkAllocation) 
     false
 }
 
-pub(super) fn write_quarantine(
-    dir: &Path,
-    sandbox_id: &str,
-    alloc: &NetworkAllocation,
-) -> Result<()> {
-    validate_quarantine_id(sandbox_id)?;
+pub fn write_quarantine(dir: &Path, sandbox_id: &str, alloc: &NetworkAllocation) -> Result<()> {
+    validate_id(sandbox_id)?;
     let marker = NetworkQuarantine {
         id: sandbox_id.to_owned(),
         allocation: alloc.clone(),
@@ -341,15 +355,19 @@ fn quarantine_path(dir: &Path, sandbox_id: &str) -> PathBuf {
     dir.join(format!("{sandbox_id}.json"))
 }
 
-fn validate_quarantine_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return Err(VmmError::Network(format!(
-            "invalid sandbox network quarantine id {id:?}"
-        )));
-    }
-    Ok(())
+/// The network's id contract is the driver port's: a VM id is a `VmId`
+/// (`[A-Za-z0-9._-]`, non-empty, at most [`VmId::MAX_LEN`] bytes, not `.`
+/// or `..`), which also makes it a safe ledger path component
+/// (`{id}.json`; a leading dot is fine — the loader skips staging files by
+/// their `.tmp` extension, not by dotfile). Checked where an id enters the
+/// network (`reserve`), on
+/// every ledger write, and on every ledger load, so a reserved address can
+/// always be quarantined, every entry the ledger holds is one the port can
+/// name, and a file from outside the contract fails at load with its id in
+/// the message rather than lingering as a quarantine `NetworkReconcile`
+/// could never list or finalize.
+pub fn validate_id(id: &str) -> Result<()> {
+    VmId::new(id)
+        .map(drop)
+        .map_err(|error| TapNetError::Network(error.to_string()))
 }
