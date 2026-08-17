@@ -73,14 +73,15 @@ fn parse_overlay_mountpoint(line: &str) -> Option<&str> {
 /// built on.
 #[must_use]
 pub fn fsid_for(mountpoint: &str) -> String {
+    use std::fmt::Write as _;
+
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(mountpoint.as_bytes());
-    let hex: String = digest
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        let _ = write!(hex, "{byte:02x}");
+    }
     format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],

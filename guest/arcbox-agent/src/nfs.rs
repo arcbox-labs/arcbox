@@ -35,8 +35,8 @@ pub const MOUNTD_PORT: u16 = 20048;
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::fmt::Write as _;
     use std::fs;
-    use std::io;
     use std::path::Path;
     use std::process::{Command, Stdio};
 
@@ -150,6 +150,21 @@ local      tpi_cots_ord  -     loopback  -       -       -
             Err(e) => tracing::warn!(error = %e, "nfs export: volume icon install failed"),
         }
 
+        // Open the watch descriptor *before* the reconcile below reads the
+        // table. Procfs reports a change only to descriptors that were already
+        // open, so opening afterwards leaves a window whose containers are
+        // both missed by the snapshot and never announced — invisible until
+        // some later, unrelated mount. Opening first makes the two overlap
+        // instead of gap.
+        let mountinfo = match fs::File::open(MOUNTINFO_PATH) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                tracing::warn!(error = %e, path = MOUNTINFO_PATH, "nfs export: live container view disabled");
+                notes.push("live-export watcher unavailable".to_string());
+                None
+            }
+        };
+
         // Renders any already-running containers too: on a warm restart
         // the mount table is populated before this runs, and waiting for
         // the next mount change would leave them invisible until one.
@@ -166,11 +181,16 @@ local      tpi_cots_ord  -     loopback  -       -       -
         ensure_nfsd_threads(&cfg)?;
         notes.push(format!("ensured nfsd threads={}", cfg.threads));
 
-        // Once: this runs again on every EnsureNfsExport, and a thread
-        // per call would pile up watchers that all rewrite the same file.
-        if !WATCHER_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            spawn_export_watcher();
-            notes.push("armed live-export watcher".to_string());
+        // Once: this runs again on every EnsureNfsExport, and a thread per call
+        // would pile up watchers all rewriting the same file. The flag is
+        // cleared if the watcher ever exits, so a later pass can replace it.
+        if let Some(mountinfo) = mountinfo {
+            if WATCHER_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                drop(mountinfo);
+            } else {
+                spawn_export_watcher(mountinfo, WatchedExports::from(&cfg));
+                notes.push("armed live-export watcher".to_string());
+            }
         }
 
         tracing::info!(
@@ -483,13 +503,11 @@ local      tpi_cots_ord  -     loopback  -       -       -
         const OPTS: &str = "no_subtree_check,insecure,all_squash,anonuid=0,anongid=0";
         let mut rendered = format!("{} 127.0.0.1/32(ro,fsid=0,{OPTS})\n", cfg.export_docker);
         if let Some(child) = cfg.export_containerd {
-            rendered.push_str(&format!("{child} 127.0.0.1/32(ro,fsid=1,{OPTS})\n"));
+            let _ = writeln!(rendered, "{child} 127.0.0.1/32(ro,fsid=1,{OPTS})");
         }
         for mountpoint in live {
             let fsid = crate::live_exports::fsid_for(mountpoint);
-            rendered.push_str(&format!(
-                "{mountpoint} 127.0.0.1/32(ro,fsid={fsid},{OPTS})\n"
-            ));
+            let _ = writeln!(rendered, "{mountpoint} 127.0.0.1/32(ro,fsid={fsid},{OPTS})");
         }
         rendered
     }
@@ -511,13 +529,71 @@ local      tpi_cots_ord  -     loopback  -       -       -
     }
 
     /// Rewrites `/etc/exports` from the current mount table and reloads it.
+    ///
+    /// Serialized, because two writers exist: `ensure_docker_export` (once per
+    /// `EnsureNfsExport`) and the watcher thread (once per mount change), and
+    /// a container starting during an ensure pass puts them in the same
+    /// instant. Without the lock they can interleave a `write` with the other's
+    /// `exportfs -ra`, which reads whatever half of the table is on disk.
+    ///
+    /// The file is replaced by rename rather than truncated in place for the
+    /// same reason: `exportfs` may be reading it. `/etc` is a tmpfs, so no
+    /// fsync is warranted — there is nothing here to survive a power cut, only
+    /// a concurrent reader to keep whole.
     fn reconcile_exports(cfg: &ExportConfig<'_>) -> Result<(), String> {
+        static EXPORTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A panicking writer leaves the table as it found it (rename is
+        // all-or-nothing), so a poisoned lock is safe to take over.
+        let _guard = EXPORTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let live = live_rootfs_exports();
-        fs::write(cfg.exports_path, render_exports(cfg, &live))
-            .map_err(|e| format!("write {} failed({e})", cfg.exports_path))?;
+        let staged = format!("{}.arcbox-tmp", cfg.exports_path);
+        fs::write(&staged, render_exports(cfg, &live))
+            .map_err(|e| format!("write {staged} failed({e})"))?;
+        if let Err(e) = fs::rename(&staged, cfg.exports_path) {
+            let _ = fs::remove_file(&staged);
+            return Err(format!(
+                "rename {staged} -> {} failed({e})",
+                cfg.exports_path
+            ));
+        }
         refresh_exports()?;
         tracing::debug!(containers = live.len(), "nfs export: reconciled");
         Ok(())
+    }
+
+    /// The parts of an [`ExportConfig`] the watcher has to carry.
+    ///
+    /// Owned, because the thread outlives the borrow — and carried at all
+    /// because `ensure_docker_export` may have *resolved* the containerd child
+    /// away on a guest with no `/var/lib/containerd`. Rebuilding a default
+    /// inside the watcher would quietly reinstate that path on the next mount
+    /// change and hand `exportfs -ra` an entry for a directory that is not
+    /// there.
+    #[derive(Clone)]
+    struct WatchedExports {
+        export_docker: String,
+        export_containerd: Option<String>,
+        exports_path: String,
+    }
+
+    impl WatchedExports {
+        fn from(cfg: &ExportConfig<'_>) -> Self {
+            Self {
+                export_docker: cfg.export_docker.to_owned(),
+                export_containerd: cfg.export_containerd.map(str::to_owned),
+                exports_path: cfg.exports_path.to_owned(),
+            }
+        }
+
+        fn as_config(&self) -> ExportConfig<'_> {
+            ExportConfig {
+                export_docker: &self.export_docker,
+                export_containerd: self.export_containerd.as_deref(),
+                exports_path: &self.exports_path,
+                ..ExportConfig::default()
+            }
+        }
     }
 
     /// Keeps the per-container entries in step with the mount table, for the
@@ -533,28 +609,42 @@ local      tpi_cots_ord  -     loopback  -       -       -
     /// pin its mount, so dockerd can unmount a container's rootfs while it is
     /// still exported. A stale entry is therefore cosmetic until the next
     /// change wakes us.
-    fn spawn_export_watcher() {
+    ///
+    /// Takes an already-open `mountinfo`. Procfs reports a change only to
+    /// descriptors open when it happened, so opening here — after the caller's
+    /// first reconcile — would silently drop every container that appeared in
+    /// between, and it would stay dropped until some unrelated mount woke us.
+    /// The caller opens first, reconciles second, and hands the descriptor
+    /// over, which leaves no gap between the snapshot and the watch.
+    fn spawn_export_watcher(mountinfo: fs::File, watched: WatchedExports) {
         std::thread::spawn(move || {
-            let file = match fs::File::open(MOUNTINFO_PATH) {
-                Ok(file) => file,
-                Err(e) => {
-                    tracing::warn!(error = %e, "nfs export: live view disabled, cannot watch mounts");
-                    return;
-                }
-            };
+            // Whatever ends this thread, let a later EnsureNfsExport start a
+            // replacement: staying "armed" after the watcher is gone would
+            // leave every future container unexported until the agent restarts.
+            let _disarm = Disarm;
 
             loop {
-                if let Err(e) = wait_for_mount_change(&file) {
+                if let Err(e) = wait_for_mount_change(&mountinfo) {
                     tracing::warn!(error = %e, "nfs export: mount watch failed, live view stops here");
                     return;
                 }
-                if let Err(e) = reconcile_exports(&ExportConfig::default()) {
+                if let Err(e) = reconcile_exports(&watched.as_config()) {
                     // Keep watching: a transient exportfs failure should not
                     // cost every later container its entry.
                     tracing::warn!(error = %e, "nfs export: reconcile failed");
                 }
             }
         });
+    }
+
+    /// Clears [`WATCHER_ARMED`] however the watcher thread ends, including a
+    /// panic.
+    struct Disarm;
+
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            WATCHER_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Blocks until the mount table changes.
@@ -570,7 +660,9 @@ local      tpi_cots_ord  -     loopback  -       -       -
         loop {
             match poll(&mut fds, PollTimeout::NONE) {
                 Ok(_) => return Ok(()),
-                Err(nix::errno::Errno::EINTR) => continue,
+                // A signal is not a watch failure — resume the wait rather
+                // than tearing the live view down for the agent's lifetime.
+                Err(nix::errno::Errno::EINTR) => {}
                 Err(e) => return Err(format!("poll({MOUNTINFO_PATH}) failed({e})")),
             }
         }
