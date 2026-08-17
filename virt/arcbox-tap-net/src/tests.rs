@@ -140,6 +140,62 @@ fn expose_target_follows_the_applied_datapath() {
     assert_eq!(manager.expose_target("vmtap0-2"), ExposeTarget::PoolIp);
 }
 
+/// A record naming any other TAP for its address is not one this pool
+/// could have written, so adoption refuses it — and hands the address
+/// back, since the owner answers a refusal by tearing the sandbox down.
+#[test]
+fn adopt_refuses_a_tap_name_this_pool_would_not_give() {
+    let pool = || TapNetwork::new("10.0.99.0/24", "10.0.99.1", vec![]).unwrap();
+    // What a previous process journaled, with the TAP name rewritten.
+    let mut allocation = pool().reserve("box").unwrap();
+    allocation.tap_name = "vmtap-elsewhere".into();
+
+    let manager = pool();
+    let error = manager
+        .adopt("box", &allocation, AttachMode::Invariant)
+        .unwrap_err();
+    assert!(error.to_string().contains("vmtap-elsewhere"), "{error}");
+    assert!(
+        !manager
+            .allocated
+            .lock()
+            .unwrap()
+            .contains(&u32::from(allocation.ip_address)),
+        "a refused adoption keeps no address"
+    );
+
+    // An id the port could never name (`..`) is refused before that.
+    allocation.tap_name = tap_name_from_ip(allocation.ip_address);
+    assert!(
+        manager
+            .adopt("..", &allocation, AttachMode::Invariant)
+            .is_err()
+    );
+}
+
+/// The TAP is the running guest's NIC: its absence means the guest's link
+/// is gone, so adoption fails rather than creating one, and the address it
+/// took goes back to the pool.
+#[test]
+#[cfg(target_os = "linux")]
+fn adopt_refuses_a_missing_tap_and_frees_the_address() {
+    let pool = || TapNetwork::new("10.0.98.0/24", "10.0.98.1", vec![]).unwrap();
+    let allocation = pool().reserve("box").unwrap();
+    let manager = pool();
+    let error = manager
+        .adopt("box", &allocation, AttachMode::Invariant)
+        .unwrap_err();
+    assert!(error.to_string().contains(&allocation.tap_name), "{error}");
+    assert!(
+        !manager
+            .allocated
+            .lock()
+            .unwrap()
+            .contains(&u32::from(allocation.ip_address)),
+        "a refused adoption keeps no address"
+    );
+}
+
 #[tokio::test]
 async fn startup_waiter_unblocks_after_host_finalization() {
     let root = tempfile::tempdir().unwrap();

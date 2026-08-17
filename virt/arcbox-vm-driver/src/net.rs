@@ -27,6 +27,27 @@ pub trait GuestNetwork: Send + Sync {
     /// the driver boots with.
     async fn activate(&self, lease: &NetworkLease, mode: AttachMode) -> Result<NicSpec>;
 
+    /// Re-registers a lease whose guest is still running, and re-establishes
+    /// whatever host state died with the previous process.
+    ///
+    /// The third way a lease becomes live: a host that restarts while its
+    /// guests keep running replays its durable leases through this, then
+    /// declares the replay done ([`NetworkReconcile::replay_complete`]).
+    /// Unlike [`GuestNetwork::activate`] it must not create or re-address
+    /// the guest's interface — the link is live and carrying traffic.
+    ///
+    /// `mode` is what the lease was activated as, which the caller knows
+    /// and the network does not: it decides whether the guest holds the
+    /// pool address itself or the fixed invariant one.
+    ///
+    /// Fallible on purpose, and the failure is not fatal to the caller: an
+    /// adapter that cannot re-establish says so, and the owner falls back
+    /// to tearing the VM down — the behavior it had before adoption
+    /// existed. Hence no default body: an adapter that silently claimed
+    /// adoption worked would leave a live guest unreachable, which is
+    /// strictly worse than that fallback.
+    async fn adopt(&self, lease: &NetworkLease, mode: AttachMode) -> Result<()>;
+
     /// Tears the host side down but keeps the address reserved until the
     /// cleanup protocol confirms host forwarding state is gone. Idempotent.
     async fn quarantine(&self, lease: NetworkLease) -> Result<()>;

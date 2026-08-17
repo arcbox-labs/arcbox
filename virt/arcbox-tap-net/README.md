@@ -38,6 +38,7 @@ for the guest agent's port-forward and init code.
 |------|-----------------|
 | `reserve(vm, policy)` | `reserve(vm)` — `Isolated` and `Nat` are the same TAP shape (egress policy is the composer's netfilter business); `Bridged` is refused |
 | `activate(lease, mode)` | `activate(alloc, mode)` — returns `NicSpec { id: "eth0", mac, Tap { name } }` |
+| `adopt(lease, mode)` | `adopt(vm, alloc, mode)` — the guest is still running: the TAP is left alone, the address goes back out of the pool, and the translation the previous process's exit took with it is re-established (its eBPF TCX links died with that process) |
 | `quarantine(lease)` | `quarantine_checked(vm, alloc)` |
 | `release(lease)` | `release_checked(alloc)` |
 | `identity(lease, mode)` | the invariant link under `Invariant` (every fresh boot and invariant restore), the pool address under `LegacySnapshot` — the resolver is the gateway either way |
