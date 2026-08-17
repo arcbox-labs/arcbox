@@ -386,17 +386,20 @@ mod tests {
             reconcile.pending_cleanups().await,
             vec![(vm("box"), lease.cleanup_token.clone())]
         );
-        // The address stays out of the pool, and the id stays refused.
+        // The address stays out of the pool, and the id is refused until
+        // the host finalizes — a retry-later answer, not a fault.
         assert!(matches!(
             GuestNetwork::reserve(&network, &vm("box"), policy(NetworkMode::Nat)).await,
-            Err(Error::Network(_))
+            Err(Error::Unavailable(_))
         ));
-        assert!(
+        // A token from another generation is a failed precondition: no
+        // retry of it can ever succeed.
+        assert!(matches!(
             reconcile
                 .validate_cleanup(&vm("box"), "wrong-generation")
-                .await
-                .is_err()
-        );
+                .await,
+            Err(Error::PreconditionFailed(_))
+        ));
         reconcile
             .validate_cleanup(&vm("box"), &lease.cleanup_token)
             .await

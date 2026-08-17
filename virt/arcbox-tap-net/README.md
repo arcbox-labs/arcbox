@@ -49,8 +49,8 @@ token; the allocation is rebuilt from it (TAP name from the address,
 resolvers from the network), so there is no side table to keep. Errors:
 `TapNetError` maps variant for variant into `arcbox_vm::VmmError`
 (`WrongState` / `Unavailable` keep their 412 / 503 meaning) and into the
-port's `Error` (`Io` kept, the rest `Network` with the classification in
-the text).
+port's `Error` (`Unavailable` and `PreconditionFailed` carry the same two
+answers; `Io` keeps its shape, the faults land on `Network`).
 
 ## Usage
 

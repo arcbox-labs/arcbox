@@ -3,9 +3,11 @@
 //! The variants mirror the shapes the sandbox manager already classifies
 //! for its wire codes — a token mismatch is `WrongState` (412 upstream), a
 //! closed startup gate or a pending same-id cleanup is `Unavailable` (503,
-//! retry later) — so `arcbox-vm`'s `From` impl maps them variant for
-//! variant. Everything the TAP, netlink, netfilter, and eBPF plumbing can
-//! fail with is `Network` with the failing step in the message.
+//! retry later) — so both `From` impls below carry them across without a
+//! reclassification: whether the manager reaches this network directly or
+//! through the driver port, the answer keeps its code. Everything the TAP,
+//! netlink, netfilter, and eBPF plumbing can fail with is `Network` with
+//! the failing step in the message.
 
 use thiserror::Error;
 
@@ -46,19 +48,21 @@ pub enum TapNetError {
 /// `Result` specialised to this crate's [`TapNetError`].
 pub type Result<T> = std::result::Result<T, TapNetError>;
 
-/// Into the port's error. `Io` keeps its shape and a `Network` message is
-/// already the whole story; a closed gate, a token mismatch, or a ledger
-/// decode failure keeps its classification in the text, because the port
-/// has no retry-later or token-mismatch variant to carry it (its
-/// `WrongState` is about VM lifecycle state).
+/// Into the port's error, variant for variant where a shape exists: a
+/// closed gate stays retry-later and a token mismatch stays a failed
+/// precondition, so the 503 / 412 a caller answers with survives the port
+/// boundary. The port's `WrongState` is about VM lifecycle state and
+/// cannot carry the token mismatch, so [`TapNetError::WrongState`]'s three
+/// fields collapse into the precondition message. `Io` keeps its shape,
+/// and a ledger decode failure is a fault like any other `Network` one.
 impl From<TapNetError> for arcbox_vm_driver::Error {
     fn from(err: TapNetError) -> Self {
         match err {
             TapNetError::Io(io) => Self::Io(io),
             TapNetError::Network(msg) => Self::Network(msg),
-            other @ (TapNetError::Json(_)
-            | TapNetError::WrongState { .. }
-            | TapNetError::Unavailable(_)) => Self::Network(other.to_string()),
+            TapNetError::Unavailable(msg) => Self::Unavailable(msg),
+            wrong @ TapNetError::WrongState { .. } => Self::PreconditionFailed(wrong.to_string()),
+            json @ TapNetError::Json(_) => Self::Network(json.to_string()),
         }
     }
 }
@@ -70,7 +74,7 @@ mod tests {
     use super::TapNetError as T;
 
     #[test]
-    fn errors_keep_io_and_flatten_the_rest_into_network() {
+    fn errors_keep_io_and_the_faults_land_on_network() {
         let io = Error::from(T::Io(std::io::Error::other("disk")));
         assert!(matches!(io, Error::Io(_)), "{io}");
         // A network failure's message is already the whole story.
@@ -79,23 +83,38 @@ mod tests {
             matches!(&network, Error::Network(m) if m == "TUNSETIFF vmtap0-2: EPERM"),
             "{network}"
         );
-        // Everything else keeps its classification in the text, since the
-        // port has no retry-later or token-mismatch shape to carry it.
-        for error in [
-            T::Unavailable("gate".into()),
-            T::WrongState {
-                id: "box".into(),
-                expected: "token a".into(),
-                actual: "token b".into(),
-            },
-            T::Json(serde_json::from_str::<u8>("x").unwrap_err()),
-        ] {
-            let text = error.to_string();
-            let mapped = Error::from(error);
-            assert!(
-                matches!(&mapped, Error::Network(m) if *m == text),
-                "{mapped}"
-            );
-        }
+        // A ledger that will not decode is a fault, not a protocol answer.
+        let json = T::Json(serde_json::from_str::<u8>("x").unwrap_err());
+        let text = json.to_string();
+        let mapped = Error::from(json);
+        assert!(
+            matches!(&mapped, Error::Network(m) if *m == text),
+            "{mapped}"
+        );
+    }
+
+    /// The cleanup protocol's two answers keep their classification across
+    /// the port: "come back later" and "that is not the token", which the
+    /// callers above turn into 503 and 412.
+    #[test]
+    fn the_cleanup_protocols_answers_survive_the_port() {
+        let gate = Error::from(T::Unavailable("startup cleanup pending".into()));
+        assert!(
+            matches!(&gate, Error::Unavailable(m) if m == "startup cleanup pending"),
+            "{gate}"
+        );
+        let mismatch = Error::from(T::WrongState {
+            id: "box".into(),
+            expected: "cleanup token a".into(),
+            actual: "b".into(),
+        });
+        let Error::PreconditionFailed(message) = &mismatch else {
+            panic!("a token mismatch is a failed precondition, got {mismatch}");
+        };
+        // The three fields the port cannot carry stay readable in the text.
+        assert!(
+            message.contains("box") && message.contains("cleanup token a") && message.contains('b'),
+            "{message}"
+        );
     }
 }

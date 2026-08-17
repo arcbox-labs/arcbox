@@ -58,6 +58,21 @@ pub enum Error {
     /// The guest-network port refused or failed an operation.
     #[error("network: {0}")]
     Network(String),
+
+    /// The operation cannot proceed yet, and retrying later is the remedy:
+    /// a startup-cleanup gate still closed, a same-id cleanup the host has
+    /// not finalized. Separate from [`Self::Network`] because a caller
+    /// surfaces it as "unavailable, come back" rather than as a fault.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+
+    /// A precondition the caller presented does not hold — a cleanup token
+    /// naming another generation, or naming one that no longer exists.
+    /// Retrying the same call never helps; the caller needs a current
+    /// token. Separate from [`Self::WrongState`], which is about where a
+    /// VM sits in its lifecycle.
+    #[error("failed precondition: {0}")]
+    PreconditionFailed(String),
 }
 
 /// `Result` specialised to this crate's [`Error`].
