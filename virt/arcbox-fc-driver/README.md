@@ -28,8 +28,9 @@ catalog, no engine, no orchestrator.
 | `api` | pause, resume, snapshot, ctrl-alt-del, describe, vm-config over the raw client |
 | `listener` | the port's `VsockListener` over a `{uds}_{port}` socket |
 | `discover` | finding a Firecracker that outlived its booter: the recorded pid and any `/proc` candidate, held to the same `--id` / `--api-sock` / jail-root test |
+| `adopt` | rebuilding a handle over what `discover` found: a bounded API reconnect for the full `FcHandle`, else `FcProcessHandle` over the process alone |
 | `prepared` | `FcPrepared: PreparedVm` — a spawned VMM waiting for a spec |
-| `handle` | `FcHandle: VmHandle + Vsock + VsockListen + Checkpoint + Detach` |
+| `handle` | `FcHandle: VmHandle + Vsock + VsockListen + Checkpoint + Detach`; `FcProcessHandle: VmHandle + Detach`, over a VMM whose API is unreachable |
 | `driver` | `FcDriver: VmDriver + Prepare + Adopt` |
 
 ## Usage
@@ -68,6 +69,25 @@ the name a checkpoint of this driver records, and a disk that already sits
 in the jail under another name is given that name too for the load (a hard
 link, or a device node or copy) and loses it once the drive points at the
 disk itself.
+
+**Adopt never fails on the API.** `Adopt::adopt` finds the VMM by its
+process — the recorded pid when it is still a Firecracker the record
+names, else a `/proc` scan by `--id`, `--api-sock`, or jail root
+(`discover`) — and `Ok(None)` means nothing survived. A found process is
+always adopted: the exit prober goes over the verified pid first, then the
+API is reconnected best-effort with a short bound (`adopt::API_TIMEOUT`,
+2 s for `GET /` and `GET /vm/config`). A VMM that answers yields the full
+`FcHandle` — vsock at the path Firecracker reports, checkpoint under a
+jail, `Quiesced` if it was paused. One whose socket is missing, wedged, or
+closes yields an `FcProcessHandle`: `id`/`record`/`state`/`events`,
+`shutdown` (`Kill` is SIGKILL plus the bounded reap; `Graceful` degrades to
+it, since the ctrl-alt-del that would ask the guest is an API call), and
+`detach`; every API-backed accessor is `None`. The record either handle
+reports names the process that was verified, not the one the caller
+recorded. This is what lets the sandbox manager's restart sweep
+`shutdown(Kill)` an orphan whose control socket died with its booter — the
+blind SIGKILL by pid it replaced had no API dependency, and neither does
+this.
 
 ## Path rules
 

@@ -44,6 +44,11 @@ impl FakeFc {
         }
     }
 
+    /// The socket this answers on.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     /// A client that talks to this socket.
     pub fn client(&self) -> fc_sdk::Client {
         fc_sdk::connection::connect(&self.socket)

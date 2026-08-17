@@ -40,6 +40,10 @@
 //! - [`discover`] — finding a Firecracker that outlived the process which
 //!   booted it: the recorded pid when it is a Firecracker the record names,
 //!   else a `/proc` scan for one, by `--id`, `--api-sock`, or jail root.
+//! - [`adopt`] — rebuilding a handle over what `discover` found: the API
+//!   reconnected best-effort within a short bound for the full `FcHandle`,
+//!   else `FcProcessHandle` over the verified process alone. An adopt never
+//!   fails on the API.
 //! - [`driver`] — [`FcDriver`], the port's `VmDriver` with `Prepare` and
 //!   `Adopt`; `boot`/`restore` are prepare-then-boot/restore.
 //!
@@ -61,6 +65,7 @@
 
 #![warn(missing_docs)]
 
+pub mod adopt;
 pub mod api;
 pub mod config;
 pub mod discover;

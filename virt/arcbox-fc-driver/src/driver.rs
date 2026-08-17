@@ -11,12 +11,9 @@ use arcbox_vm_driver::{
 use async_trait::async_trait;
 
 use crate::config::FcDriverConfig;
-use crate::handle::FcHandle;
-use crate::listener::VsockEndpoint;
 use crate::prepared::FcPrepared;
-use crate::process::FcProcess;
-use crate::render::{self, VmLayout};
-use crate::{CHECKPOINT_FORMAT, NAME, api, discover};
+use crate::render;
+use crate::{CHECKPOINT_FORMAT, NAME, adopt, discover};
 
 /// The Firecracker adapter.
 ///
@@ -127,34 +124,20 @@ impl Adopt for FcDriver {
     /// Finds the VMM `record` names — the recorded pid when it is still a
     /// Firecracker, else a `/proc` scan by `--id`, `--api-sock`, or a
     /// jail root ending in `{firecracker binary name}/{id}/root` — and
-    /// rebuilds a handle over it: the API is reconnected, the VM's devices
-    /// and paused state are read back, and its exit is tracked by probing.
+    /// rebuilds a handle over it, its exit tracked by probing. The API is
+    /// reconnected best-effort within [`adopt::API_TIMEOUT`]: a VMM that
+    /// answers yields the full [`FcHandle`](crate::FcHandle) with its
+    /// devices and paused state read back; one whose socket is missing,
+    /// wedged, or closes yields an [`FcProcessHandle`](crate::FcProcessHandle)
+    /// that can be killed, observed, and detached, and nothing else. A
+    /// verified process is never left unadoptable by its API.
     async fn adopt(&self, record: &VmRecord) -> Result<Option<Box<dyn VmHandle>>> {
-        let Some(found) = discover::find(&self.config, record) else {
-            return Ok(None);
-        };
-        let client = fc_sdk::connection::connect(&found.api_socket);
-        let info = api::describe(&client).await?;
-        let devices = api::vm_config(&client).await?;
-        let layout = VmLayout::new(
-            &record.id,
-            &found.isolation,
-            &self.config,
-            &record.runtime_dir,
-        )?;
-        let vsock = devices
-            .vsock
-            .map(|vsock| VsockEndpoint::new(layout.host_view(&vsock.uds_path)));
-        let process = Arc::new(FcProcess::adopt(found.pid, found.api_socket));
-        let quiesced = matches!(info.state, fc_sdk::types::InstanceInfoState::Paused);
-        Ok(Some(Box::new(FcHandle::new(
-            process,
-            client,
-            layout,
-            record.clone(),
-            vsock,
-            quiesced,
-        ))))
+        match discover::find(&self.config, record) {
+            Some(found) => Ok(Some(
+                adopt::rebuild(&self.config, found, record, adopt::API_TIMEOUT).await?,
+            )),
+            None => Ok(None),
+        }
     }
 }
 
