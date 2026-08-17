@@ -56,6 +56,7 @@ pub mod agent;
 pub mod config;
 pub mod environment;
 pub mod error;
+mod lifecycle;
 pub mod rootfs;
 pub mod sandbox;
 #[cfg(feature = "testkit")]

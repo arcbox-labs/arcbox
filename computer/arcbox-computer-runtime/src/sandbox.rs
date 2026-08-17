@@ -52,7 +52,7 @@ mod pause;
 mod policy;
 mod pool;
 mod reconcile;
-mod record;
+pub(crate) mod record;
 mod spec;
 mod templates;
 #[cfg(test)]
@@ -60,7 +60,7 @@ mod testing;
 mod timers;
 mod types;
 mod warm;
-mod workload;
+pub(crate) mod workload;
 
 pub use execution::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
