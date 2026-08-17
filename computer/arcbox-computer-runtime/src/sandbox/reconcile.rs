@@ -804,6 +804,34 @@ pub(super) async fn release_instances(
     }
 }
 
+/// Kill this VM, and when the kill fails hand it to the next process instead
+/// of letting go of it.
+///
+/// Every path that reaches here owns the last handle, and a handle that is
+/// merely dropped kills — unreaped, and with its vsock socket unlinked. After
+/// a kill that already failed, that leaves the guest alive and unreachable:
+/// the damaged-guest outcome, arrived at silently. Detaching first makes the
+/// drop a no-op, and the sandbox's journal survives every path that can reach
+/// here, so the next sweep finds the VM again. A driver without `Detach` runs
+/// its VMs in-process and never produced a handle for this sweep to reclaim,
+/// so there is nothing to hand over there.
+///
+/// `Err` means the VM is still alive. Whether that is fatal is the caller's:
+/// [`release_one`] is best-effort and warns, [`adopt_or_kill`] has to stop the
+/// sweep, because a live VMM pins the dm device the global CoW reap is about
+/// to walk.
+async fn kill_or_hand_over(id: &str, handle: &Arc<dyn VmHandle>) -> Result<()> {
+    let Err(error) = handle.shutdown(ShutdownMode::Kill).await else {
+        return Ok(());
+    };
+    if let Some(detach) = handle.detach()
+        && let Err(error) = detach.detach().await
+    {
+        warn!(sandbox_id = %id, %error, "handing the vmm over failed; dropping it kills it");
+    }
+    Err(error.into())
+}
+
 /// Let go of one reclaimed sandbox: kill its VM, then hand back the disk
 /// overlay and the address it was running on.
 ///
@@ -814,14 +842,6 @@ pub(super) async fn release_instances(
 /// would leave it alive and broken, which is worse than leaving all three
 /// for the next sweep: the sandbox's journal survives this path, so there
 /// is one.
-///
-/// Stopping means giving the VM up as well, not just declining to touch the
-/// other two. The caller owns the last handle by then, and a handle that is
-/// merely dropped kills — unreaped, and with its vsock socket unlinked —
-/// which would leave exactly the damaged guest this stop exists to prevent,
-/// plus the disk and address still held. So the handle is detached first. A
-/// driver without `Detach` runs its VMs in-process and never produced a
-/// handle for this sweep to reclaim, so there is nothing to hand over there.
 async fn release_one(
     id: &str,
     handle: &Arc<dyn VmHandle>,
@@ -831,16 +851,11 @@ async fn release_one(
     cow_manager: &CowManager,
 ) {
     warn!(sandbox_id = %id, "releasing a reclaimed sandbox that recovery did not take");
-    if let Err(error) = handle.shutdown(ShutdownMode::Kill).await {
+    if let Err(error) = kill_or_hand_over(id, handle).await {
         warn!(
             sandbox_id = %id, %error,
             "killing the reclaimed vmm failed; leaving it, its disk and its address for the next sweep"
         );
-        if let Some(detach) = handle.detach()
-            && let Err(error) = detach.detach().await
-        {
-            warn!(sandbox_id = %id, %error, "handing the reclaimed vmm over failed; dropping it kills it");
-        }
         return;
     }
     if let Some(cow_handle) = cow_handle
@@ -977,7 +992,14 @@ async fn adopt_or_kill(
                 sandbox_id = %record.id, vm = %vm_record.id, %reason,
                 "killing the orphaned vmm"
             );
-            handle.shutdown(ShutdownMode::Kill).await?;
+            // A kill that fails leaves the VM alive and still pinning its dm
+            // device, so the sweep stops here rather than walking into the
+            // global CoW reap. Stopping means giving the VM up as well: this
+            // is the only handle, and dropping it undetached would kill it
+            // unreaped and unlink its vsock — alive and unreachable. What
+            // `reclaim` re-established before it refused stays for the next
+            // sweep, which the surviving journal guarantees there is.
+            kill_or_hand_over(&record.id, &handle).await?;
             Ok(None)
         }
     }
@@ -1676,6 +1698,40 @@ mod tests {
 
     /// How the adoption tests below differ from one another, each shifting
     /// exactly one predicate away from the case that is kept alive.
+    /// A VM whose kill never succeeds — the reaper never sees it exit.
+    /// Wrapping a real fake handle keeps `detach` live, so a test can tell
+    /// "handed over" from "dropped, and therefore killed".
+    struct RefusesShutdown(Arc<dyn VmHandle>);
+
+    #[async_trait::async_trait]
+    impl VmHandle for RefusesShutdown {
+        fn id(&self) -> &VmId {
+            self.0.id()
+        }
+        fn record(&self) -> VmRecord {
+            self.0.record()
+        }
+        fn state(&self) -> VmState {
+            self.0.state()
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<arcbox_vm_driver::VmEvent> {
+            self.0.events()
+        }
+        async fn shutdown(
+            &self,
+            _mode: ShutdownMode,
+        ) -> arcbox_vm_driver::Result<arcbox_vm_driver::ExitStatus> {
+            Err(arcbox_vm_driver::Error::Driver {
+                driver: "fake",
+                message: "the reaper did not see it exit".into(),
+                source: None,
+            })
+        }
+        fn detach(&self) -> Option<&dyn arcbox_vm_driver::Detach> {
+            self.0.detach()
+        }
+    }
+
     struct AdoptionCase {
         /// Whether the VM the previous agent left behind has vsock — i.e.
         /// whether the driver hands back a full handle or the process-only
@@ -1991,37 +2047,6 @@ mod tests {
     async fn a_release_whose_kill_fails_keeps_the_disk_and_the_address() {
         use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
 
-        struct RefusesShutdown(Arc<dyn VmHandle>);
-
-        #[async_trait::async_trait]
-        impl VmHandle for RefusesShutdown {
-            fn id(&self) -> &VmId {
-                self.0.id()
-            }
-            fn record(&self) -> VmRecord {
-                self.0.record()
-            }
-            fn state(&self) -> VmState {
-                self.0.state()
-            }
-            fn events(&self) -> tokio::sync::broadcast::Receiver<arcbox_vm_driver::VmEvent> {
-                self.0.events()
-            }
-            async fn shutdown(
-                &self,
-                _mode: ShutdownMode,
-            ) -> arcbox_vm_driver::Result<arcbox_vm_driver::ExitStatus> {
-                Err(arcbox_vm_driver::Error::Driver {
-                    driver: "fake",
-                    message: "the reaper did not see it exit".into(),
-                    source: None,
-                })
-            }
-            fn detach(&self) -> Option<&dyn arcbox_vm_driver::Detach> {
-                self.0.detach()
-            }
-        }
-
         let data_dir = tempfile::tempdir().unwrap();
         let driver = FakeDriver::new();
         let network = FakeNetwork::new();
@@ -2090,6 +2115,44 @@ mod tests {
         assert!(
             readopted.is_some(),
             "the vm is still there for the next sweep to retry"
+        );
+    }
+
+    /// The kill every adoption refusal falls back to can itself fail, and by
+    /// then the sweep owns the only handle on a VM that is still running.
+    /// Dropping it would kill unreaped and unlink the vsock — a guest left
+    /// alive and unreachable, which is the outcome this whole path exists to
+    /// prevent. So the fallback hands the VM over and reports the failure;
+    /// the caller decides what to do with it.
+    #[tokio::test]
+    async fn a_kill_that_fails_hands_the_vm_over_instead_of_dropping_it() {
+        use arcbox_vm_driver::testkit::FakeDriver;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let vm_dir = data_dir.path().join("sandboxes").join("stuck");
+        // Still owned: the fake driver refuses to adopt an owned VM, so a
+        // later adopt succeeding is proof the handover happened.
+        let vm = boot_previous_vm(&driver, &vm_dir, "stuck", true, false).await;
+        let vm_record = vm.record();
+        let handle: Arc<dyn VmHandle> = Arc::new(RefusesShutdown(Arc::from(vm)));
+
+        let failed = kill_or_hand_over("stuck", &handle).await;
+
+        assert!(
+            failed.is_err(),
+            "a vm that is still alive is reported, not swallowed"
+        );
+        drop(handle);
+        let readopted = driver
+            .adopt()
+            .expect("the fake driver adopts")
+            .adopt(&vm_record)
+            .await
+            .unwrap();
+        assert!(
+            readopted.is_some(),
+            "the vm was handed over, so letting go of the handle did not kill it"
         );
     }
 
