@@ -7,37 +7,20 @@ use crate::lifecycle::effect::{
 };
 use crate::lifecycle::event::Event;
 use crate::lifecycle::machine::State;
+use crate::sandbox::policy::recovery::{JournalEvidence, RecoveryAction, plan};
 use crate::sandbox::record::PersistPhase;
 use crate::sandbox::{IdleAction, SandboxState};
 
-/// `sandbox::policy::recovery::plan`'s verdict per phase, mirrored.
+/// `sandbox::policy::recovery::plan`'s verdict for a phase whose journal the
+/// startup sweep tore down — the evidence a seeded machine corresponds to.
 ///
-/// Those items are `pub(in crate::sandbox)`, so this table cannot call the
-/// real one — it is checked by eye against `sandbox/policy/recovery.rs`, whose
-/// own exhaustive test pins `plan`. Widening `plan`, `RecoveryAction` and
-/// `JournalEvidence` to `pub(crate)` would make this an assertion instead of a
-/// mirror; PR-F should do it when the recovery applier moves here.
-#[derive(Debug, PartialEq, Eq)]
-enum Recovery {
-    LeaveResumable,
-    Fail,
-    Reinstate(SandboxState),
-    FinishRemove,
-}
-
-fn recovery_plan(phase: PersistPhase) -> Recovery {
-    match phase {
-        PersistPhase::Creating => Recovery::LeaveResumable,
-        PersistPhase::Starting
-        | PersistPhase::Ready
-        | PersistPhase::Stopping
-        | PersistPhase::Pausing
-        | PersistPhase::Resuming => Recovery::Fail,
-        PersistPhase::Stopped => Recovery::Reinstate(SandboxState::Stopped),
-        PersistPhase::Failed => Recovery::Reinstate(SandboxState::Failed),
-        PersistPhase::Paused => Recovery::Reinstate(SandboxState::Paused),
-        PersistPhase::Removing => Recovery::FinishRemove,
-    }
+/// The real function, not a table checked by eye: the two cannot drift.
+/// `Swept` is the one evidence a `Recovered` event can carry, since the
+/// machine is seeded from what the sweep already acted on; the refusals and
+/// the reclaimed-alive verdict never reach this path, and
+/// `sandbox/policy/recovery.rs`'s own exhaustive table covers them.
+fn recovery_plan(phase: PersistPhase) -> RecoveryAction {
+    plan(phase, JournalEvidence::Swept)
 }
 
 #[test]
@@ -48,21 +31,26 @@ fn recovery_seeds_the_state_its_own_verdict_leaves_behind() {
         match recovery_plan(phase) {
             // Nobody acknowledged the intent, so the same request key still
             // resumes it: the machine stays where a fresh one starts.
-            Recovery::LeaveResumable => {
+            RecoveryAction::LeaveResumable => {
                 assert_eq!(state.durable(), Some(PersistPhase::Creating), "{phase:?}");
                 assert_eq!(state.to_public(), SandboxState::Starting, "{phase:?}");
             }
             // Recovery already wrote `Failed`; the machine only adopts it.
-            Recovery::Fail => {
+            RecoveryAction::Fail => {
                 assert_eq!(state.durable(), Some(PersistPhase::Failed), "{phase:?}");
                 assert_eq!(state.to_public(), SandboxState::Failed, "{phase:?}");
             }
-            Recovery::Reinstate(public) => {
+            RecoveryAction::Reinstate(public) => {
                 assert_eq!(state.durable(), Some(phase), "{phase:?}");
                 assert_eq!(state.to_public(), public, "{phase:?}");
             }
-            Recovery::FinishRemove => {
+            RecoveryAction::FinishRemove => {
                 assert_eq!(state.durable(), Some(PersistPhase::Removing), "{phase:?}");
+            }
+            // Both refusals answer a sweep that found no journal or adopted
+            // a phase it must not: neither seeds a machine.
+            refused @ (RecoveryAction::RefuseUnjournaled | RecoveryAction::RefuseAdopted) => {
+                panic!("{phase:?} with a swept journal cannot yield {refused:?}")
             }
         }
         // A seeded machine must still be drivable to its end.

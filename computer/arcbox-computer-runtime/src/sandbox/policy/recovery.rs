@@ -13,7 +13,7 @@ use crate::sandbox::record::PersistPhase;
 /// What the orphan sweep established about one sandbox's runtime resources
 /// before recovery reads its durable record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::sandbox) enum JournalEvidence {
+pub enum JournalEvidence {
     /// The sweep found this sandbox's cleanup journal and tore down
     /// everything it listed.
     Swept,
@@ -29,7 +29,7 @@ pub(in crate::sandbox) enum JournalEvidence {
 
 /// What startup recovery does with one durable record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::sandbox) enum RecoveryAction {
+pub enum RecoveryAction {
     /// A create intent nobody acknowledged: left as it is, so the same
     /// request key still resumes it.
     LeaveResumable,
@@ -62,7 +62,11 @@ pub(in crate::sandbox) enum SweepAction {
 }
 
 /// Recovery's verdict on a record in `phase`, given what the sweep saw.
-pub(in crate::sandbox) fn plan(phase: PersistPhase, evidence: JournalEvidence) -> RecoveryAction {
+///
+/// Crate-visible, like the durable phase vocabulary it reads: the lifecycle
+/// state machine seeds itself from these verdicts and its invariant test
+/// asserts against this function rather than a copy of it.
+pub fn plan(phase: PersistPhase, evidence: JournalEvidence) -> RecoveryAction {
     match (phase, evidence) {
         // An adopted sandbox never stopped being usable: the sweep took its
         // VM back rather than tearing it down, so it is reinstated with the

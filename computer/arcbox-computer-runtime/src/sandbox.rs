@@ -49,7 +49,7 @@ mod execution;
 mod files;
 mod lifecycle;
 mod pause;
-mod policy;
+pub(crate) mod policy;
 mod pool;
 mod reconcile;
 pub(crate) mod record;
