@@ -3,10 +3,11 @@
 //! This crate builds the `vm-agent` binary (`src/main.rs`) that becomes
 //! PID 1 inside every sandbox microVM, cross-compiled to static musl and
 //! staged into every sandbox rootfs at `/sbin/vm-agent`. The binary is a
-//! separate deliverable from the sandbox manager (`arcbox-vm`): a consumer
-//! may ship the binary, link the manager, or both. That is why this crate
-//! depends on the shared wire vocabulary (`arcbox-vm-proto`) and never on
-//! the manager — the crate graph, not a convention, keeps the init small.
+//! separate deliverable from the sandbox manager
+//! (`arcbox-computer-runtime`): a consumer may ship the binary, link the
+//! manager, or both. That is why this crate depends on the shared wire
+//! vocabulary (`arcbox-vm-proto`) and never on the manager — the crate
+//! graph, not a convention, keeps the init small.
 //!
 //! The library half holds the agent's pure helpers, kept out of the binary
 //! so they compile and are unit-tested on every host platform:

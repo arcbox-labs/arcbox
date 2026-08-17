@@ -197,13 +197,13 @@ name = "arcbox-agent"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "arcbox-computer-runtime",
  "arcbox-connect",
  "arcbox-constants",
  "arcbox-dns",
  "arcbox-logging",
  "arcbox-pty",
  "arcbox-snapshot",
- "arcbox-vm",
  "async-trait",
  "buffa",
  "buffa-types",
@@ -360,6 +360,36 @@ dependencies = [
  "arcbox-engine",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "arcbox-computer-runtime"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "arcbox-atomic-file",
+ "arcbox-error",
+ "arcbox-ext4",
+ "arcbox-fc-driver",
+ "arcbox-snapshot",
+ "arcbox-tap-net",
+ "arcbox-vm-driver",
+ "arcbox-vm-proto",
+ "async-trait",
+ "chrono",
+ "libc",
+ "nix 0.29.0",
+ "oci2rootfs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1206,36 +1236,6 @@ dependencies = [
  "libc",
  "tempfile",
  "tracing",
-]
-
-[[package]]
-name = "arcbox-vm"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "arcbox-atomic-file",
- "arcbox-error",
- "arcbox-ext4",
- "arcbox-fc-driver",
- "arcbox-snapshot",
- "arcbox-tap-net",
- "arcbox-vm-driver",
- "arcbox-vm-proto",
- "async-trait",
- "chrono",
- "libc",
- "nix 0.29.0",
- "oci2rootfs",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

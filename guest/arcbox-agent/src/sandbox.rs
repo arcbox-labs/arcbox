@@ -1,9 +1,10 @@
 //! Sandbox service for the guest agent.
 //!
-//! Wraps [`SandboxManager`] from `arcbox-vm` and translates between the
-//! `sandbox_v1` protobuf types (from `arcbox-connect`) and the native Rust
-//! types used by `arcbox-vm`. Lifecycle CRUD lives here; executions, events,
-//! file I/O, and snapshots live in the submodules.
+//! Wraps [`SandboxManager`] from `arcbox-computer-runtime` and translates
+//! between the `sandbox_v1` protobuf types (from `arcbox-connect`) and the
+//! native Rust types used by `arcbox-computer-runtime`. Lifecycle CRUD
+//! lives here; executions, events, file I/O, and snapshots live in the
+//! submodules.
 
 mod convert;
 mod events;
@@ -16,11 +17,11 @@ mod templates;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-use arcbox_connect::sandbox_v1;
-use arcbox_vm::{
+use arcbox_computer_runtime::{
     RootfsBuilder, RootfsPaths, SandboxEnvironment, SandboxManager, SandboxMountSpec,
     SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig, VmmError,
 };
+use arcbox_connect::sandbox_v1;
 use buffa::Message;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -284,7 +285,7 @@ impl SandboxService {
                     .entry
                     .warm
                     .as_ref()
-                    .map(|warm| arcbox_vm::TemplateWarmRef {
+                    .map(|warm| arcbox_computer_runtime::TemplateWarmRef {
                         snapshot_id: warm.snapshot_id.clone(),
                         vcpus: warm.vcpus,
                         memory_mib: warm.memory_mib,
@@ -406,10 +407,10 @@ impl SandboxService {
         &self,
         req: arcbox_connect::v1::SandboxResumeCommand,
     ) -> Result<arcbox_connect::v1::SandboxResumeResponse, SandboxError> {
-        let reason = if req.reason == arcbox_vm::pause_reason::AUTO_RESUME {
-            arcbox_vm::pause_reason::AUTO_RESUME
+        let reason = if req.reason == arcbox_computer_runtime::pause_reason::AUTO_RESUME {
+            arcbox_computer_runtime::pause_reason::AUTO_RESUME
         } else {
-            arcbox_vm::pause_reason::RESUME
+            arcbox_computer_runtime::pause_reason::RESUME
         };
         let ip_address = self
             .manager
@@ -432,7 +433,7 @@ impl SandboxService {
         &self,
         req: sandbox_v1::SetLifecycleRequest,
     ) -> Result<(), SandboxError> {
-        let update = arcbox_vm::LifecycleUpdate {
+        let update = arcbox_computer_runtime::LifecycleUpdate {
             ttl_seconds: req.ttl_seconds,
             idle_timeout_seconds: req.idle_timeout_seconds,
             on_idle: req
@@ -501,7 +502,7 @@ impl SandboxService {
     pub(crate) fn sandbox_network_identity(
         &self,
         sandbox_id: &str,
-    ) -> Result<arcbox_vm::SandboxNetworkIdentity, SandboxError> {
+    ) -> Result<arcbox_computer_runtime::SandboxNetworkIdentity, SandboxError> {
         self.manager
             .sandbox_network_identity(sandbox_id)
             .map_err(SandboxError::from)
@@ -726,11 +727,11 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
 
 /// Map the wire idle policy onto the manager's; `UNSPECIFIED` (and unknown
 /// future values) resolve to the daemon default, KILL.
-fn idle_action_to_spec(action: sandbox_v1::IdleAction) -> arcbox_vm::IdleAction {
+fn idle_action_to_spec(action: sandbox_v1::IdleAction) -> arcbox_computer_runtime::IdleAction {
     match action {
-        sandbox_v1::IdleAction::Pause => arcbox_vm::IdleAction::Pause,
+        sandbox_v1::IdleAction::Pause => arcbox_computer_runtime::IdleAction::Pause,
         sandbox_v1::IdleAction::Kill | sandbox_v1::IdleAction::Unspecified => {
-            arcbox_vm::IdleAction::Kill
+            arcbox_computer_runtime::IdleAction::Kill
         }
     }
 }

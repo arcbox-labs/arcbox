@@ -141,8 +141,9 @@ async fn main() -> Result<()> {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
                 tracing_subscriber::registry()
                     .with(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| "arcbox_agent=info,arcbox_vm=info".into()),
+                        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+                            |_| "arcbox_agent=info,arcbox_computer_runtime=info".into(),
+                        ),
                     )
                     .with(
                         tracing_subscriber::fmt::layer()
@@ -162,8 +163,9 @@ async fn main() -> Result<()> {
                 eprintln!("arcbox-agent: failed to create {log_dir}: {e}, falling back to console");
                 tracing_subscriber::registry()
                     .with(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| "arcbox_agent=info,arcbox_vm=info".into()),
+                        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+                            |_| "arcbox_agent=info,arcbox_computer_runtime=info".into(),
+                        ),
                     )
                     .with(
                         tracing_subscriber::fmt::layer()
@@ -179,7 +181,7 @@ async fn main() -> Result<()> {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "arcbox_agent=info,arcbox_vm=info".into()),
+                    .unwrap_or_else(|_| "arcbox_agent=info,arcbox_computer_runtime=info".into()),
             )
             .with(
                 tracing_subscriber::fmt::layer()

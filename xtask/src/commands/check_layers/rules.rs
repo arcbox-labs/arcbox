@@ -53,7 +53,13 @@ pub const RULES: &[Rule] = &[
     },
     Rule {
         subject: Subject::Members(&["arcbox-vm-agent"]),
-        forbidden: Forbidden::Crates(&["arcbox-vm", "arcbox-snapshot", "tokio", "aya", "fc-sdk"]),
+        forbidden: Forbidden::Crates(&[
+            "arcbox-computer-runtime",
+            "arcbox-snapshot",
+            "tokio",
+            "aya",
+            "fc-sdk",
+        ]),
         reason: "CORE-127 — the in-sandbox binary is a compiler-enforced crate boundary \
                  and stays a small static musl binary",
     },
@@ -97,5 +103,22 @@ pub const EXCEPTIONS: &[Exception] = &[
         reason: "engine reaches the hypervisor seam directly until the \
                  arcbox-vm-driver port replaces that edge",
         until: "vm-stack-redesign R4",
+    },
+    Exception {
+        from: "arcbox-computer-runtime",
+        to: "arcbox-fc-driver",
+        reason: "the runtime still builds the Firecracker adapter as its own \
+                 default and calls its jailer staging helpers directly, until \
+                 the port grows a Staging capability and a composition root \
+                 supplies the driver",
+        until: "vm-stack-redesign R3 (PR-G)",
+    },
+    Exception {
+        from: "arcbox-computer-runtime",
+        to: "arcbox-tap-net",
+        reason: "the runtime still builds the TAP adapter as its own default \
+                 and re-exports it as `network`, until a composition root \
+                 supplies a GuestNetwork through the port",
+        until: "vm-stack-redesign R3 (PR-G)",
     },
 ];

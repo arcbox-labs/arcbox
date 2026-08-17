@@ -48,11 +48,11 @@ arcbox-connect.workspace = true
 buffa = "0.9.1"
 buffa-types = "0.9.1"
 
-# vsock and arcbox-vm are Linux-only
+# vsock and arcbox-computer-runtime are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
 arcbox-pty.workspace = true
 tokio-vsock = "0.5"
-arcbox-vm = { workspace = true }
+arcbox-computer-runtime = { workspace = true }
 arcbox-snapshot = { workspace = true }
 tonic.workspace = true
 tonic-prost.workspace = true
@@ -61,7 +61,7 @@ http = "1"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [dev-dependencies]
-arcbox-vm.workspace = true
+arcbox-computer-runtime.workspace = true
 tempfile = "3"
 
 [features]

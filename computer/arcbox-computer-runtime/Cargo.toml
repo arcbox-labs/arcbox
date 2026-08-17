@@ -1,5 +1,5 @@
 [package]
-name              = "arcbox-vm"
+name              = "arcbox-computer-runtime"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -16,7 +16,7 @@
 //! JSON payloads are the `serde` types here. This crate depends on `serde`
 //! alone so the agent — a static musl binary staged into every sandbox
 //! rootfs — links it without pulling in the manager, and the manager
-//! (`arcbox-vm`) links it so both ends decode the same bytes.
+//! (`arcbox-computer-runtime`) links it so both ends decode the same bytes.
 //!
 //! # Compatibility
 //!

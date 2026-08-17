@@ -4,16 +4,16 @@
 //!
 //! ```bash
 //! # Phase 1 + N only (core lifecycle + network — no guest agent required):
-//! ARCBOX_CONFIG=/etc/arcbox-vm/config.toml \
-//!   cargo run -p arcbox-vm --example sandbox-smoke
+//! ARCBOX_CONFIG=/etc/arcbox-computer-runtime/config.toml \
+//!   cargo run -p arcbox-computer-runtime --example sandbox-smoke
 //!
 //! # Also run commands + guest-side network checks (Phase 2):
 //! ARCBOX_SMOKE_RUN=1 ARCBOX_CONFIG=... \
-//!   cargo run -p arcbox-vm --example sandbox-smoke
+//!   cargo run -p arcbox-computer-runtime --example sandbox-smoke
 //!
 //! # Also checkpoint + restore (Phase 3):
 //! ARCBOX_SMOKE_CHECKPOINT=1 ARCBOX_CONFIG=... \
-//!   cargo run -p arcbox-vm --example sandbox-smoke
+//!   cargo run -p arcbox-computer-runtime --example sandbox-smoke
 //! ```
 //!
 //! | Phase | Env var                     | Extra requirement              |
@@ -29,7 +29,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use arcbox_vm::{
+use arcbox_computer_runtime::{
     RestoreSandboxSpec, SandboxEvent, SandboxManager, SandboxSpec, SandboxState, config::VmmConfig,
 };
 use tokio::sync::broadcast;
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "arcbox_vm=info".parse().unwrap()),
+                .unwrap_or_else(|_| "arcbox_computer_runtime=info".parse().unwrap()),
         )
         .init();
 
@@ -184,7 +184,10 @@ async fn main() -> anyhow::Result<()> {
         println!("\n=== Phase 2: Command execution ===");
 
         // Basic commands.
-        for cmd in [vec!["echo", "hello from arcbox-vm"], vec!["uname", "-a"]] {
+        for cmd in [
+            vec!["echo", "hello from arcbox-computer-runtime"],
+            vec!["uname", "-a"],
+        ] {
             run_cmd(&manager, &id, &cmd, 10).await?;
         }
 
@@ -352,11 +355,13 @@ async fn run_cmd(
     while let Some(chunk) = rx.recv().await {
         let chunk = chunk.context("output chunk")?;
         match chunk {
-            arcbox_vm::OutputChunk::Stdout(data) => stdout.extend_from_slice(&data),
-            arcbox_vm::OutputChunk::Stderr(data) => {
+            arcbox_computer_runtime::OutputChunk::Stdout(data) => stdout.extend_from_slice(&data),
+            arcbox_computer_runtime::OutputChunk::Stderr(data) => {
                 eprint!("{}", String::from_utf8_lossy(&data));
             }
-            arcbox_vm::OutputChunk::Exit(status) => exit_code = status.conventional_code(),
+            arcbox_computer_runtime::OutputChunk::Exit(status) => {
+                exit_code = status.conventional_code()
+            }
         }
     }
 

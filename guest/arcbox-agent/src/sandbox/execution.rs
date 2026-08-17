@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
+use arcbox_computer_runtime::ExecutionSpec;
 use arcbox_connect::sandbox_v1;
-use arcbox_vm::ExecutionSpec;
 use buffa::Message;
 use tokio::io::AsyncWrite;
 

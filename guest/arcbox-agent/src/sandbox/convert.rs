@@ -1,13 +1,15 @@
-//! Conversions between `arcbox-vm` native types and `sandbox.v1` protos,
-//! plus the shared id-ordered pagination helper.
+//! Conversions between `arcbox-computer-runtime` native types and
+//! `sandbox.v1` protos, plus the shared id-ordered pagination helper.
 
-use arcbox_connect::sandbox_v1;
-use arcbox_vm::file_io::proto as file_proto;
-use arcbox_vm::template_catalog::{ReadyProbeSpec, TemplateDefaultsSpec, TemplateEntry};
-use arcbox_vm::{
+use arcbox_computer_runtime::file_io::proto as file_proto;
+use arcbox_computer_runtime::template_catalog::{
+    ReadyProbeSpec, TemplateDefaultsSpec, TemplateEntry,
+};
+use arcbox_computer_runtime::{
     CheckpointInfo, CheckpointSummary, ExecutionChannel, ExecutionSnapshot, ExitStatus, IdleAction,
     SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxState, SandboxSummary, StdinState,
 };
+use arcbox_connect::sandbox_v1;
 use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
 

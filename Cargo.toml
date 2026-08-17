@@ -36,7 +36,6 @@ members = [
     "virt/arcbox-virtio-rng",
     "virt/arcbox-virtio-vsock",
     "virt/arcbox-virtio-balloon",
-    "virt/arcbox-vm",
     "virt/arcbox-vm-proto",
     "virt/arcbox-vm-driver",
     "virt/arcbox-fc-driver",
@@ -73,6 +72,7 @@ members = [
     # L7: Computer (MIT OR Apache-2.0)
     # ============================================
     "computer/arcbox-computer",
+    "computer/arcbox-computer-runtime",
 
     # ============================================
     # L8: Application (MIT OR Apache-2.0)
@@ -270,7 +270,6 @@ arcbox-virtio-net = { version = "0.7.0", path = "virt/arcbox-virtio-net" } # x-r
 arcbox-virtio-rng = { version = "0.7.0", path = "virt/arcbox-virtio-rng" } # x-release-please-version
 arcbox-virtio-vsock = { version = "0.7.0", path = "virt/arcbox-virtio-vsock" } # x-release-please-version
 arcbox-virtio-balloon = { version = "0.7.0", path = "virt/arcbox-virtio-balloon" } # x-release-please-version
-arcbox-vm = { version = "0.7.0", path = "virt/arcbox-vm" } # x-release-please-version
 arcbox-vm-proto = { version = "0.7.0", path = "virt/arcbox-vm-proto" } # x-release-please-version
 arcbox-vm-driver = { version = "0.7.0", path = "virt/arcbox-vm-driver" } # x-release-please-version
 arcbox-fc-driver = { version = "0.7.0", path = "virt/arcbox-fc-driver" } # x-release-please-version
@@ -294,6 +293,7 @@ arcbox-helper = { version = "1.1.0", path = "app/arcbox-helper" }
 arcbox-image = { version = "0.7.0", path = "engine/arcbox-image" } # x-release-please-version
 arcbox-engine = { version = "0.7.0", path = "engine/arcbox-engine" } # x-release-please-version
 arcbox-computer = { version = "0.7.0", path = "computer/arcbox-computer" } # x-release-please-version
+arcbox-computer-runtime = { version = "0.7.0", path = "computer/arcbox-computer-runtime" } # x-release-please-version
 arcbox-core = { version = "0.7.0", path = "app/arcbox-core" } # x-release-please-version
 arcbox-api = { version = "0.7.0", path = "app/arcbox-api" } # x-release-please-version
 arcbox-migration = { version = "0.7.0", path = "app/arcbox-migration" } # x-release-please-version

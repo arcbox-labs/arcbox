@@ -1,4 +1,4 @@
-//! `arcbox-vm` — guest-side sandbox orchestration.
+//! `arcbox-computer-runtime` — guest-side sandbox orchestration.
 //!
 //! # Scope
 //!
@@ -15,7 +15,7 @@
 //! | Crate | Runs on | Purpose | Backend |
 //! |-------|---------|---------|---------|
 //! | `arcbox-vmm` | host | boot + manage the guest VM | Virtualization.framework / KVM |
-//! | `arcbox-vm` | guest | nested sandbox microVMs | a `VmDriver` (Firecracker via `arcbox-fc-driver`) |
+//! | `arcbox-computer-runtime` | guest | nested sandbox microVMs | a `VmDriver` (Firecracker via `arcbox-fc-driver`) |
 //!
 //! The `vm-agent` binary that becomes PID 1 *inside* each sandbox is a
 //! separate crate, `arcbox-vm-agent`, and the wire vocabulary the two

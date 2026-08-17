@@ -147,7 +147,8 @@ macOS-only crate, no `arcbox-vmm` / `arcbox-hypervisor` / VMM adapter —
 engine's two edges are grandfathered until vm-stack-redesign R4), common
 (no virt/engine/computer/app/guest),
 `arcbox-vm-proto` and `arcbox-vm-driver` (leaf crates) and
-`arcbox-vm-agent` (no `arcbox-vm`/`arcbox-snapshot`/`tokio`/`aya`/`fc-sdk`).
+`arcbox-vm-agent` (no
+`arcbox-computer-runtime`/`arcbox-snapshot`/`tokio`/`aya`/`fc-sdk`).
 
 - **Adding a rule**: append a `Rule` whose `reason` names the document
   that owns it (charter decision, design doc, AGENTS.md section) — the
@@ -160,8 +161,11 @@ engine's two edges are grandfathered until vm-stack-redesign R4), common
   edge exists and the phase (`until`) that removes it. Exceptions are
   checked before the rules, so they hold as rules tighten; an exception
   whose edge no longer exists **fails the gate** — remove it with the
-  edge. Today's two: `arcbox-engine -> arcbox-vmm` and
-  `arcbox-engine -> arcbox-hypervisor`, until vm-stack-redesign R4.
+  edge. Today's four: `arcbox-engine -> arcbox-vmm` and
+  `arcbox-engine -> arcbox-hypervisor` until vm-stack-redesign R4, plus
+  `arcbox-computer-runtime -> arcbox-fc-driver` and
+  `arcbox-computer-runtime -> arcbox-tap-net` until R3's PR-G moves the
+  runtime onto the port and hands composition to its root.
 - **A new top-level directory** fails the gate until it is added to
   `Layer` (`graph.rs`) — the rules must know every layer.
 

@@ -1,7 +1,7 @@
 //! Template catalog handlers (CORE-107).
 //!
 //! Decode → manager → encode glue over the catalog surface on
-//! [`SandboxManager`](arcbox_vm::SandboxManager), plus the Build
+//! [`SandboxManager`](arcbox_computer_runtime::SandboxManager), plus the Build
 //! orchestrator, which drives the existing rootfs pipeline (`template.rs`
 //! export + `RootfsBuilder` conversion) and registers the result as the
 //! catalog draft. `template.rs` (singular) is the
@@ -11,10 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
-use arcbox_connect::sandbox_v1;
-use arcbox_vm::template_catalog::{
+use arcbox_computer_runtime::template_catalog::{
     TemplateDefaultsSpec, TemplateEntry, WarmArtifact, compute_digest,
 };
+use arcbox_connect::sandbox_v1;
 use buffa::Message;
 
 use super::{SandboxService, convert, template};
@@ -35,7 +35,7 @@ pub(super) enum TemplateSource {
     DockerImage(String),
     /// A catalog template: pre-built rootfs, defaults already merged into
     /// the request, canonical ref already pinned.
-    Catalog(arcbox_vm::template_catalog::ResolvedTemplate),
+    Catalog(arcbox_computer_runtime::template_catalog::ResolvedTemplate),
 }
 
 /// Reject the contradictory override combination the proto calls out:
@@ -115,7 +115,7 @@ impl SandboxService {
         use sandbox_v1::build_template_request::Source;
         let req = sandbox_v1::BuildTemplateRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        arcbox_vm::template_catalog::validate_template_name(&req.name)
+        arcbox_computer_runtime::template_catalog::validate_template_name(&req.name)
             .map_err(SandboxError::from)?;
         let defaults = convert::template_defaults_from_proto(&req.defaults)?;
         let source = req.source.clone().ok_or_else(|| {
@@ -228,7 +228,9 @@ impl SandboxService {
             // whose warm restore points at missing artifacts. Leave the
             // copy; the error is retryable and the referenced-or-orphan
             // outcome is safe either way.
-            Err(error @ arcbox_vm::VmmError::Unavailable(_)) => Err(SandboxError::from(error)),
+            Err(error @ arcbox_computer_runtime::VmmError::Unavailable(_)) => {
+                Err(SandboxError::from(error))
+            }
             Err(error) => {
                 // Registration certainly did not commit — the copy is
                 // otherwise orphaned (recoverable, but why wait).
