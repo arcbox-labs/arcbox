@@ -2,8 +2,8 @@ use super::types::action;
 use super::*;
 
 /// Which caller is taking the single-workload slot.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum WorkloadClaim {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadClaim {
     /// The public Run/Exec surface: claims from `Ready` only.
     Api,
     /// The boot/restore pipeline's own initial cmd: additionally claims

@@ -19,7 +19,7 @@ pub(super) const RECORD_VERSION: u32 = 1;
 /// phase at `Ready`, avoiding record writes on the execution hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(in crate::sandbox) enum SandboxPhase {
+pub enum SandboxPhase {
     Creating,
     Starting,
     Ready,
@@ -45,7 +45,12 @@ pub(in crate::sandbox) enum SandboxPhase {
 /// enum is `SandboxPhase`, and this alias — the only one of the two
 /// [`super`] re-exports — is what every other module says. R3's rename
 /// then has one module to touch.
-pub(in crate::sandbox) type PersistPhase = SandboxPhase;
+///
+/// Crate-visible rather than `pub(in crate::sandbox)`: `crate::lifecycle`'s
+/// state machine projects onto these phases and its table test is written
+/// against [`SandboxPhase::can_transition_to`], so the durable vocabulary
+/// has to reach one module outside `sandbox`.
+pub type PersistPhase = SandboxPhase;
 
 /// The stable result returned once a provisioning request has been accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,7 +253,7 @@ impl SandboxRecord {
 }
 
 impl SandboxPhase {
-    fn can_transition_to(self, next: Self) -> bool {
+    pub fn can_transition_to(self, next: Self) -> bool {
         self == next
             || matches!(
                 (self, next),
@@ -276,7 +281,7 @@ impl SandboxPhase {
             )
     }
 
-    pub(in crate::sandbox) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Creating => "creating",
             Self::Starting => "starting",
