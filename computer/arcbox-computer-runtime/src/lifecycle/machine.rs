@@ -1,0 +1,399 @@
+//! The computer lifecycle as a `statig` hierarchical state machine: the
+//! transition table itself. The hierarchy, the effect discipline and what the
+//! actor answers rather than the machine are in the module docs.
+
+use statig::prelude::*;
+
+use super::effect::{
+    Answer, Durability, Effect, Effects, Notify, RecordEnd, ReleaseScope, Timer, Unconfirmed,
+};
+use super::event::{Event, PauseReason, Provision};
+use crate::sandbox::IdleAction;
+use crate::sandbox::record::PersistPhase;
+use crate::sandbox::workload::WorkloadClaim;
+
+pub(super) type Outcome = statig::Outcome<State>;
+
+/// Zero-sized `statig` shared storage: every durable value lives on the actor
+/// and transition outputs flow through [`Effects`].
+#[derive(Debug, Default)]
+pub(super) struct ComputerLifecycle;
+
+#[state_machine(
+    initial = "State::provisioning()",
+    state(derive(Debug, Clone, Copy, PartialEq, Eq)),
+    superstate(derive(Debug))
+)]
+impl ComputerLifecycle {
+    /// A forced `Remove` and the TTL cap destroy from anywhere; every failure
+    /// class degrades to `failed` unless a state below claims it (a recoverable
+    /// capture failure, a resume that unwound). The final arm swallows the
+    /// rest: a command a state does not act on is the actor's to answer, and an
+    /// observation nobody waits for is noise.
+    #[superstate]
+    fn computer(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            // A non-forced remove that reaches here passed the busy gate — the
+            // states projecting Starting/Running refuse it below — so it does
+            // exactly what a forced one does.
+            Event::Remove { .. } | Event::TtlExpired => {
+                context.removal();
+                Transition(State::removing())
+            }
+            Event::Frozen | Event::Failure | Event::VmExited => {
+                context.failure();
+                Transition(State::failed())
+            }
+            _ => Handled,
+        }
+    }
+
+    /// The durable intent (`Creating`) exists and nothing else does.
+    #[state(superstate = "computer")]
+    fn provisioning(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::Provision(Provision::Boot { warm }) => {
+                context.persist(PersistPhase::Starting, Durability::Report(Unconfirmed::Ack));
+                context.emit(Effect::SpawnBoot { warm: *warm });
+                context.emit(Effect::Publish(Notify::Created));
+                context.emit(Effect::ArmTimer(Timer::Ttl));
+                Transition(State::staging())
+            }
+            // The restore path commits `ReadyWithOutcome` in one hop from
+            // `Creating`, so it writes nothing on the way in.
+            Event::Provision(Provision::Restore { origin }) => {
+                context.emit(Effect::SpawnRestore { origin: *origin });
+                Transition(State::restoring())
+            }
+            Event::Failure => {
+                context.emit(Effect::ForgetRecord(RecordEnd::Aborted));
+                Transition(State::gone())
+            }
+            // Recovery already applied its own durable verdict
+            // (`policy::recovery::plan`); the machine adopts what it left.
+            Event::Recovered { phase } => match phase {
+                PersistPhase::Creating => Handled,
+                PersistPhase::Starting
+                | PersistPhase::Ready
+                | PersistPhase::Stopping
+                | PersistPhase::Pausing
+                | PersistPhase::Resuming
+                | PersistPhase::Failed => Transition(State::failed()),
+                PersistPhase::Stopped => Transition(State::stopped()),
+                PersistPhase::Paused => Transition(State::paused()),
+                PersistPhase::Removing => Transition(State::removing()),
+            },
+            Event::Remove { force: false } => Handled,
+            _ => Super,
+        }
+    }
+
+    /// Resources are being acquired but are still local to the boot task, so
+    /// an abort could strand one: `ResourcesHandedOff` makes it abortable.
+    #[state(superstate = "computer")]
+    fn staging(event: &Event) -> Outcome {
+        match event {
+            Event::ResourcesHandedOff => Transition(State::booting()),
+            Event::Remove { force: false } => Handled,
+            _ => Super,
+        }
+    }
+
+    #[superstate(superstate = "computer")]
+    fn launching(event: &Event) -> Outcome {
+        match event {
+            // Already past staging; a duplicate signal is noise.
+            Event::ResourcesHandedOff | Event::Remove { force: false } => Handled,
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "launching")]
+    fn booting(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::AgentReady => {
+                context.emit(Effect::SpawnGate);
+                Transition(State::gating())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "launching")]
+    fn restoring(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::Restored => {
+                context.emit(Effect::CommitRestored {
+                    durability: Durability::Report(Unconfirmed::Ack),
+                });
+                context.emit(Effect::ArmTimer(Timer::Ttl));
+                context.emit(Effect::SpawnGate);
+                Transition(State::gating())
+            }
+            _ => Super,
+        }
+    }
+
+    /// The VM is up and READY is withheld: the warm publish freezes the guest
+    /// and the initial `cmd` owns the workload slot, so a client acting on an
+    /// early READY would hit a stopped guest or steal that slot.
+    #[state(superstate = "computer")]
+    fn gating(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::Gated => {
+                context.persist(
+                    PersistPhase::Ready,
+                    Durability::Report(Unconfirmed::Unavailable),
+                );
+                context.emit(Effect::Publish(Notify::Ready));
+                context.emit(Effect::Answer(Answer::Ready));
+                context.emit(Effect::ArmTimer(Timer::Idle));
+                Transition(State::ready())
+            }
+            // The slot is reserved for this boot's own `cmd`; an API claim
+            // cannot reach a computer that has not announced READY.
+            Event::ClaimWorkload {
+                claim: WorkloadClaim::Initial,
+            }
+            | Event::Remove { force: false } => Handled,
+            _ => Super,
+        }
+    }
+
+    #[superstate(superstate = "computer")]
+    fn active(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::Stop { budget_ms } => {
+                context.persist(PersistPhase::Stopping, Durability::Warn);
+                context.emit(Effect::CancelTimer(Timer::Idle));
+                context.emit(Effect::Publish(Notify::Stopping));
+                context.emit(Effect::SpawnStop {
+                    budget_ms: *budget_ms,
+                });
+                Transition(State::stopping())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "active")]
+    fn ready(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::ClaimWorkload { .. } => {
+                context.emit(Effect::CancelTimer(Timer::Idle));
+                context.emit(Effect::Publish(Notify::Running));
+                Transition(State::running())
+            }
+            Event::Pause { .. } => {
+                context.persist(PersistPhase::Pausing, Durability::Warn);
+                context.emit(Effect::Publish(Notify::Pausing));
+                context.emit(Effect::SpawnCheckpoint { hold: true });
+                Transition(State::capturing())
+            }
+            Event::IdleExpired {
+                action: IdleAction::Pause,
+            } => Self::ready(
+                &Event::Pause {
+                    reason: PauseReason::IdleTimeout,
+                },
+                context,
+            ),
+            Event::IdleExpired {
+                action: IdleAction::Kill,
+            } => {
+                context.removal();
+                Transition(State::removing())
+            }
+            Event::Checkpoint => {
+                context.emit(Effect::SpawnCheckpoint { hold: false });
+                Transition(State::checkpointing())
+            }
+            _ => Super,
+        }
+    }
+
+    /// The workload hot path: no record write, so a crash here reads `Ready`.
+    #[state(superstate = "active")]
+    fn running(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::WorkloadExited => {
+                context.emit(Effect::Publish(Notify::Idle));
+                context.emit(Effect::ArmTimer(Timer::Idle));
+                Transition(State::ready())
+            }
+            // One workload at a time, and neither pause nor checkpoint may
+            // freeze a guest that is running one.
+            Event::ClaimWorkload { .. }
+            | Event::Pause { .. }
+            | Event::Checkpoint
+            | Event::IdleExpired { .. }
+            | Event::Remove { force: false } => Handled,
+            _ => Super,
+        }
+    }
+
+    /// Holds `Ready` for the duration of a capture, closing the race where a
+    /// `Run` claims the slot while the guest is frozen (`to_public` still
+    /// answers `Ready`, so the wire is unchanged).
+    #[state(superstate = "active")]
+    fn checkpointing(event: &Event) -> Outcome {
+        match event {
+            // A recoverable capture failure leaves the guest running and the
+            // computer usable; only `Frozen` degrades it, through `computer`.
+            Event::CaptureDone { .. } | Event::Failure => Transition(State::ready()),
+            Event::ClaimWorkload { .. }
+            | Event::Pause { .. }
+            | Event::Checkpoint
+            | Event::IdleExpired { .. } => Handled,
+            _ => Super,
+        }
+    }
+
+    /// A pause in flight is not interruptible: `Pausing` has no durable edge to
+    /// `Stopping`, and the guest is on its way to being released.
+    #[superstate(superstate = "computer")]
+    fn suspending(event: &Event) -> Outcome {
+        match event {
+            Event::Stop { .. } => Handled,
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "suspending")]
+    fn capturing(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::CaptureDone { .. } => {
+                context.release(ReleaseScope::KeepDisk);
+                Transition(State::releasing())
+            }
+            // Recoverable: the driver resumed the guest itself, so a failed
+            // pause must leave a usable computer behind.
+            Event::Failure => {
+                context.persist(PersistPhase::Ready, Durability::Warn);
+                context.emit(Effect::Publish(Notify::Ready));
+                context.emit(Effect::ArmTimer(Timer::Idle));
+                Transition(State::ready())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "suspending")]
+    fn releasing(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::ReleasedForPause => {
+                context.persist(PersistPhase::Paused, Durability::GateJournal);
+                context.emit(Effect::ClearJournal);
+                context.emit(Effect::Publish(Notify::Paused));
+                context.emit(Effect::Answer(Answer::Paused));
+                Transition(State::paused())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "computer")]
+    fn paused(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::Resume => {
+                context.persist(
+                    PersistPhase::Resuming,
+                    Durability::Report(Unconfirmed::RevertToPaused),
+                );
+                context.emit(Effect::SpawnResume);
+                Transition(State::resuming())
+            }
+            // Idempotent.
+            Event::Pause { .. } => Handled,
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "computer")]
+    fn resuming(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::Restored => {
+                context.persist(PersistPhase::Ready, Durability::Warn);
+                context.emit(Effect::Publish(Notify::Resumed));
+                context.emit(Effect::Answer(Answer::Resumed));
+                context.emit(Effect::ArmTimer(Timer::Idle));
+                Transition(State::ready())
+            }
+            // The restore unwound: retained state is intact, so park back at
+            // `Paused` — which keeps its original `paused_at` — and let a retry
+            // or a Remove work.
+            Event::Failure => {
+                context.persist(PersistPhase::Paused, Durability::Warn);
+                context.emit(Effect::Publish(Notify::Paused));
+                Transition(State::paused())
+            }
+            Event::Remove { force: false } => Handled,
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "computer")]
+    fn stopping(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::StopDone => {
+                context.persist(PersistPhase::Stopped, Durability::GateJournal);
+                context.emit(Effect::ClearJournal);
+                context.emit(Effect::CancelTimer(Timer::Ttl));
+                context.emit(Effect::Publish(Notify::Stopped));
+                context.emit(Effect::Answer(Answer::Stopped));
+                Transition(State::stopped())
+            }
+            // Expected: we asked for it.
+            Event::VmExited => Handled,
+            _ => Super,
+        }
+    }
+
+    /// Nothing left to expire, nothing left to fail: only `Remove` acts.
+    #[superstate(superstate = "computer")]
+    fn resting(event: &Event) -> Outcome {
+        match event {
+            Event::TtlExpired
+            | Event::IdleExpired { .. }
+            | Event::VmExited
+            | Event::Failure
+            | Event::Frozen => Handled,
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "resting")]
+    fn stopped() -> Outcome {
+        Super
+    }
+
+    #[state(superstate = "resting")]
+    fn failed() -> Outcome {
+        Super
+    }
+
+    #[state(superstate = "computer")]
+    fn removing(event: &Event, context: &mut Effects) -> Outcome {
+        match event {
+            Event::RemoveDone => {
+                context.emit(Effect::ForgetRecord(RecordEnd::Removed));
+                context.emit(Effect::Publish(Notify::Removed));
+                context.emit(Effect::Answer(Answer::Removed));
+                Transition(State::gone())
+            }
+            // Coalesce concurrent removals and anything the teardown trips.
+            Event::Remove { .. }
+            | Event::TtlExpired
+            | Event::Failure
+            | Event::Frozen
+            | Event::VmExited => Handled,
+            _ => Super,
+        }
+    }
+
+    /// The record is forgotten; the actor is on its way out.
+    #[state]
+    fn gone() -> Outcome {
+        Handled
+    }
+}
