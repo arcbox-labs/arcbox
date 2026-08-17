@@ -29,9 +29,8 @@ use arcbox_vm_driver::net::{
 };
 use arcbox_vm_driver::{Error, NicAttachment, NicSpec, Result, VmId};
 use async_trait::async_trait;
-use tracing::error;
 
-use crate::{NetworkAllocation, TapNetError, TapNetwork, invariant, tap_name_from_ip};
+use crate::{NetworkAllocation, TapNetwork, invariant, tap_name_from_ip};
 
 /// The device name every guest sees its one NIC under.
 pub const NIC_ID: &str = "eth0";
@@ -166,40 +165,19 @@ impl GuestNetwork for TapNetwork {
     }
 }
 
-impl TapNetwork {
-    /// Quarantined ids the port cannot name: written by a process that
-    /// predates it under a longer id budget than [`VmId`] allows. Every
-    /// lease the port itself quarantines carries a `VmId`, so this is only
-    /// ever legacy ledger content — finalizable through the inherent
-    /// surface, invisible through the port.
-    fn unnameable_quarantines(&self) -> Vec<String> {
-        self.pending_quarantines()
-            .into_iter()
-            .filter_map(|(id, _)| VmId::new(id.as_str()).is_err().then_some(id))
-            .collect()
-    }
-}
-
 #[async_trait]
 impl NetworkReconcile for TapNetwork {
-    /// Every quarantined VM with its token. A ledger id the port cannot
-    /// name is left out — and, since it keeps the startup gate closed until
-    /// something else finalizes it, logged at error level.
+    /// Every quarantined VM with its token.
     async fn pending_cleanups(&self) -> Vec<(VmId, String)> {
         self.pending_quarantines()
             .into_iter()
-            .filter_map(|(id, token)| match VmId::new(id.as_str()) {
-                Ok(vm) => Some((vm, token)),
-                Err(error) => {
-                    error!(
-                        %id,
-                        %error,
-                        "quarantined network id is not a vm id: the port cannot finalize \
-                         it, and the startup gate stays closed until the sandbox manager \
-                         does or the ledger entry is removed"
-                    );
-                    None
-                }
+            .map(|(id, token)| {
+                // The ledger validates every id it writes and loads against
+                // the `VmId` rules (`quarantine::validate_quarantine_id`),
+                // so an entry that fails here cannot exist.
+                let vm = VmId::new(id.as_str())
+                    .expect("quarantine ledger ids are validated as VmIds at write and load");
+                (vm, token)
             })
             .collect()
     }
@@ -221,27 +199,8 @@ impl NetworkReconcile for TapNetwork {
         Ok(Self::validate_startup_cleanup(self, token)?)
     }
 
-    /// Ends the startup sweep. When the inherent gate refuses because
-    /// quarantines are still pending and some of them are ids the port
-    /// cannot name, the error says so — the caller's own `pending_cleanups`
-    /// would otherwise read empty while the gate stays shut.
     async fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
-        match Self::finalize_startup_cleanup(self, token) {
-            Err(TapNetError::Unavailable(message)) => {
-                let unnameable = self.unnameable_quarantines();
-                if unnameable.is_empty() {
-                    return Err(TapNetError::Unavailable(message).into());
-                }
-                Err(Error::Network(format!(
-                    "{message}; {} of them cannot be named through the driver port \
-                     ({}) and must be finalized through the sandbox manager or removed \
-                     from the quarantine ledger",
-                    unnameable.len(),
-                    unnameable.join(", ")
-                )))
-            }
-            other => Ok(other?),
-        }
+        Ok(Self::finalize_startup_cleanup(self, token)?)
     }
 
     async fn wait_startup_cleanup_complete(&self) {
@@ -474,19 +433,18 @@ mod tests {
         assert_eq!(reused.ip, lease.ip);
     }
 
-    /// A ledger written under a longer id budget than `VmId` allows (a
-    /// pre-port sandbox manager) still loads and is finalizable through the
-    /// inherent surface; through the port it is invisible in
-    /// `pending_cleanups`, and the startup finalization names it instead of
-    /// failing with a bare "generations remain pending".
+    /// The ledger only ever holds ids the port can name: an id past
+    /// `VmId::MAX_LEN` is refused when quarantined, and a ledger file that
+    /// carries one (written outside this contract) fails at load naming it,
+    /// instead of surviving as a quarantine `NetworkReconcile` could never
+    /// list or finalize.
     #[cfg(not(target_os = "linux"))]
-    #[tokio::test]
-    async fn a_ledger_id_the_port_cannot_name_is_reported_not_swallowed() {
+    #[test]
+    fn ledger_ids_the_port_cannot_name_are_refused_not_stranded() {
         let root = tempfile::tempdir().unwrap();
         let ledger = root.path().join("q");
-        let long_id = "x".repeat(VmId::MAX_LEN + 1);
-        {
-            let network = TapNetwork::with_quarantine_dir(
+        let network = || {
+            TapNetwork::with_quarantine_dir(
                 "10.0.0.0/29",
                 "10.0.0.1",
                 vec![],
@@ -494,41 +452,30 @@ mod tests {
                 Datapath::default(),
                 Arc::new(IptablesLegacy::default()),
             )
-            .unwrap();
-            network.mark_reconciled();
-            let startup = TapNetwork::startup_cleanup_token(&network).unwrap();
-            TapNetwork::finalize_startup_cleanup(&network, &startup).unwrap();
-            let allocation = TapNetwork::reserve(&network, &long_id).unwrap();
-            network.quarantine_checked(&long_id, &allocation).unwrap();
-        }
+        };
+        let long_id = "x".repeat(VmId::MAX_LEN + 1);
+        let fresh = network().unwrap();
+        fresh.mark_reconciled();
+        let startup = TapNetwork::startup_cleanup_token(&fresh).unwrap();
+        TapNetwork::finalize_startup_cleanup(&fresh, &startup).unwrap();
+        let allocation = TapNetwork::reserve(&fresh, &long_id).unwrap();
+        let error = fresh.quarantine_checked(&long_id, &allocation).unwrap_err();
+        assert!(error.to_string().contains("64 bytes"), "{error}");
+        assert!(fresh.pending_quarantines().is_empty());
 
-        let restarted = TapNetwork::with_quarantine_dir(
-            "10.0.0.0/29",
-            "10.0.0.1",
-            vec![],
-            ledger,
-            Datapath::default(),
-            Arc::new(IptablesLegacy::default()),
+        // A file from outside the contract: same shape, over-long id.
+        let marker = serde_json::json!({ "id": long_id, "allocation": allocation });
+        std::fs::write(
+            ledger.join(format!("{long_id}.json")),
+            serde_json::to_vec(&marker).unwrap(),
         )
         .unwrap();
-        restarted.mark_reconciled();
-        let reconcile = restarted.reconcile().unwrap();
-        assert!(reconcile.pending_cleanups().await.is_empty());
-        let startup = reconcile.startup_cleanup_token().await.unwrap();
-        let error = reconcile
-            .finalize_startup_cleanup(&startup)
-            .await
-            .unwrap_err();
+        let Err(error) = network() else {
+            panic!("a ledger holding an id the port cannot name must fail to load");
+        };
         assert!(
-            matches!(&error, Error::Network(m) if m.contains(&long_id) && m.contains("sandbox manager")),
+            error.to_string().contains(&long_id) && error.to_string().contains("64 bytes"),
             "{error}"
         );
-
-        // The inherent surface still owns it: finalize there, then the port
-        // can end the startup sweep.
-        let (id, token) = restarted.pending_quarantines().remove(0);
-        assert_eq!(id, long_id);
-        restarted.finalize_quarantine(&id, &token).unwrap();
-        reconcile.finalize_startup_cleanup(&startup).await.unwrap();
     }
 }

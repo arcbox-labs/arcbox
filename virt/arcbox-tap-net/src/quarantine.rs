@@ -5,6 +5,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use arcbox_vm_driver::VmId;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
@@ -347,6 +348,13 @@ fn quarantine_path(dir: &Path, sandbox_id: &str) -> PathBuf {
     dir.join(format!("{sandbox_id}.json"))
 }
 
+/// A ledger id is a path component (`{id}.json`) and, through the driver
+/// port, a `VmId`: `[A-Za-z0-9_-]`, non-empty, at most [`VmId::MAX_LEN`]
+/// bytes. Both the write and the load path check it, so every entry the
+/// ledger holds is one the port can name — `NetworkReconcile` never has to
+/// drop a record it cannot represent, and a file from outside that
+/// contract fails at load with its id in the message rather than lingering
+/// as an unfinalizable quarantine.
 fn validate_quarantine_id(id: &str) -> Result<()> {
     if id.is_empty()
         || !id
@@ -355,6 +363,13 @@ fn validate_quarantine_id(id: &str) -> Result<()> {
     {
         return Err(TapNetError::Network(format!(
             "invalid sandbox network quarantine id {id:?}"
+        )));
+    }
+    if id.len() > VmId::MAX_LEN {
+        return Err(TapNetError::Network(format!(
+            "sandbox network quarantine id {id:?} exceeds {} bytes, the longest id the \
+             driver port can name",
+            VmId::MAX_LEN
         )));
     }
     Ok(())
