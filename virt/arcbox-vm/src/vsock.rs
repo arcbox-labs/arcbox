@@ -23,7 +23,8 @@
 //!
 //! In the other direction, a guest-initiated connect to host port `P` is
 //! forwarded by Firecracker to a host Unix socket at `{uds_path}_{P}`; the
-//! boot readiness gate pre-listens there (see [`ReadyListener`]).
+//! boot readiness gate pre-listens there ([`arcbox_fc_driver::vsock::UdsListener`]
+//! + [`wait_ready`]).
 //!
 //! ## Frame format
 //!
@@ -32,12 +33,12 @@
 //! [`arcbox_vm_proto::exec`], re-exported here; the net-reconfig timing
 //! suffix on `MSG_EXIT` is decoded by [`ReconfigTimings`].
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use arcbox_fc_driver::vsock::UdsListener;
 use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -212,118 +213,20 @@ fn into_unix_stream(conn: VsockConn) -> Result<UnixStream> {
     }
 }
 
-/// Single attempt: connect to the Firecracker vsock UDS and complete the
-/// `CONNECT {port}` / `OK` handshake.
-async fn try_vsock_handshake(uds_path: &Path, port: u32) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(uds_path)
+/// Wait for the guest agent's readiness dial-out on a pre-bound listener:
+/// `accept()` one connection and read (and discard) its single byte.
+/// Completion is the readiness event.
+pub(crate) async fn wait_ready(listener: &UdsListener) -> Result<()> {
+    let mut stream = listener
+        .accept()
         .await
-        .map_err(|e| VmmError::Vsock(format!("connect to {}: {e}", uds_path.display())))?;
-
-    // Firecracker vsock host-initiated handshake.
+        .map_err(|e| VmmError::Vsock(format!("accept on ready socket: {e}")))?;
+    let mut byte = [0u8; 1];
     stream
-        .write_all(format!("CONNECT {port}\n").as_bytes())
+        .read(&mut byte)
         .await
-        .map_err(|e| VmmError::Vsock(format!("vsock CONNECT write: {e}")))?;
-
-    // Read "OK {port}\n".
-    let mut buf = [0u8; 64];
-    let mut i = 0usize;
-    loop {
-        let n = stream
-            .read(&mut buf[i..=i])
-            .await
-            .map_err(|e| VmmError::Vsock(format!("vsock handshake read: {e}")))?;
-        if n == 0 {
-            return Err(VmmError::Vsock("vsock handshake: connection closed".into()));
-        }
-        if buf[i] == b'\n' {
-            break;
-        }
-        i += 1;
-        if i >= buf.len() - 1 {
-            return Err(VmmError::Vsock("vsock handshake: response too long".into()));
-        }
-    }
-    let resp = std::str::from_utf8(&buf[..=i])
-        .map_err(|_| VmmError::Vsock("vsock handshake: non-UTF-8 response".into()))?;
-    if !resp.starts_with("OK") {
-        return Err(VmmError::Vsock(format!(
-            "vsock handshake: unexpected response: {resp:?}"
-        )));
-    }
-    Ok(stream)
-}
-
-/// Derive the host Unix-socket path Firecracker forwards guest-initiated
-/// [`READY_PORT`] connections to: `{uds_path}_{READY_PORT}`.
-///
-/// The suffix convention is Firecracker's hybrid-vsock contract ("a guest
-/// connection to port 52 will get forwarded to `./v.sock_52`", FC
-/// docs/vsock.md). FC resolves the path against its own filesystem view,
-/// which matches the host view here: in jailer mode both are the same file
-/// under the chroot root, in direct mode the same absolute path.
-fn ready_socket_path(uds_path: &Path) -> PathBuf {
-    let mut path = uds_path.as_os_str().to_owned();
-    path.push(format!("_{READY_PORT}"));
-    PathBuf::from(path)
-}
-
-/// Pre-bound listener for the guest agent's readiness dial-out.
-///
-/// Must be bound BEFORE Firecracker `InstanceStart`: FC forwards the guest's
-/// connect only to an already-listening socket and resets the guest
-/// otherwise, losing the event. The socket file is per-boot; dropping the
-/// listener removes it.
-pub(crate) struct ReadyListener {
-    listener: UnixListener,
-    path: PathBuf,
-}
-
-impl ReadyListener {
-    /// Bind the readiness socket for `uds_path`, replacing any stale socket
-    /// file left behind by a previous boot of the same VM directory.
-    pub(crate) fn bind(uds_path: &Path) -> Result<Self> {
-        let path = ready_socket_path(uds_path);
-        if let Err(e) = std::fs::remove_file(&path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(VmmError::Vsock(format!(
-                "remove stale ready socket {}: {e}",
-                path.display()
-            )));
-        }
-        let listener = UnixListener::bind(&path)
-            .map_err(|e| VmmError::Vsock(format!("bind ready socket {}: {e}", path.display())))?;
-        Ok(Self { listener, path })
-    }
-
-    /// The bound socket path (so jailer boots can grant FC connect access).
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Wait for the guest's dial-out: `accept()` one connection and read
-    /// (and discard) its single byte. Completion is the readiness event.
-    pub(crate) async fn wait(&self) -> Result<()> {
-        let (mut stream, _) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| VmmError::Vsock(format!("accept on ready socket: {e}")))?;
-        let mut byte = [0u8; 1];
-        stream
-            .read(&mut byte)
-            .await
-            .map_err(|e| VmmError::Vsock(format!("read ready byte: {e}")))?;
-        Ok(())
-    }
-}
-
-impl Drop for ReadyListener {
-    fn drop(&mut self) {
-        // The socket file is meaningful only to the boot that bound it.
-        let _ = std::fs::remove_file(&self.path);
-    }
+        .map_err(|e| VmmError::Vsock(format!("read ready byte: {e}")))?;
+    Ok(())
 }
 
 /// Write a single frame to any `AsyncWrite`.
@@ -750,6 +653,7 @@ mod tests {
     use std::os::fd::OwnedFd;
 
     use async_trait::async_trait;
+    use tokio::net::UnixListener;
 
     use super::*;
 
@@ -760,37 +664,6 @@ mod tests {
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(payload);
         buf
-    }
-
-    #[test]
-    fn ready_socket_path_appends_the_port_suffix() {
-        // Pins the Firecracker hybrid-vsock naming contract AND the port
-        // value: the guest dials 51, so the host must listen at `..._51`.
-        assert_eq!(
-            ready_socket_path(Path::new("/vm/dir/firecracker.vsock")),
-            Path::new("/vm/dir/firecracker.vsock_51")
-        );
-    }
-
-    #[tokio::test]
-    async fn ready_listener_accepts_the_dial_out_and_cleans_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let uds = dir.path().join("fc.vsock");
-        // A stale socket file from a previous boot must not fail the bind.
-        std::fs::write(ready_socket_path(&uds), b"stale").unwrap();
-
-        let listener = ReadyListener::bind(&uds).unwrap();
-        let dial_path = listener.path().to_owned();
-        let dial = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(&dial_path).await.unwrap();
-            stream.write_all(&[0u8]).await.unwrap();
-        });
-        listener.wait().await.unwrap();
-        dial.await.unwrap();
-
-        let path = listener.path().to_owned();
-        drop(listener);
-        assert!(!path.exists(), "drop must remove the per-boot socket file");
     }
 
     #[test]

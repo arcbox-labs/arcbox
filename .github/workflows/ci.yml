@@ -198,16 +198,16 @@ jobs:
         run: cargo run -p xtask -- check-layers
 
       - name: Check engine-layer crates on Linux
-        run: cargo check --all-targets -p arcbox-atomic-file -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-vm-driver -p arcbox-snapshot -p arcbox-engine -p arcbox-computer
+        run: cargo check --all-targets -p arcbox-atomic-file -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-snapshot -p arcbox-engine -p arcbox-computer
 
       # `--no-fail-fast` so one red run reports every broken crate rather
       # than stopping at the first, which otherwise hides later failures
       # behind a fix-and-rerun loop.
       - name: Test engine-layer crates on Linux
-        run: cargo test --no-fail-fast -p arcbox-atomic-file -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-vm-driver -p arcbox-snapshot -p arcbox-engine -p arcbox-computer
+        run: cargo test --no-fail-fast -p arcbox-atomic-file -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-snapshot -p arcbox-engine -p arcbox-computer
 
       - name: Check engine-layer crates on aarch64-unknown-linux-musl
-        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-atomic-file -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-vm-driver -p arcbox-snapshot
+        run: cargo check --all-targets --target aarch64-unknown-linux-musl -p arcbox-atomic-file -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-snapshot
 
   # Pure proto-contract analysis — no Rust toolchain, no build. Runs in
   # parallel with `ci` on a cheap Linux runner. The desktop and agent

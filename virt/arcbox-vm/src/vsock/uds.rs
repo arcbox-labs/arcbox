@@ -12,36 +12,23 @@ use std::path::PathBuf;
 use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
 use async_trait::async_trait;
 
-use crate::error::VmmError;
-
 /// Transitional [`Vsock`] over Firecracker's hybrid-vsock Unix socket.
 ///
 /// Dials by running the `CONNECT {port}` handshake on the wrapped
-/// `uds_path`. Firecracker closes the proxied connection without an `OK`
-/// when the guest has no listener on the port yet; that is the port's
-/// `ConnectionRefused`, so callers retry it. Goes away once the Firecracker
-/// driver's handle exposes [`Vsock`] itself.
+/// `uds_path` — the adapter's own [`arcbox_fc_driver::vsock::dial_uds`],
+/// which already answers the port's `ConnectionRefused` when Firecracker
+/// closes the proxied connection because the guest has no listener on the
+/// port yet, so callers retry it. Goes away once the manager takes the
+/// capability from the Firecracker driver's handle.
 pub struct UdsVsock(pub PathBuf);
 
 #[async_trait]
 impl Vsock for UdsVsock {
     async fn dial(&self, port: u32) -> arcbox_vm_driver::Result<VsockConn> {
-        match super::try_vsock_handshake(&self.0, port).await {
-            Ok(stream) => Ok(VsockConn {
-                fd: OwnedFd::from(stream.into_std()?),
-                mode: IoMode::Async,
-            }),
-            Err(VmmError::Vsock(message)) if message.contains("connection closed") => {
-                Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, message).into())
-            }
-            Err(error) => Err(arcbox_vm_driver::Error::Driver {
-                driver: "firecracker",
-                message: match error {
-                    VmmError::Vsock(message) => message,
-                    other => other.to_string(),
-                },
-                source: None,
-            }),
-        }
+        let stream = arcbox_fc_driver::vsock::dial_uds(&self.0, port).await?;
+        Ok(VsockConn {
+            fd: OwnedFd::from(stream.into_std()?),
+            mode: IoMode::Async,
+        })
     }
 }

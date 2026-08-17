@@ -1,3 +1,7 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+use arcbox_fc_driver::FcDriverConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VmmError};
@@ -74,6 +78,32 @@ pub struct FirecrackerConfig {
     /// used exactly as written, so `[]` is how a config disables CoW.
     #[serde(default)]
     pub dmsetup_candidates: Option<Vec<String>>,
+}
+
+impl From<&FirecrackerConfig> for FcDriverConfig {
+    /// The node-wide half of the Firecracker config: the binaries and the
+    /// process-level flags. The data dir, datapath, pool and warm-create
+    /// knobs stay with the manager; the jailer's per-VM fields become an
+    /// [`arcbox_vm_driver::IsolationSpec`] via [`JailerConfig`].
+    fn from(fc: &FirecrackerConfig) -> Self {
+        Self {
+            firecracker_binary: PathBuf::from(&fc.binary),
+            jailer_binary: fc.jailer.as_ref().map(|jc| PathBuf::from(&jc.binary)),
+            log_level: fc.log_level.clone(),
+            no_seccomp: fc.no_seccomp,
+            seccomp_filter: fc.seccomp_filter.as_deref().map(PathBuf::from),
+            http_api_max_payload_size: fc.http_api_max_payload_size,
+            mmds_size_limit: fc.mmds_size_limit,
+            socket_timeout: fc
+                .socket_timeout_secs
+                .map_or(Self::DEFAULT_SOCKET_TIMEOUT, Duration::from_secs),
+            resource_limits: fc
+                .jailer
+                .as_ref()
+                .map(|jc| jc.resource_limits.clone())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 fn default_pool_size() -> usize {
@@ -266,6 +296,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Iptables);
+    }
+
+    #[test]
+    fn driver_config_takes_the_process_flags_and_the_jailer_binary() {
+        let mut fc = VmmConfig::default().firecracker;
+        assert_eq!(
+            FcDriverConfig::from(&fc),
+            FcDriverConfig::new("/usr/bin/firecracker")
+        );
+
+        fc.jailer = Some(JailerConfig {
+            binary: "/usr/bin/jailer".into(),
+            uid: 0,
+            gid: 0,
+            chroot_base_dir: None,
+            netns: None,
+            new_pid_ns: false,
+            cgroup_version: None,
+            parent_cgroup: None,
+            resource_limits: vec!["fsize=2048".into()],
+        });
+        fc.log_level = Some("Error".into());
+        fc.no_seccomp = true;
+        fc.seccomp_filter = Some("/etc/fc/seccomp.bpf".into());
+        fc.http_api_max_payload_size = Some(1 << 20);
+        fc.mmds_size_limit = Some(4096);
+        fc.socket_timeout_secs = Some(15);
+        let driver = FcDriverConfig::from(&fc);
+        assert_eq!(driver.jailer_binary, Some(PathBuf::from("/usr/bin/jailer")));
+        assert_eq!(driver.log_level.as_deref(), Some("Error"));
+        assert!(driver.no_seccomp);
+        assert_eq!(
+            driver.seccomp_filter,
+            Some(PathBuf::from("/etc/fc/seccomp.bpf"))
+        );
+        assert_eq!(driver.http_api_max_payload_size, Some(1 << 20));
+        assert_eq!(driver.mmds_size_limit, Some(4096));
+        assert_eq!(driver.socket_timeout, Duration::from_secs(15));
+        assert_eq!(driver.resource_limits, vec!["fsize=2048".to_string()]);
     }
 
     #[test]

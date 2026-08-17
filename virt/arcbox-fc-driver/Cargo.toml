@@ -1,0 +1,25 @@
+[package]
+name              = "arcbox-fc-driver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description       = "The Firecracker adapter for the arcbox-vm-driver port: renders a VmSpec into Firecracker API payloads and jailer-relative paths, owns the VMM process, and serves vsock, checkpoints, prepare, and adopt over it."
+
+[dependencies]
+arcbox-vm-driver.workspace = true
+async-trait.workspace = true
+fc-sdk.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+arcbox-vm-driver = { workspace = true, features = ["testkit"] }
+arcbox-vm-proto.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

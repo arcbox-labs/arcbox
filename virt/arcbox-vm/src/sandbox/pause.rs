@@ -28,10 +28,7 @@
 //! onwards every resource is keyed by the sandbox id again and resume,
 //! reconciliation, and `Remove` all see one naming scheme.
 
-use super::boot::{
-    chroot_root, link_or_copy_for_jailer, stage_kernel_for_jailer, stage_rootfs_device_for_jailer,
-};
-use super::checkpoint::{CheckpointRequest, checkpoint_impl, move_file};
+use super::checkpoint::{CheckpointRequest, checkpoint_impl};
 use super::persistence::SandboxTransition;
 use super::types::action;
 use super::*;
@@ -595,7 +592,12 @@ impl SandboxManager {
             std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
             let vsock_path = cr.join("run/firecracker.vsock");
             let _ = std::fs::remove_file(&vsock_path);
-            let spawned = spawn_jailer(jailer, fc_cfg, id).await?;
+            let spawned = spawn_jailer(
+                &FcDriverConfig::from(fc_cfg),
+                &IsolationSpec::try_from(jailer)?,
+                id,
+            )
+            .await?;
             #[allow(
                 clippy::cast_possible_wrap,
                 reason = "Firecracker pid fits platform pid_t"

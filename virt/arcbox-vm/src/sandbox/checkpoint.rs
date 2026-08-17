@@ -1,7 +1,4 @@
-use super::boot::{
-    StageError, chroot_root, stage_kernel_for_jailer, stage_rootfs_cow_or_copy,
-    stage_snapshot_files,
-};
+use super::boot::{StageError, stage_rootfs_cow_or_copy};
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::pool::PreparedSlot;
 use super::types::action;
@@ -9,27 +6,9 @@ use super::*;
 
 /// The image format this path writes — a Firecracker `vmstate` + `mem`
 /// pair — recorded on every catalog entry so a restore can tell which
-/// driver may read it.
-pub(super) const CHECKPOINT_FORMAT: &str = "firecracker/v1";
-
-/// Move a file even when source and destination sit on different mounts.
-///
-/// The jailer chroot is its own vfsmount (bind + pivot_root), so a plain
-/// `rename(2)` out of it fails with `EXDEV` regardless of the underlying
-/// filesystem; fall back to copy + remove in that case.
-pub(super) async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    match tokio::fs::rename(from, to).await {
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            tokio::fs::copy(from, to).await?;
-            // fsync the destination before removing the source: a crash between
-            // the copy and the remove must not leave a zero-length/partial
-            // snapshot file registered in the catalog.
-            tokio::fs::File::open(to).await?.sync_all().await?;
-            tokio::fs::remove_file(from).await
-        }
-        other => other,
-    }
-}
+/// driver may read it. The Firecracker driver names it; a restore through
+/// the driver refuses any other.
+pub(super) const CHECKPOINT_FORMAT: &str = arcbox_fc_driver::CHECKPOINT_FORMAT;
 
 /// Parameters for the internal restore path
 /// ([`SandboxManager::restore_from_snapshot`]), shared by the Restore RPC
@@ -681,7 +660,12 @@ impl SandboxManager {
                     let vsock_path = cr.join("run/firecracker.vsock");
                     let _ = std::fs::remove_file(&vsock_path);
 
-                    let proc = spawn_jailer(jailer, fc_cfg, &new_id).await?;
+                    let proc = spawn_jailer(
+                        &FcDriverConfig::from(fc_cfg),
+                        &IsolationSpec::try_from(jailer)?,
+                        &new_id,
+                    )
+                    .await?;
                     Ok((proc, vsock_path))
                 }
                 .await;
@@ -768,7 +752,14 @@ impl SandboxManager {
                     // FC (mem is mapped MAP_PRIVATE on load), so the root jailer
                     // hard-links them instead of copying — the mem file is the
                     // sandbox's full memory size (CORE-75).
-                    stage_snapshot_files(&cr, &snap_meta, jc.uid, jc.gid).await
+                    let files = SnapshotFiles {
+                        id: &snap_meta.id,
+                        vmstate: &snap_meta.vmstate_path,
+                        mem: snap_meta.mem_path.as_deref(),
+                    };
+                    stage_snapshot_files(&cr, &files, jc.uid, jc.gid)
+                        .await
+                        .map_err(VmmError::from)
                 }
                 .await;
 

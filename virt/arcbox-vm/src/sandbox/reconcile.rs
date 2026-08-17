@@ -286,8 +286,11 @@ pub(super) async fn sweep_orphans(
             && let Some(ref jc) = config.firecracker.jailer
         {
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            let chroot =
-                super::boot::chroot_root(&config.firecracker.binary, base, record.resource_owner());
+            let chroot = arcbox_fc_driver::jail::chroot_root(
+                &config.firecracker.binary,
+                base,
+                record.resource_owner(),
+            );
             if let Some(parent) = chroot.parent() {
                 remove_dir_if_present(parent).await?;
             }
@@ -544,7 +547,11 @@ fn discover_firecracker_pids(
         .join("firecracker.sock");
     let jailer_root = config.firecracker.jailer.as_ref().map(|jailer| {
         let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        super::boot::chroot_root(&config.firecracker.binary, base, record.resource_owner())
+        arcbox_fc_driver::jail::chroot_root(
+            &config.firecracker.binary,
+            base,
+            record.resource_owner(),
+        )
     });
 
     for entry in std::fs::read_dir("/proc")? {
