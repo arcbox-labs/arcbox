@@ -158,9 +158,18 @@ impl TryFrom<&Metadata> for Graph {
             }
             let layer = layer_of_manifest(&metadata.workspace_root, &package.manifest_path)
                 .with_context(|| format!("placing workspace member {} in a layer", package.name))?;
+            // A dependency that carries the crate's own name is never an
+            // edge to another workspace member: member names are unique, so
+            // it is either the crate itself (the dev-dependency a crate uses
+            // to turn on its own optional feature for its tests, e.g.
+            // `testkit`) or a foreign package that happens to share the name
+            // (a registry version). The graph keys targets by name and would
+            // resolve either to the member — a false self edge — so both are
+            // dropped here; neither is something a layer rule is about.
             let mut deps: Vec<String> = package
                 .dependencies
                 .iter()
+                .filter(|dependency| dependency.name != package.name.as_str())
                 .map(|dependency| dependency.name.clone())
                 .collect();
             deps.sort();
@@ -229,6 +238,49 @@ mod tests {
         .to_string();
         assert!(error.contains("`platform`"), "{error}");
         assert!(error.contains("common, virt"), "{error}");
+    }
+
+    #[test]
+    fn a_self_dependency_is_not_an_edge() {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": [{
+                "name": "arcbox-vm-driver",
+                "version": "0.1.0",
+                "id": "path+file:///ws/virt/arcbox-vm-driver#0.1.0",
+                "manifest_path": "/ws/virt/arcbox-vm-driver/Cargo.toml",
+                "dependencies": [
+                    {"name": "arcbox-vm-driver", "req": "*", "kind": "dev", "optional": false,
+                     "uses_default_features": true, "features": ["testkit"], "target": null,
+                     "path": "/ws/virt/arcbox-vm-driver"},
+                    {"name": "arcbox-vm-driver", "req": "^0.1", "kind": null, "optional": false,
+                     "uses_default_features": true, "features": [], "target": null,
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "rename": "published-driver"},
+                    {"name": "serde", "req": "^1", "kind": null, "optional": false,
+                     "uses_default_features": true, "features": [], "target": null}
+                ],
+                "targets": [], "features": {}, "source": null, "license": null,
+                "license_file": null, "description": null, "edition": "2024",
+                "authors": [], "categories": [], "keywords": [], "readme": null,
+                "repository": null, "homepage": null, "documentation": null,
+                "links": null, "publish": null, "default_run": null, "rust_version": null,
+                "metadata": null
+            }],
+            "workspace_members": ["path+file:///ws/virt/arcbox-vm-driver#0.1.0"],
+            "workspace_default_members": ["path+file:///ws/virt/arcbox-vm-driver#0.1.0"],
+            "resolve": null,
+            "target_directory": "/ws/target",
+            "version": 1,
+            "workspace_root": "/ws",
+            "metadata": null
+        }))
+        .unwrap();
+        let graph = Graph::try_from(&metadata).unwrap();
+        assert_eq!(graph.members.len(), 1);
+        // Neither the dev-dep on itself nor the same-named registry package
+        // is an edge: by name both would resolve to the member itself, and
+        // neither is a dependency between two workspace members.
+        assert_eq!(graph.members[0].deps, ["serde"]);
     }
 
     #[test]
