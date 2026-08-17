@@ -94,7 +94,7 @@ struct Shared {
     /// stays open instead of reporting a closed channel, and so an exec's
     /// input sink keeps accepting.
     open: Mutex<Vec<Box<dyn Send>>>,
-    watchers: Mutex<Vec<mpsc::Sender<FsEventDto>>>,
+    watchers: Mutex<Vec<mpsc::UnboundedSender<FsEventDto>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -147,8 +147,13 @@ impl FakeAgentFactory {
     }
 
     /// Deliver `event` to every watch opened on this agent.
+    ///
+    /// The streams are unbounded, so the only reason a send fails is a
+    /// dropped watch — which is what makes forgetting one distinguishable
+    /// from a full buffer, since a closed stream is how the port spells
+    /// "the Computer stopped".
     pub fn emit_fs_event(&self, event: &FsEventDto) -> &Self {
-        lock(&self.shared.watchers).retain(|tx| tx.try_send(event.clone()).is_ok());
+        lock(&self.shared.watchers).retain(|tx| tx.send(event.clone()).is_ok());
         self
     }
 
@@ -404,7 +409,7 @@ impl GuestFiles for FakeAgent {
         if !lock(&self.shared.files).contains_key(path) {
             return Err(VmmError::PathNotFound(path.to_owned()));
         }
-        let (tx, events) = mpsc::channel(16);
+        let (tx, events) = mpsc::unbounded_channel();
         lock(&self.shared.watchers).push(tx);
         Ok(DirWatch::new(Box::new(FakeWatch { events })))
     }
@@ -413,7 +418,7 @@ impl GuestFiles for FakeAgent {
 /// The fake's watch stream: whatever [`FakeAgentFactory::emit_fs_event`]
 /// pushes, ending cleanly once the factory that owns it goes away.
 struct FakeWatch {
-    events: mpsc::Receiver<FsEventDto>,
+    events: mpsc::UnboundedReceiver<FsEventDto>,
 }
 
 #[async_trait]
