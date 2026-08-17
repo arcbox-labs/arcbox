@@ -114,14 +114,9 @@ fn test_tap_name_encodes_last_two_octets() {
 #[test]
 fn expose_target_follows_the_applied_datapath() {
     let manager = TapNetwork::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
-    // Legacy guests own the pool IP outright.
+    // No activation record: an invariant TAP a previous process left.
     assert_eq!(
-        manager.expose_target("vmtap0-2", false),
-        ExposeTarget::PoolIp
-    );
-    // Invariant TAP without an activation record.
-    assert_eq!(
-        manager.expose_target("vmtap0-2", true),
+        manager.expose_target("vmtap0-2"),
         ExposeTarget::GuestIpWithFwmark
     );
     let record = |applied| {
@@ -132,15 +127,17 @@ fn expose_target_follows_the_applied_datapath() {
             .insert("vmtap0-2".to_owned(), applied)
     };
     record(AppliedDatapath::Ebpf);
-    assert_eq!(
-        manager.expose_target("vmtap0-2", true),
-        ExposeTarget::PoolIp
-    );
+    assert_eq!(manager.expose_target("vmtap0-2"), ExposeTarget::PoolIp);
     record(AppliedDatapath::Iptables);
     assert_eq!(
-        manager.expose_target("vmtap0-2", true),
+        manager.expose_target("vmtap0-2"),
         ExposeTarget::GuestIpWithFwmark
     );
+    // A legacy guest owns the pool IP outright. Recorded at activation
+    // rather than left absent, which is what keeps it distinguishable
+    // from the leftover TAP above.
+    record(AppliedDatapath::Untranslated);
+    assert_eq!(manager.expose_target("vmtap0-2"), ExposeTarget::PoolIp);
 }
 
 #[tokio::test]

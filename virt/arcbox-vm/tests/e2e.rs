@@ -274,12 +274,20 @@ async fn e2e_sandbox_with_tap_network() {
     let tap_name = {
         let info = mgr.inspect_sandbox(&id).unwrap();
         let net = info.network.expect("tap mode should populate network info");
+        // The host interface is deliberately not part of the sandbox API
+        // (CORE-54); this test owns the host, so it derives the name the
+        // TAP network gives a pool address.
+        let octets = net
+            .ip_address
+            .parse::<std::net::Ipv4Addr>()
+            .expect("a pool address")
+            .octets();
+        let tap_name = format!("vmtap{}-{}", octets[2], octets[3]);
         assert!(
-            common::iface_exists(&net.tap_name),
-            "TAP {} should exist while sandbox is running",
-            net.tap_name
+            common::iface_exists(&tap_name),
+            "TAP {tap_name} should exist while sandbox is running"
         );
-        net.tap_name
+        tap_name
     };
 
     mgr.remove_sandbox(&id, true).await.unwrap();

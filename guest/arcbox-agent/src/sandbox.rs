@@ -567,6 +567,11 @@ impl SandboxService {
     }
 
     /// Validate one exact cleanup generation before host-side deletion.
+    ///
+    /// The address comes back as v4 because that is what the rules it
+    /// gates are written in: the System VM's DNAT and fwmark rules are
+    /// iptables, not ip6tables. A lease from another dataplane would be
+    /// one this cleanup path could not express.
     pub(crate) async fn prepare_cleanup(
         &self,
         ticket: &arcbox_connect::v1::SandboxCleanupTicket,
@@ -583,11 +588,18 @@ impl SandboxService {
                 .map_err(SandboxError::from)?;
             return Ok(std::net::Ipv4Addr::UNSPECIFIED);
         }
-        self.manager
+        let lease = self
+            .manager
             .validate_network_cleanup(&ticket.id, &ticket.token)
             .await
-            .map(|allocation| allocation.ip_address)
-            .map_err(SandboxError::from)
+            .map_err(SandboxError::from)?;
+        match lease.ip {
+            std::net::IpAddr::V4(ip) => Ok(ip),
+            std::net::IpAddr::V6(ip) => Err(SandboxError::Internal(format!(
+                "sandbox {} holds {ip}; host cleanup here is IPv4-only",
+                ticket.id
+            ))),
+        }
     }
 
     /// Revalidate and recycle one exact generation after guest DNAT cleanup.

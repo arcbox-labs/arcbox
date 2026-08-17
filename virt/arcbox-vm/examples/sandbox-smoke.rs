@@ -113,19 +113,21 @@ async fn main() -> anyhow::Result<()> {
         .network
         .as_ref()
         .context("no network allocation on smoke-1")?;
+    let tap = tap_name_for(&net.ip_address)
+        .with_context(|| format!("IP {} is not a pool address", net.ip_address))?;
     println!(
-        "  [net.1]  tap={} ip={} gw={}",
-        net.tap_name, net.ip_address, net.gateway
+        "  [net.1]  tap={tap} ip={} gw={}",
+        net.ip_address, net.gateway
     );
     check_ip_in_cidr(&net.ip_address, &net_cidr)
         .with_context(|| format!("IP {} not in subnet {}", net.ip_address, net_cidr))?;
     println!("  [net.1]  {} is within {net_cidr} ✓", net.ip_address);
 
     // N.2 — TAP interface visible on host.
-    if tap_exists(&net.tap_name) {
-        println!("  [net.2]  TAP {} visible on host ✓", net.tap_name);
+    if tap_exists(&tap) {
+        println!("  [net.2]  TAP {tap} visible on host ✓");
     } else {
-        bail!("TAP {} not found on host after create", net.tap_name);
+        bail!("TAP {tap} not found on host after create");
     }
 
     // N.3 — Second sandbox must receive a distinct IP.
@@ -154,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
             .inspect_sandbox(&id2)
             .ok()
             .and_then(|i| i.network)
-            .map(|n| n.tap_name);
+            .and_then(|n| tap_name_for(&n.ip_address));
 
         manager
             .stop_sandbox(&id2, 10)
@@ -433,6 +435,16 @@ fn check_ip_in_cidr(ip: &str, cidr: &str) -> anyhow::Result<()> {
     } else {
         bail!("{ip} is not in {cidr}")
     }
+}
+
+/// The TAP name the sandbox network gives a pool address.
+///
+/// Derived rather than reported: the host interface is a host detail the
+/// sandbox API deliberately does not expose (CORE-54), and this smoke test
+/// runs on the host that owns it.
+fn tap_name_for(ip: &str) -> Option<String> {
+    let octets = ip.parse::<std::net::Ipv4Addr>().ok()?.octets();
+    Some(format!("vmtap{}-{}", octets[2], octets[3]))
 }
 
 /// Return `true` if the named TAP interface exists on the host.

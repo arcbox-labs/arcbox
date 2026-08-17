@@ -52,7 +52,18 @@ impl SandboxManager {
     /// proceeds anyway and `reserve` surfaces the honest UNAVAILABLE.
     async fn await_network_release(&self, id: &SandboxId) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while self.network.quarantine_pending(id) {
+        loop {
+            match self.reconcile_network().pending_cleanups().await {
+                Ok(pending) if !pending.iter().any(|(vm, _)| vm.as_str() == id) => return,
+                Ok(_) => {}
+                Err(error) => {
+                    // The ledger is what the wait is about, so an unreadable
+                    // one is not something to spin on: fall through and let
+                    // `reserve` report it.
+                    warn!(sandbox_id = %id, %error, "network cleanup ledger is unreadable");
+                    return;
+                }
+            }
             if std::time::Instant::now() > deadline {
                 warn!(
                     sandbox_id = %id,
@@ -293,40 +304,56 @@ impl SandboxManager {
         let ttl_deadline = record.ttl_deadline;
         let spec = record.effective_spec;
         let arc = reservation.instance();
-        let mut creating_instance = arc.lock().unwrap();
-        creating_instance.record_generation = Some(generation);
-        creating_instance.labels.clone_from(&spec.labels);
-        creating_instance.spec.clone_from(&spec);
-        // Computed by the durable record so a same-key create retry keeps
-        // the original cap instead of re-deriving it from a later "now".
-        creating_instance.ttl_deadline = ttl_deadline;
+        let cleanup_lock = {
+            let mut creating_instance = arc.lock().unwrap();
+            creating_instance.record_generation = Some(generation);
+            creating_instance.labels.clone_from(&spec.labels);
+            creating_instance.spec.clone_from(&spec);
+            // Computed by the durable record so a same-key create retry keeps
+            // the original cap instead of re-deriving it from a later "now".
+            creating_instance.ttl_deadline = ttl_deadline;
+            creating_instance.cleanup_lock.clone()
+        };
+        // Reserving and activating the network are awaits, and the std
+        // `MutexGuard` on the instance cannot be held across one. The
+        // instance's cleanup lock is what closes the window instead: every
+        // teardown path for this generation takes it, so nothing can tear
+        // down what this create is still building while the guard is down.
+        let _creating = cleanup_lock.lock().await;
 
         // Reserve the IP without touching the host, durably journal it, then
         // materialize the TAP. No external resource exists before its cleanup
         // metadata does.
-        let mut net_alloc = None;
-        let setup = (|| -> Result<(String, Option<String>)> {
+        // Tracked apart from the NIC on purpose: the lease exists from
+        // `reserve` on, and the rollback below must hand back one whose TAP
+        // was never built — a journal write between the two can fail.
+        let mut lease: Option<NetworkLease> = None;
+        let mut nic: Option<NicSpec> = None;
+        let setup = async {
             if spec.network.mode != "none" {
-                net_alloc = Some(self.network.reserve(&id)?);
+                lease = Some(
+                    self.network
+                        .reserve(&VmId::new(&id)?, super::sandbox_network_policy())
+                        .await?,
+                );
             }
-            let ip_address = net_alloc
+            let ip_address = lease
                 .as_ref()
-                .map(|net| net.ip_address.to_string())
+                .map(|lease| lease.ip.to_string())
                 .unwrap_or_default();
 
             super::reconcile::create_runtime_dir(&vm_dir)?;
             let cleanup_record = super::reconcile::SandboxStateRecord::new(
                 &id,
                 None,
-                net_alloc.as_ref(),
+                lease.as_ref(),
                 None,
-                self.config.firecracker.jailer.is_some(),
+                &self.config,
                 None,
-            );
+            )?;
             super::reconcile::write_state_record(&vm_dir, &cleanup_record)?;
-            if let Some(net) = &net_alloc {
-                self.network
-                    .activate(net, crate::network::TapMode::Invariant)?;
+            if let Some(lease) = &lease {
+                nic = Some(self.network.activate(lease, AttachMode::Invariant).await?);
             }
 
             let outcome = SandboxProvisionOutcome {
@@ -335,8 +362,9 @@ impl SandboxManager {
             let commit =
                 self.records
                     .transition(&id, generation, SandboxTransition::Starting(outcome))?;
-            Ok((ip_address, commit.durability_error))
-        })();
+            Ok::<_, VmmError>((ip_address, commit.durability_error))
+        }
+        .await;
 
         let (ip_address, starting_durability_error) = match setup {
             Ok(result) => result,
@@ -348,8 +376,8 @@ impl SandboxManager {
                 warn!(sandbox_id = %id, error = %error, "sandbox create setup failed; rolling back");
                 let mut rollback_errors = Vec::new();
                 let mut network_cleanup_failed = false;
-                if let Some(net) = &net_alloc
-                    && let Err(release_error) = self.network.release_checked(net)
+                if let Some(reserved) = lease.clone()
+                    && let Err(release_error) = self.network.release(reserved).await
                 {
                     network_cleanup_failed = true;
                     rollback_errors.push(format!("network: {release_error}"));
@@ -361,7 +389,8 @@ impl SandboxManager {
                     rollback_errors.push(format!("directory {}: {remove_error}", vm_dir.display()));
                 }
                 if !rollback_errors.is_empty() {
-                    creating_instance.network.clone_from(&net_alloc);
+                    let mut creating_instance = arc.lock().unwrap();
+                    creating_instance.network = lease;
                     creating_instance.state = SandboxState::Failed;
                     creating_instance.error = Some(error.to_string());
                     let record_error = self
@@ -400,7 +429,18 @@ impl SandboxManager {
         };
 
         // Populate the reserved instance.
-        creating_instance.network.clone_from(&net_alloc);
+        let mut creating_instance = arc.lock().unwrap();
+        creating_instance.network.clone_from(&lease);
+        // What the guest is told over its NIC is the network's answer for
+        // the mode it was activated in, not a constant of any one adapter.
+        let attachment = lease.zip(nic).map(|(lease, nic)| {
+            let identity = self.network.identity(&lease, AttachMode::Invariant);
+            NetworkAttachment {
+                lease,
+                nic,
+                identity,
+            }
+        });
         // The boot bakes the invariant `ip=` identity unless the caller
         // supplied an explicit ip= (see do_boot); record which one this guest
         // runs so checkpoints carry the right restore contract.
@@ -418,13 +458,12 @@ impl SandboxManager {
             let cow_manager = Arc::clone(&self.cow_manager);
             let records = Arc::clone(&self.records);
             let id_clone = id.clone();
-            let net_alloc_clone = net_alloc;
             let (resource_handoff_tx, resource_handoff) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
                 boot_sandbox(
                     id_clone,
                     spec,
-                    net_alloc_clone,
+                    attachment,
                     vm_dir,
                     instances,
                     network,
@@ -731,7 +770,7 @@ impl SandboxManager {
                     ip_address: inst
                         .network
                         .as_ref()
-                        .map(|n| n.ip_address.to_string())
+                        .map(|lease| lease.ip.to_string())
                         .unwrap_or_default(),
                     created_at: inst.created_at,
                     paused_at: inst.paused_at,
@@ -848,4 +887,52 @@ fn snapshot_files(info: &crate::snapshot::SnapshotInfo) -> Vec<PathBuf> {
     std::iter::once(info.vmstate_path.clone())
         .chain(info.mem_path.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::fake_manager_direct;
+    use super::*;
+
+    /// A create that fails between reserving an address and building its
+    /// TAP must hand the address back.
+    ///
+    /// That window is real — the durable journal is written inside it, on
+    /// purpose, so no host resource exists before its cleanup metadata —
+    /// and a rollback that only knew about *activated* leases would strand
+    /// the address in the pool for the life of the process. Driven here by
+    /// planting a directory where the journal's file goes.
+    #[tokio::test]
+    async fn a_create_that_fails_before_activation_hands_the_address_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _driver, _probe) = fake_manager_direct(dir.path()).await;
+        let vm_dir = dir.path().join("sandboxes").join("doomed");
+        std::fs::create_dir_all(vm_dir.join("state.json")).unwrap();
+
+        let spec = SandboxSpec {
+            id: Some("doomed".into()),
+            ..SandboxSpec::default()
+        };
+        super::super::testing::expect_err(manager.create_sandbox(spec).await, "the create");
+
+        // Nothing is quarantined — the lease never reached a TAP — and the
+        // address is back in the pool for the next sandbox.
+        assert!(
+            manager
+                .reconcile_network()
+                .pending_cleanups()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reused = manager
+            .network
+            .reserve(
+                &VmId::new("next").unwrap(),
+                super::super::sandbox_network_policy(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reused.ip, "10.200.0.2".parse::<std::net::IpAddr>().unwrap());
+    }
 }

@@ -45,11 +45,42 @@ pub trait GuestNetwork: Send + Sync {
     /// [`GuestNetwork::activate`] was given.
     fn identity(&self, lease: &NetworkLease, mode: AttachMode) -> NetworkIdentity;
 
+    /// How host-side forwarding reaches this guest: the address DNAT must
+    /// target, and any packet mark the datapath needs to see.
+    ///
+    /// Decided by the datapath that actually applied to this lease, not by
+    /// the policy that was asked for — an adapter that falls back at
+    /// activation time reports the fallback's answer here. It is therefore
+    /// not derivable from [`GuestNetwork::identity`] plus the lease: a
+    /// network that gives every guest the same address translated per
+    /// interface has the host target the *lease's* address while the guest
+    /// holds the fixed one, which is the exact inverse of what those two
+    /// values say.
+    ///
+    /// A read, like [`GuestNetwork::identity`]: what applied to a lease is
+    /// state the network already holds by the time anyone can ask.
+    fn host_ingress(&self, lease: &NetworkLease) -> Result<HostIngress>;
+
     /// The cleanup-token protocol and startup sweep, when the network keeps
     /// a quarantine ledger.
     fn reconcile(&self) -> Option<&dyn NetworkReconcile> {
         None
     }
+}
+
+/// Where host-side forwarding sends packets destined for one guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostIngress {
+    /// DNAT to the lease's own (pool) address; the datapath translates
+    /// onwards.
+    PoolAddress,
+    /// DNAT to the guest's address, marking packets with `fwmark` so the
+    /// datapath's policy routing picks them up.
+    GuestAddress {
+        /// The mark the forwarding rule must set.
+        fwmark: u32,
+    },
 }
 
 /// What kind of connectivity a VM gets.
@@ -146,8 +177,14 @@ pub trait NetworkReconcile: Send + Sync {
     /// list.
     async fn pending_cleanups(&self) -> Result<Vec<(VmId, String)>>;
 
-    /// Checks that `token` names `vm`'s pending cleanup generation.
-    async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()>;
+    /// Checks that `token` names `vm`'s pending cleanup generation, and
+    /// hands back the lease it names.
+    ///
+    /// The lease is the answer, not an acknowledgement: the host cleanup
+    /// this gates is keyed by the address that generation held, and after
+    /// a restart the only place that address survives is the ledger the
+    /// network is reading here.
+    async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<NetworkLease>;
 
     /// Ends `vm`'s quarantine and returns its address to the pool.
     async fn finalize_cleanup(&self, vm: &VmId, token: &str) -> Result<()>;
@@ -164,6 +201,12 @@ pub trait NetworkReconcile: Send + Sync {
 
     /// Waits until no startup cleanup is pending.
     async fn wait_startup_cleanup_complete(&self);
+
+    /// The owner has finished replaying its durable state into this ledger.
+    /// Until it has, the startup sweep cannot be finalized: a host must not
+    /// declare a previous process's forwarding state gone while the owner is
+    /// still discovering what it left behind.
+    fn replay_complete(&self);
 }
 
 #[cfg(test)]

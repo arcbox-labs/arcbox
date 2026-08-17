@@ -3,6 +3,27 @@ use serde::{Deserialize, Serialize};
 
 pub type SandboxId = String;
 
+/// A sandbox's network as the boot flow carries it: the lease the guest
+/// network reserved, the NIC it returned when it activated that lease, and
+/// the addressing the guest is told to use over it.
+///
+/// The three travel together because all of them are needed at once and
+/// none derives the others — the crash journal records the lease, the VM
+/// spec boots the NIC, the kernel command line carries the identity, and
+/// only the network knows which interface it built for which address or
+/// what a guest on it sees.
+#[derive(Clone)]
+pub struct NetworkAttachment {
+    /// The reserved address, and the cleanup token its generation ends on.
+    pub lease: NetworkLease,
+    /// The interface the driver attaches the guest's `eth0` to.
+    pub nic: NicSpec,
+    /// What the guest is told over that interface, from
+    /// [`GuestNetwork::identity`](arcbox_vm_driver::net::GuestNetwork::identity)
+    /// under the mode it was activated in.
+    pub identity: NetworkIdentity,
+}
+
 pub(super) struct SandboxBootTask {
     pub(super) resource_handoff: Option<tokio::sync::oneshot::Receiver<()>>,
     pub(super) handle: tokio::task::JoinHandle<()>,
@@ -205,8 +226,11 @@ pub struct SandboxInstance {
     /// present once a boot or restore succeeded; shared with the tasks that
     /// checkpoint or shut it down.
     pub handle: Option<Arc<dyn VmHandle>>,
-    /// Allocated network resources.
-    pub network: Option<NetworkAllocation>,
+    /// The address the guest network reserved for this sandbox, absent
+    /// when the sandbox is networkless or its lease has been handed back.
+    /// The NIC that activating it produced is not kept: the VM was booted
+    /// with it and nothing here reads it again.
+    pub network: Option<NetworkLease>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
     pub vm_dir: PathBuf,
     /// When the sandbox record was created.
@@ -249,7 +273,7 @@ impl SandboxInstance {
     pub(super) fn new(
         id: SandboxId,
         spec: SandboxSpec,
-        network: Option<NetworkAllocation>,
+        network: Option<NetworkLease>,
         vm_dir: PathBuf,
     ) -> Self {
         Self::new_inner(id, spec, network, vm_dir, None)
@@ -258,7 +282,7 @@ impl SandboxInstance {
     pub(super) fn new_with_generation(
         id: SandboxId,
         spec: SandboxSpec,
-        network: Option<NetworkAllocation>,
+        network: Option<NetworkLease>,
         vm_dir: PathBuf,
         generation: Uuid,
     ) -> Self {
@@ -268,7 +292,7 @@ impl SandboxInstance {
     fn new_inner(
         id: SandboxId,
         spec: SandboxSpec,
-        network: Option<NetworkAllocation>,
+        network: Option<NetworkLease>,
         vm_dir: PathBuf,
         record_generation: Option<Uuid>,
     ) -> Self {
@@ -344,7 +368,6 @@ pub struct SandboxInfo {
 pub struct SandboxNetworkInfo {
     pub ip_address: String,
     pub gateway: String,
-    pub tap_name: String,
 }
 
 // Events

@@ -30,12 +30,17 @@
 //!
 //! - [`SandboxManager`] — top-level sandbox orchestrator
 //! - [`SandboxEnvironment`] — the environment-specific components a
-//!   composer supplies: the VM driver, block tooling, the packet filter
+//!   composer supplies: the VM driver, the guest network, block tooling,
+//!   the packet filter
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
-//! - [`NetworkManager`] — TAP lifecycle & IP allocation (`arcbox-tap-net`'s
-//!   `TapNetwork`, re-exported through [`network`])
+//! - [`network`] — `arcbox-tap-net`, re-exported: the Linux TAP adapter
+//!   this crate builds when a composer supplies no guest network, and the
+//!   `invariant` addressing the System VM's own port-forward and init code
+//!   still names. Sandboxes reach it only through the driver port's
+//!   `GuestNetwork`; [`NetworkManager`] is that adapter's type, not a
+//!   surface the manager speaks.
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
 //!
 //! Snapshot lineage — the checkpoint catalog, the copy-on-write rootfs
@@ -56,8 +61,11 @@ pub mod vsock;
 pub use arcbox_vm_proto::boot as boot_proto;
 
 /// The sandbox TAP network lives in `arcbox-tap-net` (vm-stack-redesign
-/// R2); this path stays so the manager and `arcbox-agent` keep resolving
-/// `crate::network::*` until R2b moves them onto the driver port.
+/// R2). Sandboxes reach it through the driver port; this path stays for
+/// the two things that are not sandbox lifecycle — building the default
+/// adapter when a composer supplies none, and the System VM's own
+/// port-forward and init code, which still name `invariant` and
+/// `ExposeTarget` until R3 moves those calls to the composition root.
 pub use arcbox_tap_net as network;
 
 // The snapshot lineage moved to the engine layer (arcbox-snapshot); these

@@ -8,42 +8,49 @@
 use std::path::{Path, PathBuf};
 
 use arcbox_vm_driver::{
-    BootSpec, CacheMode, ConsoleSpec, DiskSpec, IsolationSpec, NicAttachment, NicSpec, RestoreSpec,
-    VmId, VmSpec, VsockSpec,
+    BootSpec, CacheMode, ConsoleSpec, DiskSpec, IsolationSpec, NicSpec, RestoreSpec, VmId, VmSpec,
+    VsockSpec,
 };
 
 use crate::boot_proto::KernelIpParam;
 use crate::error::{Result, VmmError};
-use crate::network::NetworkAllocation;
-use crate::sandbox::SandboxSpec;
+use crate::sandbox::{NetworkAttachment, SandboxSpec, ipv4, netmask};
 
 /// The boot recipe as the driver port sees it.
 ///
 /// `kernel` and `rootfs` are the paths the VMM must open — in jailer mode
 /// already staged inside the jail, so the driver finds them there and
-/// stages nothing itself. Every sandbox boots the identical fixed identity
-/// (CORE-81) unless the caller pinned its own `ip=`: the pool IP stays a
-/// host-side property of the TAP, so snapshots taken from this guest are
-/// network-agnostic and restore with zero guest-side work. The guest-side
-/// vm-agent parses the `ip=` parameter back via `KernelIpParam::from_str`
-/// to derive the DNS nameserver.
+/// stages nothing itself.
+///
+/// `net` is what the guest network handed back when it activated this
+/// sandbox's lease — the one NIC a sandbox ever has plus the addressing a
+/// guest on it sees — or none when the sandbox is networkless. The `ip=`
+/// parameter is that identity, not a constant: under the TAP network's
+/// invariant identity (CORE-81) every sandbox boots the same fixed
+/// address, the pool address stays a host-side property of the interface,
+/// and snapshots are network-agnostic — but that is one adapter's answer,
+/// and a guest booted with another adapter's NIC must be told that
+/// adapter's addressing. A caller who pinned its own `ip=` keeps it. The
+/// guest-side vm-agent parses the parameter back via
+/// `KernelIpParam::from_str` to derive the DNS nameserver.
 pub(super) fn build_vm_spec(
     id: &str,
     spec: &SandboxSpec,
-    net_alloc: Option<&NetworkAllocation>,
+    net: Option<&NetworkAttachment>,
     kernel: PathBuf,
     rootfs: PathBuf,
     isolation: IsolationSpec,
 ) -> Result<VmSpec> {
-    let cmdline = if net_alloc.is_some() && !spec.boot_args.contains("ip=") {
-        let ip_param = KernelIpParam {
-            client: crate::network::invariant::GUEST_IP,
-            gateway: crate::network::invariant::GUEST_GATEWAY,
-            netmask: crate::network::invariant::GUEST_NETMASK,
-        };
-        format!("{} {ip_param}", spec.boot_args)
-    } else {
-        spec.boot_args.clone()
+    let cmdline = match net {
+        Some(net) if !spec.boot_args.contains("ip=") => {
+            let ip_param = KernelIpParam {
+                client: ipv4(net.identity.ip)?,
+                gateway: ipv4(net.identity.gateway)?,
+                netmask: netmask(net.identity.prefix_len),
+            };
+            format!("{} {ip_param}", spec.boot_args)
+        }
+        _ => spec.boot_args.clone(),
     };
     Ok(VmSpec {
         id: VmId::new(id)?,
@@ -60,7 +67,7 @@ pub(super) fn build_vm_spec(
             initrd: None,
         },
         disks: vec![rootfs_disk(rootfs)],
-        nics: net_alloc.map(nic_spec).transpose()?.into_iter().collect(),
+        nics: net.map(|net| net.nic.clone()).into_iter().collect(),
         // CID 3 is the conventional guest CID; each VMM is isolated so the
         // same CID is safe across concurrent sandboxes.
         vsock: Some(VsockSpec { guest_cid: 3 }),
@@ -86,29 +93,19 @@ pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
     }
 }
 
-/// The guest's one NIC, `eth0`, on the allocation's TAP with its MAC.
-pub(super) fn nic_spec(net: &NetworkAllocation) -> Result<NicSpec> {
-    Ok(NicSpec {
-        id: "eth0".into(),
-        mac: net.mac_address.parse().map_err(VmmError::from)?,
-        attachment: NicAttachment::Tap {
-            name: net.tap_name.clone(),
-        },
-    })
-}
-
 /// What a restore may change about the checkpointed VM: its identity
-/// (`owner`, the id the jail is keyed by), the fresh TAP, and the disk it
-/// runs on — the rootfs staged into the owner's jail.
+/// (`owner`, the id the jail is keyed by), the fresh NIC the guest network
+/// activated, and the disk it runs on — the rootfs staged into the owner's
+/// jail.
 pub(super) fn restore_spec(
     owner: &str,
     chroot: &Path,
-    net_alloc: Option<&NetworkAllocation>,
+    nic: Option<NicSpec>,
     isolation: IsolationSpec,
 ) -> Result<RestoreSpec> {
     Ok(RestoreSpec {
         id: VmId::new(owner)?,
-        nics: net_alloc.map(nic_spec).transpose()?.into_iter().collect(),
+        nics: nic.into_iter().collect(),
         disks: vec![rootfs_disk(chroot.join("rootfs.ext4"))],
         isolation,
     })
@@ -116,17 +113,38 @@ pub(super) fn restore_spec(
 
 #[cfg(test)]
 mod tests {
+    use arcbox_vm_driver::NicAttachment;
+    use arcbox_vm_driver::net::{NetworkIdentity, NetworkLease};
+
     use super::*;
 
-    fn allocation() -> NetworkAllocation {
-        NetworkAllocation {
-            tap_name: "vmtap0-7".into(),
-            ip_address: "172.20.0.7".parse().unwrap(),
-            prefix_len: 16,
-            gateway: "172.20.0.1".parse().unwrap(),
-            mac_address: "02:fc:00:00:00:07".into(),
-            dns_servers: vec![],
-            cleanup_token: String::new(),
+    /// What a guest network hands back from activating a lease: the NIC,
+    /// and the fixed invariant addressing a guest on the System VM's TAP
+    /// network is told to use over it.
+    fn attachment() -> NetworkAttachment {
+        NetworkAttachment {
+            lease: NetworkLease {
+                vm: VmId::new("box").unwrap(),
+                ip: "172.20.0.7".parse().unwrap(),
+                prefix_len: 16,
+                gateway: "172.20.0.1".parse().unwrap(),
+                mac: "02:fc:00:00:00:07".parse().unwrap(),
+                cleanup_token: "gen-1".into(),
+            },
+            nic: NicSpec {
+                id: "eth0".into(),
+                mac: "02:fc:00:00:00:07".parse().unwrap(),
+                attachment: NicAttachment::Tap {
+                    name: "vmtap0-7".into(),
+                },
+            },
+            identity: NetworkIdentity {
+                ip: crate::network::invariant::GUEST_IP.into(),
+                prefix_len: crate::network::invariant::GUEST_PREFIX_LEN,
+                gateway: crate::network::invariant::GUEST_GATEWAY.into(),
+                dns: vec![crate::network::invariant::GUEST_GATEWAY.into()],
+                mac: "02:fc:00:00:00:07".parse().unwrap(),
+            },
         }
     }
 
@@ -145,7 +163,7 @@ mod tests {
         let vm = build_vm_spec(
             "box",
             &spec,
-            Some(&allocation()),
+            Some(&attachment()),
             PathBuf::from("/jail/vmlinux"),
             PathBuf::from("/jail/rootfs.ext4"),
             IsolationSpec::None,
@@ -158,9 +176,20 @@ mod tests {
         };
         assert_eq!(image, Path::new("/jail/vmlinux"));
         assert!(cmdline.starts_with("console=ttyS0 ip="), "{cmdline}");
+        // The whole `ip=` comes from the network's identity, netmask
+        // included: the TAP network's /30 renders as the fixed netmask its
+        // guests have always booted with.
         assert!(
             cmdline.contains(&crate::network::invariant::GUEST_IP.to_string()),
             "{cmdline}"
+        );
+        assert!(
+            cmdline.contains(&crate::network::invariant::GUEST_NETMASK.to_string()),
+            "{cmdline}"
+        );
+        assert_eq!(
+            netmask(crate::network::invariant::GUEST_PREFIX_LEN),
+            crate::network::invariant::GUEST_NETMASK
         );
         assert_eq!(vm.disks.len(), 1);
         assert!(vm.disks[0].root && !vm.disks[0].read_only);
@@ -188,7 +217,7 @@ mod tests {
         let vm = build_vm_spec(
             "box",
             &pinned,
-            Some(&allocation()),
+            Some(&attachment()),
             "/k".into(),
             "/r".into(),
             IsolationSpec::None,
