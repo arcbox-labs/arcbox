@@ -385,6 +385,12 @@ pub async fn discard_kills_a_prepared_vm(h: &dyn ContractHarness) {
 /// accident.
 pub async fn restore_reattaches_disks(h: &dyn ContractHarness) {
     let driver = h.driver();
+    if !driver.capabilities().checkpoint {
+        // Nothing to restore from; skip before copying disks a hardware
+        // harness may measure in gigabytes. The accessor half of the
+        // agreement is `capabilities_agree_with_accessors`'s job.
+        return;
+    }
     let mut source_spec = h.spec(&id("reattach-src"));
     let source_dir = h.runtime_dir();
     for disk in &mut source_spec.disks {
