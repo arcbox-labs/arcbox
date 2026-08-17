@@ -836,6 +836,8 @@ async fn create_sparse_file(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     /// A manager over `cow_dir` with nothing attached and no `dmsetup`;
@@ -850,6 +852,30 @@ mod tests {
             dmsetup_bin: None,
             test_probe: None,
         }
+    }
+
+    /// A `dmsetup` that lists `listed` as snapshot devices and appends every
+    /// other invocation to `{dir}/dmsetup.log`, so a test can assert which
+    /// devices the sweep decided to remove without a device-mapper.
+    fn fake_dmsetup(dir: &Path, listed: &[&str]) -> PathBuf {
+        let listing = listed
+            .iter()
+            .enumerate()
+            .map(|(minor, name)| format!("{name}\\t(253, {minor})"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let binary = dir.join("dmsetup");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = ls ]; then printf '{listing}\\n'; else echo \"$@\" >> '{}'; fi\n",
+                dir.join("dmsetup.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary
     }
 
     fn handle_for(dm_device: &Path, template: &Path) -> CowHandle {
@@ -995,6 +1021,79 @@ mod tests {
                 .refcount,
             0
         );
+    }
+
+    /// The sweep must leave an adopted sandbox's device alone: a live VM
+    /// holds it open, so removing it fails — and `reconcile_stale` reports
+    /// that failure for the whole sweep, taking every other sandbox's
+    /// reconciliation down with it.
+    #[test]
+    fn a_live_dm_device_is_not_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = manager(tmp.path());
+        mgr.dmsetup_bin = Some(fake_dmsetup(
+            tmp.path(),
+            &["arcbox-snap-live", "arcbox-snap-dead", "foreign-snapshot"],
+        ));
+
+        mgr.reconcile_stale(&HashSet::new(), &HashSet::from(["live".to_owned()]))
+            .unwrap();
+
+        let removed = std::fs::read_to_string(tmp.path().join("dmsetup.log")).unwrap();
+        assert_eq!(
+            removed.lines().collect::<Vec<_>>(),
+            ["remove --retry arcbox-snap-dead"],
+            "the sweep removed the wrong devices"
+        );
+    }
+
+    /// A live device's overlay is the disk it is running on, so the caller
+    /// naming it as live is enough — it does not also have to remember to
+    /// list it among the retained files.
+    #[test]
+    fn a_live_sandbox_cow_file_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay = tmp.path().join("arcbox-cow-live.img");
+        std::fs::write(&overlay, b"exceptions").unwrap();
+        let mgr = manager(tmp.path());
+
+        mgr.reconcile_stale(&HashSet::new(), &HashSet::from(["live".to_owned()]))
+            .unwrap();
+
+        assert!(overlay.exists(), "a live sandbox's overlay was deleted");
+    }
+
+    /// The template map is the authority on which loops are in use, so a
+    /// marker whose template is live survives — detaching that loop would
+    /// pull the rootfs out from under the guest running on it, and the
+    /// marker is the loop's own recovery record.
+    #[test]
+    fn a_live_template_loop_survives_the_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_dir = tmp.path().join(TEMPLATE_LOOP_DIR);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let live = tmp.path().join("live.ext4");
+        let stale = tmp.path().join("stale.ext4");
+        std::fs::write(marker_dir.join("loop7"), live.to_string_lossy().as_bytes()).unwrap();
+        std::fs::write(marker_dir.join("loop8"), stale.to_string_lossy().as_bytes()).unwrap();
+        let mgr = manager(tmp.path());
+        mgr.templates.lock().unwrap().insert(
+            live,
+            TemplateEntry {
+                loop_device: "/dev/loop7".into(),
+                sectors: 1024,
+                refcount: 1,
+            },
+        );
+
+        mgr.reconcile_stale(&HashSet::new(), &HashSet::new())
+            .unwrap();
+
+        assert!(
+            marker_dir.join("loop7").exists(),
+            "the live template's recovery marker was cleared"
+        );
+        assert!(!marker_dir.join("loop8").exists());
     }
 
     /// Nothing to re-register, whatever the journal claims — and the caller

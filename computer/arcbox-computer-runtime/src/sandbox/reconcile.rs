@@ -322,7 +322,10 @@ pub(super) async fn sweep_orphans(
             .iter()
             .map(|record| (record.id.as_str(), record.phase)),
     );
-    cow_manager.reconcile_stale(&retained)?;
+    // No sandbox is kept alive across this sweep yet, so no dm device is in
+    // use by a running VM — every one of them is an orphan to reap (CORE-135
+    // part 2b decides adopt-or-kill and fills this in).
+    cow_manager.reconcile_stale(&retained, &HashSet::new())?;
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();

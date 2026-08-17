@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -145,15 +146,34 @@ impl CowManager {
 
     /// Remove orphaned dm-snapshot devices, COW files, and template loop
     /// devices left over from a previous crash. Called after orphaned
-    /// Firecracker processes are dead; it is synchronous because every
+    /// Firecracker processes are dead — every one of them except the
+    /// sandboxes named by `live_devices`, whose VMs are still running and
+    /// were reclaimed by [`Self::adopt`]. It is synchronous because every
     /// command is short and startup is already gated on reconciliation.
     ///
-    /// `keep_cow_ids` names sandboxes whose COW file is *retained state*,
-    /// not an orphan: a paused sandbox keeps its (detached) overlay on disk
-    /// so Resume can re-assemble the dm-snapshot with every written block
+    /// Both sets are keyed by the *resource owner* — the id in
+    /// `arcbox-cow-{owner}.img` and `arcbox-snap-{owner}` — which for a
+    /// sandbox that adopted a pre-warmed pool slot is the slot's id, not the
+    /// sandbox's.
+    ///
+    /// `keep_cow_files` names owners whose COW file is *retained state*, not
+    /// an orphan: a paused sandbox keeps its (detached) overlay on disk so
+    /// Resume can re-assemble the dm-snapshot with every written block
     /// intact (CORE-21). Deleting those files here would silently destroy a
     /// paused sandbox's disk across an agent restart.
-    pub fn reconcile_stale(&self, keep_cow_ids: &std::collections::HashSet<String>) -> Result<()> {
+    ///
+    /// `live_devices` names owners whose dm-snapshot is in use by a running
+    /// VM. The two sets stay separate because they describe genuinely
+    /// different states: a paused sandbox's device was already torn down at
+    /// pause, so reading its retained file as a live device would leave the
+    /// device of a sandbox that crashed mid-pause unreaped. The other
+    /// direction does hold — a live device's overlay is its running disk —
+    /// so those files are kept whether or not the caller lists them twice.
+    pub fn reconcile_stale(
+        &self,
+        keep_cow_files: &HashSet<String>,
+        live_devices: &HashSet<String>,
+    ) -> Result<()> {
         let dmsetup = self.dmsetup_bin.as_deref();
 
         // 1. Remove stale dm devices first — they pin the loop devices
@@ -164,8 +184,15 @@ impl CowManager {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if let Some(name) = line.split_whitespace().next()
-                    && name.starts_with(DM_NAME_PREFIX)
+                    && let Some(owner) = name.strip_prefix(DM_NAME_PREFIX)
                 {
+                    // A live VM holds its device open, so removing it would
+                    // fail — and fail the whole sweep, taking every other
+                    // sandbox's reconciliation with it.
+                    if live_devices.contains(owner) {
+                        debug!(dm = %name, "keeping live sandbox dm-snapshot");
+                        continue;
+                    }
                     debug!(dm = %name, "removing stale dm-snapshot");
                     // `--retry` for the same udev probe race `dmsetup_remove` documents.
                     run_sync_checked(Command::new(dmsetup).args(["remove", "--retry", name]))?;
@@ -183,8 +210,8 @@ impl CowManager {
             };
             if let Some(rest) = name.strip_prefix("arcbox-cow-") {
                 let id = rest.strip_suffix(".img").unwrap_or(rest);
-                if keep_cow_ids.contains(id) {
-                    debug!(file = %path.display(), "keeping paused sandbox cow file");
+                if keep_cow_files.contains(id) || live_devices.contains(id) {
+                    debug!(file = %path.display(), "keeping retained sandbox cow file");
                     continue;
                 }
                 for loop_device in loop_devices_for_backing_sync(&path)? {
@@ -198,10 +225,10 @@ impl CowManager {
         // 3. Detach orphaned template loop devices.
         //
         // Template attaches are tracked only in the in-memory `templates`
-        // HashMap, which is empty at startup — without this pass, every
-        // crash+restart cycle would permanently leak one read-only loop
-        // device per unique rootfs template, eventually exhausting the
-        // 256-entry loop namespace.
+        // HashMap, which holds nothing at startup but what [`Self::adopt`]
+        // put there — without this pass, every crash+restart cycle would
+        // permanently leak one read-only loop device per unique rootfs
+        // template, eventually exhausting the 256-entry loop namespace.
         //
         // We use marker files written at attach time (under
         // `{cow_dir}/.template-loops/`) rather than a system-wide "any
@@ -304,6 +331,30 @@ impl CowManager {
                     "empty template marker: {}",
                     marker_path.display()
                 )));
+            }
+            // The map is the authority on which template loops are in use:
+            // an entry means a live dm-snapshot has this template as its
+            // origin, either because this manager attached it or because
+            // [`Self::adopt`] re-registered a still-running guest's. The
+            // marker stays too — it is that loop's recovery record, and its
+            // owner clears it on teardown. Before the pending branch, not
+            // after: that branch detaches *everything* backing the template,
+            // which is precisely the live loop. A pending marker for a live
+            // template is instead cleared by a later sweep, once nothing
+            // holds it — by which time its own loop, if it ever got one, is
+            // the one the teardown detached.
+            if self
+                .templates
+                .lock()
+                .unwrap()
+                .contains_key(Path::new(&expected_backing))
+            {
+                debug!(
+                    marker = %marker_path.display(),
+                    template = %expected_backing,
+                    "keeping live template loop"
+                );
+                continue;
             }
             if loop_basename.starts_with(TEMPLATE_PENDING_PREFIX) {
                 for loop_device in loop_devices_for_backing_sync(Path::new(&expected_backing))? {
