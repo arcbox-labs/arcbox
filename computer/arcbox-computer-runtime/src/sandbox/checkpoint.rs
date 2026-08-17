@@ -841,14 +841,18 @@ impl SandboxManager {
                 )
             };
 
-        // What the guest holds on its interface, read under the mode its
-        // snapshot was addressed in: an invariant guest carries the fixed
-        // identity, a legacy one the pool address the reconfig below moves
-        // it to. Derived once — the agent and that RPC must not disagree.
+        // What the guest holds on its interface once this restore has
+        // configured it, read under the mode its snapshot was addressed in.
+        // Derived once — the agent and the re-address RPC must not disagree.
         let identity = lease.as_ref().map(|lease| {
             self.network
                 .identity(lease, super::attach_mode(snap_meta.net_invariant))
         });
+        // An invariant guest already holds it, so its agent can be told
+        // straight away. A legacy one still carries its origin's address
+        // until the RPC below lands, and this host cannot name that — so
+        // nothing is told how to reach it by address in the meantime.
+        let settled_on_load = snap_meta.net_invariant.then(|| identity.clone()).flatten();
 
         // Load the image on the prepared VMM: the disk is the rootfs staged
         // into the owner's jail, eth0 lands on the fresh TAP.
@@ -861,7 +865,9 @@ impl SandboxManager {
             )?;
             let handle: Arc<dyn VmHandle> =
                 Arc::from(prepared.restore(&staged_checkpoint, restore).await?);
-            let agent = self.agent.connect(Arc::clone(&handle), identity.as_ref())?;
+            let agent = self
+                .agent
+                .connect(Arc::clone(&handle), settled_on_load.as_ref())?;
             Ok((handle, agent))
         }
         .await;
@@ -943,19 +949,30 @@ impl SandboxManager {
 
         // The reconfig RPC is the only guest configuration still awaited —
         // and only by legacy snapshots; invariant snapshots return
-        // immediately above.
-        if let Err(error) = net_reconfig.await {
-            return Err(self
-                .rollback_restore(
-                    &new_id,
-                    reservation,
-                    error,
-                    Some(Arc::clone(&prepared)),
-                    lease.clone(),
-                    pending_cow,
-                )
-                .await);
-        }
+        // immediately above. A legacy guest holds the pool address only
+        // once it returns, so that is where its agent learns the identity.
+        let configured = net_reconfig.await.and_then(|()| {
+            if snap_meta.net_invariant {
+                Ok(Arc::clone(&agent))
+            } else {
+                self.agent.connect(Arc::clone(&handle), identity.as_ref())
+            }
+        });
+        let agent = match configured {
+            Ok(agent) => agent,
+            Err(error) => {
+                return Err(self
+                    .rollback_restore(
+                        &new_id,
+                        reservation,
+                        error,
+                        Some(Arc::clone(&prepared)),
+                        lease.clone(),
+                        pending_cow,
+                    )
+                    .await);
+            }
+        };
 
         let t_guest_cfg = std::time::Instant::now();
 

@@ -705,14 +705,21 @@ impl SandboxManager {
                     .restore(&image, restore)
                     .await?,
             );
-            // What the guest holds on its interface, read under the mode
-            // its snapshot was addressed in. Derived once — the agent and
-            // the reconfig RPC below must not disagree.
+            // What the guest holds on its interface once this resume has
+            // configured it, read under the mode its snapshot was addressed
+            // in. Derived once — the agent and the reconfig RPC below must
+            // not disagree. An invariant guest already holds it; a legacy
+            // one still carries its origin's address until that RPC lands,
+            // and this host cannot name that, so its agent is told nothing
+            // about reaching it by address in the meantime.
             let identity = lease.as_ref().map(|lease| {
                 self.network
                     .identity(lease, super::attach_mode(snap_meta.net_invariant))
             });
-            let agent = self.agent.connect(Arc::clone(&handle), identity.as_ref())?;
+            let settled_on_load = snap_meta.net_invariant.then(|| identity.clone()).flatten();
+            let agent = self
+                .agent
+                .connect(Arc::clone(&handle), settled_on_load.as_ref())?;
 
             // Clock sync is DETACHED, mirroring restore and cold boot
             // (CORE-80): the guest wall clock froze at pause time, but

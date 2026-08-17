@@ -273,11 +273,16 @@ pub(super) async fn live_sandbox_with(
     )
     .unwrap();
 
+    // A cold boot activates the interface invariant and hands the instance
+    // that identity beside the handle, so a planted one must too — an agent
+    // that reads it would otherwise see a networkless sandbox.
+    let identity = manager.network.identity(&lease, super::attach_mode(true));
     let mut instance =
         SandboxInstance::new_with_generation(id.to_owned(), spec, Some(lease), vm_dir, generation);
     instance.state = SandboxState::Ready;
     instance.prepared = Some(prepared);
     instance.handle = Some(Arc::clone(&handle));
+    instance.net_identity = Some(identity);
     instance.cow_handle = Some(cow_handle);
     let instance = Arc::new(Mutex::new(instance));
     manager
