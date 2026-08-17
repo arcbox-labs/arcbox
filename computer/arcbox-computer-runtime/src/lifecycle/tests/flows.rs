@@ -241,7 +241,13 @@ fn a_user_checkpoint_holds_ready_and_writes_no_record() {
     let (mut sm, mut context) = ready_machine();
     let (state, effects) = step(&mut sm, &mut context, &Event::Checkpoint);
     assert_eq!(state.to_public(), SandboxState::Ready);
-    assert_eq!(effects, vec![Effect::SpawnCheckpoint { hold: false }]);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::CancelTimer(Timer::Idle),
+            Effect::SpawnCheckpoint { hold: false },
+        ]
+    );
 
     // The race this state exists to close: a Run cannot claim the slot while
     // the guest is frozen, and the idle policy cannot fire either.
@@ -262,10 +268,11 @@ fn a_user_checkpoint_holds_ready_and_writes_no_record() {
     }
 
     // A recoverable failure returns to Ready without a record write, exactly
-    // as `checkpoint_sandbox` does today.
+    // as `checkpoint_sandbox` does today — with the idle window restarted,
+    // since the expiry swallowed above consumed a one-shot timer.
     let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
     assert_eq!(state.to_public(), SandboxState::Ready);
-    assert!(effects.is_empty());
+    assert_eq!(effects, vec![Effect::ArmTimer(Timer::Idle)]);
 }
 
 #[test]
@@ -366,4 +373,33 @@ fn an_unacknowledged_provision_forgets_its_record() {
 fn the_pause_reasons_are_the_ones_the_event_stream_carries() {
     assert_eq!(PauseReason::Requested.as_str(), "pause");
     assert_eq!(PauseReason::IdleTimeout.as_str(), "idle_timeout");
+}
+
+#[test]
+fn a_restore_that_fails_before_its_commit_is_rolled_back_not_parked() {
+    // `rollback_restore` force-removes: the record and every artefact go, so
+    // the id and its request key are free for a retry (and a warm create can
+    // fall back to a cold boot). Parking at `Failed` would hold both.
+    for failure in [Event::Failure, Event::VmExited, Event::Frozen] {
+        let (mut sm, mut context) = reach(&[Event::Provision(Provision::Restore {
+            origin: RestoreOrigin::WarmCreate,
+        })]);
+        let (state, effects) = step(&mut sm, &mut context, &failure);
+        assert!(matches!(state, State::Removing {}), "{failure:?}");
+        assert_eq!(
+            effects,
+            vec![
+                Effect::AbortInflight,
+                Effect::CancelTimer(Timer::Ttl),
+                Effect::CancelTimer(Timer::Idle),
+                persist(PersistPhase::Removing, Durability::Warn),
+                release(ReleaseScope::Full),
+            ],
+            "{failure:?}"
+        );
+
+        let (state, effects) = step(&mut sm, &mut context, &Event::RemoveDone);
+        assert!(matches!(state, State::Gone {}), "{failure:?}");
+        assert_eq!(effects[0], Effect::ForgetRecord(RecordEnd::Removed));
+    }
 }

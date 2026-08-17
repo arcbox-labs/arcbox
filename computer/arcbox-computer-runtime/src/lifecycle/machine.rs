@@ -130,6 +130,16 @@ impl ComputerLifecycle {
                 context.emit(Effect::SpawnGate);
                 Transition(State::gating())
             }
+            // A restore that fails before its commit is rolled back, not
+            // failed in place: `rollback_restore` force-removes the record and
+            // every artefact, so the id and its request key are free again and
+            // a warm create can fall back to a cold boot. (Failing before any
+            // resource exists is `abort_provision` today — the same end, one
+            // durable write cheaper.)
+            Event::Failure | Event::VmExited | Event::Frozen => {
+                context.removal();
+                Transition(State::removing())
+            }
             _ => Super,
         }
     }
@@ -205,6 +215,7 @@ impl ComputerLifecycle {
                 Transition(State::removing())
             }
             Event::Checkpoint => {
+                context.emit(Effect::CancelTimer(Timer::Idle));
                 context.emit(Effect::SpawnCheckpoint { hold: false });
                 Transition(State::checkpointing())
             }
@@ -236,11 +247,18 @@ impl ComputerLifecycle {
     /// `Run` claims the slot while the guest is frozen (`to_public` still
     /// answers `Ready`, so the wire is unchanged).
     #[state(superstate = "active")]
-    fn checkpointing(event: &Event) -> Outcome {
+    fn checkpointing(event: &Event, context: &mut Effects) -> Outcome {
         match event {
             // A recoverable capture failure leaves the guest running and the
             // computer usable; only `Frozen` degrades it, through `computer`.
-            Event::CaptureDone { .. } | Event::Failure => Transition(State::ready()),
+            // Either way the idle window restarts: it is cancelled on the way
+            // in, and the expiry swallowed below would otherwise be lost —
+            // the timer is one-shot, so a computer that idled through a
+            // checkpoint would never idle again.
+            Event::CaptureDone { .. } | Event::Failure => {
+                context.emit(Effect::ArmTimer(Timer::Idle));
+                Transition(State::ready())
+            }
             Event::ClaimWorkload { .. }
             | Event::Pause { .. }
             | Event::Checkpoint
