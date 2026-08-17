@@ -1,0 +1,27 @@
+[package]
+name              = "arcbox-tap-net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description       = "The Linux TAP guest network: address pool, TAP devices, identity-invariant NAT (eBPF TCX or iptables), and the quarantine ledger behind arcbox-vm-driver's GuestNetwork port."
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14.0"

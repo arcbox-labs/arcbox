@@ -86,7 +86,7 @@ enum DevCommand {
     /// Prepare boot assets under boot-assets/dev for local tests and daemons.
     BootAssets(BootAssetsArgs),
     /// Rebuild the committed sandbox NAT BPF object and both hash sidecars
-    /// (virt/arcbox-vm/bpf). Requires a clang with the BPF backend.
+    /// (virt/arcbox-tap-net/bpf). Requires a clang with the BPF backend.
     Bpf,
 }
 

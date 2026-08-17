@@ -150,7 +150,7 @@ pub(crate) fn remove(filter: &dyn PacketFilter, tap: &str, pool_ip: Ipv4Addr) ->
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(crate::error::VmmError::Network(format!(
+        Err(crate::error::TapNetError::Network(format!(
             "sandbox NAT teardown incomplete for {tap}: {}",
             failures.join("; ")
         )))
@@ -161,18 +161,19 @@ pub(crate) fn remove(filter: &dyn PacketFilter, tap: &str, pool_ip: Ipv4Addr) ->
 fn write_tap_sysctl(tap: &str, key: &str, value: &str) -> Result<()> {
     let path = format!("/proc/sys/net/ipv4/conf/{tap}/{key}");
     std::fs::write(&path, value)
-        .map_err(|e| crate::error::VmmError::Network(format!("write {path}: {e}")))
+        .map_err(|e| crate::error::TapNetError::Network(format!("write {path}: {e}")))
 }
 
 /// Resolve a TAP's interface index (also the eBPF datapath's map key).
 #[cfg(target_os = "linux")]
-pub(super) fn tap_ifindex(tap: &str) -> Result<u32> {
-    let name = std::ffi::CString::new(tap)
-        .map_err(|_| crate::error::VmmError::Network(format!("TAP name {tap:?} contains NUL")))?;
+pub fn tap_ifindex(tap: &str) -> Result<u32> {
+    let name = std::ffi::CString::new(tap).map_err(|_| {
+        crate::error::TapNetError::Network(format!("TAP name {tap:?} contains NUL"))
+    })?;
     // SAFETY: name is a valid NUL-terminated string.
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     if index == 0 {
-        return Err(crate::error::VmmError::Network(format!(
+        return Err(crate::error::TapNetError::Network(format!(
             "if_nametoindex {tap}: {}",
             std::io::Error::last_os_error()
         )));

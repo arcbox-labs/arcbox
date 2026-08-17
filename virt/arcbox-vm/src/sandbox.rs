@@ -290,18 +290,24 @@ impl SandboxManager {
         token: &str,
     ) -> Result<NetworkAllocation> {
         self.await_reconcile().await?;
-        self.network.validate_quarantine(id, token)
+        self.network
+            .validate_quarantine(id, token)
+            .map_err(VmmError::from)
     }
 
     /// Recycle one exact inactive sandbox generation after forwarding cleanup.
     pub async fn finalize_network_cleanup(&self, id: &str, token: &str) -> Result<()> {
         self.await_reconcile().await?;
-        self.network.finalize_quarantine(id, token)
+        self.network
+            .finalize_quarantine(id, token)
+            .map_err(VmmError::from)
     }
 
     /// Reject allocation/exposure until startup cleanup replay is finalized.
     pub fn ensure_startup_cleanup_complete(&self) -> Result<()> {
-        self.network.ensure_startup_cleanup_complete()
+        self.network
+            .ensure_startup_cleanup_complete()
+            .map_err(VmmError::from)
     }
 
     /// Wait until the current agent generation's startup cleanup is complete.
@@ -318,13 +324,17 @@ impl SandboxManager {
     /// Validate the current process-generation startup cleanup ticket.
     pub async fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
         self.await_reconcile().await?;
-        self.network.validate_startup_cleanup(token)
+        self.network
+            .validate_startup_cleanup(token)
+            .map_err(VmmError::from)
     }
 
     /// Release the startup gate once host listeners and legacy DNAT are gone.
     pub async fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
         self.await_reconcile().await?;
-        self.network.finalize_startup_cleanup(token)
+        self.network
+            .finalize_startup_cleanup(token)
+            .map_err(VmmError::from)
     }
 
     /// Return the active generation's network identity: the external pool IP

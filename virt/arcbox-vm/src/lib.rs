@@ -46,13 +46,17 @@ pub mod config;
 pub mod environment;
 pub mod error;
 pub mod file_io;
-pub mod network;
 pub mod rootfs;
 pub mod sandbox;
 pub mod vsock;
 
 /// Boot-parameter vocabulary shared with `vm-agent` (`arcbox_vm_proto::boot`).
 pub use arcbox_vm_proto::boot as boot_proto;
+
+/// The sandbox TAP network lives in `arcbox-tap-net` (vm-stack-redesign
+/// R2); this path stays so the manager and `arcbox-agent` keep resolving
+/// `crate::network::*` until R2b moves them onto the driver port.
+pub use arcbox_tap_net as network;
 
 // The snapshot lineage moved to the engine layer (arcbox-snapshot); these
 // paths stay so `arcbox-agent` and this crate's own modules keep compiling.

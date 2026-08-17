@@ -503,7 +503,7 @@ impl SandboxManager {
                             "{error}; restore rollback is visible, but durability is unconfirmed: {durability_error}"
                         )));
                     }
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         } else {

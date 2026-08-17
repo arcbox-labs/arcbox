@@ -1066,6 +1066,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-tap-net"
+version = "0.7.0"
+dependencies = [
+ "aya",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "arcbox-transport"
 version = "0.7.0"
 dependencies = [
@@ -1200,10 +1216,10 @@ dependencies = [
  "arcbox-ext4",
  "arcbox-fc-driver",
  "arcbox-snapshot",
+ "arcbox-tap-net",
  "arcbox-vm-driver",
  "arcbox-vm-proto",
  "async-trait",
- "aya",
  "chrono",
  "fc-sdk",
  "libc",

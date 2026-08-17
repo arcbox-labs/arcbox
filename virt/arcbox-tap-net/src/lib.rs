@@ -1,3 +1,18 @@
+//! `arcbox-tap-net` — the Linux TAP guest network of the sandbox stack.
+//!
+//! One [`NetworkManager`] owns an IPv4 pool and, per VM, a persistent TAP
+//! device on an isolated point-to-point link, the identity-invariant NAT
+//! that gives every guest the same address ([`invariant`]) — applied per
+//! TAP either as two eBPF TCX programs or as the iptables rule set behind
+//! the [`PacketFilter`] seam — and the durable quarantine ledger that keeps
+//! a released address out of the pool until host-side forwarding state is
+//! confirmed gone. It moved here from `arcbox-vm/src/network` as the Linux
+//! adapter of the `arcbox-vm-driver` `GuestNetwork` port (vm-stack-redesign
+//! D-VM6, R2). Everything that touches the kernel is Linux-only; the pool,
+//! the encoders, and the ledger compile and are unit-tested everywhere.
+
+#![warn(missing_docs)]
+
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -9,10 +24,10 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::config::SandboxDatapath;
-use crate::error::{Result, VmmError};
-
+pub use crate::error::{Result, TapNetError};
 pub use packet_filter::{IptablesLegacy, PacketFilter};
+
+pub mod error;
 
 #[cfg_attr(
     not(target_os = "linux"),
@@ -41,9 +56,26 @@ mod quarantine;
 )]
 mod rtnetlink;
 
+/// How the pool-IP <-> fixed-guest-IP translation of an invariant sandbox TAP
+/// (CORE-81) is applied host-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Datapath {
+    /// Per-TAP TCX eBPF programs: two attach syscalls and one map update per
+    /// activation, stateless, O(1) per packet (CORE-83). Falls back to
+    /// [`Self::Iptables`] automatically when the BPF object cannot be loaded
+    /// or attached.
+    #[default]
+    Ebpf,
+    /// The CORE-81 iptables rule set (mark + DNAT/SNAT + fwmark fib rules);
+    /// conntrack-stateful and O(active sandboxes) per packet. Also the only
+    /// mechanism ever applied to legacy (non-invariant) TAPs.
+    Iptables,
+}
+
 /// Host-side addressing scheme applied when a sandbox TAP is materialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TapMode {
+pub enum TapMode {
     /// Fixed guest identity + per-TAP 1:1 NAT (CORE-81): the TAP's local
     /// address is [`invariant::GUEST_GATEWAY`] and the pool IP is translated
     /// host-side. Every fresh boot and every invariant-snapshot restore.
@@ -57,7 +89,7 @@ pub(crate) enum TapMode {
 
 /// The translation mechanism actually applied to an active invariant TAP.
 ///
-/// Distinct from the configured [`SandboxDatapath`]: a TAP configured for
+/// Distinct from the configured [`Datapath`]: a TAP configured for
 /// eBPF lands on `Iptables` when the object cannot be loaded or this TAP's
 /// attach fails. Teardown and expose targeting must follow what was applied,
 /// not what was asked for.
@@ -167,7 +199,7 @@ pub struct NetworkManager {
             reason = "consulted only by the Linux activation path; other platforms activate nothing"
         )
     )]
-    datapath: SandboxDatapath,
+    datapath: Datapath,
     /// Mechanism actually applied per active invariant TAP, recorded at
     /// activation. Keyed by TAP name; entries live exactly as long as the
     /// TAP (activation inserts, teardown removes). A TAP absent here was
@@ -200,7 +232,7 @@ impl NetworkManager {
             gateway,
             dns,
             None,
-            SandboxDatapath::default(),
+            Datapath::default(),
             Arc::new(IptablesLegacy::default()),
         )
     }
@@ -208,12 +240,12 @@ impl NetworkManager {
     /// Create a manager that persists inactive allocations until host cleanup
     /// is finalized, translating invariant TAPs via `datapath` and, where
     /// that means netfilter rules, through `packet_filter`.
-    pub(crate) fn with_quarantine_dir(
+    pub fn with_quarantine_dir(
         cidr: &str,
         gateway: &str,
         dns: Vec<String>,
         quarantine_dir: PathBuf,
-        datapath: SandboxDatapath,
+        datapath: Datapath,
         packet_filter: Arc<dyn PacketFilter>,
     ) -> Result<Self> {
         Self::new_inner(
@@ -231,18 +263,18 @@ impl NetworkManager {
         gateway: &str,
         dns: Vec<String>,
         quarantine_dir: Option<PathBuf>,
-        datapath: SandboxDatapath,
+        datapath: Datapath,
         packet_filter: Arc<dyn PacketFilter>,
     ) -> Result<Self> {
         let (base, prefix_len) = parse_cidr(cidr)?;
         if !(1..=30).contains(&prefix_len) {
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "prefix length {prefix_len} out of range 1–30"
             )));
         }
         let gateway = gateway
             .parse::<Ipv4Addr>()
-            .map_err(|e| VmmError::Network(format!("invalid gateway: {e}")))?;
+            .map_err(|e| TapNetError::Network(format!("invalid gateway: {e}")))?;
         let quarantined = quarantine_dir
             .as_deref()
             .map(|dir| quarantine::load_quarantines(dir, base, prefix_len, gateway))
@@ -251,7 +283,7 @@ impl NetworkManager {
         let mut allocated = HashSet::new();
         for allocation in quarantined.values() {
             if !allocated.insert(u32::from(allocation.ip_address)) {
-                return Err(VmmError::Network(format!(
+                return Err(TapNetError::Network(format!(
                     "duplicate quarantined sandbox IP {}",
                     allocation.ip_address
                 )));
@@ -307,17 +339,17 @@ impl NetworkManager {
     /// Whether `vm_id`'s released network is still quarantined awaiting
     /// host-side cleanup finalization (a same-id [`Self::reserve`] is
     /// refused until then).
-    pub(crate) fn quarantine_pending(&self, vm_id: &str) -> bool {
+    pub fn quarantine_pending(&self, vm_id: &str) -> bool {
         self.quarantined.lock().unwrap().contains_key(vm_id)
     }
 
     /// Reserves an IP and computes its deterministic TAP metadata without
     /// creating any host resource. Sandbox lifecycle code journals this value
     /// before calling [`Self::activate`].
-    pub(crate) fn reserve(&self, vm_id: &str) -> Result<NetworkAllocation> {
+    pub fn reserve(&self, vm_id: &str) -> Result<NetworkAllocation> {
         self.ensure_startup_cleanup_complete()?;
         if self.quarantined.lock().unwrap().contains_key(vm_id) {
-            return Err(VmmError::Unavailable(format!(
+            return Err(TapNetError::Unavailable(format!(
                 "sandbox {vm_id} network cleanup is awaiting host finalization"
             )));
         }
@@ -347,7 +379,7 @@ impl NetworkManager {
         clippy::unnecessary_wraps,
         reason = "Linux TAP activation is fallible; macOS test builds compile the no-op branch"
     )]
-    pub(crate) fn activate(&self, allocation: &NetworkAllocation, mode: TapMode) -> Result<()> {
+    pub fn activate(&self, allocation: &NetworkAllocation, mode: TapMode) -> Result<()> {
         info!(
             tap = %allocation.tap_name,
             ip = %allocation.ip_address,
@@ -375,12 +407,12 @@ impl NetworkManager {
     }
 
     /// Apply the invariant pool-IP translation to an existing TAP, honoring
-    /// the configured [`SandboxDatapath`] and falling back to iptables when
+    /// the configured [`Datapath`] and falling back to iptables when
     /// the eBPF path is unavailable, then record what was applied.
     #[cfg(target_os = "linux")]
     fn install_translation(&self, allocation: &NetworkAllocation) -> Result<()> {
         let applied = match self.datapath {
-            SandboxDatapath::Iptables => {
+            Datapath::Iptables => {
                 invariant::install(
                     &*self.packet_filter,
                     &allocation.tap_name,
@@ -388,7 +420,7 @@ impl NetworkManager {
                 )?;
                 AppliedDatapath::Iptables
             }
-            SandboxDatapath::Ebpf => match self.attach_ebpf(allocation) {
+            Datapath::Ebpf => match self.attach_ebpf(allocation) {
                 Ok(ebpf::Attach::Done) => AppliedDatapath::Ebpf,
                 // The load failure already warned once; stay quiet per TAP.
                 Ok(ebpf::Attach::EngineUnavailable) => {
@@ -474,7 +506,7 @@ impl NetworkManager {
     /// plain pool-IP form suffices; everything else — iptables TAPs, legacy
     /// guests, and TAPs whose activation record died with a previous agent
     /// process — needs the CORE-81 guest-IP + fwmark form.
-    pub(crate) fn expose_target(&self, tap_name: &str, net_invariant: bool) -> ExposeTarget {
+    pub fn expose_target(&self, tap_name: &str, net_invariant: bool) -> ExposeTarget {
         if !net_invariant {
             return ExposeTarget::PoolIp;
         }
@@ -501,7 +533,7 @@ impl NetworkManager {
         clippy::unnecessary_wraps,
         reason = "Linux TAP cleanup is fallible; macOS test builds compile the no-op branch"
     )]
-    pub(crate) fn release_checked(&self, alloc: &NetworkAllocation) -> Result<()> {
+    pub fn release_checked(&self, alloc: &NetworkAllocation) -> Result<()> {
         // Translation state does not die with the device; remove it first
         // (tolerant of absence, so legacy TAPs are a no-op). A failure here
         // must NOT abort the teardown: propagating before the TAP destroy
@@ -548,7 +580,7 @@ impl NetworkManager {
                 return Ok(Ipv4Addr::from(candidate));
             }
         }
-        Err(VmmError::Network("IP pool exhausted".into()))
+        Err(TapNetError::Network("IP pool exhausted".into()))
     }
 
     #[cfg(target_os = "linux")]
@@ -561,7 +593,9 @@ impl NetworkManager {
 
         let name_bytes = tap_name.as_bytes();
         if name_bytes.len() >= libc::IFNAMSIZ {
-            return Err(VmmError::Network(format!("TAP name too long: {tap_name}")));
+            return Err(TapNetError::Network(format!(
+                "TAP name too long: {tap_name}"
+            )));
         }
 
         // 1. Create persistent TAP device via /dev/net/tun.
@@ -569,7 +603,7 @@ impl NetworkManager {
             .read(true)
             .write(true)
             .open("/dev/net/tun")
-            .map_err(|e| VmmError::Network(format!("open /dev/net/tun: {e}")))?;
+            .map_err(|e| TapNetError::Network(format!("open /dev/net/tun: {e}")))?;
 
         let mut ifr = new_ifreq(name_bytes);
         ifr.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as i16;
@@ -579,7 +613,7 @@ impl NetworkManager {
 
         // SAFETY: tun fd is valid, ifr is initialized with name and flags.
         if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF as _, &ifr) } < 0 {
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "TUNSETIFF {tap_name}: {}",
                 std::io::Error::last_os_error()
             )));
@@ -588,7 +622,7 @@ impl NetworkManager {
         // Make persistent so Firecracker can reopen the TAP by name.
         // SAFETY: tun fd is attached to the TAP device after TUNSETIFF.
         if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETPERSIST as _, 1i32) } < 0 {
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "TUNSETPERSIST {tap_name}: {}",
                 std::io::Error::last_os_error()
             )));
@@ -600,7 +634,7 @@ impl NetworkManager {
         let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if sock < 0 {
             destroy_tap(tap_name);
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "socket: {}",
                 std::io::Error::last_os_error()
             )));
@@ -611,7 +645,7 @@ impl NetworkManager {
         // SAFETY: sock and ifr.ifr_name are valid; kernel writes ifr_flags.
         if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS as _, &ifr) } < 0 {
             destroy_tap(tap_name);
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "SIOCGIFFLAGS {tap_name}: {}",
                 std::io::Error::last_os_error()
             )));
@@ -621,7 +655,7 @@ impl NetworkManager {
         // SAFETY: sock and ifr are valid.
         if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as _, &ifr) } < 0 {
             destroy_tap(tap_name);
-            return Err(VmmError::Network(format!(
+            return Err(TapNetError::Network(format!(
                 "SIOCSIFFLAGS UP {tap_name}: {}",
                 std::io::Error::last_os_error()
             )));
@@ -715,7 +749,7 @@ fn set_ifaddr(
     }
     // SAFETY: sock and req are valid; kernel reads ifr_name and sockaddr.
     if unsafe { libc::ioctl(sock.as_raw_fd(), request as _, &req) } < 0 {
-        return Err(VmmError::Network(format!(
+        return Err(TapNetError::Network(format!(
             "{label} {tap_name} {addr}: {}",
             std::io::Error::last_os_error()
         )));
@@ -741,7 +775,9 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
 
     let name_bytes = tap_name.as_bytes();
     if name_bytes.len() >= libc::IFNAMSIZ {
-        return Err(VmmError::Network(format!("TAP name too long: {tap_name}")));
+        return Err(TapNetError::Network(format!(
+            "TAP name too long: {tap_name}"
+        )));
     }
 
     // Try ioctl-based removal first.
@@ -792,14 +828,14 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
             .args(["link", "delete", tap_name])
             .output()
             .map_err(|error| {
-                VmmError::Network(format!("run ip link delete {tap_name}: {error}"))
+                TapNetError::Network(format!("run ip link delete {tap_name}: {error}"))
             })?;
         if !output.status.success() {
             delete_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
     }
     if std::path::Path::new(&sysfs).exists() {
-        return Err(VmmError::Network(match delete_error {
+        return Err(TapNetError::Network(match delete_error {
             Some(stderr) => format!("ip link delete {tap_name}: {stderr}"),
             None => format!("TAP {tap_name} still exists after deletion"),
         }));
@@ -810,14 +846,14 @@ fn destroy_tap_checked(tap_name: &str) -> Result<()> {
 fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
-        return Err(VmmError::Network(format!("invalid CIDR: {cidr}")));
+        return Err(TapNetError::Network(format!("invalid CIDR: {cidr}")));
     }
     let addr = parts[0]
         .parse::<Ipv4Addr>()
-        .map_err(|e| VmmError::Network(format!("invalid CIDR address: {e}")))?;
+        .map_err(|e| TapNetError::Network(format!("invalid CIDR address: {e}")))?;
     let prefix: u8 = parts[1]
         .parse()
-        .map_err(|e| VmmError::Network(format!("invalid prefix length: {e}")))?;
+        .map_err(|e| TapNetError::Network(format!("invalid prefix length: {e}")))?;
     Ok((addr, prefix))
 }
 
@@ -1107,7 +1143,7 @@ mod tests {
                 "10.0.0.1",
                 vec![],
                 root.path().join("network-quarantine"),
-                SandboxDatapath::default(),
+                Datapath::default(),
                 Arc::new(IptablesLegacy::default()),
             )
             .unwrap(),
@@ -1141,7 +1177,7 @@ mod tests {
             "10.0.0.1",
             vec![],
             quarantine.clone(),
-            SandboxDatapath::default(),
+            Datapath::default(),
             Arc::new(IptablesLegacy::default()),
         )
         .unwrap();
@@ -1157,7 +1193,7 @@ mod tests {
             "10.0.0.1",
             vec![],
             quarantine,
-            SandboxDatapath::default(),
+            Datapath::default(),
             Arc::new(IptablesLegacy::default()),
         )
         .unwrap();
@@ -1222,7 +1258,7 @@ mod tests {
                     "10.0.0.1",
                     vec![],
                     quarantine,
-                    SandboxDatapath::default(),
+                    Datapath::default(),
                     Arc::new(IptablesLegacy::default()),
                 )
                 .is_err()

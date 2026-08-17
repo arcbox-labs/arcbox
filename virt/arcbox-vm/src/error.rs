@@ -198,6 +198,32 @@ impl From<arcbox_vm_driver::Error> for VmmError {
     }
 }
 
+/// Variant-for-variant: the TAP network's `WrongState` (a cleanup token
+/// naming another generation) and `Unavailable` (a closed startup gate, a
+/// same-id cleanup still pending) are what the guest agent classifies as
+/// 412 and 503, and folding either into `Network` would turn them into
+/// 500s. `Io` and `Json` keep their native shapes for the same reason.
+impl From<arcbox_tap_net::TapNetError> for VmmError {
+    fn from(err: arcbox_tap_net::TapNetError) -> Self {
+        use arcbox_tap_net::TapNetError as T;
+        match err {
+            T::Network(msg) => Self::Network(msg),
+            T::Io(io) => Self::Io(io),
+            T::Json(json) => Self::Json(json),
+            T::WrongState {
+                id,
+                expected,
+                actual,
+            } => Self::WrongState {
+                id,
+                expected,
+                actual,
+            },
+            T::Unavailable(msg) => Self::Unavailable(msg),
+        }
+    }
+}
+
 /// A durable write that never landed is an I/O failure; one that landed
 /// without a confirmed rename is [`VmmError::Unavailable`] — the caller
 /// may retry, and the retry is safe because the write is idempotent.

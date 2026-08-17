@@ -13,14 +13,14 @@ pub fn run(args: DevArgs) -> Result<()> {
     }
 }
 
-/// Recompile `virt/arcbox-vm/bpf/sandbox_nat.bpf.c` into the committed
+/// Recompile `virt/arcbox-tap-net/bpf/sandbox_nat.bpf.c` into the committed
 /// `.bpf.o` and refresh both the `.c.sha256` and `.o.sha256` sidecars that
-/// the arcbox-vm `bpf_object_matches_source` test checks, so neither a
+/// the arcbox-tap-net `bpf_object_matches_source` test checks, so neither a
 /// source edit without a rebuild nor a stale committed object ships
 /// silently.
 fn rebuild_sandbox_bpf() -> Result<()> {
     let root = repo::root_from_xtask_manifest(env!("CARGO_MANIFEST_DIR"))?;
-    let bpf_dir = root.join("virt/arcbox-vm/bpf");
+    let bpf_dir = root.join("virt/arcbox-tap-net/bpf");
     let source = bpf_dir.join("sandbox_nat.bpf.c");
     let object = bpf_dir.join("sandbox_nat.bpf.o");
 

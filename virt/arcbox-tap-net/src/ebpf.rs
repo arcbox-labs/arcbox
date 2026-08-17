@@ -34,7 +34,7 @@ use std::net::Ipv4Addr;
 /// `cargo xtask dev bpf`; `tests/bpf_object.rs` pins source/object coherence
 /// and the ELF shape.
 #[cfg(target_os = "linux")]
-const OBJECT: &[u8] = include_bytes!("../../bpf/sandbox_nat.bpf.o");
+const OBJECT: &[u8] = include_bytes!("../bpf/sandbox_nat.bpf.o");
 
 /// `ifindex (host order) -> pool IP (network order)` hash map.
 #[cfg(target_os = "linux")]
@@ -50,13 +50,13 @@ const EGRESS_PROG: &str = "sandbox_nat_egress";
 /// The `SANDBOX_NAT` map value for a pool IP: a `u32` whose in-memory bytes
 /// are the address in network byte order, matching how the programs read
 /// `iphdr.saddr`/`daddr` straight out of the packet.
-pub(super) fn pool_ip_value(ip: Ipv4Addr) -> u32 {
+pub fn pool_ip_value(ip: Ipv4Addr) -> u32 {
     u32::from(ip).to_be()
 }
 
 /// Outcome of an eBPF activation attempt that did not itself error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Attach {
+pub enum Attach {
     /// Programs attached, map entry written, route replaced.
     Done,
     /// The engine failed to load earlier (warned once); the caller applies
@@ -69,10 +69,10 @@ pub(super) enum Attach {
 /// before any program is attached — the ingress isolation check treats a
 /// zero netmask as "unconfigured" and skips itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PoolValues([u32; 3]);
+pub struct PoolValues([u32; 3]);
 
 impl PoolValues {
-    pub(super) fn new(base: Ipv4Addr, prefix_len: u8, gateway: Ipv4Addr) -> Self {
+    pub fn new(base: Ipv4Addr, prefix_len: u8, gateway: Ipv4Addr) -> Self {
         // prefix_len is validated to 1..=30 by NetworkManager::new_inner.
         let mask = !0u32 << (32 - u32::from(prefix_len.min(32)));
         Self([
@@ -89,7 +89,7 @@ impl PoolValues {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) use linux::Engine;
+pub use linux::Engine;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -102,12 +102,12 @@ mod linux {
     use tracing::warn;
 
     use super::{EGRESS_PROG, INGRESS_PROG, NAT_MAP, OBJECT, POOL_MAP, PoolValues, pool_ip_value};
-    use crate::error::{Result, VmmError};
+    use crate::error::{Result, TapNetError};
 
     /// Process-wide loader state, initialized lazily on the first invariant
     /// TAP activation so agents that never run an eBPF-datapath sandbox pay
     /// nothing.
-    pub(in super::super) enum Engine {
+    pub enum Engine {
         /// No load attempted yet.
         Unloaded,
         /// Object verified and loaded; TAPs can attach.
@@ -120,7 +120,7 @@ mod linux {
     impl Engine {
         /// The loaded datapath, loading the object on first use. `None` means
         /// unavailable — the failure was logged when it happened.
-        pub(in super::super) fn ensure_loaded(&mut self, pool: PoolValues) -> Option<&mut EbpfNat> {
+        pub fn ensure_loaded(&mut self, pool: PoolValues) -> Option<&mut EbpfNat> {
             if matches!(self, Self::Unloaded) {
                 *self = match EbpfNat::load(pool) {
                     Ok(nat) => Self::Ready(Box::new(nat)),
@@ -137,7 +137,7 @@ mod linux {
         }
 
         /// The loaded datapath, if any, without triggering a load.
-        pub(in super::super) fn loaded_mut(&mut self) -> Option<&mut EbpfNat> {
+        pub fn loaded_mut(&mut self) -> Option<&mut EbpfNat> {
             match self {
                 Self::Ready(nat) => Some(nat),
                 Self::Unloaded | Self::Unavailable => None,
@@ -146,7 +146,7 @@ mod linux {
     }
 
     /// The loaded object plus the live per-TAP attachments.
-    pub(in super::super) struct EbpfNat {
+    pub struct EbpfNat {
         ebpf: aya::Ebpf,
         attachments: HashMap<String, TapAttachment>,
     }
@@ -163,21 +163,21 @@ mod linux {
         /// both programs into the kernel.
         fn load(pool: PoolValues) -> Result<Self> {
             let mut ebpf = aya::Ebpf::load(OBJECT)
-                .map_err(|e| VmmError::Network(format!("load sandbox NAT BPF object: {e}")))?;
+                .map_err(|e| TapNetError::Network(format!("load sandbox NAT BPF object: {e}")))?;
             {
                 let map = ebpf.map_mut(POOL_MAP).ok_or_else(|| missing(POOL_MAP))?;
                 let mut array = aya::maps::Array::<_, u32>::try_from(map)
-                    .map_err(|e| VmmError::Network(format!("map {POOL_MAP}: {e}")))?;
+                    .map_err(|e| TapNetError::Network(format!("map {POOL_MAP}: {e}")))?;
                 for (index, value) in pool.entries() {
                     array.set(index, value, 0).map_err(|e| {
-                        VmmError::Network(format!("write {POOL_MAP}[{index}]: {e}"))
+                        TapNetError::Network(format!("write {POOL_MAP}[{index}]: {e}"))
                     })?;
                 }
             }
             for name in [INGRESS_PROG, EGRESS_PROG] {
                 classifier(&mut ebpf, name)?
                     .load()
-                    .map_err(|e| VmmError::Network(format!("load program {name}: {e}")))?;
+                    .map_err(|e| TapNetError::Network(format!("load program {name}: {e}")))?;
             }
             Ok(Self {
                 ebpf,
@@ -187,17 +187,12 @@ mod linux {
 
         /// Attach both programs to `tap` via TCX links and map its ifindex to
         /// the pool IP. Self-cleaning: a partial attach detaches on drop.
-        pub(in super::super) fn attach(
-            &mut self,
-            tap: &str,
-            ifindex: u32,
-            pool_ip: Ipv4Addr,
-        ) -> Result<()> {
+        pub fn attach(&mut self, tap: &str, ifindex: u32, pool_ip: Ipv4Addr) -> Result<()> {
             let ingress = attach_one(&mut self.ebpf, INGRESS_PROG, tap, TcAttachType::Ingress)?;
             let egress = attach_one(&mut self.ebpf, EGRESS_PROG, tap, TcAttachType::Egress)?;
             let mut map = nat_map(&mut self.ebpf)?;
             map.insert(ifindex, pool_ip_value(pool_ip), 0)
-                .map_err(|e| VmmError::Network(format!("{NAT_MAP} insert for {tap}: {e}")))?;
+                .map_err(|e| TapNetError::Network(format!("{NAT_MAP} insert for {tap}: {e}")))?;
             self.attachments.insert(
                 tap.to_owned(),
                 TapAttachment {
@@ -212,7 +207,7 @@ mod linux {
         /// Detach `tap`'s programs (link drop) and drop its map entry, so a
         /// recycled ifindex can never inherit a stale pool IP. Unknown TAPs
         /// are a no-op.
-        pub(in super::super) fn detach(&mut self, tap: &str) -> Result<()> {
+        pub fn detach(&mut self, tap: &str) -> Result<()> {
             let Some(attachment) = self.attachments.remove(tap) else {
                 return Ok(());
             };
@@ -225,29 +220,29 @@ mod linux {
                 {
                     Ok(())
                 }
-                Err(e) => Err(VmmError::Network(format!(
+                Err(e) => Err(TapNetError::Network(format!(
                     "{NAT_MAP} remove for {tap}: {e}"
                 ))),
             }
         }
     }
 
-    fn missing(name: &str) -> VmmError {
-        VmmError::Network(format!("sandbox NAT object has no {name:?}"))
+    fn missing(name: &str) -> TapNetError {
+        TapNetError::Network(format!("sandbox NAT object has no {name:?}"))
     }
 
     fn classifier<'e>(ebpf: &'e mut aya::Ebpf, name: &str) -> Result<&'e mut SchedClassifier> {
         ebpf.program_mut(name)
             .ok_or_else(|| missing(name))?
             .try_into()
-            .map_err(|e| VmmError::Network(format!("program {name}: {e}")))
+            .map_err(|e| TapNetError::Network(format!("program {name}: {e}")))
     }
 
     fn nat_map(
         ebpf: &mut aya::Ebpf,
     ) -> Result<aya::maps::HashMap<&mut aya::maps::MapData, u32, u32>> {
         aya::maps::HashMap::try_from(ebpf.map_mut(NAT_MAP).ok_or_else(|| missing(NAT_MAP))?)
-            .map_err(|e| VmmError::Network(format!("map {NAT_MAP}: {e}")))
+            .map_err(|e| TapNetError::Network(format!("map {NAT_MAP}: {e}")))
     }
 
     /// TCX-attach one program and take ownership of its link. Never falls
@@ -266,10 +261,10 @@ mod linux {
                 attach_type,
                 TcAttachOptions::TcxOrder(LinkOrder::default()),
             )
-            .map_err(|e| VmmError::Network(format!("TCX attach {name} on {tap}: {e}")))?;
+            .map_err(|e| TapNetError::Network(format!("TCX attach {name} on {tap}: {e}")))?;
         program
             .take_link(link_id)
-            .map_err(|e| VmmError::Network(format!("own TCX link {name} on {tap}: {e}")))
+            .map_err(|e| TapNetError::Network(format!("own TCX link {name} on {tap}: {e}")))
     }
 }
 
