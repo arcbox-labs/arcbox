@@ -3,12 +3,17 @@
 //! over — so the failure paths can be driven on any host, no KVM or root.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arcbox_vm_driver::testkit::FakeDriver;
 use arcbox_vm_driver::{
-    BootSpec, ConsoleSpec, IsolationSpec, PreparedVm, VmDriver as _, VmHandle, VmId, VmSpec,
+    BootSpec, Checkpoint, CheckpointImage, CheckpointOptions, ConsoleSpec, Error, ExitStatus,
+    IsolationSpec, PreparedVm, ShutdownMode, VmDriver as _, VmEvent, VmHandle, VmId, VmRecord,
+    VmSpec, VmState,
 };
+use async_trait::async_trait;
+use tokio::sync::broadcast;
 
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::reconcile::{SandboxStateRecord, write_state_record};
@@ -78,14 +83,91 @@ fn vm_spec(id: &VmId) -> VmSpec {
     }
 }
 
-/// A `Ready` sandbox holding everything a successful boot hands its instance:
-/// the prepared VMM and the handle of the VM booted on it, a (probed) CoW
-/// overlay, a reserved network allocation, a durable `Ready` record, and a
-/// crash journal naming them. Returns the instance and the VM's handle.
+/// A VM whose checkpoint fails and leaves the guest frozen — the case where
+/// the driver's own resume after the capture failed — over a live fake VM.
+/// Everything else delegates, so killing the process the fake VM runs on
+/// (through the prepared VMM's `discard`) still shows up as `Exited` here.
+pub(super) struct FrozenOnCheckpoint {
+    inner: Arc<dyn VmHandle>,
+    frozen: AtomicBool,
+}
+
+impl FrozenOnCheckpoint {
+    pub(super) fn over(inner: Arc<dyn VmHandle>) -> Arc<dyn VmHandle> {
+        Arc::new(Self {
+            inner,
+            frozen: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl VmHandle for FrozenOnCheckpoint {
+    fn id(&self) -> &VmId {
+        self.inner.id()
+    }
+
+    fn record(&self) -> VmRecord {
+        self.inner.record()
+    }
+
+    fn state(&self) -> VmState {
+        match self.inner.state() {
+            exited @ VmState::Exited(_) => exited,
+            _ if self.frozen.load(Ordering::Acquire) => VmState::Quiesced,
+            state => state,
+        }
+    }
+
+    fn events(&self) -> broadcast::Receiver<VmEvent> {
+        self.inner.events()
+    }
+
+    async fn shutdown(&self, mode: ShutdownMode) -> arcbox_vm_driver::Result<ExitStatus> {
+        self.inner.shutdown(mode).await
+    }
+
+    fn checkpoint(&self) -> Option<&dyn Checkpoint> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Checkpoint for FrozenOnCheckpoint {
+    async fn checkpoint(
+        &self,
+        _dst: &Path,
+        _opts: CheckpointOptions,
+    ) -> arcbox_vm_driver::Result<CheckpointImage> {
+        self.frozen.store(true, Ordering::Release);
+        Err(Error::Driver {
+            driver: "fake",
+            message: "the guest stays quiesced: it could not be resumed after a failed checkpoint"
+                .into(),
+            source: None,
+        })
+    }
+}
+
+/// [`live_sandbox_with`] over the fake VM's own handle.
 pub(super) async fn live_sandbox(
     manager: &SandboxManager,
     driver: &FakeDriver,
     id: &str,
+) -> (Arc<Mutex<SandboxInstance>>, Arc<dyn VmHandle>) {
+    live_sandbox_with(manager, driver, id, |handle| handle).await
+}
+
+/// A `Ready` sandbox holding everything a successful boot hands its instance:
+/// the prepared VMM and the handle of the VM booted on it (as `wrap` dresses
+/// it), a (probed) CoW overlay, a reserved network allocation, a durable
+/// `Ready` record, and a crash journal naming them. Returns the instance and
+/// the handle it holds.
+pub(super) async fn live_sandbox_with(
+    manager: &SandboxManager,
+    driver: &FakeDriver,
+    id: &str,
+    wrap: impl FnOnce(Arc<dyn VmHandle>) -> Arc<dyn VmHandle>,
 ) -> (Arc<Mutex<SandboxInstance>>, Arc<dyn VmHandle>) {
     let vm_dir = PathBuf::from(&manager.config.firecracker.data_dir)
         .join("sandboxes")
@@ -100,7 +182,7 @@ pub(super) async fn live_sandbox(
             .await
             .unwrap(),
     );
-    let handle: Arc<dyn VmHandle> = Arc::from(prepared.boot(vm_spec(&vm_id)).await.unwrap());
+    let handle = wrap(Arc::from(prepared.boot(vm_spec(&vm_id)).await.unwrap()));
     let cow_handle = manager.cow_manager.setup(id, "/rootfs.ext4").await.unwrap();
     let network = manager.network.reserve(id).unwrap();
 

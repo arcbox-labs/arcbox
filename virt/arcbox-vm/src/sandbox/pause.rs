@@ -29,7 +29,7 @@
 //! reconciliation, and `Remove` all see one naming scheme.
 
 use super::boot::restore_spec;
-use super::checkpoint::{CheckpointRequest, checkpoint_impl};
+use super::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
 use super::persistence::SandboxTransition;
 use super::types::action;
 use super::*;
@@ -121,7 +121,7 @@ impl SandboxManager {
         // critical section as the check means a concurrent Run cannot slip
         // its `Ready → Running` claim in between and end up checkpointed
         // mid-execution.
-        let (generation, handle) = {
+        let generation = {
             let mut inst = instance.lock().unwrap();
             match inst.state {
                 SandboxState::Paused => return Ok(()),
@@ -142,13 +142,15 @@ impl SandboxManager {
                     "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
                 ));
             }
-            let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
-                id: id.clone(),
-                expected: "a sandbox with a live VM handle".into(),
-                actual: "no VM handle".into(),
-            })?;
+            if inst.handle.is_none() {
+                return Err(VmmError::WrongState {
+                    id: id.clone(),
+                    expected: "a sandbox with a live VM handle".into(),
+                    actual: "no VM handle".into(),
+                });
+            }
             inst.state = SandboxState::Pausing;
-            (inst.record_generation, handle)
+            inst.record_generation
         };
         let jailer = self
             .config
@@ -209,7 +211,7 @@ impl SandboxManager {
         .await
         {
             Ok(info) => info.snapshot_id,
-            Err(error) if handle.state() == arcbox_vm_driver::VmState::Quiesced => {
+            Err(CheckpointFailure::Frozen(error)) => {
                 let vm_dir = instance.lock().unwrap().vm_dir.clone();
                 super::boot::fail_live_sandbox_locked(
                     id,
@@ -227,7 +229,7 @@ impl SandboxManager {
                 error!(sandbox_id = %id, error = %error, "pause left the guest frozen; sandbox failed");
                 return Err(error);
             }
-            Err(error) => {
+            Err(CheckpointFailure::Recoverable(error)) => {
                 if let Some(generation) = generation
                     && let Err(revert) =
                         self.records

@@ -59,6 +59,78 @@ pub(super) struct CheckpointRequest {
     pub(super) resume_after: bool,
 }
 
+/// Why a checkpoint failed, told by what it left behind — the sandbox's
+/// fate depends on that, not on the error itself.
+pub(super) enum CheckpointFailure {
+    /// The guest is running — the driver resumed it, or the failure came
+    /// before the capture — and the sandbox is as usable as it was.
+    Recoverable(VmmError),
+    /// The guest is frozen and nothing can thaw it: the driver's own resume
+    /// after the capture failed (it settles the guest before reporting, and
+    /// this is the case where that settling itself failed), or the capture
+    /// held the guest on request and a later step failed. The port has no
+    /// resume verb, so the sandbox is unusable and the caller must fail it —
+    /// kill, release, durable `Failed` — rather than report it Ready.
+    Frozen(VmmError),
+}
+
+impl CheckpointFailure {
+    /// The error, for a caller whose next step disposes of the sandbox
+    /// either way.
+    pub(super) fn into_error(self) -> VmmError {
+        match self {
+            Self::Recoverable(error) | Self::Frozen(error) => error,
+        }
+    }
+}
+
+/// What a checkpoint captures from: the VM handle, and what the catalog
+/// entry records so a restore can re-stage — kernel/rootfs paths, the
+/// guest's addressing mode, the geometry.
+struct CheckpointSource {
+    kernel_path: String,
+    rootfs_path: String,
+    net_invariant: bool,
+    geometry: crate::snapshot::SnapshotGeometry,
+    handle: Arc<dyn VmHandle>,
+}
+
+fn checkpoint_source(
+    instances: &super::InstanceMap,
+    sandbox_id: &SandboxId,
+    expected_state: SandboxState,
+) -> Result<CheckpointSource> {
+    let instance = instances
+        .read()
+        .unwrap()
+        .get(sandbox_id)
+        .cloned()
+        .ok_or_else(|| VmmError::NotFound(sandbox_id.clone()))?;
+    let inst = instance.lock().unwrap();
+    if inst.state != expected_state {
+        return Err(VmmError::WrongState {
+            id: sandbox_id.clone(),
+            expected: expected_state.to_string(),
+            actual: inst.state.to_string(),
+        });
+    }
+    let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
+        id: sandbox_id.clone(),
+        expected: format!("{expected_state} (VM handle available)"),
+        actual: inst.state.to_string(),
+    })?;
+    Ok(CheckpointSource {
+        kernel_path: inst.spec.kernel.clone(),
+        rootfs_path: inst.spec.rootfs.clone(),
+        net_invariant: inst.net_invariant,
+        geometry: crate::snapshot::SnapshotGeometry {
+            vcpus: inst.spec.vcpus,
+            memory_mib: inst.spec.memory_mib,
+        },
+        handle,
+    })
+}
+
 /// Capture a full snapshot of a sandbox into the catalog through the
 /// driver's `Checkpoint` capability, which freezes the guest for the capture
 /// and (unless the request opts out) resumes it.
@@ -66,56 +138,56 @@ pub(super) struct CheckpointRequest {
 /// Free-standing (rather than a method) so the boot task can publish warm
 /// snapshots (CORE-77) through the exact code path the Checkpoint RPC uses,
 /// and so pause (CORE-21) inherits the same addressing-mode handling instead
-/// of re-deriving it.
+/// of re-deriving it. A failure says whether the guest is still usable
+/// ([`CheckpointFailure`]): every caller must fail the sandbox on `Frozen`.
 pub(super) async fn checkpoint_impl(
     instances: &super::InstanceMap,
     snapshots: &SnapshotCatalog,
     sandbox_id: &SandboxId,
     request: CheckpointRequest,
+) -> std::result::Result<CheckpointInfo, CheckpointFailure> {
+    let resume_after = request.resume_after;
+    let source = checkpoint_source(instances, sandbox_id, request.expected_state)
+        .map_err(CheckpointFailure::Recoverable)?;
+    let handle = Arc::clone(&source.handle);
+    let outcome = capture(snapshots, sandbox_id, source, request).await;
+    // The driver settles the guest before it reports: a failed capture is
+    // resumed, a successful one is resumed unless asked to hold. A guest
+    // still frozen where it should be running — or held by request but with
+    // the failure coming after the capture — has no way back, and the
+    // caller must not treat the sandbox as usable.
+    let frozen =
+        handle.state() == arcbox_vm_driver::VmState::Quiesced && (resume_after || outcome.is_err());
+    match (outcome, frozen) {
+        (Ok(info), false) => Ok(info),
+        (Ok(info), true) => Err(CheckpointFailure::Frozen(VmmError::Process(format!(
+            "sandbox {sandbox_id} stayed frozen after checkpoint {}: the driver could not \
+             resume the guest",
+            info.snapshot_id
+        )))),
+        (Err(error), true) => Err(CheckpointFailure::Frozen(error)),
+        (Err(error), false) => Err(CheckpointFailure::Recoverable(error)),
+    }
+}
+
+/// The capture proper: stage, freeze-capture-settle through the driver,
+/// commit to the catalog.
+async fn capture(
+    snapshots: &SnapshotCatalog,
+    sandbox_id: &SandboxId,
+    source: CheckpointSource,
+    request: CheckpointRequest,
 ) -> Result<CheckpointInfo> {
     let CheckpointRequest {
         name,
         labels,
-        expected_state,
         resume_after,
+        ..
     } = request;
-    // Verify state and capture the kernel/rootfs paths a restore re-stages,
-    // the guest's network addressing mode, and the VM handle.
-    let (kernel_path, rootfs_path, net_invariant, geometry, handle) = {
-        let instance = instances
-            .read()
-            .unwrap()
-            .get(sandbox_id)
-            .cloned()
-            .ok_or_else(|| VmmError::NotFound(sandbox_id.clone()))?;
-        let inst = instance.lock().unwrap();
-        if inst.state != expected_state {
-            return Err(VmmError::WrongState {
-                id: sandbox_id.clone(),
-                expected: expected_state.to_string(),
-                actual: inst.state.to_string(),
-            });
-        }
-        let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
-            id: sandbox_id.clone(),
-            expected: format!("{expected_state} (VM handle available)"),
-            actual: inst.state.to_string(),
-        })?;
-        (
-            inst.spec.kernel.clone(),
-            inst.spec.rootfs.clone(),
-            inst.net_invariant,
-            crate::snapshot::SnapshotGeometry {
-                vcpus: inst.spec.vcpus,
-                memory_mib: inst.spec.memory_mib,
-            },
-            handle,
-        )
-    };
     // The capability is a property of how the VM was built: the driver
     // checkpoints only jailed VMs, because a restore reopens the disk paths
     // the checkpoint recorded and only a per-VM chroot makes those private.
-    let checkpoint = handle.checkpoint().ok_or_else(|| {
+    let checkpoint = source.handle.checkpoint().ok_or_else(|| {
         VmmError::FailedPrecondition(format!(
             "sandbox {sandbox_id} cannot be checkpointed: checkpoints require jailer \
              isolation, and this VM runs without it"
@@ -154,10 +226,10 @@ pub(super) async fn checkpoint_impl(
         labels,
         snapshot_type: crate::config::SnapshotType::Full,
         parent_id: None,
-        kernel_path: Some(kernel_path),
-        rootfs_path: Some(rootfs_path),
-        net_invariant,
-        geometry: Some(geometry),
+        kernel_path: Some(source.kernel_path),
+        rootfs_path: Some(source.rootfs_path),
+        net_invariant: source.net_invariant,
+        geometry: Some(source.geometry),
         format: image.format.as_str().to_owned(),
     })?;
 
@@ -210,7 +282,7 @@ impl SandboxManager {
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
-        checkpoint_impl(
+        match checkpoint_impl(
             &self.instances,
             &self.snapshots,
             sandbox_id,
@@ -222,6 +294,43 @@ impl SandboxManager {
             },
         )
         .await
+        {
+            Ok(info) => Ok(info),
+            Err(CheckpointFailure::Recoverable(error)) => Err(error),
+            // A guest the driver could not resume is unusable: fail the
+            // sandbox the way a failed boot does rather than leave it Ready
+            // with every dial waiting out the budget.
+            Err(CheckpointFailure::Frozen(error)) => {
+                self.fail_frozen_sandbox(sandbox_id, &error).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Fail a sandbox whose guest is frozen with no way back (see
+    /// [`CheckpointFailure::Frozen`]): kill and reap the VMM, release its
+    /// runtime resources, record and publish `Failed`.
+    async fn fail_frozen_sandbox(&self, id: &SandboxId, error: &VmmError) {
+        let Some((generation, vm_dir)) = self.instances.read().unwrap().get(id).map(|arc| {
+            let inst = arc.lock().unwrap();
+            (inst.record_generation, inst.vm_dir.clone())
+        }) else {
+            return;
+        };
+        super::boot::fail_live_sandbox(
+            id,
+            generation,
+            &error.to_string(),
+            &vm_dir,
+            &self.instances,
+            &self.network,
+            &self.config,
+            &self.cow_manager,
+            &self.records,
+            &self.events_tx,
+        )
+        .await;
+        error!(sandbox_id = %id, error = %error, "checkpoint left the guest frozen; sandbox failed");
     }
 
     #[allow(
@@ -1065,5 +1174,76 @@ impl SandboxManager {
         }
         self.drain_pool(Some(snapshot_id)).await;
         self.snapshots.delete_by_id(snapshot_id).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::{
+        FrozenOnCheckpoint, assert_failed_and_released, expect_err, fake_manager, live_sandbox,
+        live_sandbox_with,
+    };
+    use super::super::types::action;
+    use super::*;
+
+    /// A capture that fails and leaves the guest running (here: the fake's
+    /// capture succeeds, the catalog commit fails, the fake resumed) is an
+    /// error the caller can retry: the sandbox stays Ready with everything
+    /// it holds.
+    #[tokio::test]
+    async fn a_recoverable_checkpoint_failure_leaves_the_sandbox_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, driver, probe) = fake_manager(dir.path()).await;
+        let (instance, handle) = live_sandbox(&manager, &driver, "keeps").await;
+
+        expect_err(
+            manager
+                .checkpoint_sandbox(&"keeps".to_owned(), "user".into(), HashMap::new())
+                .await,
+            "a checkpoint whose commit fails",
+        );
+
+        let inst = instance.lock().unwrap();
+        assert_eq!(inst.state, SandboxState::Ready);
+        assert!(inst.prepared.is_some() && inst.handle.is_some());
+        assert!(inst.cow_handle.is_some() && inst.network.is_some());
+        assert_eq!(handle.state(), arcbox_vm_driver::VmState::Running);
+        assert_eq!(probe.teardown_count(), 0);
+    }
+
+    /// A capture whose guest stayed frozen — the driver's own resume failed
+    /// — has no way back: the Checkpoint RPC fails the sandbox the way a
+    /// failed boot does instead of leaving it Ready with a guest that never
+    /// runs again.
+    #[tokio::test]
+    async fn a_checkpoint_that_leaves_the_guest_frozen_fails_and_releases_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, driver, probe) = fake_manager(dir.path()).await;
+        let (instance, handle) =
+            live_sandbox_with(&manager, &driver, "frozen", FrozenOnCheckpoint::over).await;
+        let mut events = manager.subscribe_events();
+
+        let error = expect_err(
+            manager
+                .checkpoint_sandbox(&"frozen".to_owned(), "user".into(), HashMap::new())
+                .await,
+            "a checkpoint that froze the guest",
+        );
+        assert!(
+            error.to_string().contains("could not be resumed"),
+            "the driver's error is the reported one: {error}"
+        );
+
+        assert_failed_and_released(&manager, &instance, &probe, "frozen");
+        assert!(
+            matches!(handle.state(), arcbox_vm_driver::VmState::Exited(_)),
+            "the frozen guest is killed: {}",
+            handle.state()
+        );
+        let mut actions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            actions.push(event.action);
+        }
+        assert_eq!(actions, [action::FAILED]);
     }
 }

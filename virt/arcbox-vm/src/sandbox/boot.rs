@@ -214,7 +214,7 @@ pub(super) async fn boot_sandbox(
                 } else {
                     SandboxState::Starting
                 };
-                super::warm::publish_after_boot(
+                if let Err(frozen) = super::warm::publish_after_boot(
                     &id,
                     ticket,
                     &instances,
@@ -222,7 +222,27 @@ pub(super) async fn boot_sandbox(
                     &cow_manager,
                     expected,
                 )
-                .await;
+                .await
+                {
+                    // The publish left the guest frozen with no way back:
+                    // the boot fails rather than announcing READY.
+                    let message = format!("warm snapshot publish left the guest frozen: {frozen}");
+                    fail_live_sandbox(
+                        &id,
+                        Some(generation),
+                        &message,
+                        &vm_dir,
+                        &instances,
+                        &network,
+                        &config,
+                        &cow_manager,
+                        &records,
+                        &events_tx,
+                    )
+                    .await;
+                    error!(sandbox_id = %id, error = %frozen, "sandbox warm publish froze the guest");
+                    return;
+                }
             }
 
             // Initial cmd + ready probe (CORE-107). Every cmd-carrying boot
