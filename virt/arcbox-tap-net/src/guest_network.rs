@@ -1,4 +1,4 @@
-//! [`TapNetwork`] as the port's [`GuestNetwork`].
+//! [`TapNetwork`] as the port's [`GuestNetwork`] and [`NetworkReconcile`].
 //!
 //! Nothing here is new behavior: every method is one of the inherent
 //! operations spoken in the port's vocabulary. The mapping, in one place:
@@ -10,6 +10,8 @@
 //! | `quarantine(lease)` | `quarantine_checked(vm, alloc)` |
 //! | `release(lease)` | `release_checked(alloc)` |
 //! | `identity(lease)` | the invariant identity, or the pool identity for a TAP activated as `LegacySnapshot` |
+//! | `reconcile()` | `Some(self)` while a quarantine ledger is kept |
+//! | `NetworkReconcile::*` | the `*_quarantine` / `*_startup_cleanup` methods |
 //!
 //! A [`NetworkLease`] carries what the port needs — VM, address, prefix,
 //! gateway, MAC, cleanup token — and the allocation is rebuilt from it:
@@ -23,9 +25,11 @@ use std::net::IpAddr;
 
 use arcbox_vm_driver::net::{
     AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy,
+    NetworkReconcile,
 };
 use arcbox_vm_driver::{Error, NicAttachment, NicSpec, Result, VmId};
 use async_trait::async_trait;
+use tracing::warn;
 
 use crate::{NetworkAllocation, TapNetwork, invariant, tap_name_from_ip};
 
@@ -156,15 +160,65 @@ impl GuestNetwork for TapNetwork {
         };
         Self::identity_for(lease, mode)
     }
+
+    fn reconcile(&self) -> Option<&dyn NetworkReconcile> {
+        self.quarantine_dir.is_some().then_some(self)
+    }
+}
+
+#[async_trait]
+impl NetworkReconcile for TapNetwork {
+    /// Every quarantined VM with its token. A ledger id that does not fit a
+    /// [`VmId`] — written by a process that predates the port — cannot be
+    /// spoken here and is reported instead of returned.
+    async fn pending_cleanups(&self) -> Vec<(VmId, String)> {
+        self.pending_quarantines()
+            .into_iter()
+            .filter_map(|(id, token)| match VmId::new(id.as_str()) {
+                Ok(vm) => Some((vm, token)),
+                Err(error) => {
+                    warn!(%id, %error, "quarantined network id is not a vm id; not reported");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
+        self.validate_quarantine(vm.as_str(), token)?;
+        Ok(())
+    }
+
+    async fn finalize_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
+        Ok(self.finalize_quarantine(vm.as_str(), token)?)
+    }
+
+    async fn startup_cleanup_token(&self) -> Option<String> {
+        Self::startup_cleanup_token(self)
+    }
+
+    async fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
+        Ok(Self::validate_startup_cleanup(self, token)?)
+    }
+
+    async fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
+        Ok(Self::finalize_startup_cleanup(self, token)?)
+    }
+
+    async fn wait_startup_cleanup_complete(&self) {
+        Self::wait_startup_cleanup_complete(self).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
 
     use arcbox_vm_driver::MacAddr;
 
     use super::*;
+    use crate::{Datapath, IptablesLegacy};
 
     fn v4(ip: &str) -> IpAddr {
         IpAddr::V4(ip.parse::<Ipv4Addr>().unwrap())
@@ -306,5 +360,78 @@ mod tests {
             .unwrap()
             .insert("vmtap0-2".into(), AttachMode::Invariant);
         assert_eq!(network.identity(&lease), fresh);
+    }
+
+    #[test]
+    fn reconcile_is_offered_only_with_a_ledger() {
+        assert!(network().reconcile().is_none());
+        let root = tempfile::tempdir().unwrap();
+        let ledgered = TapNetwork::with_quarantine_dir(
+            "172.20.0.0/16",
+            "172.20.0.1",
+            vec![],
+            root.path().join("q"),
+            Datapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
+        .unwrap();
+        assert!(ledgered.reconcile().is_some());
+    }
+
+    /// The token protocol through the port: quarantine, then the pending
+    /// list names the lease's token, a wrong token is refused, and
+    /// finalizing returns the address to the pool. Off Linux only, where
+    /// quarantine touches no kernel state.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn cleanup_protocol_speaks_the_lease_token() {
+        let root = tempfile::tempdir().unwrap();
+        let network = TapNetwork::with_quarantine_dir(
+            "10.0.0.0/30",
+            "10.0.0.1",
+            vec![],
+            root.path().join("q"),
+            Datapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
+        .unwrap();
+        network.mark_reconciled();
+        let reconcile = network.reconcile().unwrap();
+        let startup = reconcile.startup_cleanup_token().await.unwrap();
+        reconcile.finalize_startup_cleanup(&startup).await.unwrap();
+        assert!(reconcile.startup_cleanup_token().await.is_none());
+
+        let lease = GuestNetwork::reserve(&network, &vm("box"), policy(NetworkMode::Nat))
+            .await
+            .unwrap();
+        network.quarantine(lease.clone()).await.unwrap();
+        assert_eq!(
+            reconcile.pending_cleanups().await,
+            vec![(vm("box"), lease.cleanup_token.clone())]
+        );
+        // The address stays out of the pool, and the id stays refused.
+        assert!(matches!(
+            GuestNetwork::reserve(&network, &vm("box"), policy(NetworkMode::Nat)).await,
+            Err(Error::Network(_))
+        ));
+        assert!(
+            reconcile
+                .validate_cleanup(&vm("box"), "wrong-generation")
+                .await
+                .is_err()
+        );
+        reconcile
+            .validate_cleanup(&vm("box"), &lease.cleanup_token)
+            .await
+            .unwrap();
+        reconcile
+            .finalize_cleanup(&vm("box"), &lease.cleanup_token)
+            .await
+            .unwrap();
+        assert!(reconcile.pending_cleanups().await.is_empty());
+        let reused = GuestNetwork::reserve(&network, &vm("box"), policy(NetworkMode::Nat))
+            .await
+            .unwrap();
+        assert_eq!(reused.ip, lease.ip);
     }
 }

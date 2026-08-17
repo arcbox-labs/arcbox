@@ -12,12 +12,13 @@
 //! the encoders, and the ledger compile and are unit-tested everywhere.
 //!
 //! Two surfaces, one state: [`TapNetwork`]'s inherent methods are what the
-//! sandbox manager calls today, and its [`GuestNetwork`] impl
-//! ([`guest_network`]) is the same operations spoken in the port's
+//! sandbox manager calls today, and its [`GuestNetwork`] / [`NetworkReconcile`]
+//! impls ([`guest_network`]) are the same operations spoken in the port's
 //! vocabulary — a [`NetworkLease`] instead of a [`NetworkAllocation`], a
 //! [`NicSpec`] out of activation. R2b moves the manager onto the port.
 //!
 //! [`GuestNetwork`]: arcbox_vm_driver::net::GuestNetwork
+//! [`NetworkReconcile`]: arcbox_vm_driver::net::NetworkReconcile
 //! [`NetworkLease`]: arcbox_vm_driver::net::NetworkLease
 //! [`NicSpec`]: arcbox_vm_driver::NicSpec
 
