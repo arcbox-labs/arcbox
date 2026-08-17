@@ -37,6 +37,11 @@ pub(in crate::sandbox) enum SandboxPhase {
     Resuming,
 }
 
+/// The durable phase under the name R3's lifecycle HSM uses for it: what a
+/// crash-restart reads back, as opposed to the in-memory `SandboxState` a
+/// caller sees.
+pub(in crate::sandbox) type PersistPhase = SandboxPhase;
+
 /// The stable result returned once a provisioning request has been accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::sandbox) struct SandboxProvisionOutcome {
@@ -96,7 +101,7 @@ pub(in crate::sandbox) enum SandboxTransition {
 }
 
 impl SandboxTransition {
-    fn phase(&self) -> SandboxPhase {
+    fn phase(&self) -> PersistPhase {
         match self {
             Self::Starting(_) => SandboxPhase::Starting,
             Self::ReadyWithOutcome(_) | Self::Ready => SandboxPhase::Ready,
@@ -365,4 +370,133 @@ pub(super) fn validate_record(id: &str, record: &SandboxRecord) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SandboxPhase::*;
+    use super::*;
+
+    /// Every durable phase, in declaration order. Both axes of the edge
+    /// table below iterate this, so a phase missing here is a pair nobody
+    /// checks — [`targets_of`]'s exhaustive match is what stops a new
+    /// variant from being added without a row.
+    const ALL_PHASES: [PersistPhase; 10] = [
+        Creating, Starting, Ready, Stopping, Stopped, Failed, Removing, Pausing, Paused, Resuming,
+    ];
+
+    /// The durable edge set as a table: every phase each phase may move to,
+    /// beside the self-edge all of them allow (an idempotent re-write).
+    ///
+    /// R3's lifecycle HSM is written against this table rather than against
+    /// `can_transition_to`, which is why the test below asserts it over all
+    /// `(from, to)` pairs instead of sampling: an edge missing here becomes
+    /// a wrong state machine there.
+    fn targets_of(from: PersistPhase) -> &'static [PersistPhase] {
+        match from {
+            Creating => &[Starting, Failed, Removing],
+            Starting => &[Ready, Stopping, Failed, Removing],
+            Ready => &[Stopping, Pausing, Failed, Removing],
+            Stopping => &[Stopped, Failed, Removing],
+            Stopped | Failed => &[Removing],
+            // Terminal: `finish_remove` deletes the record rather than
+            // moving it on.
+            Removing => &[],
+            // A failed pause reverts to Ready and a completed one parks at
+            // Paused; a resume mirrors that exactly (a failed one unwinds
+            // back to Paused).
+            Pausing | Resuming => &[Paused, Ready, Failed, Removing],
+            Paused => &[Resuming, Failed, Removing],
+        }
+    }
+
+    fn outcome() -> SandboxProvisionOutcome {
+        SandboxProvisionOutcome {
+            ip_address: "192.0.2.2".into(),
+        }
+    }
+
+    fn creating(id: &str) -> SandboxRecord {
+        SandboxRecord::new(
+            id,
+            "key",
+            SandboxSpec {
+                id: Some(id.to_owned()),
+                ..SandboxSpec::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_durable_edge_set_is_exactly_this_table() {
+        for from in ALL_PHASES {
+            let targets = targets_of(from);
+            for to in ALL_PHASES {
+                let legal = from == to || targets.contains(&to);
+                assert_eq!(
+                    from.can_transition_to(to),
+                    legal,
+                    "{} -> {} should be {}",
+                    from.as_str(),
+                    to.as_str(),
+                    if legal { "legal" } else { "refused" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_transition_projects_onto_one_phase() {
+        // `SandboxTransition::phase`'s own match is exhaustive, so a new
+        // transition cannot skip this list without failing to compile there
+        // first.
+        let projections: [(SandboxTransition, PersistPhase); 10] = [
+            (SandboxTransition::Starting(outcome()), Starting),
+            (SandboxTransition::ReadyWithOutcome(outcome()), Ready),
+            (SandboxTransition::Ready, Ready),
+            (SandboxTransition::Stopping, Stopping),
+            (SandboxTransition::Stopped, Stopped),
+            (SandboxTransition::Failed("boom".into()), Failed),
+            (SandboxTransition::Removing, Removing),
+            (SandboxTransition::Pausing, Pausing),
+            (
+                SandboxTransition::Paused {
+                    snapshot_id: "snap".into(),
+                },
+                Paused,
+            ),
+            (SandboxTransition::Resuming, Resuming),
+        ];
+
+        for (transition, phase) in projections {
+            assert_eq!(transition.phase(), phase, "{transition:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_restore_may_commit_ready_straight_from_creating() {
+        // `Creating -> Ready` is not an edge...
+        let mut record = creating("box");
+        assert!(record.apply(SandboxTransition::Ready).is_err());
+        assert_eq!(record.phase, Creating);
+
+        // ...except for the restore path's single-hop commit, which carries
+        // the outcome the skipped `Starting` write would have persisted.
+        record
+            .apply(SandboxTransition::ReadyWithOutcome(outcome()))
+            .unwrap();
+        assert_eq!(record.phase, Ready);
+        assert_eq!(record.provision_outcome, Some(outcome()));
+
+        // The exception is keyed on `Creating`: from anywhere else the edge
+        // set rules, so a stopped record cannot be revived by it.
+        record.apply(SandboxTransition::Stopping).unwrap();
+        record.apply(SandboxTransition::Stopped).unwrap();
+        assert!(
+            record
+                .apply(SandboxTransition::ReadyWithOutcome(outcome()))
+                .is_err()
+        );
+        assert_eq!(record.phase, Stopped);
+    }
 }
