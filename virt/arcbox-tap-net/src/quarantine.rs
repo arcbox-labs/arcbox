@@ -10,7 +10,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
-use super::destroy_tap_checked;
+use super::tap;
 use super::{NetworkAllocation, NetworkManager, mac_from_vm_id, tap_name_from_ip};
 use crate::error::{Result, TapNetError};
 
@@ -46,7 +46,7 @@ impl NetworkManager {
         #[cfg(target_os = "linux")]
         self.deactivate_translation(alloc)?;
         #[cfg(target_os = "linux")]
-        destroy_tap_checked(&alloc.tap_name)?;
+        tap::destroy_checked(&alloc.tap_name)?;
         debug!(
             sandbox_id,
             tap = %alloc.tap_name,
@@ -95,7 +95,7 @@ impl NetworkManager {
         }
 
         #[cfg(target_os = "linux")]
-        destroy_tap_checked(&alloc.tap_name)?;
+        tap::destroy_checked(&alloc.tap_name)?;
         if let Some(dir) = self.quarantine_dir.as_deref() {
             remove_quarantine(dir, sandbox_id)?;
         }

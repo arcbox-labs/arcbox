@@ -2,15 +2,12 @@
 #[cfg(target_os = "linux")]
 pub fn is_root() -> bool {
     // /proc/self/status Uid line: real  effective  saved  filesystem
-    std::fs::read_to_string("/proc/self/status")
-        .map(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(2))
-                .map(|uid| uid == "0")
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|s| {
+        s.lines()
+            .find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(2))
+            .is_some_and(|uid| uid == "0")
+    })
 }
 
 /// Returns true if a network interface named `iface` is registered in the kernel.
@@ -19,8 +16,7 @@ pub fn iface_exists(iface: &str) -> bool {
     // /proc/net/dev lists one interface per line as "  <name>: ..."
     let needle = format!("{iface}:");
     std::fs::read_to_string("/proc/net/dev")
-        .map(|s| s.lines().any(|line| line.trim_start().starts_with(&needle)))
-        .unwrap_or(false)
+        .is_ok_and(|s| s.lines().any(|line| line.trim_start().starts_with(&needle)))
 }
 
 /// Returns true if the kernel routing table has a route for `ip` via `dev`.
@@ -29,11 +25,7 @@ pub fn has_route(ip: &str, dev: &str) -> bool {
     std::process::Command::new("/usr/sbin/ip")
         .args(["route", "show", ip])
         .output()
-        .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.contains(dev)
-        })
-        .unwrap_or(false)
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(dev))
 }
 
 /// Returns the point-to-point peer address configured on `iface`, if any.
