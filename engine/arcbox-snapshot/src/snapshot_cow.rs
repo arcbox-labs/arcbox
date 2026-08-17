@@ -1144,6 +1144,38 @@ mod tests {
         );
     }
 
+    /// The kernel answers with the path it resolved, so rediscovering a loop
+    /// by the spelling the caller configured only works when that spelling
+    /// is already canonical. A data directory reached through a symlink is
+    /// not an exotic deployment, and there it would cost a live sandbox its
+    /// adoption and hide this manager's own loops from teardown.
+    #[test]
+    fn a_template_reached_through_a_symlink_is_matched_by_its_resolved_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let templates = tmp.path().join("templates");
+        std::fs::create_dir(&templates).unwrap();
+        std::fs::write(templates.join("rootfs.ext4"), b"rootfs").unwrap();
+        let linked = tmp.path().join("data");
+        std::os::unix::fs::symlink(&templates, &linked).unwrap();
+        let configured = linked.join("rootfs.ext4");
+
+        let spellings = persistence::backing_spellings(&configured);
+
+        let resolved = std::fs::canonicalize(&configured).unwrap();
+        assert_ne!(
+            configured, resolved,
+            "the symlinked spelling has to differ, or this asserts nothing"
+        );
+        assert!(
+            spellings.contains(&configured.to_string_lossy().into_owned()),
+            "{spellings:?}"
+        );
+        assert!(
+            spellings.contains(&resolved.to_string_lossy().into_owned()),
+            "{spellings:?}"
+        );
+    }
+
     /// What makes the eventual teardown balance: the first adopted sandbox
     /// registers the template it found, and every later one holding the same
     /// template adds a reference rather than a second registration.

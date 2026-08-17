@@ -604,12 +604,33 @@ pub(super) fn remove_file_durable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How the kernel may spell `backing` in a loop device's `backing_file`:
+/// the caller's own spelling, and the resolved path.
+///
+/// [`loop_backing_file`] reports the *resolved* path of the file the device
+/// holds open, which is not the caller's spelling whenever that path
+/// reaches the file through a symlink — a data directory pointed at another
+/// volume, say. The attach path already accepts either
+/// (`BusyboxBlockTools::verify_attached`), and rediscovery has to as well:
+/// comparing one spelling makes a loop this manager attached itself
+/// invisible to teardown, and makes [`CowManager::adopt`] refuse a live
+/// sandbox whose rootfs is right there.
+pub(super) fn backing_spellings(backing: &Path) -> Vec<String> {
+    let literal = backing.to_string_lossy().into_owned();
+    let resolved = std::fs::canonicalize(backing)
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok()
+        .filter(|resolved| *resolved != literal);
+    std::iter::once(literal).chain(resolved).collect()
+}
+
 pub(super) fn loop_backs_path(loop_device: &str, backing: &Path) -> Result<bool> {
-    Ok(loop_backing_file(loop_device)?.is_some_and(|actual| actual == backing.to_string_lossy()))
+    let expected = backing_spellings(backing);
+    Ok(loop_backing_file(loop_device)?.is_some_and(|actual| expected.contains(&actual)))
 }
 
 pub(super) fn loop_devices_for_backing_sync(backing: &Path) -> Result<Vec<String>> {
-    let expected = backing.to_string_lossy();
+    let expected = backing_spellings(backing);
     let mut devices = Vec::new();
     for entry in std::fs::read_dir("/sys/block")? {
         let entry = entry?;
@@ -623,7 +644,7 @@ pub(super) fn loop_devices_for_backing_sync(backing: &Path) -> Result<Vec<String
             continue;
         }
         let device = format!("/dev/{name}");
-        if loop_backing_file(&device)?.as_deref() == Some(expected.as_ref()) {
+        if loop_backing_file(&device)?.is_some_and(|actual| expected.contains(&actual)) {
             devices.push(device);
         }
     }
