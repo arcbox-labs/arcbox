@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// The identity of a VM: non-empty, at most 64 characters, `[A-Za-z0-9._-]`.
+/// The identity of a VM: a plain name — non-empty, at most 64 characters,
+/// `[A-Za-z0-9._-]`, and not `.` or `..`.
 ///
 /// Drivers use it as a runtime-directory and socket-name component, which is
-/// what the character set protects.
+/// what the rule protects; [`DiskSpec::id`] is held to the same one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct VmId(String);
@@ -31,23 +32,7 @@ impl VmId {
     /// Validates `id` and wraps it.
     pub fn new(id: impl Into<String>) -> Result<Self> {
         let id = id.into();
-        if id.is_empty() {
-            return Err(Error::InvalidSpec("vm id must not be empty".into()));
-        }
-        if id.len() > Self::MAX_LEN {
-            return Err(Error::InvalidSpec(format!(
-                "vm id `{id}` exceeds {} characters",
-                Self::MAX_LEN
-            )));
-        }
-        if let Some(bad) = id
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-        {
-            return Err(Error::InvalidSpec(format!(
-                "vm id `{id}` contains `{bad}`; allowed: A-Z a-z 0-9 . _ -"
-            )));
-        }
+        require_plain_name("vm id", &id)?;
         Ok(Self(id))
     }
 
@@ -283,6 +268,35 @@ impl VmSpec {
 fn require_path(what: &str, path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidSpec(format!("{what} must not be empty")));
+    }
+    Ok(())
+}
+
+/// The rule for anything a driver may turn into a path component, a socket
+/// name, or a URL segment: non-empty, at most [`VmId::MAX_LEN`] bytes,
+/// `[A-Za-z0-9._-]`, and not the `.` / `..` traversal names.
+fn require_plain_name(what: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidSpec(format!("{what} must not be empty")));
+    }
+    if name.len() > VmId::MAX_LEN {
+        return Err(Error::InvalidSpec(format!(
+            "{what} `{name}` exceeds {} characters",
+            VmId::MAX_LEN
+        )));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Err(Error::InvalidSpec(format!(
+            "{what} `{name}` contains `{bad}`; allowed: A-Z a-z 0-9 . _ -"
+        )));
+    }
+    if name == "." || name == ".." {
+        return Err(Error::InvalidSpec(format!(
+            "{what} `{name}` is a path traversal name"
+        )));
     }
     Ok(())
 }
@@ -534,11 +548,24 @@ mod tests {
     fn vm_id_accepts_the_documented_alphabet_and_nothing_else() {
         assert!(VmId::new("a.b_c-D9").is_ok());
         assert!(VmId::new("x".repeat(VmId::MAX_LEN)).is_ok());
+        assert!(VmId::new(".hidden").is_ok());
+        assert!(VmId::new("...").is_ok());
         assert!(VmId::new("").is_err());
         assert!(VmId::new("x".repeat(VmId::MAX_LEN + 1)).is_err());
         assert!(VmId::new("has space").is_err());
         assert!(VmId::new("slash/y").is_err());
         assert!(VmId::new("ünïcode").is_err());
+    }
+
+    #[test]
+    fn vm_id_refuses_the_traversal_names() {
+        for bad in [".", ".."] {
+            match VmId::new(bad) {
+                Err(Error::InvalidSpec(msg)) => assert!(msg.contains("traversal"), "{msg}"),
+                other => panic!("`{bad}` gave {other:?}"),
+            }
+            assert!(serde_json::from_str::<VmId>(&format!("\"{bad}\"")).is_err());
+        }
     }
 
     #[test]
