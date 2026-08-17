@@ -10,6 +10,16 @@
 //! adapter of the `arcbox-vm-driver` `GuestNetwork` port (vm-stack-redesign
 //! D-VM6, R2). Everything that touches the kernel is Linux-only; the pool,
 //! the encoders, and the ledger compile and are unit-tested everywhere.
+//!
+//! Two surfaces, one state: [`TapNetwork`]'s inherent methods are what the
+//! sandbox manager calls today, and its [`GuestNetwork`] impl
+//! ([`guest_network`]) is the same operations spoken in the port's
+//! vocabulary — a [`NetworkLease`] instead of a [`NetworkAllocation`], a
+//! [`NicSpec`] out of activation. R2b moves the manager onto the port.
+//!
+//! [`GuestNetwork`]: arcbox_vm_driver::net::GuestNetwork
+//! [`NetworkLease`]: arcbox_vm_driver::net::NetworkLease
+//! [`NicSpec`]: arcbox_vm_driver::NicSpec
 
 #![warn(missing_docs)]
 
@@ -32,6 +42,7 @@ pub use packet_filter::{IptablesLegacy, PacketFilter};
 
 pub mod allocation;
 pub mod error;
+pub mod guest_network;
 
 #[cfg_attr(
     not(target_os = "linux"),
@@ -124,6 +135,11 @@ pub enum ExposeTarget {
 
 /// The TAP network: an IPv4 pool plus, per VM, a point-to-point TAP with
 /// its translation, and the quarantine ledger.
+///
+/// Reached two ways — through the inherent methods below (the sandbox
+/// manager, until R2b) and through the `GuestNetwork` port
+/// ([`guest_network`]). Both share this one state, so a lease the port
+/// activated is a TAP the inherent `release_checked` tears down.
 pub struct TapNetwork {
     /// Base IP from which the pool starts (host-octet 2 onwards).
     base: Ipv4Addr,
