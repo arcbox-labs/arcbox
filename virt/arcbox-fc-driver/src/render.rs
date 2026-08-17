@@ -423,6 +423,13 @@ fn is_inside_jail(path: &str) -> bool {
         && components.all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
+/// Whether `path` is a block device — the one thing rendering cannot decide
+/// from the spec alone.
+///
+/// A `stat` inside an otherwise pure function, deliberately: rendering is
+/// synchronous so its rules can be unit-tested as values, and moving the
+/// probe into the staging executor would move a path decision out of this
+/// module, which is the one place they are made.
 fn is_block_device(path: &Path) -> Result<bool> {
     use std::os::unix::fs::FileTypeExt as _;
     let metadata = std::fs::metadata(path).map_err(|source| FcError::Stat {

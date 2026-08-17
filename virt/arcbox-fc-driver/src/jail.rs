@@ -292,7 +292,9 @@ pub async fn stage_snapshot_files(
     gid: u32,
 ) -> Result<(String, Option<String>)> {
     let snap_in_chroot = chroot.join("snapshots").join(snapshot.id);
-    std::fs::create_dir_all(&snap_in_chroot).map_err(Error::Io)?;
+    tokio::fs::create_dir_all(&snap_in_chroot)
+        .await
+        .map_err(Error::Io)?;
     chown(
         &snap_in_chroot,
         Some(Uid::from_raw(uid)),
@@ -305,7 +307,7 @@ pub async fn stage_snapshot_files(
 
     link_or_copy_for_jailer(snapshot.vmstate, &snap_in_chroot.join("vmstate"), uid, gid).await?;
     let mem = if let Some(mf) = snapshot.mem
-        && mf.exists()
+        && tokio::fs::try_exists(mf).await.unwrap_or(false)
     {
         link_or_copy_for_jailer(mf, &snap_in_chroot.join("mem"), uid, gid).await?;
         Some(format!("/snapshots/{}/mem", snapshot.id))

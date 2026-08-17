@@ -22,9 +22,9 @@ pub async fn spawn(
     fc_cfg: &FcDriverConfig,
 ) -> Result<fc_sdk::FirecrackerProcess> {
     if let Some(parent) = plan.vsock_uds.parent() {
-        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
     }
-    if let Err(e) = std::fs::remove_file(&plan.vsock_uds)
+    if let Err(e) = tokio::fs::remove_file(&plan.vsock_uds).await
         && e.kind() != std::io::ErrorKind::NotFound
     {
         return Err(Error::Io(e));
@@ -32,7 +32,7 @@ pub async fn spawn(
     match &plan.mode {
         SpawnMode::Direct { log, metrics } => {
             for target in [log, metrics] {
-                std::fs::File::create(target).map_err(Error::Io)?;
+                tokio::fs::File::create(target).await.map_err(Error::Io)?;
             }
             spawn_direct(fc_cfg, plan.id.as_str(), &plan.api_socket, log, metrics).await
         }

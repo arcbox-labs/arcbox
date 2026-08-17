@@ -333,8 +333,7 @@ fn jailer_mode_mirrors_a_block_device_as_a_node() {
         })
         .map(|entry| entry.path())
     else {
-        eprintln!("no block device under /dev; skipping");
-        return;
+        panic!("no block device under /dev: this host cannot exercise the mknod staging rule");
     };
     let base = PathBuf::from("/srv/jailer");
     let plan = fc_config(
