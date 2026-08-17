@@ -233,7 +233,10 @@ impl GuestNetwork for FakeNetwork {
         }
     }
 
-    fn identity(&self, lease: &NetworkLease) -> NetworkIdentity {
+    /// The lease's own address, whichever mode it was attached in: the
+    /// fake translates nothing per interface, so the guest sees exactly
+    /// what was reserved for it.
+    fn identity(&self, lease: &NetworkLease, _mode: AttachMode) -> NetworkIdentity {
         NetworkIdentity {
             ip: lease.ip,
             prefix_len: lease.prefix_len,
@@ -367,6 +370,20 @@ mod tests {
         net.release(a.clone()).await.unwrap();
         let c = net.reserve(&id("c"), policy()).await.unwrap();
         assert_eq!(c.ip, a.ip);
+    }
+
+    #[tokio::test]
+    async fn the_guest_sees_its_lease_in_either_attach_mode() {
+        let net = FakeNetwork::new();
+        let lease = net.reserve(&id("a"), policy()).await.unwrap();
+        let invariant = net.identity(&lease, AttachMode::Invariant);
+        assert_eq!(invariant.ip, lease.ip);
+        assert_eq!(invariant.gateway, lease.gateway);
+        assert_eq!(invariant.mac, lease.mac);
+        assert_eq!(invariant.dns, vec![lease.gateway]);
+        // Nothing is translated per interface here, so the mode changes
+        // nothing about what the guest is told.
+        assert_eq!(net.identity(&lease, AttachMode::LegacySnapshot), invariant);
     }
 
     #[tokio::test]

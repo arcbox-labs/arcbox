@@ -40,7 +40,7 @@ agent's port-forward and init code.
 | `activate(lease, mode)` | `activate(alloc, mode)` — returns `NicSpec { id: "eth0", mac, Tap { name } }` |
 | `quarantine(lease)` | `quarantine_checked(vm, alloc)` |
 | `release(lease)` | `release_checked(alloc)` |
-| `identity(lease)` | the invariant link for every fresh boot and invariant restore; the pool address once the TAP was activated as `LegacySnapshot` — the resolver is the gateway either way |
+| `identity(lease, mode)` | the invariant link under `Invariant` (every fresh boot and invariant restore), the pool address under `LegacySnapshot` — the resolver is the gateway either way |
 | `reconcile()` | `Some(self)` while a quarantine ledger is kept |
 | `NetworkReconcile::*` | `pending_quarantines`, `validate_quarantine` / `finalize_quarantine`, and the `*_startup_cleanup` set |
 

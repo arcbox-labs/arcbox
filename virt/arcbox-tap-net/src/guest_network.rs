@@ -9,7 +9,7 @@
 //! | `activate(lease, mode)` | `activate(alloc, mode)`; returns the TAP as a [`NicSpec`] named `eth0` |
 //! | `quarantine(lease)` | `quarantine_checked(vm, alloc)` |
 //! | `release(lease)` | `release_checked(alloc)` |
-//! | `identity(lease)` | the invariant identity, or the pool identity for a TAP activated as `LegacySnapshot` |
+//! | `identity(lease, mode)` | the invariant identity, or the pool identity under `LegacySnapshot` |
 //! | `reconcile()` | `Some(self)` while a quarantine ledger is kept |
 //! | `NetworkReconcile::*` | the `*_quarantine` / `*_startup_cleanup` methods |
 //!
@@ -36,11 +36,6 @@ use crate::{NetworkAllocation, TapNetwork, invariant, tap_name_from_ip};
 pub const NIC_ID: &str = "eth0";
 
 impl TapNetwork {
-    /// The mode `tap_name` was activated in by this process, if it is up.
-    fn attach_mode(&self, tap_name: &str) -> Option<AttachMode> {
-        self.attached.lock().unwrap().get(tap_name).copied()
-    }
-
     /// The [`NetworkLease`] for `vm` over `allocation`.
     fn lease(vm: &VmId, allocation: &NetworkAllocation) -> NetworkLease {
         NetworkLease {
@@ -149,14 +144,7 @@ impl GuestNetwork for TapNetwork {
         Ok(self.release_checked(&allocation)?)
     }
 
-    fn identity(&self, lease: &NetworkLease) -> NetworkIdentity {
-        let mode = match lease.ip {
-            IpAddr::V4(ip) => self
-                .attach_mode(&tap_name_from_ip(ip))
-                .unwrap_or(AttachMode::Invariant),
-            // Not a lease of this network; there is no TAP to look up.
-            IpAddr::V6(_) => AttachMode::Invariant,
-        };
+    fn identity(&self, lease: &NetworkLease, mode: AttachMode) -> NetworkIdentity {
         Self::identity_for(lease, mode)
     }
 
@@ -323,16 +311,19 @@ mod tests {
         );
         // Identity still answers — the invariant shape, which needs nothing
         // from the address.
-        assert_eq!(network.identity(&lease).ip, v4("169.254.100.2"));
+        assert_eq!(
+            network.identity(&lease, AttachMode::Invariant).ip,
+            v4("169.254.100.2")
+        );
     }
 
     #[test]
-    fn identity_follows_the_recorded_attach_mode() {
+    fn identity_follows_the_attach_mode_it_is_given() {
         let network = network();
         let lease = TapNetwork::lease(&vm("box"), &TapNetwork::reserve(&network, "box").unwrap());
 
-        // Not activated yet: what a fresh boot gets on its command line.
-        let fresh = network.identity(&lease);
+        // What a fresh boot — and every invariant restore — is told.
+        let fresh = network.identity(&lease, AttachMode::Invariant);
         assert_eq!(fresh.ip, v4("169.254.100.2"));
         assert_eq!(fresh.prefix_len, 30);
         assert_eq!(fresh.gateway, v4("169.254.100.1"));
@@ -340,24 +331,12 @@ mod tests {
         assert_eq!(fresh.mac, lease.mac);
 
         // A legacy-snapshot restore re-addresses the guest to the pool.
-        network
-            .attached
-            .lock()
-            .unwrap()
-            .insert("vmtap0-2".into(), AttachMode::LegacySnapshot);
-        let legacy = network.identity(&lease);
+        let legacy = network.identity(&lease, AttachMode::LegacySnapshot);
         assert_eq!(legacy.ip, v4("172.20.0.2"));
         assert_eq!(legacy.prefix_len, 16);
         assert_eq!(legacy.gateway, v4("172.20.0.1"));
         assert_eq!(legacy.dns, vec![v4("172.20.0.1")]);
         assert_eq!(legacy.mac, lease.mac);
-
-        network
-            .attached
-            .lock()
-            .unwrap()
-            .insert("vmtap0-2".into(), AttachMode::Invariant);
-        assert_eq!(network.identity(&lease), fresh);
     }
 
     #[test]

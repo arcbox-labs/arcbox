@@ -34,9 +34,16 @@ pub trait GuestNetwork: Send + Sync {
     /// Returns the address to the pool outright, skipping quarantine.
     async fn release(&self, lease: NetworkLease) -> Result<()>;
 
-    /// The network as the guest sees it: what goes on the kernel command
-    /// line or into a net-reconfigure command.
-    fn identity(&self, lease: &NetworkLease) -> NetworkIdentity;
+    /// The network as the guest sees it under `mode`: what goes on the
+    /// kernel command line or into a net-reconfigure command.
+    ///
+    /// The mode is the caller's, not the lease's: a lease is reserved
+    /// before anyone knows how it will be attached, and the same lease
+    /// reads differently once activated as [`AttachMode::LegacySnapshot`]
+    /// (the guest owns the pool address) than as [`AttachMode::Invariant`]
+    /// (the address is the host's, translated per interface). Pass what
+    /// [`GuestNetwork::activate`] was given.
+    fn identity(&self, lease: &NetworkLease, mode: AttachMode) -> NetworkIdentity;
 
     /// The cleanup-token protocol and startup sweep, when the network keeps
     /// a quarantine ledger.

@@ -185,12 +185,6 @@ pub struct TapNetwork {
     /// with that process) or is legacy — both tear down via the tolerant
     /// iptables removal and expose via the fwmark form.
     applied: Mutex<HashMap<String, AppliedDatapath>>,
-    /// The [`AttachMode`] each active TAP was materialized in, keyed by TAP
-    /// name and living exactly as long as the TAP. What the guest sees
-    /// (`GuestNetwork::identity`) follows it; a TAP absent here — activated
-    /// by a previous process, or not yet activated — reads as `Invariant`,
-    /// the mode of every fresh boot.
-    attached: Mutex<HashMap<String, AttachMode>>,
     /// How the iptables-datapath translation (and the eBPF fallback) is
     /// expressed on this host; see [`packet_filter`].
     #[cfg_attr(
@@ -296,7 +290,6 @@ impl TapNetwork {
             startup_reconciled: AtomicBool::new(!startup_barrier),
             datapath,
             applied: Mutex::new(HashMap::new()),
-            attached: Mutex::new(HashMap::new()),
             packet_filter,
             #[cfg(target_os = "linux")]
             ebpf: Mutex::new(ebpf::Engine::Unloaded),
@@ -393,10 +386,6 @@ impl TapNetwork {
                 return Err(error);
             }
         }
-        self.attached
-            .lock()
-            .unwrap()
-            .insert(allocation.tap_name.clone(), mode);
         Ok(())
     }
 
@@ -542,7 +531,6 @@ impl TapNetwork {
 
         let ip_int = u32::from(alloc.ip_address);
         self.allocated.lock().unwrap().remove(&ip_int);
-        self.attached.lock().unwrap().remove(&alloc.tap_name);
 
         debug!(tap = %alloc.tap_name, ip = %alloc.ip_address, "releasing network");
         #[cfg(target_os = "linux")]
