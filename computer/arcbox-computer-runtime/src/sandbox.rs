@@ -246,17 +246,23 @@ impl SandboxManager {
                     )
                     .await?;
                     let mut runtime = swept.take_runtime();
-                    let inactive = reconcile::normalize_durable_records(
+                    let mut inactive = Vec::new();
+                    let normalized = reconcile::normalize_durable_records(
                         &records,
                         Path::new(&config.firecracker.data_dir),
                         Some(&mut runtime),
+                        &mut inactive,
                     );
-                    // Whatever normalization did not take is still held here
-                    // — on the error path that is every sandbox the sweep
-                    // reclaimed, and dropping the map would kill each VM
-                    // while leaving its lease and template refcount held.
+                    // A reclaimed sandbox is in exactly one of these two by
+                    // now — never claimed, or built into an instance — and
+                    // dropping either would kill its guest while leaving its
+                    // lease and template refcount held. Release both before
+                    // reporting the refusal.
                     reconcile::release_unclaimed(&mut runtime, &*network, &cow_manager).await;
-                    let inactive = inactive?;
+                    if let Err(error) = normalized {
+                        reconcile::release_instances(&mut inactive, &*network, &cow_manager).await;
+                        return Err(error);
+                    }
                     // Publish before anything else can fail. The reclaimed
                     // sandboxes' only handles live in these instances, so a
                     // later error — a runtime directory that will not delete,
@@ -280,10 +286,12 @@ impl SandboxManager {
             // covered without threading the registry through each of them.
             execution::spawn_teardown_purge(Arc::clone(&executions), events_tx.subscribe());
         } else {
-            let inactive = reconcile::normalize_durable_records(
+            let mut inactive = Vec::new();
+            reconcile::normalize_durable_records(
                 &records,
                 Path::new(&config.firecracker.data_dir),
                 None,
+                &mut inactive,
             )?;
             reconcile_capability(&*network).replay_complete();
             instances.write().unwrap().extend(

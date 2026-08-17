@@ -659,15 +659,19 @@ pub(super) struct SweptRuntime {
 /// failures; already inactive sandboxes are reconstructed without runtime
 /// handles. A create intent stays resumable, while an interrupted removal
 /// finishes as a durable tombstone.
-/// Takes `sweep` by `&mut` so that whatever this does not claim is still
-/// the caller's to dispose of — see [`release_unclaimed`], which the caller
-/// must run on both paths.
+/// Both the sweep's runtime and the instances built from it are the
+/// caller's, so a refusal partway through loses neither: what was never
+/// claimed stays in `sweep` for [`release_unclaimed`], and what was already
+/// built is in `built` for [`release_instances`]. An adopted instance holds
+/// the only handle keeping its guest alive, so dropping either here would
+/// kill that guest with its lease and template refcount still held.
 pub(super) fn normalize_durable_records(
     store: &SandboxRecordStore,
     data_dir: &Path,
     sweep: Option<&mut SweptRuntime>,
-) -> Result<Vec<SandboxInstance>> {
-    let mut inactive = Vec::new();
+    built: &mut Vec<SandboxInstance>,
+) -> Result<()> {
+    let inactive = built;
     let mut nothing_adopted = HashMap::new();
     let (swept, adopted) = match sweep {
         Some(sweep) => (Some(&sweep.swept), &mut sweep.adopted),
@@ -722,7 +726,7 @@ pub(super) fn normalize_durable_records(
         }
     }
 
-    Ok(inactive)
+    Ok(())
 }
 
 /// Dispose of every reclaimed sandbox [`normalize_durable_records`] did not
@@ -763,20 +767,78 @@ async fn release_reclaimed(
     cow_manager: &CowManager,
 ) {
     for (id, adopted) in adopted.drain() {
-        warn!(sandbox_id = %id, "releasing a reclaimed sandbox that recovery did not take");
-        if let Err(error) = adopted.handle.shutdown(ShutdownMode::Kill).await {
-            warn!(sandbox_id = %id, %error, "killing the reclaimed vmm failed");
-        }
-        if let Some(cow_handle) = &adopted.cow_handle
-            && let Err(error) = cow_manager.teardown_checked(cow_handle).await
-        {
-            warn!(sandbox_id = %id, %error, "releasing the reclaimed disk overlay failed");
-        }
-        if let Some(lease) = adopted.lease
-            && let Err(error) = network.quarantine(lease).await
-        {
-            warn!(sandbox_id = %id, %error, "quarantining the reclaimed lease failed");
-        }
+        release_one(
+            &id,
+            &adopted.handle,
+            adopted.cow_handle.as_ref(),
+            adopted.lease,
+            network,
+            cow_manager,
+        )
+        .await;
+    }
+}
+
+/// The same, for reclaimed sandboxes that recovery already built instances
+/// for when it refused. They hold exactly what the map entries held —
+/// dropping the vector would lose them the same way.
+pub(super) async fn release_instances(
+    instances: &mut Vec<SandboxInstance>,
+    network: &dyn GuestNetwork,
+    cow_manager: &CowManager,
+) {
+    for instance in instances.drain(..) {
+        let mut instance = instance;
+        let Some(handle) = instance.handle.take() else {
+            continue;
+        };
+        release_one(
+            &instance.id,
+            &handle,
+            instance.cow_handle.as_ref(),
+            instance.network.take(),
+            network,
+            cow_manager,
+        )
+        .await;
+    }
+}
+
+/// Let go of one reclaimed sandbox: kill its VM, then hand back the disk
+/// overlay and the address it was running on.
+///
+/// The order is the one live teardown uses and is load-bearing in the same
+/// way — a VMM that is still alive holds its dm device open and its TAP fd,
+/// so a failed kill **stops** the release rather than continuing past it.
+/// Taking the disk and the address away from a guest that is still running
+/// would leave it alive and broken, which is worse than leaving all three
+/// for the next sweep: the sandbox's journal survives this path, so there
+/// is one.
+async fn release_one(
+    id: &str,
+    handle: &Arc<dyn VmHandle>,
+    cow_handle: Option<&CowHandle>,
+    lease: Option<NetworkLease>,
+    network: &dyn GuestNetwork,
+    cow_manager: &CowManager,
+) {
+    warn!(sandbox_id = %id, "releasing a reclaimed sandbox that recovery did not take");
+    if let Err(error) = handle.shutdown(ShutdownMode::Kill).await {
+        warn!(
+            sandbox_id = %id, %error,
+            "killing the reclaimed vmm failed; leaving its disk and address for the next sweep"
+        );
+        return;
+    }
+    if let Some(cow_handle) = cow_handle
+        && let Err(error) = cow_manager.teardown_checked(cow_handle).await
+    {
+        warn!(sandbox_id = %id, %error, "releasing the reclaimed disk overlay failed");
+    }
+    if let Some(lease) = lease
+        && let Err(error) = network.quarantine(lease).await
+    {
+        warn!(sandbox_id = %id, %error, "quarantining the reclaimed lease failed");
     }
 }
 
@@ -1413,7 +1475,8 @@ mod tests {
             record_in_phase(&store, id, phase);
         }
 
-        let inactive = normalize_durable_records(&store, data_dir.path(), None).unwrap();
+        let mut inactive = Vec::new();
+        normalize_durable_records(&store, data_dir.path(), None, &mut inactive).unwrap();
         let inactive: HashMap<_, _> = inactive
             .into_iter()
             .map(|instance| (instance.id.clone(), instance))
@@ -1456,10 +1519,12 @@ mod tests {
         record_in_phase(&store, "mid-pause", PersistPhase::Pausing);
         record_in_phase(&store, "mid-resume", PersistPhase::Resuming);
 
-        let inactive = normalize_durable_records(
+        let mut inactive = Vec::new();
+        normalize_durable_records(
             &store,
             data_dir.path(),
             Some(&mut SweptRuntime::nothing_kept()),
+            &mut inactive,
         )
         .unwrap();
         let inactive: HashMap<_, _> = inactive
@@ -1873,30 +1938,126 @@ mod tests {
     /// a process whose reconciliation has already failed.
     #[tokio::test]
     async fn a_failed_normalization_hands_back_what_the_sweep_reclaimed() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let (vm, _manager, network, reconciled) = sweep_one(
-            data_dir.path(),
-            &AdoptionCase::live(),
-            &[("ghost", PersistPhase::Ready)],
-        )
-        .await;
+        // Durable records are normalized in sorted order, so the peer's id
+        // decides whether the refusal lands before `keeper` was claimed (it
+        // is still in the sweep's map) or after (it is already an instance).
+        // Both lose it if the loser is dropped rather than released.
+        for peer in ["aaa-ghost", "zzz-ghost"] {
+            let data_dir = tempfile::tempdir().unwrap();
+            let (vm, _manager, network, reconciled) = sweep_one(
+                data_dir.path(),
+                &AdoptionCase::live(),
+                &[(peer, PersistPhase::Ready)],
+            )
+            .await;
 
-        // `await_reconcile` reports the task's failure as text, so the
-        // message is what says which refusal it was.
-        let error = reconciled.expect_err("an unjournaled live record refuses normalization");
-        assert!(
-            error.to_string().contains("has no cleanup journal"),
-            "unexpected reconciliation failure: {error}"
+            // `await_reconcile` reports the task's failure as text, so the
+            // message is what says which refusal it was.
+            let error = reconciled.expect_err("an unjournaled live record refuses normalization");
+            assert!(
+                error.to_string().contains("has no cleanup journal"),
+                "{peer}: unexpected reconciliation failure: {error}"
+            );
+            assert_eq!(
+                vm.state(),
+                VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+                "{peer}: the reclaimed vm is killed rather than left ownerless"
+            );
+            assert_eq!(
+                network.adopted_mode(&VmId::new("keeper").unwrap()),
+                None,
+                "{peer}: its lease is handed back rather than left live"
+            );
+        }
+    }
+
+    /// A kill that fails leaves a guest running, and taking its disk and its
+    /// address away then would leave it alive and broken. The release stops
+    /// instead; the journal survives for the next sweep to retry.
+    #[tokio::test]
+    async fn a_release_whose_kill_fails_keeps_the_disk_and_the_address() {
+        use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
+
+        struct RefusesShutdown(Arc<dyn VmHandle>);
+
+        #[async_trait::async_trait]
+        impl VmHandle for RefusesShutdown {
+            fn id(&self) -> &VmId {
+                self.0.id()
+            }
+            fn record(&self) -> VmRecord {
+                self.0.record()
+            }
+            fn state(&self) -> VmState {
+                self.0.state()
+            }
+            fn events(&self) -> tokio::sync::broadcast::Receiver<arcbox_vm_driver::VmEvent> {
+                self.0.events()
+            }
+            async fn shutdown(
+                &self,
+                _mode: ShutdownMode,
+            ) -> arcbox_vm_driver::Result<arcbox_vm_driver::ExitStatus> {
+                Err(arcbox_vm_driver::Error::Driver {
+                    driver: "fake",
+                    message: "the reaper did not see it exit".into(),
+                    source: None,
+                })
+            }
+        }
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let network = FakeNetwork::new();
+        let probe = Arc::new(crate::snapshot_cow::CowTestProbe::default());
+        let cow_manager = CowManager::new_with_test_probe(
+            crate::snapshot_cow::CowOptions::new(data_dir.path()),
+            Arc::clone(&probe),
+        )
+        .unwrap();
+
+        let vm_dir = data_dir.path().join("sandboxes").join("stuck");
+        let vm = boot_previous_vm(&driver, &vm_dir, "stuck", true, true).await;
+        let lease = network
+            .reserve(
+                &VmId::new("stuck").unwrap(),
+                super::super::sandbox_network_policy(),
+            )
+            .await
+            .unwrap();
+        network.release(lease.clone()).await.unwrap();
+        network.adopt(&lease, AttachMode::Invariant).await.unwrap();
+
+        let mut adopted = HashMap::new();
+        adopted.insert(
+            "stuck".to_owned(),
+            AdoptedSandbox {
+                handle: Arc::new(RefusesShutdown(Arc::from(vm))),
+                lease: Some(lease),
+                identity: None,
+                cow_handle: Some(CowHandle {
+                    dm_name: "arcbox-snap-stuck".into(),
+                    dm_device: "/dev/mapper/arcbox-snap-stuck".into(),
+                    cow_loop: "/dev/loop7".into(),
+                    cow_file: data_dir.path().join("cow/arcbox-cow-stuck.img"),
+                    template_path: "/rootfs.ext4".into(),
+                }),
+                pool_slot_id: None,
+                net_invariant: true,
+            },
+        );
+
+        release_reclaimed(&mut adopted, &network, &cow_manager).await;
+
+        assert_eq!(
+            probe.teardown_count(),
+            0,
+            "a guest that is still running keeps its disk"
         );
         assert_eq!(
-            vm.state(),
-            VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
-            "the reclaimed vm is killed rather than left ownerless"
-        );
-        assert_eq!(
-            network.adopted_mode(&VmId::new("keeper").unwrap()),
-            None,
-            "and its lease is handed back rather than left live"
+            network.adopted_mode(&VmId::new("stuck").unwrap()),
+            Some(AttachMode::Invariant),
+            "and its address"
         );
     }
 
@@ -1968,7 +2129,8 @@ mod tests {
             normalize_durable_records(
                 &store,
                 data_dir.path(),
-                Some(&mut SweptRuntime::nothing_kept())
+                Some(&mut SweptRuntime::nothing_kept()),
+                &mut Vec::new()
             ),
             Err(crate::error::VmmError::Unavailable(_))
         ));
