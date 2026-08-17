@@ -29,9 +29,9 @@ use arcbox_vm_driver::net::{
 };
 use arcbox_vm_driver::{Error, NicAttachment, NicSpec, Result, VmId};
 use async_trait::async_trait;
-use tracing::warn;
+use tracing::error;
 
-use crate::{NetworkAllocation, TapNetwork, invariant, tap_name_from_ip};
+use crate::{NetworkAllocation, TapNetError, TapNetwork, invariant, tap_name_from_ip};
 
 /// The device name every guest sees its one NIC under.
 pub const NIC_ID: &str = "eth0";
@@ -166,18 +166,38 @@ impl GuestNetwork for TapNetwork {
     }
 }
 
+impl TapNetwork {
+    /// Quarantined ids the port cannot name: written by a process that
+    /// predates it under a longer id budget than [`VmId`] allows. Every
+    /// lease the port itself quarantines carries a `VmId`, so this is only
+    /// ever legacy ledger content — finalizable through the inherent
+    /// surface, invisible through the port.
+    fn unnameable_quarantines(&self) -> Vec<String> {
+        self.pending_quarantines()
+            .into_iter()
+            .filter_map(|(id, _)| VmId::new(id.as_str()).is_err().then_some(id))
+            .collect()
+    }
+}
+
 #[async_trait]
 impl NetworkReconcile for TapNetwork {
-    /// Every quarantined VM with its token. A ledger id that does not fit a
-    /// [`VmId`] — written by a process that predates the port — cannot be
-    /// spoken here and is reported instead of returned.
+    /// Every quarantined VM with its token. A ledger id the port cannot
+    /// name is left out — and, since it keeps the startup gate closed until
+    /// something else finalizes it, logged at error level.
     async fn pending_cleanups(&self) -> Vec<(VmId, String)> {
         self.pending_quarantines()
             .into_iter()
             .filter_map(|(id, token)| match VmId::new(id.as_str()) {
                 Ok(vm) => Some((vm, token)),
                 Err(error) => {
-                    warn!(%id, %error, "quarantined network id is not a vm id; not reported");
+                    error!(
+                        %id,
+                        %error,
+                        "quarantined network id is not a vm id: the port cannot finalize \
+                         it, and the startup gate stays closed until the sandbox manager \
+                         does or the ledger entry is removed"
+                    );
                     None
                 }
             })
@@ -201,8 +221,27 @@ impl NetworkReconcile for TapNetwork {
         Ok(Self::validate_startup_cleanup(self, token)?)
     }
 
+    /// Ends the startup sweep. When the inherent gate refuses because
+    /// quarantines are still pending and some of them are ids the port
+    /// cannot name, the error says so — the caller's own `pending_cleanups`
+    /// would otherwise read empty while the gate stays shut.
     async fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
-        Ok(Self::finalize_startup_cleanup(self, token)?)
+        match Self::finalize_startup_cleanup(self, token) {
+            Err(TapNetError::Unavailable(message)) => {
+                let unnameable = self.unnameable_quarantines();
+                if unnameable.is_empty() {
+                    return Err(TapNetError::Unavailable(message).into());
+                }
+                Err(Error::Network(format!(
+                    "{message}; {} of them cannot be named through the driver port \
+                     ({}) and must be finalized through the sandbox manager or removed \
+                     from the quarantine ledger",
+                    unnameable.len(),
+                    unnameable.join(", ")
+                )))
+            }
+            other => Ok(other?),
+        }
     }
 
     async fn wait_startup_cleanup_complete(&self) {
@@ -433,5 +472,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reused.ip, lease.ip);
+    }
+
+    /// A ledger written under a longer id budget than `VmId` allows (a
+    /// pre-port sandbox manager) still loads and is finalizable through the
+    /// inherent surface; through the port it is invisible in
+    /// `pending_cleanups`, and the startup finalization names it instead of
+    /// failing with a bare "generations remain pending".
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn a_ledger_id_the_port_cannot_name_is_reported_not_swallowed() {
+        let root = tempfile::tempdir().unwrap();
+        let ledger = root.path().join("q");
+        let long_id = "x".repeat(VmId::MAX_LEN + 1);
+        {
+            let network = TapNetwork::with_quarantine_dir(
+                "10.0.0.0/29",
+                "10.0.0.1",
+                vec![],
+                ledger.clone(),
+                Datapath::default(),
+                Arc::new(IptablesLegacy::default()),
+            )
+            .unwrap();
+            network.mark_reconciled();
+            let startup = TapNetwork::startup_cleanup_token(&network).unwrap();
+            TapNetwork::finalize_startup_cleanup(&network, &startup).unwrap();
+            let allocation = TapNetwork::reserve(&network, &long_id).unwrap();
+            network.quarantine_checked(&long_id, &allocation).unwrap();
+        }
+
+        let restarted = TapNetwork::with_quarantine_dir(
+            "10.0.0.0/29",
+            "10.0.0.1",
+            vec![],
+            ledger,
+            Datapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
+        .unwrap();
+        restarted.mark_reconciled();
+        let reconcile = restarted.reconcile().unwrap();
+        assert!(reconcile.pending_cleanups().await.is_empty());
+        let startup = reconcile.startup_cleanup_token().await.unwrap();
+        let error = reconcile
+            .finalize_startup_cleanup(&startup)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Network(m) if m.contains(&long_id) && m.contains("sandbox manager")),
+            "{error}"
+        );
+
+        // The inherent surface still owns it: finalize there, then the port
+        // can end the startup sweep.
+        let (id, token) = restarted.pending_quarantines().remove(0);
+        assert_eq!(id, long_id);
+        restarted.finalize_quarantine(&id, &token).unwrap();
+        reconcile.finalize_startup_cleanup(&startup).await.unwrap();
     }
 }
