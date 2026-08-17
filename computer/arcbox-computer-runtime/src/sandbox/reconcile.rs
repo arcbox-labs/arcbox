@@ -1475,6 +1475,226 @@ mod tests {
         assert!(!vm_dir.join(STATE_FILE).exists(), "the journal is cleared");
     }
 
+    /// How the adoption tests below differ from one another, each shifting
+    /// exactly one predicate away from the case that is kept alive.
+    struct AdoptionCase {
+        /// Whether the VM the previous agent left behind has vsock — i.e.
+        /// whether the driver hands back a full handle or the process-only
+        /// fallback of an orphan whose API never answered.
+        vsock: bool,
+        /// The durable phase the sandbox's record is in.
+        phase: PersistPhase,
+        /// Whether the journal says how its lease attaches. A record written
+        /// before adoption existed does not.
+        journal_attach_mode: bool,
+        /// Whether the guest network can take the lease back.
+        network_adopts: bool,
+    }
+
+    impl AdoptionCase {
+        /// The case adoption exists for: a `Ready` sandbox whose VM answers.
+        fn live() -> Self {
+            Self {
+                vsock: true,
+                phase: PersistPhase::Ready,
+                journal_attach_mode: true,
+                network_adopts: true,
+            }
+        }
+    }
+
+    /// Plant one sandbox that outlived its agent — a detached VM, a durable
+    /// record, and a crash journal naming both — then build a fresh manager
+    /// over the same data directory and report what its sweep made of it.
+    ///
+    /// Returns the previous agent's view of the VM and the manager, so a
+    /// caller can tell "reclaimed" from "killed" by the VM's own state.
+    async fn sweep_one(
+        data_dir: &Path,
+        case: &AdoptionCase,
+    ) -> (
+        Box<dyn VmHandle>,
+        super::super::SandboxManager,
+        std::sync::Arc<arcbox_vm_driver::testkit::FakeNetwork>,
+    ) {
+        use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
+        use arcbox_vm_driver::{BootSpec, ConsoleSpec, IsolationSpec, VmSpec, VsockSpec};
+
+        let driver = FakeDriver::new();
+        let network = std::sync::Arc::new(FakeNetwork::new());
+        let vm_dir = data_dir.join("sandboxes").join("keeper");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let vm = driver
+            .boot(
+                VmSpec {
+                    id: VmId::new("keeper").unwrap(),
+                    cpus: 1,
+                    memory_mib: 128,
+                    boot: BootSpec::Kernel {
+                        image: "/vmlinux".into(),
+                        cmdline: String::new(),
+                        initrd: None,
+                    },
+                    disks: vec![],
+                    nics: vec![],
+                    vsock: case.vsock.then_some(VsockSpec { guest_cid: 3 }),
+                    shares: vec![],
+                    console: ConsoleSpec::Off,
+                    balloon: false,
+                    entropy: false,
+                    dirty_tracking: false,
+                    isolation: IsolationSpec::None,
+                },
+                &vm_dir,
+            )
+            .await
+            .unwrap();
+        // The previous agent handed its VM over rather than killing it.
+        vm.detach().unwrap().detach().await.unwrap();
+        let pid = vm.record().process.map(|process| process.pid).unwrap();
+
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
+        let store = SandboxRecordStore::new(data_dir).unwrap();
+        record_in_phase(&store, "keeper", case.phase);
+        drop(store);
+
+        let lease = NetworkLease {
+            vm: VmId::new("keeper").unwrap(),
+            ip: "10.200.0.9".parse().unwrap(),
+            prefix_len: 16,
+            gateway: "10.200.0.1".parse().unwrap(),
+            mac: "02:fc:00:00:00:09".parse().unwrap(),
+            cleanup_token: "gen-1".into(),
+        };
+        let mut record = SandboxStateRecord::new(
+            "keeper",
+            Some(i32::try_from(pid).unwrap()),
+            Some(JournaledLease::cold_boot(&lease, true)),
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        if !case.journal_attach_mode {
+            record.attach_mode = None;
+            record.net_invariant = false;
+        }
+        write_state_record(&vm_dir, &record).unwrap();
+
+        if !case.network_adopts {
+            network.fail_adopt_once();
+        }
+        let manager = super::super::SandboxManager::with_environment(
+            config,
+            crate::SandboxEnvironment {
+                driver: Some(std::sync::Arc::new(driver)),
+                network: Some(std::sync::Arc::clone(&network) as std::sync::Arc<dyn GuestNetwork>),
+                ..crate::SandboxEnvironment::default()
+            },
+        )
+        .unwrap();
+        manager.await_reconcile().await.unwrap();
+        (vm, manager, network)
+    }
+
+    /// The payload: a `Ready` sandbox whose VM outlived its agent comes back
+    /// with everything it was running on, and its journal stays where it is.
+    #[tokio::test]
+    async fn a_live_ready_sandbox_is_reclaimed_rather_than_killed() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (vm, manager, network) = sweep_one(data_dir.path(), &AdoptionCase::live()).await;
+
+        assert_eq!(vm.state(), VmState::Running, "the guest was never killed");
+        let instances = manager.instances.read().unwrap();
+        let inst = instances["keeper"].lock().unwrap();
+        // `Ready`, not `Running`: the workload the previous process was
+        // streaming did not survive it, and `Running` refuses the next `Run`.
+        assert_eq!(inst.state, SandboxState::Ready);
+        assert!(inst.handle.is_some(), "the VM's handle came back");
+        assert!(inst.prepared.is_none(), "no PreparedVm crosses a restart");
+        assert_eq!(
+            inst.network.as_ref().map(|lease| lease.ip.to_string()),
+            Some("10.200.0.9".to_owned()),
+            "the lease came back"
+        );
+        assert!(
+            inst.net_identity.is_some(),
+            "the guest is described the way its boot described it"
+        );
+        assert!(inst.net_invariant, "and under the identity it holds");
+        assert_eq!(
+            network.adopted_mode(&VmId::new("keeper").unwrap()),
+            Some(AttachMode::Invariant),
+            "the datapath is re-established as the journal says it was built"
+        );
+        assert!(
+            data_dir
+                .path()
+                .join("sandboxes/keeper")
+                .join(STATE_FILE)
+                .exists(),
+            "an adopted journal is live state, not debris"
+        );
+    }
+
+    /// Each predicate on its own: shift one away from the live case and the
+    /// sweep falls back to the teardown it did before adoption existed.
+    #[tokio::test]
+    async fn every_adoption_predicate_falls_back_to_the_kill() {
+        for (what, case) in [
+            (
+                "a process-only handle whose api never answered",
+                AdoptionCase {
+                    vsock: false,
+                    ..AdoptionCase::live()
+                },
+            ),
+            (
+                "a boot that never reached ready",
+                AdoptionCase {
+                    phase: PersistPhase::Starting,
+                    ..AdoptionCase::live()
+                },
+            ),
+            (
+                "a journal that predates adoption",
+                AdoptionCase {
+                    journal_attach_mode: false,
+                    ..AdoptionCase::live()
+                },
+            ),
+            (
+                "a network that cannot take the lease back",
+                AdoptionCase {
+                    network_adopts: false,
+                    ..AdoptionCase::live()
+                },
+            ),
+        ] {
+            let data_dir = tempfile::tempdir().unwrap();
+            let (vm, manager, _) = sweep_one(data_dir.path(), &case).await;
+
+            assert_eq!(
+                vm.state(),
+                VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+                "{what}: the vm is killed through its adopted handle"
+            );
+            assert!(
+                !data_dir
+                    .path()
+                    .join("sandboxes/keeper")
+                    .join(STATE_FILE)
+                    .exists(),
+                "{what}: the journal is cleared"
+            );
+            let instances = manager.instances.read().unwrap();
+            let inst = instances["keeper"].lock().unwrap();
+            assert_eq!(inst.state, SandboxState::Failed, "{what}");
+            assert!(inst.handle.is_none(), "{what}");
+        }
+    }
+
     #[test]
     fn active_record_without_cleanup_journal_blocks_normalization() {
         let data_dir = tempfile::tempdir().unwrap();
