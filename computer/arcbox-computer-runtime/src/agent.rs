@@ -58,8 +58,10 @@ pub trait GuestAgentFactory: Send + Sync {
     /// The agent client for a VM that has booted or restored.
     ///
     /// `net` is what the guest was told over its interface, for an agent
-    /// reached at that address rather than through the VM handle; `None`
-    /// when the Computer is networkless.
+    /// reached at that address rather than through the VM handle. `None`
+    /// when the Computer is networkless — or when it is networked but no
+    /// address names it yet, as a legacy-addressed restore is until its
+    /// re-address RPC lands and it is reconnected with the settled one.
     fn connect(
         &self,
         handle: Arc<dyn VmHandle>,

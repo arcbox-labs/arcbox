@@ -274,8 +274,8 @@ pub(super) async fn live_sandbox_with(
     .unwrap();
 
     // A cold boot activates the interface invariant and hands the instance
-    // that identity beside the handle, so a planted one must too — an agent
-    // that reads it would otherwise see a networkless sandbox.
+    // that identity beside the handle, so a planted one must too: it is what
+    // `guest_agent` gives every agent it builds afterwards.
     let identity = manager.network.identity(&lease, super::attach_mode(true));
     let mut instance =
         SandboxInstance::new_with_generation(id.to_owned(), spec, Some(lease), vm_dir, generation);
