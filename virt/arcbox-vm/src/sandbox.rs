@@ -175,7 +175,7 @@ impl SandboxManager {
         let config = Arc::new(config);
 
         // Sweep leftovers of a previous agent process (crash / respawn):
-        // orphaned Firecracker processes, TAPs, dm devices, chroots. Create and
+        // orphaned VMM processes, TAPs, dm devices, chroots. Create and
         // restore wait for this to finish (await_reconcile) so a re-created
         // same-id sandbox can't have its deterministically-named resources torn
         // down mid-flight. Only meaningful inside a tokio runtime; sync
@@ -185,6 +185,7 @@ impl SandboxManager {
         let instances = Arc::new(RwLock::new(HashMap::new()));
         if tokio::runtime::Handle::try_current().is_ok() {
             let config = Arc::clone(&config);
+            let driver = Arc::clone(&driver);
             let network = Arc::clone(&network);
             let cow_manager = Arc::clone(&cow_manager);
             let snapshots = Arc::clone(&snapshots);
@@ -194,6 +195,7 @@ impl SandboxManager {
                 let result = async {
                     let swept = reconcile::sweep_orphans(
                         &config,
+                        driver.as_ref(),
                         &network,
                         &cow_manager,
                         &snapshots,

@@ -1,28 +1,37 @@
 //! Crash-recovery reconciliation for sandbox runtime state.
 //!
 //! `SandboxManager` state is in-memory; if the agent restarts (crash,
-//! supervision respawn) the Firecracker processes, TAP devices, dm-snapshot
+//! supervision respawn) the VMM processes, TAP devices, dm-snapshot
 //! devices, and jailer chroots of running sandboxes leak, and fresh IP
 //! allocations can collide with orphaned TAPs. To recover, every successful
 //! boot/restore persists a small `state.json` next to the sandbox's runtime
-//! files, and a new manager sweeps those records: orphaned Firecracker
-//! processes are killed and every held resource is torn down. Sandboxes are
-//! not live-reconciled yet: startup destroys orphaned runtime resources, then
-//! normalizes durable lifecycle records for replay and inspection.
+//! files, and a new manager sweeps those records: orphaned VMMs are found
+//! and killed through the driver's `Adopt` capability, and every held
+//! resource is torn down. Sandboxes are not live-reconciled yet: startup
+//! destroys orphaned runtime resources, then normalizes durable lifecycle
+//! records for replay and inspection.
 
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmId, VmRecord};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::persistence::{SandboxPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
 use super::{SandboxInstance, SandboxState};
 use crate::config::VmmConfig;
-use crate::error::Result;
+use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot_cow::{CowHandle, CowManager};
+
+/// How long the sweep gives the driver to find and reconnect to one
+/// orphaned VMM. Finding one is a `/proc` walk and reconnecting a couple of
+/// API calls; an orphan whose API never answers must not hang the sweep —
+/// and with it every create — forever.
+const ADOPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// File name of the per-sandbox crash-recovery record.
 const STATE_FILE: &str = "state.json";
@@ -89,7 +98,7 @@ impl CowRecord {
 pub(super) struct SandboxStateRecord {
     /// Sandbox ID (also the directory name).
     pub id: String,
-    /// Firecracker PID at boot time.
+    /// The VMM's PID at boot time.
     #[serde(default)]
     pub pid: Option<i32>,
     /// Network allocation to release (TAP + IP).
@@ -196,10 +205,11 @@ pub(super) struct OrphanSweep {
 /// plus snapshots a checkpoint never finished writing.
 ///
 /// Runs once per manager construction, in the background. Ordering per
-/// sandbox mirrors live teardown: kill Firecracker → wait for exit → dm
+/// sandbox mirrors live teardown: kill the VMM → wait for exit → dm
 /// teardown → TAP release → chroot + directory removal.
 pub(super) async fn sweep_orphans(
     config: &VmmConfig,
+    driver: &dyn VmDriver,
     network: &NetworkManager,
     cow_manager: &CowManager,
     snapshots: &crate::snapshot::SnapshotCatalog,
@@ -238,16 +248,10 @@ pub(super) async fn sweep_orphans(
         records.push((dir, record));
     }
 
-    // Firecracker pins dm devices, so every owned process must be dead before
+    // The VMM pins dm devices, so every owned process must be dead before
     // the global CoW sweep can report meaningful cleanup failures.
-    for (_, record) in &records {
-        let mut pids = discover_firecracker_pids(config, record)?;
-        if let Some(pid) = record.pid {
-            pids.insert(pid);
-        }
-        for pid in pids {
-            kill_orphaned_firecracker(pid).await?;
-        }
+    for (dir, record) in &records {
+        kill_orphaned_vmm(driver, dir, record).await?;
     }
     // Durably Paused sandboxes keep their retained disk state (the detached
     // COW overlay or parked rootfs): Paused is committed only after
@@ -412,38 +416,51 @@ fn inactive_instance(
     instance
 }
 
-/// SIGKILL an orphaned Firecracker process and wait for it to disappear.
+/// Kill the VMM a cleanup journal names, if it outlived the agent.
 ///
-/// The PID may have been recycled since the record was written, so the
-/// process is killed only when its command name still looks like
-/// Firecracker (Linux `/proc/<pid>/comm`; on other targets the check
-/// degrades to "process exists").
-async fn kill_orphaned_firecracker(pid: i32) -> Result<()> {
-    if !process_is_firecracker(pid) {
+/// The driver's `Adopt` capability finds it — the journaled pid when it is
+/// still that VMM (a pid recycled since the record was written is not), else
+/// whatever the driver recognises as the VM by the record's identity: the
+/// id the resources are keyed by (the adopted pool slot's, for a claimed
+/// sandbox) and its runtime directory — and its handle kills and reaps it,
+/// so the dm teardown that follows never hits EBUSY on the open block
+/// device. Nothing found is the common case: the VMM died with the agent.
+/// A driver without `Adopt` runs its VMs in-process, and those died with
+/// the agent by construction.
+async fn kill_orphaned_vmm(
+    driver: &dyn VmDriver,
+    runtime_dir: &Path,
+    record: &SandboxStateRecord,
+) -> Result<()> {
+    let Some(adopt) = driver.adopt() else {
         return Ok(());
+    };
+    let vm_record = VmRecord {
+        id: VmId::new(record.resource_owner())?,
+        driver: driver.name().to_owned(),
+        runtime_dir: runtime_dir.to_path_buf(),
+        process: record
+            .pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .map(|pid| ProcessRecord {
+                pid,
+                api_socket: None,
+            }),
+    };
+    let adopted = tokio::time::timeout(ADOPT_TIMEOUT, adopt.adopt(&vm_record))
+        .await
+        .map_err(|_| {
+            VmmError::Process(format!(
+                "sandbox {}: the driver did not find or reconnect to its vmm within {}s",
+                record.id,
+                ADOPT_TIMEOUT.as_secs()
+            ))
+        })??;
+    if let Some(handle) = adopted {
+        info!(sandbox_id = %record.id, vm = %vm_record.id, "killing the orphaned vmm");
+        handle.shutdown(ShutdownMode::Kill).await?;
     }
-    match nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    ) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-        Err(error) => {
-            return Err(crate::error::VmmError::Process(format!(
-                "kill orphaned firecracker {pid}: {error}"
-            )));
-        }
-    }
-    // The orphan was reparented to init, which reaps it; poll until the PID
-    // vanishes so dm teardown doesn't hit EBUSY on the open block device.
-    for _ in 0..50 {
-        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    Err(crate::error::VmmError::Process(format!(
-        "orphaned firecracker {pid} did not exit after SIGKILL"
-    )))
+    Ok(())
 }
 
 async fn remove_dir_if_present(path: &Path) -> Result<()> {
@@ -515,95 +532,6 @@ fn validate_state_record(
         super::validate_id("restore origin sandbox id", origin_id.unwrap())?;
     }
     Ok(())
-}
-
-/// True when `pid` is alive and (on Linux) named like a Firecracker binary.
-fn process_is_firecracker(pid: i32) -> bool {
-    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-            Ok(comm) => comm.trim_end().starts_with("firecracker"),
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn discover_firecracker_pids(
-    config: &VmmConfig,
-    record: &SandboxStateRecord,
-) -> Result<HashSet<i32>> {
-    let mut matches = HashSet::new();
-    let direct_socket = Path::new(&config.firecracker.data_dir)
-        .join("sandboxes")
-        .join(&record.id)
-        .join("firecracker.sock");
-    let jailer_root = config.firecracker.jailer.as_ref().map(|jailer| {
-        let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        arcbox_fc_driver::jail::chroot_root(
-            &config.firecracker.binary,
-            base,
-            record.resource_owner(),
-        )
-    });
-
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        if !process_is_firecracker(pid) {
-            continue;
-        }
-        let proc_dir = entry.path();
-        let direct_match = std::fs::read(proc_dir.join("cmdline"))
-            .ok()
-            .is_some_and(|bytes| cmdline_matches(&bytes, &record.id, &direct_socket));
-        let jailer_match = jailer_root.as_ref().is_some_and(|expected| {
-            std::fs::read_link(proc_dir.join("root"))
-                .ok()
-                .is_some_and(|root| root == *expected)
-        });
-        if direct_match || jailer_match {
-            matches.insert(pid);
-        }
-    }
-    Ok(matches)
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "Linux process discovery reads /proc and is fallible"
-)]
-fn discover_firecracker_pids(
-    _config: &VmmConfig,
-    _record: &SandboxStateRecord,
-) -> Result<HashSet<i32>> {
-    Ok(HashSet::new())
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn cmdline_matches(bytes: &[u8], id: &str, socket: &Path) -> bool {
-    let args: Vec<_> = bytes
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .collect();
-    args.windows(2).any(|pair| {
-        (pair[0] == b"--id" && pair[1] == id.as_bytes())
-            || (pair[0] == b"--api-sock" && pair[1] == socket.as_os_str().as_encoded_bytes())
-    })
 }
 
 #[cfg(test)]
@@ -805,29 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn dead_pid_is_not_firecracker() {
-        // PID 0 targets "the calling process group" for kill(2); use an
-        // implausibly high PID instead.
-        assert!(!process_is_firecracker(i32::MAX - 1));
-    }
-
-    #[test]
-    fn firecracker_command_line_matches_only_the_owned_id_or_socket() {
-        let socket = Path::new("/var/lib/arcbox/sandbox/sandboxes/box/firecracker.sock");
-        assert!(cmdline_matches(
-            b"firecracker\0--api-sock\0/var/lib/arcbox/sandbox/sandboxes/box/firecracker.sock\0",
-            "box",
-            socket
-        ));
-        assert!(cmdline_matches(b"firecracker\0--id\0box\0", "box", socket));
-        assert!(!cmdline_matches(
-            b"firecracker\0--id\0other\0",
-            "box",
-            socket
-        ));
-    }
-
-    #[test]
     fn startup_normalizes_crash_phases_and_restores_inactive_records() {
         let data_dir = tempfile::tempdir().unwrap();
         let store = SandboxRecordStore::new(data_dir.path()).unwrap();
@@ -946,6 +851,80 @@ mod tests {
         let inst = instances["napper"].lock().unwrap();
         assert_eq!(inst.state, SandboxState::Paused);
         assert_eq!(inst.pause_snapshot_id.as_deref(), Some("snap"));
+    }
+
+    /// A journal whose VMM outlived the agent: the sweep finds it through
+    /// the driver's Adopt capability, kills it, and clears the journal —
+    /// before anything else the sandbox held is torn down.
+    #[tokio::test]
+    async fn startup_sweep_kills_the_journaled_vmm_through_adopt() {
+        use arcbox_vm_driver::testkit::FakeDriver;
+        use arcbox_vm_driver::{BootSpec, ConsoleSpec, IsolationSpec, VmSpec, VmState};
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let vm_dir = data_dir.path().join("sandboxes").join("orphan");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        // The previous agent's VM: booted, then left running when that
+        // agent died — which is what a detached handle stands for here.
+        let vm = driver
+            .boot(
+                VmSpec {
+                    id: VmId::new("orphan").unwrap(),
+                    cpus: 1,
+                    memory_mib: 128,
+                    boot: BootSpec::Kernel {
+                        image: "/vmlinux".into(),
+                        cmdline: String::new(),
+                        initrd: None,
+                    },
+                    disks: vec![],
+                    nics: vec![],
+                    vsock: None,
+                    shares: vec![],
+                    console: ConsoleSpec::Off,
+                    balloon: false,
+                    entropy: false,
+                    dirty_tracking: false,
+                    isolation: IsolationSpec::None,
+                },
+                &vm_dir,
+            )
+            .await
+            .unwrap();
+        vm.detach().unwrap().detach().await.unwrap();
+        let pid = vm.record().process.map(|process| process.pid).unwrap();
+        write_state_record(
+            &vm_dir,
+            &SandboxStateRecord::new(
+                "orphan",
+                Some(i32::try_from(pid).unwrap()),
+                None,
+                None,
+                false,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+        let manager = super::super::SandboxManager::with_environment(
+            config,
+            crate::SandboxEnvironment {
+                driver: Some(std::sync::Arc::new(driver)),
+                ..crate::SandboxEnvironment::default()
+            },
+        )
+        .unwrap();
+        manager.await_reconcile().await.unwrap();
+
+        assert_eq!(
+            vm.state(),
+            VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+            "the orphaned vm is killed through its adopted handle"
+        );
+        assert!(!vm_dir.join(STATE_FILE).exists(), "the journal is cleared");
     }
 
     #[test]
