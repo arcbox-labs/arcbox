@@ -265,16 +265,17 @@ pub fn fc_config(spec: &VmSpec, config: &FcDriverConfig, runtime_dir: &Path) -> 
     })
 }
 
-/// Renders a restore of `image` under `spec`: the files a jail needs
-/// staged, and the `PUT /snapshot/load` payload with the image's NICs
-/// retargeted onto `spec.nics`.
+/// Renders a restore of `image` under `spec`.
+///
+/// The plan carries the files a jail needs staged, the `PUT /snapshot/load`
+/// payload with the image's NICs retargeted onto `spec.nics`, and the disks
+/// as Firecracker must see them once the image is loaded.
 ///
 /// Refuses a format this driver did not write
 /// ([`Error::ForeignCheckpoint`]) and a diff image ([`Error::InvalidSpec`]).
-/// The disks in `spec` are staged into the jail at `/{id}.ext4`, the path
-/// a checkpoint of this driver recorded for them; without a jail
-/// Firecracker reopens the recorded host paths itself and the caller must
-/// have put the disks there.
+/// A snapshot load reopens the disk paths the checkpoint recorded, which
+/// are never this restore's — so the load is rendered paused and the caller
+/// points each drive at [`FcRestorePlan::drives`] before resuming.
 pub fn fc_restore(
     image: &CheckpointImage,
     spec: &RestoreSpec,
@@ -311,9 +312,11 @@ pub fn fc_restore(
         StageKind::LinkOrCopy,
         &mut stage,
     )?;
-    for disk in &spec.disks {
-        drive(&layout, disk, &mut stage)?;
-    }
+    let drives = spec
+        .disks
+        .iter()
+        .map(|disk| drive(&layout, disk, &mut stage))
+        .collect::<Result<Vec<_>>>()?;
     let network_overrides = spec
         .nics
         .iter()
@@ -332,9 +335,11 @@ pub fn fc_restore(
             mem_backend: None,
             enable_diff_snapshots: None,
             track_dirty_pages: None,
-            resume_vm: Some(true),
+            // The guest stays frozen until its disks are reattached.
+            resume_vm: Some(false),
             network_overrides,
         },
+        drives,
     })
 }
 

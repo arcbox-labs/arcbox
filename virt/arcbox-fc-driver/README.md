@@ -47,6 +47,11 @@ let vm = driver.boot(spec, &runtime_dir).await?;   // Box<dyn VmHandle>
 
 The checkpoint format is `firecracker/v1`: a directory holding `vmstate`
 and `mem`. Restoring anything else fails with `Error::ForeignCheckpoint`.
+A restore loads the image with the guest frozen, points every drive at the
+path *this* restore gives it (`PATCH /drives/{id}`, skipped where the image
+already names it — a snapshot records the disk paths of the VM it was taken
+from, never the fresh copy-on-write device a restore runs on), and only then
+resumes.
 
 ## Path rules
 

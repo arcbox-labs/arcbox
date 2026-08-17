@@ -188,11 +188,15 @@ impl PreparedVm for FcPrepared {
             .await
             .map_err(FcError::Api)?;
         let client = vm.into_client();
-        // The image, not the spec, decides which devices the VM has — and
-        // Firecracker re-binds the vsock socket where the checkpoint
-        // recorded it, so the path is read back rather than assumed.
-        let vsock_uds = api::vm_config(&client)
-            .await?
+        // The image, not the spec, decides which devices the VM has, and it
+        // names them at the paths the checkpoint recorded — so both the
+        // disks and the vsock socket are read back rather than assumed.
+        let loaded = api::vm_config(&client).await?;
+        reattach_disks(&client, &loaded.drives, &plan.drives).await?;
+        // The load left the guest frozen so it could not touch a stale disk;
+        // it runs from here.
+        api::resume(&client).await?;
+        let vsock_uds = loaded
             .vsock
             .map(|vsock| self.layout.vsock_host_view(&vsock.uds_path));
         Ok(Box::new(self.handle(client, vsock_uds)))
@@ -203,9 +207,103 @@ impl PreparedVm for FcPrepared {
     }
 }
 
+/// Point every drive of a freshly loaded image at the path this restore
+/// gives it, skipping the ones the image already names.
+///
+/// A checkpoint records each disk's path, and a restore's disks are never
+/// at those paths — a fresh copy-on-write device, a per-VM copy, a jail of
+/// its own. The VM is still paused here, so the swap happens before the
+/// guest reads a block from the disk it was checkpointed on.
+async fn reattach_disks(
+    client: &fc_sdk::Client,
+    loaded: &[fc_sdk::types::Drive],
+    wanted: &[fc_sdk::types::Drive],
+) -> Result<()> {
+    for drive in wanted {
+        let recorded = loaded
+            .iter()
+            .find(|loaded| loaded.drive_id == drive.drive_id)
+            .ok_or_else(|| {
+                Error::InvalidSpec(format!(
+                    "{NAME}: the checkpoint has no disk `{}`",
+                    drive.drive_id
+                ))
+            })?;
+        if recorded.path_on_host != drive.path_on_host {
+            let path = drive.path_on_host.as_deref().ok_or_else(|| {
+                Error::InvalidSpec(format!("{NAME}: disk `{}` has no path", drive.drive_id))
+            })?;
+            api::update_drive(client, &drive.drive_id, path).await?;
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl VsockListen for FcPrepared {
     async fn listen(&self, port: u32) -> Result<Box<dyn VsockListener>> {
         listener::bind(&self.layout, &self.process, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fc_sdk::types::{DriveCacheType, DriveIoEngine};
+
+    use super::*;
+
+    fn drive(id: &str, path: &str) -> fc_sdk::types::Drive {
+        fc_sdk::types::Drive {
+            drive_id: id.to_owned(),
+            path_on_host: Some(path.to_owned()),
+            is_root_device: true,
+            is_read_only: Some(false),
+            partuuid: None,
+            cache_type: DriveCacheType::Unsafe,
+            rate_limiter: None,
+            io_engine: DriveIoEngine::Sync,
+            socket: None,
+        }
+    }
+
+    /// A client on a socket nobody answers on: any call it makes fails, so
+    /// a call that does not happen is provable.
+    fn unreachable_client() -> fc_sdk::Client {
+        fc_sdk::connection::connect("/nonexistent/arcbox-fc-driver/api.sock")
+    }
+
+    #[tokio::test]
+    async fn a_disk_the_image_already_names_is_not_patched() {
+        reattach_disks(
+            &unreachable_client(),
+            &[drive("rootfs", "/rootfs.ext4")],
+            &[drive("rootfs", "/rootfs.ext4")],
+        )
+        .await
+        .expect("no call is made for a path the image already names");
+    }
+
+    #[tokio::test]
+    async fn a_disk_at_a_new_path_is_patched_and_an_unknown_one_is_refused() {
+        // The patch is attempted — against a socket nobody answers on, so it
+        // fails as a driver error rather than being skipped.
+        let patched = reattach_disks(
+            &unreachable_client(),
+            &[drive("rootfs", "/rootfs.ext4")],
+            &[drive("rootfs", "/restored.ext4")],
+        )
+        .await;
+        assert!(matches!(patched, Err(Error::Driver { .. })), "{patched:?}");
+
+        let unknown = reattach_disks(
+            &unreachable_client(),
+            &[drive("rootfs", "/rootfs.ext4")],
+            &[drive("data", "/data.ext4")],
+        )
+        .await;
+        match unknown {
+            Err(Error::InvalidSpec(message)) => assert!(message.contains("data"), "{message}"),
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
     }
 }

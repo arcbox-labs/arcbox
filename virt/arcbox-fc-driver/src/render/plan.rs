@@ -99,6 +99,12 @@ pub struct FcPlan {
 pub struct FcRestorePlan {
     /// Files to stage into the jail first (empty without a jail).
     pub stage: Vec<StagePlan>,
-    /// `PUT /snapshot/load`.
+    /// `PUT /snapshot/load`, rendered paused: the load reopens the disk
+    /// paths the checkpoint recorded, so the guest must not run before the
+    /// drives below have replaced them.
     pub load: SnapshotLoadParams,
+    /// The spec's disks as Firecracker must see them after the load —
+    /// `PATCH /drives/{id}` for each whose path the image does not already
+    /// name, then resume.
+    pub drives: Vec<Drive>,
 }

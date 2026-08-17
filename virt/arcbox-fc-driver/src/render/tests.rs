@@ -414,10 +414,20 @@ fn restore_loads_the_image_and_retargets_nics_onto_the_new_taps() {
     assert!(plan.stage.is_empty());
     assert_eq!(plan.load.snapshot_path, "/snaps/abc/vmstate");
     assert_eq!(plan.load.mem_file_path.as_deref(), Some("/snaps/abc/mem"));
-    assert_eq!(plan.load.resume_vm, Some(true));
+    // The load leaves the guest frozen until the disks below replace the
+    // ones the checkpoint recorded.
+    assert_eq!(plan.load.resume_vm, Some(false));
     assert_eq!(plan.load.network_overrides.len(), 1);
     assert_eq!(plan.load.network_overrides[0].iface_id, "eth0");
     assert_eq!(plan.load.network_overrides[0].host_dev_name, "tap7");
+    // Without a jail nothing is staged, so the disks reach Firecracker only
+    // as the paths to patch onto the loaded drives.
+    assert_eq!(plan.drives.len(), 1);
+    assert_eq!(plan.drives[0].drive_id, "rootfs");
+    assert_eq!(
+        plan.drives[0].path_on_host.as_deref(),
+        Some("/run/vms/box2/rootfs.link")
+    );
 }
 
 #[test]
@@ -459,6 +469,7 @@ fn restore_stages_the_image_and_disks_into_a_jail_by_name() {
             },
         ]
     );
+    assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
 
     // An image the caller already staged into the jail is loaded in place.
     let staged = root.join("snapshots/abc");
@@ -471,6 +482,23 @@ fn restore_stages_the_image_and_disks_into_a_jail_by_name() {
     .unwrap();
     assert!(plan.stage.is_empty());
     assert_eq!(plan.load.snapshot_path, "/snapshots/abc/vmstate");
+    assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
+
+    // A disk the caller placed in the jail somewhere else than the canonical
+    // name is named where it is: the drive is patched, not staged.
+    let elsewhere = root.join("pool/slot3.ext4");
+    let plan = fc_restore(
+        &image(&staged),
+        &restore_spec("box2", jailed(&base), elsewhere),
+        &config(),
+        Path::new("/run/vms/box2"),
+    )
+    .unwrap();
+    assert!(plan.stage.is_empty());
+    assert_eq!(
+        plan.drives[0].path_on_host.as_deref(),
+        Some("/pool/slot3.ext4")
+    );
 }
 
 #[test]
