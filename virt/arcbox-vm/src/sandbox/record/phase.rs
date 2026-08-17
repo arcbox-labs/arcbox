@@ -40,6 +40,11 @@ pub(in crate::sandbox) enum SandboxPhase {
 /// The durable phase under the name R3's lifecycle HSM uses for it: what a
 /// crash-restart reads back, as opposed to the in-memory `SandboxState` a
 /// caller sees.
+///
+/// The module boundary is where the two names meet: inside `record` the
+/// enum is `SandboxPhase`, and this alias — the only one of the two
+/// [`super`] re-exports — is what every other module says. R3's rename
+/// then has one module to touch.
 pub(in crate::sandbox) type PersistPhase = SandboxPhase;
 
 /// The stable result returned once a provisioning request has been accepted.
@@ -101,7 +106,7 @@ pub(in crate::sandbox) enum SandboxTransition {
 }
 
 impl SandboxTransition {
-    fn phase(&self) -> PersistPhase {
+    fn phase(&self) -> SandboxPhase {
         match self {
             Self::Starting(_) => SandboxPhase::Starting,
             Self::ReadyWithOutcome(_) | Self::Ready => SandboxPhase::Ready,
@@ -381,7 +386,7 @@ mod tests {
     /// table below iterate this, so a phase missing here is a pair nobody
     /// checks — [`targets_of`]'s exhaustive match is what stops a new
     /// variant from being added without a row.
-    const ALL_PHASES: [PersistPhase; 10] = [
+    const ALL_PHASES: [SandboxPhase; 10] = [
         Creating, Starting, Ready, Stopping, Stopped, Failed, Removing, Pausing, Paused, Resuming,
     ];
 
@@ -392,7 +397,7 @@ mod tests {
     /// `can_transition_to`, which is why the test below asserts it over all
     /// `(from, to)` pairs instead of sampling: an edge missing here becomes
     /// a wrong state machine there.
-    fn targets_of(from: PersistPhase) -> &'static [PersistPhase] {
+    fn targets_of(from: SandboxPhase) -> &'static [SandboxPhase] {
         match from {
             Creating => &[Starting, Failed, Removing],
             Starting => &[Ready, Stopping, Failed, Removing],
@@ -450,7 +455,7 @@ mod tests {
         // `SandboxTransition::phase`'s own match is exhaustive, so a new
         // transition cannot skip this list without failing to compile there
         // first.
-        let projections: [(SandboxTransition, PersistPhase); 10] = [
+        let projections: [(SandboxTransition, SandboxPhase); 10] = [
             (SandboxTransition::Starting(outcome()), Starting),
             (SandboxTransition::ReadyWithOutcome(outcome()), Ready),
             (SandboxTransition::Ready, Ready),
