@@ -1180,8 +1180,8 @@ impl SandboxManager {
 #[cfg(test)]
 mod tests {
     use super::super::testing::{
-        FrozenOnCheckpoint, assert_failed_and_released, expect_err, fake_manager, live_sandbox,
-        live_sandbox_with,
+        FrozenOnCheckpoint, RELEASES_NETWORK, assert_failed_and_released, expect_err, fake_manager,
+        live_sandbox, live_sandbox_with,
     };
     use super::super::types::action;
     use super::*;
@@ -1206,7 +1206,8 @@ mod tests {
         let inst = instance.lock().unwrap();
         assert_eq!(inst.state, SandboxState::Ready);
         assert!(inst.prepared.is_some() && inst.handle.is_some());
-        assert!(inst.cow_handle.is_some() && inst.network.is_some());
+        assert!(inst.cow_handle.is_some());
+        assert_eq!(inst.network.is_some(), RELEASES_NETWORK);
         assert_eq!(handle.state(), arcbox_vm_driver::VmState::Running);
         assert_eq!(probe.teardown_count(), 0);
     }

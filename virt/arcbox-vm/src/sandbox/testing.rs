@@ -22,6 +22,13 @@ use crate::config::{JailerConfig, VmmConfig};
 use crate::snapshot_cow::{CowManager, CowOptions, CowTestProbe};
 use crate::{SandboxEnvironment, VmmError};
 
+/// Whether the live sandbox carries a network allocation. Releasing one on
+/// Linux talks to netlink and iptables (root, and the System VM's binaries),
+/// which an unprivileged unit test cannot — the tap-net crate skips those
+/// paths without root for the same reason; the macOS build's no-op branch
+/// is what lets these tests drive the release end to end.
+pub(super) const RELEASES_NETWORK: bool = cfg!(not(target_os = "linux"));
+
 /// A manager over [`FakeDriver`] with a probed CoW manager and jailer mode
 /// configured (checkpoints, pause and restore require it), its startup
 /// cleanup finalized so networks can be reserved.
@@ -184,7 +191,7 @@ pub(super) async fn live_sandbox_with(
     );
     let handle = wrap(Arc::from(prepared.boot(vm_spec(&vm_id)).await.unwrap()));
     let cow_handle = manager.cow_manager.setup(id, "/rootfs.ext4").await.unwrap();
-    let network = manager.network.reserve(id).unwrap();
+    let network = RELEASES_NETWORK.then(|| manager.network.reserve(id).unwrap());
 
     let spec = SandboxSpec {
         id: Some(id.to_owned()),
@@ -205,7 +212,10 @@ pub(super) async fn live_sandbox_with(
             id,
             generation,
             SandboxTransition::Starting(SandboxProvisionOutcome {
-                ip_address: network.ip_address.to_string(),
+                ip_address: network
+                    .as_ref()
+                    .map(|network| network.ip_address.to_string())
+                    .unwrap_or_default(),
             }),
         )
         .unwrap();
@@ -218,7 +228,7 @@ pub(super) async fn live_sandbox_with(
         &SandboxStateRecord::new(
             id,
             super::journaled_pid(&*prepared),
-            Some(&network),
+            network.as_ref(),
             Some(&cow_handle),
             true,
             None,
@@ -226,13 +236,8 @@ pub(super) async fn live_sandbox_with(
     )
     .unwrap();
 
-    let mut instance = SandboxInstance::new_with_generation(
-        id.to_owned(),
-        spec,
-        Some(network),
-        vm_dir,
-        generation,
-    );
+    let mut instance =
+        SandboxInstance::new_with_generation(id.to_owned(), spec, network, vm_dir, generation);
     instance.state = SandboxState::Ready;
     instance.prepared = Some(prepared);
     instance.handle = Some(Arc::clone(&handle));
@@ -248,8 +253,9 @@ pub(super) async fn live_sandbox_with(
 
 /// Every mark of a sandbox that failed the way a failed boot does: `Failed`
 /// in memory and on the durable record, no VMM (the prepared process
-/// discarded, the handle dropped), CoW overlay and network released, crash
-/// journal cleared. Panics on the first mark that is missing.
+/// discarded, the handle dropped), CoW overlay and network (where the test
+/// carries one, [`RELEASES_NETWORK`]) released, crash journal cleared.
+/// Panics on the first mark that is missing.
 pub(super) fn assert_failed_and_released(
     manager: &SandboxManager,
     instance: &Arc<Mutex<SandboxInstance>>,
@@ -267,12 +273,13 @@ pub(super) fn assert_failed_and_released(
     assert!(inst.cow_handle.is_none(), "the CoW overlay is released");
     assert!(inst.network.is_none(), "the network allocation is released");
     assert_eq!(probe.teardown_count(), 1, "the CoW teardown ran once");
-    assert!(
+    assert_eq!(
         manager
             .network
             .pending_quarantines()
             .iter()
             .any(|(quarantined, _)| quarantined == id),
+        RELEASES_NETWORK,
         "the TAP + IP are quarantined for host cleanup"
     );
     assert_eq!(

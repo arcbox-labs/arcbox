@@ -346,13 +346,16 @@ pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Strin
 }
 
 /// Kill the sandbox's VMM process and reap it: the driver's `discard`, a
-/// SIGKILL plus a bounded wait for the reaper.
+/// SIGKILL plus a bounded wait for the reaper. Once the process is gone the
+/// VM's handle only names a corpse — nothing dials, checkpoints or stops a
+/// stopped, paused or failed sandbox — so it is dropped here too, the one
+/// place both are let go.
 ///
 /// Extracted so the pause path (which keeps the disk overlay) shares the exact
 /// kill/reap discipline with full release. A failed reap (the driver's
-/// bounded wait elapsed) restores the handle so a retry can finish the job.
-/// Idempotent — the prepared VMM is `take()`n, and discarding an exited one
-/// just reports its status.
+/// bounded wait elapsed) restores the prepared VMM, and keeps the handle,
+/// so a retry can finish the job. Idempotent — the prepared VMM is
+/// `take()`n, and discarding an exited one just reports its status.
 pub(super) async fn kill_sandbox_process(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
@@ -369,6 +372,7 @@ pub(super) async fn kill_sandbox_process(
             "release the vmm of sandbox {id}: {error}"
         )));
     }
+    arc.lock().unwrap().handle = None;
     Ok(())
 }
 

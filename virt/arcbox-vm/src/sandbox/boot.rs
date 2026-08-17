@@ -444,9 +444,9 @@ fn persist_boot_failure(
 
 /// Fail a sandbox whose VM is up (or was) and whose cleanup resources all
 /// sit on its instance: persist the failure, flip the instance to `Failed`,
-/// release runtime resources (the VMM killed and reaped, CoW, TAP + IP,
-/// chroot), drop the dead VM's handle, clear the crash journal, and
-/// broadcast the FAILED event. Shared by the boot task's failure points and
+/// release runtime resources (the VMM killed and reaped and its handle
+/// dropped, CoW, TAP + IP, chroot), clear the crash journal, and broadcast
+/// the FAILED event. Shared by the boot task's failure points and
 /// by the flows that find a guest frozen with no way to thaw it; each caller
 /// logs its own context line. Takes the instance's cleanup lock;
 /// [`fail_live_sandbox_locked`] is for a caller already holding it.
@@ -518,12 +518,7 @@ pub(super) async fn fail_live_sandbox_locked(
         match super::cleanup::release_runtime_resources(id, instance, network, config, cow_manager)
             .await
         {
-            Ok(()) => {
-                // The VMM is dead and reaped; nothing dials or checkpoints
-                // a Failed sandbox, so the handle only names a corpse.
-                instance.lock().unwrap().handle = None;
-                true
-            }
+            Ok(()) => true,
             Err(error) => {
                 error!(sandbox_id = %id, error = %error, "sandbox failure cleanup incomplete");
                 false

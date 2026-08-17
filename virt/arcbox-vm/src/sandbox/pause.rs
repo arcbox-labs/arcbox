@@ -268,7 +268,6 @@ impl SandboxManager {
             inst.state = SandboxState::Paused;
             inst.paused_at = Some(Utc::now());
             inst.pause_snapshot_id = Some(snapshot_id.clone());
-            inst.handle = None;
             if paused_commit
                 .as_ref()
                 .is_none_or(|commit| commit.durability_error.is_none())
