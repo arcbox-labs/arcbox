@@ -277,9 +277,34 @@ pub async fn apply(jail: &Jail, plans: &[StagePlan]) -> Result<()> {
             StageKind::BlockNode => {
                 mknod_for_jailer(&plan.src, &plan.dst, jail.uid, jail.gid).await?;
             }
+            StageKind::Alias => alias_in_jail(&plan.src, &plan.dst, jail.uid, jail.gid).await?,
         }
     }
     Ok(())
+}
+
+/// Give a disk that is already inside the jail a second name there: a hard
+/// link to the same inode (which keeps its ownership); failing that, a
+/// device node for a block device, or a chowned copy.
+pub async fn alias_in_jail(src: &Path, dst: &Path, uid: u32, gid: u32) -> Result<()> {
+    if let Err(e) = tokio::fs::remove_file(dst).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::Io(e));
+    }
+    match tokio::fs::hard_link(src, dst).await {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            warn!(src = %src.display(), dst = %dst.display(), error = %e,
+                "hard link failed; aliasing by node or copy");
+        }
+    }
+    let metadata = tokio::fs::metadata(src).await.map_err(Error::Io)?;
+    if std::os::unix::fs::FileTypeExt::is_block_device(&metadata.file_type()) {
+        mknod_for_jailer(src, dst, uid, gid).await
+    } else {
+        copy_for_jailer(src, dst, uid, gid).await
+    }
 }
 
 /// Stage a snapshot's vmstate/mem into `{chroot}/snapshots/{snapshot_id}`
@@ -397,6 +422,29 @@ mod tests {
         assert_ne!(
             std::fs::metadata(src.join("rootfs.ext4")).unwrap().ino(),
             std::fs::metadata(root.join("rootfs.ext4")).unwrap().ino()
+        );
+
+        // An alias is the same inode under a second name, and replaces a
+        // stale entry at that name.
+        std::fs::create_dir_all(root.join("pool")).unwrap();
+        std::fs::write(root.join("pool/slot3.ext4"), b"slot").unwrap();
+        std::fs::write(root.join("data.ext4"), b"stale").unwrap();
+        apply(
+            &jail,
+            &[StagePlan {
+                src: root.join("pool/slot3.ext4"),
+                dst: root.join("data.ext4"),
+                kind: StageKind::Alias,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(root.join("data.ext4")).unwrap(), b"slot");
+        assert_eq!(
+            std::fs::metadata(root.join("pool/slot3.ext4"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(root.join("data.ext4")).unwrap().ino()
         );
     }
 }

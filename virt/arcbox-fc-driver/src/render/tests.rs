@@ -528,20 +528,31 @@ fn restore_stages_the_image_and_disks_into_a_jail_by_name() {
     )
     .unwrap();
     assert!(plan.stage.is_empty());
+    assert!(plan.aliases.is_empty(), "at the recorded name already");
     assert_eq!(plan.load.snapshot_path, "/snapshots/abc/vmstate");
     assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
 
-    // A disk the caller placed in the jail somewhere else than the canonical
-    // name is named where it is: the drive is patched, not staged.
+    // A disk the caller placed in the jail somewhere else than the recorded
+    // name is named where it is — but the load reopens `/rootfs.ext4`, so
+    // it is aliased there for the load and the alias goes once the drive
+    // is patched onto the disk itself.
     let elsewhere = root.join("pool/slot3.ext4");
     let plan = fc_restore(
         &image(&staged),
-        &restore_spec("box2", jailed(&base), elsewhere),
+        &restore_spec("box2", jailed(&base), elsewhere.clone()),
         &config(),
         Path::new("/run/vms/box2"),
     )
     .unwrap();
-    assert!(plan.stage.is_empty());
+    assert_eq!(
+        plan.stage,
+        vec![StagePlan {
+            src: elsewhere,
+            dst: root.join("rootfs.ext4"),
+            kind: StageKind::Alias,
+        }]
+    );
+    assert_eq!(plan.aliases, vec![root.join("rootfs.ext4")]);
     assert_eq!(
         plan.drives[0].path_on_host.as_deref(),
         Some("/pool/slot3.ext4")

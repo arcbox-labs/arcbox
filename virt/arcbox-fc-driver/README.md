@@ -62,7 +62,12 @@ advertises `checkpoint: false`. A restore loads the image with the guest
 frozen, points every drive at the path *this* restore gives it
 (`PATCH /drives/{id}`, skipped where the image already names it — a
 snapshot records the disk paths of the VM it was taken from, never the fresh
-copy-on-write device a restore runs on), and only then resumes.
+copy-on-write device a restore runs on), and only then resumes. The load
+must find every recorded name first: a staged disk lands at `/{id}.ext4`,
+the name a checkpoint of this driver records, and a disk that already sits
+in the jail under another name is given that name too for the load (a hard
+link, or a device node or copy) and loses it once the drive points at the
+disk itself.
 
 ## Path rules
 

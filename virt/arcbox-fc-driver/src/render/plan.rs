@@ -66,6 +66,12 @@ pub enum StageKind {
     /// A device node with the source's major/minor — for a block device
     /// (a device-mapper rootfs).
     BlockNode,
+    /// A second name, inside the jail, for a disk that is already in it: a
+    /// hard link (a device node for a block device, a copy when neither is
+    /// possible), owned like the original. A restore uses it so the load
+    /// finds a disk at the name the checkpoint recorded; the alias goes once
+    /// the drive has been pointed at the disk's real name.
+    Alias,
 }
 
 /// Everything a boot needs after the process is up.
@@ -107,4 +113,9 @@ pub struct FcRestorePlan {
     /// `PATCH /drives/{id}` for each whose path the image does not already
     /// name, then resume.
     pub drives: Vec<Drive>,
+    /// Second names staged for the load only ([`StageKind::Alias`]): a disk
+    /// that sits in the jail under a name other than the one the checkpoint
+    /// recorded is linked at the recorded name so the load can reopen it,
+    /// and unlinked again once the drive points at the disk itself.
+    pub aliases: Vec<PathBuf>,
 }

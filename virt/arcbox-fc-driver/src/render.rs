@@ -293,8 +293,10 @@ pub fn fc_config(spec: &VmSpec, config: &FcDriverConfig, runtime_dir: &Path) -> 
 /// isolation ([`Error::InvalidSpec`], see [`require_jailed_restore`]).
 /// A snapshot load reopens the disk paths the checkpoint recorded — inside
 /// the new jail, where the plan stages this restore's disks under the same
-/// names — so the load is rendered paused and the caller points each drive
-/// at [`FcRestorePlan::drives`] before resuming.
+/// names, `/{id}.ext4`, aliasing a disk that already sits in the jail
+/// elsewhere ([`FcRestorePlan::aliases`]) — so the load is rendered paused
+/// and the caller points each drive at [`FcRestorePlan::drives`] before
+/// resuming and drops the aliases.
 pub fn fc_restore(
     image: &CheckpointImage,
     spec: &RestoreSpec,
@@ -332,10 +334,31 @@ pub fn fc_restore(
         StageKind::LinkOrCopy,
         &mut stage,
     )?;
+    let mut aliases = Vec::new();
     let drives = spec
         .disks
         .iter()
-        .map(|disk| drive(&layout, disk, &mut stage))
+        .map(|disk| {
+            let drive = drive(&layout, disk, &mut stage)?;
+            // The load reopens each drive at the name the checkpoint
+            // recorded — `/{id}.ext4`, where this driver stages a disk. A
+            // disk that already sits in the jail under another name gets
+            // that name too, for the load; the drive is then pointed at the
+            // disk itself and the alias goes.
+            if let Some(jail) = &layout.jail
+                && let Some(view) = jail.view(&disk.path)
+                && view != recorded_name(disk)
+            {
+                let alias = jail.root.join(recorded_file(disk));
+                stage.push(StagePlan {
+                    src: disk.path.clone(),
+                    dst: alias.clone(),
+                    kind: StageKind::Alias,
+                });
+                aliases.push(alias);
+            }
+            Ok(drive)
+        })
         .collect::<Result<Vec<_>>>()?;
     let network_overrides = spec
         .nics
@@ -360,7 +383,19 @@ pub fn fc_restore(
             network_overrides,
         },
         drives,
+        aliases,
     })
+}
+
+/// The file a disk is staged as inside the jail, and so the name a
+/// checkpoint of this driver records for it: `{id}.ext4`.
+fn recorded_file(disk: &DiskSpec) -> String {
+    format!("{}.ext4", disk.id)
+}
+
+/// [`recorded_file`] as Firecracker names it: `/{id}.ext4`.
+fn recorded_name(disk: &DiskSpec) -> String {
+    format!("/{}", recorded_file(disk))
 }
 
 /// Checkpoints are a jailer-mode capability.
@@ -397,7 +432,7 @@ fn drive(layout: &VmLayout, disk: &DiskSpec, stage: &mut Vec<StagePlan>) -> Resu
         Some(_) if disk.read_only => StageKind::LinkOrCopy,
         Some(_) => StageKind::Copy,
     };
-    let path_on_host = layout.place(&disk.path, &format!("{}.ext4", disk.id), kind, stage)?;
+    let path_on_host = layout.place(&disk.path, &recorded_file(disk), kind, stage)?;
     Ok(Drive {
         drive_id: disk.id.clone(),
         path_on_host: Some(path_on_host),

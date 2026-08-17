@@ -202,6 +202,16 @@ impl PreparedVm for FcPrepared {
         // disks and the vsock socket are read back rather than assumed.
         let loaded = api::vm_config(&client).await?;
         reattach_disks(&client, &loaded.drives, &plan.drives).await?;
+        // The drives now name the disks themselves; the second names staged
+        // for the load are not needed any more.
+        for alias in &plan.aliases {
+            if let Err(e) = tokio::fs::remove_file(alias).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(vm = %self.record.id, alias = %alias.display(), error = %e,
+                    "a disk alias staged for the load could not be removed");
+            }
+        }
         // Firecracker rebound the vsock where the checkpoint recorded it;
         // listeners bound on this prepared VM move there before the guest
         // can dial out.
