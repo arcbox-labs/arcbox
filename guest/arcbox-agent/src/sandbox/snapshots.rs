@@ -1,7 +1,7 @@
 //! Sandbox checkpoint / restore handlers.
 
+use arcbox_computer_runtime::{RestoreSandboxSpec, SandboxState};
 use arcbox_connect::sandbox_v1;
-use arcbox_vm::{RestoreSandboxSpec, SandboxState};
 use buffa::Message;
 
 use super::{SandboxService, convert, register_sandbox_dns};

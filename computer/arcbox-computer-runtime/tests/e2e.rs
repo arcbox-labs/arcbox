@@ -16,7 +16,7 @@
 //! ## Running
 //!
 //! ```bash
-//! sudo -E cargo test --test e2e -p arcbox-vm -- --include-ignored --test-threads=1
+//! sudo -E cargo test --test e2e -p arcbox-computer-runtime -- --include-ignored --test-threads=1
 //! ```
 //!
 //! `--test-threads=1` prevents concurrent TAP interface names from colliding.
@@ -33,7 +33,7 @@ mod common;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use arcbox_vm::{
+use arcbox_computer_runtime::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxEvent, SandboxManager,
     SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig,
 };
@@ -58,7 +58,7 @@ fn try_config(data_dir: &str) -> Option<VmmConfig> {
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: Some(15),
-            sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
+            sandbox_datapath: arcbox_computer_runtime::config::SandboxDatapath::default(),
             // Direct mode cannot restore (and so never pools); keep the
             // e2e run free of background pre-warm spawns regardless.
             pool_size: 0,
@@ -340,11 +340,13 @@ async fn e2e_run_command() {
     while let Some(result) = rx.recv().await {
         let chunk = result.unwrap();
         match chunk {
-            arcbox_vm::OutputChunk::Stdout(data) => {
+            arcbox_computer_runtime::OutputChunk::Stdout(data) => {
                 stdout.push_str(&String::from_utf8_lossy(&data));
             }
-            arcbox_vm::OutputChunk::Exit(status) => exit_code = status.conventional_code(),
-            arcbox_vm::OutputChunk::Stderr(_) => {}
+            arcbox_computer_runtime::OutputChunk::Exit(status) => {
+                exit_code = status.conventional_code()
+            }
+            arcbox_computer_runtime::OutputChunk::Stderr(_) => {}
         }
     }
 

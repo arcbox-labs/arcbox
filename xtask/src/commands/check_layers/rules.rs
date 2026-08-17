@@ -53,7 +53,13 @@ pub const RULES: &[Rule] = &[
     },
     Rule {
         subject: Subject::Members(&["arcbox-vm-agent"]),
-        forbidden: Forbidden::Crates(&["arcbox-vm", "arcbox-snapshot", "tokio", "aya", "fc-sdk"]),
+        forbidden: Forbidden::Crates(&[
+            "arcbox-computer-runtime",
+            "arcbox-snapshot",
+            "tokio",
+            "aya",
+            "fc-sdk",
+        ]),
         reason: "CORE-127 — the in-sandbox binary is a compiler-enforced crate boundary \
                  and stays a small static musl binary",
     },

@@ -2,12 +2,12 @@
 //!
 //! The wire vocabulary — frame opcodes, request payloads, the stat/event
 //! DTOs, and the per-verb flows — is [`arcbox_vm_proto::file`], re-exported
-//! here as [`proto`] so `arcbox_vm::file_io::proto` keeps resolving for
-//! every consumer. This module is the tokio client the manager drives:
-//! one vsock connection per operation, dialed through the driver port's
-//! [`Vsock`] capability, timeouts, and the mapping of the agent's
-//! errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`] variants
-//! (`decode_file_err`).
+//! here as [`proto`] so `arcbox_computer_runtime::file_io::proto` keeps
+//! resolving for every consumer. This module is the tokio client the
+//! manager drives: one vsock connection per operation, dialed through the
+//! driver port's [`Vsock`] capability, timeouts, and the mapping of the
+//! agent's errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`]
+//! variants (`decode_file_err`).
 
 use std::time::Duration;
 

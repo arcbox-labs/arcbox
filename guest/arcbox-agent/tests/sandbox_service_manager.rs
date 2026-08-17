@@ -4,13 +4,15 @@ use std::time::Duration;
 
 use arcbox_agent::error::SandboxError;
 use arcbox_agent::sandbox::SandboxService;
+use arcbox_computer_runtime::VmmConfig;
+use arcbox_computer_runtime::config::{
+    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
+};
 use arcbox_connect::sandbox_v1::{
     CreateSandboxRequest, InspectSandboxRequest, ListSandboxesRequest, NetworkMode, NetworkSpec,
     RemoveSandboxRequest, SandboxState, StartExecutionRequest, StopSandboxRequest,
     WaitExecutionRequest, exit_status,
 };
-use arcbox_vm::VmmConfig;
-use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
 use buffa::Message;
 
 fn required_env(name: &str) -> String {
@@ -35,7 +37,7 @@ fn test_config() -> VmmConfig {
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: Some(15),
-            sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
+            sandbox_datapath: arcbox_computer_runtime::config::SandboxDatapath::default(),
             // Direct mode cannot restore (and so never pools or serves
             // warm creates); keep the run free of background checkpoint
             // and pre-warm work regardless.

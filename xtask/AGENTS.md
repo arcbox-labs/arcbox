@@ -147,7 +147,8 @@ macOS-only crate, no `arcbox-vmm` / `arcbox-hypervisor` / VMM adapter —
 engine's two edges are grandfathered until vm-stack-redesign R4), common
 (no virt/engine/computer/app/guest),
 `arcbox-vm-proto` and `arcbox-vm-driver` (leaf crates) and
-`arcbox-vm-agent` (no `arcbox-vm`/`arcbox-snapshot`/`tokio`/`aya`/`fc-sdk`).
+`arcbox-vm-agent` (no
+`arcbox-computer-runtime`/`arcbox-snapshot`/`tokio`/`aya`/`fc-sdk`).
 
 - **Adding a rule**: append a `Rule` whose `reason` names the document
   that owns it (charter decision, design doc, AGENTS.md section) — the

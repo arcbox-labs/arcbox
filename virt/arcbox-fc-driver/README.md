@@ -9,10 +9,10 @@ pause → snapshot → resume, `Prepare` for warm pools that spawn ahead of a
 boot, `Adopt`/`Detach` for VMs that outlive the process that booted them.
 
 Nothing above this crate names Firecracker. The sandbox manager
-(`arcbox-vm`) reaches it through `dyn VmDriver` — during the R1 migration
-it also calls the moved staging helpers directly, an edge R3 removes — and
-the only other things it depends on are the port and `fc-sdk`: no snapshot
-catalog, no engine, no orchestrator.
+(`arcbox-computer-runtime`) reaches it through `dyn VmDriver` — during the
+R1 migration it also calls the moved staging helpers directly, an edge R3
+removes — and the only other things it depends on are the port and
+`fc-sdk`: no snapshot catalog, no engine, no orchestrator.
 
 ## Layout
 

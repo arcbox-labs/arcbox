@@ -83,18 +83,18 @@ impl SandboxError {
 }
 
 /// The snapshot layer reaches the wire through the table below rather
-/// than growing a second one: `arcbox-vm` already converts
+/// than growing a second one: `arcbox-computer-runtime` already converts
 /// `SnapshotError` variant-for-variant, so the two stay in step by
 /// construction.
 impl From<arcbox_snapshot::SnapshotError> for SandboxError {
     fn from(e: arcbox_snapshot::SnapshotError) -> Self {
-        Self::from(arcbox_vm::VmmError::from(e))
+        Self::from(arcbox_computer_runtime::VmmError::from(e))
     }
 }
 
-impl From<arcbox_vm::VmmError> for SandboxError {
-    fn from(e: arcbox_vm::VmmError) -> Self {
-        use arcbox_vm::VmmError;
+impl From<arcbox_computer_runtime::VmmError> for SandboxError {
+    fn from(e: arcbox_computer_runtime::VmmError) -> Self {
+        use arcbox_computer_runtime::VmmError;
         match &e {
             // A missing sandbox path keeps its typed "path not found:"
             // message: the daemon's classifier maps the 404 onto the
@@ -135,20 +135,20 @@ mod tests {
 
     #[test]
     fn invalid_config_maps_to_400_not_500() {
-        let err = SandboxError::from(arcbox_vm::VmmError::Config("bad id".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Config("bad id".into()));
         assert!(matches!(err, SandboxError::InvalidArgument(_)));
         assert_eq!(err.status_code(), 400);
     }
 
     #[test]
     fn runtime_errors_stay_500() {
-        let err = SandboxError::from(arcbox_vm::VmmError::Vsock("boom".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Vsock("boom".into()));
         assert_eq!(err.status_code(), 500);
     }
 
     #[test]
     fn stdin_gap_maps_to_416() {
-        let err = SandboxError::from(arcbox_vm::VmmError::StdinGap {
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::StdinGap {
             accepted: 7,
             offset: 9,
         });
@@ -158,14 +158,16 @@ mod tests {
 
     #[test]
     fn paused_maps_to_423_for_the_daemon_auto_resume() {
-        let err = SandboxError::from(arcbox_vm::VmmError::Paused("box".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Paused("box".into()));
         assert!(matches!(err, SandboxError::SandboxPaused(_)));
         assert_eq!(err.status_code(), 423);
     }
 
     #[test]
     fn path_not_found_maps_to_404_with_the_classifier_prefix() {
-        let err = SandboxError::from(arcbox_vm::VmmError::PathNotFound("/a/b".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::PathNotFound(
+            "/a/b".into(),
+        ));
         assert!(matches!(err, SandboxError::NotFound(_)));
         assert_eq!(err.status_code(), 404);
         // The daemon classifier keys on this exact prefix (FILE_NOT_FOUND).
@@ -174,34 +176,44 @@ mod tests {
 
     #[test]
     fn template_errors_keep_their_classifier_prefixes_and_codes() {
-        let err = SandboxError::from(arcbox_vm::VmmError::TemplateNotFound("code:9.9".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::TemplateNotFound(
+            "code:9.9".into(),
+        ));
         assert!(matches!(err, SandboxError::NotFound(_)));
         assert_eq!(err.status_code(), 404);
         // The daemon classifier keys on this exact prefix (TEMPLATE_NOT_FOUND).
         assert_eq!(err.to_string(), "template not found: code:9.9");
 
-        let err = SandboxError::from(arcbox_vm::VmmError::TemplateVersionExists("x".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::TemplateVersionExists(
+            "x".into(),
+        ));
         assert_eq!(err.status_code(), 409);
 
-        let err = SandboxError::from(arcbox_vm::VmmError::FailedPrecondition("no draft".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::FailedPrecondition(
+            "no draft".into(),
+        ));
         assert_eq!(err.status_code(), 412);
     }
 
     #[test]
     fn directory_not_empty_maps_to_412() {
-        let err = SandboxError::from(arcbox_vm::VmmError::DirectoryNotEmpty("/full".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::DirectoryNotEmpty(
+            "/full".into(),
+        ));
         assert_eq!(err.status_code(), 412);
     }
 
     #[test]
     fn not_a_directory_maps_to_400() {
-        let err = SandboxError::from(arcbox_vm::VmmError::NotADirectory("/a/file".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::NotADirectory(
+            "/a/file".into(),
+        ));
         assert_eq!(err.status_code(), 400);
     }
 
     #[test]
     fn deadline_maps_to_504_for_the_daemon_deadline_code() {
-        let err = SandboxError::from(arcbox_vm::VmmError::DeadlineExceeded(
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::DeadlineExceeded(
             "no listener on port 8080".into(),
         ));
         assert!(matches!(err, SandboxError::Deadline(_)));
@@ -210,7 +222,7 @@ mod tests {
 
     #[test]
     fn durability_uncertainty_maps_to_503() {
-        let err = SandboxError::from(arcbox_vm::VmmError::Unavailable(
+        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Unavailable(
             "record fsync failed".into(),
         ));
         assert!(matches!(err, SandboxError::Unavailable(_)));

@@ -24,9 +24,9 @@ uuid = { workspace = true }
 [features]
 # Exposes `CowTestProbe` and `CowManager::new_with_test_probe` so a consumer
 # can assert on setup/teardown calls without a real device-mapper. Off by
-# default; `arcbox-vm` turns it on in its dev-dependencies. The seam used to
-# be `#[cfg(test)]`, which stopped reaching its caller once that caller lived
-# in another crate.
+# default; `arcbox-computer-runtime` turns it on in its dev-dependencies.
+# The seam used to be `#[cfg(test)]`, which stopped reaching its caller once
+# that caller lived in another crate.
 test-probe = []
 
 [dev-dependencies]

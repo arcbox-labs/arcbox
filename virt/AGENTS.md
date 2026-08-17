@@ -201,8 +201,8 @@ Counters") or it falsifies the metrics.
 - `virt/arcbox-tap-net/README.md` — the sandbox TAP network (pool, TAP
   ioctls, invariant NAT via eBPF TCX or iptables, quarantine ledger) is
   its own crate, the Linux adapter of `arcbox-vm-driver`'s `GuestNetwork`
-  port; `arcbox_vm::network` only re-exports it. Not part of the HV/VZ
-  VirtIO datapath above.
+  port; `arcbox_computer_runtime::network` only re-exports it. Not part of
+  the HV/VZ VirtIO datapath above.
 
 - `docs/fs-perf-limits.md` — the settled VirtioFS story: the per-op
   cross-vCPU IPI mechanism, the kernel `fuse-spin-wait` fix (+58%

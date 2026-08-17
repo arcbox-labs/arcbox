@@ -8,7 +8,7 @@
 //! - **macOS**: Virtualization.framework (managed execution)
 //! - **Linux**: KVM (manual vCPU execution)
 //!
-//! For the guest-side Firecracker sandbox stack, see `arcbox-vm`.
+//! For the guest-side Firecracker sandbox stack, see `arcbox-computer-runtime`.
 //!
 //! # Key types
 //!

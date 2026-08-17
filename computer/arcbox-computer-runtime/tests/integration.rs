@@ -1,7 +1,7 @@
 mod common;
 
-use arcbox_vm::config::SnapshotType;
-use arcbox_vm::snapshot::{SnapshotCatalog, SnapshotDraft};
+use arcbox_computer_runtime::config::SnapshotType;
+use arcbox_computer_runtime::snapshot::{SnapshotCatalog, SnapshotDraft};
 
 // ---------------------------------------------------------------------------
 // Snapshot persistence
@@ -60,7 +60,7 @@ fn snapshot_catalog_persists_across_instances() {
 fn block_device_numbers_round_trip_through_mknod() {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
-    use arcbox_vm::snapshot_cow::{device_major_minor, mknod_blkdev};
+    use arcbox_computer_runtime::snapshot_cow::{device_major_minor, mknod_blkdev};
 
     if !common::is_root() {
         eprintln!("SKIP block_device_numbers_round_trip_through_mknod — requires root");
@@ -127,7 +127,7 @@ fn block_device_numbers_round_trip_through_mknod() {
 #[test]
 #[cfg(target_os = "linux")]
 fn busybox_block_tools_attach_report_and_detach() {
-    use arcbox_vm::snapshot_cow::{BlockTools as _, BusyboxBlockTools};
+    use arcbox_computer_runtime::snapshot_cow::{BlockTools as _, BusyboxBlockTools};
 
     const IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 

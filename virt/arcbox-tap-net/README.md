@@ -27,10 +27,10 @@ owns:
   finalize.
 
 It moved here from `arcbox-vm/src/network` (vm-stack-redesign R2a,
-D-VM6). `arcbox_vm::network` re-exports the crate and `NetworkManager` is
-an alias of `TapNetwork` until R2b moves the sandbox manager onto the
-port; `invariant::GUEST_IP` and friends stay exported for the guest
-agent's port-forward and init code.
+D-VM6). `arcbox_computer_runtime::network` re-exports the crate and
+`NetworkManager` is an alias of `TapNetwork` until R2b moves the sandbox
+manager onto the port; `invariant::GUEST_IP` and friends stay exported
+for the guest agent's port-forward and init code.
 
 ## The `GuestNetwork` mapping
 
@@ -47,10 +47,11 @@ agent's port-forward and init code.
 The `NetworkLease` carries VM, address, prefix, gateway, MAC and cleanup
 token; the allocation is rebuilt from it (TAP name from the address,
 resolvers from the network), so there is no side table to keep. Errors:
-`TapNetError` maps variant for variant into `arcbox_vm::VmmError`
-(`WrongState` / `Unavailable` keep their 412 / 503 meaning) and into the
-port's `Error` (`Unavailable` and `PreconditionFailed` carry the same two
-answers; `Io` keeps its shape, the faults land on `Network`).
+`TapNetError` maps variant for variant into
+`arcbox_computer_runtime::VmmError` (`WrongState` / `Unavailable` keep
+their 412 / 503 meaning) and into the port's `Error` (`Unavailable` and
+`PreconditionFailed` carry the same two answers; `Io` keeps its shape, the
+faults land on `Network`).
 
 ## Usage
 

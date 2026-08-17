@@ -28,8 +28,8 @@ use std::net::Ipv4Addr;
 use std::process::Output;
 
 use anyhow::{Context, Result, bail};
-use arcbox_vm::network::invariant;
-use arcbox_vm::{ExposeTarget, SandboxNetworkIdentity};
+use arcbox_computer_runtime::network::invariant;
+use arcbox_computer_runtime::{ExposeTarget, SandboxNetworkIdentity};
 use tokio::process::Command;
 
 /// First port of the reserved guest relay range.

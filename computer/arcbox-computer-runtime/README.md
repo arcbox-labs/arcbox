@@ -1,21 +1,21 @@
-# arcbox-vm
+# arcbox-computer-runtime
 
 Guest-side sandbox orchestration: runs **inside** the ArcBox System VM and
 manages nested microVMs — one per sandbox — through a `VmDriver`
-([`arcbox-vm-driver`](../arcbox-vm-driver)); the reference driver is
-[`arcbox-fc-driver`](../arcbox-fc-driver), Firecracker.
+([`arcbox-vm-driver`](../../virt/arcbox-vm-driver)); the reference driver is
+[`arcbox-fc-driver`](../../virt/arcbox-fc-driver), Firecracker.
 
 Do not confuse it with `arcbox-vmm`, which is the **host** VMM that boots
 the System VM itself on Virtualization.framework or KVM. Different layer,
 different machine.
 
 ```
-host (macOS)              System VM (Linux)            sandbox (microVM)
-arcbox-daemon    ──vsock──►  arcbox-agent      ──vsock──►  vm-agent (PID 1)
-  arcbox-vmm                   arcbox-vm                     workload
-                              arcbox-vm-driver              (arcbox-vm-agent)
-                              (arcbox-fc-driver)
-                                        └── arcbox-vm-proto ──┘
+host (macOS)         System VM (Linux)              sandbox (microVM)
+arcbox-daemon  ──vsock──►  arcbox-agent        ──vsock──►  vm-agent (PID 1)
+  arcbox-vmm             arcbox-computer-runtime             workload
+                         arcbox-vm-driver                (arcbox-vm-agent)
+                         (arcbox-fc-driver)
+                                    └── arcbox-vm-proto ──┘
 ```
 
 `arcbox-agent` is this crate's only consumer: it owns the `sandbox.v1`
@@ -23,9 +23,9 @@ surface and the vsock transport, and calls `SandboxManager` underneath.
 There are no service implementations, no tonic, and no daemon here.
 
 The **`vm-agent`** binary that becomes PID 1 *inside* each sandbox is a
-separate crate, [`arcbox-vm-agent`](../arcbox-vm-agent); the wire
+separate crate, [`arcbox-vm-agent`](../../virt/arcbox-vm-agent); the wire
 vocabulary both sides share — boot parameters, exec-channel and
-file-channel frames — is [`arcbox-vm-proto`](../arcbox-vm-proto). This
+file-channel frames — is [`arcbox-vm-proto`](../../virt/arcbox-vm-proto). This
 crate and the agent each depend on the proto crate and never on each
 other, so the agent stays a small static musl binary no matter what the
 manager pulls in. `boot_proto` and `file_io::proto` stay reachable here as
@@ -40,7 +40,7 @@ once, here.
 
 ```rust
 use std::sync::Arc;
-use arcbox_vm::{SandboxManager, SandboxSpec, VmmConfig};
+use arcbox_computer_runtime::{SandboxManager, SandboxSpec, VmmConfig};
 
 let manager = Arc::new(SandboxManager::new(VmmConfig::default())?);
 
@@ -78,17 +78,17 @@ path seams follow.
 
 The sandbox network itself — the IPv4 pool, the per-sandbox TAP, the
 invariant NAT (eBPF TCX or iptables), and the quarantine ledger — is
-[`arcbox-tap-net`](../arcbox-tap-net), the Linux adapter of the
-`arcbox-vm-driver` `GuestNetwork` port; `arcbox_vm::network` re-exports
-it and `NetworkManager` is an alias of its `TapNetwork` until the manager
-moves onto the port.
+[`arcbox-tap-net`](../../virt/arcbox-tap-net), the Linux adapter of the
+`arcbox-vm-driver` `GuestNetwork` port; `arcbox_computer_runtime::network`
+re-exports it and `NetworkManager` is an alias of its `TapNetwork` until
+the manager moves onto the port.
 
 ## Build and test
 
 ```bash
-cargo test -p arcbox-vm                 # unit + integration, no Firecracker needed
-cargo clippy -p arcbox-vm -- -D warnings
-cargo test -p arcbox-tap-net            # the TAP network (root-only TAP tests skip)
+cargo test -p arcbox-computer-runtime    # unit + integration, no Firecracker needed
+cargo clippy -p arcbox-computer-runtime -- -D warnings
+cargo test -p arcbox-tap-net             # the TAP network (root-only TAP tests skip)
 
 # vm-agent, as the release ships it (aarch64 musl; brew install FiloSottile/musl-cross/musl-cross)
 cargo build -p arcbox-vm-agent --bin vm-agent --target aarch64-unknown-linux-musl --release

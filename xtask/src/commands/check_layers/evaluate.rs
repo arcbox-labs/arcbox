@@ -174,7 +174,7 @@ mod tests {
     fn crate_rule_matches_an_external_crate_by_name() {
         let graph = graph(vec![
             member("arcbox-vm-agent", Layer::Virt, &["libc", "tokio"]),
-            member("arcbox-vm", Layer::Virt, &["tokio"]),
+            member("arcbox-computer-runtime", Layer::Computer, &["tokio"]),
         ]);
         let report = evaluate(&graph, &[AGENT_STAYS_SMALL], &[]);
         assert_eq!(edges(&report.violations), ["arcbox-vm-agent -> tokio"]);

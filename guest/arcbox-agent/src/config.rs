@@ -7,9 +7,11 @@
 //! 2. `/etc/arcbox/vmm.toml`
 //! 3. Built-in guest defaults
 
+use arcbox_computer_runtime::VmmConfig;
+use arcbox_computer_runtime::config::{
+    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
+};
 use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, ARCBOX_RUNTIME_DIR};
-use arcbox_vm::VmmConfig;
-use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
 
 /// Persistent Btrfs mount that owns sandbox images, snapshots, and VM state.
 pub const SANDBOX_DATA_DIR: &str = "/var/lib/arcbox/sandbox";
@@ -30,7 +32,7 @@ fn guest_defaults() -> VmmConfig {
     VmmConfig {
         firecracker: FirecrackerConfig {
             binary: runtime_bin.join("firecracker").to_string_lossy().into(),
-            jailer: Some(arcbox_vm::config::JailerConfig {
+            jailer: Some(arcbox_computer_runtime::config::JailerConfig {
                 binary: runtime_bin.join("jailer").to_string_lossy().into(),
                 uid: 0,
                 gid: 0,
@@ -48,7 +50,7 @@ fn guest_defaults() -> VmmConfig {
             http_api_max_payload_size: None,
             mmds_size_limit: None,
             socket_timeout_secs: None,
-            sandbox_datapath: arcbox_vm::config::SandboxDatapath::default(),
+            sandbox_datapath: arcbox_computer_runtime::config::SandboxDatapath::default(),
             pool_size: 1,
             warm_create: true,
             dmsetup_candidates: Some(guest_dmsetup_candidates()),

@@ -50,8 +50,8 @@ The restructure plan and its locked decisions live in the company repo:
   (`snapshot`), the device-mapper copy-on-write rootfs manager checkpoints
   are cloned through (`snapshot_cow`), and the template catalog that
   promotes a snapshot into a versioned base image (`template_catalog`).
-  Consumed by `virt/arcbox-vm` guest-side today; the charter's snapshot
-  registry client belongs here rather than above it.
+  Consumed by `computer/arcbox-computer-runtime` guest-side today; the
+  charter's snapshot registry client belongs here rather than above it.
   - The device-mapper paths only *do* anything on Linux (`dmsetup`, thin
     pools) but compile everywhere, which is what lets the layer above
     keep its own platform-neutrality promise.
@@ -73,8 +73,9 @@ The restructure plan and its locked decisions live in the company repo:
   - `CowManager`'s test seam (`CowTestProbe`, `new_with_test_probe`) is
     behind the **`test-probe` feature**, not `#[cfg(test)]`: a
     `cfg(test)` item does not exist for another crate's tests, and its
-    only consumer — `arcbox-vm`'s cleanup tests — now lives in one.
-    `arcbox-vm` turns the feature on in its dev-dependencies.
+    only consumer — `arcbox-computer-runtime`'s cleanup tests — now lives
+    in one. `arcbox-computer-runtime` turns the feature on in its
+    dev-dependencies.
 
 ## Durable writes
 

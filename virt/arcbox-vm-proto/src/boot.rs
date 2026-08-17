@@ -12,9 +12,9 @@ use std::str::FromStr;
 ///
 /// Format: `ip=<client>::<gateway>:<netmask>::eth0:off`
 ///
-/// Constructed by the sandbox manager (`arcbox_vm::SandboxManager`) when
-/// building boot args, and parsed by `vm-agent` to derive the DNS
-/// nameserver from the gateway.
+/// Constructed by the sandbox manager
+/// (`arcbox_computer_runtime::SandboxManager`) when building boot args, and
+/// parsed by `vm-agent` to derive the DNS nameserver from the gateway.
 ///
 /// [`fmt::Display`] and [`FromStr`] round-trip through the same format so the
 /// encoding is defined exactly once.

@@ -5,15 +5,15 @@ on:
     branches: [master, develop]
     paths:
       - "guest/arcbox-agent/**"
-      - "virt/arcbox-vm/**"
+      - "computer/arcbox-computer-runtime/**"
       - "virt/arcbox-tap-net/**"
       - "virt/arcbox-vm-proto/**"
       - "virt/arcbox-vm-driver/**"
       - "virt/arcbox-fc-driver/**"
       - "virt/arcbox-vm-agent/**"
       # The snapshot catalog and the device-mapper CoW manager moved out of
-      # arcbox-vm; this suite is still the only one that drives dmsetup and
-      # thin pools on real KVM, so it has to follow them.
+      # arcbox-computer-runtime; this suite is still the only one that drives
+      # dmsetup and thin pools on real KVM, so it has to follow them.
       - "engine/arcbox-snapshot/**"
       - "common/arcbox-atomic-file/**"
       - "common/arcbox-constants/**"
@@ -25,15 +25,15 @@ on:
     branches: [master, develop]
     paths:
       - "guest/arcbox-agent/**"
-      - "virt/arcbox-vm/**"
+      - "computer/arcbox-computer-runtime/**"
       - "virt/arcbox-tap-net/**"
       - "virt/arcbox-vm-proto/**"
       - "virt/arcbox-vm-driver/**"
       - "virt/arcbox-fc-driver/**"
       - "virt/arcbox-vm-agent/**"
       # The snapshot catalog and the device-mapper CoW manager moved out of
-      # arcbox-vm; this suite is still the only one that drives dmsetup and
-      # thin pools on real KVM, so it has to follow them.
+      # arcbox-computer-runtime; this suite is still the only one that drives
+      # dmsetup and thin pools on real KVM, so it has to follow them.
       - "engine/arcbox-snapshot/**"
       - "common/arcbox-atomic-file/**"
       - "common/arcbox-constants/**"
@@ -79,15 +79,15 @@ jobs:
           restore-keys: linux-cargo-
 
       - name: Check formatting
-        run: cargo fmt -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot --check
+        run: cargo fmt -p arcbox-computer-runtime -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot --check
 
       - name: Clippy
-        run: cargo clippy -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot -- -D warnings
+        run: cargo clippy -p arcbox-computer-runtime -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot -- -D warnings
 
       - name: Unit tests
         # --bins covers the vm-agent guest handlers, whose tests are
         # target_os = "linux" and never run under the macOS workspace job.
-        run: cargo test --lib --bins -p arcbox-vm -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot
+        run: cargo test --lib --bins -p arcbox-computer-runtime -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot
 
   # ---------------------------------------------------------------------------
   # Job 2: integration tests — requires root (TAP interface creation)
@@ -124,10 +124,10 @@ jobs:
           sudo apt-get install -y busybox-static
 
       - name: Build test binary
-        run: cargo test --test integration -p arcbox-vm -p arcbox-tap-net --no-run
+        run: cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net --no-run
 
       - name: Run integration tests (as root for TAP creation and loop devices)
-        run: sudo env PATH="$PATH" HOME="$HOME" cargo test --test integration -p arcbox-vm -p arcbox-tap-net
+        run: sudo env PATH="$PATH" HOME="$HOME" cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net
 
   # ---------------------------------------------------------------------------
   # Job 3: E2E tests — requires KVM + root + Firecracker assets
@@ -231,7 +231,7 @@ jobs:
         run: |
           sudo env PATH="$PATH" HOME="$HOME" \
             FC_BINARY="$FC_BINARY" FC_KERNEL="$FC_KERNEL" FC_ROOTFS="$FC_ROOTFS" \
-            cargo test --test e2e -p arcbox-vm \
+            cargo test --test e2e -p arcbox-computer-runtime \
             -- --include-ignored --test-threads=1
 
       # The port's driver contract against the real Firecracker: directly,

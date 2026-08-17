@@ -116,7 +116,7 @@ static long (*bpf_skb_load_bytes)(const struct __sk_buff *skb, __u32 offset,
 #define bpf_htonl(x) (x)
 #endif
 
-/* 169.254.100.2 — arcbox_vm::network::invariant::GUEST_IP. */
+/* 169.254.100.2 — arcbox_computer_runtime::network::invariant::GUEST_IP. */
 #define GUEST_IP_BE bpf_htonl(0xa9fe6402)
 
 /* Indices into SANDBOX_NAT_POOL. */

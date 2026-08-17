@@ -556,7 +556,7 @@ async fn drive_sandboxes(
         &["/bin/sh", "-c", "ip addr show eth0"],
     )
     .await?;
-    // Mirrors GUEST_IP in virt/arcbox-vm/src/network/invariant.rs.
+    // Mirrors GUEST_IP in virt/arcbox-tap-net/src/invariant.rs.
     if !addr.contains("169.254.100.2/") {
         bail!("clone eth0 does not carry the invariant guest IP (got: {addr:?})");
     }
@@ -2281,7 +2281,7 @@ async fn pause_resume_scenario(
     }
     let addr =
         run_and_collect(processes, "smoke1", &["/bin/sh", "-c", "ip addr show eth0"]).await?;
-    // Mirrors GUEST_IP in virt/arcbox-vm/src/network/invariant.rs.
+    // Mirrors GUEST_IP in virt/arcbox-tap-net/src/invariant.rs.
     if !addr.contains("169.254.100.2/") {
         bail!("resumed eth0 does not carry the invariant guest IP (got: {addr:?})");
     }

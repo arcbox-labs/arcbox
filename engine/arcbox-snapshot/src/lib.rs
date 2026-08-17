@@ -7,8 +7,8 @@
 //!
 //! This is an engine-layer crate — daemon-free and platform-neutral. It
 //! owns durable on-disk state and knows nothing about who boots the VM:
-//! the guest-side sandbox manager (`arcbox-vm`) drives it today, and the
-//! future registry client belongs here rather than above it.
+//! the guest-side sandbox manager (`arcbox-computer-runtime`) drives it
+//! today, and the future registry client belongs here rather than above it.
 //!
 //! The device-mapper paths (`snapshot_cow`) only *do* anything on Linux,
 //! where `dmsetup` and thin pools exist; they compile everywhere so the

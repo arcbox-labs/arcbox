@@ -708,7 +708,10 @@ exit 0
     fn setup_sandbox_forwarding() {
         let config = crate::config::load();
         let subnet = &config.network.cidr;
-        let guest_ip = format!("{}/32", arcbox_vm::network::invariant::GUEST_IP);
+        let guest_ip = format!(
+            "{}/32",
+            arcbox_computer_runtime::network::invariant::GUEST_IP
+        );
 
         run_iptables(
             &["-I", "FORWARD", "-d", subnet, "-j", "ACCEPT"],
