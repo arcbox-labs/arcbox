@@ -158,21 +158,18 @@ impl TryFrom<&Metadata> for Graph {
             }
             let layer = layer_of_manifest(&metadata.workspace_root, &package.manifest_path)
                 .with_context(|| format!("placing workspace member {} in a layer", package.name))?;
-            // A crate's dev-dependency on itself (the way a crate turns on
-            // its own optional feature for its tests, e.g. `testkit`) is
-            // not an edge between layers; the graph drops it here so no
-            // rule has to special-case it. Identity is the manifest
-            // directory, not the name: a dependency on a *different*
-            // package that happens to share the name (a registry version,
-            // a renamed path dep) is a real edge and stays.
-            let own_dir = package.manifest_path.parent();
+            // A dependency that carries the crate's own name is never an
+            // edge to another workspace member: member names are unique, so
+            // it is either the crate itself (the dev-dependency a crate uses
+            // to turn on its own optional feature for its tests, e.g.
+            // `testkit`) or a foreign package that happens to share the name
+            // (a registry version). The graph keys targets by name and would
+            // resolve either to the member — a false self edge — so both are
+            // dropped here; neither is something a layer rule is about.
             let mut deps: Vec<String> = package
                 .dependencies
                 .iter()
-                .filter(|dependency| {
-                    !(dependency.name == package.name.as_str()
-                        && dependency.path.as_deref() == own_dir)
-                })
+                .filter(|dependency| dependency.name != package.name.as_str())
                 .map(|dependency| dependency.name.clone())
                 .collect();
             deps.sort();
@@ -280,9 +277,10 @@ mod tests {
         .unwrap();
         let graph = Graph::try_from(&metadata).unwrap();
         assert_eq!(graph.members.len(), 1);
-        // The path dep on its own directory is dropped; the same-named
-        // registry package is a real edge and stays.
-        assert_eq!(graph.members[0].deps, ["arcbox-vm-driver", "serde"]);
+        // Neither the dev-dep on itself nor the same-named registry package
+        // is an edge: by name both would resolve to the member itself, and
+        // neither is a dependency between two workspace members.
+        assert_eq!(graph.members[0].deps, ["serde"]);
     }
 
     #[test]
