@@ -24,9 +24,10 @@ use crate::spec::{MacAddr, NicAttachment, NicSpec, VmId};
 /// cleanup so that half of the protocol can be exercised too.
 ///
 /// It answers that protocol in the same error *classes* a real adapter
-/// does — [`Error::Unavailable`] for come-back-later (a quarantined id, a
-/// gate still held by pending generations) and
-/// [`Error::PreconditionFailed`] for a token naming no pending generation.
+/// does — [`Error::Unavailable`] for come-back-later (a pending startup
+/// sweep, which closes the whole pool; a quarantined id; a gate still held
+/// by pending generations) and [`Error::PreconditionFailed`] for a token
+/// naming no pending generation.
 /// A caller's retry and precondition handling is therefore testable over
 /// this fake; flattening either into [`Error::Network`] would make a
 /// broken path look fine here and fail against the TAP network.
@@ -84,8 +85,7 @@ impl FakeNetwork {
     }
 
     fn set_startup_pending(&self, ledger: &Ledger) {
-        let pending = ledger.startup.as_ref().is_some_and(|s| !s.host_cleaned);
-        self.startup_pending.send_replace(pending);
+        self.startup_pending.send_replace(ledger.startup_pending());
     }
 }
 
@@ -96,6 +96,12 @@ impl Default for FakeNetwork {
 }
 
 impl Ledger {
+    /// `true` while the startup sweep's host-side cleanup is pending —
+    /// the gate that closes the whole pool.
+    fn startup_pending(&self) -> bool {
+        self.startup.as_ref().is_some_and(|s| !s.host_cleaned)
+    }
+
     fn lowest_free_host(&self) -> Option<u16> {
         (FIRST_HOST..u16::MAX).find(|n| !self.used.contains(n))
     }
@@ -138,8 +144,16 @@ fn host_number(ip: IpAddr) -> Result<u16> {
 impl GuestNetwork for FakeNetwork {
     async fn reserve(&self, vm: &VmId, _policy: NetworkPolicy) -> Result<NetworkLease> {
         let mut ledger = lock(&self.ledger);
-        // A quarantined id is the protocol's retry-later case: the address
-        // comes back once the host finalizes that generation.
+        // While the startup sweep is pending the *whole* pool is closed,
+        // not just the ids in it: the host has yet to confirm that the
+        // forwarding state of a previous process is gone.
+        if ledger.startup_pending() {
+            return Err(Error::Unavailable(
+                "startup cleanup is awaiting host finalization".into(),
+            ));
+        }
+        // A quarantined id is the protocol's retry-later case too: the
+        // address comes back once the host finalizes that generation.
         if ledger.quarantined.contains_key(vm) {
             return Err(Error::Unavailable(format!(
                 "vm {vm} cleanup is awaiting host finalization"
@@ -525,7 +539,24 @@ mod tests {
             Err(Error::PreconditionFailed(_))
         ));
 
-        let a = net.reserve(&id("a"), policy()).await.unwrap();
+        // The pool is closed while the sweep is pending — every id, not
+        // just the ones in the ledger.
+        assert!(matches!(
+            net.reserve(&id("a"), policy()).await,
+            Err(Error::Unavailable(_))
+        ));
+
+        // A quarantine can still arrive alongside a pending sweep, because
+        // that is where both come from: a previous process's leases,
+        // replayed from its durable records.
+        let a = NetworkLease {
+            vm: id("a"),
+            ip: IpAddr::V4(Ipv4Addr::new(10, 200, 0, 2)),
+            prefix_len: PREFIX_LEN,
+            gateway: IpAddr::V4(GATEWAY),
+            mac: MacAddr::new([0x02, 0xfa, 0xce, 0x00, 0x00, 0x02]),
+            cleanup_token: "boot-1-a".into(),
+        };
         net.quarantine(a.clone()).await.unwrap();
         // A quarantined lease keeps the startup cleanup from finalizing —
         // retry-later, since finalizing that generation opens the gate.
@@ -547,6 +578,8 @@ mod tests {
             .unwrap();
         reconcile.finalize_startup_cleanup("boot-1").await.unwrap();
         assert_eq!(reconcile.startup_cleanup_token().await, None);
+        // The pool opens with it, and the replayed address is back in it.
+        assert_eq!(net.reserve(&id("a"), policy()).await.unwrap().ip, a.ip);
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await
             .expect("waiter released")
