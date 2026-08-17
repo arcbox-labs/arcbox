@@ -45,6 +45,7 @@ mod execution;
 mod files;
 mod lifecycle;
 mod pause;
+mod policy;
 mod pool;
 mod reconcile;
 mod record;
