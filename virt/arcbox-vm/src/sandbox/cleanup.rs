@@ -345,15 +345,14 @@ pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Strin
         .unwrap_or_else(|| id.to_owned())
 }
 
-/// Kill the sandbox's VMM process and reap it with a bounded wait: the
-/// driver's `discard` for a VMM the driver prepared, SIGKILL plus a bounded
-/// `wait` for one the restore paths still spawn themselves.
+/// Kill the sandbox's VMM process and reap it: the driver's `discard`, a
+/// SIGKILL plus a bounded wait for the reaper.
 ///
 /// Extracted so the pause path (which keeps the disk overlay) shares the exact
-/// kill/reap discipline with full release. A failed reap (the bounded wait
-/// elapsed) restores the handle so a retry can finish the job. Idempotent —
-/// the handles are `take()`n, and discarding an exited VMM just reports its
-/// status.
+/// kill/reap discipline with full release. A failed reap (the driver's
+/// bounded wait elapsed) restores the handle so a retry can finish the job.
+/// Idempotent — the prepared VMM is `take()`n, and discarding an exited one
+/// just reports its status.
 pub(super) async fn kill_sandbox_process(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
@@ -369,47 +368,6 @@ pub(super) async fn kill_sandbox_process(
         return Err(VmmError::Process(format!(
             "release the vmm of sandbox {id}: {error}"
         )));
-    }
-    let mut fc_process = {
-        let mut inst = arc.lock().unwrap();
-        if let Some(ref mut proc) = inst.process
-            && let Some(pid) = proc.pid()
-            && pid > 0
-        {
-            match nix::sys::signal::kill(
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            ) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                Err(error) => {
-                    return Err(VmmError::Process(format!(
-                        "kill firecracker for sandbox {id}: {error}"
-                    )));
-                }
-            }
-        }
-        inst.process.take()
-    };
-    if let Some(mut proc) = fc_process.take() {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), proc.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                arc.lock().unwrap().process = Some(proc);
-                return Err(VmmError::Process(format!(
-                    "reap firecracker for sandbox {id}: {error}"
-                )));
-            }
-            Err(_) => {
-                arc.lock().unwrap().process = Some(proc);
-                return Err(VmmError::Process(format!(
-                    "timed out reaping firecracker for sandbox {id}"
-                )));
-            }
-        }
     }
     Ok(())
 }

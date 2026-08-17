@@ -75,7 +75,7 @@ pub(super) fn delete_pause_snapshots(
 /// Runtime resources a successful in-place restore hands back to the
 /// instance.
 struct ResumedRuntime {
-    process: fc_sdk::FirecrackerProcess,
+    prepared: Arc<dyn PreparedVm>,
     vm: Arc<fc_sdk::Vm>,
     vsock_uds_path: PathBuf,
     network: Option<NetworkAllocation>,
@@ -378,7 +378,7 @@ impl SandboxManager {
                 let ip_address = resumed.ip_address.clone();
                 {
                     let mut inst = instance.lock().unwrap();
-                    inst.process = Some(resumed.process);
+                    inst.prepared = Some(resumed.prepared);
                     inst.vm = Some(resumed.vm);
                     inst.vsock_uds_path = Some(resumed.vsock_uds_path);
                     inst.network = resumed.network;
@@ -552,7 +552,7 @@ impl SandboxManager {
 
         // Incrementally-owned resources for the unwind.
         let mut net_alloc: Option<NetworkAllocation> = None;
-        let mut process: Option<fc_sdk::FirecrackerProcess> = None;
+        let mut prepared: Option<Arc<dyn PreparedVm>> = None;
         let mut cow_handle: Option<CowHandle> = None;
 
         let attempt: Result<ResumedRuntime> = async {
@@ -587,23 +587,16 @@ impl SandboxManager {
                 self.network.activate(net, mode)?;
             }
 
-            // Fresh chroot + Firecracker process.
-            let run_dir = cr.join("run");
-            std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
+            // Fresh chroot + VMM process, prepared through the driver (which
+            // clears the vsock socket path before spawning into the jail).
             let vsock_path = cr.join("run/firecracker.vsock");
-            let _ = std::fs::remove_file(&vsock_path);
-            let spawned = spawn_jailer(
-                &FcDriverConfig::from(fc_cfg),
-                &IsolationSpec::try_from(jailer)?,
-                id,
-            )
-            .await?;
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "Firecracker pid fits platform pid_t"
-            )]
-            let pid = spawned.pid().map(|pid| pid as i32);
-            process = Some(spawned);
+            let spawned: Arc<dyn PreparedVm> = Arc::from(
+                super::prepare_capability(&*self.driver)
+                    .prepare(&VmId::new(id)?, &IsolationSpec::try_from(jailer)?, vm_dir)
+                    .await?,
+            );
+            let pid = super::journaled_pid(&*spawned);
+            prepared = Some(spawned);
             journal(pid, None, net_alloc.as_ref())?;
 
             // Stage kernel + the retained disk + snapshot files.
@@ -678,11 +671,13 @@ impl SandboxManager {
                     host_dev_name: net.tap_name.clone(),
                 }];
             }
-            let socket = process
+            let socket = prepared
                 .as_ref()
-                .expect("process set above")
-                .socket_path()
-                .to_owned();
+                .expect("prepared set above")
+                .record()
+                .process
+                .and_then(|process| process.api_socket)
+                .unwrap_or_default();
             let vm = Arc::new(
                 fc_sdk::restore(
                     socket.to_str().ok_or_else(|| {
@@ -746,7 +741,7 @@ impl SandboxManager {
 
             journal(pid, cow_handle.as_ref(), net_alloc.as_ref())?;
             Ok(ResumedRuntime {
-                process: process.take().expect("process set above"),
+                prepared: prepared.take().expect("prepared set above"),
                 vm,
                 vsock_uds_path: vsock_path,
                 network: net_alloc.take(),
@@ -760,7 +755,7 @@ impl SandboxManager {
             Ok(resumed) => Ok(resumed),
             Err(error) => {
                 let unwound = self
-                    .unwind_resume(id, vm_dir, jailer, process, cow_handle, net_alloc)
+                    .unwind_resume(id, vm_dir, jailer, prepared, cow_handle, net_alloc)
                     .await;
                 Err(ResumeFailure { error, unwound })
             }
@@ -776,30 +771,16 @@ impl SandboxManager {
         id: &SandboxId,
         vm_dir: &Path,
         jailer: &crate::config::JailerConfig,
-        process: Option<fc_sdk::FirecrackerProcess>,
+        prepared: Option<Arc<dyn PreparedVm>>,
         cow_handle: Option<CowHandle>,
         net_alloc: Option<NetworkAllocation>,
     ) -> bool {
         let mut clean = true;
 
-        if let Some(mut proc) = process {
-            if let Some(pid) = proc.pid()
-                && pid > 0
-            {
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            if tokio::time::timeout(std::time::Duration::from_secs(5), proc.wait())
-                .await
-                .is_err()
-            {
-                warn!(sandbox_id = %id, "resume unwind: firecracker did not exit");
+        if let Some(prepared) = prepared {
+            // SIGKILL plus the driver's bounded wait for the reaper.
+            if let Err(error) = prepared.discard().await {
+                warn!(sandbox_id = %id, error = %error, "resume unwind: the vmm did not exit");
                 clean = false;
             }
         }

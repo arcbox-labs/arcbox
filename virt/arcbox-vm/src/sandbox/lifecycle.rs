@@ -569,27 +569,6 @@ impl SandboxManager {
                 warn!(sandbox_id = %id, "guest did not shut down in time; killing the vmm");
             }
         }
-        // A VMM the restore paths spawned themselves: wait, SIGKILL as a
-        // fallback, then reap.
-        let fc_process = instance.lock().unwrap().process.take();
-        if let Some(mut proc) = fc_process {
-            match tokio::time::timeout(remaining, proc.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    instance.lock().unwrap().process = Some(proc);
-                    return Err(VmmError::Process(format!(
-                        "wait for sandbox {id} firecracker: {error}"
-                    )));
-                }
-                Err(_) => {
-                    warn!(sandbox_id = %id, "guest did not shut down in time; killing firecracker");
-                    if let Err(error) = super::boot::kill_and_reap_fc_checked(&mut proc).await {
-                        instance.lock().unwrap().process = Some(proc);
-                        return Err(error);
-                    }
-                }
-            }
-        }
 
         // Release the VMM (if still alive), TAP/IP, CoW device, and chroot;
         // the record itself stays inspectable until Remove.

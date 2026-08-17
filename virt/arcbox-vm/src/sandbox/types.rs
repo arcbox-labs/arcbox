@@ -197,9 +197,6 @@ pub struct SandboxInstance {
     pub(super) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
     /// In-flight boot, retained until Remove can cancel and join it.
     pub(super) boot_task: Option<SandboxBootTask>,
-    /// Handle to the Firecracker process, for the VMMs the restore and
-    /// resume paths still spawn themselves; a boot's VMM is [`Self::prepared`].
-    pub process: Option<fc_sdk::FirecrackerProcess>,
     /// The VMM process this sandbox's VM runs on, as the driver prepared
     /// it (`arcbox_vm_driver::PreparedVm`): pid and API socket known,
     /// shared with the boot task, taken by cleanup to kill and reap it.
@@ -284,7 +281,6 @@ impl SandboxInstance {
             state: SandboxState::Starting,
             cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
             boot_task: None,
-            process: None,
             prepared: None,
             vm: None,
             network,

@@ -731,37 +731,6 @@ pub(super) fn create_rootfs_symlink(vm_dir: &Path, dm_device: &str) -> Result<St
         .ok_or_else(|| VmmError::Config(format!("non-UTF-8 path: {}", link_path.display())))
 }
 
-/// SIGKILL and reap a VMM the restore paths still spawn themselves; the
-/// driver's `PreparedVm::discard` is the same discipline for the rest.
-pub(super) async fn kill_and_reap_fc_checked(
-    process: &mut fc_sdk::FirecrackerProcess,
-) -> Result<()> {
-    if let Some(pid) = process.pid()
-        && pid > 0
-    {
-        match nix::sys::signal::kill(
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "Firecracker pid fits platform pid_t"
-            )]
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        ) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(error) => {
-                return Err(VmmError::Process(format!(
-                    "kill firecracker {pid}: {error}"
-                )));
-            }
-        }
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(5), process.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(VmmError::Process(format!("reap firecracker: {error}"))),
-        Err(_) => Err(VmmError::Process("timed out reaping firecracker".into())),
-    }
-}
-
 /// Tear down resources that could not be handed to their sandbox generation.
 ///
 /// The resource-handoff channel closes without its explicit signal in this

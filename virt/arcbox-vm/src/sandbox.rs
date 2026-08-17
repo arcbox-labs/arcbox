@@ -18,7 +18,6 @@ use arcbox_fc_driver::jail::{
     SnapshotFiles, chroot_root, link_or_copy_for_jailer, move_file, stage_kernel_for_jailer,
     stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
 };
-use arcbox_fc_driver::spawn::spawn_jailer;
 use arcbox_fc_driver::vsock::UdsListener;
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::{IsolationSpec, Prepare, PreparedVm, VmDriver, VmId};

@@ -286,7 +286,7 @@ impl SandboxManager {
         id: &str,
         reservation: IdReservation,
         error: VmmError,
-        process: Option<fc_sdk::FirecrackerProcess>,
+        prepared: Option<Arc<dyn PreparedVm>>,
         network: Option<NetworkAllocation>,
         cow_handle: Option<CowHandle>,
     ) -> VmmError {
@@ -295,16 +295,9 @@ impl SandboxManager {
             let inst = arc.lock().unwrap();
             (inst.vm_dir.clone(), inst.pool_slot_id.clone())
         };
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "Firecracker pid fits platform pid_t"
-        )]
         let state_record = super::reconcile::SandboxStateRecord::new(
             id,
-            process
-                .as_ref()
-                .and_then(fc_sdk::FirecrackerProcess::pid)
-                .map(|pid| pid as i32),
+            prepared.as_deref().and_then(super::journaled_pid),
             network.as_ref(),
             cow_handle.as_ref(),
             self.config.firecracker.jailer.is_some(),
@@ -316,7 +309,7 @@ impl SandboxManager {
             let mut inst = arc.lock().unwrap();
             inst.state = SandboxState::Failed;
             inst.error = Some(error.to_string());
-            inst.process = process;
+            inst.prepared = prepared;
             inst.network = network;
             inst.cow_handle = cow_handle;
         }
@@ -560,19 +553,15 @@ impl SandboxManager {
         // rollback_restore like freshly created ones.
         let claimed = self.claim_restore_slot(&request.snapshot_id);
         let pool_hit = claimed.is_some();
-        let (process, actual_vsock_path, effective_vmstate, effective_mem, t_spawned, t_staged) =
+        let (prepared, actual_vsock_path, effective_vmstate, effective_mem, t_spawned, t_staged) =
             if let Some(slot) = claimed {
                 // Record the adopting sandbox's slot id first: failure cleanup
                 // and crash reconciliation key the chroot and dm/CoW teardown
                 // on it (see release_runtime_resources / sweep_orphans).
                 reservation.instance().lock().unwrap().pool_slot_id = Some(slot.slot_id.clone());
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
                 let adopted_record = super::reconcile::SandboxStateRecord::new(
                     &new_id,
-                    slot.process.pid().map(|pid| pid as i32),
+                    super::journaled_pid(&*slot.prepared),
                     net_alloc.as_ref(),
                     slot.cow_handle.as_ref(),
                     true,
@@ -582,7 +571,7 @@ impl SandboxManager {
                 let handover = super::reconcile::write_state_record(&vm_dir, &adopted_record);
                 let PreparedSlot {
                     slot_id,
-                    process: slot_process,
+                    prepared: slot_prepared,
                     cow_handle,
                     vmstate_path,
                     mem_path,
@@ -627,7 +616,7 @@ impl SandboxManager {
                                 &new_id,
                                 reservation,
                                 error,
-                                Some(slot_process),
+                                Some(slot_prepared),
                                 net_alloc,
                                 pending_cow,
                             )
@@ -638,7 +627,7 @@ impl SandboxManager {
                 // collapse so the completion log reports them honestly as ~0.
                 let t_claimed = std::time::Instant::now();
                 (
-                    slot_process,
+                    slot_prepared,
                     vsock_path,
                     vmstate_path,
                     mem_path,
@@ -646,30 +635,24 @@ impl SandboxManager {
                     t_claimed,
                 )
             } else {
-                // Determine the actual host-side vsock UDS path FC will bind to
-                // on restore and ensure the socket path is clear before spawning.
-                //
-                // Each jailer restore owns a distinct chroot and vsock path.
-                let spawned: Result<(fc_sdk::FirecrackerProcess, PathBuf)> = async {
+                // Each jailer restore owns a distinct chroot and vsock path;
+                // the driver's prepared VMM clears the socket path before
+                // spawning into it.
+                let spawned: Result<(Arc<dyn PreparedVm>, PathBuf)> = async {
                     let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
                     let cr = chroot_root(&fc_cfg.binary, base, &new_id);
-                    // Ensure the `run/` directory exists inside the new chroot so
-                    // FC can create the vsock socket there on restore.
-                    let run_dir = cr.join("run");
-                    std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
                     let vsock_path = cr.join("run/firecracker.vsock");
-                    let _ = std::fs::remove_file(&vsock_path);
-
-                    let proc = spawn_jailer(
-                        &FcDriverConfig::from(fc_cfg),
-                        &IsolationSpec::try_from(jailer)?,
-                        &new_id,
-                    )
-                    .await?;
-                    Ok((proc, vsock_path))
+                    let prepared = super::prepare_capability(&*self.driver)
+                        .prepare(
+                            &VmId::new(&new_id)?,
+                            &IsolationSpec::try_from(jailer)?,
+                            &vm_dir,
+                        )
+                        .await?;
+                    Ok((Arc::from(prepared), vsock_path))
                 }
                 .await;
-                let (spawned_process, vsock_path) = match spawned {
+                let (spawned_prepared, vsock_path) = match spawned {
                     Ok(spawned) => spawned,
                     Err(error) => {
                         return Err(self
@@ -678,11 +661,7 @@ impl SandboxManager {
                     }
                 };
 
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
-                let pid = spawned_process.pid().map(|pid| pid as i32);
+                let pid = super::journaled_pid(&*spawned_prepared);
                 let journal = |cow: Option<&CowHandle>| {
                     super::reconcile::write_state_record(
                         &vm_dir,
@@ -702,7 +681,7 @@ impl SandboxManager {
                             &new_id,
                             reservation,
                             error,
-                            Some(spawned_process),
+                            Some(Arc::clone(&spawned_prepared)),
                             net_alloc,
                             None,
                         )
@@ -771,7 +750,7 @@ impl SandboxManager {
                                 &new_id,
                                 reservation,
                                 error,
-                                Some(spawned_process),
+                                Some(Arc::clone(&spawned_prepared)),
                                 net_alloc,
                                 pending_cow,
                             )
@@ -779,7 +758,7 @@ impl SandboxManager {
                     }
                 };
                 (
-                    spawned_process,
+                    spawned_prepared,
                     vsock_path,
                     effective_vmstate,
                     effective_mem,
@@ -806,9 +785,13 @@ impl SandboxManager {
             }];
         }
 
-        // In jailer mode, the actual socket path is inside the chroot; use the
-        // path reported by the process handle instead of vm_dir's socket_path.
-        let effective_socket = process.socket_path().to_owned();
+        // The API socket the driver's prepared VMM answers on — inside the
+        // chroot in jailer mode.
+        let effective_socket = prepared
+            .record()
+            .process
+            .and_then(|process| process.api_socket)
+            .unwrap_or_default();
         let vm = match fc_sdk::restore(effective_socket.to_str().unwrap(), load_params).await {
             Ok(v) => Arc::new(v),
             Err(e) => {
@@ -817,7 +800,7 @@ impl SandboxManager {
                         &new_id,
                         reservation,
                         VmmError::from(e),
-                        Some(process),
+                        Some(prepared),
                         net_alloc,
                         pending_cow,
                     )
@@ -899,7 +882,7 @@ impl SandboxManager {
                     &new_id,
                     reservation,
                     error,
-                    Some(process),
+                    Some(Arc::clone(&prepared)),
                     net_alloc,
                     pending_cow,
                 )
@@ -911,13 +894,9 @@ impl SandboxManager {
         // Persist cleanup metadata before handing runtime resources to the
         // instance. A failed durable write aborts and unwinds every resource.
         let adopted_slot = reservation.instance().lock().unwrap().pool_slot_id.clone();
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "Firecracker pid fits platform pid_t"
-        )]
         let state_record = super::reconcile::SandboxStateRecord::new(
             &new_id,
-            process.pid().map(|pid| pid as i32),
+            super::journaled_pid(&*prepared),
             net_alloc.as_ref(),
             pending_cow.as_ref(),
             true,
@@ -930,7 +909,7 @@ impl SandboxManager {
                     &new_id,
                     reservation,
                     error,
-                    Some(process),
+                    Some(Arc::clone(&prepared)),
                     net_alloc,
                     pending_cow,
                 )
@@ -952,7 +931,7 @@ impl SandboxManager {
                         &new_id,
                         reservation,
                         error,
-                        Some(process),
+                        Some(Arc::clone(&prepared)),
                         net_alloc,
                         pending_cow,
                     )
@@ -970,7 +949,7 @@ impl SandboxManager {
         {
             let mut inst = arc.lock().unwrap();
             inst.network.clone_from(&net_alloc);
-            inst.process = Some(process);
+            inst.prepared = Some(prepared);
             inst.vm = Some(vm);
             inst.vsock_uds_path = Some(actual_vsock_path.clone());
             inst.cow_handle = pending_cow.take();
