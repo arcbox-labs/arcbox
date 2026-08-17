@@ -9,6 +9,6 @@ mod phase;
 mod store;
 
 pub(super) use phase::{
-    ProvisionIntent, SandboxPhase, SandboxProvisionOutcome, SandboxRecord, SandboxTransition,
+    PersistPhase, ProvisionIntent, SandboxProvisionOutcome, SandboxRecord, SandboxTransition,
 };
 pub(super) use store::SandboxRecordStore;

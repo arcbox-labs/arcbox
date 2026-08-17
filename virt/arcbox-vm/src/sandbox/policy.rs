@@ -6,4 +6,5 @@
 //! decisions stay next to the resources they own.
 
 pub(super) mod pool;
+pub(super) mod recovery;
 pub(super) mod warm;

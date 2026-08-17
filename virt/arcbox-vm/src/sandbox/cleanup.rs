@@ -405,7 +405,7 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::record::{ProvisionIntent, SandboxPhase, SandboxProvisionOutcome};
+    use crate::sandbox::record::{PersistPhase, ProvisionIntent, SandboxProvisionOutcome};
     use crate::snapshot_cow::{CowOptions, CowTestProbe};
     use std::os::unix::fs::PermissionsExt;
 
@@ -965,7 +965,7 @@ mod tests {
         assert_eq!(expected.lock().unwrap().state, SandboxState::Stopping);
         assert_eq!(
             records.load("job").unwrap().unwrap().phase,
-            SandboxPhase::Removing
+            PersistPhase::Removing
         );
     }
 }

@@ -284,7 +284,7 @@ pub(super) fn assert_failed_and_released(
     );
     assert_eq!(
         manager.records.load(id).unwrap().unwrap().phase,
-        super::record::SandboxPhase::Failed
+        super::record::PersistPhase::Failed
     );
     assert!(
         !inst.vm_dir.join("state.json").exists(),
