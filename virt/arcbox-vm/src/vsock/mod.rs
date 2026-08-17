@@ -9,7 +9,7 @@
 //! frame codec speaks over. Where that connection comes from is the
 //! driver's business.
 //!
-//! The capability comes off the running VM's handle ([`HandleVsock`] keeps
+//! The capability comes off the running VM's handle (`HandleVsock` keeps
 //! that handle alive for the callers that hold the vsock across awaits).
 //! In the other direction — the guest agent's readiness dial-out — the
 //! boot pre-listens through the driver's `VsockListen` capability and
@@ -21,8 +21,8 @@
 //! [`WaitPortReq`]) are the exec-channel vocabulary in
 //! [`arcbox_vm_proto::exec`], re-exported here. This module holds the
 //! connection and framing layer plus the shared types; the protocols each
-//! have a file of their own: [`exec`] (`run`, `exec`), [`clock`]
-//! (`sync_clock`), [`net`] (`reconfigure_network`), [`wait_port`]
+//! have a file of their own: `exec` (`run`, `exec`), `clock`
+//! (`sync_clock`), `net` (`reconfigure_network`), `wait_port`
 //! (`wait_for_port`).
 
 use std::time::Duration;
@@ -152,16 +152,16 @@ async fn connect_to_agent(vsock: &dyn Vsock) -> Result<UnixStream> {
 ///
 /// Same retry semantics as [`connect_to_agent`].  Used by the file I/O and
 /// port-forward modules which operate on different vsock ports. Retries
-/// only on [`arcbox_vm_driver::Error::Io`] of kind
-/// [`ConnectionRefused`](std::io::ErrorKind::ConnectionRefused) — the
-/// port's "no guest listener yet" answer; every other error is final.
+/// only on the two transient answers [`is_transient`] names — no guest
+/// listener yet, or a VM frozen for a checkpoint; every other error is
+/// final.
 pub(crate) async fn connect_to_port(vsock: &dyn Vsock, port: u32) -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + AGENT_READY_TIMEOUT;
     let mut backoff = AGENT_READY_INITIAL_BACKOFF;
     loop {
         match vsock.dial(port).await {
             Ok(conn) => return into_unix_stream(conn),
-            Err(error) if is_not_listening(&error) => {}
+            Err(error) if is_transient(&error) => {}
             Err(error) => return Err(error.into()),
         }
         if tokio::time::Instant::now() >= deadline {
@@ -175,13 +175,24 @@ pub(crate) async fn connect_to_port(vsock: &dyn Vsock, port: u32) -> Result<Unix
     }
 }
 
-/// The dial outcome [`connect_to_port`] retries: the guest has no listener
-/// on the port yet.
-fn is_not_listening(error: &arcbox_vm_driver::Error) -> bool {
-    matches!(
-        error,
-        arcbox_vm_driver::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused
-    )
+/// The dial outcomes [`connect_to_port`] retries: the guest has no listener
+/// on the port yet ([`arcbox_vm_driver::Error::Io`] of kind
+/// [`ConnectionRefused`](std::io::ErrorKind::ConnectionRefused), the port's
+/// answer for that), or the VM is frozen for a checkpoint
+/// ([`arcbox_vm_driver::VmState::Quiesced`]). The second is a moment, not
+/// a state to fail on: a file read or an exec that races a checkpoint used
+/// to sit on the VMM's connect until the guest resumed, and the driver's
+/// refusal to dial a quiesced VM must not turn that wait into an error. A
+/// VM that stays frozen — pause holds it, then kills it — turns the retry
+/// into the exited-VM error or the ready budget's.
+fn is_transient(error: &arcbox_vm_driver::Error) -> bool {
+    match error {
+        arcbox_vm_driver::Error::Io(io) => io.kind() == std::io::ErrorKind::ConnectionRefused,
+        arcbox_vm_driver::Error::WrongState { state, .. } => {
+            *state == arcbox_vm_driver::VmState::Quiesced
+        }
+        _ => false,
+    }
 }
 
 /// Register a dialed connection with the tokio reactor.
@@ -365,9 +376,27 @@ mod tests {
         std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into()
     }
 
+    fn quiesced() -> arcbox_vm_driver::Error {
+        arcbox_vm_driver::Error::WrongState {
+            id: arcbox_vm_driver::VmId::new("vm").unwrap(),
+            state: arcbox_vm_driver::VmState::Quiesced,
+            expected: "running",
+        }
+    }
+
     #[tokio::test]
     async fn connect_retries_only_while_the_guest_is_not_listening() {
         let vsock = ScriptedVsock::new([Err(refused()), Err(refused()), Ok(IoMode::Async)]);
+        connect_to_port(&vsock, AGENT_PORT).await.unwrap();
+        assert_eq!(vsock.dials(), 3);
+    }
+
+    /// A VM frozen for a checkpoint is dialed again once it thaws — the
+    /// wait a caller racing a checkpoint always had — while an exited VM
+    /// is final.
+    #[tokio::test]
+    async fn connect_waits_out_a_quiesced_vm() {
+        let vsock = ScriptedVsock::new([Err(quiesced()), Err(quiesced()), Ok(IoMode::Async)]);
         connect_to_port(&vsock, AGENT_PORT).await.unwrap();
         assert_eq!(vsock.dials(), 3);
     }
