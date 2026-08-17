@@ -194,10 +194,11 @@ pub struct VmSpec {
 impl VmSpec {
     /// Checks the invariants no driver can repair.
     ///
-    /// CPU and memory are at least 1; disk ids, NIC ids and share tags are
-    /// non-empty and unique; at most one disk is the root; every MAC is a
-    /// non-nil unicast address; every boot, disk and share path is
-    /// non-empty; the vsock guest CID is 3 or above.
+    /// CPU and memory are at least 1; disk ids are plain names under the
+    /// [`VmId`] rule and unique; NIC ids and share tags are non-empty and
+    /// unique; at most one disk is the root; every MAC is a non-nil unicast
+    /// address; every boot, disk and share path is non-empty; the vsock
+    /// guest CID is 3 or above.
     pub fn validate(&self) -> Result<()> {
         if self.cpus == 0 {
             return Err(Error::InvalidSpec("cpus must be at least 1".into()));
@@ -208,9 +209,7 @@ impl VmSpec {
         self.boot.validate()?;
         let mut disk_ids = HashSet::new();
         for disk in &self.disks {
-            if disk.id.is_empty() {
-                return Err(Error::InvalidSpec("disk id must not be empty".into()));
-            }
+            require_plain_name("disk id", &disk.id)?;
             if !disk_ids.insert(disk.id.as_str()) {
                 return Err(Error::InvalidSpec(format!(
                     "duplicate disk id `{}`",
@@ -350,7 +349,9 @@ impl BootSpec {
 /// One block device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskSpec {
-    /// Unique within the spec; drivers use it as the device's name.
+    /// Unique within the spec; drivers use it as the device's name, and as
+    /// a file name or URL segment, so it is held to the [`VmId`] rule
+    /// (`[A-Za-z0-9._-]`, at most 64 characters, not `.` or `..`).
     pub id: String,
     /// The backing file on the host.
     pub path: PathBuf,
@@ -637,6 +638,24 @@ mod tests {
         let mut s = spec();
         s.disks[0].path = PathBuf::new();
         assert!(invalid(&s).contains("disk path"));
+    }
+
+    #[test]
+    fn disk_ids_are_plain_names() {
+        for bad in [
+            ".",
+            "..",
+            "a/b",
+            "has space",
+            "x".repeat(VmId::MAX_LEN + 1).as_str(),
+        ] {
+            let mut s = spec();
+            s.disks[0].id = bad.into();
+            assert!(invalid(&s).contains("disk id"), "`{bad}` accepted");
+        }
+        let mut s = spec();
+        s.disks[0].id = "root.fs_v2-a".into();
+        s.validate().unwrap();
     }
 
     #[test]
