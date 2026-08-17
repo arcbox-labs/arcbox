@@ -30,6 +30,7 @@ fn snapshot_catalog_persists_across_instances() {
                 rootfs_path: None,
                 net_invariant: false,
                 geometry: None,
+                format: "firecracker/v1".into(),
             })
             .unwrap()
             .id

@@ -11,8 +11,8 @@ use crate::file_io::{self, DirWatch, proto::FileStatDto};
 impl SandboxManager {
     /// Read a file from inside an alive sandbox over the vsock file channel.
     pub async fn read_sandbox_file(&self, id: &SandboxId, path: &str) -> Result<Vec<u8>> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::read_file(&uds, path).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::read_file(vsock.as_ref(), path).await
     }
 
     /// Write a file into an alive sandbox over the vsock file channel.
@@ -23,30 +23,30 @@ impl SandboxManager {
         mode: u32,
         data: &[u8],
     ) -> Result<()> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::write_file(&uds, path, mode, data).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::write_file(vsock.as_ref(), path, mode, data).await
     }
 
     /// Stat one path inside an alive sandbox (symlinks reported, not
     /// followed).
     pub async fn stat_sandbox_path(&self, id: &SandboxId, path: &str) -> Result<FileStatDto> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::stat_file(&uds, path).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::stat_file(vsock.as_ref(), path).await
     }
 
     /// List a directory inside an alive sandbox, non-recursively, with full
     /// per-entry metadata.
     pub async fn list_sandbox_dir(&self, id: &SandboxId, path: &str) -> Result<Vec<FileStatDto>> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::list_dir(&uds, path).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::list_dir(vsock.as_ref(), path).await
     }
 
     /// Create a directory (and missing parents) inside an alive sandbox.
     /// Succeeds when the directory already exists. `mode` must already be
     /// defaulted by the caller.
     pub async fn make_sandbox_dir(&self, id: &SandboxId, path: &str, mode: u32) -> Result<()> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::make_dir(&uds, path, mode).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::make_dir(vsock.as_ref(), path, mode).await
     }
 
     /// Remove a file, symlink, or directory inside an alive sandbox. A
@@ -57,14 +57,14 @@ impl SandboxManager {
         path: &str,
         recursive: bool,
     ) -> Result<()> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::remove_entry(&uds, path, recursive).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::remove_entry(vsock.as_ref(), path, recursive).await
     }
 
     /// Rename / move an entry within an alive sandbox.
     pub async fn move_sandbox_path(&self, id: &SandboxId, from: &str, to: &str) -> Result<()> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::move_entry(&uds, from, to).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::move_entry(vsock.as_ref(), from, to).await
     }
 
     /// Open a directory watch inside an alive sandbox. The returned stream
@@ -75,7 +75,7 @@ impl SandboxManager {
         path: &str,
         recursive: bool,
     ) -> Result<DirWatch> {
-        let uds = self.require_alive_vsock(id)?;
-        file_io::watch_dir(&uds, path, recursive).await
+        let vsock = self.require_alive_vsock(id)?;
+        file_io::watch_dir(vsock.as_ref(), path, recursive).await
     }
 }

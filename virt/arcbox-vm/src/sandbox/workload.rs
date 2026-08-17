@@ -148,7 +148,7 @@ fn spawn_exit_watcher(
 /// rolls the claim back to `Ready`.
 pub(super) async fn start_run_workload(
     id: &SandboxId,
-    uds_path: &Path,
+    vsock: &dyn arcbox_vm_driver::Vsock,
     start: StartCommand,
     instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
@@ -156,7 +156,7 @@ pub(super) async fn start_run_workload(
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
     claim_workload(id, instances, claim)?;
 
-    let inner_rx = match vsock::run(uds_path, start).await {
+    let inner_rx = match vsock::run(vsock, start).await {
         Ok(rx) => rx,
         Err(e) => {
             release_running(id, instances);
@@ -184,7 +184,7 @@ impl SandboxManager {
         tty_size: Option<(u16, u16)>,
         timeout_seconds: u32,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
-        let uds_path = self.require_ready_vsock(id)?;
+        let vsock = self.require_ready_vsock(id)?;
 
         let start = StartCommand {
             cmd,
@@ -199,7 +199,7 @@ impl SandboxManager {
 
         start_run_workload(
             id,
-            &uds_path,
+            vsock.as_ref(),
             start,
             &self.instances,
             &self.events_tx,

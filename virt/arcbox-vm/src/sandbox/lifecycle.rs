@@ -789,11 +789,15 @@ impl SandboxManager {
             .ok_or_else(|| VmmError::NotFound(id.clone()))
     }
 
-    /// Verify the sandbox is `Ready` and return its vsock UDS path.
+    /// Verify the sandbox is `Ready` and return the vsock capability that
+    /// reaches its guest agent.
     ///
     /// A paused sandbox answers [`VmmError::Paused`], not `WrongState`, so
     /// the daemon can resume it transparently and retry (CORE-21).
-    pub(super) fn require_ready_vsock(&self, id: &SandboxId) -> Result<PathBuf> {
+    pub(super) fn require_ready_vsock(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
@@ -809,17 +813,18 @@ impl SandboxManager {
                 });
             }
         }
-        inst.vsock_uds_path
-            .clone()
-            .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no vsock configured")))
+        guest_vsock(id, &inst)
     }
 
-    /// Verify the sandbox is alive (Ready or Running) and return its vsock
-    /// UDS path. Unlike [`Self::require_ready_vsock`], an in-flight workload
-    /// does not block the operation — file I/O works alongside Run/Exec.
-    /// Paused states map to [`VmmError::Paused`] for the daemon's
-    /// transparent resume, as above.
-    pub(super) fn require_alive_vsock(&self, id: &SandboxId) -> Result<PathBuf> {
+    /// Verify the sandbox is alive (Ready or Running) and return the vsock
+    /// capability that reaches its guest agent. Unlike
+    /// [`Self::require_ready_vsock`], an in-flight workload does not block
+    /// the operation — file I/O works alongside Run/Exec. Paused states map
+    /// to [`VmmError::Paused`] for the daemon's transparent resume, as above.
+    pub(super) fn require_alive_vsock(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
@@ -835,10 +840,17 @@ impl SandboxManager {
                 });
             }
         }
-        inst.vsock_uds_path
-            .clone()
-            .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no vsock configured")))
+        guest_vsock(id, &inst)
     }
+}
+
+/// The vsock capability reaching `inst`'s guest agent, once a boot or
+/// restore has handed one over.
+fn guest_vsock(id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
+    inst.vsock_uds_path
+        .clone()
+        .map(|path| Arc::new(vsock::UdsVsock(path)) as Arc<dyn arcbox_vm_driver::Vsock>)
+        .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no vsock configured")))
 }
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.

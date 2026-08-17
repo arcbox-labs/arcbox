@@ -37,6 +37,15 @@ pub enum VmmError {
     #[error("fc-sdk error: {0}")]
     Sdk(#[from] fc_sdk::Error),
 
+    /// The VM driver — the port's adapter, or a capability reached through
+    /// it — failed in a way that has no native shape here (an adapter
+    /// fault, a foreign checkpoint). The port's `NotFound`, `WrongState`,
+    /// `Io`, `Network` and `InvalidSpec` land on their native variants
+    /// instead (see the `From` impl), so the guest agent's wire mapping
+    /// keeps answering 404 / 412 for them rather than 500.
+    #[error("driver error: {0}")]
+    Driver(#[source] arcbox_vm_driver::Error),
+
     /// Network-related error (TAP creation, IP allocation, etc.).
     #[error("network error: {0}")]
     Network(String),
@@ -157,6 +166,34 @@ impl From<arcbox_snapshot::SnapshotError> for VmmError {
             S::TemplateVersionExists(msg) => Self::TemplateVersionExists(msg),
             S::FailedPrecondition(msg) => Self::FailedPrecondition(msg),
             S::Unavailable(msg) => Self::Unavailable(msg),
+        }
+    }
+}
+
+/// Variant-for-variant where a native shape exists, so a driver-reported
+/// `NotFound` or `WrongState` keeps the wire code the equivalent native
+/// error already has (the guest agent classifies `VmmError` by variant;
+/// anything it does not know becomes a 500). What has no native shape —
+/// an adapter fault, a checkpoint another driver wrote — stays
+/// [`VmmError::Driver`] with the port error intact for its `source` chain.
+impl From<arcbox_vm_driver::Error> for VmmError {
+    fn from(err: arcbox_vm_driver::Error) -> Self {
+        use arcbox_vm_driver::Error as D;
+        match err {
+            D::NotFound(id) => Self::NotFound(id.to_string()),
+            D::WrongState {
+                id,
+                state,
+                expected,
+            } => Self::WrongState {
+                id: id.to_string(),
+                expected: expected.to_string(),
+                actual: state.to_string(),
+            },
+            D::Io(io) => Self::Io(io),
+            D::Network(msg) => Self::Network(msg),
+            D::InvalidSpec(msg) => Self::Config(msg),
+            other @ (D::Driver { .. } | D::ForeignCheckpoint(_)) => Self::Driver(other),
         }
     }
 }

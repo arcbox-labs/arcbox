@@ -72,6 +72,23 @@ pub struct SnapshotMeta {
     /// `None` (consumers that need it reject with an actionable error).
     #[serde(default)]
     pub geometry: Option<SnapshotGeometry>,
+    /// The checkpoint image's on-disk format, named by the driver that
+    /// wrote it — a restore hands the image only to a driver that names the
+    /// same format. Defaults to [`LEGACY_FORMAT`] for entries catalogued
+    /// before the field existed.
+    #[serde(default = "legacy_format")]
+    pub format: String,
+}
+
+/// The image format of every entry catalogued before
+/// [`SnapshotMeta::format`] was recorded.
+///
+/// Firecracker was the only VMM writing checkpoints then, so a `meta.json`
+/// without the field is a Firecracker `vmstate` + `mem` pair.
+pub const LEGACY_FORMAT: &str = "firecracker/v1";
+
+fn legacy_format() -> String {
+    LEGACY_FORMAT.to_owned()
 }
 
 /// Info returned to callers / gRPC layer.
@@ -182,6 +199,8 @@ pub struct SnapshotDraft {
     pub net_invariant: bool,
     /// Capture-time VM geometry, when the producer knows it.
     pub geometry: Option<SnapshotGeometry>,
+    /// The image format the producer wrote (see [`SnapshotMeta::format`]).
+    pub format: String,
 }
 
 /// A snapshot being written, not yet part of the catalog.
@@ -237,6 +256,7 @@ impl PendingSnapshot<'_> {
             rootfs_path: draft.rootfs_path,
             net_invariant: draft.net_invariant,
             geometry: draft.geometry,
+            format: draft.format,
         };
 
         sync_private_file(&staging.join(VMSTATE_FILE))?;
@@ -526,6 +546,7 @@ mod tests {
             rootfs_path: None,
             net_invariant: false,
             geometry: None,
+            format: "fake/v1".into(),
         }
     }
 
@@ -618,9 +639,30 @@ mod tests {
         let listed = catalog.list("vm-1").unwrap();
         assert_eq!(listed.len(), 1, "pre-labels snapshot must still load");
         assert!(listed[0].labels.is_empty());
+        let meta = catalog.get("vm-1", "old-snap").unwrap();
         // Field absent on disk → legacy addressing → the reconfig-RPC restore
         // path must stay selected.
-        assert!(!catalog.get("vm-1", "old-snap").unwrap().net_invariant);
+        assert!(!meta.net_invariant);
+        // Field absent on disk → written by the only VMM there was.
+        assert_eq!(meta.format, LEGACY_FORMAT);
+    }
+
+    #[test]
+    fn format_survives_the_catalog_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = publish(
+            &catalog,
+            "vm-1",
+            SnapshotDraft {
+                format: "cloud-hypervisor/v3".into(),
+                ..draft()
+            },
+        );
+        assert_eq!(
+            catalog.get("vm-1", &meta.id).unwrap().format,
+            "cloud-hypervisor/v3"
+        );
     }
 
     #[test]

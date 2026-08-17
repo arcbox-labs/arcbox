@@ -132,6 +132,7 @@ impl SandboxManager {
             rootfs_path: Some(rootfs_path.clone()),
             net_invariant: source.net_invariant,
             geometry: Some(geometry),
+            format: source.format,
         })?;
         info!(
             template = template_name,
@@ -421,6 +422,7 @@ mod tests {
                 rootfs_path: Some("/cache/rootfs-tpl.ext4".into()),
                 net_invariant: true,
                 geometry: None,
+                format: crate::sandbox::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap()
             .id
@@ -492,6 +494,7 @@ mod tests {
                     vcpus: 2,
                     memory_mib: 512,
                 }),
+                format: crate::sandbox::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap()
             .id;

@@ -691,6 +691,8 @@ impl SandboxManager {
                 .await
                 .map_err(VmmError::from)?,
             );
+            let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
+                Arc::new(vsock::UdsVsock(vsock_path.clone()));
 
             // Clock sync is DETACHED, mirroring restore and cold boot
             // (CORE-80): the guest wall clock froze at pause time, but
@@ -700,11 +702,11 @@ impl SandboxManager {
             // on the resume critical path.
             {
                 let id = id.clone();
-                let vsock_path = vsock_path.clone();
+                let vsock = Arc::clone(&vsock);
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        vsock::sync_clock(&vsock_path),
+                        vsock::sync_clock(vsock.as_ref()),
                     )
                     .await
                     {
@@ -733,7 +735,7 @@ impl SandboxManager {
                 };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    vsock::reconfigure_network(&vsock_path, &cmd),
+                    vsock::reconfigure_network(vsock.as_ref(), &cmd),
                 )
                 .await
                 .map_err(|_| VmmError::Vsock("net reconfig after resume timed out".into()))
@@ -1042,6 +1044,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: false,
                 geometry: None,
+                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap();
         let pending = manager.snapshots.begin("box").unwrap();
@@ -1056,6 +1059,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: false,
                 geometry: None,
+                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap();
 
@@ -1096,6 +1100,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: false,
                 geometry: None,
+                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap();
 

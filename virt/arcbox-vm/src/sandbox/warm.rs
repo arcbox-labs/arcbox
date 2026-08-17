@@ -622,6 +622,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: true,
                 geometry: None,
+                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap()
             .id

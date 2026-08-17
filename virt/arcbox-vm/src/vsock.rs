@@ -1,9 +1,20 @@
 //! Host-side vsock client for communicating with the in-VM guest agent.
 //!
+//! ## Reaching the guest
+//!
+//! Every protocol function here dials the guest through the driver port's
+//! [`Vsock`] capability: [`connect_to_port`] asks it for a connection to a
+//! guest port and retries — only — while the guest has no listener there
+//! yet, then turns the [`VsockConn`] it hands back into the tokio stream the
+//! frame codec speaks over. Where that connection comes from is the
+//! driver's business.
+//!
 //! ## How Firecracker proxies vsock
 //!
-//! Firecracker exposes a Unix domain socket (`uds_path`) that acts as a proxy
-//! for host-initiated connections to guest vsock ports.  The handshake:
+//! Until the Firecracker adapter owns it, [`UdsVsock`] performs the
+//! dial: Firecracker exposes a Unix domain socket (`uds_path`) that acts as
+//! a proxy for host-initiated connections to guest vsock ports.  The
+//! handshake:
 //!
 //! 1. Connect to `uds_path`.
 //! 2. Write `"CONNECT {AGENT_PORT}\n"`.
@@ -24,6 +35,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -37,6 +49,9 @@ pub(crate) use arcbox_vm_proto::exec::{MAX_FRAME_SIZE, MSG_CLOCK_SYNC, MSG_NET_R
 use arcbox_vm_proto::exec::{
     MSG_EOF, MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_START, MSG_STDERR, MSG_STDIN, MSG_STDOUT,
 };
+
+mod uds;
+pub use uds::UdsVsock;
 
 // =============================================================================
 // Public types
@@ -135,37 +150,65 @@ fn next_backoff(current: Duration) -> Duration {
 
 /// Open a host-initiated vsock connection to the guest agent (port 52).
 ///
-/// Retries the `CONNECT` handshake until the guest agent accepts or
-/// [`AGENT_READY_TIMEOUT`] elapses.  Firecracker responds with "connection
-/// closed" when no listener is active on the guest vsock port yet (kernel
-/// still booting / vm-agent not started), so that response is treated as a
-/// transient error and retried.
-async fn connect_to_agent(uds_path: &Path) -> Result<UnixStream> {
-    connect_to_port(uds_path, AGENT_PORT).await
+/// Retries the dial until the guest agent accepts or [`AGENT_READY_TIMEOUT`]
+/// elapses: a guest still booting (kernel up, vm-agent not yet listening)
+/// answers every dial with `ConnectionRefused`, the one transient outcome.
+async fn connect_to_agent(vsock: &dyn Vsock) -> Result<UnixStream> {
+    connect_to_port(vsock, AGENT_PORT).await
 }
 
 /// Open a host-initiated vsock connection to an arbitrary guest port.
 ///
 /// Same retry semantics as [`connect_to_agent`].  Used by the file I/O and
-/// port-forward modules which operate on different vsock ports.
-pub(crate) async fn connect_to_port(uds_path: &Path, port: u32) -> Result<UnixStream> {
+/// port-forward modules which operate on different vsock ports. Retries
+/// only on [`arcbox_vm_driver::Error::Io`] of kind
+/// [`ConnectionRefused`](std::io::ErrorKind::ConnectionRefused) — the
+/// port's "no guest listener yet" answer; every other error is final.
+pub(crate) async fn connect_to_port(vsock: &dyn Vsock, port: u32) -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + AGENT_READY_TIMEOUT;
     let mut backoff = AGENT_READY_INITIAL_BACKOFF;
     loop {
-        match try_vsock_handshake(uds_path, port).await {
-            Ok(stream) => return Ok(stream),
-            Err(VmmError::Vsock(ref msg)) if msg.contains("connection closed") => {}
-            Err(e) => return Err(e),
+        match vsock.dial(port).await {
+            Ok(conn) => return into_unix_stream(conn),
+            Err(error) if is_not_listening(&error) => {}
+            Err(error) => return Err(error.into()),
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(VmmError::Vsock(format!(
-                "vsock port {port} on {} did not become ready within {}s",
-                uds_path.display(),
+                "vsock port {port} did not become ready within {}s",
                 AGENT_READY_TIMEOUT.as_secs(),
             )));
         }
         tokio::time::sleep(backoff).await;
         backoff = next_backoff(backoff);
+    }
+}
+
+/// The dial outcome [`connect_to_port`] retries: the guest has no listener
+/// on the port yet.
+fn is_not_listening(error: &arcbox_vm_driver::Error) -> bool {
+    matches!(
+        error,
+        arcbox_vm_driver::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Register a dialed connection with the tokio reactor.
+///
+/// This client is tokio tasks all the way down and has no blocking-thread
+/// transport, so a connection whose driver requires [`IoMode::Blocking`] is
+/// refused rather than misregistered with the reactor.
+fn into_unix_stream(conn: VsockConn) -> Result<UnixStream> {
+    match conn.mode {
+        IoMode::Async => {
+            let stream = std::os::unix::net::UnixStream::from(conn.fd);
+            stream.set_nonblocking(true)?;
+            Ok(UnixStream::from_std(stream)?)
+        }
+        IoMode::Blocking => Err(VmmError::Vsock(
+            "vsock connection requires blocking I/O, which the guest-agent client cannot drive"
+                .into(),
+        )),
     }
 }
 
@@ -372,10 +415,10 @@ async fn drain_output<R: AsyncReadExt + Unpin>(
 /// Returns a channel receiver.  The final [`OutputChunk`] has
 /// `stream == "exit"` and carries the process exit code.
 pub async fn run(
-    uds_path: &Path,
+    vsock: &dyn Vsock,
     start: StartCommand,
 ) -> Result<mpsc::Receiver<Result<OutputChunk>>> {
-    let mut stream = connect_to_agent(uds_path).await?;
+    let mut stream = connect_to_agent(vsock).await?;
 
     // Send the start command.
     let payload = serde_json::to_vec(&start)
@@ -408,13 +451,13 @@ pub async fn run(
 /// - Read [`OutputChunk`]s from `output_receiver` for stdout, stderr, and the
 ///   final exit frame.
 pub async fn exec(
-    uds_path: &Path,
+    vsock: &dyn Vsock,
     start: StartCommand,
 ) -> Result<(
     mpsc::Sender<ExecInputMsg>,
     mpsc::Receiver<Result<OutputChunk>>,
 )> {
-    let stream = connect_to_agent(uds_path).await?;
+    let stream = connect_to_agent(vsock).await?;
 
     // Send the start command.
     let payload = serde_json::to_vec(&start)
@@ -484,12 +527,12 @@ pub enum ClockSync {
 /// round trip itself failed (connect, transport, malformed reply); an agent
 /// that answered-but-failed is `Ok(ClockSync::AgentError)` so callers can
 /// separate liveness from the clock side effect.
-pub async fn sync_clock(uds_path: &Path) -> Result<ClockSync> {
+pub async fn sync_clock(vsock: &dyn Vsock) -> Result<ClockSync> {
     // Split connect vs frame RTT: on a just-resumed guest these have very
     // different causes (vsock handshake vs guest-side processing), and the
     // CORE-75 settle-window investigation needs them attributable.
     let started = std::time::Instant::now();
-    let mut stream = connect_to_agent(uds_path).await?;
+    let mut stream = connect_to_agent(vsock).await?;
     let connected = std::time::Instant::now();
 
     let now = std::time::SystemTime::now()
@@ -556,11 +599,11 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
 /// boot configuration, so a restore that allocated a new TAP/IP must
 /// re-address the guest or the clone collides with the running origin.
 pub async fn reconfigure_network(
-    uds_path: &Path,
+    vsock: &dyn Vsock,
     cmd: &crate::boot_proto::NetReconfigCommand,
 ) -> Result<()> {
     let started = std::time::Instant::now();
-    let mut stream = connect_to_agent(uds_path).await?;
+    let mut stream = connect_to_agent(vsock).await?;
     let connected = std::time::Instant::now();
     let result = net_reconfig_on_stream(&mut stream, cmd).await;
     info!(
@@ -629,8 +672,8 @@ async fn net_reconfig_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWri
 /// the listener appears or `timeout` elapses. The host-side read deadline
 /// adds slack on top of the guest's own budget so a live guest always
 /// answers first.
-pub async fn wait_for_port(uds_path: &Path, port: u16, timeout: Duration) -> Result<PortWait> {
-    let mut stream = connect_to_agent(uds_path).await?;
+pub async fn wait_for_port(vsock: &dyn Vsock, port: u16, timeout: Duration) -> Result<PortWait> {
+    let mut stream = connect_to_agent(vsock).await?;
     wait_for_port_on_stream(&mut stream, port, timeout).await
 }
 
@@ -704,6 +747,10 @@ impl ReconfigTimings {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::OwnedFd;
+
+    use async_trait::async_trait;
+
     use super::*;
 
     /// Build a raw frame byte-by-byte for use in read tests.
@@ -755,6 +802,144 @@ mod tests {
             backoff = next_backoff(backoff);
         }
         assert_eq!(delays, [2, 4, 8, 16, 32, 64, 128, 200, 200, 200]);
+    }
+
+    /// A [`Vsock`] whose dials answer from a script. Once the script runs
+    /// out it answers `ConnectionRefused` forever — a guest that never
+    /// listens.
+    struct ScriptedVsock {
+        script: std::sync::Mutex<std::collections::VecDeque<arcbox_vm_driver::Result<IoMode>>>,
+        dials: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedVsock {
+        fn new(script: impl IntoIterator<Item = arcbox_vm_driver::Result<IoMode>>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(script.into_iter().collect()),
+                dials: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn dials(&self) -> usize {
+            self.dials.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Vsock for ScriptedVsock {
+        async fn dial(&self, _port: u32) -> arcbox_vm_driver::Result<VsockConn> {
+            self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = self.script.lock().unwrap().pop_front();
+            let mode = next.unwrap_or_else(|| Err(refused()))?;
+            let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            Ok(VsockConn {
+                fd: OwnedFd::from(ours),
+                mode,
+            })
+        }
+    }
+
+    fn refused() -> arcbox_vm_driver::Error {
+        std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into()
+    }
+
+    #[tokio::test]
+    async fn connect_retries_only_while_the_guest_is_not_listening() {
+        let vsock = ScriptedVsock::new([Err(refused()), Err(refused()), Ok(IoMode::Async)]);
+        connect_to_port(&vsock, AGENT_PORT).await.unwrap();
+        assert_eq!(vsock.dials(), 3);
+    }
+
+    #[tokio::test]
+    async fn connect_fails_fast_on_any_other_error() {
+        // Each final error keeps its native shape through the conversion:
+        // an I/O failure stays `Io`, a driver `WrongState` stays
+        // `WrongState` (the guest agent maps that to 412, not 500).
+        type Native = fn(&VmmError) -> bool;
+        let finals: [(arcbox_vm_driver::Error, Native); 2] = [
+            (
+                arcbox_vm_driver::Error::Io(std::io::ErrorKind::BrokenPipe.into()),
+                |err| matches!(err, VmmError::Io(_)),
+            ),
+            (
+                arcbox_vm_driver::Error::WrongState {
+                    id: arcbox_vm_driver::VmId::new("vm").unwrap(),
+                    state: arcbox_vm_driver::VmState::Exited(
+                        arcbox_vm_driver::ExitStatus::signaled(9),
+                    ),
+                    expected: "running",
+                },
+                |err| matches!(err, VmmError::WrongState { expected, actual, .. } if expected == "running" && actual.starts_with("exited")),
+            ),
+        ];
+        for (error, native) in finals {
+            let vsock = ScriptedVsock::new([Err(error), Ok(IoMode::Async)]);
+            let err = connect_to_port(&vsock, AGENT_PORT).await.unwrap_err();
+            assert!(native(&err), "unexpected error: {err}");
+            assert_eq!(vsock.dials(), 1, "a final error must not be retried");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_gives_up_after_the_ready_budget() {
+        let vsock = ScriptedVsock::new([]);
+        let err = connect_to_port(&vsock, AGENT_PORT).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::Vsock(ref m) if m.contains("did not become ready within 30s")),
+            "unexpected error: {err}"
+        );
+        assert!(vsock.dials() > 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_connections_are_refused_not_misregistered() {
+        let vsock = ScriptedVsock::new([Ok(IoMode::Blocking)]);
+        let err = connect_to_port(&vsock, AGENT_PORT).await.unwrap_err();
+        assert!(
+            matches!(err, VmmError::Vsock(ref m) if m.contains("blocking I/O")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The transitional adapter's classification of Firecracker's proxy
+    /// answers: closed without `OK` is the retryable "no listener yet",
+    /// anything else final, `OK` a usable async connection.
+    #[tokio::test]
+    async fn uds_vsock_classifies_the_proxy_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fc.vsock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            for answer in [None, Some(&b"NOPE\n"[..]), Some(&b"OK 52\n"[..])] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut byte = [0u8; 1];
+                loop {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+                if let Some(answer) = answer {
+                    stream.write_all(answer).await.unwrap();
+                    // Keep the accepted end alive until the dial returns.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
+        let vsock = UdsVsock(path);
+
+        let err = vsock.dial(AGENT_PORT).await.unwrap_err();
+        assert!(
+            is_not_listening(&err),
+            "closed proxy must be ConnectionRefused: {err}"
+        );
+        let err = vsock.dial(AGENT_PORT).await.unwrap_err();
+        assert!(
+            matches!(err, arcbox_vm_driver::Error::Driver { .. }),
+            "unexpected response must be final: {err}"
+        );
+        let conn = vsock.dial(AGENT_PORT).await.unwrap();
+        assert_eq!(conn.mode, IoMode::Async);
     }
 
     #[tokio::test]
