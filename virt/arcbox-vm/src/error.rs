@@ -44,7 +44,7 @@ pub enum VmmError {
     /// instead (see the `From` impl), so the guest agent's wire mapping
     /// keeps answering 404 / 412 for them rather than 500.
     #[error("driver error: {0}")]
-    Driver(arcbox_vm_driver::Error),
+    Driver(#[source] arcbox_vm_driver::Error),
 
     /// Network-related error (TAP creation, IP allocation, etc.).
     #[error("network error: {0}")]
