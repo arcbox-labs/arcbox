@@ -4,3 +4,5 @@
 //! it either check what must hold in every state, or pin one flow at a time.
 
 mod harness;
+mod invariants;
+mod projections;
