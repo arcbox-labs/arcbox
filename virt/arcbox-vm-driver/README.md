@@ -40,8 +40,12 @@ that the flags and the accessors agree.
 | `DebugSnapshot` | `handle.debug()` | driver-specific JSON for post-mortems |
 
 `net::GuestNetwork` is the second port: reserve a lease, activate it into
-a `NicSpec`, quarantine/release, and the `NetworkReconcile` cleanup-token
-protocol.
+a `NicSpec`, ask what the guest sees under the mode it was activated in,
+quarantine/release, and the `NetworkReconcile` cleanup-token protocol.
+That protocol answers with `Error::Unavailable` (come back later) and
+`Error::PreconditionFailed` (that token names no pending generation);
+those two classes are the contract callers turn into their wire codes, so
+an adapter must not flatten them into `Error::Network`.
 
 ## Usage
 

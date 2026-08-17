@@ -169,8 +169,10 @@ impl From<arcbox_snapshot::SnapshotError> for VmmError {
 /// Variant-for-variant where a native shape exists, so a driver-reported
 /// `NotFound` or `WrongState` keeps the wire code the equivalent native
 /// error already has (the guest agent classifies `VmmError` by variant;
-/// anything it does not know becomes a 500). What has no native shape —
-/// an adapter fault, a checkpoint another driver wrote — stays
+/// anything it does not know becomes a 500), and so do the guest
+/// network's two protocol answers — retry-later and failed precondition,
+/// the 503 and 412 of the cleanup-token protocol. What has no native
+/// shape — an adapter fault, a checkpoint another driver wrote — stays
 /// [`VmmError::Driver`] with the port error intact for its `source` chain.
 impl From<arcbox_vm_driver::Error> for VmmError {
     fn from(err: arcbox_vm_driver::Error) -> Self {
@@ -189,6 +191,12 @@ impl From<arcbox_vm_driver::Error> for VmmError {
             D::Io(io) => Self::Io(io),
             D::Network(msg) => Self::Network(msg),
             D::InvalidSpec(msg) => Self::Config(msg),
+            // The cleanup-token protocol's two answers: come back later
+            // (503) and this token is not the one (412). They arrive here
+            // from the guest network and are what the agent's classifier
+            // turns back into those codes.
+            D::Unavailable(msg) => Self::Unavailable(msg),
+            D::PreconditionFailed(msg) => Self::FailedPrecondition(msg),
             other @ (D::Driver { .. } | D::ForeignCheckpoint(_)) => Self::Driver(other),
         }
     }
@@ -280,5 +288,25 @@ mod tests {
     fn test_network_error_display() {
         let e = VmmError::Network("TAP creation failed".into());
         assert_eq!(e.to_string(), "network error: TAP creation failed");
+    }
+
+    /// The guest network answers the cleanup-token protocol with "come
+    /// back later" and "that is not the token"; both cross the driver port
+    /// and must land on the variants the agent classifies as 503 and 412.
+    /// Folding either into `Network` would make it a 500.
+    #[test]
+    fn the_ports_cleanup_answers_keep_their_classification() {
+        use arcbox_vm_driver::Error as D;
+
+        let retry = VmmError::from(D::Unavailable("startup cleanup pending".into()));
+        assert!(
+            matches!(&retry, VmmError::Unavailable(m) if m == "startup cleanup pending"),
+            "{retry}"
+        );
+        let mismatch = VmmError::from(D::PreconditionFailed("token b is not token a".into()));
+        assert!(
+            matches!(&mismatch, VmmError::FailedPrecondition(m) if m == "token b is not token a"),
+            "{mismatch}"
+        );
     }
 }

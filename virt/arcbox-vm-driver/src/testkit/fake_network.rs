@@ -22,6 +22,15 @@ use crate::spec::{MacAddr, NicAttachment, NicSpec, VmId};
 /// [`NetworkReconcile`] drains through the token protocol.
 /// [`FakeNetwork::with_startup_cleanup`] starts with a pending startup
 /// cleanup so that half of the protocol can be exercised too.
+///
+/// It answers that protocol in the same error *classes* a real adapter
+/// does — [`Error::Unavailable`] for come-back-later (a pending startup
+/// sweep, which closes the whole pool; a quarantined id; a gate still held
+/// by pending generations) and [`Error::PreconditionFailed`] for a token
+/// naming no pending generation.
+/// A caller's retry and precondition handling is therefore testable over
+/// this fake; flattening either into [`Error::Network`] would make a
+/// broken path look fine here and fail against the TAP network.
 pub struct FakeNetwork {
     ledger: Mutex<Ledger>,
     /// `true` while a startup cleanup is pending.
@@ -76,8 +85,7 @@ impl FakeNetwork {
     }
 
     fn set_startup_pending(&self, ledger: &Ledger) {
-        let pending = ledger.startup.as_ref().is_some_and(|s| !s.host_cleaned);
-        self.startup_pending.send_replace(pending);
+        self.startup_pending.send_replace(ledger.startup_pending());
     }
 }
 
@@ -88,6 +96,12 @@ impl Default for FakeNetwork {
 }
 
 impl Ledger {
+    /// `true` while the startup sweep's host-side cleanup is pending —
+    /// the gate that closes the whole pool.
+    fn startup_pending(&self) -> bool {
+        self.startup.as_ref().is_some_and(|s| !s.host_cleaned)
+    }
+
     fn lowest_free_host(&self) -> Option<u16> {
         (FIRST_HOST..u16::MAX).find(|n| !self.used.contains(n))
     }
@@ -130,7 +144,22 @@ fn host_number(ip: IpAddr) -> Result<u16> {
 impl GuestNetwork for FakeNetwork {
     async fn reserve(&self, vm: &VmId, _policy: NetworkPolicy) -> Result<NetworkLease> {
         let mut ledger = lock(&self.ledger);
-        if ledger.active.contains_key(vm) || ledger.quarantined.contains_key(vm) {
+        // While the startup sweep is pending the *whole* pool is closed,
+        // not just the ids in it: the host has yet to confirm that the
+        // forwarding state of a previous process is gone.
+        if ledger.startup_pending() {
+            return Err(Error::Unavailable(
+                "startup cleanup is awaiting host finalization".into(),
+            ));
+        }
+        // A quarantined id is the protocol's retry-later case too: the
+        // address comes back once the host finalizes that generation.
+        if ledger.quarantined.contains_key(vm) {
+            return Err(Error::Unavailable(format!(
+                "vm {vm} cleanup is awaiting host finalization"
+            )));
+        }
+        if ledger.active.contains_key(vm) {
             return Err(Error::Network(format!("vm {vm} already holds a lease")));
         }
         let host = ledger
@@ -186,7 +215,9 @@ impl GuestNetwork for FakeNetwork {
             if existing.cleanup_token == lease.cleanup_token {
                 return Ok(());
             }
-            return Err(Error::Network(format!(
+            // Another generation of this id is mid-cleanup: retry-later,
+            // like the reserve above.
+            return Err(Error::Unavailable(format!(
                 "vm {} already has a different quarantined lease",
                 lease.vm
             )));
@@ -233,7 +264,10 @@ impl GuestNetwork for FakeNetwork {
         }
     }
 
-    fn identity(&self, lease: &NetworkLease) -> NetworkIdentity {
+    /// The lease's own address, whichever mode it was attached in: the
+    /// fake translates nothing per interface, so the guest sees exactly
+    /// what was reserved for it.
+    fn identity(&self, lease: &NetworkLease, _mode: AttachMode) -> NetworkIdentity {
         NetworkIdentity {
             ip: lease.ip,
             prefix_len: lease.prefix_len,
@@ -250,12 +284,14 @@ impl GuestNetwork for FakeNetwork {
 
 #[async_trait]
 impl NetworkReconcile for FakeNetwork {
-    async fn pending_cleanups(&self) -> Vec<(VmId, String)> {
-        lock(&self.ledger)
+    /// Always `Ok`: this ledger is a map keyed by [`VmId`], so it cannot
+    /// hold an id the protocol could not name.
+    async fn pending_cleanups(&self) -> Result<Vec<(VmId, String)>> {
+        Ok(lock(&self.ledger)
             .quarantined
             .iter()
             .map(|(vm, lease)| (vm.clone(), lease.cleanup_token.clone()))
-            .collect()
+            .collect())
     }
 
     async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
@@ -287,7 +323,8 @@ impl NetworkReconcile for FakeNetwork {
         let mut ledger = lock(&self.ledger);
         ledger.validate_startup_cleanup(token)?;
         if !ledger.quarantined.is_empty() {
-            return Err(Error::Network(
+            // Retry-later: the gate opens once those generations drain.
+            return Err(Error::Unavailable(
                 "cleanup generations remain pending; finalize them first".into(),
             ));
         }
@@ -306,13 +343,16 @@ impl NetworkReconcile for FakeNetwork {
 }
 
 impl Ledger {
+    /// A token that does not name a pending generation — of this VM or of
+    /// none at all — is a failed precondition: no retry of that token can
+    /// succeed, the caller needs a current one.
     fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
         let lease = self
             .quarantined
             .get(vm)
-            .ok_or_else(|| Error::Network(format!("vm {vm} has no pending cleanup")))?;
+            .ok_or_else(|| Error::PreconditionFailed(format!("vm {vm} has no pending cleanup")))?;
         if lease.cleanup_token != token {
-            return Err(Error::Network(format!(
+            return Err(Error::PreconditionFailed(format!(
                 "vm {vm} cleanup token does not name the pending generation"
             )));
         }
@@ -322,10 +362,12 @@ impl Ledger {
     fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
         match &self.startup {
             Some(startup) if !startup.host_cleaned && startup.token == token => Ok(()),
-            Some(startup) if !startup.host_cleaned => {
-                Err(Error::Network("startup cleanup token mismatch".into()))
-            }
-            _ => Err(Error::Network("no startup cleanup is pending".into())),
+            Some(startup) if !startup.host_cleaned => Err(Error::PreconditionFailed(
+                "startup cleanup token mismatch".into(),
+            )),
+            _ => Err(Error::PreconditionFailed(
+                "no startup cleanup is pending".into(),
+            )),
         }
     }
 }
@@ -370,6 +412,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_guest_sees_its_lease_in_either_attach_mode() {
+        let net = FakeNetwork::new();
+        let lease = net.reserve(&id("a"), policy()).await.unwrap();
+        let invariant = net.identity(&lease, AttachMode::Invariant);
+        assert_eq!(invariant.ip, lease.ip);
+        assert_eq!(invariant.gateway, lease.gateway);
+        assert_eq!(invariant.mac, lease.mac);
+        assert_eq!(invariant.dns, vec![lease.gateway]);
+        // Nothing is translated per interface here, so the mode changes
+        // nothing about what the guest is told.
+        assert_eq!(net.identity(&lease, AttachMode::LegacySnapshot), invariant);
+    }
+
+    #[tokio::test]
     async fn quarantine_holds_the_address_until_the_token_finalizes_it() {
         let net = FakeNetwork::new();
         let a = net.reserve(&id("a"), policy()).await.unwrap();
@@ -377,15 +433,28 @@ mod tests {
         net.quarantine(a.clone()).await.unwrap(); // idempotent
         let mut other = a.clone();
         other.cleanup_token = "other".into();
-        assert!(net.quarantine(other).await.is_err());
+        assert!(matches!(
+            net.quarantine(other).await,
+            Err(Error::Unavailable(_))
+        ));
         assert!(net.activate(&a, AttachMode::Invariant).await.is_err());
 
         let reconcile = net.reconcile().unwrap();
         assert_eq!(
-            reconcile.pending_cleanups().await,
+            reconcile.pending_cleanups().await.unwrap(),
             vec![(id("a"), a.cleanup_token.clone())]
         );
-        assert!(reconcile.validate_cleanup(&id("a"), "wrong").await.is_err());
+        // A token that names no pending generation is a failed
+        // precondition; the id itself is refused until the host finalizes,
+        // which is a retry-later. Callers turn those into 412 and 503.
+        assert!(matches!(
+            reconcile.validate_cleanup(&id("a"), "wrong").await,
+            Err(Error::PreconditionFailed(_))
+        ));
+        assert!(matches!(
+            net.reserve(&id("a"), policy()).await,
+            Err(Error::Unavailable(_))
+        ));
         // Still held: the next lease does not get a's address.
         let b = net.reserve(&id("b"), policy()).await.unwrap();
         assert_ne!(b.ip, a.ip);
@@ -394,7 +463,7 @@ mod tests {
             .finalize_cleanup(&id("a"), &a.cleanup_token)
             .await
             .unwrap();
-        assert!(reconcile.pending_cleanups().await.is_empty());
+        assert!(reconcile.pending_cleanups().await.unwrap().is_empty());
         let c = net.reserve(&id("c"), policy()).await.unwrap();
         assert_eq!(c.ip, a.ip);
     }
@@ -427,7 +496,14 @@ mod tests {
         forged.cleanup_token = "forged".into();
         assert!(net.release(forged).await.is_err());
         net.release(a2.clone()).await.unwrap();
-        assert!(net.reconcile().unwrap().pending_cleanups().await.is_empty());
+        assert!(
+            net.reconcile()
+                .unwrap()
+                .pending_cleanups()
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let reused = net.reserve(&id("d"), policy()).await.unwrap();
         assert_eq!(reused.ip, a2.ip);
 
@@ -457,12 +533,37 @@ mod tests {
             reconcile.startup_cleanup_token().await.as_deref(),
             Some("boot-1")
         );
-        assert!(reconcile.validate_startup_cleanup("boot-2").await.is_err());
+        // Another generation's token can never name this sweep.
+        assert!(matches!(
+            reconcile.validate_startup_cleanup("boot-2").await,
+            Err(Error::PreconditionFailed(_))
+        ));
 
-        let a = net.reserve(&id("a"), policy()).await.unwrap();
+        // The pool is closed while the sweep is pending — every id, not
+        // just the ones in the ledger.
+        assert!(matches!(
+            net.reserve(&id("a"), policy()).await,
+            Err(Error::Unavailable(_))
+        ));
+
+        // A quarantine can still arrive alongside a pending sweep, because
+        // that is where both come from: a previous process's leases,
+        // replayed from its durable records.
+        let a = NetworkLease {
+            vm: id("a"),
+            ip: IpAddr::V4(Ipv4Addr::new(10, 200, 0, 2)),
+            prefix_len: PREFIX_LEN,
+            gateway: IpAddr::V4(GATEWAY),
+            mac: MacAddr::new([0x02, 0xfa, 0xce, 0x00, 0x00, 0x02]),
+            cleanup_token: "boot-1-a".into(),
+        };
         net.quarantine(a.clone()).await.unwrap();
-        // A quarantined lease keeps the startup cleanup from finalizing.
-        assert!(reconcile.finalize_startup_cleanup("boot-1").await.is_err());
+        // A quarantined lease keeps the startup cleanup from finalizing —
+        // retry-later, since finalizing that generation opens the gate.
+        assert!(matches!(
+            reconcile.finalize_startup_cleanup("boot-1").await,
+            Err(Error::Unavailable(_))
+        ));
 
         let waiter = tokio::spawn({
             let net = std::sync::Arc::clone(&net);
@@ -477,6 +578,8 @@ mod tests {
             .unwrap();
         reconcile.finalize_startup_cleanup("boot-1").await.unwrap();
         assert_eq!(reconcile.startup_cleanup_token().await, None);
+        // The pool opens with it, and the replayed address is back in it.
+        assert_eq!(net.reserve(&id("a"), policy()).await.unwrap().ip, a.ip);
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await
             .expect("waiter released")

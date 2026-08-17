@@ -48,7 +48,6 @@ impl TapNetwork {
         self.deactivate_translation(alloc)?;
         #[cfg(target_os = "linux")]
         tap::destroy_checked(&alloc.tap_name)?;
-        self.attached.lock().unwrap().remove(&alloc.tap_name);
         debug!(
             sandbox_id,
             tap = %alloc.tap_name,

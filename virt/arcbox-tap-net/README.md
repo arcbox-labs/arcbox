@@ -40,17 +40,17 @@ agent's port-forward and init code.
 | `activate(lease, mode)` | `activate(alloc, mode)` — returns `NicSpec { id: "eth0", mac, Tap { name } }` |
 | `quarantine(lease)` | `quarantine_checked(vm, alloc)` |
 | `release(lease)` | `release_checked(alloc)` |
-| `identity(lease)` | the invariant link for every fresh boot and invariant restore; the pool address once the TAP was activated as `LegacySnapshot` — the resolver is the gateway either way |
+| `identity(lease, mode)` | the invariant link under `Invariant` (every fresh boot and invariant restore), the pool address under `LegacySnapshot` — the resolver is the gateway either way |
 | `reconcile()` | `Some(self)` while a quarantine ledger is kept |
-| `NetworkReconcile::*` | `pending_quarantines`, `validate_quarantine` / `finalize_quarantine`, and the `*_startup_cleanup` set |
+| `NetworkReconcile::*` | `pending_quarantines` (an id the port cannot name is an error, not a dropped entry), `validate_quarantine` / `finalize_quarantine`, and the `*_startup_cleanup` set |
 
 The `NetworkLease` carries VM, address, prefix, gateway, MAC and cleanup
 token; the allocation is rebuilt from it (TAP name from the address,
 resolvers from the network), so there is no side table to keep. Errors:
 `TapNetError` maps variant for variant into `arcbox_vm::VmmError`
 (`WrongState` / `Unavailable` keep their 412 / 503 meaning) and into the
-port's `Error` (`Io` kept, the rest `Network` with the classification in
-the text).
+port's `Error` (`Unavailable` and `PreconditionFailed` carry the same two
+answers; `Io` keeps its shape, the faults land on `Network`).
 
 ## Usage
 
