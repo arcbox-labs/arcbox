@@ -156,16 +156,22 @@ impl GuestNetwork for TapNetwork {
 #[async_trait]
 impl NetworkReconcile for TapNetwork {
     /// Every quarantined VM with its token.
-    async fn pending_cleanups(&self) -> Vec<(VmId, String)> {
+    ///
+    /// Every id the network reserves, writes, or loads passes the `VmId`
+    /// rules (`quarantine::validate_id`), so a ledger entry that fails
+    /// here cannot come from this crate — but the ledger is on disk, and
+    /// an entry the port cannot name would pin its address out of the pool
+    /// with no way to finalize it. It is reported, not skipped.
+    async fn pending_cleanups(&self) -> Result<Vec<(VmId, String)>> {
         self.pending_quarantines()
             .into_iter()
             .map(|(id, token)| {
-                // Every id the network reserves, writes, or loads passes the
-                // `VmId` rules (`quarantine::validate_id`), so an entry that
-                // fails here cannot exist.
-                let vm = VmId::new(id.as_str())
-                    .expect("quarantine ledger ids are validated as VmIds at write and load");
-                (vm, token)
+                let vm = VmId::new(id.as_str()).map_err(|error| {
+                    Error::Network(format!(
+                        "quarantine ledger holds an id this port cannot name: {error}"
+                    ))
+                })?;
+                Ok((vm, token))
             })
             .collect()
     }
@@ -355,6 +361,50 @@ mod tests {
         assert!(ledgered.reconcile().is_some());
     }
 
+    /// The loader refuses a ledger file whose id the port cannot name (see
+    /// below), so this can only be reached by planting one — but the list
+    /// is read from durable state, and an entry it cannot name pins an
+    /// address out of the pool. Reporting it is what makes that visible;
+    /// dropping it would hide the leak, and panicking would take the
+    /// caller down.
+    #[tokio::test]
+    async fn a_ledger_id_the_port_cannot_name_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let network = TapNetwork::with_quarantine_dir(
+            "172.20.0.0/16",
+            "172.20.0.1",
+            vec![],
+            root.path().join("q"),
+            Datapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
+        .unwrap();
+        let long_id = "x".repeat(VmId::MAX_LEN + 1);
+        network.quarantined.lock().unwrap().insert(
+            long_id.clone(),
+            NetworkAllocation {
+                tap_name: "vmtap0-3".into(),
+                ip_address: "172.20.0.3".parse().unwrap(),
+                prefix_len: 16,
+                gateway: "172.20.0.1".parse().unwrap(),
+                mac_address: crate::mac_from_vm_id(&long_id).to_string(),
+                dns_servers: vec![],
+                cleanup_token: uuid::Uuid::new_v4().to_string(),
+            },
+        );
+
+        let error = network
+            .reconcile()
+            .unwrap()
+            .pending_cleanups()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Network(m) if m.contains("cannot name")),
+            "{error}"
+        );
+    }
+
     /// The token protocol through the port: quarantine, then the pending
     /// list names the lease's token, a wrong token is refused, and
     /// finalizing returns the address to the pool. Off Linux only, where
@@ -383,7 +433,7 @@ mod tests {
             .unwrap();
         network.quarantine(lease.clone()).await.unwrap();
         assert_eq!(
-            reconcile.pending_cleanups().await,
+            reconcile.pending_cleanups().await.unwrap(),
             vec![(vm("box"), lease.cleanup_token.clone())]
         );
         // The address stays out of the pool, and the id is refused until
@@ -408,7 +458,7 @@ mod tests {
             .finalize_cleanup(&vm("box"), &lease.cleanup_token)
             .await
             .unwrap();
-        assert!(reconcile.pending_cleanups().await.is_empty());
+        assert!(reconcile.pending_cleanups().await.unwrap().is_empty());
         let reused = GuestNetwork::reserve(&network, &vm("box"), policy(NetworkMode::Nat))
             .await
             .unwrap();

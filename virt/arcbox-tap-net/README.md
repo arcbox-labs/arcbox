@@ -42,7 +42,7 @@ agent's port-forward and init code.
 | `release(lease)` | `release_checked(alloc)` |
 | `identity(lease, mode)` | the invariant link under `Invariant` (every fresh boot and invariant restore), the pool address under `LegacySnapshot` — the resolver is the gateway either way |
 | `reconcile()` | `Some(self)` while a quarantine ledger is kept |
-| `NetworkReconcile::*` | `pending_quarantines`, `validate_quarantine` / `finalize_quarantine`, and the `*_startup_cleanup` set |
+| `NetworkReconcile::*` | `pending_quarantines` (an id the port cannot name is an error, not a dropped entry), `validate_quarantine` / `finalize_quarantine`, and the `*_startup_cleanup` set |
 
 The `NetworkLease` carries VM, address, prefix, gateway, MAC and cleanup
 token; the allocation is rebuilt from it (TAP name from the address,

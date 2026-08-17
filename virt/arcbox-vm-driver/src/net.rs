@@ -132,7 +132,13 @@ pub struct NetworkIdentity {
 pub trait NetworkReconcile: Send + Sync {
     /// VMs whose leases are quarantined, with the token each finalization
     /// must present.
-    async fn pending_cleanups(&self) -> Vec<(VmId, String)>;
+    ///
+    /// Fallible because a durable ledger is read back from disk: an entry
+    /// whose id is not a [`VmId`] is one this protocol could never name,
+    /// list, or finalize, and its address would stay out of the pool
+    /// forever. The caller sees that as an error rather than as a shorter
+    /// list.
+    async fn pending_cleanups(&self) -> Result<Vec<(VmId, String)>>;
 
     /// Checks that `token` names `vm`'s pending cleanup generation.
     async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()>;
