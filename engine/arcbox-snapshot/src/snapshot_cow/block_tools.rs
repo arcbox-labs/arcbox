@@ -164,7 +164,7 @@ impl BlockTools for BusyboxBlockTools {
                 return Ok(device);
             }
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            if !(is_busy_message(&stderr) || loop_backing_file(&device)?.is_some()) {
+            if !(is_busy_message(&stderr, backing_str) || loop_backing_file(&device)?.is_some()) {
                 return Err(SnapshotError::DeviceMapper(format!(
                     "losetup {device} {}: {stderr}",
                     backing.display()
@@ -229,10 +229,17 @@ fn parse_free_loop(stdout: &[u8]) -> Result<String> {
 }
 
 /// Whether a failed attach's stderr names the lost-race error: the kernel's
-/// `EBUSY` ("Device or resource busy") from a device that was free a moment
-/// ago, however the tool spells it.
-fn is_busy_message(stderr: &str) -> bool {
-    stderr.to_ascii_lowercase().contains("busy")
+/// `EBUSY` from a device that was free a moment ago — "Device or resource
+/// busy" under glibc, "Resource busy" under musl, however the tool spells
+/// it. `losetup` echoes the backing path (`losetup: FILE: <reason>`, or
+/// just `losetup: FILE` when it died with errno 0), so that path is scrubbed
+/// first: a `busybox-…` template must not turn a permanent failure into a
+/// phantom race.
+fn is_busy_message(stderr: &str, backing: &str) -> bool {
+    stderr
+        .replace(backing, "")
+        .to_ascii_lowercase()
+        .contains("busy")
 }
 
 /// The file the kernel reports as backing loop device `device`
@@ -376,16 +383,37 @@ mod tests {
     }
 
     #[test]
-    fn busy_classifier_matches_the_kernel_message_however_spelled() {
+    fn busy_classifier_reads_the_reason_not_the_echoed_path() {
+        let img = "/tmp/x.img";
         assert!(is_busy_message(
-            "losetup: /tmp/x.img: Device or resource busy"
+            "losetup: /tmp/x.img: Device or resource busy\n",
+            img
         ));
-        assert!(is_busy_message("losetup: /dev/loop3: EBUSY"));
-        assert!(is_busy_message("device BUSY"));
+        assert!(is_busy_message("losetup: /tmp/x.img: Resource busy", img));
+        assert!(is_busy_message("losetup: /dev/loop3: EBUSY", img));
+        assert!(is_busy_message(
+            "losetup: /tmp/x.img: failed to set up loop device: Device or resource busy",
+            img
+        ));
         assert!(!is_busy_message(
-            "losetup: /tmp/x.img: No such file or directory"
+            "losetup: /tmp/x.img: No such file or directory",
+            img
         ));
-        assert!(!is_busy_message(""));
+        assert!(!is_busy_message("", img));
+
+        let template = "/templates/busybox-1.36.ext4";
+        assert!(!is_busy_message(
+            "losetup: /templates/busybox-1.36.ext4: No such file or directory",
+            template
+        ));
+        assert!(!is_busy_message(
+            "losetup: /templates/busybox-1.36.ext4",
+            template
+        ));
+        assert!(is_busy_message(
+            "losetup: /templates/busybox-1.36.ext4: Resource busy",
+            template
+        ));
     }
 
     /// A busybox stand-in: a shell script that logs every invocation's
