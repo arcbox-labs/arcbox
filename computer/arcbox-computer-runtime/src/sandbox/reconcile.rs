@@ -826,6 +826,10 @@ async fn can_reclaim(
     // `Ready` and nothing else. `Starting` died with the boot task that was
     // driving it and no path here finishes one; the transitional phases died
     // between resource states, so what their journals name is half-built.
+    // `Starting` also covers the pool-slot handover window, where the slot's
+    // journal and the claiming sandbox's briefly name one VMM (`checkpoint.rs`
+    // documents why both exist): reclaiming through one while the other kills
+    // is precisely what that window must stay safe against.
     match phase {
         Some(super::record::PersistPhase::Ready) => {}
         Some(phase) => return Err(format!("its durable record is {}", phase.as_str())),
