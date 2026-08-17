@@ -377,10 +377,29 @@ pub async fn discard_kills_a_prepared_vm(h: &dyn ContractHarness) {
 
 /// A restore names the image's disks at new host paths (a copy here, a
 /// fresh CoW device in production) and comes up under the new id.
+///
+/// The source boots from private copies of the harness's disks, and those
+/// copies are removed once they have been copied again for the restore, so
+/// a driver that reopens the paths recorded in the checkpoint instead of
+/// the ones in `RestoreSpec::disks` fails here rather than passing by
+/// accident.
 pub async fn restore_reattaches_disks(h: &dyn ContractHarness) {
-    let source = boot(h, "reattach-src").await;
+    let driver = h.driver();
+    let mut source_spec = h.spec(&id("reattach-src"));
+    let source_dir = h.runtime_dir();
+    for disk in &mut source_spec.disks {
+        let private = source_dir.join(format!("{}.src", disk.id));
+        std::fs::copy(&disk.path, &private).expect("copy the disk for the source");
+        disk.path = private;
+    }
+    let source = driver
+        .boot(source_spec.clone(), &source_dir)
+        .await
+        .expect("boot");
+    h.ready(&*source).await;
     let Some(cp) = source.checkpoint() else {
-        assert!(!h.driver().capabilities().checkpoint);
+        assert!(!driver.capabilities().checkpoint);
+        source.shutdown(ShutdownMode::Kill).await.expect("kill");
         return;
     };
     let opts = CheckpointOptions {
@@ -388,7 +407,7 @@ pub async fn restore_reattaches_disks(h: &dyn ContractHarness) {
         kind: CheckpointKind::Full,
     };
     let image = cp
-        .checkpoint(&h.runtime_dir().join("checkpoint"), opts)
+        .checkpoint(&source_dir.join("checkpoint"), opts)
         .await
         .expect("checkpoint");
     source
@@ -396,27 +415,27 @@ pub async fn restore_reattaches_disks(h: &dyn ContractHarness) {
         .await
         .expect("kill source");
 
-    let template = h.spec(&id("reattach-dst"));
-    let copies = h.runtime_dir();
-    let disks = template
+    let restore_dir = h.runtime_dir();
+    let disks = source_spec
         .disks
         .into_iter()
         .map(|mut disk| {
-            let copy = copies.join(format!("{}.restored", disk.id));
+            let copy = restore_dir.join(format!("{}.restored", disk.id));
             std::fs::copy(&disk.path, &copy).expect("copy the disk for the restore");
+            std::fs::remove_file(&disk.path).expect("remove the source disk");
             disk.path = copy;
             disk
         })
         .collect();
+    let template = h.spec(&id("reattach-dst"));
     let restore = RestoreSpec {
         id: id("reattach-dst"),
         nics: template.nics,
         disks,
         isolation: template.isolation,
     };
-    let restored = h
-        .driver()
-        .restore(&image, restore, &h.runtime_dir())
+    let restored = driver
+        .restore(&image, restore, &restore_dir)
         .await
         .expect("restore onto the copied disks");
     assert_eq!(*restored.id(), id("reattach-dst"));
