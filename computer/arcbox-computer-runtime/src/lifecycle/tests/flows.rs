@@ -78,6 +78,7 @@ fn a_restore_commits_ready_in_one_hop_before_its_gate() {
 
     let (state, effects) = step(&mut sm, &mut context, &Event::Restored);
     assert_eq!(state.to_public(), SandboxState::Starting);
+    assert!(matches!(state, State::Gating { committed: true }));
     assert_eq!(
         effects,
         vec![
@@ -88,6 +89,20 @@ fn a_restore_commits_ready_in_one_hop_before_its_gate() {
             },
             Effect::ArmTimer(Timer::Ttl),
             Effect::SpawnGate,
+        ]
+    );
+
+    // The gate then announces READY without writing the record again: a
+    // second write would put an fsync on the restore's hot path and could
+    // refuse a computer that is already durably `Ready`.
+    let (state, effects) = step(&mut sm, &mut context, &Event::Gated);
+    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::Publish(Notify::Ready),
+            Effect::Answer(Answer::Ready),
+            Effect::ArmTimer(Timer::Idle),
         ]
     );
 }
@@ -111,7 +126,7 @@ fn the_boots_own_cmd_claims_the_slot_the_gate_reserved_for_it() {
             claim: WorkloadClaim::Initial,
         },
     );
-    assert!(matches!(state, State::Gating {}));
+    assert!(matches!(state, State::Gating { committed: false }));
     assert!(effects.is_empty());
 }
 
@@ -157,6 +172,7 @@ fn a_pause_captures_releases_and_parks_at_paused() {
         effects,
         vec![
             persist(PersistPhase::Pausing, Durability::Warn),
+            Effect::CancelTimer(Timer::Idle),
             Effect::Publish(Notify::Pausing),
             Effect::SpawnCheckpoint { hold: true },
         ]
@@ -228,6 +244,7 @@ fn a_frozen_guest_fails_the_computer_from_either_capture_path() {
             vec![
                 persist(PersistPhase::Failed, Durability::GateJournal),
                 release(ReleaseScope::Runtime),
+                Effect::ClearJournal,
                 Effect::CancelTimer(Timer::Idle),
                 Effect::CancelTimer(Timer::Ttl),
                 Effect::Publish(Notify::Failed),

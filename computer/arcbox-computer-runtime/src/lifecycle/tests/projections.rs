@@ -1,7 +1,6 @@
 //! Reachability, and the two projections over every leaf.
 
 use super::harness::{LEAVES, explore, ordinal};
-use crate::lifecycle::machine::State;
 use crate::sandbox::SandboxState;
 use crate::sandbox::record::PersistPhase;
 
@@ -55,47 +54,41 @@ fn every_leaf_projects_onto_a_public_state() {
 #[test]
 fn every_leaf_projects_onto_a_durable_phase() {
     use PersistPhase as P;
-    let expected = [
-        (0, Some(P::Creating)),  // provisioning: the reserved intent
-        (1, Some(P::Starting)),  // staging
-        (2, Some(P::Starting)),  // booting
-        (3, Some(P::Creating)),  // restoring: commits Ready in one hop
-        (4, None),               // gating: Starting on a boot, Ready on a restore
-        (5, Some(P::Ready)),     // ready
-        (6, Some(P::Ready)),     // running: the hot path writes nothing
-        (7, Some(P::Ready)),     // checkpointing
-        (8, Some(P::Pausing)),   // capturing
-        (9, Some(P::Pausing)),   // releasing
-        (10, Some(P::Paused)),   // paused
-        (11, Some(P::Resuming)), // resuming
-        (12, Some(P::Stopping)), // stopping
-        (13, Some(P::Stopped)),  // stopped
-        (14, Some(P::Failed)),   // failed
-        (15, Some(P::Removing)), // removing
-        (16, None),              // gone: the record is forgotten
+    // Indexed by `ordinal`. `gating` is the one leaf two paths reach on
+    // different phases, so it carries the discriminator and lists both; the
+    // walk below pins which one each path actually holds.
+    let expected: [&[Option<P>]; LEAVES] = [
+        &[Some(P::Creating)],                 // provisioning: the reserved intent
+        &[Some(P::Starting)],                 // staging
+        &[Some(P::Starting)],                 // booting
+        &[Some(P::Creating)],                 // restoring: commits Ready in one hop
+        &[Some(P::Starting), Some(P::Ready)], // gating
+        &[Some(P::Ready)],                    // ready
+        &[Some(P::Ready)],                    // running: the hot path writes nothing
+        &[Some(P::Ready)],                    // checkpointing
+        &[Some(P::Pausing)],                  // capturing
+        &[Some(P::Pausing)],                  // releasing
+        &[Some(P::Paused)],                   // paused
+        &[Some(P::Resuming)],                 // resuming
+        &[Some(P::Stopping)],                 // stopping
+        &[Some(P::Stopped)],                  // stopped
+        &[Some(P::Failed)],                   // failed
+        &[Some(P::Removing)],                 // removing
+        &[None],                              // gone: the record is forgotten
     ];
-    assert_eq!(expected.len(), LEAVES);
     for node in explore() {
-        let (_, durable) = expected[ordinal(node.state)];
-        assert_eq!(node.state.durable(), durable, "{:?}", node.state);
+        let durable = node.state.durable();
+        assert!(
+            expected[ordinal(node.state)].contains(&durable),
+            "{:?} projects {durable:?}",
+            node.state
+        );
     }
 }
 
 #[test]
 fn the_durable_projection_is_the_phase_actually_in_effect() {
     for node in explore() {
-        if matches!(node.state, State::Gating {}) {
-            // The exception `durable` documents: a cold boot arrives here on
-            // `Starting` and commits `Ready` after the probe, a restore
-            // arrives already `Ready`. Both really happen.
-            assert!(
-                node.phase == Some(PersistPhase::Starting)
-                    || node.phase == Some(PersistPhase::Ready),
-                "gating reached on {:?}",
-                node.phase
-            );
-            continue;
-        }
         assert_eq!(
             node.state.durable(),
             node.phase,

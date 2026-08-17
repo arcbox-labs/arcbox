@@ -18,7 +18,7 @@ impl State {
             | Self::Staging {}
             | Self::Booting {}
             | Self::Restoring {}
-            | Self::Gating {}
+            | Self::Gating { .. }
             | Self::Resuming {} => SandboxState::Starting,
             Self::Ready {} | Self::Checkpointing {} => SandboxState::Ready,
             Self::Running {} => SandboxState::Running,
@@ -38,17 +38,25 @@ impl State {
     /// `Ready`, and `provisioning`/`restoring` sit on the `Creating` intent
     /// reserved before the machine was driven.
     ///
-    /// `gating` is the one leaf whose durable phase its identity does not fix,
-    /// and deliberately so: a cold boot commits `Ready` *after* the ready probe
-    /// (so a probe failure fails from the recorded `Starting`) while a restore
-    /// commits it *before* (so a crash mid-probe reconciles as a dead-but-Ready
-    /// computer). Both orderings are documented at their sites; the machine
-    /// cannot collapse them into one answer.
+    /// `gating` is the leaf a computer reaches by two paths whose durable
+    /// phase differs — a cold boot commits `Ready` *after* the ready probe, so
+    /// a probe failure fails from the recorded `Starting`, while a restore
+    /// commits it *before*, so a crash mid-probe reconciles as a dead-but-Ready
+    /// computer. Both orderings are load-bearing and documented at their sites,
+    /// which is why the state carries the discriminator rather than the
+    /// projection guessing.
     pub(super) fn durable(self) -> Option<PersistPhase> {
         match self {
             Self::Provisioning {} | Self::Restoring {} => Some(PersistPhase::Creating),
             Self::Staging {} | Self::Booting {} => Some(PersistPhase::Starting),
-            Self::Gating {} | Self::Gone {} => None,
+            // A cold boot arrives here still `Starting` and commits `Ready`
+            // after the probe; a restore arrives already committed.
+            Self::Gating { committed } => Some(if committed {
+                PersistPhase::Ready
+            } else {
+                PersistPhase::Starting
+            }),
+            Self::Gone {} => None,
             Self::Ready {} | Self::Running {} | Self::Checkpointing {} => Some(PersistPhase::Ready),
             Self::Capturing {} | Self::Releasing {} => Some(PersistPhase::Pausing),
             Self::Paused {} => Some(PersistPhase::Paused),

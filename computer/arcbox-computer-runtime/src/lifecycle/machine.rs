@@ -113,7 +113,7 @@ impl ComputerLifecycle {
         match event {
             Event::AgentReady => {
                 context.emit(Effect::SpawnGate);
-                Transition(State::gating())
+                Transition(State::gating(false))
             }
             _ => Super,
         }
@@ -128,7 +128,7 @@ impl ComputerLifecycle {
                 });
                 context.emit(Effect::ArmTimer(Timer::Ttl));
                 context.emit(Effect::SpawnGate);
-                Transition(State::gating())
+                Transition(State::gating(true))
             }
             // A restore that fails before its commit is rolled back, not
             // failed in place: `rollback_restore` force-removes the record and
@@ -148,13 +148,24 @@ impl ComputerLifecycle {
     /// and the initial `cmd` owns the workload slot, so a client acting on an
     /// early READY would hit a stopped guest or steal that slot.
     #[state(superstate = "computer")]
-    fn gating(event: &Event, context: &mut Effects) -> Outcome {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "statig passes state-local storage by reference"
+    )]
+    fn gating(committed: &bool, event: &Event, context: &mut Effects) -> Outcome {
         match event {
             Event::Gated => {
-                context.persist(
-                    PersistPhase::Ready,
-                    Durability::Report(Unconfirmed::Unavailable),
-                );
+                // A cold boot commits `Ready` here, after the probe, so a
+                // probe failure fails from the recorded `Starting`. A restore
+                // committed it in one hop before the gate ran: writing it
+                // again would put an fsync on the restore's hot path and could
+                // refuse a computer that is already durably `Ready`.
+                if !*committed {
+                    context.persist(
+                        PersistPhase::Ready,
+                        Durability::Report(Unconfirmed::Unavailable),
+                    );
+                }
                 context.emit(Effect::Publish(Notify::Ready));
                 context.emit(Effect::Answer(Answer::Ready));
                 context.emit(Effect::ArmTimer(Timer::Idle));
@@ -196,6 +207,7 @@ impl ComputerLifecycle {
             }
             Event::Pause { .. } => {
                 context.persist(PersistPhase::Pausing, Durability::Warn);
+                context.emit(Effect::CancelTimer(Timer::Idle));
                 context.emit(Effect::Publish(Notify::Pausing));
                 context.emit(Effect::SpawnCheckpoint { hold: true });
                 Transition(State::capturing())

@@ -165,10 +165,14 @@ impl Effects {
     }
 
     /// Shared failure: `sandbox::boot::fail_live_sandbox` — persist `Failed`,
-    /// release the runtime, drop the timers, publish FAILED.
+    /// release the runtime, clear the journal behind both, drop the timers,
+    /// publish FAILED. The journal clear is gated on the write being
+    /// confirmed *and* the release completing: what it records is the
+    /// resources a restart would otherwise have to reclaim.
     pub(super) fn failure(&mut self) {
         self.persist(PersistPhase::Failed, Durability::GateJournal);
         self.release(ReleaseScope::Runtime);
+        self.emit(Effect::ClearJournal);
         self.emit(Effect::CancelTimer(Timer::Idle));
         self.emit(Effect::CancelTimer(Timer::Ttl));
         self.emit(Effect::Publish(Notify::Failed));

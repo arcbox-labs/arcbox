@@ -221,7 +221,7 @@ fn the_idle_policy_only_fires_on_a_ready_computer() {
         },
     );
     assert_eq!(state.to_public(), SandboxState::Pausing);
-    assert_eq!(effects[1], Effect::Publish(Notify::Pausing));
+    assert!(effects.contains(&Effect::Publish(Notify::Pausing)));
 
     let (mut sm, mut context) = ready_machine();
     let (state, _) = step(
