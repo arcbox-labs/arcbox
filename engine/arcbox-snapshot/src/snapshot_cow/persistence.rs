@@ -367,11 +367,18 @@ impl CowManager {
             let dev = format!("/dev/{loop_basename}");
             // Verify the loop is still attached AND still backs the
             // expected template, so we never detach a /dev/loopN that
-            // was reused by another process after our crash.
+            // was reused by another process after our crash. Either
+            // spelling counts (see [`backing_spellings`]): the marker holds
+            // the path this manager was configured with, the kernel answers
+            // with the one it resolved, and reading a difference between
+            // them as "reused by someone else" clears the marker and strands
+            // the loop forever — the exact leak this pass exists to prevent.
+            let expected = backing_spellings(Path::new(&expected_backing));
             let actual_backing = loop_backing_file(&dev)?;
 
-            if !expected_backing.is_empty()
-                && actual_backing.as_deref() == Some(expected_backing.as_str())
+            if actual_backing
+                .as_ref()
+                .is_some_and(|actual| expected.contains(actual))
             {
                 debug!(dev = %dev, "detaching stale template loop");
                 self.tools.detach_loop(&dev)?;
