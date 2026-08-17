@@ -330,9 +330,10 @@ impl TapNetwork {
 
     /// Reserves an IP and computes its deterministic TAP metadata without
     /// creating any host resource. Sandbox lifecycle code journals this value
-    /// before calling [`Self::activate`]. `vm_id` is held to the network's id
-    /// contract (`[A-Za-z0-9_-]`, at most 64 bytes) here, so that whatever is
-    /// reserved can later be quarantined and named through the driver port.
+    /// before calling [`Self::activate`]. `vm_id` is held to the driver
+    /// port's `VmId` rules here (`[A-Za-z0-9._-]`, at most 64 bytes), so that
+    /// whatever is reserved can later be quarantined and named through the
+    /// port.
     pub fn reserve(&self, vm_id: &str) -> Result<NetworkAllocation> {
         quarantine::validate_id(vm_id)?;
         self.ensure_startup_cleanup_complete()?;

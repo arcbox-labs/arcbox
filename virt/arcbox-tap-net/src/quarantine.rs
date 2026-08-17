@@ -348,30 +348,17 @@ fn quarantine_path(dir: &Path, sandbox_id: &str) -> PathBuf {
     dir.join(format!("{sandbox_id}.json"))
 }
 
-/// The network's id contract: a VM id is a ledger path component
-/// (`{id}.json`) and, through the driver port, a `VmId` — `[A-Za-z0-9_-]`,
-/// non-empty, at most [`VmId::MAX_LEN`] bytes. Checked where an id enters
-/// the network (`reserve`), on every ledger write, and on every ledger
-/// load, so a reserved address can always be quarantined, every entry the
-/// ledger holds is one the port can name, and a file from outside the
-/// contract fails at load with its id in the message rather than lingering
-/// as a quarantine `NetworkReconcile` could never list or finalize.
+/// The network's id contract is the driver port's: a VM id is a `VmId`
+/// (`[A-Za-z0-9._-]`, non-empty, at most [`VmId::MAX_LEN`] bytes, not `.`
+/// or `..`), which also makes it a safe ledger path component
+/// (`{id}.json`). Checked where an id enters the network (`reserve`), on
+/// every ledger write, and on every ledger load, so a reserved address can
+/// always be quarantined, every entry the ledger holds is one the port can
+/// name, and a file from outside the contract fails at load with its id in
+/// the message rather than lingering as a quarantine `NetworkReconcile`
+/// could never list or finalize.
 pub fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return Err(TapNetError::Network(format!(
-            "invalid sandbox network quarantine id {id:?}"
-        )));
-    }
-    if id.len() > VmId::MAX_LEN {
-        return Err(TapNetError::Network(format!(
-            "sandbox network quarantine id {id:?} exceeds {} bytes, the longest id the \
-             driver port can name",
-            VmId::MAX_LEN
-        )));
-    }
-    Ok(())
+    VmId::new(id)
+        .map(drop)
+        .map_err(|error| TapNetError::Network(error.to_string()))
 }

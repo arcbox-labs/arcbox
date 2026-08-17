@@ -434,7 +434,8 @@ mod tests {
     }
 
     /// The network only ever carries ids the port can name: an id past
-    /// `VmId::MAX_LEN` is refused at `reserve` (before any TAP exists), and
+    /// `VmId::MAX_LEN` is refused at `reserve` (before any TAP exists) with
+    /// the port's own message, and
     /// a ledger file that carries one (written outside this contract) fails
     /// at load naming it, instead of surviving as a quarantine
     /// `NetworkReconcile` could never list or finalize.
@@ -459,7 +460,7 @@ mod tests {
         let startup = TapNetwork::startup_cleanup_token(&fresh).unwrap();
         TapNetwork::finalize_startup_cleanup(&fresh, &startup).unwrap();
         let error = TapNetwork::reserve(&fresh, &long_id).unwrap_err();
-        assert!(error.to_string().contains("64 bytes"), "{error}");
+        assert!(error.to_string().contains("exceeds 64"), "{error}");
         // Nothing was taken from the pool.
         assert_eq!(
             TapNetwork::reserve(&fresh, "box").unwrap().ip_address,
@@ -486,7 +487,7 @@ mod tests {
             panic!("a ledger holding an id the port cannot name must fail to load");
         };
         assert!(
-            error.to_string().contains(&long_id) && error.to_string().contains("64 bytes"),
+            error.to_string().contains(&long_id) && error.to_string().contains("exceeds 64"),
             "{error}"
         );
     }
