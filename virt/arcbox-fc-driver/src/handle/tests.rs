@@ -6,6 +6,10 @@ use super::*;
 use crate::config::FcDriverConfig;
 use crate::process::testing::{pid_exists, spawn};
 
+mod fake_fc;
+
+use fake_fc::FakeFc;
+
 /// A handle over a `sleep` child and an API socket nobody answers on.
 fn handle(dir: &Path, isolation: IsolationSpec, vsock: bool) -> FcHandle {
     handle_over(Arc::new(spawn("sleep", &["30"])), dir, isolation, vsock)
@@ -17,6 +21,19 @@ fn handle_over(
     dir: &Path,
     isolation: IsolationSpec,
     vsock: bool,
+) -> FcHandle {
+    let client = fc_sdk::connection::connect(dir.join("absent.sock"));
+    with_client(process, client, dir, isolation, vsock, false)
+}
+
+/// A handle over `process`, talking to `client`.
+fn with_client(
+    process: Arc<FcProcess>,
+    client: fc_sdk::Client,
+    dir: &Path,
+    isolation: IsolationSpec,
+    vsock: bool,
+    quiesced: bool,
 ) -> FcHandle {
     let id = VmId::new("box").unwrap();
     let mut config = FcDriverConfig::new("/opt/fc/firecracker");
@@ -32,14 +49,24 @@ fn handle_over(
         }),
     };
     let vsock_uds = vsock.then(|| layout.vsock_host_uds());
-    FcHandle::new(
-        process,
-        fc_sdk::connection::connect(dir.join("absent.sock")),
-        layout,
-        record,
-        vsock_uds,
-        false,
-    )
+    FcHandle::new(process, client, layout, record, vsock_uds, quiesced)
+}
+
+/// A Firecracker that pauses and describes itself happily, and answers
+/// `snapshot/create` and the resume as the test asks.
+fn scripted(dir: &Path, capture: u16, resume: u16, state: &'static str) -> FakeFc {
+    FakeFc::start(dir, move |route, body| match route {
+        "PATCH /vm" if body.contains("Resumed") => {
+            (resume, r#"{"fault_message":"no resume"}"#.into())
+        }
+        "PATCH /vm" => (204, String::new()),
+        "PUT /snapshot/create" => (capture, r#"{"fault_message":"no capture"}"#.into()),
+        "GET /" => (
+            200,
+            format!(r#"{{"app_name":"fake","id":"box","state":"{state}","vmm_version":"1.10.1"}}"#),
+        ),
+        other => panic!("the driver called {other} unexpectedly"),
+    })
 }
 
 fn jail(dir: &Path) -> IsolationSpec {
@@ -193,6 +220,100 @@ async fn snapshots_are_written_in_place_or_staged_in_the_jail() {
         }
         SnapshotSite::Direct { .. } => panic!("outside the jail is staged"),
     }
+}
+
+#[tokio::test]
+async fn a_failed_capture_is_reported_even_when_the_resume_fails_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let fc = scripted(dir.path(), 400, 400, "Paused");
+    let vm = with_client(
+        Arc::new(spawn("sleep", &["30"])),
+        fc.client(),
+        dir.path(),
+        IsolationSpec::None,
+        false,
+        false,
+    );
+    let failed = VmHandle::checkpoint(&vm)
+        .unwrap()
+        .checkpoint(&dir.path().join("ckpt"), CheckpointOptions::default())
+        .await;
+    match failed {
+        Err(Error::Driver { message, .. }) => {
+            assert!(message.contains("no capture"), "{message}");
+        }
+        other => panic!("expected the capture failure, got {other:?}"),
+    }
+    // The resume was attempted and did not take: the guest really is frozen.
+    assert_eq!(vm.state(), VmState::Quiesced);
+    let calls = fc.calls();
+    assert!(
+        calls.iter().any(|call| call.contains("Paused")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| call.contains("Resumed")),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_capture_leaves_a_resumed_guest_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let fc = scripted(dir.path(), 400, 204, "Paused");
+    let vm = with_client(
+        Arc::new(spawn("sleep", &["30"])),
+        fc.client(),
+        dir.path(),
+        IsolationSpec::None,
+        false,
+        false,
+    );
+    assert!(
+        VmHandle::checkpoint(&vm)
+            .unwrap()
+            .checkpoint(&dir.path().join("ckpt"), CheckpointOptions::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(vm.state(), VmState::Running);
+}
+
+#[tokio::test]
+async fn a_guest_the_handle_believes_is_frozen_is_asked_before_the_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    // The handle thinks the guest is quiesced; Firecracker says it runs.
+    let fc = scripted(dir.path(), 204, 204, "Running");
+    let vm = with_client(
+        Arc::new(spawn("sleep", &["30"])),
+        fc.client(),
+        dir.path(),
+        IsolationSpec::None,
+        false,
+        true,
+    );
+    assert_eq!(vm.state(), VmState::Quiesced);
+    let opts = CheckpointOptions {
+        after: AfterCheckpoint::HoldQuiesced,
+        kind: CheckpointKind::Full,
+    };
+    VmHandle::checkpoint(&vm)
+        .unwrap()
+        .checkpoint(&dir.path().join("ckpt"), opts)
+        .await
+        .expect("checkpoint");
+    let calls = fc.calls();
+    assert_eq!(calls[0], "GET /", "{calls:?}");
+    assert!(
+        calls[1].contains("Paused"),
+        "the stale belief was corrected: {calls:?}"
+    );
+    // A hold does not resume, and the guest is frozen for real this time.
+    assert!(
+        !calls.iter().any(|call| call.contains("Resumed")),
+        "{calls:?}"
+    );
+    assert_eq!(vm.state(), VmState::Quiesced);
 }
 
 #[tokio::test]

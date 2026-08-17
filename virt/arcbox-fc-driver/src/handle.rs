@@ -233,7 +233,8 @@ impl Checkpoint for FcHandle {
                 "{NAME}: diff checkpoints are not supported"
             )));
         }
-        let was_quiesced = self.require_alive()? == VmState::Quiesced;
+        self.require_alive()?;
+        let was_quiesced = self.observe_quiesced().await?;
         tokio::fs::create_dir_all(dst).await?;
         let site = self.snapshot_site(dst).await?;
 
@@ -255,11 +256,26 @@ impl Checkpoint for FcHandle {
         // Resume after a successful capture that did not ask to hold, and
         // after any failure that found the guest running.
         let hold = captured.is_ok() && opts.after == AfterCheckpoint::HoldQuiesced;
-        if !hold && (captured.is_ok() || !was_quiesced) {
-            api::resume(&self.client).await?;
-            self.quiesced.store(false, Ordering::Release);
+        let resumed = if hold || (captured.is_err() && was_quiesced) {
+            Ok(())
+        } else {
+            let resumed = api::resume(&self.client).await;
+            if resumed.is_ok() {
+                self.quiesced.store(false, Ordering::Release);
+            }
+            resumed
+        };
+        // The capture is what the caller asked for, so its failure is the
+        // one reported; a resume that failed on top of it is logged, and the
+        // guest keeps reporting Quiesced, which is what it is.
+        if let Err(captured) = captured {
+            if let Err(resumed) = resumed {
+                tracing::error!(vm = %self.record.id, error = %resumed,
+                    "the guest stays quiesced: it could not be resumed after a failed checkpoint");
+            }
+            return Err(captured.into());
         }
-        captured?;
+        resumed?;
 
         if let SnapshotSite::Staged { dir, .. } = &site {
             // The guest is either resumed (files complete, FC flushed them
@@ -278,6 +294,27 @@ impl Checkpoint for FcHandle {
 }
 
 impl FcHandle {
+    /// Whether the guest is frozen, asked of Firecracker when this handle
+    /// believes it is.
+    ///
+    /// A handle only ever believes that after a checkpoint that held the
+    /// guest, an adopted VM that was already paused, or a resume that failed
+    /// — rare, and each a state the next checkpoint must not take on trust
+    /// (it decides whether to pause). A guest this handle believes is
+    /// running was never quiesced behind its back, so the common path costs
+    /// nothing.
+    async fn observe_quiesced(&self) -> Result<bool> {
+        if !self.quiesced.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let paused = matches!(
+            api::describe(&self.client).await?.state,
+            fc_sdk::types::InstanceInfoState::Paused
+        );
+        self.quiesced.store(paused, Ordering::Release);
+        Ok(paused)
+    }
+
     /// Where Firecracker writes the snapshot: `dst` itself without a jail
     /// or when `dst` is already inside it (chowned so the jailed VMM can
     /// write there), else a fresh `{jail}/snapshots/<n>` to move from.
