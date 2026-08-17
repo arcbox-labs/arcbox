@@ -1,7 +1,10 @@
-# computer/ — Agent-Computer Domain Layer Agent Guidance
+# computer/ — Agent-Computer Layer Agent Guidance
 
-The transport-free sandbox/agent-computer protocols. The restructure plan
-and its locked decisions live in the company repo:
+Two different things live here, and most rules below bind only one of
+them: `arcbox-computer`, the transport-free protocols, and
+`arcbox-computer-runtime`, the runtime that actually boots Computers. Read
+the Crates section before assuming a rule applies to your crate. The
+restructure plan and its locked decisions live in the company repo:
 `engineering/arcbox/architecture-charter.md`.
 
 ## Layer rules
@@ -16,15 +19,22 @@ and its locked decisions live in the company repo:
   Protocol code is generic over the trait — do not add a concrete
   `Runtime` type anywhere here.
 - **Platform-neutral**: must compile and pass unit tests on Linux as well
-  as macOS (the `linux-engine` CI job gates it).
-- **Mechanically checked**: `cargo xtask check-layers` (same CI job) fails
-  on a direct edge from `computer/` into `app/`, `arcbox-vmm`,
+  as macOS. The gate differs per crate: `arcbox-computer` is in the
+  `linux-engine` CI job's package list; `arcbox-computer-runtime` is
+  deliberately not, because `test-vm-linux` already builds, lints and
+  tests it on real KVM — that suite is its Linux gate and its oracle.
+- **Mechanically checked**: `cargo xtask check-layers` (the `linux-engine`
+  job) fails on a direct edge from `computer/` into `app/`, `arcbox-vmm`,
   `arcbox-hypervisor`, a macOS-only crate or a VMM adapter — the rules
-  live in `xtask/src/commands/check_layers/rules.rs`.
-- Errors speak `arcbox_engine::EngineError`; predicates like
-  `EngineError::Agent { code }` carry the agent's HTTP-style wire codes
-  (404/412 obsolete-ticket, 423 paused, 503 retry) — those codes are
-  protocol contract, mirrored guest-side.
+  live in `xtask/src/commands/check_layers/rules.rs`. Two of those edges
+  are grandfathered for `arcbox-computer-runtime` (below); an `Exception`
+  whose edge disappears **fails** the gate, which is what retires them.
+- Errors speak `arcbox_engine::EngineError` **in `arcbox-computer`**;
+  predicates like `EngineError::Agent { code }` carry the agent's
+  HTTP-style wire codes (404/412 obsolete-ticket, 423 paused, 503 retry)
+  — those codes are protocol contract, mirrored guest-side.
+  `arcbox-computer-runtime` has its own `VmmError` and does not speak
+  `EngineError`; the guest agent converts at its boundary.
 
 ## Crates
 
@@ -41,6 +51,28 @@ and its locked decisions live in the company repo:
   Domain errors are modeled, not stringified
   (`ExposePortError::Raced`, `ListExposedPortsError::Unstable`) — the
   arcbox-api adapters map them onto Connect codes.
+- `arcbox-computer-runtime` — the runtime that boots Computers: lifecycle,
+  exec, files, checkpoints, pause/resume, warm pools, over the
+  `arcbox-vm-driver` port. It ran as `virt/arcbox-vm` until
+  vm-stack-redesign R3 moved it here; the in-sandbox init is
+  `arcbox-vm-agent` and the wire vocabulary `arcbox-vm-proto`, both still
+  under `virt/`. Its own README has the crate map.
+  - **It composes two adapters directly** — `arcbox-fc-driver` and
+    `arcbox-tap-net` — which the layer rule forbids, so both edges are
+    grandfathered `until: "vm-stack-redesign R3 (PR-G)"`, when the node
+    composition root supplies them through the port instead. Do not add a
+    third adapter edge; take it through `arcbox-vm-driver`.
+  - **The on-disk vocabulary is frozen.** `sandbox-records/`,
+    `sandboxes/`, `state.json`, `sandbox-network-quarantine`,
+    `arcbox-pause`, `paused-rootfs.ext4`, `arcbox.warm_key`, the `pool-`
+    id prefix, `arcbox-cow-{id}` / `arcbox-snap-{id}`. `RECORD_VERSION`
+    is 1 and there is no migration story, so renaming any of them breaks
+    upgrade-in-place — the R3 rename deliberately leaves every one of
+    them alone.
+  - **Transitional naming**: the crate is `arcbox-computer-runtime` but
+    its types still read `SandboxManager` / `SandboxSpec` / `VmmConfig` /
+    `VmmError`. The `Computer*` rename is its own PR, with `compat.rs`
+    aliases for the guest agent. Not an inconsistency to file.
 
 ## Reaching the platform without a `#[cfg]`
 
