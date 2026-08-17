@@ -22,6 +22,22 @@ pub struct NetworkAttachment {
     /// [`GuestNetwork::identity`](arcbox_vm_driver::net::GuestNetwork::identity)
     /// under the mode it was activated in.
     pub identity: NetworkIdentity,
+    /// Whether this boot bakes the fixed invariant identity (CORE-81) into
+    /// the guest's command line, which it does not when the caller supplied
+    /// their own `ip=`.
+    ///
+    /// Carried beside the mode rather than confused with it: the host side
+    /// of a cold boot is *always* activated
+    /// [`AttachMode::Invariant`](arcbox_vm_driver::net::AttachMode::Invariant),
+    /// so this flag says something about the guest, not about the datapath.
+    pub invariant_identity: bool,
+}
+
+impl NetworkAttachment {
+    /// This attachment as the crash journal records it.
+    pub(super) fn journaled(&self) -> super::reconcile::JournaledLease<'_> {
+        super::reconcile::JournaledLease::cold_boot(&self.lease, self.invariant_identity)
+    }
 }
 
 pub(super) struct SandboxBootTask {

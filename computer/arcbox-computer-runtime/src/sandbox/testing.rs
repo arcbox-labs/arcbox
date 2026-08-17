@@ -15,7 +15,7 @@ use arcbox_vm_driver::{
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use super::reconcile::{SandboxStateRecord, write_state_record};
+use super::reconcile::{JournaledLease, SandboxStateRecord, write_state_record};
 use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::{SandboxInstance, SandboxManager, SandboxSpec, SandboxState};
 use crate::config::{JailerConfig, VmmConfig};
@@ -264,7 +264,10 @@ pub(super) async fn live_sandbox_with(
         &SandboxStateRecord::new(
             id,
             super::journaled_pid(&*prepared),
-            Some(&lease),
+            // A cold boot with the invariant identity baked in, which is
+            // what `live_sandbox` stands for and what the identity below
+            // is read under.
+            Some(JournaledLease::cold_boot(&lease, true)),
             Some(&cow_handle),
             &manager.config,
             None,

@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use arcbox_vm_driver::net::{GuestNetwork, NetworkLease};
+use arcbox_vm_driver::net::{AttachMode, GuestNetwork, NetworkLease};
 use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmId, VmRecord};
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -132,6 +132,101 @@ pub(super) struct SandboxStateRecord {
     /// slot id the jailer chroot and dm/CoW names are keyed by.
     #[serde(default)]
     pub pool_slot_id: Option<String>,
+    /// The [`AttachMode`] this record's lease was activated as — what
+    /// [`GuestNetwork::adopt`] must re-establish for a sandbox the sweep
+    /// keeps alive.
+    ///
+    /// Emphatically **not** derivable from [`Self::net_invariant`]: a cold
+    /// boot always activates [`AttachMode::Invariant`], while that flag says
+    /// only whether the boot baked the invariant `ip=` into the guest's
+    /// command line — false whenever the caller supplied their own. Restore
+    /// and resume are the only paths that vary the mode, and they take it
+    /// from the *snapshot's* flag. Re-establishing `LegacySnapshot` on a TAP
+    /// that was activated `Invariant` is no translation at all, i.e. a live
+    /// guest nothing can reach.
+    ///
+    /// `None` for a networkless sandbox, and in every record written before
+    /// adoption existed. A record that names a lease without it is not
+    /// adoptable: the wrong datapath is worse than the teardown it replaces.
+    #[serde(default)]
+    pub attach_mode: Option<JournaledAttachMode>,
+    /// Whether the guest holds the fixed invariant identity (CORE-81).
+    ///
+    /// [`SandboxInstance::net_invariant`] as an adopted sandbox is rebuilt
+    /// with it, and so what that sandbox's next checkpoint records as its
+    /// restore contract. A different fact from [`Self::attach_mode`] — see
+    /// there.
+    #[serde(default)]
+    pub net_invariant: bool,
+}
+
+/// How a lease's host side was attached, in the journal's own vocabulary.
+///
+/// A journal-local mirror of [`AttachMode`], which carries no serde derives;
+/// mapped at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum JournaledAttachMode {
+    Invariant,
+    LegacySnapshot,
+}
+
+impl From<AttachMode> for JournaledAttachMode {
+    fn from(mode: AttachMode) -> Self {
+        match mode {
+            AttachMode::Invariant => Self::Invariant,
+            AttachMode::LegacySnapshot => Self::LegacySnapshot,
+        }
+    }
+}
+
+impl From<JournaledAttachMode> for AttachMode {
+    fn from(mode: JournaledAttachMode) -> Self {
+        match mode {
+            JournaledAttachMode::Invariant => Self::Invariant,
+            JournaledAttachMode::LegacySnapshot => Self::LegacySnapshot,
+        }
+    }
+}
+
+/// A lease as the journal records it: the address, the [`AttachMode`] its
+/// host side is activated as, and whether the guest holds the fixed
+/// invariant identity.
+///
+/// The three travel together because a restart that keeps the guest running
+/// must re-establish that exact datapath, and no two of them give the third.
+/// One parameter rather than a lease plus two loose flags is what stops a
+/// journal site from recording an address without saying how it is attached.
+#[derive(Clone, Copy)]
+pub(super) struct JournaledLease<'a> {
+    lease: &'a NetworkLease,
+    mode: AttachMode,
+    invariant_identity: bool,
+}
+
+impl<'a> JournaledLease<'a> {
+    /// A cold boot's lease. Its host side is always activated
+    /// [`AttachMode::Invariant`] (`lifecycle.rs`, unconditional);
+    /// `baked_invariant_ip` says only whether the boot also put that
+    /// identity on the guest's command line.
+    pub fn cold_boot(lease: &'a NetworkLease, baked_invariant_ip: bool) -> Self {
+        Self {
+            lease,
+            mode: AttachMode::Invariant,
+            invariant_identity: baked_invariant_ip,
+        }
+    }
+
+    /// A restore's or resume's lease: the snapshot's own flag decides both
+    /// the mode and the guest's identity — the same expression that feeds
+    /// the `activate` these journal writes precede.
+    pub fn from_snapshot(lease: &'a NetworkLease, net_invariant: bool) -> Self {
+        Self {
+            lease,
+            mode: super::attach_mode(net_invariant),
+            invariant_identity: net_invariant,
+        }
+    }
 }
 
 /// The TAP name an allocation for `ip` carries.
@@ -149,22 +244,24 @@ impl SandboxStateRecord {
     pub fn new(
         id: &str,
         pid: Option<i32>,
-        network: Option<&NetworkLease>,
+        network: Option<JournaledLease<'_>>,
         cow: Option<&CowHandle>,
         config: &VmmConfig,
         restore_origin_dir: Option<&Path>,
     ) -> Result<Self> {
-        let network = network
-            .map(|lease| legacy_allocation(lease, &config.network.dns))
+        let allocation = network
+            .map(|net| legacy_allocation(net.lease, &config.network.dns))
             .transpose()?;
         Ok(Self {
             id: id.to_owned(),
             pid,
-            network,
+            network: allocation,
             cow: cow.map(CowRecord::from_handle),
             jailer: config.firecracker.jailer.is_some(),
             restore_origin_dir: restore_origin_dir.map(Path::to_path_buf),
             pool_slot_id: None,
+            attach_mode: network.map(|net| net.mode.into()),
+            net_invariant: network.is_some_and(|net| net.invariant_identity),
         })
     }
 
@@ -617,9 +714,10 @@ mod tests {
         assert_eq!(lease.mac.to_string(), "02:fc:00:00:00:07");
         assert_eq!(lease.cleanup_token, "gen-1");
 
-        // ...and the record this agent writes from that lease is the same
-        // JSON, field for field — including the two the lease does not
-        // carry, which are reconstructed rather than dropped.
+        // ...and the record this agent writes from that lease still says
+        // everything the old shape said, field for field — including the two
+        // the lease does not carry, which are reconstructed rather than
+        // dropped. What adoption added is purely additive on top.
         let mut config = VmmConfig::default();
         config.network.dns = vec!["1.1.1.1".into()];
         config.firecracker.jailer = Some(crate::config::JailerConfig {
@@ -633,12 +731,84 @@ mod tests {
             parent_cgroup: None,
             resource_limits: vec![],
         });
-        let written =
-            SandboxStateRecord::new("box", Some(4242), Some(&lease), None, &config, None).unwrap();
+        let written = SandboxStateRecord::new(
+            "box",
+            Some(4242),
+            Some(JournaledLease::cold_boot(&lease, true)),
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&written).unwrap();
+        let fields = value.as_object_mut().unwrap();
         assert_eq!(
-            serde_json::to_value(&written).unwrap(),
+            fields.remove("attach_mode"),
+            Some(serde_json::json!("invariant"))
+        );
+        assert_eq!(
+            fields.remove("net_invariant"),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            value,
             serde_json::from_str::<serde_json::Value>(LEGACY_RECORD).unwrap()
         );
+    }
+
+    /// The two fields adoption added default the way the record's
+    /// both-directions contract requires: a journal written before they
+    /// existed loads, and says it is not adoptable rather than guessing a
+    /// datapath.
+    #[test]
+    fn a_journal_without_an_attach_mode_loads_as_not_adoptable() {
+        let record: SandboxStateRecord = serde_json::from_str(LEGACY_RECORD).unwrap();
+        assert_eq!(record.attach_mode, None);
+        assert!(!record.net_invariant);
+    }
+
+    /// A cold boot always activates `Invariant`, whatever the guest's own
+    /// identity ends up being — the distinction the journal exists to keep.
+    #[test]
+    fn a_cold_boot_journals_the_invariant_mode_even_without_the_invariant_identity() {
+        let lease = NetworkLease {
+            vm: VmId::new("box").unwrap(),
+            ip: "172.20.0.7".parse().unwrap(),
+            prefix_len: 16,
+            gateway: "172.20.0.1".parse().unwrap(),
+            mac: "02:fc:00:00:00:07".parse().unwrap(),
+            cleanup_token: "gen-1".into(),
+        };
+        let config = VmmConfig::default();
+        for baked in [true, false] {
+            let record = SandboxStateRecord::new(
+                "box",
+                None,
+                Some(JournaledLease::cold_boot(&lease, baked)),
+                None,
+                &config,
+                None,
+            )
+            .unwrap();
+            assert_eq!(record.attach_mode, Some(JournaledAttachMode::Invariant));
+            assert_eq!(record.net_invariant, baked);
+        }
+        // A restore or resume is the only thing that varies the mode, and
+        // both halves come from the snapshot's flag there.
+        let legacy = SandboxStateRecord::new(
+            "box",
+            None,
+            Some(JournaledLease::from_snapshot(&lease, false)),
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.attach_mode,
+            Some(JournaledAttachMode::LegacySnapshot)
+        );
+        assert!(!legacy.net_invariant);
     }
 
     fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: PersistPhase) -> SandboxRecord {
@@ -752,6 +922,8 @@ mod tests {
             jailer: true,
             restore_origin_dir: None,
             pool_slot_id: Some("pool-1".into()),
+            attach_mode: Some(JournaledAttachMode::Invariant),
+            net_invariant: true,
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         let parsed: SandboxStateRecord = serde_json::from_slice(&bytes).unwrap();
@@ -786,6 +958,8 @@ mod tests {
             jailer: true,
             restore_origin_dir: None,
             pool_slot_id: slot.map(str::to_owned),
+            attach_mode: None,
+            net_invariant: false,
         };
 
         // Slot-keyed resources validate against the slot id, not the sandbox id.

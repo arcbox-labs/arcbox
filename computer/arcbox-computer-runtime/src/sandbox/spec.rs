@@ -145,6 +145,7 @@ mod tests {
                 dns: vec![crate::network::invariant::GUEST_GATEWAY.into()],
                 mac: "02:fc:00:00:00:07".parse().unwrap(),
             },
+            invariant_identity: true,
         }
     }
 

@@ -1,5 +1,6 @@
 use super::boot::boot_sandbox;
 use super::cleanup::{inst_to_info, remove_sandbox_impl};
+use super::reconcile::JournaledLease;
 use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
@@ -329,6 +330,11 @@ impl SandboxManager {
         // was never built — a journal write between the two can fail.
         let mut lease: Option<NetworkLease> = None;
         let mut nic: Option<NicSpec> = None;
+        // Whether this boot bakes the fixed invariant identity into the
+        // guest's command line (see do_boot); false when the caller brought
+        // their own `ip=`. Independent of the mode the host side is attached
+        // in, which is `Invariant` either way.
+        let invariant_identity = !spec.boot_args.contains("ip=");
         let setup = async {
             if spec.network.mode != "none" {
                 lease = Some(
@@ -346,7 +352,9 @@ impl SandboxManager {
             let cleanup_record = super::reconcile::SandboxStateRecord::new(
                 &id,
                 None,
-                lease.as_ref(),
+                lease
+                    .as_ref()
+                    .map(|lease| JournaledLease::cold_boot(lease, invariant_identity)),
                 None,
                 &self.config,
                 None,
@@ -439,13 +447,13 @@ impl SandboxManager {
                 lease,
                 nic,
                 identity,
+                invariant_identity,
             }
         });
         // The boot bakes the invariant `ip=` identity unless the caller
         // supplied an explicit ip= (see do_boot); record which one this guest
         // runs so checkpoints carry the right restore contract.
-        creating_instance.net_invariant =
-            creating_instance.network.is_some() && !spec.boot_args.contains("ip=");
+        creating_instance.net_invariant = creating_instance.network.is_some() && invariant_identity;
 
         // Retain the boot task so force/TTL removal can cancel and join it
         // before deleting the crash-recovery journal.

@@ -29,6 +29,7 @@
 //! reconciliation, and `Remove` all see one naming scheme.
 
 use super::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
+use super::reconcile::JournaledLease;
 use super::record::SandboxTransition;
 use super::spec::restore_spec;
 use super::types::action;
@@ -609,6 +610,10 @@ impl SandboxManager {
                 .map(|lease| lease.ip.to_string())
                 .unwrap_or_default();
             let journal = |pid: Option<i32>, cow: Option<&CowHandle>, net: Option<&NetworkLease>| {
+                // The lease attaches the way the snapshot says, exactly as
+                // the `activate` below does — the same expression, so the
+                // journal and the datapath cannot disagree.
+                let net = net.map(|lease| JournaledLease::from_snapshot(lease, snap_meta.net_invariant));
                 super::reconcile::SandboxStateRecord::new(id, pid, net, cow, &self.config, None)
                     .and_then(|record| super::reconcile::write_state_record(vm_dir, &record))
             };
