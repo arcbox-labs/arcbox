@@ -68,13 +68,16 @@ struct FcHarness {
 }
 
 impl FcHarness {
-    /// Firecracker run directly; `None` without the assets.
+    /// Firecracker run directly; `None` without the assets. No jailer, so
+    /// the driver claims no checkpoints and the contract's checkpoint and
+    /// restore checks skip themselves.
     fn direct() -> Option<Self> {
         Some(Self::new(Assets::from_env()?, None))
     }
 
-    /// Firecracker under the jailer as uid/gid 0 (production's shape);
-    /// `None` without the assets or `FC_JAILER`.
+    /// Firecracker under the jailer as uid/gid 0 (production's shape), the
+    /// mode checkpoints and restores are possible in; `None` without the
+    /// assets or `FC_JAILER`.
     fn jailer() -> Option<Self> {
         let jailer: PathBuf = std::env::var_os("FC_JAILER")?.into();
         Some(Self::new(Assets::from_env()?, Some(jailer)))

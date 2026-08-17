@@ -52,6 +52,17 @@ fn with_client(
     FcHandle::new(process, client, layout, record, vsock, quiesced)
 }
 
+/// A checkpoint destination inside the VM's jail, so the capture is
+/// written in place and nothing has to be moved out afterwards (the
+/// scripted Firecracker writes no files).
+fn in_jail(vm: &FcHandle) -> PathBuf {
+    vm.layout
+        .jail()
+        .expect("checkpoints are taken on jailed vms")
+        .root
+        .join("snapshots/ckpt")
+}
+
 /// A Firecracker that pauses and describes itself happily, and answers
 /// `snapshot/create` and the resume as the test asks.
 fn scripted(dir: &Path, capture: u16, resume: u16, state: &'static str) -> FakeFc {
@@ -83,7 +94,7 @@ fn jail(dir: &Path) -> IsolationSpec {
 #[tokio::test]
 async fn state_follows_the_process_and_kill_reports_the_signal() {
     let dir = tempfile::tempdir().unwrap();
-    let vm = handle(dir.path(), IsolationSpec::None, true);
+    let vm = handle(dir.path(), jail(dir.path()), true);
     assert_eq!(vm.state(), VmState::Running);
     assert!(vm.vsock().is_some() && vm.vsock_listener().is_some());
     assert!(VmHandle::checkpoint(&vm).is_some() && VmHandle::detach(&vm).is_some());
@@ -105,10 +116,21 @@ async fn state_follows_the_process_and_kill_reports_the_signal() {
     assert!(matches!(
         VmHandle::checkpoint(&vm)
             .unwrap()
-            .checkpoint(&dir.path().join("ckpt"), CheckpointOptions::default())
+            .checkpoint(&in_jail(&vm), CheckpointOptions::default())
             .await,
         Err(Error::WrongState { .. })
     ));
+}
+
+#[tokio::test]
+async fn checkpoints_are_a_jailer_mode_capability() {
+    // Firecracker reopens the recorded drive paths on load, so a checkpoint
+    // can be restored only inside a per-VM chroot; an unjailed VM has no
+    // checkpoint accessor.
+    let dir = tempfile::tempdir().unwrap();
+    let vm = handle(dir.path(), IsolationSpec::None, true);
+    assert!(VmHandle::checkpoint(&vm).is_none());
+    assert!(vm.vsock().is_some() && VmHandle::detach(&vm).is_some());
 }
 
 #[tokio::test]
@@ -170,7 +192,7 @@ async fn drop_kills_unless_detached() {
 #[tokio::test]
 async fn diff_checkpoints_are_refused_before_touching_the_guest() {
     let dir = tempfile::tempdir().unwrap();
-    let vm = handle(dir.path(), IsolationSpec::None, false);
+    let vm = handle(dir.path(), jail(dir.path()), false);
     let opts = CheckpointOptions {
         after: AfterCheckpoint::Resume,
         kind: CheckpointKind::Diff,
@@ -178,7 +200,7 @@ async fn diff_checkpoints_are_refused_before_touching_the_guest() {
     assert!(matches!(
         VmHandle::checkpoint(&vm)
             .unwrap()
-            .checkpoint(&dir.path().join("ckpt"), opts)
+            .checkpoint(&in_jail(&vm), opts)
             .await,
         Err(Error::InvalidSpec(_))
     ));
@@ -230,13 +252,13 @@ async fn a_failed_capture_is_reported_even_when_the_resume_fails_too() {
         Arc::new(spawn("sleep", &["30"])),
         fc.client(),
         dir.path(),
-        IsolationSpec::None,
+        jail(dir.path()),
         false,
         false,
     );
     let failed = VmHandle::checkpoint(&vm)
         .unwrap()
-        .checkpoint(&dir.path().join("ckpt"), CheckpointOptions::default())
+        .checkpoint(&in_jail(&vm), CheckpointOptions::default())
         .await;
     match failed {
         Err(Error::Driver { message, .. }) => {
@@ -265,14 +287,14 @@ async fn a_failed_capture_leaves_a_resumed_guest_running() {
         Arc::new(spawn("sleep", &["30"])),
         fc.client(),
         dir.path(),
-        IsolationSpec::None,
+        jail(dir.path()),
         false,
         false,
     );
     assert!(
         VmHandle::checkpoint(&vm)
             .unwrap()
-            .checkpoint(&dir.path().join("ckpt"), CheckpointOptions::default())
+            .checkpoint(&in_jail(&vm), CheckpointOptions::default())
             .await
             .is_err()
     );
@@ -288,7 +310,7 @@ async fn a_guest_the_handle_believes_is_frozen_is_asked_before_the_capture() {
         Arc::new(spawn("sleep", &["30"])),
         fc.client(),
         dir.path(),
-        IsolationSpec::None,
+        jail(dir.path()),
         false,
         true,
     );
@@ -299,7 +321,7 @@ async fn a_guest_the_handle_believes_is_frozen_is_asked_before_the_capture() {
     };
     VmHandle::checkpoint(&vm)
         .unwrap()
-        .checkpoint(&dir.path().join("ckpt"), opts)
+        .checkpoint(&in_jail(&vm), opts)
         .await
         .expect("checkpoint");
     let calls = fc.calls();

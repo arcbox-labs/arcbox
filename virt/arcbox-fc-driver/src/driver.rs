@@ -15,7 +15,7 @@ use crate::handle::FcHandle;
 use crate::listener::VsockEndpoint;
 use crate::prepared::FcPrepared;
 use crate::process::FcProcess;
-use crate::render::VmLayout;
+use crate::render::{self, VmLayout};
 use crate::{CHECKPOINT_FORMAT, NAME, api, discover};
 
 /// The Firecracker adapter.
@@ -56,11 +56,15 @@ impl VmDriver for FcDriver {
         NAME
     }
 
+    /// Checkpoints are claimed only with a jailer configured: a restore is
+    /// possible only inside a per-VM chroot
+    /// ([`render::require_jailed_restore`]), and a driver that cannot
+    /// restore does not claim to checkpoint.
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities {
             vsock: true,
             vsock_listen: true,
-            checkpoint: true,
+            checkpoint: self.config.jailer_binary.is_some(),
             diff_checkpoint: false,
             adopt: true,
             prepare: true,
@@ -85,10 +89,12 @@ impl VmDriver for FcDriver {
         spec: RestoreSpec,
         runtime_dir: &Path,
     ) -> Result<Box<dyn VmHandle>> {
-        // Refuse a foreign image before spawning anything.
+        // Refuse a foreign image, and a restore outside a jail, before
+        // spawning anything.
         if image.format.as_str() != CHECKPOINT_FORMAT {
             return Err(Error::ForeignCheckpoint(image.format.clone()));
         }
+        render::require_jailed_restore(&spec.isolation)?;
         let prepared = self
             .prepare_vm(&spec.id, &spec.isolation, runtime_dir)
             .await?;
@@ -138,7 +144,7 @@ impl Adopt for FcDriver {
         )?;
         let vsock = devices
             .vsock
-            .map(|vsock| VsockEndpoint::new(layout.vsock_host_view(&vsock.uds_path)));
+            .map(|vsock| VsockEndpoint::new(layout.host_view(&vsock.uds_path)));
         let process = Arc::new(FcProcess::adopt(found.pid, found.api_socket));
         let quiesced = matches!(info.state, fc_sdk::types::InstanceInfoState::Paused);
         Ok(Some(Box::new(FcHandle::new(
@@ -199,10 +205,16 @@ mod tests {
         let driver = driver();
         assert_eq!(driver.name(), "firecracker");
         let caps = driver.capabilities();
-        assert!(caps.vsock && caps.vsock_listen && caps.checkpoint);
+        assert!(caps.vsock && caps.vsock_listen);
         assert!(caps.adopt && caps.prepare);
         assert!(!caps.diff_checkpoint && !caps.balloon && !caps.console && !caps.debug);
         assert!(VmDriver::adopt(&driver).is_some() && VmDriver::prepare(&driver).is_some());
+        // Checkpoints go with the jailer: without one nothing could be
+        // restored, so nothing is claimed.
+        assert!(!caps.checkpoint);
+        let mut config = FcDriverConfig::new("/nonexistent/arcbox-fc-driver/firecracker");
+        config.jailer_binary = Some("/nonexistent/arcbox-fc-driver/jailer".into());
+        assert!(FcDriver::new(config).capabilities().checkpoint);
     }
 
     #[tokio::test]
@@ -244,8 +256,17 @@ mod tests {
             isolation: IsolationSpec::None,
         };
         assert!(matches!(
-            driver.restore(&image, restore, dir.path()).await,
+            driver.restore(&image, restore.clone(), dir.path()).await,
             Err(Error::ForeignCheckpoint(_))
+        ));
+        // A restore outside a jail is refused before a spawn too.
+        let own = CheckpointImage {
+            format: CheckpointFormat::new(CHECKPOINT_FORMAT),
+            ..image
+        };
+        assert!(matches!(
+            driver.restore(&own, restore, dir.path()).await,
+            Err(Error::InvalidSpec(msg)) if msg.contains("jailer isolation")
         ));
         assert!(
             !dir.path().join("firecracker.log").exists(),

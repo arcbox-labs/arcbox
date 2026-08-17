@@ -47,11 +47,22 @@ let vm = driver.boot(spec, &runtime_dir).await?;   // Box<dyn VmHandle>
 
 The checkpoint format is `firecracker/v1`: a directory holding `vmstate`
 and `mem`. Restoring anything else fails with `Error::ForeignCheckpoint`.
-A restore loads the image with the guest frozen, points every drive at the
-path *this* restore gives it (`PATCH /drives/{id}`, skipped where the image
-already names it — a snapshot records the disk paths of the VM it was taken
-from, never the fresh copy-on-write device a restore runs on), and only then
-resumes.
+
+**Checkpoints are a jailer-mode capability.** `PUT /snapshot/load` reopens
+every drive at the path the checkpoint recorded, with no override, so a
+restored VM can be given other disks only where that path is private to
+it — inside a per-VM chroot, where the driver stages this restore's disks
+under the recorded names. Without a jail the recorded paths are the source
+VM's own host paths, shared with it (the sandbox manager refuses direct-mode
+restores for the same reason). So `capabilities().checkpoint` is `true`
+only with a jailer binary configured, `FcHandle::checkpoint()` is `Some`
+only for a VM under `IsolationSpec::Jailer`, and a `RestoreSpec` without
+jailer isolation is refused with `Error::InvalidSpec` — direct mode
+advertises `checkpoint: false`. A restore loads the image with the guest
+frozen, points every drive at the path *this* restore gives it
+(`PATCH /drives/{id}`, skipped where the image already names it — a
+snapshot records the disk paths of the VM it was taken from, never the fresh
+copy-on-write device a restore runs on), and only then resumes.
 
 ## Path rules
 

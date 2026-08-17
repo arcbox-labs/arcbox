@@ -128,13 +128,13 @@ impl VmLayout {
         }
     }
 
-    /// The host view of a vsock socket path Firecracker reports (`GET
-    /// /vm/config`, which is what a restored or adopted VM actually bound):
+    /// The host view of a path Firecracker reports (`GET /vm/config` after
+    /// a restore or on adopt — a vsock socket it bound, a disk it opened):
     /// jail-relative under a jail, verbatim otherwise.
-    pub fn vsock_host_view(&self, fc_uds: &str) -> PathBuf {
+    pub fn host_view(&self, fc_path: &str) -> PathBuf {
         match &self.jail {
-            Some(jail) => jail.root.join(fc_uds.trim_start_matches('/')),
-            None => PathBuf::from(fc_uds),
+            Some(jail) => jail.root.join(fc_path.trim_start_matches('/')),
+            None => PathBuf::from(fc_path),
         }
     }
 
@@ -289,10 +289,12 @@ pub fn fc_config(spec: &VmSpec, config: &FcDriverConfig, runtime_dir: &Path) -> 
 /// as Firecracker must see them once the image is loaded.
 ///
 /// Refuses a format this driver did not write
-/// ([`Error::ForeignCheckpoint`]) and a diff image ([`Error::InvalidSpec`]).
-/// A snapshot load reopens the disk paths the checkpoint recorded, which
-/// are never this restore's — so the load is rendered paused and the caller
-/// points each drive at [`FcRestorePlan::drives`] before resuming.
+/// ([`Error::ForeignCheckpoint`]), a diff image, and a spec without jailer
+/// isolation ([`Error::InvalidSpec`], see [`require_jailed_restore`]).
+/// A snapshot load reopens the disk paths the checkpoint recorded — inside
+/// the new jail, where the plan stages this restore's disks under the same
+/// names — so the load is rendered paused and the caller points each drive
+/// at [`FcRestorePlan::drives`] before resuming.
 pub fn fc_restore(
     image: &CheckpointImage,
     spec: &RestoreSpec,
@@ -305,6 +307,7 @@ pub fn fc_restore(
     if image.kind != CheckpointKind::Full {
         return Err(unsupported("diff checkpoints are not restored"));
     }
+    require_jailed_restore(&spec.isolation)?;
     let layout = VmLayout::new(&spec.id, &spec.isolation, config, runtime_dir)?;
     let name = image
         .dir
@@ -358,6 +361,23 @@ pub fn fc_restore(
         },
         drives,
     })
+}
+
+/// Checkpoints are a jailer-mode capability.
+///
+/// `PUT /snapshot/load` reopens every drive at the path the checkpoint
+/// recorded, with no override, so a restored VM can be given other disks
+/// only where that path is private to it — inside a per-VM chroot, where
+/// this driver stages them under the recorded names. Without a jail the
+/// recorded paths are the source VM's own host paths, shared with it, and a
+/// restore is refused.
+pub fn require_jailed_restore(isolation: &IsolationSpec) -> Result<()> {
+    match isolation {
+        IsolationSpec::Jailer { .. } => Ok(()),
+        _ => Err(unsupported(
+            "restore needs jailer isolation: Firecracker reopens the recorded drive paths on load",
+        )),
+    }
 }
 
 fn drive(layout: &VmLayout, disk: &DiskSpec, stage: &mut Vec<StagePlan>) -> Result<Drive> {

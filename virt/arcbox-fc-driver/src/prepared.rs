@@ -207,8 +207,7 @@ impl PreparedVm for FcPrepared {
         // can dial out.
         let has_vsock = loaded.vsock.is_some();
         if let Some(vsock) = loaded.vsock {
-            self.vsock
-                .relocate(self.layout.vsock_host_view(&vsock.uds_path));
+            self.vsock.relocate(self.layout.host_view(&vsock.uds_path));
         }
         // The load left the guest frozen so it could not touch a stale disk;
         // it runs from here.

@@ -56,7 +56,7 @@ fn direct_layout_names_the_runtime_dir_sockets_and_passes_paths_verbatim() {
         "/run/vms/box/firecracker.vsock"
     );
     assert_eq!(
-        layout.vsock_host_view("/run/vms/other/firecracker.vsock"),
+        layout.host_view("/run/vms/other/firecracker.vsock"),
         Path::new("/run/vms/other/firecracker.vsock")
     );
     let plan = layout.spawn_plan();
@@ -93,7 +93,7 @@ fn jailer_layout_relativizes_inside_paths_and_stages_outside_ones() {
     assert_eq!(layout.vsock_host_uds(), root.join("run/firecracker.vsock"));
     assert_eq!(layout.vsock_fc_uds().unwrap(), "/run/firecracker.vsock");
     assert_eq!(
-        layout.vsock_host_view("/run/firecracker.vsock"),
+        layout.host_view("/run/firecracker.vsock"),
         root.join("run/firecracker.vsock")
     );
     let plan = layout.spawn_plan();
@@ -453,8 +453,10 @@ fn restore_spec(id: &str, isolation: IsolationSpec, rootfs: PathBuf) -> RestoreS
 }
 
 #[test]
-fn restore_loads_the_image_and_retargets_nics_onto_the_new_taps() {
-    let plan = fc_restore(
+fn restore_is_a_jailer_mode_capability() {
+    // Without a jail the load would reopen the source VM's own host paths;
+    // the restore is refused before anything is planned.
+    let error = fc_restore(
         &image(Path::new("/snaps/abc")),
         &restore_spec(
             "box2",
@@ -463,25 +465,10 @@ fn restore_loads_the_image_and_retargets_nics_onto_the_new_taps() {
         ),
         &config(),
         Path::new("/run/vms/box2"),
-    )
-    .unwrap();
-    assert!(plan.stage.is_empty());
-    assert_eq!(plan.load.snapshot_path, "/snaps/abc/vmstate");
-    assert_eq!(plan.load.mem_file_path.as_deref(), Some("/snaps/abc/mem"));
-    // The load leaves the guest frozen until the disks below replace the
-    // ones the checkpoint recorded.
-    assert_eq!(plan.load.resume_vm, Some(false));
-    assert_eq!(plan.load.network_overrides.len(), 1);
-    assert_eq!(plan.load.network_overrides[0].iface_id, "eth0");
-    assert_eq!(plan.load.network_overrides[0].host_dev_name, "tap7");
-    // Without a jail nothing is staged, so the disks reach Firecracker only
-    // as the paths to patch onto the loaded drives.
-    assert_eq!(plan.drives.len(), 1);
-    assert_eq!(plan.drives[0].drive_id, "rootfs");
-    assert_eq!(
-        plan.drives[0].path_on_host.as_deref(),
-        Some("/run/vms/box2/rootfs.link")
     );
+    assert!(invalid(error).contains("jailer isolation"));
+    assert!(require_jailed_restore(&IsolationSpec::None).is_err());
+    assert!(require_jailed_restore(&jailed(Path::new("/srv/jailer"))).is_ok());
 }
 
 #[test]
@@ -503,6 +490,12 @@ fn restore_stages_the_image_and_disks_into_a_jail_by_name() {
         plan.load.mem_file_path.as_deref(),
         Some("/snapshots/abc/mem")
     );
+    // The load leaves the guest frozen until the drives below replace the
+    // ones the checkpoint recorded, and lands each NIC on its new TAP.
+    assert_eq!(plan.load.resume_vm, Some(false));
+    assert_eq!(plan.load.network_overrides.len(), 1);
+    assert_eq!(plan.load.network_overrides[0].iface_id, "eth0");
+    assert_eq!(plan.load.network_overrides[0].host_dev_name, "tap7");
     assert_eq!(
         plan.stage,
         vec![
@@ -559,11 +552,19 @@ fn restore_stages_the_image_and_disks_into_a_jail_by_name() {
 fn restore_refuses_foreign_and_diff_images() {
     let mut foreign = image(Path::new("/snaps/abc"));
     foreign.format = CheckpointFormat::new("fake/v1");
-    let spec = restore_spec("box2", IsolationSpec::None, "/x".into());
-    match fc_restore(&foreign, &spec, &config(), Path::new("/run/vms/box2")) {
+    // A foreign format is refused first, whatever the isolation.
+    let unjailed = restore_spec("box2", IsolationSpec::None, "/x".into());
+    match fc_restore(&foreign, &unjailed, &config(), Path::new("/run/vms/box2")) {
         Err(Error::ForeignCheckpoint(format)) => assert_eq!(format.as_str(), "fake/v1"),
         other => panic!("expected ForeignCheckpoint, got {other:?}"),
     }
+    // A disk already inside the jail, so nothing is stat'ed on the way to
+    // the checks below.
+    let spec = restore_spec(
+        "box2",
+        jailed(Path::new("/srv/jailer")),
+        "/srv/jailer/firecracker/box2/root/rootfs.ext4".into(),
+    );
     let mut diff = image(Path::new("/snaps/abc"));
     diff.kind = CheckpointKind::Diff;
     assert!(

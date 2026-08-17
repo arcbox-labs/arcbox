@@ -53,6 +53,10 @@
 //!   jailer's chroot relativity is not re-derived anywhere else.
 //! - Host resources are RAII guards with explicit release: a process is
 //!   killed on drop unless a handle took it and was detached.
+//! - Checkpoints are a jailer-mode capability: a snapshot load reopens the
+//!   recorded drive paths, so relocation onto other disks is possible only
+//!   inside a per-VM chroot ([`render::require_jailed_restore`]). Direct
+//!   mode advertises `checkpoint: false`.
 
 #![warn(missing_docs)]
 

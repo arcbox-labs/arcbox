@@ -175,8 +175,11 @@ impl VmHandle for FcHandle {
         self.vsock.is_some().then_some(self)
     }
 
+    /// `Some` for a jailed VM only: a checkpoint is worth taking only where
+    /// it can be restored, and that is inside a per-VM chroot
+    /// ([`crate::render::require_jailed_restore`]).
     fn checkpoint(&self) -> Option<&dyn Checkpoint> {
-        Some(self)
+        self.layout.jail().is_some().then_some(self)
     }
 
     fn vsock_listener(&self) -> Option<&dyn VsockListen> {
