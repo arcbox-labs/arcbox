@@ -7,6 +7,10 @@
 
 pub(super) mod deadlines;
 pub(super) mod pool;
-pub(super) mod recovery;
+/// `pub` only in the lint's spelling: the `policy` module above is
+/// `pub(crate)`, so this reaches exactly `crate::lifecycle`, whose state
+/// machine seeds itself from [`recovery::plan`]'s verdicts and asserts
+/// against that function rather than a copy of it.
+pub mod recovery;
 pub(super) mod settle;
 pub(super) mod warm;

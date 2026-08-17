@@ -13,7 +13,7 @@ use crate::sandbox::record::PersistPhase;
 /// What the orphan sweep established about one sandbox's runtime resources
 /// before recovery reads its durable record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::sandbox) enum JournalEvidence {
+pub enum JournalEvidence {
     /// The sweep found this sandbox's cleanup journal and tore down
     /// everything it listed.
     Swept,
@@ -21,11 +21,15 @@ pub(in crate::sandbox) enum JournalEvidence {
     Unjournaled,
     /// No sweep ran, so nothing is known about its resources.
     Unchecked,
+    /// The sweep found this sandbox's VM still running and reclaimed it:
+    /// its handle, its lease's datapath and its disk overlay belong to this
+    /// process again, and nothing it listed was torn down.
+    Adopted,
 }
 
 /// What startup recovery does with one durable record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::sandbox) enum RecoveryAction {
+pub enum RecoveryAction {
     /// A create intent nobody acknowledged: left as it is, so the same
     /// request key still resumes it.
     LeaveResumable,
@@ -41,6 +45,11 @@ pub(in crate::sandbox) enum RecoveryAction {
     /// cannot prove they are gone, so recovery refuses rather than declaring
     /// a sandbox failed while its VMM may still be running.
     RefuseUnjournaled,
+    /// The sweep reported adopting a sandbox from a phase it must not adopt.
+    /// Recovery refuses rather than guess: the alternatives are declaring a
+    /// live sandbox failed or claiming a readiness nobody established, and
+    /// the VM is safe meanwhile — this process holds its handle.
+    RefuseAdopted,
 }
 
 /// What the startup sweep does with one crash journal.
@@ -53,31 +62,51 @@ pub(in crate::sandbox) enum SweepAction {
 }
 
 /// Recovery's verdict on a record in `phase`, given what the sweep saw.
-pub(in crate::sandbox) fn plan(phase: PersistPhase, evidence: JournalEvidence) -> RecoveryAction {
-    match phase {
-        PersistPhase::Creating => RecoveryAction::LeaveResumable,
+///
+/// Crate-visible, like the durable phase vocabulary it reads: the lifecycle
+/// state machine seeds itself from these verdicts and its invariant test
+/// asserts against this function rather than a copy of it.
+pub fn plan(phase: PersistPhase, evidence: JournalEvidence) -> RecoveryAction {
+    match (phase, evidence) {
+        // An adopted sandbox never stopped being usable: the sweep took its
+        // VM back rather than tearing it down, so it is reinstated with the
+        // runtime state it already had. `Ready`, not `Running` — the
+        // workload the previous process was streaming did not survive it,
+        // and `Running` is what refuses the next `Run`.
+        (PersistPhase::Ready, JournalEvidence::Adopted) => {
+            RecoveryAction::Reinstate(SandboxState::Ready)
+        }
+        // The sweep adopts a durably `Ready` sandbox and nothing else
+        // (`reconcile::adopt_or_kill`), so this pairing is unreachable by
+        // construction rather than merely unusual.
+        (_, JournalEvidence::Adopted) => RecoveryAction::RefuseAdopted,
+
+        (PersistPhase::Creating, _) => RecoveryAction::LeaveResumable,
         // A live phase's runtime resources are journaled as they are
         // acquired, so a missing journal means the sweep never saw — and
         // never tore down — this sandbox's VMM, TAP and overlay.
-        PersistPhase::Starting | PersistPhase::Ready | PersistPhase::Stopping => match evidence {
-            JournalEvidence::Unjournaled => RecoveryAction::RefuseUnjournaled,
-            JournalEvidence::Swept | JournalEvidence::Unchecked => RecoveryAction::Fail,
-        },
+        (
+            PersistPhase::Starting | PersistPhase::Ready | PersistPhase::Stopping,
+            JournalEvidence::Unjournaled,
+        ) => RecoveryAction::RefuseUnjournaled,
+        (PersistPhase::Starting | PersistPhase::Ready | PersistPhase::Stopping, _) => {
+            RecoveryAction::Fail
+        }
         // An interrupted pause/resume died between resource states; the
         // sweep already tore down whatever its journal listed (including the
         // disk overlay), so the sandbox is unrecoverable. Unlike the live
         // phases above, a missing journal is normal here — a resume starts
         // from a Paused record whose journal was already cleared (after the
         // Paused commit) and re-journals as it re-allocates.
-        PersistPhase::Pausing | PersistPhase::Resuming => RecoveryAction::Fail,
+        (PersistPhase::Pausing | PersistPhase::Resuming, _) => RecoveryAction::Fail,
         // Paused commits only after every runtime resource was released, and
         // the sweep preserves durably Paused retained state (clearing any
         // stale journal), so a paused sandbox always survives a restart
         // resumable.
-        PersistPhase::Paused => RecoveryAction::Reinstate(SandboxState::Paused),
-        PersistPhase::Stopped => RecoveryAction::Reinstate(SandboxState::Stopped),
-        PersistPhase::Failed => RecoveryAction::Reinstate(SandboxState::Failed),
-        PersistPhase::Removing => RecoveryAction::FinishRemove,
+        (PersistPhase::Paused, _) => RecoveryAction::Reinstate(SandboxState::Paused),
+        (PersistPhase::Stopped, _) => RecoveryAction::Reinstate(SandboxState::Stopped),
+        (PersistPhase::Failed, _) => RecoveryAction::Reinstate(SandboxState::Failed),
+        (PersistPhase::Removing, _) => RecoveryAction::FinishRemove,
     }
 }
 
@@ -114,64 +143,78 @@ pub(in crate::sandbox) fn sweep_action(id: &str, retained: &HashSet<String>) -> 
 mod tests {
     use super::*;
 
+    /// All ten phases against all four evidences: every pairing has one
+    /// stated verdict, including the ones only a sweep bug could produce.
     #[test]
     fn every_durable_phase_has_one_recovery_action() {
         // (phase, verdict with a journal or with no sweep, verdict when the
-        // sweep ran and found no journal).
+        // sweep ran and found no journal, verdict when the sweep adopted the
+        // sandbox's live VM).
         let table = [
             (
                 PersistPhase::Creating,
                 RecoveryAction::LeaveResumable,
                 RecoveryAction::LeaveResumable,
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Starting,
                 RecoveryAction::Fail,
                 RecoveryAction::RefuseUnjournaled,
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Ready,
                 RecoveryAction::Fail,
                 RecoveryAction::RefuseUnjournaled,
+                RecoveryAction::Reinstate(SandboxState::Ready),
             ),
             (
                 PersistPhase::Stopping,
                 RecoveryAction::Fail,
                 RecoveryAction::RefuseUnjournaled,
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Stopped,
                 RecoveryAction::Reinstate(SandboxState::Stopped),
                 RecoveryAction::Reinstate(SandboxState::Stopped),
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Failed,
                 RecoveryAction::Reinstate(SandboxState::Failed),
                 RecoveryAction::Reinstate(SandboxState::Failed),
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Removing,
                 RecoveryAction::FinishRemove,
                 RecoveryAction::FinishRemove,
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Pausing,
                 RecoveryAction::Fail,
                 RecoveryAction::Fail,
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Paused,
                 RecoveryAction::Reinstate(SandboxState::Paused),
                 RecoveryAction::Reinstate(SandboxState::Paused),
+                RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Resuming,
                 RecoveryAction::Fail,
                 RecoveryAction::Fail,
+                RecoveryAction::RefuseAdopted,
             ),
         ];
 
-        for (phase, journaled, unjournaled) in table {
+        assert_eq!(table.len(), 10, "every durable phase is covered");
+        for (phase, journaled, unjournaled, adopted) in table {
             for evidence in [JournalEvidence::Swept, JournalEvidence::Unchecked] {
                 assert_eq!(plan(phase, evidence), journaled, "{phase:?} {evidence:?}");
             }
@@ -179,6 +222,11 @@ mod tests {
                 plan(phase, JournalEvidence::Unjournaled),
                 unjournaled,
                 "{phase:?} unjournaled"
+            );
+            assert_eq!(
+                plan(phase, JournalEvidence::Adopted),
+                adopted,
+                "{phase:?} adopted"
             );
         }
     }

@@ -15,7 +15,7 @@ use arcbox_vm_driver::{
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use super::reconcile::{SandboxStateRecord, write_state_record};
+use super::reconcile::{JournaledLease, SandboxStateRecord, write_state_record};
 use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::{SandboxInstance, SandboxManager, SandboxSpec, SandboxState};
 use crate::config::{JailerConfig, VmmConfig};
@@ -191,6 +191,57 @@ impl Checkpoint for FrozenOnCheckpoint {
     }
 }
 
+/// A handle that remembers how it was asked to shut down.
+///
+/// The fake VM reports the same exit status whether it was killed or merely
+/// dropped, so a test that must prove a kill *was asked for* — rather than
+/// that a handle went out of scope — reads it here.
+pub(super) struct RecordsShutdown {
+    inner: Arc<dyn VmHandle>,
+    modes: Mutex<Vec<ShutdownMode>>,
+}
+
+impl RecordsShutdown {
+    /// Wrap `inner`, handing back both the recorder and the handle to
+    /// install — [`live_sandbox_with`] only returns the erased one.
+    pub(super) fn wrap(inner: Arc<dyn VmHandle>) -> (Arc<Self>, Arc<dyn VmHandle>) {
+        let recorder = Arc::new(Self {
+            inner,
+            modes: Mutex::new(Vec::new()),
+        });
+        (Arc::clone(&recorder), recorder)
+    }
+
+    /// How this handle was shut down, in order.
+    pub(super) fn modes(&self) -> Vec<ShutdownMode> {
+        self.modes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl VmHandle for RecordsShutdown {
+    fn id(&self) -> &VmId {
+        self.inner.id()
+    }
+
+    fn record(&self) -> VmRecord {
+        self.inner.record()
+    }
+
+    fn state(&self) -> VmState {
+        self.inner.state()
+    }
+
+    fn events(&self) -> broadcast::Receiver<VmEvent> {
+        self.inner.events()
+    }
+
+    async fn shutdown(&self, mode: ShutdownMode) -> arcbox_vm_driver::Result<ExitStatus> {
+        self.modes.lock().unwrap().push(mode);
+        self.inner.shutdown(mode).await
+    }
+}
+
 /// [`live_sandbox_with`] over the fake VM's own handle.
 pub(super) async fn live_sandbox(
     manager: &SandboxManager,
@@ -264,7 +315,10 @@ pub(super) async fn live_sandbox_with(
         &SandboxStateRecord::new(
             id,
             super::journaled_pid(&*prepared),
-            Some(&lease),
+            // A cold boot with the invariant identity baked in, which is
+            // what `live_sandbox` stands for and what the identity below
+            // is read under.
+            Some(JournaledLease::cold_boot(&lease, true)),
             Some(&cow_handle),
             &manager.config,
             None,

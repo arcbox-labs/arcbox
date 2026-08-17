@@ -1,6 +1,7 @@
 use super::record::{SandboxRecordStore, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
+use arcbox_vm_driver::ShutdownMode;
 use arcbox_vm_driver::net::GuestNetwork;
 
 #[cfg(not(test))]
@@ -351,25 +352,45 @@ pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Strin
 /// stopped, paused or failed sandbox — so it is dropped here too, the one
 /// place both are let go.
 ///
+/// A sandbox this process adopted rather than booted has no `PreparedVm` —
+/// nothing hands the driver's grip on a *process* back across a restart — so
+/// its VM is killed through the handle, which reaps as well. Without that
+/// arm an adopted sandbox's Remove would report success while its VMM kept
+/// running, and the dm device and TAP would then be torn out from under a
+/// live guest.
+///
 /// Extracted so the pause path (which keeps the disk overlay) shares the exact
 /// kill/reap discipline with full release. A failed reap (the driver's
-/// bounded wait elapsed) restores the prepared VMM, and keeps the handle,
-/// so a retry can finish the job. Idempotent — the prepared VMM is
-/// `take()`n, and discarding an exited one just reports its status.
+/// bounded wait elapsed) restores whichever grip it took, and keeps the
+/// handle, so a retry can finish the job. Idempotent — both are `take()`n,
+/// and killing an exited VM just reports its status.
 pub(super) async fn kill_sandbox_process(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
 ) -> Result<()> {
-    let prepared = arc.lock().unwrap().prepared.take();
+    let (prepared, handle) = {
+        let mut inst = arc.lock().unwrap();
+        let prepared = inst.prepared.take();
+        // Only the adopted case needs the handle: while a `PreparedVm` is
+        // present it owns the process, and discarding it is the whole kill.
+        let handle = prepared.is_none().then(|| inst.handle.clone()).flatten();
+        (prepared, handle)
+    };
     // Kill and await the exit outside the lock; the driver bounds the wait so
     // cleanup proceeds (and reports) even if the process is stuck in
     // uninterruptible sleep after SIGKILL.
-    if let Some(prepared) = prepared
-        && let Err(error) = prepared.discard().await
+    if let Some(prepared) = prepared {
+        if let Err(error) = prepared.discard().await {
+            arc.lock().unwrap().prepared = Some(prepared);
+            return Err(VmmError::Process(format!(
+                "release the vmm of sandbox {id}: {error}"
+            )));
+        }
+    } else if let Some(handle) = handle
+        && let Err(error) = handle.shutdown(ShutdownMode::Kill).await
     {
-        arc.lock().unwrap().prepared = Some(prepared);
         return Err(VmmError::Process(format!(
-            "release the vmm of sandbox {id}: {error}"
+            "release the adopted vmm of sandbox {id}: {error}"
         )));
     }
     {
@@ -412,6 +433,45 @@ mod tests {
     use crate::snapshot_cow::{CowOptions, CowTestProbe};
     use arcbox_vm_driver::testkit::FakeNetwork;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A sandbox this process adopted rather than booted holds a handle and
+    /// no `PreparedVm`, and Remove must still reach its VMM: the old code
+    /// took the `None` arm, cleared the handle, and reported success while
+    /// Firecracker kept running — after which the dm device and TAP were
+    /// torn out from under a live guest.
+    #[tokio::test]
+    async fn removing_an_adopted_sandbox_kills_its_vm_through_the_handle() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (manager, driver, probe) =
+            super::super::testing::fake_manager_direct(data_dir.path()).await;
+        let recorder = std::sync::OnceLock::new();
+        let (instance, _handle) =
+            super::super::testing::live_sandbox_with(&manager, &driver, "adopted", |inner| {
+                let (recording, handle) = super::super::testing::RecordsShutdown::wrap(inner);
+                let _ = recorder.set(recording);
+                handle
+            })
+            .await;
+        // What the startup sweep hands back: the VM's handle, and no grip on
+        // the process — nothing returns a `PreparedVm` across a restart.
+        instance.lock().unwrap().prepared = None;
+
+        manager
+            .remove_sandbox(&"adopted".to_owned(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorder.get().unwrap().modes(),
+            vec![ShutdownMode::Kill],
+            "the adopted vm is killed through its own handle"
+        );
+        let inst = instance.lock().unwrap();
+        assert!(inst.handle.is_none(), "the dead VM's handle is dropped");
+        assert!(inst.cow_handle.is_none(), "the CoW overlay is released");
+        assert!(inst.network.is_none(), "the network lease is released");
+        assert_eq!(probe.teardown_count(), 1);
+    }
 
     fn instance(id: &str) -> Arc<Mutex<SandboxInstance>> {
         Arc::new(Mutex::new(SandboxInstance::new(

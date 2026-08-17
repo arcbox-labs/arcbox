@@ -26,7 +26,21 @@ pub trait SandboxHost: Send + Sync {
     fn lock_host_state(&self) -> impl Future<Output = Self::StateGuard<'_>> + Send;
 
     /// Drops every sandbox-owned host resource (listeners, DNS): the
-    /// agent-startup handshake, when the guest has no sandboxes left.
+    /// agent-startup handshake.
+    ///
+    /// Written for an agent whose restart left no sandbox alive. Since
+    /// CORE-135 the guest's startup sweep reclaims a sandbox whose VM is
+    /// still running, and this call still drops that sandbox's DNS record
+    /// and host port listeners — it keeps running, and stays reachable over
+    /// vsock and at its address, but its name and its published ports go
+    /// until something re-registers them. Its guest-side forwarding rules
+    /// are not affected (the guest half of the startup ticket sweeps only
+    /// legacy-format rules), so nothing leaks; a later Remove still cleans
+    /// them through `remove_orphan_rules_for`.
+    ///
+    /// Restoring the host half is its own change — the host would have to
+    /// learn which sandboxes survived and replay their DNS and bindings —
+    /// and belongs here rather than in the runtime that adopts them.
     fn clear_host_state(&self) -> impl Future<Output = ()> + Send;
 
     /// Removes the host port listeners owned by one sandbox.

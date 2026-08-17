@@ -1,5 +1,6 @@
 use super::boot::boot_sandbox;
 use super::cleanup::{inst_to_info, remove_sandbox_impl};
+use super::reconcile::JournaledLease;
 use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
@@ -329,6 +330,11 @@ impl SandboxManager {
         // was never built — a journal write between the two can fail.
         let mut lease: Option<NetworkLease> = None;
         let mut nic: Option<NicSpec> = None;
+        // Whether this boot bakes the fixed invariant identity into the
+        // guest's command line (see do_boot); false when the caller brought
+        // their own `ip=`. Independent of the mode the host side is attached
+        // in, which is `Invariant` either way.
+        let invariant_identity = !spec.boot_args.contains("ip=");
         let setup = async {
             if spec.network.mode != "none" {
                 lease = Some(
@@ -346,7 +352,9 @@ impl SandboxManager {
             let cleanup_record = super::reconcile::SandboxStateRecord::new(
                 &id,
                 None,
-                lease.as_ref(),
+                lease
+                    .as_ref()
+                    .map(|lease| JournaledLease::cold_boot(lease, invariant_identity)),
                 None,
                 &self.config,
                 None,
@@ -439,13 +447,13 @@ impl SandboxManager {
                 lease,
                 nic,
                 identity,
+                invariant_identity,
             }
         });
         // The boot bakes the invariant `ip=` identity unless the caller
         // supplied an explicit ip= (see do_boot); record which one this guest
         // runs so checkpoints carry the right restore contract.
-        creating_instance.net_invariant =
-            creating_instance.network.is_some() && !spec.boot_args.contains("ip=");
+        creating_instance.net_invariant = creating_instance.network.is_some() && invariant_identity;
 
         // Retain the boot task so force/TTL removal can cancel and join it
         // before deleting the crash-recovery journal.
@@ -637,6 +645,51 @@ impl SandboxManager {
             .map(|commit| commit.confirmed("sandbox stop"))
             .transpose()?;
         Ok(())
+    }
+
+    /// Give up ownership of every live VM without stopping it, so this
+    /// process can exit and the next one adopt them.
+    ///
+    /// The composer calls this on graceful shutdown. Without it a clean exit
+    /// unwinds into the driver handle's `Drop`, which kills — so the startup
+    /// sweep's adoption would only ever fire after a crash, never after the
+    /// binary upgrade or redeploy it mainly exists for.
+    ///
+    /// Best-effort per sandbox: one VM that refuses to be handed over must
+    /// not cost the others theirs, so failures are collected and reported
+    /// together. A driver without `Detach` runs its VMs in-process and has
+    /// nothing to hand over — the same reasoning the sweep applies to
+    /// `Adopt`. The `PreparedVm` a booted sandbox also holds needs no such
+    /// step: it kills on drop only while it is still unconsumed.
+    pub async fn detach_all(&self) -> Result<()> {
+        let live: Vec<(SandboxId, Arc<dyn VmHandle>)> = self
+            .instances
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, arc)| {
+                let handle = arc.lock().unwrap().handle.clone();
+                handle.map(|handle| (id.clone(), handle))
+            })
+            .collect();
+
+        let mut failures = Vec::new();
+        for (id, handle) in live {
+            let Some(detach) = handle.detach() else {
+                continue;
+            };
+            match detach.detach().await {
+                Ok(_) => info!(sandbox_id = %id, "handed the sandbox's vm to the next process"),
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(VmmError::Unavailable(format!(
+            "some sandboxes could not be handed over and will be killed on exit: {}",
+            failures.join("; ")
+        )))
     }
 
     /// Forcibly destroy a sandbox and release all resources immediately.
@@ -894,9 +947,40 @@ fn snapshot_files(info: &crate::snapshot::SnapshotInfo) -> Vec<PathBuf> {
 mod tests {
     use std::time::Duration;
 
-    use super::super::testing::{fake_manager_direct, fake_manager_with_agent};
+    use super::super::testing::{fake_manager_direct, fake_manager_with_agent, live_sandbox};
     use super::*;
     use crate::testkit::agent::{FakeAgentFactory, Reply};
+
+    /// A graceful exit must leave the guests running, or the startup sweep's
+    /// adoption is reachable only after a crash: the driver handle kills on
+    /// drop until it has been detached.
+    #[tokio::test]
+    async fn detach_all_hands_every_live_vm_to_the_next_process() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (manager, driver, _probe) = fake_manager_direct(data_dir.path()).await;
+        let (instance, handle) = live_sandbox(&manager, &driver, "keeper").await;
+        let record = handle.record();
+
+        manager.detach_all().await.unwrap();
+
+        // Everything this process held is let go, the way an orderly exit
+        // unwinds it...
+        drop(handle);
+        drop(instance);
+        drop(manager);
+
+        // ...and the guest is still there for the next process to reclaim.
+        let adopted = driver
+            .adopt()
+            .expect("the fake driver adopts")
+            .adopt(&record)
+            .await
+            .unwrap();
+        assert!(
+            adopted.is_some(),
+            "the vm outlived the process that booted it"
+        );
+    }
 
     /// Wait for `action` on `id`, or fail the test.
     async fn await_action(

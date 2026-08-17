@@ -49,7 +49,7 @@ mod execution;
 mod files;
 mod lifecycle;
 mod pause;
-mod policy;
+pub(crate) mod policy;
 mod pool;
 mod reconcile;
 pub(crate) mod record;
@@ -236,7 +236,7 @@ impl SandboxManager {
             let instances = Arc::clone(&instances);
             tokio::spawn(async move {
                 let result = async {
-                    let swept = reconcile::sweep_orphans(
+                    let mut swept = reconcile::sweep_orphans(
                         &config,
                         driver.as_ref(),
                         &*network,
@@ -245,24 +245,39 @@ impl SandboxManager {
                         &records,
                     )
                     .await?;
-                    let inactive = reconcile::normalize_durable_records(
+                    let mut runtime = swept.take_runtime();
+                    let mut inactive = Vec::new();
+                    let normalized = reconcile::normalize_durable_records(
                         &records,
                         Path::new(&config.firecracker.data_dir),
-                        Some(&swept.ids),
-                    )?;
-                    reconcile::finalize_sweep(swept).await?;
-                    reconcile_capability(&*network).replay_complete();
-                    Ok::<_, VmmError>(inactive)
-                }
-                .await
-                .map(|inactive| {
-                    let mut map = instances.write().unwrap();
-                    map.extend(
+                        Some(&mut runtime),
+                        &mut inactive,
+                    );
+                    // A reclaimed sandbox is in exactly one of these two by
+                    // now — never claimed, or built into an instance — and
+                    // dropping either would kill its guest while leaving its
+                    // lease and template refcount held. Release both before
+                    // reporting the refusal.
+                    reconcile::release_unclaimed(&mut runtime, &*network, &cow_manager).await;
+                    if let Err(error) = normalized {
+                        reconcile::release_instances(&mut inactive, &*network, &cow_manager).await;
+                        return Err(error);
+                    }
+                    // Publish before anything else can fail. The reclaimed
+                    // sandboxes' only handles live in these instances, so a
+                    // later error — a runtime directory that will not delete,
+                    // say — would otherwise un-reclaim every guest by
+                    // dropping them, over something none of them caused.
+                    instances.write().unwrap().extend(
                         inactive
                             .into_iter()
                             .map(|instance| (instance.id.clone(), Arc::new(Mutex::new(instance)))),
                     );
-                })
+                    reconcile::finalize_sweep(swept).await?;
+                    reconcile_capability(&*network).replay_complete();
+                    Ok::<_, VmmError>(())
+                }
+                .await
                 .map_err(|error| Arc::<str>::from(error.to_string()));
                 let _ = reconcile_tx.send(Some(result));
             });
@@ -271,10 +286,12 @@ impl SandboxManager {
             // covered without threading the registry through each of them.
             execution::spawn_teardown_purge(Arc::clone(&executions), events_tx.subscribe());
         } else {
-            let inactive = reconcile::normalize_durable_records(
+            let mut inactive = Vec::new();
+            reconcile::normalize_durable_records(
                 &records,
                 Path::new(&config.firecracker.data_dir),
                 None,
+                &mut inactive,
             )?;
             reconcile_capability(&*network).replay_complete();
             instances.write().unwrap().extend(

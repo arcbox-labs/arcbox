@@ -867,7 +867,7 @@ async fn do_boot(
     let journal_error = super::reconcile::SandboxStateRecord::new(
         id,
         process_pid,
-        net.map(|net| &net.lease),
+        net.map(NetworkAttachment::journaled),
         None,
         config,
         None,
@@ -946,7 +946,7 @@ async fn do_boot(
                     let record = super::reconcile::SandboxStateRecord::new(
                         id,
                         process_pid,
-                        net.map(|net| &net.lease),
+                        net.map(NetworkAttachment::journaled),
                         cow_handle.as_ref(),
                         config,
                         None,
@@ -974,7 +974,7 @@ async fn do_boot(
                             let record = super::reconcile::SandboxStateRecord::new(
                                 id,
                                 process_pid,
-                                net.map(|net| &net.lease),
+                                net.map(NetworkAttachment::journaled),
                                 None,
                                 config,
                                 None,
@@ -1011,7 +1011,7 @@ async fn do_boot(
                     let record = super::reconcile::SandboxStateRecord::new(
                         id,
                         process_pid,
-                        net.map(|net| &net.lease),
+                        net.map(NetworkAttachment::journaled),
                         cow_handle.as_ref(),
                         config,
                         None,

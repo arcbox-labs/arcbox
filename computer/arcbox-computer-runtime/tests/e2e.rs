@@ -358,3 +358,183 @@ async fn e2e_run_command() {
 
     mgr.remove_sandbox(&id, true).await.unwrap();
 }
+
+/// The VMM pid the sandbox's crash journal names, so the test can prove a
+/// process outlived its manager — and, later, that Remove reaped it.
+#[cfg(target_os = "linux")]
+fn journaled_pid(data_dir: &std::path::Path, id: &str) -> i32 {
+    let journal = data_dir.join("sandboxes").join(id).join("state.json");
+    let bytes = std::fs::read(&journal)
+        .unwrap_or_else(|error| panic!("read {}: {error}", journal.display()));
+    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["pid"]
+        .as_i64()
+        .expect("a journaled vmm pid") as i32
+}
+
+/// Whether `pid` is still a live Firecracker, rather than a pid the kernel
+/// handed to something else since — or a zombie.
+///
+/// Both managers in this test run in one process, so nothing `waitpid()`s a
+/// VMM that Remove killed and it lingers unreaped, still named
+/// "firecracker". The state letter is what says it is gone, exactly as the
+/// driver's own liveness probe reads it.
+#[cfg(target_os = "linux")]
+fn firecracker_alive(pid: i32) -> bool {
+    // `/proc/<pid>/stat` is "<pid> (<comm>) <state> ...", and comm may itself
+    // contain spaces or parens — split at the LAST ')'.
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((named, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let is_firecracker = named
+        .split_once('(')
+        .is_some_and(|(_, comm)| comm.starts_with("firecracker"));
+    let is_live = rest
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| state != "Z" && state != "X");
+    is_firecracker && is_live
+}
+
+/// CORE-135's acceptance test: a sandbox survives the process that booted
+/// it. Boot one, hand its VM over the way a graceful shutdown does, drop the
+/// manager, and build a fresh one over the same data directory — the sandbox
+/// is still running, its host-side datapath is still in place, an exec still
+/// works through it, and removing it still leaves no Firecracker behind.
+///
+/// Requires root: the reclaimed resource this proves is a real TAP interface,
+/// and only a real one proves adoption.
+///
+/// The reclaimed *dm-snapshot* is not covered here. `CowManager` reaches
+/// losetup through `BusyboxBlockTools`, which needs `/bin/busybox`; this
+/// suite's runner does not install it (the `integration` job does), so the
+/// boot falls back to using the rootfs directly and `CowManager::adopt` is
+/// never called. Installing busybox in this job would extend the test to
+/// that half — and would put every other test in this file on dm-snapshot
+/// too, which is why it is a change of its own rather than a line here.
+#[tokio::test]
+#[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables, root, and vm-agent in rootfs"]
+async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
+    #[cfg(target_os = "linux")]
+    if !common::is_root() {
+        eprintln!("SKIP e2e_sandbox_outlives_its_manager_and_is_adopted — requires root");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_owned();
+    let Some(cfg) = try_config(data_dir.to_str().unwrap()) else {
+        eprintln!(
+            "SKIP e2e_sandbox_outlives_its_manager_and_is_adopted — FC_BINARY/FC_KERNEL/FC_ROOTFS not set"
+        );
+        return;
+    };
+
+    let (id, ip) = {
+        let mgr = SandboxManager::new(cfg).unwrap();
+        finalize_startup_cleanup(&mgr).await;
+        let mut events = mgr.subscribe_events();
+        let (id, ip) = mgr.create_sandbox(SandboxSpec::default()).await.unwrap();
+        assert!(
+            wait_for_event(&mut events, &id, "ready").await,
+            "sandbox did not reach ready"
+        );
+        // What a graceful shutdown owes the next process: without this the
+        // manager's handles kill their VMs as they unwind, and there is
+        // nothing left to adopt.
+        mgr.detach_all().await.unwrap();
+        (id, ip)
+    };
+
+    #[cfg(target_os = "linux")]
+    let pid = journaled_pid(&data_dir, &id);
+    #[cfg(target_os = "linux")]
+    let tap_name = {
+        let octets = ip
+            .parse::<std::net::Ipv4Addr>()
+            .expect("tap mode assigns a pool address")
+            .octets();
+        format!("vmtap{}-{}", octets[2], octets[3])
+    };
+    #[cfg(target_os = "linux")]
+    assert!(
+        firecracker_alive(pid),
+        "the vmm outlives the manager that booted it"
+    );
+
+    // The next process: same data directory, nothing else carried over.
+    let cfg = try_config(data_dir.to_str().unwrap()).unwrap();
+    let mgr = SandboxManager::new(cfg).unwrap();
+    // Awaits the startup sweep, which is where adoption happens.
+    if let Some(token) = mgr.startup_cleanup_token().await.unwrap() {
+        mgr.finalize_startup_cleanup(&token).await.unwrap();
+    }
+
+    let info = mgr.inspect_sandbox(&id).unwrap();
+    assert_eq!(
+        info.state,
+        SandboxState::Ready,
+        "the sandbox is usable again, not failed"
+    );
+    assert_eq!(
+        info.network.as_ref().map(|net| net.ip_address.clone()),
+        Some(ip),
+        "it kept the address its guest is configured with"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        common::iface_exists(&tap_name),
+        "TAP {tap_name} survived the restart rather than being swept"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(firecracker_alive(pid), "the guest was never restarted");
+
+    // An exec proves the vsock path was re-established, not just that the
+    // process is alive: this agent was built from the adopted handle.
+    let mut rx = mgr
+        .run_in_sandbox(
+            &id,
+            vec!["echo".into(), "still here".into()],
+            HashMap::new(),
+            "/".into(),
+            "root".into(),
+            false,
+            None,
+            30,
+        )
+        .await
+        .unwrap();
+    let mut stdout = String::new();
+    let mut exit_code: i32 = -1;
+    while let Some(result) = rx.recv().await {
+        match result.unwrap() {
+            arcbox_computer_runtime::OutputChunk::Stdout(data) => {
+                stdout.push_str(&String::from_utf8_lossy(&data));
+            }
+            arcbox_computer_runtime::OutputChunk::Exit(status) => {
+                exit_code = status.conventional_code();
+            }
+            arcbox_computer_runtime::OutputChunk::Stderr(_) => {}
+        }
+    }
+    assert!(
+        stdout.contains("still here"),
+        "expected 'still here' in stdout, got: {stdout:?}"
+    );
+    assert_eq!(exit_code, 0);
+
+    // And the adopted sandbox is still removable — through the handle, since
+    // no PreparedVm crosses a restart.
+    mgr.remove_sandbox(&id, true).await.unwrap();
+    assert!(mgr.inspect_sandbox(&id).is_err());
+    #[cfg(target_os = "linux")]
+    {
+        assert!(!firecracker_alive(pid), "remove left a firecracker behind");
+        assert!(
+            !common::iface_exists(&tap_name),
+            "TAP {tap_name} survived the removal"
+        );
+    }
+}

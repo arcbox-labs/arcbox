@@ -1,6 +1,7 @@
 use super::boot::{StageError, stage_rootfs_cow_or_copy};
 use super::policy::settle::{self, Capture, GuestHold, Settlement};
 use super::pool::PreparedSlot;
+use super::reconcile::JournaledLease;
 use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::action;
 use super::*;
@@ -353,6 +354,7 @@ impl SandboxManager {
         error: VmmError,
         prepared: Option<Arc<dyn PreparedVm>>,
         network: Option<NetworkLease>,
+        net_invariant: bool,
         cow_handle: Option<CowHandle>,
     ) -> VmmError {
         let arc = reservation.instance();
@@ -363,7 +365,9 @@ impl SandboxManager {
         let journal_error = super::reconcile::SandboxStateRecord::new(
             id,
             prepared.as_deref().and_then(super::journaled_pid),
-            network.as_ref(),
+            network
+                .as_ref()
+                .map(|lease| JournaledLease::from_snapshot(lease, net_invariant)),
             cow_handle.as_ref(),
             &self.config,
             None,
@@ -579,6 +583,10 @@ impl SandboxManager {
             .as_ref()
             .map(|lease| lease.ip.to_string())
             .unwrap_or_default();
+        // Every journal this restore writes records the lease the way the
+        // `activate` below attaches it: from the snapshot's own flag, never
+        // from a constant. One binding so the two cannot drift.
+        let net_invariant = snap_meta.net_invariant;
         // The NIC is tracked apart from the lease: the lease is owed back
         // to the pool from `reserve` on, so the rollback below must see one
         // whose TAP a failed journal write meant was never built.
@@ -588,7 +596,9 @@ impl SandboxManager {
             let cleanup_record = super::reconcile::SandboxStateRecord::new(
                 &new_id,
                 None,
-                lease.as_ref(),
+                lease
+                    .as_ref()
+                    .map(|lease| JournaledLease::from_snapshot(lease, net_invariant)),
                 None,
                 &self.config,
                 None,
@@ -610,7 +620,15 @@ impl SandboxManager {
         .await;
         if let Err(error) = setup {
             return Err(self
-                .rollback_restore(&new_id, reservation, error, None, lease, None)
+                .rollback_restore(
+                    &new_id,
+                    reservation,
+                    error,
+                    None,
+                    lease,
+                    snap_meta.net_invariant,
+                    None,
+                )
                 .await);
         }
         let fc_cfg = &self.config.firecracker;
@@ -642,7 +660,9 @@ impl SandboxManager {
                 let handover = super::reconcile::SandboxStateRecord::new(
                     &new_id,
                     super::journaled_pid(&*slot.prepared),
-                    lease.as_ref(),
+                    lease
+                        .as_ref()
+                        .map(|lease| JournaledLease::from_snapshot(lease, net_invariant)),
                     slot.cow_handle.as_ref(),
                     &self.config,
                     None,
@@ -696,6 +716,7 @@ impl SandboxManager {
                                 error,
                                 Some(slot_prepared),
                                 lease.clone(),
+                                snap_meta.net_invariant,
                                 pending_cow,
                             )
                             .await);
@@ -731,6 +752,7 @@ impl SandboxManager {
                                 error,
                                 None,
                                 lease.clone(),
+                                snap_meta.net_invariant,
                                 None,
                             )
                             .await);
@@ -742,7 +764,9 @@ impl SandboxManager {
                     super::reconcile::SandboxStateRecord::new(
                         &new_id,
                         pid,
-                        lease.as_ref(),
+                        lease
+                            .as_ref()
+                            .map(|lease| JournaledLease::from_snapshot(lease, net_invariant)),
                         cow,
                         &self.config,
                         None,
@@ -757,6 +781,7 @@ impl SandboxManager {
                             error,
                             Some(Arc::clone(&spawned_prepared)),
                             lease.clone(),
+                            snap_meta.net_invariant,
                             None,
                         )
                         .await);
@@ -826,6 +851,7 @@ impl SandboxManager {
                                 error,
                                 Some(Arc::clone(&spawned_prepared)),
                                 lease.clone(),
+                                snap_meta.net_invariant,
                                 pending_cow,
                             )
                             .await);
@@ -881,6 +907,7 @@ impl SandboxManager {
                         error,
                         Some(prepared),
                         lease.clone(),
+                        snap_meta.net_invariant,
                         pending_cow,
                     )
                     .await);
@@ -968,6 +995,7 @@ impl SandboxManager {
                         error,
                         Some(Arc::clone(&prepared)),
                         lease.clone(),
+                        snap_meta.net_invariant,
                         pending_cow,
                     )
                     .await);
@@ -979,17 +1007,19 @@ impl SandboxManager {
         // Persist cleanup metadata before handing runtime resources to the
         // instance. A failed durable write aborts and unwinds every resource.
         let adopted_slot = reservation.instance().lock().unwrap().pool_slot_id.clone();
-        let journaled = super::reconcile::SandboxStateRecord::new(
+        let final_journal = super::reconcile::SandboxStateRecord::new(
             &new_id,
             super::journaled_pid(&*prepared),
-            lease.as_ref(),
+            lease
+                .as_ref()
+                .map(|lease| JournaledLease::from_snapshot(lease, net_invariant)),
             pending_cow.as_ref(),
             &self.config,
             None,
         )
         .map(|record| record.with_pool_slot(adopted_slot.as_deref()))
         .and_then(|record| super::reconcile::write_state_record(&vm_dir, &record));
-        if let Err(error) = journaled {
+        if let Err(error) = final_journal {
             return Err(self
                 .rollback_restore(
                     &new_id,
@@ -997,6 +1027,7 @@ impl SandboxManager {
                     error,
                     Some(Arc::clone(&prepared)),
                     lease.clone(),
+                    snap_meta.net_invariant,
                     pending_cow,
                 )
                 .await);
@@ -1019,6 +1050,7 @@ impl SandboxManager {
                         error,
                         Some(Arc::clone(&prepared)),
                         lease.clone(),
+                        snap_meta.net_invariant,
                         pending_cow,
                     )
                     .await);
