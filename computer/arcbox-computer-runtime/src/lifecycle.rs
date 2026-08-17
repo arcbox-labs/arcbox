@@ -56,3 +56,7 @@
 mod effect;
 mod event;
 mod machine;
+mod projection;
+
+#[cfg(test)]
+mod tests;
