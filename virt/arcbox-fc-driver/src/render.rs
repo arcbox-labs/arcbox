@@ -60,8 +60,9 @@ impl VmLayout {
         runtime_dir: &Path,
     ) -> Result<Self> {
         // The id is a directory name here — the jail is `{base}/{exec}/{id}/
-        // root` — and the port allows dots in it, so `.` and `..` would name
-        // another VM's jail, or the base itself.
+        // root` — so `.` and `..` would name another VM's jail, or the base
+        // itself. The port refuses them at the id; a layout is built from
+        // whatever id it is handed, so the same rule is checked here too.
         if !is_plain_component(id.as_str()) {
             return Err(unsupported(&format!("vm id `{id}` must be a plain name")));
         }

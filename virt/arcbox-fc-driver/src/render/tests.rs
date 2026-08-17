@@ -352,16 +352,15 @@ fn jailer_mode_mirrors_a_block_device_as_a_node() {
 
 #[test]
 fn a_vm_id_cannot_name_another_jail() {
-    // The port allows dots in an id, and the jail is `{base}/{exec}/{id}/root`.
+    // The jail is `{base}/{exec}/{id}/root`, so `.` and `..` would name the
+    // binary's or the base's own `root`. The port refuses them at the id;
+    // the layout's guard is the second lock on the same door.
     for id in [".", ".."] {
-        let id = VmId::new(id).expect("the port accepts it");
-        let error = VmLayout::new(
-            &id,
-            &jailed(Path::new("/srv/jailer")),
-            &config(),
-            Path::new("/run/vms/box"),
+        assert!(
+            matches!(VmId::new(id), Err(Error::InvalidSpec(_))),
+            "`{id}` is refused by the port"
         );
-        assert!(invalid(error).contains("vm id"), "`{id}` is refused");
+        assert!(!is_plain_component(id), "`{id}` is refused by the layout");
     }
     // A dot inside a name is not a component of its own.
     assert!(

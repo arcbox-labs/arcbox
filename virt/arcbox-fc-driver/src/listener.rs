@@ -197,8 +197,6 @@ impl VsockListener for FcListener {
 mod tests {
     use std::time::Duration;
 
-    use tokio::io::AsyncWriteExt as _;
-
     use super::*;
     use crate::config::FcDriverConfig;
     use crate::process::testing::spawn;
@@ -228,19 +226,20 @@ mod tests {
         let dial = tokio::spawn(async move {
             let path = listener_socket_path(&recorded, 51);
             for _ in 0..100 {
-                if let Ok(mut stream) = UnixStream::connect(&path).await {
-                    stream.write_all(&[0]).await.unwrap();
-                    return;
+                if let Ok(stream) = UnixStream::connect(&path).await {
+                    return stream;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             panic!("the relocated listener never came up at {}", path.display());
         });
-        tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
             .expect("accept before the deadline")
             .expect("accept the dial-out at the recorded path");
-        dial.await.unwrap();
+        // The guest end outlives the accept, so nothing races a close.
+        let guest = dial.await.unwrap();
+        drop((accepted, guest));
 
         // The original place stays bound too, and both go with the listener.
         assert!(dir.path().join("firecracker.vsock_51").exists());
