@@ -351,6 +351,31 @@ fn jailer_mode_mirrors_a_block_device_as_a_node() {
 }
 
 #[test]
+fn a_vm_id_cannot_name_another_jail() {
+    // The port allows dots in an id, and the jail is `{base}/{exec}/{id}/root`.
+    for id in [".", ".."] {
+        let id = VmId::new(id).expect("the port accepts it");
+        let error = VmLayout::new(
+            &id,
+            &jailed(Path::new("/srv/jailer")),
+            &config(),
+            Path::new("/run/vms/box"),
+        );
+        assert!(invalid(error).contains("vm id"), "`{id}` is refused");
+    }
+    // A dot inside a name is not a component of its own.
+    assert!(
+        VmLayout::new(
+            &VmId::new("box.1").unwrap(),
+            &jailed(Path::new("/srv/jailer")),
+            &config(),
+            Path::new("/run/vms/box"),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn a_disk_id_cannot_reach_out_of_the_jail() {
     let base = PathBuf::from("/srv/jailer");
     for isolation in [IsolationSpec::None, jailed(&base)] {

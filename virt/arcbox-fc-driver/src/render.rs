@@ -59,6 +59,12 @@ impl VmLayout {
         config: &FcDriverConfig,
         runtime_dir: &Path,
     ) -> Result<Self> {
+        // The id is a directory name here — the jail is `{base}/{exec}/{id}/
+        // root` — and the port allows dots in it, so `.` and `..` would name
+        // another VM's jail, or the base itself.
+        if !is_plain_component(id.as_str()) {
+            return Err(unsupported(&format!("vm id `{id}` must be a plain name")));
+        }
         let jail = match isolation {
             IsolationSpec::None => None,
             IsolationSpec::Jailer {

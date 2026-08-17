@@ -69,9 +69,10 @@ resumes.
   is `{jail}/run/firecracker.socket`, the vsock socket
   `/run/firecracker.vsock` inside and `{jail}/run/firecracker.vsock` outside.
 
-A disk `id` must be a plain name: it becomes a device id in the API URL and,
-under a jail, the file the disk is staged as, so anything that could reach
-out of the jail is refused.
+A VM `id` and a disk `id` must each be a plain name: the first is the jail's
+directory, the second a device id in the API URL and the file the disk is
+staged as. Anything that could name a path outside the jail — `.`, `..`, a
+separator — is refused.
 
 Console files and sockets, virtiofs shares, and the balloon are refused
 with `Error::InvalidSpec` — the driver claims none of those capabilities.
