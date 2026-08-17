@@ -739,10 +739,13 @@ impl SandboxManager {
             if let Some(lease) = &lease
                 && !snap_meta.net_invariant
             {
+                let identity = self
+                    .network
+                    .identity(lease, crate::network::TapMode::LegacySnapshot);
                 let cmd = crate::boot_proto::NetReconfigCommand {
-                    ip: lease.ipv4()?,
-                    netmask: lease.netmask(),
-                    gateway: lease.gateway_ipv4()?,
+                    ip: super::ipv4(identity.ip)?,
+                    netmask: super::netmask(identity.prefix_len),
+                    gateway: super::ipv4(identity.gateway)?,
                 };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),

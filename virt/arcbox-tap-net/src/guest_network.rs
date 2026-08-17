@@ -154,6 +154,9 @@ impl GuestNetwork for TapNetwork {
     /// DNAT to the pool address, an iptables one takes the fixed guest
     /// address plus the pool IP's mark, which is what selects that TAP's
     /// policy-routing table (CORE-81/CORE-83).
+    ///
+    /// [`TryFrom<HostIngress> for ExposeTarget`](ExposeTarget::try_from) is
+    /// the inverse, for the System VM code that still names the local type.
     fn host_ingress(&self, lease: &NetworkLease) -> Result<HostIngress> {
         let allocation = self.allocation(lease)?;
         Ok(match self.expose_target(&allocation.tap_name) {
@@ -226,6 +229,32 @@ impl NetworkReconcile for TapNetwork {
 
     fn replay_complete(&self) {
         self.mark_reconciled();
+    }
+}
+
+/// The port's answer as this crate's own vocabulary, for the System VM
+/// code that still names [`ExposeTarget`] (R3 moves that call to the
+/// composition root and this impl goes with it).
+///
+/// Lossy in one direction only: a mark travels with
+/// [`HostIngress::GuestAddress`] and [`ExposeTarget`] has no room for it.
+/// That costs nothing over *this* network, whose `host_ingress` mints the
+/// mark as `invariant::fwmark(pool_ip)` — the value the System VM's
+/// port-forward code derives from the pool address it is handed anyway —
+/// so the round trip through here is lossless. It would cost an adapter
+/// whose mark is anything else, which is why this conversion belongs to
+/// the adapter that can make that promise rather than to the consumer.
+impl TryFrom<HostIngress> for ExposeTarget {
+    type Error = Error;
+
+    fn try_from(ingress: HostIngress) -> Result<Self> {
+        match ingress {
+            HostIngress::PoolAddress => Ok(Self::PoolIp),
+            HostIngress::GuestAddress { .. } => Ok(Self::GuestIpWithFwmark),
+            other => Err(Error::Network(format!(
+                "host ingress {other:?} has no expose target on a TAP network"
+            ))),
+        }
     }
 }
 
@@ -411,6 +440,32 @@ mod tests {
         let mut foreign = lease;
         foreign.ip = "fd00::2".parse().unwrap();
         assert!(network.host_ingress(&foreign).is_err());
+    }
+
+    /// The round trip over this network is lossless: the mark it mints is
+    /// the one the System VM's port-forward code derives for itself.
+    #[tokio::test]
+    async fn expose_target_round_trips_through_host_ingress() {
+        let network = network();
+        let lease = GuestNetwork::reserve(&network, &vm("box"), policy(NetworkMode::Nat))
+            .await
+            .unwrap();
+        let tap = network.allocation(&lease).unwrap().tap_name;
+        for (applied, expected) in [
+            (crate::AppliedDatapath::Ebpf, ExposeTarget::PoolIp),
+            (crate::AppliedDatapath::Untranslated, ExposeTarget::PoolIp),
+            (
+                crate::AppliedDatapath::Iptables,
+                ExposeTarget::GuestIpWithFwmark,
+            ),
+        ] {
+            network.applied.lock().unwrap().insert(tap.clone(), applied);
+            let ingress = network.host_ingress(&lease).unwrap();
+            assert_eq!(ExposeTarget::try_from(ingress).unwrap(), expected);
+            if let HostIngress::GuestAddress { fwmark } = ingress {
+                assert_eq!(fwmark, invariant::fwmark("172.20.0.2".parse().unwrap()));
+            }
+        }
     }
 
     #[test]

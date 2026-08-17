@@ -20,7 +20,7 @@ use arcbox_fc_driver::jail::{
 };
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::net::{
-    GuestNetwork, HostIngress, NetworkLease, NetworkMode, NetworkPolicy, NetworkReconcile,
+    GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy, NetworkReconcile,
 };
 use arcbox_vm_driver::{
     CheckpointFormat, CheckpointImage, CheckpointKind, IsolationSpec, NicSpec, Prepare, PreparedVm,
@@ -435,7 +435,7 @@ impl SandboxManager {
         Ok(SandboxNetworkIdentity {
             ip: lease.ipv4()?,
             cleanup_token: lease.cleanup_token.clone(),
-            expose: expose_target(self.network.host_ingress(lease)?)?,
+            expose: crate::network::ExposeTarget::try_from(self.network.host_ingress(lease)?)?,
         })
     }
 }
@@ -453,54 +453,36 @@ pub(super) trait LeaseExt {
     fn ipv4(&self) -> Result<std::net::Ipv4Addr>;
     /// The gateway the guest routes through.
     fn gateway_ipv4(&self) -> Result<std::net::Ipv4Addr>;
-    /// The subnet mask `prefix_len` describes, clamped at /32 so an
-    /// out-of-range prefix cannot overflow the shift.
-    fn netmask(&self) -> std::net::Ipv4Addr;
 }
 
 impl LeaseExt for NetworkLease {
     fn ipv4(&self) -> Result<std::net::Ipv4Addr> {
-        ipv4(self.ip, self)
+        ipv4(self.ip)
     }
 
     fn gateway_ipv4(&self) -> Result<std::net::Ipv4Addr> {
-        ipv4(self.gateway, self)
-    }
-
-    fn netmask(&self) -> std::net::Ipv4Addr {
-        let prefix = self.prefix_len.min(32);
-        if prefix == 0 {
-            std::net::Ipv4Addr::UNSPECIFIED
-        } else {
-            std::net::Ipv4Addr::from(!0u32 << (32 - prefix))
-        }
+        ipv4(self.gateway)
     }
 }
 
-fn ipv4(address: std::net::IpAddr, lease: &NetworkLease) -> Result<std::net::Ipv4Addr> {
+/// One address of a lease or identity, narrowed. See [`LeaseExt`].
+pub(super) fn ipv4(address: std::net::IpAddr) -> Result<std::net::Ipv4Addr> {
     match address {
         std::net::IpAddr::V4(v4) => Ok(v4),
         std::net::IpAddr::V6(v6) => Err(VmmError::Network(format!(
-            "sandbox {} holds {v6}; this manager's sandboxes are IPv4-only",
-            lease.vm
+            "the guest network offered {v6}; this manager's sandboxes are IPv4-only"
         ))),
     }
 }
 
-/// How host-side forwarding must target a sandbox, as the guest agent's
-/// port-forward code still names it.
-///
-/// The mark travels with [`HostIngress::GuestAddress`] but is dropped
-/// here: the agent derives the same value from the pool address it is
-/// already given (`arcbox_tap_net::invariant::fwmark`). R3 moves that call
-/// to the composition root and this mapping goes with it.
-fn expose_target(ingress: HostIngress) -> Result<crate::network::ExposeTarget> {
-    match ingress {
-        HostIngress::PoolAddress => Ok(crate::network::ExposeTarget::PoolIp),
-        HostIngress::GuestAddress { .. } => Ok(crate::network::ExposeTarget::GuestIpWithFwmark),
-        other => Err(VmmError::Network(format!(
-            "guest network reports host ingress {other:?}, which has no expose target here"
-        ))),
+/// The subnet mask `prefix_len` describes, clamped at /32 so an
+/// out-of-range prefix cannot overflow the shift.
+pub(super) fn netmask(prefix_len: u8) -> std::net::Ipv4Addr {
+    let prefix = prefix_len.min(32);
+    if prefix == 0 {
+        std::net::Ipv4Addr::UNSPECIFIED
+    } else {
+        std::net::Ipv4Addr::from(!0u32 << (32 - prefix))
     }
 }
 

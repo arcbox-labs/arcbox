@@ -1084,15 +1084,8 @@ async fn do_boot(
     }
     .map_err(|error| failed(error.into()))?;
 
-    let vm_spec = build_vm_spec(
-        id,
-        spec,
-        net.map(|net| net.nic.clone()),
-        kernel_path,
-        rootfs_path,
-        isolation,
-    )
-    .map_err(failed)?;
+    let vm_spec =
+        build_vm_spec(id, spec, net, kernel_path, rootfs_path, isolation).map_err(failed)?;
     let handle = prepared
         .boot(vm_spec)
         .await

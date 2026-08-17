@@ -3,20 +3,25 @@ use serde::{Deserialize, Serialize};
 
 pub type SandboxId = String;
 
-/// A sandbox's network as the boot and restore flows carry it: the lease
-/// the guest network reserved, and the NIC it returned when it activated
-/// that lease.
+/// A sandbox's network as the boot flow carries it: the lease the guest
+/// network reserved, the NIC it returned when it activated that lease, and
+/// the addressing the guest is told to use over it.
 ///
-/// The two travel together because both halves are needed at once and
-/// neither derives the other — the crash journal records the lease, the
-/// VM spec boots the NIC, and only the network knows which interface it
-/// built for which address.
+/// The three travel together because all of them are needed at once and
+/// none derives the others — the crash journal records the lease, the VM
+/// spec boots the NIC, the kernel command line carries the identity, and
+/// only the network knows which interface it built for which address or
+/// what a guest on it sees.
 #[derive(Clone)]
 pub struct NetworkAttachment {
     /// The reserved address, and the cleanup token its generation ends on.
     pub lease: NetworkLease,
     /// The interface the driver attaches the guest's `eth0` to.
     pub nic: NicSpec,
+    /// What the guest is told over that interface, from
+    /// [`GuestNetwork::identity`](arcbox_vm_driver::net::GuestNetwork::identity)
+    /// under the mode it was activated in.
+    pub identity: NetworkIdentity,
 }
 
 pub(super) struct SandboxBootTask {

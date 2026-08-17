@@ -435,9 +435,18 @@ impl SandboxManager {
         // Populate the reserved instance.
         let mut creating_instance = arc.lock().unwrap();
         creating_instance.network.clone_from(&lease);
-        let attachment = lease
-            .zip(nic)
-            .map(|(lease, nic)| NetworkAttachment { lease, nic });
+        // What the guest is told over its NIC is the network's answer for
+        // the mode it was activated in, not a constant of any one adapter.
+        let attachment = lease.zip(nic).map(|(lease, nic)| {
+            let identity = self
+                .network
+                .identity(&lease, crate::network::TapMode::Invariant);
+            NetworkAttachment {
+                lease,
+                nic,
+                identity,
+            }
+        });
         // The boot bakes the invariant `ip=` identity unless the caller
         // supplied an explicit ip= (see do_boot); record which one this guest
         // runs so checkpoints carry the right restore contract.
