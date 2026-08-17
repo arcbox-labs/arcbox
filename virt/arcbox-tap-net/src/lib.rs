@@ -408,6 +408,113 @@ impl TapNetwork {
         Ok(())
     }
 
+    /// Take `alloc` back as a live network for `vm_id`, whose guest
+    /// outlived the process that activated it, re-establishing the host
+    /// state that died with that process.
+    ///
+    /// Not a second [`Self::activate`]: the TAP is the running guest's
+    /// NIC, so it is never created or re-addressed here, and its absence
+    /// is an error — the link the guest boots on is gone, and the owner's
+    /// answer to that is to tear the sandbox down. A failure therefore
+    /// leaves the pool exactly as it found it. Deliberately not gated on
+    /// [`Self::ensure_startup_cleanup_complete`], unlike [`Self::reserve`]:
+    /// adoption is what the startup sweep does, before that gate opens.
+    pub fn adopt(&self, vm_id: &str, alloc: &NetworkAllocation, mode: AttachMode) -> Result<()> {
+        quarantine::validate_id(vm_id)?;
+        // A journaled record is not this process's memory: hold it to the
+        // rules `reserve` writes by, as the ledger's loader holds its
+        // markers. An address outside this pool is the case that bites —
+        // `next_ip` would never see it as taken, while its TAP name (the
+        // last two octets) can be one this pool hands out.
+        quarantine::validate_allocation(vm_id, alloc, self.base, self.prefix_len, self.gateway)?;
+        // Live or awaiting cleanup finalization, never both.
+        if self.quarantined.lock().unwrap().contains_key(vm_id) {
+            return Err(TapNetError::WrongState {
+                id: vm_id.to_owned(),
+                expected: "no pending cleanup".into(),
+                actual: "cleanup awaiting host finalization".into(),
+            });
+        }
+        // Two records claiming one address is an inconsistent journal:
+        // adopting either is a guess, and handing it out again would put a
+        // second sandbox on a live TAP.
+        if !self
+            .allocated
+            .lock()
+            .unwrap()
+            .insert(u32::from(alloc.ip_address))
+        {
+            return Err(TapNetError::Network(format!(
+                "sandbox {vm_id} cannot adopt {}: the address is already allocated",
+                alloc.ip_address
+            )));
+        }
+        let adopted = self.readopt_host_state(alloc, mode);
+        if adopted.is_err() {
+            // The owner's fallback is to tear the sandbox down, so a
+            // refused adoption must not keep the address on its way out.
+            self.allocated
+                .lock()
+                .unwrap()
+                .remove(&u32::from(alloc.ip_address));
+        }
+        adopted
+    }
+
+    /// The half of [`Self::adopt`] that runs with the address already
+    /// taken: the guest's device, and the translation its exit took away.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "Linux adoption is fallible; macOS test builds compile the no-op branch"
+    )]
+    fn readopt_host_state(&self, alloc: &NetworkAllocation, mode: AttachMode) -> Result<()> {
+        info!(
+            tap = %alloc.tap_name,
+            ip = %alloc.ip_address,
+            ?mode,
+            "adopting a live sandbox network"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // Existence only — never `tap::create`: the interface is live
+            // and carrying the guest's traffic.
+            invariant::tap_ifindex(&alloc.tap_name)?;
+            if mode == AttachMode::Invariant {
+                // eBPF TCX links are file descriptors that died with the
+                // process that opened them (see the `ebpf` module docs), so
+                // an adopted invariant TAP has its onlink route and no
+                // programs: the guest is alive and unreachable until they
+                // are re-attached. Iptables rules survive instead and their
+                // install appends rather than replaces, so remove first —
+                // through the tolerant removal (no `applied` record yet is
+                // exactly its "activated by a previous agent process"
+                // case). Its absent-rule case is already an `Ok`, so an
+                // error here means the removal itself failed and what the
+                // TAP still carries is unknown; installing on top of that
+                // duplicates every surviving rule, so refuse instead and
+                // let the owner fall back.
+                self.deactivate_translation(alloc)?;
+                if let Err(error) = self.install_translation(alloc) {
+                    // As in `activate`, minus the TAP destroy: the device
+                    // is the live guest's. This leaves the TAP with no
+                    // translation rather than half of one, which is where
+                    // the failed removal above would have left it anyway.
+                    let _ = self.deactivate_translation(alloc);
+                    return Err(error);
+                }
+            } else {
+                // Same reason as in `activate`: `expose_target` reads an
+                // absent record as an invariant TAP this process did not
+                // activate, and answers the opposite way.
+                self.applied
+                    .lock()
+                    .unwrap()
+                    .insert(alloc.tap_name.clone(), AppliedDatapath::Untranslated);
+            }
+        }
+        Ok(())
+    }
+
     /// Apply the invariant pool-IP translation to an existing TAP, honoring
     /// the configured [`Datapath`] and falling back to iptables when
     /// the eBPF path is unavailable, then record what was applied.

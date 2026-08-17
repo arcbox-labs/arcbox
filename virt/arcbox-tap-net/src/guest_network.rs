@@ -7,6 +7,7 @@
 //! |------|----------|
 //! | `reserve(vm, policy)` | `reserve(vm)`; the [`NetworkAllocation`] becomes a [`NetworkLease`] |
 //! | `activate(lease, mode)` | `activate(alloc, mode)`; returns the TAP as a [`NicSpec`] named `eth0` |
+//! | `adopt(lease, mode)` | `adopt(vm, alloc, mode)`; the guest is already running |
 //! | `quarantine(lease)` | `quarantine_checked(vm, alloc)` |
 //! | `release(lease)` | `release_checked(alloc)` |
 //! | `identity(lease, mode)` | the invariant identity, or the pool identity under `LegacySnapshot` |
@@ -134,6 +135,13 @@ impl GuestNetwork for TapNetwork {
         let allocation = self.allocation(lease)?;
         Self::activate(self, &allocation, mode)?;
         Ok(Self::nic_spec(lease, &allocation))
+    }
+
+    /// The TAP is the running guest's NIC: adoption re-establishes the
+    /// host state around it and leaves the device alone.
+    async fn adopt(&self, lease: &NetworkLease, mode: AttachMode) -> Result<()> {
+        let allocation = self.allocation(lease)?;
+        Ok(Self::adopt(self, lease.vm.as_str(), &allocation, mode)?)
     }
 
     async fn quarantine(&self, lease: NetworkLease) -> Result<()> {
@@ -352,6 +360,83 @@ mod tests {
             NicAttachment::Tap {
                 name: "vmtap0-2".into()
             }
+        );
+    }
+
+    /// The pool must stop offering an adopted address, or the next
+    /// `reserve` puts a second sandbox on a live guest's TAP — and a
+    /// refused adoption must leave it exactly as it was, since the owner's
+    /// fallback is to tear that sandbox down. Off Linux, where adoption's
+    /// host half has no live device to find.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn an_adopted_address_leaves_the_pool_and_a_refusal_changes_nothing() {
+        // What a previous process journaled, its guest still running.
+        let previous = network();
+        let lease = GuestNetwork::reserve(&previous, &vm("box"), policy(NetworkMode::Nat))
+            .await
+            .unwrap();
+        assert_eq!(lease.ip, v4("172.20.0.2"));
+        drop(previous);
+
+        let restarted = network();
+        GuestNetwork::adopt(&restarted, &lease, AttachMode::Invariant)
+            .await
+            .unwrap();
+        let fresh = GuestNetwork::reserve(&restarted, &vm("other"), policy(NetworkMode::Nat))
+            .await
+            .unwrap();
+        assert_eq!(fresh.ip, v4("172.20.0.3"), "the adopted address is held");
+
+        // Two records claiming one address: adopting either is a guess.
+        let mut twin = lease.clone();
+        twin.vm = vm("twin");
+        twin.mac = crate::mac_from_vm_id("twin");
+        let error = GuestNetwork::adopt(&restarted, &twin, AttachMode::Invariant)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Network(m) if m.contains("172.20.0.2")),
+            "{error}"
+        );
+        // The refusal handed nothing back: were it to free the live
+        // guest's address, the pool would offer it here.
+        let next = GuestNetwork::reserve(&restarted, &vm("third"), policy(NetworkMode::Nat))
+            .await
+            .unwrap();
+        assert_eq!(next.ip, v4("172.20.0.4"));
+    }
+
+    /// Live or awaiting cleanup finalization, never both: a quarantined
+    /// id is refused before any host work, in the class no retry fixes.
+    #[tokio::test]
+    async fn a_quarantined_lease_is_not_adoptable() {
+        let root = tempfile::tempdir().unwrap();
+        let ledgered = TapNetwork::with_quarantine_dir(
+            "172.20.0.0/16",
+            "172.20.0.1",
+            vec![],
+            root.path().join("q"),
+            Datapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
+        .unwrap();
+        // The allocation a previous process journaled and this one found
+        // in its ledger, awaiting the host's cleanup finalization.
+        let allocation = TapNetwork::reserve(&network(), "box").unwrap();
+        ledgered
+            .quarantined
+            .lock()
+            .unwrap()
+            .insert("box".to_owned(), allocation.clone());
+
+        let lease = TapNetwork::lease(&vm("box"), &allocation);
+        let error = GuestNetwork::adopt(&ledgered, &lease, AttachMode::Invariant)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::PreconditionFailed(m) if m.contains("box")),
+            "{error}"
         );
     }
 

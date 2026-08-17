@@ -262,7 +262,7 @@ pub fn load_quarantines(
                 marker.id
             )));
         }
-        validate_quarantine_allocation(&marker.id, &marker.allocation, base, prefix_len, gateway)?;
+        validate_allocation(&marker.id, &marker.allocation, base, prefix_len, gateway)?;
         if !tokens.insert(marker.allocation.cleanup_token.clone()) {
             return Err(TapNetError::Network(format!(
                 "duplicate sandbox network quarantine token for {}",
@@ -289,7 +289,12 @@ pub fn load_quarantines(
     Ok(quarantined)
 }
 
-fn validate_quarantine_allocation(
+/// Whether `allocation` is one this network could have written for `id`:
+/// an allocatable address of this pool, with the prefix, gateway, TAP name
+/// and MAC that `reserve` derives. Applied to every record read back from
+/// durable state — the ledger's markers at load, and a journaled lease at
+/// [`TapNetwork::adopt`] — since neither is this process's own memory.
+pub fn validate_allocation(
     id: &str,
     allocation: &NetworkAllocation,
     base: Ipv4Addr,
@@ -303,7 +308,7 @@ fn validate_quarantine_allocation(
     let broadcast = network | !mask;
     if ip & mask != network || ip <= network + 1 || ip == u32::from(gateway) || ip == broadcast {
         return Err(TapNetError::Network(format!(
-            "sandbox network quarantine {id} has non-allocatable IP {}",
+            "sandbox network record {id} has non-allocatable IP {}",
             allocation.ip_address
         )));
     }
@@ -313,7 +318,7 @@ fn validate_quarantine_allocation(
         || allocation.mac_address != mac_from_vm_id(id).to_string()
     {
         return Err(TapNetError::Network(format!(
-            "sandbox network quarantine {id} metadata does not match the current network"
+            "sandbox network record {id} metadata does not match the current network"
         )));
     }
     Ok(())

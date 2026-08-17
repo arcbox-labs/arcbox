@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::watch;
@@ -25,6 +26,8 @@ use crate::spec::{MacAddr, NicAttachment, NicSpec, VmId};
 /// cleanup so that half of the protocol can be exercised too — including
 /// its ordering: until [`NetworkReconcile::replay_complete`] says the
 /// owner has finished replaying, no token names a finalizable sweep.
+/// `adopt` is the third way a lease becomes live;
+/// [`FakeNetwork::fail_adopt_once`] scripts the refusal to fall back from.
 ///
 /// It answers that protocol in the same error *classes* a real adapter
 /// does — [`Error::Unavailable`] for come-back-later (a pending startup
@@ -38,6 +41,8 @@ pub struct FakeNetwork {
     ledger: Mutex<Ledger>,
     /// `true` while a startup cleanup is pending.
     startup_pending: watch::Sender<bool>,
+    /// Scripted failure, armed once and consumed by the next `adopt`.
+    fail_adopt: AtomicBool,
 }
 
 #[derive(Default)]
@@ -45,6 +50,8 @@ struct Ledger {
     /// Host numbers in use, active or quarantined.
     used: BTreeSet<u16>,
     active: HashMap<VmId, NetworkLease>,
+    /// The mode each adopted lease was originally activated in.
+    adopted: HashMap<VmId, AttachMode>,
     quarantined: HashMap<VmId, NetworkLease>,
     startup: Option<StartupCleanup>,
     minted: u64,
@@ -88,7 +95,21 @@ impl FakeNetwork {
                 ..Ledger::default()
             }),
             startup_pending: watch::Sender::new(pending),
+            fail_adopt: AtomicBool::new(false),
         }
+    }
+
+    /// Arms a scripted failure: the next [`GuestNetwork::adopt`] fails
+    /// and changes nothing — an adapter that cannot re-establish the host
+    /// state its guest needs, which the owner must answer by tearing the
+    /// VM down rather than keeping a live but unreachable one.
+    pub fn fail_adopt_once(&self) {
+        self.fail_adopt.store(true, Ordering::Release);
+    }
+
+    /// The mode `vm`'s lease was adopted in, if it was adopted.
+    pub fn adopted_mode(&self, vm: &VmId) -> Option<AttachMode> {
+        lock(&self.ledger).adopted.get(vm).copied()
     }
 
     fn set_startup_pending(&self, ledger: &Ledger) {
@@ -215,6 +236,55 @@ impl GuestNetwork for FakeNetwork {
         })
     }
 
+    /// Re-registers `lease` as live. Nothing here dies with a process, so
+    /// adoption is bookkeeping only: the address leaves the pool as
+    /// `reserve` takes it, and the mode is recorded
+    /// ([`FakeNetwork::adopted_mode`]). Its refusals are a real adapter's,
+    /// each saying the durable record cannot be true — a lease of another
+    /// network, one awaiting cleanup finalization (live or quarantined,
+    /// never both), an address already held (re-adoption included: this is
+    /// not idempotent) — plus a VM that already holds a live lease, which
+    /// is this fake being stricter than an address pool can be, as its
+    /// `reserve` already is. Unlike `reserve` it is not gated on the
+    /// startup sweep: adoption is what that sweep does.
+    async fn adopt(&self, lease: &NetworkLease, mode: AttachMode) -> Result<()> {
+        if self.fail_adopt.swap(false, Ordering::AcqRel) {
+            return Err(Error::Network(format!(
+                "scripted adopt failure for vm {}",
+                lease.vm
+            )));
+        }
+        let host = host_number(lease.ip)?;
+        let mut ledger = lock(&self.ledger);
+        if ledger.quarantined.contains_key(&lease.vm) {
+            return Err(Error::PreconditionFailed(format!(
+                "vm {} lease is quarantined; it cannot also be live",
+                lease.vm
+            )));
+        }
+        // Address before VM, as the TAP network answers it: its live state
+        // is the address pool, so re-adopting a live lease is the
+        // duplicate-address refusal there too. The VM check below is this
+        // fake being stricter than an address pool can be — the same
+        // strictness its `reserve` already has.
+        if !ledger.used.insert(host) {
+            return Err(Error::Network(format!(
+                "vm {} cannot adopt {}: the address is already held",
+                lease.vm, lease.ip
+            )));
+        }
+        if ledger.active.contains_key(&lease.vm) {
+            ledger.used.remove(&host);
+            return Err(Error::PreconditionFailed(format!(
+                "vm {} already holds a live lease",
+                lease.vm
+            )));
+        }
+        ledger.active.insert(lease.vm.clone(), lease.clone());
+        ledger.adopted.insert(lease.vm.clone(), mode);
+        Ok(())
+    }
+
     async fn quarantine(&self, lease: NetworkLease) -> Result<()> {
         let mut ledger = lock(&self.ledger);
         let host = host_number(lease.ip)?;
@@ -232,6 +302,7 @@ impl GuestNetwork for FakeNetwork {
         match ledger.active.get(&lease.vm) {
             Some(current) if *current == lease => {
                 ledger.active.remove(&lease.vm);
+                ledger.adopted.remove(&lease.vm);
             }
             Some(_) => return Err(ledger.stale(&lease)),
             // A lease replayed from a durable record after a crash is
@@ -259,6 +330,7 @@ impl GuestNetwork for FakeNetwork {
         match current {
             Some(current) if *current == lease => {
                 ledger.active.remove(&lease.vm);
+                ledger.adopted.remove(&lease.vm);
                 ledger.quarantined.remove(&lease.vm);
                 ledger.used.remove(&host);
                 Ok(())
@@ -455,6 +527,82 @@ mod tests {
         let mut foreign = lease;
         foreign.ip = "192.0.2.7".parse().unwrap();
         assert!(net.host_ingress(&foreign).is_err());
+    }
+
+    /// A lease as a previous process's durable record hands it back: this
+    /// network never minted it.
+    fn replayed(vm: &str, host: u16) -> NetworkLease {
+        let [hi, lo] = host.to_be_bytes();
+        NetworkLease {
+            vm: id(vm),
+            ip: IpAddr::V4(Ipv4Addr::new(10, 200, hi, lo)),
+            prefix_len: PREFIX_LEN,
+            gateway: IpAddr::V4(GATEWAY),
+            mac: MacAddr::new([0x02, 0xfa, 0xce, 0x00, hi, lo]),
+            cleanup_token: format!("boot-1-{vm}"),
+        }
+    }
+
+    /// Adoption is the third way a lease becomes live, so the pool must
+    /// stop offering its address and every live-path read must answer
+    /// about it.
+    #[tokio::test]
+    async fn an_adopted_lease_holds_its_address_and_answers_the_live_reads() {
+        let net = FakeNetwork::new();
+        let live = replayed("a", 2);
+        net.adopt(&live, AttachMode::Invariant).await.unwrap();
+        assert_eq!(net.adopted_mode(&id("a")), Some(AttachMode::Invariant));
+        // Re-adopting a live lease is the address collision, the answer the
+        // TAP network gives it too — `adopt` is not a no-op the second time.
+        assert!(matches!(
+            net.adopt(&live, AttachMode::Invariant).await,
+            Err(Error::Network(_))
+        ));
+        // The pool has stopped offering that address...
+        let next = net.reserve(&id("b"), policy()).await.unwrap();
+        assert_ne!(next.ip, live.ip);
+        // ...and the reads a live lease answers do answer about it.
+        assert_eq!(net.identity(&live, AttachMode::Invariant).ip, live.ip);
+        assert_eq!(net.host_ingress(&live).unwrap(), HostIngress::PoolAddress);
+
+        // Two records claiming one address: adopting either is a guess.
+        let mut twin = live.clone();
+        twin.vm = id("twin");
+        assert!(matches!(
+            net.adopt(&twin, AttachMode::Invariant).await,
+            Err(Error::Network(_))
+        ));
+        // The refusal changed nothing: the pool hands out what it would
+        // have handed out anyway.
+        let after = net.reserve(&id("c"), policy()).await.unwrap();
+        assert_eq!(after.ip, "10.200.0.4".parse::<IpAddr>().unwrap());
+        // Not a lease of this network at all.
+        let mut foreign = live.clone();
+        foreign.ip = "192.0.2.7".parse().unwrap();
+        assert!(net.adopt(&foreign, AttachMode::Invariant).await.is_err());
+
+        // Live and awaiting cleanup are exclusive, in both directions.
+        net.quarantine(live.clone()).await.unwrap();
+        assert_eq!(net.adopted_mode(&id("a")), None);
+        assert!(matches!(
+            net.adopt(&live, AttachMode::Invariant).await,
+            Err(Error::PreconditionFailed(_))
+        ));
+    }
+
+    /// The scripted refusal an owner falls back from leaves the pool
+    /// untouched, so tearing the VM down is all that happened.
+    #[tokio::test]
+    async fn a_scripted_adopt_failure_takes_nothing_and_is_armed_once() {
+        let net = FakeNetwork::new();
+        let live = replayed("a", 2);
+        net.fail_adopt_once();
+        assert!(net.adopt(&live, AttachMode::Invariant).await.is_err());
+        assert_eq!(net.adopted_mode(&id("a")), None);
+        // Nothing was taken: the same adopt goes through once the knob is
+        // spent, where a half-applied one would refuse a duplicate.
+        net.adopt(&live, AttachMode::LegacySnapshot).await.unwrap();
+        assert_eq!(net.adopted_mode(&id("a")), Some(AttachMode::LegacySnapshot));
     }
 
     #[tokio::test]

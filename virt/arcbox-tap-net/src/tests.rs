@@ -140,6 +140,72 @@ fn expose_target_follows_the_applied_datapath() {
     assert_eq!(manager.expose_target("vmtap0-2"), ExposeTarget::PoolIp);
 }
 
+/// A journaled record is held to the rules `reserve` writes by. The
+/// address matters most: one from another pool is invisible to `next_ip`,
+/// while its TAP name — the last two octets — can be one this pool hands
+/// out, so a later sandbox would create its TAP over a live guest's.
+#[test]
+fn adopt_refuses_a_record_this_pool_would_not_have_written() {
+    let pool = || TapNetwork::new("10.0.99.0/24", "10.0.99.1", vec![]).unwrap();
+    let journaled = pool().reserve("box").unwrap();
+    let manager = pool();
+
+    let mut foreign = journaled.clone();
+    foreign.ip_address = "172.20.99.2".parse().unwrap(); // also named vmtap99-2
+    let error = manager
+        .adopt("box", &foreign, AttachMode::Invariant)
+        .unwrap_err();
+    assert!(error.to_string().contains("non-allocatable"), "{error}");
+
+    let mut renamed = journaled.clone();
+    renamed.tap_name = "vmtap-elsewhere".into();
+    assert!(
+        manager
+            .adopt("box", &renamed, AttachMode::Invariant)
+            .is_err()
+    );
+    // Another VM's record: the MAC follows the id that reserved it.
+    assert!(
+        manager
+            .adopt("other", &journaled, AttachMode::Invariant)
+            .is_err()
+    );
+    // An id the port could never name (`..`) is refused before all of that.
+    assert!(
+        manager
+            .adopt("..", &journaled, AttachMode::Invariant)
+            .is_err()
+    );
+
+    assert!(
+        manager.allocated.lock().unwrap().is_empty(),
+        "a refused adoption keeps no address"
+    );
+}
+
+/// The TAP is the running guest's NIC: its absence means the guest's link
+/// is gone, so adoption fails rather than creating one, and the address it
+/// took goes back to the pool.
+#[test]
+#[cfg(target_os = "linux")]
+fn adopt_refuses_a_missing_tap_and_frees_the_address() {
+    let pool = || TapNetwork::new("10.0.98.0/24", "10.0.98.1", vec![]).unwrap();
+    let allocation = pool().reserve("box").unwrap();
+    let manager = pool();
+    let error = manager
+        .adopt("box", &allocation, AttachMode::Invariant)
+        .unwrap_err();
+    assert!(error.to_string().contains(&allocation.tap_name), "{error}");
+    assert!(
+        !manager
+            .allocated
+            .lock()
+            .unwrap()
+            .contains(&u32::from(allocation.ip_address)),
+        "a refused adoption keeps no address"
+    );
+}
+
 #[tokio::test]
 async fn startup_waiter_unblocks_after_host_finalization() {
     let root = tempfile::tempdir().unwrap();
