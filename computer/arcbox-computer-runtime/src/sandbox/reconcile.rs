@@ -399,11 +399,18 @@ pub(super) struct AdoptedSandbox {
     net_invariant: bool,
 }
 
+/// What one sweep did, in the two pieces its caller needs at different
+/// moments: [`OrphanSweep::take_runtime`] first, for normalization, and the
+/// runtime directories afterwards, for [`finalize_sweep`].
+///
+/// Both halves are private so neither can be read after the first has been
+/// taken out.
 pub(super) struct OrphanSweep {
-    pub ids: HashSet<String>,
+    /// Ids whose journaled resources were torn down.
+    ids: HashSet<String>,
     /// Sandboxes reclaimed alive, by id. Their journals stay on disk — they
     /// are live state again, not debris — and so do their runtime dirs.
-    pub adopted: HashMap<String, AdoptedSandbox>,
+    adopted: HashMap<String, AdoptedSandbox>,
     runtime_dirs: Vec<PathBuf>,
 }
 
@@ -592,8 +599,8 @@ pub(super) async fn finalize_sweep(sweep: OrphanSweep) -> Result<()> {
 /// onto the instances built here while the runtime directories it also
 /// carries are needed afterwards, by [`finalize_sweep`].
 pub(super) struct SweptRuntime {
-    pub swept: HashSet<String>,
-    pub adopted: HashMap<String, AdoptedSandbox>,
+    swept: HashSet<String>,
+    adopted: HashMap<String, AdoptedSandbox>,
 }
 
 /// Normalizes durable records after the orphan sweep decided each sandbox's
