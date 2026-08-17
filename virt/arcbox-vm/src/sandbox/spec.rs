@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use arcbox_vm_driver::{
-    BootSpec, CacheMode, ConsoleSpec, DiskSpec, IsolationSpec, NicAttachment, NicSpec, RestoreSpec,
-    VmId, VmSpec, VsockSpec,
+    BootSpec, CacheMode, ConsoleSpec, DiskSpec, IsolationSpec, NicSpec, RestoreSpec, VmId, VmSpec,
+    VsockSpec,
 };
 
 use crate::boot_proto::KernelIpParam;
@@ -89,17 +89,6 @@ pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
     }
 }
 
-/// The guest's one NIC, `eth0`, on the allocation's TAP with its MAC.
-pub(super) fn nic_spec(net: &crate::network::NetworkAllocation) -> Result<NicSpec> {
-    Ok(NicSpec {
-        id: "eth0".into(),
-        mac: net.mac_address.parse().map_err(VmmError::from)?,
-        attachment: NicAttachment::Tap {
-            name: net.tap_name.clone(),
-        },
-    })
-}
-
 /// What a restore may change about the checkpointed VM: its identity
 /// (`owner`, the id the jail is keyed by), the fresh NIC the guest network
 /// activated, and the disk it runs on — the rootfs staged into the owner's
@@ -120,6 +109,8 @@ pub(super) fn restore_spec(
 
 #[cfg(test)]
 mod tests {
+    use arcbox_vm_driver::NicAttachment;
+
     use super::*;
 
     /// The NIC a guest network hands back from activating a lease.

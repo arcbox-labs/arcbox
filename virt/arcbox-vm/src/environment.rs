@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use arcbox_snapshot::snapshot_cow::{BlockTools, BusyboxBlockTools};
 use arcbox_vm_driver::VmDriver;
+use arcbox_vm_driver::net::GuestNetwork;
 
 use crate::network::{IptablesLegacy, PacketFilter};
 
@@ -27,6 +28,17 @@ pub struct SandboxEnvironment {
     /// the VMM ahead of the guest, and a driver without it is refused at
     /// construction rather than at the first boot.
     pub driver: Option<Arc<dyn VmDriver>>,
+    /// What the sandboxes' NICs attach to, behind the guest-network port
+    /// (`arcbox_vm_driver::net::GuestNetwork`). `None` — the reference —
+    /// is the Linux TAP network built from the config's `[network]`
+    /// section, its datapath, and the packet filter below, inside
+    /// `SandboxManager::with_environment`; a composer on another
+    /// dataplane supplies its own here. Whatever is supplied must offer
+    /// the `NetworkReconcile` capability: the quarantine ledger is how a
+    /// host learns which addresses a previous process still holds, and a
+    /// network without it is refused at construction rather than at the
+    /// first cleanup ticket.
+    pub network: Option<Arc<dyn GuestNetwork>>,
     /// Loop-device and block-size operations for the copy-on-write rootfs
     /// (`arcbox_snapshot::snapshot_cow::BlockTools`).
     pub block_tools: Arc<dyn BlockTools>,
@@ -38,11 +50,13 @@ pub struct SandboxEnvironment {
 
 impl Default for SandboxEnvironment {
     /// The System VM's userland: the Firecracker driver from the config,
-    /// busybox applets at [`BusyboxBlockTools::DEFAULT_PATH`],
-    /// iptables-legacy at [`IptablesLegacy::DEFAULT_PATH`].
+    /// the TAP network from the config, busybox applets at
+    /// [`BusyboxBlockTools::DEFAULT_PATH`], iptables-legacy at
+    /// [`IptablesLegacy::DEFAULT_PATH`].
     fn default() -> Self {
         Self {
             driver: None,
+            network: None,
             block_tools: Arc::new(BusyboxBlockTools::default()),
             packet_filter: Arc::new(IptablesLegacy::default()),
         }

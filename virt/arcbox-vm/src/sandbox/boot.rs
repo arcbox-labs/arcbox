@@ -1,8 +1,9 @@
 use super::record::{SandboxRecordStore, SandboxTransition};
-use super::spec::{build_vm_spec, nic_spec};
+use super::spec::build_vm_spec;
 use super::types::action;
 use super::*;
 use arcbox_snapshot::SnapshotError;
+use arcbox_vm_driver::net::GuestNetwork;
 use arcbox_vm_driver::{VmHandle, VsockListener};
 
 type BootOutput = (Arc<dyn VmHandle>, Box<dyn VsockListener>);
@@ -30,10 +31,10 @@ struct BootFailure {
 pub(super) async fn boot_sandbox(
     id: SandboxId,
     spec: SandboxSpec,
-    net_alloc: Option<NetworkAllocation>,
+    net: Option<NetworkAttachment>,
     vm_dir: PathBuf,
     instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
-    network: Arc<NetworkManager>,
+    network: Arc<dyn GuestNetwork>,
     driver: Arc<dyn VmDriver>,
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
@@ -46,7 +47,7 @@ pub(super) async fn boot_sandbox(
     match do_boot(
         &id,
         &spec,
-        net_alloc.as_ref(),
+        net.as_ref(),
         &vm_dir,
         driver.as_ref(),
         &config,
@@ -458,7 +459,7 @@ pub(super) async fn fail_live_sandbox(
     message: &str,
     vm_dir: &Path,
     instances: &super::InstanceMap,
-    network: &Arc<NetworkManager>,
+    network: &Arc<dyn GuestNetwork>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
     records: &SandboxRecordStore,
@@ -496,7 +497,7 @@ pub(super) async fn fail_live_sandbox_locked(
     message: &str,
     vm_dir: &Path,
     instance: &Arc<Mutex<SandboxInstance>>,
-    network: &Arc<NetworkManager>,
+    network: &Arc<dyn GuestNetwork>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
     records: &SandboxRecordStore,
@@ -811,7 +812,7 @@ async fn tear_down_orphaned_boot(
 async fn do_boot(
     id: &str,
     spec: &SandboxSpec,
-    net_alloc: Option<&NetworkAllocation>,
+    net: Option<&NetworkAttachment>,
     vm_dir: &Path,
     driver: &dyn VmDriver,
     config: &VmmConfig,
@@ -848,15 +849,16 @@ async fn do_boot(
     };
 
     let process_pid = super::journaled_pid(&*prepared);
-    let spawned_record = super::reconcile::SandboxStateRecord::new(
+    let journal_error = super::reconcile::SandboxStateRecord::new(
         id,
         process_pid,
-        net_alloc,
+        net.map(|net| &net.lease),
         None,
-        fc_cfg.jailer.is_some(),
+        config,
         None,
-    );
-    let journal_error = super::reconcile::write_state_record(vm_dir, &spawned_record).err();
+    )
+    .and_then(|record| super::reconcile::write_state_record(vm_dir, &record))
+    .err();
 
     // Once the VMM is up, make it immediately owned by the instance. Cleanup
     // still waits for the paths/CoW phase before it may abort boot.
@@ -929,11 +931,11 @@ async fn do_boot(
                     let record = super::reconcile::SandboxStateRecord::new(
                         id,
                         process_pid,
-                        net_alloc,
+                        net.map(|net| &net.lease),
                         cow_handle.as_ref(),
-                        true,
+                        config,
                         None,
-                    );
+                    )?;
                     super::reconcile::write_state_record(vm_dir, &record)?;
                     match stage_rootfs_device_for_jailer(
                         &cr,
@@ -957,11 +959,11 @@ async fn do_boot(
                             let record = super::reconcile::SandboxStateRecord::new(
                                 id,
                                 process_pid,
-                                net_alloc,
+                                net.map(|net| &net.lease),
                                 None,
-                                true,
+                                config,
                                 None,
-                            );
+                            )?;
                             super::reconcile::write_state_record(vm_dir, &record)?;
                             stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid).await?
                         }
@@ -994,11 +996,11 @@ async fn do_boot(
                     let record = super::reconcile::SandboxStateRecord::new(
                         id,
                         process_pid,
-                        net_alloc,
+                        net.map(|net| &net.lease),
                         cow_handle.as_ref(),
-                        false,
+                        config,
                         None,
-                    );
+                    )?;
                     super::reconcile::write_state_record(vm_dir, &record)?;
                     create_rootfs_symlink(vm_dir, &cow_handle.as_ref().unwrap().dm_device)?
                 }
@@ -1082,9 +1084,15 @@ async fn do_boot(
     }
     .map_err(|error| failed(error.into()))?;
 
-    let nic = net_alloc.map(nic_spec).transpose().map_err(failed)?;
-    let vm_spec =
-        build_vm_spec(id, spec, nic, kernel_path, rootfs_path, isolation).map_err(failed)?;
+    let vm_spec = build_vm_spec(
+        id,
+        spec,
+        net.map(|net| net.nic.clone()),
+        kernel_path,
+        rootfs_path,
+        isolation,
+    )
+    .map_err(failed)?;
     let handle = prepared
         .boot(vm_spec)
         .await

@@ -19,8 +19,11 @@ use arcbox_fc_driver::jail::{
     stage_snapshot_files,
 };
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
+use arcbox_vm_driver::net::{
+    GuestNetwork, HostIngress, NetworkLease, NetworkMode, NetworkPolicy, NetworkReconcile,
+};
 use arcbox_vm_driver::{
-    CheckpointFormat, CheckpointImage, CheckpointKind, IsolationSpec, Prepare, PreparedVm,
+    CheckpointFormat, CheckpointImage, CheckpointKind, IsolationSpec, NicSpec, Prepare, PreparedVm,
     VmDriver, VmHandle, VmId,
 };
 use chrono::{DateTime, Utc};
@@ -31,7 +34,7 @@ use uuid::Uuid;
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
-use crate::network::{NetworkAllocation, NetworkManager};
+use crate::network::NetworkManager;
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::template_catalog::TemplateCatalog;
@@ -61,6 +64,7 @@ pub use execution::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
 pub use pause::reason as pause_reason;
+pub(crate) use types::NetworkAttachment;
 pub use types::{
     CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
     SandboxEvent, SandboxId, SandboxInfo, SandboxInstance, SandboxMountSpec, SandboxNetworkInfo,
@@ -81,7 +85,10 @@ pub struct SandboxManager {
     /// `Prepare` capability is required at construction: the boot and pool
     /// flows spawn the VMM ahead of the guest.
     driver: Arc<dyn VmDriver>,
-    network: Arc<NetworkManager>,
+    /// What every sandbox NIC attaches to, behind the guest-network port.
+    /// Its `NetworkReconcile` capability is required at construction: the
+    /// cleanup-token protocol and the startup sweep are not optional here.
+    network: Arc<dyn GuestNetwork>,
     snapshots: Arc<SnapshotCatalog>,
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
@@ -117,8 +124,11 @@ impl SandboxManager {
     /// Fails with [`VmmError::Config`] when the environment's driver lacks a
     /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
     /// ahead of the guest), `Vsock` (the guest agent is reached over it) or
-    /// `VsockListen` (the readiness gate is the guest's dial-out) — so a
-    /// driver without one is refused here instead of at the first boot.
+    /// `VsockListen` (the readiness gate is the guest's dial-out) — or when
+    /// its guest network offers no `NetworkReconcile` (the cleanup-token
+    /// protocol is how a host releases the addresses a previous process
+    /// held), so an environment missing one is refused here instead of at
+    /// the first boot or the first cleanup ticket.
     pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
         let driver = environment.driver.unwrap_or_else(|| {
             Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))) as Arc<dyn VmDriver>
@@ -152,14 +162,24 @@ impl SandboxManager {
             &config.firecracker.data_dir,
         ))?);
         drop(records.load_all()?);
-        let network = Arc::new(NetworkManager::with_quarantine_dir(
-            &config.network.cidr,
-            &config.network.gateway,
-            config.network.dns.clone(),
-            Path::new(&config.firecracker.data_dir).join("sandbox-network-quarantine"),
-            config.firecracker.sandbox_datapath,
-            environment.packet_filter,
-        )?);
+        let network: Arc<dyn GuestNetwork> = match environment.network {
+            Some(network) => network,
+            None => Arc::new(NetworkManager::with_quarantine_dir(
+                &config.network.cidr,
+                &config.network.gateway,
+                config.network.dns.clone(),
+                Path::new(&config.firecracker.data_dir).join("sandbox-network-quarantine"),
+                config.firecracker.sandbox_datapath,
+                environment.packet_filter,
+            )?),
+        };
+        if network.reconcile().is_none() {
+            return Err(VmmError::Config(
+                "guest network has no reconcile capability; the quarantine ledger is how a host \
+                 releases the addresses a previous process held"
+                    .into(),
+            ));
+        }
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -200,7 +220,7 @@ impl SandboxManager {
                     let swept = reconcile::sweep_orphans(
                         &config,
                         driver.as_ref(),
-                        &network,
+                        &*network,
                         &cow_manager,
                         &snapshots,
                         &records,
@@ -212,7 +232,7 @@ impl SandboxManager {
                         Some(&swept.ids),
                     )?;
                     reconcile::finalize_sweep(swept).await?;
-                    network.mark_reconciled();
+                    reconcile_capability(&*network).replay_complete();
                     Ok::<_, VmmError>(inactive)
                 }
                 .await
@@ -237,7 +257,7 @@ impl SandboxManager {
                 Path::new(&config.firecracker.data_dir),
                 None,
             )?;
-            network.mark_reconciled();
+            reconcile_capability(&*network).replay_complete();
             instances.write().unwrap().extend(
                 inactive
                     .into_iter()
@@ -322,71 +342,89 @@ impl SandboxManager {
     /// forwarding cleanup.
     pub async fn pending_network_cleanups(&self) -> Result<Vec<(String, String)>> {
         self.await_reconcile().await?;
-        Ok(self.network.pending_quarantines())
+        Ok(self
+            .reconcile_network()
+            .pending_cleanups()
+            .await
+            .map_err(VmmError::from)?
+            .into_iter()
+            .map(|(vm, token)| (vm.as_str().to_owned(), token))
+            .collect())
     }
 
     /// Validate one exact pending host-cleanup ticket.
-    pub async fn validate_network_cleanup(
-        &self,
-        id: &str,
-        token: &str,
-    ) -> Result<NetworkAllocation> {
+    ///
+    /// Returns the lease that generation held: the host's forwarding rules
+    /// for it are keyed by its address, and after an agent restart the
+    /// quarantine ledger is the only place that address survives.
+    pub async fn validate_network_cleanup(&self, id: &str, token: &str) -> Result<NetworkLease> {
         self.await_reconcile().await?;
-        self.network
-            .validate_quarantine(id, token)
-            .map_err(VmmError::from)
+        Ok(self
+            .reconcile_network()
+            .validate_cleanup(&VmId::new(id)?, token)
+            .await?)
     }
 
     /// Recycle one exact inactive sandbox generation after forwarding cleanup.
     pub async fn finalize_network_cleanup(&self, id: &str, token: &str) -> Result<()> {
         self.await_reconcile().await?;
-        self.network
-            .finalize_quarantine(id, token)
-            .map_err(VmmError::from)
-    }
-
-    /// Reject allocation/exposure until startup cleanup replay is finalized.
-    pub fn ensure_startup_cleanup_complete(&self) -> Result<()> {
-        self.network
-            .ensure_startup_cleanup_complete()
-            .map_err(VmmError::from)
+        Ok(self
+            .reconcile_network()
+            .finalize_cleanup(&VmId::new(id)?, token)
+            .await?)
     }
 
     /// Wait until the current agent generation's startup cleanup is complete.
     pub async fn wait_startup_cleanup_complete(&self) {
-        self.network.wait_startup_cleanup_complete().await;
+        self.reconcile_network()
+            .wait_startup_cleanup_complete()
+            .await;
     }
 
     /// Opaque ticket for the host cleanup pass required after agent startup.
     pub async fn startup_cleanup_token(&self) -> Result<Option<String>> {
         self.await_reconcile().await?;
-        Ok(self.network.startup_cleanup_token())
+        Ok(self.reconcile_network().startup_cleanup_token().await)
     }
 
     /// Validate the current process-generation startup cleanup ticket.
     pub async fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
         self.await_reconcile().await?;
-        self.network
+        Ok(self
+            .reconcile_network()
             .validate_startup_cleanup(token)
-            .map_err(VmmError::from)
+            .await?)
     }
 
     /// Release the startup gate once host listeners and legacy DNAT are gone.
     pub async fn finalize_startup_cleanup(&self, token: &str) -> Result<()> {
         self.await_reconcile().await?;
-        self.network
+        Ok(self
+            .reconcile_network()
             .finalize_startup_cleanup(token)
-            .map_err(VmmError::from)
+            .await?)
+    }
+
+    /// The guest network's cleanup protocol.
+    pub(super) fn reconcile_network(&self) -> &dyn NetworkReconcile {
+        reconcile_capability(&*self.network)
     }
 
     /// Return the active generation's network identity: the external pool IP
     /// (what DNS, expose, and the API report), its opaque cleanup token, and
     /// how expose DNAT must target the sandbox (CORE-81/CORE-83).
+    ///
+    /// No startup-cleanup gate here, unlike every method above. An identity
+    /// needs a live lease; a lease comes only from `reserve`, which the
+    /// guest network refuses while the same startup barrier is closed; and
+    /// both callers in the guest agent await `wait_startup_cleanup_complete`
+    /// before asking. The gate this used to take could therefore only ever
+    /// have fired for a sandbox that has no lease to report anyway, and it
+    /// has no non-blocking form on the port.
     pub fn sandbox_network_identity(&self, id: &str) -> Result<SandboxNetworkIdentity> {
-        self.ensure_startup_cleanup_complete()?;
         let instance = self.get_instance(&id.to_owned())?;
         let instance = instance.lock().unwrap();
-        let allocation = instance
+        let lease = instance
             .network
             .as_ref()
             .ok_or_else(|| VmmError::WrongState {
@@ -395,10 +433,82 @@ impl SandboxManager {
                 actual: instance.state.to_string(),
             })?;
         Ok(SandboxNetworkIdentity {
-            ip: allocation.ip_address,
-            cleanup_token: allocation.cleanup_token.clone(),
-            expose: self.network.expose_target(&allocation.tap_name),
+            ip: lease.ipv4()?,
+            cleanup_token: lease.cleanup_token.clone(),
+            expose: expose_target(self.network.host_ingress(lease)?)?,
         })
+    }
+}
+
+/// What the sandbox stack needs from a [`NetworkLease`] beyond its fields.
+///
+/// The port's lease carries an [`IpAddr`](std::net::IpAddr) because a guest
+/// network need not be IPv4 (the platform's node dataplane is IPv6-only),
+/// while everything downstream of *this* manager — the pool address it
+/// reports, the netmask a legacy guest is reconfigured with, the crash
+/// journal's on-disk shape — is v4. The narrowing happens here, once, and
+/// says so when a lease cannot answer.
+pub(super) trait LeaseExt {
+    /// The lease's address.
+    fn ipv4(&self) -> Result<std::net::Ipv4Addr>;
+    /// The gateway the guest routes through.
+    fn gateway_ipv4(&self) -> Result<std::net::Ipv4Addr>;
+    /// The subnet mask `prefix_len` describes, clamped at /32 so an
+    /// out-of-range prefix cannot overflow the shift.
+    fn netmask(&self) -> std::net::Ipv4Addr;
+}
+
+impl LeaseExt for NetworkLease {
+    fn ipv4(&self) -> Result<std::net::Ipv4Addr> {
+        ipv4(self.ip, self)
+    }
+
+    fn gateway_ipv4(&self) -> Result<std::net::Ipv4Addr> {
+        ipv4(self.gateway, self)
+    }
+
+    fn netmask(&self) -> std::net::Ipv4Addr {
+        let prefix = self.prefix_len.min(32);
+        if prefix == 0 {
+            std::net::Ipv4Addr::UNSPECIFIED
+        } else {
+            std::net::Ipv4Addr::from(!0u32 << (32 - prefix))
+        }
+    }
+}
+
+fn ipv4(address: std::net::IpAddr, lease: &NetworkLease) -> Result<std::net::Ipv4Addr> {
+    match address {
+        std::net::IpAddr::V4(v4) => Ok(v4),
+        std::net::IpAddr::V6(v6) => Err(VmmError::Network(format!(
+            "sandbox {} holds {v6}; this manager's sandboxes are IPv4-only",
+            lease.vm
+        ))),
+    }
+}
+
+/// How host-side forwarding must target a sandbox, as the guest agent's
+/// port-forward code still names it.
+///
+/// The mark travels with [`HostIngress::GuestAddress`] but is dropped
+/// here: the agent derives the same value from the pool address it is
+/// already given (`arcbox_tap_net::invariant::fwmark`). R3 moves that call
+/// to the composition root and this mapping goes with it.
+fn expose_target(ingress: HostIngress) -> Result<crate::network::ExposeTarget> {
+    match ingress {
+        HostIngress::PoolAddress => Ok(crate::network::ExposeTarget::PoolIp),
+        HostIngress::GuestAddress { .. } => Ok(crate::network::ExposeTarget::GuestIpWithFwmark),
+        other => Err(VmmError::Network(format!(
+            "guest network reports host ingress {other:?}, which has no expose target here"
+        ))),
+    }
+}
+
+/// The connectivity every sandbox gets: egress through the host's address,
+/// which is what the System VM's netfilter provides for the pool.
+pub(super) const fn sandbox_network_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        mode: NetworkMode::Nat,
     }
 }
 
@@ -412,6 +522,16 @@ pub struct SandboxNetworkIdentity {
     /// How expose DNAT must target this sandbox, decided by the datapath
     /// actually applied to its TAP (CORE-81/CORE-83).
     pub expose: crate::network::ExposeTarget,
+}
+
+/// The guest network's cleanup protocol, which
+/// [`SandboxManager::with_environment`] requires — the quarantine ledger
+/// gates every address the pool hands out, and the startup sweep gates the
+/// pool itself.
+pub(super) fn reconcile_capability(network: &dyn GuestNetwork) -> &dyn NetworkReconcile {
+    network.reconcile().expect(
+        "SandboxManager::with_environment requires the guest network's reconcile capability",
+    )
 }
 
 /// The driver's `Prepare` capability, which [`SandboxManager::with_environment`]

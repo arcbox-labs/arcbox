@@ -77,10 +77,10 @@ pub(super) async fn prepare_slot(
     reconcile::create_runtime_dir(&vm_dir)?;
     reconcile::write_state_record(
         &vm_dir,
-        &SandboxStateRecord::new(&slot_id, None, None, None, true, None),
+        &SandboxStateRecord::new(&slot_id, None, None, None, config, None)?,
     )?;
 
-    match stage_slot(driver, fc_cfg, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
+    match stage_slot(driver, config, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
         Ok((prepared, cow_handle, image)) => Ok(PreparedSlot {
             slot_id,
             prepared,
@@ -148,13 +148,14 @@ type StagedSlot = (Arc<dyn PreparedVm>, Option<CowHandle>, CheckpointImage);
 
 async fn stage_slot(
     driver: &dyn VmDriver,
-    fc_cfg: &crate::config::FirecrackerConfig,
+    config: &VmmConfig,
     jc: &JailerConfig,
     cow_manager: &CowManager,
     snapshot: &SnapshotMeta,
     slot_id: &str,
     vm_dir: &Path,
 ) -> std::result::Result<StagedSlot, SlotFailure> {
+    let fc_cfg = &config.firecracker;
     let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
     let cr = chroot_root(&fc_cfg.binary, base, slot_id);
 
@@ -172,7 +173,7 @@ async fn stage_slot(
     let journal = |cow: Option<&CowHandle>| {
         reconcile::write_state_record(
             vm_dir,
-            &SandboxStateRecord::new(slot_id, pid, None, cow, true, None),
+            &SandboxStateRecord::new(slot_id, pid, None, cow, config, None)?,
         )
     };
     let carry = |error: VmmError, prepared, cow_handle| SlotFailure {

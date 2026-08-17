@@ -513,7 +513,7 @@ impl TapNetwork {
     /// suffices for both; everything else — iptables TAPs, and TAPs whose
     /// activation record died with a previous agent process — needs the
     /// CORE-81 guest-IP + fwmark form.
-    pub fn expose_target(&self, tap_name: &str) -> ExposeTarget {
+    pub(crate) fn expose_target(&self, tap_name: &str) -> ExposeTarget {
         match self.applied.lock().unwrap().get(tap_name) {
             Some(AppliedDatapath::Ebpf | AppliedDatapath::Untranslated) => ExposeTarget::PoolIp,
             Some(AppliedDatapath::Iptables) | None => ExposeTarget::GuestIpWithFwmark,

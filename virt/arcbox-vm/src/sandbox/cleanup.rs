@@ -1,6 +1,7 @@
 use super::record::{SandboxRecordStore, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
+use arcbox_vm_driver::net::GuestNetwork;
 
 #[cfg(not(test))]
 const BOOT_RESOURCE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,7 +26,7 @@ pub(super) async fn remove_sandbox_impl(
     force: bool,
     expected: &Arc<Mutex<SandboxInstance>>,
     instances: &Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
-    network: &Arc<NetworkManager>,
+    network: &Arc<dyn GuestNetwork>,
     events_tx: &broadcast::Sender<SandboxEvent>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
@@ -209,7 +210,7 @@ pub(super) async fn expire_sandbox(
     generation: Option<Uuid>,
     armed_for: &std::sync::Weak<Mutex<SandboxInstance>>,
     instances: &Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
-    network: &Arc<NetworkManager>,
+    network: &Arc<dyn GuestNetwork>,
     events_tx: &broadcast::Sender<SandboxEvent>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
@@ -273,7 +274,7 @@ pub(super) async fn expire_sandbox(
 pub(super) async fn release_runtime_resources(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
-    network: &Arc<NetworkManager>,
+    network: &Arc<dyn GuestNetwork>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
 ) -> Result<()> {
@@ -294,13 +295,12 @@ pub(super) async fn release_runtime_resources(
 
     // Release network resources (destroys TAP via ioctl).
     {
-        let mut inst = arc.lock().unwrap();
-        if let Some(net) = inst.network.take() {
-            drop(inst);
-            if let Err(error) = network.quarantine_checked(id, &net) {
-                arc.lock().unwrap().network = Some(net);
-                return Err(error.into());
-            }
+        let lease = arc.lock().unwrap().network.take();
+        if let Some(lease) = lease
+            && let Err(error) = network.quarantine(lease.clone()).await
+        {
+            arc.lock().unwrap().network = Some(lease);
+            return Err(error.into());
         }
     }
 
@@ -383,10 +383,9 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
         labels: inst.labels.clone(),
         vcpus: inst.spec.vcpus,
         memory_mib: inst.spec.memory_mib,
-        network: inst.network.as_ref().map(|n| SandboxNetworkInfo {
-            ip_address: n.ip_address.to_string(),
-            gateway: n.gateway.to_string(),
-            tap_name: n.tap_name.clone(),
+        network: inst.network.as_ref().map(|lease| SandboxNetworkInfo {
+            ip_address: lease.ip.to_string(),
+            gateway: lease.gateway.to_string(),
         }),
         created_at: inst.created_at,
         ready_at: inst.ready_at,
@@ -407,6 +406,7 @@ mod tests {
     use super::*;
     use crate::sandbox::record::{PersistPhase, ProvisionIntent, SandboxProvisionOutcome};
     use crate::snapshot_cow::{CowOptions, CowTestProbe};
+    use arcbox_vm_driver::testkit::FakeNetwork;
     use std::os::unix::fs::PermissionsExt;
 
     fn instance(id: &str) -> Arc<Mutex<SandboxInstance>> {
@@ -489,14 +489,7 @@ mod tests {
             let mut config = VmmConfig::default();
             config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
             let config = Arc::new(config);
-            let network = Arc::new(
-                NetworkManager::new(
-                    &config.network.cidr,
-                    &config.network.gateway,
-                    config.network.dns.clone(),
-                )
-                .unwrap(),
-            );
+            let network: Arc<dyn GuestNetwork> = Arc::new(FakeNetwork::new());
             let cow_manager =
                 Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
             let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
@@ -627,14 +620,7 @@ mod tests {
         let mut config = VmmConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         let config = Arc::new(config);
-        let network = Arc::new(
-            NetworkManager::new(
-                &config.network.cidr,
-                &config.network.gateway,
-                config.network.dns.clone(),
-            )
-            .unwrap(),
-        );
+        let network: Arc<dyn GuestNetwork> = Arc::new(FakeNetwork::new());
         let cow_manager =
             Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
         let snapshots = Arc::new(crate::snapshot::SnapshotCatalog::new(
@@ -824,14 +810,7 @@ mod tests {
         let arc = instance("job");
         arc.lock().unwrap().pool_slot_id = Some("pool-slot".into());
         let config = Arc::new(config);
-        let network = Arc::new(
-            NetworkManager::new(
-                &config.network.cidr,
-                &config.network.gateway,
-                config.network.dns.clone(),
-            )
-            .unwrap(),
-        );
+        let network: Arc<dyn GuestNetwork> = Arc::new(FakeNetwork::new());
         let cow_manager =
             Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
 
@@ -873,14 +852,7 @@ mod tests {
         let mut config = VmmConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         let config = Arc::new(config);
-        let network = Arc::new(
-            NetworkManager::new(
-                &config.network.cidr,
-                &config.network.gateway,
-                config.network.dns.clone(),
-            )
-            .unwrap(),
-        );
+        let network: Arc<dyn GuestNetwork> = Arc::new(FakeNetwork::new());
         let cow_manager =
             Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
         let records = Arc::new(SandboxRecordStore::new(data_dir.path()).unwrap());

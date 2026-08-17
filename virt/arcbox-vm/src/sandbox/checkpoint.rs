@@ -352,7 +352,7 @@ impl SandboxManager {
         reservation: IdReservation,
         error: VmmError,
         prepared: Option<Arc<dyn PreparedVm>>,
-        network: Option<NetworkAllocation>,
+        network: Option<NetworkLease>,
         cow_handle: Option<CowHandle>,
     ) -> VmmError {
         let arc = reservation.instance();
@@ -360,16 +360,17 @@ impl SandboxManager {
             let inst = arc.lock().unwrap();
             (inst.vm_dir.clone(), inst.pool_slot_id.clone())
         };
-        let state_record = super::reconcile::SandboxStateRecord::new(
+        let journal_error = super::reconcile::SandboxStateRecord::new(
             id,
             prepared.as_deref().and_then(super::journaled_pid),
             network.as_ref(),
             cow_handle.as_ref(),
-            self.config.firecracker.jailer.is_some(),
+            &self.config,
             None,
         )
-        .with_pool_slot(pool_slot_id.as_deref());
-        let journal_error = super::reconcile::write_state_record(&vm_dir, &state_record).err();
+        .map(|record| record.with_pool_slot(pool_slot_id.as_deref()))
+        .and_then(|record| super::reconcile::write_state_record(&vm_dir, &record))
+        .err();
         {
             let mut inst = arc.lock().unwrap();
             inst.state = SandboxState::Failed;
@@ -551,9 +552,16 @@ impl SandboxManager {
 
         // Reserve network metadata, journal it, then materialize the TAP. This
         // mirrors Create so an agent crash never leaves an unowned interface.
-        let net_alloc = if request.network_override {
-            match self.network.reserve(&new_id) {
-                Ok(allocation) => Some(allocation),
+        let lease = if request.network_override {
+            match self
+                .network
+                .reserve(
+                    &VmId::new(new_id.as_str())?,
+                    super::sandbox_network_policy(),
+                )
+                .await
+            {
+                Ok(lease) => Some(lease),
                 Err(error) => {
                     let abort = self.records.abort_provision(&new_id, generation)?;
                     if let Some(durability_error) = abort.durability_error {
@@ -567,22 +575,26 @@ impl SandboxManager {
         } else {
             None
         };
-        let ip_address = net_alloc
+        let ip_address = lease
             .as_ref()
-            .map(|n| n.ip_address.to_string())
+            .map(|lease| lease.ip.to_string())
             .unwrap_or_default();
-        let setup = (|| -> Result<()> {
+        // The NIC is tracked apart from the lease: the lease is owed back
+        // to the pool from `reserve` on, so the rollback below must see one
+        // whose TAP a failed journal write meant was never built.
+        let mut nic: Option<NicSpec> = None;
+        let setup = async {
             super::reconcile::create_runtime_dir(&vm_dir)?;
             let cleanup_record = super::reconcile::SandboxStateRecord::new(
                 &new_id,
                 None,
-                net_alloc.as_ref(),
+                lease.as_ref(),
                 None,
-                self.config.firecracker.jailer.is_some(),
+                &self.config,
                 None,
-            );
+            )?;
             super::reconcile::write_state_record(&vm_dir, &cleanup_record)?;
-            if let Some(network) = &net_alloc {
+            if let Some(lease) = &lease {
                 // The restored guest keeps the addressing its snapshot baked:
                 // invariant snapshots pair with an invariant TAP (host-side
                 // NAT, no guest work); legacy snapshots keep the legacy TAP
@@ -592,13 +604,14 @@ impl SandboxManager {
                 } else {
                     crate::network::TapMode::LegacySnapshot
                 };
-                self.network.activate(network, mode)?;
+                nic = Some(self.network.activate(lease, mode).await?);
             }
-            Ok(())
-        })();
+            Ok::<_, VmmError>(())
+        }
+        .await;
         if let Err(error) = setup {
             return Err(self
-                .rollback_restore(&new_id, reservation, error, None, net_alloc, None)
+                .rollback_restore(&new_id, reservation, error, None, lease, None)
                 .await);
         }
         let fc_cfg = &self.config.firecracker;
@@ -627,16 +640,16 @@ impl SandboxManager {
                 // and crash reconciliation key the chroot and dm/CoW teardown
                 // on it (see release_runtime_resources / sweep_orphans).
                 reservation.instance().lock().unwrap().pool_slot_id = Some(slot.slot_id.clone());
-                let adopted_record = super::reconcile::SandboxStateRecord::new(
+                let handover = super::reconcile::SandboxStateRecord::new(
                     &new_id,
                     super::journaled_pid(&*slot.prepared),
-                    net_alloc.as_ref(),
+                    lease.as_ref(),
                     slot.cow_handle.as_ref(),
-                    true,
+                    &self.config,
                     None,
                 )
-                .with_pool_slot(Some(&slot.slot_id));
-                let handover = super::reconcile::write_state_record(&vm_dir, &adopted_record);
+                .map(|record| record.with_pool_slot(Some(&slot.slot_id)))
+                .and_then(|record| super::reconcile::write_state_record(&vm_dir, &record));
                 let PreparedSlot {
                     slot_id,
                     prepared: slot_prepared,
@@ -683,7 +696,7 @@ impl SandboxManager {
                                 reservation,
                                 error,
                                 Some(slot_prepared),
-                                net_alloc,
+                                lease.clone(),
                                 pending_cow,
                             )
                             .await);
@@ -713,24 +726,29 @@ impl SandboxManager {
                     Ok(spawned) => spawned,
                     Err(error) => {
                         return Err(self
-                            .rollback_restore(&new_id, reservation, error, None, net_alloc, None)
+                            .rollback_restore(
+                                &new_id,
+                                reservation,
+                                error,
+                                None,
+                                lease.clone(),
+                                None,
+                            )
                             .await);
                     }
                 };
 
                 let pid = super::journaled_pid(&*spawned_prepared);
                 let journal = |cow: Option<&CowHandle>| {
-                    super::reconcile::write_state_record(
-                        &vm_dir,
-                        &super::reconcile::SandboxStateRecord::new(
-                            &new_id,
-                            pid,
-                            net_alloc.as_ref(),
-                            cow,
-                            true,
-                            None,
-                        ),
+                    super::reconcile::SandboxStateRecord::new(
+                        &new_id,
+                        pid,
+                        lease.as_ref(),
+                        cow,
+                        &self.config,
+                        None,
                     )
+                    .and_then(|record| super::reconcile::write_state_record(&vm_dir, &record))
                 };
                 if let Err(error) = journal(None) {
                     return Err(self
@@ -739,7 +757,7 @@ impl SandboxManager {
                             reservation,
                             error,
                             Some(Arc::clone(&spawned_prepared)),
-                            net_alloc,
+                            lease.clone(),
                             None,
                         )
                         .await);
@@ -808,7 +826,7 @@ impl SandboxManager {
                                 reservation,
                                 error,
                                 Some(Arc::clone(&spawned_prepared)),
-                                net_alloc,
+                                lease.clone(),
                                 pending_cow,
                             )
                             .await);
@@ -830,7 +848,7 @@ impl SandboxManager {
             let restore = super::spec::restore_spec(
                 &resource_owner,
                 &chroot,
-                net_alloc.as_ref().map(super::spec::nic_spec).transpose()?,
+                nic.clone(),
                 IsolationSpec::try_from(jailer)?,
             )?;
             Ok(Arc::from(
@@ -847,7 +865,7 @@ impl SandboxManager {
                         reservation,
                         error,
                         Some(prepared),
-                        net_alloc,
+                        lease.clone(),
                         pending_cow,
                     )
                     .await);
@@ -894,7 +912,7 @@ impl SandboxManager {
         // silent breakage `network_override` exists to prevent — fail the
         // restore rather than hand back a half-networked sandbox.
         let net_reconfig = async {
-            let Some(ref net) = net_alloc else {
+            let Some(lease) = &lease else {
                 return Ok(());
             };
             // Invariant-addressed snapshot: the guest already holds the fixed
@@ -906,9 +924,9 @@ impl SandboxManager {
                 return Ok(());
             }
             let cmd = crate::boot_proto::NetReconfigCommand {
-                ip: net.ip_address,
-                netmask: net.netmask(),
-                gateway: net.gateway,
+                ip: lease.ipv4()?,
+                netmask: lease.netmask(),
+                gateway: lease.gateway_ipv4()?,
             };
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -929,7 +947,7 @@ impl SandboxManager {
                     reservation,
                     error,
                     Some(Arc::clone(&prepared)),
-                    net_alloc,
+                    lease.clone(),
                     pending_cow,
                 )
                 .await);
@@ -940,23 +958,24 @@ impl SandboxManager {
         // Persist cleanup metadata before handing runtime resources to the
         // instance. A failed durable write aborts and unwinds every resource.
         let adopted_slot = reservation.instance().lock().unwrap().pool_slot_id.clone();
-        let state_record = super::reconcile::SandboxStateRecord::new(
+        let journaled = super::reconcile::SandboxStateRecord::new(
             &new_id,
             super::journaled_pid(&*prepared),
-            net_alloc.as_ref(),
+            lease.as_ref(),
             pending_cow.as_ref(),
-            true,
+            &self.config,
             None,
         )
-        .with_pool_slot(adopted_slot.as_deref());
-        if let Err(error) = super::reconcile::write_state_record(&vm_dir, &state_record) {
+        .map(|record| record.with_pool_slot(adopted_slot.as_deref()))
+        .and_then(|record| super::reconcile::write_state_record(&vm_dir, &record));
+        if let Err(error) = journaled {
             return Err(self
                 .rollback_restore(
                     &new_id,
                     reservation,
                     error,
                     Some(Arc::clone(&prepared)),
-                    net_alloc,
+                    lease.clone(),
                     pending_cow,
                 )
                 .await);
@@ -978,7 +997,7 @@ impl SandboxManager {
                         reservation,
                         error,
                         Some(Arc::clone(&prepared)),
-                        net_alloc,
+                        lease.clone(),
                         pending_cow,
                     )
                     .await);
@@ -994,7 +1013,7 @@ impl SandboxManager {
         let arc = reservation.instance();
         {
             let mut inst = arc.lock().unwrap();
-            inst.network.clone_from(&net_alloc);
+            inst.network.clone_from(&lease);
             inst.prepared = Some(prepared);
             inst.handle = Some(handle);
             inst.cow_handle = pending_cow.take();
@@ -1189,8 +1208,8 @@ impl SandboxManager {
 #[cfg(test)]
 mod tests {
     use super::super::testing::{
-        FrozenOnCheckpoint, RELEASES_NETWORK, assert_failed_and_released, expect_err, fake_manager,
-        live_sandbox, live_sandbox_with,
+        FrozenOnCheckpoint, assert_failed_and_released, expect_err, fake_manager, live_sandbox,
+        live_sandbox_with,
     };
     use super::super::types::action;
     use super::*;
@@ -1216,7 +1235,10 @@ mod tests {
         assert_eq!(inst.state, SandboxState::Ready);
         assert!(inst.prepared.is_some() && inst.handle.is_some());
         assert!(inst.cow_handle.is_some());
-        assert_eq!(inst.network.is_some(), RELEASES_NETWORK);
+        assert!(
+            inst.network.is_some(),
+            "the lease survives a failed capture"
+        );
         assert_eq!(handle.state(), arcbox_vm_driver::VmState::Running);
         assert_eq!(probe.teardown_count(), 0);
     }
@@ -1244,7 +1266,7 @@ mod tests {
             "the driver's error is the reported one: {error}"
         );
 
-        assert_failed_and_released(&manager, &instance, &probe, "frozen");
+        assert_failed_and_released(&manager, &instance, &probe, "frozen").await;
         assert!(
             matches!(handle.state(), arcbox_vm_driver::VmState::Exited(_)),
             "the frozen guest is killed: {}",

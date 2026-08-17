@@ -78,7 +78,7 @@ pub(super) fn delete_pause_snapshots(
 struct ResumedRuntime {
     prepared: Arc<dyn PreparedVm>,
     handle: Arc<dyn VmHandle>,
-    network: Option<NetworkAllocation>,
+    network: Option<NetworkLease>,
     cow_handle: Option<CowHandle>,
     ip_address: String,
 }
@@ -308,7 +308,7 @@ impl SandboxManager {
                     return Ok(inst
                         .network
                         .as_ref()
-                        .map(|n| n.ip_address.to_string())
+                        .map(|lease| lease.ip.to_string())
                         .unwrap_or_default());
                 }
                 SandboxState::Paused => {}
@@ -545,13 +545,12 @@ impl SandboxManager {
         }
 
         {
-            let mut inst = arc.lock().unwrap();
-            if let Some(net) = inst.network.take() {
-                drop(inst);
-                if let Err(error) = self.network.quarantine_checked(id, &net) {
-                    arc.lock().unwrap().network = Some(net);
-                    return Err(error.into());
-                }
+            let lease = arc.lock().unwrap().network.take();
+            if let Some(lease) = lease
+                && let Err(error) = self.network.quarantine(lease.clone()).await
+            {
+                arc.lock().unwrap().network = Some(lease);
+                return Err(error.into());
             }
         }
 
@@ -581,8 +580,12 @@ impl SandboxManager {
         let uid = jailer.uid;
         let gid = jailer.gid;
 
-        // Incrementally-owned resources for the unwind.
-        let mut net_alloc: Option<NetworkAllocation> = None;
+        // Incrementally-owned resources for the unwind. The lease is held
+        // apart from the NIC because it is owed to the pool from `reserve`
+        // on, and the journal write between the two can fail — an unwind
+        // that only knew about activated leases would strand that address.
+        let mut lease: Option<NetworkLease> = None;
+        let mut nic: Option<NicSpec> = None;
         let mut prepared: Option<Arc<dyn PreparedVm>> = None;
         let mut cow_handle: Option<CowHandle> = None;
 
@@ -591,20 +594,22 @@ impl SandboxManager {
             // TAP — the same order boot and restore use, so a crash never
             // leaves an unowned interface.
             if networked {
-                net_alloc = Some(self.network.reserve(id)?);
+                lease = Some(
+                    self.network
+                        .reserve(&VmId::new(id.as_str())?, super::sandbox_network_policy())
+                        .await?,
+                );
             }
-            let ip_address = net_alloc
+            let ip_address = lease
                 .as_ref()
-                .map(|n| n.ip_address.to_string())
+                .map(|lease| lease.ip.to_string())
                 .unwrap_or_default();
-            let journal =
-                |pid: Option<i32>, cow: Option<&CowHandle>, net: Option<&NetworkAllocation>| {
-                    let record =
-                        super::reconcile::SandboxStateRecord::new(id, pid, net, cow, true, None);
-                    super::reconcile::write_state_record(vm_dir, &record)
-                };
-            journal(None, None, net_alloc.as_ref())?;
-            if let Some(net) = &net_alloc {
+            let journal = |pid: Option<i32>, cow: Option<&CowHandle>, net: Option<&NetworkLease>| {
+                super::reconcile::SandboxStateRecord::new(id, pid, net, cow, &self.config, None)
+                    .and_then(|record| super::reconcile::write_state_record(vm_dir, &record))
+            };
+            journal(None, None, lease.as_ref())?;
+            if let Some(lease) = &lease {
                 // The resumed guest keeps the addressing its pause checkpoint
                 // baked, exactly as Restore does: an invariant guest pairs
                 // with an invariant TAP (host-side NAT, no guest work), a
@@ -615,7 +620,7 @@ impl SandboxManager {
                 } else {
                     crate::network::TapMode::LegacySnapshot
                 };
-                self.network.activate(net, mode)?;
+                nic = Some(self.network.activate(lease, mode).await?);
             }
 
             // Fresh chroot + VMM process, prepared through the driver.
@@ -626,7 +631,7 @@ impl SandboxManager {
             );
             let pid = super::journaled_pid(&*spawned);
             prepared = Some(spawned);
-            journal(pid, None, net_alloc.as_ref())?;
+            journal(pid, None, lease.as_ref())?;
 
             // Stage kernel + the retained disk + snapshot files.
             if let Some(kernel) = snap_meta.kernel_path.as_deref() {
@@ -640,7 +645,7 @@ impl SandboxManager {
                     ))
                 })?;
                 let handle = self.cow_manager.reattach(id, rootfs).await?;
-                journal(pid, Some(&handle), net_alloc.as_ref())?;
+                journal(pid, Some(&handle), lease.as_ref())?;
                 stage_rootfs_device_for_jailer(&cr, &handle.dm_device, uid, gid).await?;
                 cow_handle = Some(handle);
             } else {
@@ -687,7 +692,7 @@ impl SandboxManager {
             let restore = restore_spec(
                 id,
                 &cr,
-                net_alloc.as_ref().map(super::spec::nic_spec).transpose()?,
+                nic.clone(),
                 IsolationSpec::try_from(jailer)?,
             )?;
             let handle: Arc<dyn VmHandle> = Arc::from(
@@ -731,13 +736,13 @@ impl SandboxManager {
             // identity and its resolv.conf already points at the fixed
             // gateway; the fresh TAP carries the new pool IP host-side, so
             // resume awaits nothing here.
-            if let Some(ref net) = net_alloc
+            if let Some(lease) = &lease
                 && !snap_meta.net_invariant
             {
                 let cmd = crate::boot_proto::NetReconfigCommand {
-                    ip: net.ip_address,
-                    netmask: net.netmask(),
-                    gateway: net.gateway,
+                    ip: lease.ipv4()?,
+                    netmask: lease.netmask(),
+                    gateway: lease.gateway_ipv4()?,
                 };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
@@ -748,11 +753,11 @@ impl SandboxManager {
                 .and_then(|r| r)?;
             }
 
-            journal(pid, cow_handle.as_ref(), net_alloc.as_ref())?;
+            journal(pid, cow_handle.as_ref(), lease.as_ref())?;
             Ok(ResumedRuntime {
                 prepared: prepared.take().expect("prepared set above"),
                 handle,
-                network: net_alloc.take(),
+                network: lease.take(),
                 cow_handle: cow_handle.take(),
                 ip_address,
             })
@@ -763,7 +768,7 @@ impl SandboxManager {
             Ok(resumed) => Ok(resumed),
             Err(error) => {
                 let unwound = self
-                    .unwind_resume(id, vm_dir, jailer, prepared, cow_handle, net_alloc)
+                    .unwind_resume(id, vm_dir, jailer, prepared, cow_handle, lease)
                     .await;
                 Err(ResumeFailure { error, unwound })
             }
@@ -781,7 +786,7 @@ impl SandboxManager {
         jailer: &crate::config::JailerConfig,
         prepared: Option<Arc<dyn PreparedVm>>,
         cow_handle: Option<CowHandle>,
-        net_alloc: Option<NetworkAllocation>,
+        net_lease: Option<NetworkLease>,
     ) -> bool {
         let mut clean = true;
 
@@ -812,8 +817,8 @@ impl SandboxManager {
             }
         }
 
-        if let Some(net) = net_alloc
-            && let Err(error) = self.network.quarantine_checked(id, &net)
+        if let Some(lease) = net_lease
+            && let Err(error) = self.network.quarantine(lease).await
         {
             warn!(sandbox_id = %id, error = %error, "resume unwind: network quarantine failed");
             clean = false;
@@ -990,7 +995,8 @@ mod tests {
             "the commit failure is the reported error: {error}"
         );
 
-        super::super::testing::assert_failed_and_released(&manager, &instance, &probe, "frozen");
+        super::super::testing::assert_failed_and_released(&manager, &instance, &probe, "frozen")
+            .await;
         assert_eq!(
             handle.state(),
             arcbox_vm_driver::VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),

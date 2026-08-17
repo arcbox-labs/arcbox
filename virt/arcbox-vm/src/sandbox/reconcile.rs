@@ -16,16 +16,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use arcbox_vm_driver::net::{GuestNetwork, NetworkLease};
 use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmId, VmRecord};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
 use super::record::{SandboxRecord, SandboxRecordStore, SandboxTransition};
-use super::{SandboxInstance, SandboxState};
+use super::{LeaseExt, SandboxInstance, SandboxState};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
-use crate::network::{NetworkAllocation, NetworkManager};
+use crate::network::NetworkAllocation;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
 /// How long the sweep gives the driver to find and reconnect to one
@@ -102,7 +103,20 @@ pub(super) struct SandboxStateRecord {
     /// The VMM's PID at boot time.
     #[serde(default)]
     pub pid: Option<i32>,
-    /// Network allocation to release (TAP + IP).
+    /// The lease to hand back, in the shape `arcbox-tap-net`'s
+    /// [`NetworkAllocation`] has written since before the guest-network
+    /// port existed.
+    ///
+    /// The lease is what the sweep actually needs, but the on-disk shape
+    /// is a contract in both directions (see the type doc above), and
+    /// `NetworkAllocation`'s `tap_name` and `dns_servers` are not
+    /// `#[serde(default)]`: dropping either would turn one skipped
+    /// sandbox into a sweep that fails to parse and leaks every journaled
+    /// resource on an agent that predates the port. Both are therefore
+    /// reconstructed on write — the TAP name by [`tap_name_for`], the
+    /// same rule [`validate_state_record`] enforces, and the resolvers
+    /// from the network config the pool was built with — and neither is
+    /// read back: [`SandboxStateRecord::lease`] is what the sweep uses.
     #[serde(default)]
     pub network: Option<NetworkAllocation>,
     /// dm-snapshot CoW resources to tear down.
@@ -120,25 +134,56 @@ pub(super) struct SandboxStateRecord {
     pub pool_slot_id: Option<String>,
 }
 
+/// The TAP name an allocation for `ip` carries.
+///
+/// One definition, shared by the journal writer and
+/// [`validate_state_record`], so a record this agent writes is exactly one
+/// it accepts.
+fn tap_name_for(ip: std::net::Ipv4Addr) -> String {
+    let octets = ip.octets();
+    format!("vmtap{}-{}", octets[2], octets[3])
+}
+
 impl SandboxStateRecord {
     /// Assemble a record from boot/restore results.
     pub fn new(
         id: &str,
         pid: Option<i32>,
-        network: Option<&NetworkAllocation>,
+        network: Option<&NetworkLease>,
         cow: Option<&CowHandle>,
-        jailer: bool,
+        config: &VmmConfig,
         restore_origin_dir: Option<&Path>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let network = network
+            .map(|lease| legacy_allocation(lease, &config.network.dns))
+            .transpose()?;
+        Ok(Self {
             id: id.to_owned(),
             pid,
-            network: network.cloned(),
+            network,
             cow: cow.map(CowRecord::from_handle),
-            jailer,
+            jailer: config.firecracker.jailer.is_some(),
             restore_origin_dir: restore_origin_dir.map(Path::to_path_buf),
             pool_slot_id: None,
-        }
+        })
+    }
+
+    /// The lease this record's network field stands for, for a sweep that
+    /// must hand the address back.
+    pub fn lease(&self) -> Result<Option<NetworkLease>> {
+        self.network
+            .as_ref()
+            .map(|allocation| {
+                Ok(NetworkLease {
+                    vm: VmId::new(self.id.as_str())?,
+                    ip: allocation.ip_address.into(),
+                    prefix_len: allocation.prefix_len,
+                    gateway: allocation.gateway.into(),
+                    mac: allocation.mac_address.parse().map_err(VmmError::from)?,
+                    cleanup_token: allocation.cleanup_token.clone(),
+                })
+            })
+            .transpose()
     }
 
     /// Key the record's chroot and dm/CoW resources by an adopted pool
@@ -154,6 +199,23 @@ impl SandboxStateRecord {
     pub fn resource_owner(&self) -> &str {
         self.pool_slot_id.as_deref().unwrap_or(&self.id)
     }
+}
+
+/// `lease` in the journal's legacy allocation shape.
+///
+/// `tap_name` and `dns_servers` are the two fields a lease does not carry;
+/// see [`SandboxStateRecord::network`] for why they are written anyway.
+fn legacy_allocation(lease: &NetworkLease, dns: &[String]) -> Result<NetworkAllocation> {
+    let ip = lease.ipv4()?;
+    Ok(NetworkAllocation {
+        tap_name: tap_name_for(ip),
+        ip_address: ip,
+        prefix_len: lease.prefix_len,
+        gateway: lease.gateway_ipv4()?,
+        mac_address: lease.mac.to_string(),
+        dns_servers: dns.to_vec(),
+        cleanup_token: lease.cleanup_token.clone(),
+    })
 }
 
 /// Atomically persist crash-recovery metadata before resources are exposed.
@@ -211,7 +273,7 @@ pub(super) struct OrphanSweep {
 pub(super) async fn sweep_orphans(
     config: &VmmConfig,
     driver: &dyn VmDriver,
-    network: &NetworkManager,
+    network: &dyn GuestNetwork,
     cow_manager: &CowManager,
     snapshots: &crate::snapshot::SnapshotCatalog,
     store: &SandboxRecordStore,
@@ -276,8 +338,8 @@ pub(super) async fn sweep_orphans(
             cow_manager.teardown_checked(&cow.into_handle()).await?;
         }
 
-        if let Some(alloc) = &record.network {
-            network.quarantine_checked(&record.id, alloc)?;
+        if let Some(lease) = record.lease()? {
+            network.quarantine(lease).await.map_err(VmmError::from)?;
         }
 
         if record.jailer
@@ -459,8 +521,7 @@ fn validate_state_record(
         )));
     }
     if let Some(network) = &record.network {
-        let octets = network.ip_address.octets();
-        let expected = format!("vmtap{}-{}", octets[2], octets[3]);
+        let expected = tap_name_for(network.ip_address);
         if network.tap_name != expected {
             return Err(crate::error::VmmError::Config(format!(
                 "sandbox {} cleanup record has unexpected TAP {}",
@@ -514,6 +575,68 @@ mod tests {
     use super::super::SandboxSpec;
     use super::super::record::{PersistPhase, ProvisionIntent, SandboxProvisionOutcome};
     use super::*;
+
+    /// `state.json` written before the guest-network port existed, verbatim.
+    /// The sweep replays leases out of records like this one, so the shape
+    /// is a contract in both directions: this agent must read it, and an
+    /// agent that predates the port must read what this one writes (its
+    /// `NetworkAllocation` has no `#[serde(default)]` on `tap_name` or
+    /// `dns_servers`, and a record missing either fails its whole sweep).
+    const LEGACY_RECORD: &str = r#"{
+      "id": "box",
+      "pid": 4242,
+      "network": {
+        "tap_name": "vmtap0-7",
+        "ip_address": "172.20.0.7",
+        "prefix_len": 16,
+        "gateway": "172.20.0.1",
+        "mac_address": "02:fc:00:00:00:07",
+        "dns_servers": ["1.1.1.1"],
+        "cleanup_token": "gen-1"
+      },
+      "cow": null,
+      "jailer": true,
+      "restore_origin_dir": null,
+      "pool_slot_id": null
+    }"#;
+
+    #[test]
+    fn a_pre_port_journal_loads_and_is_written_back_unchanged() {
+        let record: SandboxStateRecord = serde_json::from_str(LEGACY_RECORD).unwrap();
+        let lease = record.lease().unwrap().expect("the record holds a lease");
+        assert_eq!(lease.vm.as_str(), "box");
+        assert_eq!(lease.ip, "172.20.0.7".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(lease.prefix_len, 16);
+        assert_eq!(
+            lease.gateway,
+            "172.20.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(lease.mac.to_string(), "02:fc:00:00:00:07");
+        assert_eq!(lease.cleanup_token, "gen-1");
+
+        // ...and the record this agent writes from that lease is the same
+        // JSON, field for field — including the two the lease does not
+        // carry, which are reconstructed rather than dropped.
+        let mut config = VmmConfig::default();
+        config.network.dns = vec!["1.1.1.1".into()];
+        config.firecracker.jailer = Some(crate::config::JailerConfig {
+            binary: "/usr/bin/jailer".into(),
+            uid: 0,
+            gid: 0,
+            chroot_base_dir: None,
+            netns: None,
+            new_pid_ns: false,
+            cgroup_version: None,
+            parent_cgroup: None,
+            resource_limits: vec![],
+        });
+        let written =
+            SandboxStateRecord::new("box", Some(4242), Some(&lease), None, &config, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&written).unwrap(),
+            serde_json::from_str::<serde_json::Value>(LEGACY_RECORD).unwrap()
+        );
+    }
 
     fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: PersistPhase) -> SandboxRecord {
         let spec = SandboxSpec {
@@ -867,6 +990,8 @@ mod tests {
             .unwrap();
         vm.detach().unwrap().detach().await.unwrap();
         let pid = vm.record().process.map(|process| process.pid).unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         write_state_record(
             &vm_dir,
             &SandboxStateRecord::new(
@@ -874,14 +999,12 @@ mod tests {
                 Some(i32::try_from(pid).unwrap()),
                 None,
                 None,
-                false,
+                &config,
                 None,
-            ),
+            )
+            .unwrap(),
         )
         .unwrap();
-
-        let mut config = VmmConfig::default();
-        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         let manager = super::super::SandboxManager::with_environment(
             config,
             crate::SandboxEnvironment {

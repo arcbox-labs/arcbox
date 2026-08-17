@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arcbox_vm_driver::testkit::FakeDriver;
+use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
 use arcbox_vm_driver::{
     BootSpec, Checkpoint, CheckpointImage, CheckpointOptions, ConsoleSpec, Error, ExitStatus,
     IsolationSpec, PreparedVm, ShutdownMode, VmDriver as _, VmEvent, VmHandle, VmId, VmRecord,
@@ -22,37 +22,60 @@ use crate::config::{JailerConfig, VmmConfig};
 use crate::snapshot_cow::{CowManager, CowOptions, CowTestProbe};
 use crate::{SandboxEnvironment, VmmError};
 
-/// Whether the live sandbox carries a network allocation. Releasing one on
-/// Linux talks to netlink and iptables (root, and the System VM's binaries),
-/// which an unprivileged unit test cannot — the tap-net crate skips those
-/// paths without root for the same reason; the macOS build's no-op branch
-/// is what lets these tests drive the release end to end.
-pub(super) const RELEASES_NETWORK: bool = cfg!(not(target_os = "linux"));
-
-/// A manager over [`FakeDriver`] with a probed CoW manager and jailer mode
-/// configured (checkpoints, pause and restore require it), its startup
-/// cleanup finalized so networks can be reserved.
+/// A manager over [`FakeDriver`] and [`FakeNetwork`] with a probed CoW
+/// manager and jailer mode configured (checkpoints, pause and restore
+/// require it), its startup cleanup finalized so leases can be reserved.
+///
+/// Both fakes are what make these tests platform-free: the TAP network
+/// reserves and releases through netlink and iptables, which an
+/// unprivileged unit test cannot drive on Linux, so the release paths used
+/// to be exercised on macOS only.
 pub(super) async fn fake_manager(
     data_dir: &Path,
 ) -> (SandboxManager, FakeDriver, Arc<CowTestProbe>) {
+    build_fake_manager(
+        data_dir,
+        Some(JailerConfig {
+            binary: "/usr/bin/jailer".into(),
+            uid: 0,
+            gid: 0,
+            chroot_base_dir: Some(data_dir.join("jailer").to_string_lossy().into_owned()),
+            netns: None,
+            new_pid_ns: false,
+            cgroup_version: None,
+            parent_cgroup: None,
+            resource_limits: vec![],
+        }),
+    )
+    .await
+}
+
+/// [`fake_manager`] in direct mode, for the flows that do not need a
+/// jailer.
+///
+/// A jailer chroot under a temp dir spends the whole AF_UNIX socket-path
+/// budget, leaving `max_sandbox_id_len` at zero — so any test that calls
+/// `create_sandbox` for real is refused at id validation before it reaches
+/// anything it meant to exercise.
+pub(super) async fn fake_manager_direct(
+    data_dir: &Path,
+) -> (SandboxManager, FakeDriver, Arc<CowTestProbe>) {
+    build_fake_manager(data_dir, None).await
+}
+
+async fn build_fake_manager(
+    data_dir: &Path,
+    jailer: Option<JailerConfig>,
+) -> (SandboxManager, FakeDriver, Arc<CowTestProbe>) {
     let mut config = VmmConfig::default();
     config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
-    config.firecracker.jailer = Some(JailerConfig {
-        binary: "/usr/bin/jailer".into(),
-        uid: 0,
-        gid: 0,
-        chroot_base_dir: Some(data_dir.join("jailer").to_string_lossy().into_owned()),
-        netns: None,
-        new_pid_ns: false,
-        cgroup_version: None,
-        parent_cgroup: None,
-        resource_limits: vec![],
-    });
+    config.firecracker.jailer = jailer;
     let driver = FakeDriver::new();
     let mut manager = SandboxManager::with_environment(
         config,
         SandboxEnvironment {
             driver: Some(Arc::new(driver.clone())),
+            network: Some(Arc::new(FakeNetwork::with_startup_cleanup("test-boot"))),
             ..SandboxEnvironment::default()
         },
     )
@@ -191,7 +214,11 @@ pub(super) async fn live_sandbox_with(
     );
     let handle = wrap(Arc::from(prepared.boot(vm_spec(&vm_id)).await.unwrap()));
     let cow_handle = manager.cow_manager.setup(id, "/rootfs.ext4").await.unwrap();
-    let network = RELEASES_NETWORK.then(|| manager.network.reserve(id).unwrap());
+    let lease = manager
+        .network
+        .reserve(&vm_id, super::sandbox_network_policy())
+        .await
+        .unwrap();
 
     let spec = SandboxSpec {
         id: Some(id.to_owned()),
@@ -212,10 +239,7 @@ pub(super) async fn live_sandbox_with(
             id,
             generation,
             SandboxTransition::Starting(SandboxProvisionOutcome {
-                ip_address: network
-                    .as_ref()
-                    .map(|network| network.ip_address.to_string())
-                    .unwrap_or_default(),
+                ip_address: lease.ip.to_string(),
             }),
         )
         .unwrap();
@@ -228,16 +252,17 @@ pub(super) async fn live_sandbox_with(
         &SandboxStateRecord::new(
             id,
             super::journaled_pid(&*prepared),
-            network.as_ref(),
+            Some(&lease),
             Some(&cow_handle),
-            true,
+            &manager.config,
             None,
-        ),
+        )
+        .unwrap(),
     )
     .unwrap();
 
     let mut instance =
-        SandboxInstance::new_with_generation(id.to_owned(), spec, network, vm_dir, generation);
+        SandboxInstance::new_with_generation(id.to_owned(), spec, Some(lease), vm_dir, generation);
     instance.state = SandboxState::Ready;
     instance.prepared = Some(prepared);
     instance.handle = Some(Arc::clone(&handle));
@@ -253,42 +278,44 @@ pub(super) async fn live_sandbox_with(
 
 /// Every mark of a sandbox that failed the way a failed boot does: `Failed`
 /// in memory and on the durable record, no VMM (the prepared process
-/// discarded, the handle dropped), CoW overlay and network (where the test
-/// carries one, [`RELEASES_NETWORK`]) released, crash journal cleared.
-/// Panics on the first mark that is missing.
-pub(super) fn assert_failed_and_released(
+/// discarded, the handle dropped), CoW overlay and network lease released,
+/// crash journal cleared. Panics on the first mark that is missing.
+pub(super) async fn assert_failed_and_released(
     manager: &SandboxManager,
     instance: &Arc<Mutex<SandboxInstance>>,
     probe: &CowTestProbe,
     id: &str,
 ) {
-    let inst = instance.lock().unwrap();
-    assert_eq!(inst.state, SandboxState::Failed);
+    {
+        let inst = instance.lock().unwrap();
+        assert_eq!(inst.state, SandboxState::Failed);
+        assert!(
+            inst.error.is_some(),
+            "the failure is recorded on the instance"
+        );
+        assert!(inst.prepared.is_none(), "the VMM process is discarded");
+        assert!(inst.handle.is_none(), "the dead VM's handle is dropped");
+        assert!(inst.cow_handle.is_none(), "the CoW overlay is released");
+        assert!(inst.network.is_none(), "the network lease is released");
+        assert_eq!(probe.teardown_count(), 1, "the CoW teardown ran once");
+        assert_eq!(
+            manager.records.load(id).unwrap().unwrap().phase,
+            super::record::PersistPhase::Failed
+        );
+        assert!(
+            !inst.vm_dir.join("state.json").exists(),
+            "the crash journal is cleared once every resource is released"
+        );
+    }
     assert!(
-        inst.error.is_some(),
-        "the failure is recorded on the instance"
-    );
-    assert!(inst.prepared.is_none(), "the VMM process is discarded");
-    assert!(inst.handle.is_none(), "the dead VM's handle is dropped");
-    assert!(inst.cow_handle.is_none(), "the CoW overlay is released");
-    assert!(inst.network.is_none(), "the network allocation is released");
-    assert_eq!(probe.teardown_count(), 1, "the CoW teardown ran once");
-    assert_eq!(
         manager
-            .network
-            .pending_quarantines()
+            .reconcile_network()
+            .pending_cleanups()
+            .await
+            .unwrap()
             .iter()
-            .any(|(quarantined, _)| quarantined == id),
-        RELEASES_NETWORK,
-        "the TAP + IP are quarantined for host cleanup"
-    );
-    assert_eq!(
-        manager.records.load(id).unwrap().unwrap().phase,
-        super::record::PersistPhase::Failed
-    );
-    assert!(
-        !inst.vm_dir.join("state.json").exists(),
-        "the crash journal is cleared once every resource is released"
+            .any(|(quarantined, _)| quarantined.as_str() == id),
+        "the address is quarantined for host cleanup"
     );
 }
 
