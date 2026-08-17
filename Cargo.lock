@@ -1069,6 +1069,8 @@ dependencies = [
 name = "arcbox-tap-net"
 version = "0.7.0"
 dependencies = [
+ "arcbox-vm-driver",
+ "async-trait",
  "aya",
  "libc",
  "serde",

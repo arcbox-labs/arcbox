@@ -1,3 +1,9 @@
+//! Helpers shared by the `integration` and `e2e` test binaries.
+#![allow(
+    dead_code,
+    reason = "each test binary compiles this module and uses its own subset"
+)]
+
 /// Returns true if the process is running with effective UID 0 (root).
 #[cfg(target_os = "linux")]
 pub fn is_root() -> bool {

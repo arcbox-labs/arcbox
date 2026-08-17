@@ -11,10 +11,10 @@ use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
 use super::tap;
-use super::{NetworkAllocation, NetworkManager, mac_from_vm_id, tap_name_from_ip};
+use super::{NetworkAllocation, TapNetwork, mac_from_vm_id, tap_name_from_ip};
 use crate::error::{Result, TapNetError};
 
-impl NetworkManager {
+impl TapNetwork {
     /// Deactivate a sandbox TAP while retaining its IP until host forwarding
     /// cleanup is confirmed.
     pub fn quarantine_checked(&self, sandbox_id: &str, alloc: &NetworkAllocation) -> Result<()> {
@@ -47,6 +47,7 @@ impl NetworkManager {
         self.deactivate_translation(alloc)?;
         #[cfg(target_os = "linux")]
         tap::destroy_checked(&alloc.tap_name)?;
+        self.attached.lock().unwrap().remove(&alloc.tap_name);
         debug!(
             sandbox_id,
             tap = %alloc.tap_name,
@@ -217,7 +218,7 @@ pub fn load_quarantines(
                 dir.display()
             ))
         })?;
-        // The sandbox data root is created durably before NetworkManager.
+        // The sandbox data root is created durably before TapNetwork.
         // Syncing that existing parent makes this new directory entry durable.
         std::fs::File::open(parent)?.sync_all()?;
     }
@@ -291,7 +292,7 @@ fn validate_quarantine_allocation(
     if allocation.prefix_len != prefix_len
         || allocation.gateway != gateway
         || allocation.tap_name != tap_name_from_ip(allocation.ip_address)
-        || allocation.mac_address != mac_from_vm_id(id)
+        || allocation.mac_address != mac_from_vm_id(id).to_string()
     {
         return Err(TapNetError::Network(format!(
             "sandbox network quarantine {id} metadata does not match the current network"

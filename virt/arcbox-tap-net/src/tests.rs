@@ -20,7 +20,7 @@ fn test_allocate_sequential_ips() {
         eprintln!("SKIP test_allocate_sequential_ips — requires root (TAP creation)");
         return;
     }
-    let mgr = NetworkManager::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
+    let mgr = TapNetwork::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
     let a1 = mgr.allocate("vm-1").unwrap();
     let a2 = mgr.allocate("vm-2").unwrap();
     assert_ne!(a1.ip_address, a2.ip_address);
@@ -33,7 +33,7 @@ fn test_release_returns_ip_to_pool() {
         eprintln!("SKIP test_release_returns_ip_to_pool — requires root (TAP creation)");
         return;
     }
-    let mgr = NetworkManager::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
+    let mgr = TapNetwork::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
     let a1 = mgr.allocate("vm-1").unwrap();
     let first_ip = a1.ip_address;
     mgr.release(&a1);
@@ -49,10 +49,10 @@ fn test_mac_deterministic() {
 
 #[test]
 fn test_invalid_prefix_len_rejected() {
-    assert!(NetworkManager::new("10.0.0.0/0", "10.0.0.1", vec![]).is_err());
-    assert!(NetworkManager::new("10.0.0.0/31", "10.0.0.1", vec![]).is_err());
-    assert!(NetworkManager::new("10.0.0.0/32", "10.0.0.1", vec![]).is_err());
-    assert!(NetworkManager::new("10.0.0.0/24", "10.0.0.1", vec![]).is_ok());
+    assert!(TapNetwork::new("10.0.0.0/0", "10.0.0.1", vec![]).is_err());
+    assert!(TapNetwork::new("10.0.0.0/31", "10.0.0.1", vec![]).is_err());
+    assert!(TapNetwork::new("10.0.0.0/32", "10.0.0.1", vec![]).is_err());
+    assert!(TapNetwork::new("10.0.0.0/24", "10.0.0.1", vec![]).is_ok());
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn test_next_ip_respects_subnet_boundary() {
         return;
     }
     // /30 has exactly 2 host addresses (.1 gateway, .2 first usable)
-    let mgr = NetworkManager::new("10.0.0.0/30", "10.0.0.1", vec![]).unwrap();
+    let mgr = TapNetwork::new("10.0.0.0/30", "10.0.0.1", vec![]).unwrap();
     let a = mgr.allocate("vm-1").unwrap();
     assert_eq!(a.ip_address, "10.0.0.2".parse::<Ipv4Addr>().unwrap());
     // Pool is now exhausted
@@ -78,7 +78,7 @@ fn test_pool_exhaustion_on_slash29() {
         return;
     }
     // /29 has 6 usable addresses; gateway takes offset 1, leaving 5 for VMs.
-    let mgr = NetworkManager::new("10.0.0.0/29", "10.0.0.1", vec![]).unwrap();
+    let mgr = TapNetwork::new("10.0.0.0/29", "10.0.0.1", vec![]).unwrap();
     for i in 0..5 {
         mgr.allocate(&format!("vm-{i}")).unwrap();
     }
@@ -87,7 +87,7 @@ fn test_pool_exhaustion_on_slash29() {
 
 #[test]
 fn test_mac_unicast_and_locally_administered_bits() {
-    let mac = mac_from_vm_id("test-vm");
+    let mac = mac_from_vm_id("test-vm").to_string();
     let first_byte = u8::from_str_radix(&mac[..2], 16).unwrap();
     // Bit 1 set → locally administered; bit 0 clear → unicast.
     assert_eq!(
@@ -113,7 +113,7 @@ fn test_tap_name_encodes_last_two_octets() {
 /// iptables machinery could still be translating.
 #[test]
 fn expose_target_follows_the_applied_datapath() {
-    let manager = NetworkManager::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
+    let manager = TapNetwork::new("172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
     // Legacy guests own the pool IP outright.
     assert_eq!(
         manager.expose_target("vmtap0-2", false),
@@ -147,7 +147,7 @@ fn expose_target_follows_the_applied_datapath() {
 async fn startup_waiter_unblocks_after_host_finalization() {
     let root = tempfile::tempdir().unwrap();
     let manager = std::sync::Arc::new(
-        NetworkManager::with_quarantine_dir(
+        TapNetwork::with_quarantine_dir(
             "10.0.0.0/30",
             "10.0.0.1",
             vec![],
@@ -181,7 +181,7 @@ async fn startup_waiter_unblocks_after_host_finalization() {
 fn durable_quarantine_blocks_reuse_until_startup_and_generation_finalize() {
     let root = tempfile::tempdir().unwrap();
     let quarantine = root.path().join("network-quarantine");
-    let manager = NetworkManager::with_quarantine_dir(
+    let manager = TapNetwork::with_quarantine_dir(
         "10.0.0.0/30",
         "10.0.0.1",
         vec![],
@@ -197,7 +197,7 @@ fn durable_quarantine_blocks_reuse_until_startup_and_generation_finalize() {
     quarantine::write_quarantine(&quarantine, "old", &allocation).unwrap();
     drop(manager);
 
-    let restarted = NetworkManager::with_quarantine_dir(
+    let restarted = TapNetwork::with_quarantine_dir(
         "10.0.0.0/30",
         "10.0.0.1",
         vec![],
@@ -255,14 +255,14 @@ fn quarantine_loader_rejects_foreign_or_inconsistent_allocations() {
             ip_address: "10.0.0.2".parse().unwrap(),
             prefix_len: 30,
             gateway: "10.0.0.1".parse().unwrap(),
-            mac_address: mac_from_vm_id("box"),
+            mac_address: mac_from_vm_id("box").to_string(),
             dns_servers: vec![],
             cleanup_token: Uuid::new_v4().to_string(),
         };
         mutate(&mut allocation);
         quarantine::write_quarantine(&quarantine, "box", &allocation).unwrap();
         assert!(
-            NetworkManager::with_quarantine_dir(
+            TapNetwork::with_quarantine_dir(
                 "10.0.0.0/30",
                 "10.0.0.1",
                 vec![],

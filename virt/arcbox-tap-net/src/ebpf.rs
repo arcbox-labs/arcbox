@@ -73,7 +73,7 @@ pub struct PoolValues([u32; 3]);
 
 impl PoolValues {
     pub fn new(base: Ipv4Addr, prefix_len: u8, gateway: Ipv4Addr) -> Self {
-        // prefix_len is validated to 1..=30 by NetworkManager::new_inner.
+        // prefix_len is validated to 1..=30 by TapNetwork::new_inner.
         let mask = !0u32 << (32 - u32::from(prefix_len.min(32)));
         Self([
             (u32::from(base) & mask).to_be(),

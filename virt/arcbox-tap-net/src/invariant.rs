@@ -82,6 +82,9 @@ pub const GUEST_GATEWAY: Ipv4Addr = Ipv4Addr::new(169, 254, 100, 1);
 /// the guest.
 pub const GUEST_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 252);
 
+/// [`GUEST_NETMASK`] as a prefix length.
+pub const GUEST_PREFIX_LEN: u8 = 30;
+
 /// Priority of the per-sandbox fwmark fib rules (before `main`, 32766).
 const FIB_RULE_PRIORITY: u32 = 8000;
 
@@ -189,7 +192,8 @@ mod tests {
     fn constants_form_one_point_to_point_link() {
         // /30: gateway and guest are the only hosts, in the same subnet.
         let mask = u32::from(GUEST_NETMASK);
-        assert_eq!(mask.count_ones(), 30);
+        assert_eq!(mask.count_ones(), u32::from(GUEST_PREFIX_LEN));
+        assert_eq!(mask.leading_ones(), u32::from(GUEST_PREFIX_LEN));
         assert_eq!(
             u32::from(GUEST_IP) & mask,
             u32::from(GUEST_GATEWAY) & mask,

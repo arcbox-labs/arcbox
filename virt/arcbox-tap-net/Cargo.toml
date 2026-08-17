@@ -8,6 +8,8 @@ repository.workspace = true
 description       = "The Linux TAP guest network: address pool, TAP devices, identity-invariant NAT (eBPF TCX or iptables), and the quarantine ledger behind arcbox-vm-driver's GuestNetwork port."
 
 [dependencies]
+arcbox-vm-driver.workspace = true
+async-trait.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

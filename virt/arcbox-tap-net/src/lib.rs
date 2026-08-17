@@ -1,6 +1,6 @@
 //! `arcbox-tap-net` — the Linux TAP guest network of the sandbox stack.
 //!
-//! One [`NetworkManager`] owns an IPv4 pool and, per VM, a persistent TAP
+//! One [`TapNetwork`] owns an IPv4 pool and, per VM, a persistent TAP
 //! device on an isolated point-to-point link, the identity-invariant NAT
 //! that gives every guest the same address ([`invariant`]) — applied per
 //! TAP either as two eBPF TCX programs or as the iptables rule set behind
@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use arcbox_vm_driver::MacAddr;
+pub use arcbox_vm_driver::net::AttachMode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, info};
@@ -77,19 +79,14 @@ pub enum Datapath {
     Iptables,
 }
 
-/// Host-side addressing scheme applied when a sandbox TAP is materialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TapMode {
-    /// Fixed guest identity + per-TAP 1:1 NAT (CORE-81): the TAP's local
-    /// address is [`invariant::GUEST_GATEWAY`] and the pool IP is translated
-    /// host-side. Every fresh boot and every invariant-snapshot restore.
-    Invariant,
-    /// The pre-invariant shape: the TAP's local address is the pool gateway
-    /// and the guest owns the pool IP directly. Only restores of legacy
-    /// snapshots (no `net_invariant` marker), whose guests are re-addressed
-    /// over the reconfig RPC.
-    LegacySnapshot,
-}
+/// The name the sandbox manager gives [`AttachMode`] — the host-side
+/// addressing scheme applied when a TAP is materialized (see
+/// [`TapNetwork::activate`]). Kept until R2b moves the manager onto the port.
+pub type TapMode = AttachMode;
+
+/// The name this type had inside `arcbox-vm`; the sandbox manager keeps
+/// using it until R2b moves it onto the port.
+pub type NetworkManager = TapNetwork;
 
 /// The translation mechanism actually applied to an active invariant TAP.
 ///
@@ -125,8 +122,9 @@ pub enum ExposeTarget {
     GuestIpWithFwmark,
 }
 
-/// Shared manager for TAP interfaces and guest IP addresses.
-pub struct NetworkManager {
+/// The TAP network: an IPv4 pool plus, per VM, a point-to-point TAP with
+/// its translation, and the quarantine ledger.
+pub struct TapNetwork {
     /// Base IP from which the pool starts (host-octet 2 onwards).
     base: Ipv4Addr,
     /// Network prefix length (e.g. 16 for /16).
@@ -170,6 +168,12 @@ pub struct NetworkManager {
     /// with that process) or is legacy — both tear down via the tolerant
     /// iptables removal and expose via the fwmark form.
     applied: Mutex<HashMap<String, AppliedDatapath>>,
+    /// The [`AttachMode`] each active TAP was materialized in, keyed by TAP
+    /// name and living exactly as long as the TAP. What the guest sees
+    /// (`GuestNetwork::identity`) follows it; a TAP absent here — activated
+    /// by a previous process, or not yet activated — reads as `Invariant`,
+    /// the mode of every fresh boot.
+    attached: Mutex<HashMap<String, AttachMode>>,
     /// How the iptables-datapath translation (and the eBPF fallback) is
     /// expressed on this host; see [`packet_filter`].
     #[cfg_attr(
@@ -185,7 +189,7 @@ pub struct NetworkManager {
     ebpf: Mutex<ebpf::Engine>,
 }
 
-impl NetworkManager {
+impl TapNetwork {
     /// Create a new manager from the network configuration.
     ///
     /// `cidr` must be in `a.b.c.d/n` notation (e.g. `"172.20.0.0/16"`).
@@ -275,6 +279,7 @@ impl NetworkManager {
             startup_reconciled: AtomicBool::new(!startup_barrier),
             datapath,
             applied: Mutex::new(HashMap::new()),
+            attached: Mutex::new(HashMap::new()),
             packet_filter,
             #[cfg(target_os = "linux")]
             ebpf: Mutex::new(ebpf::Engine::Unloaded),
@@ -292,7 +297,7 @@ impl NetworkManager {
     /// TAPs via [`Self::activate`].
     pub fn allocate(&self, vm_id: &str) -> Result<NetworkAllocation> {
         let allocation = self.reserve(vm_id)?;
-        if let Err(error) = self.activate(&allocation, TapMode::LegacySnapshot) {
+        if let Err(error) = self.activate(&allocation, AttachMode::LegacySnapshot) {
             self.release(&allocation);
             return Err(error);
         }
@@ -318,14 +323,12 @@ impl NetworkManager {
         }
         let ip = self.next_ip()?;
         let tap_name = tap_name_from_ip(ip);
-        let mac = mac_from_vm_id(vm_id);
-
         Ok(NetworkAllocation {
             tap_name,
             ip_address: ip,
             prefix_len: self.prefix_len,
             gateway: self.gateway,
-            mac_address: mac,
+            mac_address: mac_from_vm_id(vm_id).to_string(),
             dns_servers: self.dns.clone(),
             cleanup_token: Uuid::new_v4().to_string(),
         })
@@ -333,16 +336,19 @@ impl NetworkManager {
 
     /// Materializes a previously reserved network allocation.
     ///
-    /// In [`TapMode::Invariant`] the TAP's local address is the fixed
+    /// In [`AttachMode::Invariant`] the TAP's local address is the fixed
     /// [`invariant::GUEST_GATEWAY`] and the per-TAP 1:1 NAT (pool IP ↔ fixed
-    /// guest IP) is installed alongside; in [`TapMode::LegacySnapshot`] the
-    /// TAP carries the pool gateway and no translation, matching guests that
-    /// own the pool IP directly.
+    /// guest IP) is installed alongside — every fresh boot and every
+    /// invariant-snapshot restore; in [`AttachMode::LegacySnapshot`] the TAP
+    /// carries the pool gateway and no translation, matching guests that own
+    /// the pool IP directly — restores of snapshots that predate the
+    /// invariant identity, whose guests are re-addressed over the reconfig
+    /// RPC.
     #[allow(
         clippy::unnecessary_wraps,
         reason = "Linux TAP activation is fallible; macOS test builds compile the no-op branch"
     )]
-    pub fn activate(&self, allocation: &NetworkAllocation, mode: TapMode) -> Result<()> {
+    pub fn activate(&self, allocation: &NetworkAllocation, mode: AttachMode) -> Result<()> {
         info!(
             tap = %allocation.tap_name,
             ip = %allocation.ip_address,
@@ -352,11 +358,11 @@ impl NetworkManager {
         #[cfg(target_os = "linux")]
         {
             let local = match mode {
-                TapMode::Invariant => invariant::GUEST_GATEWAY,
-                TapMode::LegacySnapshot => self.gateway,
+                AttachMode::Invariant => invariant::GUEST_GATEWAY,
+                AttachMode::LegacySnapshot => self.gateway,
             };
             tap::create(&allocation.tap_name, local, allocation.ip_address)?;
-            if mode == TapMode::Invariant
+            if mode == AttachMode::Invariant
                 && let Err(error) = self.install_translation(allocation)
             {
                 // Unwind the partial translation and the TAP so a failed
@@ -366,6 +372,10 @@ impl NetworkManager {
                 return Err(error);
             }
         }
+        self.attached
+            .lock()
+            .unwrap()
+            .insert(allocation.tap_name.clone(), mode);
         Ok(())
     }
 
@@ -511,6 +521,7 @@ impl NetworkManager {
 
         let ip_int = u32::from(alloc.ip_address);
         self.allocated.lock().unwrap().remove(&ip_int);
+        self.attached.lock().unwrap().remove(&alloc.tap_name);
 
         debug!(tap = %alloc.tap_name, ip = %alloc.ip_address, "releasing network");
         #[cfg(target_os = "linux")]
@@ -567,7 +578,8 @@ fn tap_name_from_ip(ip: Ipv4Addr) -> String {
     format!("vmtap{}-{}", octets[2], octets[3])
 }
 
-fn mac_from_vm_id(vm_id: &str) -> String {
+/// The guest MAC of `vm_id`: deterministic, locally administered, unicast.
+fn mac_from_vm_id(vm_id: &str) -> MacAddr {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -575,18 +587,14 @@ fn mac_from_vm_id(vm_id: &str) -> String {
     vm_id.hash(&mut hasher);
     let h = hasher.finish();
     // Locally administered, unicast: set bit 1 of first octet, clear bit 0.
-    let b: [u8; 6] = [
+    MacAddr::new([
         0x02 | (((h >> 40) & 0xfe) as u8),
         ((h >> 32) & 0xff) as u8,
         ((h >> 24) & 0xff) as u8,
         ((h >> 16) & 0xff) as u8,
         ((h >> 8) & 0xff) as u8,
         (h & 0xff) as u8,
-    ];
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5]
-    )
+    ])
 }
 
 #[cfg(test)]
