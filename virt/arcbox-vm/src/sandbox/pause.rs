@@ -28,6 +28,7 @@
 //! onwards every resource is keyed by the sandbox id again and resume,
 //! reconciliation, and `Remove` all see one naming scheme.
 
+use super::boot::restore_spec;
 use super::checkpoint::{CheckpointRequest, checkpoint_impl};
 use super::persistence::SandboxTransition;
 use super::types::action;
@@ -76,7 +77,7 @@ pub(super) fn delete_pause_snapshots(
 /// instance.
 struct ResumedRuntime {
     prepared: Arc<dyn PreparedVm>,
-    vm: Arc<fc_sdk::Vm>,
+    handle: Arc<dyn VmHandle>,
     vsock_uds_path: PathBuf,
     network: Option<NetworkAllocation>,
     cow_handle: Option<CowHandle>,
@@ -121,7 +122,7 @@ impl SandboxManager {
         // critical section as the check means a concurrent Run cannot slip
         // its `Ready → Running` claim in between and end up checkpointed
         // mid-execution.
-        let (generation, vm) = {
+        let generation = {
             let mut inst = instance.lock().unwrap();
             match inst.state {
                 SandboxState::Paused => return Ok(()),
@@ -142,17 +143,15 @@ impl SandboxManager {
                     "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
                 ));
             }
-            let vm = inst
-                .vm
-                .as_ref()
-                .map(Arc::clone)
-                .ok_or_else(|| VmmError::WrongState {
+            if inst.handle.is_none() {
+                return Err(VmmError::WrongState {
                     id: id.clone(),
                     expected: "a sandbox with a live VM handle".into(),
                     actual: "no VM handle".into(),
-                })?;
+                });
+            }
             inst.state = SandboxState::Pausing;
-            (inst.record_generation, vm)
+            inst.record_generation
         };
         let jailer = self
             .config
@@ -186,15 +185,14 @@ impl SandboxManager {
             .send(SandboxEvent::new(id, action::PAUSING).with_attr("reason", pause_reason));
 
         // Checkpoint through the shared implementation — it owns the
-        // chroot-owner (pool slot) and addressing-mode bookkeeping — but with
-        // the resume suppressed: guest progress past the memory image would
-        // diverge from the retained disk overlay. On failure the VM is
-        // resumed here and the sandbox reverts to Ready, because a failed
-        // pause must leave a usable sandbox behind.
+        // addressing-mode bookkeeping — but with the guest held quiesced
+        // afterwards: guest progress past the memory image would diverge
+        // from the retained disk overlay. On failure the driver has already
+        // resumed the guest, and the sandbox reverts to Ready, because a
+        // failed pause must leave a usable sandbox behind.
         let snapshot_id = match checkpoint_impl(
             &self.instances,
             &self.snapshots,
-            &self.config,
             id,
             CheckpointRequest {
                 name: PAUSE_SNAPSHOT_NAME.to_owned(),
@@ -207,7 +205,6 @@ impl SandboxManager {
         {
             Ok(info) => info.snapshot_id,
             Err(error) => {
-                let _ = vm.resume().await;
                 if let Some(generation) = generation
                     && let Err(revert) =
                         self.records
@@ -220,8 +217,8 @@ impl SandboxManager {
                 return Err(error);
             }
         };
-        // Deliberately no `vm.resume()` on success: guest progress after the
-        // snapshot would diverge from the retained disk overlay.
+        // The guest stays quiesced on success: progress after the snapshot
+        // would diverge from the retained disk overlay.
 
         // Release the VM, TAP + IP (quarantined for host cleanup), and
         // chroot; keep the disk. A failure here is a half-released sandbox
@@ -263,7 +260,7 @@ impl SandboxManager {
             inst.state = SandboxState::Paused;
             inst.paused_at = Some(Utc::now());
             inst.pause_snapshot_id = Some(snapshot_id.clone());
-            inst.vm = None;
+            inst.handle = None;
             inst.vsock_uds_path = None;
             if paused_commit
                 .as_ref()
@@ -379,7 +376,7 @@ impl SandboxManager {
                 {
                     let mut inst = instance.lock().unwrap();
                     inst.prepared = Some(resumed.prepared);
-                    inst.vm = Some(resumed.vm);
+                    inst.handle = Some(resumed.handle);
                     inst.vsock_uds_path = Some(resumed.vsock_uds_path);
                     inst.network = resumed.network;
                     inst.cow_handle = resumed.cow_handle;
@@ -646,47 +643,27 @@ impl SandboxManager {
                 gid,
             )
             .await?;
-            let effective_mem = if let Some(ref mem) = snap_meta.mem_path
+            if let Some(ref mem) = snap_meta.mem_path
                 && mem.exists()
             {
                 link_or_copy_for_jailer(mem, &snap_in_chroot.join("mem"), uid, gid).await?;
-                Some(format!("/snapshots/{}/mem", snap_meta.id))
-            } else {
-                None
-            };
-
-            // Load the snapshot; retarget eth0 onto the fresh TAP.
-            let mut load_params = fc_sdk::types::SnapshotLoadParams {
-                snapshot_path: format!("/snapshots/{}/vmstate", snap_meta.id),
-                mem_file_path: effective_mem,
-                mem_backend: None,
-                enable_diff_snapshots: None,
-                track_dirty_pages: None,
-                resume_vm: Some(true),
-                network_overrides: vec![],
-            };
-            if let Some(ref net) = net_alloc {
-                load_params.network_overrides = vec![fc_sdk::types::NetworkOverride {
-                    iface_id: "eth0".into(),
-                    host_dev_name: net.tap_name.clone(),
-                }];
             }
-            let socket = prepared
-                .as_ref()
-                .expect("prepared set above")
-                .record()
-                .process
-                .and_then(|process| process.api_socket)
-                .unwrap_or_default();
-            let vm = Arc::new(
-                fc_sdk::restore(
-                    socket.to_str().ok_or_else(|| {
-                        VmmError::Config("non-UTF-8 firecracker socket path".into())
-                    })?,
-                    load_params,
-                )
-                .await
-                .map_err(VmmError::from)?,
+
+            // Load the snapshot on the prepared VMM: the retained disk in
+            // this jail, eth0 retargeted onto the fresh TAP.
+            let image = super::checkpoint_image(snap_in_chroot, &snap_meta.format);
+            let restore = restore_spec(
+                id,
+                &cr,
+                net_alloc.as_ref(),
+                IsolationSpec::try_from(jailer)?,
+            )?;
+            let handle: Arc<dyn VmHandle> = Arc::from(
+                prepared
+                    .as_ref()
+                    .expect("prepared set above")
+                    .restore(&image, restore)
+                    .await?,
             );
             let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
                 Arc::new(vsock::UdsVsock(vsock_path.clone()));
@@ -742,7 +719,7 @@ impl SandboxManager {
             journal(pid, cow_handle.as_ref(), net_alloc.as_ref())?;
             Ok(ResumedRuntime {
                 prepared: prepared.take().expect("prepared set above"),
-                vm,
+                handle,
                 vsock_uds_path: vsock_path,
                 network: net_alloc.take(),
                 cow_handle: cow_handle.take(),

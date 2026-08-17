@@ -257,7 +257,6 @@ impl SandboxManager {
         let info = super::checkpoint::checkpoint_impl(
             &self.instances,
             &self.snapshots,
-            &self.config,
             id,
             super::checkpoint::CheckpointRequest {
                 name: format!("template-{template}"),

@@ -35,10 +35,9 @@ pub(super) struct PreparedSlot {
     pub prepared: Arc<dyn PreparedVm>,
     /// dm-snapshot of the snapshot's rootfs (`None` = copy fallback).
     pub cow_handle: Option<CowHandle>,
-    /// Chroot-relative vmstate path for `SnapshotLoadParams`.
-    pub vmstate_path: String,
-    /// Chroot-relative mem path, when the snapshot has one.
-    pub mem_path: Option<String>,
+    /// The checkpoint as staged into the slot's chroot, ready for the
+    /// driver to load.
+    pub image: CheckpointImage,
     /// Host-side vsock UDS path inside the slot's chroot.
     pub vsock_path: PathBuf,
     /// Slot runtime dir (`sandboxes/pool-<uuid>`) holding its crash journal.
@@ -228,12 +227,11 @@ pub(super) async fn prepare_slot(
     )?;
 
     match stage_slot(driver, fc_cfg, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
-        Ok((prepared, cow_handle, vmstate_path, mem_path, vsock_path)) => Ok(PreparedSlot {
+        Ok((prepared, cow_handle, image, vsock_path)) => Ok(PreparedSlot {
             slot_id,
             prepared,
             cow_handle,
-            vmstate_path,
-            mem_path,
+            image,
             vsock_path,
             vm_dir,
         }),
@@ -296,8 +294,7 @@ impl From<VmmError> for SlotFailure {
 type StagedSlot = (
     Arc<dyn PreparedVm>,
     Option<CowHandle>,
-    String,
-    Option<String>,
+    CheckpointImage,
     PathBuf,
 );
 
@@ -365,8 +362,10 @@ async fn stage_slot(
         mem: snapshot.mem_path.as_deref(),
     };
     match stage_snapshot_files(&cr, &files, jc.uid, jc.gid).await {
-        Ok((vmstate_path, mem_path)) => {
-            Ok((prepared, cow_handle, vmstate_path, mem_path, vsock_path))
+        Ok(_) => {
+            let image =
+                super::checkpoint_image(cr.join("snapshots").join(&snapshot.id), &snapshot.format);
+            Ok((prepared, cow_handle, image, vsock_path))
         }
         Err(error) => Err(carry(error.into(), Some(prepared), cow_handle)),
     }

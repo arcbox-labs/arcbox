@@ -342,7 +342,6 @@ async fn publish_warm_snapshot(
     let info = super::checkpoint::checkpoint_impl(
         instances,
         &ticket.snapshots,
-        config,
         sandbox_id,
         super::checkpoint::CheckpointRequest {
             name,

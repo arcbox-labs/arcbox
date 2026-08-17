@@ -3,11 +3,13 @@ use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransi
 use super::pool::PreparedSlot;
 use super::types::action;
 use super::*;
+use arcbox_vm_driver::{AfterCheckpoint, CheckpointOptions};
 
-/// The image format this path writes — a Firecracker `vmstate` + `mem`
-/// pair — recorded on every catalog entry so a restore can tell which
-/// driver may read it. The Firecracker driver names it; a restore through
-/// the driver refuses any other.
+/// The image format the reference driver writes, for tests that seed the
+/// catalog by hand. Production never names it: [`checkpoint_impl`] records
+/// whatever format the driver's `CheckpointImage` reports, and a restore
+/// hands that back to the driver, which refuses any other.
+#[cfg(test)]
 pub(super) const CHECKPOINT_FORMAT: &str = arcbox_fc_driver::CHECKPOINT_FORMAT;
 
 /// Parameters for the internal restore path
@@ -53,21 +55,21 @@ pub(super) struct CheckpointRequest {
     ///
     /// False only for pause, whose whole point is that the guest must never
     /// run past the memory image — any progress after it would diverge from
-    /// the retained disk overlay. The caller then owns the resume-on-error.
+    /// the retained disk overlay; the driver then holds it quiesced.
     pub(super) resume_after: bool,
 }
 
-/// Pause a sandbox, capture a full snapshot into the catalog, and (unless
-/// the request opts out) resume it.
+/// Capture a full snapshot of a sandbox into the catalog through the
+/// driver's `Checkpoint` capability, which freezes the guest for the capture
+/// and (unless the request opts out) resumes it.
 ///
 /// Free-standing (rather than a method) so the boot task can publish warm
 /// snapshots (CORE-77) through the exact code path the Checkpoint RPC uses,
-/// and so pause (CORE-21) inherits the same chroot-owner and addressing-mode
-/// handling instead of re-deriving it.
+/// and so pause (CORE-21) inherits the same addressing-mode handling instead
+/// of re-deriving it.
 pub(super) async fn checkpoint_impl(
     instances: &super::InstanceMap,
     snapshots: &SnapshotCatalog,
-    config: &VmmConfig,
     sandbox_id: &SandboxId,
     request: CheckpointRequest,
 ) -> Result<CheckpointInfo> {
@@ -77,12 +79,9 @@ pub(super) async fn checkpoint_impl(
         expected_state,
         resume_after,
     } = request;
-    // Verify state and capture the kernel/rootfs paths for jailer
-    // re-staging, the id the sandbox's chroot is actually keyed by
-    // — a sandbox restored from a pre-warmed pool slot lives in the
-    // slot's chroot, and FC resolves snapshot paths inside it — plus
-    // the guest's network addressing mode and the VM API handle.
-    let (kernel_path, rootfs_path, chroot_owner, net_invariant, geometry, vm) = {
+    // Verify state and capture the kernel/rootfs paths a restore re-stages,
+    // the guest's network addressing mode, and the VM handle.
+    let (kernel_path, rootfs_path, net_invariant, geometry, handle) = {
         let instance = instances
             .read()
             .unwrap()
@@ -97,105 +96,54 @@ pub(super) async fn checkpoint_impl(
                 actual: inst.state.to_string(),
             });
         }
-        let vm = inst
-            .vm
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| VmmError::WrongState {
-                id: sandbox_id.clone(),
-                expected: format!("{expected_state} (VM handle available)"),
-                actual: inst.state.to_string(),
-            })?;
-        // Only needed for jailer mode; safe to capture regardless.
+        let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
+            id: sandbox_id.clone(),
+            expected: format!("{expected_state} (VM handle available)"),
+            actual: inst.state.to_string(),
+        })?;
         (
             inst.spec.kernel.clone(),
             inst.spec.rootfs.clone(),
-            inst.pool_slot_id
-                .clone()
-                .unwrap_or_else(|| sandbox_id.clone()),
             inst.net_invariant,
             crate::snapshot::SnapshotGeometry {
                 vcpus: inst.spec.vcpus,
                 memory_mib: inst.spec.memory_mib,
             },
-            vm,
+            handle,
         )
     };
+    // The capability is a property of how the VM was built: the driver
+    // checkpoints only jailed VMs, because a restore reopens the disk paths
+    // the checkpoint recorded and only a per-VM chroot makes those private.
+    let checkpoint = handle.checkpoint().ok_or_else(|| {
+        VmmError::FailedPrecondition(format!(
+            "sandbox {sandbox_id} cannot be checkpointed: checkpoints require jailer \
+             isolation, and this VM runs without it"
+        ))
+    })?;
 
     // Staging directory outside the catalog: the snapshot becomes visible
     // only on commit, and dropping `pending` on any error below takes the
     // directory and whatever partial vmstate/mem it holds with it.
     let pending = snapshots.begin(sandbox_id)?;
-    let snapshot_id = pending.id().to_owned();
-    let staging_dir = pending.dir();
 
-    // Pause before snapshotting.
-    vm.pause().await.map_err(VmmError::from)?;
-
-    // Everything between pause and resume is fallible (chroot dir setup,
-    // chown, the snapshot RPC). Run it in a block whose result is handled
-    // only AFTER the resume — a bare `?` here previously left the guest
-    // paused forever, wedging every later RPC. Returns the chroot snapshot
-    // dir (jailer mode) to move afterward.
-    //
-    // In jailer mode FC runs inside a chroot and can only write to paths
-    // within it, so the snapshot is written to a chroot-local dir and moved
-    // into staging after resume.
-    let paused: Result<Option<PathBuf>> = async {
-        let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
-            if let Some(ref jc) = config.firecracker.jailer {
-                let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                let cr = chroot_root(&config.firecracker.binary, base, &chroot_owner);
-                let chroot_snap = cr.join("snapshots").join(&snapshot_id);
-                std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
-                // Firecracker runs as jc.uid/jc.gid; chown the directory so
-                // it can create the snapshot files.
-                let uid = nix::unistd::Uid::from_raw(jc.uid);
-                let gid = nix::unistd::Gid::from_raw(jc.gid);
-                nix::unistd::chown(&chroot_snap, Some(uid), Some(gid))
-                    .map_err(|e| VmmError::Process(format!("chown snapshot dir: {e}")))?;
-                // Paths as seen by Firecracker inside the chroot.
-                let fc_vmstate = format!("/snapshots/{snapshot_id}/vmstate");
-                let fc_mem = format!("/snapshots/{snapshot_id}/mem");
-                (fc_vmstate, fc_mem, Some(chroot_snap))
-            } else {
-                (
-                    staging_dir.join("vmstate").to_str().unwrap().to_owned(),
-                    staging_dir.join("mem").to_str().unwrap().to_owned(),
-                    None,
-                )
-            };
-
-        vm.create_snapshot(&fc_vmstate_path, &fc_mem_path)
-            .await
-            .map_err(VmmError::from)?;
-        Ok(chroot_snap_dir_opt)
-    }
-    .await;
-
-    // Always resume, regardless of how the paused section fared — unless the
-    // caller owns the resume decision (pause).
-    if resume_after {
-        let _ = vm.resume().await;
-    }
-
-    let chroot_snap_dir_opt = paused?;
-
-    // If jailer mode, move snapshot files from the chroot into staging. The
-    // guest is either resumed (and the files complete, FC having flushed
-    // them before returning) or deliberately left paused, so in both cases
-    // nothing is still writing to them.
-    if let Some(chroot_snap) = chroot_snap_dir_opt {
-        move_file(&chroot_snap.join("vmstate"), &staging_dir.join("vmstate"))
-            .await
-            .map_err(VmmError::Io)?;
-        if chroot_snap.join("mem").exists() {
-            move_file(&chroot_snap.join("mem"), &staging_dir.join("mem"))
-                .await
-                .map_err(VmmError::Io)?;
-        }
-        let _ = tokio::fs::remove_dir_all(&chroot_snap).await;
-    }
+    // The driver owns the freeze: it pauses the guest, writes the capture
+    // (into the jail and out to the staging dir), and resumes — or, for
+    // pause, holds the guest quiesced — settling the guest before it
+    // reports any failure, so a failed capture never leaves the VM paused.
+    let image = checkpoint
+        .checkpoint(
+            &pending.dir(),
+            CheckpointOptions {
+                after: if resume_after {
+                    AfterCheckpoint::Resume
+                } else {
+                    AfterCheckpoint::HoldQuiesced
+                },
+                kind: CheckpointKind::Full,
+            },
+        )
+        .await?;
 
     // Store kernel/rootfs template paths so restore can re-derive them.
     // Jailer mode needs them for chroot staging; direct mode needs the
@@ -210,7 +158,7 @@ pub(super) async fn checkpoint_impl(
         rootfs_path: Some(rootfs_path),
         net_invariant,
         geometry: Some(geometry),
-        format: CHECKPOINT_FORMAT.to_owned(),
+        format: image.format.as_str().to_owned(),
     })?;
 
     let snap_dir_path = meta
@@ -265,7 +213,6 @@ impl SandboxManager {
         checkpoint_impl(
             &self.instances,
             &self.snapshots,
-            &self.config,
             sandbox_id,
             CheckpointRequest {
                 name,
@@ -551,9 +498,12 @@ impl SandboxManager {
         // reconfiguration as the only restore work. From the claim on, the
         // slot's resources are owned by this restore and unwind through
         // rollback_restore like freshly created ones.
+        let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
         let claimed = self.claim_restore_slot(&request.snapshot_id);
         let pool_hit = claimed.is_some();
-        let (prepared, actual_vsock_path, effective_vmstate, effective_mem, t_spawned, t_staged) =
+        // The id the jail is keyed by (the slot's for a pool hit), which is
+        // also the id the driver prepared the VMM under.
+        let (prepared, jail_owner, actual_vsock_path, staged_image, t_spawned, t_staged) =
             if let Some(slot) = claimed {
                 // Record the adopting sandbox's slot id first: failure cleanup
                 // and crash reconciliation key the chroot and dm/CoW teardown
@@ -573,8 +523,7 @@ impl SandboxManager {
                     slot_id,
                     prepared: slot_prepared,
                     cow_handle,
-                    vmstate_path,
-                    mem_path,
+                    image,
                     vsock_path,
                     vm_dir: slot_vm_dir,
                 } = slot;
@@ -628,9 +577,9 @@ impl SandboxManager {
                 let t_claimed = std::time::Instant::now();
                 (
                     slot_prepared,
+                    slot_id,
                     vsock_path,
-                    vmstate_path,
-                    mem_path,
+                    image,
                     t_claimed,
                     t_claimed,
                 )
@@ -639,7 +588,6 @@ impl SandboxManager {
                 // the driver's prepared VMM clears the socket path before
                 // spawning into it.
                 let spawned: Result<(Arc<dyn PreparedVm>, PathBuf)> = async {
-                    let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
                     let cr = chroot_root(&fc_cfg.binary, base, &new_id);
                     let vsock_path = cr.join("run/firecracker.vsock");
                     let prepared = super::prepare_capability(&*self.driver)
@@ -694,9 +642,8 @@ impl SandboxManager {
                 // chroot and cannot access the catalog's host-absolute paths.
                 // Stage the snapshot files into the new sandbox's chroot and use
                 // chroot-relative paths.
-                let setup_result: Result<(String, Option<String>)> = async {
+                let setup_result: Result<CheckpointImage> = async {
                     let jc = jailer;
-                    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
                     let cr = chroot_root(&fc_cfg.binary, base, &new_id);
 
                     // Stage kernel (always hard-linked or copied, ~16MB).
@@ -736,14 +683,16 @@ impl SandboxManager {
                         vmstate: &snap_meta.vmstate_path,
                         mem: snap_meta.mem_path.as_deref(),
                     };
-                    stage_snapshot_files(&cr, &files, jc.uid, jc.gid)
-                        .await
-                        .map_err(VmmError::from)
+                    stage_snapshot_files(&cr, &files, jc.uid, jc.gid).await?;
+                    Ok(super::checkpoint_image(
+                        cr.join("snapshots").join(&snap_meta.id),
+                        &snap_meta.format,
+                    ))
                 }
                 .await;
 
-                let (effective_vmstate, effective_mem) = match setup_result {
-                    Ok(staged) => staged,
+                let image = match setup_result {
+                    Ok(image) => image,
                     Err(error) => {
                         return Err(self
                             .rollback_restore(
@@ -759,47 +708,34 @@ impl SandboxManager {
                 };
                 (
                     spawned_prepared,
+                    new_id.clone(),
                     vsock_path,
-                    effective_vmstate,
-                    effective_mem,
+                    image,
                     t_spawned,
                     std::time::Instant::now(),
                 )
             };
 
-        // Build the restore parameters.
-        let mut load_params = fc_sdk::types::SnapshotLoadParams {
-            snapshot_path: effective_vmstate,
-            mem_file_path: effective_mem,
-            mem_backend: None,
-            enable_diff_snapshots: None,
-            track_dirty_pages: None,
-            resume_vm: Some(true),
-            network_overrides: vec![],
-        };
-
-        if let Some(ref net) = net_alloc {
-            load_params.network_overrides = vec![fc_sdk::types::NetworkOverride {
-                iface_id: "eth0".into(),
-                host_dev_name: net.tap_name.clone(),
-            }];
+        // Load the image on the prepared VMM: the disk is the rootfs staged
+        // into the owner's jail, eth0 lands on the fresh TAP.
+        let loaded: Result<Arc<dyn VmHandle>> = async {
+            let restore = super::boot::restore_spec(
+                &jail_owner,
+                &chroot_root(&fc_cfg.binary, base, &jail_owner),
+                net_alloc.as_ref(),
+                IsolationSpec::try_from(jailer)?,
+            )?;
+            Ok(Arc::from(prepared.restore(&staged_image, restore).await?))
         }
-
-        // The API socket the driver's prepared VMM answers on — inside the
-        // chroot in jailer mode.
-        let effective_socket = prepared
-            .record()
-            .process
-            .and_then(|process| process.api_socket)
-            .unwrap_or_default();
-        let vm = match fc_sdk::restore(effective_socket.to_str().unwrap(), load_params).await {
-            Ok(v) => Arc::new(v),
-            Err(e) => {
+        .await;
+        let handle = match loaded {
+            Ok(handle) => handle,
+            Err(error) => {
                 return Err(self
                     .rollback_restore(
                         &new_id,
                         reservation,
-                        VmmError::from(e),
+                        error,
                         Some(prepared),
                         net_alloc,
                         pending_cow,
@@ -950,7 +886,7 @@ impl SandboxManager {
             let mut inst = arc.lock().unwrap();
             inst.network.clone_from(&net_alloc);
             inst.prepared = Some(prepared);
-            inst.vm = Some(vm);
+            inst.handle = Some(handle);
             inst.vsock_uds_path = Some(actual_vsock_path.clone());
             inst.cow_handle = pending_cow.take();
             inst.net_invariant = snap_meta.net_invariant;

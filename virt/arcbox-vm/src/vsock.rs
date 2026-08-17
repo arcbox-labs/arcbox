@@ -23,8 +23,8 @@
 //!
 //! In the other direction, a guest-initiated connect to host port `P` is
 //! forwarded by Firecracker to a host Unix socket at `{uds_path}_{P}`; the
-//! boot readiness gate pre-listens there ([`arcbox_fc_driver::vsock::UdsListener`]
-//! + [`wait_ready`]).
+//! boot readiness gate pre-listens there through the driver's `VsockListen`
+//! capability ([`wait_ready`]).
 //!
 //! ## Frame format
 //!
@@ -35,8 +35,7 @@
 
 use std::time::Duration;
 
-use arcbox_fc_driver::vsock::UdsListener;
-use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
+use arcbox_vm_driver::{IoMode, Vsock, VsockConn, VsockListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -216,11 +215,12 @@ fn into_unix_stream(conn: VsockConn) -> Result<UnixStream> {
 /// Wait for the guest agent's readiness dial-out on a pre-bound listener:
 /// `accept()` one connection and read (and discard) its single byte.
 /// Completion is the readiness event.
-pub(crate) async fn wait_ready(listener: &UdsListener) -> Result<()> {
-    let mut stream = listener
+pub(crate) async fn wait_ready(listener: &mut dyn VsockListener) -> Result<()> {
+    let conn = listener
         .accept()
         .await
         .map_err(|e| VmmError::Vsock(format!("accept on ready socket: {e}")))?;
+    let mut stream = into_unix_stream(conn)?;
     let mut byte = [0u8; 1];
     stream
         .read(&mut byte)

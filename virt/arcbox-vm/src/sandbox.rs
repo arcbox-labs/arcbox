@@ -9,7 +9,6 @@
 //! in a background task which broadcasts a `"ready"` event on success.
 
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -18,13 +17,12 @@ use arcbox_fc_driver::jail::{
     SnapshotFiles, chroot_root, link_or_copy_for_jailer, move_file, stage_kernel_for_jailer,
     stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
 };
-use arcbox_fc_driver::vsock::UdsListener;
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
-use arcbox_vm_driver::{IsolationSpec, Prepare, PreparedVm, VmDriver, VmId};
+use arcbox_vm_driver::{
+    CheckpointFormat, CheckpointImage, CheckpointKind, IsolationSpec, Prepare, PreparedVm,
+    VmDriver, VmHandle, VmId,
+};
 use chrono::{DateTime, Utc};
-use fc_sdk::VmBuilder;
-use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
-use nix::unistd::{Gid, Uid, chown};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -417,6 +415,17 @@ pub(super) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
         .jailer
         .as_ref()
         .map_or(Ok(IsolationSpec::None), IsolationSpec::try_from)
+}
+
+/// A catalogued checkpoint as the driver reads it back: the directory the
+/// files were staged into (`vmstate` + `mem`) and the format the catalog
+/// recorded at capture — legacy entries default to the Firecracker format.
+pub(super) fn checkpoint_image(dir: PathBuf, format: &str) -> CheckpointImage {
+    CheckpointImage {
+        dir,
+        format: CheckpointFormat::new(format),
+        kind: CheckpointKind::Full,
+    }
 }
 
 /// Stock sandbox id budget: what [`max_sandbox_id_len`] computes for the

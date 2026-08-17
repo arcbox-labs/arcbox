@@ -201,8 +201,10 @@ pub struct SandboxInstance {
     /// it (`arcbox_vm_driver::PreparedVm`): pid and API socket known,
     /// shared with the boot task, taken by cleanup to kill and reap it.
     pub prepared: Option<Arc<dyn PreparedVm>>,
-    /// Post-boot API handle (present once the VM has booted).
-    pub vm: Option<Arc<fc_sdk::Vm>>,
+    /// The running VM behind the driver port (`arcbox_vm_driver::VmHandle`),
+    /// present once a boot or restore succeeded; shared with the tasks that
+    /// checkpoint or shut it down.
+    pub handle: Option<Arc<dyn VmHandle>>,
     /// Allocated network resources.
     pub network: Option<NetworkAllocation>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
@@ -282,7 +284,7 @@ impl SandboxInstance {
             cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
             boot_task: None,
             prepared: None,
-            vm: None,
+            handle: None,
             network,
             vm_dir,
             vsock_uds_path: None,

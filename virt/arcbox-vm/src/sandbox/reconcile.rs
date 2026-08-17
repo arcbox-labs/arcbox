@@ -860,7 +860,7 @@ mod tests {
             assert_eq!(instance.error.as_deref(), Some(AGENT_RESTART_ERROR));
             assert_eq!(instance.record_generation, Some(record.generation));
             assert!(instance.prepared.is_none());
-            assert!(instance.vm.is_none());
+            assert!(instance.handle.is_none());
             assert!(instance.network.is_none());
         }
 

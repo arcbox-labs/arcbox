@@ -3,6 +3,7 @@ use super::cleanup::{inst_to_info, remove_sandbox_impl};
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
+use arcbox_vm_driver::ShutdownMode;
 
 /// Whether a create may restore from warm sources and publish into the
 /// warm-cache LRU. [`Disabled`](Self::Disabled) exists for the prewarm
@@ -495,7 +496,7 @@ impl SandboxManager {
             super::reconcile::clear_state_record(&vm_dir)?;
             return Ok(());
         }
-        let (was_running, vm_handle, record_generation, last_exited_at) = {
+        let (was_running, handle, record_generation, last_exited_at) = {
             let mut inst = instance.lock().unwrap();
             match inst.state {
                 SandboxState::Ready | SandboxState::Running | SandboxState::Stopping => {}
@@ -510,7 +511,7 @@ impl SandboxManager {
             let was_running = inst.state == SandboxState::Running;
             let captured = (
                 was_running,
-                inst.vm.as_ref().map(Arc::clone),
+                inst.handle.clone(),
                 inst.record_generation,
                 inst.last_exited_at,
             );
@@ -544,34 +545,23 @@ impl SandboxManager {
             }
         }
 
-        // Ask the guest to shut down. Ctrl+Alt+Del triggers a guest reboot,
-        // which Firecracker turns into a VM exit. Errors are ignored — the
-        // VM may already be gone.
-        if let Some(vm) = vm_handle {
-            let _ = tokio::time::timeout(Duration::from_secs(5), vm.send_ctrl_alt_del()).await;
+        // Ask the guest to shut down and wait for it within the remaining
+        // budget; the driver kills the VMM at the deadline (and reports a
+        // reap that timed out — the handle stays on the instance for a
+        // retry). A VM that never came up has no handle to ask.
+        if let Some(handle) = handle {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::from_secs(1))
+                .max(Duration::from_secs(1));
+            handle
+                .shutdown(ShutdownMode::Graceful { timeout: remaining })
+                .await
+                .map_err(|error| VmmError::Process(format!("shut down sandbox {id}: {error}")))?;
         }
 
-        // Wait for the VMM to exit within the remaining budget; the release
-        // below kills and reaps whatever is still alive. Transitional: the
-        // driver's prepared VMM is polled for liveness until the handle owns
-        // the shutdown.
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or(Duration::from_secs(1))
-            .max(Duration::from_secs(1));
-        let prepared = instance.lock().unwrap().prepared.clone();
-        if let Some(prepared) = prepared {
-            let exit_deadline = tokio::time::Instant::now() + remaining;
-            while prepared.alive() && tokio::time::Instant::now() < exit_deadline {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if prepared.alive() {
-                warn!(sandbox_id = %id, "guest did not shut down in time; killing the vmm");
-            }
-        }
-
-        // Release the VMM (if still alive), TAP/IP, CoW device, and chroot;
-        // the record itself stays inspectable until Remove.
+        // Release the VMM (already exited, or never booted), TAP/IP, CoW
+        // device, and chroot; the record itself stays inspectable until Remove.
         let stop_commit = {
             super::cleanup::release_runtime_resources(
                 id,
