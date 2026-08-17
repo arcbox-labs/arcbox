@@ -227,15 +227,22 @@ pub fn load_quarantines(
     let mut tokens = HashSet::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() || entry.file_name().to_string_lossy().starts_with('.') {
+        if !entry.file_type()?.is_file() {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            return Err(TapNetError::Network(format!(
-                "unexpected sandbox network quarantine file {}",
-                path.display()
-            )));
+        match path.extension().and_then(|value| value.to_str()) {
+            // A staging file (`.{id}-{uuid}.tmp`) a crash left mid-write. The
+            // skip is keyed on that shape, not on a leading dot: a `VmId` may
+            // start with one, and its marker `.{id}.json` must load.
+            Some("tmp") => continue,
+            Some("json") => {}
+            _ => {
+                return Err(TapNetError::Network(format!(
+                    "unexpected sandbox network quarantine file {}",
+                    path.display()
+                )));
+            }
         }
         let marker: NetworkQuarantine = serde_json::from_slice(&std::fs::read(&path)?)?;
         validate_id(&marker.id)?;
@@ -351,7 +358,9 @@ fn quarantine_path(dir: &Path, sandbox_id: &str) -> PathBuf {
 /// The network's id contract is the driver port's: a VM id is a `VmId`
 /// (`[A-Za-z0-9._-]`, non-empty, at most [`VmId::MAX_LEN`] bytes, not `.`
 /// or `..`), which also makes it a safe ledger path component
-/// (`{id}.json`). Checked where an id enters the network (`reserve`), on
+/// (`{id}.json`; a leading dot is fine — the loader skips staging files by
+/// their `.tmp` extension, not by dotfile). Checked where an id enters the
+/// network (`reserve`), on
 /// every ledger write, and on every ledger load, so a reserved address can
 /// always be quarantined, every entry the ledger holds is one the port can
 /// name, and a file from outside the contract fails at load with its id in

@@ -230,6 +230,48 @@ fn durable_quarantine_blocks_reuse_until_startup_and_generation_finalize() {
     assert_eq!(reused.ip_address, allocation.ip_address);
 }
 
+/// A `VmId` may start with a dot, so its marker is a dotfile; the loader
+/// must still read it — it skips staging leftovers by their `.tmp` shape,
+/// not by the leading dot — or the address silently returns to the pool
+/// on restart while the marker lingers unlisted.
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn quarantine_of_a_dotted_id_survives_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let quarantine = root.path().join("network-quarantine");
+    let network = || {
+        TapNetwork::with_quarantine_dir(
+            "10.0.0.0/30",
+            "10.0.0.1",
+            vec![],
+            quarantine.clone(),
+            Datapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
+        .unwrap()
+    };
+    let first = network();
+    first.mark_reconciled();
+    let startup = first.startup_cleanup_token().unwrap();
+    first.finalize_startup_cleanup(&startup).unwrap();
+    let allocation = first.reserve(".hidden").unwrap();
+    first.quarantine_checked(".hidden", &allocation).unwrap();
+    // A staging leftover of the shape a crash mid-write leaves behind.
+    std::fs::write(quarantine.join(".hidden-stale.tmp"), b"{").unwrap();
+    drop(first);
+
+    let restarted = network();
+    assert_eq!(
+        restarted.pending_quarantines(),
+        vec![(".hidden".to_owned(), allocation.cleanup_token)]
+    );
+    restarted.mark_reconciled();
+    assert!(
+        restarted.reserve("other").is_err(),
+        "the address stays held"
+    );
+}
+
 #[test]
 fn quarantine_loader_rejects_foreign_or_inconsistent_allocations() {
     let mutations: [fn(&mut NetworkAllocation); 4] = [
