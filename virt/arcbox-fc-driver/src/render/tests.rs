@@ -352,6 +352,37 @@ fn jailer_mode_mirrors_a_block_device_as_a_node() {
 }
 
 #[test]
+fn a_disk_id_cannot_reach_out_of_the_jail() {
+    let base = PathBuf::from("/srv/jailer");
+    for isolation in [IsolationSpec::None, jailed(&base)] {
+        let mut s = spec("box", isolation, "/images/rootfs.ext4".into());
+        // Staging joins `{id}.ext4` onto the jail root and replaces whatever
+        // is there — with a copy, or a device node.
+        s.disks[0].id = "../../etc/shadow".into();
+        assert!(
+            invalid(fc_config(&s, &config(), Path::new("/run/vms/box"))).contains("disk id"),
+            "a traversing disk id is refused"
+        );
+        s.disks[0].id = "nested/name".into();
+        assert!(invalid(fc_config(&s, &config(), Path::new("/run/vms/box"))).contains("disk id"));
+    }
+
+    // The same guard covers every staged name, whoever supplies it.
+    let layout = layout(&jailed(&base));
+    let mut stage = Vec::new();
+    assert!(
+        invalid(layout.place(
+            Path::new("/images/vmlinux"),
+            "../vmlinux",
+            StageKind::LinkOrCopy,
+            &mut stage,
+        ))
+        .contains("inside the jail")
+    );
+    assert!(stage.is_empty());
+}
+
+#[test]
 fn what_firecracker_cannot_do_is_refused_before_anything_runs() {
     let base = |mutate: fn(&mut VmSpec)| {
         let mut s = spec("box", IsolationSpec::None, "/images/rootfs.ext4".into());

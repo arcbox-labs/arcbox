@@ -162,6 +162,11 @@ impl VmLayout {
     /// The path Firecracker is told for `host`, and the staging that makes
     /// it true: verbatim without a jail; `/` + relative when already inside
     /// the jail; otherwise staged to `/{in_jail}` by `kind`.
+    ///
+    /// `in_jail` must be a relative path of plain components — parts of it
+    /// come from the spec (a disk `id`), and staging writes, replaces, and
+    /// mknods at the destination, so a `..` in it would reach a host file
+    /// outside the jail.
     pub fn place(
         &self,
         host: &Path,
@@ -172,6 +177,11 @@ impl VmLayout {
         let Some(jail) = &self.jail else {
             return utf8(host);
         };
+        if !is_inside_jail(in_jail) {
+            return Err(unsupported(&format!(
+                "`{in_jail}` does not name a path inside the jail"
+            )));
+        }
         if let Some(view) = jail.view(host) {
             return Ok(view);
         }
@@ -344,6 +354,14 @@ pub fn fc_restore(
 }
 
 fn drive(layout: &VmLayout, disk: &DiskSpec, stage: &mut Vec<StagePlan>) -> Result<Drive> {
+    // The id names a Firecracker device (`PUT /drives/{id}`, and the URL a
+    // restore patches) and, under a jail, the file the disk is staged as.
+    if !is_plain_component(&disk.id) {
+        return Err(unsupported(&format!(
+            "disk id `{}` must be a plain name",
+            disk.id
+        )));
+    }
     let kind = match &layout.jail {
         // Verbatim, or already inside the jail: nothing is staged.
         None => StageKind::Copy,
@@ -387,6 +405,22 @@ fn tap_name(nic: &NicSpec) -> Result<String> {
             nic.id
         ))),
     }
+}
+
+/// True when `name` is one plain path component: no separator, no `.` or
+/// `..`, no root, nothing a jail-relative path may not be made of.
+fn is_plain_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+/// True when `path` is relative and made only of plain components, so
+/// joining it onto the jail root lands inside the jail.
+fn is_inside_jail(path: &str) -> bool {
+    let mut components = Path::new(path).components().peekable();
+    components.peek().is_some()
+        && components.all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn is_block_device(path: &Path) -> Result<bool> {
