@@ -140,9 +140,20 @@ impl TapNetwork {
 
     /// Check that `token` names the pending startup cleanup of this process
     /// generation and that reconciliation has finished.
+    ///
+    /// The two refusals are different answers and must not be folded
+    /// together. Before [`Self::mark_reconciled`] the owner is still
+    /// replaying what a previous process left, so no token — not even the
+    /// current one — can finalize a sweep whose contents are still being
+    /// discovered: retry-later, and the same token will do. Everything else
+    /// is a token that does not name this generation, which no retry fixes.
     pub fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
-        if !self.startup_reconciled.load(Ordering::Acquire)
-            || !self.startup_barrier.load(Ordering::Acquire)
+        if !self.startup_reconciled.load(Ordering::Acquire) {
+            return Err(TapNetError::Unavailable(
+                "sandbox startup cleanup is awaiting the owner's durable-state replay".into(),
+            ));
+        }
+        if !self.startup_barrier.load(Ordering::Acquire)
             || self.startup_host_cleaned.load(Ordering::Acquire)
             || token != self.startup_token
         {

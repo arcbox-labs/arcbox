@@ -547,14 +547,24 @@ mod tests {
         .unwrap();
         let reconcile = network.reconcile().unwrap();
         // Until the owner says it has replayed, no token finalizes the
-        // sweep — what it must cover is still being discovered.
-        assert!(
+        // sweep — what it must cover is still being discovered. The class
+        // is the point: come back later, holding the very token that was
+        // just refused, rather than "fetch a current one".
+        assert!(matches!(
             reconcile
                 .validate_startup_cleanup(&TapNetwork::startup_cleanup_token(&network).unwrap())
-                .await
-                .is_err()
-        );
+                .await,
+            Err(Error::Unavailable(_))
+        ));
         reconcile.replay_complete();
+        // Once it has, a token that names no pending sweep is the other
+        // answer entirely: a failed precondition no retry can satisfy.
+        assert!(matches!(
+            reconcile
+                .validate_startup_cleanup("another-generation")
+                .await,
+            Err(Error::PreconditionFailed(_))
+        ));
         let startup = reconcile.startup_cleanup_token().await.unwrap();
         reconcile.finalize_startup_cleanup(&startup).await.unwrap();
         assert!(reconcile.startup_cleanup_token().await.is_none());
