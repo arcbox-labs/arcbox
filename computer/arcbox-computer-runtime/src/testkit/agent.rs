@@ -22,12 +22,13 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::agent::{
-    ClockSync, DirWatch, ExecInput, ExecInputMsg, ExitStatus, GuestAgent, GuestAgentFactory,
-    GuestFiles, OutputChunk, PortWait, Readiness, ReadyGate, StartCommand,
+    ClockSync, DirWatch, ExecInput, ExecInputMsg, ExitStatus, FsEvents, GuestAgent,
+    GuestAgentFactory, GuestFiles, OutputChunk, PortWait, ProbeGate, Readiness, ReadyGate,
+    StartCommand,
 };
 use crate::boot_proto::NetReconfigCommand;
 use crate::error::{Result, VmmError};
-use crate::file_proto::{FileStatDto, KIND_DIR, KIND_FILE};
+use crate::file_proto::{FileStatDto, FsEventDto, KIND_DIR, KIND_FILE};
 
 /// What the guest does when it is asked to start a command.
 #[derive(Debug, Clone)]
@@ -93,6 +94,7 @@ struct Shared {
     /// stays open instead of reporting a closed channel, and so an exec's
     /// input sink keeps accepting.
     open: Mutex<Vec<Box<dyn Send>>>,
+    watchers: Mutex<Vec<mpsc::Sender<FsEventDto>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -144,6 +146,12 @@ impl FakeAgentFactory {
         self
     }
 
+    /// Deliver `event` to every watch opened on this agent.
+    pub fn emit_fs_event(&self, event: &FsEventDto) -> &Self {
+        lock(&self.shared.watchers).retain(|tx| tx.try_send(event.clone()).is_ok());
+        self
+    }
+
     /// Read the in-memory filesystem back.
     #[must_use]
     pub fn file(&self, path: &str) -> Option<Vec<u8>> {
@@ -181,7 +189,7 @@ impl GuestAgentFactory for FakeAgentFactory {
     }
 
     async fn arm_readiness(&self, _prepared: &dyn PreparedVm) -> Result<Box<dyn ReadyGate>> {
-        Ok(Box::new(NoGate))
+        Ok(Box::new(ProbeGate))
     }
 
     fn connect(
@@ -192,16 +200,6 @@ impl GuestAgentFactory for FakeAgentFactory {
         Ok(Arc::new(FakeAgent {
             shared: Arc::clone(&self.shared),
         }))
-    }
-}
-
-/// [`Readiness::Probe`]: nothing to observe.
-struct NoGate;
-
-#[async_trait]
-impl ReadyGate for NoGate {
-    async fn wait(&mut self, _handle: &Arc<dyn VmHandle>) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -406,11 +404,21 @@ impl GuestFiles for FakeAgent {
         if !lock(&self.shared.files).contains_key(path) {
             return Err(VmmError::PathNotFound(path.to_owned()));
         }
-        let (ours, theirs) = tokio::net::UnixStream::pair()
-            .map_err(|e| VmmError::Vsock(format!("fake watch pair: {e}")))?;
-        // Hold the guest end: dropping it would end the stream at once,
-        // which is what a stopped sandbox looks like, not a live watch.
-        lock(&self.shared.open).push(Box::new(theirs));
-        Ok(DirWatch::over(ours))
+        let (tx, events) = mpsc::channel(16);
+        lock(&self.shared.watchers).push(tx);
+        Ok(DirWatch::new(Box::new(FakeWatch { events })))
+    }
+}
+
+/// The fake's watch stream: whatever [`FakeAgentFactory::emit_fs_event`]
+/// pushes, ending cleanly once the factory that owns it goes away.
+struct FakeWatch {
+    events: mpsc::Receiver<FsEventDto>,
+}
+
+#[async_trait]
+impl FsEvents for FakeWatch {
+    async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
+        Ok(self.events.recv().await)
     }
 }

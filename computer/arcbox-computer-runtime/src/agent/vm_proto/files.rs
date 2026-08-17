@@ -17,6 +17,7 @@ use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
 
 use super::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
+use crate::agent::{DirWatch, FsEvents};
 use crate::error::{Result, VmmError};
 
 /// Per-operation timeout for file I/O over vsock.
@@ -254,24 +255,13 @@ pub(super) async fn move_entry(vsock: &dyn Vsock, from: &str, to: &str) -> Resul
 /// The connection streams `FILE_EVENT` frames until either side closes it.
 /// Dropping this closes the connection, which is the cancellation signal
 /// the vm-agent tears its inotify watch down on.
-#[derive(Debug)]
-pub struct DirWatch {
+struct VsockWatch {
     stream: UnixStream,
 }
 
-impl DirWatch {
-    /// A watch over an already-open stream, for a [`GuestFiles`] that is
-    /// not this transport (`crate::testkit`).
-    ///
-    /// [`GuestFiles`]: crate::agent::GuestFiles
-    #[cfg(feature = "testkit")]
-    pub(crate) const fn over(stream: UnixStream) -> Self {
-        Self { stream }
-    }
-
-    /// Next filesystem event. `Ok(None)` is the clean end of the stream —
-    /// the vm-agent side closed the connection (sandbox stopped).
-    pub async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
+#[async_trait::async_trait]
+impl FsEvents for VsockWatch {
+    async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
         // Read the frame-type byte manually: a clean EOF is only clean at a
         // frame boundary, which `read_frame`'s `read_exact` cannot express.
         let mut ty = [0u8; 1];
@@ -327,7 +317,7 @@ pub(super) async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) ->
             .await
             .map_err(|e| VmmError::Vsock(format!("read watch ack: {e}")))?;
         match resp_type {
-            FILE_ACK => Ok(DirWatch { stream }),
+            FILE_ACK => Ok(DirWatch::new(Box::new(VsockWatch { stream }))),
             FILE_ERR => Err(decode_file_err(&resp)),
             other => Err(VmmError::Vsock(format!(
                 "unexpected watch ack type 0x{other:02x}"

@@ -508,21 +508,21 @@ pub(super) fn netmask(prefix_len: u8) -> std::net::Ipv4Addr {
 
 /// The connectivity every sandbox gets: egress through the host's address,
 /// which is what the System VM's netfilter provides for the pool.
-/// The mode a guest's interface was activated in, which is what
-/// [`GuestNetwork::identity`] must be read under: fresh boots take the
-/// fixed invariant identity, and only checkpoints taken before it existed
-/// carry the pool address on the interface itself.
+pub(super) const fn sandbox_network_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        mode: NetworkMode::Nat,
+    }
+}
+
+/// The mode a guest's interface is activated in, which is also the mode
+/// [`GuestNetwork::identity`] must be read under: a fresh boot and every
+/// invariant-snapshot restore take the fixed identity, and only checkpoints
+/// taken before it existed carry the pool address on the interface itself.
 pub(super) const fn attach_mode(net_invariant: bool) -> AttachMode {
     if net_invariant {
         AttachMode::Invariant
     } else {
         AttachMode::LegacySnapshot
-    }
-}
-
-pub(super) const fn sandbox_network_policy() -> NetworkPolicy {
-    NetworkPolicy {
-        mode: NetworkMode::Nat,
     }
 }
 

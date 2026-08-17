@@ -13,11 +13,11 @@ use arcbox_vm_driver::{PreparedVm, VmHandle, Vsock, VsockListener};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use super::files::{self, DirWatch};
+use super::files;
 use super::{HandleVsock, READY_PORT, clock, connect_to_port, exec, net, wait_port, wait_ready};
 use crate::agent::{
-    ClockSync, ExecInput, GuestAgent, GuestAgentFactory, GuestFiles, OutputChunk, PortWait,
-    Readiness, ReadyGate, StartCommand,
+    ClockSync, DirWatch, ExecInput, GuestAgent, GuestAgentFactory, GuestFiles, OutputChunk,
+    PortWait, ProbeGate, Readiness, ReadyGate, StartCommand,
 };
 use crate::boot_proto::NetReconfigCommand;
 use crate::error::Result;
@@ -158,6 +158,8 @@ impl GuestAgentFactory for VmProtoAgentFactory {
                 Ok(Box::new(DialOutGate { listener }))
             }
             Readiness::Poll { port } => Ok(Box::new(PollGate { port })),
+            // Transport-independent: it round-trips the agent, which every
+            // implementation has.
             Readiness::Probe => Ok(Box::new(ProbeGate)),
         }
     }
@@ -179,7 +181,11 @@ struct DialOutGate {
 
 #[async_trait]
 impl ReadyGate for DialOutGate {
-    async fn wait(&mut self, _handle: &Arc<dyn VmHandle>) -> Result<()> {
+    async fn wait(
+        &mut self,
+        _handle: &Arc<dyn VmHandle>,
+        _agent: &Arc<dyn GuestAgent>,
+    ) -> Result<()> {
         wait_ready(&mut *self.listener).await
     }
 }
@@ -196,20 +202,13 @@ struct PollGate {
 
 #[async_trait]
 impl ReadyGate for PollGate {
-    async fn wait(&mut self, handle: &Arc<dyn VmHandle>) -> Result<()> {
+    async fn wait(
+        &mut self,
+        handle: &Arc<dyn VmHandle>,
+        _agent: &Arc<dyn GuestAgent>,
+    ) -> Result<()> {
         let vsock = HandleVsock(Arc::clone(handle));
         connect_to_port(&vsock, self.port).await.map(drop)
-    }
-}
-
-/// [`Readiness::Probe`]: nothing announces this guest, so there is nothing
-/// to wait for — the first agent call the boot flow makes is the check.
-struct ProbeGate;
-
-#[async_trait]
-impl ReadyGate for ProbeGate {
-    async fn wait(&mut self, _handle: &Arc<dyn VmHandle>) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -246,11 +245,18 @@ mod tests {
         }
     }
 
-    /// Arm a gate on a prepared VM, boot it, and return both.
+    /// Arm a gate on a prepared VM, boot it, and return everything the
+    /// wait needs.
     async fn armed(
         readiness: Readiness,
         dir: &std::path::Path,
-    ) -> (FakeDriver, VmId, Arc<dyn VmHandle>, Box<dyn ReadyGate>) {
+    ) -> (
+        FakeDriver,
+        VmId,
+        Arc<dyn VmHandle>,
+        Arc<dyn GuestAgent>,
+        Box<dyn ReadyGate>,
+    ) {
         let driver = FakeDriver::new();
         let id = VmId::new("gate").unwrap();
         let prepared = driver
@@ -259,12 +265,11 @@ mod tests {
             .prepare(&id, &IsolationSpec::None, dir)
             .await
             .unwrap();
-        let gate = VmProtoAgentFactory::with_readiness(readiness)
-            .arm_readiness(prepared.as_ref())
-            .await
-            .unwrap();
+        let factory = VmProtoAgentFactory::with_readiness(readiness);
+        let gate = factory.arm_readiness(prepared.as_ref()).await.unwrap();
         let handle: Arc<dyn VmHandle> = Arc::from(prepared.boot(vm_spec(&id)).await.unwrap());
-        (driver, id, handle, gate)
+        let agent = factory.connect(Arc::clone(&handle), None).unwrap();
+        (driver, id, handle, agent, gate)
     }
 
     /// The dial-out gate is the guest's one connection plus its one byte,
@@ -272,13 +277,13 @@ mod tests {
     #[tokio::test]
     async fn dial_out_gate_takes_the_guests_one_byte() {
         let dir = tempfile::tempdir().unwrap();
-        let (driver, id, handle, mut gate) =
+        let (driver, id, handle, agent, mut gate) =
             armed(Readiness::DialOut { port: READY_PORT }, dir.path()).await;
 
         let mut guest = driver.guest_dial(&id, READY_PORT).unwrap();
         guest.write_all(&[1]).unwrap();
 
-        gate.wait(&handle).await.unwrap();
+        gate.wait(&handle, &agent).await.unwrap();
     }
 
     /// The poll gate reaches the guest through the booted VM — it had
@@ -286,18 +291,9 @@ mod tests {
     #[tokio::test]
     async fn poll_gate_dials_the_booted_guest() {
         let dir = tempfile::tempdir().unwrap();
-        let (_driver, _id, handle, mut gate) =
+        let (_driver, _id, handle, agent, mut gate) =
             armed(Readiness::Poll { port: 52 }, dir.path()).await;
 
-        gate.wait(&handle).await.unwrap();
-    }
-
-    /// The probe gate has nothing to observe and says so immediately.
-    #[tokio::test]
-    async fn probe_gate_does_not_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_driver, _id, handle, mut gate) = armed(Readiness::Probe, dir.path()).await;
-
-        gate.wait(&handle).await.unwrap();
+        gate.wait(&handle, &agent).await.unwrap();
     }
 }

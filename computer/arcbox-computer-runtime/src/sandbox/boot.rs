@@ -84,22 +84,32 @@ pub(super) async fn boot_sandbox(
             // (the vm-agent binary among them) rebuild the default template
             // and re-inject it into docker templates automatically, so a
             // guest always carries the agent from the same build as its host.
-            let agent_ready =
-                match tokio::time::timeout(AGENT_GATE_TIMEOUT, ready_gate.wait(&handle)).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => {
-                        Err(VmmError::Vsock(format!("agent readiness gate: {error}")))
+            //
+            // The agent client is built first: `connect` performs no I/O, and
+            // a gate that observes at the agent level rather than the
+            // transport's (`Readiness::Probe`) has nothing to wait on
+            // without it.
+            let gated = match agents.connect(Arc::clone(&handle), net.as_ref().map(|n| &n.identity))
+            {
+                Ok(agent) => {
+                    match tokio::time::timeout(AGENT_GATE_TIMEOUT, ready_gate.wait(&handle, &agent))
+                        .await
+                    {
+                        Ok(Ok(())) => Ok(agent),
+                        Ok(Err(error)) => {
+                            Err(VmmError::Vsock(format!("agent readiness gate: {error}")))
+                        }
+                        Err(_) => Err(VmmError::Vsock(format!(
+                            "agent readiness gate: the guest agent did not answer within {}s",
+                            AGENT_GATE_TIMEOUT.as_secs()
+                        ))),
                     }
-                    Err(_) => Err(VmmError::Vsock(format!(
-                        "agent readiness gate: the guest agent did not announce itself within {}s",
-                        AGENT_GATE_TIMEOUT.as_secs()
-                    ))),
-                };
+                }
+                Err(error) => Err(error),
+            };
             // The observer is per-boot; the gate has consumed its one event.
             drop(ready_gate);
-            let agent = match agent_ready.and_then(|()| {
-                agents.connect(Arc::clone(&handle), net.as_ref().map(|n| &n.identity))
-            }) {
+            let agent = match gated {
                 Ok(agent) => agent,
                 Err(error) => {
                     let message = error.to_string();

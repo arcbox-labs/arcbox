@@ -948,20 +948,22 @@ mod tests {
             .unwrap();
         await_action(&mut events, &id, action::READY).await;
 
-        // The initial cmd ran through the reserved claim, and the detached
-        // clock sync reached the guest (HV-less guests wake at the kernel
-        // epoch, so a boot that skips it is a real regression).
+        // The initial cmd ran through the reserved claim, and the guest
+        // clock was set twice: once by the readiness probe this factory
+        // gates on, once by the detached cold-boot sync (guests with no RTC
+        // wake at the kernel epoch, so a boot that skips that is a real
+        // regression).
         assert!(agent.started().contains(&vec!["/bin/hello".to_owned()]));
         for _ in 0..100 {
-            if agent.clock_syncs() > 0 {
+            if agent.clock_syncs() >= 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(
             agent.clock_syncs(),
-            1,
-            "the boot syncs the guest clock once"
+            2,
+            "the readiness probe and the detached cold-boot sync, one each"
         );
         assert!(
             agent.net_reconfigs().is_empty(),
@@ -985,6 +987,22 @@ mod tests {
             manager.stat_sandbox_path(&id, "/tmp/note").await,
             Err(VmmError::PathNotFound(_))
         ));
+
+        // A watch is a stream the port owns rather than a socket, so what
+        // the guest side emits arrives through it whatever the transport.
+        let mut watch = manager
+            .watch_sandbox_dir(&id, "/tmp/moved", false)
+            .await
+            .unwrap();
+        agent.emit_fs_event(&crate::file_proto::FsEventDto {
+            kind: crate::file_proto::EVENT_MODIFIED.to_owned(),
+            path: "/tmp/moved".to_owned(),
+            renamed_to: String::new(),
+        });
+        assert_eq!(
+            watch.next_event().await.unwrap().map(|event| event.path),
+            Some("/tmp/moved".to_owned())
+        );
 
         // And so does a workload, once the initial cmd has released the slot.
         for _ in 0..100 {

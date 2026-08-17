@@ -25,11 +25,11 @@ use tokio::sync::mpsc;
 
 use crate::boot_proto::NetReconfigCommand;
 use crate::error::Result;
-use crate::file_proto::FileStatDto;
+use crate::file_proto::{FileStatDto, FsEventDto};
 
 pub mod vm_proto;
 
-pub use vm_proto::{DirWatch, VmProtoAgent, VmProtoAgentFactory};
+pub use vm_proto::{VmProtoAgent, VmProtoAgentFactory};
 
 /// The command vocabulary the guest agent starts processes from, shared
 /// with `vm-agent` through `arcbox-vm-proto`.
@@ -77,23 +77,48 @@ pub enum Readiness {
     /// The host dials the guest's `port` until the agent accepts. Nothing
     /// to arm — the wait needs the running VM.
     Poll { port: u32 },
-    /// No transport-level announcement: readiness is the first agent call
-    /// that succeeds, which the boot flow makes anyway. The wait returns
-    /// immediately.
+    /// No transport-level announcement: the gate is one agent round trip
+    /// ([`ProbeGate`]), because a Computer that cannot announce itself
+    /// still must not be called ready before it answers.
     Probe,
 }
 
 /// An armed readiness observer, awaited once.
 #[async_trait]
 pub trait ReadyGate: Send {
-    /// Wait for the guest agent to announce itself.
+    /// Wait for the guest agent to be serving.
     ///
-    /// `handle` is the VM that booted after this gate was armed: a
-    /// [`Readiness::DialOut`] gate ignores it — its observer has been
-    /// listening since before the guest started — while [`Readiness::Poll`]
-    /// dials the guest through it, because there was nothing to dial when
-    /// the gate was armed. The caller owns the deadline.
-    async fn wait(&mut self, handle: &Arc<dyn VmHandle>) -> Result<()>;
+    /// Both arguments describe the VM that booted *after* this gate was
+    /// armed, which is why they arrive here rather than at arming time: a
+    /// [`Readiness::DialOut`] gate uses neither (its observer has been
+    /// listening since before the guest started), [`Readiness::Poll`]
+    /// dials the guest over `handle`'s transport, and [`Readiness::Probe`]
+    /// round-trips `agent`. The caller owns the deadline.
+    async fn wait(&mut self, handle: &Arc<dyn VmHandle>, agent: &Arc<dyn GuestAgent>)
+    -> Result<()>;
+}
+
+/// [`Readiness::Probe`]: one agent round trip, which is the whole of what
+/// this shape can observe.
+///
+/// [`GuestAgent::sync_clock`] is that round trip — its `Ok` means the agent
+/// accepted a connection, parsed a frame and replied — and it is what the
+/// cold-boot path used as its readiness gate before the guest learned to
+/// dial out. Its side effect is one the boot wants anyway.
+///
+/// Transport-independent, so every factory that answers
+/// [`Readiness::Probe`] returns this rather than its own.
+pub struct ProbeGate;
+
+#[async_trait]
+impl ReadyGate for ProbeGate {
+    async fn wait(
+        &mut self,
+        _handle: &Arc<dyn VmHandle>,
+        agent: &Arc<dyn GuestAgent>,
+    ) -> Result<()> {
+        agent.sync_clock().await.map(drop)
+    }
 }
 
 /// The agent inside one running Computer.
@@ -148,6 +173,40 @@ pub trait GuestFiles: Send + Sync {
     /// Open a directory watch. The stream ends cleanly when the Computer
     /// stops; dropping it cancels the watch.
     async fn watch(&self, path: &str, recursive: bool) -> Result<DirWatch>;
+}
+
+/// A live directory watch inside one Computer.
+///
+/// Dropping it cancels the watch — for the vm-proto client that is the
+/// connection close the agent tears its inotify watch down on.
+pub struct DirWatch(Box<dyn FsEvents>);
+
+impl DirWatch {
+    /// Wrap an implementation's event stream. This is what makes
+    /// [`GuestFiles::watch`] implementable off this crate's transport.
+    #[must_use]
+    pub fn new(events: Box<dyn FsEvents>) -> Self {
+        Self(events)
+    }
+
+    /// Next filesystem event. `Ok(None)` is the clean end of the stream —
+    /// the guest side closed it because the Computer stopped.
+    pub async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
+        self.0.next_event().await
+    }
+}
+
+impl std::fmt::Debug for DirWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirWatch").finish_non_exhaustive()
+    }
+}
+
+/// One implementation's directory-watch event stream.
+#[async_trait]
+pub trait FsEvents: Send {
+    /// Next event, or `Ok(None)` once the stream ends cleanly.
+    async fn next_event(&mut self) -> Result<Option<FsEventDto>>;
 }
 
 /// How a guest workload terminated.

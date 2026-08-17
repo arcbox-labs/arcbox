@@ -51,7 +51,6 @@ mod net;
 mod wait_port;
 
 pub use client::{VmProtoAgent, VmProtoAgentFactory};
-pub use files::DirWatch;
 pub(crate) use handle::HandleVsock;
 
 impl ExitStatus {
