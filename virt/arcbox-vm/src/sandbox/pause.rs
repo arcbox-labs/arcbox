@@ -121,7 +121,7 @@ impl SandboxManager {
         // critical section as the check means a concurrent Run cannot slip
         // its `Ready → Running` claim in between and end up checkpointed
         // mid-execution.
-        let generation = {
+        let (generation, handle) = {
             let mut inst = instance.lock().unwrap();
             match inst.state {
                 SandboxState::Paused => return Ok(()),
@@ -142,15 +142,13 @@ impl SandboxManager {
                     "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
                 ));
             }
-            if inst.handle.is_none() {
-                return Err(VmmError::WrongState {
-                    id: id.clone(),
-                    expected: "a sandbox with a live VM handle".into(),
-                    actual: "no VM handle".into(),
-                });
-            }
+            let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
+                id: id.clone(),
+                expected: "a sandbox with a live VM handle".into(),
+                actual: "no VM handle".into(),
+            })?;
             inst.state = SandboxState::Pausing;
-            inst.record_generation
+            (inst.record_generation, handle)
         };
         let jailer = self
             .config
@@ -186,9 +184,14 @@ impl SandboxManager {
         // Checkpoint through the shared implementation — it owns the
         // addressing-mode bookkeeping — but with the guest held quiesced
         // afterwards: guest progress past the memory image would diverge
-        // from the retained disk overlay. On failure the driver has already
-        // resumed the guest, and the sandbox reverts to Ready, because a
-        // failed pause must leave a usable sandbox behind.
+        // from the retained disk overlay. A capture that fails leaves the
+        // guest running (the driver resumes it itself) and the sandbox
+        // reverts to Ready, because a failed pause must leave a usable
+        // sandbox behind. A capture that succeeded and held the guest, with
+        // the failure coming after it — the catalog commit — is different:
+        // the port has no verb to thaw a held VM (pause is hold-then-kill
+        // by design), so that sandbox cannot go back to Ready; it is killed
+        // and fails honestly rather than reporting Ready for a frozen guest.
         let snapshot_id = match checkpoint_impl(
             &self.instances,
             &self.snapshots,
@@ -203,6 +206,12 @@ impl SandboxManager {
         .await
         {
             Ok(info) => info.snapshot_id,
+            Err(error) if handle.state() == arcbox_vm_driver::VmState::Quiesced => {
+                if let Err(kill) = handle.shutdown(arcbox_vm_driver::ShutdownMode::Kill).await {
+                    warn!(sandbox_id = %id, error = %kill, "held guest of a failed pause could not be killed");
+                }
+                return Err(self.fail_pause(id, &instance, generation, error));
+            }
             Err(error) => {
                 if let Some(generation) = generation
                     && let Err(revert) =
@@ -223,24 +232,7 @@ impl SandboxManager {
         // chroot; keep the disk. A failure here is a half-released sandbox
         // whose VM state is already gone — degrade honestly to Failed.
         if let Err(error) = self.release_for_pause(id, &instance, jailer).await {
-            if let Some(generation) = generation
-                && let Err(mark) = self.records.transition(
-                    id,
-                    generation,
-                    SandboxTransition::Failed(error.to_string()),
-                )
-            {
-                warn!(sandbox_id = %id, error = %mark, "pause failure transition failed");
-            }
-            {
-                let mut inst = instance.lock().unwrap();
-                inst.state = SandboxState::Failed;
-                inst.error = Some(error.to_string());
-            }
-            let _ = self
-                .events_tx
-                .send(SandboxEvent::new(id, action::FAILED).with_attr("error", &error.to_string()));
-            return Err(error);
+            return Err(self.fail_pause(id, &instance, generation, error));
         }
 
         let paused_commit = generation
@@ -453,6 +445,35 @@ impl SandboxManager {
                 Err(failure.error)
             }
         }
+    }
+
+    /// Degrade a pause that cannot leave a usable sandbox behind to `Failed`:
+    /// record and publish the failure, and hand `error` back to the caller.
+    fn fail_pause(
+        &self,
+        id: &SandboxId,
+        instance: &Arc<Mutex<SandboxInstance>>,
+        generation: Option<Uuid>,
+        error: VmmError,
+    ) -> VmmError {
+        if let Some(generation) = generation
+            && let Err(mark) = self.records.transition(
+                id,
+                generation,
+                SandboxTransition::Failed(error.to_string()),
+            )
+        {
+            warn!(sandbox_id = %id, error = %mark, "pause failure transition failed");
+        }
+        {
+            let mut inst = instance.lock().unwrap();
+            inst.state = SandboxState::Failed;
+            inst.error = Some(error.to_string());
+        }
+        let _ = self
+            .events_tx
+            .send(SandboxEvent::new(id, action::FAILED).with_attr("error", &error.to_string()));
+        error
     }
 
     /// Free the VM, network, and chroot of a checkpointed sandbox while
