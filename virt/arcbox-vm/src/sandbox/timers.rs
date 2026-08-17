@@ -17,6 +17,7 @@
 //! if the epoch still matches) so a stale timer can neither fire nor be
 //! aborted mid-teardown.
 
+use super::policy::deadlines;
 use super::types::action;
 use super::*;
 
@@ -246,17 +247,7 @@ impl SandboxManager {
             let inst = instance.lock().unwrap();
             (inst.ttl_deadline, inst.record_generation, inst.state)
         };
-        // A terminal sandbox has nothing left to expire, and the live path
-        // cancels its TTL on the STOPPED/FAILED edge. Without this guard the
-        // restart resync re-arms one — `inactive_instance` restores
-        // `ttl_deadline` for every recovered record regardless of state — so
-        // whether a stopped sandbox's record gets reaped would depend on
-        // whether the agent happened to bounce.
-        if matches!(state, SandboxState::Stopped | SandboxState::Failed) {
-            self.timers.ttl.cancel(id);
-            return;
-        }
-        let Some(deadline) = deadline else {
+        let Some(deadline) = deadlines::ttl_due(state, deadline) else {
             self.timers.ttl.cancel(id);
             return;
         };
@@ -325,15 +316,11 @@ impl SandboxManager {
             self.timers.idle.cancel(id);
             return;
         };
-        let timeout_seconds = {
+        let idle_after = {
             let inst = instance.lock().unwrap();
-            if inst.state != SandboxState::Ready || inst.spec.idle_timeout_seconds == 0 {
-                None
-            } else {
-                Some(inst.spec.idle_timeout_seconds)
-            }
+            deadlines::idle_due(inst.state, inst.spec.idle_timeout_seconds)
         };
-        let Some(timeout_seconds) = timeout_seconds else {
+        let Some(idle_after) = idle_after else {
             self.timers.idle.cancel(id);
             return;
         };
@@ -344,7 +331,7 @@ impl SandboxManager {
         let id = id.clone();
         self.timers.idle.arm(&id.clone(), move |epoch| {
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(u64::from(timeout_seconds))).await;
+                tokio::time::sleep(idle_after).await;
                 let Some(manager) = weak_manager.upgrade() else {
                     return;
                 };
@@ -420,8 +407,7 @@ impl SandboxManager {
 
 /// Sleep until a wall-clock deadline (already-past deadlines return at once).
 async fn sleep_until_utc(deadline: DateTime<Utc>) {
-    let remaining = (deadline - Utc::now()).to_std().unwrap_or(Duration::ZERO);
-    tokio::time::sleep(remaining).await;
+    tokio::time::sleep(deadlines::remaining(deadline, Utc::now())).await;
 }
 
 #[cfg(test)]

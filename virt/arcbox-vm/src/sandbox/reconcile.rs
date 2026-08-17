@@ -20,7 +20,8 @@ use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmId, VmRecord};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::persistence::{SandboxPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
+use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
+use super::record::{SandboxRecord, SandboxRecordStore, SandboxTransition};
 use super::{SandboxInstance, SandboxState};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
@@ -253,25 +254,18 @@ pub(super) async fn sweep_orphans(
     for (dir, record) in &records {
         kill_orphaned_vmm(driver, dir, record).await?;
     }
-    // Durably Paused sandboxes keep their retained disk state (the detached
-    // COW overlay or parked rootfs): Paused is committed only after
-    // `release_for_pause` (or the resume unwind) released every runtime
-    // resource, so a cleanup journal found next to it is a leftover of the
-    // crash window between that commit and the journal clear — not evidence
-    // of a torn release. Those journals are dropped as stale; every other
-    // journaled sandbox is swept.
-    let paused: HashSet<String> = store
-        .load_all()?
-        .into_iter()
-        .filter(|record| record.phase == SandboxPhase::Paused)
-        .map(|record| record.id)
-        .collect();
-    cow_manager.reconcile_stale(&paused)?;
+    let durable = store.load_all()?;
+    let retained = recovery::retained_ids(
+        durable
+            .iter()
+            .map(|record| (record.id.as_str(), record.phase)),
+    );
+    cow_manager.reconcile_stale(&retained)?;
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();
     for (dir, mut record) in records {
-        if paused.contains(&record.id) {
+        if recovery::sweep_action(&record.id, &retained) == SweepAction::DropStaleJournal {
             info!(sandbox_id = %record.id, "dropping stale pause journal, keeping retained state");
             clear_state_record(&dir)?;
             continue;
@@ -331,16 +325,21 @@ pub(super) fn normalize_durable_records(
     let mut inactive = Vec::new();
 
     for record in store.load_all()? {
-        match record.phase {
-            SandboxPhase::Creating => {}
-            SandboxPhase::Starting | SandboxPhase::Ready | SandboxPhase::Stopping => {
-                if swept.is_some_and(|ids| !ids.contains(&record.id)) {
-                    return Err(crate::error::VmmError::Unavailable(format!(
-                        "sandbox {} is {} but has no cleanup journal",
-                        record.id,
-                        record.phase.as_str()
-                    )));
-                }
+        let evidence = match swept {
+            None => JournalEvidence::Unchecked,
+            Some(ids) if ids.contains(&record.id) => JournalEvidence::Swept,
+            Some(_) => JournalEvidence::Unjournaled,
+        };
+        match recovery::plan(record.phase, evidence) {
+            RecoveryAction::LeaveResumable => {}
+            RecoveryAction::RefuseUnjournaled => {
+                return Err(crate::error::VmmError::Unavailable(format!(
+                    "sandbox {} is {} but has no cleanup journal",
+                    record.id,
+                    record.phase.as_str()
+                )));
+            }
+            RecoveryAction::Fail => {
                 let record = store
                     .transition(
                         &record.id,
@@ -350,36 +349,10 @@ pub(super) fn normalize_durable_records(
                     .confirmed("sandbox restart normalization")?;
                 inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
             }
-            // An interrupted pause/resume died between resource states; the
-            // sweep already tore down whatever its journal listed (including
-            // the disk overlay), so the sandbox is unrecoverable. Unlike the
-            // live phases above, a missing journal is normal here — a resume
-            // starts from a Paused record whose journal was already cleared
-            // (after the Paused commit) and re-journals as it re-allocates.
-            SandboxPhase::Pausing | SandboxPhase::Resuming => {
-                let record = store
-                    .transition(
-                        &record.id,
-                        record.generation,
-                        SandboxTransition::Failed(AGENT_RESTART_ERROR.into()),
-                    )?
-                    .confirmed("sandbox restart normalization")?;
-                inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
+            RecoveryAction::Reinstate(state) => {
+                inactive.push(inactive_instance(record, state, data_dir));
             }
-            // Paused commits only after every runtime resource was released,
-            // and the sweep preserves durably Paused retained state (clearing
-            // any stale journal), so a paused sandbox always survives a
-            // restart resumable.
-            SandboxPhase::Paused => {
-                inactive.push(inactive_instance(record, SandboxState::Paused, data_dir));
-            }
-            SandboxPhase::Stopped => {
-                inactive.push(inactive_instance(record, SandboxState::Stopped, data_dir));
-            }
-            SandboxPhase::Failed => {
-                inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
-            }
-            SandboxPhase::Removing => {
+            RecoveryAction::FinishRemove => {
                 store
                     .finish_remove(&record.id, record.generation)?
                     .confirmed("sandbox removal recovery")?;
@@ -539,10 +512,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::super::SandboxSpec;
-    use super::super::persistence::{ProvisionIntent, SandboxProvisionOutcome};
+    use super::super::record::{PersistPhase, ProvisionIntent, SandboxProvisionOutcome};
     use super::*;
 
-    fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: SandboxPhase) -> SandboxRecord {
+    fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: PersistPhase) -> SandboxRecord {
         let spec = SandboxSpec {
             id: Some(id.into()),
             ..SandboxSpec::default()
@@ -554,8 +527,8 @@ mod tests {
         let generation = record.generation;
 
         match phase {
-            SandboxPhase::Creating => return record,
-            SandboxPhase::Failed => {
+            PersistPhase::Creating => return record,
+            PersistPhase::Failed => {
                 store
                     .transition(
                         id,
@@ -564,7 +537,7 @@ mod tests {
                     )
                     .unwrap();
             }
-            SandboxPhase::Removing => {
+            PersistPhase::Removing => {
                 store
                     .transition(
                         id,
@@ -589,30 +562,30 @@ mod tests {
                     )
                     .unwrap();
                 match phase {
-                    SandboxPhase::Starting => {}
-                    SandboxPhase::Ready => {
+                    PersistPhase::Starting => {}
+                    PersistPhase::Ready => {
                         store
                             .transition(id, generation, SandboxTransition::Ready)
                             .unwrap();
                     }
-                    SandboxPhase::Stopping | SandboxPhase::Stopped => {
+                    PersistPhase::Stopping | PersistPhase::Stopped => {
                         store
                             .transition(id, generation, SandboxTransition::Stopping)
                             .unwrap();
-                        if phase == SandboxPhase::Stopped {
+                        if phase == PersistPhase::Stopped {
                             store
                                 .transition(id, generation, SandboxTransition::Stopped)
                                 .unwrap();
                         }
                     }
-                    SandboxPhase::Pausing | SandboxPhase::Paused | SandboxPhase::Resuming => {
+                    PersistPhase::Pausing | PersistPhase::Paused | PersistPhase::Resuming => {
                         store
                             .transition(id, generation, SandboxTransition::Ready)
                             .unwrap();
                         store
                             .transition(id, generation, SandboxTransition::Pausing)
                             .unwrap();
-                        if phase != SandboxPhase::Pausing {
+                        if phase != PersistPhase::Pausing {
                             store
                                 .transition(
                                     id,
@@ -623,7 +596,7 @@ mod tests {
                                 )
                                 .unwrap();
                         }
-                        if phase == SandboxPhase::Resuming {
+                        if phase == PersistPhase::Resuming {
                             store
                                 .transition(id, generation, SandboxTransition::Resuming)
                                 .unwrap();
@@ -737,13 +710,13 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let store = SandboxRecordStore::new(data_dir.path()).unwrap();
         for (id, phase) in [
-            ("creating", SandboxPhase::Creating),
-            ("starting", SandboxPhase::Starting),
-            ("ready", SandboxPhase::Ready),
-            ("stopping", SandboxPhase::Stopping),
-            ("stopped", SandboxPhase::Stopped),
-            ("failed", SandboxPhase::Failed),
-            ("removing", SandboxPhase::Removing),
+            ("creating", PersistPhase::Creating),
+            ("starting", PersistPhase::Starting),
+            ("ready", PersistPhase::Ready),
+            ("stopping", PersistPhase::Stopping),
+            ("stopped", PersistPhase::Stopped),
+            ("failed", PersistPhase::Failed),
+            ("removing", PersistPhase::Removing),
         ] {
             record_in_phase(&store, id, phase);
         }
@@ -757,7 +730,7 @@ mod tests {
         assert_eq!(inactive.len(), 5);
         for id in ["starting", "ready", "stopping"] {
             let record = store.load(id).unwrap().unwrap();
-            assert_eq!(record.phase, SandboxPhase::Failed);
+            assert_eq!(record.phase, PersistPhase::Failed);
             assert_eq!(record.error.as_deref(), Some(AGENT_RESTART_ERROR));
 
             let instance = &inactive[id];
@@ -777,7 +750,7 @@ mod tests {
         );
         assert_eq!(
             store.load("creating").unwrap().unwrap().phase,
-            SandboxPhase::Creating
+            PersistPhase::Creating
         );
         assert!(store.load("removing").unwrap().is_none());
         assert!(!inactive.contains_key("removing"));
@@ -787,9 +760,9 @@ mod tests {
     fn paused_records_survive_restart_while_interrupted_transitions_fail() {
         let data_dir = tempfile::tempdir().unwrap();
         let store = SandboxRecordStore::new(data_dir.path()).unwrap();
-        record_in_phase(&store, "clean", SandboxPhase::Paused);
-        record_in_phase(&store, "mid-pause", SandboxPhase::Pausing);
-        record_in_phase(&store, "mid-resume", SandboxPhase::Resuming);
+        record_in_phase(&store, "clean", PersistPhase::Paused);
+        record_in_phase(&store, "mid-pause", PersistPhase::Pausing);
+        record_in_phase(&store, "mid-resume", PersistPhase::Resuming);
 
         let inactive =
             normalize_durable_records(&store, data_dir.path(), Some(&HashSet::new())).unwrap();
@@ -804,7 +777,7 @@ mod tests {
         assert!(clean.paused_at.is_some());
         assert_eq!(
             store.load("clean").unwrap().unwrap().phase,
-            SandboxPhase::Paused
+            PersistPhase::Paused
         );
 
         // An interrupted pause/resume never reached a durable Paused commit;
@@ -813,7 +786,7 @@ mod tests {
             assert_eq!(inactive[id].state, SandboxState::Failed, "{id}");
             assert_eq!(
                 store.load(id).unwrap().unwrap().phase,
-                SandboxPhase::Failed,
+                PersistPhase::Failed,
                 "{id}"
             );
         }
@@ -826,7 +799,7 @@ mod tests {
     async fn stale_pause_journal_is_dropped_and_retained_state_survives() {
         let data_dir = tempfile::tempdir().unwrap();
         let store = SandboxRecordStore::new(data_dir.path()).unwrap();
-        record_in_phase(&store, "napper", SandboxPhase::Paused);
+        record_in_phase(&store, "napper", PersistPhase::Paused);
 
         let vm_dir = data_dir.path().join("sandboxes").join("napper");
         std::fs::create_dir_all(&vm_dir).unwrap();
@@ -931,7 +904,7 @@ mod tests {
     fn active_record_without_cleanup_journal_blocks_normalization() {
         let data_dir = tempfile::tempdir().unwrap();
         let store = SandboxRecordStore::new(data_dir.path()).unwrap();
-        record_in_phase(&store, "starting", SandboxPhase::Starting);
+        record_in_phase(&store, "starting", PersistPhase::Starting);
 
         assert!(matches!(
             normalize_durable_records(&store, data_dir.path(), Some(&HashSet::new())),
@@ -939,7 +912,7 @@ mod tests {
         ));
         assert_eq!(
             store.load("starting").unwrap().unwrap().phase,
-            SandboxPhase::Starting
+            PersistPhase::Starting
         );
     }
 }

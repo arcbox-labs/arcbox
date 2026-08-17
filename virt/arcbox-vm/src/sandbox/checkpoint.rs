@@ -1,6 +1,7 @@
 use super::boot::{StageError, stage_rootfs_cow_or_copy};
-use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
+use super::policy::settle::{self, Capture, GuestHold, Settlement};
 use super::pool::PreparedSlot;
+use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::action;
 use super::*;
 use arcbox_vm_driver::{AfterCheckpoint, CheckpointOptions};
@@ -151,22 +152,30 @@ pub(super) async fn checkpoint_impl(
         .map_err(CheckpointFailure::Recoverable)?;
     let handle = Arc::clone(&source.handle);
     let outcome = capture(snapshots, sandbox_id, source, request).await;
-    // The driver settles the guest before it reports: a failed capture is
-    // resumed, a successful one is resumed unless asked to hold. A guest
-    // still frozen where it should be running — or held by request but with
-    // the failure coming after the capture — has no way back, and the
-    // caller must not treat the sandbox as usable.
-    let frozen =
-        handle.state() == arcbox_vm_driver::VmState::Quiesced && (resume_after || outcome.is_err());
-    match (outcome, frozen) {
-        (Ok(info), false) => Ok(info),
-        (Ok(info), true) => Err(CheckpointFailure::Frozen(VmmError::Process(format!(
-            "sandbox {sandbox_id} stayed frozen after checkpoint {}: the driver could not \
-             resume the guest",
-            info.snapshot_id
-        )))),
-        (Err(error), true) => Err(CheckpointFailure::Frozen(error)),
-        (Err(error), false) => Err(CheckpointFailure::Recoverable(error)),
+    let settlement = settle::settlement(
+        handle.state(),
+        if resume_after {
+            GuestHold::Resume
+        } else {
+            GuestHold::Hold
+        },
+        if outcome.is_ok() {
+            Capture::Succeeded
+        } else {
+            Capture::Failed
+        },
+    );
+    match (outcome, settlement) {
+        (Ok(info), Settlement::AsRequested) => Ok(info),
+        (Ok(info), Settlement::Frozen) => {
+            Err(CheckpointFailure::Frozen(VmmError::Process(format!(
+                "sandbox {sandbox_id} stayed frozen after checkpoint {}: the driver could not \
+                 resume the guest",
+                info.snapshot_id
+            ))))
+        }
+        (Err(error), Settlement::Frozen) => Err(CheckpointFailure::Frozen(error)),
+        (Err(error), Settlement::AsRequested) => Err(CheckpointFailure::Recoverable(error)),
     }
 }
 
@@ -818,7 +827,7 @@ impl SandboxManager {
         // Load the image on the prepared VMM: the disk is the rootfs staged
         // into the owner's jail, eth0 lands on the fresh TAP.
         let loaded: Result<Arc<dyn VmHandle>> = async {
-            let restore = super::boot::restore_spec(
+            let restore = super::spec::restore_spec(
                 &resource_owner,
                 &chroot,
                 net_alloc.as_ref(),
