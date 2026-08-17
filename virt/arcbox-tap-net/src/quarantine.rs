@@ -238,7 +238,7 @@ pub fn load_quarantines(
             )));
         }
         let marker: NetworkQuarantine = serde_json::from_slice(&std::fs::read(&path)?)?;
-        validate_quarantine_id(&marker.id)?;
+        validate_id(&marker.id)?;
         if Uuid::parse_str(&marker.allocation.cleanup_token).is_err() {
             return Err(TapNetError::Network(format!(
                 "sandbox network quarantine {} has an invalid cleanup token",
@@ -315,7 +315,7 @@ fn same_allocation(existing: &NetworkAllocation, requested: &NetworkAllocation) 
 }
 
 pub fn write_quarantine(dir: &Path, sandbox_id: &str, alloc: &NetworkAllocation) -> Result<()> {
-    validate_quarantine_id(sandbox_id)?;
+    validate_id(sandbox_id)?;
     let marker = NetworkQuarantine {
         id: sandbox_id.to_owned(),
         allocation: alloc.clone(),
@@ -348,14 +348,15 @@ fn quarantine_path(dir: &Path, sandbox_id: &str) -> PathBuf {
     dir.join(format!("{sandbox_id}.json"))
 }
 
-/// A ledger id is a path component (`{id}.json`) and, through the driver
-/// port, a `VmId`: `[A-Za-z0-9_-]`, non-empty, at most [`VmId::MAX_LEN`]
-/// bytes. Both the write and the load path check it, so every entry the
-/// ledger holds is one the port can name — `NetworkReconcile` never has to
-/// drop a record it cannot represent, and a file from outside that
+/// The network's id contract: a VM id is a ledger path component
+/// (`{id}.json`) and, through the driver port, a `VmId` — `[A-Za-z0-9_-]`,
+/// non-empty, at most [`VmId::MAX_LEN`] bytes. Checked where an id enters
+/// the network (`reserve`), on every ledger write, and on every ledger
+/// load, so a reserved address can always be quarantined, every entry the
+/// ledger holds is one the port can name, and a file from outside the
 /// contract fails at load with its id in the message rather than lingering
-/// as an unfinalizable quarantine.
-fn validate_quarantine_id(id: &str) -> Result<()> {
+/// as a quarantine `NetworkReconcile` could never list or finalize.
+pub fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || !id
             .bytes()

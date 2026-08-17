@@ -20,8 +20,9 @@ owns:
   encoders, unit-tested;
 - the durable quarantine ledger and the startup-cleanup token protocol
   that keep a released address out of the pool until the host confirms
-  its forwarding state is gone. Ledger ids are held to the port's `VmId`
-  rules (`[A-Za-z0-9_-]`, at most 64 bytes) on write and on load, so
+  its forwarding state is gone. VM ids are held to the port's `VmId`
+  rules (`[A-Za-z0-9_-]`, at most 64 bytes) at `reserve` and on every
+  ledger write and load, so whatever is reserved can be quarantined and
   every entry is one `NetworkReconcile` can list and finalize.
 
 It moved here from `arcbox-vm/src/network` (vm-stack-redesign R2a,

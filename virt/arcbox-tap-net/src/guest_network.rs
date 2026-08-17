@@ -172,9 +172,9 @@ impl NetworkReconcile for TapNetwork {
         self.pending_quarantines()
             .into_iter()
             .map(|(id, token)| {
-                // The ledger validates every id it writes and loads against
-                // the `VmId` rules (`quarantine::validate_quarantine_id`),
-                // so an entry that fails here cannot exist.
+                // Every id the network reserves, writes, or loads passes the
+                // `VmId` rules (`quarantine::validate_id`), so an entry that
+                // fails here cannot exist.
                 let vm = VmId::new(id.as_str())
                     .expect("quarantine ledger ids are validated as VmIds at write and load");
                 (vm, token)
@@ -433,14 +433,14 @@ mod tests {
         assert_eq!(reused.ip, lease.ip);
     }
 
-    /// The ledger only ever holds ids the port can name: an id past
-    /// `VmId::MAX_LEN` is refused when quarantined, and a ledger file that
-    /// carries one (written outside this contract) fails at load naming it,
-    /// instead of surviving as a quarantine `NetworkReconcile` could never
-    /// list or finalize.
+    /// The network only ever carries ids the port can name: an id past
+    /// `VmId::MAX_LEN` is refused at `reserve` (before any TAP exists), and
+    /// a ledger file that carries one (written outside this contract) fails
+    /// at load naming it, instead of surviving as a quarantine
+    /// `NetworkReconcile` could never list or finalize.
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn ledger_ids_the_port_cannot_name_are_refused_not_stranded() {
+    fn ids_the_port_cannot_name_are_refused_not_stranded() {
         let root = tempfile::tempdir().unwrap();
         let ledger = root.path().join("q");
         let network = || {
@@ -458,12 +458,24 @@ mod tests {
         fresh.mark_reconciled();
         let startup = TapNetwork::startup_cleanup_token(&fresh).unwrap();
         TapNetwork::finalize_startup_cleanup(&fresh, &startup).unwrap();
-        let allocation = TapNetwork::reserve(&fresh, &long_id).unwrap();
-        let error = fresh.quarantine_checked(&long_id, &allocation).unwrap_err();
+        let error = TapNetwork::reserve(&fresh, &long_id).unwrap_err();
         assert!(error.to_string().contains("64 bytes"), "{error}");
-        assert!(fresh.pending_quarantines().is_empty());
+        // Nothing was taken from the pool.
+        assert_eq!(
+            TapNetwork::reserve(&fresh, "box").unwrap().ip_address,
+            "10.0.0.2".parse::<Ipv4Addr>().unwrap()
+        );
 
-        // A file from outside the contract: same shape, over-long id.
+        // A file from outside the contract: the ledger's shape, over-long id.
+        let allocation = NetworkAllocation {
+            tap_name: tap_name_from_ip("10.0.0.3".parse().unwrap()),
+            ip_address: "10.0.0.3".parse().unwrap(),
+            prefix_len: 29,
+            gateway: "10.0.0.1".parse().unwrap(),
+            mac_address: crate::mac_from_vm_id(&long_id).to_string(),
+            dns_servers: vec![],
+            cleanup_token: uuid::Uuid::new_v4().to_string(),
+        };
         let marker = serde_json::json!({ "id": long_id, "allocation": allocation });
         std::fs::write(
             ledger.join(format!("{long_id}.json")),
