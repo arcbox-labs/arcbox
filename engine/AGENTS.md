@@ -65,7 +65,11 @@ The restructure plan and its locked decisions live in the company repo:
     one; the System VM's `/arcbox/bin/dmsetup` comes from the guest
     agent's `VmmConfig` (`firecracker.dmsetup_candidates`), not from here.
     Adding a new host operation means adding a trait method, never a
-    hard-coded binary path.
+    hard-coded binary path. BusyBox's `losetup` has no `--show` (no long
+    options at all), so `BusyboxBlockTools` attaches as `losetup -f` then
+    `losetup LOOPDEV FILE` with a bounded retry when the queried device is
+    claimed in between — tested against a real busybox in
+    `test-vm-linux`'s `integration` job.
   - `CowManager`'s test seam (`CowTestProbe`, `new_with_test_probe`) is
     behind the **`test-probe` feature**, not `#[cfg(test)]`: a
     `cfg(test)` item does not exist for another crate's tests, and its
