@@ -5,6 +5,7 @@ use std::process::Command;
 
 use tracing::{debug, warn};
 
+use super::block_tools::loop_backing_file;
 use super::{
     CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
     TEMPLATE_PENDING_PREFIX, dmsetup_remove,
@@ -206,7 +207,7 @@ impl CowManager {
             // Verify the loop is still attached AND still backs the
             // expected template, so we never detach a /dev/loopN that
             // was reused by another process after our crash.
-            let actual_backing = loop_backing_path(loop_basename)?;
+            let actual_backing = loop_backing_file(&dev)?;
 
             if !expected_backing.is_empty()
                 && actual_backing.as_deref() == Some(expected_backing.as_str())
@@ -443,13 +444,7 @@ pub(super) fn remove_file_durable(path: &Path) -> Result<()> {
 }
 
 pub(super) fn loop_backs_path(loop_device: &str, backing: &Path) -> Result<bool> {
-    let Some(loop_name) = Path::new(loop_device)
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
-        return Ok(false);
-    };
-    Ok(loop_backing_path(loop_name)?.is_some_and(|actual| actual == backing.to_string_lossy()))
+    Ok(loop_backing_file(loop_device)?.is_some_and(|actual| actual == backing.to_string_lossy()))
 }
 
 pub(super) fn loop_devices_for_backing_sync(backing: &Path) -> Result<Vec<String>> {
@@ -466,20 +461,13 @@ pub(super) fn loop_devices_for_backing_sync(backing: &Path) -> Result<Vec<String
         if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
-        if loop_backing_path(&name)?.as_deref() == Some(expected.as_ref()) {
-            devices.push(format!("/dev/{name}"));
+        let device = format!("/dev/{name}");
+        if loop_backing_file(&device)?.as_deref() == Some(expected.as_ref()) {
+            devices.push(device);
         }
     }
     devices.sort();
     Ok(devices)
-}
-
-fn loop_backing_path(loop_name: &str) -> Result<Option<String>> {
-    match std::fs::read_to_string(format!("/sys/block/{loop_name}/loop/backing_file")) {
-        Ok(path) => Ok(Some(path.trim().to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn incomplete_cleanup(

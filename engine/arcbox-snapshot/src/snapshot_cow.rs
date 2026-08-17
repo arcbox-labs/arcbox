@@ -190,8 +190,10 @@ pub struct CowManager {
     /// Serializes the cache-miss attach+insert window so two concurrent
     /// first-time setups for the same template converge on a single
     /// `TemplateEntry` instead of each attaching its own loop device and
-    /// leaking the loser.  (TOCTOU on `losetup -f` itself is handled by
-    /// the kernel via `losetup --show`.)
+    /// leaking the loser.  (The other race — a free loop device claimed by
+    /// another process between query and attach — is [`BlockTools`]'s to
+    /// handle; `BusyboxBlockTools` re-queries and retries, since busybox
+    /// has no atomic `losetup -f --show`.)
     losetup_lock: AsyncMutex<()>,
     cow_dir: PathBuf,
     tools: Arc<dyn BlockTools>,
