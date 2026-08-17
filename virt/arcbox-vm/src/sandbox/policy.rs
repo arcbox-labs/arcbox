@@ -5,6 +5,7 @@
 //! on any host — no KVM, no root. The impure halves that act on those
 //! decisions stay next to the resources they own.
 
+pub(super) mod deadlines;
 pub(super) mod pool;
 pub(super) mod recovery;
 pub(super) mod warm;
