@@ -615,12 +615,11 @@ impl SandboxManager {
                 // with an invariant TAP (host-side NAT, no guest work), a
                 // legacy one with the legacy TAP shape plus the reconfig RPC
                 // below (CORE-81).
-                let mode = if snap_meta.net_invariant {
-                    AttachMode::Invariant
-                } else {
-                    AttachMode::LegacySnapshot
-                };
-                nic = Some(self.network.activate(lease, mode).await?);
+                nic = Some(
+                    self.network
+                        .activate(lease, super::attach_mode(snap_meta.net_invariant))
+                        .await?,
+                );
             }
 
             // Fresh chroot + VMM process, prepared through the driver.
@@ -702,8 +701,14 @@ impl SandboxManager {
                     .restore(&image, restore)
                     .await?,
             );
-            let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-                Arc::new(vm_proto::HandleVsock(Arc::clone(&handle)));
+            // What the guest holds on its interface, read under the mode
+            // its snapshot was addressed in. Derived once — the agent and
+            // the reconfig RPC below must not disagree.
+            let identity = lease.as_ref().map(|lease| {
+                self.network
+                    .identity(lease, super::attach_mode(snap_meta.net_invariant))
+            });
+            let agent = self.agent.connect(Arc::clone(&handle), identity.as_ref())?;
 
             // Clock sync is DETACHED, mirroring restore and cold boot
             // (CORE-80): the guest wall clock froze at pause time, but
@@ -713,11 +718,11 @@ impl SandboxManager {
             // on the resume critical path.
             {
                 let id = id.clone();
-                let vsock = Arc::clone(&vsock);
+                let agent = Arc::clone(&agent);
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        vm_proto::sync_clock(vsock.as_ref()),
+                        agent.sync_clock(),
                     )
                     .await
                     {
@@ -736,12 +741,9 @@ impl SandboxManager {
             // identity and its resolv.conf already points at the fixed
             // gateway; the fresh TAP carries the new pool IP host-side, so
             // resume awaits nothing here.
-            if let Some(lease) = &lease
+            if let Some(identity) = &identity
                 && !snap_meta.net_invariant
             {
-                let identity = self
-                    .network
-                    .identity(lease, AttachMode::LegacySnapshot);
                 let cmd = crate::boot_proto::NetReconfigCommand {
                     ip: super::ipv4(identity.ip)?,
                     netmask: super::netmask(identity.prefix_len),
@@ -749,7 +751,7 @@ impl SandboxManager {
                 };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    vm_proto::reconfigure_network(vsock.as_ref(), &cmd),
+                    agent.reconfigure_network(&cmd),
                 )
                 .await
                 .map_err(|_| VmmError::Vsock("net reconfig after resume timed out".into()))
@@ -1063,11 +1065,11 @@ mod tests {
         insert_instance(&manager, "asleep", SandboxState::Paused);
 
         assert!(matches!(
-            manager.require_ready_vsock(&"asleep".to_owned()),
+            manager.require_ready_agent(&"asleep".to_owned()),
             Err(VmmError::Paused(id)) if id == "asleep"
         ));
         assert!(matches!(
-            manager.require_alive_vsock(&"asleep".to_owned()),
+            manager.require_alive_agent(&"asleep".to_owned()),
             Err(VmmError::Paused(id)) if id == "asleep"
         ));
     }

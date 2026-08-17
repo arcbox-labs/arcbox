@@ -49,7 +49,7 @@ struct ReadReq<'a> {
 /// The guest agent creates any missing parent directories.  `mode` is the Unix
 /// file permission bits (e.g. `0o644`); `0` defaults to `0o644` on the agent
 /// side.
-pub(crate) async fn write_file(
+pub(super) async fn write_file(
     vsock: &dyn Vsock,
     path: &str,
     mode: u32,
@@ -101,7 +101,7 @@ async fn write_file_inner(vsock: &dyn Vsock, path: &str, mode: u32, data: &[u8])
 }
 
 /// Read the file at `path` inside the sandbox and return its contents.
-pub(crate) async fn read_file(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
+pub(super) async fn read_file(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
     tokio::time::timeout(FILE_IO_TIMEOUT, read_file_inner(vsock, path))
         .await
         .map_err(|_| VmmError::Vsock("file read: timed out".into()))?
@@ -197,7 +197,7 @@ fn parse_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T> {
 }
 
 /// Stat one path inside the sandbox (symlinks reported, not followed).
-pub(crate) async fn stat_file(vsock: &dyn Vsock, path: &str) -> Result<FileStatDto> {
+pub(super) async fn stat_file(vsock: &dyn Vsock, path: &str) -> Result<FileStatDto> {
     let req = StatReq {
         path: path.to_owned(),
     };
@@ -207,7 +207,7 @@ pub(crate) async fn stat_file(vsock: &dyn Vsock, path: &str) -> Result<FileStatD
 
 /// List a directory inside the sandbox, non-recursively, entries sorted by
 /// name with full metadata.
-pub(crate) async fn list_dir(vsock: &dyn Vsock, path: &str) -> Result<Vec<FileStatDto>> {
+pub(super) async fn list_dir(vsock: &dyn Vsock, path: &str) -> Result<Vec<FileStatDto>> {
     let req = ListDirReq {
         path: path.to_owned(),
     };
@@ -218,7 +218,7 @@ pub(crate) async fn list_dir(vsock: &dyn Vsock, path: &str) -> Result<Vec<FileSt
 /// Create a directory (and missing parents) inside the sandbox. Succeeds
 /// when the directory already exists. `mode` is the Unix permission bits;
 /// `0` defaults to `0o755` on the agent side.
-pub(crate) async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result<()> {
+pub(super) async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result<()> {
     let req = MakeDirReq {
         path: path.to_owned(),
         mode,
@@ -230,7 +230,7 @@ pub(crate) async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result
 /// Remove a file, symlink, or directory inside the sandbox. A non-empty
 /// directory requires `recursive` and fails with
 /// [`VmmError::DirectoryNotEmpty`] otherwise.
-pub(crate) async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<()> {
+pub(super) async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<()> {
     let req = RemoveReq {
         path: path.to_owned(),
         recursive,
@@ -240,7 +240,7 @@ pub(crate) async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool)
 }
 
 /// Rename / move an entry within the sandbox.
-pub(crate) async fn move_entry(vsock: &dyn Vsock, from: &str, to: &str) -> Result<()> {
+pub(super) async fn move_entry(vsock: &dyn Vsock, from: &str, to: &str) -> Result<()> {
     let req = MoveReq {
         from: from.to_owned(),
         to: to.to_owned(),
@@ -302,7 +302,7 @@ impl DirWatch {
 /// Open a directory watch inside the sandbox. The setup handshake (connect,
 /// request, `FILE_ACK`) is bounded by [`FILE_IO_TIMEOUT`]; the returned
 /// stream itself is long-lived and unbounded.
-pub(crate) async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<DirWatch> {
+pub(super) async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<DirWatch> {
     let req = WatchReq {
         path: path.to_owned(),
         recursive,

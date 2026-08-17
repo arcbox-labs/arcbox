@@ -138,8 +138,8 @@ fn spawn_exit_watcher(
     wrapped_rx
 }
 
-/// Start a non-interactive workload over the sandbox's vsock and wire up the
-/// `Running → Ready` state machine.
+/// Start a non-interactive workload through the sandbox's agent and wire up
+/// the `Running → Ready` state machine.
 ///
 /// Shared by `Run` (`WorkloadClaim::Api`) and the initial `cmd` launched by
 /// the boot/restore tails (`WorkloadClaim::Initial`): claims the sandbox
@@ -148,7 +148,7 @@ fn spawn_exit_watcher(
 /// rolls the claim back to `Ready`.
 pub(super) async fn start_run_workload(
     id: &SandboxId,
-    vsock: &dyn arcbox_vm_driver::Vsock,
+    agent: &dyn GuestAgent,
     start: StartCommand,
     instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
@@ -156,7 +156,7 @@ pub(super) async fn start_run_workload(
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
     claim_workload(id, instances, claim)?;
 
-    let inner_rx = match vm_proto::run(vsock, start).await {
+    let inner_rx = match agent.run(start).await {
         Ok(rx) => rx,
         Err(e) => {
             release_running(id, instances);
@@ -184,7 +184,7 @@ impl SandboxManager {
         tty_size: Option<(u16, u16)>,
         timeout_seconds: u32,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
-        let vsock = self.require_ready_vsock(id)?;
+        let agent = self.require_ready_agent(id)?;
 
         let start = StartCommand {
             cmd,
@@ -199,7 +199,7 @@ impl SandboxManager {
 
         start_run_workload(
             id,
-            vsock.as_ref(),
+            agent.as_ref(),
             start,
             &self.instances,
             &self.events_tx,

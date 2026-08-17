@@ -705,7 +705,7 @@ impl SandboxManager {
             )));
         };
 
-        let vsock = self.require_ready_vsock(sandbox_id)?;
+        let agent = self.require_ready_agent(sandbox_id)?;
         let start = StartCommand {
             cmd: spec.cmd.clone(),
             env: spec.env.clone(),
@@ -721,7 +721,7 @@ impl SandboxManager {
         // racer never launches a process (same discipline as workload.rs).
         super::workload::claim_running(sandbox_id, &self.instances)?;
 
-        let (input_tx, output_rx) = match vm_proto::exec(vsock.as_ref(), start).await {
+        let (input_tx, output_rx) = match agent.exec(start).await {
             Ok(pair) => pair,
             Err(e) => {
                 super::workload::release_running(sandbox_id, &self.instances);
@@ -871,8 +871,8 @@ impl SandboxManager {
         port: u16,
         timeout: Duration,
     ) -> Result<()> {
-        let vsock = self.require_alive_vsock(id)?;
-        match vm_proto::wait_for_port(vsock.as_ref(), port, timeout).await? {
+        let agent = self.require_alive_agent(id)?;
+        match agent.wait_for_port(port, timeout).await? {
             crate::agent::PortWait::Listening => Ok(()),
             crate::agent::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
                 "no listener on port {port} in sandbox '{id}' within {}s",

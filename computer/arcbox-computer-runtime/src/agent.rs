@@ -29,8 +29,7 @@ use crate::file_proto::FileStatDto;
 
 pub mod vm_proto;
 
-pub use vm_proto::files::DirWatch;
-pub use vm_proto::{VmProtoAgent, VmProtoAgentFactory};
+pub use vm_proto::{DirWatch, VmProtoAgent, VmProtoAgentFactory};
 
 /// The command vocabulary the guest agent starts processes from, shared
 /// with `vm-agent` through `arcbox-vm-proto`.

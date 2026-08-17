@@ -599,12 +599,11 @@ impl SandboxManager {
                 // invariant snapshots pair with an invariant TAP (host-side
                 // NAT, no guest work); legacy snapshots keep the legacy TAP
                 // shape and are re-addressed over the reconfig RPC below.
-                let mode = if snap_meta.net_invariant {
-                    AttachMode::Invariant
-                } else {
-                    AttachMode::LegacySnapshot
-                };
-                nic = Some(self.network.activate(lease, mode).await?);
+                nic = Some(
+                    self.network
+                        .activate(lease, super::attach_mode(snap_meta.net_invariant))
+                        .await?,
+                );
             }
             Ok::<_, VmmError>(())
         }
@@ -842,22 +841,32 @@ impl SandboxManager {
                 )
             };
 
+        // What the guest holds on its interface, read under the mode its
+        // snapshot was addressed in: an invariant guest carries the fixed
+        // identity, a legacy one the pool address the reconfig below moves
+        // it to. Derived once — the agent and that RPC must not disagree.
+        let identity = lease.as_ref().map(|lease| {
+            self.network
+                .identity(lease, super::attach_mode(snap_meta.net_invariant))
+        });
+
         // Load the image on the prepared VMM: the disk is the rootfs staged
         // into the owner's jail, eth0 lands on the fresh TAP.
-        let loaded: Result<Arc<dyn VmHandle>> = async {
+        let loaded: Result<(Arc<dyn VmHandle>, Arc<dyn GuestAgent>)> = async {
             let restore = super::spec::restore_spec(
                 &resource_owner,
                 &chroot,
                 nic.clone(),
                 IsolationSpec::try_from(jailer)?,
             )?;
-            Ok(Arc::from(
-                prepared.restore(&staged_checkpoint, restore).await?,
-            ))
+            let handle: Arc<dyn VmHandle> =
+                Arc::from(prepared.restore(&staged_checkpoint, restore).await?);
+            let agent = self.agent.connect(Arc::clone(&handle), identity.as_ref())?;
+            Ok((handle, agent))
         }
         .await;
-        let handle = match loaded {
-            Ok(handle) => handle,
+        let (handle, agent) = match loaded {
+            Ok(loaded) => loaded,
             Err(error) => {
                 return Err(self
                     .rollback_restore(
@@ -873,8 +882,6 @@ impl SandboxManager {
         };
 
         let t_loaded = std::time::Instant::now();
-        let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-            Arc::new(vm_proto::HandleVsock(Arc::clone(&handle)));
 
         // Clock sync after restore is DETACHED, mirroring the cold-boot path
         // (boot.rs): vm-agent re-syncs itself from ptp_kvm (/dev/ptp0) on
@@ -886,13 +893,10 @@ impl SandboxManager {
         // restore RPC (CORE-80).
         {
             let id = new_id.clone();
-            let vsock = Arc::clone(&vsock);
+            let agent = Arc::clone(&agent);
             tokio::spawn(async move {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    vm_proto::sync_clock(vsock.as_ref()),
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::from_secs(10), agent.sync_clock())
+                    .await
                 {
                     Ok(Ok(ClockSync::Synced)) => {}
                     Ok(Ok(ClockSync::AgentError(code))) => {
@@ -912,9 +916,6 @@ impl SandboxManager {
         // silent breakage `network_override` exists to prevent — fail the
         // restore rather than hand back a half-networked sandbox.
         let net_reconfig = async {
-            let Some(lease) = &lease else {
-                return Ok(());
-            };
             // Invariant-addressed snapshot: the guest already holds the fixed
             // link-local identity and its resolv.conf already points at the
             // fixed gateway; the fresh TAP carries the new pool IP host-side.
@@ -923,9 +924,9 @@ impl SandboxManager {
             if snap_meta.net_invariant {
                 return Ok(());
             }
-            // What to tell the guest is the network's answer for the mode
-            // its interface was activated in, not the lease read raw.
-            let identity = self.network.identity(lease, AttachMode::LegacySnapshot);
+            let Some(identity) = identity.as_ref() else {
+                return Ok(());
+            };
             let cmd = crate::boot_proto::NetReconfigCommand {
                 ip: super::ipv4(identity.ip)?,
                 netmask: super::netmask(identity.prefix_len),
@@ -933,7 +934,7 @@ impl SandboxManager {
             };
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                vm_proto::reconfigure_network(vsock.as_ref(), &cmd),
+                agent.reconfigure_network(&cmd),
             )
             .await
             .map_err(|_| VmmError::Vsock("net reconfig after restore timed out".into()))
@@ -1062,7 +1063,7 @@ impl SandboxManager {
             super::boot::run_initial_cmd(
                 &new_id,
                 effective_spec.clone(),
-                vsock.as_ref(),
+                agent.as_ref(),
                 &self.instances,
                 &self.events_tx,
             )
@@ -1072,7 +1073,7 @@ impl SandboxManager {
         };
         if warm_create
             && let Some(probe) = effective_spec.ready_probe.clone()
-            && let Err(probe_error) = super::boot::run_ready_probe(&probe, vsock.as_ref()).await
+            && let Err(probe_error) = super::boot::run_ready_probe(&probe, agent.as_ref()).await
         {
             let message = format!("ready probe failed after restore: {probe_error}");
             if let Err(remove_error) = self.remove_sandbox(&new_id, true).await {
@@ -1125,7 +1126,7 @@ impl SandboxManager {
             let _ = super::boot::run_initial_cmd(
                 &new_id,
                 effective_spec,
-                vsock.as_ref(),
+                agent.as_ref(),
                 &self.instances,
                 &self.events_tx,
             )

@@ -45,19 +45,14 @@ use arcbox_vm_proto::exec::{MSG_EXIT, MSG_STDERR, MSG_STDOUT};
 mod client;
 mod clock;
 mod exec;
-pub mod files;
+mod files;
 mod handle;
 mod net;
 mod wait_port;
 
 pub use client::{VmProtoAgent, VmProtoAgentFactory};
+pub use files::DirWatch;
 pub(crate) use handle::HandleVsock;
-// The flows still call the protocol functions directly; the next commit
-// moves them onto the port and these go with it.
-pub(crate) use clock::sync_clock;
-pub(crate) use exec::{exec, run};
-pub(crate) use net::reconfigure_network;
-pub(crate) use wait_port::wait_for_port;
 
 impl ExitStatus {
     /// Decode a `MSG_EXIT` payload.

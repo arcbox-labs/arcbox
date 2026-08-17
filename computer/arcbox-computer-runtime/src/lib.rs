@@ -30,8 +30,11 @@
 //!
 //! - [`SandboxManager`] — top-level sandbox orchestrator
 //! - [`SandboxEnvironment`] — the environment-specific components a
-//!   composer supplies: the VM driver, the guest network, block tooling,
-//!   the packet filter
+//!   composer supplies: the VM driver, the guest network, the guest-agent
+//!   factory, block tooling, the packet filter
+//! - [`agent`] — the guest-agent port: how the runtime reaches the agent
+//!   inside a Computer (exec, files, clock, readiness), with the
+//!   `arcbox-vm-proto` vsock client as its one implementation
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state

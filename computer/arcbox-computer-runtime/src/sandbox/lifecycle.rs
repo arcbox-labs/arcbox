@@ -457,6 +457,7 @@ impl SandboxManager {
             let events_tx = self.events_tx.clone();
             let cow_manager = Arc::clone(&self.cow_manager);
             let records = Arc::clone(&self.records);
+            let agents = Arc::clone(&self.agent);
             let id_clone = id.clone();
             let (resource_handoff_tx, resource_handoff) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
@@ -475,6 +476,7 @@ impl SandboxManager {
                     generation,
                     warm_publish,
                     resource_handoff_tx,
+                    agents,
                 )
                 .await;
             });
@@ -814,15 +816,11 @@ impl SandboxManager {
             .ok_or_else(|| VmmError::NotFound(id.clone()))
     }
 
-    /// Verify the sandbox is `Ready` and return the vsock capability that
-    /// reaches its guest agent.
+    /// Verify the sandbox is `Ready` and return the agent inside it.
     ///
     /// A paused sandbox answers [`VmmError::Paused`], not `WrongState`, so
     /// the daemon can resume it transparently and retry (CORE-21).
-    pub(super) fn require_ready_vsock(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
+    pub(super) fn require_ready_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
@@ -838,18 +836,15 @@ impl SandboxManager {
                 });
             }
         }
-        guest_vsock(id, &inst)
+        self.guest_agent(id, &inst)
     }
 
-    /// Verify the sandbox is alive (Ready or Running) and return the vsock
-    /// capability that reaches its guest agent. Unlike
-    /// [`Self::require_ready_vsock`], an in-flight workload does not block
-    /// the operation — file I/O works alongside Run/Exec. Paused states map
-    /// to [`VmmError::Paused`] for the daemon's transparent resume, as above.
-    pub(super) fn require_alive_vsock(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
+    /// Verify the sandbox is alive (Ready or Running) and return the agent
+    /// inside it. Unlike [`Self::require_ready_agent`], an in-flight
+    /// workload does not block the operation — file I/O works alongside
+    /// Run/Exec. Paused states map to [`VmmError::Paused`] for the daemon's
+    /// transparent resume, as above.
+    pub(super) fn require_alive_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
@@ -865,17 +860,27 @@ impl SandboxManager {
                 });
             }
         }
-        guest_vsock(id, &inst)
+        self.guest_agent(id, &inst)
     }
-}
 
-/// The vsock capability reaching `inst`'s guest agent: the running VM's,
-/// once a boot or restore has handed its handle over.
-fn guest_vsock(id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
-    inst.handle
-        .clone()
-        .map(|handle| Arc::new(vm_proto::HandleVsock(handle)) as Arc<dyn arcbox_vm_driver::Vsock>)
-        .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))
+    /// The agent reaching `inst`'s guest, built from the running VM's
+    /// handle once a boot or restore has handed it over.
+    ///
+    /// On the exec and file hot paths, so it stays a construction from
+    /// state already held: no lock beyond the instance's, no mailbox, no
+    /// I/O. The identity is what the guest was told over its interface,
+    /// read under the mode that interface was activated in.
+    fn guest_agent(&self, id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn GuestAgent>> {
+        let handle = inst
+            .handle
+            .clone()
+            .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))?;
+        let identity = inst.network.as_ref().map(|lease| {
+            self.network
+                .identity(lease, super::attach_mode(inst.net_invariant))
+        });
+        self.agent.connect(handle, identity.as_ref())
+    }
 }
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.

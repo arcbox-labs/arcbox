@@ -15,11 +15,7 @@ use crate::error::{Result, VmmError};
 /// the listener appears or `timeout` elapses. The host-side read deadline
 /// adds slack on top of the guest's own budget so a live guest always
 /// answers first.
-pub async fn wait_for_port(
-    vsock: &dyn Vsock,
-    port: u16,
-    timeout: Duration,
-) -> Result<PortWait> {
+pub async fn wait_for_port(vsock: &dyn Vsock, port: u16, timeout: Duration) -> Result<PortWait> {
     let mut stream = connect_to_agent(vsock).await?;
     wait_for_port_on_stream(&mut stream, port, timeout).await
 }

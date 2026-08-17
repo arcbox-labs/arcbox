@@ -32,9 +32,8 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::agent::vm_proto;
 use crate::agent::{ClockSync, ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-use crate::agent::{GuestAgentFactory, Readiness, VmProtoAgentFactory};
+use crate::agent::{GuestAgent, GuestAgentFactory, Readiness, VmProtoAgentFactory};
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
@@ -92,6 +91,10 @@ pub struct SandboxManager {
     /// Its `NetworkReconcile` capability is required at construction: the
     /// cleanup-token protocol and the startup sweep are not optional here.
     network: Arc<dyn GuestNetwork>,
+    /// How every sandbox's guest agent is reached, behind the guest-agent
+    /// port. It also owns the readiness gate the boot flow arms before the
+    /// guest starts.
+    agent: Arc<dyn GuestAgentFactory>,
     snapshots: Arc<SnapshotCatalog>,
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
@@ -287,6 +290,7 @@ impl SandboxManager {
             records,
             driver,
             network,
+            agent,
             snapshots,
             templates,
             config,
@@ -504,6 +508,18 @@ pub(super) fn netmask(prefix_len: u8) -> std::net::Ipv4Addr {
 
 /// The connectivity every sandbox gets: egress through the host's address,
 /// which is what the System VM's netfilter provides for the pool.
+/// The mode a guest's interface was activated in, which is what
+/// [`GuestNetwork::identity`] must be read under: fresh boots take the
+/// fixed invariant identity, and only checkpoints taken before it existed
+/// carry the pool address on the interface itself.
+pub(super) const fn attach_mode(net_invariant: bool) -> AttachMode {
+    if net_invariant {
+        AttachMode::Invariant
+    } else {
+        AttachMode::LegacySnapshot
+    }
+}
+
 pub(super) const fn sandbox_network_policy() -> NetworkPolicy {
     NetworkPolicy {
         mode: NetworkMode::Nat,

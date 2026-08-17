@@ -3,14 +3,16 @@ use super::spec::build_vm_spec;
 use super::types::action;
 use super::*;
 use arcbox_snapshot::SnapshotError;
+use arcbox_vm_driver::VmHandle;
 use arcbox_vm_driver::net::GuestNetwork;
-use arcbox_vm_driver::{VmHandle, VsockListener};
 
-type BootOutput = (Arc<dyn VmHandle>, Box<dyn VsockListener>);
+use crate::agent::ReadyGate;
 
-/// How long the readiness gate waits for vm-agent's dial-out (the guest
-/// connect to [`vm_proto::READY_PORT`]) before the boot is declared failed.
-/// Covers guest kernel boot plus agent startup.
+type BootOutput = (Arc<dyn VmHandle>, Box<dyn ReadyGate>);
+
+/// How long the readiness gate waits for the guest agent to announce
+/// itself before the boot is declared failed. Covers guest kernel boot plus
+/// agent startup.
 const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Cap on the non-gating cold-boot clock sync: `sync_clock`'s internal
@@ -43,6 +45,7 @@ pub(super) async fn boot_sandbox(
     generation: Uuid,
     warm_publish: Option<super::warm::WarmPublishTicket>,
     resource_handoff: tokio::sync::oneshot::Sender<()>,
+    agents: Arc<dyn GuestAgentFactory>,
 ) {
     match do_boot(
         &id,
@@ -50,6 +53,7 @@ pub(super) async fn boot_sandbox(
         net.as_ref(),
         &vm_dir,
         driver.as_ref(),
+        agents.as_ref(),
         &config,
         &cow_manager,
         &instances,
@@ -58,7 +62,7 @@ pub(super) async fn boot_sandbox(
     )
     .await
     {
-        Ok((handle, mut ready_listener)) => {
+        Ok((handle, mut ready_gate)) => {
             let current = instances.read().unwrap().get(&id).cloned();
             let is_current_generation = current
                 .as_ref()
@@ -69,52 +73,53 @@ pub(super) async fn boot_sandbox(
             }
 
             // READY promises "accepting executions", but InstanceStart returns
-            // while the guest kernel is still booting and vm-agent is not yet
-            // listening. The gate is an event, not a poll: once its exec and
-            // file listeners are up, vm-agent dials host port READY_PORT, and
-            // the accept on the listener do_boot pre-bound IS the signal.
+            // while the guest kernel is still booting and the agent is not yet
+            // serving. Under the vm-proto agent the gate is an event, not a
+            // poll: once its exec and file listeners are up, vm-agent dials
+            // the host back, and the accept on the listener do_boot pre-armed
+            // IS the signal.
             //
             // Compat: an OLD vm-agent (no dial-out) under this host would sit
             // out the full gate timeout — but the template freshness keys
             // (the vm-agent binary among them) rebuild the default template
             // and re-inject it into docker templates automatically, so a
             // guest always carries the agent from the same build as its host.
-            let agent_ready = match tokio::time::timeout(
-                AGENT_GATE_TIMEOUT,
-                vm_proto::wait_ready(&mut *ready_listener),
-            )
-            .await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(VmmError::Vsock(format!("agent readiness gate: {error}"))),
-                Err(_) => Err(VmmError::Vsock(format!(
-                    "agent readiness gate: vm-agent did not dial the ready port within {}s",
-                    AGENT_GATE_TIMEOUT.as_secs()
-                ))),
+            let agent_ready =
+                match tokio::time::timeout(AGENT_GATE_TIMEOUT, ready_gate.wait(&handle)).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => {
+                        Err(VmmError::Vsock(format!("agent readiness gate: {error}")))
+                    }
+                    Err(_) => Err(VmmError::Vsock(format!(
+                        "agent readiness gate: the guest agent did not announce itself within {}s",
+                        AGENT_GATE_TIMEOUT.as_secs()
+                    ))),
+                };
+            // The observer is per-boot; the gate has consumed its one event.
+            drop(ready_gate);
+            let agent = match agent_ready.and_then(|()| {
+                agents.connect(Arc::clone(&handle), net.as_ref().map(|n| &n.identity))
+            }) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    let message = error.to_string();
+                    fail_live_sandbox(
+                        &id,
+                        Some(generation),
+                        &message,
+                        &vm_dir,
+                        &instances,
+                        &network,
+                        &config,
+                        &cow_manager,
+                        &records,
+                        &events_tx,
+                    )
+                    .await;
+                    error!(sandbox_id = %id, %error, "sandbox agent was not reachable after boot");
+                    return;
+                }
             };
-            // The socket file is per-boot; the gate has consumed its one event.
-            drop(ready_listener);
-            if let Err(gate_error) = agent_ready {
-                let message = gate_error.to_string();
-                fail_live_sandbox(
-                    &id,
-                    Some(generation),
-                    &message,
-                    &vm_dir,
-                    &instances,
-                    &network,
-                    &config,
-                    &cow_manager,
-                    &records,
-                    &events_tx,
-                )
-                .await;
-                error!(sandbox_id = %id, error = %gate_error, "sandbox agent readiness gate failed");
-                return;
-            }
-
-            let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-                Arc::new(vm_proto::HandleVsock(Arc::clone(&handle)));
 
             // The guest clock still needs setting on cold boot (no RTC — the
             // guest wakes at the kernel default epoch), but it must not delay
@@ -126,14 +131,9 @@ pub(super) async fn boot_sandbox(
             // retires once ptp is proven in production.
             {
                 let id = id.clone();
-                let vsock = Arc::clone(&vsock);
+                let agent = Arc::clone(&agent);
                 tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        CLOCK_SYNC_TIMEOUT,
-                        vm_proto::sync_clock(vsock.as_ref()),
-                    )
-                    .await
-                    {
+                    match tokio::time::timeout(CLOCK_SYNC_TIMEOUT, agent.sync_clock()).await {
                         Ok(Ok(ClockSync::Synced)) => {}
                         Ok(Ok(ClockSync::AgentError(code))) => {
                             warn!(
@@ -258,10 +258,10 @@ pub(super) async fn boot_sandbox(
             let cmd_started = if spec.cmd.is_empty() {
                 false
             } else {
-                run_initial_cmd(&id, spec.clone(), vsock.as_ref(), &instances, &events_tx).await
+                run_initial_cmd(&id, spec.clone(), agent.as_ref(), &instances, &events_tx).await
             };
             if let Some(probe) = spec.ready_probe.clone()
-                && let Err(probe_error) = run_ready_probe(&probe, vsock.as_ref()).await
+                && let Err(probe_error) = run_ready_probe(&probe, agent.as_ref()).await
             {
                 let message = format!("ready probe failed: {probe_error}");
                 fail_live_sandbox(
@@ -319,7 +319,7 @@ pub(super) async fn boot_sandbox(
             // second failure is final — warned, the sandbox stays Ready,
             // the caller can still Run/Exec.
             if !cmd_started && !spec.cmd.is_empty() {
-                let _ = run_initial_cmd(&id, spec, vsock.as_ref(), &instances, &events_tx).await;
+                let _ = run_initial_cmd(&id, spec, agent.as_ref(), &instances, &events_tx).await;
             }
         }
         Err(mut failure) => {
@@ -547,7 +547,7 @@ const READY_PROBE_RETRY_MS: u64 = 500;
 /// until it exits 0 or the deadline elapses.
 pub(super) async fn run_ready_probe(
     probe: &crate::template_catalog::ReadyProbeSpec,
-    vsock: &dyn arcbox_vm_driver::Vsock,
+    agent: &dyn GuestAgent,
 ) -> Result<()> {
     use crate::template_catalog::ReadyProbeSpec;
     let effective = |timeout_seconds: u32| {
@@ -561,7 +561,10 @@ pub(super) async fn run_ready_probe(
         ReadyProbeSpec::Port {
             port,
             timeout_seconds,
-        } => match vm_proto::wait_for_port(vsock, *port, effective(*timeout_seconds)).await? {
+        } => match agent
+            .wait_for_port(*port, effective(*timeout_seconds))
+            .await?
+        {
             PortWait::Listening => Ok(()),
             PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
                 "no listener on port {port} within the ready-probe deadline"
@@ -591,7 +594,7 @@ pub(super) async fn run_ready_probe(
                 // The guest kill timer has whole-second granularity; the
                 // host timeout enforces the exact remaining budget.
                 let budget_secs = u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX);
-                match tokio::time::timeout(remaining, run_probe_command(cmd, vsock, budget_secs))
+                match tokio::time::timeout(remaining, run_probe_command(cmd, agent, budget_secs))
                     .await
                 {
                     Ok(Ok(ExitStatus::Code(0))) => return Ok(()),
@@ -621,7 +624,7 @@ pub(super) async fn run_ready_probe(
 /// One probe attempt: run the command and wait for its exit status.
 async fn run_probe_command(
     cmd: &[String],
-    vsock: &dyn arcbox_vm_driver::Vsock,
+    agent: &dyn GuestAgent,
     timeout_seconds: u32,
 ) -> Result<ExitStatus> {
     let start = StartCommand {
@@ -634,7 +637,7 @@ async fn run_probe_command(
         tty_height: 24,
         timeout_seconds,
     };
-    let (_input, mut output) = vm_proto::exec(vsock, start).await?;
+    let (_input, mut output) = agent.exec(start).await?;
     while let Some(chunk) = output.recv().await {
         if let OutputChunk::Exit(status) = chunk? {
             return Ok(status);
@@ -664,7 +667,7 @@ async fn run_probe_command(
 pub(super) async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
-    vsock: &dyn arcbox_vm_driver::Vsock,
+    agent: &dyn GuestAgent,
     instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) -> bool {
@@ -680,7 +683,7 @@ pub(super) async fn run_initial_cmd(
     };
     match super::workload::start_run_workload(
         id,
-        vsock,
+        agent,
         start,
         instances,
         events_tx,
@@ -815,6 +818,7 @@ async fn do_boot(
     net: Option<&NetworkAttachment>,
     vm_dir: &Path,
     driver: &dyn VmDriver,
+    agents: &dyn GuestAgentFactory,
     config: &VmmConfig,
     cow_manager: &CowManager,
     instances: &super::InstanceMap,
@@ -1066,23 +1070,21 @@ async fn do_boot(
         });
     }
 
-    // Bind the readiness listener BEFORE the guest starts: vm-agent dials
-    // host port READY_PORT as soon as it is serving, and the VMM forwards
-    // that guest-initiated connect only if someone is already listening —
-    // otherwise the guest is reset and the one readiness event is lost.
-    // The prepared VM binds it where the guest's dial-out lands.
+    // Arm the readiness observer BEFORE the guest starts: a guest that
+    // announces itself by dialing the host does so the moment it is
+    // serving, and the VMM forwards that connect only if someone is already
+    // listening — otherwise the guest is reset and the one readiness event
+    // is lost. Which observer that is, and whether there is one at all, is
+    // the agent port's business.
     let failed = |error: VmmError| BootFailure {
         error,
         prepared: None,
         cow_handle: None,
     };
-    let ready_listener = match prepared.vsock_listener() {
-        Some(listen) => listen.listen(vm_proto::READY_PORT).await,
-        None => Err(arcbox_vm_driver::Error::InvalidSpec(
-            "the vm driver cannot listen for the guest's readiness dial-out".into(),
-        )),
-    }
-    .map_err(|error| failed(error.into()))?;
+    let ready_gate = agents
+        .arm_readiness(prepared.as_ref())
+        .await
+        .map_err(failed)?;
 
     let vm_spec =
         build_vm_spec(id, spec, net, kernel_path, rootfs_path, isolation).map_err(failed)?;
@@ -1090,7 +1092,7 @@ async fn do_boot(
         .boot(vm_spec)
         .await
         .map_err(|error| failed(error.into()))?;
-    Ok((Arc::from(handle), ready_listener))
+    Ok((Arc::from(handle), ready_gate))
 }
 
 /// A staged file's host path inside the jail, from the chroot-relative name
