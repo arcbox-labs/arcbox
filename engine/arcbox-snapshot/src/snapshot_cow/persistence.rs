@@ -1,14 +1,15 @@
+use std::collections::hash_map::Entry;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::block_tools::loop_backing_file;
 use super::{
-    CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
-    TEMPLATE_PENDING_PREFIX, dmsetup_remove,
+    CowHandle, CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
+    TEMPLATE_PENDING_PREFIX, TemplateEntry, dmsetup_remove,
 };
 use crate::error::{Result, SnapshotError};
 
@@ -34,6 +35,114 @@ impl SetupOrphan {
 }
 
 impl CowManager {
+    /// Re-register the CoW resources of a sandbox whose VM is still running.
+    ///
+    /// Verifies the dm device is present and that the template's loop device
+    /// is still attached and still backs `handle.template_path`, then takes
+    /// the template refcount the handle is documented to own — which is what
+    /// keeps [`Self::reconcile_stale`] from detaching a shared loop out from
+    /// under a live rootfs, and what makes the eventual teardown balance.
+    ///
+    /// Call before [`Self::reconcile_stale`], once per adopted sandbox. A
+    /// failed verification is an error rather than a silent skip: the
+    /// caller's fallback is to tear the sandbox down, and it has to know.
+    pub fn adopt(&self, handle: &CowHandle) -> Result<()> {
+        #[cfg(any(test, feature = "test-probe"))]
+        if self.test_probe.is_some() {
+            // The probe stands in for every device this method inspects.
+            return Ok(());
+        }
+        // The device the guest is running on. Without it there is no
+        // snapshot to re-register, whatever the journal claims.
+        if !Path::new(&handle.dm_device).exists() {
+            return Err(SnapshotError::FailedPrecondition(format!(
+                "sandbox device {} is gone",
+                handle.dm_device
+            )));
+        }
+        // That snapshot's origin. Rediscovered rather than journaled: the
+        // loop belongs to the kernel, and only the kernel can say whether it
+        // still backs the template this handle names.
+        let loop_device = match loop_devices_for_backing_sync(&handle.template_path)?.as_slice() {
+            [device] => device.clone(),
+            [] => {
+                return Err(SnapshotError::FailedPrecondition(format!(
+                    "no loop device backs template {}",
+                    handle.template_path.display()
+                )));
+            }
+            // Which of them the live snapshot's origin is cannot be told from
+            // the backing file alone, and holding the refcount on the wrong
+            // one leaks the other at teardown.
+            devices => {
+                return Err(SnapshotError::FailedPrecondition(format!(
+                    "template {} is attached through {}",
+                    handle.template_path.display(),
+                    devices.join(", ")
+                )));
+            }
+        };
+        // Read before the map is locked, and unconditionally: the template
+        // map must never be held across a block-tools subprocess, and one
+        // extra `blockdev` per adopted sandbox is invisible next to the rest
+        // of a startup sweep.
+        let sectors = self.tools.device_sectors(&loop_device)?;
+        self.take_template_ref(&handle.template_path, &loop_device, sectors)?;
+        info!(
+            dm = %handle.dm_name,
+            template = %handle.template_path.display(),
+            loop_device = %loop_device,
+            "adopted a live sandbox's dm-snapshot"
+        );
+        Ok(())
+    }
+
+    /// Register `template` as held through `loop_device`, or add a reference
+    /// to the registration another holder already made.
+    ///
+    /// The bookkeeping half of [`Self::adopt`], with the device checks
+    /// already done: the reference the adopted handle's teardown decrements.
+    pub(super) fn take_template_ref(
+        &self,
+        template: &Path,
+        loop_device: &str,
+        sectors: u64,
+    ) -> Result<()> {
+        match self.templates.lock().unwrap().entry(template.to_path_buf()) {
+            Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                // The same "incomplete setup" sentinel the acquire path
+                // refuses on: a template whose detach failed with no owner
+                // left to retry it must not be resurrected by an adoption.
+                if entry.refcount == 0 {
+                    return Err(SnapshotError::Unavailable(format!(
+                        "template {} still owns resources from an incomplete CoW setup",
+                        template.display()
+                    )));
+                }
+                // One template, one loop: a second one is a view of the
+                // world this manager cannot reconcile, and picking either
+                // would leak the other.
+                if entry.loop_device != loop_device {
+                    return Err(SnapshotError::FailedPrecondition(format!(
+                        "template {} is held through {} but backs {loop_device}",
+                        template.display(),
+                        entry.loop_device
+                    )));
+                }
+                entry.refcount += 1;
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(TemplateEntry {
+                    loop_device: loop_device.to_owned(),
+                    sectors,
+                    refcount: 1,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Remove orphaned dm-snapshot devices, COW files, and template loop
     /// devices left over from a previous crash. Called after orphaned
     /// Firecracker processes are dead; it is synchronous because every

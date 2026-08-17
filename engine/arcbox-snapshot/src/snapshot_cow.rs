@@ -838,6 +838,30 @@ async fn create_sparse_file(
 mod tests {
     use super::*;
 
+    /// A manager over `cow_dir` with nothing attached and no `dmsetup`;
+    /// tests that need one adjust the field they are about.
+    fn manager(cow_dir: &Path) -> CowManager {
+        CowManager {
+            templates: Mutex::new(HashMap::new()),
+            setup_orphans: Mutex::new(HashMap::new()),
+            losetup_lock: AsyncMutex::new(()),
+            cow_dir: cow_dir.to_path_buf(),
+            tools: Arc::new(BusyboxBlockTools::default()),
+            dmsetup_bin: None,
+            test_probe: None,
+        }
+    }
+
+    fn handle_for(dm_device: &Path, template: &Path) -> CowHandle {
+        CowHandle {
+            dm_name: "arcbox-snap-box".into(),
+            dm_device: dm_device.to_string_lossy().into_owned(),
+            cow_loop: "/dev/loop9".into(),
+            cow_file: PathBuf::from("/nonexistent/arcbox-cow-box.img"),
+            template_path: template.to_path_buf(),
+        }
+    }
+
     #[test]
     fn test_dm_name_format() {
         let name = format!("{DM_NAME_PREFIX}test-sandbox-123");
@@ -881,15 +905,7 @@ mod tests {
     #[test]
     fn template_marker_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(tmp.path());
 
         let template = PathBuf::from("/var/lib/arcbox/rootfs.ext4");
         mgr.write_template_marker("/dev/loop7", &template).unwrap();
@@ -912,15 +928,7 @@ mod tests {
         std::fs::create_dir_all(&marker_dir).unwrap();
         let temporary = marker_dir.join(format!("{TEMPLATE_MARKER_TEMP_PREFIX}loop7"));
         std::fs::write(&temporary, b"/partial").unwrap();
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(tmp.path());
 
         mgr.cleanup_stale_template_markers().unwrap();
 
@@ -943,15 +951,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cow_file = tmp.path().join("existing.img");
         std::fs::write(&cow_file, b"owned by another setup").unwrap();
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(tmp.path());
 
         let _ = mgr
             .rollback_setup(
@@ -971,22 +971,16 @@ mod tests {
     async fn zero_ref_template_is_not_reused() {
         let tmp = tempfile::tempdir().unwrap();
         let template = PathBuf::from("/template");
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::from([(
-                template.clone(),
-                TemplateEntry {
-                    loop_device: "/dev/loop7".into(),
-                    sectors: 1024,
-                    refcount: 0,
-                },
-            )])),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: Some("/not-used".into()),
-            test_probe: None,
-        };
+        let mut mgr = manager(tmp.path());
+        mgr.dmsetup_bin = Some("/not-used".into());
+        mgr.templates.lock().unwrap().insert(
+            template.clone(),
+            TemplateEntry {
+                loop_device: "/dev/loop7".into(),
+                sectors: 1024,
+                refcount: 0,
+            },
+        );
 
         assert!(matches!(
             mgr.setup("box", template.to_str().unwrap()).await,
@@ -1003,17 +997,126 @@ mod tests {
         );
     }
 
+    /// Nothing to re-register, whatever the journal claims — and the caller
+    /// has to hear about it, because its fallback is to kill the sandbox.
+    #[test]
+    fn adopt_refuses_a_missing_dm_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager(tmp.path());
+        let handle = handle_for(
+            &tmp.path().join("arcbox-snap-box"),
+            &tmp.path().join("t.ext4"),
+        );
+
+        let error = mgr.adopt(&handle).unwrap_err();
+
+        assert!(
+            matches!(&error, SnapshotError::FailedPrecondition(m) if m.contains("arcbox-snap-box")),
+            "{error}"
+        );
+        assert!(mgr.templates.lock().unwrap().is_empty());
+    }
+
+    /// The loop is the kernel's, so only the kernel can say whether it still
+    /// backs the recorded template; nothing backing it means the origin of
+    /// that snapshot cannot be identified, let alone held. Linux-only: off
+    /// it there is no `/sys/block` to answer either way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_refuses_a_template_no_loop_device_backs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Stands in for the live device node: `adopt` asks only whether the
+        // guest's device is still there.
+        let dm_device = tmp.path().join("arcbox-snap-box");
+        std::fs::write(&dm_device, b"").unwrap();
+        let template = tmp.path().join("t.ext4");
+        std::fs::write(&template, b"rootfs").unwrap();
+        let mgr = manager(tmp.path());
+
+        let error = mgr.adopt(&handle_for(&dm_device, &template)).unwrap_err();
+
+        assert!(
+            matches!(&error, SnapshotError::FailedPrecondition(m) if m.contains("no loop device backs")),
+            "{error}"
+        );
+        assert!(
+            mgr.templates.lock().unwrap().is_empty(),
+            "a refused adoption took a template reference"
+        );
+    }
+
+    /// What makes the eventual teardown balance: the first adopted sandbox
+    /// registers the template it found, and every later one holding the same
+    /// template adds a reference rather than a second registration.
+    #[test]
+    fn adopting_a_shared_template_registers_then_references() {
+        let mgr = manager(Path::new("/tmp"));
+        let template = Path::new("/templates/rootfs.ext4");
+
+        mgr.take_template_ref(template, "/dev/loop7", 2048).unwrap();
+        mgr.take_template_ref(template, "/dev/loop7", 2048).unwrap();
+
+        let templates = mgr.templates.lock().unwrap();
+        let entry = templates.get(template).unwrap();
+        assert_eq!(entry.refcount, 2);
+        assert_eq!(entry.loop_device, "/dev/loop7");
+        assert_eq!(entry.sectors, 2048);
+    }
+
+    /// Two refusals with the same consequence — the caller kills the sandbox
+    /// rather than adopt onto a template this manager cannot account for: an
+    /// entry left at refcount zero is the incomplete-setup sentinel the
+    /// acquire path also refuses on, and an entry naming a different loop
+    /// means one of the two is a leak whichever way it is resolved.
+    #[test]
+    fn adopting_refuses_a_zero_ref_or_relocated_template() {
+        let mgr = manager(Path::new("/tmp"));
+        let template = Path::new("/templates/rootfs.ext4");
+        mgr.templates.lock().unwrap().insert(
+            template.to_path_buf(),
+            TemplateEntry {
+                loop_device: "/dev/loop7".into(),
+                sectors: 2048,
+                refcount: 0,
+            },
+        );
+
+        let incomplete = mgr
+            .take_template_ref(template, "/dev/loop7", 2048)
+            .unwrap_err();
+        assert!(
+            matches!(&incomplete, SnapshotError::Unavailable(m) if m.contains("incomplete CoW setup")),
+            "{incomplete}"
+        );
+
+        mgr.templates
+            .lock()
+            .unwrap()
+            .get_mut(template)
+            .unwrap()
+            .refcount = 1;
+        let relocated = mgr
+            .take_template_ref(template, "/dev/loop9", 2048)
+            .unwrap_err();
+        assert!(
+            matches!(&relocated, SnapshotError::FailedPrecondition(m) if m.contains("/dev/loop9")),
+            "{relocated}"
+        );
+        assert_eq!(
+            mgr.templates
+                .lock()
+                .unwrap()
+                .get(template)
+                .unwrap()
+                .refcount,
+            1,
+            "a refused adoption took a template reference"
+        );
+    }
+
     #[tokio::test]
     async fn test_release_template_refcount() {
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: PathBuf::from("/tmp"),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(Path::new("/tmp"));
 
         let path = PathBuf::from("/tmp/template.ext4");
         {
