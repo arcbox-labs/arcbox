@@ -157,11 +157,15 @@ impl GuestNetwork for TapNetwork {
 impl NetworkReconcile for TapNetwork {
     /// Every quarantined VM with its token.
     ///
-    /// Every id the network reserves, writes, or loads passes the `VmId`
-    /// rules (`quarantine::validate_id`), so a ledger entry that fails
-    /// here cannot come from this crate — but the ledger is on disk, and
-    /// an entry the port cannot name would pin its address out of the pool
-    /// with no way to finalize it. It is reported, not skipped.
+    /// The error is a broken invariant rather than an expected on-disk
+    /// case: every id this crate reserves, writes, or loads passes the
+    /// `VmId` rules (`quarantine::validate_id`), and a marker file
+    /// carrying anything else fails construction outright. Should one
+    /// reach here, the whole list fails rather than losing that one entry
+    /// from it — nothing can name the entry, so nothing can finalize it,
+    /// so `finalize_startup_cleanup` refuses while it sits in the ledger
+    /// and the startup gate never opens. Dropping it would trade one loud
+    /// failure for that permanent, unexplained stall.
     async fn pending_cleanups(&self) -> Result<Vec<(VmId, String)>> {
         self.pending_quarantines()
             .into_iter()
