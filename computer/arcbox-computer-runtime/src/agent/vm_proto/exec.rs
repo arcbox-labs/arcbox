@@ -5,7 +5,8 @@ use tokio::sync::mpsc;
 use arcbox_vm_driver::Vsock;
 use arcbox_vm_proto::exec::{MSG_EOF, MSG_RESIZE, MSG_SIGNAL, MSG_START, MSG_STDIN};
 
-use super::{ExecInputMsg, OutputChunk, StartCommand, connect_to_agent, drain_output, write_frame};
+use super::{StartCommand, connect_to_agent, drain_output, write_frame};
+use crate::agent::{ExecInputMsg, OutputChunk};
 use crate::error::{Result, VmmError};
 
 /// Run a command in the sandbox and stream its output.

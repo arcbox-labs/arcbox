@@ -32,7 +32,9 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::agent::vm_proto::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
+use crate::agent::vm_proto;
+use crate::agent::{ClockSync, ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
+use crate::agent::{GuestAgentFactory, Readiness, VmProtoAgentFactory};
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
@@ -124,15 +126,19 @@ impl SandboxManager {
     ///
     /// Fails with [`VmmError::Config`] when the environment's driver lacks a
     /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
-    /// ahead of the guest), `Vsock` (the guest agent is reached over it) or
-    /// `VsockListen` (the readiness gate is the guest's dial-out) — or when
-    /// its guest network offers no `NetworkReconcile` (the cleanup-token
-    /// protocol is how a host releases the addresses a previous process
-    /// held), so an environment missing one is refused here instead of at
-    /// the first boot or the first cleanup ticket.
+    /// ahead of the guest), `Vsock` (the guest agent is reached over it), or
+    /// whatever the agent factory's readiness gate needs (`VsockListen` for
+    /// the guest's dial-out) — or when its guest network offers no
+    /// `NetworkReconcile` (the cleanup-token protocol is how a host
+    /// releases the addresses a previous process held), so an environment
+    /// missing one is refused here instead of at the first boot or the
+    /// first cleanup ticket.
     pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
         let driver = environment.driver.unwrap_or_else(|| {
             Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))) as Arc<dyn VmDriver>
+        });
+        let agent = environment.agent.unwrap_or_else(|| {
+            Arc::new(VmProtoAgentFactory::default()) as Arc<dyn GuestAgentFactory>
         });
         let capabilities = driver.capabilities();
         for (missing, capability, need) in [
@@ -141,13 +147,22 @@ impl SandboxManager {
                 "prepare",
                 "the boot and pool flows spawn the VMM ahead of the guest",
             ),
+            // The last hard-wired transport assumption in this layer: every
+            // agent implementation the crate ships reaches its guest through
+            // the VM handle. It leaves with the composition root (PR-G),
+            // which is what will know whether its Computers are dialable at
+            // all.
             (
                 !capabilities.vsock,
                 "vsock",
                 "the guest agent is reached over vsock",
             ),
+            // What the readiness gate needs is the agent port's answer, not
+            // this layer's: only a dial-out has to be listened for before
+            // the guest starts.
             (
-                !capabilities.vsock_listen,
+                matches!(agent.readiness(), Readiness::DialOut { .. })
+                    && !capabilities.vsock_listen,
                 "vsock_listen",
                 "the readiness gate is the guest's vsock dial-out",
             ),

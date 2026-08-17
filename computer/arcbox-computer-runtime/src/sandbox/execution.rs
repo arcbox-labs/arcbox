@@ -873,8 +873,8 @@ impl SandboxManager {
     ) -> Result<()> {
         let vsock = self.require_alive_vsock(id)?;
         match vm_proto::wait_for_port(vsock.as_ref(), port, timeout).await? {
-            crate::agent::vm_proto::PortWait::Listening => Ok(()),
-            crate::agent::vm_proto::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+            crate::agent::PortWait::Listening => Ok(()),
+            crate::agent::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
                 "no listener on port {port} in sandbox '{id}' within {}s",
                 timeout.as_secs()
             ))),

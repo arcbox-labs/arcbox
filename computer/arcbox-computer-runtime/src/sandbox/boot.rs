@@ -134,8 +134,8 @@ pub(super) async fn boot_sandbox(
                     )
                     .await
                     {
-                        Ok(Ok(vm_proto::ClockSync::Synced)) => {}
-                        Ok(Ok(vm_proto::ClockSync::AgentError(code))) => {
+                        Ok(Ok(ClockSync::Synced)) => {}
+                        Ok(Ok(ClockSync::AgentError(code))) => {
                             warn!(
                                 sandbox_id = %id, code,
                                 "agent could not set the clock; continuing with a possibly skewed clock"
@@ -562,8 +562,8 @@ pub(super) async fn run_ready_probe(
             port,
             timeout_seconds,
         } => match vm_proto::wait_for_port(vsock, *port, effective(*timeout_seconds)).await? {
-            vm_proto::PortWait::Listening => Ok(()),
-            vm_proto::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+            PortWait::Listening => Ok(()),
+            PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
                 "no listener on port {port} within the ready-probe deadline"
             ))),
         },

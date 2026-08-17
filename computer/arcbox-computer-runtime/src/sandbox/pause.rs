@@ -721,8 +721,8 @@ impl SandboxManager {
                     )
                     .await
                     {
-                        Ok(Ok(vm_proto::ClockSync::Synced)) => {}
-                        Ok(Ok(vm_proto::ClockSync::AgentError(code))) => {
+                        Ok(Ok(ClockSync::Synced)) => {}
+                        Ok(Ok(ClockSync::AgentError(code))) => {
                             warn!(sandbox_id = %id, code, "agent could not set the clock after resume");
                         }
                         Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after resume failed: {e}"),

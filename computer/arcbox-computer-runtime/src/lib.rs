@@ -75,7 +75,7 @@ pub use arcbox_tap_net as network;
 // paths stay so `arcbox-agent` and this crate's own modules keep compiling.
 pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
-pub use agent::vm_proto::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
+pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
 };

@@ -14,6 +14,7 @@ use arcbox_snapshot::snapshot_cow::{BlockTools, BusyboxBlockTools};
 use arcbox_vm_driver::VmDriver;
 use arcbox_vm_driver::net::GuestNetwork;
 
+use crate::agent::GuestAgentFactory;
 use crate::network::{IptablesLegacy, PacketFilter};
 
 /// What differs between hosts of the sandbox stack.
@@ -39,6 +40,16 @@ pub struct SandboxEnvironment {
     /// network without it is refused at construction rather than at the
     /// first cleanup ticket.
     pub network: Option<Arc<dyn GuestNetwork>>,
+    /// How the runtime reaches the agent inside each sandbox, behind the
+    /// guest-agent port ([`crate::agent::GuestAgentFactory`]). `None` — the
+    /// reference — is the `arcbox-vm-proto` client over the driver's vsock
+    /// capability ([`crate::agent::VmProtoAgentFactory`]), which is what
+    /// every Firecracker sandbox speaks; a composer whose Computers are
+    /// not reachable that way supplies its own. The factory also decides
+    /// what the readiness gate needs from the driver, so an environment
+    /// whose driver cannot serve it is refused at construction rather than
+    /// at the first boot.
+    pub agent: Option<Arc<dyn GuestAgentFactory>>,
     /// Loop-device and block-size operations for the copy-on-write rootfs
     /// (`arcbox_snapshot::snapshot_cow::BlockTools`).
     pub block_tools: Arc<dyn BlockTools>,
@@ -50,13 +61,15 @@ pub struct SandboxEnvironment {
 
 impl Default for SandboxEnvironment {
     /// The System VM's userland: the Firecracker driver from the config,
-    /// the TAP network from the config, busybox applets at
+    /// the TAP network from the config, the vm-proto agent client, busybox
+    /// applets at
     /// [`BusyboxBlockTools::DEFAULT_PATH`], iptables-legacy at
     /// [`IptablesLegacy::DEFAULT_PATH`].
     fn default() -> Self {
         Self {
             driver: None,
             network: None,
+            agent: None,
             block_tools: Arc::new(BusyboxBlockTools::default()),
             packet_filter: Arc::new(IptablesLegacy::default()),
         }

@@ -6,21 +6,8 @@ use arcbox_vm_driver::Vsock;
 use tracing::info;
 
 use super::{MSG_CLOCK_SYNC, MSG_EXIT, connect_to_agent, read_frame, write_frame};
+use crate::agent::ClockSync;
 use crate::error::{Result, VmmError};
-
-/// Outcome of a completed clock-sync round trip.
-///
-/// Both variants prove liveness — the agent accepted the connection, parsed
-/// the frame, and replied — which is what the boot readiness gate needs.
-/// Only [`ClockSync::Synced`] means the guest wall clock was actually set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClockSync {
-    /// The agent set the clock.
-    Synced,
-    /// The agent answered but could not set the clock (e.g. `clock_settime`
-    /// failed); it carries the agent-reported exit code.
-    AgentError(i32),
-}
 
 /// Synchronise the guest clock to the current host time.
 ///
