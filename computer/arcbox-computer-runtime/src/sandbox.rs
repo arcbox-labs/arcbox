@@ -32,6 +32,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::agent::vm_proto::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
@@ -39,7 +40,6 @@ use crate::network::NetworkManager;
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::template_catalog::TemplateCatalog;
-use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 
 mod boot;
 mod checkpoint;

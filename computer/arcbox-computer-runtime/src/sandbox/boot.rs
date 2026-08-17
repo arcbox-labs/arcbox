@@ -9,7 +9,7 @@ use arcbox_vm_driver::{VmHandle, VsockListener};
 type BootOutput = (Arc<dyn VmHandle>, Box<dyn VsockListener>);
 
 /// How long the readiness gate waits for vm-agent's dial-out (the guest
-/// connect to [`vsock::READY_PORT`]) before the boot is declared failed.
+/// connect to [`vm_proto::READY_PORT`]) before the boot is declared failed.
 /// Covers guest kernel boot plus agent startup.
 const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(35);
 
@@ -81,7 +81,7 @@ pub(super) async fn boot_sandbox(
             // guest always carries the agent from the same build as its host.
             let agent_ready = match tokio::time::timeout(
                 AGENT_GATE_TIMEOUT,
-                vsock::wait_ready(&mut *ready_listener),
+                vm_proto::wait_ready(&mut *ready_listener),
             )
             .await
             {
@@ -114,7 +114,7 @@ pub(super) async fn boot_sandbox(
             }
 
             let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-                Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
+                Arc::new(vm_proto::HandleVsock(Arc::clone(&handle)));
 
             // The guest clock still needs setting on cold boot (no RTC — the
             // guest wakes at the kernel default epoch), but it must not delay
@@ -130,12 +130,12 @@ pub(super) async fn boot_sandbox(
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         CLOCK_SYNC_TIMEOUT,
-                        vsock::sync_clock(vsock.as_ref()),
+                        vm_proto::sync_clock(vsock.as_ref()),
                     )
                     .await
                     {
-                        Ok(Ok(vsock::ClockSync::Synced)) => {}
-                        Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                        Ok(Ok(vm_proto::ClockSync::Synced)) => {}
+                        Ok(Ok(vm_proto::ClockSync::AgentError(code))) => {
                             warn!(
                                 sandbox_id = %id, code,
                                 "agent could not set the clock; continuing with a possibly skewed clock"
@@ -561,9 +561,9 @@ pub(super) async fn run_ready_probe(
         ReadyProbeSpec::Port {
             port,
             timeout_seconds,
-        } => match vsock::wait_for_port(vsock, *port, effective(*timeout_seconds)).await? {
-            vsock::PortWait::Listening => Ok(()),
-            vsock::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+        } => match vm_proto::wait_for_port(vsock, *port, effective(*timeout_seconds)).await? {
+            vm_proto::PortWait::Listening => Ok(()),
+            vm_proto::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
                 "no listener on port {port} within the ready-probe deadline"
             ))),
         },
@@ -634,7 +634,7 @@ async fn run_probe_command(
         tty_height: 24,
         timeout_seconds,
     };
-    let (_input, mut output) = vsock::exec(vsock, start).await?;
+    let (_input, mut output) = vm_proto::exec(vsock, start).await?;
     while let Some(chunk) = output.recv().await {
         if let OutputChunk::Exit(status) = chunk? {
             return Ok(status);
@@ -1077,7 +1077,7 @@ async fn do_boot(
         cow_handle: None,
     };
     let ready_listener = match prepared.vsock_listener() {
-        Some(listen) => listen.listen(vsock::READY_PORT).await,
+        Some(listen) => listen.listen(vm_proto::READY_PORT).await,
         None => Err(arcbox_vm_driver::Error::InvalidSpec(
             "the vm driver cannot listen for the guest's readiness dial-out".into(),
         )),

@@ -99,7 +99,7 @@ impl SandboxService {
             }
         };
 
-        let max = arcbox_computer_runtime::file_io::proto::MAX_FILE_SIZE;
+        let max = arcbox_computer_runtime::file_proto::MAX_FILE_SIZE;
         let mut data = Vec::new();
         loop {
             match read_message(stream).await {

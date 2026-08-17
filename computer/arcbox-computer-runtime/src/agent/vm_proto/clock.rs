@@ -98,8 +98,8 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
 
 #[cfg(test)]
 mod tests {
+    use super::super::MSG_STDOUT;
     use super::*;
-    use crate::vsock::MSG_STDOUT;
 
     /// Simulate a successful clock sync exchange.
     #[tokio::test]

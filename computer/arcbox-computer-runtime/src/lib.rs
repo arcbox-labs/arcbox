@@ -24,7 +24,7 @@
 //! neither links the other, so the crate graph — not a convention — keeps
 //! the agent (cross-compiled to static musl and staged into every sandbox
 //! rootfs) free of the manager and its dependencies. `boot_proto` and
-//! `file_io::proto` remain reachable through this crate as re-exports.
+//! `file_proto` remain reachable through this crate as re-exports.
 //!
 //! # Public API
 //!
@@ -49,16 +49,19 @@
 //! paths are re-exports of it so existing imports keep resolving; name
 //! `arcbox_snapshot` directly in new code.
 
+pub mod agent;
 pub mod config;
 pub mod environment;
 pub mod error;
-pub mod file_io;
 pub mod rootfs;
 pub mod sandbox;
-pub mod vsock;
 
 /// Boot-parameter vocabulary shared with `vm-agent` (`arcbox_vm_proto::boot`).
 pub use arcbox_vm_proto::boot as boot_proto;
+
+/// File-channel vocabulary shared with `vm-agent` (`arcbox_vm_proto::file`):
+/// the stat/event DTOs and the size caps a caller validates against.
+pub use arcbox_vm_proto::file as file_proto;
 
 /// The sandbox TAP network lives in `arcbox-tap-net` (vm-stack-redesign
 /// R2). Sandboxes reach it through the driver port; this path stays for
@@ -72,6 +75,7 @@ pub use arcbox_tap_net as network;
 // paths stay so `arcbox-agent` and this crate's own modules keep compiling.
 pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
+pub use agent::vm_proto::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
 };
@@ -90,4 +94,3 @@ pub use sandbox::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
-pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};

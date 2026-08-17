@@ -156,7 +156,7 @@ pub(super) async fn start_run_workload(
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
     claim_workload(id, instances, claim)?;
 
-    let inner_rx = match vsock::run(vsock, start).await {
+    let inner_rx = match vm_proto::run(vsock, start).await {
         Ok(rx) => rx,
         Err(e) => {
             release_running(id, instances);

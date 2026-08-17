@@ -1,7 +1,7 @@
 //! Conversions between `arcbox-computer-runtime` native types and
 //! `sandbox.v1` protos, plus the shared id-ordered pagination helper.
 
-use arcbox_computer_runtime::file_io::proto as file_proto;
+use arcbox_computer_runtime::file_proto;
 use arcbox_computer_runtime::template_catalog::{
     ReadyProbeSpec, TemplateDefaultsSpec, TemplateEntry,
 };

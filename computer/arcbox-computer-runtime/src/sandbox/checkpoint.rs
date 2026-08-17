@@ -874,7 +874,7 @@ impl SandboxManager {
 
         let t_loaded = std::time::Instant::now();
         let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-            Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
+            Arc::new(vm_proto::HandleVsock(Arc::clone(&handle)));
 
         // Clock sync after restore is DETACHED, mirroring the cold-boot path
         // (boot.rs): vm-agent re-syncs itself from ptp_kvm (/dev/ptp0) on
@@ -890,12 +890,12 @@ impl SandboxManager {
             tokio::spawn(async move {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    vsock::sync_clock(vsock.as_ref()),
+                    vm_proto::sync_clock(vsock.as_ref()),
                 )
                 .await
                 {
-                    Ok(Ok(vsock::ClockSync::Synced)) => {}
-                    Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                    Ok(Ok(vm_proto::ClockSync::Synced)) => {}
+                    Ok(Ok(vm_proto::ClockSync::AgentError(code))) => {
                         warn!(sandbox_id = %id, code, "agent could not set the clock after restore");
                     }
                     Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after restore failed: {e}"),
@@ -933,7 +933,7 @@ impl SandboxManager {
             };
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                vsock::reconfigure_network(vsock.as_ref(), &cmd),
+                vm_proto::reconfigure_network(vsock.as_ref(), &cmd),
             )
             .await
             .map_err(|_| VmmError::Vsock("net reconfig after restore timed out".into()))

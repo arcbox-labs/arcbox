@@ -703,7 +703,7 @@ impl SandboxManager {
                     .await?,
             );
             let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-                Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
+                Arc::new(vm_proto::HandleVsock(Arc::clone(&handle)));
 
             // Clock sync is DETACHED, mirroring restore and cold boot
             // (CORE-80): the guest wall clock froze at pause time, but
@@ -717,12 +717,12 @@ impl SandboxManager {
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        vsock::sync_clock(vsock.as_ref()),
+                        vm_proto::sync_clock(vsock.as_ref()),
                     )
                     .await
                     {
-                        Ok(Ok(vsock::ClockSync::Synced)) => {}
-                        Ok(Ok(vsock::ClockSync::AgentError(code))) => {
+                        Ok(Ok(vm_proto::ClockSync::Synced)) => {}
+                        Ok(Ok(vm_proto::ClockSync::AgentError(code))) => {
                             warn!(sandbox_id = %id, code, "agent could not set the clock after resume");
                         }
                         Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after resume failed: {e}"),
@@ -749,7 +749,7 @@ impl SandboxManager {
                 };
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    vsock::reconfigure_network(vsock.as_ref(), &cmd),
+                    vm_proto::reconfigure_network(vsock.as_ref(), &cmd),
                 )
                 .await
                 .map_err(|_| VmmError::Vsock("net reconfig after resume timed out".into()))

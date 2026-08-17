@@ -874,7 +874,7 @@ impl SandboxManager {
 fn guest_vsock(id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
     inst.handle
         .clone()
-        .map(|handle| Arc::new(vsock::HandleVsock(handle)) as Arc<dyn arcbox_vm_driver::Vsock>)
+        .map(|handle| Arc::new(vm_proto::HandleVsock(handle)) as Arc<dyn arcbox_vm_driver::Vsock>)
         .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))
 }
 

@@ -945,7 +945,7 @@ mod agent {
 
     /// Format a file-op failure with the machine-readable errno prefix the
     /// host maps onto typed errors
-    /// (`arcbox_computer_runtime::file_io::decode_file_err`).
+    /// (`arcbox_computer_runtime::agent::vm_proto::files::decode_file_err`).
     fn path_err_payload(op: &str, path: &str, e: &std::io::Error) -> String {
         match e.raw_os_error() {
             Some(libc::ENOENT) => format!("{ERR_NOT_FOUND}{path}"),

@@ -2,8 +2,8 @@
 //!
 //! The wire vocabulary — frame opcodes, request payloads, the stat/event
 //! DTOs, and the per-verb flows — is [`arcbox_vm_proto::file`], re-exported
-//! here as [`proto`] so `arcbox_computer_runtime::file_io::proto` keeps
-//! resolving for every consumer. This module is the tokio client the
+//! here as [`proto`], and from the crate root as [`crate::file_proto`] —
+//! the path consumers name. This module is the tokio client the
 //! manager drives: one vsock connection per operation, dialed through the
 //! driver port's [`Vsock`] capability, timeouts, and the mapping of the
 //! agent's errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`]
@@ -16,8 +16,8 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
 
+use super::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
 use crate::error::{Result, VmmError};
-use crate::vsock::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
 
 /// Per-operation timeout for file I/O over vsock.
 const FILE_IO_TIMEOUT: Duration = Duration::from_mins(1);
@@ -333,7 +333,7 @@ mod tests {
     use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
     use async_trait::async_trait;
 
-    use crate::vsock::{read_frame as async_read_frame, write_frame as async_write_frame};
+    use super::super::{read_frame as async_read_frame, write_frame as async_write_frame};
 
     /// A [`Vsock`] over a plain Unix socket: every dial connects to the one
     /// path, whatever the port — the file protocol under test does not care

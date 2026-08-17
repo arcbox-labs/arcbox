@@ -42,6 +42,7 @@ use arcbox_vm_proto::exec::{MSG_EXIT, MSG_STDERR, MSG_STDOUT};
 
 mod clock;
 mod exec;
+pub mod files;
 mod handle;
 mod net;
 mod wait_port;
