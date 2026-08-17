@@ -368,6 +368,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "arcbox-atomic-file",
+ "arcbox-computer-runtime",
  "arcbox-error",
  "arcbox-ext4",
  "arcbox-fc-driver",

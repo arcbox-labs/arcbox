@@ -58,6 +58,8 @@ pub mod environment;
 pub mod error;
 pub mod rootfs;
 pub mod sandbox;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 /// Boot-parameter vocabulary shared with `vm-agent` (`arcbox_vm_proto::boot`).
 pub use arcbox_vm_proto::boot as boot_proto;

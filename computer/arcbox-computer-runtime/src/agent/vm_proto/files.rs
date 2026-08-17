@@ -260,6 +260,15 @@ pub struct DirWatch {
 }
 
 impl DirWatch {
+    /// A watch over an already-open stream, for a [`GuestFiles`] that is
+    /// not this transport (`crate::testkit`).
+    ///
+    /// [`GuestFiles`]: crate::agent::GuestFiles
+    #[cfg(feature = "testkit")]
+    pub(crate) const fn over(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+
     /// Next filesystem event. `Ok(None)` is the clean end of the stream —
     /// the vm-agent side closed the connection (sandbox stopped).
     pub async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
