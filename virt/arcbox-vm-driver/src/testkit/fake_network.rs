@@ -22,6 +22,14 @@ use crate::spec::{MacAddr, NicAttachment, NicSpec, VmId};
 /// [`NetworkReconcile`] drains through the token protocol.
 /// [`FakeNetwork::with_startup_cleanup`] starts with a pending startup
 /// cleanup so that half of the protocol can be exercised too.
+///
+/// It answers that protocol in the same error *classes* a real adapter
+/// does — [`Error::Unavailable`] for come-back-later (a quarantined id, a
+/// gate still held by pending generations) and
+/// [`Error::PreconditionFailed`] for a token naming no pending generation.
+/// A caller's retry and precondition handling is therefore testable over
+/// this fake; flattening either into [`Error::Network`] would make a
+/// broken path look fine here and fail against the TAP network.
 pub struct FakeNetwork {
     ledger: Mutex<Ledger>,
     /// `true` while a startup cleanup is pending.
@@ -130,7 +138,14 @@ fn host_number(ip: IpAddr) -> Result<u16> {
 impl GuestNetwork for FakeNetwork {
     async fn reserve(&self, vm: &VmId, _policy: NetworkPolicy) -> Result<NetworkLease> {
         let mut ledger = lock(&self.ledger);
-        if ledger.active.contains_key(vm) || ledger.quarantined.contains_key(vm) {
+        // A quarantined id is the protocol's retry-later case: the address
+        // comes back once the host finalizes that generation.
+        if ledger.quarantined.contains_key(vm) {
+            return Err(Error::Unavailable(format!(
+                "vm {vm} cleanup is awaiting host finalization"
+            )));
+        }
+        if ledger.active.contains_key(vm) {
             return Err(Error::Network(format!("vm {vm} already holds a lease")));
         }
         let host = ledger
@@ -186,7 +201,9 @@ impl GuestNetwork for FakeNetwork {
             if existing.cleanup_token == lease.cleanup_token {
                 return Ok(());
             }
-            return Err(Error::Network(format!(
+            // Another generation of this id is mid-cleanup: retry-later,
+            // like the reserve above.
+            return Err(Error::Unavailable(format!(
                 "vm {} already has a different quarantined lease",
                 lease.vm
             )));
@@ -292,7 +309,8 @@ impl NetworkReconcile for FakeNetwork {
         let mut ledger = lock(&self.ledger);
         ledger.validate_startup_cleanup(token)?;
         if !ledger.quarantined.is_empty() {
-            return Err(Error::Network(
+            // Retry-later: the gate opens once those generations drain.
+            return Err(Error::Unavailable(
                 "cleanup generations remain pending; finalize them first".into(),
             ));
         }
@@ -311,13 +329,16 @@ impl NetworkReconcile for FakeNetwork {
 }
 
 impl Ledger {
+    /// A token that does not name a pending generation — of this VM or of
+    /// none at all — is a failed precondition: no retry of that token can
+    /// succeed, the caller needs a current one.
     fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
         let lease = self
             .quarantined
             .get(vm)
-            .ok_or_else(|| Error::Network(format!("vm {vm} has no pending cleanup")))?;
+            .ok_or_else(|| Error::PreconditionFailed(format!("vm {vm} has no pending cleanup")))?;
         if lease.cleanup_token != token {
-            return Err(Error::Network(format!(
+            return Err(Error::PreconditionFailed(format!(
                 "vm {vm} cleanup token does not name the pending generation"
             )));
         }
@@ -327,10 +348,12 @@ impl Ledger {
     fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
         match &self.startup {
             Some(startup) if !startup.host_cleaned && startup.token == token => Ok(()),
-            Some(startup) if !startup.host_cleaned => {
-                Err(Error::Network("startup cleanup token mismatch".into()))
-            }
-            _ => Err(Error::Network("no startup cleanup is pending".into())),
+            Some(startup) if !startup.host_cleaned => Err(Error::PreconditionFailed(
+                "startup cleanup token mismatch".into(),
+            )),
+            _ => Err(Error::PreconditionFailed(
+                "no startup cleanup is pending".into(),
+            )),
         }
     }
 }
@@ -396,7 +419,10 @@ mod tests {
         net.quarantine(a.clone()).await.unwrap(); // idempotent
         let mut other = a.clone();
         other.cleanup_token = "other".into();
-        assert!(net.quarantine(other).await.is_err());
+        assert!(matches!(
+            net.quarantine(other).await,
+            Err(Error::Unavailable(_))
+        ));
         assert!(net.activate(&a, AttachMode::Invariant).await.is_err());
 
         let reconcile = net.reconcile().unwrap();
@@ -404,7 +430,17 @@ mod tests {
             reconcile.pending_cleanups().await.unwrap(),
             vec![(id("a"), a.cleanup_token.clone())]
         );
-        assert!(reconcile.validate_cleanup(&id("a"), "wrong").await.is_err());
+        // A token that names no pending generation is a failed
+        // precondition; the id itself is refused until the host finalizes,
+        // which is a retry-later. Callers turn those into 412 and 503.
+        assert!(matches!(
+            reconcile.validate_cleanup(&id("a"), "wrong").await,
+            Err(Error::PreconditionFailed(_))
+        ));
+        assert!(matches!(
+            net.reserve(&id("a"), policy()).await,
+            Err(Error::Unavailable(_))
+        ));
         // Still held: the next lease does not get a's address.
         let b = net.reserve(&id("b"), policy()).await.unwrap();
         assert_ne!(b.ip, a.ip);
@@ -483,12 +519,20 @@ mod tests {
             reconcile.startup_cleanup_token().await.as_deref(),
             Some("boot-1")
         );
-        assert!(reconcile.validate_startup_cleanup("boot-2").await.is_err());
+        // Another generation's token can never name this sweep.
+        assert!(matches!(
+            reconcile.validate_startup_cleanup("boot-2").await,
+            Err(Error::PreconditionFailed(_))
+        ));
 
         let a = net.reserve(&id("a"), policy()).await.unwrap();
         net.quarantine(a.clone()).await.unwrap();
-        // A quarantined lease keeps the startup cleanup from finalizing.
-        assert!(reconcile.finalize_startup_cleanup("boot-1").await.is_err());
+        // A quarantined lease keeps the startup cleanup from finalizing —
+        // retry-later, since finalizing that generation opens the gate.
+        assert!(matches!(
+            reconcile.finalize_startup_cleanup("boot-1").await,
+            Err(Error::Unavailable(_))
+        ));
 
         let waiter = tokio::spawn({
             let net = std::sync::Arc::clone(&net);
