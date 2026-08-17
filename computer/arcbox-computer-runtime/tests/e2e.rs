@@ -344,7 +344,7 @@ async fn e2e_run_command() {
                 stdout.push_str(&String::from_utf8_lossy(&data));
             }
             arcbox_computer_runtime::OutputChunk::Exit(status) => {
-                exit_code = status.conventional_code()
+                exit_code = status.conventional_code();
             }
             arcbox_computer_runtime::OutputChunk::Stderr(_) => {}
         }
