@@ -18,10 +18,10 @@ use arcbox_fc_driver::jail::{
     SnapshotFiles, chroot_root, link_or_copy_for_jailer, move_file, stage_kernel_for_jailer,
     stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
 };
-use arcbox_fc_driver::spawn::{spawn_direct, spawn_jailer};
+use arcbox_fc_driver::spawn::spawn_jailer;
 use arcbox_fc_driver::vsock::UdsListener;
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
-use arcbox_vm_driver::{IsolationSpec, VmDriver};
+use arcbox_vm_driver::{IsolationSpec, Prepare, PreparedVm, VmDriver, VmId};
 use chrono::{DateTime, Utc};
 use fc_sdk::VmBuilder;
 use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
@@ -79,10 +79,6 @@ pub struct SandboxManager {
     /// The VMM every sandbox runs under, behind the driver port. Its
     /// `Prepare` capability is required at construction: the boot and pool
     /// flows spawn the VMM ahead of the guest.
-    #[allow(
-        dead_code,
-        reason = "read from the next commit on, once the boot, pool and restore flows own their VMs through it"
-    )]
     driver: Arc<dyn VmDriver>,
     network: Arc<NetworkManager>,
     snapshots: Arc<SnapshotCatalog>,
@@ -394,6 +390,34 @@ pub struct SandboxNetworkIdentity {
     /// How expose DNAT must target this sandbox, decided by the datapath
     /// actually applied to its TAP (CORE-81/CORE-83).
     pub expose: crate::network::ExposeTarget,
+}
+
+/// The driver's `Prepare` capability, which [`SandboxManager::with_environment`]
+/// requires — the boot, pool, and restore flows all spawn the VMM before
+/// there is a guest to run on it.
+pub(super) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
+    driver
+        .prepare()
+        .expect("SandboxManager::with_environment requires the driver's Prepare capability")
+}
+
+/// The VMM's pid as the crash journal records it: what a restart sweep
+/// kills before tearing the sandbox's other resources down.
+pub(super) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
+    prepared
+        .record()
+        .process
+        .and_then(|process| i32::try_from(process.pid).ok())
+}
+
+/// The isolation every sandbox VMM runs under: the jailer's, when one is
+/// configured; none otherwise (direct mode).
+pub(super) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
+    config
+        .firecracker
+        .jailer
+        .as_ref()
+        .map_or(Ok(IsolationSpec::None), IsolationSpec::try_from)
 }
 
 /// Stock sandbox id budget: what [`max_sandbox_id_len`] computes for the

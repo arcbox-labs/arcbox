@@ -345,15 +345,31 @@ pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Strin
         .unwrap_or_else(|| id.to_owned())
 }
 
-/// SIGKILL the sandbox's Firecracker process and reap it with a bounded wait.
+/// Kill the sandbox's VMM process and reap it with a bounded wait: the
+/// driver's `discard` for a VMM the driver prepared, SIGKILL plus a bounded
+/// `wait` for one the restore paths still spawn themselves.
 ///
 /// Extracted so the pause path (which keeps the disk overlay) shares the exact
-/// kill/reap discipline with full release. A failed reap restores the handle
-/// so a retry can finish the job. Idempotent — the process is `take()`n.
+/// kill/reap discipline with full release. A failed reap (the bounded wait
+/// elapsed) restores the handle so a retry can finish the job. Idempotent —
+/// the handles are `take()`n, and discarding an exited VMM just reports its
+/// status.
 pub(super) async fn kill_sandbox_process(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
 ) -> Result<()> {
+    let prepared = arc.lock().unwrap().prepared.take();
+    // Kill and await the exit outside the lock; the driver bounds the wait so
+    // cleanup proceeds (and reports) even if the process is stuck in
+    // uninterruptible sleep after SIGKILL.
+    if let Some(prepared) = prepared
+        && let Err(error) = prepared.discard().await
+    {
+        arc.lock().unwrap().prepared = Some(prepared);
+        return Err(VmmError::Process(format!(
+            "release the vmm of sandbox {id}: {error}"
+        )));
+    }
     let mut fc_process = {
         let mut inst = arc.lock().unwrap();
         if let Some(ref mut proc) = inst.process
@@ -378,8 +394,6 @@ pub(super) async fn kill_sandbox_process(
         }
         inst.process.take()
     };
-    // Await process exit outside the lock. Use a timeout so cleanup proceeds
-    // even if the process is stuck in uninterruptible sleep after SIGKILL.
     if let Some(mut proc) = fc_process.take() {
         match tokio::time::timeout(std::time::Duration::from_secs(5), proc.wait()).await {
             Ok(Ok(_)) => {}
@@ -786,10 +800,11 @@ mod tests {
             .unwrap()
             .lock()
             .unwrap()
-            .process
+            .prepared
             .as_ref()
-            .and_then(fc_sdk::FirecrackerProcess::pid)
-            .expect("spawned process must be owned by the instance");
+            .and_then(|prepared| prepared.record().process)
+            .map(|process| process.pid)
+            .expect("the prepared vmm must be owned by the instance");
         assert!(
             manager
                 .instances

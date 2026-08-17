@@ -17,7 +17,7 @@ const CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BootFailure {
     error: VmmError,
-    process: Option<fc_sdk::FirecrackerProcess>,
+    prepared: Option<Arc<dyn PreparedVm>>,
     cow_handle: Option<CowHandle>,
 }
 
@@ -32,6 +32,7 @@ pub(super) async fn boot_sandbox(
     vm_dir: PathBuf,
     instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
     network: Arc<NetworkManager>,
+    driver: Arc<dyn VmDriver>,
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
@@ -45,6 +46,7 @@ pub(super) async fn boot_sandbox(
         &spec,
         net_alloc.as_ref(),
         &vm_dir,
+        driver.as_ref(),
         &config,
         &cow_manager,
         &instances,
@@ -318,8 +320,8 @@ pub(super) async fn boot_sandbox(
                         persist_boot_failure(&records, &id, generation, &message);
                     inst.state = SandboxState::Failed;
                     inst.error = Some(message.clone());
-                    if let Some(process) = failure.process.take() {
-                        inst.process = Some(process);
+                    if let Some(prepared) = failure.prepared.take() {
+                        inst.prepared = Some(prepared);
                     }
                     if let Some(cow_handle) = failure.cow_handle.take() {
                         inst.cow_handle = Some(cow_handle);
@@ -343,8 +345,8 @@ pub(super) async fn boot_sandbox(
                         false
                     }
                 }
-            } else if let Some(process) = failure.process.take() {
-                match tear_down_orphaned_boot(process, failure.cow_handle.take(), &cow_manager)
+            } else if let Some(prepared) = failure.prepared.take() {
+                match tear_down_orphaned_boot(&*prepared, failure.cow_handle.take(), &cow_manager)
                     .await
                 {
                     Ok(()) => true,
@@ -729,6 +731,8 @@ pub(super) fn create_rootfs_symlink(vm_dir: &Path, dm_device: &str) -> Result<St
         .ok_or_else(|| VmmError::Config(format!("non-UTF-8 path: {}", link_path.display())))
 }
 
+/// SIGKILL and reap a VMM the restore paths still spawn themselves; the
+/// driver's `PreparedVm::discard` is the same discipline for the rest.
 pub(super) async fn kill_and_reap_fc_checked(
     process: &mut fc_sdk::FirecrackerProcess,
 ) -> Result<()> {
@@ -764,22 +768,23 @@ pub(super) async fn kill_and_reap_fc_checked(
 /// case, so Remove joins this cleanup instead of aborting it. TAP/IP and the
 /// jailer chroot remain managed by lifecycle cleanup or restart reconciliation.
 async fn tear_down_orphaned_boot(
-    mut process: fc_sdk::FirecrackerProcess,
+    prepared: &dyn PreparedVm,
     cow_handle: Option<CowHandle>,
     cow_manager: &CowManager,
 ) -> Result<()> {
-    // Kill + reap FC before the dm teardown so `dmsetup remove` doesn't hit
-    // EBUSY on the still-open block device.
-    kill_and_reap_fc_checked(&mut process).await?;
+    // Kill + reap the VMM before the dm teardown so `dmsetup remove` doesn't
+    // hit EBUSY on the still-open block device.
+    prepared.discard().await?;
     if let Some(handle) = cow_handle {
         cow_manager.teardown_checked(&handle).await?;
     }
     Ok(())
 }
 
-/// Perform the actual Firecracker boot: spawn process, configure, start VM.
+/// Perform the actual boot: prepare the VMM through the driver, stage,
+/// configure, start the VM.
 ///
-/// The spawned process is transferred to its [`SandboxInstance`] immediately.
+/// The prepared VMM is transferred to its [`SandboxInstance`] immediately.
 /// Cleanup is allowed to abort this task only after the paths/CoW phase has
 /// finished and every live `CowHandle` has also been transferred.
 #[allow(
@@ -791,6 +796,7 @@ async fn do_boot(
     spec: &SandboxSpec,
     net_alloc: Option<&NetworkAllocation>,
     vm_dir: &Path,
+    driver: &dyn VmDriver,
     config: &VmmConfig,
     cow_manager: &CowManager,
     instances: &super::InstanceMap,
@@ -798,64 +804,39 @@ async fn do_boot(
     resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) -> std::result::Result<BootOutput, BootFailure> {
     let mut resource_handoff = Some(resource_handoff);
-    let log_path = vm_dir.join("firecracker.log");
-    let metrics_path = vm_dir.join("firecracker.metrics");
-    // socket_path is used only for the direct (non-jailer) mode spawn.
-    let socket_path = vm_dir.join("firecracker.sock");
-
     let fc_cfg = &config.firecracker;
 
-    // Some Firecracker builds expect log/metrics targets to pre-exist when
-    // --log-path/--metrics-path are provided. Pre-create both files to avoid
-    // startup failures with ENOENT across version variants.
-    let prepare_files = (|| -> Result<()> {
-        if fc_cfg.jailer.is_some() {
-            return Ok(());
-        }
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).map_err(VmmError::Io)?;
-        }
-        std::fs::File::create(&log_path).map_err(VmmError::Io)?;
-        std::fs::File::create(&metrics_path).map_err(VmmError::Io)?;
-        Ok(())
-    })();
-    if let Err(error) = prepare_files {
-        complete_resource_handoff(&mut resource_handoff);
-        return Err(BootFailure {
-            error,
-            process: None,
-            cow_handle: None,
-        });
-    }
-
-    // Spawn the Firecracker process (direct or via Jailer).
-    let process_result: Result<fc_sdk::FirecrackerProcess> = async {
-        let driver_config = FcDriverConfig::from(fc_cfg);
-        Ok(if let Some(ref jc) = fc_cfg.jailer {
-            spawn_jailer(&driver_config, &IsolationSpec::try_from(jc)?, id).await?
-        } else {
-            spawn_direct(&driver_config, id, &socket_path, &log_path, &metrics_path).await?
-        })
+    // Spawn the VMM ahead of the guest: the driver's prepared VM owns the
+    // process, pre-creates whatever its spawn needs (log and metrics files
+    // in direct mode, the jail's `run/`), and knows the pid to journal.
+    let prepared: Result<Arc<dyn PreparedVm>> = async {
+        let vm_id = VmId::new(id)?;
+        let isolation = super::isolation_spec(config)?;
+        Ok(Arc::from(
+            super::prepare_capability(driver)
+                .prepare(&vm_id, &isolation, vm_dir)
+                .await?,
+        ))
     }
     .await;
-    let process = match process_result {
-        Ok(process) => process,
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             complete_resource_handoff(&mut resource_handoff);
             return Err(BootFailure {
                 error,
-                process: None,
+                prepared: None,
                 cow_handle: None,
             });
         }
     };
 
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "Firecracker pid fits platform pid_t"
-    )]
-    let process_pid = process.pid().map(|pid| pid as i32);
-    let process_socket = process.socket_path().to_owned();
+    let process_pid = super::journaled_pid(&*prepared);
+    let process_socket = prepared
+        .record()
+        .process
+        .and_then(|process| process.api_socket)
+        .unwrap_or_default();
     let spawned_record = super::reconcile::SandboxStateRecord::new(
         id,
         process_pid,
@@ -866,15 +847,14 @@ async fn do_boot(
     );
     let journal_error = super::reconcile::write_state_record(vm_dir, &spawned_record).err();
 
-    // Once spawn returns, make the process immediately owned by the instance.
-    // Cleanup still waits for the paths/CoW phase before it may abort boot.
-    let mut process = Some(process);
+    // Once the VMM is up, make it immediately owned by the instance. Cleanup
+    // still waits for the paths/CoW phase before it may abort boot.
     let state = {
         let map = instances.read().unwrap();
         map.get(id).and_then(|instance| {
             let mut instance = instance.lock().unwrap();
             (instance.record_generation == Some(generation)).then(|| {
-                instance.process = process.take();
+                instance.prepared = Some(Arc::clone(&prepared));
                 instance.state
             })
         })
@@ -890,7 +870,7 @@ async fn do_boot(
                 expected: "the current sandbox generation".into(),
                 actual: "replaced or removed".into(),
             },
-            process,
+            prepared: Some(prepared),
             cow_handle: None,
         });
     };
@@ -902,7 +882,7 @@ async fn do_boot(
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
             },
-            process: None,
+            prepared: None,
             cow_handle: None,
         });
     }
@@ -910,7 +890,7 @@ async fn do_boot(
         complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
             error,
-            process: None,
+            prepared: None,
             cow_handle: None,
         });
     }
@@ -1056,7 +1036,7 @@ async fn do_boot(
                 expected: "the current sandbox generation".into(),
                 actual: "replaced or removed during boot setup".into(),
             },
-            process: None,
+            prepared: None,
             cow_handle,
         });
     };
@@ -1065,7 +1045,7 @@ async fn do_boot(
     let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path) =
         paths.map_err(|error| BootFailure {
             error,
-            process: None,
+            prepared: None,
             cow_handle: None,
         })?;
     if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
@@ -1075,7 +1055,7 @@ async fn do_boot(
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
             },
-            process: None,
+            prepared: None,
             cow_handle: None,
         });
     }
@@ -1090,7 +1070,7 @@ async fn do_boot(
         Err(error) => {
             return Err(BootFailure {
                 error: error.into(),
-                process: None,
+                prepared: None,
                 cow_handle: None,
             });
         }
@@ -1109,7 +1089,7 @@ async fn do_boot(
                 "chown ready socket {}: {e}",
                 ready_listener.path().display()
             )),
-            process: None,
+            prepared: None,
             cow_handle: None,
         });
     }
@@ -1197,7 +1177,7 @@ async fn do_boot(
         Err(e) => {
             return Err(BootFailure {
                 error: VmmError::from(e),
-                process: None,
+                prepared: None,
                 cow_handle: None,
             });
         }

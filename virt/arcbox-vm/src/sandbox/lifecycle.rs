@@ -411,6 +411,7 @@ impl SandboxManager {
         {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
+            let driver = Arc::clone(&self.driver);
             let config = Arc::clone(&self.config);
             let events_tx = self.events_tx.clone();
             let cow_manager = Arc::clone(&self.cow_manager);
@@ -426,6 +427,7 @@ impl SandboxManager {
                     vm_dir,
                     instances,
                     network,
+                    driver,
                     config,
                     events_tx,
                     cow_manager,
@@ -549,14 +551,28 @@ impl SandboxManager {
             let _ = tokio::time::timeout(Duration::from_secs(5), vm.send_ctrl_alt_del()).await;
         }
 
-        // Wait for Firecracker to exit within the remaining budget; SIGKILL
-        // as a fallback, then reap.
+        // Wait for the VMM to exit within the remaining budget; the release
+        // below kills and reaps whatever is still alive. Transitional: the
+        // driver's prepared VMM is polled for liveness until the handle owns
+        // the shutdown.
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::from_secs(1))
+            .max(Duration::from_secs(1));
+        let prepared = instance.lock().unwrap().prepared.clone();
+        if let Some(prepared) = prepared {
+            let exit_deadline = tokio::time::Instant::now() + remaining;
+            while prepared.alive() && tokio::time::Instant::now() < exit_deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if prepared.alive() {
+                warn!(sandbox_id = %id, "guest did not shut down in time; killing the vmm");
+            }
+        }
+        // A VMM the restore paths spawned themselves: wait, SIGKILL as a
+        // fallback, then reap.
         let fc_process = instance.lock().unwrap().process.take();
         if let Some(mut proc) = fc_process {
-            let remaining = deadline
-                .checked_duration_since(tokio::time::Instant::now())
-                .unwrap_or(Duration::from_secs(1))
-                .max(Duration::from_secs(1));
             match tokio::time::timeout(remaining, proc.wait()).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
@@ -575,8 +591,8 @@ impl SandboxManager {
             }
         }
 
-        // Release TAP/IP, CoW device, and chroot now that FC is gone; the
-        // record itself stays inspectable until Remove.
+        // Release the VMM (if still alive), TAP/IP, CoW device, and chroot;
+        // the record itself stays inspectable until Remove.
         let stop_commit = {
             super::cleanup::release_runtime_resources(
                 id,
