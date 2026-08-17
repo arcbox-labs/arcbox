@@ -49,6 +49,8 @@ mod persistence;
 mod pool;
 mod reconcile;
 mod templates;
+#[cfg(test)]
+mod testing;
 mod timers;
 mod types;
 mod warm;

@@ -190,8 +190,11 @@ impl SandboxManager {
         // sandbox behind. A capture that succeeded and held the guest, with
         // the failure coming after it — the catalog commit — is different:
         // the port has no verb to thaw a held VM (pause is hold-then-kill
-        // by design), so that sandbox cannot go back to Ready; it is killed
-        // and fails honestly rather than reporting Ready for a frozen guest.
+        // by design), so that sandbox cannot go back to Ready; it fails the
+        // way a failed boot does — VMM killed and reaped, CoW, TAP + IP and
+        // chroot released, durable `Failed`, journal cleared, FAILED event —
+        // rather than reporting Ready for a frozen guest or holding its
+        // resources until Remove.
         let snapshot_id = match checkpoint_impl(
             &self.instances,
             &self.snapshots,
@@ -207,10 +210,22 @@ impl SandboxManager {
         {
             Ok(info) => info.snapshot_id,
             Err(error) if handle.state() == arcbox_vm_driver::VmState::Quiesced => {
-                if let Err(kill) = handle.shutdown(arcbox_vm_driver::ShutdownMode::Kill).await {
-                    warn!(sandbox_id = %id, error = %kill, "held guest of a failed pause could not be killed");
-                }
-                return Err(self.fail_pause(id, &instance, generation, error));
+                let vm_dir = instance.lock().unwrap().vm_dir.clone();
+                super::boot::fail_live_sandbox_locked(
+                    id,
+                    generation,
+                    &error.to_string(),
+                    &vm_dir,
+                    &instance,
+                    &self.network,
+                    &self.config,
+                    &self.cow_manager,
+                    &self.records,
+                    &self.events_tx,
+                )
+                .await;
+                error!(sandbox_id = %id, error = %error, "pause left the guest frozen; sandbox failed");
+                return Err(error);
             }
             Err(error) => {
                 if let Some(generation) = generation
@@ -946,6 +961,52 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, VmmError::Config(_)), "{error}");
         assert!(error.to_string().contains("jailer"), "{error}");
+    }
+
+    /// A pause whose capture succeeded and held the guest, but whose commit
+    /// failed, cannot go back to Ready — the port has no thaw — so it fails
+    /// the sandbox the way a failed boot does and releases everything it
+    /// held: nothing may sit in `Failed` still owning a frozen VMM, its
+    /// TAP + IP, its overlay and its chroot until an explicit Remove.
+    ///
+    /// The fake driver's capture writes `checkpoint.json`, not the vmstate
+    /// and mem pair the catalog commits, so with it a `HoldQuiesced` capture
+    /// succeeds and the commit that follows fails — exactly this case.
+    #[tokio::test]
+    async fn pause_that_leaves_the_guest_frozen_fails_and_releases_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, driver, probe) = super::super::testing::fake_manager(dir.path()).await;
+        let (instance, handle) =
+            super::super::testing::live_sandbox(&manager, &driver, "frozen").await;
+        let mut events = manager.subscribe_events();
+
+        let error = super::super::testing::expect_err(
+            manager.pause_sandbox(&"frozen".to_owned()).await,
+            "a pause whose commit fails",
+        );
+        assert!(
+            !matches!(error, VmmError::WrongState { .. }),
+            "the commit failure is the reported error: {error}"
+        );
+
+        super::super::testing::assert_failed_and_released(&manager, &instance, &probe, "frozen");
+        assert_eq!(
+            handle.state(),
+            arcbox_vm_driver::VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+            "the frozen guest is killed"
+        );
+        let mut actions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            actions.push(event.action);
+        }
+        assert_eq!(actions, [action::PAUSING, action::FAILED]);
+        // Nothing to resume: the sandbox is Failed, not Paused.
+        assert!(matches!(
+            manager
+                .resume_sandbox(&"frozen".to_owned(), reason::RESUME)
+                .await,
+            Err(VmmError::WrongState { .. })
+        ));
     }
 
     #[tokio::test]

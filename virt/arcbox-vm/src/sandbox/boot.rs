@@ -97,9 +97,9 @@ pub(super) async fn boot_sandbox(
             drop(ready_listener);
             if let Err(gate_error) = agent_ready {
                 let message = gate_error.to_string();
-                fail_started_boot(
+                fail_live_sandbox(
                     &id,
-                    generation,
+                    Some(generation),
                     &message,
                     &vm_dir,
                     &instances,
@@ -245,9 +245,9 @@ pub(super) async fn boot_sandbox(
                 && let Err(probe_error) = run_ready_probe(&probe, vsock.as_ref()).await
             {
                 let message = format!("ready probe failed: {probe_error}");
-                fail_started_boot(
+                fail_live_sandbox(
                     &id,
-                    generation,
+                    Some(generation),
                     &message,
                     &vm_dir,
                     &instances,
@@ -275,9 +275,9 @@ pub(super) async fn boot_sandbox(
                     });
             if let Err(record_error) = durable_ready {
                 let message = format!("failed to persist ready state: {record_error}");
-                fail_started_boot(
+                fail_live_sandbox(
                     &id,
-                    generation,
+                    Some(generation),
                     &message,
                     &vm_dir,
                     &instances,
@@ -318,9 +318,9 @@ pub(super) async fn boot_sandbox(
             let mut failure_record_visible = false;
             if let Some(ref arc) = value {
                 let mut inst = arc.lock().unwrap();
-                if can_mark_boot_failed(&inst, generation) {
+                if can_mark_boot_failed(&inst, Some(generation)) {
                     (failure_record_visible, record_error) =
-                        persist_boot_failure(&records, &id, generation, &message);
+                        persist_boot_failure(&records, &id, Some(generation), &message);
                     inst.state = SandboxState::Failed;
                     inst.error = Some(message.clone());
                     if let Some(prepared) = failure.prepared.take() {
@@ -390,17 +390,25 @@ pub(super) async fn boot_sandbox(
     }
 }
 
-fn can_mark_boot_failed(inst: &SandboxInstance, generation: Uuid) -> bool {
-    inst.record_generation == Some(generation)
+/// Whether `inst` is the generation a failure was observed on and can still
+/// take it: a replaced instance, or one already stopping, keeps its own fate.
+fn can_mark_boot_failed(inst: &SandboxInstance, generation: Option<Uuid>) -> bool {
+    inst.record_generation == generation
         && !matches!(inst.state, SandboxState::Stopping | SandboxState::Stopped)
 }
 
+/// Persist the durable `Failed` transition. Returns whether the failure is
+/// visible in the record store, and the durability or transition error if
+/// any; an instance without a durable record (`None`) has nothing to persist.
 fn persist_boot_failure(
     records: &SandboxRecordStore,
     id: &str,
-    generation: Uuid,
+    generation: Option<Uuid>,
     message: &str,
 ) -> (bool, Option<String>) {
+    let Some(generation) = generation else {
+        return (true, None);
+    };
     match records.transition(
         id,
         generation,
@@ -414,18 +422,21 @@ fn persist_boot_failure(
     }
 }
 
-/// Fail a boot whose VM process already started and whose cleanup resources
-/// were all transferred to the instance: persist the failure, flip the
-/// instance to `Failed`, release runtime resources, clear the boot journal,
-/// and broadcast the FAILED event. Shared by the agent-readiness gate and the
-/// durable-Ready persistence check; each caller logs its own context line.
+/// Fail a sandbox whose VM is up (or was) and whose cleanup resources all
+/// sit on its instance: persist the failure, flip the instance to `Failed`,
+/// release runtime resources (the VMM killed and reaped, CoW, TAP + IP,
+/// chroot), drop the dead VM's handle, clear the crash journal, and
+/// broadcast the FAILED event. Shared by the boot task's failure points and
+/// by the flows that find a guest frozen with no way to thaw it; each caller
+/// logs its own context line. Takes the instance's cleanup lock;
+/// [`fail_live_sandbox_locked`] is for a caller already holding it.
 #[allow(
     clippy::too_many_arguments,
     reason = "failure handling spans the boot task's captured manager state"
 )]
-async fn fail_started_boot(
+pub(super) async fn fail_live_sandbox(
     id: &SandboxId,
-    generation: Uuid,
+    generation: Option<Uuid>,
     message: &str,
     vm_dir: &Path,
     instances: &super::InstanceMap,
@@ -435,56 +446,77 @@ async fn fail_started_boot(
     records: &SandboxRecordStore,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) {
-    let value = instances.read().unwrap().get(id).cloned();
-    let cleanup_lock = value
-        .as_ref()
-        .map(|arc| arc.lock().unwrap().cleanup_lock.clone());
-    let _cleanup_guard = match cleanup_lock.as_ref() {
-        Some(lock) => Some(lock.lock().await),
-        None => None,
+    let Some(instance) = instances.read().unwrap().get(id).cloned() else {
+        return;
     };
-    let mut updated_current = false;
-    let mut failure_record_error = None;
-    let mut failure_record_visible = false;
-    if let Some(ref arc) = value {
-        let mut inst = arc.lock().unwrap();
-        if can_mark_boot_failed(&inst, generation) {
-            (failure_record_visible, failure_record_error) =
-                persist_boot_failure(records, id, generation, message);
-            inst.state = SandboxState::Failed;
-            inst.error = Some(message.to_owned());
-            updated_current = true;
+    let cleanup_lock = instance.lock().unwrap().cleanup_lock.clone();
+    let _cleanup_guard = cleanup_lock.lock().await;
+    fail_live_sandbox_locked(
+        id,
+        generation,
+        message,
+        vm_dir,
+        &instance,
+        network,
+        config,
+        cow_manager,
+        records,
+        events_tx,
+    )
+    .await;
+}
+
+/// [`fail_live_sandbox`] for a caller that already holds `instance`'s cleanup
+/// lock and knows the instance is the one registered under `id`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "failure handling spans the manager's resource set"
+)]
+pub(super) async fn fail_live_sandbox_locked(
+    id: &SandboxId,
+    generation: Option<Uuid>,
+    message: &str,
+    vm_dir: &Path,
+    instance: &Arc<Mutex<SandboxInstance>>,
+    network: &Arc<NetworkManager>,
+    config: &Arc<VmmConfig>,
+    cow_manager: &Arc<CowManager>,
+    records: &SandboxRecordStore,
+    events_tx: &broadcast::Sender<SandboxEvent>,
+) {
+    let (failure_record_visible, failure_record_error) = {
+        let mut inst = instance.lock().unwrap();
+        if !can_mark_boot_failed(&inst, generation) {
+            return;
         }
-    }
-    let cleanup_complete = if updated_current {
-        match super::cleanup::release_runtime_resources(
-            id,
-            value.as_ref().unwrap(),
-            network,
-            config,
-            cow_manager,
-        )
-        .await
+        let persisted = persist_boot_failure(records, id, generation, message);
+        inst.state = SandboxState::Failed;
+        inst.error = Some(message.to_owned());
+        persisted
+    };
+    let cleanup_complete =
+        match super::cleanup::release_runtime_resources(id, instance, network, config, cow_manager)
+            .await
         {
-            Ok(()) => true,
+            Ok(()) => {
+                // The VMM is dead and reaped; nothing dials or checkpoints
+                // a Failed sandbox, so the handle only names a corpse.
+                instance.lock().unwrap().handle = None;
+                true
+            }
             Err(error) => {
-                error!(sandbox_id = %id, error = %error, "boot failure cleanup incomplete");
+                error!(sandbox_id = %id, error = %error, "sandbox failure cleanup incomplete");
                 false
             }
-        }
-    } else {
-        false
-    };
+        };
     if failure_record_visible && cleanup_complete {
         if let Err(error) = super::reconcile::clear_state_record(vm_dir) {
-            error!(sandbox_id = %id, error = %error, "boot failure journal cleanup is not durable");
+            error!(sandbox_id = %id, error = %error, "sandbox failure journal cleanup is not durable");
         }
     }
-    if updated_current {
-        let _ = events_tx.send(SandboxEvent::new(id, action::FAILED).with_attr("error", message));
-    }
+    let _ = events_tx.send(SandboxEvent::new(id, action::FAILED).with_attr("error", message));
     if let Some(error) = failure_record_error {
-        error!(sandbox_id = %id, error, "failed to persist sandbox boot failure");
+        error!(sandbox_id = %id, error, "failed to persist sandbox failure");
     }
 }
 
@@ -1266,11 +1298,11 @@ mod tests {
             generation,
         );
 
-        assert!(can_mark_boot_failed(&instance, generation));
+        assert!(can_mark_boot_failed(&instance, Some(generation)));
         instance.state = SandboxState::Stopping;
-        assert!(!can_mark_boot_failed(&instance, generation));
+        assert!(!can_mark_boot_failed(&instance, Some(generation)));
         instance.state = SandboxState::Stopped;
-        assert!(!can_mark_boot_failed(&instance, generation));
-        assert!(!can_mark_boot_failed(&instance, Uuid::new_v4()));
+        assert!(!can_mark_boot_failed(&instance, Some(generation)));
+        assert!(!can_mark_boot_failed(&instance, Some(Uuid::new_v4())));
     }
 }
