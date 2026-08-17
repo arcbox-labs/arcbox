@@ -58,7 +58,8 @@ impl CowManager {
                     && name.starts_with(DM_NAME_PREFIX)
                 {
                     debug!(dm = %name, "removing stale dm-snapshot");
-                    run_sync_checked(Command::new(dmsetup).args(["remove", name]))?;
+                    // `--retry` for the same udev probe race `dmsetup_remove` documents.
+                    run_sync_checked(Command::new(dmsetup).args(["remove", "--retry", name]))?;
                 }
             }
         }
