@@ -814,6 +814,14 @@ pub(super) async fn release_instances(
 /// would leave it alive and broken, which is worse than leaving all three
 /// for the next sweep: the sandbox's journal survives this path, so there
 /// is one.
+///
+/// Stopping means giving the VM up as well, not just declining to touch the
+/// other two. The caller owns the last handle by then, and a handle that is
+/// merely dropped kills — unreaped, and with its vsock socket unlinked —
+/// which would leave exactly the damaged guest this stop exists to prevent,
+/// plus the disk and address still held. So the handle is detached first. A
+/// driver without `Detach` runs its VMs in-process and never produced a
+/// handle for this sweep to reclaim, so there is nothing to hand over there.
 async fn release_one(
     id: &str,
     handle: &Arc<dyn VmHandle>,
@@ -826,8 +834,13 @@ async fn release_one(
     if let Err(error) = handle.shutdown(ShutdownMode::Kill).await {
         warn!(
             sandbox_id = %id, %error,
-            "killing the reclaimed vmm failed; leaving its disk and address for the next sweep"
+            "killing the reclaimed vmm failed; leaving it, its disk and its address for the next sweep"
         );
+        if let Some(detach) = handle.detach()
+            && let Err(error) = detach.detach().await
+        {
+            warn!(sandbox_id = %id, %error, "handing the reclaimed vmm over failed; dropping it kills it");
+        }
         return;
     }
     if let Some(cow_handle) = cow_handle
@@ -2004,6 +2017,9 @@ mod tests {
                     source: None,
                 })
             }
+            fn detach(&self) -> Option<&dyn arcbox_vm_driver::Detach> {
+                self.0.detach()
+            }
         }
 
         let data_dir = tempfile::tempdir().unwrap();
@@ -2017,7 +2033,11 @@ mod tests {
         .unwrap();
 
         let vm_dir = data_dir.path().join("sandboxes").join("stuck");
-        let vm = boot_previous_vm(&driver, &vm_dir, "stuck", true, true).await;
+        // Still owned, so that giving ownership up is observable: the fake
+        // driver refuses to adopt an owned VM, and a dropped-not-detached
+        // handle kills it.
+        let vm = boot_previous_vm(&driver, &vm_dir, "stuck", true, false).await;
+        let vm_record = vm.record();
         let lease = network
             .reserve(
                 &VmId::new("stuck").unwrap(),
@@ -2058,6 +2078,18 @@ mod tests {
             network.adopted_mode(&VmId::new("stuck").unwrap()),
             Some(AttachMode::Invariant),
             "and its address"
+        );
+        // And the guest itself: the release let go of it rather than
+        // dropping the handle, which would have killed it unreaped.
+        let readopted = driver
+            .adopt()
+            .expect("the fake driver adopts")
+            .adopt(&vm_record)
+            .await
+            .unwrap();
+        assert!(
+            readopted.is_some(),
+            "the vm is still there for the next sweep to retry"
         );
     }
 
