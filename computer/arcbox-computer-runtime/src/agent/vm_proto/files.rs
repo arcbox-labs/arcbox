@@ -2,8 +2,8 @@
 //!
 //! The wire vocabulary — frame opcodes, request payloads, the stat/event
 //! DTOs, and the per-verb flows — is [`arcbox_vm_proto::file`], re-exported
-//! here as [`proto`] so `arcbox_computer_runtime::file_io::proto` keeps
-//! resolving for every consumer. This module is the tokio client the
+//! here as [`proto`], and from the crate root as [`crate::file_proto`] —
+//! the path consumers name. This module is the tokio client the
 //! manager drives: one vsock connection per operation, dialed through the
 //! driver port's [`Vsock`] capability, timeouts, and the mapping of the
 //! agent's errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`]
@@ -16,8 +16,9 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
 
+use super::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
+use crate::agent::{DirWatch, FsEvents};
 use crate::error::{Result, VmmError};
-use crate::vsock::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
 
 /// Per-operation timeout for file I/O over vsock.
 const FILE_IO_TIMEOUT: Duration = Duration::from_mins(1);
@@ -49,7 +50,12 @@ struct ReadReq<'a> {
 /// The guest agent creates any missing parent directories.  `mode` is the Unix
 /// file permission bits (e.g. `0o644`); `0` defaults to `0o644` on the agent
 /// side.
-pub async fn write_file(vsock: &dyn Vsock, path: &str, mode: u32, data: &[u8]) -> Result<()> {
+pub(super) async fn write_file(
+    vsock: &dyn Vsock,
+    path: &str,
+    mode: u32,
+    data: &[u8],
+) -> Result<()> {
     if data.len() > MAX_FILE_SIZE {
         return Err(VmmError::Vsock(format!(
             "file too large ({} bytes, max {MAX_FILE_SIZE})",
@@ -96,7 +102,7 @@ async fn write_file_inner(vsock: &dyn Vsock, path: &str, mode: u32, data: &[u8])
 }
 
 /// Read the file at `path` inside the sandbox and return its contents.
-pub async fn read_file(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
+pub(super) async fn read_file(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
     tokio::time::timeout(FILE_IO_TIMEOUT, read_file_inner(vsock, path))
         .await
         .map_err(|_| VmmError::Vsock("file read: timed out".into()))?
@@ -192,7 +198,7 @@ fn parse_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T> {
 }
 
 /// Stat one path inside the sandbox (symlinks reported, not followed).
-pub async fn stat_file(vsock: &dyn Vsock, path: &str) -> Result<FileStatDto> {
+pub(super) async fn stat_file(vsock: &dyn Vsock, path: &str) -> Result<FileStatDto> {
     let req = StatReq {
         path: path.to_owned(),
     };
@@ -202,7 +208,7 @@ pub async fn stat_file(vsock: &dyn Vsock, path: &str) -> Result<FileStatDto> {
 
 /// List a directory inside the sandbox, non-recursively, entries sorted by
 /// name with full metadata.
-pub async fn list_dir(vsock: &dyn Vsock, path: &str) -> Result<Vec<FileStatDto>> {
+pub(super) async fn list_dir(vsock: &dyn Vsock, path: &str) -> Result<Vec<FileStatDto>> {
     let req = ListDirReq {
         path: path.to_owned(),
     };
@@ -213,7 +219,7 @@ pub async fn list_dir(vsock: &dyn Vsock, path: &str) -> Result<Vec<FileStatDto>>
 /// Create a directory (and missing parents) inside the sandbox. Succeeds
 /// when the directory already exists. `mode` is the Unix permission bits;
 /// `0` defaults to `0o755` on the agent side.
-pub async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result<()> {
+pub(super) async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result<()> {
     let req = MakeDirReq {
         path: path.to_owned(),
         mode,
@@ -225,7 +231,7 @@ pub async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result<()> {
 /// Remove a file, symlink, or directory inside the sandbox. A non-empty
 /// directory requires `recursive` and fails with
 /// [`VmmError::DirectoryNotEmpty`] otherwise.
-pub async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<()> {
+pub(super) async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<()> {
     let req = RemoveReq {
         path: path.to_owned(),
         recursive,
@@ -235,7 +241,7 @@ pub async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool) -> Res
 }
 
 /// Rename / move an entry within the sandbox.
-pub async fn move_entry(vsock: &dyn Vsock, from: &str, to: &str) -> Result<()> {
+pub(super) async fn move_entry(vsock: &dyn Vsock, from: &str, to: &str) -> Result<()> {
     let req = MoveReq {
         from: from.to_owned(),
         to: to.to_owned(),
@@ -249,15 +255,13 @@ pub async fn move_entry(vsock: &dyn Vsock, from: &str, to: &str) -> Result<()> {
 /// The connection streams `FILE_EVENT` frames until either side closes it.
 /// Dropping this closes the connection, which is the cancellation signal
 /// the vm-agent tears its inotify watch down on.
-#[derive(Debug)]
-pub struct DirWatch {
+struct VsockWatch {
     stream: UnixStream,
 }
 
-impl DirWatch {
-    /// Next filesystem event. `Ok(None)` is the clean end of the stream —
-    /// the vm-agent side closed the connection (sandbox stopped).
-    pub async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
+#[async_trait::async_trait]
+impl FsEvents for VsockWatch {
+    async fn next_event(&mut self) -> Result<Option<FsEventDto>> {
         // Read the frame-type byte manually: a clean EOF is only clean at a
         // frame boundary, which `read_frame`'s `read_exact` cannot express.
         let mut ty = [0u8; 1];
@@ -297,7 +301,7 @@ impl DirWatch {
 /// Open a directory watch inside the sandbox. The setup handshake (connect,
 /// request, `FILE_ACK`) is bounded by [`FILE_IO_TIMEOUT`]; the returned
 /// stream itself is long-lived and unbounded.
-pub async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<DirWatch> {
+pub(super) async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<DirWatch> {
     let req = WatchReq {
         path: path.to_owned(),
         recursive,
@@ -313,7 +317,7 @@ pub async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result
             .await
             .map_err(|e| VmmError::Vsock(format!("read watch ack: {e}")))?;
         match resp_type {
-            FILE_ACK => Ok(DirWatch { stream }),
+            FILE_ACK => Ok(DirWatch::new(Box::new(VsockWatch { stream }))),
             FILE_ERR => Err(decode_file_err(&resp)),
             other => Err(VmmError::Vsock(format!(
                 "unexpected watch ack type 0x{other:02x}"
@@ -333,7 +337,7 @@ mod tests {
     use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
     use async_trait::async_trait;
 
-    use crate::vsock::{read_frame as async_read_frame, write_frame as async_write_frame};
+    use super::super::{read_frame as async_read_frame, write_frame as async_write_frame};
 
     /// A [`Vsock`] over a plain Unix socket: every dial connects to the one
     /// path, whatever the port — the file protocol under test does not care

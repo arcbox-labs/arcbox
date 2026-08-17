@@ -20,10 +20,11 @@
 //! The opcodes, payload layouts, and the JSON DTOs ([`StartCommand`],
 //! [`WaitPortReq`]) are the exec-channel vocabulary in
 //! [`arcbox_vm_proto::exec`], re-exported here. This module holds the
-//! connection and framing layer plus the shared types; the protocols each
-//! have a file of their own: `exec` (`run`, `exec`), `clock`
-//! (`sync_clock`), `net` (`reconfigure_network`), `wait_port`
-//! (`wait_for_port`).
+//! connection and framing layer; the protocols each have a file of their
+//! own — `exec` (`run`, `exec`), `clock` (`sync_clock`), `net`
+//! (`reconfigure_network`), `wait_port` (`wait_for_port`), `files` — and
+//! `client` is what maps them onto the [`GuestAgent`](crate::agent::GuestAgent)
+//! port. The vocabulary they speak belongs to the port, not here.
 
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::agent::{ExitStatus, OutputChunk};
 use crate::error::{Result, VmmError};
 
 // Exec-channel vocabulary, shared with vm-agent through `arcbox-vm-proto`.
@@ -40,38 +42,18 @@ pub use arcbox_vm_proto::exec::{AGENT_PORT, MSG_WAIT_PORT, READY_PORT, StartComm
 pub(crate) use arcbox_vm_proto::exec::{MAX_FRAME_SIZE, MSG_CLOCK_SYNC, MSG_NET_RECONFIG};
 use arcbox_vm_proto::exec::{MSG_EXIT, MSG_STDERR, MSG_STDOUT};
 
+mod client;
 mod clock;
 mod exec;
+mod files;
 mod handle;
 mod net;
 mod wait_port;
 
-pub use clock::{ClockSync, sync_clock};
-pub use exec::{exec, run};
+pub use client::{VmProtoAgent, VmProtoAgentFactory};
 pub(crate) use handle::HandleVsock;
-pub use net::reconfigure_network;
-pub use wait_port::wait_for_port;
-
-/// How a guest workload terminated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitStatus {
-    /// The process exited normally with this code.
-    Code(i32),
-    /// The process was killed by this POSIX signal.
-    Signaled(i32),
-}
 
 impl ExitStatus {
-    /// Shell-convention scalar: the exit code itself, or `128 + signal` for a
-    /// signal death. For consumers that can only carry one integer.
-    #[must_use]
-    pub const fn conventional_code(self) -> i32 {
-        match self {
-            Self::Code(code) => code,
-            Self::Signaled(signal) => 128 + signal,
-        }
-    }
-
     /// Decode a `MSG_EXIT` payload.
     ///
     /// New agents send `[i32 LE code][i32 LE signal]`; agents from before the
@@ -91,39 +73,6 @@ impl ExitStatus {
         };
         Self::Code(code)
     }
-}
-
-/// A chunk of output emitted by a guest process.
-#[derive(Debug, Clone)]
-pub enum OutputChunk {
-    /// Bytes from the process's stdout (the merged PTY stream for `tty` sessions).
-    Stdout(Vec<u8>),
-    /// Bytes from the process's stderr (never emitted for `tty` sessions).
-    Stderr(Vec<u8>),
-    /// The process terminated. Always the final chunk of a session.
-    Exit(ExitStatus),
-}
-
-/// A message the host sends to the guest during an exec/run session.
-#[derive(Debug)]
-pub enum ExecInputMsg {
-    /// Raw bytes to forward to the process's stdin.
-    Stdin(Vec<u8>),
-    /// Resize the pseudo-TTY.
-    Resize { width: u16, height: u16 },
-    /// Deliver a POSIX signal to the workload's process group.
-    Signal(i32),
-    /// Signal EOF on the process's stdin.
-    Eof,
-}
-
-/// Outcome of a guest listen-table wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PortWait {
-    /// A listener on the port exists.
-    Listening,
-    /// The deadline elapsed with no listener.
-    Deadline,
 }
 
 /// How long to wait for the guest agent to start accepting vsock connections.

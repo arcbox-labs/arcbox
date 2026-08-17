@@ -457,6 +457,7 @@ impl SandboxManager {
             let events_tx = self.events_tx.clone();
             let cow_manager = Arc::clone(&self.cow_manager);
             let records = Arc::clone(&self.records);
+            let agents = Arc::clone(&self.agent);
             let id_clone = id.clone();
             let (resource_handoff_tx, resource_handoff) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
@@ -475,6 +476,7 @@ impl SandboxManager {
                     generation,
                     warm_publish,
                     resource_handoff_tx,
+                    agents,
                 )
                 .await;
             });
@@ -814,15 +816,11 @@ impl SandboxManager {
             .ok_or_else(|| VmmError::NotFound(id.clone()))
     }
 
-    /// Verify the sandbox is `Ready` and return the vsock capability that
-    /// reaches its guest agent.
+    /// Verify the sandbox is `Ready` and return the agent inside it.
     ///
     /// A paused sandbox answers [`VmmError::Paused`], not `WrongState`, so
     /// the daemon can resume it transparently and retry (CORE-21).
-    pub(super) fn require_ready_vsock(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
+    pub(super) fn require_ready_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
@@ -838,18 +836,15 @@ impl SandboxManager {
                 });
             }
         }
-        guest_vsock(id, &inst)
+        self.guest_agent(id, &inst)
     }
 
-    /// Verify the sandbox is alive (Ready or Running) and return the vsock
-    /// capability that reaches its guest agent. Unlike
-    /// [`Self::require_ready_vsock`], an in-flight workload does not block
-    /// the operation — file I/O works alongside Run/Exec. Paused states map
-    /// to [`VmmError::Paused`] for the daemon's transparent resume, as above.
-    pub(super) fn require_alive_vsock(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
+    /// Verify the sandbox is alive (Ready or Running) and return the agent
+    /// inside it. Unlike [`Self::require_ready_agent`], an in-flight
+    /// workload does not block the operation — file I/O works alongside
+    /// Run/Exec. Paused states map to [`VmmError::Paused`] for the daemon's
+    /// transparent resume, as above.
+    pub(super) fn require_alive_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
         match inst.state {
@@ -865,17 +860,23 @@ impl SandboxManager {
                 });
             }
         }
-        guest_vsock(id, &inst)
+        self.guest_agent(id, &inst)
     }
-}
 
-/// The vsock capability reaching `inst`'s guest agent: the running VM's,
-/// once a boot or restore has handed its handle over.
-fn guest_vsock(id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
-    inst.handle
-        .clone()
-        .map(|handle| Arc::new(vsock::HandleVsock(handle)) as Arc<dyn arcbox_vm_driver::Vsock>)
-        .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))
+    /// The agent reaching `inst`'s guest, built from the running VM's
+    /// handle once a boot or restore has handed it over.
+    ///
+    /// On the exec and file hot paths, so it stays a construction from
+    /// state already held: no lock beyond the instance's, no mailbox, no
+    /// I/O, and the identity read rather than re-derived — it is the one
+    /// the boot, restore or resume handed its own agent.
+    fn guest_agent(&self, id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn GuestAgent>> {
+        let handle = inst
+            .handle
+            .clone()
+            .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))?;
+        self.agent.connect(handle, inst.net_identity.as_ref())
+    }
 }
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.
@@ -891,8 +892,202 @@ fn snapshot_files(info: &crate::snapshot::SnapshotInfo) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::fake_manager_direct;
+    use std::time::Duration;
+
+    use super::super::testing::{fake_manager_direct, fake_manager_with_agent};
     use super::*;
+    use crate::testkit::agent::{FakeAgentFactory, Reply};
+
+    /// Wait for `action` on `id`, or fail the test.
+    async fn await_action(
+        events: &mut broadcast::Receiver<SandboxEvent>,
+        id: &str,
+        action: &str,
+    ) -> SandboxEvent {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no {action} for {id} within the deadline"))
+                .expect("the event stream stays open");
+            if event.sandbox_id == id && event.action == action {
+                return event;
+            }
+            assert_ne!(
+                (event.action.as_str(), event.sandbox_id.as_str()),
+                (action::FAILED, id),
+                "the boot failed instead: {:?}",
+                event.attributes
+            );
+        }
+    }
+
+    /// The whole cold-boot path with no VMM: create, boot on the fake
+    /// driver, pass the readiness gate, run the initial cmd, reach READY —
+    /// then exec and move files through the port. This is what the fakes
+    /// buy; before the agent port there was no way to reach READY without
+    /// Firecracker, KVM and root.
+    #[tokio::test]
+    async fn a_create_boots_to_ready_and_serves_exec_and_files_over_the_fakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _driver, _probe, agent) = fake_manager_with_agent(dir.path(), None).await;
+        agent.on(&["/bin/hello"], Reply::stdout(b"hi".to_vec()));
+        let mut events = manager.subscribe_events();
+
+        let (id, _ip) = manager
+            .create_sandbox(SandboxSpec {
+                id: Some("booted".into()),
+                cmd: vec!["/bin/hello".into()],
+                ..SandboxSpec::default()
+            })
+            .await
+            .unwrap();
+        await_action(&mut events, &id, action::READY).await;
+
+        // The initial cmd ran through the reserved claim, and the guest
+        // clock was set twice: once by the readiness probe this factory
+        // gates on, once by the detached cold-boot sync (guests with no RTC
+        // wake at the kernel epoch, so a boot that skips that is a real
+        // regression).
+        assert!(agent.started().contains(&vec!["/bin/hello".to_owned()]));
+        for _ in 0..100 {
+            if agent.clock_syncs() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            agent.clock_syncs(),
+            2,
+            "the readiness probe and the detached cold-boot sync, one each"
+        );
+        assert!(
+            agent.net_reconfigs().is_empty(),
+            "a cold boot re-addresses nothing"
+        );
+
+        // The file verbs reach the guest through the port.
+        manager
+            .write_sandbox_file(&id, "/tmp/note", 0o644, b"written")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.read_sandbox_file(&id, "/tmp/note").await.unwrap(),
+            b"written"
+        );
+        manager
+            .move_sandbox_path(&id, "/tmp/note", "/tmp/moved")
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.stat_sandbox_path(&id, "/tmp/note").await,
+            Err(VmmError::PathNotFound(_))
+        ));
+
+        // A watch is a stream the port owns rather than a socket, so what
+        // the guest side emits arrives through it whatever the transport.
+        let mut watch = manager
+            .watch_sandbox_dir(&id, "/tmp/moved", false)
+            .await
+            .unwrap();
+        agent.emit_fs_event(&crate::file_proto::FsEventDto {
+            kind: crate::file_proto::EVENT_MODIFIED.to_owned(),
+            path: "/tmp/moved".to_owned(),
+            renamed_to: String::new(),
+        });
+        assert_eq!(
+            watch.next_event().await.unwrap().map(|event| event.path),
+            Some("/tmp/moved".to_owned())
+        );
+
+        // And so does a workload, once the initial cmd has released the slot.
+        for _ in 0..100 {
+            if manager.inspect_sandbox(&id).unwrap().state == SandboxState::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut output = manager
+            .run_in_sandbox(
+                &id,
+                vec!["/bin/hello".into()],
+                HashMap::new(),
+                String::new(),
+                String::new(),
+                false,
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let mut stdout = Vec::new();
+        while let Some(chunk) = output.recv().await {
+            match chunk.unwrap() {
+                OutputChunk::Stdout(bytes) => stdout.extend_from_slice(&bytes),
+                OutputChunk::Exit(status) => assert_eq!(status, ExitStatus::Code(0)),
+                OutputChunk::Stderr(_) => {}
+            }
+        }
+        assert_eq!(stdout, b"hi");
+    }
+
+    /// A ready-probe command that never exits must end on the probe's own
+    /// budget, not park the boot forever. The host timeout is the only
+    /// thing that can end it — the guest's kill timer is the fake's to not
+    /// have — so this is exactly the path the double bound exists for.
+    #[tokio::test]
+    async fn a_ready_probe_command_that_never_exits_fails_the_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _driver, _probe, agent) = fake_manager_with_agent(dir.path(), None).await;
+        agent.on(&["/bin/wedged"], Reply::NeverExits);
+        let mut events = manager.subscribe_events();
+
+        let (id, _ip) = manager
+            .create_sandbox(SandboxSpec {
+                id: Some("wedged".into()),
+                ready_probe: Some(crate::template_catalog::ReadyProbeSpec::Command {
+                    cmd: vec!["/bin/wedged".into()],
+                    timeout_seconds: 1,
+                }),
+                ..SandboxSpec::default()
+            })
+            .await
+            .unwrap();
+
+        let failure = await_action(&mut events, &id, action::FAILED).await;
+        assert!(
+            failure.attributes["error"].contains("ready probe failed"),
+            "unexpected failure: {:?}",
+            failure.attributes
+        );
+    }
+
+    /// A factory whose guests announce nothing needs no `vsock_listen` from
+    /// the driver: what the readiness gate costs is the agent port's answer.
+    #[test]
+    fn a_probing_agent_does_not_require_a_listening_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
+        let driver = arcbox_vm_driver::testkit::FakeDriver::builder()
+            .capabilities(arcbox_vm_driver::DriverCapabilities {
+                vsock_listen: false,
+                ..arcbox_vm_driver::testkit::FakeDriver::new().capabilities()
+            })
+            .build();
+        SandboxManager::with_environment(
+            config,
+            SandboxEnvironment {
+                driver: Some(Arc::new(driver)),
+                network: Some(Arc::new(
+                    arcbox_vm_driver::testkit::FakeNetwork::with_startup_cleanup("test-boot"),
+                )),
+                agent: Some(Arc::new(FakeAgentFactory::new())),
+                ..SandboxEnvironment::default()
+            },
+        )
+        .expect("a probing agent asks the driver for no listener");
+    }
 
     /// A create that fails between reserving an address and building its
     /// TAP must hand the address back.

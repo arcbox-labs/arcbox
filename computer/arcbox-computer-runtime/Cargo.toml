@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description       = "Sandbox orchestration over nested microVMs behind the arcbox-vm-driver port: boot, exec, files, checkpoints, warm pools. The in-sandbox init is arcbox-vm-agent; the wire vocabulary is arcbox-vm-proto."
 
+[features]
+# The agent-port fake: `FakeAgentFactory`, which with the driver port's
+# `FakeDriver` and `FakeNetwork` runs the real boot path with no VMM. Off
+# by default so production builds carry none of it.
+testkit = []
+
 [dependencies]
 arcbox-atomic-file.workspace = true
 arcbox-vm-proto.workspace = true
@@ -32,6 +38,10 @@ oci2rootfs = { version = "0.2.1", default-features = false }
 arcbox-ext4 = "0.1.2"
 
 [dev-dependencies]
+# The crate's own tests always exercise the testkit: a path-only self
+# dev-dependency turns the feature on for test builds and is stripped at
+# publish time.
+arcbox-computer-runtime = { path = ".", features = ["testkit"] }
 arcbox-snapshot = { workspace = true, features = ["test-probe"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 anyhow.workspace   = true

@@ -372,7 +372,11 @@ pub(super) async fn kill_sandbox_process(
             "release the vmm of sandbox {id}: {error}"
         )));
     }
-    arc.lock().unwrap().handle = None;
+    {
+        let mut inst = arc.lock().unwrap();
+        inst.handle = None;
+        inst.net_identity = None;
+    }
     Ok(())
 }
 

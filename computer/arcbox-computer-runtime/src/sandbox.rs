@@ -32,6 +32,8 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::agent::{ClockSync, ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
+use crate::agent::{GuestAgent, GuestAgentFactory, Readiness, VmProtoAgentFactory};
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
@@ -39,7 +41,6 @@ use crate::network::NetworkManager;
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::template_catalog::TemplateCatalog;
-use crate::vsock::{self, ExecInputMsg, ExitStatus, OutputChunk, StartCommand};
 
 mod boot;
 mod checkpoint;
@@ -90,6 +91,10 @@ pub struct SandboxManager {
     /// Its `NetworkReconcile` capability is required at construction: the
     /// cleanup-token protocol and the startup sweep are not optional here.
     network: Arc<dyn GuestNetwork>,
+    /// How every sandbox's guest agent is reached, behind the guest-agent
+    /// port. It also owns the readiness gate the boot flow arms before the
+    /// guest starts.
+    agent: Arc<dyn GuestAgentFactory>,
     snapshots: Arc<SnapshotCatalog>,
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
@@ -124,15 +129,19 @@ impl SandboxManager {
     ///
     /// Fails with [`VmmError::Config`] when the environment's driver lacks a
     /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
-    /// ahead of the guest), `Vsock` (the guest agent is reached over it) or
-    /// `VsockListen` (the readiness gate is the guest's dial-out) — or when
-    /// its guest network offers no `NetworkReconcile` (the cleanup-token
-    /// protocol is how a host releases the addresses a previous process
-    /// held), so an environment missing one is refused here instead of at
-    /// the first boot or the first cleanup ticket.
+    /// ahead of the guest), `Vsock` (the guest agent is reached over it), or
+    /// whatever the agent factory's readiness gate needs (`VsockListen` for
+    /// the guest's dial-out) — or when its guest network offers no
+    /// `NetworkReconcile` (the cleanup-token protocol is how a host
+    /// releases the addresses a previous process held), so an environment
+    /// missing one is refused here instead of at the first boot or the
+    /// first cleanup ticket.
     pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
         let driver = environment.driver.unwrap_or_else(|| {
             Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))) as Arc<dyn VmDriver>
+        });
+        let agent = environment.agent.unwrap_or_else(|| {
+            Arc::new(VmProtoAgentFactory::default()) as Arc<dyn GuestAgentFactory>
         });
         let capabilities = driver.capabilities();
         for (missing, capability, need) in [
@@ -141,13 +150,22 @@ impl SandboxManager {
                 "prepare",
                 "the boot and pool flows spawn the VMM ahead of the guest",
             ),
+            // The last hard-wired transport assumption in this layer: every
+            // agent implementation the crate ships reaches its guest through
+            // the VM handle. It leaves with the composition root (PR-G),
+            // which is what will know whether its Computers are dialable at
+            // all.
             (
                 !capabilities.vsock,
                 "vsock",
                 "the guest agent is reached over vsock",
             ),
+            // What the readiness gate needs is the agent port's answer, not
+            // this layer's: only a dial-out has to be listened for before
+            // the guest starts.
             (
-                !capabilities.vsock_listen,
+                matches!(agent.readiness(), Readiness::DialOut { .. })
+                    && !capabilities.vsock_listen,
                 "vsock_listen",
                 "the readiness gate is the guest's vsock dial-out",
             ),
@@ -272,6 +290,7 @@ impl SandboxManager {
             records,
             driver,
             network,
+            agent,
             snapshots,
             templates,
             config,
@@ -492,6 +511,18 @@ pub(super) fn netmask(prefix_len: u8) -> std::net::Ipv4Addr {
 pub(super) const fn sandbox_network_policy() -> NetworkPolicy {
     NetworkPolicy {
         mode: NetworkMode::Nat,
+    }
+}
+
+/// The mode a guest's interface is activated in, which is also the mode
+/// [`GuestNetwork::identity`] must be read under: a fresh boot and every
+/// invariant-snapshot restore take the fixed identity, and only checkpoints
+/// taken before it existed carry the pool address on the interface itself.
+pub(super) const fn attach_mode(net_invariant: bool) -> AttachMode {
+    if net_invariant {
+        AttachMode::Invariant
+    } else {
+        AttachMode::LegacySnapshot
     }
 }
 

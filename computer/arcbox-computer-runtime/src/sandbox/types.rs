@@ -231,6 +231,15 @@ pub struct SandboxInstance {
     /// The NIC that activating it produced is not kept: the VM was booted
     /// with it and nothing here reads it again.
     pub network: Option<NetworkLease>,
+    /// What the guest was told over that interface, as the boot, restore or
+    /// resume that produced [`Self::handle`] read it. Kept rather than
+    /// re-derived: the mode a lease is read under is not recoverable from
+    /// the instance alone (a caller-supplied `ip=` leaves `net_invariant`
+    /// false on a guest whose interface was activated invariant), so the
+    /// agent the exec and file paths build would otherwise describe the
+    /// guest differently from the one its boot built. Cleared with the
+    /// handle.
+    pub(super) net_identity: Option<NetworkIdentity>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
     pub vm_dir: PathBuf,
     /// When the sandbox record was created.
@@ -306,6 +315,7 @@ impl SandboxInstance {
             boot_task: None,
             prepared: None,
             handle: None,
+            net_identity: None,
             network,
             vm_dir,
             created_at: Utc::now(),

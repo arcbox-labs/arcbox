@@ -20,6 +20,7 @@ use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition}
 use super::{SandboxInstance, SandboxManager, SandboxSpec, SandboxState};
 use crate::config::{JailerConfig, VmmConfig};
 use crate::snapshot_cow::{CowManager, CowOptions, CowTestProbe};
+use crate::testkit::agent::FakeAgentFactory;
 use crate::{SandboxEnvironment, VmmError};
 
 /// A manager over [`FakeDriver`] and [`FakeNetwork`] with a probed CoW
@@ -33,7 +34,7 @@ use crate::{SandboxEnvironment, VmmError};
 pub(super) async fn fake_manager(
     data_dir: &Path,
 ) -> (SandboxManager, FakeDriver, Arc<CowTestProbe>) {
-    build_fake_manager(
+    let (manager, driver, probe, _agent) = fake_manager_with_agent(
         data_dir,
         Some(JailerConfig {
             binary: "/usr/bin/jailer".into(),
@@ -47,7 +48,8 @@ pub(super) async fn fake_manager(
             resource_limits: vec![],
         }),
     )
-    .await
+    .await;
+    (manager, driver, probe)
 }
 
 /// [`fake_manager`] in direct mode, for the flows that do not need a
@@ -60,22 +62,32 @@ pub(super) async fn fake_manager(
 pub(super) async fn fake_manager_direct(
     data_dir: &Path,
 ) -> (SandboxManager, FakeDriver, Arc<CowTestProbe>) {
-    build_fake_manager(data_dir, None).await
+    let (manager, driver, probe, _agent) = fake_manager_with_agent(data_dir, None).await;
+    (manager, driver, probe)
 }
 
-async fn build_fake_manager(
+/// [`fake_manager_direct`] keeping the scripted agent, for the tests that
+/// drive a real boot rather than planting an instance.
+pub(super) async fn fake_manager_with_agent(
     data_dir: &Path,
     jailer: Option<JailerConfig>,
-) -> (SandboxManager, FakeDriver, Arc<CowTestProbe>) {
+) -> (
+    SandboxManager,
+    FakeDriver,
+    Arc<CowTestProbe>,
+    FakeAgentFactory,
+) {
     let mut config = VmmConfig::default();
     config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
     config.firecracker.jailer = jailer;
     let driver = FakeDriver::new();
+    let agent = FakeAgentFactory::new();
     let mut manager = SandboxManager::with_environment(
         config,
         SandboxEnvironment {
             driver: Some(Arc::new(driver.clone())),
             network: Some(Arc::new(FakeNetwork::with_startup_cleanup("test-boot"))),
+            agent: Some(Arc::new(agent.clone())),
             ..SandboxEnvironment::default()
         },
     )
@@ -87,7 +99,7 @@ async fn build_fake_manager(
     );
     let token = manager.startup_cleanup_token().await.unwrap().unwrap();
     manager.finalize_startup_cleanup(&token).await.unwrap();
-    (manager, driver, probe)
+    (manager, driver, probe, agent)
 }
 
 /// A minimal spec the fake boots.
@@ -261,11 +273,16 @@ pub(super) async fn live_sandbox_with(
     )
     .unwrap();
 
+    // A cold boot activates the interface invariant and hands the instance
+    // that identity beside the handle, so a planted one must too: it is what
+    // `guest_agent` gives every agent it builds afterwards.
+    let identity = manager.network.identity(&lease, super::attach_mode(true));
     let mut instance =
         SandboxInstance::new_with_generation(id.to_owned(), spec, Some(lease), vm_dir, generation);
     instance.state = SandboxState::Ready;
     instance.prepared = Some(prepared);
     instance.handle = Some(Arc::clone(&handle));
+    instance.net_identity = Some(identity);
     instance.cow_handle = Some(cow_handle);
     let instance = Arc::new(Mutex::new(instance));
     manager

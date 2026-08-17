@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use arcbox_vm_driver::Vsock;
 
-use super::{
-    MSG_EXIT, MSG_WAIT_PORT, PortWait, WaitPortReq, connect_to_agent, read_frame, write_frame,
-};
+use super::{MSG_EXIT, MSG_WAIT_PORT, WaitPortReq, connect_to_agent, read_frame, write_frame};
+use crate::agent::PortWait;
 use crate::error::{Result, VmmError};
 /// Wait until the guest's TCP listen table has a listener on `port`.
 ///

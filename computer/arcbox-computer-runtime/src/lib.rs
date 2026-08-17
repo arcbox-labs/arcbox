@@ -24,14 +24,17 @@
 //! neither links the other, so the crate graph — not a convention — keeps
 //! the agent (cross-compiled to static musl and staged into every sandbox
 //! rootfs) free of the manager and its dependencies. `boot_proto` and
-//! `file_io::proto` remain reachable through this crate as re-exports.
+//! `file_proto` remain reachable through this crate as re-exports.
 //!
 //! # Public API
 //!
 //! - [`SandboxManager`] — top-level sandbox orchestrator
 //! - [`SandboxEnvironment`] — the environment-specific components a
-//!   composer supplies: the VM driver, the guest network, block tooling,
-//!   the packet filter
+//!   composer supplies: the VM driver, the guest network, the guest-agent
+//!   factory, block tooling, the packet filter
+//! - [`agent`] — the guest-agent port: how the runtime reaches the agent
+//!   inside a Computer (exec, files, clock, readiness), with the
+//!   `arcbox-vm-proto` vsock client as its one implementation
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
@@ -49,16 +52,21 @@
 //! paths are re-exports of it so existing imports keep resolving; name
 //! `arcbox_snapshot` directly in new code.
 
+pub mod agent;
 pub mod config;
 pub mod environment;
 pub mod error;
-pub mod file_io;
 pub mod rootfs;
 pub mod sandbox;
-pub mod vsock;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 /// Boot-parameter vocabulary shared with `vm-agent` (`arcbox_vm_proto::boot`).
 pub use arcbox_vm_proto::boot as boot_proto;
+
+/// File-channel vocabulary shared with `vm-agent` (`arcbox_vm_proto::file`):
+/// the stat/event DTOs and the size caps a caller validates against.
+pub use arcbox_vm_proto::file as file_proto;
 
 /// The sandbox TAP network lives in `arcbox-tap-net` (vm-stack-redesign
 /// R2). Sandboxes reach it through the driver port; this path stays for
@@ -72,6 +80,7 @@ pub use arcbox_tap_net as network;
 // paths stay so `arcbox-agent` and this crate's own modules keep compiling.
 pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
+pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
 };
@@ -90,4 +99,3 @@ pub use sandbox::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
-pub use vsock::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};

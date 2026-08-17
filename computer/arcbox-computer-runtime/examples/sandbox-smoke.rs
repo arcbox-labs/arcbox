@@ -360,7 +360,7 @@ async fn run_cmd(
                 eprint!("{}", String::from_utf8_lossy(&data));
             }
             arcbox_computer_runtime::OutputChunk::Exit(status) => {
-                exit_code = status.conventional_code()
+                exit_code = status.conventional_code();
             }
         }
     }
