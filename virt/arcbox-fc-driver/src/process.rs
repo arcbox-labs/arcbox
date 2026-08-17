@@ -76,7 +76,8 @@ pub struct FcProcess {
     exit: watch::Sender<Option<ExitStatus>>,
     events: broadcast::Sender<VmEvent>,
     /// Tells the task that observes the process — the waiter or the prober
-    /// — to stand down; taken by `detach`, dropped with the process.
+    /// — to stand down: sent by `detach` (the child is released), dropped
+    /// with the process (the waiter still reaps; the prober stops).
     stand_down: Mutex<Option<oneshot::Sender<()>>>,
     /// Set by `detach`: nothing here kills or observes the process any more.
     detached: AtomicBool,
@@ -310,7 +311,14 @@ async fn waiter<C: Vmm>(
         tokio::pin!(wait);
         tokio::select! {
             status = &mut wait => Some(status),
-            _ = &mut stand_down => None,
+            stood_down = &mut stand_down => match stood_down {
+                // A detach: the child is released, not reaped.
+                Ok(()) => None,
+                // The process value went away without a detach — after a
+                // kill on drop, typically. Nobody is left to tell, but the
+                // child is still ours to reap.
+                Err(_) => Some(wait.await),
+            },
         }
     };
     match outcome {
@@ -457,6 +465,22 @@ mod tests {
         assert!(pid_exists(pid), "a detached child keeps running");
         #[allow(clippy::cast_possible_wrap, reason = "test pid")]
         kill(Pid::from_raw(pid as i32), Signal::SIGKILL).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_process_is_still_reaped_after_a_kill_on_drop() {
+        let process = spawn("sleep", &["30"]);
+        let pid = process.pid();
+        // What a handle's drop does: SIGKILL, then the last reference goes.
+        let mut exit = process.subscribe();
+        process.kill_now();
+        drop(process);
+        tokio::time::timeout(Duration::from_secs(5), exit.changed())
+            .await
+            .expect("the waiter reaps and publishes without a live process")
+            .expect("the waiter still holds the exit channel");
+        assert_eq!(*exit.borrow(), Some(ExitStatus::signaled(9)));
+        assert!(!pid_exists(pid), "reaped, not left a zombie");
     }
 
     #[tokio::test]
