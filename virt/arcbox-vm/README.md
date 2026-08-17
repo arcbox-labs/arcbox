@@ -62,7 +62,10 @@ between the System VM's busybox userland and a stock distro — is a
 separate input, `SandboxEnvironment`. `SandboxManager::new(config)` uses
 the reference environment (the System VM's); a composer on another host
 overrides the members it owns and calls
-`SandboxManager::with_environment(config, env)`. Today that is the
+`SandboxManager::with_environment(config, env)`. Today that is the VM
+driver behind `arcbox_vm_driver::VmDriver` (`None` = the Firecracker
+driver built from `[firecracker]`; whatever is supplied must claim the
+`Prepare` capability, which the boot and pool flows need), the
 loop-device tooling behind `arcbox_snapshot::snapshot_cow::BlockTools`
 (`BusyboxBlockTools` is the reference; a `util-linux` or ioctl
 implementation is a consumer's few dozen lines) and the netfilter

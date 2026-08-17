@@ -14,14 +14,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use arcbox_fc_driver::FcDriverConfig;
 use arcbox_fc_driver::jail::{
     SnapshotFiles, chroot_root, link_or_copy_for_jailer, move_file, stage_kernel_for_jailer,
     stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
 };
 use arcbox_fc_driver::spawn::{spawn_direct, spawn_jailer};
 use arcbox_fc_driver::vsock::UdsListener;
-use arcbox_vm_driver::IsolationSpec;
+use arcbox_fc_driver::{FcDriver, FcDriverConfig};
+use arcbox_vm_driver::{IsolationSpec, VmDriver};
 use chrono::{DateTime, Utc};
 use fc_sdk::VmBuilder;
 use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
@@ -76,6 +76,14 @@ pub(crate) type InstanceMap = Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxIns
 pub struct SandboxManager {
     instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
     records: Arc<persistence::SandboxRecordStore>,
+    /// The VMM every sandbox runs under, behind the driver port. Its
+    /// `Prepare` capability is required at construction: the boot and pool
+    /// flows spawn the VMM ahead of the guest.
+    #[allow(
+        dead_code,
+        reason = "read from the next commit on, once the boot, pool and restore flows own their VMs through it"
+    )]
+    driver: Arc<dyn VmDriver>,
     network: Arc<NetworkManager>,
     snapshots: Arc<SnapshotCatalog>,
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
@@ -108,7 +116,20 @@ impl SandboxManager {
 
     /// Create a new manager from the given configuration, with the
     /// environment-specific components the composer supplies.
+    ///
+    /// Fails with [`VmmError::Config`] when the environment's driver claims
+    /// no `Prepare` capability — the flows spawn the VMM ahead of the
+    /// guest, so a driver without it would fail at the first boot instead.
     pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
+        let driver = environment.driver.unwrap_or_else(|| {
+            Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))) as Arc<dyn VmDriver>
+        });
+        if driver.prepare().is_none() {
+            return Err(VmmError::Config(format!(
+                "VM driver `{}` has no prepare capability; the sandbox boot and pool flows need one",
+                driver.name()
+            )));
+        }
         let records = Arc::new(persistence::SandboxRecordStore::new(Path::new(
             &config.firecracker.data_dir,
         ))?);
@@ -208,6 +229,7 @@ impl SandboxManager {
         Ok(Self {
             instances,
             records,
+            driver,
             network,
             snapshots,
             templates,
@@ -544,6 +566,38 @@ mod tests {
             None,
             PathBuf::from("/tmp/x"),
         )
+    }
+
+    /// The manager refuses, at construction, a driver that cannot spawn the
+    /// VMM ahead of a boot: the pool and boot flows both prepare first, so
+    /// a driver without `Prepare` would fail at the first create instead.
+    #[test]
+    fn construction_requires_the_drivers_prepare_capability() {
+        use arcbox_vm_driver::testkit::FakeDriver;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
+        let environment = |driver: FakeDriver| SandboxEnvironment {
+            driver: Some(Arc::new(driver)),
+            ..SandboxEnvironment::default()
+        };
+
+        let unprepared = FakeDriver::builder()
+            .capabilities(arcbox_vm_driver::DriverCapabilities {
+                prepare: false,
+                ..FakeDriver::new().capabilities()
+            })
+            .build();
+        let error = SandboxManager::with_environment(config.clone(), environment(unprepared))
+            .err()
+            .expect("a driver without Prepare is refused");
+        assert!(matches!(error, VmmError::Config(_)), "{error}");
+        assert!(error.to_string().contains("prepare"), "{error}");
+
+        let manager = SandboxManager::with_environment(config, environment(FakeDriver::new()))
+            .expect("a driver with Prepare is accepted");
+        assert_eq!(manager.driver.name(), "fake");
     }
 
     #[test]

@@ -29,7 +29,7 @@
 //!
 //! - [`SandboxManager`] — top-level sandbox orchestrator
 //! - [`SandboxEnvironment`] — the environment-specific components a
-//!   composer supplies (block tooling today; more seams follow)
+//!   composer supplies: the VM driver, block tooling, the packet filter
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state

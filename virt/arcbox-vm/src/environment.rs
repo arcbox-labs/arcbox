@@ -11,12 +11,22 @@
 use std::sync::Arc;
 
 use arcbox_snapshot::snapshot_cow::{BlockTools, BusyboxBlockTools};
+use arcbox_vm_driver::VmDriver;
 
 use crate::network::{IptablesLegacy, PacketFilter};
 
 /// What differs between hosts of the sandbox stack.
 #[derive(Clone)]
 pub struct SandboxEnvironment {
+    /// The VMM the sandboxes run under, behind the driver port
+    /// (`arcbox_vm_driver::VmDriver`). `None` — the reference — is the
+    /// Firecracker driver built from the config's `[firecracker]` section
+    /// inside `SandboxManager::with_environment`; a composer wanting
+    /// another VMM supplies its adapter here. Whatever is supplied must
+    /// claim the `Prepare` capability: the boot and warm-pool flows spawn
+    /// the VMM ahead of the guest, and a driver without it is refused at
+    /// construction rather than at the first boot.
+    pub driver: Option<Arc<dyn VmDriver>>,
     /// Loop-device and block-size operations for the copy-on-write rootfs
     /// (`arcbox_snapshot::snapshot_cow::BlockTools`).
     pub block_tools: Arc<dyn BlockTools>,
@@ -27,11 +37,12 @@ pub struct SandboxEnvironment {
 }
 
 impl Default for SandboxEnvironment {
-    /// The System VM's userland: busybox applets at
-    /// [`BusyboxBlockTools::DEFAULT_PATH`], iptables-legacy at
-    /// [`IptablesLegacy::DEFAULT_PATH`].
+    /// The System VM's userland: the Firecracker driver from the config,
+    /// busybox applets at [`BusyboxBlockTools::DEFAULT_PATH`],
+    /// iptables-legacy at [`IptablesLegacy::DEFAULT_PATH`].
     fn default() -> Self {
         Self {
+            driver: None,
             block_tools: Arc::new(BusyboxBlockTools::default()),
             packet_filter: Arc::new(IptablesLegacy::default()),
         }
@@ -40,6 +51,11 @@ impl Default for SandboxEnvironment {
 
 impl std::fmt::Debug for SandboxEnvironment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SandboxEnvironment").finish_non_exhaustive()
+        f.debug_struct("SandboxEnvironment")
+            .field(
+                "driver",
+                &self.driver.as_ref().map_or("<from config>", |d| d.name()),
+            )
+            .finish_non_exhaustive()
     }
 }
