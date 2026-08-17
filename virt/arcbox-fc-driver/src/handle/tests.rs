@@ -3,12 +3,9 @@
 use arcbox_vm_driver::{IsolationSpec, ProcessRecord};
 
 use super::*;
+use crate::api::fake_fc::FakeFc;
 use crate::config::FcDriverConfig;
 use crate::process::testing::{pid_exists, spawn};
-
-mod fake_fc;
-
-use fake_fc::FakeFc;
 
 /// A handle over a `sleep` child and an API socket nobody answers on.
 fn handle(dir: &Path, isolation: IsolationSpec, vsock: bool) -> FcHandle {
