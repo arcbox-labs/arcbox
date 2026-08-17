@@ -265,10 +265,13 @@ fn quarantine_of_a_dotted_id_survives_reload() {
         restarted.pending_quarantines(),
         vec![(".hidden".to_owned(), allocation.cleanup_token)]
     );
-    restarted.mark_reconciled();
     assert!(
-        restarted.reserve("other").is_err(),
-        "the address stays held"
+        restarted
+            .allocated
+            .lock()
+            .unwrap()
+            .contains(&u32::from(allocation.ip_address)),
+        "the quarantined address stays out of the pool"
     );
 }
 
