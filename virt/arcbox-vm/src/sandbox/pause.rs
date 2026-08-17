@@ -28,9 +28,9 @@
 //! onwards every resource is keyed by the sandbox id again and resume,
 //! reconciliation, and `Remove` all see one naming scheme.
 
-use super::boot::restore_spec;
 use super::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
 use super::record::SandboxTransition;
+use super::spec::restore_spec;
 use super::types::action;
 use super::*;
 

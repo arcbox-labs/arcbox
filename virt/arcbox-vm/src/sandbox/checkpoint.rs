@@ -827,7 +827,7 @@ impl SandboxManager {
         // Load the image on the prepared VMM: the disk is the rootfs staged
         // into the owner's jail, eth0 lands on the fresh TAP.
         let loaded: Result<Arc<dyn VmHandle>> = async {
-            let restore = super::boot::restore_spec(
+            let restore = super::spec::restore_spec(
                 &resource_owner,
                 &chroot,
                 net_alloc.as_ref(),

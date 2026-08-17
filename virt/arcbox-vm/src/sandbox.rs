@@ -28,7 +28,6 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::boot_proto::KernelIpParam;
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
@@ -49,6 +48,7 @@ mod policy;
 mod pool;
 mod reconcile;
 mod record;
+mod spec;
 mod templates;
 #[cfg(test)]
 mod testing;
