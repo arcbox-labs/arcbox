@@ -257,19 +257,21 @@ impl SandboxManager {
                     // while leaving its lease and template refcount held.
                     reconcile::release_unclaimed(&mut runtime, &*network, &cow_manager).await;
                     let inactive = inactive?;
-                    reconcile::finalize_sweep(swept).await?;
-                    reconcile_capability(&*network).replay_complete();
-                    Ok::<_, VmmError>(inactive)
-                }
-                .await
-                .map(|inactive| {
-                    let mut map = instances.write().unwrap();
-                    map.extend(
+                    // Publish before anything else can fail. The reclaimed
+                    // sandboxes' only handles live in these instances, so a
+                    // later error — a runtime directory that will not delete,
+                    // say — would otherwise un-reclaim every guest by
+                    // dropping them, over something none of them caused.
+                    instances.write().unwrap().extend(
                         inactive
                             .into_iter()
                             .map(|instance| (instance.id.clone(), Arc::new(Mutex::new(instance)))),
                     );
-                })
+                    reconcile::finalize_sweep(swept).await?;
+                    reconcile_capability(&*network).replay_complete();
+                    Ok::<_, VmmError>(())
+                }
+                .await
                 .map_err(|error| Arc::<str>::from(error.to_string()));
                 let _ = reconcile_tx.send(Some(result));
             });

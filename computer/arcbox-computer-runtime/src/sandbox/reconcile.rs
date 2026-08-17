@@ -100,17 +100,9 @@ impl CowRecord {
         }
     }
 
-    fn into_handle(self) -> CowHandle {
-        CowHandle {
-            dm_name: self.dm_name,
-            dm_device: self.dm_device,
-            cow_loop: self.cow_loop,
-            cow_file: self.cow_file,
-            template_path: self.template_path,
-        }
-    }
-
-    /// The same handle for a record the sweep keeps rather than consumes.
+    /// The handle this record stands for. By reference because the sweep
+    /// decides a record's fate before it disposes of it, so it still needs
+    /// the rest of the record afterwards.
     fn to_handle(&self) -> CowHandle {
         CowHandle {
             dm_name: self.dm_name.clone(),
@@ -498,6 +490,9 @@ pub(super) async fn sweep_orphans(
         validate_state_record(config, &sandboxes_dir, &dir, &record)?;
         records.push((dir, record));
     }
+    // `read_dir` order is arbitrary; a stable one makes a sweep that fails
+    // partway reproducible, and lets a test say which journal it failed on.
+    records.sort_by(|(_, left), (_, right)| left.id.cmp(&right.id));
 
     // Durable phases first: whether a journaled VM may be kept depends on
     // what its record says the sandbox was doing.
@@ -512,11 +507,59 @@ pub(super) async fn sweep_orphans(
         .map(|record| (record.id.as_str(), record.phase))
         .collect();
 
+    // From the first reclaim on, every error path has to hand back what it
+    // took: propagating out of here would drop the map, which kills each
+    // reclaimed guest through its handle while leaving its lease and
+    // template refcount held.
+    let mut adopted = HashMap::new();
+    let reaped = reap_orphans(
+        &records,
+        &mut adopted,
+        &retained,
+        &phases,
+        config,
+        driver,
+        network,
+        cow_manager,
+    )
+    .await;
+    let (swept, runtime_dirs) = match reaped {
+        Ok(reaped) => reaped,
+        Err(error) => {
+            release_reclaimed(&mut adopted, network, cow_manager).await;
+            return Err(error);
+        }
+    };
+
+    Ok(OrphanSweep {
+        ids: swept,
+        adopted,
+        runtime_dirs,
+    })
+}
+
+/// Decide each journal's fate and tear down everything not kept.
+///
+/// Split out so [`sweep_orphans`] has exactly one place to release what a
+/// failure leaves reclaimed but unowned.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sweep's whole resource set, threaded rather than re-derived"
+)]
+async fn reap_orphans(
+    records: &[(PathBuf, SandboxStateRecord)],
+    adopted: &mut HashMap<String, AdoptedSandbox>,
+    retained: &HashSet<String>,
+    phases: &HashMap<&str, super::record::PersistPhase>,
+    config: &VmmConfig,
+    driver: &dyn VmDriver,
+    network: &dyn GuestNetwork,
+    cow_manager: &CowManager,
+) -> Result<(HashSet<String>, Vec<PathBuf>)> {
     // Every VM this sweep does not keep must be dead before the global CoW
     // sweep runs: a live VMM pins its dm device, and a pinned device turns
     // a reap into an error that fails the whole reconciliation.
-    let mut adopted = HashMap::new();
-    for (dir, record) in &records {
+    for (dir, record) in records {
         if let Some(reclaimed) = adopt_or_kill(
             driver,
             network,
@@ -547,22 +590,22 @@ pub(super) async fn sweep_orphans(
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();
-    for (dir, mut record) in records {
+    for (dir, record) in records {
         // An adopted sandbox's journal names what this process now owns, so
         // it stays exactly where it is — as does its runtime directory,
         // which `finalize_sweep` only removes for the ids listed here.
         if adopted.contains_key(&record.id) {
             continue;
         }
-        if recovery::sweep_action(&record.id, &retained) == SweepAction::DropStaleJournal {
+        if recovery::sweep_action(&record.id, retained) == SweepAction::DropStaleJournal {
             info!(sandbox_id = %record.id, "dropping stale pause journal, keeping retained state");
-            clear_state_record(&dir)?;
+            clear_state_record(dir)?;
             continue;
         }
         info!(sandbox_id = %record.id, "reconciling orphaned sandbox");
 
-        if let Some(cow) = record.cow.take() {
-            cow_manager.teardown_checked(&cow.into_handle()).await?;
+        if let Some(cow) = &record.cow {
+            cow_manager.teardown_checked(&cow.to_handle()).await?;
         }
 
         if let Some(lease) = record.lease()? {
@@ -583,15 +626,11 @@ pub(super) async fn sweep_orphans(
             }
         }
 
-        runtime_dirs.push(dir);
-        swept.insert(record.id);
+        runtime_dirs.push(dir.clone());
+        swept.insert(record.id.clone());
     }
 
-    Ok(OrphanSweep {
-        ids: swept,
-        adopted,
-        runtime_dirs,
-    })
+    Ok((swept, runtime_dirs))
 }
 
 /// Deletes cleanup journals only after durable lifecycle normalization commits.
@@ -703,7 +742,27 @@ pub(super) async fn release_unclaimed(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
 ) {
-    for (id, adopted) in runtime.adopted.drain() {
+    release_reclaimed(&mut runtime.adopted, network, cow_manager).await;
+}
+
+/// Give back the two resources a reclaim took, and kill the VM it took them
+/// for.
+///
+/// Every failure between reclaiming a sandbox and handing it to the instance
+/// map routes through here. Letting the map drop instead would kill each VM
+/// through its handle's `Drop` while leaving its lease live in the network
+/// and its template refcount held — resources released by nobody. Killing is
+/// the right disposition once nothing can own them; doing it silently, and
+/// only half of it, is not.
+///
+/// Best-effort per resource: it runs while an error is already on its way
+/// out, and every sandbox's journal survives to be swept again.
+async fn release_reclaimed(
+    adopted: &mut HashMap<String, AdoptedSandbox>,
+    network: &dyn GuestNetwork,
+    cow_manager: &CowManager,
+) {
+    for (id, adopted) in adopted.drain() {
         warn!(sandbox_id = %id, "releasing a reclaimed sandbox that recovery did not take");
         if let Err(error) = adopted.handle.shutdown(ShutdownMode::Kill).await {
             warn!(sandbox_id = %id, %error, "killing the reclaimed vmm failed");
@@ -1265,7 +1324,7 @@ mod tests {
         assert!(parsed.jailer);
         assert_eq!(parsed.pool_slot_id.as_deref(), Some("pool-1"));
         assert_eq!(parsed.resource_owner(), "pool-1");
-        let handle = parsed.cow.unwrap().into_handle();
+        let handle = parsed.cow.unwrap().to_handle();
         assert_eq!(handle.dm_name, "arcbox-snap-sb-1");
     }
 
@@ -1565,6 +1624,50 @@ mod tests {
         }
     }
 
+    /// A VM the previous agent booted in `vm_dir`, optionally handed over
+    /// rather than killed. Kept undetached, the fake driver refuses to adopt
+    /// it — which is how a sweep-time adopt failure is staged.
+    async fn boot_previous_vm(
+        driver: &arcbox_vm_driver::testkit::FakeDriver,
+        vm_dir: &Path,
+        id: &str,
+        vsock: bool,
+        handed_over: bool,
+    ) -> Box<dyn VmHandle> {
+        use arcbox_vm_driver::{BootSpec, ConsoleSpec, IsolationSpec, VmSpec, VsockSpec};
+
+        std::fs::create_dir_all(vm_dir).unwrap();
+        let vm = driver
+            .boot(
+                VmSpec {
+                    id: VmId::new(id).unwrap(),
+                    cpus: 1,
+                    memory_mib: 128,
+                    boot: BootSpec::Kernel {
+                        image: "/vmlinux".into(),
+                        cmdline: String::new(),
+                        initrd: None,
+                    },
+                    disks: vec![],
+                    nics: vec![],
+                    vsock: vsock.then_some(VsockSpec { guest_cid: 3 }),
+                    shares: vec![],
+                    console: ConsoleSpec::Off,
+                    balloon: false,
+                    entropy: false,
+                    dirty_tracking: false,
+                    isolation: IsolationSpec::None,
+                },
+                vm_dir,
+            )
+            .await
+            .unwrap();
+        if handed_over {
+            vm.detach().unwrap().detach().await.unwrap();
+        }
+        vm
+    }
+
     /// Plant one sandbox that outlived its agent — a detached VM, a durable
     /// record, and a crash journal naming both — then build a fresh manager
     /// over the same data directory and report what its sweep made of it.
@@ -1582,39 +1685,11 @@ mod tests {
         Result<()>,
     ) {
         use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
-        use arcbox_vm_driver::{BootSpec, ConsoleSpec, IsolationSpec, VmSpec, VsockSpec};
 
         let driver = FakeDriver::new();
         let network = std::sync::Arc::new(FakeNetwork::new());
         let vm_dir = data_dir.join("sandboxes").join("keeper");
-        std::fs::create_dir_all(&vm_dir).unwrap();
-        let vm = driver
-            .boot(
-                VmSpec {
-                    id: VmId::new("keeper").unwrap(),
-                    cpus: 1,
-                    memory_mib: 128,
-                    boot: BootSpec::Kernel {
-                        image: "/vmlinux".into(),
-                        cmdline: String::new(),
-                        initrd: None,
-                    },
-                    disks: vec![],
-                    nics: vec![],
-                    vsock: case.vsock.then_some(VsockSpec { guest_cid: 3 }),
-                    shares: vec![],
-                    console: ConsoleSpec::Off,
-                    balloon: false,
-                    entropy: false,
-                    dirty_tracking: false,
-                    isolation: IsolationSpec::None,
-                },
-                &vm_dir,
-            )
-            .await
-            .unwrap();
-        // The previous agent handed its VM over rather than killing it.
-        vm.detach().unwrap().detach().await.unwrap();
+        let vm = boot_previous_vm(&driver, &vm_dir, "keeper", case.vsock, true).await;
         let pid = vm.record().process.map(|process| process.pid).unwrap();
 
         let mut config = VmmConfig::default();
@@ -1706,6 +1781,87 @@ mod tests {
                 .join(STATE_FILE)
                 .exists(),
             "an adopted journal is live state, not debris"
+        );
+    }
+
+    /// The sweep itself can fail after reclaiming: an orphan the driver
+    /// refuses to adopt aborts it, and what it already took must be handed
+    /// back rather than dropped. Deterministic because the sweep sorts its
+    /// journals, so `keeper` is reclaimed before `zzz-broken` fails.
+    #[tokio::test]
+    async fn a_failed_sweep_hands_back_what_it_already_reclaimed() {
+        use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let network = std::sync::Arc::new(FakeNetwork::new());
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        let keeper_dir = data_dir.path().join("sandboxes").join("keeper");
+        let keeper = boot_previous_vm(&driver, &keeper_dir, "keeper", true, true).await;
+        let lease = NetworkLease {
+            vm: VmId::new("keeper").unwrap(),
+            ip: "10.200.0.9".parse().unwrap(),
+            prefix_len: 16,
+            gateway: "10.200.0.1".parse().unwrap(),
+            mac: "02:fc:00:00:00:09".parse().unwrap(),
+            cleanup_token: "gen-1".into(),
+        };
+        write_state_record(
+            &keeper_dir,
+            &SandboxStateRecord::new(
+                "keeper",
+                keeper
+                    .record()
+                    .process
+                    .map(|process| i32::try_from(process.pid).unwrap()),
+                Some(JournaledLease::cold_boot(&lease, true)),
+                None,
+                &config,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Still owned by a live handle, which the fake driver refuses to
+        // adopt — the sweep's own error, after `keeper` was reclaimed.
+        let broken_dir = data_dir.path().join("sandboxes").join("zzz-broken");
+        let _broken = boot_previous_vm(&driver, &broken_dir, "zzz-broken", true, false).await;
+        write_state_record(
+            &broken_dir,
+            &SandboxStateRecord::new("zzz-broken", None, None, None, &config, None).unwrap(),
+        )
+        .unwrap();
+
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, "keeper", PersistPhase::Ready);
+        drop(store);
+
+        let manager = super::super::SandboxManager::with_environment(
+            config,
+            crate::SandboxEnvironment {
+                driver: Some(std::sync::Arc::new(driver)),
+                network: Some(std::sync::Arc::clone(&network) as std::sync::Arc<dyn GuestNetwork>),
+                ..crate::SandboxEnvironment::default()
+            },
+        )
+        .unwrap();
+
+        manager
+            .await_reconcile()
+            .await
+            .expect_err("an orphan the driver cannot adopt fails the sweep");
+        assert_eq!(
+            keeper.state(),
+            VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+            "the reclaimed vm is killed rather than left ownerless"
+        );
+        assert_eq!(
+            network.adopted_mode(&VmId::new("keeper").unwrap()),
+            None,
+            "and its lease is handed back rather than left live"
         );
     }
 
