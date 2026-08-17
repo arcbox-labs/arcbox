@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+// Only the default type parameter: the policy never touches a slot's
+// contents, and every test drives it over `SlotPool<u32>`.
 use crate::sandbox::pool::PreparedSlot;
 
 /// Most distinct snapshot ids pooled at once. The least recently restored

@@ -7,8 +7,8 @@
 
 use std::collections::HashSet;
 
+use crate::sandbox::SandboxState;
 use crate::sandbox::record::PersistPhase;
-use crate::sandbox::types::SandboxState;
 
 /// What the orphan sweep established about one sandbox's runtime resources
 /// before recovery reads its durable record.
