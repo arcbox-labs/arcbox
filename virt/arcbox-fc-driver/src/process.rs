@@ -9,7 +9,9 @@
 //! on the watch. Because the waiter reaps eagerly, "alive" is answered
 //! from the watch, never from the pid: a reaped pid is never probed or
 //! signalled again. An adopted process (no child to wait on) is the one
-//! exception, tracked by probing `/proc` until it is seen gone.
+//! exception: a prober task watches the pid until it is seen gone and
+//! publishes the exit the same way, so subscribers of an adopted VM are
+//! woken like those of a spawned one.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -28,7 +30,7 @@ use crate::error::{FcError, Result};
 /// may retry.
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often an adopted process is probed while waiting for it to exit.
+/// How often the prober checks whether an adopted process is still there.
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The exit status recorded for a process whose real status was never
@@ -73,17 +75,20 @@ pub struct FcProcess {
     api_socket: PathBuf,
     exit: watch::Sender<Option<ExitStatus>>,
     events: broadcast::Sender<VmEvent>,
+    /// Tells the task that observes the process — the waiter or the prober
+    /// — to stand down; taken by `detach`, dropped with the process.
+    stand_down: Mutex<Option<oneshot::Sender<()>>>,
+    /// Set by `detach`: nothing here kills or observes the process any more.
+    detached: AtomicBool,
     ownership: Ownership,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ownership {
-    /// A waiter task owns the child; `detach` tells it to release.
-    Owned {
-        detach: Mutex<Option<oneshot::Sender<()>>>,
-        detached: AtomicBool,
-    },
+    /// A waiter task owns the child and reaps it.
+    Owned,
     /// Found running; nobody here can reap it, so its exit is inferred by
-    /// probing the pid.
+    /// probing the pid — by a prober task, and on demand.
     Adopted,
 }
 
@@ -95,34 +100,43 @@ impl FcProcess {
     /// signal and must not keep the process.
     pub fn spawn<C: Vmm>(child: C, api_socket: PathBuf) -> Result<Self> {
         let pid = child.pid().ok_or(FcError::NoPid)?;
-        let (exit, _) = watch::channel(None);
-        let (events, _) = broadcast::channel(16);
-        let (detach_tx, detach_rx) = oneshot::channel();
-        let process = Self {
-            pid,
-            api_socket,
-            exit: exit.clone(),
-            events: events.clone(),
-            ownership: Ownership::Owned {
-                detach: Mutex::new(Some(detach_tx)),
-                detached: AtomicBool::new(false),
-            },
-        };
-        tokio::spawn(waiter(child, exit, events, detach_rx));
+        let (process, stand_down) = Self::new(pid, api_socket, Ownership::Owned);
+        tokio::spawn(waiter(
+            child,
+            process.exit.clone(),
+            process.events.clone(),
+            stand_down,
+        ));
         Ok(process)
     }
 
-    /// Track a process this crate did not spawn.
+    /// Track a process this crate did not spawn: a prober task watches the
+    /// pid and publishes its exit once it is gone.
     pub fn adopt(pid: u32, api_socket: PathBuf) -> Self {
+        let (process, stand_down) = Self::new(pid, api_socket, Ownership::Adopted);
+        tokio::spawn(prober(
+            pid,
+            process.exit.clone(),
+            process.events.clone(),
+            stand_down,
+        ));
+        process
+    }
+
+    fn new(pid: u32, api_socket: PathBuf, ownership: Ownership) -> (Self, oneshot::Receiver<()>) {
         let (exit, _) = watch::channel(None);
         let (events, _) = broadcast::channel(16);
-        Self {
+        let (stand_down, stood_down) = oneshot::channel();
+        let process = Self {
             pid,
             api_socket,
             exit,
             events,
-            ownership: Ownership::Adopted,
-        }
+            stand_down: Mutex::new(Some(stand_down)),
+            detached: AtomicBool::new(false),
+            ownership,
+        };
+        (process, stood_down)
     }
 
     /// The VMM's pid.
@@ -135,14 +149,15 @@ impl FcProcess {
         &self.api_socket
     }
 
-    /// How the process ended, once it has. An adopted process is probed
-    /// here; the first probe that finds it gone records [`UNKNOWN_EXIT`].
+    /// How the process ended, once it has. An adopted process is also probed
+    /// here, so the answer is exact between two prober ticks; the first probe
+    /// that finds it gone records [`UNKNOWN_EXIT`].
     pub fn exit_status(&self) -> Option<ExitStatus> {
         let recorded = *self.exit.borrow();
         if let Some(status) = recorded {
             return Some(status);
         }
-        if matches!(self.ownership, Ownership::Adopted) && !probe_alive(self.pid) {
+        if self.ownership == Ownership::Adopted && !self.is_detached() && !probe_alive(self.pid) {
             return Some(publish(&self.exit, &self.events, UNKNOWN_EXIT));
         }
         None
@@ -175,15 +190,8 @@ impl FcProcess {
             if remaining.is_zero() {
                 return None;
             }
-            match self.ownership {
-                Ownership::Owned { .. } => {
-                    if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
-                        return None;
-                    }
-                }
-                Ownership::Adopted => {
-                    tokio::time::sleep(remaining.min(PROBE_INTERVAL)).await;
-                }
+            if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
+                return None;
             }
         }
     }
@@ -208,25 +216,24 @@ impl FcProcess {
         }
     }
 
-    /// Release the child: nothing here kills it any more, and the waiter
-    /// stops reaping. `Exited` is never reported for a detached process.
+    /// Release the process, spawned or adopted: nothing here kills it any
+    /// more, the waiter stops reaping and the prober stops probing. `Exited`
+    /// is never reported for a detached process.
     pub fn detach(&self) {
-        if let Ownership::Owned { detach, detached } = &self.ownership {
-            detached.store(true, Ordering::Release);
-            let tx = detach.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Some(tx) = tx {
-                let _ = tx.send(());
-            }
+        self.detached.store(true, Ordering::Release);
+        let tx = self
+            .stand_down
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(tx) = tx {
+            let _ = tx.send(());
         }
     }
 
-    /// `true` after [`detach`](Self::detach) (always `false` for an
-    /// adopted process, which was never owned).
+    /// `true` after [`detach`](Self::detach).
     pub fn is_detached(&self) -> bool {
-        match &self.ownership {
-            Ownership::Owned { detached, .. } => detached.load(Ordering::Acquire),
-            Ownership::Adopted => false,
-        }
+        self.detached.load(Ordering::Acquire)
     }
 
     fn signal(&self, signal: Signal) -> Result<()> {
@@ -291,7 +298,7 @@ async fn waiter<C: Vmm>(
     child: C,
     exit: watch::Sender<Option<ExitStatus>>,
     events: broadcast::Sender<VmEvent>,
-    mut detach: oneshot::Receiver<()>,
+    mut stand_down: oneshot::Receiver<()>,
 ) {
     let mut held = Held {
         child: Some(child),
@@ -303,7 +310,7 @@ async fn waiter<C: Vmm>(
         tokio::pin!(wait);
         tokio::select! {
             status = &mut wait => Some(status),
-            _ = &mut detach => None,
+            _ = &mut stand_down => None,
         }
     };
     match outcome {
@@ -312,6 +319,27 @@ async fn waiter<C: Vmm>(
         }
         None => {
             held.detached = true;
+        }
+    }
+}
+
+/// Watches an adopted pid every [`PROBE_INTERVAL`] and publishes
+/// [`UNKNOWN_EXIT`] once it is gone; told to stand down by `detach`, or by
+/// the process value being dropped (the sender goes with it).
+async fn prober(
+    pid: u32,
+    exit: watch::Sender<Option<ExitStatus>>,
+    events: broadcast::Sender<VmEvent>,
+    mut stand_down: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut stand_down => return,
+            () = tokio::time::sleep(PROBE_INTERVAL) => {}
+        }
+        if !probe_alive(pid) {
+            publish(&exit, &events, UNKNOWN_EXIT);
+            return;
         }
     }
 }
@@ -440,17 +468,58 @@ mod tests {
         let process = FcProcess::adopt(child.id().unwrap(), PathBuf::from("/tmp/api.sock"));
         assert!(process.alive());
         assert!(!process.is_detached());
+        let mut events = process.events();
         // Killed out from under us and reaped by its real parent, the probe
-        // sees it gone and records an unknown exit — once.
+        // sees it gone and records an unknown exit — once, whether the
+        // on-demand probe or the prober task gets there first.
         child.kill().await.unwrap();
         child.wait().await.unwrap();
-        let mut events = process.events();
         assert_eq!(process.exit_status(), Some(UNKNOWN_EXIT));
         assert!(!process.alive());
-        assert_eq!(events.try_recv().unwrap(), VmEvent::Exited(UNKNOWN_EXIT));
+        assert_eq!(events.recv().await.unwrap(), VmEvent::Exited(UNKNOWN_EXIT));
         assert_eq!(process.exit_status(), Some(UNKNOWN_EXIT));
+        tokio::time::sleep(PROBE_INTERVAL * 2).await;
         assert!(events.try_recv().is_err(), "the exit is recorded once");
         assert_eq!(process.kill().await.unwrap(), UNKNOWN_EXIT);
+    }
+
+    #[tokio::test]
+    async fn an_adopted_process_wakes_its_subscribers_when_it_dies_on_its_own() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let process = FcProcess::adopt(child.id().unwrap(), PathBuf::from("/tmp/api.sock"));
+        let mut events = process.events();
+        let mut exit = process.subscribe();
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        // Nobody asks `exit_status`; the prober alone must deliver.
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the prober publishes the exit")
+            .unwrap();
+        assert_eq!(event, VmEvent::Exited(UNKNOWN_EXIT));
+        assert!(exit.has_changed().unwrap());
+        assert_eq!(*exit.borrow_and_update(), Some(UNKNOWN_EXIT));
+    }
+
+    #[tokio::test]
+    async fn detach_releases_an_adopted_process_too() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let process = FcProcess::adopt(child.id().unwrap(), PathBuf::from("/tmp/api.sock"));
+        process.detach();
+        assert!(process.is_detached());
+        // Once released, the process is neither killed nor observed here.
+        let mut events = process.events();
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        tokio::time::sleep(PROBE_INTERVAL * 2).await;
+        assert!(process.alive(), "a detached process is not observed");
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

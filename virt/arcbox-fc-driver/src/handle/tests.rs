@@ -1,7 +1,5 @@
 //! Handle behavior over plain children and an API socket nobody answers on.
 
-use std::path::PathBuf;
-
 use arcbox_vm_driver::{IsolationSpec, ProcessRecord};
 
 use super::*;
@@ -10,11 +8,20 @@ use crate::process::testing::{pid_exists, spawn};
 
 /// A handle over a `sleep` child and an API socket nobody answers on.
 fn handle(dir: &Path, isolation: IsolationSpec, vsock: bool) -> FcHandle {
+    handle_over(Arc::new(spawn("sleep", &["30"])), dir, isolation, vsock)
+}
+
+/// A handle over `process` and an API socket nobody answers on.
+fn handle_over(
+    process: Arc<FcProcess>,
+    dir: &Path,
+    isolation: IsolationSpec,
+    vsock: bool,
+) -> FcHandle {
     let id = VmId::new("box").unwrap();
     let mut config = FcDriverConfig::new("/opt/fc/firecracker");
     config.jailer_binary = Some("/opt/fc/jailer".into());
     let layout = VmLayout::new(&id, &isolation, &config, dir).unwrap();
-    let process = Arc::new(spawn("sleep", &["30"]));
     let record = VmRecord {
         id,
         driver: NAME.to_owned(),
@@ -115,6 +122,22 @@ async fn drop_kills_unless_detached() {
         nix::sys::signal::Signal::SIGKILL,
     )
     .unwrap();
+
+    // An adopted vm is released the same way: detach, then drop, and it
+    // keeps running for the next adopter.
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let adopted = Arc::new(FcProcess::adopt(pid, dir.path().join("absent.sock")));
+    let vm = handle_over(adopted, dir.path(), IsolationSpec::None, false);
+    VmHandle::detach(&vm).unwrap().detach().await.unwrap();
+    drop(vm);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(pid_exists(pid), "a detached adopted vm keeps running");
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
 }
 
 #[tokio::test]
@@ -195,5 +218,4 @@ async fn a_listener_fails_once_the_vm_exits() {
     killer.await.unwrap();
     drop(listener);
     assert!(!dir.path().join("firecracker.vsock_51").exists());
-    let _ = PathBuf::new();
 }
