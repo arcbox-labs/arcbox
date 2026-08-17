@@ -328,9 +328,28 @@ pub async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vsock::{
-        UdsVsock, read_frame as async_read_frame, write_frame as async_write_frame,
-    };
+    use std::path::PathBuf;
+
+    use arcbox_vm_driver::{IoMode, Vsock, VsockConn};
+    use async_trait::async_trait;
+
+    use crate::vsock::{read_frame as async_read_frame, write_frame as async_write_frame};
+
+    /// A [`Vsock`] over a plain Unix socket: every dial connects to the one
+    /// path, whatever the port — the file protocol under test does not care
+    /// how the connection came about.
+    struct UnixVsock(PathBuf);
+
+    #[async_trait]
+    impl Vsock for UnixVsock {
+        async fn dial(&self, _port: u32) -> arcbox_vm_driver::Result<VsockConn> {
+            let stream = UnixStream::connect(&self.0).await?;
+            Ok(VsockConn {
+                fd: stream.into_std()?.into(),
+                mode: IoMode::Async,
+            })
+        }
+    }
 
     #[test]
     fn test_write_req_serializes() {
@@ -533,10 +552,9 @@ mod tests {
         ));
     }
 
-    /// Bind a mock Firecracker vsock UDS: accept one connection, answer the
-    /// `CONNECT {port}` handshake, then hand the stream to `script`. The
-    /// returned [`UdsVsock`] dials it.
-    async fn mock_vsock_server<F, Fut>(script: F) -> (tempfile::TempDir, UdsVsock)
+    /// Bind a mock guest agent: accept one connection and hand the stream
+    /// to `script`. The returned [`UnixVsock`] dials it.
+    async fn mock_vsock_server<F, Fut>(script: F) -> (tempfile::TempDir, UnixVsock)
     where
         F: FnOnce(UnixStream) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send,
@@ -545,20 +563,10 @@ mod tests {
         let path = dir.path().join("v.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // Consume "CONNECT {port}\n".
-            let mut byte = [0u8; 1];
-            loop {
-                stream.read_exact(&mut byte).await.unwrap();
-                if byte[0] == b'\n' {
-                    break;
-                }
-            }
-            use tokio::io::AsyncWriteExt as _;
-            stream.write_all(b"OK 53\n").await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
             script(stream).await;
         });
-        (dir, UdsVsock(path))
+        (dir, UnixVsock(path))
     }
 
     #[tokio::test]

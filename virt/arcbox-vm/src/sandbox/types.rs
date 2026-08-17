@@ -209,9 +209,6 @@ pub struct SandboxInstance {
     pub network: Option<NetworkAllocation>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
     pub vm_dir: PathBuf,
-    /// Path to the Firecracker vsock Unix domain socket (host side).
-    /// `None` until the VM is booted.
-    pub vsock_uds_path: Option<PathBuf>,
     /// When the sandbox record was created.
     pub created_at: DateTime<Utc>,
     /// When the sandbox first became ready.
@@ -287,7 +284,6 @@ impl SandboxInstance {
             handle: None,
             network,
             vm_dir,
-            vsock_uds_path: None,
             created_at: Utc::now(),
             ready_at: None,
             last_exited_at: None,
@@ -300,11 +296,6 @@ impl SandboxInstance {
             pause_snapshot_id: None,
             ttl_deadline: None,
         }
-    }
-
-    /// Path to the Firecracker API socket for this sandbox.
-    pub fn socket_path(&self) -> PathBuf {
-        self.vm_dir.join("firecracker.sock")
     }
 }
 

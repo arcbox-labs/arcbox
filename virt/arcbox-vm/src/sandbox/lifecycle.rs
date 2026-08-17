@@ -829,13 +829,13 @@ impl SandboxManager {
     }
 }
 
-/// The vsock capability reaching `inst`'s guest agent, once a boot or
-/// restore has handed one over.
+/// The vsock capability reaching `inst`'s guest agent: the running VM's,
+/// once a boot or restore has handed its handle over.
 fn guest_vsock(id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
-    inst.vsock_uds_path
+    inst.handle
         .clone()
-        .map(|path| Arc::new(vsock::UdsVsock(path)) as Arc<dyn arcbox_vm_driver::Vsock>)
-        .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no vsock configured")))
+        .map(|handle| Arc::new(vsock::HandleVsock(handle)) as Arc<dyn arcbox_vm_driver::Vsock>)
+        .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))
 }
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.

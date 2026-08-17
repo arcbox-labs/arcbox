@@ -38,8 +38,6 @@ pub(super) struct PreparedSlot {
     /// The checkpoint as staged into the slot's chroot, ready for the
     /// driver to load.
     pub image: CheckpointImage,
-    /// Host-side vsock UDS path inside the slot's chroot.
-    pub vsock_path: PathBuf,
     /// Slot runtime dir (`sandboxes/pool-<uuid>`) holding its crash journal.
     pub vm_dir: PathBuf,
 }
@@ -227,12 +225,11 @@ pub(super) async fn prepare_slot(
     )?;
 
     match stage_slot(driver, fc_cfg, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
-        Ok((prepared, cow_handle, image, vsock_path)) => Ok(PreparedSlot {
+        Ok((prepared, cow_handle, image)) => Ok(PreparedSlot {
             slot_id,
             prepared,
             cow_handle,
             image,
-            vsock_path,
             vm_dir,
         }),
         Err(mut failure) => {
@@ -291,12 +288,7 @@ impl From<VmmError> for SlotFailure {
     }
 }
 
-type StagedSlot = (
-    Arc<dyn PreparedVm>,
-    Option<CowHandle>,
-    CheckpointImage,
-    PathBuf,
-);
+type StagedSlot = (Arc<dyn PreparedVm>, Option<CowHandle>, CheckpointImage);
 
 async fn stage_slot(
     driver: &dyn VmDriver,
@@ -309,7 +301,6 @@ async fn stage_slot(
 ) -> std::result::Result<StagedSlot, SlotFailure> {
     let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
     let cr = chroot_root(&fc_cfg.binary, base, slot_id);
-    let vsock_path = cr.join("run/firecracker.vsock");
 
     let prepared: Arc<dyn PreparedVm> = Arc::from(
         super::prepare_capability(driver)
@@ -365,7 +356,7 @@ async fn stage_slot(
         Ok(_) => {
             let image =
                 super::checkpoint_image(cr.join("snapshots").join(&snapshot.id), &snapshot.format);
-            Ok((prepared, cow_handle, image, vsock_path))
+            Ok((prepared, cow_handle, image))
         }
         Err(error) => Err(carry(error.into(), Some(prepared), cow_handle)),
     }

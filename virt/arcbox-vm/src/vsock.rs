@@ -9,22 +9,11 @@
 //! frame codec speaks over. Where that connection comes from is the
 //! driver's business.
 //!
-//! ## How Firecracker proxies vsock
-//!
-//! Until the Firecracker adapter owns it, [`UdsVsock`] performs the
-//! dial: Firecracker exposes a Unix domain socket (`uds_path`) that acts as
-//! a proxy for host-initiated connections to guest vsock ports.  The
-//! handshake:
-//!
-//! 1. Connect to `uds_path`.
-//! 2. Write `"CONNECT {AGENT_PORT}\n"`.
-//! 3. Read until `'\n'` — the response is `"OK {host_ephemeral_port}\n"`.
-//! 4. The socket is now a bidirectional pipe to the guest's vsock port.
-//!
-//! In the other direction, a guest-initiated connect to host port `P` is
-//! forwarded by Firecracker to a host Unix socket at `{uds_path}_{P}`; the
-//! boot readiness gate pre-listens there through the driver's `VsockListen`
-//! capability ([`wait_ready`]).
+//! The capability comes off the running VM's handle ([`HandleVsock`] keeps
+//! that handle alive for the callers that hold the vsock across awaits).
+//! In the other direction — the guest agent's readiness dial-out — the
+//! boot pre-listens through the driver's `VsockListen` capability and
+//! [`wait_ready`] takes the one connection.
 //!
 //! ## Frame format
 //!
@@ -50,8 +39,8 @@ use arcbox_vm_proto::exec::{
     MSG_EOF, MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_START, MSG_STDERR, MSG_STDIN, MSG_STDOUT,
 };
 
-mod uds;
-pub use uds::UdsVsock;
+mod handle;
+pub(crate) use handle::HandleVsock;
 
 // =============================================================================
 // Public types
@@ -653,7 +642,6 @@ mod tests {
     use std::os::fd::OwnedFd;
 
     use async_trait::async_trait;
-    use tokio::net::UnixListener;
 
     use super::*;
 
@@ -772,47 +760,6 @@ mod tests {
             matches!(err, VmmError::Vsock(ref m) if m.contains("blocking I/O")),
             "unexpected error: {err}"
         );
-    }
-
-    /// The transitional adapter's classification of Firecracker's proxy
-    /// answers: closed without `OK` is the retryable "no listener yet",
-    /// anything else final, `OK` a usable async connection.
-    #[tokio::test]
-    async fn uds_vsock_classifies_the_proxy_handshake() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fc.vsock");
-        let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
-            for answer in [None, Some(&b"NOPE\n"[..]), Some(&b"OK 52\n"[..])] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut byte = [0u8; 1];
-                loop {
-                    stream.read_exact(&mut byte).await.unwrap();
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                }
-                if let Some(answer) = answer {
-                    stream.write_all(answer).await.unwrap();
-                    // Keep the accepted end alive until the dial returns.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        });
-        let vsock = UdsVsock(path);
-
-        let err = vsock.dial(AGENT_PORT).await.unwrap_err();
-        assert!(
-            is_not_listening(&err),
-            "closed proxy must be ConnectionRefused: {err}"
-        );
-        let err = vsock.dial(AGENT_PORT).await.unwrap_err();
-        assert!(
-            matches!(err, arcbox_vm_driver::Error::Driver { .. }),
-            "unexpected response must be final: {err}"
-        );
-        let conn = vsock.dial(AGENT_PORT).await.unwrap();
-        assert_eq!(conn.mode, IoMode::Async);
     }
 
     #[tokio::test]

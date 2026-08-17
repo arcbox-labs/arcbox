@@ -7,7 +7,7 @@ use arcbox_vm_driver::{
     VmSpec, VsockListener, VsockSpec,
 };
 
-type BootOutput = (Arc<dyn VmHandle>, PathBuf, Box<dyn VsockListener>);
+type BootOutput = (Arc<dyn VmHandle>, Box<dyn VsockListener>);
 
 /// How long the readiness gate waits for vm-agent's dial-out (the guest
 /// connect to [`vsock::READY_PORT`]) before the boot is declared failed.
@@ -59,7 +59,7 @@ pub(super) async fn boot_sandbox(
     )
     .await
     {
-        Ok((handle, vsock_uds_path, mut ready_listener)) => {
+        Ok((handle, mut ready_listener)) => {
             let current = instances.read().unwrap().get(&id).cloned();
             let is_current_generation = current
                 .as_ref()
@@ -115,7 +115,7 @@ pub(super) async fn boot_sandbox(
             }
 
             let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-                Arc::new(vsock::UdsVsock(vsock_uds_path.clone()));
+                Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
 
             // The guest clock still needs setting on cold boot (no RTC — the
             // guest wakes at the kernel default epoch), but it must not delay
@@ -168,7 +168,6 @@ pub(super) async fn boot_sandbox(
                             false
                         } else {
                             inst.handle = handle.take();
-                            inst.vsock_uds_path = Some(vsock_uds_path.clone());
                             // With an initial cmd the instance stays
                             // `Starting`: the tail below moves it straight
                             // to Running via the reserved Initial claim, so
@@ -862,14 +861,14 @@ async fn do_boot(
         });
     }
 
-    // Determine kernel, rootfs, and vsock paths.
+    // Determine the kernel and rootfs paths.
     //
     // In jailer mode the files must exist inside the chroot: they are staged
     // there and named to the driver by their in-jail host path, which it
     // passes to the VMM chroot-relative. In direct mode the host-absolute
     // paths from the spec are used as-is.
     let mut cow_handle = None;
-    let paths: Result<(PathBuf, PathBuf, PathBuf)> = async {
+    let paths: Result<(PathBuf, PathBuf)> = async {
         if let Some(ref jc) = fc_cfg.jailer {
             // Jailer mode: stage kernel + rootfs into chroot.
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
@@ -936,8 +935,7 @@ async fn do_boot(
                 }
             };
 
-            let vsock_host = cr.join("run/firecracker.vsock");
-            Ok((in_jail(&cr, &k), in_jail(&cr, &r), vsock_host))
+            Ok((in_jail(&cr, &k), in_jail(&cr, &r)))
         } else {
             // Direct mode: try dm-snapshot CoW, fall back to using rootfs directly.
             // When CoW is active, create a stable `{vm_dir}/rootfs.link` symlink
@@ -971,12 +969,7 @@ async fn do_boot(
                     spec.rootfs.clone()
                 }
             };
-            let vsock_path = vm_dir.join("firecracker.vsock");
-            Ok((
-                PathBuf::from(&spec.kernel),
-                PathBuf::from(rootfs),
-                vsock_path,
-            ))
+            Ok((PathBuf::from(&spec.kernel), PathBuf::from(rootfs)))
         }
     }
     .await;
@@ -1009,7 +1002,7 @@ async fn do_boot(
     };
     complete_resource_handoff(&mut resource_handoff);
 
-    let (kernel_path, rootfs_path, vsock_host_path) = paths.map_err(|error| BootFailure {
+    let (kernel_path, rootfs_path) = paths.map_err(|error| BootFailure {
         error,
         prepared: None,
         cow_handle: None,
@@ -1050,7 +1043,7 @@ async fn do_boot(
         .boot(vm_spec)
         .await
         .map_err(|error| failed(error.into()))?;
-    Ok((Arc::from(handle), vsock_host_path, ready_listener))
+    Ok((Arc::from(handle), ready_listener))
 }
 
 /// A staged file's host path inside the jail, from the chroot-relative name

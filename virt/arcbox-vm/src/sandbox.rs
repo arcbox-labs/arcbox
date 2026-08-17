@@ -110,18 +110,39 @@ impl SandboxManager {
     /// Create a new manager from the given configuration, with the
     /// environment-specific components the composer supplies.
     ///
-    /// Fails with [`VmmError::Config`] when the environment's driver claims
-    /// no `Prepare` capability — the flows spawn the VMM ahead of the
-    /// guest, so a driver without it would fail at the first boot instead.
+    /// Fails with [`VmmError::Config`] when the environment's driver lacks a
+    /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
+    /// ahead of the guest), `Vsock` (the guest agent is reached over it) or
+    /// `VsockListen` (the readiness gate is the guest's dial-out) — so a
+    /// driver without one is refused here instead of at the first boot.
     pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
         let driver = environment.driver.unwrap_or_else(|| {
             Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))) as Arc<dyn VmDriver>
         });
-        if driver.prepare().is_none() {
-            return Err(VmmError::Config(format!(
-                "VM driver `{}` has no prepare capability; the sandbox boot and pool flows need one",
-                driver.name()
-            )));
+        let capabilities = driver.capabilities();
+        for (missing, capability, need) in [
+            (
+                driver.prepare().is_none(),
+                "prepare",
+                "the boot and pool flows spawn the VMM ahead of the guest",
+            ),
+            (
+                !capabilities.vsock,
+                "vsock",
+                "the guest agent is reached over vsock",
+            ),
+            (
+                !capabilities.vsock_listen,
+                "vsock_listen",
+                "the readiness gate is the guest's vsock dial-out",
+            ),
+        ] {
+            if missing {
+                return Err(VmmError::Config(format!(
+                    "VM driver `{}` has no {capability} capability; {need}",
+                    driver.name()
+                )));
+            }
         }
         let records = Arc::new(persistence::SandboxRecordStore::new(Path::new(
             &config.firecracker.data_dir,
@@ -601,11 +622,13 @@ mod tests {
     }
 
     /// The manager refuses, at construction, a driver that cannot spawn the
-    /// VMM ahead of a boot: the pool and boot flows both prepare first, so
-    /// a driver without `Prepare` would fail at the first create instead.
+    /// VMM ahead of a boot, dial the guest, or take its readiness dial-out:
+    /// every sandbox flow needs all three, so a driver without one would
+    /// fail at the first create instead.
     #[test]
-    fn construction_requires_the_drivers_prepare_capability() {
+    fn construction_requires_the_drivers_prepare_and_vsock_capabilities() {
         use arcbox_vm_driver::testkit::FakeDriver;
+        use arcbox_vm_driver::{DriverCapabilities, VmDriver as _};
 
         let dir = tempfile::tempdir().unwrap();
         let mut config = VmmConfig::default();
@@ -614,21 +637,41 @@ mod tests {
             driver: Some(Arc::new(driver)),
             ..SandboxEnvironment::default()
         };
+        let all = FakeDriver::new().capabilities();
 
-        let unprepared = FakeDriver::builder()
-            .capabilities(arcbox_vm_driver::DriverCapabilities {
-                prepare: false,
-                ..FakeDriver::new().capabilities()
-            })
-            .build();
-        let error = SandboxManager::with_environment(config.clone(), environment(unprepared))
-            .err()
-            .expect("a driver without Prepare is refused");
-        assert!(matches!(error, VmmError::Config(_)), "{error}");
-        assert!(error.to_string().contains("prepare"), "{error}");
+        for (name, capabilities) in [
+            (
+                "prepare",
+                DriverCapabilities {
+                    prepare: false,
+                    ..all.clone()
+                },
+            ),
+            (
+                "vsock",
+                DriverCapabilities {
+                    vsock: false,
+                    ..all.clone()
+                },
+            ),
+            (
+                "vsock_listen",
+                DriverCapabilities {
+                    vsock_listen: false,
+                    ..all
+                },
+            ),
+        ] {
+            let driver = FakeDriver::builder().capabilities(capabilities).build();
+            let error = SandboxManager::with_environment(config.clone(), environment(driver))
+                .err()
+                .unwrap_or_else(|| panic!("a driver without {name} is refused"));
+            assert!(matches!(error, VmmError::Config(_)), "{error}");
+            assert!(error.to_string().contains(name), "{error}");
+        }
 
         let manager = SandboxManager::with_environment(config, environment(FakeDriver::new()))
-            .expect("a driver with Prepare is accepted");
+            .expect("a driver with every needed capability is accepted");
         assert_eq!(manager.driver.name(), "fake");
     }
 

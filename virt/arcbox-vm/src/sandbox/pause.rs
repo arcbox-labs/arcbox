@@ -78,7 +78,6 @@ pub(super) fn delete_pause_snapshots(
 struct ResumedRuntime {
     prepared: Arc<dyn PreparedVm>,
     handle: Arc<dyn VmHandle>,
-    vsock_uds_path: PathBuf,
     network: Option<NetworkAllocation>,
     cow_handle: Option<CowHandle>,
     ip_address: String,
@@ -261,7 +260,6 @@ impl SandboxManager {
             inst.paused_at = Some(Utc::now());
             inst.pause_snapshot_id = Some(snapshot_id.clone());
             inst.handle = None;
-            inst.vsock_uds_path = None;
             if paused_commit
                 .as_ref()
                 .is_none_or(|commit| commit.durability_error.is_none())
@@ -377,7 +375,6 @@ impl SandboxManager {
                     let mut inst = instance.lock().unwrap();
                     inst.prepared = Some(resumed.prepared);
                     inst.handle = Some(resumed.handle);
-                    inst.vsock_uds_path = Some(resumed.vsock_uds_path);
                     inst.network = resumed.network;
                     inst.cow_handle = resumed.cow_handle;
                     // Re-establish the guest's addressing mode from the
@@ -584,9 +581,7 @@ impl SandboxManager {
                 self.network.activate(net, mode)?;
             }
 
-            // Fresh chroot + VMM process, prepared through the driver (which
-            // clears the vsock socket path before spawning into the jail).
-            let vsock_path = cr.join("run/firecracker.vsock");
+            // Fresh chroot + VMM process, prepared through the driver.
             let spawned: Arc<dyn PreparedVm> = Arc::from(
                 super::prepare_capability(&*self.driver)
                     .prepare(&VmId::new(id)?, &IsolationSpec::try_from(jailer)?, vm_dir)
@@ -666,7 +661,7 @@ impl SandboxManager {
                     .await?,
             );
             let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-                Arc::new(vsock::UdsVsock(vsock_path.clone()));
+                Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
 
             // Clock sync is DETACHED, mirroring restore and cold boot
             // (CORE-80): the guest wall clock froze at pause time, but
@@ -720,7 +715,6 @@ impl SandboxManager {
             Ok(ResumedRuntime {
                 prepared: prepared.take().expect("prepared set above"),
                 handle,
-                vsock_uds_path: vsock_path,
                 network: net_alloc.take(),
                 cow_handle: cow_handle.take(),
                 ip_address,

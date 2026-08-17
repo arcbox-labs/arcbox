@@ -503,7 +503,7 @@ impl SandboxManager {
         let pool_hit = claimed.is_some();
         // The id the jail is keyed by (the slot's for a pool hit), which is
         // also the id the driver prepared the VMM under.
-        let (prepared, jail_owner, actual_vsock_path, staged_image, t_spawned, t_staged) =
+        let (prepared, resource_owner, chroot, staged_checkpoint, t_prepared, t_staged) =
             if let Some(slot) = claimed {
                 // Record the adopting sandbox's slot id first: failure cleanup
                 // and crash reconciliation key the chroot and dm/CoW teardown
@@ -524,7 +524,6 @@ impl SandboxManager {
                     prepared: slot_prepared,
                     cow_handle,
                     image,
-                    vsock_path,
                     vm_dir: slot_vm_dir,
                 } = slot;
                 pending_cow = cow_handle;
@@ -575,21 +574,13 @@ impl SandboxManager {
                 // Both phases were pre-executed by the slot; the timestamps
                 // collapse so the completion log reports them honestly as ~0.
                 let t_claimed = std::time::Instant::now();
-                (
-                    slot_prepared,
-                    slot_id,
-                    vsock_path,
-                    image,
-                    t_claimed,
-                    t_claimed,
-                )
+                let chroot = chroot_root(&fc_cfg.binary, base, &slot_id);
+                (slot_prepared, slot_id, chroot, image, t_claimed, t_claimed)
             } else {
-                // Each jailer restore owns a distinct chroot and vsock path;
-                // the driver's prepared VMM clears the socket path before
-                // spawning into it.
-                let spawned: Result<(Arc<dyn PreparedVm>, PathBuf)> = async {
-                    let cr = chroot_root(&fc_cfg.binary, base, &new_id);
-                    let vsock_path = cr.join("run/firecracker.vsock");
+                // Each jailer restore owns a distinct chroot; the driver's
+                // prepared VMM spawns into it.
+                let cr = chroot_root(&fc_cfg.binary, base, &new_id);
+                let spawned: Result<Arc<dyn PreparedVm>> = async {
                     let prepared = super::prepare_capability(&*self.driver)
                         .prepare(
                             &VmId::new(&new_id)?,
@@ -597,10 +588,10 @@ impl SandboxManager {
                             &vm_dir,
                         )
                         .await?;
-                    Ok((Arc::from(prepared), vsock_path))
+                    Ok(Arc::from(prepared))
                 }
                 .await;
-                let (spawned_prepared, vsock_path) = match spawned {
+                let spawned_prepared = match spawned {
                     Ok(spawned) => spawned,
                     Err(error) => {
                         return Err(self
@@ -636,7 +627,7 @@ impl SandboxManager {
                         .await);
                 }
 
-                let t_spawned = std::time::Instant::now();
+                let t_prepared = std::time::Instant::now();
 
                 // In jailer mode the restored FC process also runs inside a
                 // chroot and cannot access the catalog's host-absolute paths.
@@ -644,7 +635,6 @@ impl SandboxManager {
                 // chroot-relative paths.
                 let setup_result: Result<CheckpointImage> = async {
                     let jc = jailer;
-                    let cr = chroot_root(&fc_cfg.binary, base, &new_id);
 
                     // Stage kernel (always hard-linked or copied, ~16MB).
                     if let Some(k) = snap_meta.kernel_path.as_deref() {
@@ -709,9 +699,9 @@ impl SandboxManager {
                 (
                     spawned_prepared,
                     new_id.clone(),
-                    vsock_path,
+                    cr,
                     image,
-                    t_spawned,
+                    t_prepared,
                     std::time::Instant::now(),
                 )
             };
@@ -720,12 +710,14 @@ impl SandboxManager {
         // into the owner's jail, eth0 lands on the fresh TAP.
         let loaded: Result<Arc<dyn VmHandle>> = async {
             let restore = super::boot::restore_spec(
-                &jail_owner,
-                &chroot_root(&fc_cfg.binary, base, &jail_owner),
+                &resource_owner,
+                &chroot,
                 net_alloc.as_ref(),
                 IsolationSpec::try_from(jailer)?,
             )?;
-            Ok(Arc::from(prepared.restore(&staged_image, restore).await?))
+            Ok(Arc::from(
+                prepared.restore(&staged_checkpoint, restore).await?,
+            ))
         }
         .await;
         let handle = match loaded {
@@ -746,7 +738,7 @@ impl SandboxManager {
 
         let t_loaded = std::time::Instant::now();
         let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-            Arc::new(vsock::UdsVsock(actual_vsock_path.clone()));
+            Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
 
         // Clock sync after restore is DETACHED, mirroring the cold-boot path
         // (boot.rs): vm-agent re-syncs itself from ptp_kvm (/dev/ptp0) on
@@ -887,7 +879,6 @@ impl SandboxManager {
             inst.network.clone_from(&net_alloc);
             inst.prepared = Some(prepared);
             inst.handle = Some(handle);
-            inst.vsock_uds_path = Some(actual_vsock_path.clone());
             inst.cow_handle = pending_cow.take();
             inst.net_invariant = snap_meta.net_invariant;
             // A warm create that owes the spec's initial cmd stays
@@ -974,8 +965,8 @@ impl SandboxManager {
             snapshot_id = %request.snapshot_id,
             pool_hit,
             warm_create,
-            spawn_ms = ms(t_spawned.duration_since(restore_started)),
-            stage_ms = ms(t_staged.duration_since(t_spawned)),
+            spawn_ms = ms(t_prepared.duration_since(restore_started)),
+            stage_ms = ms(t_staged.duration_since(t_prepared)),
             load_ms = ms(t_loaded.duration_since(t_staged)),
             guest_cfg_ms = ms(t_guest_cfg.duration_since(t_loaded)),
             total_ms = ms(restore_started.elapsed()),
