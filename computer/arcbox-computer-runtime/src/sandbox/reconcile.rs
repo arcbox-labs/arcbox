@@ -30,6 +30,15 @@
 //!
 //! Everything else is torn down as before, and then durable lifecycle
 //! records are normalized for replay and inspection.
+//!
+//! What a reclaim does *not* restore is the host's half: the composing host
+//! clears every sandbox's DNS record and port listeners on the startup
+//! handshake ([`SandboxHost::clear_host_state`]'s premise was that a
+//! restarting agent left nothing alive), so an adopted sandbox keeps
+//! running and stays reachable over vsock and at its address, but loses its
+//! name and its published ports until something re-registers them. Nothing
+//! leaks — the guest-side forwarding rules survive and a later Remove still
+//! sweeps them — and the fix belongs to the host half, not here.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
@@ -745,7 +754,7 @@ fn adopted_instance(
 ///
 /// A handle that comes back is either reclaimed — with its datapath and its
 /// disk overlay — or killed and reaped, so the dm teardown that follows
-/// never hits EBUSY on an open block device. [`can_reclaim`] decides which,
+/// never hits EBUSY on an open block device. [`reclaim`] decides which,
 /// and every one of its refusals falls back to that kill: the behaviour this
 /// sweep had before adoption existed.
 async fn adopt_or_kill(
@@ -785,7 +794,7 @@ async fn adopt_or_kill(
     };
     let handle: Arc<dyn VmHandle> = Arc::from(handle);
 
-    match can_reclaim(network, cow_manager, record, phase, &handle).await {
+    match reclaim(network, cow_manager, record, phase, &handle).await {
         Ok(reclaimed) => {
             info!(sandbox_id = %record.id, vm = %vm_record.id, "reclaimed a sandbox whose vm outlived its agent");
             Ok(Some(reclaimed))
@@ -801,8 +810,8 @@ async fn adopt_or_kill(
     }
 }
 
-/// Whether this live VM can be handed back to the manager, and the runtime
-/// state that comes with it if so.
+/// Take this live VM and the host state it was running on back, or say why
+/// it cannot be taken.
 ///
 /// `Err` carries why not, and is never fatal — the caller kills instead,
 /// which is what this sweep always did. Nothing partial needs unwinding
@@ -810,7 +819,7 @@ async fn adopt_or_kill(
 /// template refcount) are released by exactly the teardown the kill path
 /// then runs, and releasing them here as well would double-drop the
 /// template's refcount.
-async fn can_reclaim(
+async fn reclaim(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
     record: &SandboxStateRecord,
