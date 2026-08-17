@@ -33,7 +33,8 @@
 //! - [`handle`] — [`FcHandle`], the port's `VmHandle` over a running VM:
 //!   state and events from the guard, `Kill` and `Graceful` shutdown, and
 //!   the vsock, listen, checkpoint (pause → snapshot → resume or hold),
-//!   and detach capabilities.
+//!   and detach capabilities; and [`FcProcessHandle`], the same port over
+//!   a VMM process whose API is unreachable — kill, observe, detach.
 //! - [`prepared`] — [`FcPrepared`], the port's `PreparedVm`: a spawned
 //!   VMM waiting for a spec, listeners bound before the guest starts.
 //! - [`discover`] — finding a Firecracker that outlived the process which
@@ -77,7 +78,7 @@ pub mod vsock;
 pub use config::FcDriverConfig;
 pub use driver::FcDriver;
 pub use error::FcError;
-pub use handle::FcHandle;
+pub use handle::{FcHandle, FcProcessHandle};
 pub use prepared::FcPrepared;
 
 /// The driver's name.
