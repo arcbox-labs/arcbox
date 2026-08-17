@@ -15,6 +15,7 @@ use fc_sdk::VmBuilder;
 use crate::config::FcDriverConfig;
 use crate::error::FcError;
 use crate::handle::FcHandle;
+use crate::listener::VsockEndpoint;
 use crate::process::FcProcess;
 use crate::render::{self, VmLayout};
 use crate::{NAME, api, jail, listener, spawn};
@@ -28,6 +29,10 @@ pub struct FcPrepared {
     layout: VmLayout,
     process: Arc<FcProcess>,
     record: VmRecord,
+    /// Where guest dial-outs land: the layout's vsock socket, until a
+    /// restore learns where the checkpoint had it and moves it. Listeners
+    /// bound before the boot or restore follow.
+    vsock: VsockEndpoint,
     /// A boot or restore succeeded.
     consumed: AtomicBool,
     /// Serializes `boot` / `restore` so at most one can succeed.
@@ -62,11 +67,13 @@ impl FcPrepared {
                 api_socket: Some(plan.api_socket),
             }),
         };
+        let vsock = VsockEndpoint::new(layout.vsock_host_uds());
         Ok(Self {
             config,
             layout,
             process,
             record,
+            vsock,
             consumed: AtomicBool::new(false),
             launch: tokio::sync::Mutex::new(()),
         })
@@ -106,14 +113,14 @@ impl FcPrepared {
         Ok(())
     }
 
-    fn handle(&self, client: fc_sdk::Client, vsock_uds: Option<std::path::PathBuf>) -> FcHandle {
+    fn handle(&self, client: fc_sdk::Client, has_vsock: bool) -> FcHandle {
         self.consumed.store(true, Ordering::Release);
         FcHandle::new(
             Arc::clone(&self.process),
             client,
             self.layout.clone(),
             self.record.clone(),
-            vsock_uds,
+            has_vsock.then(|| self.vsock.clone()),
             false,
         )
     }
@@ -169,7 +176,9 @@ impl PreparedVm for FcPrepared {
             builder = builder.entropy(entropy);
         }
         let vm = builder.start().await.map_err(FcError::Api)?;
-        Ok(Box::new(self.handle(vm.into_client(), plan.vsock_host_uds)))
+        Ok(Box::new(
+            self.handle(vm.into_client(), plan.vsock_host_uds.is_some()),
+        ))
     }
 
     async fn restore(
@@ -193,13 +202,18 @@ impl PreparedVm for FcPrepared {
         // disks and the vsock socket are read back rather than assumed.
         let loaded = api::vm_config(&client).await?;
         reattach_disks(&client, &loaded.drives, &plan.drives).await?;
+        // Firecracker rebound the vsock where the checkpoint recorded it;
+        // listeners bound on this prepared VM move there before the guest
+        // can dial out.
+        let has_vsock = loaded.vsock.is_some();
+        if let Some(vsock) = loaded.vsock {
+            self.vsock
+                .relocate(self.layout.vsock_host_view(&vsock.uds_path));
+        }
         // The load left the guest frozen so it could not touch a stale disk;
         // it runs from here.
         api::resume(&client).await?;
-        let vsock_uds = loaded
-            .vsock
-            .map(|vsock| self.layout.vsock_host_view(&vsock.uds_path));
-        Ok(Box::new(self.handle(client, vsock_uds)))
+        Ok(Box::new(self.handle(client, has_vsock)))
     }
 
     async fn discard(&self) -> Result<ExitStatus> {
@@ -241,8 +255,11 @@ async fn reattach_disks(
 
 #[async_trait]
 impl VsockListen for FcPrepared {
+    /// Bound next to the layout's vsock socket, where a boot puts the
+    /// device; a restore moves the endpoint to the recorded path before
+    /// the guest resumes and the listener follows.
     async fn listen(&self, port: u32) -> Result<Box<dyn VsockListener>> {
-        listener::bind(&self.layout, &self.process, port)
+        listener::bind(&self.layout, &self.vsock, &self.process, port)
     }
 }
 

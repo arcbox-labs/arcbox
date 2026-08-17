@@ -12,6 +12,7 @@ use async_trait::async_trait;
 
 use crate::config::FcDriverConfig;
 use crate::handle::FcHandle;
+use crate::listener::VsockEndpoint;
 use crate::prepared::FcPrepared;
 use crate::process::FcProcess;
 use crate::render::VmLayout;
@@ -135,9 +136,9 @@ impl Adopt for FcDriver {
             &self.config,
             &record.runtime_dir,
         )?;
-        let vsock_uds = devices
+        let vsock = devices
             .vsock
-            .map(|vsock| layout.vsock_host_view(&vsock.uds_path));
+            .map(|vsock| VsockEndpoint::new(layout.vsock_host_view(&vsock.uds_path)));
         let process = Arc::new(FcProcess::adopt(found.pid, found.api_socket));
         let quiesced = matches!(info.state, fc_sdk::types::InstanceInfoState::Paused);
         Ok(Some(Box::new(FcHandle::new(
@@ -145,7 +146,7 @@ impl Adopt for FcDriver {
             client,
             layout,
             record.clone(),
-            vsock_uds,
+            vsock,
             quiesced,
         ))))
     }

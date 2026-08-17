@@ -48,8 +48,8 @@ fn with_client(
             api_socket: Some(layout.api_socket()),
         }),
     };
-    let vsock_uds = vsock.then(|| layout.vsock_host_uds());
-    FcHandle::new(process, client, layout, record, vsock_uds, quiesced)
+    let vsock = vsock.then(|| VsockEndpoint::new(layout.vsock_host_uds()));
+    FcHandle::new(process, client, layout, record, vsock, quiesced)
 }
 
 /// A Firecracker that pauses and describes itself happily, and answers
@@ -339,4 +339,52 @@ async fn a_listener_fails_once_the_vm_exits() {
     killer.await.unwrap();
     drop(listener);
     assert!(!dir.path().join("firecracker.vsock_51").exists());
+}
+
+#[tokio::test]
+async fn listen_binds_next_to_the_socket_dial_uses_not_the_layout_path() {
+    // A restored (or adopted) VM has its vsock where the checkpoint
+    // recorded it — in direct mode the source VM's runtime dir, not this
+    // one's. Guest dial-outs land next to that socket, so the listener
+    // must be bound there too.
+    let dir = tempfile::tempdir().unwrap();
+    let recorded = dir.path().join("source").join("firecracker.vsock");
+    std::fs::create_dir_all(recorded.parent().unwrap()).unwrap();
+    let id = VmId::new("box").unwrap();
+    let config = FcDriverConfig::new("/opt/fc/firecracker");
+    let layout = VmLayout::new(&id, &IsolationSpec::None, &config, dir.path()).unwrap();
+    assert_ne!(layout.vsock_host_uds(), recorded);
+    let process = Arc::new(spawn("sleep", &["30"]));
+    let record = VmRecord {
+        id,
+        driver: NAME.to_owned(),
+        runtime_dir: dir.path().to_path_buf(),
+        process: Some(ProcessRecord {
+            pid: process.pid(),
+            api_socket: Some(layout.api_socket()),
+        }),
+    };
+    let vm = FcHandle::new(
+        process,
+        fc_sdk::connection::connect(dir.path().join("absent.sock")),
+        layout,
+        record,
+        Some(VsockEndpoint::new(recorded.clone())),
+        false,
+    );
+
+    let listener = vm.vsock_listener().unwrap().listen(51).await.unwrap();
+    assert!(
+        dir.path().join("source/firecracker.vsock_51").exists(),
+        "bound next to the recorded socket"
+    );
+    assert!(
+        !dir.path().join("firecracker.vsock_51").exists(),
+        "not next to the layout's socket"
+    );
+    drop(listener);
+    // And a kill unlinks the recorded socket, not the layout's.
+    std::fs::write(&recorded, b"").unwrap();
+    vm.shutdown(ShutdownMode::Kill).await.unwrap();
+    assert!(!recorded.exists());
 }

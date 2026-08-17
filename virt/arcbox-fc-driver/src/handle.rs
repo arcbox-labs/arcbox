@@ -17,6 +17,7 @@ use nix::unistd::{Gid, Uid, chown};
 use tokio::sync::broadcast;
 
 use crate::error::FcError;
+use crate::listener::VsockEndpoint;
 use crate::process::FcProcess;
 use crate::render::VmLayout;
 use crate::{CHECKPOINT_FORMAT, NAME, api, jail, listener, vsock};
@@ -36,8 +37,9 @@ pub struct FcHandle {
     client: Client,
     layout: VmLayout,
     record: VmRecord,
-    /// The vsock socket the host dials, when the VM has a vsock device.
-    vsock_uds: Option<PathBuf>,
+    /// The vsock socket the host dials and listens next to, when the VM
+    /// has a vsock device; shared with the prepared VM the handle came from.
+    vsock: Option<VsockEndpoint>,
     /// Frozen after a checkpoint that asked to hold.
     quiesced: AtomicBool,
 }
@@ -52,7 +54,7 @@ impl FcHandle {
         client: Client,
         layout: VmLayout,
         record: VmRecord,
-        vsock_uds: Option<PathBuf>,
+        vsock: Option<VsockEndpoint>,
         quiesced: bool,
     ) -> Self {
         Self {
@@ -60,17 +62,25 @@ impl FcHandle {
             client,
             layout,
             record,
-            vsock_uds,
+            vsock,
             quiesced: AtomicBool::new(quiesced),
         }
+    }
+
+    fn vsock_endpoint(&self) -> Result<&VsockEndpoint> {
+        self.vsock.as_ref().ok_or_else(|| Error::Driver {
+            driver: NAME,
+            message: "vm has no vsock device".into(),
+            source: None,
+        })
     }
 
     /// Firecracker leaves its vsock Unix socket behind; once the process is
     /// gone the file is ours to remove — a restore that re-binds the
     /// recorded path (direct mode) must find it free.
     fn unlink_vsock(&self) {
-        if let Some(uds) = &self.vsock_uds {
-            let _ = std::fs::remove_file(uds);
+        if let Some(vsock) = &self.vsock {
+            let _ = std::fs::remove_file(vsock.path());
         }
     }
 
@@ -162,7 +172,7 @@ impl VmHandle for FcHandle {
     }
 
     fn vsock(&self) -> Option<&dyn Vsock> {
-        self.vsock_uds.is_some().then_some(self)
+        self.vsock.is_some().then_some(self)
     }
 
     fn checkpoint(&self) -> Option<&dyn Checkpoint> {
@@ -170,7 +180,7 @@ impl VmHandle for FcHandle {
     }
 
     fn vsock_listener(&self) -> Option<&dyn VsockListen> {
-        self.vsock_uds.is_some().then_some(self)
+        self.vsock.is_some().then_some(self)
     }
 
     fn detach(&self) -> Option<&dyn Detach> {
@@ -182,12 +192,8 @@ impl VmHandle for FcHandle {
 impl Vsock for FcHandle {
     async fn dial(&self, port: u32) -> Result<VsockConn> {
         self.require_state(VmState::Running, "running")?;
-        let uds = self.vsock_uds.as_deref().ok_or_else(|| Error::Driver {
-            driver: NAME,
-            message: "vm has no vsock device".into(),
-            source: None,
-        })?;
-        let stream = vsock::dial_uds(uds, port).await?;
+        let uds = self.vsock_endpoint()?.path();
+        let stream = vsock::dial_uds(&uds, port).await?;
         Ok(VsockConn {
             fd: stream.into_std()?.into(),
             mode: IoMode::Async,
@@ -197,8 +203,10 @@ impl Vsock for FcHandle {
 
 #[async_trait]
 impl VsockListen for FcHandle {
+    /// Bound next to the same socket [`Vsock::dial`] uses — after a restore
+    /// the one the checkpoint recorded, which is where the guest dials out.
     async fn listen(&self, port: u32) -> Result<Box<dyn VsockListener>> {
-        listener::bind(&self.layout, &self.process, port)
+        listener::bind(&self.layout, self.vsock_endpoint()?, &self.process, port)
     }
 }
 

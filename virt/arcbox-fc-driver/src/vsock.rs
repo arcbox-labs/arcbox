@@ -138,16 +138,24 @@ impl UdsListener {
 
     /// Wait for the next guest connection.
     pub async fn accept(&self) -> Result<UnixStream> {
-        let (stream, _) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|source| FcError::VsockListen {
-                what: "accept on listener socket",
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(stream)
+        std::future::poll_fn(|cx| self.poll_accept(cx)).await
+    }
+
+    /// Poll for the next guest connection.
+    pub fn poll_accept(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<UnixStream>> {
+        self.listener.poll_accept(cx).map(|accepted| {
+            accepted.map(|(stream, _)| stream).map_err(|source| {
+                FcError::VsockListen {
+                    what: "accept on listener socket",
+                    path: self.path.clone(),
+                    source,
+                }
+                .into()
+            })
+        })
     }
 }
 
