@@ -12,6 +12,7 @@ description = "Cargo xtask build-automation tasks for the ArcBox workspace"
 [dependencies]
 anyhow.workspace = true
 arcbox-constants.workspace = true
+cargo_metadata = "0.23.1"
 clap = { workspace = true, features = ["derive", "env"] }
 dirs.workspace = true
 flate2 = "1.1.9"

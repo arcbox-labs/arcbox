@@ -24,6 +24,10 @@ devenv shell -- cargo xtask <command>
 
 ## Commands
 
+- `cargo xtask check-layers` — fail on any direct workspace dependency edge
+  that breaks a layer rule (rules and grandfathered edges live in
+  `src/commands/check_layers/rules.rs`); `--verbose` lists every edge. CI runs
+  it in the `linux-engine` job.
 - `cargo xtask dev boot-assets` — prepare `boot-assets/dev` from the user boot
   cache or a neighboring `arcbox-kernel` checkout.
 - `cargo xtask dev bpf` — rebuild the committed sandbox NAT BPF object and its
@@ -45,6 +49,12 @@ xtask/
     main.rs                  # CLI shape and dispatch only
     commands/
       mod.rs
+      check_layers.rs        # layer-rule gate over cargo metadata
+      check_layers/
+        evaluate.rs          # pure evaluator + synthetic-graph tests
+        graph.rs             # Layer / Member / Graph from cargo metadata
+        rule.rs              # Rule / Subject / Forbidden / Exception vocabulary
+        rules.rs             # the RULES and EXCEPTIONS tables
       dev.rs                 # development orchestration
       e2e.rs                 # e2e stress runner (prebuild + artifact archive)
       idle.rs                # idle CPU/RSS sampler

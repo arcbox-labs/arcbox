@@ -187,6 +187,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-linux-engine-
 
+      # The layer rules this job exists to protect (engine/ and computer/
+      # are daemon-free and platform-neutral, common/ has no VM dependency,
+      # orchestrators depend on the port and never on an adapter) are
+      # checked mechanically from `cargo metadata` ahead of the build steps:
+      # a forbidden edge fails here with the rule's reason rather than as a
+      # Linux build break three crates away. The rules and the grandfathered
+      # edges live in xtask/src/commands/check_layers/rules.rs.
+      - name: Check layer rules
+        run: cargo run -p xtask -- check-layers
+
       - name: Check engine-layer crates on Linux
         run: cargo check --all-targets -p arcbox-atomic-file -p arcbox-image -p arcbox-net -p splicetcp -p arcbox-hypervisor -p arcbox-virtio-net -p arcbox-vmm -p arcbox-snapshot -p arcbox-engine -p arcbox-computer
 

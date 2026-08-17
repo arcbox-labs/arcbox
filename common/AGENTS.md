@@ -18,7 +18,10 @@ distribution".
   (`virt/arcbox-net/examples/tun_proxy.rs`, docs/surge-tun-proxy.md). Every
   change must serve **both**; adding a VM type here silently breaks the host
   harness. Most net-crate `lib.rs` headers restate this (arcbox-xnu-net's
-  does not) — keep them true.
+  does not) — keep them true. The dependency half is checked mechanically
+  by `cargo xtask check-layers` in CI (`linux-engine` job), for every
+  `common/` crate, net or not: no direct edge into `virt/`, `engine/`,
+  `computer/`, `app/` or `guest/`.
 
 ## arcbox-asset & distribution — invariants (net-purity rule does not apply)
 

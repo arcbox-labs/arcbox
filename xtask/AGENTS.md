@@ -5,9 +5,10 @@ runners, samplers, asset staging, release tooling) belong here, not in
 ad-hoc shell scripts. Command shape lives in `src/main.rs`; design rules
 (when to use `xshell` vs `std::process::Command`, no script-wrapper
 facades) live in `README.md` — follow them, don't restate them. Commands
-today: `dev boot-assets`, `e2e`, `idle`, `macos dev`, `release
-{check-tool-updates,package-tarball}`. This file focuses on `e2e` and
-`idle`, the two the HV fix campaign leans on.
+today: `check-layers`, `dev boot-assets`, `e2e`, `idle`, `macos dev`,
+`release {check-tool-updates,package-tarball}`. This file focuses on
+`e2e` and `idle`, the two the HV fix campaign leans on, and on
+`check-layers`, the CI layer-rule gate.
 
 ## `xtask e2e` — the SKIP_BUILD / prebuild contract
 
@@ -130,6 +131,39 @@ points above the hypervisor. Defaults: `--test boot_assets --backend vz
    (`ARCBOX_HV_E2E_VCPUS/MEMORY_MB/BALLOON/BOOT_ONLY=1`) one dimension
    at a time (this is how ABX-386's "vCPU count, threshold exactly 8" was
    localized). See `virt/AGENTS.md`.
+
+## `xtask check-layers` — the layer rules live in code
+
+`cargo xtask check-layers` reads `cargo metadata --no-deps`, builds the
+graph of **direct** edges between workspace members, and fails on any
+edge a layer rule forbids; CI runs it in the `linux-engine` job. The
+rules and the grandfathered edges are data in
+`src/commands/check_layers/rules.rs` (`RULES`, `EXCEPTIONS`); the
+evaluator (`evaluate.rs`) is a pure function over a small typed graph and
+is unit-tested on synthetic graphs, so a rule change comes with a test
+there, not with a manifest edit. `--verbose` prints every member edge and
+every grandfathered edge. Rules cover engine/computer (no `app/`, no
+macOS-only crate, no `arcbox-vmm` / `arcbox-hypervisor` / VMM adapter —
+engine's two edges are grandfathered until vm-stack-redesign R4), common
+(no virt/engine/computer/app/guest),
+`arcbox-vm-proto` and `arcbox-vm-driver` (leaf crates) and
+`arcbox-vm-agent` (no `arcbox-vm`/`arcbox-snapshot`/`tokio`/`aya`/`fc-sdk`).
+
+- **Adding a rule**: append a `Rule` whose `reason` names the document
+  that owns it (charter decision, design doc, AGENTS.md section) — the
+  reason is what a violation prints. A rule may name a crate that does not
+  exist yet (`arcbox-fc-driver`, `arcbox-vm-driver`); it is a no-op until
+  the crate lands. Every dependency kind counts (normal, dev, build), only
+  workspace members are walked, and an external crate is checked only
+  where a rule names it (`Forbidden::Crates`).
+- **Adding an exception**: append an `Exception` with the `reason` the
+  edge exists and the phase (`until`) that removes it. Exceptions are
+  checked before the rules, so they hold as rules tighten; an exception
+  whose edge no longer exists **fails the gate** — remove it with the
+  edge. Today's two: `arcbox-engine -> arcbox-vmm` and
+  `arcbox-engine -> arcbox-hypervisor`, until vm-stack-redesign R4.
+- **A new top-level directory** fails the gate until it is added to
+  `Layer` (`graph.rs`) — the rules must know every layer.
 
 ## `xtask idle`
 

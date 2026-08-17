@@ -17,6 +17,10 @@ and its locked decisions live in the company repo:
   `Runtime` type anywhere here.
 - **Platform-neutral**: must compile and pass unit tests on Linux as well
   as macOS (the `linux-engine` CI job gates it).
+- **Mechanically checked**: `cargo xtask check-layers` (same CI job) fails
+  on a direct edge from `computer/` into `app/`, `arcbox-vmm`,
+  `arcbox-hypervisor`, a macOS-only crate or a VMM adapter — the rules
+  live in `xtask/src/commands/check_layers/rules.rs`.
 - Errors speak `arcbox_engine::EngineError`; predicates like
   `EngineError::Agent { code }` carry the agent's HTTP-style wire codes
   (404/412 obsolete-ticket, 423 paused, 503 retry) — those codes are
