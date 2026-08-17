@@ -158,9 +158,14 @@ impl TryFrom<&Metadata> for Graph {
             }
             let layer = layer_of_manifest(&metadata.workspace_root, &package.manifest_path)
                 .with_context(|| format!("placing workspace member {} in a layer", package.name))?;
+            // A crate's dev-dependency on itself (the way a crate turns on
+            // its own optional feature for its tests, e.g. `testkit`) is
+            // not an edge between layers; the graph drops it here so no
+            // rule has to special-case it.
             let mut deps: Vec<String> = package
                 .dependencies
                 .iter()
+                .filter(|dependency| dependency.name != package.name.as_str())
                 .map(|dependency| dependency.name.clone())
                 .collect();
             deps.sort();
@@ -229,6 +234,41 @@ mod tests {
         .to_string();
         assert!(error.contains("`platform`"), "{error}");
         assert!(error.contains("common, virt"), "{error}");
+    }
+
+    #[test]
+    fn a_self_dependency_is_not_an_edge() {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": [{
+                "name": "arcbox-vm-driver",
+                "version": "0.1.0",
+                "id": "path+file:///ws/virt/arcbox-vm-driver#0.1.0",
+                "manifest_path": "/ws/virt/arcbox-vm-driver/Cargo.toml",
+                "dependencies": [
+                    {"name": "arcbox-vm-driver", "req": "*", "kind": "dev", "optional": false,
+                     "uses_default_features": true, "features": ["testkit"], "target": null},
+                    {"name": "serde", "req": "^1", "kind": null, "optional": false,
+                     "uses_default_features": true, "features": [], "target": null}
+                ],
+                "targets": [], "features": {}, "source": null, "license": null,
+                "license_file": null, "description": null, "edition": "2024",
+                "authors": [], "categories": [], "keywords": [], "readme": null,
+                "repository": null, "homepage": null, "documentation": null,
+                "links": null, "publish": null, "default_run": null, "rust_version": null,
+                "metadata": null
+            }],
+            "workspace_members": ["path+file:///ws/virt/arcbox-vm-driver#0.1.0"],
+            "workspace_default_members": ["path+file:///ws/virt/arcbox-vm-driver#0.1.0"],
+            "resolve": null,
+            "target_directory": "/ws/target",
+            "version": 1,
+            "workspace_root": "/ws",
+            "metadata": null
+        }))
+        .unwrap();
+        let graph = Graph::try_from(&metadata).unwrap();
+        assert_eq!(graph.members.len(), 1);
+        assert_eq!(graph.members[0].deps, ["serde"]);
     }
 
     #[test]
