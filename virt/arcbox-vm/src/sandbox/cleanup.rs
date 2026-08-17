@@ -1,4 +1,4 @@
-use super::persistence::{SandboxRecordStore, SandboxTransition};
+use super::record::{SandboxRecordStore, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
 
@@ -405,7 +405,7 @@ pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::persistence::{ProvisionIntent, SandboxPhase, SandboxProvisionOutcome};
+    use crate::sandbox::record::{ProvisionIntent, SandboxPhase, SandboxProvisionOutcome};
     use crate::snapshot_cow::{CowOptions, CowTestProbe};
     use std::os::unix::fs::PermissionsExt;
 

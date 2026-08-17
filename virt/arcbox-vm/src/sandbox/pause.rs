@@ -30,7 +30,7 @@
 
 use super::boot::restore_spec;
 use super::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
-use super::persistence::SandboxTransition;
+use super::record::SandboxTransition;
 use super::types::action;
 use super::*;
 

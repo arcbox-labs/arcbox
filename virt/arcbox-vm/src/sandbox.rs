@@ -45,9 +45,9 @@ mod execution;
 mod files;
 mod lifecycle;
 mod pause;
-mod persistence;
 mod pool;
 mod reconcile;
+mod record;
 mod templates;
 #[cfg(test)]
 mod testing;
@@ -75,7 +75,7 @@ pub(crate) type InstanceMap = Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxIns
 /// Manages the full lifecycle of multiple sandbox microVMs.
 pub struct SandboxManager {
     instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
-    records: Arc<persistence::SandboxRecordStore>,
+    records: Arc<record::SandboxRecordStore>,
     /// The VMM every sandbox runs under, behind the driver port. Its
     /// `Prepare` capability is required at construction: the boot and pool
     /// flows spawn the VMM ahead of the guest.
@@ -147,7 +147,7 @@ impl SandboxManager {
                 )));
             }
         }
-        let records = Arc::new(persistence::SandboxRecordStore::new(Path::new(
+        let records = Arc::new(record::SandboxRecordStore::new(Path::new(
             &config.firecracker.data_dir,
         ))?);
         drop(records.load_all()?);

@@ -15,8 +15,8 @@ use arcbox_vm_driver::{
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::reconcile::{SandboxStateRecord, write_state_record};
+use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::{SandboxInstance, SandboxManager, SandboxSpec, SandboxState};
 use crate::config::{JailerConfig, VmmConfig};
 use crate::snapshot_cow::{CowManager, CowOptions, CowTestProbe};
@@ -284,7 +284,7 @@ pub(super) fn assert_failed_and_released(
     );
     assert_eq!(
         manager.records.load(id).unwrap().unwrap().phase,
-        super::persistence::SandboxPhase::Failed
+        super::record::SandboxPhase::Failed
     );
     assert!(
         !inst.vm_dir.join("state.json").exists(),

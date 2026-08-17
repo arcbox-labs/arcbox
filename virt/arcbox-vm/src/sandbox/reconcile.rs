@@ -20,7 +20,7 @@ use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmId, VmRecord};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::persistence::{SandboxPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
+use super::record::{SandboxPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
 use super::{SandboxInstance, SandboxState};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
@@ -539,7 +539,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::super::SandboxSpec;
-    use super::super::persistence::{ProvisionIntent, SandboxProvisionOutcome};
+    use super::super::record::{ProvisionIntent, SandboxProvisionOutcome};
     use super::*;
 
     fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: SandboxPhase) -> SandboxRecord {

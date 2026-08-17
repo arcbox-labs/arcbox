@@ -1,4 +1,4 @@
-use super::persistence::{SandboxRecordStore, SandboxTransition};
+use super::record::{SandboxRecordStore, SandboxTransition};
 use super::types::action;
 use super::*;
 use arcbox_snapshot::SnapshotError;

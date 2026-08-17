@@ -1,6 +1,6 @@
 use super::boot::boot_sandbox;
 use super::cleanup::{inst_to_info, remove_sandbox_impl};
-use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
+use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
 use arcbox_vm_driver::ShutdownMode;

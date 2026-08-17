@@ -1,6 +1,6 @@
 use super::boot::{StageError, stage_rootfs_cow_or_copy};
-use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::pool::PreparedSlot;
+use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::action;
 use super::*;
 use arcbox_vm_driver::{AfterCheckpoint, CheckpointOptions};
