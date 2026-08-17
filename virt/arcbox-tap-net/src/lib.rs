@@ -100,12 +100,15 @@ pub type TapMode = AttachMode;
 /// using it until R2b moves it onto the port.
 pub type NetworkManager = TapNetwork;
 
-/// The translation mechanism actually applied to an active invariant TAP.
+/// The translation mechanism actually applied to an active TAP.
 ///
 /// Distinct from the configured [`Datapath`]: a TAP configured for
 /// eBPF lands on `Iptables` when the object cannot be loaded or this TAP's
 /// attach fails. Teardown and expose targeting must follow what was applied,
-/// not what was asked for.
+/// not what was asked for — which is why a [`AttachMode::LegacySnapshot`]
+/// TAP records [`Self::Untranslated`] rather than nothing at all: absent and
+/// "deliberately untranslated" are opposite answers for expose targeting,
+/// and only the second one is knowable from the lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -119,9 +122,19 @@ enum AppliedDatapath {
     Ebpf,
     /// The CORE-81 iptables/fwmark rule set.
     Iptables,
+    /// None: the guest owns the pool address itself, so nothing is
+    /// rewritten per TAP ([`AttachMode::LegacySnapshot`]).
+    Untranslated,
 }
 
 /// How host-side expose/port-forward DNAT must target a sandbox.
+///
+/// This crate answers the question through the port, as
+/// [`GuestNetwork::host_ingress`]; the type stays public because the
+/// System VM's port-forward code still names it (R3 moves that call to
+/// the composition root).
+///
+/// [`GuestNetwork::host_ingress`]: arcbox_vm_driver::net::GuestNetwork::host_ingress
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExposeTarget {
     /// DNAT straight to the pool IP, delivered by the main-table TAP route.
@@ -376,14 +389,24 @@ impl TapNetwork {
                 AttachMode::LegacySnapshot => self.gateway,
             };
             tap::create(&allocation.tap_name, local, allocation.ip_address)?;
-            if mode == AttachMode::Invariant
-                && let Err(error) = self.install_translation(allocation)
-            {
-                // Unwind the partial translation and the TAP so a failed
-                // activation leaves no half-translated interface behind.
-                let _ = self.deactivate_translation(allocation);
-                tap::destroy(&allocation.tap_name);
-                return Err(error);
+            if mode == AttachMode::Invariant {
+                if let Err(error) = self.install_translation(allocation) {
+                    // Unwind the partial translation and the TAP so a failed
+                    // activation leaves no half-translated interface behind.
+                    let _ = self.deactivate_translation(allocation);
+                    tap::destroy(&allocation.tap_name);
+                    return Err(error);
+                }
+            } else {
+                // A legacy guest owns the pool address, so this TAP carries
+                // no translation — recorded, not left absent, because
+                // `expose_target` reads an absent record as "an invariant
+                // TAP this process did not activate" and answers the
+                // opposite way.
+                self.applied
+                    .lock()
+                    .unwrap()
+                    .insert(allocation.tap_name.clone(), AppliedDatapath::Untranslated);
             }
         }
         Ok(())
@@ -485,16 +508,14 @@ impl TapNetwork {
     /// How expose DNAT must target the sandbox behind `tap_name` (CORE-83).
     ///
     /// Follows the *applied* datapath, not the configured one: an eBPF TAP's
-    /// egress program translates pool-IP packets on the TAP itself, so the
-    /// plain pool-IP form suffices; everything else — iptables TAPs, legacy
-    /// guests, and TAPs whose activation record died with a previous agent
-    /// process — needs the CORE-81 guest-IP + fwmark form.
-    pub fn expose_target(&self, tap_name: &str, net_invariant: bool) -> ExposeTarget {
-        if !net_invariant {
-            return ExposeTarget::PoolIp;
-        }
+    /// egress program translates pool-IP packets on the TAP itself and a
+    /// legacy TAP never translated anything, so the plain pool-IP form
+    /// suffices for both; everything else — iptables TAPs, and TAPs whose
+    /// activation record died with a previous agent process — needs the
+    /// CORE-81 guest-IP + fwmark form.
+    pub fn expose_target(&self, tap_name: &str) -> ExposeTarget {
         match self.applied.lock().unwrap().get(tap_name) {
-            Some(AppliedDatapath::Ebpf) => ExposeTarget::PoolIp,
+            Some(AppliedDatapath::Ebpf | AppliedDatapath::Untranslated) => ExposeTarget::PoolIp,
             Some(AppliedDatapath::Iptables) | None => ExposeTarget::GuestIpWithFwmark,
         }
     }

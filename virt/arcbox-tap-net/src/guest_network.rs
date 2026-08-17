@@ -10,8 +10,10 @@
 //! | `quarantine(lease)` | `quarantine_checked(vm, alloc)` |
 //! | `release(lease)` | `release_checked(alloc)` |
 //! | `identity(lease, mode)` | the invariant identity, or the pool identity under `LegacySnapshot` |
+//! | `host_ingress(lease)` | `expose_target(tap)`, with the pool IP's fwmark |
 //! | `reconcile()` | `Some(self)` while a quarantine ledger is kept |
 //! | `NetworkReconcile::*` | the `*_quarantine` / `*_startup_cleanup` methods |
+//! | `replay_complete()` | `mark_reconciled()` |
 //!
 //! A [`NetworkLease`] carries what the port needs — VM, address, prefix,
 //! gateway, MAC, cleanup token — and the allocation is rebuilt from it:
@@ -24,13 +26,13 @@
 use std::net::IpAddr;
 
 use arcbox_vm_driver::net::{
-    AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy,
-    NetworkReconcile,
+    AttachMode, GuestNetwork, HostIngress, NetworkIdentity, NetworkLease, NetworkMode,
+    NetworkPolicy, NetworkReconcile,
 };
 use arcbox_vm_driver::{Error, NicAttachment, NicSpec, Result, VmId};
 use async_trait::async_trait;
 
-use crate::{NetworkAllocation, TapNetwork, invariant, tap_name_from_ip};
+use crate::{ExposeTarget, NetworkAllocation, TapNetwork, invariant, tap_name_from_ip};
 
 /// The device name every guest sees its one NIC under.
 pub const NIC_ID: &str = "eth0";
@@ -148,6 +150,20 @@ impl GuestNetwork for TapNetwork {
         Self::identity_for(lease, mode)
     }
 
+    /// What the lease's TAP actually carries: an eBPF or legacy TAP takes
+    /// DNAT to the pool address, an iptables one takes the fixed guest
+    /// address plus the pool IP's mark, which is what selects that TAP's
+    /// policy-routing table (CORE-81/CORE-83).
+    fn host_ingress(&self, lease: &NetworkLease) -> Result<HostIngress> {
+        let allocation = self.allocation(lease)?;
+        Ok(match self.expose_target(&allocation.tap_name) {
+            ExposeTarget::PoolIp => HostIngress::PoolAddress,
+            ExposeTarget::GuestIpWithFwmark => HostIngress::GuestAddress {
+                fwmark: invariant::fwmark(allocation.ip_address),
+            },
+        })
+    }
+
     fn reconcile(&self) -> Option<&dyn NetworkReconcile> {
         self.quarantine_dir.is_some().then_some(self)
     }
@@ -180,9 +196,12 @@ impl NetworkReconcile for TapNetwork {
             .collect()
     }
 
-    async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
-        self.validate_quarantine(vm.as_str(), token)?;
-        Ok(())
+    /// The ledger's own copy of the allocation, back as the lease it was.
+    /// After a restart it is the only record of the address that
+    /// generation held, which is what the host's cleanup matches on.
+    async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<NetworkLease> {
+        let allocation = self.validate_quarantine(vm.as_str(), token)?;
+        Ok(Self::lease(vm, &allocation))
     }
 
     async fn finalize_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
@@ -203,6 +222,10 @@ impl NetworkReconcile for TapNetwork {
 
     async fn wait_startup_cleanup_complete(&self) {
         Self::wait_startup_cleanup_complete(self).await;
+    }
+
+    fn replay_complete(&self) {
+        self.mark_reconciled();
     }
 }
 
@@ -349,6 +372,47 @@ mod tests {
         assert_eq!(legacy.mac, lease.mac);
     }
 
+    /// Host ingress follows what the lease's TAP actually carries, which
+    /// is the inverse of what the guest is told under the invariant
+    /// identity: the guest holds the fixed address while the host must
+    /// target the pool one. No mapping from identity + lease could say
+    /// that, which is why the port asks the network.
+    #[tokio::test]
+    async fn host_ingress_follows_the_tap_and_inverts_the_guest_identity() {
+        let network = network();
+        let lease = GuestNetwork::reserve(&network, &vm("box"), policy(NetworkMode::Nat))
+            .await
+            .unwrap();
+        let tap = network.allocation(&lease).unwrap().tap_name;
+        let record = |applied| {
+            network.applied.lock().unwrap().insert(tap.clone(), applied);
+        };
+
+        record(crate::AppliedDatapath::Ebpf);
+        assert_eq!(
+            network.host_ingress(&lease).unwrap(),
+            HostIngress::PoolAddress
+        );
+        // The guest, meanwhile, is told the fixed invariant address.
+        assert_eq!(
+            network.identity(&lease, AttachMode::Invariant).ip,
+            v4("169.254.100.2")
+        );
+
+        record(crate::AppliedDatapath::Iptables);
+        assert_eq!(
+            network.host_ingress(&lease).unwrap(),
+            HostIngress::GuestAddress {
+                fwmark: invariant::fwmark("172.20.0.2".parse().unwrap()),
+            }
+        );
+
+        // A lease this network could never have handed out.
+        let mut foreign = lease;
+        foreign.ip = "fd00::2".parse().unwrap();
+        assert!(network.host_ingress(&foreign).is_err());
+    }
+
     #[test]
     fn reconcile_is_offered_only_with_a_ledger() {
         assert!(network().reconcile().is_none());
@@ -426,8 +490,16 @@ mod tests {
             Arc::new(IptablesLegacy::default()),
         )
         .unwrap();
-        network.mark_reconciled();
         let reconcile = network.reconcile().unwrap();
+        // Until the owner says it has replayed, no token finalizes the
+        // sweep — what it must cover is still being discovered.
+        assert!(
+            reconcile
+                .validate_startup_cleanup(&TapNetwork::startup_cleanup_token(&network).unwrap())
+                .await
+                .is_err()
+        );
+        reconcile.replay_complete();
         let startup = reconcile.startup_cleanup_token().await.unwrap();
         reconcile.finalize_startup_cleanup(&startup).await.unwrap();
         assert!(reconcile.startup_cleanup_token().await.is_none());
@@ -454,10 +526,15 @@ mod tests {
                 .await,
             Err(Error::PreconditionFailed(_))
         ));
-        reconcile
-            .validate_cleanup(&vm("box"), &lease.cleanup_token)
-            .await
-            .unwrap();
+        // The right token hands back the lease the ledger holds — after a
+        // restart, the only surviving record of that generation's address.
+        assert_eq!(
+            reconcile
+                .validate_cleanup(&vm("box"), &lease.cleanup_token)
+                .await
+                .unwrap(),
+            lease
+        );
         reconcile
             .finalize_cleanup(&vm("box"), &lease.cleanup_token)
             .await

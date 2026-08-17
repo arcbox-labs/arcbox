@@ -10,7 +10,8 @@ use tokio::sync::watch;
 use super::lock;
 use crate::error::{Error, Result};
 use crate::net::{
-    AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkPolicy, NetworkReconcile,
+    AttachMode, GuestNetwork, HostIngress, NetworkIdentity, NetworkLease, NetworkPolicy,
+    NetworkReconcile,
 };
 use crate::spec::{MacAddr, NicAttachment, NicSpec, VmId};
 
@@ -21,7 +22,9 @@ use crate::spec::{MacAddr, NicAttachment, NicSpec, VmId};
 /// `NicSpec` on `tapN`; `quarantine` moves a lease into a ledger that
 /// [`NetworkReconcile`] drains through the token protocol.
 /// [`FakeNetwork::with_startup_cleanup`] starts with a pending startup
-/// cleanup so that half of the protocol can be exercised too.
+/// cleanup so that half of the protocol can be exercised too — including
+/// its ordering: until [`NetworkReconcile::replay_complete`] says the
+/// owner has finished replaying, no token names a finalizable sweep.
 ///
 /// It answers that protocol in the same error *classes* a real adapter
 /// does — [`Error::Unavailable`] for come-back-later (a pending startup
@@ -50,6 +53,9 @@ struct Ledger {
 struct StartupCleanup {
     token: String,
     host_cleaned: bool,
+    /// `true` once the owner said it had replayed its durable state into
+    /// this ledger; until then no token names a finalizable sweep.
+    replayed: bool,
 }
 
 const PREFIX_LEN: u8 = 16;
@@ -70,6 +76,7 @@ impl FakeNetwork {
         Self::build(Some(StartupCleanup {
             token: token.into(),
             host_cleaned: false,
+            replayed: false,
         }))
     }
 
@@ -277,6 +284,14 @@ impl GuestNetwork for FakeNetwork {
         }
     }
 
+    /// The lease's own address: the fake translates nothing per interface,
+    /// so there is no mark to set and nothing for the host to target but
+    /// the address the guest itself holds.
+    fn host_ingress(&self, lease: &NetworkLease) -> Result<HostIngress> {
+        host_number(lease.ip)?;
+        Ok(HostIngress::PoolAddress)
+    }
+
     fn reconcile(&self) -> Option<&dyn NetworkReconcile> {
         Some(self)
     }
@@ -294,8 +309,8 @@ impl NetworkReconcile for FakeNetwork {
             .collect())
     }
 
-    async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
-        lock(&self.ledger).validate_cleanup(vm, token)
+    async fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<NetworkLease> {
+        lock(&self.ledger).validate_cleanup(vm, token).cloned()
     }
 
     async fn finalize_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
@@ -340,13 +355,19 @@ impl NetworkReconcile for FakeNetwork {
         // A closed channel cannot happen: the sender lives in `self`.
         let _ = pending.wait_for(|pending| !pending).await;
     }
+
+    fn replay_complete(&self) {
+        if let Some(startup) = lock(&self.ledger).startup.as_mut() {
+            startup.replayed = true;
+        }
+    }
 }
 
 impl Ledger {
     /// A token that does not name a pending generation — of this VM or of
     /// none at all — is a failed precondition: no retry of that token can
     /// succeed, the caller needs a current one.
-    fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<()> {
+    fn validate_cleanup(&self, vm: &VmId, token: &str) -> Result<&NetworkLease> {
         let lease = self
             .quarantined
             .get(vm)
@@ -356,11 +377,16 @@ impl Ledger {
                 "vm {vm} cleanup token does not name the pending generation"
             )));
         }
-        Ok(())
+        Ok(lease)
     }
 
     fn validate_startup_cleanup(&self, token: &str) -> Result<()> {
         match &self.startup {
+            // The owner is still discovering what the previous process
+            // left: come back, rather than "that token is wrong".
+            Some(startup) if !startup.replayed => Err(Error::Unavailable(
+                "the network's owner has not finished replaying its durable state".into(),
+            )),
             Some(startup) if !startup.host_cleaned && startup.token == token => Ok(()),
             Some(startup) if !startup.host_cleaned => Err(Error::PreconditionFailed(
                 "startup cleanup token mismatch".into(),
@@ -421,8 +447,14 @@ mod tests {
         assert_eq!(invariant.mac, lease.mac);
         assert_eq!(invariant.dns, vec![lease.gateway]);
         // Nothing is translated per interface here, so the mode changes
-        // nothing about what the guest is told.
+        // nothing about what the guest is told — and the host reaches the
+        // guest at that same address, with no mark to set.
         assert_eq!(net.identity(&lease, AttachMode::LegacySnapshot), invariant);
+        assert_eq!(net.host_ingress(&lease).unwrap(), HostIngress::PoolAddress);
+        // A lease from another network is not one this fake can answer for.
+        let mut foreign = lease;
+        foreign.ip = "192.0.2.7".parse().unwrap();
+        assert!(net.host_ingress(&foreign).is_err());
     }
 
     #[tokio::test]
@@ -451,6 +483,16 @@ mod tests {
             reconcile.validate_cleanup(&id("a"), "wrong").await,
             Err(Error::PreconditionFailed(_))
         ));
+        // The right token hands the lease back: the address is what the
+        // host's cleanup of that generation is keyed by, and after a
+        // restart the ledger is the only place it survives.
+        assert_eq!(
+            reconcile
+                .validate_cleanup(&id("a"), &a.cleanup_token)
+                .await
+                .unwrap(),
+            a
+        );
         assert!(matches!(
             net.reserve(&id("a"), policy()).await,
             Err(Error::Unavailable(_))
@@ -533,6 +575,14 @@ mod tests {
             reconcile.startup_cleanup_token().await.as_deref(),
             Some("boot-1")
         );
+        // Nothing can be finalized while the owner is still replaying its
+        // durable state: even its own token is a come-back-later, because
+        // what the sweep must cover is not yet known.
+        assert!(matches!(
+            reconcile.validate_startup_cleanup("boot-1").await,
+            Err(Error::Unavailable(_))
+        ));
+        reconcile.replay_complete();
         // Another generation's token can never name this sweep.
         assert!(matches!(
             reconcile.validate_startup_cleanup("boot-2").await,

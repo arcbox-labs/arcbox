@@ -397,9 +397,7 @@ impl SandboxManager {
         Ok(SandboxNetworkIdentity {
             ip: allocation.ip_address,
             cleanup_token: allocation.cleanup_token.clone(),
-            expose: self
-                .network
-                .expose_target(&allocation.tap_name, instance.net_invariant),
+            expose: self.network.expose_target(&allocation.tap_name),
         })
     }
 }
