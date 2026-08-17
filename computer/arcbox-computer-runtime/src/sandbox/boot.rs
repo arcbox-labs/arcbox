@@ -177,6 +177,7 @@ pub(super) async fn boot_sandbox(
                             false
                         } else {
                             inst.handle = handle.take();
+                            inst.net_identity = net.as_ref().map(|n| n.identity.clone());
                             // With an initial cmd the instance stays
                             // `Starting`: the tail below moves it straight
                             // to Running via the reserved Initial claim, so

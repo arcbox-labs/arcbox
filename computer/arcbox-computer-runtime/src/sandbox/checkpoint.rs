@@ -1020,6 +1020,7 @@ impl SandboxManager {
             inst.network.clone_from(&lease);
             inst.prepared = Some(prepared);
             inst.handle = Some(handle);
+            inst.net_identity.clone_from(&identity);
             inst.cow_handle = pending_cow.take();
             inst.net_invariant = snap_meta.net_invariant;
             // A warm create that owes the spec's initial cmd stays

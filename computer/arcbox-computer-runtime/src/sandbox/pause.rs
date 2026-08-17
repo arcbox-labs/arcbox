@@ -79,6 +79,9 @@ struct ResumedRuntime {
     prepared: Arc<dyn PreparedVm>,
     handle: Arc<dyn VmHandle>,
     network: Option<NetworkLease>,
+    /// What the resumed guest holds on its interface — see
+    /// [`SandboxInstance::net_identity`].
+    net_identity: Option<NetworkIdentity>,
     cow_handle: Option<CowHandle>,
     ip_address: String,
 }
@@ -383,6 +386,7 @@ impl SandboxManager {
                     let mut inst = instance.lock().unwrap();
                     inst.prepared = Some(resumed.prepared);
                     inst.handle = Some(resumed.handle);
+                    inst.net_identity = resumed.net_identity;
                     inst.network = resumed.network;
                     inst.cow_handle = resumed.cow_handle;
                     // Re-establish the guest's addressing mode from the
@@ -762,6 +766,7 @@ impl SandboxManager {
             Ok(ResumedRuntime {
                 prepared: prepared.take().expect("prepared set above"),
                 handle,
+                net_identity: identity,
                 network: lease.take(),
                 cow_handle: cow_handle.take(),
                 ip_address,

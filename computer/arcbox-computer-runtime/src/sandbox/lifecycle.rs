@@ -868,18 +868,14 @@ impl SandboxManager {
     ///
     /// On the exec and file hot paths, so it stays a construction from
     /// state already held: no lock beyond the instance's, no mailbox, no
-    /// I/O. The identity is what the guest was told over its interface,
-    /// read under the mode that interface was activated in.
+    /// I/O, and the identity read rather than re-derived — it is the one
+    /// the boot, restore or resume handed its own agent.
     fn guest_agent(&self, id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn GuestAgent>> {
         let handle = inst
             .handle
             .clone()
             .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))?;
-        let identity = inst.network.as_ref().map(|lease| {
-            self.network
-                .identity(lease, super::attach_mode(inst.net_invariant))
-        });
-        self.agent.connect(handle, identity.as_ref())
+        self.agent.connect(handle, inst.net_identity.as_ref())
     }
 }
 
