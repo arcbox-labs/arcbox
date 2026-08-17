@@ -1,11 +1,11 @@
 //! A Firecracker API socket the tests can script.
 //!
-//! The interesting checkpoint paths are the ones where a call fails —
-//! a capture that fails and a resume that fails on top of it, a guest the
-//! handle believes is frozen and is not. None of them are reachable against
-//! a real Firecracker, so this answers its API instead: one closure decides
-//! every reply from the request's method, path and body, and every request
-//! is recorded in order.
+//! The interesting paths are the ones a real Firecracker cannot be made to
+//! take — a capture that fails and a resume that fails on top of it, a
+//! guest the handle believes is frozen and is not, an adopt that finds the
+//! VMM answering. This answers the API instead: one closure decides every
+//! reply from the request's method, path and body, and every request is
+//! recorded in order.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,6 +42,11 @@ impl FakeFc {
             calls,
             server,
         }
+    }
+
+    /// The socket this answers on.
+    pub fn socket(&self) -> &Path {
+        &self.socket
     }
 
     /// A client that talks to this socket.

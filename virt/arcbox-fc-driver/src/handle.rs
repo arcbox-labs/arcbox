@@ -1,5 +1,8 @@
 //! [`FcHandle`]: a running Firecracker VM behind the port's [`VmHandle`],
 //! with the vsock, listen, checkpoint, and detach capabilities.
+//!
+//! [`FcProcessHandle`] is the same port over a VMM process whose API is out
+//! of reach: kill, observe, detach, and nothing the API would serve.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,8 +25,11 @@ use crate::process::FcProcess;
 use crate::render::VmLayout;
 use crate::{CHECKPOINT_FORMAT, NAME, api, jail, listener, vsock};
 
+pub mod process_only;
 #[cfg(test)]
 mod tests;
+
+pub use process_only::FcProcessHandle;
 
 /// How long a graceful shutdown gives the `SendCtrlAltDel` API call itself.
 const CTRL_ALT_DEL_TIMEOUT: Duration = Duration::from_secs(5);

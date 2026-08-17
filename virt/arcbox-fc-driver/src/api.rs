@@ -12,6 +12,9 @@ use fc_sdk::types::{
 
 use crate::error::{FcError, Result};
 
+#[cfg(test)]
+pub(crate) mod fake_fc;
+
 /// `PATCH /vm {"state": "Paused"}`.
 pub async fn pause(client: &Client) -> Result<()> {
     client
