@@ -33,7 +33,8 @@
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
-//! - [`NetworkManager`] — TAP lifecycle & IP allocation
+//! - [`NetworkManager`] — TAP lifecycle & IP allocation (`arcbox-tap-net`'s
+//!   `TapNetwork`, re-exported through [`network`])
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
 //!
 //! Snapshot lineage — the checkpoint catalog, the copy-on-write rootfs
