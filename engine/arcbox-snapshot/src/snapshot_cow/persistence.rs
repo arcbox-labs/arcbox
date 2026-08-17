@@ -1,14 +1,16 @@
+use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::block_tools::loop_backing_file;
 use super::{
-    CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
-    TEMPLATE_PENDING_PREFIX, dmsetup_remove,
+    CowHandle, CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
+    TEMPLATE_PENDING_PREFIX, TemplateEntry, dmsetup_remove,
 };
 use crate::error::{Result, SnapshotError};
 
@@ -34,17 +36,144 @@ impl SetupOrphan {
 }
 
 impl CowManager {
+    /// Re-register the CoW resources of a sandbox whose VM is still running.
+    ///
+    /// Verifies the dm device is present and that the template's loop device
+    /// is still attached and still backs `handle.template_path`, then takes
+    /// the template refcount the handle is documented to own — which is what
+    /// keeps [`Self::reconcile_stale`] from detaching a shared loop out from
+    /// under a live rootfs, and what makes the eventual teardown balance.
+    ///
+    /// Call before [`Self::reconcile_stale`], once per adopted sandbox. A
+    /// failed verification is an error rather than a silent skip: the
+    /// caller's fallback is to tear the sandbox down, and it has to know.
+    pub fn adopt(&self, handle: &CowHandle) -> Result<()> {
+        #[cfg(any(test, feature = "test-probe"))]
+        if self.test_probe.is_some() {
+            // The probe stands in for every device this method inspects.
+            return Ok(());
+        }
+        // The device the guest is running on. Without it there is no
+        // snapshot to re-register, whatever the journal claims.
+        if !Path::new(&handle.dm_device).exists() {
+            return Err(SnapshotError::FailedPrecondition(format!(
+                "sandbox device {} is gone",
+                handle.dm_device
+            )));
+        }
+        // That snapshot's origin. Rediscovered rather than journaled: the
+        // loop belongs to the kernel, and only the kernel can say whether it
+        // still backs the template this handle names.
+        let loop_device = match loop_devices_for_backing_sync(&handle.template_path)?.as_slice() {
+            [device] => device.clone(),
+            [] => {
+                return Err(SnapshotError::FailedPrecondition(format!(
+                    "no loop device backs template {}",
+                    handle.template_path.display()
+                )));
+            }
+            // Which of them the live snapshot's origin is cannot be told from
+            // the backing file alone, and holding the refcount on the wrong
+            // one leaks the other at teardown.
+            devices => {
+                return Err(SnapshotError::FailedPrecondition(format!(
+                    "template {} is attached through {}",
+                    handle.template_path.display(),
+                    devices.join(", ")
+                )));
+            }
+        };
+        // Read before the map is locked, and unconditionally: the template
+        // map must never be held across a block-tools subprocess, and one
+        // extra `blockdev` per adopted sandbox is invisible next to the rest
+        // of a startup sweep.
+        let sectors = self.tools.device_sectors(&loop_device)?;
+        self.take_template_ref(&handle.template_path, &loop_device, sectors)?;
+        info!(
+            dm = %handle.dm_name,
+            template = %handle.template_path.display(),
+            loop_device = %loop_device,
+            "adopted a live sandbox's dm-snapshot"
+        );
+        Ok(())
+    }
+
+    /// Register `template` as held through `loop_device`, or add a reference
+    /// to the registration another holder already made.
+    ///
+    /// The bookkeeping half of [`Self::adopt`], with the device checks
+    /// already done: the reference the adopted handle's teardown decrements.
+    pub(super) fn take_template_ref(
+        &self,
+        template: &Path,
+        loop_device: &str,
+        sectors: u64,
+    ) -> Result<()> {
+        match self.templates.lock().unwrap().entry(template.to_path_buf()) {
+            Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                // The same "incomplete setup" sentinel the acquire path
+                // refuses on: a template whose detach failed with no owner
+                // left to retry it must not be resurrected by an adoption.
+                if entry.refcount == 0 {
+                    return Err(SnapshotError::Unavailable(format!(
+                        "template {} still owns resources from an incomplete CoW setup",
+                        template.display()
+                    )));
+                }
+                // One template, one loop: a second one is a view of the
+                // world this manager cannot reconcile, and picking either
+                // would leak the other.
+                if entry.loop_device != loop_device {
+                    return Err(SnapshotError::FailedPrecondition(format!(
+                        "template {} is held through {} but backs {loop_device}",
+                        template.display(),
+                        entry.loop_device
+                    )));
+                }
+                entry.refcount += 1;
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(TemplateEntry {
+                    loop_device: loop_device.to_owned(),
+                    sectors,
+                    refcount: 1,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Remove orphaned dm-snapshot devices, COW files, and template loop
     /// devices left over from a previous crash. Called after orphaned
-    /// Firecracker processes are dead; it is synchronous because every
+    /// Firecracker processes are dead — every one of them except the
+    /// sandboxes named by `live_devices`, whose VMs are still running and
+    /// were reclaimed by [`Self::adopt`]. It is synchronous because every
     /// command is short and startup is already gated on reconciliation.
     ///
-    /// `keep_cow_ids` names sandboxes whose COW file is *retained state*,
-    /// not an orphan: a paused sandbox keeps its (detached) overlay on disk
-    /// so Resume can re-assemble the dm-snapshot with every written block
+    /// Both sets are keyed by the *resource owner* — the id in
+    /// `arcbox-cow-{owner}.img` and `arcbox-snap-{owner}` — which for a
+    /// sandbox that adopted a pre-warmed pool slot is the slot's id, not the
+    /// sandbox's.
+    ///
+    /// `keep_cow_files` names owners whose COW file is *retained state*, not
+    /// an orphan: a paused sandbox keeps its (detached) overlay on disk so
+    /// Resume can re-assemble the dm-snapshot with every written block
     /// intact (CORE-21). Deleting those files here would silently destroy a
     /// paused sandbox's disk across an agent restart.
-    pub fn reconcile_stale(&self, keep_cow_ids: &std::collections::HashSet<String>) -> Result<()> {
+    ///
+    /// `live_devices` names owners whose dm-snapshot is in use by a running
+    /// VM. The two sets stay separate because they describe genuinely
+    /// different states: a paused sandbox's device was already torn down at
+    /// pause, so reading its retained file as a live device would leave the
+    /// device of a sandbox that crashed mid-pause unreaped. The other
+    /// direction does hold — a live device's overlay is its running disk —
+    /// so those files are kept whether or not the caller lists them twice.
+    pub fn reconcile_stale(
+        &self,
+        keep_cow_files: &HashSet<String>,
+        live_devices: &HashSet<String>,
+    ) -> Result<()> {
         let dmsetup = self.dmsetup_bin.as_deref();
 
         // 1. Remove stale dm devices first — they pin the loop devices
@@ -55,8 +184,15 @@ impl CowManager {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if let Some(name) = line.split_whitespace().next()
-                    && name.starts_with(DM_NAME_PREFIX)
+                    && let Some(owner) = name.strip_prefix(DM_NAME_PREFIX)
                 {
+                    // A live VM holds its device open, so removing it would
+                    // fail — and fail the whole sweep, taking every other
+                    // sandbox's reconciliation with it.
+                    if live_devices.contains(owner) {
+                        debug!(dm = %name, "keeping live sandbox dm-snapshot");
+                        continue;
+                    }
                     debug!(dm = %name, "removing stale dm-snapshot");
                     // `--retry` for the same udev probe race `dmsetup_remove` documents.
                     run_sync_checked(Command::new(dmsetup).args(["remove", "--retry", name]))?;
@@ -74,8 +210,8 @@ impl CowManager {
             };
             if let Some(rest) = name.strip_prefix("arcbox-cow-") {
                 let id = rest.strip_suffix(".img").unwrap_or(rest);
-                if keep_cow_ids.contains(id) {
-                    debug!(file = %path.display(), "keeping paused sandbox cow file");
+                if keep_cow_files.contains(id) || live_devices.contains(id) {
+                    debug!(file = %path.display(), "keeping retained sandbox cow file");
                     continue;
                 }
                 for loop_device in loop_devices_for_backing_sync(&path)? {
@@ -89,10 +225,10 @@ impl CowManager {
         // 3. Detach orphaned template loop devices.
         //
         // Template attaches are tracked only in the in-memory `templates`
-        // HashMap, which is empty at startup — without this pass, every
-        // crash+restart cycle would permanently leak one read-only loop
-        // device per unique rootfs template, eventually exhausting the
-        // 256-entry loop namespace.
+        // HashMap, which holds nothing at startup but what [`Self::adopt`]
+        // put there — without this pass, every crash+restart cycle would
+        // permanently leak one read-only loop device per unique rootfs
+        // template, eventually exhausting the 256-entry loop namespace.
         //
         // We use marker files written at attach time (under
         // `{cow_dir}/.template-loops/`) rather than a system-wide "any
@@ -196,6 +332,30 @@ impl CowManager {
                     marker_path.display()
                 )));
             }
+            // The map is the authority on which template loops are in use:
+            // an entry means a live dm-snapshot has this template as its
+            // origin, either because this manager attached it or because
+            // [`Self::adopt`] re-registered a still-running guest's. The
+            // marker stays too — it is that loop's recovery record, and its
+            // owner clears it on teardown. Before the pending branch, not
+            // after: that branch detaches *everything* backing the template,
+            // which is precisely the live loop. A pending marker for a live
+            // template is instead cleared by a later sweep, once nothing
+            // holds it — by which time its own loop, if it ever got one, is
+            // the one the teardown detached.
+            if self
+                .templates
+                .lock()
+                .unwrap()
+                .contains_key(Path::new(&expected_backing))
+            {
+                debug!(
+                    marker = %marker_path.display(),
+                    template = %expected_backing,
+                    "keeping live template loop"
+                );
+                continue;
+            }
             if loop_basename.starts_with(TEMPLATE_PENDING_PREFIX) {
                 for loop_device in loop_devices_for_backing_sync(Path::new(&expected_backing))? {
                     self.tools.detach_loop(&loop_device)?;
@@ -207,11 +367,18 @@ impl CowManager {
             let dev = format!("/dev/{loop_basename}");
             // Verify the loop is still attached AND still backs the
             // expected template, so we never detach a /dev/loopN that
-            // was reused by another process after our crash.
+            // was reused by another process after our crash. Either
+            // spelling counts (see [`backing_spellings`]): the marker holds
+            // the path this manager was configured with, the kernel answers
+            // with the one it resolved, and reading a difference between
+            // them as "reused by someone else" clears the marker and strands
+            // the loop forever — the exact leak this pass exists to prevent.
+            let expected = backing_spellings(Path::new(&expected_backing));
             let actual_backing = loop_backing_file(&dev)?;
 
-            if !expected_backing.is_empty()
-                && actual_backing.as_deref() == Some(expected_backing.as_str())
+            if actual_backing
+                .as_ref()
+                .is_some_and(|actual| expected.contains(actual))
             {
                 debug!(dev = %dev, "detaching stale template loop");
                 self.tools.detach_loop(&dev)?;
@@ -444,12 +611,33 @@ pub(super) fn remove_file_durable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How the kernel may spell `backing` in a loop device's `backing_file`:
+/// the caller's own spelling, and the resolved path.
+///
+/// [`loop_backing_file`] reports the *resolved* path of the file the device
+/// holds open, which is not the caller's spelling whenever that path
+/// reaches the file through a symlink — a data directory pointed at another
+/// volume, say. The attach path already accepts either
+/// (`BusyboxBlockTools::verify_attached`), and rediscovery has to as well:
+/// comparing one spelling makes a loop this manager attached itself
+/// invisible to teardown, and makes [`CowManager::adopt`] refuse a live
+/// sandbox whose rootfs is right there.
+pub(super) fn backing_spellings(backing: &Path) -> Vec<String> {
+    let literal = backing.to_string_lossy().into_owned();
+    let resolved = std::fs::canonicalize(backing)
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok()
+        .filter(|resolved| *resolved != literal);
+    std::iter::once(literal).chain(resolved).collect()
+}
+
 pub(super) fn loop_backs_path(loop_device: &str, backing: &Path) -> Result<bool> {
-    Ok(loop_backing_file(loop_device)?.is_some_and(|actual| actual == backing.to_string_lossy()))
+    let expected = backing_spellings(backing);
+    Ok(loop_backing_file(loop_device)?.is_some_and(|actual| expected.contains(&actual)))
 }
 
 pub(super) fn loop_devices_for_backing_sync(backing: &Path) -> Result<Vec<String>> {
-    let expected = backing.to_string_lossy();
+    let expected = backing_spellings(backing);
     let mut devices = Vec::new();
     for entry in std::fs::read_dir("/sys/block")? {
         let entry = entry?;
@@ -463,7 +651,7 @@ pub(super) fn loop_devices_for_backing_sync(backing: &Path) -> Result<Vec<String
             continue;
         }
         let device = format!("/dev/{name}");
-        if loop_backing_file(&device)?.as_deref() == Some(expected.as_ref()) {
+        if loop_backing_file(&device)?.is_some_and(|actual| expected.contains(&actual)) {
             devices.push(device);
         }
     }

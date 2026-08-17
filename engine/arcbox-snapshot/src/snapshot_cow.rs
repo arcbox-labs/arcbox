@@ -836,7 +836,57 @@ async fn create_sparse_file(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    /// A manager over `cow_dir` with nothing attached and no `dmsetup`;
+    /// tests that need one adjust the field they are about.
+    fn manager(cow_dir: &Path) -> CowManager {
+        CowManager {
+            templates: Mutex::new(HashMap::new()),
+            setup_orphans: Mutex::new(HashMap::new()),
+            losetup_lock: AsyncMutex::new(()),
+            cow_dir: cow_dir.to_path_buf(),
+            tools: Arc::new(BusyboxBlockTools::default()),
+            dmsetup_bin: None,
+            test_probe: None,
+        }
+    }
+
+    /// A `dmsetup` that lists `listed` as snapshot devices and appends every
+    /// other invocation to `{dir}/dmsetup.log`, so a test can assert which
+    /// devices the sweep decided to remove without a device-mapper.
+    fn fake_dmsetup(dir: &Path, listed: &[&str]) -> PathBuf {
+        let listing = listed
+            .iter()
+            .enumerate()
+            .map(|(minor, name)| format!("{name}\\t(253, {minor})"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let binary = dir.join("dmsetup");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = ls ]; then printf '{listing}\\n'; else echo \"$@\" >> '{}'; fi\n",
+                dir.join("dmsetup.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary
+    }
+
+    fn handle_for(dm_device: &Path, template: &Path) -> CowHandle {
+        CowHandle {
+            dm_name: "arcbox-snap-box".into(),
+            dm_device: dm_device.to_string_lossy().into_owned(),
+            cow_loop: "/dev/loop9".into(),
+            cow_file: PathBuf::from("/nonexistent/arcbox-cow-box.img"),
+            template_path: template.to_path_buf(),
+        }
+    }
 
     #[test]
     fn test_dm_name_format() {
@@ -881,15 +931,7 @@ mod tests {
     #[test]
     fn template_marker_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(tmp.path());
 
         let template = PathBuf::from("/var/lib/arcbox/rootfs.ext4");
         mgr.write_template_marker("/dev/loop7", &template).unwrap();
@@ -912,15 +954,7 @@ mod tests {
         std::fs::create_dir_all(&marker_dir).unwrap();
         let temporary = marker_dir.join(format!("{TEMPLATE_MARKER_TEMP_PREFIX}loop7"));
         std::fs::write(&temporary, b"/partial").unwrap();
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(tmp.path());
 
         mgr.cleanup_stale_template_markers().unwrap();
 
@@ -943,15 +977,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cow_file = tmp.path().join("existing.img");
         std::fs::write(&cow_file, b"owned by another setup").unwrap();
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(tmp.path());
 
         let _ = mgr
             .rollback_setup(
@@ -971,22 +997,16 @@ mod tests {
     async fn zero_ref_template_is_not_reused() {
         let tmp = tempfile::tempdir().unwrap();
         let template = PathBuf::from("/template");
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::from([(
-                template.clone(),
-                TemplateEntry {
-                    loop_device: "/dev/loop7".into(),
-                    sectors: 1024,
-                    refcount: 0,
-                },
-            )])),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: tmp.path().to_path_buf(),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: Some("/not-used".into()),
-            test_probe: None,
-        };
+        let mut mgr = manager(tmp.path());
+        mgr.dmsetup_bin = Some("/not-used".into());
+        mgr.templates.lock().unwrap().insert(
+            template.clone(),
+            TemplateEntry {
+                loop_device: "/dev/loop7".into(),
+                sectors: 1024,
+                refcount: 0,
+            },
+        );
 
         assert!(matches!(
             mgr.setup("box", template.to_str().unwrap()).await,
@@ -1003,17 +1023,231 @@ mod tests {
         );
     }
 
+    /// The sweep must leave an adopted sandbox's device alone: a live VM
+    /// holds it open, so removing it fails — and `reconcile_stale` reports
+    /// that failure for the whole sweep, taking every other sandbox's
+    /// reconciliation down with it.
+    #[test]
+    fn a_live_dm_device_is_not_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = manager(tmp.path());
+        mgr.dmsetup_bin = Some(fake_dmsetup(
+            tmp.path(),
+            &["arcbox-snap-live", "arcbox-snap-dead", "foreign-snapshot"],
+        ));
+
+        mgr.reconcile_stale(&HashSet::new(), &HashSet::from(["live".to_owned()]))
+            .unwrap();
+
+        let removed = std::fs::read_to_string(tmp.path().join("dmsetup.log")).unwrap();
+        assert_eq!(
+            removed.lines().collect::<Vec<_>>(),
+            ["remove --retry arcbox-snap-dead"],
+            "the sweep removed the wrong devices"
+        );
+    }
+
+    /// A live device's overlay is the disk it is running on, so the caller
+    /// naming it as live is enough — it does not also have to remember to
+    /// list it among the retained files.
+    #[test]
+    fn a_live_sandbox_cow_file_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay = tmp.path().join("arcbox-cow-live.img");
+        std::fs::write(&overlay, b"exceptions").unwrap();
+        let mgr = manager(tmp.path());
+
+        mgr.reconcile_stale(&HashSet::new(), &HashSet::from(["live".to_owned()]))
+            .unwrap();
+
+        assert!(overlay.exists(), "a live sandbox's overlay was deleted");
+    }
+
+    /// The template map is the authority on which loops are in use, so a
+    /// marker whose template is live survives — detaching that loop would
+    /// pull the rootfs out from under the guest running on it, and the
+    /// marker is the loop's own recovery record.
+    #[test]
+    fn a_live_template_loop_survives_the_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_dir = tmp.path().join(TEMPLATE_LOOP_DIR);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let live = tmp.path().join("live.ext4");
+        let stale = tmp.path().join("stale.ext4");
+        std::fs::write(marker_dir.join("loop7"), live.to_string_lossy().as_bytes()).unwrap();
+        std::fs::write(marker_dir.join("loop8"), stale.to_string_lossy().as_bytes()).unwrap();
+        let mgr = manager(tmp.path());
+        mgr.templates.lock().unwrap().insert(
+            live,
+            TemplateEntry {
+                loop_device: "/dev/loop7".into(),
+                sectors: 1024,
+                refcount: 1,
+            },
+        );
+
+        mgr.reconcile_stale(&HashSet::new(), &HashSet::new())
+            .unwrap();
+
+        assert!(
+            marker_dir.join("loop7").exists(),
+            "the live template's recovery marker was cleared"
+        );
+        assert!(!marker_dir.join("loop8").exists());
+    }
+
+    /// Nothing to re-register, whatever the journal claims — and the caller
+    /// has to hear about it, because its fallback is to kill the sandbox.
+    #[test]
+    fn adopt_refuses_a_missing_dm_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager(tmp.path());
+        let handle = handle_for(
+            &tmp.path().join("arcbox-snap-box"),
+            &tmp.path().join("t.ext4"),
+        );
+
+        let error = mgr.adopt(&handle).unwrap_err();
+
+        assert!(
+            matches!(&error, SnapshotError::FailedPrecondition(m) if m.contains("arcbox-snap-box")),
+            "{error}"
+        );
+        assert!(mgr.templates.lock().unwrap().is_empty());
+    }
+
+    /// The loop is the kernel's, so only the kernel can say whether it still
+    /// backs the recorded template; nothing backing it means the origin of
+    /// that snapshot cannot be identified, let alone held. Linux-only: off
+    /// it there is no `/sys/block` to answer either way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_refuses_a_template_no_loop_device_backs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Stands in for the live device node: `adopt` asks only whether the
+        // guest's device is still there.
+        let dm_device = tmp.path().join("arcbox-snap-box");
+        std::fs::write(&dm_device, b"").unwrap();
+        let template = tmp.path().join("t.ext4");
+        std::fs::write(&template, b"rootfs").unwrap();
+        let mgr = manager(tmp.path());
+
+        let error = mgr.adopt(&handle_for(&dm_device, &template)).unwrap_err();
+
+        assert!(
+            matches!(&error, SnapshotError::FailedPrecondition(m) if m.contains("no loop device backs")),
+            "{error}"
+        );
+        assert!(
+            mgr.templates.lock().unwrap().is_empty(),
+            "a refused adoption took a template reference"
+        );
+    }
+
+    /// The kernel answers with the path it resolved, so rediscovering a loop
+    /// by the spelling the caller configured only works when that spelling
+    /// is already canonical. A data directory reached through a symlink is
+    /// not an exotic deployment, and there it would cost a live sandbox its
+    /// adoption and hide this manager's own loops from teardown.
+    #[test]
+    fn a_template_reached_through_a_symlink_is_matched_by_its_resolved_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let templates = tmp.path().join("templates");
+        std::fs::create_dir(&templates).unwrap();
+        std::fs::write(templates.join("rootfs.ext4"), b"rootfs").unwrap();
+        let linked = tmp.path().join("data");
+        std::os::unix::fs::symlink(&templates, &linked).unwrap();
+        let configured = linked.join("rootfs.ext4");
+
+        let spellings = persistence::backing_spellings(&configured);
+
+        let resolved = std::fs::canonicalize(&configured).unwrap();
+        assert_ne!(
+            configured, resolved,
+            "the symlinked spelling has to differ, or this asserts nothing"
+        );
+        assert!(
+            spellings.contains(&configured.to_string_lossy().into_owned()),
+            "{spellings:?}"
+        );
+        assert!(
+            spellings.contains(&resolved.to_string_lossy().into_owned()),
+            "{spellings:?}"
+        );
+    }
+
+    /// What makes the eventual teardown balance: the first adopted sandbox
+    /// registers the template it found, and every later one holding the same
+    /// template adds a reference rather than a second registration.
+    #[test]
+    fn adopting_a_shared_template_registers_then_references() {
+        let mgr = manager(Path::new("/tmp"));
+        let template = Path::new("/templates/rootfs.ext4");
+
+        mgr.take_template_ref(template, "/dev/loop7", 2048).unwrap();
+        mgr.take_template_ref(template, "/dev/loop7", 2048).unwrap();
+
+        let templates = mgr.templates.lock().unwrap();
+        let entry = templates.get(template).unwrap();
+        assert_eq!(entry.refcount, 2);
+        assert_eq!(entry.loop_device, "/dev/loop7");
+        assert_eq!(entry.sectors, 2048);
+    }
+
+    /// Two refusals with the same consequence — the caller kills the sandbox
+    /// rather than adopt onto a template this manager cannot account for: an
+    /// entry left at refcount zero is the incomplete-setup sentinel the
+    /// acquire path also refuses on, and an entry naming a different loop
+    /// means one of the two is a leak whichever way it is resolved.
+    #[test]
+    fn adopting_refuses_a_zero_ref_or_relocated_template() {
+        let mgr = manager(Path::new("/tmp"));
+        let template = Path::new("/templates/rootfs.ext4");
+        mgr.templates.lock().unwrap().insert(
+            template.to_path_buf(),
+            TemplateEntry {
+                loop_device: "/dev/loop7".into(),
+                sectors: 2048,
+                refcount: 0,
+            },
+        );
+
+        let incomplete = mgr
+            .take_template_ref(template, "/dev/loop7", 2048)
+            .unwrap_err();
+        assert!(
+            matches!(&incomplete, SnapshotError::Unavailable(m) if m.contains("incomplete CoW setup")),
+            "{incomplete}"
+        );
+
+        mgr.templates
+            .lock()
+            .unwrap()
+            .get_mut(template)
+            .unwrap()
+            .refcount = 1;
+        let relocated = mgr
+            .take_template_ref(template, "/dev/loop9", 2048)
+            .unwrap_err();
+        assert!(
+            matches!(&relocated, SnapshotError::FailedPrecondition(m) if m.contains("/dev/loop9")),
+            "{relocated}"
+        );
+        assert_eq!(
+            mgr.templates
+                .lock()
+                .unwrap()
+                .get(template)
+                .unwrap()
+                .refcount,
+            1,
+            "a refused adoption took a template reference"
+        );
+    }
+
     #[tokio::test]
     async fn test_release_template_refcount() {
-        let mgr = CowManager {
-            templates: Mutex::new(HashMap::new()),
-            setup_orphans: Mutex::new(HashMap::new()),
-            losetup_lock: AsyncMutex::new(()),
-            cow_dir: PathBuf::from("/tmp"),
-            tools: Arc::new(BusyboxBlockTools::default()),
-            dmsetup_bin: None,
-            test_probe: None,
-        };
+        let mgr = manager(Path::new("/tmp"));
 
         let path = PathBuf::from("/tmp/template.ext4");
         {
