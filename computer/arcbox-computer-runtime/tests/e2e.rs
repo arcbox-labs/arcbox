@@ -371,13 +371,31 @@ fn journaled_pid(data_dir: &std::path::Path, id: &str) -> i32 {
         .expect("a journaled vmm pid") as i32
 }
 
-/// Whether `pid` is still a live Firecracker, rather than merely a live pid
-/// the kernel handed to something else since.
+/// Whether `pid` is still a live Firecracker, rather than a pid the kernel
+/// handed to something else since — or a zombie.
+///
+/// Both managers in this test run in one process, so nothing `waitpid()`s a
+/// VMM that Remove killed and it lingers unreaped, still named
+/// "firecracker". The state letter is what says it is gone, exactly as the
+/// driver's own liveness probe reads it.
 #[cfg(target_os = "linux")]
 fn firecracker_alive(pid: i32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|comm| comm.trim_start().starts_with("firecracker"))
-        .unwrap_or(false)
+    // `/proc/<pid>/stat` is "<pid> (<comm>) <state> ...", and comm may itself
+    // contain spaces or parens — split at the LAST ')'.
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((named, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let is_firecracker = named
+        .split_once('(')
+        .is_some_and(|(_, comm)| comm.starts_with("firecracker"));
+    let is_live = rest
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| state != "Z" && state != "X");
+    is_firecracker && is_live
 }
 
 /// CORE-135's acceptance test: a sandbox survives the process that booted
