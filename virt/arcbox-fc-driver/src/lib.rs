@@ -37,8 +37,8 @@
 //! - [`prepared`] — [`FcPrepared`], the port's `PreparedVm`: a spawned
 //!   VMM waiting for a spec, listeners bound before the guest starts.
 //! - [`discover`] — finding a Firecracker that outlived the process which
-//!   booted it: the recorded pid while it is still a Firecracker, else a
-//!   `/proc` scan by `--id`, `--api-sock`, or jail root.
+//!   booted it: the recorded pid when it is a Firecracker the record names,
+//!   else a `/proc` scan for one, by `--id`, `--api-sock`, or jail root.
 //! - [`driver`] — [`FcDriver`], the port's `VmDriver` with `Prepare` and
 //!   `Adopt`; `boot`/`restore` are prepare-then-boot/restore.
 //!

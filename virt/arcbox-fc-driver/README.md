@@ -27,7 +27,7 @@ catalog, no engine, no orchestrator.
 | `process` | the process guard: waiter task, exit watch + event, kill / wait, detach |
 | `api` | pause, resume, snapshot, ctrl-alt-del, describe, vm-config over the raw client |
 | `listener` | the port's `VsockListener` over a `{uds}_{port}` socket |
-| `discover` | finding a Firecracker that outlived its booter (recorded pid, `/proc` scan) |
+| `discover` | finding a Firecracker that outlived its booter: the recorded pid and any `/proc` candidate, held to the same `--id` / `--api-sock` / jail-root test |
 | `prepared` | `FcPrepared: PreparedVm` — a spawned VMM waiting for a spec |
 | `handle` | `FcHandle: VmHandle + Vsock + VsockListen + Checkpoint + Detach` |
 | `driver` | `FcDriver: VmDriver + Prepare + Adopt` |

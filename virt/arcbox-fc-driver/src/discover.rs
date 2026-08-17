@@ -1,12 +1,16 @@
 //! Finding a Firecracker that outlived the process which booted it.
 //!
-//! The recorded pid may have been recycled since the record was written, so
-//! it counts only while its command name still looks like Firecracker
-//! (`/proc/<pid>/comm` on Linux; elsewhere the check degrades to "process
-//! exists"). On Linux, `/proc` is also scanned for a Firecracker whose
-//! command line names the VM (`--id`) or its API socket (`--api-sock`), or
-//! whose root is the VM's jail — the same three signatures the sandbox
-//! manager's restart sweep keys on.
+//! The recorded pid may have been recycled since the record was written —
+//! by another Firecracker, on a busy node — so it is held to the same
+//! identity test as any other candidate: a Firecracker (`/proc/<pid>/comm`)
+//! whose command line names the VM (`--id`) or its API socket
+//! (`--api-sock`), or whose root is the VM's jail. Those are the three
+//! signatures the sandbox manager's restart sweep keys on, and the recorded
+//! pid only saves the `/proc` scan that looks for the same thing.
+//!
+//! All three read `/proc`, so nothing is adopted off Linux: an unverified
+//! pid is a VM this driver would later signal, and Firecracker needs KVM
+//! anyway.
 
 use std::path::{Path, PathBuf};
 
@@ -30,12 +34,13 @@ pub struct Found {
 /// The Firecracker `record` names, if one is still running.
 pub fn find(config: &FcDriverConfig, record: &VmRecord) -> Option<Found> {
     let recorded_socket = record.process.as_ref().and_then(|p| p.api_socket.clone());
+    let identity = Identity::of(config, record, recorded_socket.as_deref());
     let pid = record
         .process
         .as_ref()
         .map(|p| p.pid)
-        .filter(|pid| process_is_firecracker(*pid))
-        .or_else(|| scan_proc(config, record, recorded_socket.as_deref()))?;
+        .filter(|pid| identity.matches(*pid))
+        .or_else(|| identity.scan_proc())?;
     let jail_root = jail_root_of(pid);
     let api_socket = recorded_socket
         .or_else(|| cmdline_api_socket(pid, jail_root.as_deref()))
@@ -145,42 +150,77 @@ fn process_ids(pid: u32) -> Option<(u32, u32)> {
     }
 }
 
-/// Scan `/proc` for a Firecracker that names the VM: `--id {id}`,
-/// `--api-sock {socket}`, or a root ending in `{exec}/{id}/root`.
-#[cfg(target_os = "linux")]
-fn scan_proc(config: &FcDriverConfig, record: &VmRecord, socket: Option<&Path>) -> Option<u32> {
-    let direct_socket = socket.map_or_else(
-        || record.runtime_dir.join("firecracker.sock"),
-        Path::to_path_buf,
-    );
-    let jail_tail = config
-        .firecracker_binary
-        .file_name()
-        .map(|exec| Path::new(exec).join(record.id.as_str()).join("root"));
-    let entries = std::fs::read_dir("/proc").ok()?;
-    entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            process_is_firecracker(pid).then_some((pid, entry.path()))
-        })
-        .find(|(_, proc_dir)| {
-            let direct_match = std::fs::read(proc_dir.join("cmdline"))
-                .ok()
-                .is_some_and(|bytes| cmdline_matches(&bytes, record.id.as_str(), &direct_socket));
-            let jail_match = jail_tail.as_ref().is_some_and(|tail| {
-                std::fs::read_link(proc_dir.join("root"))
-                    .ok()
-                    .is_some_and(|root| root.ends_with(tail))
-            });
-            direct_match || jail_match
-        })
-        .map(|(pid, _)| pid)
+/// What makes a running process *this* VM: the id on its command line, the
+/// API socket it was given, or the jail it is chrooted into.
+struct Identity<'a> {
+    id: &'a str,
+    /// The direct-mode API socket: the recorded one, else where a direct
+    /// spawn for this record would have put it.
+    socket: PathBuf,
+    /// `{firecracker binary name}/{id}/root`, the tail of the VM's jail.
+    jail_tail: Option<PathBuf>,
 }
 
-#[cfg(not(target_os = "linux"))]
-fn scan_proc(_config: &FcDriverConfig, _record: &VmRecord, _socket: Option<&Path>) -> Option<u32> {
-    None
+impl<'a> Identity<'a> {
+    fn of(config: &FcDriverConfig, record: &'a VmRecord, socket: Option<&Path>) -> Self {
+        Self {
+            id: record.id.as_str(),
+            socket: socket.map_or_else(
+                || record.runtime_dir.join("firecracker.sock"),
+                Path::to_path_buf,
+            ),
+            jail_tail: config
+                .firecracker_binary
+                .file_name()
+                .map(|exec| Path::new(exec).join(record.id.as_str()).join("root")),
+        }
+    }
+
+    /// True when `pid` is a live Firecracker that this record names.
+    fn matches(&self, pid: u32) -> bool {
+        process_is_firecracker(pid) && self.identifies(Path::new("/proc").join(pid.to_string()))
+    }
+
+    /// True when the `/proc` entry's command line or root names this VM.
+    #[cfg(target_os = "linux")]
+    fn identifies(&self, proc_dir: PathBuf) -> bool {
+        let by_cmdline = std::fs::read(proc_dir.join("cmdline"))
+            .ok()
+            .is_some_and(|bytes| cmdline_matches(&bytes, self.id, &self.socket));
+        let by_jail = self.jail_tail.as_ref().is_some_and(|tail| {
+            std::fs::read_link(proc_dir.join("root"))
+                .ok()
+                .is_some_and(|root| root.ends_with(tail))
+        });
+        by_cmdline || by_jail
+    }
+
+    /// Identity is a `/proc` question; off Linux there is nothing to ask.
+    #[cfg(not(target_os = "linux"))]
+    fn identifies(&self, _proc_dir: PathBuf) -> bool {
+        let _ = (self.id, &self.socket, &self.jail_tail);
+        false
+    }
+
+    /// Scan `/proc` for the VM: `--id {id}`, `--api-sock {socket}`, or a
+    /// root ending in `{exec}/{id}/root`.
+    #[cfg(target_os = "linux")]
+    fn scan_proc(&self) -> Option<u32> {
+        let entries = std::fs::read_dir("/proc").ok()?;
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+                process_is_firecracker(pid).then_some((pid, entry.path()))
+            })
+            .find(|(_, proc_dir)| self.identifies(proc_dir.clone()))
+            .map(|(pid, _)| pid)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn scan_proc(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The value following `flag` in a NUL-separated command line.
@@ -237,6 +277,21 @@ mod tests {
             Some(&b"/run/firecracker.socket"[..])
         );
         assert_eq!(cmdline_arg(b"firecracker\0--id\0", b"--id"), None);
+    }
+
+    #[test]
+    fn a_recorded_pid_that_is_not_this_vm_is_not_adopted() {
+        // The test binary itself: alive, and nothing about it names the VM.
+        let record = VmRecord {
+            id: arcbox_vm_driver::VmId::new("recycled").unwrap(),
+            driver: crate::NAME.to_owned(),
+            runtime_dir: "/nonexistent/arcbox-fc-driver".into(),
+            process: Some(arcbox_vm_driver::ProcessRecord {
+                pid: std::process::id(),
+                api_socket: None,
+            }),
+        };
+        assert!(find(&FcDriverConfig::new("/opt/fc/firecracker"), &record).is_none());
     }
 
     #[test]
