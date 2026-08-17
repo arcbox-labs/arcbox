@@ -1,19 +1,20 @@
 # arcbox-vm
 
 Guest-side sandbox orchestration: runs **inside** the ArcBox System VM and
-manages nested [Firecracker](https://firecracker-microvm.github.io/)
-microVMs — one per sandbox — through
-[`fc-sdk`](https://crates.io/crates/fc-sdk).
+manages nested microVMs — one per sandbox — through a `VmDriver`
+([`arcbox-vm-driver`](../arcbox-vm-driver)); the reference driver is
+[`arcbox-fc-driver`](../arcbox-fc-driver), Firecracker.
 
 Do not confuse it with `arcbox-vmm`, which is the **host** VMM that boots
 the System VM itself on Virtualization.framework or KVM. Different layer,
 different machine.
 
 ```
-host (macOS)              System VM (Linux)            sandbox (Firecracker)
+host (macOS)              System VM (Linux)            sandbox (microVM)
 arcbox-daemon    ──vsock──►  arcbox-agent      ──vsock──►  vm-agent (PID 1)
   arcbox-vmm                   arcbox-vm                     workload
-                                 fc-sdk                    (arcbox-vm-agent)
+                              arcbox-vm-driver              (arcbox-vm-agent)
+                              (arcbox-fc-driver)
                                         └── arcbox-vm-proto ──┘
 ```
 
@@ -62,7 +63,10 @@ between the System VM's busybox userland and a stock distro — is a
 separate input, `SandboxEnvironment`. `SandboxManager::new(config)` uses
 the reference environment (the System VM's); a composer on another host
 overrides the members it owns and calls
-`SandboxManager::with_environment(config, env)`. Today that is the
+`SandboxManager::with_environment(config, env)`. Today that is the VM
+driver behind `arcbox_vm_driver::VmDriver` (`None` = the Firecracker
+driver built from `[firecracker]`; whatever is supplied must claim the
+`Prepare` capability, which the boot and pool flows need), the
 loop-device tooling behind `arcbox_snapshot::snapshot_cow::BlockTools`
 (`BusyboxBlockTools` is the reference; a `util-linux` or ioctl
 implementation is a consumer's few dozen lines) and the netfilter

@@ -257,7 +257,6 @@ impl SandboxManager {
         let info = super::checkpoint::checkpoint_impl(
             &self.instances,
             &self.snapshots,
-            &self.config,
             id,
             super::checkpoint::CheckpointRequest {
                 name: format!("template-{template}"),
@@ -266,7 +265,11 @@ impl SandboxManager {
                 resume_after: true,
             },
         )
-        .await?;
+        .await
+        // The builder is force-removed by the caller whichever way this
+        // ends, so a guest left frozen needs no failing here: the removal
+        // kills and releases it.
+        .map_err(super::checkpoint::CheckpointFailure::into_error)?;
         let meta = self.snapshots.find_by_id(&info.snapshot_id)?;
         let mut artifact_bytes = std::fs::metadata(&meta.vmstate_path).map_or(0, |m| m.len());
         if let Some(mem) = &meta.mem_path {

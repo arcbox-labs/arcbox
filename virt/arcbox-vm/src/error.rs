@@ -33,10 +33,6 @@ pub enum VmmError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// Error from the Firecracker SDK.
-    #[error("fc-sdk error: {0}")]
-    Sdk(#[from] fc_sdk::Error),
-
     /// The VM driver — the port's adapter, or a capability reached through
     /// it — failed in a way that has no native shape here (an adapter
     /// fault, a foreign checkpoint). The port's `NotFound`, `WrongState`,

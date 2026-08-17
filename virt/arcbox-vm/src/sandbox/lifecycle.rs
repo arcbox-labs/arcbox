@@ -3,6 +3,7 @@ use super::cleanup::{inst_to_info, remove_sandbox_impl};
 use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
 use super::types::{SandboxBootTask, action};
 use super::*;
+use arcbox_vm_driver::ShutdownMode;
 
 /// Whether a create may restore from warm sources and publish into the
 /// warm-cache LRU. [`Disabled`](Self::Disabled) exists for the prewarm
@@ -411,6 +412,7 @@ impl SandboxManager {
         {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
+            let driver = Arc::clone(&self.driver);
             let config = Arc::clone(&self.config);
             let events_tx = self.events_tx.clone();
             let cow_manager = Arc::clone(&self.cow_manager);
@@ -426,6 +428,7 @@ impl SandboxManager {
                     vm_dir,
                     instances,
                     network,
+                    driver,
                     config,
                     events_tx,
                     cow_manager,
@@ -462,7 +465,7 @@ impl SandboxManager {
     ///
     /// Waits up to `timeout_seconds` (default 30 s) for an active workload
     /// to exit, asks the guest to shut down (Ctrl+Alt+Del reboots the guest,
-    /// which exits Firecracker), and SIGKILLs Firecracker only if it
+    /// which exits the VMM), and the driver SIGKILLs the VMM only if it
     /// outlives the remaining budget. All runtime resources (TAP + IP,
     /// dm-snapshot CoW, jailer chroot) are released on `Stopped`; only the
     /// inspectable record and the log directory survive until `Remove`.
@@ -493,7 +496,7 @@ impl SandboxManager {
             super::reconcile::clear_state_record(&vm_dir)?;
             return Ok(());
         }
-        let (was_running, vm_handle, record_generation, last_exited_at) = {
+        let (was_running, handle, record_generation, last_exited_at) = {
             let mut inst = instance.lock().unwrap();
             match inst.state {
                 SandboxState::Ready | SandboxState::Running | SandboxState::Stopping => {}
@@ -508,7 +511,7 @@ impl SandboxManager {
             let was_running = inst.state == SandboxState::Running;
             let captured = (
                 was_running,
-                inst.vm.as_ref().map(Arc::clone),
+                inst.handle.clone(),
                 inst.record_generation,
                 inst.last_exited_at,
             );
@@ -542,41 +545,24 @@ impl SandboxManager {
             }
         }
 
-        // Ask the guest to shut down. Ctrl+Alt+Del triggers a guest reboot,
-        // which Firecracker turns into a VM exit. Errors are ignored — the
-        // VM may already be gone.
-        if let Some(vm) = vm_handle {
-            let _ = tokio::time::timeout(Duration::from_secs(5), vm.send_ctrl_alt_del()).await;
-        }
-
-        // Wait for Firecracker to exit within the remaining budget; SIGKILL
-        // as a fallback, then reap.
-        let fc_process = instance.lock().unwrap().process.take();
-        if let Some(mut proc) = fc_process {
+        // Ask the guest to shut down (Ctrl+Alt+Del reboots it, which the VMM
+        // turns into a VM exit) and wait for it within the remaining
+        // budget; the driver kills the VMM at the deadline (and reports a
+        // reap that timed out — the handle stays on the instance for a
+        // retry). A VM that never came up has no handle to ask.
+        if let Some(handle) = handle {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::from_secs(1))
                 .max(Duration::from_secs(1));
-            match tokio::time::timeout(remaining, proc.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    instance.lock().unwrap().process = Some(proc);
-                    return Err(VmmError::Process(format!(
-                        "wait for sandbox {id} firecracker: {error}"
-                    )));
-                }
-                Err(_) => {
-                    warn!(sandbox_id = %id, "guest did not shut down in time; killing firecracker");
-                    if let Err(error) = super::boot::kill_and_reap_fc_checked(&mut proc).await {
-                        instance.lock().unwrap().process = Some(proc);
-                        return Err(error);
-                    }
-                }
-            }
+            handle
+                .shutdown(ShutdownMode::Graceful { timeout: remaining })
+                .await
+                .map_err(|error| VmmError::Process(format!("shut down sandbox {id}: {error}")))?;
         }
 
-        // Release TAP/IP, CoW device, and chroot now that FC is gone; the
-        // record itself stays inspectable until Remove.
+        // Release the VMM (already exited, or never booted), TAP/IP, CoW
+        // device, and chroot; the record itself stays inspectable until Remove.
         let stop_commit = {
             super::cleanup::release_runtime_resources(
                 id,
@@ -844,13 +830,13 @@ impl SandboxManager {
     }
 }
 
-/// The vsock capability reaching `inst`'s guest agent, once a boot or
-/// restore has handed one over.
+/// The vsock capability reaching `inst`'s guest agent: the running VM's,
+/// once a boot or restore has handed its handle over.
 fn guest_vsock(id: &SandboxId, inst: &SandboxInstance) -> Result<Arc<dyn arcbox_vm_driver::Vsock>> {
-    inst.vsock_uds_path
+    inst.handle
         .clone()
-        .map(|path| Arc::new(vsock::UdsVsock(path)) as Arc<dyn arcbox_vm_driver::Vsock>)
-        .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no vsock configured")))
+        .map(|handle| Arc::new(vsock::HandleVsock(handle)) as Arc<dyn arcbox_vm_driver::Vsock>)
+        .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))
 }
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.

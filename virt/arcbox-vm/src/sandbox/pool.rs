@@ -1,7 +1,7 @@
 //! Pre-warmed restore slots (CORE-78).
 //!
-//! The fixed host-side setup of a snapshot restore — jailer chroot,
-//! Firecracker spawn, kernel/vmstate/mem staging, dm-snapshot — costs
+//! The fixed host-side setup of a snapshot restore — jailer chroot, the
+//! VMM spawn, kernel/vmstate/mem staging, dm-snapshot — costs
 //! ~114 ms of the restore RPC. A [`PreparedSlot`] pre-executes exactly
 //! that sequence, so a restore that claims one proceeds directly to
 //! LoadSnapshot + guest reconfiguration.
@@ -13,7 +13,7 @@
 //! LoadSnapshot time binds a claimed slot to its TAP, which keeps slots
 //! network-agnostic (the seam CORE-81 builds on).
 
-use super::boot::{StageError, kill_and_reap_fc_checked, stage_rootfs_cow_or_copy};
+use super::boot::{StageError, stage_rootfs_cow_or_copy};
 use super::reconcile::{self, POOL_SLOT_PREFIX, SandboxStateRecord};
 use super::*;
 use crate::config::JailerConfig;
@@ -23,53 +23,23 @@ use crate::snapshot::SnapshotMeta;
 /// id is evicted — its slots torn down — when a third id starts filling.
 const MAX_POOLED_SNAPSHOTS: usize = 2;
 
-/// A fully staged restore slot: jailer chroot prepared, Firecracker
-/// spawned (API socket up, nothing loaded yet), kernel + vmstate + mem
-/// staged, dm-snapshot of the rootfs created.
+/// A fully staged restore slot: jailer chroot prepared, the VMM spawned
+/// (API socket up, nothing loaded yet), kernel + vmstate + mem staged,
+/// dm-snapshot of the rootfs created.
 pub(super) struct PreparedSlot {
     /// Slot id (`pool-<uuid>`): the chroot, dm/CoW names, and crash
     /// journal are keyed by it.
     pub slot_id: String,
-    /// Firecracker process, chrooted into the slot's jail.
-    pub process: fc_sdk::FirecrackerProcess,
+    /// The VMM the driver prepared, chrooted into the slot's jail and
+    /// waiting for the snapshot load.
+    pub prepared: Arc<dyn PreparedVm>,
     /// dm-snapshot of the snapshot's rootfs (`None` = copy fallback).
     pub cow_handle: Option<CowHandle>,
-    /// Chroot-relative vmstate path for `SnapshotLoadParams`.
-    pub vmstate_path: String,
-    /// Chroot-relative mem path, when the snapshot has one.
-    pub mem_path: Option<String>,
-    /// Host-side vsock UDS path inside the slot's chroot.
-    pub vsock_path: PathBuf,
+    /// The checkpoint as staged into the slot's chroot, ready for the
+    /// driver to load.
+    pub image: CheckpointImage,
     /// Slot runtime dir (`sandboxes/pool-<uuid>`) holding its crash journal.
     pub vm_dir: PathBuf,
-}
-
-impl PreparedSlot {
-    /// Whether the pre-spawned Firecracker process is still alive.
-    ///
-    /// `kill(pid, 0)` alone is not enough: it succeeds for a zombie, and a
-    /// parked slot's child is never `wait()`ed while pooled, so an FC that
-    /// died mid-park stays a zombie until claim and would pass a signal
-    /// probe. Read the `/proc` state instead (this code runs in the Linux
-    /// guest) and treat zombie/dead as gone; the claim path then discards
-    /// the slot and its kill+reap teardown collects the corpse. An external
-    /// `waitpid` is NOT an option here — the pid is owned by the handle's
-    /// tokio `Child`, and reaping it out from under that handle races its
-    /// own `wait`.
-    pub fn process_alive(&self) -> bool {
-        self.process.pid().is_some_and(|pid| {
-            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                // The state letter is the field after the parenthesized comm;
-                // comm may itself contain spaces or parens, so split at the
-                // LAST ')'.
-                Ok(stat) => stat
-                    .rsplit_once(')')
-                    .and_then(|(_, rest)| rest.split_whitespace().next())
-                    .is_some_and(|state| state != "Z" && state != "X"),
-                Err(_) => false,
-            }
-        })
-    }
 }
 
 /// Refill work computed under the pool lock: how many slot prepares to
@@ -82,7 +52,7 @@ pub(super) struct FillPlan<S> {
 /// Slot storage and policy: keyed by snapshot id, capped to
 /// [`MAX_POOLED_SNAPSHOTS`] distinct ids (LRU), with in-flight refill
 /// accounting. Generic over the slot type so the policy is unit-testable
-/// without spawning Firecracker; the lock is never held across an await.
+/// without spawning a VMM; the lock is never held across an await.
 pub(super) struct SlotPool<S = PreparedSlot> {
     inner: Mutex<PoolInner<S>>,
 }
@@ -217,11 +187,12 @@ impl<S> PoolInner<S> {
     }
 }
 
-/// Pre-execute the restore setup sequence for `snapshot`: journal, spawn
-/// the jailed Firecracker, stage kernel + rootfs (dm-snapshot with copy
-/// fallback) + vmstate/mem hard links. A failure unwinds every partial
-/// resource before returning.
+/// Pre-execute the restore setup sequence for `snapshot`: journal, prepare
+/// the jailed VMM through the driver, stage kernel + rootfs (dm-snapshot
+/// with copy fallback) + vmstate/mem hard links. A failure unwinds every
+/// partial resource before returning.
 pub(super) async fn prepare_slot(
+    driver: &dyn VmDriver,
     config: &VmmConfig,
     cow_manager: &CowManager,
     snapshot: &SnapshotMeta,
@@ -253,24 +224,22 @@ pub(super) async fn prepare_slot(
         &SandboxStateRecord::new(&slot_id, None, None, None, true, None),
     )?;
 
-    match stage_slot(fc_cfg, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
-        Ok((process, cow_handle, vmstate_path, mem_path, vsock_path)) => Ok(PreparedSlot {
+    match stage_slot(driver, fc_cfg, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
+        Ok((prepared, cow_handle, image)) => Ok(PreparedSlot {
             slot_id,
-            process,
+            prepared,
             cow_handle,
-            vmstate_path,
-            mem_path,
-            vsock_path,
+            image,
             vm_dir,
         }),
         Err(mut failure) => {
             // Unwind whatever the failed stage acquired; on unwind failure
             // the journal stays for the startup sweep to retry.
-            let fc_unwound = match failure.process.take() {
-                Some(mut process) => match kill_and_reap_fc_checked(&mut process).await {
-                    Ok(()) => true,
+            let fc_unwound = match failure.prepared.take() {
+                Some(prepared) => match prepared.discard().await {
+                    Ok(_) => true,
                     Err(error) => {
-                        warn!(slot_id, error = %error, "failed slot prepare left its firecracker behind");
+                        warn!(slot_id, error = %error, "failed slot prepare left its vmm behind");
                         false
                     }
                 },
@@ -305,7 +274,7 @@ pub(super) async fn prepare_slot(
 
 struct SlotFailure {
     error: VmmError,
-    process: Option<fc_sdk::FirecrackerProcess>,
+    prepared: Option<Arc<dyn PreparedVm>>,
     cow_handle: Option<CowHandle>,
 }
 
@@ -313,21 +282,16 @@ impl From<VmmError> for SlotFailure {
     fn from(error: VmmError) -> Self {
         Self {
             error,
-            process: None,
+            prepared: None,
             cow_handle: None,
         }
     }
 }
 
-type StagedSlot = (
-    fc_sdk::FirecrackerProcess,
-    Option<CowHandle>,
-    String,
-    Option<String>,
-    PathBuf,
-);
+type StagedSlot = (Arc<dyn PreparedVm>, Option<CowHandle>, CheckpointImage);
 
 async fn stage_slot(
+    driver: &dyn VmDriver,
     fc_cfg: &crate::config::FirecrackerConfig,
     jc: &JailerConfig,
     cow_manager: &CowManager,
@@ -337,39 +301,36 @@ async fn stage_slot(
 ) -> std::result::Result<StagedSlot, SlotFailure> {
     let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
     let cr = chroot_root(&fc_cfg.binary, base, slot_id);
-    std::fs::create_dir_all(cr.join("run")).map_err(VmmError::Io)?;
-    let vsock_path = cr.join("run/firecracker.vsock");
 
-    let process = spawn_jailer(
-        &FcDriverConfig::from(fc_cfg),
-        &IsolationSpec::try_from(jc)?,
-        slot_id,
-    )
-    .await
-    .map_err(VmmError::from)?;
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "Firecracker pid fits platform pid_t"
-    )]
-    let pid = process.pid().map(|pid| pid as i32);
+    let prepared: Arc<dyn PreparedVm> = Arc::from(
+        super::prepare_capability(driver)
+            .prepare(
+                &VmId::new(slot_id).map_err(VmmError::from)?,
+                &IsolationSpec::try_from(jc)?,
+                vm_dir,
+            )
+            .await
+            .map_err(VmmError::from)?,
+    );
+    let pid = super::journaled_pid(&*prepared);
     let journal = |cow: Option<&CowHandle>| {
         reconcile::write_state_record(
             vm_dir,
             &SandboxStateRecord::new(slot_id, pid, None, cow, true, None),
         )
     };
-    let carry = |error: VmmError, process, cow_handle| SlotFailure {
+    let carry = |error: VmmError, prepared, cow_handle| SlotFailure {
         error,
-        process,
+        prepared,
         cow_handle,
     };
     if let Err(error) = journal(None) {
-        return Err(carry(error, Some(process), None));
+        return Err(carry(error, Some(prepared), None));
     }
 
     if let Some(kernel) = snapshot.kernel_path.as_deref() {
         if let Err(error) = stage_kernel_for_jailer(&cr, kernel, jc.uid, jc.gid).await {
-            return Err(carry(error.into(), Some(process), None));
+            return Err(carry(error.into(), Some(prepared), None));
         }
     }
 
@@ -382,7 +343,7 @@ async fn stage_slot(
             Err(StageError {
                 error,
                 cow_handle: leaked,
-            }) => return Err(carry(error, Some(process), leaked)),
+            }) => return Err(carry(error, Some(prepared), leaked)),
         }
     }
 
@@ -392,10 +353,12 @@ async fn stage_slot(
         mem: snapshot.mem_path.as_deref(),
     };
     match stage_snapshot_files(&cr, &files, jc.uid, jc.gid).await {
-        Ok((vmstate_path, mem_path)) => {
-            Ok((process, cow_handle, vmstate_path, mem_path, vsock_path))
+        Ok(_) => {
+            let image =
+                super::checkpoint_image(cr.join("snapshots").join(&snapshot.id), &snapshot.format);
+            Ok((prepared, cow_handle, image))
         }
-        Err(error) => Err(carry(error.into(), Some(process), cow_handle)),
+        Err(error) => Err(carry(error.into(), Some(prepared), cow_handle)),
     }
 }
 
@@ -429,9 +392,9 @@ pub(super) async fn destroy_slot(
     cow_manager: &CowManager,
     mut slot: PreparedSlot,
 ) -> Result<()> {
-    // FC must be dead before the dm teardown (`dmsetup remove` returns
+    // The VMM must be dead before the dm teardown (`dmsetup remove` returns
     // EBUSY while the block device is open).
-    kill_and_reap_fc_checked(&mut slot.process).await?;
+    slot.prepared.discard().await?;
     if let Some(handle) = slot.cow_handle.take() {
         cow_manager.teardown_checked(&handle).await?;
     }
@@ -454,19 +417,18 @@ pub(super) async fn destroy_slot(
 }
 
 impl SandboxManager {
-    /// Claim a live pre-warmed slot for `snapshot_id`. Slots whose
-    /// Firecracker died in the meantime are discarded and torn down in
-    /// the background.
+    /// Claim a live pre-warmed slot for `snapshot_id`. Slots whose VMM
+    /// died in the meantime are discarded and torn down in the background.
     pub(super) fn claim_restore_slot(&self, snapshot_id: &str) -> Option<PreparedSlot> {
         loop {
             let slot = self.pool.claim(snapshot_id)?;
-            if slot.process_alive() {
+            if slot.prepared.alive() {
                 return Some(slot);
             }
             warn!(
                 snapshot_id,
                 slot_id = %slot.slot_id,
-                "discarding pre-warmed slot whose firecracker died"
+                "discarding pre-warmed slot whose vmm died"
             );
             self.spawn_slot_teardown(slot);
         }
@@ -501,6 +463,7 @@ impl SandboxManager {
         }
         for _ in 0..plan.spawn {
             let pool = Arc::clone(&self.pool);
+            let driver = Arc::clone(&self.driver);
             let config = Arc::clone(&self.config);
             let cow_manager = Arc::clone(&self.cow_manager);
             let snapshots = Arc::clone(&self.snapshots);
@@ -508,7 +471,7 @@ impl SandboxManager {
             tokio::spawn(async move {
                 // Re-resolve the snapshot: it may have been deleted since.
                 let staged = match snapshots.find_by_id(&snapshot_id) {
-                    Ok(meta) => prepare_slot(&config, &cow_manager, &meta).await,
+                    Ok(meta) => prepare_slot(driver.as_ref(), &config, &cow_manager, &meta).await,
                     Err(error) => Err(error.into()),
                 };
                 match staged {
@@ -556,7 +519,7 @@ mod tests {
     use super::*;
 
     // Policy tests run against `SlotPool<u32>` — the slot type is opaque
-    // to the policy, so no Firecracker process is needed.
+    // to the policy, so no VMM process is needed.
 
     /// Refill `snapshot` to `target` and deliver every planned slot as
     /// consecutive values starting at `base`.

@@ -9,23 +9,21 @@
 //! in a background task which broadcasts a `"ready"` event on success.
 
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use arcbox_fc_driver::FcDriverConfig;
 use arcbox_fc_driver::jail::{
-    SnapshotFiles, chroot_root, link_or_copy_for_jailer, move_file, stage_kernel_for_jailer,
-    stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
+    SnapshotFiles, api_socket_path, chroot_root, link_or_copy_for_jailer, move_file,
+    stage_kernel_for_jailer, stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer,
+    stage_snapshot_files,
 };
-use arcbox_fc_driver::spawn::{spawn_direct, spawn_jailer};
-use arcbox_fc_driver::vsock::UdsListener;
-use arcbox_vm_driver::IsolationSpec;
+use arcbox_fc_driver::{FcDriver, FcDriverConfig};
+use arcbox_vm_driver::{
+    CheckpointFormat, CheckpointImage, CheckpointKind, IsolationSpec, Prepare, PreparedVm,
+    VmDriver, VmHandle, VmId,
+};
 use chrono::{DateTime, Utc};
-use fc_sdk::VmBuilder;
-use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
-use nix::unistd::{Gid, Uid, chown};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -51,6 +49,8 @@ mod persistence;
 mod pool;
 mod reconcile;
 mod templates;
+#[cfg(test)]
+mod testing;
 mod timers;
 mod types;
 mod warm;
@@ -76,6 +76,10 @@ pub(crate) type InstanceMap = Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxIns
 pub struct SandboxManager {
     instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
     records: Arc<persistence::SandboxRecordStore>,
+    /// The VMM every sandbox runs under, behind the driver port. Its
+    /// `Prepare` capability is required at construction: the boot and pool
+    /// flows spawn the VMM ahead of the guest.
+    driver: Arc<dyn VmDriver>,
     network: Arc<NetworkManager>,
     snapshots: Arc<SnapshotCatalog>,
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
@@ -108,7 +112,41 @@ impl SandboxManager {
 
     /// Create a new manager from the given configuration, with the
     /// environment-specific components the composer supplies.
+    ///
+    /// Fails with [`VmmError::Config`] when the environment's driver lacks a
+    /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
+    /// ahead of the guest), `Vsock` (the guest agent is reached over it) or
+    /// `VsockListen` (the readiness gate is the guest's dial-out) — so a
+    /// driver without one is refused here instead of at the first boot.
     pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
+        let driver = environment.driver.unwrap_or_else(|| {
+            Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))) as Arc<dyn VmDriver>
+        });
+        let capabilities = driver.capabilities();
+        for (missing, capability, need) in [
+            (
+                driver.prepare().is_none(),
+                "prepare",
+                "the boot and pool flows spawn the VMM ahead of the guest",
+            ),
+            (
+                !capabilities.vsock,
+                "vsock",
+                "the guest agent is reached over vsock",
+            ),
+            (
+                !capabilities.vsock_listen,
+                "vsock_listen",
+                "the readiness gate is the guest's vsock dial-out",
+            ),
+        ] {
+            if missing {
+                return Err(VmmError::Config(format!(
+                    "VM driver `{}` has no {capability} capability; {need}",
+                    driver.name()
+                )));
+            }
+        }
         let records = Arc::new(persistence::SandboxRecordStore::new(Path::new(
             &config.firecracker.data_dir,
         ))?);
@@ -140,7 +178,7 @@ impl SandboxManager {
         let config = Arc::new(config);
 
         // Sweep leftovers of a previous agent process (crash / respawn):
-        // orphaned Firecracker processes, TAPs, dm devices, chroots. Create and
+        // orphaned VMM processes, TAPs, dm devices, chroots. Create and
         // restore wait for this to finish (await_reconcile) so a re-created
         // same-id sandbox can't have its deterministically-named resources torn
         // down mid-flight. Only meaningful inside a tokio runtime; sync
@@ -150,6 +188,7 @@ impl SandboxManager {
         let instances = Arc::new(RwLock::new(HashMap::new()));
         if tokio::runtime::Handle::try_current().is_ok() {
             let config = Arc::clone(&config);
+            let driver = Arc::clone(&driver);
             let network = Arc::clone(&network);
             let cow_manager = Arc::clone(&cow_manager);
             let snapshots = Arc::clone(&snapshots);
@@ -159,6 +198,7 @@ impl SandboxManager {
                 let result = async {
                     let swept = reconcile::sweep_orphans(
                         &config,
+                        driver.as_ref(),
                         &network,
                         &cow_manager,
                         &snapshots,
@@ -208,6 +248,7 @@ impl SandboxManager {
         Ok(Self {
             instances,
             records,
+            driver,
             network,
             snapshots,
             templates,
@@ -374,6 +415,45 @@ pub struct SandboxNetworkIdentity {
     pub expose: crate::network::ExposeTarget,
 }
 
+/// The driver's `Prepare` capability, which [`SandboxManager::with_environment`]
+/// requires — the boot, pool, and restore flows all spawn the VMM before
+/// there is a guest to run on it.
+pub(super) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
+    driver
+        .prepare()
+        .expect("SandboxManager::with_environment requires the driver's Prepare capability")
+}
+
+/// The VMM's pid as the crash journal records it: what a restart sweep
+/// kills before tearing the sandbox's other resources down.
+pub(super) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
+    prepared
+        .record()
+        .process
+        .and_then(|process| i32::try_from(process.pid).ok())
+}
+
+/// The isolation every sandbox VMM runs under: the jailer's, when one is
+/// configured; none otherwise (direct mode).
+pub(super) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
+    config
+        .firecracker
+        .jailer
+        .as_ref()
+        .map_or(Ok(IsolationSpec::None), IsolationSpec::try_from)
+}
+
+/// A catalogued checkpoint as the driver reads it back: the directory the
+/// files were staged into (`vmstate` + `mem`) and the format the catalog
+/// recorded at capture — legacy entries default to the Firecracker format.
+pub(super) fn checkpoint_image(dir: PathBuf, format: &str) -> CheckpointImage {
+    CheckpointImage {
+        dir,
+        format: CheckpointFormat::new(format),
+        kind: CheckpointKind::Full,
+    }
+}
+
 /// Stock sandbox id budget: what [`max_sandbox_id_len`] computes for the
 /// guest config (`/var/lib/arcbox/jailer` + `firecracker`), kept as the
 /// fallback when no jailer is configured — direct mode has no jailer
@@ -381,28 +461,27 @@ pub struct SandboxNetworkIdentity {
 const STOCK_MAX_ID_LEN: usize = 44;
 
 /// Longest sandbox id the configured jailer layout leaves room for: the
-/// jailer API socket
-/// `{chroot_base}/{fc_basename}/{id}/root/run/firecracker.socket` must fit
-/// AF_UNIX's 107-byte `sun_path`. An oversized id otherwise fails as an
-/// opaque "timed out waiting for socket": fc-sdk's readiness probe is a
-/// `connect()`, which ENAMETOOLONGs on every attempt even though
-/// Firecracker is up and bound inside the chroot (caught by the CORE-107
-/// prewarm e2e, whose 51-char builder id overflowed the stock budget by
-/// 7 bytes). Computed from the config so a longer chroot base or binary
-/// name tightens the budget instead of silently reintroducing the
-/// timeout.
+/// jailer API socket (`arcbox_fc_driver::jail::api_socket_path`, under
+/// `{chroot_base}/{vmm basename}/{id}/root`) must fit AF_UNIX's 107-byte
+/// `sun_path`. An oversized id otherwise fails as an opaque "timed out
+/// waiting for socket": the driver's readiness probe is a `connect()`,
+/// which ENAMETOOLONGs on every attempt even though the VMM is up and
+/// bound inside the chroot (caught by the CORE-107 prewarm e2e, whose
+/// 51-char builder id overflowed the stock budget by 7 bytes). Measured on
+/// the driver's own layout so a longer chroot base or binary name tightens
+/// the budget instead of silently reintroducing the timeout.
 pub(super) fn max_sandbox_id_len(config: &VmmConfig) -> usize {
     const SUN_PATH: usize = 107;
-    const TAIL: usize = "/root/run/firecracker.socket".len();
     let Some(jc) = &config.firecracker.jailer else {
         return STOCK_MAX_ID_LEN;
     };
-    // Mirrors spawn_jailer / checkpoint_impl: fc-sdk's default chroot base.
-    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-    let exec = Path::new(&config.firecracker.binary)
-        .file_name()
-        .map_or(0, |name| name.len());
-    SUN_PATH.saturating_sub(base.len() + 1 + exec + 1 + TAIL)
+    // Everything around the id, measured on a one-byte id.
+    let with_one_byte_id = api_socket_path(&chroot_root(
+        &config.firecracker.binary,
+        jc.chroot_base(),
+        "x",
+    ));
+    SUN_PATH.saturating_sub(with_one_byte_id.as_os_str().len() - 1)
 }
 
 /// Validate a caller-supplied sandbox or snapshot id.
@@ -546,6 +625,60 @@ mod tests {
         )
     }
 
+    /// The manager refuses, at construction, a driver that cannot spawn the
+    /// VMM ahead of a boot, dial the guest, or take its readiness dial-out:
+    /// every sandbox flow needs all three, so a driver without one would
+    /// fail at the first create instead.
+    #[test]
+    fn construction_requires_the_drivers_prepare_and_vsock_capabilities() {
+        use arcbox_vm_driver::testkit::FakeDriver;
+        use arcbox_vm_driver::{DriverCapabilities, VmDriver as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
+        let environment = |driver: FakeDriver| SandboxEnvironment {
+            driver: Some(Arc::new(driver)),
+            ..SandboxEnvironment::default()
+        };
+        let all = FakeDriver::new().capabilities();
+
+        for (name, capabilities) in [
+            (
+                "prepare",
+                DriverCapabilities {
+                    prepare: false,
+                    ..all.clone()
+                },
+            ),
+            (
+                "vsock",
+                DriverCapabilities {
+                    vsock: false,
+                    ..all.clone()
+                },
+            ),
+            (
+                "vsock_listen",
+                DriverCapabilities {
+                    vsock_listen: false,
+                    ..all
+                },
+            ),
+        ] {
+            let driver = FakeDriver::builder().capabilities(capabilities).build();
+            let error = SandboxManager::with_environment(config.clone(), environment(driver))
+                .err()
+                .unwrap_or_else(|| panic!("a driver without {name} is refused"));
+            assert!(matches!(error, VmmError::Config(_)), "{error}");
+            assert!(error.to_string().contains(name), "{error}");
+        }
+
+        let manager = SandboxManager::with_environment(config, environment(FakeDriver::new()))
+            .expect("a driver with every needed capability is accepted");
+        assert_eq!(manager.driver.name(), "fake");
+    }
+
     #[test]
     fn reserve_id_rejects_a_concurrent_duplicate() {
         let instances: InstanceMap = Arc::new(RwLock::new(HashMap::new()));
@@ -565,7 +698,7 @@ mod tests {
             assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
         }
         // A 36-char UUID fits; anything past the jailer socket budget must
-        // fail fast at ingress instead of surfacing as an fc-sdk connect
+        // fail fast at ingress instead of surfacing as a socket connect
         // timeout. The generic validator stays uncapped — it also runs
         // against persisted records and non-jailer (snapshot/execution)
         // ids, where a legacy over-long id must not become fatal.

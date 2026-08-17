@@ -269,10 +269,15 @@ pub(super) struct WarmPublishTicket {
 
 /// Publish the warm snapshot for a freshly booted, still-idle sandbox.
 ///
-/// Single-flighted per key, and every failure is a warn — cache population
-/// must never fail a healthy boot. `expected_state` is what the boot tail
-/// left the instance in: `Ready` for a cmd-less boot, `Starting` when the
-/// tail is still holding the workload slot for the initial cmd.
+/// Single-flighted per key, and a failed publish is a warn — cache
+/// population must never fail a healthy boot. The one exception is a
+/// checkpoint that left the guest frozen
+/// ([`CheckpointFailure::Frozen`](super::checkpoint::CheckpointFailure)):
+/// that sandbox is not healthy, and the error comes back so the boot fails
+/// instead of announcing READY for a guest that never runs again.
+/// `expected_state` is what the boot tail left the instance in: `Ready` for
+/// a cmd-less boot, `Starting` when the tail is still holding the workload
+/// slot for the initial cmd.
 pub(super) async fn publish_after_boot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
@@ -280,13 +285,13 @@ pub(super) async fn publish_after_boot(
     config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,
-) {
+) -> Result<()> {
     if !ticket.cache.begin_publish(&ticket.key) {
         debug!(
             sandbox_id,
             "a warm snapshot publish for this key is already in flight"
         );
-        return;
+        return Ok(());
     }
     let started = std::time::Instant::now();
     let published = publish_warm_snapshot(
@@ -306,14 +311,41 @@ pub(super) async fn publish_after_boot(
                 sandbox_id,
                 snapshot_id, checkpoint_ms, "warm template snapshot published"
             );
+            Ok(())
         }
-        Ok(None) => {}
-        Err(error) => {
+        Ok(None) => Ok(()),
+        Err(PublishFailure::Frozen(error)) => Err(error),
+        Err(PublishFailure::Recoverable(error)) => {
             warn!(
                 sandbox_id,
                 %error,
                 "warm snapshot publish failed; later creates keep cold-booting"
             );
+            Ok(())
+        }
+    }
+}
+
+/// How a warm publish failed: the sandbox is either as usable as it was, or
+/// its guest is frozen and the boot must fail (see
+/// [`CheckpointFailure`](super::checkpoint::CheckpointFailure)).
+enum PublishFailure {
+    Recoverable(VmmError),
+    Frozen(VmmError),
+}
+
+impl From<VmmError> for PublishFailure {
+    fn from(error: VmmError) -> Self {
+        Self::Recoverable(error)
+    }
+}
+
+impl From<super::checkpoint::CheckpointFailure> for PublishFailure {
+    fn from(failure: super::checkpoint::CheckpointFailure) -> Self {
+        use super::checkpoint::CheckpointFailure;
+        match failure {
+            CheckpointFailure::Recoverable(error) => Self::Recoverable(error),
+            CheckpointFailure::Frozen(error) => Self::Frozen(error),
         }
     }
 }
@@ -328,7 +360,7 @@ async fn publish_warm_snapshot(
     config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,
-) -> Result<Option<String>> {
+) -> std::result::Result<Option<String>, PublishFailure> {
     // A concurrent first-create may have published while this guest booted.
     if warm_entries(&ticket.snapshots)?
         .iter()
@@ -342,7 +374,6 @@ async fn publish_warm_snapshot(
     let info = super::checkpoint::checkpoint_impl(
         instances,
         &ticket.snapshots,
-        config,
         sandbox_id,
         super::checkpoint::CheckpointRequest {
             name,
@@ -391,9 +422,65 @@ async fn publish_warm_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use super::super::testing::{
+        FrozenOnCheckpoint, fake_manager, live_sandbox, live_sandbox_with,
+    };
     use super::*;
     use crate::config::JailerConfig;
     use crate::snapshot::SnapshotDraft;
+
+    /// The warm publish is best-effort — a failed capture that left the
+    /// guest running is a warning and the boot goes on — except when the
+    /// capture left the guest frozen: that comes back as the error the boot
+    /// task fails the sandbox on, instead of announcing READY for it.
+    #[tokio::test]
+    async fn publish_after_boot_surfaces_only_a_frozen_guest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, driver, _probe) = fake_manager(dir.path()).await;
+        let ticket = |suffix: &str| WarmPublishTicket {
+            key: derive(&base_spec(), kernel_fingerprint(), base_fingerprint()),
+            cache: Arc::new(WarmCache::default()),
+            snapshots: Arc::new(SnapshotCatalog::new(
+                dir.path().join(suffix).to_string_lossy().as_ref(),
+            )),
+            pool: Arc::new(super::super::pool::SlotPool::default()),
+        };
+
+        // The fake's capture succeeds and the guest runs on; only the commit
+        // fails (no vmstate/mem pair): recoverable, so the boot proceeds.
+        let (instance, _handle) = live_sandbox(&manager, &driver, "warm-ok").await;
+        publish_after_boot(
+            &"warm-ok".to_owned(),
+            &ticket("a"),
+            &manager.instances,
+            &manager.config,
+            &manager.cow_manager,
+            SandboxState::Ready,
+        )
+        .await
+        .expect("a recoverable publish failure is not the boot's problem");
+        assert_eq!(instance.lock().unwrap().state, SandboxState::Ready);
+
+        // The guest stayed frozen: the boot task must fail the sandbox.
+        let (instance, _handle) =
+            live_sandbox_with(&manager, &driver, "warm-frozen", FrozenOnCheckpoint::over).await;
+        let error = publish_after_boot(
+            &"warm-frozen".to_owned(),
+            &ticket("b"),
+            &manager.instances,
+            &manager.config,
+            &manager.cow_manager,
+            SandboxState::Ready,
+        )
+        .await
+        .expect_err("a frozen guest fails the boot");
+        assert!(
+            error.to_string().contains("could not be resumed"),
+            "{error}"
+        );
+        // The publish itself only reports; the boot task does the failing.
+        assert_eq!(instance.lock().unwrap().state, SandboxState::Ready);
+    }
 
     fn kernel_fingerprint() -> FileFingerprint {
         FileFingerprint {

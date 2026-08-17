@@ -2,8 +2,12 @@ use super::persistence::{SandboxRecordStore, SandboxTransition};
 use super::types::action;
 use super::*;
 use arcbox_snapshot::SnapshotError;
+use arcbox_vm_driver::{
+    BootSpec, CacheMode, ConsoleSpec, DiskSpec, NicAttachment, NicSpec, RestoreSpec, VmHandle,
+    VmSpec, VsockListener, VsockSpec,
+};
 
-type BootOutput = (Arc<fc_sdk::Vm>, PathBuf, UdsListener);
+type BootOutput = (Arc<dyn VmHandle>, Box<dyn VsockListener>);
 
 /// How long the readiness gate waits for vm-agent's dial-out (the guest
 /// connect to [`vsock::READY_PORT`]) before the boot is declared failed.
@@ -17,7 +21,7 @@ const CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BootFailure {
     error: VmmError,
-    process: Option<fc_sdk::FirecrackerProcess>,
+    prepared: Option<Arc<dyn PreparedVm>>,
     cow_handle: Option<CowHandle>,
 }
 
@@ -32,6 +36,7 @@ pub(super) async fn boot_sandbox(
     vm_dir: PathBuf,
     instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
     network: Arc<NetworkManager>,
+    driver: Arc<dyn VmDriver>,
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
@@ -45,6 +50,7 @@ pub(super) async fn boot_sandbox(
         &spec,
         net_alloc.as_ref(),
         &vm_dir,
+        driver.as_ref(),
         &config,
         &cow_manager,
         &instances,
@@ -53,7 +59,7 @@ pub(super) async fn boot_sandbox(
     )
     .await
     {
-        Ok((vm, vsock_uds_path, ready_listener)) => {
+        Ok((handle, mut ready_listener)) => {
             let current = instances.read().unwrap().get(&id).cloned();
             let is_current_generation = current
                 .as_ref()
@@ -74,26 +80,26 @@ pub(super) async fn boot_sandbox(
             // (the vm-agent binary among them) rebuild the default template
             // and re-inject it into docker templates automatically, so a
             // guest always carries the agent from the same build as its host.
-            let agent_ready =
-                match tokio::time::timeout(AGENT_GATE_TIMEOUT, vsock::wait_ready(&ready_listener))
-                    .await
-                {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => {
-                        Err(VmmError::Vsock(format!("agent readiness gate: {error}")))
-                    }
-                    Err(_) => Err(VmmError::Vsock(format!(
-                        "agent readiness gate: vm-agent did not dial the ready port within {}s",
-                        AGENT_GATE_TIMEOUT.as_secs()
-                    ))),
-                };
+            let agent_ready = match tokio::time::timeout(
+                AGENT_GATE_TIMEOUT,
+                vsock::wait_ready(&mut *ready_listener),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(VmmError::Vsock(format!("agent readiness gate: {error}"))),
+                Err(_) => Err(VmmError::Vsock(format!(
+                    "agent readiness gate: vm-agent did not dial the ready port within {}s",
+                    AGENT_GATE_TIMEOUT.as_secs()
+                ))),
+            };
             // The socket file is per-boot; the gate has consumed its one event.
             drop(ready_listener);
             if let Err(gate_error) = agent_ready {
                 let message = gate_error.to_string();
-                fail_started_boot(
+                fail_live_sandbox(
                     &id,
-                    generation,
+                    Some(generation),
                     &message,
                     &vm_dir,
                     &instances,
@@ -109,7 +115,7 @@ pub(super) async fn boot_sandbox(
             }
 
             let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-                Arc::new(vsock::UdsVsock(vsock_uds_path.clone()));
+                Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
 
             // The guest clock still needs setting on cold boot (no RTC — the
             // guest wakes at the kernel default epoch), but it must not delay
@@ -148,9 +154,9 @@ pub(super) async fn boot_sandbox(
 
             let ready_at = Utc::now();
 
-            // Hand the post-boot API objects to the instance. Every cleanup
+            // Hand the running VM's handle to the instance. Every cleanup
             // resource was transferred before configuration could be aborted.
-            let mut vm = Some(vm);
+            let mut handle = Some(handle);
             let accepted = {
                 let map = instances.read().unwrap();
                 match map.get(&id) {
@@ -161,8 +167,7 @@ pub(super) async fn boot_sandbox(
                         {
                             false
                         } else {
-                            inst.vm = vm.take();
-                            inst.vsock_uds_path = Some(vsock_uds_path.clone());
+                            inst.handle = handle.take();
                             // With an initial cmd the instance stays
                             // `Starting`: the tail below moves it straight
                             // to Running via the reserved Initial claim, so
@@ -209,7 +214,7 @@ pub(super) async fn boot_sandbox(
                 } else {
                     SandboxState::Starting
                 };
-                super::warm::publish_after_boot(
+                if let Err(frozen) = super::warm::publish_after_boot(
                     &id,
                     ticket,
                     &instances,
@@ -217,7 +222,27 @@ pub(super) async fn boot_sandbox(
                     &cow_manager,
                     expected,
                 )
-                .await;
+                .await
+                {
+                    // The publish left the guest frozen with no way back:
+                    // the boot fails rather than announcing READY.
+                    let message = format!("warm snapshot publish left the guest frozen: {frozen}");
+                    fail_live_sandbox(
+                        &id,
+                        Some(generation),
+                        &message,
+                        &vm_dir,
+                        &instances,
+                        &network,
+                        &config,
+                        &cow_manager,
+                        &records,
+                        &events_tx,
+                    )
+                    .await;
+                    error!(sandbox_id = %id, error = %frozen, "sandbox warm publish froze the guest");
+                    return;
+                }
             }
 
             // Initial cmd + ready probe (CORE-107). Every cmd-carrying boot
@@ -240,9 +265,9 @@ pub(super) async fn boot_sandbox(
                 && let Err(probe_error) = run_ready_probe(&probe, vsock.as_ref()).await
             {
                 let message = format!("ready probe failed: {probe_error}");
-                fail_started_boot(
+                fail_live_sandbox(
                     &id,
-                    generation,
+                    Some(generation),
                     &message,
                     &vm_dir,
                     &instances,
@@ -270,9 +295,9 @@ pub(super) async fn boot_sandbox(
                     });
             if let Err(record_error) = durable_ready {
                 let message = format!("failed to persist ready state: {record_error}");
-                fail_started_boot(
+                fail_live_sandbox(
                     &id,
-                    generation,
+                    Some(generation),
                     &message,
                     &vm_dir,
                     &instances,
@@ -313,13 +338,13 @@ pub(super) async fn boot_sandbox(
             let mut failure_record_visible = false;
             if let Some(ref arc) = value {
                 let mut inst = arc.lock().unwrap();
-                if can_mark_boot_failed(&inst, generation) {
+                if can_mark_boot_failed(&inst, Some(generation)) {
                     (failure_record_visible, record_error) =
-                        persist_boot_failure(&records, &id, generation, &message);
+                        persist_boot_failure(&records, &id, Some(generation), &message);
                     inst.state = SandboxState::Failed;
                     inst.error = Some(message.clone());
-                    if let Some(process) = failure.process.take() {
-                        inst.process = Some(process);
+                    if let Some(prepared) = failure.prepared.take() {
+                        inst.prepared = Some(prepared);
                     }
                     if let Some(cow_handle) = failure.cow_handle.take() {
                         inst.cow_handle = Some(cow_handle);
@@ -343,8 +368,8 @@ pub(super) async fn boot_sandbox(
                         false
                     }
                 }
-            } else if let Some(process) = failure.process.take() {
-                match tear_down_orphaned_boot(process, failure.cow_handle.take(), &cow_manager)
+            } else if let Some(prepared) = failure.prepared.take() {
+                match tear_down_orphaned_boot(&*prepared, failure.cow_handle.take(), &cow_manager)
                     .await
                 {
                     Ok(()) => true,
@@ -385,17 +410,25 @@ pub(super) async fn boot_sandbox(
     }
 }
 
-fn can_mark_boot_failed(inst: &SandboxInstance, generation: Uuid) -> bool {
-    inst.record_generation == Some(generation)
+/// Whether `inst` is the generation a failure was observed on and can still
+/// take it: a replaced instance, or one already stopping, keeps its own fate.
+fn can_mark_boot_failed(inst: &SandboxInstance, generation: Option<Uuid>) -> bool {
+    inst.record_generation == generation
         && !matches!(inst.state, SandboxState::Stopping | SandboxState::Stopped)
 }
 
+/// Persist the durable `Failed` transition. Returns whether the failure is
+/// visible in the record store, and the durability or transition error if
+/// any; an instance without a durable record (`None`) has nothing to persist.
 fn persist_boot_failure(
     records: &SandboxRecordStore,
     id: &str,
-    generation: Uuid,
+    generation: Option<Uuid>,
     message: &str,
 ) -> (bool, Option<String>) {
+    let Some(generation) = generation else {
+        return (true, None);
+    };
     match records.transition(
         id,
         generation,
@@ -409,18 +442,21 @@ fn persist_boot_failure(
     }
 }
 
-/// Fail a boot whose VM process already started and whose cleanup resources
-/// were all transferred to the instance: persist the failure, flip the
-/// instance to `Failed`, release runtime resources, clear the boot journal,
-/// and broadcast the FAILED event. Shared by the agent-readiness gate and the
-/// durable-Ready persistence check; each caller logs its own context line.
+/// Fail a sandbox whose VM is up (or was) and whose cleanup resources all
+/// sit on its instance: persist the failure, flip the instance to `Failed`,
+/// release runtime resources (the VMM killed and reaped and its handle
+/// dropped, CoW, TAP + IP, chroot), clear the crash journal, and broadcast
+/// the FAILED event. Shared by the boot task's failure points and
+/// by the flows that find a guest frozen with no way to thaw it; each caller
+/// logs its own context line. Takes the instance's cleanup lock;
+/// [`fail_live_sandbox_locked`] is for a caller already holding it.
 #[allow(
     clippy::too_many_arguments,
     reason = "failure handling spans the boot task's captured manager state"
 )]
-async fn fail_started_boot(
+pub(super) async fn fail_live_sandbox(
     id: &SandboxId,
-    generation: Uuid,
+    generation: Option<Uuid>,
     message: &str,
     vm_dir: &Path,
     instances: &super::InstanceMap,
@@ -430,56 +466,72 @@ async fn fail_started_boot(
     records: &SandboxRecordStore,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) {
-    let value = instances.read().unwrap().get(id).cloned();
-    let cleanup_lock = value
-        .as_ref()
-        .map(|arc| arc.lock().unwrap().cleanup_lock.clone());
-    let _cleanup_guard = match cleanup_lock.as_ref() {
-        Some(lock) => Some(lock.lock().await),
-        None => None,
+    let Some(instance) = instances.read().unwrap().get(id).cloned() else {
+        return;
     };
-    let mut updated_current = false;
-    let mut failure_record_error = None;
-    let mut failure_record_visible = false;
-    if let Some(ref arc) = value {
-        let mut inst = arc.lock().unwrap();
-        if can_mark_boot_failed(&inst, generation) {
-            (failure_record_visible, failure_record_error) =
-                persist_boot_failure(records, id, generation, message);
-            inst.state = SandboxState::Failed;
-            inst.error = Some(message.to_owned());
-            updated_current = true;
+    let cleanup_lock = instance.lock().unwrap().cleanup_lock.clone();
+    let _cleanup_guard = cleanup_lock.lock().await;
+    fail_live_sandbox_locked(
+        id,
+        generation,
+        message,
+        vm_dir,
+        &instance,
+        network,
+        config,
+        cow_manager,
+        records,
+        events_tx,
+    )
+    .await;
+}
+
+/// [`fail_live_sandbox`] for a caller that already holds `instance`'s cleanup
+/// lock and knows the instance is the one registered under `id`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "failure handling spans the manager's resource set"
+)]
+pub(super) async fn fail_live_sandbox_locked(
+    id: &SandboxId,
+    generation: Option<Uuid>,
+    message: &str,
+    vm_dir: &Path,
+    instance: &Arc<Mutex<SandboxInstance>>,
+    network: &Arc<NetworkManager>,
+    config: &Arc<VmmConfig>,
+    cow_manager: &Arc<CowManager>,
+    records: &SandboxRecordStore,
+    events_tx: &broadcast::Sender<SandboxEvent>,
+) {
+    let (failure_record_visible, failure_record_error) = {
+        let mut inst = instance.lock().unwrap();
+        if !can_mark_boot_failed(&inst, generation) {
+            return;
         }
-    }
-    let cleanup_complete = if updated_current {
-        match super::cleanup::release_runtime_resources(
-            id,
-            value.as_ref().unwrap(),
-            network,
-            config,
-            cow_manager,
-        )
-        .await
+        let persisted = persist_boot_failure(records, id, generation, message);
+        inst.state = SandboxState::Failed;
+        inst.error = Some(message.to_owned());
+        persisted
+    };
+    let cleanup_complete =
+        match super::cleanup::release_runtime_resources(id, instance, network, config, cow_manager)
+            .await
         {
             Ok(()) => true,
             Err(error) => {
-                error!(sandbox_id = %id, error = %error, "boot failure cleanup incomplete");
+                error!(sandbox_id = %id, error = %error, "sandbox failure cleanup incomplete");
                 false
             }
-        }
-    } else {
-        false
-    };
+        };
     if failure_record_visible && cleanup_complete {
         if let Err(error) = super::reconcile::clear_state_record(vm_dir) {
-            error!(sandbox_id = %id, error = %error, "boot failure journal cleanup is not durable");
+            error!(sandbox_id = %id, error = %error, "sandbox failure journal cleanup is not durable");
         }
     }
-    if updated_current {
-        let _ = events_tx.send(SandboxEvent::new(id, action::FAILED).with_attr("error", message));
-    }
+    let _ = events_tx.send(SandboxEvent::new(id, action::FAILED).with_attr("error", message));
     if let Some(error) = failure_record_error {
-        error!(sandbox_id = %id, error, "failed to persist sandbox boot failure");
+        error!(sandbox_id = %id, error, "failed to persist sandbox failure");
     }
 }
 
@@ -729,57 +781,29 @@ pub(super) fn create_rootfs_symlink(vm_dir: &Path, dm_device: &str) -> Result<St
         .ok_or_else(|| VmmError::Config(format!("non-UTF-8 path: {}", link_path.display())))
 }
 
-pub(super) async fn kill_and_reap_fc_checked(
-    process: &mut fc_sdk::FirecrackerProcess,
-) -> Result<()> {
-    if let Some(pid) = process.pid()
-        && pid > 0
-    {
-        match nix::sys::signal::kill(
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "Firecracker pid fits platform pid_t"
-            )]
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        ) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(error) => {
-                return Err(VmmError::Process(format!(
-                    "kill firecracker {pid}: {error}"
-                )));
-            }
-        }
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(5), process.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(VmmError::Process(format!("reap firecracker: {error}"))),
-        Err(_) => Err(VmmError::Process("timed out reaping firecracker".into())),
-    }
-}
-
 /// Tear down resources that could not be handed to their sandbox generation.
 ///
 /// The resource-handoff channel closes without its explicit signal in this
 /// case, so Remove joins this cleanup instead of aborting it. TAP/IP and the
 /// jailer chroot remain managed by lifecycle cleanup or restart reconciliation.
 async fn tear_down_orphaned_boot(
-    mut process: fc_sdk::FirecrackerProcess,
+    prepared: &dyn PreparedVm,
     cow_handle: Option<CowHandle>,
     cow_manager: &CowManager,
 ) -> Result<()> {
-    // Kill + reap FC before the dm teardown so `dmsetup remove` doesn't hit
-    // EBUSY on the still-open block device.
-    kill_and_reap_fc_checked(&mut process).await?;
+    // Kill + reap the VMM before the dm teardown so `dmsetup remove` doesn't
+    // hit EBUSY on the still-open block device.
+    prepared.discard().await?;
     if let Some(handle) = cow_handle {
         cow_manager.teardown_checked(&handle).await?;
     }
     Ok(())
 }
 
-/// Perform the actual Firecracker boot: spawn process, configure, start VM.
+/// Perform the actual boot: prepare the VMM through the driver, stage,
+/// configure, start the VM.
 ///
-/// The spawned process is transferred to its [`SandboxInstance`] immediately.
+/// The prepared VMM is transferred to its [`SandboxInstance`] immediately.
 /// Cleanup is allowed to abort this task only after the paths/CoW phase has
 /// finished and every live `CowHandle` has also been transferred.
 #[allow(
@@ -791,6 +815,7 @@ async fn do_boot(
     spec: &SandboxSpec,
     net_alloc: Option<&NetworkAllocation>,
     vm_dir: &Path,
+    driver: &dyn VmDriver,
     config: &VmmConfig,
     cow_manager: &CowManager,
     instances: &super::InstanceMap,
@@ -798,64 +823,33 @@ async fn do_boot(
     resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) -> std::result::Result<BootOutput, BootFailure> {
     let mut resource_handoff = Some(resource_handoff);
-    let log_path = vm_dir.join("firecracker.log");
-    let metrics_path = vm_dir.join("firecracker.metrics");
-    // socket_path is used only for the direct (non-jailer) mode spawn.
-    let socket_path = vm_dir.join("firecracker.sock");
-
     let fc_cfg = &config.firecracker;
 
-    // Some Firecracker builds expect log/metrics targets to pre-exist when
-    // --log-path/--metrics-path are provided. Pre-create both files to avoid
-    // startup failures with ENOENT across version variants.
-    let prepare_files = (|| -> Result<()> {
-        if fc_cfg.jailer.is_some() {
-            return Ok(());
-        }
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).map_err(VmmError::Io)?;
-        }
-        std::fs::File::create(&log_path).map_err(VmmError::Io)?;
-        std::fs::File::create(&metrics_path).map_err(VmmError::Io)?;
-        Ok(())
-    })();
-    if let Err(error) = prepare_files {
-        complete_resource_handoff(&mut resource_handoff);
-        return Err(BootFailure {
-            error,
-            process: None,
-            cow_handle: None,
-        });
-    }
-
-    // Spawn the Firecracker process (direct or via Jailer).
-    let process_result: Result<fc_sdk::FirecrackerProcess> = async {
-        let driver_config = FcDriverConfig::from(fc_cfg);
-        Ok(if let Some(ref jc) = fc_cfg.jailer {
-            spawn_jailer(&driver_config, &IsolationSpec::try_from(jc)?, id).await?
-        } else {
-            spawn_direct(&driver_config, id, &socket_path, &log_path, &metrics_path).await?
-        })
+    // Spawn the VMM ahead of the guest: the driver's prepared VM owns the
+    // process, pre-creates whatever its spawn needs (log and metrics files
+    // in direct mode, the jail's `run/`), and knows the pid to journal.
+    let prepared: Result<(Arc<dyn PreparedVm>, IsolationSpec)> = async {
+        let vm_id = VmId::new(id)?;
+        let isolation = super::isolation_spec(config)?;
+        let prepared = super::prepare_capability(driver)
+            .prepare(&vm_id, &isolation, vm_dir)
+            .await?;
+        Ok((Arc::from(prepared), isolation))
     }
     .await;
-    let process = match process_result {
-        Ok(process) => process,
+    let (prepared, isolation) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             complete_resource_handoff(&mut resource_handoff);
             return Err(BootFailure {
                 error,
-                process: None,
+                prepared: None,
                 cow_handle: None,
             });
         }
     };
 
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "Firecracker pid fits platform pid_t"
-    )]
-    let process_pid = process.pid().map(|pid| pid as i32);
-    let process_socket = process.socket_path().to_owned();
+    let process_pid = super::journaled_pid(&*prepared);
     let spawned_record = super::reconcile::SandboxStateRecord::new(
         id,
         process_pid,
@@ -866,15 +860,14 @@ async fn do_boot(
     );
     let journal_error = super::reconcile::write_state_record(vm_dir, &spawned_record).err();
 
-    // Once spawn returns, make the process immediately owned by the instance.
-    // Cleanup still waits for the paths/CoW phase before it may abort boot.
-    let mut process = Some(process);
+    // Once the VMM is up, make it immediately owned by the instance. Cleanup
+    // still waits for the paths/CoW phase before it may abort boot.
     let state = {
         let map = instances.read().unwrap();
         map.get(id).and_then(|instance| {
             let mut instance = instance.lock().unwrap();
             (instance.record_generation == Some(generation)).then(|| {
-                instance.process = process.take();
+                instance.prepared = Some(Arc::clone(&prepared));
                 instance.state
             })
         })
@@ -890,7 +883,7 @@ async fn do_boot(
                 expected: "the current sandbox generation".into(),
                 actual: "replaced or removed".into(),
             },
-            process,
+            prepared: Some(prepared),
             cow_handle: None,
         });
     };
@@ -902,7 +895,7 @@ async fn do_boot(
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
             },
-            process: None,
+            prepared: None,
             cow_handle: None,
         });
     }
@@ -910,18 +903,19 @@ async fn do_boot(
         complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
             error,
-            process: None,
+            prepared: None,
             cow_handle: None,
         });
     }
 
-    // Determine kernel, rootfs, and vsock paths.
+    // Determine the kernel and rootfs paths.
     //
-    // In jailer mode the files must exist inside the chroot, and paths passed
-    // to the FC API are relative to the chroot root.  In direct mode the
-    // host-absolute paths from the spec are used as-is.
+    // In jailer mode the files must exist inside the chroot: they are staged
+    // there and named to the driver by their in-jail host path, which it
+    // passes to the VMM chroot-relative. In direct mode the host-absolute
+    // paths from the spec are used as-is.
     let mut cow_handle = None;
-    let paths: Result<(String, String, String, PathBuf)> = async {
+    let paths: Result<(PathBuf, PathBuf)> = async {
         if let Some(ref jc) = fc_cfg.jailer {
             // Jailer mode: stage kernel + rootfs into chroot.
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
@@ -988,8 +982,7 @@ async fn do_boot(
                 }
             };
 
-            let vsock_host = cr.join("run/firecracker.vsock");
-            Ok((k, r, "/run/firecracker.vsock".to_string(), vsock_host))
+            Ok((in_jail(&cr, &k), in_jail(&cr, &r)))
         } else {
             // Direct mode: try dm-snapshot CoW, fall back to using rootfs directly.
             // When CoW is active, create a stable `{vm_dir}/rootfs.link` symlink
@@ -1023,13 +1016,7 @@ async fn do_boot(
                     spec.rootfs.clone()
                 }
             };
-            let vsock_path = vm_dir.join("firecracker.vsock");
-            Ok((
-                spec.kernel.clone(),
-                rootfs,
-                vsock_path.to_str().unwrap().to_owned(),
-                vsock_path,
-            ))
+            Ok((PathBuf::from(&spec.kernel), PathBuf::from(rootfs)))
         }
     }
     .await;
@@ -1056,18 +1043,17 @@ async fn do_boot(
                 expected: "the current sandbox generation".into(),
                 actual: "replaced or removed during boot setup".into(),
             },
-            process: None,
+            prepared: None,
             cow_handle,
         });
     };
     complete_resource_handoff(&mut resource_handoff);
 
-    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path) =
-        paths.map_err(|error| BootFailure {
-            error,
-            process: None,
-            cow_handle: None,
-        })?;
+    let (kernel_path, rootfs_path) = paths.map_err(|error| BootFailure {
+        error,
+        prepared: None,
+        cow_handle: None,
+    })?;
     if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
         return Err(BootFailure {
             error: VmmError::WrongState {
@@ -1075,134 +1061,139 @@ async fn do_boot(
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
             },
-            process: None,
+            prepared: None,
             cow_handle: None,
         });
     }
 
-    // Bind the readiness listener BEFORE InstanceStart: vm-agent dials host
-    // port READY_PORT as soon as it is serving, and Firecracker forwards
-    // that guest-initiated connect to `{uds_path}_{READY_PORT}` only if
-    // someone is already listening there — otherwise the guest is reset and
-    // the one readiness event is lost.
-    let ready_listener = match UdsListener::bind(&vsock_host_path, vsock::READY_PORT) {
-        Ok(listener) => listener,
-        Err(error) => {
-            return Err(BootFailure {
-                error: error.into(),
-                process: None,
-                cow_handle: None,
-            });
-        }
+    // Bind the readiness listener BEFORE the guest starts: vm-agent dials
+    // host port READY_PORT as soon as it is serving, and the VMM forwards
+    // that guest-initiated connect only if someone is already listening —
+    // otherwise the guest is reset and the one readiness event is lost.
+    // The prepared VM binds it where the guest's dial-out lands.
+    let failed = |error: VmmError| BootFailure {
+        error,
+        prepared: None,
+        cow_handle: None,
     };
-    // In jailer mode Firecracker connect(2)s to the socket as the jailed
-    // uid/gid, and connecting requires write permission on the socket file.
-    if let Some(ref jc) = fc_cfg.jailer
-        && let Err(e) = chown(
-            ready_listener.path(),
-            Some(Uid::from_raw(jc.uid)),
-            Some(Gid::from_raw(jc.gid)),
-        )
-    {
-        return Err(BootFailure {
-            error: VmmError::Process(format!(
-                "chown ready socket {}: {e}",
-                ready_listener.path().display()
-            )),
-            process: None,
-            cow_handle: None,
-        });
+    let ready_listener = match prepared.vsock_listener() {
+        Some(listen) => listen.listen(vsock::READY_PORT).await,
+        None => Err(arcbox_vm_driver::Error::InvalidSpec(
+            "the vm driver cannot listen for the guest's readiness dial-out".into(),
+        )),
     }
+    .map_err(|error| failed(error.into()))?;
 
-    // Configure and boot the VM.
-    let vcpu_count =
-        NonZeroU64::new(spec.vcpus.max(1) as u64).expect("max(1) guarantees a non-zero vCPU count");
+    let vm_spec =
+        build_vm_spec(id, spec, net_alloc, kernel_path, rootfs_path, isolation).map_err(failed)?;
+    let handle = prepared
+        .boot(vm_spec)
+        .await
+        .map_err(|error| failed(error.into()))?;
+    Ok((Arc::from(handle), ready_listener))
+}
 
-    // Append static IP configuration to boot args so the kernel configures
-    // eth0 before init runs.  The guest-side vm-agent parses this back via
-    // `KernelIpParam::from_str` to derive the DNS nameserver.
-    //
-    // Every sandbox boots the identical fixed identity (CORE-81): the pool
-    // IP stays a host-side property of the TAP, so snapshots taken from this
-    // guest are network-agnostic and restore with zero guest-side work.
-    let boot_args = if net_alloc.is_some() {
-        if spec.boot_args.contains("ip=") {
-            spec.boot_args.clone()
-        } else {
-            let ip_param = KernelIpParam {
-                client: crate::network::invariant::GUEST_IP,
-                gateway: crate::network::invariant::GUEST_GATEWAY,
-                netmask: crate::network::invariant::GUEST_NETMASK,
-            };
-            format!("{} {ip_param}", spec.boot_args)
-        }
+/// A staged file's host path inside the jail, from the chroot-relative name
+/// the staging helpers return (`/vmlinux` → `{chroot}/vmlinux`).
+fn in_jail(chroot: &Path, name: &str) -> PathBuf {
+    chroot.join(name.trim_start_matches('/'))
+}
+
+/// The boot recipe as the driver port sees it.
+///
+/// `kernel` and `rootfs` are the paths the VMM must open — in jailer mode
+/// already staged inside the jail, so the driver finds them there and
+/// stages nothing itself. Every sandbox boots the identical fixed identity
+/// (CORE-81) unless the caller pinned its own `ip=`: the pool IP stays a
+/// host-side property of the TAP, so snapshots taken from this guest are
+/// network-agnostic and restore with zero guest-side work. The guest-side
+/// vm-agent parses the `ip=` parameter back via `KernelIpParam::from_str`
+/// to derive the DNS nameserver.
+fn build_vm_spec(
+    id: &str,
+    spec: &SandboxSpec,
+    net_alloc: Option<&NetworkAllocation>,
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    isolation: IsolationSpec,
+) -> Result<VmSpec> {
+    let cmdline = if net_alloc.is_some() && !spec.boot_args.contains("ip=") {
+        let ip_param = KernelIpParam {
+            client: crate::network::invariant::GUEST_IP,
+            gateway: crate::network::invariant::GUEST_GATEWAY,
+            netmask: crate::network::invariant::GUEST_NETMASK,
+        };
+        format!("{} {ip_param}", spec.boot_args)
     } else {
         spec.boot_args.clone()
     };
+    Ok(VmSpec {
+        id: VmId::new(id)?,
+        cpus: spec.vcpus.max(1),
+        memory_mib: u32::try_from(spec.memory_mib).map_err(|_| {
+            VmmError::Config(format!(
+                "memory_mib {} exceeds what a VM spec can carry",
+                spec.memory_mib
+            ))
+        })?,
+        boot: BootSpec::Kernel {
+            image: kernel,
+            cmdline,
+            initrd: None,
+        },
+        disks: vec![rootfs_disk(rootfs)],
+        nics: net_alloc.map(nic_spec).transpose()?.into_iter().collect(),
+        // CID 3 is the conventional guest CID; each VMM is isolated so the
+        // same CID is safe across concurrent sandboxes.
+        vsock: Some(VsockSpec { guest_cid: 3 }),
+        shares: Vec::new(),
+        console: ConsoleSpec::Off,
+        balloon: false,
+        entropy: false,
+        // Dirty-page tracking so checkpointing is always available.
+        dirty_tracking: true,
+        isolation,
+    })
+}
 
-    let mut builder = VmBuilder::new(process_socket)
-        .boot_source(BootSource {
-            kernel_image_path: kernel_path,
-            boot_args: Some(boot_args),
-            initrd_path: None,
-        })
-        .machine_config(fc_sdk::types::MachineConfiguration {
-            vcpu_count,
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "memory MiB value fits Firecracker API i64"
-            )]
-            mem_size_mib: spec.memory_mib as i64,
-            smt: false,
-            // Enable dirty-page tracking so checkpointing is always available.
-            track_dirty_pages: true,
-            cpu_template: None,
-            huge_pages: None,
-        })
-        .drive(Drive {
-            drive_id: "rootfs".into(),
-            path_on_host: Some(rootfs_path),
-            is_root_device: true,
-            is_read_only: Some(false),
-            partuuid: None,
-            cache_type: fc_sdk::types::DriveCacheType::Unsafe,
-            rate_limiter: None,
-            io_engine: fc_sdk::types::DriveIoEngine::Sync,
-            socket: None,
-        });
-
-    if let Some(net) = net_alloc {
-        builder = builder.network_interface(NetworkInterface {
-            iface_id: "eth0".into(),
-            guest_mac: Some(net.mac_address.clone()),
-            host_dev_name: net.tap_name.clone(),
-            rx_rate_limiter: None,
-            tx_rate_limiter: None,
-        });
+/// The root disk: writable, `Unsafe` host caching, id `rootfs` — the name a
+/// checkpoint of this driver records for it, which a restore must reuse.
+pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
+    DiskSpec {
+        id: "rootfs".into(),
+        path,
+        read_only: false,
+        root: true,
+        cache: CacheMode::Unsafe,
     }
+}
 
-    // Configure vsock device so the guest agent can receive connections.
-    // vsock_fc_path is the path FC uses inside its own filesystem view;
-    // vsock_host_path is the host-absolute path used to connect from the host.
-    builder = builder.vsock(Vsock {
-        // CID 3 is the conventional guest CID; each Firecracker process is
-        // isolated so the same CID is safe across concurrent sandboxes.
-        guest_cid: 3,
-        uds_path: vsock_fc_path,
-        vsock_id: None,
-    });
+/// The guest's one NIC, `eth0`, on the allocation's TAP with its MAC.
+pub(super) fn nic_spec(net: &NetworkAllocation) -> Result<NicSpec> {
+    Ok(NicSpec {
+        id: "eth0".into(),
+        mac: net.mac_address.parse().map_err(VmmError::from)?,
+        attachment: NicAttachment::Tap {
+            name: net.tap_name.clone(),
+        },
+    })
+}
 
-    let vm = match builder.start().await {
-        Ok(v) => Arc::new(v),
-        Err(e) => {
-            return Err(BootFailure {
-                error: VmmError::from(e),
-                process: None,
-                cow_handle: None,
-            });
-        }
-    };
-    Ok((vm, vsock_host_path, ready_listener))
+/// What a restore may change about the checkpointed VM: its identity
+/// (`owner`, the id the jail is keyed by), the fresh TAP, and the disk it
+/// runs on — the rootfs staged into the owner's jail.
+pub(super) fn restore_spec(
+    owner: &str,
+    chroot: &Path,
+    net_alloc: Option<&NetworkAllocation>,
+    isolation: IsolationSpec,
+) -> Result<RestoreSpec> {
+    Ok(RestoreSpec {
+        id: VmId::new(owner)?,
+        nics: net_alloc.map(nic_spec).transpose()?.into_iter().collect(),
+        disks: vec![rootfs_disk(chroot.join("rootfs.ext4"))],
+        isolation,
+    })
 }
 
 fn complete_resource_handoff(signal: &mut Option<tokio::sync::oneshot::Sender<()>>) {
@@ -1215,6 +1206,102 @@ fn complete_resource_handoff(signal: &mut Option<tokio::sync::oneshot::Sender<()
 mod tests {
     use super::*;
 
+    fn allocation() -> NetworkAllocation {
+        NetworkAllocation {
+            tap_name: "vmtap0-7".into(),
+            ip_address: "172.20.0.7".parse().unwrap(),
+            prefix_len: 16,
+            gateway: "172.20.0.1".parse().unwrap(),
+            mac_address: "02:fc:00:00:00:07".into(),
+            dns_servers: vec![],
+            cleanup_token: String::new(),
+        }
+    }
+
+    /// The spec the driver boots: the invariant `ip=` identity baked into
+    /// the cmdline (unless the caller pinned one), the geometry with at
+    /// least one vCPU, one writable root disk, `eth0` on the TAP, vsock
+    /// CID 3, dirty tracking on — and nothing the sandbox never had.
+    #[test]
+    fn boot_spec_bakes_the_invariant_identity_and_the_fixed_devices() {
+        let spec = SandboxSpec {
+            boot_args: "console=ttyS0".into(),
+            vcpus: 0,
+            memory_mib: 512,
+            ..SandboxSpec::default()
+        };
+        let vm = build_vm_spec(
+            "box",
+            &spec,
+            Some(&allocation()),
+            PathBuf::from("/jail/vmlinux"),
+            PathBuf::from("/jail/rootfs.ext4"),
+            IsolationSpec::None,
+        )
+        .unwrap();
+        assert_eq!(vm.id.as_str(), "box");
+        assert_eq!((vm.cpus, vm.memory_mib), (1, 512));
+        let BootSpec::Kernel { image, cmdline, .. } = &vm.boot else {
+            panic!("a direct kernel boot");
+        };
+        assert_eq!(image, Path::new("/jail/vmlinux"));
+        assert!(cmdline.starts_with("console=ttyS0 ip="), "{cmdline}");
+        assert!(
+            cmdline.contains(&crate::network::invariant::GUEST_IP.to_string()),
+            "{cmdline}"
+        );
+        assert_eq!(vm.disks.len(), 1);
+        assert!(vm.disks[0].root && !vm.disks[0].read_only);
+        assert_eq!(vm.disks[0].path, Path::new("/jail/rootfs.ext4"));
+        assert_eq!(vm.nics.len(), 1);
+        assert_eq!(vm.nics[0].mac.to_string(), "02:fc:00:00:00:07");
+        assert_eq!(
+            vm.nics[0].attachment,
+            NicAttachment::Tap {
+                name: "vmtap0-7".into()
+            }
+        );
+        assert_eq!(vm.vsock.map(|v| v.guest_cid), Some(3));
+        assert!(vm.dirty_tracking && !vm.balloon && !vm.entropy);
+        assert_eq!(vm.console, ConsoleSpec::Off);
+        vm.validate()
+            .expect("the driver accepts what the manager builds");
+
+        // A caller-pinned `ip=` is kept verbatim; no network means no NIC
+        // and no `ip=` at all.
+        let pinned = SandboxSpec {
+            boot_args: "ip=10.0.0.2::10.0.0.1:255.255.255.0".into(),
+            ..spec.clone()
+        };
+        let vm = build_vm_spec(
+            "box",
+            &pinned,
+            Some(&allocation()),
+            "/k".into(),
+            "/r".into(),
+            IsolationSpec::None,
+        )
+        .unwrap();
+        let BootSpec::Kernel { cmdline, .. } = &vm.boot else {
+            unreachable!()
+        };
+        assert_eq!(cmdline, &pinned.boot_args);
+        let vm = build_vm_spec(
+            "box",
+            &spec,
+            None,
+            "/k".into(),
+            "/r".into(),
+            IsolationSpec::None,
+        )
+        .unwrap();
+        assert!(vm.nics.is_empty());
+        let BootSpec::Kernel { cmdline, .. } = &vm.boot else {
+            unreachable!()
+        };
+        assert_eq!(cmdline, "console=ttyS0");
+    }
+
     #[test]
     fn boot_failure_cannot_overwrite_shutdown() {
         let generation = Uuid::new_v4();
@@ -1226,11 +1313,11 @@ mod tests {
             generation,
         );
 
-        assert!(can_mark_boot_failed(&instance, generation));
+        assert!(can_mark_boot_failed(&instance, Some(generation)));
         instance.state = SandboxState::Stopping;
-        assert!(!can_mark_boot_failed(&instance, generation));
+        assert!(!can_mark_boot_failed(&instance, Some(generation)));
         instance.state = SandboxState::Stopped;
-        assert!(!can_mark_boot_failed(&instance, generation));
-        assert!(!can_mark_boot_failed(&instance, Uuid::new_v4()));
+        assert!(!can_mark_boot_failed(&instance, Some(generation)));
+        assert!(!can_mark_boot_failed(&instance, Some(Uuid::new_v4())));
     }
 }

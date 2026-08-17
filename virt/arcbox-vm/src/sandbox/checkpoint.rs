@@ -3,11 +3,13 @@ use super::persistence::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransi
 use super::pool::PreparedSlot;
 use super::types::action;
 use super::*;
+use arcbox_vm_driver::{AfterCheckpoint, CheckpointOptions};
 
-/// The image format this path writes — a Firecracker `vmstate` + `mem`
-/// pair — recorded on every catalog entry so a restore can tell which
-/// driver may read it. The Firecracker driver names it; a restore through
-/// the driver refuses any other.
+/// The image format the reference driver writes, for tests that seed the
+/// catalog by hand. Production never names it: [`checkpoint_impl`] records
+/// whatever format the driver's `CheckpointImage` reports, and a restore
+/// hands that back to the driver, which refuses any other.
+#[cfg(test)]
 pub(super) const CHECKPOINT_FORMAT: &str = arcbox_fc_driver::CHECKPOINT_FORMAT;
 
 /// Parameters for the internal restore path
@@ -53,149 +55,167 @@ pub(super) struct CheckpointRequest {
     ///
     /// False only for pause, whose whole point is that the guest must never
     /// run past the memory image — any progress after it would diverge from
-    /// the retained disk overlay. The caller then owns the resume-on-error.
+    /// the retained disk overlay; the driver then holds it quiesced.
     pub(super) resume_after: bool,
 }
 
-/// Pause a sandbox, capture a full snapshot into the catalog, and (unless
-/// the request opts out) resume it.
+/// Why a checkpoint failed, told by what it left behind — the sandbox's
+/// fate depends on that, not on the error itself.
+pub(super) enum CheckpointFailure {
+    /// The guest is running — the driver resumed it, or the failure came
+    /// before the capture — and the sandbox is as usable as it was.
+    Recoverable(VmmError),
+    /// The guest is frozen and nothing can thaw it: the driver's own resume
+    /// after the capture failed (it settles the guest before reporting, and
+    /// this is the case where that settling itself failed), or the capture
+    /// held the guest on request and a later step failed. The port has no
+    /// resume verb, so the sandbox is unusable and the caller must fail it —
+    /// kill, release, durable `Failed` — rather than report it Ready.
+    Frozen(VmmError),
+}
+
+impl CheckpointFailure {
+    /// The error, for a caller whose next step disposes of the sandbox
+    /// either way.
+    pub(super) fn into_error(self) -> VmmError {
+        match self {
+            Self::Recoverable(error) | Self::Frozen(error) => error,
+        }
+    }
+}
+
+/// What a checkpoint captures from: the VM handle, and what the catalog
+/// entry records so a restore can re-stage — kernel/rootfs paths, the
+/// guest's addressing mode, the geometry.
+struct CheckpointSource {
+    kernel_path: String,
+    rootfs_path: String,
+    net_invariant: bool,
+    geometry: crate::snapshot::SnapshotGeometry,
+    handle: Arc<dyn VmHandle>,
+}
+
+fn checkpoint_source(
+    instances: &super::InstanceMap,
+    sandbox_id: &SandboxId,
+    expected_state: SandboxState,
+) -> Result<CheckpointSource> {
+    let instance = instances
+        .read()
+        .unwrap()
+        .get(sandbox_id)
+        .cloned()
+        .ok_or_else(|| VmmError::NotFound(sandbox_id.clone()))?;
+    let inst = instance.lock().unwrap();
+    if inst.state != expected_state {
+        return Err(VmmError::WrongState {
+            id: sandbox_id.clone(),
+            expected: expected_state.to_string(),
+            actual: inst.state.to_string(),
+        });
+    }
+    let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
+        id: sandbox_id.clone(),
+        expected: format!("{expected_state} (VM handle available)"),
+        actual: inst.state.to_string(),
+    })?;
+    Ok(CheckpointSource {
+        kernel_path: inst.spec.kernel.clone(),
+        rootfs_path: inst.spec.rootfs.clone(),
+        net_invariant: inst.net_invariant,
+        geometry: crate::snapshot::SnapshotGeometry {
+            vcpus: inst.spec.vcpus,
+            memory_mib: inst.spec.memory_mib,
+        },
+        handle,
+    })
+}
+
+/// Capture a full snapshot of a sandbox into the catalog through the
+/// driver's `Checkpoint` capability, which freezes the guest for the capture
+/// and (unless the request opts out) resumes it.
 ///
 /// Free-standing (rather than a method) so the boot task can publish warm
 /// snapshots (CORE-77) through the exact code path the Checkpoint RPC uses,
-/// and so pause (CORE-21) inherits the same chroot-owner and addressing-mode
-/// handling instead of re-deriving it.
+/// and so pause (CORE-21) inherits the same addressing-mode handling instead
+/// of re-deriving it. A failure says whether the guest is still usable
+/// ([`CheckpointFailure`]): every caller must fail the sandbox on `Frozen`.
 pub(super) async fn checkpoint_impl(
     instances: &super::InstanceMap,
     snapshots: &SnapshotCatalog,
-    config: &VmmConfig,
     sandbox_id: &SandboxId,
+    request: CheckpointRequest,
+) -> std::result::Result<CheckpointInfo, CheckpointFailure> {
+    let resume_after = request.resume_after;
+    let source = checkpoint_source(instances, sandbox_id, request.expected_state)
+        .map_err(CheckpointFailure::Recoverable)?;
+    let handle = Arc::clone(&source.handle);
+    let outcome = capture(snapshots, sandbox_id, source, request).await;
+    // The driver settles the guest before it reports: a failed capture is
+    // resumed, a successful one is resumed unless asked to hold. A guest
+    // still frozen where it should be running — or held by request but with
+    // the failure coming after the capture — has no way back, and the
+    // caller must not treat the sandbox as usable.
+    let frozen =
+        handle.state() == arcbox_vm_driver::VmState::Quiesced && (resume_after || outcome.is_err());
+    match (outcome, frozen) {
+        (Ok(info), false) => Ok(info),
+        (Ok(info), true) => Err(CheckpointFailure::Frozen(VmmError::Process(format!(
+            "sandbox {sandbox_id} stayed frozen after checkpoint {}: the driver could not \
+             resume the guest",
+            info.snapshot_id
+        )))),
+        (Err(error), true) => Err(CheckpointFailure::Frozen(error)),
+        (Err(error), false) => Err(CheckpointFailure::Recoverable(error)),
+    }
+}
+
+/// The capture proper: stage, freeze-capture-settle through the driver,
+/// commit to the catalog.
+async fn capture(
+    snapshots: &SnapshotCatalog,
+    sandbox_id: &SandboxId,
+    source: CheckpointSource,
     request: CheckpointRequest,
 ) -> Result<CheckpointInfo> {
     let CheckpointRequest {
         name,
         labels,
-        expected_state,
         resume_after,
+        ..
     } = request;
-    // Verify state and capture the kernel/rootfs paths for jailer
-    // re-staging, the id the sandbox's chroot is actually keyed by
-    // — a sandbox restored from a pre-warmed pool slot lives in the
-    // slot's chroot, and FC resolves snapshot paths inside it — plus
-    // the guest's network addressing mode and the VM API handle.
-    let (kernel_path, rootfs_path, chroot_owner, net_invariant, geometry, vm) = {
-        let instance = instances
-            .read()
-            .unwrap()
-            .get(sandbox_id)
-            .cloned()
-            .ok_or_else(|| VmmError::NotFound(sandbox_id.clone()))?;
-        let inst = instance.lock().unwrap();
-        if inst.state != expected_state {
-            return Err(VmmError::WrongState {
-                id: sandbox_id.clone(),
-                expected: expected_state.to_string(),
-                actual: inst.state.to_string(),
-            });
-        }
-        let vm = inst
-            .vm
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| VmmError::WrongState {
-                id: sandbox_id.clone(),
-                expected: format!("{expected_state} (VM handle available)"),
-                actual: inst.state.to_string(),
-            })?;
-        // Only needed for jailer mode; safe to capture regardless.
-        (
-            inst.spec.kernel.clone(),
-            inst.spec.rootfs.clone(),
-            inst.pool_slot_id
-                .clone()
-                .unwrap_or_else(|| sandbox_id.clone()),
-            inst.net_invariant,
-            crate::snapshot::SnapshotGeometry {
-                vcpus: inst.spec.vcpus,
-                memory_mib: inst.spec.memory_mib,
-            },
-            vm,
-        )
-    };
+    // The capability is a property of how the VM was built: the driver
+    // checkpoints only jailed VMs, because a restore reopens the disk paths
+    // the checkpoint recorded and only a per-VM chroot makes those private.
+    let checkpoint = source.handle.checkpoint().ok_or_else(|| {
+        VmmError::FailedPrecondition(format!(
+            "sandbox {sandbox_id} cannot be checkpointed: checkpoints require jailer \
+             isolation, and this VM runs without it"
+        ))
+    })?;
 
     // Staging directory outside the catalog: the snapshot becomes visible
     // only on commit, and dropping `pending` on any error below takes the
     // directory and whatever partial vmstate/mem it holds with it.
     let pending = snapshots.begin(sandbox_id)?;
-    let snapshot_id = pending.id().to_owned();
-    let staging_dir = pending.dir();
 
-    // Pause before snapshotting.
-    vm.pause().await.map_err(VmmError::from)?;
-
-    // Everything between pause and resume is fallible (chroot dir setup,
-    // chown, the snapshot RPC). Run it in a block whose result is handled
-    // only AFTER the resume — a bare `?` here previously left the guest
-    // paused forever, wedging every later RPC. Returns the chroot snapshot
-    // dir (jailer mode) to move afterward.
-    //
-    // In jailer mode FC runs inside a chroot and can only write to paths
-    // within it, so the snapshot is written to a chroot-local dir and moved
-    // into staging after resume.
-    let paused: Result<Option<PathBuf>> = async {
-        let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
-            if let Some(ref jc) = config.firecracker.jailer {
-                let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                let cr = chroot_root(&config.firecracker.binary, base, &chroot_owner);
-                let chroot_snap = cr.join("snapshots").join(&snapshot_id);
-                std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
-                // Firecracker runs as jc.uid/jc.gid; chown the directory so
-                // it can create the snapshot files.
-                let uid = nix::unistd::Uid::from_raw(jc.uid);
-                let gid = nix::unistd::Gid::from_raw(jc.gid);
-                nix::unistd::chown(&chroot_snap, Some(uid), Some(gid))
-                    .map_err(|e| VmmError::Process(format!("chown snapshot dir: {e}")))?;
-                // Paths as seen by Firecracker inside the chroot.
-                let fc_vmstate = format!("/snapshots/{snapshot_id}/vmstate");
-                let fc_mem = format!("/snapshots/{snapshot_id}/mem");
-                (fc_vmstate, fc_mem, Some(chroot_snap))
-            } else {
-                (
-                    staging_dir.join("vmstate").to_str().unwrap().to_owned(),
-                    staging_dir.join("mem").to_str().unwrap().to_owned(),
-                    None,
-                )
-            };
-
-        vm.create_snapshot(&fc_vmstate_path, &fc_mem_path)
-            .await
-            .map_err(VmmError::from)?;
-        Ok(chroot_snap_dir_opt)
-    }
-    .await;
-
-    // Always resume, regardless of how the paused section fared — unless the
-    // caller owns the resume decision (pause).
-    if resume_after {
-        let _ = vm.resume().await;
-    }
-
-    let chroot_snap_dir_opt = paused?;
-
-    // If jailer mode, move snapshot files from the chroot into staging. The
-    // guest is either resumed (and the files complete, FC having flushed
-    // them before returning) or deliberately left paused, so in both cases
-    // nothing is still writing to them.
-    if let Some(chroot_snap) = chroot_snap_dir_opt {
-        move_file(&chroot_snap.join("vmstate"), &staging_dir.join("vmstate"))
-            .await
-            .map_err(VmmError::Io)?;
-        if chroot_snap.join("mem").exists() {
-            move_file(&chroot_snap.join("mem"), &staging_dir.join("mem"))
-                .await
-                .map_err(VmmError::Io)?;
-        }
-        let _ = tokio::fs::remove_dir_all(&chroot_snap).await;
-    }
+    // The driver owns the freeze: it pauses the guest, writes the capture
+    // (into the jail and out to the staging dir), and resumes — or, for
+    // pause, holds the guest quiesced — settling the guest before it
+    // reports any failure, so a failed capture never leaves the VM paused.
+    let image = checkpoint
+        .checkpoint(
+            &pending.dir(),
+            CheckpointOptions {
+                after: if resume_after {
+                    AfterCheckpoint::Resume
+                } else {
+                    AfterCheckpoint::HoldQuiesced
+                },
+                kind: CheckpointKind::Full,
+            },
+        )
+        .await?;
 
     // Store kernel/rootfs template paths so restore can re-derive them.
     // Jailer mode needs them for chroot staging; direct mode needs the
@@ -206,11 +226,11 @@ pub(super) async fn checkpoint_impl(
         labels,
         snapshot_type: crate::config::SnapshotType::Full,
         parent_id: None,
-        kernel_path: Some(kernel_path),
-        rootfs_path: Some(rootfs_path),
-        net_invariant,
-        geometry: Some(geometry),
-        format: CHECKPOINT_FORMAT.to_owned(),
+        kernel_path: Some(source.kernel_path),
+        rootfs_path: Some(source.rootfs_path),
+        net_invariant: source.net_invariant,
+        geometry: Some(source.geometry),
+        format: image.format.as_str().to_owned(),
     })?;
 
     let snap_dir_path = meta
@@ -262,10 +282,9 @@ impl SandboxManager {
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
-        checkpoint_impl(
+        match checkpoint_impl(
             &self.instances,
             &self.snapshots,
-            &self.config,
             sandbox_id,
             CheckpointRequest {
                 name,
@@ -275,6 +294,43 @@ impl SandboxManager {
             },
         )
         .await
+        {
+            Ok(info) => Ok(info),
+            Err(CheckpointFailure::Recoverable(error)) => Err(error),
+            // A guest the driver could not resume is unusable: fail the
+            // sandbox the way a failed boot does rather than leave it Ready
+            // with every dial waiting out the budget.
+            Err(CheckpointFailure::Frozen(error)) => {
+                self.fail_frozen_sandbox(sandbox_id, &error).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Fail a sandbox whose guest is frozen with no way back (see
+    /// [`CheckpointFailure::Frozen`]): kill and reap the VMM, release its
+    /// runtime resources, record and publish `Failed`.
+    async fn fail_frozen_sandbox(&self, id: &SandboxId, error: &VmmError) {
+        let Some((generation, vm_dir)) = self.instances.read().unwrap().get(id).map(|arc| {
+            let inst = arc.lock().unwrap();
+            (inst.record_generation, inst.vm_dir.clone())
+        }) else {
+            return;
+        };
+        super::boot::fail_live_sandbox(
+            id,
+            generation,
+            &error.to_string(),
+            &vm_dir,
+            &self.instances,
+            &self.network,
+            &self.config,
+            &self.cow_manager,
+            &self.records,
+            &self.events_tx,
+        )
+        .await;
+        error!(sandbox_id = %id, error = %error, "checkpoint left the guest frozen; sandbox failed");
     }
 
     #[allow(
@@ -286,7 +342,7 @@ impl SandboxManager {
         id: &str,
         reservation: IdReservation,
         error: VmmError,
-        process: Option<fc_sdk::FirecrackerProcess>,
+        prepared: Option<Arc<dyn PreparedVm>>,
         network: Option<NetworkAllocation>,
         cow_handle: Option<CowHandle>,
     ) -> VmmError {
@@ -295,16 +351,9 @@ impl SandboxManager {
             let inst = arc.lock().unwrap();
             (inst.vm_dir.clone(), inst.pool_slot_id.clone())
         };
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "Firecracker pid fits platform pid_t"
-        )]
         let state_record = super::reconcile::SandboxStateRecord::new(
             id,
-            process
-                .as_ref()
-                .and_then(fc_sdk::FirecrackerProcess::pid)
-                .map(|pid| pid as i32),
+            prepared.as_deref().and_then(super::journaled_pid),
             network.as_ref(),
             cow_handle.as_ref(),
             self.config.firecracker.jailer.is_some(),
@@ -316,7 +365,7 @@ impl SandboxManager {
             let mut inst = arc.lock().unwrap();
             inst.state = SandboxState::Failed;
             inst.error = Some(error.to_string());
-            inst.process = process;
+            inst.prepared = prepared;
             inst.network = network;
             inst.cow_handle = cow_handle;
         }
@@ -558,21 +607,20 @@ impl SandboxManager {
         // reconfiguration as the only restore work. From the claim on, the
         // slot's resources are owned by this restore and unwind through
         // rollback_restore like freshly created ones.
+        let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
         let claimed = self.claim_restore_slot(&request.snapshot_id);
         let pool_hit = claimed.is_some();
-        let (process, actual_vsock_path, effective_vmstate, effective_mem, t_spawned, t_staged) =
+        // The id the jail is keyed by (the slot's for a pool hit), which is
+        // also the id the driver prepared the VMM under.
+        let (prepared, resource_owner, chroot, staged_checkpoint, t_prepared, t_staged) =
             if let Some(slot) = claimed {
                 // Record the adopting sandbox's slot id first: failure cleanup
                 // and crash reconciliation key the chroot and dm/CoW teardown
                 // on it (see release_runtime_resources / sweep_orphans).
                 reservation.instance().lock().unwrap().pool_slot_id = Some(slot.slot_id.clone());
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
                 let adopted_record = super::reconcile::SandboxStateRecord::new(
                     &new_id,
-                    slot.process.pid().map(|pid| pid as i32),
+                    super::journaled_pid(&*slot.prepared),
                     net_alloc.as_ref(),
                     slot.cow_handle.as_ref(),
                     true,
@@ -582,11 +630,9 @@ impl SandboxManager {
                 let handover = super::reconcile::write_state_record(&vm_dir, &adopted_record);
                 let PreparedSlot {
                     slot_id,
-                    process: slot_process,
+                    prepared: slot_prepared,
                     cow_handle,
-                    vmstate_path,
-                    mem_path,
-                    vsock_path,
+                    image,
                     vm_dir: slot_vm_dir,
                 } = slot;
                 pending_cow = cow_handle;
@@ -627,7 +673,7 @@ impl SandboxManager {
                                 &new_id,
                                 reservation,
                                 error,
-                                Some(slot_process),
+                                Some(slot_prepared),
                                 net_alloc,
                                 pending_cow,
                             )
@@ -637,39 +683,24 @@ impl SandboxManager {
                 // Both phases were pre-executed by the slot; the timestamps
                 // collapse so the completion log reports them honestly as ~0.
                 let t_claimed = std::time::Instant::now();
-                (
-                    slot_process,
-                    vsock_path,
-                    vmstate_path,
-                    mem_path,
-                    t_claimed,
-                    t_claimed,
-                )
+                let chroot = chroot_root(&fc_cfg.binary, base, &slot_id);
+                (slot_prepared, slot_id, chroot, image, t_claimed, t_claimed)
             } else {
-                // Determine the actual host-side vsock UDS path FC will bind to
-                // on restore and ensure the socket path is clear before spawning.
-                //
-                // Each jailer restore owns a distinct chroot and vsock path.
-                let spawned: Result<(fc_sdk::FirecrackerProcess, PathBuf)> = async {
-                    let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                    let cr = chroot_root(&fc_cfg.binary, base, &new_id);
-                    // Ensure the `run/` directory exists inside the new chroot so
-                    // FC can create the vsock socket there on restore.
-                    let run_dir = cr.join("run");
-                    std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
-                    let vsock_path = cr.join("run/firecracker.vsock");
-                    let _ = std::fs::remove_file(&vsock_path);
-
-                    let proc = spawn_jailer(
-                        &FcDriverConfig::from(fc_cfg),
-                        &IsolationSpec::try_from(jailer)?,
-                        &new_id,
-                    )
-                    .await?;
-                    Ok((proc, vsock_path))
+                // Each jailer restore owns a distinct chroot; the driver's
+                // prepared VMM spawns into it.
+                let cr = chroot_root(&fc_cfg.binary, base, &new_id);
+                let spawned: Result<Arc<dyn PreparedVm>> = async {
+                    let prepared = super::prepare_capability(&*self.driver)
+                        .prepare(
+                            &VmId::new(&new_id)?,
+                            &IsolationSpec::try_from(jailer)?,
+                            &vm_dir,
+                        )
+                        .await?;
+                    Ok(Arc::from(prepared))
                 }
                 .await;
-                let (spawned_process, vsock_path) = match spawned {
+                let spawned_prepared = match spawned {
                     Ok(spawned) => spawned,
                     Err(error) => {
                         return Err(self
@@ -678,11 +709,7 @@ impl SandboxManager {
                     }
                 };
 
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
-                let pid = spawned_process.pid().map(|pid| pid as i32);
+                let pid = super::journaled_pid(&*spawned_prepared);
                 let journal = |cow: Option<&CowHandle>| {
                     super::reconcile::write_state_record(
                         &vm_dir,
@@ -702,23 +729,21 @@ impl SandboxManager {
                             &new_id,
                             reservation,
                             error,
-                            Some(spawned_process),
+                            Some(Arc::clone(&spawned_prepared)),
                             net_alloc,
                             None,
                         )
                         .await);
                 }
 
-                let t_spawned = std::time::Instant::now();
+                let t_prepared = std::time::Instant::now();
 
                 // In jailer mode the restored FC process also runs inside a
                 // chroot and cannot access the catalog's host-absolute paths.
                 // Stage the snapshot files into the new sandbox's chroot and use
                 // chroot-relative paths.
-                let setup_result: Result<(String, Option<String>)> = async {
+                let setup_result: Result<CheckpointImage> = async {
                     let jc = jailer;
-                    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                    let cr = chroot_root(&fc_cfg.binary, base, &new_id);
 
                     // Stage kernel (always hard-linked or copied, ~16MB).
                     if let Some(k) = snap_meta.kernel_path.as_deref() {
@@ -757,21 +782,23 @@ impl SandboxManager {
                         vmstate: &snap_meta.vmstate_path,
                         mem: snap_meta.mem_path.as_deref(),
                     };
-                    stage_snapshot_files(&cr, &files, jc.uid, jc.gid)
-                        .await
-                        .map_err(VmmError::from)
+                    stage_snapshot_files(&cr, &files, jc.uid, jc.gid).await?;
+                    Ok(super::checkpoint_image(
+                        cr.join("snapshots").join(&snap_meta.id),
+                        &snap_meta.format,
+                    ))
                 }
                 .await;
 
-                let (effective_vmstate, effective_mem) = match setup_result {
-                    Ok(staged) => staged,
+                let image = match setup_result {
+                    Ok(image) => image,
                     Err(error) => {
                         return Err(self
                             .rollback_restore(
                                 &new_id,
                                 reservation,
                                 error,
-                                Some(spawned_process),
+                                Some(Arc::clone(&spawned_prepared)),
                                 net_alloc,
                                 pending_cow,
                             )
@@ -779,45 +806,38 @@ impl SandboxManager {
                     }
                 };
                 (
-                    spawned_process,
-                    vsock_path,
-                    effective_vmstate,
-                    effective_mem,
-                    t_spawned,
+                    spawned_prepared,
+                    new_id.clone(),
+                    cr,
+                    image,
+                    t_prepared,
                     std::time::Instant::now(),
                 )
             };
 
-        // Build the restore parameters.
-        let mut load_params = fc_sdk::types::SnapshotLoadParams {
-            snapshot_path: effective_vmstate,
-            mem_file_path: effective_mem,
-            mem_backend: None,
-            enable_diff_snapshots: None,
-            track_dirty_pages: None,
-            resume_vm: Some(true),
-            network_overrides: vec![],
-        };
-
-        if let Some(ref net) = net_alloc {
-            load_params.network_overrides = vec![fc_sdk::types::NetworkOverride {
-                iface_id: "eth0".into(),
-                host_dev_name: net.tap_name.clone(),
-            }];
+        // Load the image on the prepared VMM: the disk is the rootfs staged
+        // into the owner's jail, eth0 lands on the fresh TAP.
+        let loaded: Result<Arc<dyn VmHandle>> = async {
+            let restore = super::boot::restore_spec(
+                &resource_owner,
+                &chroot,
+                net_alloc.as_ref(),
+                IsolationSpec::try_from(jailer)?,
+            )?;
+            Ok(Arc::from(
+                prepared.restore(&staged_checkpoint, restore).await?,
+            ))
         }
-
-        // In jailer mode, the actual socket path is inside the chroot; use the
-        // path reported by the process handle instead of vm_dir's socket_path.
-        let effective_socket = process.socket_path().to_owned();
-        let vm = match fc_sdk::restore(effective_socket.to_str().unwrap(), load_params).await {
-            Ok(v) => Arc::new(v),
-            Err(e) => {
+        .await;
+        let handle = match loaded {
+            Ok(handle) => handle,
+            Err(error) => {
                 return Err(self
                     .rollback_restore(
                         &new_id,
                         reservation,
-                        VmmError::from(e),
-                        Some(process),
+                        error,
+                        Some(prepared),
                         net_alloc,
                         pending_cow,
                     )
@@ -827,7 +847,7 @@ impl SandboxManager {
 
         let t_loaded = std::time::Instant::now();
         let vsock: Arc<dyn arcbox_vm_driver::Vsock> =
-            Arc::new(vsock::UdsVsock(actual_vsock_path.clone()));
+            Arc::new(vsock::HandleVsock(Arc::clone(&handle)));
 
         // Clock sync after restore is DETACHED, mirroring the cold-boot path
         // (boot.rs): vm-agent re-syncs itself from ptp_kvm (/dev/ptp0) on
@@ -899,7 +919,7 @@ impl SandboxManager {
                     &new_id,
                     reservation,
                     error,
-                    Some(process),
+                    Some(Arc::clone(&prepared)),
                     net_alloc,
                     pending_cow,
                 )
@@ -911,13 +931,9 @@ impl SandboxManager {
         // Persist cleanup metadata before handing runtime resources to the
         // instance. A failed durable write aborts and unwinds every resource.
         let adopted_slot = reservation.instance().lock().unwrap().pool_slot_id.clone();
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "Firecracker pid fits platform pid_t"
-        )]
         let state_record = super::reconcile::SandboxStateRecord::new(
             &new_id,
-            process.pid().map(|pid| pid as i32),
+            super::journaled_pid(&*prepared),
             net_alloc.as_ref(),
             pending_cow.as_ref(),
             true,
@@ -930,7 +946,7 @@ impl SandboxManager {
                     &new_id,
                     reservation,
                     error,
-                    Some(process),
+                    Some(Arc::clone(&prepared)),
                     net_alloc,
                     pending_cow,
                 )
@@ -952,7 +968,7 @@ impl SandboxManager {
                         &new_id,
                         reservation,
                         error,
-                        Some(process),
+                        Some(Arc::clone(&prepared)),
                         net_alloc,
                         pending_cow,
                     )
@@ -970,9 +986,8 @@ impl SandboxManager {
         {
             let mut inst = arc.lock().unwrap();
             inst.network.clone_from(&net_alloc);
-            inst.process = Some(process);
-            inst.vm = Some(vm);
-            inst.vsock_uds_path = Some(actual_vsock_path.clone());
+            inst.prepared = Some(prepared);
+            inst.handle = Some(handle);
             inst.cow_handle = pending_cow.take();
             inst.net_invariant = snap_meta.net_invariant;
             // A warm create that owes the spec's initial cmd stays
@@ -1059,8 +1074,8 @@ impl SandboxManager {
             snapshot_id = %request.snapshot_id,
             pool_hit,
             warm_create,
-            spawn_ms = ms(t_spawned.duration_since(restore_started)),
-            stage_ms = ms(t_staged.duration_since(t_spawned)),
+            spawn_ms = ms(t_prepared.duration_since(restore_started)),
+            stage_ms = ms(t_staged.duration_since(t_prepared)),
             load_ms = ms(t_loaded.duration_since(t_staged)),
             guest_cfg_ms = ms(t_guest_cfg.duration_since(t_loaded)),
             total_ms = ms(restore_started.elapsed()),
@@ -1159,5 +1174,77 @@ impl SandboxManager {
         }
         self.drain_pool(Some(snapshot_id)).await;
         self.snapshots.delete_by_id(snapshot_id).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::{
+        FrozenOnCheckpoint, RELEASES_NETWORK, assert_failed_and_released, expect_err, fake_manager,
+        live_sandbox, live_sandbox_with,
+    };
+    use super::super::types::action;
+    use super::*;
+
+    /// A capture that fails and leaves the guest running (here: the fake's
+    /// capture succeeds, the catalog commit fails, the fake resumed) is an
+    /// error the caller can retry: the sandbox stays Ready with everything
+    /// it holds.
+    #[tokio::test]
+    async fn a_recoverable_checkpoint_failure_leaves_the_sandbox_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, driver, probe) = fake_manager(dir.path()).await;
+        let (instance, handle) = live_sandbox(&manager, &driver, "keeps").await;
+
+        expect_err(
+            manager
+                .checkpoint_sandbox(&"keeps".to_owned(), "user".into(), HashMap::new())
+                .await,
+            "a checkpoint whose commit fails",
+        );
+
+        let inst = instance.lock().unwrap();
+        assert_eq!(inst.state, SandboxState::Ready);
+        assert!(inst.prepared.is_some() && inst.handle.is_some());
+        assert!(inst.cow_handle.is_some());
+        assert_eq!(inst.network.is_some(), RELEASES_NETWORK);
+        assert_eq!(handle.state(), arcbox_vm_driver::VmState::Running);
+        assert_eq!(probe.teardown_count(), 0);
+    }
+
+    /// A capture whose guest stayed frozen — the driver's own resume failed
+    /// — has no way back: the Checkpoint RPC fails the sandbox the way a
+    /// failed boot does instead of leaving it Ready with a guest that never
+    /// runs again.
+    #[tokio::test]
+    async fn a_checkpoint_that_leaves_the_guest_frozen_fails_and_releases_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, driver, probe) = fake_manager(dir.path()).await;
+        let (instance, handle) =
+            live_sandbox_with(&manager, &driver, "frozen", FrozenOnCheckpoint::over).await;
+        let mut events = manager.subscribe_events();
+
+        let error = expect_err(
+            manager
+                .checkpoint_sandbox(&"frozen".to_owned(), "user".into(), HashMap::new())
+                .await,
+            "a checkpoint that froze the guest",
+        );
+        assert!(
+            error.to_string().contains("could not be resumed"),
+            "the driver's error is the reported one: {error}"
+        );
+
+        assert_failed_and_released(&manager, &instance, &probe, "frozen");
+        assert!(
+            matches!(handle.state(), arcbox_vm_driver::VmState::Exited(_)),
+            "the frozen guest is killed: {}",
+            handle.state()
+        );
+        let mut actions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            actions.push(event.action);
+        }
+        assert_eq!(actions, [action::FAILED]);
     }
 }

@@ -1223,7 +1223,6 @@ dependencies = [
  "arcbox-vm-proto",
  "async-trait",
  "chrono",
- "fc-sdk",
  "libc",
  "nix 0.29.0",
  "oci2rootfs",

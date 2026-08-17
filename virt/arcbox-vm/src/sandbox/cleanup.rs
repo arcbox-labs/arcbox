@@ -262,14 +262,14 @@ pub(super) async fn expire_sandbox(
     }
 }
 
-/// Free every runtime resource a sandbox holds: the Firecracker process
-/// (SIGKILL + bounded reap), the dm-snapshot CoW device, the TAP + IP
-/// allocation, and the jailer chroot. Idempotent — every resource is
+/// Free every runtime resource a sandbox holds: the VMM process (SIGKILL +
+/// bounded reap through the driver), the dm-snapshot CoW device, the TAP +
+/// IP allocation, and the jailer chroot. Idempotent — every resource is
 /// `take()`n, so calling this from both Stop and Remove is safe.
 ///
-/// The ordering is load-bearing: FC must be dead before the CoW teardown
-/// (`dmsetup remove` returns EBUSY while the block device is open) and
-/// before TAP destruction (the ioctl fails while the fd is held).
+/// The ordering is load-bearing: the VMM must be dead before the CoW
+/// teardown (`dmsetup remove` returns EBUSY while the block device is open)
+/// and before TAP destruction (the ioctl fails while the fd is held).
 pub(super) async fn release_runtime_resources(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
@@ -279,8 +279,8 @@ pub(super) async fn release_runtime_resources(
 ) -> Result<()> {
     kill_sandbox_process(id, arc).await?;
 
-    // Teardown dm-snapshot CoW device (must happen after FC process exits
-    // because Firecracker holds the block device open).
+    // Teardown dm-snapshot CoW device (must happen after the VMM exits
+    // because it holds the block device open).
     {
         let cow_handle = arc.lock().unwrap().cow_handle.take();
         if let Some(handle) = cow_handle
@@ -345,58 +345,34 @@ pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Strin
         .unwrap_or_else(|| id.to_owned())
 }
 
-/// SIGKILL the sandbox's Firecracker process and reap it with a bounded wait.
+/// Kill the sandbox's VMM process and reap it: the driver's `discard`, a
+/// SIGKILL plus a bounded wait for the reaper. Once the process is gone the
+/// VM's handle only names a corpse — nothing dials, checkpoints or stops a
+/// stopped, paused or failed sandbox — so it is dropped here too, the one
+/// place both are let go.
 ///
 /// Extracted so the pause path (which keeps the disk overlay) shares the exact
-/// kill/reap discipline with full release. A failed reap restores the handle
-/// so a retry can finish the job. Idempotent — the process is `take()`n.
+/// kill/reap discipline with full release. A failed reap (the driver's
+/// bounded wait elapsed) restores the prepared VMM, and keeps the handle,
+/// so a retry can finish the job. Idempotent — the prepared VMM is
+/// `take()`n, and discarding an exited one just reports its status.
 pub(super) async fn kill_sandbox_process(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
 ) -> Result<()> {
-    let mut fc_process = {
-        let mut inst = arc.lock().unwrap();
-        if let Some(ref mut proc) = inst.process
-            && let Some(pid) = proc.pid()
-            && pid > 0
-        {
-            match nix::sys::signal::kill(
-                #[allow(
-                    clippy::cast_possible_wrap,
-                    reason = "Firecracker pid fits platform pid_t"
-                )]
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            ) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                Err(error) => {
-                    return Err(VmmError::Process(format!(
-                        "kill firecracker for sandbox {id}: {error}"
-                    )));
-                }
-            }
-        }
-        inst.process.take()
-    };
-    // Await process exit outside the lock. Use a timeout so cleanup proceeds
-    // even if the process is stuck in uninterruptible sleep after SIGKILL.
-    if let Some(mut proc) = fc_process.take() {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), proc.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                arc.lock().unwrap().process = Some(proc);
-                return Err(VmmError::Process(format!(
-                    "reap firecracker for sandbox {id}: {error}"
-                )));
-            }
-            Err(_) => {
-                arc.lock().unwrap().process = Some(proc);
-                return Err(VmmError::Process(format!(
-                    "timed out reaping firecracker for sandbox {id}"
-                )));
-            }
-        }
+    let prepared = arc.lock().unwrap().prepared.take();
+    // Kill and await the exit outside the lock; the driver bounds the wait so
+    // cleanup proceeds (and reports) even if the process is stuck in
+    // uninterruptible sleep after SIGKILL.
+    if let Some(prepared) = prepared
+        && let Err(error) = prepared.discard().await
+    {
+        arc.lock().unwrap().prepared = Some(prepared);
+        return Err(VmmError::Process(format!(
+            "release the vmm of sandbox {id}: {error}"
+        )));
     }
+    arc.lock().unwrap().handle = None;
     Ok(())
 }
 
@@ -786,10 +762,11 @@ mod tests {
             .unwrap()
             .lock()
             .unwrap()
-            .process
+            .prepared
             .as_ref()
-            .and_then(fc_sdk::FirecrackerProcess::pid)
-            .expect("spawned process must be owned by the instance");
+            .and_then(|prepared| prepared.record().process)
+            .map(|process| process.pid)
+            .expect("the prepared vmm must be owned by the instance");
         assert!(
             manager
                 .instances

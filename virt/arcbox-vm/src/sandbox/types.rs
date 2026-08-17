@@ -13,7 +13,7 @@ pub(super) struct SandboxBootTask {
 /// Lifecycle state of a sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxState {
-    /// Firecracker process spawned; VM still booting.
+    /// VMM prepared; VM still booting.
     Starting,
     /// VM booted and ready to accept workloads (or last workload exited).
     Ready,
@@ -197,17 +197,18 @@ pub struct SandboxInstance {
     pub(super) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
     /// In-flight boot, retained until Remove can cancel and join it.
     pub(super) boot_task: Option<SandboxBootTask>,
-    /// Handle to the Firecracker process.
-    pub process: Option<fc_sdk::FirecrackerProcess>,
-    /// Post-boot API handle (present once the VM has booted).
-    pub vm: Option<Arc<fc_sdk::Vm>>,
+    /// The VMM process this sandbox's VM runs on, as the driver prepared
+    /// it (`arcbox_vm_driver::PreparedVm`): pid and API socket known,
+    /// shared with the boot task, taken by cleanup to kill and reap it.
+    pub prepared: Option<Arc<dyn PreparedVm>>,
+    /// The running VM behind the driver port (`arcbox_vm_driver::VmHandle`),
+    /// present once a boot or restore succeeded; shared with the tasks that
+    /// checkpoint or shut it down.
+    pub handle: Option<Arc<dyn VmHandle>>,
     /// Allocated network resources.
     pub network: Option<NetworkAllocation>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
     pub vm_dir: PathBuf,
-    /// Path to the Firecracker vsock Unix domain socket (host side).
-    /// `None` until the VM is booted.
-    pub vsock_uds_path: Option<PathBuf>,
     /// When the sandbox record was created.
     pub created_at: DateTime<Utc>,
     /// When the sandbox first became ready.
@@ -279,11 +280,10 @@ impl SandboxInstance {
             state: SandboxState::Starting,
             cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
             boot_task: None,
-            process: None,
-            vm: None,
+            prepared: None,
+            handle: None,
             network,
             vm_dir,
-            vsock_uds_path: None,
             created_at: Utc::now(),
             ready_at: None,
             last_exited_at: None,
@@ -296,11 +296,6 @@ impl SandboxInstance {
             pause_snapshot_id: None,
             ttl_deadline: None,
         }
-    }
-
-    /// Path to the Firecracker API socket for this sandbox.
-    pub fn socket_path(&self) -> PathBuf {
-        self.vm_dir.join("firecracker.sock")
     }
 }
 
