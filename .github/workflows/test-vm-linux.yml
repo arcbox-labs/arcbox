@@ -113,10 +113,20 @@ jobs:
           key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-cargo-
 
+      # BusyBox's losetup has no long options; the loop-attach code drives
+      # it as `losetup -f` then `losetup LOOPDEV FILE`, and the only honest
+      # check is a real busybox. Ubuntu's 1.30 has the same option surface
+      # as the System VM's, so it exercises the same path
+      # (busybox_block_tools_attach_report_and_detach).
+      - name: Install busybox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static
+
       - name: Build test binary
         run: cargo test --test integration -p arcbox-vm -p arcbox-tap-net --no-run
 
-      - name: Run integration tests (as root for TAP creation)
+      - name: Run integration tests (as root for TAP creation and loop devices)
         run: sudo env PATH="$PATH" HOME="$HOME" cargo test --test integration -p arcbox-vm -p arcbox-tap-net
 
   # ---------------------------------------------------------------------------
