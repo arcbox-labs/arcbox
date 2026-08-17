@@ -8,4 +8,5 @@
 pub(super) mod deadlines;
 pub(super) mod pool;
 pub(super) mod recovery;
+pub(super) mod settle;
 pub(super) mod warm;
