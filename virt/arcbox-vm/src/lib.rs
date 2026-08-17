@@ -1,10 +1,11 @@
-//! `arcbox-vm` — guest-side Firecracker sandbox orchestration.
+//! `arcbox-vm` — guest-side sandbox orchestration.
 //!
 //! # Scope
 //!
-//! This crate runs **inside** the Linux guest VM, managing nested Firecracker
-//! microVMs for workload isolation (sandboxes).  It is consumed exclusively by
-//! `arcbox-agent`.
+//! This crate runs **inside** the Linux guest VM, managing nested microVMs
+//! for workload isolation (sandboxes) through a `VmDriver`
+//! (`arcbox_vm_driver`) — the reference driver is `arcbox-fc-driver`,
+//! Firecracker. It is consumed exclusively by `arcbox-agent`.
 //!
 //! The **host-side** VMM that boots the guest is [`arcbox-vmm`], which sits on
 //! top of `arcbox-hypervisor` (Virtualization.framework on macOS, KVM on
@@ -14,7 +15,7 @@
 //! | Crate | Runs on | Purpose | Backend |
 //! |-------|---------|---------|---------|
 //! | `arcbox-vmm` | host | boot + manage the guest VM | Virtualization.framework / KVM |
-//! | `arcbox-vm` | guest | nested sandbox microVMs | Firecracker (`fc-sdk`) |
+//! | `arcbox-vm` | guest | nested sandbox microVMs | a `VmDriver` (Firecracker via `arcbox-fc-driver`) |
 //!
 //! The `vm-agent` binary that becomes PID 1 *inside* each sandbox is a
 //! separate crate, `arcbox-vm-agent`, and the wire vocabulary the two

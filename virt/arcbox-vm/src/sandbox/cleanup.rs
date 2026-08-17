@@ -262,14 +262,14 @@ pub(super) async fn expire_sandbox(
     }
 }
 
-/// Free every runtime resource a sandbox holds: the Firecracker process
-/// (SIGKILL + bounded reap), the dm-snapshot CoW device, the TAP + IP
-/// allocation, and the jailer chroot. Idempotent — every resource is
+/// Free every runtime resource a sandbox holds: the VMM process (SIGKILL +
+/// bounded reap through the driver), the dm-snapshot CoW device, the TAP +
+/// IP allocation, and the jailer chroot. Idempotent — every resource is
 /// `take()`n, so calling this from both Stop and Remove is safe.
 ///
-/// The ordering is load-bearing: FC must be dead before the CoW teardown
-/// (`dmsetup remove` returns EBUSY while the block device is open) and
-/// before TAP destruction (the ioctl fails while the fd is held).
+/// The ordering is load-bearing: the VMM must be dead before the CoW
+/// teardown (`dmsetup remove` returns EBUSY while the block device is open)
+/// and before TAP destruction (the ioctl fails while the fd is held).
 pub(super) async fn release_runtime_resources(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
@@ -279,8 +279,8 @@ pub(super) async fn release_runtime_resources(
 ) -> Result<()> {
     kill_sandbox_process(id, arc).await?;
 
-    // Teardown dm-snapshot CoW device (must happen after FC process exits
-    // because Firecracker holds the block device open).
+    // Teardown dm-snapshot CoW device (must happen after the VMM exits
+    // because it holds the block device open).
     {
         let cow_handle = arc.lock().unwrap().cow_handle.take();
         if let Some(handle) = cow_handle

@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description       = "Sandbox orchestration over Firecracker microVMs: boot, exec, files, checkpoints, warm pools. The in-sandbox init is arcbox-vm-agent; the wire vocabulary is arcbox-vm-proto."
+description       = "Sandbox orchestration over nested microVMs behind the arcbox-vm-driver port: boot, exec, files, checkpoints, warm pools. The in-sandbox init is arcbox-vm-agent; the wire vocabulary is arcbox-vm-proto."
 
 [dependencies]
 arcbox-atomic-file.workspace = true
@@ -14,7 +14,6 @@ arcbox-vm-driver.workspace = true
 arcbox-tap-net.workspace = true
 arcbox-error.workspace = true
 arcbox-snapshot.workspace = true
-fc-sdk.workspace       = true
 arcbox-fc-driver.workspace = true
 tokio.workspace        = true
 thiserror.workspace    = true

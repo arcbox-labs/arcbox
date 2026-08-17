@@ -465,7 +465,7 @@ impl SandboxManager {
     ///
     /// Waits up to `timeout_seconds` (default 30 s) for an active workload
     /// to exit, asks the guest to shut down (Ctrl+Alt+Del reboots the guest,
-    /// which exits Firecracker), and SIGKILLs Firecracker only if it
+    /// which exits the VMM), and the driver SIGKILLs the VMM only if it
     /// outlives the remaining budget. All runtime resources (TAP + IP,
     /// dm-snapshot CoW, jailer chroot) are released on `Stopped`; only the
     /// inspectable record and the log directory survive until `Remove`.
@@ -545,7 +545,8 @@ impl SandboxManager {
             }
         }
 
-        // Ask the guest to shut down and wait for it within the remaining
+        // Ask the guest to shut down (Ctrl+Alt+Del reboots it, which the VMM
+        // turns into a VM exit) and wait for it within the remaining
         // budget; the driver kills the VMM at the deadline (and reports a
         // reap that timed out — the handle stays on the instance for a
         // retry). A VM that never came up has no handle to ask.

@@ -13,7 +13,7 @@ pub(super) struct SandboxBootTask {
 /// Lifecycle state of a sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxState {
-    /// Firecracker process spawned; VM still booting.
+    /// VMM prepared; VM still booting.
     Starting,
     /// VM booted and ready to accept workloads (or last workload exited).
     Ready,

@@ -1,7 +1,7 @@
 //! Pre-warmed restore slots (CORE-78).
 //!
-//! The fixed host-side setup of a snapshot restore — jailer chroot,
-//! Firecracker spawn, kernel/vmstate/mem staging, dm-snapshot — costs
+//! The fixed host-side setup of a snapshot restore — jailer chroot, the
+//! VMM spawn, kernel/vmstate/mem staging, dm-snapshot — costs
 //! ~114 ms of the restore RPC. A [`PreparedSlot`] pre-executes exactly
 //! that sequence, so a restore that claims one proceeds directly to
 //! LoadSnapshot + guest reconfiguration.
@@ -52,7 +52,7 @@ pub(super) struct FillPlan<S> {
 /// Slot storage and policy: keyed by snapshot id, capped to
 /// [`MAX_POOLED_SNAPSHOTS`] distinct ids (LRU), with in-flight refill
 /// accounting. Generic over the slot type so the policy is unit-testable
-/// without spawning Firecracker; the lock is never held across an await.
+/// without spawning a VMM; the lock is never held across an await.
 pub(super) struct SlotPool<S = PreparedSlot> {
     inner: Mutex<PoolInner<S>>,
 }
@@ -239,7 +239,7 @@ pub(super) async fn prepare_slot(
                 Some(prepared) => match prepared.discard().await {
                     Ok(_) => true,
                     Err(error) => {
-                        warn!(slot_id, error = %error, "failed slot prepare left its firecracker behind");
+                        warn!(slot_id, error = %error, "failed slot prepare left its vmm behind");
                         false
                     }
                 },
@@ -428,7 +428,7 @@ impl SandboxManager {
             warn!(
                 snapshot_id,
                 slot_id = %slot.slot_id,
-                "discarding pre-warmed slot whose firecracker died"
+                "discarding pre-warmed slot whose vmm died"
             );
             self.spawn_slot_teardown(slot);
         }
@@ -519,7 +519,7 @@ mod tests {
     use super::*;
 
     // Policy tests run against `SlotPool<u32>` — the slot type is opaque
-    // to the policy, so no Firecracker process is needed.
+    // to the policy, so no VMM process is needed.
 
     /// Refill `snapshot` to `target` and deliver every planned slot as
     /// consecutive values starting at `base`.

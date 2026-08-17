@@ -458,7 +458,7 @@ impl SandboxManager {
     /// Free the VM, network, and chroot of a checkpointed sandbox while
     /// keeping its disk.
     ///
-    /// Ordering is load-bearing, mirroring full release: Firecracker must be
+    /// Ordering is load-bearing, mirroring full release: the VMM must be
     /// dead before the dm detach (EBUSY) and TAP destruction. The network
     /// allocation is quarantined — the daemon completes host-side forwarding
     /// cleanup through the same durable ticket flow Stop uses.
@@ -526,7 +526,7 @@ impl SandboxManager {
 
     /// Re-create the runtime of a paused sandbox from its checkpoint.
     ///
-    /// On failure every re-created resource is unwound (Firecracker killed,
+    /// On failure every re-created resource is unwound (the VMM killed,
     /// overlay detached with its COW kept, copy-mode rootfs parked again,
     /// fresh network quarantined, chroot and journal removed) so the caller
     /// can park the sandbox back at `Paused`.

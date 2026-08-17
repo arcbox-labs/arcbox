@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arcbox_fc_driver::jail::{
-    SnapshotFiles, chroot_root, link_or_copy_for_jailer, move_file, stage_kernel_for_jailer,
-    stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
+    SnapshotFiles, api_socket_path, chroot_root, link_or_copy_for_jailer, move_file,
+    stage_kernel_for_jailer, stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer,
+    stage_snapshot_files,
 };
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::{
@@ -458,28 +459,27 @@ pub(super) fn checkpoint_image(dir: PathBuf, format: &str) -> CheckpointImage {
 const STOCK_MAX_ID_LEN: usize = 44;
 
 /// Longest sandbox id the configured jailer layout leaves room for: the
-/// jailer API socket
-/// `{chroot_base}/{fc_basename}/{id}/root/run/firecracker.socket` must fit
-/// AF_UNIX's 107-byte `sun_path`. An oversized id otherwise fails as an
-/// opaque "timed out waiting for socket": fc-sdk's readiness probe is a
-/// `connect()`, which ENAMETOOLONGs on every attempt even though
-/// Firecracker is up and bound inside the chroot (caught by the CORE-107
-/// prewarm e2e, whose 51-char builder id overflowed the stock budget by
-/// 7 bytes). Computed from the config so a longer chroot base or binary
-/// name tightens the budget instead of silently reintroducing the
-/// timeout.
+/// jailer API socket (`arcbox_fc_driver::jail::api_socket_path`, under
+/// `{chroot_base}/{vmm basename}/{id}/root`) must fit AF_UNIX's 107-byte
+/// `sun_path`. An oversized id otherwise fails as an opaque "timed out
+/// waiting for socket": the driver's readiness probe is a `connect()`,
+/// which ENAMETOOLONGs on every attempt even though the VMM is up and
+/// bound inside the chroot (caught by the CORE-107 prewarm e2e, whose
+/// 51-char builder id overflowed the stock budget by 7 bytes). Measured on
+/// the driver's own layout so a longer chroot base or binary name tightens
+/// the budget instead of silently reintroducing the timeout.
 pub(super) fn max_sandbox_id_len(config: &VmmConfig) -> usize {
     const SUN_PATH: usize = 107;
-    const TAIL: usize = "/root/run/firecracker.socket".len();
     let Some(jc) = &config.firecracker.jailer else {
         return STOCK_MAX_ID_LEN;
     };
-    // Mirrors spawn_jailer / checkpoint_impl: fc-sdk's default chroot base.
-    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-    let exec = Path::new(&config.firecracker.binary)
-        .file_name()
-        .map_or(0, |name| name.len());
-    SUN_PATH.saturating_sub(base.len() + 1 + exec + 1 + TAIL)
+    // Everything around the id, measured on a one-byte id.
+    let with_one_byte_id = api_socket_path(&chroot_root(
+        &config.firecracker.binary,
+        jc.chroot_base(),
+        "x",
+    ));
+    SUN_PATH.saturating_sub(with_one_byte_id.as_os_str().len() - 1)
 }
 
 /// Validate a caller-supplied sandbox or snapshot id.
@@ -696,7 +696,7 @@ mod tests {
             assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
         }
         // A 36-char UUID fits; anything past the jailer socket budget must
-        // fail fast at ingress instead of surfacing as an fc-sdk connect
+        // fail fast at ingress instead of surfacing as a socket connect
         // timeout. The generic validator stays uncapped — it also runs
         // against persisted records and non-jailer (snapshot/execution)
         // ids, where a legacy over-long id must not become fatal.

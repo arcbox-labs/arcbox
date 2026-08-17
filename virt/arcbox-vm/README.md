@@ -1,19 +1,20 @@
 # arcbox-vm
 
 Guest-side sandbox orchestration: runs **inside** the ArcBox System VM and
-manages nested [Firecracker](https://firecracker-microvm.github.io/)
-microVMs — one per sandbox — through
-[`fc-sdk`](https://crates.io/crates/fc-sdk).
+manages nested microVMs — one per sandbox — through a `VmDriver`
+([`arcbox-vm-driver`](../arcbox-vm-driver)); the reference driver is
+[`arcbox-fc-driver`](../arcbox-fc-driver), Firecracker.
 
 Do not confuse it with `arcbox-vmm`, which is the **host** VMM that boots
 the System VM itself on Virtualization.framework or KVM. Different layer,
 different machine.
 
 ```
-host (macOS)              System VM (Linux)            sandbox (Firecracker)
+host (macOS)              System VM (Linux)            sandbox (microVM)
 arcbox-daemon    ──vsock──►  arcbox-agent      ──vsock──►  vm-agent (PID 1)
   arcbox-vmm                   arcbox-vm                     workload
-                                 fc-sdk                    (arcbox-vm-agent)
+                              arcbox-vm-driver              (arcbox-vm-agent)
+                              (arcbox-fc-driver)
                                         └── arcbox-vm-proto ──┘
 ```
 
