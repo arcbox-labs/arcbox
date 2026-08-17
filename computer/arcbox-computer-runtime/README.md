@@ -66,8 +66,13 @@ overrides the members it owns and calls
 `SandboxManager::with_environment(config, env)`. Today that is the VM
 driver behind `arcbox_vm_driver::VmDriver` (`None` = the Firecracker
 driver built from `[firecracker]`; whatever is supplied must claim the
-`Prepare` capability, which the boot and pool flows need), the
-loop-device tooling behind `arcbox_snapshot::snapshot_cow::BlockTools`
+`Prepare` capability, which the boot and pool flows need), what its NICs
+attach to behind `arcbox_vm_driver::net::GuestNetwork` (`None` = the TAP
+network from `[network]`), how its guest agent is reached behind
+`agent::GuestAgentFactory` (`None` = the `arcbox-vm-proto` client over
+the driver's vsock, which also decides what the readiness gate needs from
+the driver), the loop-device tooling behind
+`arcbox_snapshot::snapshot_cow::BlockTools`
 (`BusyboxBlockTools` is the reference; a `util-linux` or ioctl
 implementation is a consumer's few dozen lines) and the netfilter
 rendering of the identity-invariant translation behind
