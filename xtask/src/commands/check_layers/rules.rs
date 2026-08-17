@@ -104,4 +104,21 @@ pub const EXCEPTIONS: &[Exception] = &[
                  arcbox-vm-driver port replaces that edge",
         until: "vm-stack-redesign R4",
     },
+    Exception {
+        from: "arcbox-computer-runtime",
+        to: "arcbox-fc-driver",
+        reason: "the runtime still builds the Firecracker adapter as its own \
+                 default and calls its jailer staging helpers directly, until \
+                 the port grows a Staging capability and a composition root \
+                 supplies the driver",
+        until: "vm-stack-redesign R3 (PR-G)",
+    },
+    Exception {
+        from: "arcbox-computer-runtime",
+        to: "arcbox-tap-net",
+        reason: "the runtime still builds the TAP adapter as its own default \
+                 and re-exports it as `network`, until a composition root \
+                 supplies a GuestNetwork through the port",
+        until: "vm-stack-redesign R3 (PR-G)",
+    },
 ];
