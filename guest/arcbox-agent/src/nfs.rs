@@ -58,9 +58,10 @@ mod platform {
     const NETCONFIG_PATH: &str = "/etc/netconfig";
     const NFSD_THREADS: &str = "4";
 
-    /// Guards the single mount-table watcher against repeated
-    /// `ensure_docker_export` calls.
-    static WATCHER_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Backoff after a `poll()` failure on the mount table. Long, because
+    /// there is no realistic persistent error here — this exists so a
+    /// surprising one cannot become a spin.
+    const WATCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Minimal libtirpc netconfig. The guest rootfs ships none, and without it
     /// `rpc.mountd` logs "No V2 or V3 listeners created" and serves nothing;
@@ -181,16 +182,12 @@ local      tpi_cots_ord  -     loopback  -       -       -
         ensure_nfsd_threads(&cfg)?;
         notes.push(format!("ensured nfsd threads={}", cfg.threads));
 
-        // Once: this runs again on every EnsureNfsExport, and a thread per call
-        // would pile up watchers all rewriting the same file. The flag is
-        // cleared if the watcher ever exits, so a later pass can replace it.
-        if let Some(mountinfo) = mountinfo {
-            if WATCHER_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                drop(mountinfo);
-            } else {
-                spawn_export_watcher(mountinfo, WatchedExports::from(&cfg));
-                notes.push("armed live-export watcher".to_string());
-            }
+        // Idempotent: this runs again on every EnsureNfsExport, and a thread
+        // per call would pile up watchers all rewriting the same file.
+        if let Some(mountinfo) = mountinfo
+            && ensure_export_watcher(mountinfo, WatchedExports::from(&cfg))
+        {
+            notes.push("armed live-export watcher".to_string());
         }
 
         tracing::info!(
@@ -616,35 +613,54 @@ local      tpi_cots_ord  -     loopback  -       -       -
     /// between, and it would stay dropped until some unrelated mount woke us.
     /// The caller opens first, reconciles second, and hands the descriptor
     /// over, which leaves no gap between the snapshot and the watch.
-    fn spawn_export_watcher(mountinfo: fs::File, watched: WatchedExports) {
-        std::thread::spawn(move || {
-            // Whatever ends this thread, let a later EnsureNfsExport start a
-            // replacement: staying "armed" after the watcher is gone would
-            // leave every future container unexported until the agent restarts.
-            let _disarm = Disarm;
-
-            loop {
-                if let Err(e) = wait_for_mount_change(&mountinfo) {
-                    tracing::warn!(error = %e, "nfs export: mount watch failed, live view stops here");
-                    return;
-                }
-                if let Err(e) = reconcile_exports(&watched.as_config()) {
-                    // Keep watching: a transient exportfs failure should not
-                    // cost every later container its entry.
-                    tracing::warn!(error = %e, "nfs export: reconcile failed");
-                }
+    ///
+    /// **This loop does not return.** Neither failure it can meet is worth
+    /// ending the live view for: a failing `exportfs` is usually transient,
+    /// and `poll()` on a procfs descriptor we own has no realistic persistent
+    /// error. Retrying both is also what makes the supervision below sound —
+    /// a thread that can exit on its own turns every "is it still alive?"
+    /// check into a race with its own last instruction.
+    fn watch_exports(mountinfo: &fs::File, watched: &WatchedExports) -> ! {
+        loop {
+            if let Err(e) = wait_for_mount_change(mountinfo) {
+                tracing::warn!(error = %e, "nfs export: mount watch failed, retrying");
+                std::thread::sleep(WATCH_RETRY_DELAY);
+                continue;
             }
-        });
+            if let Err(e) = reconcile_exports(&watched.as_config()) {
+                // A transient exportfs failure should not cost every later
+                // container its entry.
+                tracing::warn!(error = %e, "nfs export: reconcile failed");
+            }
+        }
     }
 
-    /// Clears [`WATCHER_ARMED`] however the watcher thread ends, including a
-    /// panic.
-    struct Disarm;
+    /// Starts the watcher if one is not already running.
+    ///
+    /// Returns whether it started one. Holding the slot across the check makes
+    /// this atomic against a concurrent `EnsureNfsExport`, and because
+    /// [`watch_exports`] never returns, `is_finished()` means the thread
+    /// panicked rather than "is about to stop" — so there is no window where a
+    /// caller sees a live watcher that is really on its way out and declines to
+    /// replace it. An earlier version used an `AtomicBool` cleared by a `Drop`
+    /// guard and had exactly that window: the ensure call would observe
+    /// "armed", skip the respawn, and only then would the flag clear, leaving
+    /// the guest with no watcher and the host with no reason to ask again.
+    fn ensure_export_watcher(mountinfo: fs::File, watched: WatchedExports) -> bool {
+        static WATCHER: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
 
-    impl Drop for Disarm {
-        fn drop(&mut self) {
-            WATCHER_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut slot = WATCHER.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return false;
         }
+        if slot.is_some() {
+            tracing::warn!("nfs export: watcher had died, starting a replacement");
+        }
+        *slot = Some(std::thread::spawn(move || {
+            watch_exports(&mountinfo, &watched);
+        }));
+        true
     }
 
     /// Blocks until the mount table changes.
