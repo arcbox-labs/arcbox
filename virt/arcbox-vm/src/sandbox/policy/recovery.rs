@@ -95,27 +95,19 @@ pub(in crate::sandbox) fn retained_ids<'a>(
         .collect()
 }
 
-/// What to do with each crash journal found, in the order they were read.
+/// What to do with the crash journal `id` left behind.
 ///
 /// A journal beside a retained sandbox is a leftover of the crash window
 /// between its durable commit and the journal clear — not evidence of a
 /// torn release — so it is dropped rather than acted on. Everything else,
 /// including a journal with no durable record at all (a pre-warmed pool
 /// slot), is an orphan.
-pub(in crate::sandbox) fn sweep_plan<'a>(
-    journaled: impl IntoIterator<Item = &'a str>,
-    retained: &HashSet<String>,
-) -> Vec<SweepAction> {
-    journaled
-        .into_iter()
-        .map(|id| {
-            if retained.contains(id) {
-                SweepAction::DropStaleJournal
-            } else {
-                SweepAction::Reclaim
-            }
-        })
-        .collect()
+pub(in crate::sandbox) fn sweep_action(id: &str, retained: &HashSet<String>) -> SweepAction {
+    if retained.contains(id) {
+        SweepAction::DropStaleJournal
+    } else {
+        SweepAction::Reclaim
+    }
 }
 
 #[cfg(test)]
@@ -207,13 +199,12 @@ mod tests {
     fn a_retained_sandboxs_journal_is_stale_and_every_other_one_is_an_orphan() {
         let retained = HashSet::from(["paused".to_owned()]);
         assert_eq!(
-            sweep_plan(["paused", "live", "pool-1f2e"], &retained),
-            vec![
-                SweepAction::DropStaleJournal,
-                SweepAction::Reclaim,
-                SweepAction::Reclaim
-            ]
+            sweep_action("paused", &retained),
+            SweepAction::DropStaleJournal
         );
-        assert!(sweep_plan([], &retained).is_empty());
+        assert_eq!(sweep_action("live", &retained), SweepAction::Reclaim);
+        // A pre-warmed pool slot journals like a sandbox but has no durable
+        // record at all.
+        assert_eq!(sweep_action("pool-1f2e", &retained), SweepAction::Reclaim);
     }
 }

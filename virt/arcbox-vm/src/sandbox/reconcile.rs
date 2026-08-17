@@ -261,15 +261,11 @@ pub(super) async fn sweep_orphans(
             .map(|record| (record.id.as_str(), record.phase)),
     );
     cow_manager.reconcile_stale(&retained)?;
-    let plan = recovery::sweep_plan(
-        records.iter().map(|(_, record)| record.id.as_str()),
-        &retained,
-    );
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();
-    for ((dir, mut record), action) in records.into_iter().zip(plan) {
-        if action == SweepAction::DropStaleJournal {
+    for (dir, mut record) in records {
+        if recovery::sweep_action(&record.id, &retained) == SweepAction::DropStaleJournal {
             info!(sandbox_id = %record.id, "dropping stale pause journal, keeping retained state");
             clear_state_record(&dir)?;
             continue;
