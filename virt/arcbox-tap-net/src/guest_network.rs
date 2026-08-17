@@ -391,6 +391,7 @@ mod tests {
         // Two records claiming one address: adopting either is a guess.
         let mut twin = lease.clone();
         twin.vm = vm("twin");
+        twin.mac = crate::mac_from_vm_id("twin");
         let error = GuestNetwork::adopt(&restarted, &twin, AttachMode::Invariant)
             .await
             .unwrap_err();

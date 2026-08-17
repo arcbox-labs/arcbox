@@ -140,36 +140,46 @@ fn expose_target_follows_the_applied_datapath() {
     assert_eq!(manager.expose_target("vmtap0-2"), ExposeTarget::PoolIp);
 }
 
-/// A record naming any other TAP for its address is not one this pool
-/// could have written, so adoption refuses it — and hands the address
-/// back, since the owner answers a refusal by tearing the sandbox down.
+/// A journaled record is held to the rules `reserve` writes by. The
+/// address matters most: one from another pool is invisible to `next_ip`,
+/// while its TAP name — the last two octets — can be one this pool hands
+/// out, so a later sandbox would create its TAP over a live guest's.
 #[test]
-fn adopt_refuses_a_tap_name_this_pool_would_not_give() {
+fn adopt_refuses_a_record_this_pool_would_not_have_written() {
     let pool = || TapNetwork::new("10.0.99.0/24", "10.0.99.1", vec![]).unwrap();
-    // What a previous process journaled, with the TAP name rewritten.
-    let mut allocation = pool().reserve("box").unwrap();
-    allocation.tap_name = "vmtap-elsewhere".into();
-
+    let journaled = pool().reserve("box").unwrap();
     let manager = pool();
-    let error = manager
-        .adopt("box", &allocation, AttachMode::Invariant)
-        .unwrap_err();
-    assert!(error.to_string().contains("vmtap-elsewhere"), "{error}");
-    assert!(
-        !manager
-            .allocated
-            .lock()
-            .unwrap()
-            .contains(&u32::from(allocation.ip_address)),
-        "a refused adoption keeps no address"
-    );
 
-    // An id the port could never name (`..`) is refused before that.
-    allocation.tap_name = tap_name_from_ip(allocation.ip_address);
+    let mut foreign = journaled.clone();
+    foreign.ip_address = "172.20.99.2".parse().unwrap(); // also named vmtap99-2
+    let error = manager
+        .adopt("box", &foreign, AttachMode::Invariant)
+        .unwrap_err();
+    assert!(error.to_string().contains("non-allocatable"), "{error}");
+
+    let mut renamed = journaled.clone();
+    renamed.tap_name = "vmtap-elsewhere".into();
     assert!(
         manager
-            .adopt("..", &allocation, AttachMode::Invariant)
+            .adopt("box", &renamed, AttachMode::Invariant)
             .is_err()
+    );
+    // Another VM's record: the MAC follows the id that reserved it.
+    assert!(
+        manager
+            .adopt("other", &journaled, AttachMode::Invariant)
+            .is_err()
+    );
+    // An id the port could never name (`..`) is refused before all of that.
+    assert!(
+        manager
+            .adopt("..", &journaled, AttachMode::Invariant)
+            .is_err()
+    );
+
+    assert!(
+        manager.allocated.lock().unwrap().is_empty(),
+        "a refused adoption keeps no address"
     );
 }
 

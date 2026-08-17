@@ -421,6 +421,12 @@ impl TapNetwork {
     /// adoption is what the startup sweep does, before that gate opens.
     pub fn adopt(&self, vm_id: &str, alloc: &NetworkAllocation, mode: AttachMode) -> Result<()> {
         quarantine::validate_id(vm_id)?;
+        // A journaled record is not this process's memory: hold it to the
+        // rules `reserve` writes by, as the ledger's loader holds its
+        // markers. An address outside this pool is the case that bites —
+        // `next_ip` would never see it as taken, while its TAP name (the
+        // last two octets) can be one this pool hands out.
+        quarantine::validate_allocation(vm_id, alloc, self.base, self.prefix_len, self.gateway)?;
         // Live or awaiting cleanup finalization, never both.
         if self.quarantined.lock().unwrap().contains_key(vm_id) {
             return Err(TapNetError::WrongState {
@@ -456,7 +462,11 @@ impl TapNetwork {
     }
 
     /// The half of [`Self::adopt`] that runs with the address already
-    /// taken: the pool's naming rule, the guest's device, the translation.
+    /// taken: the guest's device, and the translation its exit took away.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "Linux adoption is fallible; macOS test builds compile the no-op branch"
+    )]
     fn readopt_host_state(&self, alloc: &NetworkAllocation, mode: AttachMode) -> Result<()> {
         info!(
             tap = %alloc.tap_name,
@@ -464,14 +474,6 @@ impl TapNetwork {
             ?mode,
             "adopting a live sandbox network"
         );
-        // The rule `reserve` writes by: any other TAP name for this
-        // address is not a record this pool could have produced.
-        if alloc.tap_name != tap_name_from_ip(alloc.ip_address) {
-            return Err(TapNetError::Network(format!(
-                "adopted TAP {} is not the name this pool gives {}",
-                alloc.tap_name, alloc.ip_address
-            )));
-        }
         #[cfg(target_os = "linux")]
         {
             // Existence only — never `tap::create`: the interface is live
@@ -486,15 +488,12 @@ impl TapNetwork {
                 // install appends rather than replaces, so remove first —
                 // through the tolerant removal (no `applied` record yet is
                 // exactly its "activated by a previous agent process"
-                // case), whose failure on rules that never existed must not
-                // block the adoption.
-                if let Err(error) = self.deactivate_translation(alloc) {
-                    debug!(
-                        tap = %alloc.tap_name,
-                        %error,
-                        "pre-adoption translation removal incomplete"
-                    );
-                }
+                // case). Its absent-rule case is already an `Ok`, so an
+                // error here means the removal itself failed and what the
+                // TAP still carries is unknown; installing on top of that
+                // duplicates every surviving rule, so refuse instead and
+                // let the owner fall back.
+                self.deactivate_translation(alloc)?;
                 self.install_translation(alloc)?;
             } else {
                 // Same reason as in `activate`: `expose_target` reads an
