@@ -87,6 +87,12 @@ pub enum AttachMode {
 ///
 /// Serialized into the VM's durable record so cleanup can be replayed after
 /// a crash; `cleanup_token` is what the two-step cleanup protocol checks.
+///
+/// Deliberately plain — no `#[non_exhaustive]`, because a runtime builds
+/// one from a record it read back and needs every field. What that costs
+/// is that the field *names* are an on-disk contract: a field added here
+/// must carry `#[serde(default)]` so a record written before it still
+/// loads, and nothing may key on the order they are declared in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkLease {
     /// The VM this lease belongs to.
