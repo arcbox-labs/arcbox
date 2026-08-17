@@ -404,8 +404,16 @@ fn firecracker_alive(pid: i32) -> bool {
 /// is still running, its host-side datapath is still in place, an exec still
 /// works through it, and removing it still leaves no Firecracker behind.
 ///
-/// Requires root: the reclaimed resources are a TAP interface and (where
-/// dmsetup is available) a dm-snapshot, and only a real one proves adoption.
+/// Requires root: the reclaimed resource this proves is a real TAP interface,
+/// and only a real one proves adoption.
+///
+/// The reclaimed *dm-snapshot* is not covered here. `CowManager` reaches
+/// losetup through `BusyboxBlockTools`, which needs `/bin/busybox`; this
+/// suite's runner does not install it (the `integration` job does), so the
+/// boot falls back to using the rootfs directly and `CowManager::adopt` is
+/// never called. Installing busybox in this job would extend the test to
+/// that half — and would put every other test in this file on dm-snapshot
+/// too, which is why it is a change of its own rather than a line here.
 #[tokio::test]
 #[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables, root, and vm-agent in rootfs"]
 async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
