@@ -2,22 +2,43 @@
 //!
 //! `SandboxManager` state is in-memory; if the agent restarts (crash,
 //! supervision respawn) the VMM processes, TAP devices, dm-snapshot
-//! devices, and jailer chroots of running sandboxes leak, and fresh IP
-//! allocations can collide with orphaned TAPs. To recover, every successful
-//! boot/restore persists a small `state.json` next to the sandbox's runtime
-//! files, and a new manager sweeps those records: orphaned VMMs are found
-//! and killed through the driver's `Adopt` capability, and every held
-//! resource is torn down. Sandboxes are not live-reconciled yet: startup
-//! destroys orphaned runtime resources, then normalizes durable lifecycle
-//! records for replay and inspection.
+//! devices, and jailer chroots of running sandboxes are left with no owner,
+//! and fresh IP allocations can collide with orphaned TAPs. To recover,
+//! every successful boot/restore persists a small `state.json` next to the
+//! sandbox's runtime files, and a new manager sweeps those records.
+//!
+//! A sandbox whose VM is *still running* is reclaimed rather than
+//! destroyed, so a crash or an upgrade of the composing process does not
+//! cost every guest on the node its work (CORE-135). One journal is adopted
+//! when all of these hold, and killed the moment any of them does not —
+//! every refusal falls back to the teardown this sweep did before adoption
+//! existed, because re-establishing the wrong host state is worse than
+//! starting over:
+//!
+//! - the driver's `Adopt` capability found and reconnected to the VMM;
+//! - that handle reports [`VmState::Running`] — a quiesced guest is a
+//!   checkpoint that died between the pause and the resume;
+//! - the handle has vsock, which is what separates a full one from the
+//!   process-only fallback an orphan with a dead API yields: without it
+//!   nothing can be run, paused or checkpointed in the sandbox, only killed;
+//! - the durable record is `Ready`. `Starting` died with the boot task that
+//!   was driving it and nothing here finishes one; the transitional phases
+//!   died between resource states;
+//! - the journal says how its lease attaches ([`SandboxStateRecord::attach_mode`]),
+//!   and the guest network takes that lease back under exactly that mode;
+//! - the CoW manager re-registers the dm-snapshot the guest is running on.
+//!
+//! Everything else is torn down as before, and then durable lifecycle
+//! records are normalized for replay and inspection.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use arcbox_vm_driver::net::{AttachMode, GuestNetwork, NetworkLease};
-use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmId, VmRecord};
+use arcbox_vm_driver::net::{AttachMode, GuestNetwork, NetworkIdentity, NetworkLease};
+use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmHandle, VmId, VmRecord, VmState};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -77,6 +98,17 @@ impl CowRecord {
             cow_loop: self.cow_loop,
             cow_file: self.cow_file,
             template_path: self.template_path,
+        }
+    }
+
+    /// The same handle for a record the sweep keeps rather than consumes.
+    fn to_handle(&self) -> CowHandle {
+        CowHandle {
+            dm_name: self.dm_name.clone(),
+            dm_device: self.dm_device.clone(),
+            cow_loop: self.cow_loop.clone(),
+            cow_file: self.cow_file.clone(),
+            template_path: self.template_path.clone(),
         }
     }
 }
@@ -356,16 +388,62 @@ pub(super) fn clear_state_record(vm_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One sandbox whose VM outlived the process that booted it, with every
+/// runtime resource the sweep took back for it.
+pub(super) struct AdoptedSandbox {
+    handle: Arc<dyn VmHandle>,
+    lease: Option<NetworkLease>,
+    identity: Option<NetworkIdentity>,
+    cow_handle: Option<CowHandle>,
+    pool_slot_id: Option<String>,
+    net_invariant: bool,
+}
+
 pub(super) struct OrphanSweep {
     pub ids: HashSet<String>,
+    /// Sandboxes reclaimed alive, by id. Their journals stay on disk — they
+    /// are live state again, not debris — and so do their runtime dirs.
+    pub adopted: HashMap<String, AdoptedSandbox>,
     runtime_dirs: Vec<PathBuf>,
 }
 
-/// Sweep `<data_dir>/sandboxes/*/state.json` and tear down every leftover,
-/// plus snapshots a checkpoint never finished writing.
+impl SweptRuntime {
+    /// A sweep that reclaimed nothing and kept nothing alive.
+    #[cfg(test)]
+    fn nothing_kept() -> Self {
+        Self {
+            swept: HashSet::new(),
+            adopted: HashMap::new(),
+        }
+    }
+}
+
+impl OrphanSweep {
+    fn empty() -> Self {
+        Self {
+            ids: HashSet::new(),
+            adopted: HashMap::new(),
+            runtime_dirs: Vec::new(),
+        }
+    }
+
+    /// What [`normalize_durable_records`] needs, taken out so the runtime
+    /// directories stay here for [`finalize_sweep`] — which must not run
+    /// until normalization has committed.
+    pub(super) fn take_runtime(&mut self) -> SweptRuntime {
+        SweptRuntime {
+            swept: std::mem::take(&mut self.ids),
+            adopted: std::mem::take(&mut self.adopted),
+        }
+    }
+}
+
+/// Sweep `<data_dir>/sandboxes/*/state.json`: reclaim every sandbox whose VM
+/// is still running, tear down everything else, and drop the snapshots a
+/// checkpoint never finished writing.
 ///
 /// Runs once per manager construction, in the background. Ordering per
-/// sandbox mirrors live teardown: kill the VMM → wait for exit → dm
+/// killed sandbox mirrors live teardown: kill the VMM → wait for exit → dm
 /// teardown → TAP release → chroot + directory removal.
 pub(super) async fn sweep_orphans(
     config: &VmmConfig,
@@ -383,10 +461,7 @@ pub(super) async fn sweep_orphans(
     let entries = match std::fs::read_dir(&sandboxes_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(OrphanSweep {
-                ids: HashSet::new(),
-                runtime_dirs: Vec::new(),
-            });
+            return Ok(OrphanSweep::empty());
         }
         Err(error) => return Err(error.into()),
     };
@@ -408,25 +483,61 @@ pub(super) async fn sweep_orphans(
         records.push((dir, record));
     }
 
-    // The VMM pins dm devices, so every owned process must be dead before
-    // the global CoW sweep can report meaningful cleanup failures.
-    for (dir, record) in &records {
-        kill_orphaned_vmm(driver, dir, record).await?;
-    }
+    // Durable phases first: whether a journaled VM may be kept depends on
+    // what its record says the sandbox was doing.
     let durable = store.load_all()?;
     let retained = recovery::retained_ids(
         durable
             .iter()
             .map(|record| (record.id.as_str(), record.phase)),
     );
-    // No sandbox is kept alive across this sweep yet, so no dm device is in
-    // use by a running VM — every one of them is an orphan to reap (CORE-135
-    // part 2b decides adopt-or-kill and fills this in).
-    cow_manager.reconcile_stale(&retained, &HashSet::new())?;
+    let phases: HashMap<&str, _> = durable
+        .iter()
+        .map(|record| (record.id.as_str(), record.phase))
+        .collect();
+
+    // Every VM this sweep does not keep must be dead before the global CoW
+    // sweep runs: a live VMM pins its dm device, and a pinned device turns
+    // a reap into an error that fails the whole reconciliation.
+    let mut adopted = HashMap::new();
+    for (dir, record) in &records {
+        if let Some(reclaimed) = adopt_or_kill(
+            driver,
+            network,
+            cow_manager,
+            dir,
+            record,
+            phases.get(record.id.as_str()).copied(),
+        )
+        .await?
+        {
+            adopted.insert(record.id.clone(), reclaimed);
+        }
+    }
+
+    // The dm devices an adopted VM is running on, keyed the way the CoW
+    // manager names them. Their overlay files are kept too — the two sets
+    // are distinct because a paused sandbox has a retained file and no
+    // device, so folding them together would leave the device of a sandbox
+    // that crashed mid-pause unreaped.
+    let live_devices: HashSet<String> = records
+        .iter()
+        .filter(|(_, record)| adopted.contains_key(&record.id))
+        .map(|(_, record)| record.resource_owner().to_owned())
+        .collect();
+    let mut keep_cow_files = retained.clone();
+    keep_cow_files.extend(live_devices.iter().cloned());
+    cow_manager.reconcile_stale(&keep_cow_files, &live_devices)?;
 
     let mut swept = HashSet::new();
     let mut runtime_dirs = Vec::new();
     for (dir, mut record) in records {
+        // An adopted sandbox's journal names what this process now owns, so
+        // it stays exactly where it is — as does its runtime directory,
+        // which `finalize_sweep` only removes for the ids listed here.
+        if adopted.contains_key(&record.id) {
+            continue;
+        }
         if recovery::sweep_action(&record.id, &retained) == SweepAction::DropStaleJournal {
             info!(sandbox_id = %record.id, "dropping stale pause journal, keeping retained state");
             clear_state_record(&dir)?;
@@ -462,6 +573,7 @@ pub(super) async fn sweep_orphans(
 
     Ok(OrphanSweep {
         ids: swept,
+        adopted,
         runtime_dirs,
     })
 }
@@ -474,21 +586,39 @@ pub(super) async fn finalize_sweep(sweep: OrphanSweep) -> Result<()> {
     Ok(())
 }
 
-/// Normalizes durable records after orphan resources have been swept.
+/// What the sweep established, for the normalization that follows it.
 ///
-/// Interrupted live phases become inspectable failures; already inactive
-/// sandboxes are reconstructed without runtime handles. A create intent stays
-/// resumable, while an interrupted removal finishes as a durable tombstone.
+/// Split from [`OrphanSweep`] because the adopted runtime state is moved
+/// onto the instances built here while the runtime directories it also
+/// carries are needed afterwards, by [`finalize_sweep`].
+pub(super) struct SweptRuntime {
+    pub swept: HashSet<String>,
+    pub adopted: HashMap<String, AdoptedSandbox>,
+}
+
+/// Normalizes durable records after the orphan sweep decided each sandbox's
+/// fate.
+///
+/// A sandbox whose VM the sweep reclaimed comes back live, with the runtime
+/// state that came with it. Interrupted live phases become inspectable
+/// failures; already inactive sandboxes are reconstructed without runtime
+/// handles. A create intent stays resumable, while an interrupted removal
+/// finishes as a durable tombstone.
 pub(super) fn normalize_durable_records(
     store: &SandboxRecordStore,
     data_dir: &Path,
-    swept: Option<&HashSet<String>>,
+    sweep: Option<SweptRuntime>,
 ) -> Result<Vec<SandboxInstance>> {
     let mut inactive = Vec::new();
+    let (swept, mut adopted) = match sweep {
+        Some(sweep) => (Some(sweep.swept), sweep.adopted),
+        None => (None, HashMap::new()),
+    };
 
     for record in store.load_all()? {
-        let evidence = match swept {
+        let evidence = match &swept {
             None => JournalEvidence::Unchecked,
+            Some(_) if adopted.contains_key(&record.id) => JournalEvidence::Adopted,
             Some(ids) if ids.contains(&record.id) => JournalEvidence::Swept,
             Some(_) => JournalEvidence::Unjournaled,
         };
@@ -497,6 +627,13 @@ pub(super) fn normalize_durable_records(
             RecoveryAction::RefuseUnjournaled => {
                 return Err(crate::error::VmmError::Unavailable(format!(
                     "sandbox {} is {} but has no cleanup journal",
+                    record.id,
+                    record.phase.as_str()
+                )));
+            }
+            RecoveryAction::RefuseAdopted => {
+                return Err(crate::error::VmmError::Unavailable(format!(
+                    "sandbox {} is {}, a phase the startup sweep must not adopt",
                     record.id,
                     record.phase.as_str()
                 )));
@@ -512,7 +649,11 @@ pub(super) fn normalize_durable_records(
                 inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
             }
             RecoveryAction::Reinstate(state) => {
-                inactive.push(inactive_instance(record, state, data_dir));
+                let instance = match adopted.remove(&record.id) {
+                    Some(reclaimed) => adopted_instance(record, state, data_dir, reclaimed),
+                    None => inactive_instance(record, state, data_dir),
+                };
+                inactive.push(instance);
             }
             RecoveryAction::FinishRemove => {
                 store
@@ -551,24 +692,65 @@ fn inactive_instance(
     instance
 }
 
-/// Kill the VMM a cleanup journal names, if it outlived the agent.
+/// [`inactive_instance`] plus everything the sweep reclaimed: the VM's
+/// handle, the lease whose datapath was re-established and the identity the
+/// guest holds over it, the disk overlay, and the slot the resources are
+/// named after.
+///
+/// `prepared` stays `None` — a `PreparedVm` is the driver's grip on the VMM
+/// *process*, and nothing hands one back across a restart; teardown of an
+/// adopted sandbox goes through the handle instead (`cleanup.rs`). `ready_at`
+/// is not journaled, so it stays `None` rather than being invented from this
+/// restart's clock.
+fn adopted_instance(
+    record: SandboxRecord,
+    state: SandboxState,
+    data_dir: &Path,
+    adopted: AdoptedSandbox,
+) -> SandboxInstance {
+    let AdoptedSandbox {
+        handle,
+        lease,
+        identity,
+        cow_handle,
+        pool_slot_id,
+        net_invariant,
+    } = adopted;
+    let mut instance = inactive_instance(record, state, data_dir);
+    instance.handle = Some(handle);
+    instance.network = lease;
+    instance.net_identity = identity;
+    instance.cow_handle = cow_handle;
+    instance.pool_slot_id = pool_slot_id;
+    instance.net_invariant = net_invariant;
+    instance
+}
+
+/// Reclaim the VM a cleanup journal names, or kill it.
 ///
 /// The driver's `Adopt` capability finds it — the journaled pid when it is
 /// still that VMM (a pid recycled since the record was written is not), else
 /// whatever the driver recognises as the VM by the record's identity: the
 /// id the resources are keyed by (the adopted pool slot's, for a claimed
-/// sandbox) and its runtime directory — and its handle kills and reaps it,
-/// so the dm teardown that follows never hits EBUSY on the open block
-/// device. Nothing found is the common case: the VMM died with the agent.
-/// A driver without `Adopt` runs its VMs in-process, and those died with
-/// the agent by construction.
-async fn kill_orphaned_vmm(
+/// sandbox) and its runtime directory. Nothing found is the common case:
+/// the VMM died with the agent. A driver without `Adopt` runs its VMs
+/// in-process, and those died with the agent by construction.
+///
+/// A handle that comes back is either reclaimed — with its datapath and its
+/// disk overlay — or killed and reaped, so the dm teardown that follows
+/// never hits EBUSY on an open block device. [`can_reclaim`] decides which,
+/// and every one of its refusals falls back to that kill: the behaviour this
+/// sweep had before adoption existed.
+async fn adopt_or_kill(
     driver: &dyn VmDriver,
+    network: &dyn GuestNetwork,
+    cow_manager: &CowManager,
     runtime_dir: &Path,
     record: &SandboxStateRecord,
-) -> Result<()> {
+    phase: Option<super::record::PersistPhase>,
+) -> Result<Option<AdoptedSandbox>> {
     let Some(adopt) = driver.adopt() else {
-        return Ok(());
+        return Ok(None);
     };
     let vm_record = VmRecord {
         id: VmId::new(record.resource_owner())?,
@@ -591,11 +773,103 @@ async fn kill_orphaned_vmm(
                 ADOPT_TIMEOUT.as_secs()
             ))
         })??;
-    if let Some(handle) = adopted {
-        info!(sandbox_id = %record.id, vm = %vm_record.id, "killing the orphaned vmm");
-        handle.shutdown(ShutdownMode::Kill).await?;
+    let Some(handle) = adopted else {
+        return Ok(None);
+    };
+    let handle: Arc<dyn VmHandle> = Arc::from(handle);
+
+    match can_reclaim(network, cow_manager, record, phase, &handle).await {
+        Ok(reclaimed) => {
+            info!(sandbox_id = %record.id, vm = %vm_record.id, "reclaimed a sandbox whose vm outlived its agent");
+            Ok(Some(reclaimed))
+        }
+        Err(reason) => {
+            info!(
+                sandbox_id = %record.id, vm = %vm_record.id, %reason,
+                "killing the orphaned vmm"
+            );
+            handle.shutdown(ShutdownMode::Kill).await?;
+            Ok(None)
+        }
     }
-    Ok(())
+}
+
+/// Whether this live VM can be handed back to the manager, and the runtime
+/// state that comes with it if so.
+///
+/// `Err` carries why not, and is never fatal — the caller kills instead,
+/// which is what this sweep always did. Nothing partial needs unwinding
+/// here either: the two resources this takes (the lease's datapath, the
+/// template refcount) are released by exactly the teardown the kill path
+/// then runs, and releasing them here as well would double-drop the
+/// template's refcount.
+async fn can_reclaim(
+    network: &dyn GuestNetwork,
+    cow_manager: &CowManager,
+    record: &SandboxStateRecord,
+    phase: Option<super::record::PersistPhase>,
+    handle: &Arc<dyn VmHandle>,
+) -> std::result::Result<AdoptedSandbox, String> {
+    // A guest that is quiesced (a checkpoint that died between the pause and
+    // the resume) or gone answers nothing; only a running one is usable.
+    match handle.state() {
+        VmState::Running => {}
+        state => return Err(format!("its vm is {state}")),
+    }
+    // What separates a full handle from the process-only fallback an orphan
+    // whose API never answered yields: without vsock nothing can be run,
+    // paused or checkpointed in this sandbox, only killed. Adopting one
+    // would leave a sandbox that answers `inspect` and fails everything else.
+    if handle.vsock().is_none() {
+        return Err("its vmm's api never answered, so only a kill can be driven through it".into());
+    }
+    // `Ready` and nothing else. `Starting` died with the boot task that was
+    // driving it and no path here finishes one; the transitional phases died
+    // between resource states, so what their journals name is half-built.
+    match phase {
+        Some(super::record::PersistPhase::Ready) => {}
+        Some(phase) => return Err(format!("its durable record is {}", phase.as_str())),
+        None => return Err("it has no durable record".into()),
+    }
+
+    let lease = record.lease().map_err(|error| error.to_string())?;
+    let mode = match (&lease, record.attach_mode) {
+        (Some(_), None) => {
+            return Err(
+                "its journal predates adoption and does not say how its network attaches".into(),
+            );
+        }
+        (_, mode) => mode.map(AttachMode::from),
+    };
+    // Re-establish the host state that died with the previous process. Not
+    // idempotent by design: an adapter that cannot take the lease back says
+    // so rather than leaving a live guest unreachable.
+    let identity = match (&lease, mode) {
+        (Some(lease), Some(mode)) => {
+            network
+                .adopt(lease, mode)
+                .await
+                .map_err(|error| format!("its network could not be re-established: {error}"))?;
+            Some(network.identity(lease, mode))
+        }
+        _ => None,
+    };
+
+    let cow_handle = record.cow.as_ref().map(CowRecord::to_handle);
+    if let Some(cow_handle) = &cow_handle {
+        cow_manager
+            .adopt(cow_handle)
+            .map_err(|error| format!("its disk overlay could not be re-registered: {error}"))?;
+    }
+
+    Ok(AdoptedSandbox {
+        handle: Arc::clone(handle),
+        lease,
+        identity,
+        cow_handle,
+        pool_slot_id: record.pool_slot_id.clone(),
+        net_invariant: record.net_invariant,
+    })
 }
 
 async fn remove_dir_if_present(path: &Path) -> Result<()> {
@@ -1065,7 +1339,8 @@ mod tests {
         record_in_phase(&store, "mid-resume", PersistPhase::Resuming);
 
         let inactive =
-            normalize_durable_records(&store, data_dir.path(), Some(&HashSet::new())).unwrap();
+            normalize_durable_records(&store, data_dir.path(), Some(SweptRuntime::nothing_kept()))
+                .unwrap();
         let inactive: HashMap<_, _> = inactive
             .into_iter()
             .map(|instance| (instance.id.clone(), instance))
@@ -1207,7 +1482,7 @@ mod tests {
         record_in_phase(&store, "starting", PersistPhase::Starting);
 
         assert!(matches!(
-            normalize_durable_records(&store, data_dir.path(), Some(&HashSet::new())),
+            normalize_durable_records(&store, data_dir.path(), Some(SweptRuntime::nothing_kept())),
             Err(crate::error::VmmError::Unavailable(_))
         ));
         assert_eq!(

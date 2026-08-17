@@ -236,7 +236,7 @@ impl SandboxManager {
             let instances = Arc::clone(&instances);
             tokio::spawn(async move {
                 let result = async {
-                    let swept = reconcile::sweep_orphans(
+                    let mut swept = reconcile::sweep_orphans(
                         &config,
                         driver.as_ref(),
                         &*network,
@@ -248,7 +248,7 @@ impl SandboxManager {
                     let inactive = reconcile::normalize_durable_records(
                         &records,
                         Path::new(&config.firecracker.data_dir),
-                        Some(&swept.ids),
+                        Some(swept.take_runtime()),
                     )?;
                     reconcile::finalize_sweep(swept).await?;
                     reconcile_capability(&*network).replay_complete();
