@@ -161,11 +161,18 @@ impl TryFrom<&Metadata> for Graph {
             // A crate's dev-dependency on itself (the way a crate turns on
             // its own optional feature for its tests, e.g. `testkit`) is
             // not an edge between layers; the graph drops it here so no
-            // rule has to special-case it.
+            // rule has to special-case it. Identity is the manifest
+            // directory, not the name: a dependency on a *different*
+            // package that happens to share the name (a registry version,
+            // a renamed path dep) is a real edge and stays.
+            let own_dir = package.manifest_path.parent();
             let mut deps: Vec<String> = package
                 .dependencies
                 .iter()
-                .filter(|dependency| dependency.name != package.name.as_str())
+                .filter(|dependency| {
+                    !(dependency.name == package.name.as_str()
+                        && dependency.path.as_deref() == own_dir)
+                })
                 .map(|dependency| dependency.name.clone())
                 .collect();
             deps.sort();
@@ -246,7 +253,12 @@ mod tests {
                 "manifest_path": "/ws/virt/arcbox-vm-driver/Cargo.toml",
                 "dependencies": [
                     {"name": "arcbox-vm-driver", "req": "*", "kind": "dev", "optional": false,
-                     "uses_default_features": true, "features": ["testkit"], "target": null},
+                     "uses_default_features": true, "features": ["testkit"], "target": null,
+                     "path": "/ws/virt/arcbox-vm-driver"},
+                    {"name": "arcbox-vm-driver", "req": "^0.1", "kind": null, "optional": false,
+                     "uses_default_features": true, "features": [], "target": null,
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "rename": "published-driver"},
                     {"name": "serde", "req": "^1", "kind": null, "optional": false,
                      "uses_default_features": true, "features": [], "target": null}
                 ],
@@ -268,7 +280,9 @@ mod tests {
         .unwrap();
         let graph = Graph::try_from(&metadata).unwrap();
         assert_eq!(graph.members.len(), 1);
-        assert_eq!(graph.members[0].deps, ["serde"]);
+        // The path dep on its own directory is dropped; the same-named
+        // registry package is a real edge and stays.
+        assert_eq!(graph.members[0].deps, ["arcbox-vm-driver", "serde"]);
     }
 
     #[test]
