@@ -49,7 +49,7 @@ use std::time::Duration;
 use arcbox_vm_driver::net::{AttachMode, GuestNetwork, NetworkIdentity, NetworkLease};
 use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmHandle, VmId, VmRecord, VmState};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
 use super::record::{SandboxRecord, SandboxRecordStore, SandboxTransition};
@@ -620,15 +620,19 @@ pub(super) struct SweptRuntime {
 /// failures; already inactive sandboxes are reconstructed without runtime
 /// handles. A create intent stays resumable, while an interrupted removal
 /// finishes as a durable tombstone.
+/// Takes `sweep` by `&mut` so that whatever this does not claim is still
+/// the caller's to dispose of — see [`release_unclaimed`], which the caller
+/// must run on both paths.
 pub(super) fn normalize_durable_records(
     store: &SandboxRecordStore,
     data_dir: &Path,
-    sweep: Option<SweptRuntime>,
+    sweep: Option<&mut SweptRuntime>,
 ) -> Result<Vec<SandboxInstance>> {
     let mut inactive = Vec::new();
-    let (swept, mut adopted) = match sweep {
-        Some(sweep) => (Some(sweep.swept), sweep.adopted),
-        None => (None, HashMap::new()),
+    let mut nothing_adopted = HashMap::new();
+    let (swept, adopted) = match sweep {
+        Some(sweep) => (Some(&sweep.swept), &mut sweep.adopted),
+        None => (None, &mut nothing_adopted),
     };
 
     for record in store.load_all()? {
@@ -680,6 +684,41 @@ pub(super) fn normalize_durable_records(
     }
 
     Ok(inactive)
+}
+
+/// Dispose of every reclaimed sandbox [`normalize_durable_records`] did not
+/// take: kill its VM and hand back the two resources the reclaim took.
+///
+/// A no-op on the happy path — normalization claims every adopted record —
+/// and the reason it is called on the error path too. Dropping the map
+/// there would kill each VM through the handle's `Drop` while leaving its
+/// lease live in the network and its template refcount held, which is the
+/// one shape this sweep must never produce: resources released by nobody,
+/// in a process whose reconciliation has already failed.
+///
+/// Best-effort per resource, because it runs while an error is already on
+/// its way out and each sandbox's journal survives to be swept again.
+pub(super) async fn release_unclaimed(
+    runtime: &mut SweptRuntime,
+    network: &dyn GuestNetwork,
+    cow_manager: &CowManager,
+) {
+    for (id, adopted) in runtime.adopted.drain() {
+        warn!(sandbox_id = %id, "releasing a reclaimed sandbox that recovery did not take");
+        if let Err(error) = adopted.handle.shutdown(ShutdownMode::Kill).await {
+            warn!(sandbox_id = %id, %error, "killing the reclaimed vmm failed");
+        }
+        if let Some(cow_handle) = &adopted.cow_handle
+            && let Err(error) = cow_manager.teardown_checked(cow_handle).await
+        {
+            warn!(sandbox_id = %id, %error, "releasing the reclaimed disk overlay failed");
+        }
+        if let Some(lease) = adopted.lease
+            && let Err(error) = network.quarantine(lease).await
+        {
+            warn!(sandbox_id = %id, %error, "quarantining the reclaimed lease failed");
+        }
+    }
 }
 
 fn inactive_instance(
@@ -1358,9 +1397,12 @@ mod tests {
         record_in_phase(&store, "mid-pause", PersistPhase::Pausing);
         record_in_phase(&store, "mid-resume", PersistPhase::Resuming);
 
-        let inactive =
-            normalize_durable_records(&store, data_dir.path(), Some(SweptRuntime::nothing_kept()))
-                .unwrap();
+        let inactive = normalize_durable_records(
+            &store,
+            data_dir.path(),
+            Some(&mut SweptRuntime::nothing_kept()),
+        )
+        .unwrap();
         let inactive: HashMap<_, _> = inactive
             .into_iter()
             .map(|instance| (instance.id.clone(), instance))
@@ -1532,10 +1574,12 @@ mod tests {
     async fn sweep_one(
         data_dir: &Path,
         case: &AdoptionCase,
+        unjournaled: &[(&str, PersistPhase)],
     ) -> (
         Box<dyn VmHandle>,
         super::super::SandboxManager,
         std::sync::Arc<arcbox_vm_driver::testkit::FakeNetwork>,
+        Result<()>,
     ) {
         use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
         use arcbox_vm_driver::{BootSpec, ConsoleSpec, IsolationSpec, VmSpec, VsockSpec};
@@ -1577,6 +1621,11 @@ mod tests {
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
         let store = SandboxRecordStore::new(data_dir).unwrap();
         record_in_phase(&store, "keeper", case.phase);
+        // Durable records with no journal at all, which is what makes
+        // recovery refuse to normalize and fails the whole reconciliation.
+        for (id, phase) in unjournaled {
+            record_in_phase(&store, id, *phase);
+        }
         drop(store);
 
         let lease = NetworkLease {
@@ -1614,8 +1663,8 @@ mod tests {
             },
         )
         .unwrap();
-        manager.await_reconcile().await.unwrap();
-        (vm, manager, network)
+        let reconciled = manager.await_reconcile().await;
+        (vm, manager, network, reconciled)
     }
 
     /// The payload: a `Ready` sandbox whose VM outlived its agent comes back
@@ -1623,7 +1672,9 @@ mod tests {
     #[tokio::test]
     async fn a_live_ready_sandbox_is_reclaimed_rather_than_killed() {
         let data_dir = tempfile::tempdir().unwrap();
-        let (vm, manager, network) = sweep_one(data_dir.path(), &AdoptionCase::live()).await;
+        let (vm, manager, network, reconciled) =
+            sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
+        reconciled.unwrap();
 
         assert_eq!(vm.state(), VmState::Running, "the guest was never killed");
         let instances = manager.instances.read().unwrap();
@@ -1655,6 +1706,41 @@ mod tests {
                 .join(STATE_FILE)
                 .exists(),
             "an adopted journal is live state, not debris"
+        );
+    }
+
+    /// Recovery can still refuse *after* the sweep reclaimed something — a
+    /// peer record in a live phase with no journal is enough. What the sweep
+    /// took must then be handed back explicitly: letting the map drop would
+    /// kill each VM through its handle while leaving the lease live in the
+    /// network and the template refcount held, i.e. resources nobody owns in
+    /// a process whose reconciliation has already failed.
+    #[tokio::test]
+    async fn a_failed_normalization_hands_back_what_the_sweep_reclaimed() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (vm, _manager, network, reconciled) = sweep_one(
+            data_dir.path(),
+            &AdoptionCase::live(),
+            &[("ghost", PersistPhase::Ready)],
+        )
+        .await;
+
+        // `await_reconcile` reports the task's failure as text, so the
+        // message is what says which refusal it was.
+        let error = reconciled.expect_err("an unjournaled live record refuses normalization");
+        assert!(
+            error.to_string().contains("has no cleanup journal"),
+            "unexpected reconciliation failure: {error}"
+        );
+        assert_eq!(
+            vm.state(),
+            VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+            "the reclaimed vm is killed rather than left ownerless"
+        );
+        assert_eq!(
+            network.adopted_mode(&VmId::new("keeper").unwrap()),
+            None,
+            "and its lease is handed back rather than left live"
         );
     }
 
@@ -1693,7 +1779,8 @@ mod tests {
             ),
         ] {
             let data_dir = tempfile::tempdir().unwrap();
-            let (vm, manager, _) = sweep_one(data_dir.path(), &case).await;
+            let (vm, manager, _, reconciled) = sweep_one(data_dir.path(), &case, &[]).await;
+            reconciled.unwrap();
 
             assert_eq!(
                 vm.state(),
@@ -1722,7 +1809,11 @@ mod tests {
         record_in_phase(&store, "starting", PersistPhase::Starting);
 
         assert!(matches!(
-            normalize_durable_records(&store, data_dir.path(), Some(SweptRuntime::nothing_kept())),
+            normalize_durable_records(
+                &store,
+                data_dir.path(),
+                Some(&mut SweptRuntime::nothing_kept())
+            ),
             Err(crate::error::VmmError::Unavailable(_))
         ));
         assert_eq!(

@@ -245,11 +245,18 @@ impl SandboxManager {
                         &records,
                     )
                     .await?;
+                    let mut runtime = swept.take_runtime();
                     let inactive = reconcile::normalize_durable_records(
                         &records,
                         Path::new(&config.firecracker.data_dir),
-                        Some(swept.take_runtime()),
-                    )?;
+                        Some(&mut runtime),
+                    );
+                    // Whatever normalization did not take is still held here
+                    // — on the error path that is every sandbox the sweep
+                    // reclaimed, and dropping the map would kill each VM
+                    // while leaving its lease and template refcount held.
+                    reconcile::release_unclaimed(&mut runtime, &*network, &cow_manager).await;
+                    let inactive = inactive?;
                     reconcile::finalize_sweep(swept).await?;
                     reconcile_capability(&*network).replay_complete();
                     Ok::<_, VmmError>(inactive)
