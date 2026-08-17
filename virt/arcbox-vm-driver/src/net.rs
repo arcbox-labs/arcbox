@@ -40,6 +40,11 @@ pub trait GuestNetwork: Send + Sync {
     /// and the network does not: it decides whether the guest holds the
     /// pool address itself or the fixed invariant one.
     ///
+    /// Not idempotent, unlike [`GuestNetwork::quarantine`]: a lease that is
+    /// already live, or whose address another live lease holds, is an
+    /// error. Two records claiming one address is an inconsistent replay,
+    /// and adopting either of them is a guess.
+    ///
     /// Fallible on purpose, and the failure is not fatal to the caller: an
     /// adapter that cannot re-establish says so, and the owner falls back
     /// to tearing the VM down — the behavior it had before adoption

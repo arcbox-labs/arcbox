@@ -242,8 +242,11 @@ impl GuestNetwork for FakeNetwork {
     /// ([`FakeNetwork::adopted_mode`]). Its refusals are a real adapter's,
     /// each saying the durable record cannot be true — a lease of another
     /// network, one awaiting cleanup finalization (live or quarantined,
-    /// never both), an address already held. Unlike `reserve` it is not
-    /// gated on the startup sweep: adoption is what that sweep does.
+    /// never both), an address already held (re-adoption included: this is
+    /// not idempotent) — plus a VM that already holds a live lease, which
+    /// is this fake being stricter than an address pool can be, as its
+    /// `reserve` already is. Unlike `reserve` it is not gated on the
+    /// startup sweep: adoption is what that sweep does.
     async fn adopt(&self, lease: &NetworkLease, mode: AttachMode) -> Result<()> {
         if self.fail_adopt.swap(false, Ordering::AcqRel) {
             return Err(Error::Network(format!(
@@ -259,16 +262,22 @@ impl GuestNetwork for FakeNetwork {
                 lease.vm
             )));
         }
-        if ledger.active.contains_key(&lease.vm) {
-            return Err(Error::PreconditionFailed(format!(
-                "vm {} already holds a live lease",
-                lease.vm
-            )));
-        }
+        // Address before VM, as the TAP network answers it: its live state
+        // is the address pool, so re-adopting a live lease is the
+        // duplicate-address refusal there too. The VM check below is this
+        // fake being stricter than an address pool can be — the same
+        // strictness its `reserve` already has.
         if !ledger.used.insert(host) {
             return Err(Error::Network(format!(
                 "vm {} cannot adopt {}: the address is already held",
                 lease.vm, lease.ip
+            )));
+        }
+        if ledger.active.contains_key(&lease.vm) {
+            ledger.used.remove(&host);
+            return Err(Error::PreconditionFailed(format!(
+                "vm {} already holds a live lease",
+                lease.vm
             )));
         }
         ledger.active.insert(lease.vm.clone(), lease.clone());
@@ -543,6 +552,12 @@ mod tests {
         let live = replayed("a", 2);
         net.adopt(&live, AttachMode::Invariant).await.unwrap();
         assert_eq!(net.adopted_mode(&id("a")), Some(AttachMode::Invariant));
+        // Re-adopting a live lease is the address collision, the answer the
+        // TAP network gives it too — `adopt` is not a no-op the second time.
+        assert!(matches!(
+            net.adopt(&live, AttachMode::Invariant).await,
+            Err(Error::Network(_))
+        ));
         // The pool has stopped offering that address...
         let next = net.reserve(&id("b"), policy()).await.unwrap();
         assert_ne!(next.ip, live.ip);

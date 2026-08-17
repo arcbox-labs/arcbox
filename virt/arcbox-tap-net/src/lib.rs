@@ -494,7 +494,14 @@ impl TapNetwork {
                 // duplicates every surviving rule, so refuse instead and
                 // let the owner fall back.
                 self.deactivate_translation(alloc)?;
-                self.install_translation(alloc)?;
+                if let Err(error) = self.install_translation(alloc) {
+                    // As in `activate`, minus the TAP destroy: the device
+                    // is the live guest's. This leaves the TAP with no
+                    // translation rather than half of one, which is where
+                    // the failed removal above would have left it anyway.
+                    let _ = self.deactivate_translation(alloc);
+                    return Err(error);
+                }
             } else {
                 // Same reason as in `activate`: `expose_target` reads an
                 // absent record as an invariant TAP this process did not
