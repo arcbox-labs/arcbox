@@ -51,14 +51,14 @@ mod lifecycle;
 mod pause;
 pub(crate) mod policy;
 mod pool;
-mod reconcile;
+pub(crate) mod reconcile;
 pub(crate) mod record;
 mod spec;
 mod templates;
 #[cfg(test)]
 mod testing;
 mod timers;
-mod types;
+pub(crate) mod types;
 mod warm;
 pub(crate) mod workload;
 

@@ -2,7 +2,11 @@
 //! timers should be armed at all, and how long is left on one.
 //!
 //! Pure — `super::super::timers` owns the epoch-stamped slots, the sleeping
-//! tasks and the expiry actions.
+//! tasks and the expiry actions, and `crate::lifecycle`'s actor owns the two
+//! `Sleep`s that replace them.
+//!
+//! `pub` below is only the lint's spelling: this module is private and its
+//! parent is `pub(crate)`, so these reach the crate and no further.
 
 use std::time::Duration;
 
@@ -18,10 +22,7 @@ use crate::sandbox::SandboxState;
 /// resync would re-arm one — recovery restores `ttl_deadline` for every
 /// record regardless of state — so whether a stopped sandbox's record gets
 /// reaped would depend on whether the agent happened to bounce.
-pub(in crate::sandbox) fn ttl_due(
-    state: SandboxState,
-    deadline: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+pub fn ttl_due(state: SandboxState, deadline: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     match state {
         SandboxState::Stopped | SandboxState::Failed => None,
         _ => deadline,
@@ -33,13 +34,13 @@ pub(in crate::sandbox) fn ttl_due(
 ///
 /// Idle detection only makes sense while a sandbox is `Ready`: every other
 /// state either has a workload running or is on its way out.
-pub(in crate::sandbox) fn idle_due(state: SandboxState, timeout_seconds: u32) -> Option<Duration> {
+pub fn idle_due(state: SandboxState, timeout_seconds: u32) -> Option<Duration> {
     (state == SandboxState::Ready && timeout_seconds != 0)
         .then(|| Duration::from_secs(u64::from(timeout_seconds)))
 }
 
 /// How long is left until `deadline`; an already-past deadline is due now.
-pub(in crate::sandbox) fn remaining(deadline: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+pub fn remaining(deadline: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
     (deadline - now).to_std().unwrap_or(Duration::ZERO)
 }
 

@@ -431,7 +431,7 @@ pub struct SandboxEvent {
 }
 
 impl SandboxEvent {
-    pub(super) fn new(sandbox_id: &str, action: &str) -> Self {
+    pub fn new(sandbox_id: &str, action: &str) -> Self {
         Self {
             sandbox_id: sandbox_id.to_owned(),
             action: action.to_owned(),
@@ -440,7 +440,7 @@ impl SandboxEvent {
         }
     }
 
-    pub(super) fn with_attr(mut self, key: &str, value: &str) -> Self {
+    pub fn with_attr(mut self, key: &str, value: &str) -> Self {
         self.attributes.insert(key.to_owned(), value.to_owned());
         self
     }

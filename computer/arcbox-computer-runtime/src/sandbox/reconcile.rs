@@ -379,7 +379,7 @@ pub(super) fn create_runtime_dir(vm_dir: &Path) -> Result<()> {
 }
 
 /// Remove the crash-recovery record (resources have been released).
-pub(super) fn clear_state_record(vm_dir: &Path) -> Result<()> {
+pub fn clear_state_record(vm_dir: &Path) -> Result<()> {
     match std::fs::remove_file(vm_dir.join(STATE_FILE)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

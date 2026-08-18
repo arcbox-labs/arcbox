@@ -5,7 +5,10 @@
 //! on any host — no KVM, no root. The impure halves that act on those
 //! decisions stay next to the resources they own.
 
-pub(super) mod deadlines;
+/// `pub` only in the lint's spelling, like [`recovery`]: the `policy` module
+/// is `pub(crate)`, so this reaches exactly `crate::lifecycle`, whose actor
+/// owns the two deadline timers.
+pub mod deadlines;
 pub(super) mod pool;
 /// `pub` only in the lint's spelling: the `policy` module above is
 /// `pub(crate)`, so this reaches exactly `crate::lifecycle`, whose state
