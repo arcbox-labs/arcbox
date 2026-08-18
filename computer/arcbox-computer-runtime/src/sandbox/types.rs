@@ -283,7 +283,7 @@ pub struct SandboxInstance {
     /// (CORE-81). Set by the create path when the boot bakes the invariant
     /// `ip=` parameter, and inherited from [`crate::snapshot::SnapshotMeta`]
     /// on restore so chained checkpoints record the guest's actual addressing.
-    pub(super) net_invariant: bool,
+    pub(crate) net_invariant: bool,
     /// When the sandbox reached `Paused` (None otherwise).
     pub paused_at: Option<DateTime<Utc>>,
     /// Catalog id of the internal pause checkpoint (state == `Paused` only).

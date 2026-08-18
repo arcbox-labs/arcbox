@@ -40,7 +40,7 @@ impl ComputerLifecycle {
                 context.removal();
                 Transition(State::removing())
             }
-            Event::Frozen | Event::Failure | Event::VmExited => {
+            Event::Frozen | Event::Failure | Event::Stranded | Event::VmExited => {
                 context.failure();
                 Transition(State::failed())
             }
@@ -149,8 +149,9 @@ impl ComputerLifecycle {
             // every artefact, so the id and its request key are free again and
             // a warm create can fall back to a cold boot. (Failing before any
             // resource exists is `abort_provision` today — the same end, one
-            // durable write cheaper.)
-            Event::Failure | Event::VmExited | Event::Frozen => {
+            // durable write cheaper.) It force-removes either way, so a
+            // stranded restore takes the same path.
+            Event::Failure | Event::Stranded | Event::VmExited | Event::Frozen => {
                 context.removal();
                 Transition(State::removing())
             }
@@ -380,7 +381,11 @@ impl ComputerLifecycle {
             }
             // The restore unwound: retained state is intact, so park back at
             // `Paused` — which keeps its original `paused_at` — and let a retry
-            // or a Remove work.
+            // or a Remove work. A resume that could *not* unwind is
+            // `Stranded` and falls through to `computer`, which fails the
+            // computer: recording `Paused` for a half-allocated one would
+            // have the restart sweep reinstate it as resumable and drop the
+            // journal naming what it still holds.
             Event::Failure => {
                 context.persist(PersistPhase::Paused, Durability::Warn);
                 context.emit(Effect::Publish(Notify::Paused));
@@ -416,6 +421,7 @@ impl ComputerLifecycle {
             | Event::IdleExpired { .. }
             | Event::VmExited
             | Event::Failure
+            | Event::Stranded
             | Event::Frozen => Handled,
             _ => Super,
         }
@@ -444,6 +450,7 @@ impl ComputerLifecycle {
             Event::Remove { .. }
             | Event::TtlExpired
             | Event::Failure
+            | Event::Stranded
             | Event::Frozen
             | Event::VmExited => Handled,
             _ => Super,

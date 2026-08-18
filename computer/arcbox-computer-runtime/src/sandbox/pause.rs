@@ -28,12 +28,15 @@
 //! onwards every resource is keyed by the sandbox id again and resume,
 //! reconciliation, and `Remove` all see one naming scheme.
 
-use super::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
-use super::reconcile::JournaledLease;
+use crate::lifecycle::tasks::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
+// The pause release and the resume proper live with the machine that names
+// them (`Effect::SpawnRelease { KeepDisk }` / `SpawnResume`); this module
+// still drives them until R3 PR-F2 flips the manager onto the actor.
 use super::record::SandboxTransition;
-use super::spec::restore_spec;
 use super::types::action;
 use super::*;
+use crate::lifecycle::tasks::pause::release_for_pause;
+use crate::lifecycle::tasks::resume::restore_paused;
 
 /// Reserved catalog name for internal pause checkpoints.
 ///
@@ -43,7 +46,7 @@ use super::*;
 pub(super) const PAUSE_SNAPSHOT_NAME: &str = "arcbox-pause";
 
 /// Where a copy-mode rootfs is parked inside `vm_dir` while paused.
-pub(super) const PAUSED_ROOTFS_FILE: &str = "paused-rootfs.ext4";
+pub const PAUSED_ROOTFS_FILE: &str = "paused-rootfs.ext4";
 
 /// Reason attribute values for pause/resume events.
 pub mod reason {
@@ -76,24 +79,24 @@ pub(super) fn delete_pause_snapshots(
 
 /// Runtime resources a successful in-place restore hands back to the
 /// instance.
-struct ResumedRuntime {
-    prepared: Arc<dyn PreparedVm>,
-    handle: Arc<dyn VmHandle>,
-    network: Option<NetworkLease>,
+pub struct ResumedRuntime {
+    pub prepared: Arc<dyn PreparedVm>,
+    pub handle: Arc<dyn VmHandle>,
+    pub network: Option<NetworkLease>,
     /// What the resumed guest holds on its interface — see
     /// [`SandboxInstance::net_identity`].
-    net_identity: Option<NetworkIdentity>,
-    cow_handle: Option<CowHandle>,
-    ip_address: String,
+    pub net_identity: Option<NetworkIdentity>,
+    pub cow_handle: Option<CowHandle>,
+    pub ip_address: String,
 }
 
 /// How a failed resume left the sandbox.
-struct ResumeFailure {
-    error: VmmError,
+pub struct ResumeFailure {
+    pub error: VmmError,
     /// True when every re-created resource was released again and the
     /// retained pause state (checkpoint + disk) is intact — the sandbox can
     /// go back to `Paused` and a retry can succeed.
-    unwound: bool,
+    pub unwound: bool,
 }
 
 impl SandboxManager {
@@ -252,7 +255,16 @@ impl SandboxManager {
         // Release the VM, TAP + IP (quarantined for host cleanup), and
         // chroot; keep the disk. A failure here is a half-released sandbox
         // whose VM state is already gone — degrade honestly to Failed.
-        if let Err(error) = self.release_for_pause(id, &instance, jailer).await {
+        if let Err(error) = release_for_pause(
+            id,
+            &instance,
+            jailer,
+            &self.config,
+            &self.cow_manager,
+            &*self.network,
+        )
+        .await
+        {
             return Err(self.fail_pause(id, &instance, generation, error));
         }
 
@@ -371,9 +383,19 @@ impl SandboxManager {
         instance.lock().unwrap().state = SandboxState::Starting;
 
         let restore_started = std::time::Instant::now();
-        match self
-            .restore_paused(id, jailer, &snap_meta, &vm_dir, networked)
-            .await
+        match restore_paused(
+            id,
+            jailer,
+            &snap_meta,
+            &vm_dir,
+            networked,
+            &self.config,
+            &self.cow_manager,
+            &*self.driver,
+            &*self.network,
+            &*self.agent,
+        )
+        .await
         {
             Ok(resumed) => {
                 let ready_commit = generation
@@ -497,376 +519,6 @@ impl SandboxManager {
         error
     }
 
-    /// Free the VM, network, and chroot of a checkpointed sandbox while
-    /// keeping its disk.
-    ///
-    /// Ordering is load-bearing, mirroring full release: the VMM must be
-    /// dead before the dm detach (EBUSY) and TAP destruction. The network
-    /// allocation is quarantined — the daemon completes host-side forwarding
-    /// cleanup through the same durable ticket flow Stop uses.
-    ///
-    /// A sandbox that adopted a pre-warmed slot (CORE-78) is released out of
-    /// the *slot's* chroot and its slot-keyed overlay is renamed onto the
-    /// sandbox-id path, so `Paused` is always reached with every retained
-    /// resource keyed by the sandbox id.
-    async fn release_for_pause(
-        &self,
-        id: &SandboxId,
-        arc: &Arc<Mutex<SandboxInstance>>,
-        jailer: &crate::config::JailerConfig,
-    ) -> Result<()> {
-        super::cleanup::kill_sandbox_process(id, arc).await?;
-        let owner = super::cleanup::chroot_owner(id, arc);
-
-        // Disk: detach the overlay but keep its COW file; the copy-mode
-        // fallback parks the staged rootfs (the sandbox's actual disk) in
-        // vm_dir before the chroot is removed.
-        let cow_handle = arc.lock().unwrap().cow_handle.take();
-        if let Some(handle) = cow_handle {
-            if let Err(error) = self.cow_manager.detach_keep_cow(&handle).await {
-                arc.lock().unwrap().cow_handle = Some(handle);
-                return Err(error.into());
-            }
-            // A slot-keyed overlay must become sandbox-keyed: resume's
-            // `reattach`, the restart sweep's keep-list, and `Remove` all
-            // look the file up by sandbox id.
-            let retained = self.preserved_cow_file(id);
-            let detached = self.preserved_cow_file(&owner);
-            if detached != retained && detached.exists() {
-                tokio::fs::rename(&detached, &retained)
-                    .await
-                    .map_err(VmmError::Io)?;
-            }
-        } else {
-            let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            let staged =
-                chroot_root(&self.config.firecracker.binary, base, &owner).join("rootfs.ext4");
-            if staged.exists() {
-                let vm_dir = arc.lock().unwrap().vm_dir.clone();
-                move_file(&staged, &vm_dir.join(PAUSED_ROOTFS_FILE))
-                    .await
-                    .map_err(VmmError::Io)?;
-            }
-        }
-
-        {
-            let lease = arc.lock().unwrap().network.take();
-            if let Some(lease) = lease
-                && let Err(error) = self.network.quarantine(lease.clone()).await
-            {
-                arc.lock().unwrap().network = Some(lease);
-                return Err(error.into());
-            }
-        }
-
-        super::cleanup::remove_jailer_chroot(id, arc, &self.config).await?;
-        // Nothing slot-keyed survives this point.
-        arc.lock().unwrap().pool_slot_id = None;
-        Ok(())
-    }
-
-    /// Re-create the runtime of a paused sandbox from its checkpoint.
-    ///
-    /// On failure every re-created resource is unwound (the VMM killed,
-    /// overlay detached with its COW kept, copy-mode rootfs parked again,
-    /// fresh network quarantined, chroot and journal removed) so the caller
-    /// can park the sandbox back at `Paused`.
-    async fn restore_paused(
-        &self,
-        id: &SandboxId,
-        jailer: &crate::config::JailerConfig,
-        snap_meta: &crate::snapshot::SnapshotMeta,
-        vm_dir: &Path,
-        networked: bool,
-    ) -> std::result::Result<ResumedRuntime, ResumeFailure> {
-        let fc_cfg = &self.config.firecracker;
-        let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        let cr = chroot_root(&fc_cfg.binary, base, id);
-        let uid = jailer.uid;
-        let gid = jailer.gid;
-
-        // Incrementally-owned resources for the unwind. The lease is held
-        // apart from the NIC because it is owed to the pool from `reserve`
-        // on, and the journal write between the two can fail — an unwind
-        // that only knew about activated leases would strand that address.
-        let mut lease: Option<NetworkLease> = None;
-        let mut nic: Option<NicSpec> = None;
-        let mut prepared: Option<Arc<dyn PreparedVm>> = None;
-        let mut cow_handle: Option<CowHandle> = None;
-
-        let attempt: Result<ResumedRuntime> = async {
-            // Reserve network metadata, journal it, then materialize the
-            // TAP — the same order boot and restore use, so a crash never
-            // leaves an unowned interface.
-            if networked {
-                lease = Some(
-                    self.network
-                        .reserve(&VmId::new(id.as_str())?, super::sandbox_network_policy())
-                        .await?,
-                );
-            }
-            let ip_address = lease
-                .as_ref()
-                .map(|lease| lease.ip.to_string())
-                .unwrap_or_default();
-            let journal = |pid: Option<i32>, cow: Option<&CowHandle>, net: Option<&NetworkLease>| {
-                // The lease attaches the way the snapshot says, exactly as
-                // the `activate` below does — the same expression, so the
-                // journal and the datapath cannot disagree.
-                let net = net.map(|lease| JournaledLease::from_snapshot(lease, snap_meta.net_invariant));
-                super::reconcile::SandboxStateRecord::new(id, pid, net, cow, &self.config, None)
-                    .and_then(|record| super::reconcile::write_state_record(vm_dir, &record))
-            };
-            journal(None, None, lease.as_ref())?;
-            if let Some(lease) = &lease {
-                // The resumed guest keeps the addressing its pause checkpoint
-                // baked, exactly as Restore does: an invariant guest pairs
-                // with an invariant TAP (host-side NAT, no guest work), a
-                // legacy one with the legacy TAP shape plus the reconfig RPC
-                // below (CORE-81).
-                nic = Some(
-                    self.network
-                        .activate(lease, super::attach_mode(snap_meta.net_invariant))
-                        .await?,
-                );
-            }
-
-            // Fresh chroot + VMM process, prepared through the driver.
-            let spawned: Arc<dyn PreparedVm> = Arc::from(
-                super::prepare_capability(&*self.driver)
-                    .prepare(&VmId::new(id)?, &IsolationSpec::try_from(jailer)?, vm_dir)
-                    .await?,
-            );
-            let pid = super::journaled_pid(&*spawned);
-            prepared = Some(spawned);
-            journal(pid, None, lease.as_ref())?;
-
-            // Stage kernel + the retained disk + snapshot files.
-            if let Some(kernel) = snap_meta.kernel_path.as_deref() {
-                stage_kernel_for_jailer(&cr, kernel, uid, gid).await?;
-            }
-            let preserved_cow = self.preserved_cow_file(id);
-            if preserved_cow.exists() {
-                let rootfs = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
-                    VmmError::Snapshot(format!(
-                        "pause checkpoint for {id} records no rootfs template"
-                    ))
-                })?;
-                let handle = self.cow_manager.reattach(id, rootfs).await?;
-                journal(pid, Some(&handle), lease.as_ref())?;
-                stage_rootfs_device_for_jailer(&cr, &handle.dm_device, uid, gid).await?;
-                cow_handle = Some(handle);
-            } else {
-                let parked = vm_dir.join(PAUSED_ROOTFS_FILE);
-                if !parked.exists() {
-                    return Err(VmmError::Snapshot(format!(
-                        "paused sandbox {id} has neither a preserved overlay nor a parked rootfs"
-                    )));
-                }
-                let staged = cr.join("rootfs.ext4");
-                move_file(&parked, &staged).await.map_err(VmmError::Io)?;
-                nix::unistd::chown(
-                    &staged,
-                    Some(nix::unistd::Uid::from_raw(uid)),
-                    Some(nix::unistd::Gid::from_raw(gid)),
-                )
-                .map_err(|e| VmmError::Process(format!("chown parked rootfs: {e}")))?;
-            }
-
-            let snap_in_chroot = cr.join("snapshots").join(&snap_meta.id);
-            std::fs::create_dir_all(&snap_in_chroot).map_err(VmmError::Io)?;
-            nix::unistd::chown(
-                &snap_in_chroot,
-                Some(nix::unistd::Uid::from_raw(uid)),
-                Some(nix::unistd::Gid::from_raw(gid)),
-            )
-            .map_err(|e| VmmError::Process(format!("chown snap dir: {e}")))?;
-            link_or_copy_for_jailer(
-                &snap_meta.vmstate_path,
-                &snap_in_chroot.join("vmstate"),
-                uid,
-                gid,
-            )
-            .await?;
-            if let Some(ref mem) = snap_meta.mem_path
-                && mem.exists()
-            {
-                link_or_copy_for_jailer(mem, &snap_in_chroot.join("mem"), uid, gid).await?;
-            }
-
-            // Load the snapshot on the prepared VMM: the retained disk in
-            // this jail, eth0 retargeted onto the fresh TAP.
-            let image = super::checkpoint_image(snap_in_chroot, &snap_meta.format);
-            let restore = restore_spec(
-                id,
-                &cr,
-                nic.clone(),
-                IsolationSpec::try_from(jailer)?,
-            )?;
-            let handle: Arc<dyn VmHandle> = Arc::from(
-                prepared
-                    .as_ref()
-                    .expect("prepared set above")
-                    .restore(&image, restore)
-                    .await?,
-            );
-            // What the guest holds on its interface once this resume has
-            // configured it, read under the mode its snapshot was addressed
-            // in. Derived once — the agent and the reconfig RPC below must
-            // not disagree. An invariant guest already holds it; a legacy
-            // one still carries its origin's address until that RPC lands,
-            // and this host cannot name that, so its agent is told nothing
-            // about reaching it by address in the meantime.
-            let identity = lease.as_ref().map(|lease| {
-                self.network
-                    .identity(lease, super::attach_mode(snap_meta.net_invariant))
-            });
-            let settled_on_load = snap_meta.net_invariant.then(|| identity.clone()).flatten();
-            let agent = self
-                .agent
-                .connect(Arc::clone(&handle), settled_on_load.as_ref())?;
-
-            // Clock sync is DETACHED, mirroring restore and cold boot
-            // (CORE-80): the guest wall clock froze at pause time, but
-            // vm-agent re-syncs itself from ptp_kvm on every accepted exec
-            // connection, so correct time no longer depends on this RPC.
-            // Awaiting it would put the post-resume vsock connect settle back
-            // on the resume critical path.
-            {
-                let id = id.clone();
-                let agent = Arc::clone(&agent);
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        agent.sync_clock(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(ClockSync::Synced)) => {}
-                        Ok(Ok(ClockSync::AgentError(code))) => {
-                            warn!(sandbox_id = %id, code, "agent could not set the clock after resume");
-                        }
-                        Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after resume failed: {e}"),
-                        Err(_) => warn!(sandbox_id = %id, "clock sync after resume timed out"),
-                    }
-                });
-            }
-
-            // Re-address the guest only when its snapshot is legacy-addressed.
-            // An invariant guest (CORE-81) already holds the fixed link-local
-            // identity and its resolv.conf already points at the fixed
-            // gateway; the fresh TAP carries the new pool IP host-side, so
-            // resume awaits nothing here.
-            if let Some(identity) = &identity
-                && !snap_meta.net_invariant
-            {
-                let cmd = crate::boot_proto::NetReconfigCommand {
-                    ip: super::ipv4(identity.ip)?,
-                    netmask: super::netmask(identity.prefix_len),
-                    gateway: super::ipv4(identity.gateway)?,
-                };
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    agent.reconfigure_network(&cmd),
-                )
-                .await
-                .map_err(|_| VmmError::Vsock("net reconfig after resume timed out".into()))
-                .and_then(|r| r)?;
-            }
-
-            journal(pid, cow_handle.as_ref(), lease.as_ref())?;
-            Ok(ResumedRuntime {
-                prepared: prepared.take().expect("prepared set above"),
-                handle,
-                net_identity: identity,
-                network: lease.take(),
-                cow_handle: cow_handle.take(),
-                ip_address,
-            })
-        }
-        .await;
-
-        match attempt {
-            Ok(resumed) => Ok(resumed),
-            Err(error) => {
-                let unwound = self
-                    .unwind_resume(id, vm_dir, jailer, prepared, cow_handle, lease)
-                    .await;
-                Err(ResumeFailure { error, unwound })
-            }
-        }
-    }
-
-    /// Best-effort release of everything a failed resume re-created,
-    /// restoring the on-disk shape of a cleanly paused sandbox.
-    ///
-    /// Returns true when the sandbox can safely go back to `Paused`.
-    async fn unwind_resume(
-        &self,
-        id: &SandboxId,
-        vm_dir: &Path,
-        jailer: &crate::config::JailerConfig,
-        prepared: Option<Arc<dyn PreparedVm>>,
-        cow_handle: Option<CowHandle>,
-        net_lease: Option<NetworkLease>,
-    ) -> bool {
-        let mut clean = true;
-
-        if let Some(prepared) = prepared {
-            // SIGKILL plus the driver's bounded wait for the reaper.
-            if let Err(error) = prepared.discard().await {
-                warn!(sandbox_id = %id, error = %error, "resume unwind: the vmm did not exit");
-                clean = false;
-            }
-        }
-
-        if let Some(handle) = cow_handle
-            && let Err(error) = self.cow_manager.detach_keep_cow(&handle).await
-        {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: overlay detach failed");
-            clean = false;
-        }
-
-        // Copy-mode fallback: park the staged rootfs back in vm_dir so the
-        // retained disk state survives the chroot removal below.
-        let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        let cr = chroot_root(&self.config.firecracker.binary, base, id);
-        let staged = cr.join("rootfs.ext4");
-        if !self.preserved_cow_file(id).exists() && staged.exists() {
-            if let Err(error) = move_file(&staged, &vm_dir.join(PAUSED_ROOTFS_FILE)).await {
-                warn!(sandbox_id = %id, error = %error, "resume unwind: parking rootfs failed");
-                clean = false;
-            }
-        }
-
-        if let Some(lease) = net_lease
-            && let Err(error) = self.network.quarantine(lease).await
-        {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: network quarantine failed");
-            clean = false;
-        }
-
-        if let Some(parent) = cr.parent()
-            && let Err(error) = tokio::fs::remove_dir_all(parent).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: chroot removal failed");
-            clean = false;
-        }
-
-        if clean && let Err(error) = super::reconcile::clear_state_record(vm_dir) {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: journal removal failed");
-            clean = false;
-        }
-        clean
-    }
-
-    fn preserved_cow_file(&self, id: &str) -> PathBuf {
-        PathBuf::from(&self.config.firecracker.data_dir)
-            .join("cow")
-            .join(format!("arcbox-cow-{id}.img"))
-    }
-
     /// Locate a paused sandbox's retained artifacts.
     ///
     /// Pure field reads — no filesystem access — so it is the only half of
@@ -878,7 +530,7 @@ impl SandboxManager {
     pub(super) fn paused_artifacts(&self, inst: &SandboxInstance) -> PausedArtifacts {
         PausedArtifacts {
             pause_snapshot_id: inst.pause_snapshot_id.clone(),
-            preserved_cow: self.preserved_cow_file(&inst.id),
+            preserved_cow: super::preserved_cow_file(&self.config, &inst.id),
             parked_rootfs: inst.vm_dir.join(PAUSED_ROOTFS_FILE),
         }
     }
@@ -925,6 +577,7 @@ impl PausedArtifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::SnapshotDraft;
 
     async fn manager(data_dir: &Path) -> SandboxManager {
         let mut config = VmmConfig::default();

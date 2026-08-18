@@ -15,5 +15,5 @@ pub(super) mod pool;
 /// machine seeds itself from [`recovery::plan`]'s verdicts and asserts
 /// against that function rather than a copy of it.
 pub mod recovery;
-pub(super) mod settle;
+pub mod settle;
 pub(super) mod warm;

@@ -316,10 +316,10 @@ pub(super) async fn release_runtime_resources(
 /// Keyed by the adopted pool slot id when the sandbox claimed a pre-warmed
 /// slot (CORE-78), by the sandbox id otherwise. Shared with the pause path,
 /// which releases the same chroot while keeping the disk.
-pub(super) async fn remove_jailer_chroot(
+pub async fn remove_jailer_chroot(
     id: &str,
     arc: &Arc<Mutex<SandboxInstance>>,
-    config: &Arc<VmmConfig>,
+    config: &VmmConfig,
 ) -> Result<()> {
     let Some(ref jc) = config.firecracker.jailer else {
         return Ok(());
@@ -338,7 +338,7 @@ pub(super) async fn remove_jailer_chroot(
 }
 
 /// Id the sandbox's jailer chroot and dm/CoW resources are named after.
-pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> String {
+pub fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> String {
     arc.lock()
         .unwrap()
         .pool_slot_id
@@ -364,10 +364,7 @@ pub(super) fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Strin
 /// bounded wait elapsed) restores whichever grip it took, and keeps the
 /// handle, so a retry can finish the job. Idempotent — both are `take()`n,
 /// and killing an exited VM just reports its status.
-pub(super) async fn kill_sandbox_process(
-    id: &str,
-    arc: &Arc<Mutex<SandboxInstance>>,
-) -> Result<()> {
+pub async fn kill_sandbox_process(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Result<()> {
     let (prepared, handle) = {
         let mut inst = arc.lock().unwrap();
         let prepared = inst.prepared.take();

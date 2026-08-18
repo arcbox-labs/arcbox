@@ -116,6 +116,7 @@ pub(super) fn alphabet() -> Vec<Event> {
         Event::RemoveDone,
         Event::Failure,
         Event::Frozen,
+        Event::Stranded,
         Event::VmExited,
         Event::TtlExpired,
         Event::IdleExpired {

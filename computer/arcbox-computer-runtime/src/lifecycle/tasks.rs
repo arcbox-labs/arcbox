@@ -20,7 +20,10 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 pub mod boot;
+pub mod checkpoint;
+pub mod pause;
 pub mod restore;
+pub mod resume;
 
 use super::effect::ReleaseScope;
 use super::event::{Event, RestoreOrigin};
@@ -59,6 +62,15 @@ impl TaskFailure {
     pub(super) fn frozen(error: VmmError) -> Self {
         Self {
             event: Event::Frozen,
+            error,
+        }
+    }
+
+    /// The flow could not unwind what it had allocated, so the computer
+    /// cannot go back to the phase it came from — see [`Event::Stranded`].
+    pub(super) fn stranded(error: VmmError) -> Self {
+        Self {
+            event: Event::Stranded,
             error,
         }
     }

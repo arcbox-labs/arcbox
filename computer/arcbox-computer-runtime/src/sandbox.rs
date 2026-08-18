@@ -14,9 +14,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arcbox_fc_driver::jail::{
-    SnapshotFiles, api_socket_path, chroot_root, link_or_copy_for_jailer, move_file,
-    stage_kernel_for_jailer, stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer,
-    stage_snapshot_files,
+    SnapshotFiles, api_socket_path, chroot_root, stage_kernel_for_jailer,
+    stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
 };
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::net::{
@@ -32,23 +31,23 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::agent::{ClockSync, ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
+use crate::agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 use crate::agent::{GuestAgent, GuestAgentFactory, Readiness, VmProtoAgentFactory};
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
 use crate::network::NetworkManager;
-use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
+use crate::snapshot::SnapshotCatalog;
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::template_catalog::TemplateCatalog;
 
 pub(crate) mod boot;
 mod checkpoint;
-mod cleanup;
+pub(crate) mod cleanup;
 mod execution;
 mod files;
 mod lifecycle;
-mod pause;
+pub(crate) mod pause;
 pub(crate) mod policy;
 pub(crate) mod pool;
 pub(crate) mod reconcile;
@@ -591,6 +590,15 @@ pub(crate) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
         .jailer
         .as_ref()
         .map_or(Ok(IsolationSpec::None), IsolationSpec::try_from)
+}
+
+/// Where a paused computer's retained disk overlay lives: a function of the
+/// data dir and the id, which is why the flows that keep, rename, look for
+/// and delete it can all say it the same way.
+pub(crate) fn preserved_cow_file(config: &VmmConfig, id: &str) -> PathBuf {
+    PathBuf::from(&config.firecracker.data_dir)
+        .join("cow")
+        .join(format!("arcbox-cow-{id}.img"))
 }
 
 /// A catalogued checkpoint as the driver reads it back: the directory the

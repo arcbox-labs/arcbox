@@ -403,6 +403,33 @@ fn resume_reverts_to_paused_when_the_restore_unwinds() {
 }
 
 #[test]
+fn a_resume_that_could_not_unwind_fails_instead_of_parking_at_paused() {
+    // The crash-safety half of the two-valued resume failure: `Paused` is a
+    // promise that the retained state is whole and the computer is
+    // resumable, and a restart sweep reads it that way. A resume that left
+    // resources allocated has not kept that promise.
+    let (mut sm, mut context) = reach(&[
+        Event::Recovered {
+            phase: PersistPhase::Paused,
+        },
+        Event::Resume,
+    ]);
+    let (state, effects) = step(&mut sm, &mut context, &Event::Stranded);
+    assert_eq!(state.to_public(), SandboxState::Failed);
+    assert_eq!(
+        effects,
+        vec![
+            persist(PersistPhase::Failed, Durability::GateJournal),
+            release(ReleaseScope::Runtime),
+            Effect::ClearJournal,
+            Effect::CancelTimer(Timer::Idle),
+            Effect::CancelTimer(Timer::Ttl),
+            Effect::Publish(Notify::Failed),
+        ]
+    );
+}
+
+#[test]
 fn a_stop_drains_through_stopping_and_clears_the_journal() {
     let (mut sm, mut context) = ready_machine();
     let (state, effects) = step(

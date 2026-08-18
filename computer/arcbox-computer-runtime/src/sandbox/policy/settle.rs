@@ -5,7 +5,7 @@
 //! reports — a failed capture is resumed, a successful one is resumed
 //! unless the request asked to hold it — so a guest found frozen where it
 //! should be running has no way back: the port has no resume verb. Every
-//! caller of `super::super::checkpoint::checkpoint_impl` must fail the
+//! caller of `crate::lifecycle::tasks::checkpoint::checkpoint_impl` must fail the
 //! sandbox on [`Settlement::Frozen`] rather than report it usable.
 
 use arcbox_vm_driver::VmState;
@@ -13,7 +13,7 @@ use arcbox_vm_driver::VmState;
 /// What the request asked the driver to do with the guest once the capture
 /// was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::sandbox) enum GuestHold {
+pub enum GuestHold {
     /// Resume it — every checkpoint but pause.
     Resume,
     /// Hold it quiesced: pause's whole point is that the guest must never
@@ -23,14 +23,14 @@ pub(in crate::sandbox) enum GuestHold {
 
 /// Whether the capture produced a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::sandbox) enum Capture {
+pub enum Capture {
     Succeeded,
     Failed,
 }
 
 /// Where the guest ended up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::sandbox) enum Settlement {
+pub enum Settlement {
     /// Running again, or held quiesced on purpose with the capture in hand:
     /// the sandbox is as usable as the request intended.
     AsRequested,
@@ -41,11 +41,7 @@ pub(in crate::sandbox) enum Settlement {
 
 /// Read the settlement off the guest's state, the request's intent, and
 /// whether the capture succeeded.
-pub(in crate::sandbox) fn settlement(
-    state: VmState,
-    hold: GuestHold,
-    capture: Capture,
-) -> Settlement {
+pub fn settlement(state: VmState, hold: GuestHold, capture: Capture) -> Settlement {
     let frozen =
         state == VmState::Quiesced && (hold == GuestHold::Resume || capture == Capture::Failed);
     if frozen {
