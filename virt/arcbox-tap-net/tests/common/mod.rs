@@ -45,3 +45,62 @@ pub fn get_peer_addr(iface: &str) -> Option<String> {
     }
     None
 }
+
+/// Where a stock distro installs `nft`, in the order [`Nftables::discover`]
+/// searches — kept here so a test can also *read* the ruleset it installed.
+#[cfg(target_os = "linux")]
+const NFT_CANDIDATES: &[&str] = &["/usr/sbin/nft", "/sbin/nft"];
+
+/// The `nft` binary to drive, having moved this thread into a private
+/// network namespace — or `None`, with the reason printed.
+///
+/// The namespace is what makes this test safe to run on a workstation:
+/// nftables rulesets are per-netns, so `table ip arcbox` is created,
+/// inspected, and discarded without the host's own ruleset ever seeing it.
+/// It is per-*thread*, so sibling tests keep the netns they started in.
+///
+/// `ARCBOX_REQUIRE_NFT=1` turns a skip into a failure, for hosts known to
+/// have nft (CI) — otherwise the coverage evaporates the day the package
+/// stops being installed.
+#[cfg(target_os = "linux")]
+pub fn nft_in_private_netns(test: &str) -> Option<std::path::PathBuf> {
+    let require = std::env::var("ARCBOX_REQUIRE_NFT").is_ok_and(|v| v == "1");
+    let skip = |reason: String| -> Option<std::path::PathBuf> {
+        assert!(
+            !require,
+            "ARCBOX_REQUIRE_NFT=1 but {test} would skip: {reason}"
+        );
+        eprintln!("SKIP {test} — {reason}");
+        None
+    };
+
+    if !is_root() {
+        return skip("requires root (netfilter, and unshare(CLONE_NEWNET))".into());
+    }
+    let Some(nft) = NFT_CANDIDATES
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|bin| bin.exists())
+    else {
+        return skip(format!("no nft among {}", NFT_CANDIDATES.join(", ")));
+    };
+    // SAFETY: `unshare` is a plain syscall with no memory operands; it moves
+    // this thread into a fresh network namespace and reports failure through
+    // errno, which the caller turns into a skip.
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        let errno = std::io::Error::last_os_error();
+        return skip(format!("unshare(CLONE_NEWNET): {errno}"));
+    }
+    Some(nft)
+}
+
+/// How many rules in `table ip arcbox` carry `tag`. Every rule of one TAP's
+/// translation carries exactly one, so this is that TAP's rule count.
+#[cfg(target_os = "linux")]
+pub fn nft_rules_tagged(nft: &std::path::Path, tag: &str) -> usize {
+    let output = std::process::Command::new(nft)
+        .args(["-j", "-a", "list", "table", "ip", "arcbox"])
+        .output()
+        .expect("run nft");
+    String::from_utf8_lossy(&output.stdout).matches(tag).count()
+}
