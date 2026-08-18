@@ -200,4 +200,8 @@ impl ComputerTasks for ComputerFlows {
     async fn release(&self, scope: ReleaseScope) -> TaskResult {
         self.release_scope(scope).await
     }
+
+    fn adopted_agent(&self) -> Option<Arc<dyn GuestAgent>> {
+        self.agent().ok()
+    }
 }

@@ -63,6 +63,22 @@ impl SandboxManager {
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
+        self.capture_checkpoint(sandbox_id, name, labels).await
+    }
+
+    /// [`Self::checkpoint_sandbox`] without the reserved-name and
+    /// reserved-label guards, for the catalogs that own those names.
+    ///
+    /// The guards exist to stop a *caller* squatting on the pause
+    /// machinery's snapshot name or the warm cache's lookup label; the
+    /// template catalog's own prewarm writes `arcbox.template`, which is
+    /// exactly what the label guard refuses.
+    pub(super) async fn capture_checkpoint(
+        &self,
+        sandbox_id: &SandboxId,
+        name: String,
+        labels: HashMap<String, String>,
+    ) -> Result<CheckpointInfo> {
         self.mailbox(sandbox_id)?
             .ask(sandbox_id, |reply| Command::Checkpoint {
                 spec: CaptureSpec { name, labels },

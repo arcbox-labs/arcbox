@@ -257,7 +257,7 @@ impl SandboxManager {
         // The prewarm builder is this manager's own computer, captured
         // through the same path a user checkpoint takes.
         let info = self
-            .checkpoint_sandbox(
+            .capture_checkpoint(
                 &id.to_owned(),
                 format!("template-{template}"),
                 HashMap::from([(TEMPLATE_LABEL.to_owned(), template.to_owned())]),

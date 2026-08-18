@@ -502,6 +502,11 @@ impl ComputerActor {
                     .await;
             }
             Seeded::Adopted => {
+                // Published before the state, so no reader ever sees a
+                // `Ready` computer it cannot dial.
+                if let Some(agent) = self.tasks.adopted_agent() {
+                    self.publish_agent(agent);
+                }
                 self.dispatch(&mut machine, Event::Adopted).await;
             }
         }

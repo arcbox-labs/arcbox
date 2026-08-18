@@ -145,4 +145,13 @@ pub trait ComputerTasks: Send + Sync + 'static {
 
     /// Release the resources `scope` names.
     async fn release(&self, scope: ReleaseScope) -> TaskResult;
+
+    /// The agent reaching a computer this process never launched: the one
+    /// the startup sweep took back, whose handle it already holds.
+    ///
+    /// Every other computer's agent arrives with the flow that produced it.
+    /// An adopted one runs no flow at all, and the data plane reads the
+    /// agent off the snapshot — so without this an adopted computer would be
+    /// `Ready` and undialable, which is most of what adoption is for.
+    fn adopted_agent(&self) -> Option<Arc<dyn GuestAgent>>;
 }

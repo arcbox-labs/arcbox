@@ -448,6 +448,7 @@ pub(super) async fn live_sandbox_with(
         launch: Launch::Reinstated,
         seeded: Seeded::Adopted,
     });
+    await_state(manager, id, SandboxState::Ready).await;
     (shared, handle)
 }
 

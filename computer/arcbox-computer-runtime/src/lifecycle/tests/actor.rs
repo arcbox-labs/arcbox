@@ -179,6 +179,10 @@ impl ComputerTasks for Script {
         Ok(())
     }
 
+    fn adopted_agent(&self) -> Option<Arc<dyn GuestAgent>> {
+        Some(Arc::clone(&self.agent))
+    }
+
     async fn release(&self, _scope: ReleaseScope) -> TaskResult {
         self.record("release");
         if self.release_fails.load(Ordering::SeqCst) {

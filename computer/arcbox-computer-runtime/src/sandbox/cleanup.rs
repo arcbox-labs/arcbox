@@ -68,6 +68,45 @@ mod tests {
         assert_eq!(probe.teardown_count(), 1);
     }
 
+    /// A computer the startup sweep took back must be usable, not merely
+    /// listed: it runs no flow in this process, so nothing publishes the
+    /// agent the exec path reads unless the seeding does.
+    ///
+    /// The unit-scale half of the CORE-135 acceptance test, which proves the
+    /// same thing across a real process boundary.
+    #[tokio::test]
+    async fn an_adopted_computer_serves_an_exec() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (manager, driver, _probe, agents) =
+            super::super::testing::fake_manager_with_agent(data_dir.path(), None).await;
+        agents.on(
+            &["echo", "still here"],
+            crate::testkit::agent::Reply::stdout(b"still here".to_vec()),
+        );
+        super::super::testing::live_sandbox(&manager, &driver, "adopted").await;
+
+        let mut output = manager
+            .run_in_sandbox(
+                &"adopted".to_owned(),
+                vec!["echo".into(), "still here".into()],
+                HashMap::new(),
+                String::new(),
+                String::new(),
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect("an adopted computer is dialable");
+        let mut stdout = Vec::new();
+        while let Some(chunk) = output.recv().await {
+            if let crate::agent::OutputChunk::Stdout(data) = chunk.unwrap() {
+                stdout.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(stdout, b"still here");
+    }
+
     #[tokio::test]
     async fn force_remove_tears_down_cow_after_blocked_boot() {
         let data_dir = tempfile::tempdir().unwrap();

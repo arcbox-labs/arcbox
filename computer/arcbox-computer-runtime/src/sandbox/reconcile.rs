@@ -1977,13 +1977,11 @@ mod tests {
             Some("10.200.0.9".to_owned()),
             "the lease came back"
         );
-        // The guest is reachable again: an adopted computer never booted in
-        // this process, so its agent is built from the handle the sweep
-        // reclaimed and the identity its own boot described it with.
-        assert!(
-            keeper.agent.is_some() || keeper.handle.is_some(),
-            "the adopted guest is dialable"
-        );
+        // Dialable, not merely `Ready`: an adopted computer runs no flow, so
+        // nothing else would ever publish the agent the data plane reads off
+        // this snapshot — and a `Ready` computer nobody can exec into is
+        // most of what adoption exists to prevent.
+        assert!(keeper.agent.is_some(), "the adopted guest is dialable");
         assert_eq!(
             network.adopted_mode(&VmId::new("keeper").unwrap()),
             Some(AttachMode::Invariant),
