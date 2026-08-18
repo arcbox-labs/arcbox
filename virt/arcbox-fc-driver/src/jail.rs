@@ -6,7 +6,8 @@
 //! checkpoint's vmstate and mem — is staged in first, owned by the jailed
 //! uid/gid, and named to Firecracker by its chroot-relative path. This
 //! module is that staging: the layout, and one primitive per way a file
-//! can be brought in (hard link or copy, plain copy, block-device node).
+//! can be brought in (hard link or copy, plain copy, block-device node,
+//! or the file itself moved in when the caller gives it up).
 
 use std::path::{Path, PathBuf};
 
@@ -87,6 +88,35 @@ pub fn api_socket_path(chroot_root: &Path) -> PathBuf {
 /// [`VSOCK_UDS_IN_JAIL`].
 pub fn vsock_uds_path(chroot_root: &Path) -> PathBuf {
     chroot_root.join("run/firecracker.vsock")
+}
+
+/// What AF_UNIX leaves for a path: `sun_path` is 108 bytes, and the last
+/// one is the terminator.
+const SUN_PATH: usize = 107;
+
+/// The longest VM id this jailer layout leaves room for.
+///
+/// The id is a directory component of the chroot, and the longest path
+/// under it that has a hard limit is the API socket — the jail's two
+/// sockets both live in `{jail}/run/`, and `firecracker.socket` is the
+/// longer name. A chroot base that spends the budget makes that socket
+/// unaddressable, and nothing says so: the jailer creates the path and
+/// Firecracker binds it from inside the chroot, where the name is short,
+/// while every `connect` from the host fails. What that looks like is a
+/// VMM that is up and answering nothing — a boot that timed out.
+///
+/// Saturating on purpose. A base deep enough to spend all 107 bytes
+/// leaves room for no id at all, and `0` is the answer that says so; the
+/// subtraction wrapping into a huge budget would hand out ids that cannot
+/// work. A chroot base under a deep temporary directory reaches this in
+/// tests long before production does.
+pub fn id_budget(fc_binary: impl AsRef<Path>, chroot_base_dir: impl AsRef<Path>) -> usize {
+    // Everything around the id, measured on a one-byte id.
+    let fixed = api_socket_path(&chroot_root(fc_binary, chroot_base_dir, "x"))
+        .as_os_str()
+        .len()
+        .saturating_sub(1);
+    SUN_PATH.saturating_sub(fixed)
 }
 
 /// Where the vsock Unix socket lives from inside the jail.
@@ -207,6 +237,29 @@ pub async fn copy_for_jailer(src: &Path, dst: &Path, uid: u32, gid: u32) -> Resu
     Ok(())
 }
 
+/// Move a file the caller hands over into the jail and give it to the
+/// jailed uid/gid — the file itself, not a copy of it, so a disk the size
+/// of a guest's rootfs comes back without being duplicated.
+///
+/// A stale entry at the destination is removed first, exactly as a copy or
+/// a device node would: a `rename` onto a directory left by a crash fails,
+/// and one onto a stale block device node would replace it silently.
+pub async fn move_into_jail(src: &Path, dst: &Path, uid: u32, gid: u32) -> Result<()> {
+    if let Err(e) = tokio::fs::remove_file(dst).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::Io(e));
+    }
+    move_file(src, dst).await.map_err(Error::Io)?;
+    chown(dst, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(|source| {
+        FcError::Chown {
+            path: dst.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(())
+}
+
 /// Create a block device node in the jailer chroot pointing to a dm device.
 ///
 /// Returns the chroot-relative rootfs path (`"/rootfs.ext4"`).
@@ -277,6 +330,7 @@ pub async fn apply(jail: &Jail, plans: &[StagePlan]) -> Result<()> {
             StageKind::BlockNode => {
                 mknod_for_jailer(&plan.src, &plan.dst, jail.uid, jail.gid).await?;
             }
+            StageKind::Move => move_into_jail(&plan.src, &plan.dst, jail.uid, jail.gid).await?,
             StageKind::Alias => alias_in_jail(&plan.src, &plan.dst, jail.uid, jail.gid).await?,
         }
     }
@@ -368,6 +422,62 @@ mod tests {
             Some("/snapshots/abc/vmstate")
         );
         assert_eq!(jail.view(Path::new("/images/vmlinux")), None);
+    }
+
+    #[test]
+    fn the_id_budget_is_what_the_socket_leaves_and_never_wraps() {
+        let budget = id_budget("/opt/fc/firecracker", "/srv/jailer");
+        assert_eq!(
+            budget,
+            SUN_PATH - "/srv/jailer/firecracker//root/run/firecracker.socket".len()
+        );
+        // An id of exactly the budget fills `sun_path` and no more.
+        let fits = api_socket_path(&chroot_root(
+            "/opt/fc/firecracker",
+            "/srv/jailer",
+            &"a".repeat(budget),
+        ));
+        assert_eq!(fits.as_os_str().len(), SUN_PATH);
+
+        // A chroot base deep enough spends the whole budget: zero, not a
+        // wrap into a length that would look generous and never connect.
+        // A temp dir a few levels down is already most of the way there,
+        // which is how a test suite meets this before production does.
+        let deep = PathBuf::from("/").join("d".repeat(200));
+        assert_eq!(id_budget("/opt/fc/firecracker", deep), 0);
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_file_is_moved_in_and_replaces_what_it_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let parked = dir.path().join("parked.ext4");
+        std::fs::write(&parked, b"the disk itself").unwrap();
+        let root = dir.path().join("jail/firecracker/box/root");
+        std::fs::create_dir_all(&root).unwrap();
+        // A leftover at the destination from the run that parked it.
+        std::fs::write(root.join("rootfs.ext4"), b"stale").unwrap();
+        let jail = Jail {
+            root: root.clone(),
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+        };
+
+        apply(
+            &jail,
+            &[StagePlan {
+                src: parked.clone(),
+                dst: root.join("rootfs.ext4"),
+                kind: StageKind::Move,
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("rootfs.ext4")).unwrap(),
+            b"the disk itself"
+        );
+        assert!(!parked.exists(), "a handed-over disk is moved, not copied");
     }
 
     #[tokio::test]

@@ -1,13 +1,14 @@
 //! [`FcPrepared`]: a spawned Firecracker waiting for a spec — the port's
 //! [`PreparedVm`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arcbox_vm_driver::{
-    CheckpointImage, Error, ExitStatus, IsolationSpec, PreparedVm, ProcessRecord, RestoreSpec,
-    Result, VmHandle, VmId, VmRecord, VmSpec, VmState, VsockListen, VsockListener,
+    CheckpointImage, DiskSource, Error, ExitStatus, IsolationSpec, PreparedVm, ProcessRecord,
+    RestoreSpec, Result, Staging, VmHandle, VmId, VmRecord, VmSpec, VmState, VsockListen,
+    VsockListener,
 };
 use async_trait::async_trait;
 use fc_sdk::VmBuilder;
@@ -17,7 +18,7 @@ use crate::error::FcError;
 use crate::handle::FcHandle;
 use crate::listener::VsockEndpoint;
 use crate::process::FcProcess;
-use crate::render::{self, VmLayout};
+use crate::render::{self, StageKind, VmLayout};
 use crate::{NAME, api, jail, listener, spawn};
 
 /// A spawned VMM process with its API socket up and nothing loaded yet.
@@ -113,6 +114,23 @@ impl FcPrepared {
         Ok(())
     }
 
+    /// Brings `src` into the jail at `in_jail` and answers with the host
+    /// path it landed at — the path a spec must name for it, which
+    /// rendering then passes to Firecracker chroot-relative.
+    ///
+    /// Goes through [`VmLayout::place`] rather than staging directly, so
+    /// every path decision stays in `render`: without a jail this is the
+    /// identity, and a source already inside the jail is named where it is
+    /// instead of being copied onto itself.
+    async fn bring_in(&self, src: &Path, in_jail: &str, kind: StageKind) -> Result<PathBuf> {
+        let mut stage = Vec::new();
+        let named = self.layout.place(src, in_jail, kind, &mut stage)?;
+        if let Some(jail) = self.layout.jail() {
+            jail::apply(jail, &stage).await?;
+        }
+        Ok(self.layout.host_view(&named))
+    }
+
     fn handle(&self, client: fc_sdk::Client, has_vsock: bool) -> FcHandle {
         self.consumed.store(true, Ordering::Release);
         FcHandle::new(
@@ -149,6 +167,10 @@ impl PreparedVm for FcPrepared {
     }
 
     fn vsock_listener(&self) -> Option<&dyn VsockListen> {
+        Some(self)
+    }
+
+    fn staging(&self) -> Option<&dyn Staging> {
         Some(self)
     }
 
@@ -225,8 +247,100 @@ impl PreparedVm for FcPrepared {
         Ok(Box::new(self.handle(client, has_vsock)))
     }
 
+    /// Kills the VMM, then removes the jail the spawn created — the whole
+    /// `{chroot base}/{binary}/{id}` tree, staged files and all.
+    ///
+    /// The kill comes first: a live Firecracker holds its disks open, and
+    /// the jail is its root. Removal failures are reported rather than
+    /// warned about, because the caller's remedy is to call again — this
+    /// is idempotent, and a second kill just reports the same status.
     async fn discard(&self) -> Result<ExitStatus> {
-        Ok(self.process.kill().await?)
+        let status = self.process.kill().await?;
+        if let Some(jail) = self.layout.jail()
+            && let Some(dir) = jail.root.parent()
+            && let Err(e) = tokio::fs::remove_dir_all(dir).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(Error::Io(e));
+        }
+        Ok(status)
+    }
+}
+
+/// The jail is the staging area: files land under its root, named as
+/// [`render`] would have named them for a boot, so a spec that carries
+/// what these hand back is rendered without staging anything twice.
+/// Without a jail every verb is the identity — the VMM reads host paths as
+/// they are, and there is nothing to bring anywhere.
+#[async_trait]
+impl Staging for FcPrepared {
+    async fn stage_kernel(&self, src: &Path) -> Result<PathBuf> {
+        self.bring_in(src, render::KERNEL_FILE, StageKind::LinkOrCopy)
+            .await
+    }
+
+    async fn stage_disk(&self, id: &str, source: DiskSource<'_>) -> Result<PathBuf> {
+        let kind = match source {
+            DiskSource::Device(_) => StageKind::BlockNode,
+            // Never a hard link: Firecracker writes guest blocks into a
+            // disk, and a link would write them into the caller's file.
+            DiskSource::Image(_) => StageKind::Copy,
+            DiskSource::Handover(_) => StageKind::Move,
+        };
+        self.bring_in(source.path(), &render::disk_file(id), kind)
+            .await
+    }
+
+    async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool> {
+        let Some(jail) = self.layout.jail() else {
+            return Ok(false);
+        };
+        let staged = jail.root.join(render::disk_file(id));
+        if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
+            return Ok(false);
+        }
+        // The jail is its own vfsmount, so this crosses one even on the
+        // same filesystem; `move_file` handles the EXDEV that follows.
+        jail::move_file(&staged, dst).await.map_err(Error::Io)?;
+        Ok(true)
+    }
+
+    async fn stage_checkpoint(&self, image: &CheckpointImage) -> Result<CheckpointImage> {
+        let Some(jail) = self.layout.jail() else {
+            return Ok(image.clone());
+        };
+        if jail.view(&image.dir).is_some() {
+            return Ok(image.clone());
+        }
+        let name = image
+            .dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::InvalidSpec(format!(
+                    "{NAME}: checkpoint dir {} has no usable name",
+                    image.dir.display()
+                ))
+            })?;
+        let in_jail = render::checkpoint_dir(name);
+        // Both files are read-only to Firecracker (mem is mapped
+        // MAP_PRIVATE on load), so a root jailer links instead of copying
+        // — the mem file is the guest's whole memory.
+        self.bring_in(
+            &image.dir.join("vmstate"),
+            &format!("{in_jail}/vmstate"),
+            StageKind::LinkOrCopy,
+        )
+        .await?;
+        let mem = image.dir.join("mem");
+        if tokio::fs::try_exists(&mem).await.unwrap_or(false) {
+            self.bring_in(&mem, &format!("{in_jail}/mem"), StageKind::LinkOrCopy)
+                .await?;
+        }
+        Ok(CheckpointImage {
+            dir: jail.root.join(&in_jail),
+            ..image.clone()
+        })
     }
 }
 

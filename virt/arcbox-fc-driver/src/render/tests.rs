@@ -321,6 +321,33 @@ fn jailer_mode_stages_outside_files_and_relativizes_inside_ones() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_boot_whose_files_are_already_staged_plans_no_staging() {
+    // What `Staging` puts in the jail lands at the names rendering uses,
+    // so a spec carrying them is rendered without staging a second copy —
+    // the property a warm slot's pre-staged boot depends on. Both sides
+    // read the same names from `KERNEL_FILE` / `disk_file`.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("jail");
+    let root = base.join("firecracker/box/root");
+    std::fs::create_dir_all(&root).unwrap();
+    let kernel = root.join(KERNEL_FILE);
+    let rootfs = root.join(disk_file("rootfs"));
+    std::fs::write(&kernel, b"kernel").unwrap();
+    std::fs::write(&rootfs, b"disk").unwrap();
+
+    let mut s = spec("box", jailed(&base), rootfs);
+    s.boot = BootSpec::Kernel {
+        image: kernel,
+        cmdline: "console=ttyS0".into(),
+        initrd: None,
+    };
+    let plan = fc_config(&s, &config(), Path::new("/run/vms/box")).unwrap();
+    assert!(plan.stage.is_empty(), "{:?}", plan.stage);
+    assert_eq!(plan.boot_source.kernel_image_path, "/vmlinux");
+    assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
+}
+
+#[test]
 fn jailer_mode_mirrors_a_block_device_as_a_node() {
     use std::os::unix::fs::FileTypeExt as _;
     let Some(device) = std::fs::read_dir("/dev")
