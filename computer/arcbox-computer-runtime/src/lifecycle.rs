@@ -55,7 +55,10 @@
     reason = "R3 PR-E lands the HSM with its tests; PR-F wires the actor"
 )]
 
-mod actor;
+/// `pub` in the lint's spelling only, as `tasks` below: the manager
+/// constructs and addresses actors, and `lifecycle` is private, so this
+/// reaches the crate and no further.
+pub mod actor;
 mod effect;
 mod event;
 mod machine;

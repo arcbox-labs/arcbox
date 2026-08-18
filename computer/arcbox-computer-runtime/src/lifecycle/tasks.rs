@@ -30,6 +30,7 @@ use super::effect::ReleaseScope;
 use super::event::{Event, RestoreOrigin};
 use crate::agent::GuestAgent;
 use crate::error::VmmError;
+use crate::sandbox::CheckpointInfo;
 use crate::sandbox::record::SandboxProvisionOutcome;
 
 /// What a sub-task hands back: its own success value, or the failure class
@@ -122,14 +123,15 @@ pub(super) trait ComputerTasks: Send + Sync + 'static {
     /// Capture a checkpoint. `hold` keeps the guest quiesced afterwards (the
     /// pause path): progress past the memory image would diverge from the
     /// retained disk overlay.
-    async fn checkpoint(&self, hold: bool) -> TaskResult<String>;
+    async fn checkpoint(&self, hold: bool) -> TaskResult<CheckpointInfo>;
 
     /// Restore a paused computer in place, back onto a fresh network.
     async fn resume(&self) -> TaskResult<Arc<dyn GuestAgent>>;
 
-    /// Drain the workload, shut the guest down, and release its runtime
-    /// resources within `budget`.
-    async fn stop(&self, budget: Duration) -> TaskResult;
+    /// Shut the guest down and release its runtime resources within
+    /// `budget`. `drain` gives a running workload the budget to finish
+    /// first.
+    async fn stop(&self, budget: Duration, drain: bool) -> TaskResult;
 
     /// Release the resources `scope` names.
     async fn release(&self, scope: ReleaseScope) -> TaskResult;

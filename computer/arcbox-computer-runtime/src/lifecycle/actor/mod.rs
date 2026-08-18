@@ -58,7 +58,7 @@ use crate::sandbox::record::{
 };
 use crate::sandbox::types::action;
 use crate::sandbox::workload::WorkloadClaim;
-use crate::sandbox::{IdleAction, SandboxEvent, SandboxId, SandboxState};
+use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxId, SandboxState};
 
 mod commands;
 mod effects;
@@ -86,9 +86,9 @@ pub(super) enum Command {
         outcome: SandboxProvisionOutcome,
         reply: Reply,
     },
-    /// Capture a user checkpoint; answered with the catalog id.
+    /// Capture a user checkpoint; answered with the catalog entry.
     Checkpoint {
-        reply: oneshot::Sender<Result<String>>,
+        reply: oneshot::Sender<Result<CheckpointInfo>>,
     },
     Pause {
         reason: PauseReason,
@@ -113,10 +113,13 @@ pub(super) enum Command {
         claim: WorkloadClaim,
         reply: Reply,
     },
-    /// The workload's exit chunk arrived.
+    /// The workload ended.
     WorkloadExited {
-        status: ExitStatus,
+        outcome: WorkloadOutcome,
     },
+    /// The dispatch a claim was taken for failed, so the slot goes back
+    /// without a workload having run.
+    ReleaseWorkload,
     /// Replace the deadline policy (`SetLifecycle`, CORE-60).
     SetLifecycle {
         deadlines: Deadlines,
@@ -124,6 +127,15 @@ pub(super) enum Command {
     },
     /// The guest went away without being asked to.
     VmExited,
+}
+
+/// How a workload ended: with a status, or with its session broken before
+/// one arrived. `execution::run_session`'s two branches; both leave the
+/// computer idle, and only the attributes of the IDLE event differ.
+#[derive(Debug, Clone)]
+pub(super) enum WorkloadOutcome {
+    Exited(ExitStatus),
+    Broke(String),
 }
 
 /// The deadline policy of one computer: the hard lifetime cap, and the idle
@@ -167,7 +179,7 @@ enum Report {
     Restored(Arc<dyn GuestAgent>, SandboxProvisionOutcome),
     Resumed(Arc<dyn GuestAgent>),
     Gated,
-    Captured(String),
+    Captured(CheckpointInfo),
     Released(ReleaseScope),
     Stopped,
     Failed(TaskFailure),
@@ -223,6 +235,7 @@ pub(super) struct ComputerActor {
     records: Arc<SandboxRecordStore>,
     events_tx: broadcast::Sender<SandboxEvent>,
     tasks: Arc<dyn ComputerTasks>,
+    seeded: Seeded,
     commands: mpsc::UnboundedReceiver<Command>,
     completions_tx: mpsc::UnboundedSender<Completion>,
     completions: mpsc::UnboundedReceiver<Completion>,
@@ -233,7 +246,7 @@ pub(super) struct ComputerActor {
     /// drain ends: a refused durable write fails the flow that asked for it.
     queued: VecDeque<Event>,
     waiters: Vec<(Answer, Reply)>,
-    capture_reply: Option<oneshot::Sender<Result<String>>>,
+    capture_reply: Option<oneshot::Sender<Result<CheckpointInfo>>>,
     /// A graceful stop asked for while a launch was in flight, dispatched as
     /// soon as the launch resolves. Today's `stop_sandbox` answers
     /// `WrongState` there; deferring is what the engine's actor does and what
@@ -256,7 +269,7 @@ pub(super) struct ComputerActor {
     /// Attributes of the events a transition asks for.
     pause_reason: PauseReason,
     resume_reason: String,
-    exit_status: Option<ExitStatus>,
+    exit: Option<WorkloadOutcome>,
     /// A visible-but-unconfirmed durable write, reported to the next caller
     /// the flow answers.
     unconfirmed: Option<String>,
@@ -280,6 +293,19 @@ pub(super) struct ComputerActor {
     timers_enabled: watch::Receiver<bool>,
 }
 
+/// How a computer's machine starts.
+///
+/// A fresh one is provisioned by its caller. The other two are the startup
+/// sweep's: `Recovered` adopts the phase recovery left in the record, and
+/// `Adopted` is the computer whose VM the sweep took back — already usable,
+/// having never booted in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seeded {
+    Fresh,
+    Recovered(PersistPhase),
+    Adopted,
+}
+
 /// What one actor is built from.
 pub(super) struct ComputerSeed {
     pub(super) id: SandboxId,
@@ -290,6 +316,7 @@ pub(super) struct ComputerSeed {
     pub(super) tasks: Arc<dyn ComputerTasks>,
     pub(super) deadlines: Deadlines,
     pub(super) timers_enabled: watch::Receiver<bool>,
+    pub(super) seeded: Seeded,
 }
 
 impl ComputerActor {
@@ -306,6 +333,7 @@ impl ComputerActor {
             records: seed.records,
             events_tx: seed.events_tx,
             tasks: seed.tasks,
+            seeded: seed.seeded,
             commands,
             completions_tx,
             completions,
@@ -324,7 +352,7 @@ impl ComputerActor {
             outcome: SandboxProvisionOutcome::default(),
             pause_reason: PauseReason::Requested,
             resume_reason: crate::sandbox::pause_reason::RESUME.to_owned(),
-            exit_status: None,
+            exit: None,
             unconfirmed: None,
             answer_error: None,
             clear_journal_after_release: false,
@@ -344,6 +372,21 @@ impl ComputerActor {
             .init_with_context(&mut self.effects);
         drop(self.effects.take());
         self.publish_state(*machine.state());
+        // The sweep's computers start where recovery left them, and their
+        // deadlines are re-armed from the record — `resync_lifecycle_timers`
+        // after the startup sweep, without the epoch-stamped slots it needed
+        // to tell a stale timer from a live one.
+        match self.seeded {
+            Seeded::Fresh => {}
+            Seeded::Recovered(phase) => {
+                self.dispatch(&mut machine, Event::Recovered { phase })
+                    .await;
+            }
+            Seeded::Adopted => {
+                self.dispatch(&mut machine, Event::Adopted).await;
+            }
+        }
+        self.rearm(*machine.state());
 
         loop {
             tokio::select! {

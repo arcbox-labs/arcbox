@@ -86,6 +86,10 @@ impl ComputerLifecycle {
                 PersistPhase::Paused => Transition(State::paused()),
                 PersistPhase::Removing => Transition(State::removing()),
             },
+            // The sweep took the VM back with everything it was running on,
+            // so this computer is usable from here without a launch — the
+            // record already says `Ready` and recovery left it that way.
+            Event::Adopted => Transition(State::ready()),
             Event::Remove { force: false } => Handled,
             _ => Super,
         }
@@ -206,6 +210,18 @@ impl ComputerLifecycle {
                 context.emit(Effect::Publish(Notify::Running));
                 Transition(State::gating(*committed, true))
             }
+            // The dispatch the claim was taken for failed: the slot goes
+            // back, and nothing was announced to take back.
+            Event::WorkloadReleased if *claimed => Transition(State::gating(*committed, false)),
+            // A restore's gate runs *after* its atomic commit, so its failure
+            // is unwound with the post-commit verb: force-remove, freeing the
+            // id and its request key so a warm create can fall back to a cold
+            // boot (`restore_from_snapshot`'s probe branch). A cold boot's
+            // gate is pre-commit and parks at `failed` through `computer`.
+            Event::Failure | Event::Frozen | Event::Stranded if *committed => {
+                context.removal();
+                Transition(State::removing())
+            }
             Event::ClaimWorkload { .. } | Event::Remove { force: false } => Handled,
             _ => Super,
         }
@@ -215,12 +231,7 @@ impl ComputerLifecycle {
     fn active(event: &Event, context: &mut Effects) -> Outcome {
         match event {
             Event::Stop { budget_ms } => {
-                context.persist(PersistPhase::Stopping, Durability::Warn);
-                context.emit(Effect::CancelTimer(Timer::Idle));
-                context.emit(Effect::Publish(Notify::Stopping));
-                context.emit(Effect::SpawnStop {
-                    budget_ms: *budget_ms,
-                });
+                context.stop(*budget_ms, false);
                 Transition(State::stopping())
             }
             _ => Super,
@@ -273,6 +284,17 @@ impl ComputerLifecycle {
                 context.emit(Effect::Publish(Notify::Idle));
                 context.emit(Effect::ArmTimer(Timer::Idle));
                 Transition(State::ready())
+            }
+            // Nothing ran, so nothing is announced — the difference from
+            // `WorkloadExited`, which owes an IDLE for the workload that did.
+            Event::WorkloadReleased => {
+                context.emit(Effect::ArmTimer(Timer::Idle));
+                Transition(State::ready())
+            }
+            // The only stop that has a workload to drain first.
+            Event::Stop { budget_ms } => {
+                context.stop(*budget_ms, true);
+                Transition(State::stopping())
             }
             // One workload at a time, and neither pause nor checkpoint may
             // freeze a guest that is running one.

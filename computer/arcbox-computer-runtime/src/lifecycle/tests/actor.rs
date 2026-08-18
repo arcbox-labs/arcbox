@@ -18,13 +18,15 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
-use crate::lifecycle::actor::{Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines};
+use crate::lifecycle::actor::{
+    Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Seeded,
+};
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::event::{Provision, RestoreOrigin};
 use crate::lifecycle::tasks::{ComputerTasks, TaskFailure, TaskResult};
 use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
-use crate::sandbox::{IdleAction, SandboxEvent, SandboxState};
+use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxState};
 use crate::testkit::agent::FakeAgentFactory;
 
 /// What the fake boot does with its resource handoff — the only sub-task the
@@ -153,9 +155,13 @@ impl ComputerTasks for Script {
         Ok((Arc::clone(&self.agent), SandboxProvisionOutcome::default()))
     }
 
-    async fn checkpoint(&self, _hold: bool) -> TaskResult<String> {
+    async fn checkpoint(&self, _hold: bool) -> TaskResult<CheckpointInfo> {
         self.record("checkpoint");
-        Ok("snap".to_owned())
+        Ok(CheckpointInfo {
+            snapshot_id: "snap".to_owned(),
+            snapshot_dir: String::new(),
+            created_at: String::new(),
+        })
     }
 
     async fn resume(&self) -> TaskResult<Arc<dyn GuestAgent>> {
@@ -163,7 +169,7 @@ impl ComputerTasks for Script {
         Ok(Arc::clone(&self.agent))
     }
 
-    async fn stop(&self, _budget: Duration) -> TaskResult {
+    async fn stop(&self, _budget: Duration, _drain: bool) -> TaskResult {
         self.record("stop");
         Ok(())
     }
@@ -226,6 +232,7 @@ impl Harness {
             tasks: Arc::clone(&script) as Arc<dyn ComputerTasks>,
             deadlines,
             timers_enabled,
+            seeded: Seeded::Fresh,
         };
         let actor = tokio::spawn(ComputerActor::new(seed, commands_rx, snapshot_tx).run());
         Self {

@@ -9,6 +9,7 @@ use crate::lifecycle::event::Event;
 use crate::lifecycle::machine::State;
 use crate::sandbox::policy::recovery::{JournalEvidence, RecoveryAction, plan};
 use crate::sandbox::record::PersistPhase;
+use crate::sandbox::workload::WorkloadClaim;
 use crate::sandbox::{IdleAction, SandboxState};
 
 /// `sandbox::policy::recovery::plan`'s verdict for a phase whose journal the
@@ -63,6 +64,36 @@ fn recovery_seeds_the_state_its_own_verdict_leaves_behind() {
             "{phase:?} did not reach a terminal state"
         );
     }
+}
+
+/// The one recovery verdict `Recovered` cannot carry: an adopted computer's
+/// record still says `Ready`, and the sweep took its VM back rather than
+/// tearing it down, so it is usable without ever having booted here. Seeding
+/// it from the phase alone would read `Ready` as the interrupted live phase
+/// it is for every *other* evidence and fail the computer — losing a guest
+/// the sweep had just saved.
+#[test]
+fn an_adopted_computer_is_seeded_ready_without_a_launch() {
+    assert_eq!(
+        plan(PersistPhase::Ready, JournalEvidence::Adopted),
+        RecoveryAction::Reinstate(SandboxState::Ready),
+    );
+    let (sm, mut context) = reach(&[Event::Adopted]);
+    let state = *sm.state();
+    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.durable(), Some(PersistPhase::Ready));
+
+    // And it is a real `ready`, not a look-alike: it accepts work, pauses,
+    // and stops like one that booted here.
+    let mut sm = sm;
+    let (state, _) = step(
+        &mut sm,
+        &mut context,
+        &Event::ClaimWorkload {
+            claim: WorkloadClaim::Api,
+        },
+    );
+    assert_eq!(state.to_public(), SandboxState::Running);
 }
 
 // ----- narrative flows -----

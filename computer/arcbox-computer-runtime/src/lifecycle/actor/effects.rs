@@ -72,7 +72,7 @@ impl ComputerActor {
                 let tasks = Arc::clone(&self.tasks);
                 self.spawn(Handoff::Abortable, async move {
                     match tasks.checkpoint(hold).await {
-                        Ok(snapshot_id) => Report::Captured(snapshot_id),
+                        Ok(info) => Report::Captured(info),
                         Err(failure) => Report::Failed(failure),
                     }
                 });
@@ -88,12 +88,12 @@ impl ComputerActor {
                     }
                 });
             }
-            Effect::SpawnStop { budget_ms } => {
+            Effect::SpawnStop { budget_ms, drain } => {
                 self.forget_agent();
                 let tasks = Arc::clone(&self.tasks);
                 let budget = Duration::from_millis(budget_ms);
                 self.spawn(Handoff::Abortable, async move {
-                    match tasks.stop(budget).await {
+                    match tasks.stop(budget, drain).await {
                         Ok(()) => Report::Stopped,
                         Err(failure) => Report::Failed(failure),
                     }
@@ -281,8 +281,8 @@ impl ComputerActor {
             }
             Notify::Pausing => event.with_attr("reason", self.pause_reason.as_str()),
             Notify::Resumed => event.with_attr("reason", &self.resume_reason.clone()),
-            Notify::Idle => match self.exit_status.take() {
-                Some(status) => {
+            Notify::Idle => match self.exit.take() {
+                Some(WorkloadOutcome::Exited(status)) => {
                     let event =
                         event.with_attr("exit_code", &status.conventional_code().to_string());
                     match status {
@@ -292,6 +292,11 @@ impl ComputerActor {
                         ExitStatus::Code(_) => event,
                     }
                 }
+                // The session broke before an exit chunk arrived. The guest
+                // kills the workload when its host connection drops, so the
+                // computer is idle either way — but there is no status to
+                // report, only why (`execution::abort_workload`).
+                Some(WorkloadOutcome::Broke(error)) => event.with_attr("error", &error),
                 None => event,
             },
             _ => event,

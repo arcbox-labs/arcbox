@@ -125,9 +125,12 @@ impl ComputerActor {
                     }))
                 });
             }
-            Command::WorkloadExited { status } => {
-                self.exit_status = Some(status);
+            Command::WorkloadExited { outcome } => {
+                self.exit = Some(outcome);
                 self.dispatch(machine, Event::WorkloadExited).await;
+            }
+            Command::ReleaseWorkload => {
+                self.dispatch(machine, Event::WorkloadReleased).await;
             }
             Command::SetLifecycle { deadlines, reply } => {
                 // `set_sandbox_lifecycle` refuses a computer on its way out:

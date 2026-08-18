@@ -21,11 +21,9 @@ pub(super) enum Provision {
     },
 }
 
-/// Why a restore is running. Mirrors `sandbox::checkpoint::RestoreOrigin`,
-/// which is `pub(in crate::sandbox)` and so unreachable from here; PR-F
-/// unifies them when the restore task moves into this module.
+/// Why a restore is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RestoreOrigin {
+pub enum RestoreOrigin {
     /// The Restore RPC: the computer announces itself with READY alone.
     Restore,
     /// The warm-create reroute (CORE-77): watchers must see CREATED then
@@ -73,7 +71,13 @@ pub(super) enum Event {
     ClaimWorkload {
         claim: WorkloadClaim,
     },
+    /// The workload ended — with an exit status, or with the session broken
+    /// before one arrived. Both publish IDLE; the actor holds which.
     WorkloadExited,
+    /// The claim was given back without a workload ever running: the guest
+    /// refused the dispatch the claim was taken for. Nothing to announce —
+    /// the computer simply goes back to accepting work.
+    WorkloadReleased,
     // Sub-task completions.
     /// The boot task transferred every cleanup resource onto the computer, so
     /// aborting it can no longer strand one.
@@ -119,4 +123,9 @@ pub(super) enum Event {
     Recovered {
         phase: PersistPhase,
     },
+    /// The startup sweep found this computer's VM still running and took it
+    /// back, with its lease, its disk overlay and its handle. It never
+    /// stopped being usable, and it never booted in this process — the one
+    /// way into `ready` that runs no launch.
+    Adopted,
 }

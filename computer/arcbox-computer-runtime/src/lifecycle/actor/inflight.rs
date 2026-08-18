@@ -192,9 +192,10 @@ impl ComputerActor {
                 Some(Event::Restored)
             }
             Report::Gated => Some(Event::Gated),
-            Report::Captured(snapshot_id) => {
+            Report::Captured(info) => {
+                let snapshot_id = info.snapshot_id.clone();
                 if let Some(reply) = self.capture_reply.take() {
-                    let _ = reply.send(Ok(snapshot_id.clone()));
+                    let _ = reply.send(Ok(info));
                 }
                 self.pause_snapshot_id = Some(snapshot_id.clone());
                 Some(Event::CaptureDone { snapshot_id })
