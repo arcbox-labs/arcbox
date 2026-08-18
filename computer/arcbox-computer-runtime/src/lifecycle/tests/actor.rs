@@ -68,6 +68,7 @@ struct Script {
     restore_finished: AtomicBool,
     restore_fails: AtomicBool,
     checkpoint_takes: Mutex<Option<Duration>>,
+    release_takes: Mutex<Option<Duration>>,
     /// How long the gate holds READY back, which is how a test observes a
     /// computer while its launch is still in flight.
     gate_takes: Mutex<Option<Duration>>,
@@ -86,6 +87,7 @@ impl Script {
             restore_finished: AtomicBool::new(false),
             restore_fails: AtomicBool::new(false),
             checkpoint_takes: Mutex::new(None),
+            release_takes: Mutex::new(None),
             gate_takes: Mutex::new(None),
             cleanup_finished: AtomicBool::new(false),
         })
@@ -201,6 +203,10 @@ impl ComputerTasks for Script {
 
     async fn release(&self, _scope: ReleaseScope) -> TaskResult {
         self.record("release");
+        let takes = *self.release_takes.lock().unwrap();
+        if let Some(takes) = takes {
+            tokio::time::sleep(takes).await;
+        }
         if self.release_fails.load(Ordering::SeqCst) {
             return Err(TaskFailure::recoverable(VmmError::Process(
                 "the vmm would not die".into(),
@@ -930,6 +936,44 @@ async fn a_record_that_will_not_move_stalls_the_teardown() {
         .await;
     assert!(!harness.registered.load(Ordering::SeqCst));
     harness.joined().await;
+}
+
+/// A removal parked on a record that will not delete is not answered `Ok`
+/// just because the machine reached `gone`.
+///
+/// The record — and with it the id — is exactly what the parked step is still
+/// trying to release, so a second `Remove` waits for the retry rather than
+/// being told the computer is gone.
+#[tokio::test(start_paused = true)]
+async fn a_removal_parked_on_its_record_is_not_answered_done() {
+    let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+
+    let record_path = harness.dir.path().join("sandbox-records").join("box.json");
+    // A slow release holds the teardown open between the `Removing` write and
+    // the deletion, which is the window this needs: only the deletion is
+    // refused.
+    *harness.script.release_takes.lock().unwrap() = Some(Duration::from_secs(1));
+    let removing = harness.send(|reply| Command::Remove { force: true, reply });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let record = std::fs::read(&record_path).unwrap();
+    std::fs::remove_file(&record_path).unwrap();
+    std::fs::create_dir(&record_path).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let second = harness.send(|reply| Command::Remove { force: true, reply });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.registered.load(Ordering::SeqCst),
+        "the id is still owned by a record that would not delete"
+    );
+
+    std::fs::remove_dir(&record_path).unwrap();
+    std::fs::write(&record_path, record).unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    removing.ok().await;
+    second.ok().await;
+    assert!(!harness.registered.load(Ordering::SeqCst));
 }
 
 /// A `Stop` (or a `Remove`) during a user checkpoint answers the checkpoint.

@@ -112,6 +112,15 @@ impl ComputerActor {
                             self.restart_teardown(*machine.state()).await;
                         }
                     }
+                    // `gone` with a step still parked is not done: the
+                    // durable record — and with it the id — is what that step
+                    // is trying to release, so the reply just pushed waits
+                    // for the retry rather than being answered now.
+                    State::Gone {} if self.stalled.is_some() => {
+                        if self.retry.is_none() {
+                            self.resume_stalled().await;
+                        }
+                    }
                     State::Gone {} => self.answer(Answer::Removed),
                     // Refused, and nothing acted — so the reply is still the
                     // one just parked.
