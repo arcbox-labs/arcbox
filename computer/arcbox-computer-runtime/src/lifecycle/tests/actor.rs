@@ -37,6 +37,9 @@ enum Boot {
     /// Hands off and completes in the same poll, so its completion is already
     /// enqueued when the abort lands.
     HandsOffAndCompletes,
+    /// Hands off, then panics: the join reports it, and a teardown must not
+    /// swallow that.
+    HandsOffThenPanics,
     /// Completes at once.
     Completes,
 }
@@ -98,6 +101,12 @@ impl ComputerTasks for Script {
                 let _ = handed_off.send(());
                 std::future::pending::<()>().await;
                 unreachable!("a hanging boot is only ever aborted")
+            }
+            Boot::HandsOffThenPanics => {
+                // Panics in the same poll as the signal, so the abort finds
+                // a task that has already fallen over.
+                let _ = handed_off.send(());
+                panic!("the boot task fell over")
             }
             Boot::HandsOffAndCompletes | Boot::Completes => {
                 let _ = handed_off.send(());
@@ -459,6 +468,26 @@ async fn a_removal_whose_release_fails_answers_its_caller() {
         error.to_string().contains("the vmm would not die"),
         "{error}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicked_sub_task_is_reported_rather_than_swallowed() {
+    // `cancel_and_join_boot` maps a join that is not a cancellation onto an
+    // error that fails the removal; treating it as a clean join would hide
+    // both the panic and whatever the task never transferred.
+    let harness = Harness::start(Boot::HandsOffThenPanics, no_deadlines()).await;
+    harness.send(|reply| Command::Provision {
+        provision: Provision::Boot { warm: false },
+        outcome: SandboxProvisionOutcome::default(),
+        reply,
+    });
+    let error = harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .error()
+        .await;
+    assert!(error.to_string().contains("panicked"), "{error}");
+    // ...and the teardown still ran: a release takes more, not less.
+    assert!(harness.script.calls().contains(&"release"));
 }
 
 #[tokio::test(start_paused = true)]

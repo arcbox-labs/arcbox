@@ -260,6 +260,9 @@ pub(super) struct ComputerActor {
     /// A visible-but-unconfirmed durable write, reported to the next caller
     /// the flow answers.
     unconfirmed: Option<String>,
+    /// A step of the flow that failed loudly without stopping it — a
+    /// panicked sub-task — reported to the caller its answer reaches.
+    answer_error: Option<String>,
     /// A journal clear owed to a release that is still running: the journal
     /// records exactly the resources a restart would have to reclaim, so it
     /// may only be dropped once they are gone.
@@ -323,6 +326,7 @@ impl ComputerActor {
             resume_reason: crate::sandbox::pause_reason::RESUME.to_owned(),
             exit_status: None,
             unconfirmed: None,
+            answer_error: None,
             clear_journal_after_release: false,
             journal_blocked: false,
             deadlines: seed.deadlines,

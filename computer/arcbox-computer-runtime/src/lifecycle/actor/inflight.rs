@@ -31,12 +31,14 @@ impl ComputerActor {
 
     /// Cancels the in-flight sub-task, waiting out its resource handoff first.
     ///
-    /// The three outcomes `cleanup::cancel_and_join_boot` has: the handoff
-    /// lands and the task is aborted; the task ended without signalling, so
-    /// it is joined instead and its own failure cleanup finishes; or the wait
-    /// elapses, in which case the task is re-parked and the rest of the
-    /// teardown stalls until a retry takes it. A task that unwinds its own
-    /// resources ([`Handoff::JoinOnly`]) is only ever joined — see there.
+    /// The outcomes `cleanup::cancel_and_join_boot` has: the handoff lands
+    /// and the task is aborted; the task ended without signalling, so it is
+    /// joined instead and its own failure cleanup finishes; the wait elapses,
+    /// in which case the task is re-parked and the rest of the teardown
+    /// stalls until a retry takes it; or the join itself reports a panic,
+    /// which the teardown carries to its caller rather than swallowing. A
+    /// task that unwinds its own resources ([`Handoff::JoinOnly`]) is only
+    /// ever joined — see there.
     pub(super) async fn abort_inflight(&mut self) -> Flow {
         let Some(mut task) = self.inflight.take() else {
             self.epoch += 1;
@@ -66,11 +68,18 @@ impl ComputerActor {
                 task.handoff = Handoff::JoinOnly;
             }
         }
-        if tokio::time::timeout(HANDOFF_TIMEOUT, &mut task.handle)
-            .await
-            .is_err()
-        {
-            return self.stall(task);
+        match tokio::time::timeout(HANDOFF_TIMEOUT, &mut task.handle).await {
+            Err(_) => return self.stall(task),
+            // A cancelled task is what we asked for. A panicked one is not:
+            // today's join maps it to an error that fails the removal, and
+            // swallowing it would hide both the panic and whatever the task
+            // never got to transfer. The teardown still runs — a release
+            // takes more, not less — but its caller hears about it.
+            Ok(Err(error)) if !error.is_cancelled() => {
+                error!(sandbox_id = %self.id, %error, "a computer sub-task panicked");
+                self.answer_error = Some(format!("sub-task panicked: {error}"));
+            }
+            Ok(_) => {}
         }
         task.handoff = Handoff::Abortable;
         self.epoch += 1;

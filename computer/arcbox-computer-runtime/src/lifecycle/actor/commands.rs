@@ -131,15 +131,21 @@ impl ComputerActor {
 
     pub(super) fn answer(&mut self, answer: Answer) {
         let unconfirmed = self.unconfirmed.take();
+        let failed = self.answer_error.take();
         let mut remaining = Vec::new();
         for (parked, reply) in std::mem::take(&mut self.waiters) {
             if parked == answer {
-                let _ = reply.send(match &unconfirmed {
-                    Some(detail) => Err(VmmError::AckUnconfirmed {
+                let _ = reply.send(match (&failed, &unconfirmed) {
+                    // The flow reached its answer, but a step of it failed
+                    // loudly on the way; the caller hears that first.
+                    (Some(detail), _) => {
+                        Err(VmmError::Process(format!("computer {}: {detail}", self.id)))
+                    }
+                    (None, Some(detail)) => Err(VmmError::AckUnconfirmed {
                         id: self.id.clone(),
                         detail: detail.clone(),
                     }),
-                    None => Ok(()),
+                    (None, None) => Ok(()),
                 });
             } else {
                 remaining.push((parked, reply));
