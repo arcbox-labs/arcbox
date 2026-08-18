@@ -435,7 +435,39 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&script);
+        // The probe ran the script, so every test starts from an empty record.
+        std::fs::remove_file(&calls).ok();
         (BusyboxBlockTools::new(script), calls)
+    }
+
+    /// Run the freshly written `script` until the kernel stops refusing it.
+    ///
+    /// A sibling test thread that forks — `CowManager::new` probes every
+    /// `dmsetup` candidate, so most of this crate's tests do — between this
+    /// thread's `create` and `close` leaves its child holding a write fd to
+    /// the script, and Linux will not exec a file that is open for writing
+    /// (`ETXTBSY`). The window closes as soon as that child execs and never
+    /// reopens, since nothing writes the script again; exec'ing it until it
+    /// runs is what proves the window is shut.
+    fn wait_until_executable(script: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match Command::new(script).output() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{} stayed busy for 5s",
+                        script.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => {
+                    other.unwrap();
+                    return;
+                }
+            }
+        }
     }
 
     fn attach_calls(calls: &Path) -> Vec<String> {
