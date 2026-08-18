@@ -119,6 +119,49 @@ async fn a_create_boots_to_ready_and_serves_exec_and_files() {
     assert_eq!(fixture.run(&id, &["/bin/hello"]).await, b"hi");
 }
 
+/// The claim on the workload slot *is* the transition into Running, so a
+/// cmd-carrying boot announces RUNNING before READY, and IDLE when the cmd
+/// gives the slot back.
+///
+/// Where IDLE falls relative to READY is not fixed and must not be: the
+/// gate finishing and the workload exiting are concurrent, which is why
+/// the machine handles the exit in `gating` as well as in `running`.
+#[tokio::test]
+async fn a_cmd_carrying_boot_announces_its_workload_around_ready() {
+    let fixture = Fixture::jailed().await;
+    let mut events = fixture.manager.subscribe_events();
+
+    let (id, _ip) = fixture
+        .manager
+        .create_sandbox(SandboxSpec {
+            id: Some("noisy".into()),
+            cmd: vec!["/bin/hello".into()],
+            ..SandboxSpec::default()
+        })
+        .await
+        .unwrap();
+    fixture.await_state(&id, SandboxState::Ready).await;
+
+    let actions = drain_actions(&mut events, &id);
+    assert!(
+        actions
+            == [
+                action::CREATED,
+                action::RUNNING,
+                action::READY,
+                action::IDLE
+            ]
+            || actions
+                == [
+                    action::CREATED,
+                    action::RUNNING,
+                    action::IDLE,
+                    action::READY
+                ],
+        "{actions:?}"
+    );
+}
+
 /// A ready-probe command that never exits must end on the probe's own
 /// budget, not park the boot forever. The host timeout is the only thing
 /// that can end it — the guest's kill timer is the fake's to not have — so
@@ -281,6 +324,7 @@ async fn a_create_that_fails_before_activation_hands_the_address_back() {
 #[tokio::test(start_paused = true)]
 async fn an_idle_computer_is_removed_when_its_policy_says_kill() {
     let fixture = Fixture::jailed().await;
+    let mut events = fixture.manager.subscribe_events();
     let id = fixture
         .booted(SandboxSpec {
             id: Some("bored".into()),
@@ -291,6 +335,7 @@ async fn an_idle_computer_is_removed_when_its_policy_says_kill() {
         .await;
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    await_action(&mut events, &id, action::REMOVED).await;
     fixture.await_gone(&id).await;
 }
 
@@ -412,7 +457,9 @@ async fn set_lifecycle_rejects_terminal_states_and_missing_ids() {
     ));
 
     let stopped = fixture.ready("halted").await;
+    let mut events = fixture.manager.subscribe_events();
     fixture.manager.stop_sandbox(&stopped, 1).await.unwrap();
+    await_action(&mut events, &stopped, action::STOPPED).await;
     fixture.await_state(&stopped, SandboxState::Stopped).await;
     assert!(matches!(
         fixture
@@ -460,6 +507,7 @@ async fn a_pause_records_what_it_retained_and_a_resume_uses_it() {
         pausing.attributes.get("reason").map(String::as_str),
         Some(pause_reason::PAUSE)
     );
+    await_action(&mut events, &id, action::PAUSED).await;
 
     let info = fixture.manager.inspect_sandbox(&id).unwrap();
     assert!(info.paused_at.is_some(), "the pause records when it froze");
@@ -495,6 +543,11 @@ async fn a_pause_records_what_it_retained_and_a_resume_uses_it() {
         .await
         .unwrap();
     assert!(!ip.is_empty(), "a resume answers with its fresh address");
+    let resumed = await_action(&mut events, &id, action::RESUMED).await;
+    assert_eq!(
+        resumed.attributes.get("reason").map(String::as_str),
+        Some(pause_reason::RESUME)
+    );
     fixture.await_state(&id, SandboxState::Ready).await;
     assert_eq!(
         fixture.run(&id, &["/bin/hello"]).await,
@@ -984,12 +1037,14 @@ async fn remove_refuses_a_busy_computer_unless_forced() {
     fixture.agent().on(&["/bin/wedged"], Reply::NeverExits);
     let id = fixture.booted(never_exits("busy")).await;
     fixture.await_state(&id, SandboxState::Running).await;
+    let mut events = fixture.manager.subscribe_events();
 
     assert!(matches!(
         fixture.manager.remove_sandbox(&id, false).await,
         Err(VmmError::WrongState { .. })
     ));
     fixture.manager.remove_sandbox(&id, true).await.unwrap();
+    await_action(&mut events, &id, action::REMOVED).await;
     fixture.await_gone(&id).await;
 }
 

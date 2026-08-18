@@ -13,13 +13,8 @@
 //! its public API, so nothing here can put a computer in a state a real
 //! flow does not produce.
 
-#![allow(
-    dead_code,
-    reason = "each test binary compiles this module and uses its own subset"
-)]
-
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -216,11 +211,6 @@ impl Fixture {
     /// torn down.
     pub fn cow(&self) -> &CowTestProbe {
         &self.ports.cow
-    }
-
-    /// The data directory the manager was built on.
-    pub fn data_dir(&self) -> &Path {
-        self.dir.path()
     }
 
     /// A computer's runtime directory.
