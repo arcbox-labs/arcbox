@@ -22,7 +22,7 @@ use crate::lifecycle::actor::{
     Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Seeded,
 };
 use crate::lifecycle::effect::ReleaseScope;
-use crate::lifecycle::event::{Provision, RestoreOrigin};
+use crate::lifecycle::event::{PauseReason, Provision, RestoreOrigin};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::lifecycle::tasks::{CaptureSpec, ComputerTasks, TaskFailure, TaskResult};
 use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
@@ -204,6 +204,7 @@ impl ComputerTasks for Script {
 /// One actor, its mailbox, its snapshot, and the events it publishes.
 struct Harness {
     commands: mpsc::UnboundedSender<Command>,
+    runtime: crate::lifecycle::runtime::Runtime,
     snapshot: watch::Receiver<ComputerSnapshot>,
     events: broadcast::Receiver<SandboxEvent>,
     script: Arc<Script>,
@@ -247,7 +248,7 @@ impl Harness {
         }
         let seed = ComputerSeed {
             id: "box".to_owned(),
-            runtime,
+            runtime: Arc::clone(&runtime),
             unregister: Arc::new(|| {}),
             // No durable record: these tests exercise the actor, not the
             // store, so the record writes are no-ops. The crash journal is
@@ -265,6 +266,7 @@ impl Harness {
         let actor = tokio::spawn(ComputerActor::new(seed, commands_rx, snapshot_tx).run());
         Self {
             commands,
+            runtime,
             snapshot,
             events,
             script,
@@ -769,5 +771,29 @@ async fn a_failed_restore_answers_only_once_its_teardown_has_freed_the_id() {
         harness.script.calls(),
         vec!["restore", "release"],
         "the teardown ran before the caller was told"
+    );
+}
+
+/// A paused computer records what it retained where its readers look.
+///
+/// `Inspect` and `List` size the checkpoint and the disk overlay from the
+/// runtime, and a resume finds its checkpoint there — `pause_sandbox` wrote
+/// both at the `Paused` commit, and nothing else does.
+#[tokio::test(start_paused = true)]
+async fn a_paused_computer_records_what_it_retained() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+
+    let paused = harness.send(|reply| Command::Pause {
+        reason: PauseReason::Requested,
+        reply,
+    });
+    paused.ok().await;
+
+    let runtime = harness.runtime.lock().unwrap();
+    assert_eq!(runtime.pause_snapshot_id.as_deref(), Some("snap"));
+    assert!(
+        runtime.paused_at.is_some(),
+        "a paused computer reports when it went to sleep"
     );
 }

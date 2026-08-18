@@ -149,9 +149,21 @@ impl ComputerActor {
             }
             PersistPhase::Removing => SandboxTransition::Removing,
             PersistPhase::Pausing => SandboxTransition::Pausing,
-            PersistPhase::Paused => SandboxTransition::Paused {
-                snapshot_id: self.pause_snapshot_id.clone().unwrap_or_default(),
-            },
+            PersistPhase::Paused => {
+                // What a paused computer retains, recorded where every
+                // reader of it looks: `Inspect` and `List` size the
+                // checkpoint and the overlay from here, and a resume finds
+                // its checkpoint here. `paused_at` is set once — the resume
+                // unwind writes `Paused` again and must not restamp it.
+                let mut runtime = self.runtime.lock().unwrap();
+                runtime.paused_at.get_or_insert_with(Utc::now);
+                runtime
+                    .pause_snapshot_id
+                    .clone_from(&self.pause_snapshot_id);
+                SandboxTransition::Paused {
+                    snapshot_id: self.pause_snapshot_id.clone().unwrap_or_default(),
+                }
+            }
             PersistPhase::Resuming => SandboxTransition::Resuming,
             // The provisioning intent is written before there is a machine to
             // ask for it, so no transition names it.
