@@ -96,11 +96,30 @@ pub fn nft_in_private_netns(test: &str) -> Option<std::path::PathBuf> {
 
 /// How many rules in `table ip arcbox` carry `tag`. Every rule of one TAP's
 /// translation carries exactly one, so this is that TAP's rule count.
+///
+/// Matches the comment for equality, the way the production reader in
+/// `packet_filter::nftables` does: a substring count would fold
+/// `arcbox-nat:vmtap9-20` into a query for `arcbox-nat:vmtap9-2`. A failed
+/// listing panics rather than counting zero — "the table is gone" and "nft
+/// could not be asked" are opposite answers, and the assertions that expect
+/// `0` must not accept the second.
 #[cfg(target_os = "linux")]
 pub fn nft_rules_tagged(nft: &std::path::Path, tag: &str) -> usize {
     let output = std::process::Command::new(nft)
         .args(["-j", "-a", "list", "table", "ip", "arcbox"])
         .output()
         .expect("run nft");
-    String::from_utf8_lossy(&output.stdout).matches(tag).count()
+    assert!(
+        output.status.success(),
+        "nft list table ip arcbox: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let listing: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse nft listing");
+    listing["nftables"]
+        .as_array()
+        .expect("nftables listing array")
+        .iter()
+        .filter(|item| item["rule"]["comment"] == serde_json::json!(tag))
+        .count()
 }
