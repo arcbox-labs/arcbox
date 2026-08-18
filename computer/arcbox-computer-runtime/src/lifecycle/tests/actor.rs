@@ -204,6 +204,8 @@ impl ComputerTasks for Script {
 /// One actor, its mailbox, its snapshot, and the events it publishes.
 struct Harness {
     commands: mpsc::UnboundedSender<Command>,
+    /// Whether the computer is still in its manager's registry.
+    registered: Arc<AtomicBool>,
     runtime: crate::lifecycle::runtime::Runtime,
     snapshot: watch::Receiver<ComputerSnapshot>,
     events: broadcast::Receiver<SandboxEvent>,
@@ -215,16 +217,22 @@ struct Harness {
 
 impl Harness {
     async fn start(boot: Boot, deadlines: Deadlines) -> Self {
-        Self::started(boot, deadlines, false).await
+        Self::started(boot, deadlines, false, false).await
+    }
+
+    /// A harness whose computer owns a durable record, so what the actor
+    /// does when that record refuses to move is observable.
+    async fn recorded(boot: Boot, deadlines: Deadlines) -> Self {
+        Self::started(boot, deadlines, false, true).await
     }
 
     /// A harness whose computer has a crash journal on disk, so what the
     /// actor refuses to drop is observable.
     async fn journalled(boot: Boot, deadlines: Deadlines) -> Self {
-        Self::started(boot, deadlines, true).await
+        Self::started(boot, deadlines, true, false).await
     }
 
-    async fn started(boot: Boot, deadlines: Deadlines, journal: bool) -> Self {
+    async fn started(boot: Boot, deadlines: Deadlines, journal: bool, record: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let script = Script::new(boot, agent().await);
         let (events_tx, events) = broadcast::channel(64);
@@ -246,17 +254,36 @@ impl Harness {
             let record = SandboxStateRecord::new("box", None, None, None, &config, None).unwrap();
             write_state_record(dir.path(), &record).unwrap();
         }
+        let records = Arc::new(SandboxRecordStore::new(dir.path()).unwrap());
+        // No durable record by default: these tests exercise the actor, not
+        // the store, so the record writes are no-ops. The crash journal is
+        // not — it is a file beside them, and its ordering is the thing
+        // under test above.
+        let generation = record.then(|| {
+            match records
+                .provision_intent(
+                    "box",
+                    "key",
+                    SandboxSpec {
+                        id: Some("box".to_owned()),
+                        ..SandboxSpec::default()
+                    },
+                )
+                .unwrap()
+            {
+                crate::sandbox::record::ProvisionIntent::Created(record) => record.generation,
+                other => panic!("unexpected intent: {other:?}"),
+            }
+        });
+        let registered = Arc::new(AtomicBool::new(true));
+        let unregister = Arc::clone(&registered);
         let seed = ComputerSeed {
             id: "box".to_owned(),
             runtime: Arc::clone(&runtime),
-            unregister: Arc::new(|| {}),
-            // No durable record: these tests exercise the actor, not the
-            // store, so the record writes are no-ops. The crash journal is
-            // not — it is a file beside them, and its ordering is the thing
-            // under test above.
-            generation: None,
+            unregister: Arc::new(move || unregister.store(false, Ordering::SeqCst)),
+            generation,
             vm_dir: dir.path().to_path_buf(),
-            records: Arc::new(SandboxRecordStore::new(dir.path()).unwrap()),
+            records,
             events_tx,
             tasks: Arc::clone(&script) as Arc<dyn ComputerTasks>,
             deadlines,
@@ -266,6 +293,7 @@ impl Harness {
         let actor = tokio::spawn(ComputerActor::new(seed, commands_rx, snapshot_tx).run());
         Self {
             commands,
+            registered,
             runtime,
             snapshot,
             events,
@@ -842,4 +870,44 @@ async fn an_idle_pause_says_so_on_its_event() {
         pausing.attributes.get("reason").map(String::as_str),
         Some(crate::sandbox::pause_reason::IDLE_TIMEOUT)
     );
+}
+
+/// A record that will not delete stalls the teardown instead of reporting it
+/// done.
+///
+/// `remove_sandbox_impl` propagates a failed `finish_remove` *before* it drops
+/// its map entry: the record still owns the id, and only a retry that re-runs
+/// the deletion can free it. Unregistering and announcing REMOVED anyway
+/// would leave that id un-creatable — `cancel_pending_or_missing` refuses
+/// anything past `Creating` — until the next startup sweep.
+#[tokio::test(start_paused = true)]
+async fn a_record_that_will_not_delete_stalls_the_teardown() {
+    let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+
+    // A directory where the record file goes: every read of it fails, so the
+    // deletion cannot complete.
+    let record_path = harness.dir.path().join("sandbox-records").join("box.json");
+    std::fs::remove_file(&record_path).unwrap();
+    std::fs::create_dir(&record_path).unwrap();
+
+    let removing = harness.send(|reply| Command::Remove { force: true, reply });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        harness.registered.load(Ordering::SeqCst),
+        "the computer stays where a retry can reach it"
+    );
+    assert!(
+        !harness
+            .actions()
+            .contains(&crate::sandbox::types::action::REMOVED.to_owned()),
+        "nothing announces a removal that did not finish"
+    );
+
+    // Let the deletion through; the retry finishes the teardown.
+    std::fs::remove_dir(&record_path).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    removing.ok().await;
+    assert!(!harness.registered.load(Ordering::SeqCst));
+    harness.joined().await;
 }

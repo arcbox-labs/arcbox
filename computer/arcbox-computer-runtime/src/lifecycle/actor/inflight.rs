@@ -104,9 +104,26 @@ impl ComputerActor {
             "the computer's in-flight work still owns resources; retrying the teardown"
         );
         self.inflight = Some(task);
+        self.stalled_on = StalledStep::Handoff;
+        self.schedule_retry();
+        Flow::Stalled
+    }
+
+    /// Schedules the backoff a stalled teardown resumes on.
+    pub(super) fn schedule_retry(&mut self) {
         self.retry = Some(Box::pin(tokio::time::sleep(self.retry_backoff)));
         self.retry_backoff = self.retry_backoff.saturating_mul(2).min(RETRY_MAX);
-        Flow::Stalled
+    }
+
+    /// Records what the current drain stalled on, with the effects it did not
+    /// reach.
+    pub(super) fn park_stalled(&mut self, state: State, effects: Vec<Effect>) {
+        let retry = std::mem::replace(&mut self.stalled_on, StalledStep::Handoff);
+        self.stalled = Some(Stalled {
+            retry,
+            state,
+            effects,
+        });
     }
 
     /// Re-drives a teardown that stopped rather than finished — its release
@@ -126,22 +143,23 @@ impl ComputerActor {
         }
     }
 
-    /// Retries the abort a stalled teardown is waiting on, then replays it.
+    /// Retries the step a stalled teardown is waiting on, then replays it.
     pub(super) async fn resume_stalled(&mut self) {
         let Some(stalled) = self.stalled.take() else {
             return;
         };
-        if self.abort_inflight().await == Flow::Stalled {
+        let retried = match stalled.retry {
+            StalledStep::Handoff => self.abort_inflight().await,
+            StalledStep::Record(end) => self.forget(end),
+        };
+        if retried == Flow::Stalled {
             self.stalled = Some(stalled);
             return;
         }
         let mut effects = stalled.effects.into_iter();
         while let Some(effect) = effects.next() {
             if Box::pin(self.apply(effect, stalled.state)).await == Flow::Stalled {
-                self.stalled = Some(Stalled {
-                    state: stalled.state,
-                    effects: effects.collect(),
-                });
+                self.park_stalled(stalled.state, effects.collect());
                 return;
             }
         }

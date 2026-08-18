@@ -314,10 +314,22 @@ enum Handoff {
     JoinOnly,
 }
 
-/// A teardown parked behind a handoff that has not landed yet.
+/// A teardown parked on a step that could not complete yet: the rest of its
+/// effects, and the step to retry first.
 struct Stalled {
+    retry: StalledStep,
     state: State,
     effects: Vec<Effect>,
+}
+
+/// What a stalled teardown is waiting on.
+enum StalledStep {
+    /// The in-flight sub-task has not handed its resources over.
+    Handoff,
+    /// The durable record would not delete. Until it does, the id is still
+    /// owned — `remove_sandbox_impl` propagates that failure rather than
+    /// dropping its map entry, because only a retry can free the id.
+    Record(RecordEnd),
 }
 
 /// Whether the effect drain may continue.
@@ -365,10 +377,13 @@ pub struct ComputerActor {
     pending_stop: Option<Duration>,
     inflight: Option<Preemptible>,
     epoch: u64,
-    /// The teardown parked behind a handoff, replayed when a retry takes it.
-    /// This is `cleanup::expire_sandbox`'s retry loop, collapsed into the
-    /// actor: the handoff is the only transient failure a removal has.
+    /// The teardown parked on a step it could not finish, replayed when a
+    /// retry takes it. This is `cleanup::expire_sandbox`'s retry loop,
+    /// collapsed into the actor.
     stalled: Option<Stalled>,
+    /// What the step currently being applied stalled on, read by
+    /// [`Self::park_stalled`].
+    stalled_on: StalledStep,
     retry_backoff: Duration,
     /// The reason of the failure being recorded, for the durable `Failed`
     /// write and the FAILED event.
@@ -467,6 +482,7 @@ impl ComputerActor {
             inflight: None,
             epoch: 0,
             stalled: None,
+            stalled_on: StalledStep::Handoff,
             retry_backoff: RETRY_INITIAL,
             error: None,
             pause_snapshot_id: None,
@@ -565,7 +581,9 @@ impl ComputerActor {
                 }
                 Ok(()) = self.timers_enabled.changed() => self.rearm(*machine.state()),
             }
-            if matches!(machine.state(), State::Gone {}) {
+            // A computer whose record would not delete is not gone yet: its
+            // id is still owned, and the retry below is what frees it.
+            if matches!(machine.state(), State::Gone {}) && self.stalled.is_none() {
                 break;
             }
         }
@@ -614,10 +632,7 @@ impl ComputerActor {
         let mut effects = effects.into_iter();
         while let Some(effect) = effects.next() {
             if self.apply(effect, after).await == Flow::Stalled {
-                self.stalled = Some(Stalled {
-                    state: after,
-                    effects: effects.collect(),
-                });
+                self.park_stalled(after, effects.collect());
                 break;
             }
         }

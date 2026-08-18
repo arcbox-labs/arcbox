@@ -138,7 +138,7 @@ impl SandboxRecordStore {
     }
 
     /// Persists a new provisioning intent or classifies the existing match.
-    pub(in crate::sandbox) fn provision_intent(
+    pub(crate) fn provision_intent(
         &self,
         id: &str,
         request_key: &str,

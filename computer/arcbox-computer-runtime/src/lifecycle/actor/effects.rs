@@ -26,13 +26,7 @@ impl ComputerActor {
                 SandboxTransition::ReadyWithOutcome(self.outcome.clone()),
                 durability,
             ),
-            Effect::ForgetRecord(end) => {
-                self.forget(end);
-                // Before REMOVED is announced, as `remove_sandbox_impl`
-                // drops its map entry before broadcasting: a reader that
-                // acts on the event must not still find the computer.
-                (self.unregister)();
-            }
+            Effect::ForgetRecord(end) => return self.forget(end),
             Effect::ClearJournal => {
                 // `failure()` asks for the clear in the same breath as the
                 // release it must follow; `stopping`/`releasing` ask once
@@ -244,9 +238,19 @@ impl ComputerActor {
         self.queued.push_back(Event::Failure);
     }
 
-    fn forget(&mut self, end: RecordEnd) {
+    /// Deletes the durable record, and with it the computer's claim on its
+    /// id.
+    ///
+    /// A refusal stalls the teardown rather than continuing past it:
+    /// `remove_sandbox_impl` propagates a failed `finish_remove` *before* it
+    /// drops its map entry, because the record still owns the id and only a
+    /// retry that re-runs the deletion can free it. Reporting the removal
+    /// done here would leave that id un-creatable until the next startup
+    /// sweep.
+    pub(super) fn forget(&mut self, end: RecordEnd) -> Flow {
         let Some(generation) = self.generation else {
-            return;
+            (self.unregister)();
+            return Flow::Continue;
         };
         let outcome = match end {
             RecordEnd::Aborted => self.records.abort_provision(&self.id, generation),
@@ -257,9 +261,27 @@ impl ComputerActor {
                 if let Some(error) = commit.durability_error {
                     self.unconfirmed = Some(error);
                 }
+                // Before REMOVED is announced, as `remove_sandbox_impl` drops
+                // its map entry before broadcasting: a reader that acts on
+                // the event must not still find the computer.
+                (self.unregister)();
+                self.retry_backoff = RETRY_INITIAL;
+                // The teardown finished, so whatever failed loudly on the
+                // way is no longer what its caller needs to hear.
+                self.answer_error = None;
+                Flow::Continue
             }
             Err(error) => {
-                error!(sandbox_id = %self.id, %error, "failed to forget the computer's record");
+                error!(
+                    sandbox_id = %self.id,
+                    %error,
+                    retry_millis = self.retry_backoff.as_millis(),
+                    "the computer's record would not delete; retrying the teardown"
+                );
+                self.answer_error = Some(error.to_string());
+                self.stalled_on = StalledStep::Record(end);
+                self.schedule_retry();
+                Flow::Stalled
             }
         }
     }
