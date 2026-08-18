@@ -35,9 +35,16 @@ that the flags and the accessors agree.
 | `Checkpoint` | `handle.checkpoint()` | capture to disk; `Resume` or `HoldQuiesced` afterwards |
 | `Adopt` / `Detach` | `driver.adopt()` / `handle.detach()` | VMs that outlive the process (external VMMs) |
 | `Prepare` | `driver.prepare()` | spawn the VMM ahead of a boot: pid journaled and READY listener bound before the guest starts; `boot` is exactly prepare-then-boot |
+| `Staging` | `prepared.staging()` | bring the kernel, the disks and a checkpoint into the area this VM's VMM can reach, and name each as its spec must; `unstage_disk` takes a disk back out, `discard` removes the rest |
 | `Balloon` | `handle.balloon()` | set/read the memory balloon |
 | `Console` | `handle.console()` | read guest console output |
 | `DebugSnapshot` | `handle.debug()` | driver-specific JSON for post-mortems |
+
+`VmDriver::id_budget(&isolation)` is the one thing a driver knows about
+ids that the port's own `VmId` rule does not: the longest id its layout
+leaves room for, or `None` when it imposes no limit. `Some(0)` is a real
+answer — a chroot base deep enough to spend the whole AF_UNIX path budget
+leaves room for no id at all.
 
 `net::GuestNetwork` is the second port: reserve a lease, activate it into
 a `NicSpec`, adopt one whose guest outlived the process that activated it

@@ -1,7 +1,7 @@
 //! The fake's `Prepare` capability: a "spawned" VMM waiting for a spec.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -11,13 +11,26 @@ use super::fake_driver::{DriverInner, NAME};
 use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, VmInner};
 use super::fake_vsock::{FakeListener, Inbound};
 use super::lock;
-use crate::capability::{CheckpointImage, Prepare, PreparedVm, VsockListen, VsockListener};
+use crate::capability::{
+    CheckpointImage, DiskSource, Prepare, PreparedVm, Staging, VsockListen, VsockListener,
+};
 use crate::driver::{ExitStatus, ProcessRecord, RestoreSpec, VmHandle, VmRecord, VmState};
 use crate::error::{Error, Result};
 use crate::spec::{IsolationSpec, VmId, VmSpec};
 
 /// What `discard` reports for a process killed before or after its boot.
 const SIGKILL: i32 = 9;
+
+/// How a staged file gets into the staging area.
+#[derive(Debug, Clone, Copy)]
+enum Bring {
+    /// A stand-in for a device node.
+    Device,
+    /// A private copy; the source stays.
+    Copy,
+    /// The source is consumed.
+    Move,
+}
 
 /// The `Prepare` capability, on its own type so its `prepare` method does
 /// not shadow the driver's accessor of the same name.
@@ -146,6 +159,46 @@ impl PreparedFake {
         Ok(Box::new(FakeVm::new(vm)))
     }
 
+    /// The VM's staging area: a directory of its own under the runtime
+    /// dir, standing in for a jail's chroot.
+    fn staging_root(&self) -> PathBuf {
+        self.record.runtime_dir.join("staged")
+    }
+
+    /// Brings `src` into the staging area at `rel`, and answers with where
+    /// it landed. A source already inside the area is left where it is —
+    /// the same short-circuit a real confinement makes.
+    async fn bring_in(&self, src: &Path, rel: &str, how: Bring) -> Result<PathBuf> {
+        let root = self.staging_root();
+        if src.starts_with(&root) {
+            return Ok(src.to_path_buf());
+        }
+        let dst = root.join(rel);
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match tokio::fs::remove_file(&dst).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::Io(e)),
+            _ => {}
+        }
+        match how {
+            // A device node is not something a fake can make; a symlink is
+            // the stand-in, and it is visibly not a copy.
+            Bring::Device => tokio::fs::symlink(src, &dst).await?,
+            Bring::Copy => {
+                tokio::fs::copy(src, &dst).await?;
+            }
+            Bring::Move => match tokio::fs::rename(src, &dst).await {
+                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                    tokio::fs::copy(src, &dst).await?;
+                    tokio::fs::remove_file(src).await?;
+                }
+                other => other?,
+            },
+        }
+        Ok(dst)
+    }
+
     /// Kills whatever `phase` says is running: the booted VM, or the bare
     /// process itself.
     fn kill(&self, phase: &mut Phase) -> ExitStatus {
@@ -194,6 +247,10 @@ impl PreparedVm for PreparedFake {
         self.driver.caps.vsock_listen.then_some(self)
     }
 
+    fn staging(&self) -> Option<&dyn Staging> {
+        self.driver.caps.staging.then_some(self)
+    }
+
     async fn boot(&self, spec: VmSpec) -> Result<Box<dyn VmHandle>> {
         let balloon_target_bytes = u64::from(spec.memory_mib) << 20;
         self.launch(spec, balloon_target_bytes)
@@ -228,7 +285,71 @@ impl PreparedVm for PreparedFake {
     }
 
     async fn discard(&self) -> Result<ExitStatus> {
-        Ok(self.kill(&mut lock(&self.phase)))
+        let status = self.kill(&mut lock(&self.phase));
+        match tokio::fs::remove_dir_all(self.staging_root()).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::Io(e)),
+            _ => {}
+        }
+        Ok(status)
+    }
+}
+
+/// Files land in `{runtime_dir}/staged`, under the names a jail would give
+/// them: `vmlinux`, `{disk id}.ext4`, `snapshots/{image dir name}`.
+#[async_trait]
+impl Staging for PreparedFake {
+    async fn stage_kernel(&self, src: &Path) -> Result<PathBuf> {
+        self.bring_in(src, "vmlinux", Bring::Copy).await
+    }
+
+    async fn stage_disk(&self, id: &str, source: DiskSource<'_>) -> Result<PathBuf> {
+        let how = match source {
+            DiskSource::Device(_) => Bring::Device,
+            DiskSource::Image(_) => Bring::Copy,
+            DiskSource::Handover(_) => Bring::Move,
+        };
+        self.bring_in(source.path(), &format!("{id}.ext4"), how)
+            .await
+    }
+
+    async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool> {
+        let staged = self.staging_root().join(format!("{id}.ext4"));
+        if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
+            return Ok(false);
+        }
+        match tokio::fs::rename(&staged, dst).await {
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                tokio::fs::copy(&staged, dst).await?;
+                tokio::fs::remove_file(&staged).await?;
+            }
+            other => other?,
+        }
+        Ok(true)
+    }
+
+    async fn stage_checkpoint(&self, image: &CheckpointImage) -> Result<CheckpointImage> {
+        let root = self.staging_root();
+        if image.dir.starts_with(&root) {
+            return Ok(image.clone());
+        }
+        let name = image.dir.file_name().ok_or_else(|| {
+            Error::InvalidSpec(format!(
+                "checkpoint dir {} has no usable name",
+                image.dir.display()
+            ))
+        })?;
+        let dir = root.join("snapshots").join(name);
+        tokio::fs::create_dir_all(&dir).await?;
+        let mut entries = tokio::fs::read_dir(&image.dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                tokio::fs::copy(entry.path(), dir.join(entry.file_name())).await?;
+            }
+        }
+        Ok(CheckpointImage {
+            dir,
+            ..image.clone()
+        })
     }
 }
 

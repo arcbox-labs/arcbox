@@ -65,6 +65,7 @@ impl VmDriver for FcDriver {
             diff_checkpoint: false,
             adopt: true,
             prepare: true,
+            staging: false,
             balloon: false,
             console: false,
             debug: false,

@@ -76,6 +76,12 @@ pub trait PreparedVm: Send + Sync {
         None
     }
 
+    /// Bring the files this VM boots from into the area its VMM can reach.
+    /// `Some` iff [`crate::DriverCapabilities::staging`].
+    fn staging(&self) -> Option<&dyn Staging> {
+        None
+    }
+
     /// Boots `spec` on this process. `spec.id` and `spec.isolation` must
     /// equal what `prepare` was given ([`crate::Error::InvalidSpec`]
     /// otherwise); the handle shares this process. At most one `boot` or
@@ -89,9 +95,107 @@ pub trait PreparedVm: Send + Sync {
         spec: RestoreSpec,
     ) -> Result<Box<dyn VmHandle>>;
 
-    /// Kills and reaps the process now. Idempotent, and valid after a boot
-    /// too (it kills that VM); the status is how the process ended.
+    /// Kills and reaps the process now, and removes everything the VM was
+    /// given: its [`Staging`] area and, with it, whatever was staged
+    /// there. Idempotent, and valid after a boot too (it kills that VM);
+    /// the status is how the process ended.
+    ///
+    /// The removal is the reason a caller does not have to know what a
+    /// confinement is made of — but it is also unconditional, so a disk
+    /// that must outlive the VM is taken out with
+    /// [`Staging::unstage_disk`] *before* this, not after.
     async fn discard(&self) -> Result<ExitStatus>;
+}
+
+/// Bring the files a VM boots from into the private area its VMM can
+/// reach.
+///
+/// A confined VMM — Firecracker under the jailer, chrooted into a per-VM
+/// directory — can open nothing outside that area, so its kernel, its
+/// disks, and a checkpoint's files have to be inside before the VM is told
+/// about them. *Which* files those are is the orchestrator's business;
+/// where they must be, and how they get there (a hard link, a private
+/// copy, a device node), is the driver's. This capability is that split:
+/// the caller says what a file is, and gets back the path its spec must
+/// name for it. It never learns whether a confinement exists.
+///
+/// Present iff [`crate::DriverCapabilities::staging`]. A driver whose VMs
+/// read host paths as they are still offers it, as the identity: staging
+/// such a file is a no-op that answers with the path it was given. That is
+/// what lets an orchestrator stage unconditionally instead of branching on
+/// a confinement it is not supposed to know about.
+///
+/// Staging a file that is already in the VM's area leaves it alone and
+/// names it where it is — so a caller may stage what an earlier stage, or
+/// a warm slot it claimed, already put there.
+///
+/// Everything staged lives and dies with the VM: [`PreparedVm::discard`]
+/// removes the area whole.
+#[async_trait]
+pub trait Staging: Send + Sync {
+    /// Stages `src` as this VM's kernel image, and returns the path the
+    /// spec's [`BootSpec::Kernel`](crate::BootSpec::Kernel) must name.
+    async fn stage_kernel(&self, src: &Path) -> Result<PathBuf>;
+
+    /// Stages `source` as this VM's disk `id`, and returns the path the
+    /// [`DiskSpec`](crate::DiskSpec) carrying that id must name.
+    ///
+    /// `id` is the disk id the spec will carry, not a file name. A driver
+    /// that records disk paths in its checkpoints (Firecracker does)
+    /// records the name it staged the disk under, and a restore reproduces
+    /// that name from the same id — so a disk staged under one id and
+    /// specced under another is a checkpoint that will not restore.
+    async fn stage_disk(&self, id: &str, source: DiskSource<'_>) -> Result<PathBuf>;
+
+    /// Moves this VM's disk `id` back out to `dst`, so it survives
+    /// [`PreparedVm::discard`].
+    ///
+    /// The disk is gone from the VM's area once this returns; putting it
+    /// back into a later VM is [`DiskSource::Handover`]. `Ok(false)` means
+    /// there was no such disk staged — for a driver that stages nothing,
+    /// or a disk that was never brought in — which is an outcome, not a
+    /// failure.
+    ///
+    /// The VM must not be writing to the disk. A caller takes a disk out
+    /// of a VM it is about to discard, and the guest is already stopped or
+    /// [`Quiesced`](crate::VmState::Quiesced) by then.
+    async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool>;
+
+    /// Stages `image`'s files, and returns the image as this VM must name
+    /// it for [`PreparedVm::restore`].
+    ///
+    /// A warm pool stages a checkpoint into a slot long before any restore
+    /// is asked for, and that — not the confinement — is what makes this a
+    /// verb of its own: the memory file is the guest's entire RAM, so
+    /// bringing it in is the expensive half of a restore, and a slot that
+    /// paid for it up front restores in milliseconds.
+    async fn stage_checkpoint(&self, image: &CheckpointImage) -> Result<CheckpointImage>;
+}
+
+/// What a disk being staged is — which decides what the VM gets, and what
+/// happens to the caller's own copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskSource<'a> {
+    /// A block device — a device-mapper volume, a loop device — that the
+    /// VM must open as one. Mirrored, never copied.
+    Device(&'a Path),
+    /// A file the caller keeps: the VM gets a private copy, so guest
+    /// writes never reach the original.
+    Image(&'a Path),
+    /// A file the caller gives up: it is moved in, and no longer exists at
+    /// the source once staging returns. The counterpart of
+    /// [`Staging::unstage_disk`] — the disk of a discarded VM, parked
+    /// outside, coming back into a fresh one.
+    Handover(&'a Path),
+}
+
+impl<'a> DiskSource<'a> {
+    /// The host path this source names.
+    pub fn path(&self) -> &'a Path {
+        match self {
+            Self::Device(path) | Self::Image(path) | Self::Handover(path) => path,
+        }
+    }
 }
 
 /// Accept vsock connections the guest initiates (the READY dial-out).
