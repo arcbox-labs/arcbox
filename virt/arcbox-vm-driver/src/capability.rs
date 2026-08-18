@@ -95,15 +95,8 @@ pub trait PreparedVm: Send + Sync {
         spec: RestoreSpec,
     ) -> Result<Box<dyn VmHandle>>;
 
-    /// Kills and reaps the process now, and removes everything the VM was
-    /// given: its [`Staging`] area and, with it, whatever was staged
-    /// there. Idempotent, and valid after a boot too (it kills that VM);
-    /// the status is how the process ended.
-    ///
-    /// The removal is the reason a caller does not have to know what a
-    /// confinement is made of — but it is also unconditional, so a disk
-    /// that must outlive the VM is taken out with
-    /// [`Staging::unstage_disk`] *before* this, not after.
+    /// Kills and reaps the process now. Idempotent, and valid after a boot
+    /// too (it kills that VM); the status is how the process ended.
     async fn discard(&self) -> Result<ExitStatus>;
 }
 
@@ -129,8 +122,11 @@ pub trait PreparedVm: Send + Sync {
 /// names it where it is — so a caller may stage what an earlier stage, or
 /// a warm slot it claimed, already put there.
 ///
-/// Everything staged lives and dies with the VM: [`PreparedVm::discard`]
-/// removes the area whole.
+/// The area belongs to the VM and does not outlive it, so a disk that must
+/// is taken back out with [`unstage_disk`](Self::unstage_disk). Which verb
+/// removes the area is the driver's business, and today it is not
+/// [`PreparedVm::discard`] on every adapter — do not read the absence of a
+/// disk after a discard as "the driver kept it".
 #[async_trait]
 pub trait Staging: Send + Sync {
     /// Stages `src` as this VM's kernel image, and returns the path the
@@ -140,15 +136,17 @@ pub trait Staging: Send + Sync {
     /// Stages `source` as this VM's disk `id`, and returns the path the
     /// [`DiskSpec`](crate::DiskSpec) carrying that id must name.
     ///
-    /// `id` is the disk id the spec will carry, not a file name. A driver
-    /// that records disk paths in its checkpoints (Firecracker does)
-    /// records the name it staged the disk under, and a restore reproduces
-    /// that name from the same id — so a disk staged under one id and
-    /// specced under another is a checkpoint that will not restore.
+    /// `id` is the disk id the spec will carry, not a file name, and a
+    /// plain one — the same rule [`DiskSpec::id`](crate::DiskSpec) is held
+    /// to, refused rather than resolved by an adapter, since staging
+    /// writes and replaces at the name it makes from it. A driver that
+    /// records disk paths in its checkpoints (Firecracker does) records
+    /// the name it staged the disk under, and a restore reproduces that
+    /// name from the same id — so a disk staged under one id and specced
+    /// under another is a checkpoint that will not restore.
     async fn stage_disk(&self, id: &str, source: DiskSource<'_>) -> Result<PathBuf>;
 
-    /// Moves this VM's disk `id` back out to `dst`, so it survives
-    /// [`PreparedVm::discard`].
+    /// Moves this VM's disk `id` back out to `dst`, so it survives the VM.
     ///
     /// The disk is gone from the VM's area once this returns; putting it
     /// back into a later VM is [`DiskSource::Handover`]. `Ok(false)` means
@@ -159,6 +157,11 @@ pub trait Staging: Send + Sync {
     /// The VM must not be writing to the disk. A caller takes a disk out
     /// of a VM it is about to discard, and the guest is already stopped or
     /// [`Quiesced`](crate::VmState::Quiesced) by then.
+    ///
+    /// `id` is a disk id, held to the same rule as
+    /// [`DiskSpec::id`](crate::DiskSpec) — a plain name. An adapter
+    /// refuses anything else rather than resolving it against its own
+    /// layout, because this verb *moves a file*.
     async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool>;
 
     /// Stages `image`'s files, and returns the image as this VM must name

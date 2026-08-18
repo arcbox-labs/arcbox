@@ -72,13 +72,13 @@ pub trait VmDriver: Send + Sync {
     /// it has a limit of its own.
     ///
     /// A driver's layout can bound the id even though the port does not:
-    /// Firecracker's jailer puts the API socket at
-    /// `{chroot base}/{binary}/{id}/root/run/firecracker.socket`, and
-    /// AF_UNIX leaves 107 bytes for a path, so a long chroot base or a
-    /// long id makes that socket unaddressable. The failure does not name
-    /// itself — the VMM comes up and binds inside its chroot while every
-    /// `connect` from outside fails, which reads as a boot that timed out.
-    /// An orchestrator minting ids asks here instead of guessing.
+    /// Firecracker's jailer puts its sockets under
+    /// `{chroot base}/{binary}/{id}/root/run/`, and AF_UNIX leaves 107
+    /// bytes for a path, so a long chroot base or a long id makes them
+    /// unaddressable. The failure does not name itself — the VMM comes up
+    /// and binds inside its chroot while every `connect` from outside
+    /// fails, which reads as a boot that timed out. An orchestrator
+    /// minting ids asks here instead of guessing.
     ///
     /// `None` means this driver imposes no limit of its own, not that the
     /// question is unsupported; everything else an id must be is

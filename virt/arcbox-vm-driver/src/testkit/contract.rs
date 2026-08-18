@@ -203,7 +203,7 @@ macro_rules! driver_contract {
                 discard_kills_a_prepared_vm,
                 restore_reattaches_disks,
                 a_staged_spec_boots,
-                discard_removes_what_was_staged,
+                a_staged_disk_can_be_taken_back_out,
             }
         }
     };

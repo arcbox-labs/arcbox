@@ -108,15 +108,17 @@ this.
 
   `Staging` on a prepared VM stages the same files under the same names
   ahead of the boot that renders them, which is how a warm pool pays for a
-  checkpoint's memory file before a restore asks for it; `discard` removes
-  the whole `{chroot_base}/{binary}/{id}` tree, so a disk that must outlive
-  the VM leaves through `unstage_disk` first. Without a jail every staging
-  verb is the identity.
+  checkpoint's memory file before a restore asks for it; `unstage_disk`
+  takes a disk back out of the jail, so it survives the VM. Without a jail
+  every staging verb is the identity. Removing the jail itself is still
+  the caller's, not `discard`'s — see the note on `FcPrepared::discard`.
 
-  That API socket is also what bounds a VM id: it must fit AF_UNIX's 107
+  Those sockets are also what bounds a VM id: each must fit AF_UNIX's 107
   bytes, so `id_budget` answers with what the chroot base and binary name
-  leave — `0` for a base that spends it all, since the alternative is ids
-  that look fine and never connect.
+  leave for the longest of them — the guest dial-out listener,
+  `{jail}/run/firecracker.vsock_{port}`, not the API socket — and `0` for
+  a base that spends it all, since the alternative is ids that look fine
+  and never connect.
 
 A VM `id` and a disk `id` must each be a plain name: the first is the jail's
 directory, the second a device id in the API URL and the file the disk is

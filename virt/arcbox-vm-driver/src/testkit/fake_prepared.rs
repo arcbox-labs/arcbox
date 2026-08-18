@@ -165,38 +165,55 @@ impl PreparedFake {
         self.record.runtime_dir.join("staged")
     }
 
-    /// Brings `src` into the staging area at `rel`, and answers with where
+    /// Where the disk `id` sits in the staging area.
+    ///
+    /// Refuses an id that is not a plain name, exactly as a real adapter
+    /// must: staging writes and replaces at this path and unstaging moves
+    /// what it finds there, so a `..` would reach a file outside the area.
+    /// The fake enforces it because it is the reference driver — a gap it
+    /// shares with the adapters is a gap no contract check can see.
+    fn staged_disk(&self, id: &str) -> Result<PathBuf> {
+        let mut components = Path::new(id).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(Error::InvalidSpec(format!(
+                "disk id `{id}` must be a plain name"
+            )));
+        }
+        Ok(self.staging_root().join(format!("{id}.ext4")))
+    }
+
+    /// Brings `src` into the staging area at `dst`, and answers with where
     /// it landed. A source already inside the area is left where it is —
     /// the same short-circuit a real confinement makes.
-    async fn bring_in(&self, src: &Path, rel: &str, how: Bring) -> Result<PathBuf> {
-        let root = self.staging_root();
-        if src.starts_with(&root) {
+    async fn bring_in(&self, src: &Path, dst: &Path, how: Bring) -> Result<PathBuf> {
+        if src.starts_with(self.staging_root()) {
             return Ok(src.to_path_buf());
         }
-        let dst = root.join(rel);
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        match tokio::fs::remove_file(&dst).await {
+        match tokio::fs::remove_file(dst).await {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::Io(e)),
             _ => {}
         }
         match how {
             // A device node is not something a fake can make; a symlink is
             // the stand-in, and it is visibly not a copy.
-            Bring::Device => tokio::fs::symlink(src, &dst).await?,
+            Bring::Device => tokio::fs::symlink(src, dst).await?,
             Bring::Copy => {
-                tokio::fs::copy(src, &dst).await?;
+                tokio::fs::copy(src, dst).await?;
             }
-            Bring::Move => match tokio::fs::rename(src, &dst).await {
+            Bring::Move => match tokio::fs::rename(src, dst).await {
                 Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                    tokio::fs::copy(src, &dst).await?;
+                    tokio::fs::copy(src, dst).await?;
                     tokio::fs::remove_file(src).await?;
                 }
                 other => other?,
             },
         }
-        Ok(dst)
+        Ok(dst.to_path_buf())
     }
 
     /// Kills whatever `phase` says is running: the booted VM, or the bare
@@ -285,12 +302,7 @@ impl PreparedVm for PreparedFake {
     }
 
     async fn discard(&self) -> Result<ExitStatus> {
-        let status = self.kill(&mut lock(&self.phase));
-        match tokio::fs::remove_dir_all(self.staging_root()).await {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::Io(e)),
-            _ => {}
-        }
-        Ok(status)
+        Ok(self.kill(&mut lock(&self.phase)))
     }
 }
 
@@ -299,7 +311,8 @@ impl PreparedVm for PreparedFake {
 #[async_trait]
 impl Staging for PreparedFake {
     async fn stage_kernel(&self, src: &Path) -> Result<PathBuf> {
-        self.bring_in(src, "vmlinux", Bring::Copy).await
+        self.bring_in(src, &self.staging_root().join("vmlinux"), Bring::Copy)
+            .await
     }
 
     async fn stage_disk(&self, id: &str, source: DiskSource<'_>) -> Result<PathBuf> {
@@ -308,12 +321,12 @@ impl Staging for PreparedFake {
             DiskSource::Image(_) => Bring::Copy,
             DiskSource::Handover(_) => Bring::Move,
         };
-        self.bring_in(source.path(), &format!("{id}.ext4"), how)
-            .await
+        let into = self.staged_disk(id)?;
+        self.bring_in(source.path(), &into, how).await
     }
 
     async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool> {
-        let staged = self.staging_root().join(format!("{id}.ext4"));
+        let staged = self.staged_disk(id)?;
         if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
             return Ok(false);
         }

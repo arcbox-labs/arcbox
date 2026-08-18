@@ -107,10 +107,10 @@ impl VmDriver for FcDriver {
         Some(self)
     }
 
-    /// Under the jailer, what the API socket's path leaves for the id
-    /// ([`jail::id_budget`]) — so a longer chroot base or a longer binary
-    /// name tightens the budget rather than silently reintroducing the
-    /// connect timeout it exists to prevent.
+    /// Under the jailer, what the longest socket path in the jail leaves
+    /// for the id ([`jail::id_budget`]) — so a longer chroot base or a
+    /// longer binary name tightens the budget rather than silently
+    /// reintroducing the connect timeout it exists to prevent.
     ///
     /// Nothing bounds the id in direct mode: the API socket and the vsock
     /// live in the runtime dir, where the id is not part of the path. An

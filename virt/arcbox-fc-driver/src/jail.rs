@@ -94,28 +94,49 @@ pub fn vsock_uds_path(chroot_root: &Path) -> PathBuf {
 /// one is the terminator.
 const SUN_PATH: usize = 107;
 
+/// The widest listener port [`id_budget`] leaves room for.
+///
+/// [`VsockListen::listen`](arcbox_vm_driver::VsockListen::listen) takes a
+/// `u32`, but reserving all ten digits costs ten bytes of id — on the
+/// stock layout the difference between accepting and refusing the 36-byte
+/// UUIDs an orchestrator mints. Refusing every id is a worse failure than
+/// the `ENAMETOOLONG` a wider port would raise at bind time, which names
+/// the path it could not bind; no consumer of this driver listens above
+/// `u16::MAX`.
+const WIDEST_RESERVED_PORT: u32 = u16::MAX as u32;
+
 /// The longest VM id this jailer layout leaves room for.
 ///
-/// The id is a directory component of the chroot, and the longest path
-/// under it that has a hard limit is the API socket — the jail's two
-/// sockets both live in `{jail}/run/`, and `firecracker.socket` is the
-/// longer name. A chroot base that spends the budget makes that socket
-/// unaddressable, and nothing says so: the jailer creates the path and
-/// Firecracker binds it from inside the chroot, where the name is short,
-/// while every `connect` from the host fails. What that looks like is a
-/// VMM that is up and answering nothing — a boot that timed out.
+/// The id is a directory component of the chroot, so every socket bound
+/// under it carries the id in its path and has 107 bytes to fit in. Two
+/// do: the API socket, and the guest dial-out listener — the vsock UDS
+/// plus Firecracker's `_{port}` suffix ([`crate::vsock::listener_socket_path`]),
+/// which is the longer of the two and is bound *before* the guest starts.
+/// The budget is measured against whichever is longer, so it cannot be
+/// invalidated by renaming one of them.
 ///
-/// Saturating on purpose. A base deep enough to spend all 107 bytes
-/// leaves room for no id at all, and `0` is the answer that says so; the
+/// Getting this wrong does not announce itself. The jailer creates the
+/// path and Firecracker binds it from inside the chroot, where the name is
+/// short, while every `connect` from the host fails — a VMM that is up and
+/// answering nothing, read as a boot that timed out.
+///
+/// Saturating on purpose. A base deep enough to spend all 107 bytes leaves
+/// room for no id at all, and `0` is the answer that says so; the
 /// subtraction wrapping into a huge budget would hand out ids that cannot
 /// work. A chroot base under a deep temporary directory reaches this in
 /// tests long before production does.
 pub fn id_budget(fc_binary: impl AsRef<Path>, chroot_base_dir: impl AsRef<Path>) -> usize {
     // Everything around the id, measured on a one-byte id.
-    let fixed = api_socket_path(&chroot_root(fc_binary, chroot_base_dir, "x"))
-        .as_os_str()
-        .len()
-        .saturating_sub(1);
+    let root = chroot_root(fc_binary, chroot_base_dir, "x");
+    let fixed = [
+        api_socket_path(&root),
+        crate::vsock::listener_socket_path(&vsock_uds_path(&root), WIDEST_RESERVED_PORT),
+    ]
+    .iter()
+    .map(|path| path.as_os_str().len())
+    .max()
+    .unwrap_or_default()
+    .saturating_sub(1);
     SUN_PATH.saturating_sub(fixed)
 }
 
@@ -425,19 +446,25 @@ mod tests {
     }
 
     #[test]
-    fn the_id_budget_is_what_the_socket_leaves_and_never_wraps() {
+    fn the_id_budget_is_what_the_longest_socket_leaves_and_never_wraps() {
         let budget = id_budget("/opt/fc/firecracker", "/srv/jailer");
+        // The dial-out listener, not the API socket, is what the budget is
+        // measured against: it is the longer path, and it is bound before
+        // the guest starts.
+        assert!(
+            "/run/firecracker.vsock_65535".len() > "/run/firecracker.socket".len(),
+            "the API socket became the longer path; the budget must follow it"
+        );
         assert_eq!(
             budget,
-            SUN_PATH - "/srv/jailer/firecracker//root/run/firecracker.socket".len()
+            SUN_PATH - "/srv/jailer/firecracker//root/run/firecracker.vsock_65535".len()
         );
-        // An id of exactly the budget fills `sun_path` and no more.
-        let fits = api_socket_path(&chroot_root(
-            "/opt/fc/firecracker",
-            "/srv/jailer",
-            &"a".repeat(budget),
-        ));
+        // An id of exactly the budget fills `sun_path` for that listener
+        // and leaves the API socket comfortably inside it.
+        let root = chroot_root("/opt/fc/firecracker", "/srv/jailer", &"a".repeat(budget));
+        let fits = crate::vsock::listener_socket_path(&vsock_uds_path(&root), 65535);
         assert_eq!(fits.as_os_str().len(), SUN_PATH);
+        assert!(api_socket_path(&root).as_os_str().len() < SUN_PATH);
 
         // A chroot base deep enough spends the whole budget: zero, not a
         // wrap into a length that would look generous and never connect.

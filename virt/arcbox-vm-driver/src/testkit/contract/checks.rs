@@ -498,14 +498,14 @@ pub async fn a_staged_spec_boots(h: &dyn ContractHarness) {
     vm.shutdown(ShutdownMode::Kill).await.expect("kill");
 }
 
-/// `unstage_disk` takes a disk back out intact, and `discard` removes
-/// whatever is still staged.
+/// `unstage_disk` takes a staged disk back out intact, and
+/// [`DiskSource::Handover`] puts it back by moving it.
 ///
-/// The two halves of the same rule: everything staged for a VM dies with
-/// it, so anything that must outlive it leaves first. A driver that stages
-/// nothing answers the identity — nothing to take out, and the caller's
-/// own file untouched by the discard.
-pub async fn discard_removes_what_was_staged(h: &dyn ContractHarness) {
+/// The way anything survives the VM it was staged for: the area belongs to
+/// the VM, and a disk that must outlive it leaves first. A driver that
+/// stages nothing answers the identity instead — nothing to take out, and
+/// the caller's own file where it always was.
+pub async fn a_staged_disk_can_be_taken_back_out(h: &dyn ContractHarness) {
     const CONTENT: &[u8] = b"a disk staged by the contract";
 
     let driver = h.driver();
@@ -513,7 +513,7 @@ pub async fn discard_removes_what_was_staged(h: &dyn ContractHarness) {
         assert!(!driver.capabilities().prepare);
         return;
     };
-    let spec = h.spec(&id("staged-discard"));
+    let spec = h.spec(&id("staged-unstage"));
     let dir = h.runtime_dir();
     let prepared = prepare
         .prepare(&spec.id, &spec.isolation, &dir)
@@ -544,20 +544,31 @@ pub async fn discard_removes_what_was_staged(h: &dyn ContractHarness) {
         CONTENT
     );
 
+    // A disk id names a file the driver writes, replaces and moves, so one
+    // that is not a plain name is refused rather than resolved.
+    assert!(
+        staging
+            .stage_disk("../escape", DiskSource::Image(&source))
+            .await
+            .is_err(),
+        "a traversing disk id was staged"
+    );
+    assert!(
+        staging.unstage_disk("../escape", &dir).await.is_err(),
+        "a traversing disk id was unstaged"
+    );
+
+    let parked = dir.join("parked.ext4");
     if staged == source {
         // Identity staging: the file was already where the VM reads it, so
-        // there is nothing to take out and nothing for `discard` to remove.
+        // there is nothing to take out and nothing was moved.
         assert!(
             !staging
-                .unstage_disk("data", &dir.join("parked.ext4"))
+                .unstage_disk("data", &parked)
                 .await
                 .expect("unstage what was never staged")
         );
-        prepared.discard().await.expect("discard");
-        assert!(
-            tokio::fs::try_exists(&source).await.unwrap_or(false),
-            "a driver that stages nothing must not remove the caller's file"
-        );
+        assert!(tokio::fs::try_exists(&source).await.unwrap_or(false));
         return;
     }
 
@@ -577,7 +588,6 @@ pub async fn discard_removes_what_was_staged(h: &dyn ContractHarness) {
         CONTENT
     );
 
-    let parked = dir.join("parked.ext4");
     assert!(
         staging
             .unstage_disk("data", &parked)
@@ -590,6 +600,10 @@ pub async fn discard_removes_what_was_staged(h: &dyn ContractHarness) {
             .await
             .expect("read the parked disk"),
         CONTENT
+    );
+    assert!(
+        !tokio::fs::try_exists(&staged).await.unwrap_or(true),
+        "the disk is gone from the vm's area"
     );
     assert!(
         !staging
@@ -608,15 +622,9 @@ pub async fn discard_removes_what_was_staged(h: &dyn ContractHarness) {
         !tokio::fs::try_exists(&parked).await.unwrap_or(true),
         "a handed-over disk is moved, not copied"
     );
-
-    let status = prepared.discard().await.expect("discard");
-    assert!(
-        !tokio::fs::try_exists(&back).await.unwrap_or(true),
-        "discard left a staged disk behind"
-    );
     assert_eq!(
-        prepared.discard().await.expect("second discard"),
-        status,
-        "discard is idempotent once it has removed the staging area"
+        tokio::fs::read(&back).await.expect("read the disk back in"),
+        CONTENT
     );
+    prepared.discard().await.expect("discard");
 }

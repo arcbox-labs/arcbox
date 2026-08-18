@@ -425,6 +425,20 @@ pub fn disk_file(id: &str) -> String {
     format!("{id}.ext4")
 }
 
+/// [`disk_file`] for an id that came from a staging caller rather than
+/// from a validated spec: refused unless it is a plain name.
+///
+/// `drive` holds a spec's disk id to the same rule, and `place` refuses a
+/// traversing destination — but only under a jail, since without one it
+/// stages nothing. Staging is asked for an id in both modes, so the rule
+/// is checked here, where it does not depend on a confinement existing.
+pub fn staged_disk_file(id: &str) -> Result<String> {
+    if !is_plain_component(id) {
+        return Err(unsupported(&format!("disk id `{id}` must be a plain name")));
+    }
+    Ok(disk_file(id))
+}
+
 /// The directory a checkpoint whose image dir is named `name` is staged
 /// into inside the jail.
 ///

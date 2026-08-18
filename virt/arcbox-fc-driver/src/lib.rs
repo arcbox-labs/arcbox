@@ -17,8 +17,8 @@
 //!   and [`RestoreSpec`](arcbox_vm_driver::RestoreSpec) →
 //!   [`render::FcRestorePlan`]: every path Firecracker sees, and the
 //!   jailer's chroot relativity, is decided there and nowhere else.
-//! - [`jail`] — the jailer's chroot layout, the id budget its API socket
-//!   path leaves ([`jail::id_budget`]), and how host files are staged into
+//! - [`jail`] — the jailer's chroot layout, the id budget its longest
+//!   socket path leaves ([`jail::id_budget`]), and how host files are staged into
 //!   it (link-or-copy, copy, block-device node, move-in), including
 //!   [`jail::apply`] for a rendered plan.
 //! - [`spawn`] — the `firecracker` / `jailer` process spawn from a
@@ -38,8 +38,7 @@
 //!   a VMM process whose API is unreachable — kill, observe, detach.
 //! - [`prepared`] — [`FcPrepared`], the port's `PreparedVm`: a spawned
 //!   VMM waiting for a spec, listeners bound before the guest starts, and
-//!   the `Staging` capability over its jail — `discard` takes the jail
-//!   with it.
+//!   the `Staging` capability over its jail.
 //! - [`discover`] — finding a Firecracker that outlived the process which
 //!   booted it: the recorded pid when it is a Firecracker the record names,
 //!   else a `/proc` scan for one, by `--id`, `--api-sock`, or jail root.

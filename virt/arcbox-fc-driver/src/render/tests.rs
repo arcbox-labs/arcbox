@@ -434,6 +434,11 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
     );
     assert!(stage.is_empty());
     assert!(invalid(layout.jail_path("../rootfs.ext4")).contains("inside the jail"));
+    // A staging caller's disk id is refused without reference to a jail:
+    // `place` guards the destination only when there is one to escape
+    // from, so the rule would otherwise hold in one isolation mode only.
+    assert!(invalid(staged_disk_file("../escape")).contains("plain name"));
+    assert_eq!(staged_disk_file("rootfs").unwrap(), "rootfs.ext4");
     assert_eq!(
         layout.jail_path(&disk_file("rootfs")).unwrap(),
         Some(base.join("firecracker/box/root/rootfs.ext4"))

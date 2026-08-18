@@ -247,23 +247,16 @@ impl PreparedVm for FcPrepared {
         Ok(Box::new(self.handle(client, has_vsock)))
     }
 
-    /// Kills the VMM, then removes the jail the spawn created — the whole
-    /// `{chroot base}/{binary}/{id}` tree, staged files and all.
-    ///
-    /// The kill comes first: a live Firecracker holds its disks open, and
-    /// the jail is its root. Removal failures are reported rather than
-    /// warned about, because the caller's remedy is to call again — this
-    /// is idempotent, and a second kill just reports the same status.
+    /// Kills the VMM. The jail it was spawned into outlives it: the one
+    /// caller still removes the chroot itself, and its copy-mode pause
+    /// path takes the sandbox's only writable disk out of that chroot
+    /// *after* discarding, so a `discard` that removed the jail here would
+    /// destroy the disk it is about to park — silently, since the move is
+    /// guarded by an existence check. Removing the jail moves onto this
+    /// verb in the same change that reorders those call sites onto
+    /// [`Staging::unstage_disk`] (vm-stack-redesign R3, PR-G2).
     async fn discard(&self) -> Result<ExitStatus> {
-        let status = self.process.kill().await?;
-        if let Some(jail) = self.layout.jail()
-            && let Some(dir) = jail.root.parent()
-            && let Err(e) = tokio::fs::remove_dir_all(dir).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(Error::Io(e));
-        }
-        Ok(status)
+        Ok(self.process.kill().await?)
     }
 }
 
@@ -287,12 +280,12 @@ impl Staging for FcPrepared {
             DiskSource::Image(_) => StageKind::Copy,
             DiskSource::Handover(_) => StageKind::Move,
         };
-        self.bring_in(source.path(), &render::disk_file(id), kind)
+        self.bring_in(source.path(), &render::staged_disk_file(id)?, kind)
             .await
     }
 
     async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool> {
-        let Some(staged) = self.layout.jail_path(&render::disk_file(id))? else {
+        let Some(staged) = self.layout.jail_path(&render::staged_disk_file(id)?)? else {
             return Ok(false);
         };
         if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
