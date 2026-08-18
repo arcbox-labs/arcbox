@@ -442,15 +442,14 @@ mod tests {
     use super::super::types::action;
     use super::*;
 
-    /// A capture that fails and leaves the guest running (here: the fake's
-    /// capture succeeds, the catalog commit fails, the fake resumed) is an
-    /// error the caller can retry: the sandbox stays Ready with everything
-    /// it holds.
+    /// A capture that fails and leaves the guest running is an error the
+    /// caller can retry: the sandbox stays Ready with everything it holds.
     #[tokio::test]
     async fn a_recoverable_checkpoint_failure_leaves_the_sandbox_ready() {
         let dir = tempfile::tempdir().unwrap();
         let (manager, driver, probe) = fake_manager(dir.path()).await;
         let (instance, handle) = live_sandbox(&manager, &driver, "keeps").await;
+        driver.fail_next_checkpoint();
 
         expect_err(
             manager

@@ -220,7 +220,8 @@ async fn checkpoint_writes_an_image_restore_reads_back_with_overrides() {
         .unwrap();
     assert_eq!(vm.state(), VmState::Quiesced);
     assert_eq!(image.format, CheckpointFormat::new("fake/v1"));
-    assert!(image.dir.join("checkpoint.json").is_file());
+    assert!(image.dir.join("vmstate").is_file());
+    assert!(image.dir.join("mem").is_file());
     // A quiesced VM can be checkpointed again and resumed.
     let resume = CheckpointOptions::default();
     vm.checkpoint()
@@ -354,10 +355,8 @@ async fn detach_keeps_the_vm_alive_for_adopt_and_only_once() {
 #[tokio::test]
 async fn scripted_failures_fire_once() {
     let dir = tempfile::tempdir().unwrap();
-    let driver = FakeDriver::builder()
-        .fail_boot_once()
-        .fail_checkpoint_once()
-        .build();
+    let driver = FakeDriver::new();
+    driver.fail_next_boot().fail_next_checkpoint();
     assert!(matches!(
         driver.boot(spec("vm-1"), dir.path()).await.err(),
         Some(Error::Driver { .. })
@@ -373,6 +372,55 @@ async fn scripted_failures_fire_once() {
     cp.checkpoint(&dir.path().join("b"), CheckpointOptions::default())
         .await
         .unwrap();
+}
+
+/// A frozen checkpoint failure differs from an ordinary one in the state
+/// it leaves behind, and that state is the whole signal: a caller reads
+/// `Quiesced` back from a capture it asked to resume and knows the port
+/// has no verb left to thaw the guest.
+#[tokio::test]
+async fn a_frozen_checkpoint_failure_leaves_the_guest_quiesced() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    driver.freeze_next_checkpoint();
+    let vm = driver.boot(spec("vm-1"), dir.path()).await.unwrap();
+    let cp = vm.checkpoint().unwrap();
+
+    assert!(matches!(
+        cp.checkpoint(&dir.path().join("a"), CheckpointOptions::default())
+            .await
+            .err(),
+        Some(Error::Driver { .. })
+    ));
+    assert_eq!(vm.state(), VmState::Quiesced);
+    // Armed once: the retry captures and resumes.
+    cp.checkpoint(&dir.path().join("b"), CheckpointOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(vm.state(), VmState::Running);
+}
+
+/// A VM that was asked to die is distinguishable from one whose handle
+/// merely went out of scope, though both end `Exited` with the same
+/// status — which is what makes a teardown that forgot its shutdown
+/// visible at all.
+#[tokio::test]
+async fn the_driver_reports_which_shutdowns_a_vm_was_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    let asked = VmId::new("vm-asked").unwrap();
+    let dropped = VmId::new("vm-dropped").unwrap();
+    assert!(driver.shutdowns(&asked).is_empty(), "no such vm yet");
+
+    let vm = driver.boot(spec("vm-asked"), dir.path()).await.unwrap();
+    vm.shutdown(ShutdownMode::Kill).await.unwrap();
+    assert_eq!(driver.shutdowns(&asked), vec![ShutdownMode::Kill]);
+
+    drop(driver.boot(spec("vm-dropped"), dir.path()).await.unwrap());
+    assert!(
+        driver.shutdowns(&dropped).is_empty(),
+        "a killing drop is not a shutdown anyone asked for"
+    );
 }
 
 #[tokio::test]

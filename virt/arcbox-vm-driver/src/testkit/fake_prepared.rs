@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::fake_driver::{DriverInner, NAME};
-use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, VmInner};
+use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, VMSTATE_FILE, VmInner};
 use super::fake_vsock::{FakeListener, Inbound};
 use super::lock;
 use crate::capability::{
@@ -159,12 +159,7 @@ impl PreparedFake {
         spec.validate()?;
         let mut phase = lock(&self.phase);
         self.require_unused(&phase)?;
-        if self
-            .driver
-            .knobs
-            .fail_boot_once
-            .swap(false, Ordering::AcqRel)
-        {
+        if self.driver.knobs.fail_boot.swap(false, Ordering::AcqRel) {
             return Err(Error::Driver {
                 driver: NAME,
                 message: "scripted boot failure".into(),
@@ -309,7 +304,7 @@ impl PreparedVm for PreparedFake {
         if !self.driver.caps.checkpoint || image.format.as_str() != CHECKPOINT_FORMAT {
             return Err(Error::ForeignCheckpoint(image.format.clone()));
         }
-        let bytes = tokio::fs::read(image.dir.join("checkpoint.json")).await?;
+        let bytes = tokio::fs::read(image.dir.join(VMSTATE_FILE)).await?;
         let file: CheckpointFile = serde_json::from_slice(&bytes).map_err(std::io::Error::from)?;
         if file.format.as_str() != CHECKPOINT_FORMAT {
             return Err(Error::ForeignCheckpoint(file.format));

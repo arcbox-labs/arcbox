@@ -31,7 +31,25 @@ const SIGKILL: i32 = 9;
 /// The on-disk format the fake writes and the only one it restores.
 pub(super) const CHECKPOINT_FORMAT: &str = "fake/v1";
 
-/// The contents of a fake checkpoint's `checkpoint.json`.
+/// The machine-state file every checkpoint writes, and the one `restore`
+/// reads back.
+///
+/// Named the way a real adapter names it because consumers stage a
+/// checkpoint by moving *these two files* — a fake that invented its own
+/// name would be restorable only in place, and nothing that stages a
+/// checkpoint into a jail could be tested over it.
+pub(super) const VMSTATE_FILE: &str = "vmstate";
+
+/// The guest-memory file a full checkpoint writes beside the vmstate. A
+/// diff checkpoint writes none, which is the difference a catalog records.
+pub(super) const MEM_FILE: &str = "mem";
+
+/// What the fake puts in [`MEM_FILE`]. Fixed and small: it stands for guest
+/// memory without costing what guest memory costs, and nothing reads it —
+/// a restore replays [`VMSTATE_FILE`].
+const MEM_IMAGE: &[u8] = b"fake guest memory\n";
+
+/// The contents of a fake checkpoint's [`VMSTATE_FILE`].
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct CheckpointFile {
     pub(super) format: CheckpointFormat,
@@ -56,6 +74,13 @@ pub(super) struct VmInner {
     inbound: Arc<Inbound>,
     console: Mutex<Vec<u8>>,
     balloon_target_bytes: AtomicU64,
+    /// Every `shutdown` this VM was asked for, in order.
+    ///
+    /// A killing `Drop` is deliberately not one of them: it goes through
+    /// `exit`, so a test can tell a VM that was *asked* to die from one
+    /// whose handle merely went out of scope — and the two are different
+    /// bugs in a teardown path.
+    shutdowns: Mutex<Vec<ShutdownMode>>,
 }
 
 impl VmInner {
@@ -79,6 +104,7 @@ impl VmInner {
             inbound,
             console: Mutex::new(Vec::new()),
             balloon_target_bytes: AtomicU64::new(balloon_target_bytes),
+            shutdowns: Mutex::new(Vec::new()),
         })
     }
 
@@ -140,6 +166,10 @@ impl VmInner {
     pub(super) fn push_console(&self, bytes: &[u8]) {
         lock(&self.console).extend_from_slice(bytes);
     }
+
+    pub(super) fn shutdowns(&self) -> Vec<ShutdownMode> {
+        lock(&self.shutdowns).clone()
+    }
 }
 
 /// A [`VmHandle`] onto a fake VM.
@@ -197,6 +227,7 @@ impl VmHandle for FakeVm {
     }
 
     async fn shutdown(&self, mode: ShutdownMode) -> Result<ExitStatus> {
+        lock(&self.vm.shutdowns).push(mode);
         let status = match mode {
             ShutdownMode::Graceful { .. } => ExitStatus::exited(0),
             ShutdownMode::Kill => ExitStatus::signaled(SIGKILL),
@@ -272,10 +303,29 @@ impl Checkpoint for Checkpointer {
                 source: None,
             });
         }
-        if vm.knobs.fail_checkpoint_once.swap(false, Ordering::AcqRel) {
+        if vm.knobs.fail_checkpoint.swap(false, Ordering::AcqRel) {
             return Err(Error::Driver {
                 driver: NAME,
                 message: "scripted checkpoint failure".into(),
+                source: None,
+            });
+        }
+        // The one failure a caller cannot recover from: the capture is
+        // written or not, but the guest is left quiesced where the request
+        // asked for it back. Set before reporting, because that is the
+        // order the state a caller reads has to be in.
+        if vm.knobs.freeze_checkpoint.swap(false, Ordering::AcqRel) {
+            {
+                let mut state = lock(&vm.state);
+                if !matches!(*state, VmState::Exited(_)) {
+                    *state = VmState::Quiesced;
+                }
+            }
+            return Err(Error::Driver {
+                driver: NAME,
+                message: "the guest stays quiesced: it could not be resumed after a failed \
+                          checkpoint"
+                    .into(),
                 source: None,
             });
         }
@@ -287,7 +337,10 @@ impl Checkpoint for Checkpointer {
         };
         let json = serde_json::to_vec_pretty(&file).map_err(std::io::Error::from)?;
         tokio::fs::create_dir_all(dst).await?;
-        tokio::fs::write(dst.join("checkpoint.json"), json).await?;
+        tokio::fs::write(dst.join(VMSTATE_FILE), json).await?;
+        if opts.kind == CheckpointKind::Full {
+            tokio::fs::write(dst.join(MEM_FILE), MEM_IMAGE).await?;
+        }
         {
             let mut state = lock(&vm.state);
             if !matches!(*state, VmState::Exited(_)) {

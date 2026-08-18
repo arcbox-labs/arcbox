@@ -255,21 +255,18 @@ mod tests {
         assert!(error.to_string().contains("jailer"), "{error}");
     }
 
-    /// A pause whose capture succeeded and held the guest, but whose commit
-    /// failed, cannot go back to Ready — the port has no thaw — so it fails
-    /// the sandbox the way a failed boot does and releases everything it
-    /// held: nothing may sit in `Failed` still owning a frozen VMM, its
-    /// TAP + IP, its overlay and its chroot until an explicit Remove.
-    ///
-    /// The fake driver's capture writes `checkpoint.json`, not the vmstate
-    /// and mem pair the catalog commits, so with it a `HoldQuiesced` capture
-    /// succeeds and the commit that follows fails — exactly this case.
+    /// A pause whose capture failed after freezing the guest cannot go back
+    /// to Ready — the port has no thaw — so it fails the sandbox the way a
+    /// failed boot does and releases everything it held: nothing may sit in
+    /// `Failed` still owning a frozen VMM, its TAP + IP, its overlay and
+    /// its chroot until an explicit Remove.
     #[tokio::test]
     async fn pause_that_leaves_the_guest_frozen_fails_and_releases_the_sandbox() {
         let dir = tempfile::tempdir().unwrap();
         let (manager, driver, probe) = super::super::testing::fake_manager(dir.path()).await;
         let (instance, handle) =
             super::super::testing::live_sandbox(&manager, &driver, "frozen").await;
+        driver.freeze_next_checkpoint();
         let mut events = manager.subscribe_events();
 
         let error = super::super::testing::expect_err(
