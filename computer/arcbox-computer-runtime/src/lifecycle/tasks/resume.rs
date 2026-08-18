@@ -14,7 +14,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arcbox_fc_driver::jail::chroot_root;
 use arcbox_vm_driver::net::{GuestNetwork, NetworkLease};
 use arcbox_vm_driver::{DiskSource, IsolationSpec, NicSpec, PreparedVm, VmDriver, VmHandle, VmId};
 use tracing::warn;
@@ -32,9 +31,9 @@ use crate::snapshot_cow::{CowHandle, CowManager};
 /// Re-create the runtime of a paused sandbox from its checkpoint.
 ///
 /// On failure every re-created resource is unwound (a copy-mode rootfs
-/// parked again, the VMM killed, the overlay detached with its COW kept,
-/// the fresh network quarantined, chroot and journal removed) so the
-/// caller can park the sandbox back at `Paused`.
+/// parked again, the VMM killed — which takes the area it ran in — the
+/// overlay detached with its COW kept, the fresh network quarantined, the
+/// journal removed) so the caller can park the sandbox back at `Paused`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the resume spans the resource set its computer owns"
@@ -230,7 +229,6 @@ pub async fn restore_paused(
             let unwound = unwind_resume(
                 id,
                 vm_dir,
-                jailer,
                 config,
                 cow_manager,
                 network,
@@ -291,7 +289,6 @@ async fn park_copy_mode_rootfs(
 async fn unwind_resume(
     id: &SandboxId,
     vm_dir: &Path,
-    jailer: &JailerConfig,
     config: &VmmConfig,
     cow_manager: &CowManager,
     network: &dyn GuestNetwork,
@@ -316,21 +313,10 @@ async fn unwind_resume(
         clean = false;
     }
 
-    let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-    let cr = chroot_root(&config.firecracker.binary, base, id);
-
     if let Some(lease) = net_lease
         && let Err(error) = network.quarantine(lease).await
     {
         warn!(sandbox_id = %id, error = %error, "resume unwind: network quarantine failed");
-        clean = false;
-    }
-
-    if let Some(parent) = cr.parent()
-        && let Err(error) = tokio::fs::remove_dir_all(parent).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: chroot removal failed");
         clean = false;
     }
 

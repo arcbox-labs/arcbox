@@ -51,6 +51,26 @@ impl Jail {
             .ok()
             .map(|rel| format!("/{}", rel.display()))
     }
+
+    /// Remove the jail and everything staged into it.
+    ///
+    /// The jailer's per-VM directory is `{base}/{exec}/{id}`, of which
+    /// [`root`](Self::root) is the `root/` inside it — the whole thing
+    /// goes, because the copy of the Firecracker binary and the cgroup
+    /// bookkeeping beside it belong to this VM too.
+    ///
+    /// Already gone is not a failure: this is called wherever a VM ends,
+    /// and a VM can end more than once.
+    pub async fn remove(&self) -> Result<()> {
+        let Some(dir) = self.root.parent() else {
+            return Ok(());
+        };
+        match tokio::fs::remove_dir_all(dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
 }
 
 /// `path` with its `.` and `..` components resolved as far as they can be
@@ -510,6 +530,27 @@ mod tests {
         // which is how a test suite meets this before production does.
         let deep = PathBuf::from("/").join("d".repeat(200));
         assert_eq!(id_budget("/opt/fc/firecracker", deep), 0);
+    }
+
+    #[tokio::test]
+    async fn removing_a_jail_takes_the_whole_per_vm_directory_and_tolerates_its_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let per_vm = dir.path().join("jail/firecracker/box");
+        let root = per_vm.join("root");
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        std::fs::write(root.join("rootfs.ext4"), b"disk").unwrap();
+        // The jailer's copy of the binary sits beside `root/`, not in it.
+        std::fs::write(per_vm.join("firecracker"), b"vmm").unwrap();
+        let jail = Jail {
+            root,
+            uid: 0,
+            gid: 0,
+        };
+
+        jail.remove().await.unwrap();
+        assert!(!per_vm.exists(), "the whole per-vm directory goes");
+        assert!(dir.path().join("jail/firecracker").exists(), "and no more");
+        jail.remove().await.expect("a vm can end more than once");
     }
 
     #[tokio::test]

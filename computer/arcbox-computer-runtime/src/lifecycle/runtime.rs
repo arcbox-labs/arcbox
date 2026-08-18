@@ -80,13 +80,14 @@ pub struct ComputerRuntime {
     /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
     pub cow_handle: Option<CowHandle>,
     /// When this sandbox adopted a pre-warmed restore slot's resources
-    /// (CORE-78), the slot id (`pool-<uuid>`) its jailer chroot and dm/CoW
-    /// names are keyed by. `None` for resources created under the
-    /// sandbox's own id.
+    /// (CORE-78), the slot id (`pool-<uuid>`) its VM and its dm/CoW names
+    /// are keyed by. `None` for resources created under the sandbox's own
+    /// id.
     ///
-    /// Cleared by pause: releasing a paused sandbox renames its retained
-    /// overlay to the sandbox-id path and destroys the slot chroot, so a
-    /// resumed sandbox owns everything under its own id again.
+    /// Cleared by pause: releasing a paused sandbox discards the slot's VM
+    /// (which takes the area its files were staged into) and renames its
+    /// retained overlay to the sandbox-id path, so a resumed sandbox owns
+    /// everything under its own id again.
     pub(crate) pool_slot_id: Option<String>,
     /// Whether this guest runs the fixed invariant network identity
     /// (CORE-81). Set by the create path when the boot bakes the invariant

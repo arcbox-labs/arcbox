@@ -18,6 +18,7 @@ use arcbox_vm_driver::{
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
+use crate::jail::Jail;
 use crate::process::FcProcess;
 
 /// A VMM process this driver verified but cannot talk to.
@@ -27,12 +28,20 @@ use crate::process::FcProcess;
 pub struct FcProcessHandle {
     process: Arc<FcProcess>,
     record: VmRecord,
+    /// The area this VM runs in, when it has one. Reachable without the
+    /// API: it is a property of how the VMM was launched, which the adopt
+    /// read off the process itself.
+    jail: Option<Jail>,
 }
 
 impl FcProcessHandle {
-    /// A handle over `process`, reporting `record`.
-    pub fn new(process: Arc<FcProcess>, record: VmRecord) -> Self {
-        Self { process, record }
+    /// A handle over `process`, reporting `record` and running in `jail`.
+    pub fn new(process: Arc<FcProcess>, record: VmRecord, jail: Option<Jail>) -> Self {
+        Self {
+            process,
+            record,
+            jail,
+        }
     }
 }
 
@@ -70,12 +79,23 @@ impl VmHandle for FcProcessHandle {
     /// `Kill` as for any VM. `Graceful` degrades to it — asking the guest
     /// (`SendCtrlAltDel`) needs the API this handle does not have, and
     /// waiting out the deadline without having asked would gain nothing.
+    ///
+    /// The jail goes with the kill, on the same rule as
+    /// [`FcHandle::shutdown`](crate::FcHandle): every VM reaching this
+    /// handle was adopted, so nothing else is left to remove the area it
+    /// ran in — unless the VM was handed on instead.
     async fn shutdown(&self, mode: ShutdownMode) -> Result<ExitStatus> {
         if matches!(mode, ShutdownMode::Graceful { .. }) && self.process.alive() {
             tracing::warn!(vm = %self.record.id, pid = self.process.pid(),
                 "the vmm's api is unreachable: a graceful shutdown cannot ask the guest and kills it");
         }
-        Ok(self.process.kill().await?)
+        let status = self.process.kill().await?;
+        if let Some(jail) = &self.jail
+            && !self.process.is_detached()
+        {
+            jail.remove().await?;
+        }
+        Ok(status)
     }
 
     /// Present as on every handle of this driver: releasing the process
@@ -106,6 +126,11 @@ mod tests {
 
     /// A `sleep` child adopted as a VMM, and the child to reap it with.
     fn adopted() -> (FcProcessHandle, tokio::process::Child) {
+        adopted_in(None)
+    }
+
+    /// [`adopted`], running in `jail`.
+    fn adopted_in(jail: Option<Jail>) -> (FcProcessHandle, tokio::process::Child) {
         let child = tokio::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -122,7 +147,26 @@ mod tests {
             }),
         };
         let process = Arc::new(FcProcess::adopt(pid, socket));
-        (FcProcessHandle::new(process, record), child)
+        (FcProcessHandle::new(process, record, jail), child)
+    }
+
+    /// An API this handle cannot reach costs it the VM's devices, never
+    /// the area the VM runs in: every VM that reaches this handle was
+    /// adopted, so nothing else is left to take the jail down with it.
+    #[tokio::test]
+    async fn the_jail_goes_with_the_kill_even_without_an_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let area = dir.path().join("jail/firecracker/box");
+        std::fs::create_dir_all(area.join("root")).unwrap();
+        let (vm, mut child) = adopted_in(Some(Jail {
+            root: area.join("root"),
+            uid: 0,
+            gid: 0,
+        }));
+        let reaper = tokio::spawn(async move { child.wait().await.unwrap() });
+        vm.shutdown(ShutdownMode::Kill).await.unwrap();
+        assert!(!area.exists(), "the adopted vm's jail goes with the kill");
+        reaper.await.unwrap();
     }
 
     fn signal_of(status: std::process::ExitStatus) -> Option<i32> {

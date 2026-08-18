@@ -8,8 +8,8 @@
 //! The ordering mirrors a full release and is load-bearing for the same
 //! reasons: the VMM must be dead before the dm detach (EBUSY) and before the
 //! TAP goes. What differs is the disk — the overlay is detached with its COW
-//! file kept, or, in copy mode, the staged rootfs is parked in `vm_dir`
-//! before the chroot is removed — and the renaming that leaves every
+//! file kept, or, in copy mode, the staged rootfs is taken back out of the
+//! VM's area and parked in `vm_dir` — and the renaming that leaves every
 //! retained resource keyed by the computer's own id.
 //!
 //! **The copy-mode disk comes out of the VM's area before the VMM is
@@ -76,7 +76,9 @@ pub async fn release_for_pause(
             // the routes an adopted computer is missing arrive with R3
             // PR-G3.
             VmmError::Unavailable(format!(
-                "computer {id} runs on a copied rootfs and was adopted after an agent restart,                  so its disk cannot be taken out of the vm it was staged into; it can be                  stopped or removed, but not paused"
+                "computer {id} runs on a copied rootfs and was adopted after an agent \
+                 restart, so its disk cannot be taken out of the vm it was staged into; \
+                 it can be stopped or removed, but not paused"
             ))
         })?;
         sandbox::staging_capability(&*prepared)
@@ -85,7 +87,7 @@ pub async fn release_for_pause(
     }
 
     super::release::kill_sandbox_process(id, arc).await?;
-    let owner = super::release::chroot_owner(id, arc);
+    let owner = super::release::resource_owner(id, arc);
 
     // Disk: detach the overlay but keep its COW file.
     let cow_handle = arc.lock().unwrap().cow_handle.take();
@@ -116,8 +118,8 @@ pub async fn release_for_pause(
         }
     }
 
-    super::release::remove_jailer_chroot(id, arc, config).await?;
-    // Nothing slot-keyed survives this point.
+    // Nothing slot-keyed survives this point: the slot's VM is gone with
+    // the area it ran in, and its overlay was renamed above.
     arc.lock().unwrap().pool_slot_id = None;
     Ok(())
 }

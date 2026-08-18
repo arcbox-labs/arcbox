@@ -5,7 +5,7 @@ use arcbox_vm_driver::{IsolationSpec, ProcessRecord};
 use super::*;
 use crate::api::fake_fc::FakeFc;
 use crate::config::FcDriverConfig;
-use crate::process::testing::{pid_exists, spawn};
+use crate::process::testing::{adopt, pid_exists, spawn};
 
 /// A handle over a `sleep` child and an API socket nobody answers on.
 fn handle(dir: &Path, isolation: IsolationSpec, vsock: bool) -> FcHandle {
@@ -117,6 +117,40 @@ async fn state_follows_the_process_and_kill_reports_the_signal() {
             .await,
         Err(Error::WrongState { .. })
     ));
+}
+
+/// The jail belongs to whichever grip owns the VMM. A spawned VM's grip
+/// is its `FcPrepared`, which takes the jail on `discard`, so a kill
+/// through the handle must leave it standing — the pause path kills a
+/// spawned VM and then still reads out of its area. An *adopted* VM has
+/// no such grip: its jail outlived the process that made it, and this
+/// handle is the last thing that can take it away.
+#[tokio::test]
+async fn only_an_adopted_vm_takes_its_jail_with_the_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let isolation = jail(dir.path());
+
+    let spawned = handle(dir.path(), isolation.clone(), false);
+    let area = spawned
+        .layout
+        .jail()
+        .unwrap()
+        .root
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(&area).unwrap();
+    spawned.shutdown(ShutdownMode::Kill).await.unwrap();
+    assert!(area.exists(), "a spawned vm's jail waits for its discard");
+
+    let (process, mut child) = adopt("sleep", &["30"]);
+    // Nothing in this process reaps an adopted VMM; the child's real
+    // parent — this test — does, and the handle's kill observes it.
+    let reaper = tokio::spawn(async move { child.wait().await.unwrap() });
+    let adopted = handle_over(Arc::new(process), dir.path(), isolation, false);
+    adopted.shutdown(ShutdownMode::Kill).await.unwrap();
+    assert!(!area.exists(), "an adopted vm's jail goes with the kill");
+    reaper.await.unwrap();
 }
 
 #[tokio::test]

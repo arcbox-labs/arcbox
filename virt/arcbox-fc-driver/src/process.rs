@@ -237,6 +237,16 @@ impl FcProcess {
         self.detached.load(Ordering::Acquire)
     }
 
+    /// `true` for a process this driver found running rather than spawned.
+    ///
+    /// The distinction is which grip owns the VM's on-disk area: a spawned
+    /// process has a [`FcPrepared`](crate::FcPrepared) that made the jail
+    /// and takes it away on `discard`, an adopted one has none — its jail
+    /// outlived the process that made it, and the handle is all there is.
+    pub fn is_adopted(&self) -> bool {
+        self.ownership == Ownership::Adopted
+    }
+
     fn signal(&self, signal: Signal) -> Result<()> {
         #[allow(
             clippy::cast_possible_wrap,
@@ -410,6 +420,18 @@ pub(crate) mod testing {
             .spawn()
             .expect("spawn test child");
         FcProcess::spawn(Child(child), PathBuf::from("/tmp/api.sock")).unwrap()
+    }
+
+    /// An [`FcProcess`] adopted over a `program args` child, plus the
+    /// child itself — nothing here reaps an adopted process, so the test
+    /// that owns it must.
+    pub fn adopt(program: &str, args: &[&str]) -> (FcProcess, tokio::process::Child) {
+        let child = tokio::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id().expect("a spawned child has a pid");
+        (FcProcess::adopt(pid, PathBuf::from("/tmp/api.sock")), child)
     }
 
     /// `true` while `pid` can be signalled.

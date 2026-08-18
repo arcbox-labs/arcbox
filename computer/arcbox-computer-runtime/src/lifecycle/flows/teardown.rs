@@ -95,9 +95,9 @@ impl ComputerFlows {
                 })?;
         }
 
-        // Release the VMM (already exited, or never booted), TAP/IP, CoW
-        // device, and chroot; the record itself stays inspectable until
-        // Remove.
+        // Release the VMM (already exited, or never booted) and with it the
+        // area its files were staged into, then TAP/IP and the CoW device;
+        // the record itself stays inspectable until Remove.
         self.release_scope(ReleaseScope::Runtime).await?;
         info!(sandbox_id = %self.id, "computer stopped");
         Ok(())
@@ -111,7 +111,6 @@ impl ComputerFlows {
                     &self.id,
                     &self.computer,
                     &services.network,
-                    &services.config,
                     &services.cow_manager,
                 )
                 .await

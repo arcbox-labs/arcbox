@@ -19,7 +19,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use arcbox_fc_driver::jail::chroot_root;
 use arcbox_vm_driver::ShutdownMode;
 use arcbox_vm_driver::net::GuestNetwork;
 
@@ -30,9 +29,10 @@ use crate::sandbox;
 use crate::snapshot_cow::CowManager;
 
 /// Free every runtime resource a sandbox holds: the VMM process (SIGKILL +
-/// bounded reap through the driver), the dm-snapshot CoW device, the TAP +
-/// IP allocation, and the jailer chroot. Idempotent — every resource is
-/// `take()`n, so calling this from both Stop and Remove is safe.
+/// bounded reap through the driver, which takes the area the VM's files
+/// were staged into with it), the dm-snapshot CoW device, and the TAP + IP
+/// allocation. Idempotent — every resource is `take()`n, so calling this
+/// from both Stop and Remove is safe.
 ///
 /// The ordering is load-bearing: the VMM must be dead before the CoW
 /// teardown (`dmsetup remove` returns EBUSY while the block device is open)
@@ -41,7 +41,6 @@ pub async fn release_runtime_resources(
     id: &str,
     arc: &Arc<Mutex<ComputerRuntime>>,
     network: &Arc<dyn GuestNetwork>,
-    config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
 ) -> Result<()> {
     kill_sandbox_process(id, arc).await?;
@@ -60,50 +59,21 @@ pub async fn release_runtime_resources(
     cow_manager.cleanup_setup_orphan(id).await?;
 
     // Release network resources (destroys TAP via ioctl).
+    let lease = arc.lock().unwrap().network.take();
+    if let Some(lease) = lease
+        && let Err(error) = network.quarantine(lease.clone()).await
     {
-        let lease = arc.lock().unwrap().network.take();
-        if let Some(lease) = lease
-            && let Err(error) = network.quarantine(lease.clone()).await
-        {
-            arc.lock().unwrap().network = Some(lease);
-            return Err(error.into());
-        }
-    }
-
-    // Clean up the jailer chroot directory if applicable. A sandbox that
-    // adopted a pre-warmed pool slot lives in the slot's chroot, so the
-    // removal is keyed by the owning id, not the sandbox id.
-    remove_jailer_chroot(id, arc, config).await
-}
-
-/// Remove the jailer chroot a sandbox actually lives in.
-///
-/// Keyed by the adopted pool slot id when the sandbox claimed a pre-warmed
-/// slot (CORE-78), by the sandbox id otherwise. Shared with the pause path,
-/// which releases the same chroot while keeping the disk.
-pub async fn remove_jailer_chroot(
-    id: &str,
-    arc: &Arc<Mutex<ComputerRuntime>>,
-    config: &VmmConfig,
-) -> Result<()> {
-    let Some(ref jc) = config.firecracker.jailer else {
-        return Ok(());
-    };
-    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-    let chroot_owner = chroot_owner(id, arc);
-    let chroot_dir = chroot_root(&config.firecracker.binary, base, &chroot_owner);
-    // Remove {base}/{exec_name}/{id}/ (parent of "root/").
-    if let Some(parent) = chroot_dir.parent()
-        && let Err(e) = tokio::fs::remove_dir_all(parent).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(VmmError::Io(e));
+        arc.lock().unwrap().network = Some(lease);
+        return Err(error.into());
     }
     Ok(())
 }
 
-/// Id the sandbox's jailer chroot and dm/CoW resources are named after.
-pub fn chroot_owner(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> String {
+/// Id this computer's dm/CoW resources are named after.
+///
+/// A computer that adopted a pre-warmed pool slot (CORE-78) runs on the
+/// slot's resources, so they are named after the slot and not after it.
+pub fn resource_owner(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> String {
     arc.lock()
         .unwrap()
         .pool_slot_id
@@ -116,6 +86,11 @@ pub fn chroot_owner(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> String {
 /// VM's handle only names a corpse — nothing dials, checkpoints or stops a
 /// stopped, paused or failed sandbox — so it is dropped here too, the one
 /// place both are let go.
+///
+/// **The driver takes the VM's staging area with the kill**, so anything
+/// that has to outlive the VM leaves through `Staging::unstage_disk`
+/// before this is called — which is what the pause release does with a
+/// copy-mode rootfs.
 ///
 /// A sandbox this process adopted rather than booted has no `PreparedVm` —
 /// nothing hands the driver's grip on a *process* back across a restart — so
@@ -178,7 +153,7 @@ pub async fn release_everything(
     cow_manager: &Arc<CowManager>,
     snapshots: &Arc<crate::snapshot::SnapshotCatalog>,
 ) -> Result<()> {
-    release_runtime_resources(id, arc, network, config, cow_manager).await?;
+    release_runtime_resources(id, arc, network, cow_manager).await?;
 
     // Pause artifacts survive Stop-style release by design (CORE-21); Remove
     // is where they die: the retained disk overlay and the internal pause

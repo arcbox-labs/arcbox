@@ -52,32 +52,49 @@ impl FcPrepared {
         let layout = VmLayout::new(id, isolation, &config, runtime_dir)?;
         tokio::fs::create_dir_all(runtime_dir).await?;
         let plan = layout.spawn_plan();
-        let child = spawn::spawn(&plan, &config).await?;
-        debug_assert_eq!(
-            child.socket_path(),
-            plan.api_socket,
-            "the layout and fc-sdk agree on the API socket"
-        );
-        let process = Arc::new(FcProcess::spawn(child, plan.api_socket.clone())?);
-        let record = VmRecord {
-            id: id.clone(),
-            driver: NAME.to_owned(),
-            runtime_dir: runtime_dir.to_path_buf(),
-            process: Some(ProcessRecord {
-                pid: process.pid(),
-                api_socket: Some(plan.api_socket),
-            }),
-        };
-        let vsock = VsockEndpoint::new(layout.vsock_host_uds());
-        Ok(Self {
-            config,
-            layout,
-            process,
-            record,
-            vsock,
-            consumed: AtomicBool::new(false),
-            launch: tokio::sync::Mutex::new(()),
-        })
+        let spawned = async {
+            let child = spawn::spawn(&plan, &config).await?;
+            debug_assert_eq!(
+                child.socket_path(),
+                plan.api_socket,
+                "the layout and fc-sdk agree on the API socket"
+            );
+            let process = Arc::new(FcProcess::spawn(child, plan.api_socket.clone())?);
+            let record = VmRecord {
+                id: id.clone(),
+                driver: NAME.to_owned(),
+                runtime_dir: runtime_dir.to_path_buf(),
+                process: Some(ProcessRecord {
+                    pid: process.pid(),
+                    api_socket: Some(plan.api_socket.clone()),
+                }),
+            };
+            let vsock = VsockEndpoint::new(layout.vsock_host_uds());
+            Ok(Self {
+                config: Arc::clone(&config),
+                layout: layout.clone(),
+                process,
+                record,
+                vsock,
+                consumed: AtomicBool::new(false),
+                launch: tokio::sync::Mutex::new(()),
+            })
+        }
+        .await;
+        if spawned.is_err()
+            && let Some(jail) = layout.jail()
+        {
+            // The jailer makes the chroot before it execs, so a spawn that
+            // failed after that point leaves one standing with no grip to
+            // discard it. The area goes with the failure exactly as it goes
+            // with a discard — best-effort, because the spawn's own error
+            // is the one worth reporting.
+            if let Err(error) = jail.remove().await {
+                tracing::warn!(vm = %id, error = %error,
+                    "the jail of a vmm that failed to spawn could not be removed");
+            }
+        }
+        spawned
     }
 
     fn require_unused(&self) -> Result<()> {
@@ -247,16 +264,22 @@ impl PreparedVm for FcPrepared {
         Ok(Box::new(self.handle(client, has_vsock)))
     }
 
-    /// Kills the VMM. The jail it was spawned into outlives it: the one
-    /// caller still removes the chroot itself, and its copy-mode pause
-    /// path takes the sandbox's only writable disk out of that chroot
-    /// *after* discarding, so a `discard` that removed the jail here would
-    /// destroy the disk it is about to park — silently, since the move is
-    /// guarded by an existence check. Removing the jail moves onto this
-    /// verb in the same change that reorders those call sites onto
-    /// [`Staging::unstage_disk`] (vm-stack-redesign R3, PR-G2).
+    /// Kills the VMM, and the jail goes with it.
+    ///
+    /// This grip made the area — the jailer built the chroot for the
+    /// process this discards — so it is the grip that takes it away, and
+    /// with it every file staged in. A caller that wants something out of
+    /// there takes it out first, through
+    /// [`Staging::unstage_disk`]; that is what the paused computer's
+    /// copy-mode rootfs does. Reporting a removal failure rather than
+    /// swallowing it is deliberate: the caller keeps its grip and can
+    /// retry, and both halves are idempotent.
     async fn discard(&self) -> Result<ExitStatus> {
-        Ok(self.process.kill().await?)
+        let status = self.process.kill().await?;
+        if let Some(jail) = self.layout.jail() {
+            jail.remove().await?;
+        }
+        Ok(status)
     }
 }
 
