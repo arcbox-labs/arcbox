@@ -152,6 +152,52 @@ async fn a_ready_probe_command_that_never_exits_fails_the_boot() {
     );
 }
 
+/// The boot's own `cmd` can exit before its readiness gate finishes, and
+/// the computer must still reach READY — and settle at `Ready`, not at
+/// the `Running` its exited workload left behind.
+#[tokio::test]
+async fn a_boot_whose_cmd_exits_while_the_gate_runs_still_reaches_ready() {
+    let fixture = Fixture::jailed().await;
+    fixture.agent().on(&["/bin/cmd"], Reply::ok());
+    // Fails at first, so the gate is still retrying when the cmd exits.
+    fixture.agent().on(&["/bin/probe"], Reply::code(1));
+    let mut events = fixture.manager.subscribe_events();
+
+    let (id, _ip) = fixture
+        .manager
+        .create_sandbox(SandboxSpec {
+            id: Some("gated".into()),
+            cmd: vec!["/bin/cmd".into()],
+            ready_probe: Some(
+                arcbox_computer_runtime::template_catalog::ReadyProbeSpec::Command {
+                    cmd: vec!["/bin/probe".into()],
+                    timeout_seconds: 30,
+                },
+            ),
+            ..SandboxSpec::default()
+        })
+        .await
+        .unwrap();
+
+    // Both have run: the workload exited inside the gate.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let started = fixture.agent().started();
+        if started.iter().any(|cmd| cmd == &["/bin/cmd".to_owned()])
+            && started.iter().any(|cmd| cmd == &["/bin/probe".to_owned()])
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{started:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    fixture.agent().on(&["/bin/probe"], Reply::ok());
+
+    await_action(&mut events, &id, action::READY).await;
+    fixture.await_state(&id, SandboxState::Ready).await;
+    assert_eq!(fixture.run(&id, &["/bin/cmd"]).await, Vec::<u8>::new());
+}
+
 /// A boot the driver refuses fails the computer and gives back everything
 /// the create had allocated — the address included, which is only visible
 /// through the quarantine ledger.
