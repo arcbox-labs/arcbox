@@ -68,6 +68,8 @@ pub(super) struct VmInner {
     state: Mutex<VmState>,
     /// A live, non-detached handle exists.
     owned: AtomicBool,
+    /// This VM came up from a checkpoint rather than from a boot.
+    restored: bool,
     events: broadcast::Sender<VmEvent>,
     /// Guest-initiated connections; shared with the prepared process the VM
     /// was booted on, so listeners bound before boot keep working.
@@ -91,6 +93,7 @@ impl VmInner {
         knobs: Arc<Knobs>,
         balloon_target_bytes: u64,
         inbound: Arc<Inbound>,
+        restored: bool,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(16);
         Arc::new(Self {
@@ -100,6 +103,7 @@ impl VmInner {
             knobs,
             state: Mutex::new(VmState::Running),
             owned: AtomicBool::new(false),
+            restored,
             events,
             inbound,
             console: Mutex::new(Vec::new()),
@@ -118,6 +122,10 @@ impl VmInner {
 
     pub(super) fn is_owned(&self) -> bool {
         self.owned.load(Ordering::Acquire)
+    }
+
+    pub(super) const fn is_restored(&self) -> bool {
+        self.restored
     }
 
     /// Moves to `Exited(status)` and returns the status the VM ended with:
@@ -338,8 +346,16 @@ impl Checkpoint for Checkpointer {
         let json = serde_json::to_vec_pretty(&file).map_err(std::io::Error::from)?;
         tokio::fs::create_dir_all(dst).await?;
         tokio::fs::write(dst.join(VMSTATE_FILE), json).await?;
+        // A diff checkpoint has no memory image, and a destination that
+        // held a full one must not keep it: what a consumer stages is
+        // whatever is in the directory, so a stale `mem` would travel with
+        // a diff image as if it belonged to it.
         if opts.kind == CheckpointKind::Full {
             tokio::fs::write(dst.join(MEM_FILE), MEM_IMAGE).await?;
+        } else if let Err(error) = tokio::fs::remove_file(dst.join(MEM_FILE)).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(Error::Io(error));
         }
         {
             let mut state = lock(&vm.state);

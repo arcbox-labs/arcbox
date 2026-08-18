@@ -201,6 +201,16 @@ impl FakeDriver {
             .map(|vm| vm.exit(ExitStatus::signaled(SIGKILL)))
     }
 
+    /// The VMs that came up from a checkpoint rather than from a boot.
+    ///
+    /// The one observable that tells a restore from a cold boot: both end
+    /// with a running guest under the caller's id, so a warm or pooled
+    /// path that quietly regressed into booting looks identical from
+    /// above.
+    pub fn restored_vms(&self) -> Vec<VmId> {
+        self.inner.filtered(VmInner::is_restored)
+    }
+
     /// The live VMs a handle still holds — exactly the ones
     /// [`Adopt::adopt`] would refuse.
     ///
@@ -236,6 +246,7 @@ impl DriverInner {
         record: VmRecord,
         balloon_target_bytes: u64,
         inbound: Arc<Inbound>,
+        restored: bool,
     ) -> Result<Arc<VmInner>> {
         let mut vms = lock(&self.vms);
         if let Some(existing) = vms.get(&spec.id) {
@@ -257,17 +268,24 @@ impl DriverInner {
             Arc::clone(&self.knobs),
             balloon_target_bytes,
             inbound,
+            restored,
         );
         vms.insert(vm.id().clone(), Arc::clone(&vm));
         Ok(vm)
     }
 
     fn owned_vms(&self) -> Vec<VmId> {
-        lock(&self.vms)
+        self.filtered(|vm| !matches!(vm.state(), VmState::Exited(_)) && vm.is_owned())
+    }
+
+    fn filtered(&self, keep: impl Fn(&VmInner) -> bool) -> Vec<VmId> {
+        let mut ids: Vec<VmId> = lock(&self.vms)
             .values()
-            .filter(|vm| !matches!(vm.state(), VmState::Exited(_)) && vm.is_owned())
+            .filter(|vm| keep(vm))
             .map(|vm| vm.id().clone())
-            .collect()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// The VM under `id`, alive or exited — unlike [`Self::live`], this

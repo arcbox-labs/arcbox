@@ -758,6 +758,11 @@ async fn a_checkpoint_restores_onto_a_fresh_address() {
         .await
         .unwrap();
     fixture.await_state(&clone, SandboxState::Ready).await;
+    assert_eq!(
+        fixture.driver().restored_vms(),
+        vec![arcbox_vm_driver::VmId::new(&clone).unwrap()],
+        "the clone came from the checkpoint, not from a second boot"
+    );
     assert_ne!(
         clone_ip,
         fixture
@@ -950,12 +955,19 @@ async fn a_warm_create_publishes_a_snapshot_the_next_create_restores() {
         !fixture.manager.pinned_rootfs_paths().unwrap().is_empty(),
         "the warm snapshot pins the rootfs it was taken from"
     );
+    assert!(
+        fixture.driver().restored_vms().is_empty(),
+        "the first create of a shape has nothing to restore from"
+    );
 
     let second = fixture.ready("second").await;
     assert_ne!(first, second);
+    // The whole point, and not visible from the state a caller reads: a
+    // cold-booted second computer also reaches Ready under its own id.
     assert_eq!(
-        fixture.manager.inspect_sandbox(&second).unwrap().state,
-        SandboxState::Ready
+        fixture.driver().restored_vms(),
+        vec![arcbox_vm_driver::VmId::new(&second).unwrap()],
+        "the second create of the same shape restores instead of booting"
     );
 }
 

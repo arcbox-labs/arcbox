@@ -400,6 +400,51 @@ async fn a_frozen_checkpoint_failure_leaves_the_guest_quiesced() {
     assert_eq!(vm.state(), VmState::Running);
 }
 
+/// A restore is distinguishable from a boot, though both end with a
+/// running guest under the caller's id.
+#[tokio::test]
+async fn the_driver_reports_which_vms_came_from_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    let booted = driver.boot(full_spec("vm-1"), dir.path()).await.unwrap();
+    assert!(driver.restored_vms().is_empty());
+
+    let image = booted
+        .checkpoint()
+        .unwrap()
+        .checkpoint(&dir.path().join("ckpt"), CheckpointOptions::default())
+        .await
+        .unwrap();
+    let _restored = driver
+        .restore(&image, restore_spec("vm-2"), dir.path())
+        .await
+        .unwrap();
+    assert_eq!(driver.restored_vms(), vec![VmId::new("vm-2").unwrap()]);
+}
+
+/// A full checkpoint is the vmstate *and* the memory image: a restore
+/// given one without the other is a staging bug, not an image.
+#[tokio::test]
+async fn a_full_checkpoint_missing_its_memory_image_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    let vm = driver.boot(full_spec("vm-1"), dir.path()).await.unwrap();
+    let image = vm
+        .checkpoint()
+        .unwrap()
+        .checkpoint(&dir.path().join("ckpt"), CheckpointOptions::default())
+        .await
+        .unwrap();
+    std::fs::remove_file(image.dir.join("mem")).unwrap();
+
+    assert!(matches!(
+        driver
+            .restore(&image, restore_spec("vm-2"), dir.path())
+            .await,
+        Err(Error::InvalidSpec(_))
+    ));
+}
+
 /// A VM that was asked to die is distinguishable from one whose handle
 /// merely went out of scope, though both end `Exited` with the same
 /// status — which is what makes a teardown that forgot its shutdown
