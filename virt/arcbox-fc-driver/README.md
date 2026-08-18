@@ -22,7 +22,7 @@ removes — and the only other things it depends on are the port and
 | `config` | `FcDriverConfig` — binaries, seccomp, log level, API-socket wait, jailer resource limits |
 | `error` | `FcError`, folded into the port's `Error::Driver { driver: "firecracker", .. }` |
 | `render` | `VmLayout` (every path Firecracker sees, and the jailer's relativity), `VmSpec` → `FcPlan`, `RestoreSpec` → `FcRestorePlan` |
-| `jail` | chroot layout, the id budget the API socket's path leaves, and staging (link-or-copy, copy, block-device node, move-in), `apply` for a rendered plan, `move_file` out of a jail |
+| `jail` | chroot layout, the id budget the longest jail socket leaves, and staging (link-or-copy, copy, block-device node, move-in), `apply` for a rendered plan, `move_file` out of a jail |
 | `spawn` | `firecracker` / `jailer` process spawn from a `SpawnPlan` |
 | `vsock` | the `CONNECT <port>` handshake and the `{uds}_{port}` listener |
 | `process` | the process guard: waiter task, exit watch + event, kill / wait, detach |
