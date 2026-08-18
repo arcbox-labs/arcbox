@@ -219,8 +219,11 @@ impl ComputerLifecycle {
                 Transition(State::gating(*committed, false))
             }
             // The dispatch the claim was taken for failed: the slot goes
-            // back, and nothing was announced to take back.
-            Event::WorkloadReleased if *claimed => Transition(State::gating(*committed, false)),
+            // back, balancing the RUNNING the claim announced.
+            Event::WorkloadReleased if *claimed => {
+                context.emit(Effect::Publish(Notify::Idle));
+                Transition(State::gating(*committed, false))
+            }
             // A restore's gate runs *after* its atomic commit, so its failure
             // is unwound with the post-commit verb: force-remove, freeing the
             // id and its request key so a warm create can fall back to a cold
@@ -293,9 +296,12 @@ impl ComputerLifecycle {
                 context.emit(Effect::ArmTimer(Timer::Idle));
                 Transition(State::ready())
             }
-            // Nothing ran, so nothing is announced — the difference from
-            // `WorkloadExited`, which owes an IDLE for the workload that did.
+            // The claim announced RUNNING before the dispatch it was taken
+            // for, so giving it back owes the balancing IDLE — a subscriber
+            // must not be left believing a workload is running. It carries no
+            // exit status, because nothing ran.
             Event::WorkloadReleased => {
+                context.emit(Effect::Publish(Notify::Idle));
                 context.emit(Effect::ArmTimer(Timer::Idle));
                 Transition(State::ready())
             }

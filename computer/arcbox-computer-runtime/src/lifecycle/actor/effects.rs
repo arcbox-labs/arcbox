@@ -20,12 +20,14 @@ impl ComputerActor {
     /// what the timers and the durable writes are relative to.
     pub(super) async fn apply(&mut self, effect: Effect, state: State) -> Flow {
         match effect {
-            Effect::PersistPhase { phase, durability } => self.persist(phase, durability),
-            Effect::CommitRestored { durability } => self.commit(
-                PersistPhase::Ready,
-                SandboxTransition::ReadyWithOutcome(self.outcome.clone()),
-                durability,
-            ),
+            Effect::PersistPhase { phase, durability } => return self.persist(phase, durability),
+            Effect::CommitRestored { durability } => {
+                return self.commit(
+                    PersistPhase::Ready,
+                    SandboxTransition::ReadyWithOutcome(self.outcome.clone()),
+                    durability,
+                );
+            }
             Effect::ForgetRecord(end) => return self.forget(end),
             Effect::ClearJournal => {
                 // `failure()` asks for the clear in the same breath as the
@@ -90,6 +92,16 @@ impl ComputerActor {
                 });
             }
             Effect::SpawnStop { budget_ms, drain } => {
+                // Read here, not in the task: this runs in the same poll as
+                // the transition, so an exit recorded before it is the one
+                // the drain is already waiting for.
+                let drain = if drain {
+                    Drain::Until {
+                        since: self.runtime.lock().unwrap().last_exited_at,
+                    }
+                } else {
+                    Drain::No
+                };
                 self.forget_agent();
                 let tasks = Arc::clone(&self.tasks);
                 let budget = Duration::from_millis(budget_ms);
@@ -132,7 +144,7 @@ impl ComputerActor {
         Flow::Continue
     }
 
-    fn persist(&mut self, phase: PersistPhase, durability: Durability) {
+    fn persist(&mut self, phase: PersistPhase, durability: Durability) -> Flow {
         let transition = match phase {
             PersistPhase::Starting => SandboxTransition::Starting(self.outcome.clone()),
             PersistPhase::Ready => SandboxTransition::Ready,
@@ -161,9 +173,9 @@ impl ComputerActor {
             PersistPhase::Resuming => SandboxTransition::Resuming,
             // The provisioning intent is written before there is a machine to
             // ask for it, so no transition names it.
-            PersistPhase::Creating => return,
+            PersistPhase::Creating => return Flow::Continue,
         };
-        self.commit(phase, transition, durability);
+        self.commit(phase, transition, durability)
     }
 
     fn commit(
@@ -171,9 +183,9 @@ impl ComputerActor {
         phase: PersistPhase,
         transition: SandboxTransition,
         durability: Durability,
-    ) {
+    ) -> Flow {
         let Some(generation) = self.generation else {
-            return;
+            return Flow::Continue;
         };
         let commit = match self.records.transition(&self.id, generation, transition) {
             Ok(commit) => commit,
@@ -187,12 +199,13 @@ impl ComputerActor {
             }
         };
         let Some(error) = commit.durability_error else {
-            return;
+            return Flow::Continue;
         };
         let phase = phase.as_str();
         match durability {
             Durability::Warn => {
                 warn!(sandbox_id = %self.id, error, phase, "durable write is unconfirmed; continuing");
+                Flow::Continue
             }
             Durability::GateJournal => {
                 // The gate *is* the handling: an unconfirmed write keeps the
@@ -200,8 +213,12 @@ impl ComputerActor {
                 // records.
                 warn!(sandbox_id = %self.id, error, phase, "durable write is unconfirmed; keeping the crash journal");
                 self.journal_blocked = true;
+                Flow::Continue
             }
-            Durability::Report(Unconfirmed::Ack) => self.unconfirmed = Some(error),
+            Durability::Report(Unconfirmed::Ack) => {
+                self.unconfirmed = Some(error);
+                Flow::Continue
+            }
             Durability::Report(Unconfirmed::Unavailable) => self.fail_write(&format!(
                 "state is visible, but durability is unconfirmed: {error}"
             )),
@@ -218,7 +235,7 @@ impl ComputerActor {
                 );
                 self.fail_write(&format!(
                     "state is visible, but durability is unconfirmed: {error}"
-                ));
+                ))
             }
         }
     }
@@ -230,12 +247,20 @@ impl ComputerActor {
     /// answer *immediately* have nothing parked — a cold create is told its
     /// boot is under way as soon as the machine acts, and that answer has to
     /// carry this instead.
-    fn fail_write(&mut self, detail: &str) {
+    ///
+    /// A parked *removal* hears too, unlike every other failure: the removal
+    /// is normally what answers them, and here it is the thing that did not
+    /// happen. `begin_removal` propagates a refused `Removing` write the same
+    /// way, before anything is torn down.
+    fn fail_write(&mut self, detail: &str) -> Flow {
         let error = VmmError::Unavailable(format!("computer {} {detail}", self.id));
         self.error = Some(error.to_string());
         self.answer_error = Some(error.to_string());
-        self.fail_waiters(error);
+        self.fail_every_waiter(error);
         self.queued.push_back(Event::Failure);
+        // The rest of this transition described work the write was recording:
+        // a resume, a shutdown, a release. None of it may happen now.
+        Flow::Refused
     }
 
     /// Deletes the durable record, and with it the computer's claim on its

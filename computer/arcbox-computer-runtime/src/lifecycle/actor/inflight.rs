@@ -18,6 +18,7 @@ impl ComputerActor {
     {
         if let Some(previous) = self.inflight.take() {
             previous.handle.abort();
+            self.abandon_capture();
         }
         self.epoch += 1;
         let epoch = self.epoch;
@@ -27,6 +28,21 @@ impl ComputerActor {
             let _ = completions.send(Completion { epoch, report });
         });
         self.inflight = Some(Preemptible { handle, handoff });
+    }
+
+    /// Answers a capture whose sub-task was preempted.
+    ///
+    /// A `Stop` or a `Remove` during a user checkpoint supersedes the capture
+    /// task, and the epoch then drops whatever it would have reported — so
+    /// without this its caller waits on a reply nobody will ever send. A stop
+    /// that succeeds leaves the actor alive, so not even its exit answers.
+    fn abandon_capture(&mut self) {
+        if let Some(reply) = self.capture_reply.take() {
+            let _ = reply.send(Err(VmmError::Unavailable(format!(
+                "computer {}: the checkpoint was preempted by another operation",
+                self.id
+            ))));
+        }
     }
 
     /// Cancels the in-flight sub-task, waiting out its resource handoff first.
@@ -92,6 +108,7 @@ impl ComputerActor {
         }
         self.epoch += 1;
         self.retry_backoff = RETRY_INITIAL;
+        self.abandon_capture();
         Flow::Continue
     }
 
@@ -127,19 +144,26 @@ impl ComputerActor {
     }
 
     /// Re-drives a teardown that stopped rather than finished — its release
-    /// failed, or a panicked sub-task abandoned it. Today's equivalent is a
-    /// retried `remove_sandbox_impl`, which re-runs the whole teardown.
+    /// failed, a durable write was refused, or a panicked sub-task abandoned
+    /// it. Today's equivalent is a retried `remove_sandbox_impl`, which
+    /// re-runs the whole teardown including the `Removing` write.
     pub(super) async fn restart_teardown(&mut self, state: State) {
         if self.stalled.is_some() {
             self.resume_stalled().await;
-        } else {
-            self.apply(
-                Effect::SpawnRelease {
-                    scope: ReleaseScope::Full,
-                },
-                state,
-            )
-            .await;
+            return;
+        }
+        let mut effects = Effects::default();
+        effects.removal();
+        let mut effects = effects.take().into_iter();
+        while let Some(effect) = effects.next() {
+            match Box::pin(self.apply(effect, state)).await {
+                Flow::Continue => {}
+                Flow::Stalled => {
+                    self.park_stalled(state, effects.collect());
+                    return;
+                }
+                Flow::Refused => return,
+            }
         }
     }
 
@@ -158,9 +182,13 @@ impl ComputerActor {
         }
         let mut effects = stalled.effects.into_iter();
         while let Some(effect) = effects.next() {
-            if Box::pin(self.apply(effect, stalled.state)).await == Flow::Stalled {
-                self.park_stalled(stalled.state, effects.collect());
-                return;
+            match Box::pin(self.apply(effect, stalled.state)).await {
+                Flow::Continue => {}
+                Flow::Stalled => {
+                    self.park_stalled(stalled.state, effects.collect());
+                    return;
+                }
+                Flow::Refused => return,
             }
         }
     }

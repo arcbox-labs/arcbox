@@ -93,6 +93,23 @@ impl TaskFailure {
     }
 }
 
+/// Whether a stop must wait a workload out, and the exit marker it waits to
+/// move past.
+///
+/// The marker is read **with** the `Running -> Stopping` transition rather
+/// than when the task first runs: the exit and the stop are both messages to
+/// the same actor, so an exit recorded between them is already the change
+/// this is waiting for — and a task that sampled the marker afterwards would
+/// wait for a second exit that can never come, burning the whole budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drain {
+    /// Nothing is running.
+    No,
+    Until {
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    },
+}
+
 /// What a user checkpoint records in the catalog. The pause capture brings
 /// none: it writes the reserved internal name, which no user checkpoint may
 /// squat on.
@@ -139,9 +156,8 @@ pub trait ComputerTasks: Send + Sync + 'static {
     async fn resume(&self) -> TaskResult<Arc<dyn GuestAgent>>;
 
     /// Shut the guest down and release its runtime resources within
-    /// `budget`. `drain` gives a running workload the budget to finish
-    /// first.
-    async fn stop(&self, budget: Duration, drain: bool) -> TaskResult;
+    /// `budget`, giving a running workload the budget to finish first.
+    async fn stop(&self, budget: Duration, drain: Drain) -> TaskResult;
 
     /// Release the resources `scope` names.
     async fn release(&self, scope: ReleaseScope) -> TaskResult;

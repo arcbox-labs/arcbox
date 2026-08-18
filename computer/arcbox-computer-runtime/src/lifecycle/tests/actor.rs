@@ -19,15 +19,18 @@ use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{
-    Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Seeded,
+    Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Seeded, WorkloadOutcome,
 };
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::event::{PauseReason, Provision, RestoreOrigin};
 use crate::lifecycle::runtime::ComputerRuntime;
-use crate::lifecycle::tasks::{CaptureSpec, ComputerTasks, TaskFailure, TaskResult};
+use crate::lifecycle::tasks::{CaptureSpec, ComputerTasks, Drain, TaskFailure, TaskResult};
 use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
-use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxSpec, SandboxState};
+use crate::sandbox::workload::WorkloadClaim;
+use crate::sandbox::{
+    CheckpointInfo, IdleAction, LifecycleUpdate, SandboxEvent, SandboxSpec, SandboxState,
+};
 use crate::testkit::agent::FakeAgentFactory;
 
 /// What the fake boot does with its resource handoff — the only sub-task the
@@ -64,6 +67,7 @@ struct Script {
     restore_takes: Mutex<Option<Duration>>,
     restore_finished: AtomicBool,
     restore_fails: AtomicBool,
+    checkpoint_takes: Mutex<Option<Duration>>,
     /// How long the gate holds READY back, which is how a test observes a
     /// computer while its launch is still in flight.
     gate_takes: Mutex<Option<Duration>>,
@@ -81,6 +85,7 @@ impl Script {
             restore_takes: Mutex::new(None),
             restore_finished: AtomicBool::new(false),
             restore_fails: AtomicBool::new(false),
+            checkpoint_takes: Mutex::new(None),
             gate_takes: Mutex::new(None),
             cleanup_finished: AtomicBool::new(false),
         })
@@ -169,6 +174,10 @@ impl ComputerTasks for Script {
         _spec: Option<CaptureSpec>,
     ) -> TaskResult<CheckpointInfo> {
         self.record("checkpoint");
+        let takes = *self.checkpoint_takes.lock().unwrap();
+        if let Some(takes) = takes {
+            tokio::time::sleep(takes).await;
+        }
         Ok(CheckpointInfo {
             snapshot_id: "snap".to_owned(),
             snapshot_dir: String::new(),
@@ -181,7 +190,7 @@ impl ComputerTasks for Script {
         Ok(Arc::clone(&self.agent))
     }
 
-    async fn stop(&self, _budget: Duration, _drain: bool) -> TaskResult {
+    async fn stop(&self, _budget: Duration, _drain: Drain) -> TaskResult {
         self.record("stop");
         Ok(())
     }
@@ -881,18 +890,25 @@ async fn an_idle_pause_says_so_on_its_event() {
 /// would leave that id un-creatable — `cancel_pending_or_missing` refuses
 /// anything past `Creating` — until the next startup sweep.
 #[tokio::test(start_paused = true)]
-async fn a_record_that_will_not_delete_stalls_the_teardown() {
+async fn a_record_that_will_not_move_stalls_the_teardown() {
     let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
 
-    // A directory where the record file goes: every read of it fails, so the
-    // deletion cannot complete.
+    // A directory where the record file goes: every read of it fails, so
+    // neither the `Removing` write nor the deletion can complete.
     let record_path = harness.dir.path().join("sandbox-records").join("box.json");
+    let record = std::fs::read(&record_path).unwrap();
     std::fs::remove_file(&record_path).unwrap();
     std::fs::create_dir(&record_path).unwrap();
 
-    let removing = harness.send(|reply| Command::Remove { force: true, reply });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let refused = harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .error()
+        .await;
+    assert!(
+        refused.to_string().contains("recording removing failed"),
+        "the caller hears the write that was refused: {refused}"
+    );
     assert!(
         harness.registered.load(Ordering::SeqCst),
         "the computer stays where a retry can reach it"
@@ -901,13 +917,167 @@ async fn a_record_that_will_not_delete_stalls_the_teardown() {
         !harness
             .actions()
             .contains(&crate::sandbox::types::action::REMOVED.to_owned()),
-        "nothing announces a removal that did not finish"
+        "nothing announces a removal that did not happen"
     );
 
-    // Let the deletion through; the retry finishes the teardown.
+    // Let the record through again; a retried removal finishes it, `Removing`
+    // write and all.
     std::fs::remove_dir(&record_path).unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    removing.ok().await;
+    std::fs::write(&record_path, record).unwrap();
+    harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .ok()
+        .await;
     assert!(!harness.registered.load(Ordering::SeqCst));
     harness.joined().await;
+}
+
+/// A `Stop` (or a `Remove`) during a user checkpoint answers the checkpoint.
+///
+/// The stop supersedes the capture task, and the epoch then drops whatever it
+/// would have reported — so without this its caller waits on a reply nobody
+/// will send. A stop that succeeds leaves the actor alive, so not even its
+/// exit answers.
+#[tokio::test(start_paused = true)]
+async fn a_preempted_checkpoint_answers_its_caller() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    *harness.script.checkpoint_takes.lock().unwrap() = Some(Duration::from_secs(30));
+
+    let (reply, capture) = oneshot::channel();
+    harness
+        .commands
+        .send(Command::Checkpoint {
+            spec: CaptureSpec {
+                name: "snap".to_owned(),
+                labels: std::collections::HashMap::new(),
+            },
+            reply,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    harness
+        .send(|reply| Command::Stop {
+            budget: Duration::from_secs(1),
+            reply,
+        })
+        .ok()
+        .await;
+
+    let answered = tokio::time::timeout(Duration::from_secs(5), capture)
+        .await
+        .expect("the preempted checkpoint answers rather than hanging")
+        .unwrap();
+    let error = match answered {
+        Ok(_) => panic!("a preempted checkpoint cannot report a snapshot"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("preempted"), "{error}");
+}
+
+/// A stop whose workload exits between the transition and the drain's first
+/// poll does not wait the whole budget out.
+///
+/// The marker is read with the `Running -> Stopping` transition, so an exit
+/// recorded before the task runs is already the change the drain is waiting
+/// for. Sampling it inside the task compares against the exit that already
+/// happened.
+#[tokio::test(start_paused = true)]
+async fn a_stop_drains_against_the_marker_its_transition_saw() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    harness
+        .send(|reply| Command::ClaimWorkload {
+            claim: WorkloadClaim::Api,
+            reply,
+        })
+        .ok()
+        .await;
+
+    // The stop is ordered while the workload is running; its exit lands in
+    // the same breath.
+    let stopping = harness.send(|reply| Command::Stop {
+        budget: Duration::from_secs(1),
+        reply,
+    });
+    harness
+        .commands
+        .send(Command::WorkloadExited {
+            outcome: WorkloadOutcome::Exited(crate::agent::ExitStatus::Code(0)),
+        })
+        .unwrap();
+
+    stopping.ok().await;
+    assert_eq!(harness.script.calls().last().copied(), Some("stop"));
+}
+
+/// Two concurrent partial `SetLifecycle` calls compose.
+///
+/// `None` means unchanged, and resolving the patch outside the actor made
+/// that a lie: both callers would read the same policy, send a whole one, and
+/// the second would restore what the first had just changed.
+#[tokio::test(start_paused = true)]
+async fn concurrent_partial_lifecycle_updates_compose() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+
+    let ttl_only = harness.send(|reply| Command::SetLifecycle {
+        update: LifecycleUpdate {
+            ttl_seconds: Some(600),
+            ..LifecycleUpdate::default()
+        },
+        reply,
+    });
+    let idle_only = harness.send(|reply| Command::SetLifecycle {
+        update: LifecycleUpdate {
+            idle_timeout_seconds: Some(30),
+            ..LifecycleUpdate::default()
+        },
+        reply,
+    });
+    ttl_only.ok().await;
+    idle_only.ok().await;
+
+    let deadlines = harness.snapshot.borrow().deadlines;
+    assert!(deadlines.ttl.is_some(), "the TTL-only update survived");
+    assert_eq!(deadlines.idle_timeout_seconds, 30);
+}
+
+/// A required durable write that is refused abandons the rest of its
+/// transition.
+///
+/// The `Resuming` write records that a resume is under way; the effects after
+/// it *are* that resume. Letting them run against a record that never moved
+/// leaves a live VM whose machine has already gone back to `Paused`, and a
+/// caller parked on an answer nothing will send.
+#[tokio::test(start_paused = true)]
+async fn a_refused_resume_write_abandons_the_resume_it_was_recording() {
+    let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    harness
+        .send(|reply| Command::Pause {
+            reason: PauseReason::Requested,
+            reply,
+        })
+        .ok()
+        .await;
+
+    // A directory where the record goes: the `Resuming` write is refused.
+    let record_path = harness.dir.path().join("sandbox-records").join("box.json");
+    std::fs::remove_file(&record_path).unwrap();
+    std::fs::create_dir(&record_path).unwrap();
+
+    let error = harness
+        .send(|reply| Command::Resume {
+            reason: "resume".to_owned(),
+            reply,
+        })
+        .error()
+        .await;
+    assert!(error.to_string().contains("recording"), "{error}");
+    assert!(
+        !harness.script.calls().contains(&"resume"),
+        "the resume the write was recording must not have run"
+    );
 }

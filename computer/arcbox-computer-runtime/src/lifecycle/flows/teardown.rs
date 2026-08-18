@@ -10,7 +10,7 @@ use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::tasks::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
 use crate::lifecycle::tasks::pause::release_for_pause;
 use crate::lifecycle::tasks::release::{release_everything, release_runtime_resources};
-use crate::lifecycle::tasks::{CaptureSpec, TaskFailure, TaskResult};
+use crate::lifecycle::tasks::{CaptureSpec, Drain, TaskFailure, TaskResult};
 use crate::sandbox::pause::PAUSE_SNAPSHOT_NAME;
 use crate::sandbox::{CheckpointInfo, SandboxState};
 
@@ -57,19 +57,17 @@ impl ComputerFlows {
 
     /// Drain the workload, ask the guest to shut down, and release what it
     /// was running on.
-    pub(super) async fn stop_vm(&self, budget: Duration, drain: bool) -> TaskResult {
+    pub(super) async fn stop_vm(&self, budget: Duration, drain: Drain) -> TaskResult {
         let deadline = tokio::time::Instant::now() + budget;
-        let (handle, last_exited_at) = {
-            let computer = self.computer.lock().unwrap();
-            (computer.handle.clone(), computer.last_exited_at)
-        };
+        let handle = self.computer.lock().unwrap().handle.clone();
 
         // Give an active workload the budget to finish. The exit watcher
         // records `last_exited_at` when the exit chunk arrives, so poll for
-        // that signal.
-        if drain {
+        // that signal — against the marker as it stood when the stop was
+        // ordered, which is what makes an exit landing in between count.
+        if let Drain::Until { since } = drain {
             while tokio::time::Instant::now() < deadline {
-                if self.computer.lock().unwrap().last_exited_at != last_exited_at {
+                if self.computer.lock().unwrap().last_exited_at != since {
                     break;
                 }
                 tokio::time::sleep(DRAIN_POLL).await;

@@ -39,28 +39,16 @@ impl SandboxManager {
     ) -> Result<()> {
         self.await_reconcile().await?;
         let computer = self.computer(id)?;
-        // Resolved against what the computer currently has, which only its
-        // actor may change — so the read and the send cannot interleave with
-        // another `SetLifecycle` in a way that loses one of the three knobs.
-        let deadlines = {
-            let snapshot = computer.snapshot.borrow();
-            let mut deadlines = snapshot.deadlines;
-            if let Some(ttl) = update.ttl_seconds {
-                deadlines.ttl =
-                    (ttl > 0).then(|| Utc::now() + chrono::Duration::seconds(i64::from(ttl)));
-            }
-            if let Some(idle) = update.idle_timeout_seconds {
-                deadlines.idle_timeout_seconds = idle;
-            }
-            if let Some(policy) = update.on_idle {
-                deadlines.on_idle = policy;
-            }
-            deadlines
-        };
+        // The patch goes to the actor, which resolves it against what the
+        // computer currently has. Resolving it here would let two concurrent
+        // partial updates each read the same policy and send a whole one, so
+        // the second would undo the first's field — which `None` means
+        // unchanged promises it does not.
         computer
             .mailbox
-            .ask(id, |reply| Command::SetLifecycle { deadlines, reply })
+            .ask(id, |reply| Command::SetLifecycle { update, reply })
             .await?;
+        let deadlines = computer.snapshot.borrow().deadlines;
         info!(
             sandbox_id = %id,
             ttl_deadline = ?deadlines.ttl,

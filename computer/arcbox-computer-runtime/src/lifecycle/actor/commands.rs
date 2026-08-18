@@ -24,7 +24,7 @@ impl ComputerActor {
                 } else if restore {
                     // A restore's caller waits for READY; a create returns
                     // while its boot runs.
-                    self.waiters.push((Answer::Ready, reply));
+                    self.park(Answer::Ready, reply);
                 } else {
                     let _ = reply.send(self.acknowledged());
                 }
@@ -41,7 +41,7 @@ impl ComputerActor {
             Command::Pause { reason, reply } => {
                 self.pause_reason = reason;
                 if self.dispatch(machine, Event::Pause { reason }).await {
-                    self.waiters.push((Answer::Paused, reply));
+                    self.park(Answer::Paused, reply);
                 } else {
                     // Pausing a paused computer is a no-op.
                     let _ = reply.send(match self.public() {
@@ -53,7 +53,7 @@ impl ComputerActor {
             Command::Resume { reason, reply } => {
                 self.resume_reason = reason;
                 if self.dispatch(machine, Event::Resume).await {
-                    self.waiters.push((Answer::Resumed, reply));
+                    self.park(Answer::Resumed, reply);
                 } else {
                     // Resuming a live computer is a no-op.
                     let _ = reply.send(match self.public() {
@@ -65,7 +65,7 @@ impl ComputerActor {
             Command::Stop { budget, reply } => {
                 let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
                 if self.dispatch(machine, Event::Stop { budget_ms }).await {
-                    self.waiters.push((Answer::Stopped, reply));
+                    self.park(Answer::Stopped, reply);
                     return;
                 }
                 // A stop asked for during a launch is deferred until the
@@ -78,7 +78,7 @@ impl ComputerActor {
                     return;
                 }
                 match self.public() {
-                    SandboxState::Stopping => self.waiters.push((Answer::Stopped, reply)),
+                    SandboxState::Stopping => self.park(Answer::Stopped, reply),
                     // `stop_sandbox`'s retry. A `Stopped` write that was
                     // visible but not confirmed kept the crash journal, and
                     // a second stop is the only thing that finishes it —
@@ -150,7 +150,7 @@ impl ComputerActor {
             Command::ReleaseWorkload => {
                 self.dispatch(machine, Event::WorkloadReleased).await;
             }
-            Command::SetLifecycle { deadlines, reply } => {
+            Command::SetLifecycle { update, reply } => {
                 // `set_sandbox_lifecycle` refuses a computer on its way out:
                 // nothing is left for a deadline to fire on, and the record
                 // it would persist to is about to be a tombstone.
@@ -163,7 +163,17 @@ impl ComputerActor {
                     ));
                     return;
                 }
-                self.deadlines = deadlines;
+                if let Some(ttl) = update.ttl_seconds {
+                    self.deadlines.ttl =
+                        (ttl > 0).then(|| Utc::now() + chrono::Duration::seconds(i64::from(ttl)));
+                }
+                if let Some(idle) = update.idle_timeout_seconds {
+                    self.deadlines.idle_timeout_seconds = idle;
+                }
+                if let Some(policy) = update.on_idle {
+                    self.deadlines.on_idle = policy;
+                }
+                let deadlines = self.deadlines;
                 {
                     // Mirrored onto the runtime too: it is what the startup
                     // sweep reads a computer's deadlines back from, so a
@@ -205,6 +215,18 @@ impl ComputerActor {
         self.unblock_journal();
         self.clear_journal();
         Ok(())
+    }
+
+    /// Parks a caller on the answer its flow owes it — unless the flow
+    /// already failed on a required durable write, in which case there is
+    /// nothing left to answer it and the caller hears now.
+    fn park(&mut self, answer: Answer, reply: Reply) {
+        match self.answer_error.take() {
+            Some(detail) => {
+                let _ = reply.send(Err(VmmError::Unavailable(detail)));
+            }
+            None => self.waiters.push((answer, reply)),
+        }
     }
 
     pub(super) fn answer(&mut self, answer: Answer) {

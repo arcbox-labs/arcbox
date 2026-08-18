@@ -517,11 +517,16 @@ fn a_restore_that_fails_before_its_commit_is_rolled_back_not_parked() {
 }
 
 /// The claim rollback: a `Run` that claimed the slot and then could not
-/// dispatch. `workload::release_running` announces nothing today, and neither
-/// does this — the difference from a workload that actually ran and owes an
-/// IDLE. What it does owe is the idle window, which the claim cancelled.
+/// dispatch.
+///
+/// The claim *is* the transition into `Running`, so it announces RUNNING
+/// before the dispatch it was taken for — and giving the slot back therefore
+/// owes the balancing IDLE, or a subscriber is left believing a workload is
+/// running. It carries no exit status, because nothing ran. Today's
+/// `release_running` announces neither, which is only coherent while the
+/// claim announces nothing either.
 #[test]
-fn a_released_claim_reopens_the_computer_without_announcing_an_exit() {
+fn a_released_claim_reopens_the_computer_and_balances_its_running() {
     let (mut sm, mut context) = ready_machine();
     let (state, _) = step(
         &mut sm,
@@ -534,7 +539,10 @@ fn a_released_claim_reopens_the_computer_without_announcing_an_exit() {
 
     let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadReleased);
     assert_eq!(state.to_public(), SandboxState::Ready);
-    assert_eq!(effects, vec![Effect::ArmTimer(Timer::Idle)]);
+    assert_eq!(
+        effects,
+        vec![Effect::Publish(Notify::Idle), Effect::ArmTimer(Timer::Idle)]
+    );
 
     // The same rollback during the gate gives the reservation back, and READY
     // is still owed the boot's own `cmd`-less announcement.
@@ -549,7 +557,7 @@ fn a_released_claim_reopens_the_computer_without_announcing_an_exit() {
     assert_eq!(sm.state().to_public(), SandboxState::Running);
     let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadReleased);
     assert_eq!(state.to_public(), SandboxState::Starting);
-    assert!(effects.is_empty());
+    assert_eq!(effects, vec![Effect::Publish(Notify::Idle)]);
     let (state, effects) = step(&mut sm, &mut context, &Event::Gated);
     assert_eq!(state.to_public(), SandboxState::Ready);
     assert!(effects.contains(&Effect::ArmTimer(Timer::Idle)));

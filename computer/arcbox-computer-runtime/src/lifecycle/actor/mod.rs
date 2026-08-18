@@ -50,7 +50,7 @@ use super::effect::{
 pub use super::event::PauseReason;
 use super::event::{Event, Provision};
 use super::machine::{ComputerLifecycle, State};
-use super::tasks::{CaptureSpec, ComputerTasks, TaskFailure};
+use super::tasks::{CaptureSpec, ComputerTasks, Drain, TaskFailure};
 use arcbox_vm_driver::VmHandle;
 use arcbox_vm_driver::net::NetworkLease;
 
@@ -63,7 +63,9 @@ use crate::sandbox::record::{
 };
 use crate::sandbox::types::action;
 use crate::sandbox::workload::WorkloadClaim;
-use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxId, SandboxState};
+use crate::sandbox::{
+    CheckpointInfo, IdleAction, LifecycleUpdate, SandboxEvent, SandboxId, SandboxState,
+};
 
 mod commands;
 mod effects;
@@ -177,9 +179,14 @@ pub enum Command {
     /// The dispatch a claim was taken for failed, so the slot goes back
     /// without a workload having run.
     ReleaseWorkload,
-    /// Replace the deadline policy (`SetLifecycle`, CORE-60).
+    /// Adjust the deadline policy (`SetLifecycle`, CORE-60).
+    ///
+    /// The *patch*, not the resolved value: two concurrent partial updates
+    /// that each read the current policy and sent a whole one would have the
+    /// second undo the first's field, which `None means unchanged` promises
+    /// it does not. Resolved in the actor, where they are serialized.
     SetLifecycle {
-        deadlines: Deadlines,
+        update: LifecycleUpdate,
         reply: Reply,
     },
     /// The guest went away without being asked to.
@@ -336,7 +343,12 @@ enum StalledStep {
 #[derive(PartialEq, Eq)]
 enum Flow {
     Continue,
+    /// Parked on a step that has not finished; the rest is replayed when a
+    /// retry takes it.
     Stalled,
+    /// A required step was refused. The rest of the transition is abandoned
+    /// — it described work that must not happen without it.
+    Refused,
 }
 
 /// The lifecycle actor.
@@ -631,9 +643,16 @@ impl ComputerActor {
         self.publish_state(after);
         let mut effects = effects.into_iter();
         while let Some(effect) = effects.next() {
-            if self.apply(effect, after).await == Flow::Stalled {
-                self.park_stalled(after, effects.collect());
-                break;
+            match self.apply(effect, after).await {
+                Flow::Continue => {}
+                Flow::Stalled => {
+                    self.park_stalled(after, effects.collect());
+                    break;
+                }
+                // Dropped, not parked: a `Resuming` write that was refused
+                // must not be followed by the resume it was recording, and a
+                // refused `Stopping` must not be followed by the shutdown.
+                Flow::Refused => break,
             }
         }
         // And after it, because the effects themselves write to the runtime

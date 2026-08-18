@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use super::actor::{Mailbox, WeakMailbox};
 use super::effect::ReleaseScope;
 use super::event::RestoreOrigin;
-use super::tasks::{CaptureSpec, ComputerTasks, TaskFailure, TaskResult};
+use super::tasks::{CaptureSpec, ComputerTasks, Drain, TaskFailure, TaskResult};
 use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
@@ -193,7 +193,7 @@ impl ComputerTasks for ComputerFlows {
         self.resume_vm().await
     }
 
-    async fn stop(&self, budget: Duration, drain: bool) -> TaskResult {
+    async fn stop(&self, budget: Duration, drain: Drain) -> TaskResult {
         self.stop_vm(budget, drain).await
     }
 
