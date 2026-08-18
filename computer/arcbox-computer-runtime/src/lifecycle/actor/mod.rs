@@ -31,10 +31,10 @@
 //! bodies onto [`ComputerTasks`] one file at a time; PR-F2 flips the manager
 //! onto it and implements the port.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -50,6 +50,9 @@ use super::effect::{
 use super::event::{Event, PauseReason, Provision};
 use super::machine::{ComputerLifecycle, State};
 use super::tasks::{ComputerTasks, TaskFailure};
+use arcbox_vm_driver::VmHandle;
+use arcbox_vm_driver::net::NetworkLease;
+
 use crate::agent::{ExitStatus, GuestAgent};
 use crate::error::{Result, VmmError};
 use crate::sandbox::policy::deadlines;
@@ -58,7 +61,9 @@ use crate::sandbox::record::{
 };
 use crate::sandbox::types::action;
 use crate::sandbox::workload::WorkloadClaim;
-use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxId, SandboxState};
+use crate::sandbox::{
+    CheckpointInfo, IdleAction, SandboxEvent, SandboxId, SandboxInstance, SandboxState,
+};
 
 mod commands;
 mod effects;
@@ -196,17 +201,62 @@ pub struct Deadlines {
 
 /// What a read of a computer sees without touching the mailbox.
 ///
-/// [`Self::agent`] is the point (§B.6 of the R3 plan): it is present exactly
-/// while the guest is dialable, so exec, the file verbs and the workload path
+/// The whole read path — `inspect`, `list`, the network identity, the handle
+/// a graceful exit hands over — is a fold over these, so no reader waits on a
+/// mailbox and no reader takes a lock a lifecycle transition also needs. The
+/// actor is the only writer, and it republishes after every transition and
+/// every sub-task completion.
+///
+/// [`Self::agent`] is the sharpest edge of that (§B.6 of the R3 plan): it is
+/// present exactly while the guest is dialable, so exec and the file verbs
 /// take it from here and call the guest directly rather than asking the actor
-/// for it. PR-F2 grows this into the full read path (the lease, the
-/// timestamps, the pause state) as the manager's instance dies.
-#[derive(Clone, Default)]
+/// for it.
+#[derive(Clone)]
 pub struct ComputerSnapshot {
-    /// `None` until the actor has published its first state.
-    pub state: Option<SandboxState>,
+    pub state: SandboxState,
     pub agent: Option<Arc<dyn GuestAgent>>,
+    /// The running VM, for the graceful hand-over a process exit does.
+    pub handle: Option<Arc<dyn VmHandle>>,
     pub error: Option<String>,
+    pub labels: HashMap<String, String>,
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub lease: Option<NetworkLease>,
+    pub vm_dir: PathBuf,
+    pub created_at: DateTime<Utc>,
+    pub ready_at: Option<DateTime<Utc>>,
+    pub last_exited_at: Option<DateTime<Utc>>,
+    pub last_exit_status: Option<ExitStatus>,
+    pub paused_at: Option<DateTime<Utc>>,
+    pub pause_snapshot_id: Option<String>,
+    pub deadlines: Deadlines,
+}
+
+impl ComputerSnapshot {
+    /// The read view of `runtime` in `state`, under `deadlines`.
+    ///
+    /// Everything but the agent, which the actor publishes and withdraws
+    /// with the guest's reachability rather than reading it off the runtime.
+    pub fn project(runtime: &SandboxInstance, state: SandboxState, deadlines: Deadlines) -> Self {
+        Self {
+            state,
+            agent: None,
+            handle: runtime.handle.clone(),
+            error: runtime.error.clone(),
+            labels: runtime.labels.clone(),
+            vcpus: runtime.spec.vcpus,
+            memory_mib: runtime.spec.memory_mib,
+            lease: runtime.network.clone(),
+            vm_dir: runtime.vm_dir.clone(),
+            created_at: runtime.created_at,
+            ready_at: runtime.ready_at,
+            last_exited_at: runtime.last_exited_at,
+            last_exit_status: runtime.last_exit_status,
+            paused_at: runtime.paused_at,
+            pause_snapshot_id: runtime.pause_snapshot_id.clone(),
+            deadlines,
+        }
+    }
 }
 
 /// A sub-task's outcome, tagged with the epoch of the task that produced it.
@@ -275,6 +325,15 @@ enum Flow {
 /// The lifecycle actor.
 pub struct ComputerActor {
     id: SandboxId,
+    /// The resources this computer holds, shared with the sub-tasks the
+    /// actor spawns. The actor is the only other writer: it mirrors the
+    /// public state into it, records the workload's exit, and projects the
+    /// read snapshot from it.
+    runtime: Arc<Mutex<SandboxInstance>>,
+    /// Drops this computer's registry entry. Called when the record is
+    /// forgotten, before REMOVED is announced — `remove_sandbox_impl`'s own
+    /// order — and again when the actor stops for any other reason.
+    unregister: Arc<dyn Fn() + Send + Sync>,
     /// The durable record's generation, `None` for a computer with no record
     /// — the durable effects are then no-ops, as they are today.
     generation: Option<Uuid>,
@@ -356,6 +415,8 @@ pub enum Seeded {
 /// What one actor is built from.
 pub struct ComputerSeed {
     pub id: SandboxId,
+    pub runtime: Arc<Mutex<SandboxInstance>>,
+    pub unregister: Arc<dyn Fn() + Send + Sync>,
     pub generation: Option<Uuid>,
     pub vm_dir: PathBuf,
     pub records: Arc<SandboxRecordStore>,
@@ -375,6 +436,8 @@ impl ComputerActor {
         let (completions_tx, completions) = mpsc::unbounded_channel();
         Self {
             id: seed.id,
+            runtime: seed.runtime,
+            unregister: seed.unregister,
             generation: seed.generation,
             vm_dir: seed.vm_dir,
             records: seed.records,
@@ -486,6 +549,10 @@ impl ComputerActor {
         if let Some(task) = self.inflight.take() {
             task.handle.abort();
         }
+        // Whatever stopped this actor — its record forgotten, or the last
+        // sender dropped by a reservation nobody committed — nothing can
+        // reach the computer through the registry any more.
+        (self.unregister)();
         // A caller parked on an answer this computer will never give — a
         // stop deferred behind a launch a removal then preempted, say —
         // would otherwise learn only that its channel closed.
@@ -515,8 +582,11 @@ impl ComputerActor {
                 to = %after.to_public(),
                 "computer lifecycle transition"
             );
-            self.publish_state(after);
         }
+        // Unconditionally, not only on a public change: the flows write the
+        // lease, the timestamps and the pause checkpoint onto the runtime as
+        // they go, and a dispatch is when the actor next looks.
+        self.publish_state(after);
         let mut effects = effects.into_iter();
         while let Some(effect) = effects.next() {
             if self.apply(effect, after).await == Flow::Stalled {

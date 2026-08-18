@@ -26,7 +26,9 @@ use crate::lifecycle::event::{Provision, RestoreOrigin};
 use crate::lifecycle::tasks::{ComputerTasks, TaskFailure, TaskResult};
 use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
-use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxState};
+use crate::sandbox::{
+    CheckpointInfo, IdleAction, SandboxEvent, SandboxInstance, SandboxSpec, SandboxState,
+};
 use crate::testkit::agent::FakeAgentFactory;
 
 /// What the fake boot does with its resource handoff — the only sub-task the
@@ -212,7 +214,17 @@ impl Harness {
         let script = Script::new(boot, agent().await);
         let (events_tx, events) = broadcast::channel(64);
         let (commands, commands_rx) = mpsc::unbounded_channel();
-        let (snapshot_tx, snapshot) = watch::channel(ComputerSnapshot::default());
+        let runtime = Arc::new(Mutex::new(SandboxInstance::new(
+            "box".to_owned(),
+            SandboxSpec::default(),
+            None,
+            dir.path().to_path_buf(),
+        )));
+        let (snapshot_tx, snapshot) = watch::channel(ComputerSnapshot::project(
+            &runtime.lock().unwrap(),
+            SandboxState::Starting,
+            deadlines,
+        ));
         let (timers, timers_enabled) = watch::channel(true);
         if journal {
             let config = VmmConfig::default();
@@ -221,6 +233,8 @@ impl Harness {
         }
         let seed = ComputerSeed {
             id: "box".to_owned(),
+            runtime,
+            unregister: Arc::new(|| {}),
             // No durable record: these tests exercise the actor, not the
             // store, so the record writes are no-ops. The crash journal is
             // not — it is a file beside them, and its ordering is the thing
@@ -268,7 +282,7 @@ impl Harness {
     /// Waits for the snapshot to reach `state`.
     async fn settled(&mut self, state: SandboxState) {
         self.snapshot
-            .wait_for(|snapshot| snapshot.state == Some(state))
+            .wait_for(|snapshot| snapshot.state == state)
             .await
             .unwrap();
     }

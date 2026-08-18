@@ -26,7 +26,13 @@ impl ComputerActor {
                 SandboxTransition::ReadyWithOutcome(self.outcome.clone()),
                 durability,
             ),
-            Effect::ForgetRecord(end) => self.forget(end),
+            Effect::ForgetRecord(end) => {
+                self.forget(end);
+                // Before REMOVED is announced, as `remove_sandbox_impl`
+                // drops its map entry before broadcasting: a reader that
+                // acts on the event must not still find the computer.
+                (self.unregister)();
+            }
             Effect::ClearJournal => {
                 // `failure()` asks for the clear in the same breath as the
                 // release it must follow; `stopping`/`releasing` ask once
@@ -250,14 +256,31 @@ impl ComputerActor {
         }
     }
 
-    pub(super) fn public(&self) -> Option<SandboxState> {
+    pub(super) fn public(&self) -> SandboxState {
         self.snapshot_tx.borrow().state
     }
 
+    /// Mirrors the machine's state into the runtime and republishes the read
+    /// snapshot from it.
+    ///
+    /// The runtime's `state` is what a sub-task reads to see a teardown that
+    /// started while it was running — the cooperative half of preemption. The
+    /// snapshot is what every reader sees, and it is re-projected on every
+    /// transition and completion rather than patched field by field: the
+    /// fields the flows write (the lease a restore reserved, the timestamps,
+    /// the pause checkpoint) change out here, not in the machine.
     pub(super) fn publish_state(&self, state: State) {
         let public = state.to_public();
-        self.snapshot_tx
-            .send_modify(|snapshot| snapshot.state = Some(public));
+        let projected = {
+            let mut runtime = self.runtime.lock().unwrap();
+            runtime.state = public;
+            ComputerSnapshot::project(&runtime, public, self.deadlines)
+        };
+        self.snapshot_tx.send_modify(|snapshot| {
+            let agent = snapshot.agent.take();
+            *snapshot = projected;
+            snapshot.agent = agent;
+        });
     }
 
     pub(super) fn publish_agent(&self, agent: Arc<dyn GuestAgent>) {

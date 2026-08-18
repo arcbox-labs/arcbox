@@ -236,6 +236,10 @@ impl ComputerActor {
         };
         if let Some(event) = event {
             self.dispatch(machine, event).await;
+        } else {
+            // A completion the machine does not act on still changed what a
+            // reader sees: the release that reported here dropped the lease.
+            self.publish_state(*machine.state());
         }
         self.serve_pending_stop(machine).await;
     }
@@ -256,7 +260,7 @@ impl ComputerActor {
         }
         self.pending_stop = None;
         match self.public() {
-            Some(SandboxState::Ready | SandboxState::Running) => {
+            SandboxState::Ready | SandboxState::Running => {
                 let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
                 self.dispatch(machine, Event::Stop { budget_ms }).await;
             }

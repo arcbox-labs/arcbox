@@ -295,7 +295,7 @@ pub struct SandboxInstance {
 }
 
 impl SandboxInstance {
-    pub(super) fn new(
+    pub(crate) fn new(
         id: SandboxId,
         spec: SandboxSpec,
         network: Option<NetworkLease>,
@@ -304,7 +304,7 @@ impl SandboxInstance {
         Self::new_inner(id, spec, network, vm_dir, None)
     }
 
-    pub(super) fn new_with_generation(
+    pub(crate) fn new_with_generation(
         id: SandboxId,
         spec: SandboxSpec,
         network: Option<NetworkLease>,

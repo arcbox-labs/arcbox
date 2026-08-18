@@ -5,6 +5,8 @@
 //! non-forced remove of a busy computer) is this half of the actor, which
 //! is also where a caller parks until the effect that answers it lands.
 
+use chrono::Utc;
+
 use super::*;
 
 impl ComputerActor {
@@ -41,7 +43,7 @@ impl ComputerActor {
                 } else {
                     // Pausing a paused computer is a no-op.
                     let _ = reply.send(match self.public() {
-                        Some(SandboxState::Paused) => Ok(()),
+                        SandboxState::Paused => Ok(()),
                         _ => Err(self.wrong_state("Ready")),
                     });
                 }
@@ -53,7 +55,7 @@ impl ComputerActor {
                 } else {
                     // Resuming a live computer is a no-op.
                     let _ = reply.send(match self.public() {
-                        Some(SandboxState::Ready | SandboxState::Running) => Ok(()),
+                        SandboxState::Ready | SandboxState::Running => Ok(()),
                         _ => Err(self.wrong_state("Paused")),
                     });
                 }
@@ -74,8 +76,8 @@ impl ComputerActor {
                     return;
                 }
                 match self.public() {
-                    Some(SandboxState::Stopping) => self.waiters.push((Answer::Stopped, reply)),
-                    Some(SandboxState::Stopped) => {
+                    SandboxState::Stopping => self.waiters.push((Answer::Stopped, reply)),
+                    SandboxState::Stopped => {
                         let _ = reply.send(Ok(()));
                     }
                     _ => {
@@ -126,6 +128,15 @@ impl ComputerActor {
                 });
             }
             Command::WorkloadExited { outcome } => {
+                {
+                    // The stop's drain polls for this: it is how a graceful
+                    // stop knows the workload it is waiting out has finished.
+                    let mut runtime = self.runtime.lock().unwrap();
+                    if let WorkloadOutcome::Exited(status) = &outcome {
+                        runtime.last_exit_status = Some(*status);
+                    }
+                    runtime.last_exited_at = Some(Utc::now());
+                }
                 self.exit = Some(outcome);
                 self.dispatch(machine, Event::WorkloadExited).await;
             }
@@ -138,7 +149,7 @@ impl ComputerActor {
                 // it would persist to is about to be a tombstone.
                 if matches!(
                     self.public(),
-                    Some(SandboxState::Stopping | SandboxState::Stopped | SandboxState::Failed)
+                    SandboxState::Stopping | SandboxState::Stopped | SandboxState::Failed
                 ) {
                     let _ = reply.send(Err(
                         self.wrong_state("a live computer (not stopping, stopped, or failed)")
@@ -235,9 +246,7 @@ impl ComputerActor {
         VmmError::WrongState {
             id: self.id.clone(),
             expected: expected.to_owned(),
-            actual: self
-                .public()
-                .map_or_else(|| "unknown".to_owned(), |state| state.to_string()),
+            actual: self.public().to_string(),
         }
     }
 }
