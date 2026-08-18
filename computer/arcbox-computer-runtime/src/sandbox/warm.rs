@@ -110,7 +110,7 @@ pub struct WarmPublishTicket {
 pub async fn publish_after_boot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
-    computer: &Arc<Mutex<SandboxInstance>>,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,
@@ -186,7 +186,7 @@ impl From<crate::lifecycle::tasks::checkpoint::CheckpointFailure> for PublishFai
 async fn publish_warm_snapshot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
-    computer: &Arc<Mutex<SandboxInstance>>,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,

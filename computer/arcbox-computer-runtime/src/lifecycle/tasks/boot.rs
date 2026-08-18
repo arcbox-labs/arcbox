@@ -22,9 +22,10 @@ use tracing::{debug, warn};
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory, ReadyGate};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::boot::create_rootfs_symlink;
 use crate::sandbox::spec::build_vm_spec;
-use crate::sandbox::{self, NetworkAttachment, SandboxInstance, SandboxSpec, SandboxState};
+use crate::sandbox::{self, NetworkAttachment, SandboxSpec, SandboxState};
 use crate::snapshot_cow::{CowHandle, CowManager};
 
 pub type BootOutput = (Arc<dyn VmHandle>, Box<dyn ReadyGate>);
@@ -126,7 +127,7 @@ pub async fn wait_for_agent(
 /// Perform the actual boot: prepare the VMM through the driver, stage,
 /// configure, start the VM.
 ///
-/// The prepared VMM is transferred to its [`SandboxInstance`] immediately.
+/// The prepared VMM is transferred to its [`ComputerRuntime`] immediately.
 /// Cleanup is allowed to abort this task only after the paths/CoW phase has
 /// finished and every live `CowHandle` has also been transferred.
 ///
@@ -140,7 +141,7 @@ pub async fn wait_for_agent(
 /// a Remove during a boot is safe at all. Re-stated here because moving code
 /// is exactly when an invariant carried by a single comment gets lost.
 ///
-/// [`SandboxInstance`]: crate::sandbox::SandboxInstance
+/// [`ComputerRuntime`]: crate::sandbox::ComputerRuntime
 #[allow(
     clippy::too_many_arguments,
     reason = "boot owns one exact sandbox generation and its handoff signal"
@@ -154,7 +155,7 @@ pub async fn do_boot(
     agents: &dyn GuestAgentFactory,
     config: &VmmConfig,
     cow_manager: &CowManager,
-    computer: &Arc<Mutex<SandboxInstance>>,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) -> std::result::Result<BootOutput, BootFailure> {
     let mut resource_handoff = Some(resource_handoff);

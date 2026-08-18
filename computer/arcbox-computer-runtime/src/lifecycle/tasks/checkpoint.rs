@@ -19,8 +19,9 @@ use arcbox_vm_driver::{AfterCheckpoint, CheckpointKind, CheckpointOptions, VmHan
 use tracing::info;
 
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::settle::{self, Capture, GuestHold, Settlement};
-use crate::sandbox::{CheckpointInfo, SandboxId, SandboxInstance, SandboxState};
+use crate::sandbox::{CheckpointInfo, SandboxId, SandboxState};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 
 /// What a single [`checkpoint_impl`] call should capture, and how it should
@@ -79,7 +80,7 @@ struct CheckpointSource {
 }
 
 fn checkpoint_source(
-    computer: &Arc<Mutex<SandboxInstance>>,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     sandbox_id: &SandboxId,
     expected_state: SandboxState,
 ) -> Result<CheckpointSource> {
@@ -118,7 +119,7 @@ fn checkpoint_source(
 /// of re-deriving it. A failure says whether the guest is still usable
 /// ([`CheckpointFailure`]): every caller must fail the sandbox on `Frozen`.
 pub async fn checkpoint_impl(
-    computer: &Arc<Mutex<SandboxInstance>>,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     snapshots: &SnapshotCatalog,
     sandbox_id: &SandboxId,
     request: CheckpointRequest,

@@ -183,7 +183,7 @@ impl SandboxManager {
         let reservation = super::reserve_actor(
             &self.computers,
             &new_id,
-            SandboxInstance::new(new_id.clone(), restore_spec.clone(), None, vm_dir.clone()),
+            ComputerRuntime::new(new_id.clone(), restore_spec.clone(), None, vm_dir.clone()),
         )?;
         let record = match self
             .records

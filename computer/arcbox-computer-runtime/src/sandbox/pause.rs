@@ -77,7 +77,7 @@ pub struct ResumedRuntime {
     pub handle: Arc<dyn VmHandle>,
     pub network: Option<NetworkLease>,
     /// What the resumed guest holds on its interface — see
-    /// [`SandboxInstance::net_identity`].
+    /// [`ComputerRuntime::net_identity`].
     pub net_identity: Option<NetworkIdentity>,
     pub cow_handle: Option<CowHandle>,
 }

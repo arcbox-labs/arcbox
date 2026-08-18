@@ -23,12 +23,11 @@ use crate::lifecycle::actor::{
 };
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::event::{Provision, RestoreOrigin};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::lifecycle::tasks::{CaptureSpec, ComputerTasks, TaskFailure, TaskResult};
 use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
-use crate::sandbox::{
-    CheckpointInfo, IdleAction, SandboxEvent, SandboxInstance, SandboxSpec, SandboxState,
-};
+use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxSpec, SandboxState};
 use crate::testkit::agent::FakeAgentFactory;
 
 /// What the fake boot does with its resource handoff — the only sub-task the
@@ -218,7 +217,7 @@ impl Harness {
         let script = Script::new(boot, agent().await);
         let (events_tx, events) = broadcast::channel(64);
         let (commands, commands_rx) = mpsc::unbounded_channel();
-        let runtime = Arc::new(Mutex::new(SandboxInstance::new(
+        let runtime = Arc::new(Mutex::new(ComputerRuntime::new(
             "box".to_owned(),
             SandboxSpec::default(),
             None,

@@ -281,7 +281,7 @@ impl SandboxManager {
         let reservation = super::reserve_actor(
             &self.computers,
             &id,
-            SandboxInstance::new(id.clone(), spec.clone(), None, vm_dir.clone()),
+            ComputerRuntime::new(id.clone(), spec.clone(), None, vm_dir.clone()),
         )?;
 
         // This durable boundary still precedes every external side effect.
@@ -589,7 +589,7 @@ impl SandboxManager {
                 match super::reserve_actor(
                     &self.computers,
                     id,
-                    SandboxInstance::new(
+                    ComputerRuntime::new(
                         id.clone(),
                         SandboxSpec {
                             id: Some(id.clone()),

@@ -56,15 +56,14 @@ use arcbox_vm_driver::net::NetworkLease;
 
 use crate::agent::{ExitStatus, GuestAgent};
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::deadlines;
 use crate::sandbox::record::{
     PersistPhase, SandboxProvisionOutcome, SandboxRecordStore, SandboxTransition,
 };
 use crate::sandbox::types::action;
 use crate::sandbox::workload::WorkloadClaim;
-use crate::sandbox::{
-    CheckpointInfo, IdleAction, SandboxEvent, SandboxId, SandboxInstance, SandboxState,
-};
+use crate::sandbox::{CheckpointInfo, IdleAction, SandboxEvent, SandboxId, SandboxState};
 
 mod commands;
 mod effects;
@@ -243,7 +242,7 @@ impl ComputerSnapshot {
     ///
     /// Everything but the agent, which the actor publishes and withdraws
     /// with the guest's reachability rather than reading it off the runtime.
-    pub fn project(runtime: &SandboxInstance, state: SandboxState, deadlines: Deadlines) -> Self {
+    pub fn project(runtime: &ComputerRuntime, state: SandboxState, deadlines: Deadlines) -> Self {
         Self {
             state,
             agent: None,
@@ -335,7 +334,7 @@ pub struct ComputerActor {
     /// actor spawns. The actor is the only other writer: it mirrors the
     /// public state into it, records the workload's exit, and projects the
     /// read snapshot from it.
-    runtime: Arc<Mutex<SandboxInstance>>,
+    runtime: Arc<Mutex<ComputerRuntime>>,
     /// Drops this computer's registry entry. Called when the record is
     /// forgotten, before REMOVED is announced — `remove_sandbox_impl`'s own
     /// order — and again when the actor stops for any other reason.
@@ -424,7 +423,7 @@ pub enum Seeded {
 /// What one actor is built from.
 pub struct ComputerSeed {
     pub id: SandboxId,
-    pub runtime: Arc<Mutex<SandboxInstance>>,
+    pub runtime: Arc<Mutex<ComputerRuntime>>,
     pub unregister: Arc<dyn Fn() + Send + Sync>,
     pub generation: Option<Uuid>,
     pub vm_dir: PathBuf,

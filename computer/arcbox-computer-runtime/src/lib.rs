@@ -37,7 +37,7 @@
 //!   `arcbox-vm-proto` vsock client as its one implementation
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
-//! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
+//! - [`SandboxState`] — a computer's public lifecycle state
 //! - [`network`] — `arcbox-tap-net`, re-exported: the Linux TAP adapter
 //!   this crate builds when a composer supplies no guest network, and the
 //!   `invariant` addressing the System VM's own port-forward and init code

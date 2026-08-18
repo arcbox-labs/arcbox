@@ -25,7 +25,8 @@ use arcbox_vm_driver::net::GuestNetwork;
 
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
-use crate::sandbox::{self, SandboxInstance};
+use crate::lifecycle::runtime::ComputerRuntime;
+use crate::sandbox;
 use crate::snapshot_cow::CowManager;
 
 /// Free every runtime resource a sandbox holds: the VMM process (SIGKILL +
@@ -38,7 +39,7 @@ use crate::snapshot_cow::CowManager;
 /// and before TAP destruction (the ioctl fails while the fd is held).
 pub async fn release_runtime_resources(
     id: &str,
-    arc: &Arc<Mutex<SandboxInstance>>,
+    arc: &Arc<Mutex<ComputerRuntime>>,
     network: &Arc<dyn GuestNetwork>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
@@ -82,7 +83,7 @@ pub async fn release_runtime_resources(
 /// which releases the same chroot while keeping the disk.
 pub async fn remove_jailer_chroot(
     id: &str,
-    arc: &Arc<Mutex<SandboxInstance>>,
+    arc: &Arc<Mutex<ComputerRuntime>>,
     config: &VmmConfig,
 ) -> Result<()> {
     let Some(ref jc) = config.firecracker.jailer else {
@@ -102,7 +103,7 @@ pub async fn remove_jailer_chroot(
 }
 
 /// Id the sandbox's jailer chroot and dm/CoW resources are named after.
-pub fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> String {
+pub fn chroot_owner(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> String {
     arc.lock()
         .unwrap()
         .pool_slot_id
@@ -128,7 +129,7 @@ pub fn chroot_owner(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> String {
 /// bounded wait elapsed) restores whichever grip it took, and keeps the
 /// handle, so a retry can finish the job. Idempotent — both are `take()`n,
 /// and killing an exited VM just reports its status.
-pub async fn kill_sandbox_process(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -> Result<()> {
+pub async fn kill_sandbox_process(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> Result<()> {
     let (prepared, handle) = {
         let mut inst = arc.lock().unwrap();
         let prepared = inst.prepared.take();
@@ -171,7 +172,7 @@ pub async fn kill_sandbox_process(id: &str, arc: &Arc<Mutex<SandboxInstance>>) -
 /// recorded durably is exactly the one nobody else will ever collect.
 pub async fn release_everything(
     id: &str,
-    arc: &Arc<Mutex<SandboxInstance>>,
+    arc: &Arc<Mutex<ComputerRuntime>>,
     network: &Arc<dyn GuestNetwork>,
     config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,

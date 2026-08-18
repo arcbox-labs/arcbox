@@ -20,8 +20,8 @@ mod tests {
     use arcbox_vm_driver::testkit::FakeNetwork;
     use std::os::unix::fs::PermissionsExt;
 
-    fn instance(id: &str) -> Arc<Mutex<SandboxInstance>> {
-        Arc::new(Mutex::new(SandboxInstance::new(
+    fn instance(id: &str) -> Arc<Mutex<ComputerRuntime>> {
+        Arc::new(Mutex::new(ComputerRuntime::new(
             id.to_owned(),
             SandboxSpec::default(),
             None,

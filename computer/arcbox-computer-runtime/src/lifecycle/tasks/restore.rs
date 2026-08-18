@@ -31,10 +31,11 @@ use tracing::warn;
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory};
 use crate::config::{JailerConfig, VmmConfig};
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
+use crate::sandbox;
 use crate::sandbox::boot::{StageError, stage_rootfs_cow_or_copy};
 use crate::sandbox::pool::PreparedSlot;
 use crate::sandbox::reconcile::JournaledLease;
-use crate::sandbox::{self, SandboxInstance};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
@@ -55,7 +56,7 @@ pub struct RestoreVm<'a> {
     /// The reserved instance: a claimed pool slot is recorded on it before
     /// anything else, because failure cleanup and the startup sweep key the
     /// chroot and dm/CoW teardown on that id.
-    pub instance: &'a Arc<Mutex<SandboxInstance>>,
+    pub instance: &'a Arc<Mutex<ComputerRuntime>>,
     /// A pre-warmed slot this restore adopted (CORE-78), when the pool had
     /// one for this checkpoint.
     pub claimed: Option<PreparedSlot>,
@@ -130,7 +131,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
     //
     // - `pending_cow`: a CowHandle has no Drop impl, so a `?` propagating
     //   the error would silently leak the dm device + loop + COW file.
-    // On success, the CoW handle is moved onto the SandboxInstance.
+    // On success, the CoW handle is moved onto the ComputerRuntime.
     let mut pending_cow: Option<CowHandle> = None;
 
     // CORE-78: a pre-warmed slot has already executed the spawn and

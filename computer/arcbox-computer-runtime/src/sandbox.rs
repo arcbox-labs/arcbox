@@ -41,6 +41,7 @@ use crate::lifecycle::actor::{
 };
 use crate::lifecycle::event::{Provision, RestoreOrigin};
 use crate::lifecycle::flows::{BootLaunch, ComputerFlows, ComputerServices, Launch, RestoreLaunch};
+use crate::lifecycle::runtime::{ComputerRuntime, Runtime};
 use crate::network::NetworkManager;
 use crate::snapshot::SnapshotCatalog;
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
@@ -73,8 +74,8 @@ pub use pause::reason as pause_reason;
 pub(crate) use types::NetworkAttachment;
 pub use types::{
     CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
-    SandboxEvent, SandboxId, SandboxInfo, SandboxInstance, SandboxMountSpec, SandboxNetworkInfo,
-    SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary, TemplateWarmRef,
+    SandboxEvent, SandboxId, SandboxInfo, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec,
+    SandboxSpec, SandboxState, SandboxSummary, TemplateWarmRef,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -83,7 +84,7 @@ type ReconcileResult = std::result::Result<(), Arc<str>>;
 /// One computer as the registry holds it: its mailbox, its read snapshot, and
 /// the identity that tells this incarnation from a same-id replacement.
 ///
-/// What replaced `Arc<Mutex<SandboxInstance>>`. Every verb is a send on the
+/// What replaced `Arc<Mutex<ComputerRuntime>>`. Every verb is a send on the
 /// mailbox and every read is a borrow of the snapshot, so neither the map
 /// lock nor a per-computer mutex is ever held across an await — the
 /// discipline `list_sandboxes` used to have to state.
@@ -96,9 +97,6 @@ pub(crate) struct ComputerRef {
 
 /// The live computers, by id.
 pub(crate) type Computers = Arc<RwLock<HashMap<SandboxId, ComputerRef>>>;
-
-/// A computer's runtime state as its actor and its sub-tasks share it.
-pub(crate) type Runtime = Arc<Mutex<SandboxInstance>>;
 
 /// Manages the full lifecycle of multiple sandbox microVMs.
 pub struct SandboxManager {
@@ -757,7 +755,7 @@ pub(super) fn validate_new_sandbox_id(id: &str, config: &VmmConfig) -> Result<()
 pub(crate) fn reserve_actor(
     computers: &Computers,
     id: &SandboxId,
-    runtime: SandboxInstance,
+    runtime: ComputerRuntime,
 ) -> Result<ActorReservation> {
     let mut map = computers.write().unwrap();
     if map.contains_key(id) {
@@ -906,8 +904,8 @@ fn forget_computer(computers: &Computers, id: &SandboxId, incarnation: Uuid) {
 mod tests {
     use super::*;
 
-    fn placeholder(id: &str) -> SandboxInstance {
-        SandboxInstance::new(
+    fn placeholder(id: &str) -> ComputerRuntime {
+        ComputerRuntime::new(
             id.to_owned(),
             SandboxSpec::default(),
             None,

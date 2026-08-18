@@ -29,11 +29,12 @@ use super::tasks::{CaptureSpec, ComputerTasks, TaskFailure, TaskResult};
 use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pool::SlotPool;
 use crate::sandbox::record::SandboxProvisionOutcome;
 use crate::sandbox::record::SandboxRecordStore;
 use crate::sandbox::warm::WarmPublishTicket;
-use crate::sandbox::{CheckpointInfo, NetworkAttachment, SandboxEvent, SandboxId, SandboxInstance};
+use crate::sandbox::{CheckpointInfo, NetworkAttachment, SandboxEvent, SandboxId};
 use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
 use crate::snapshot_cow::CowManager;
 
@@ -93,7 +94,7 @@ pub struct RestoreLaunch {
 /// One computer's flows.
 pub struct ComputerFlows {
     id: SandboxId,
-    computer: Arc<Mutex<SandboxInstance>>,
+    computer: Arc<Mutex<ComputerRuntime>>,
     services: Arc<ComputerServices>,
     mailbox: WeakMailbox,
     launch: Mutex<Launch>,
@@ -102,7 +103,7 @@ pub struct ComputerFlows {
 impl ComputerFlows {
     pub fn new(
         id: SandboxId,
-        computer: Arc<Mutex<SandboxInstance>>,
+        computer: Arc<Mutex<ComputerRuntime>>,
         services: Arc<ComputerServices>,
         mailbox: &Mailbox,
         launch: Launch,

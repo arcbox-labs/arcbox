@@ -67,6 +67,9 @@ pub mod event;
 pub mod flows;
 mod machine;
 mod projection;
+/// `pub` in the lint's spelling only: the flows and the manager's claim
+/// both name a computer's runtime state.
+pub mod runtime;
 /// `pub` in the lint's spelling only: `lifecycle` is a private module, so
 /// this reaches the crate and no further. The flows it holds are still
 /// driven from `sandbox` until PR-F2 flips the manager onto the actor.

@@ -53,10 +53,11 @@ use tracing::{info, warn};
 
 use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
 use super::record::{PersistPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
-use super::{LeaseExt, SandboxInstance, SandboxState};
+use super::{LeaseExt, SandboxState};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{Deadlines, Seeded};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::network::NetworkAllocation;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
@@ -186,7 +187,7 @@ pub struct SandboxStateRecord {
     pub attach_mode: Option<JournaledAttachMode>,
     /// Whether the guest holds the fixed invariant identity (CORE-81).
     ///
-    /// [`SandboxInstance::net_invariant`] as an adopted sandbox is rebuilt
+    /// [`ComputerRuntime::net_invariant`] as an adopted sandbox is rebuilt
     /// with it, and so what that sandbox's next checkpoint records as its
     /// restore contract. A different fact from [`Self::attach_mode`] — see
     /// there.
@@ -885,14 +886,14 @@ async fn release_one(
 
 /// A computer the startup sweep reconstructed, and how its machine starts.
 pub(super) struct RecoveredComputer {
-    runtime: SandboxInstance,
+    runtime: ComputerRuntime,
     seeded: Seeded,
 }
 
 impl RecoveredComputer {
     /// A computer with no runtime resources, in the phase recovery left its
     /// record in.
-    fn reinstated(runtime: SandboxInstance) -> Self {
+    fn reinstated(runtime: ComputerRuntime) -> Self {
         let seeded = Seeded::Recovered(phase_of(runtime.state));
         Self { runtime, seeded }
     }
@@ -955,9 +956,9 @@ fn inactive_instance(
     record: SandboxRecord,
     state: SandboxState,
     data_dir: &Path,
-) -> SandboxInstance {
+) -> ComputerRuntime {
     let vm_dir = data_dir.join("sandboxes").join(&record.id);
-    let mut instance = SandboxInstance::new_with_generation(
+    let mut instance = ComputerRuntime::new_with_generation(
         record.id,
         record.effective_spec,
         None,
@@ -992,7 +993,7 @@ fn adopted_instance(
     state: SandboxState,
     data_dir: &Path,
     adopted: AdoptedSandbox,
-) -> SandboxInstance {
+) -> ComputerRuntime {
     let AdoptedSandbox {
         handle,
         lease,

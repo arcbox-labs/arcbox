@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 
 use super::reconcile::{JournaledLease, SandboxStateRecord, write_state_record};
 use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
-use super::{Runtime, SandboxInstance, SandboxManager, SandboxSpec, SandboxState};
+use super::{ComputerRuntime, Runtime, SandboxManager, SandboxSpec, SandboxState};
 use crate::config::{JailerConfig, VmmConfig};
 use crate::lifecycle::actor::{Command, Deadlines, Seeded};
 use crate::lifecycle::flows::Launch;
@@ -268,12 +268,12 @@ pub(super) async fn plant_computer_with(
     manager: &SandboxManager,
     id: &str,
     state: SandboxState,
-    dress: impl FnOnce(&mut SandboxInstance),
+    dress: impl FnOnce(&mut ComputerRuntime),
 ) -> Runtime {
     let vm_dir = PathBuf::from(&manager.config.firecracker.data_dir)
         .join("sandboxes")
         .join(id);
-    let mut runtime = SandboxInstance::new(
+    let mut runtime = ComputerRuntime::new(
         id.to_owned(),
         SandboxSpec {
             id: Some(id.to_owned()),
@@ -427,7 +427,7 @@ pub(super) async fn live_sandbox_with(
         .network
         .identity(&lease, super::attach_mode(true));
     let mut runtime =
-        SandboxInstance::new_with_generation(id.to_owned(), spec, Some(lease), vm_dir, generation);
+        ComputerRuntime::new_with_generation(id.to_owned(), spec, Some(lease), vm_dir, generation);
     runtime.state = SandboxState::Ready;
     runtime.prepared = Some(prepared);
     runtime.handle = Some(Arc::clone(&handle));
