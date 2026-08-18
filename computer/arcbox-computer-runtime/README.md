@@ -73,8 +73,9 @@ network from `[network]`), how its guest agent is reached behind
 the driver's vsock, which also decides what the readiness gate needs from
 the driver), the loop-device tooling behind
 `arcbox_snapshot::snapshot_cow::BlockTools`
-(`BusyboxBlockTools` is the reference; a `util-linux` or ioctl
-implementation is a consumer's few dozen lines) and the netfilter
+(`BusyboxBlockTools` is the reference, `UtilLinuxBlockTools` the
+stock-distro one; an ioctl implementation is a consumer's few dozen
+lines) and the netfilter
 rendering of the identity-invariant translation behind
 `arcbox_tap_net::PacketFilter` (`IptablesLegacy` is the reference;
 a stock distro on the nft backend supplies an nftables one — legacy and

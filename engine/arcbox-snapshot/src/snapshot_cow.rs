@@ -8,8 +8,10 @@
 //! Requires `CONFIG_DM_SNAPSHOT=y` in the kernel, a `dmsetup` binary at one
 //! of [`CowOptions::dmsetup_candidates`], and loop-device tooling supplied
 //! through the [`BlockTools`] seam ([`BusyboxBlockTools`] is the reference:
-//! the System VM's busybox applets). `PATH` is never searched — the guest
-//! does not have a meaningful one.
+//! the System VM's busybox applets; [`UtilLinuxBlockTools`] is the stock
+//! distro's `/sbin` userland). `PATH` is never searched — neither the
+//! guest nor a node agent has a meaningful one, so both implementations
+//! take absolute paths.
 
 use std::collections::HashMap;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -27,7 +29,9 @@ use crate::error::{Result, SnapshotError};
 mod block_tools;
 mod persistence;
 
-pub use block_tools::{BlockTools, BusyboxBlockTools, device_major_minor, mknod_blkdev};
+pub use block_tools::{
+    BlockTools, BusyboxBlockTools, UtilLinuxBlockTools, device_major_minor, mknod_blkdev,
+};
 use persistence::{
     SetupOrphan, clear_owner_marker, loop_backs_path, loop_devices_for_backing_sync,
     remove_file_durable,
