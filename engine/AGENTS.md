@@ -64,8 +64,8 @@ The restructure plan and its locked decisions live in the company repo:
     direct) supplies its own without forking the module. `stat`/`mknod`
     are syscalls, not applets, so they have no seam. The crate's own
     `dmsetup` search list is the stock-distro one; the System VM's
-    `/arcbox/bin/dmsetup` comes from the guest
-    agent's `VmmConfig` (`firecracker.dmsetup_candidates`), not from here.
+    `/arcbox/bin/dmsetup` comes from the guest agent's `VmmConfig`
+    (`firecracker.dmsetup_candidates`), not from here.
     Adding a new host operation means adding a trait method, never a
     hard-coded binary path. BusyBox's `losetup` has no `--show` (no long
     options at all), so `BusyboxBlockTools` attaches as `losetup -f` then
@@ -76,8 +76,8 @@ The restructure plan and its locked decisions live in the company repo:
     the real binaries in `test-vm-linux`'s `integration` job.
     `UtilLinuxBlockTools::discover` probes `--version` rather than trusting
     existence: on busybox-based images `/sbin/losetup` is a symlink to the
-    applet, which would fail on the first attach instead of at
-    composition.
+    applet, which existence alone would select — failing on the first
+    attach instead of at composition.
   - `CowManager`'s test seam (`CowTestProbe`, `new_with_test_probe`) is
     behind the **`test-probe` feature**, not `#[cfg(test)]`: a
     `cfg(test)` item does not exist for another crate's tests, and its
