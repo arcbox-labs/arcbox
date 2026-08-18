@@ -321,6 +321,33 @@ fn jailer_mode_stages_outside_files_and_relativizes_inside_ones() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_boot_whose_files_are_already_staged_plans_no_staging() {
+    // What `Staging` puts in the jail lands at the names rendering uses,
+    // so a spec carrying them is rendered without staging a second copy —
+    // the property a warm slot's pre-staged boot depends on. Both sides
+    // read the same names from `KERNEL_FILE` / `disk_file`.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("jail");
+    let root = base.join("firecracker/box/root");
+    std::fs::create_dir_all(&root).unwrap();
+    let kernel = root.join(KERNEL_FILE);
+    let rootfs = root.join(disk_file("rootfs"));
+    std::fs::write(&kernel, b"kernel").unwrap();
+    std::fs::write(&rootfs, b"disk").unwrap();
+
+    let mut s = spec("box", jailed(&base), rootfs);
+    s.boot = BootSpec::Kernel {
+        image: kernel,
+        cmdline: "console=ttyS0".into(),
+        initrd: None,
+    };
+    let plan = fc_config(&s, &config(), Path::new("/run/vms/box")).unwrap();
+    assert!(plan.stage.is_empty(), "{:?}", plan.stage);
+    assert_eq!(plan.boot_source.kernel_image_path, "/vmlinux");
+    assert_eq!(plan.drives[0].path_on_host.as_deref(), Some("/rootfs.ext4"));
+}
+
+#[test]
 fn jailer_mode_mirrors_a_block_device_as_a_node() {
     use std::os::unix::fs::FileTypeExt as _;
     let Some(device) = std::fs::read_dir("/dev")
@@ -390,7 +417,10 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
         assert!(invalid(fc_config(&s, &config(), Path::new("/run/vms/box"))).contains("disk id"));
     }
 
-    // The same guard covers every staged name, whoever supplies it.
+    // The same guard covers every staged name, whoever supplies it —
+    // including a caller asking where a staged file went, which is how a
+    // disk leaves the jail again.
+    let direct = layout(&IsolationSpec::None);
     let layout = layout(&jailed(&base));
     let mut stage = Vec::new();
     assert!(
@@ -403,6 +433,53 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
         .contains("inside the jail")
     );
     assert!(stage.is_empty());
+    assert!(invalid(layout.jail_path("../rootfs.ext4")).contains("inside the jail"));
+    // A staging caller's disk id is refused without reference to a jail:
+    // `place` guards the destination only when there is one to escape
+    // from, so the rule would otherwise hold in one isolation mode only.
+    assert!(invalid(staged_disk_file("../escape")).contains("plain name"));
+    assert_eq!(staged_disk_file("rootfs").unwrap(), "rootfs.ext4");
+
+    // A source spelled through the jail root but resolving outside it is
+    // not already in the jail, so `place` stages it rather than naming it
+    // where the components pretend it is — otherwise Firecracker is told
+    // a path its chroot cannot reach, and a move never happens at all.
+    let outside = base.join("firecracker/box/root/../../../outside.ext4");
+    assert!(
+        outside.starts_with(layout.jail().unwrap().root.as_path()),
+        "as written it passes for a file in the jail"
+    );
+    assert_eq!(
+        layout.jail().unwrap().view(&outside),
+        None,
+        "resolved, it is not in the jail"
+    );
+    let mut planned = Vec::new();
+    assert_eq!(
+        layout
+            .place(&outside, "rootfs.ext4", StageKind::Copy, &mut planned)
+            .unwrap(),
+        "/rootfs.ext4"
+    );
+    assert_eq!(
+        planned,
+        vec![StagePlan {
+            // Staged from the path as given: which file to read is not
+            // the question the resolution answers.
+            src: outside,
+            dst: base.join("firecracker/box/root/rootfs.ext4"),
+            kind: StageKind::Copy,
+        }]
+    );
+    assert_eq!(
+        layout.jail_path(&disk_file("rootfs")).unwrap(),
+        Some(base.join("firecracker/box/root/rootfs.ext4"))
+    );
+    assert_eq!(
+        direct.jail_path("rootfs.ext4").unwrap(),
+        None,
+        "a VM with no jail has nothing staged anywhere"
+    );
 }
 
 #[test]

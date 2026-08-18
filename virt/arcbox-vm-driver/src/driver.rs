@@ -67,6 +67,28 @@ pub trait VmDriver: Send + Sync {
     fn prepare(&self) -> Option<&dyn Prepare> {
         None
     }
+
+    /// The longest [`VmId`] this driver can run under an isolation, when
+    /// it has a limit of its own.
+    ///
+    /// A driver's layout can bound the id even though the port does not:
+    /// Firecracker's jailer puts its sockets under
+    /// `{chroot base}/{binary}/{id}/root/run/`, and AF_UNIX leaves 107
+    /// bytes for a path, so a long chroot base or a long id makes them
+    /// unaddressable. The failure does not name itself — the VMM comes up
+    /// and binds inside its chroot while every `connect` from outside
+    /// fails, which reads as a boot that timed out. An orchestrator
+    /// minting ids asks here instead of guessing.
+    ///
+    /// `None` means this driver imposes no limit of its own, not that the
+    /// question is unsupported; everything else an id must be is
+    /// [`VmId`]'s own rule. `Some(0)` is a real answer: a layout whose
+    /// fixed part already spends the whole budget leaves room for no id at
+    /// all, and a caller must then refuse every id rather than let the
+    /// arithmetic wrap into a plausible one.
+    fn id_budget(&self, _isolation: &IsolationSpec) -> Option<usize> {
+        None
+    }
 }
 
 /// A running (or just-exited) VM.
@@ -167,6 +189,10 @@ pub struct DriverCapabilities {
     pub adopt: bool,
     /// The VMM can be spawned ahead of a boot ([`Prepare`]).
     pub prepare: bool,
+    /// Prepared VMs expose [`Staging`](crate::Staging): the files a VM
+    /// boots from are brought into an area of its own and named by where
+    /// they landed.
+    pub staging: bool,
     /// Handles expose a memory balloon.
     pub balloon: bool,
     /// Handles expose the guest console output.

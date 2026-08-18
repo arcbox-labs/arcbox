@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use crate::config::FcDriverConfig;
 use crate::prepared::FcPrepared;
 use crate::render;
-use crate::{CHECKPOINT_FORMAT, NAME, adopt, discover};
+use crate::{CHECKPOINT_FORMAT, NAME, adopt, discover, jail};
 
 /// The Firecracker adapter.
 ///
@@ -65,6 +65,7 @@ impl VmDriver for FcDriver {
             diff_checkpoint: false,
             adopt: true,
             prepare: true,
+            staging: true,
             balloon: false,
             console: false,
             debug: false,
@@ -104,6 +105,25 @@ impl VmDriver for FcDriver {
 
     fn prepare(&self) -> Option<&dyn Prepare> {
         Some(self)
+    }
+
+    /// Under the jailer, what the longest socket path in the jail leaves
+    /// for the id ([`jail::id_budget`]) — so a longer chroot base or a
+    /// longer binary name tightens the budget rather than silently
+    /// reintroducing the connect timeout it exists to prevent.
+    ///
+    /// Nothing bounds the id in direct mode: the API socket and the vsock
+    /// live in the runtime dir, where the id is not part of the path. An
+    /// isolation this driver cannot run at all is refused when its layout
+    /// is built, not here.
+    fn id_budget(&self, isolation: &IsolationSpec) -> Option<usize> {
+        match isolation {
+            IsolationSpec::Jailer { chroot_base, .. } => Some(jail::id_budget(
+                &self.config.firecracker_binary,
+                chroot_base,
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -189,7 +209,7 @@ mod tests {
         assert_eq!(driver.name(), "firecracker");
         let caps = driver.capabilities();
         assert!(caps.vsock && caps.vsock_listen);
-        assert!(caps.adopt && caps.prepare);
+        assert!(caps.adopt && caps.prepare && caps.staging);
         assert!(!caps.diff_checkpoint && !caps.balloon && !caps.console && !caps.debug);
         assert!(VmDriver::adopt(&driver).is_some() && VmDriver::prepare(&driver).is_some());
         // Checkpoints go with the jailer: without one nothing could be
@@ -198,6 +218,39 @@ mod tests {
         let mut config = FcDriverConfig::new("/nonexistent/arcbox-fc-driver/firecracker");
         config.jailer_binary = Some("/nonexistent/arcbox-fc-driver/jailer".into());
         assert!(FcDriver::new(config).capabilities().checkpoint);
+    }
+
+    #[test]
+    fn the_id_budget_is_the_jails_and_direct_mode_has_none() {
+        let driver = driver();
+        // Nothing in a direct-mode VM's paths carries the id.
+        assert_eq!(driver.id_budget(&IsolationSpec::None), None);
+
+        let jailed = |chroot_base: &str| IsolationSpec::Jailer {
+            uid: 0,
+            gid: 0,
+            chroot_base: chroot_base.into(),
+            netns: None,
+            new_pid_ns: false,
+            cgroup: None,
+        };
+        assert_eq!(
+            driver.id_budget(&jailed("/srv/jailer")),
+            Some(crate::jail::id_budget(
+                "/nonexistent/arcbox-fc-driver/firecracker",
+                "/srv/jailer"
+            ))
+        );
+        // A deeper base is a tighter budget, and a deep enough one leaves
+        // nothing: the caller must refuse every id rather than mint one.
+        assert!(
+            driver.id_budget(&jailed("/srv/jailer/nested/deeper"))
+                < driver.id_budget(&jailed("/srv/jailer"))
+        );
+        assert_eq!(
+            driver.id_budget(&jailed(&format!("/{}", "d".repeat(200)))),
+            Some(0)
+        );
     }
 
     #[tokio::test]

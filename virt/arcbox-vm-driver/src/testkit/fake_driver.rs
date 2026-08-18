@@ -36,10 +36,12 @@ pub(super) struct Knobs {
 /// `checkpoint.json` that `restore` reads back; `Adopt`/`Detach` go through
 /// the driver's registry; `Prepare` hands out a process with a synthetic
 /// pid that `boot`/`restore` then run on — the driver's own `boot` is
-/// exactly that pair; `Console` returns what [`FakeDriver::push_console`]
-/// pushed. [`FakeDriver::builder`] scripts failures and narrows the claimed
-/// capabilities — the accessors follow the claims, so the contract can be
-/// run against a reduced set.
+/// exactly that pair; `Staging` brings files into a `staged/` directory
+/// under the runtime dir, which outlives the discard as a real driver's
+/// staging area does today; `Console` returns what
+/// [`FakeDriver::push_console`] pushed. [`FakeDriver::builder`] scripts
+/// failures and narrows the claimed capabilities — the accessors follow
+/// the claims, so the contract can be run against a reduced set.
 ///
 /// The driver's name is `"fake"`; its checkpoint format is `"fake/v1"`.
 #[derive(Clone)]
@@ -124,6 +126,7 @@ impl FakeDriver {
                 diff_checkpoint: true,
                 adopt: true,
                 prepare: true,
+                staging: true,
                 balloon: true,
                 console: true,
                 debug: true,

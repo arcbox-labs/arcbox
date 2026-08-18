@@ -6,7 +6,8 @@ jailer) chroot-relative paths, owns the `firecracker`/`jailer` process,
 and serves the port's capabilities over it: `Vsock` and `VsockListen`
 through the hybrid-vsock Unix socket, `Checkpoint` through
 pause → snapshot → resume, `Prepare` for warm pools that spawn ahead of a
-boot, `Adopt`/`Detach` for VMs that outlive the process that booted them.
+boot, `Staging` for bringing that boot's files into the jail before it,
+`Adopt`/`Detach` for VMs that outlive the process that booted them.
 
 Nothing above this crate names Firecracker. The sandbox manager
 (`arcbox-computer-runtime`) reaches it through `dyn VmDriver` — during the
@@ -21,7 +22,7 @@ removes — and the only other things it depends on are the port and
 | `config` | `FcDriverConfig` — binaries, seccomp, log level, API-socket wait, jailer resource limits |
 | `error` | `FcError`, folded into the port's `Error::Driver { driver: "firecracker", .. }` |
 | `render` | `VmLayout` (every path Firecracker sees, and the jailer's relativity), `VmSpec` → `FcPlan`, `RestoreSpec` → `FcRestorePlan` |
-| `jail` | chroot layout and staging (link-or-copy, copy, block-device node), `apply` for a rendered plan, `move_file` out of a jail |
+| `jail` | chroot layout, the id budget the longest jail socket leaves, and staging (link-or-copy, copy, block-device node, move-in), `apply` for a rendered plan, `move_file` out of a jail |
 | `spawn` | `firecracker` / `jailer` process spawn from a `SpawnPlan` |
 | `vsock` | the `CONNECT <port>` handshake and the `{uds}_{port}` listener |
 | `process` | the process guard: waiter task, exit watch + event, kill / wait, detach |
@@ -29,7 +30,7 @@ removes — and the only other things it depends on are the port and
 | `listener` | the port's `VsockListener` over a `{uds}_{port}` socket |
 | `discover` | finding a Firecracker that outlived its booter: the recorded pid and any `/proc` candidate, held to the same `--id` / `--api-sock` / jail-root test |
 | `adopt` | rebuilding a handle over what `discover` found: a bounded API reconnect for the full `FcHandle`, else `FcProcessHandle` over the process alone |
-| `prepared` | `FcPrepared: PreparedVm` — a spawned VMM waiting for a spec |
+| `prepared` | `FcPrepared: PreparedVm + VsockListen + Staging` — a spawned VMM waiting for a spec, and the jail its files are staged into |
 | `handle` | `FcHandle: VmHandle + Vsock + VsockListen + Checkpoint + Detach`; `FcProcessHandle: VmHandle + Detach`, over a VMM whose API is unreachable |
 | `driver` | `FcDriver: VmDriver + Prepare + Adopt` |
 
@@ -104,6 +105,20 @@ this.
   checkpoint to `/snapshots/{image dir name}/{vmstate,mem}`. The API socket
   is `{jail}/run/firecracker.socket`, the vsock socket
   `/run/firecracker.vsock` inside and `{jail}/run/firecracker.vsock` outside.
+
+  `Staging` on a prepared VM stages the same files under the same names
+  ahead of the boot that renders them, which is how a warm pool pays for a
+  checkpoint's memory file before a restore asks for it; `unstage_disk`
+  takes a disk back out of the jail, so it survives the VM. Without a jail
+  every staging verb is the identity. Removing the jail itself is still
+  the caller's, not `discard`'s — see the note on `FcPrepared::discard`.
+
+  Those sockets are also what bounds a VM id: each must fit AF_UNIX's 107
+  bytes, so `id_budget` answers with what the chroot base and binary name
+  leave for the longest of them — the guest dial-out listener,
+  `{jail}/run/firecracker.vsock_{port}`, not the API socket — and `0` for
+  a base that spends it all, since the alternative is ids that look fine
+  and never connect.
 
 A VM `id` and a disk `id` must each be a plain name: the first is the jail's
 directory, the second a device id in the API URL and the file the disk is

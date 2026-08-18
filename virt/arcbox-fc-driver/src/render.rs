@@ -174,6 +174,10 @@ impl VmLayout {
     /// come from the spec (a disk `id`), and staging writes, replaces, and
     /// mknods at the destination, so a `..` in it would reach a host file
     /// outside the jail.
+    ///
+    /// Whether `host` is already inside is [`Jail::view`]'s question, and
+    /// it resolves the path to answer it. The file is staged *from*
+    /// `host` as given, which is the path the caller named.
     pub fn place(
         &self,
         host: &Path,
@@ -198,6 +202,25 @@ impl VmLayout {
             kind,
         });
         Ok(format!("/{in_jail}"))
+    }
+
+    /// The host path `in_jail` names inside the jail, or `None` when the VM
+    /// has none.
+    ///
+    /// The read-only counterpart of [`place`](Self::place), for asking
+    /// about a file already staged rather than bringing one in — and it
+    /// holds `in_jail` to the same rule, because a caller that can name a
+    /// staged file can otherwise name one outside the jail and move it.
+    pub fn jail_path(&self, in_jail: &str) -> Result<Option<PathBuf>> {
+        let Some(jail) = &self.jail else {
+            return Ok(None);
+        };
+        if !is_inside_jail(in_jail) {
+            return Err(unsupported(&format!(
+                "`{in_jail}` does not name a path inside the jail"
+            )));
+        }
+        Ok(Some(jail.root.join(in_jail)))
     }
 }
 
@@ -229,7 +252,12 @@ pub fn fc_config(spec: &VmSpec, config: &FcDriverConfig, runtime_dir: &Path) -> 
             cmdline,
             initrd,
         } => BootSource {
-            kernel_image_path: layout.place(image, "vmlinux", StageKind::LinkOrCopy, &mut stage)?,
+            kernel_image_path: layout.place(
+                image,
+                KERNEL_FILE,
+                StageKind::LinkOrCopy,
+                &mut stage,
+            )?,
             boot_args: Some(cmdline.clone()),
             initrd_path: initrd
                 .as_deref()
@@ -322,15 +350,16 @@ pub fn fc_restore(
             ))
         })?;
     let mut stage = Vec::new();
+    let dir = checkpoint_dir(name);
     let snapshot_path = layout.place(
         &image.dir.join("vmstate"),
-        &format!("snapshots/{name}/vmstate"),
+        &format!("{dir}/vmstate"),
         StageKind::LinkOrCopy,
         &mut stage,
     )?;
     let mem_file_path = layout.place(
         &image.dir.join("mem"),
-        &format!("snapshots/{name}/mem"),
+        &format!("{dir}/mem"),
         StageKind::LinkOrCopy,
         &mut stage,
     )?;
@@ -387,10 +416,49 @@ pub fn fc_restore(
     })
 }
 
+/// The file the kernel is staged as inside the jail.
+pub const KERNEL_FILE: &str = "vmlinux";
+
+/// The file a disk with this id is staged as inside the jail, and so the
+/// name a checkpoint of this driver records for it: `{id}.ext4`.
+///
+/// Shared with [`Staging::stage_disk`](arcbox_vm_driver::Staging::stage_disk):
+/// a disk staged ahead of a boot must land where rendering that boot would
+/// have put it, or the render stages a second copy of it beside the first.
+pub fn disk_file(id: &str) -> String {
+    format!("{id}.ext4")
+}
+
+/// [`disk_file`] for an id that came from a staging caller rather than
+/// from a validated spec: refused unless it is a plain name.
+///
+/// `drive` holds a spec's disk id to the same rule, and `place` refuses a
+/// traversing destination — but only under a jail, since without one it
+/// stages nothing. Staging is asked for an id in both modes, so the rule
+/// is checked here, where it does not depend on a confinement existing.
+pub fn staged_disk_file(id: &str) -> Result<String> {
+    if !is_plain_component(id) {
+        return Err(unsupported(&format!("disk id `{id}` must be a plain name")));
+    }
+    Ok(disk_file(id))
+}
+
+/// The directory a checkpoint whose image dir is named `name` is staged
+/// into inside the jail.
+///
+/// Shared with
+/// [`Staging::stage_checkpoint`](arcbox_vm_driver::Staging::stage_checkpoint)
+/// for the same reason as [`disk_file`], and here it is load-bearing
+/// twice: a warm pool stages an image into a slot long before the restore
+/// that loads it renders the same paths.
+pub fn checkpoint_dir(name: &str) -> String {
+    format!("snapshots/{name}")
+}
+
 /// The file a disk is staged as inside the jail, and so the name a
-/// checkpoint of this driver records for it: `{id}.ext4`.
+/// checkpoint of this driver records for it.
 fn recorded_file(disk: &DiskSpec) -> String {
-    format!("{}.ext4", disk.id)
+    disk_file(&disk.id)
 }
 
 /// [`recorded_file`] as Firecracker names it: `/{id}.ext4`.

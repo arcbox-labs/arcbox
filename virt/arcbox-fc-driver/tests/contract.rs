@@ -249,4 +249,7 @@ contract_modes! {
     prepared_listener_is_live_before_boot,
     discard_kills_a_prepared_vm,
     restore_reattaches_disks,
+    a_staged_spec_boots,
+    a_staged_disk_can_be_taken_back_out,
+    a_staged_checkpoint_restores,
 }

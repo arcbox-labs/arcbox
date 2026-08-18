@@ -106,13 +106,13 @@ impl ContractHarness for FakeHarness {
             cpus: 1,
             memory_mib: 128,
             boot: BootSpec::Kernel {
-                image: "/fake/vmlinux".into(),
+                image: self.file("vmlinux"),
                 cmdline: "console=hvc0".into(),
                 initrd: None,
             },
             disks: vec![DiskSpec {
                 id: "rootfs".into(),
-                path: self.disk_file("rootfs.ext4"),
+                path: self.file("rootfs.ext4"),
                 read_only: false,
                 root: true,
                 cache: CacheMode::Unsafe,
@@ -159,8 +159,9 @@ impl ContractHarness for FakeHarness {
 
 impl FakeHarness {
     /// A real (empty) file under the harness root, so a contract check that
-    /// copies a disk for a restore has something to copy.
-    fn disk_file(&self, name: &str) -> PathBuf {
+    /// copies a disk for a restore, or stages the spec's own files, has
+    /// something to copy.
+    fn file(&self, name: &str) -> PathBuf {
         let path = self.root.path().join(name);
         if !path.exists() {
             std::fs::write(&path, b"").expect("disk file under the harness root");
@@ -201,6 +202,9 @@ macro_rules! driver_contract {
                 prepared_listener_is_live_before_boot,
                 discard_kills_a_prepared_vm,
                 restore_reattaches_disks,
+                a_staged_spec_boots,
+                a_staged_disk_can_be_taken_back_out,
+                a_staged_checkpoint_restores,
             }
         }
     };

@@ -66,6 +66,12 @@ pub enum StageKind {
     /// A device node with the source's major/minor — for a block device
     /// (a device-mapper rootfs).
     BlockNode,
+    /// The source itself, moved in and chowned — for a disk the caller
+    /// hands over instead of keeping: the one an earlier VM's jail was
+    /// emptied into, coming back. Never rendered from a spec; only
+    /// [`Staging::stage_disk`](arcbox_vm_driver::Staging::stage_disk) asks
+    /// for it, because only the caller knows it is giving the file up.
+    Move,
     /// A second name, inside the jail, for a disk that is already in it: a
     /// hard link (a device node for a block device, a copy when neither is
     /// possible), owned like the original. A restore uses it so the load
