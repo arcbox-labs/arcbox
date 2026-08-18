@@ -42,6 +42,9 @@ enum Boot {
     /// Hands off, then panics: the join reports it, and a teardown must not
     /// swallow that.
     HandsOffThenPanics,
+    /// Ends *without* signalling and then tears down what it never handed
+    /// over, which a teardown must let finish rather than cut short.
+    DropsHandoffThenCleansUp,
     /// Completes at once.
     Completes,
 }
@@ -60,6 +63,8 @@ struct Script {
     /// How long the gate holds READY back, which is how a test observes a
     /// computer while its launch is still in flight.
     gate_takes: Mutex<Option<Duration>>,
+    /// Whether a boot that never handed off got to finish its own teardown.
+    cleanup_finished: AtomicBool,
 }
 
 impl Script {
@@ -72,6 +77,7 @@ impl Script {
             restore_takes: Mutex::new(None),
             restore_finished: AtomicBool::new(false),
             gate_takes: Mutex::new(None),
+            cleanup_finished: AtomicBool::new(false),
         })
     }
 
@@ -103,6 +109,14 @@ impl ComputerTasks for Script {
                 let _ = handed_off.send(());
                 std::future::pending::<()>().await;
                 unreachable!("a hanging boot is only ever aborted")
+            }
+            Boot::DropsHandoffThenCleansUp => {
+                drop(handed_off);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                self.cleanup_finished.store(true, Ordering::SeqCst);
+                Err(TaskFailure::recoverable(VmmError::Process(
+                    "the vmm would not spawn".into(),
+                )))
             }
             Boot::HandsOffThenPanics => {
                 // Panics in the same poll as the signal, so the abort finds
@@ -564,6 +578,32 @@ async fn a_panicked_sub_task_is_reported_rather_than_swallowed() {
         .ok()
         .await;
     assert!(harness.script.calls().contains(&"release"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_boot_that_never_handed_off_is_joined_so_its_own_cleanup_finishes() {
+    // The middle arm of `cancel_and_join_boot`: a producer that ended
+    // without declaring abort safety is tearing down what it never handed
+    // over — the prepared VMM, a CoW handle — and aborting it there strands
+    // exactly those.
+    let harness = Harness::start(Boot::DropsHandoffThenCleansUp, no_deadlines()).await;
+    harness.send(|reply| Command::Provision {
+        provision: Provision::Boot { warm: false },
+        outcome: SandboxProvisionOutcome::default(),
+        reply,
+    });
+    // Let the actor observe the dropped signal before the teardown asks.
+    harness.awaited("boot").await;
+    tokio::task::yield_now().await;
+
+    harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .ok()
+        .await;
+    assert!(
+        harness.script.cleanup_finished.load(Ordering::SeqCst),
+        "the boot's own cleanup was cut short"
+    );
 }
 
 #[tokio::test(start_paused = true)]

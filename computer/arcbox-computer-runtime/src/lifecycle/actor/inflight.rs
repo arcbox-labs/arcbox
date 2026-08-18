@@ -51,9 +51,11 @@ impl ComputerActor {
                     // point is now the computer's, so aborting cannot strand
                     // one.
                     Ok(Ok(())) => task.handle.abort(),
-                    // The producer ended without declaring abort safety: join
-                    // it so its own failure cleanup can finish.
-                    Ok(Err(_)) => {}
+                    // The producer ended without declaring abort safety: it
+                    // is tearing down what it never handed over, so it is
+                    // joined rather than cut short — and a retry after a
+                    // stalled join must join it too.
+                    Ok(Err(_)) => task.handoff = Handoff::JoinOnly,
                     Err(_) => {
                         task.handoff = Handoff::Awaited(signal);
                         return self.stall(task);
@@ -88,7 +90,6 @@ impl ComputerActor {
             }
             Ok(_) => {}
         }
-        task.handoff = Handoff::Abortable;
         self.epoch += 1;
         self.retry_backoff = RETRY_INITIAL;
         Flow::Continue

@@ -355,11 +355,19 @@ impl ComputerActor {
                     self.on_completion(&mut machine, completion).await;
                 }
                 landed = handoff(&mut self.inflight) => {
-                    // The signal is consumed either way: a producer that
-                    // ended without it cannot send it later, and an abort
-                    // from here on no longer has to wait.
+                    // The signal is consumed either way — a producer that
+                    // ended without it cannot send it later — but what that
+                    // leaves behind differs. Signalled: the resources are
+                    // the computer's and the task is abortable. Dropped: the
+                    // task is on its own failure path, tearing down what it
+                    // never handed over, and must be joined rather than cut
+                    // short (`cancel_and_join_boot`'s middle arm).
                     if let Some(task) = self.inflight.as_mut() {
-                        task.handoff = Handoff::Abortable;
+                        task.handoff = if landed {
+                            Handoff::Abortable
+                        } else {
+                            Handoff::JoinOnly
+                        };
                     }
                     if landed {
                         self.dispatch(&mut machine, Event::ResourcesHandedOff).await;
