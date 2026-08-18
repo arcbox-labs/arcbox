@@ -321,6 +321,16 @@ impl Harness {
         self.dir.path().join("state.json").exists()
     }
 
+    /// The next event carrying `action`.
+    async fn next_event(&mut self, action: &str) -> SandboxEvent {
+        loop {
+            let event = self.events.recv().await.expect("the event bus stays open");
+            if event.action == action {
+                return event;
+            }
+        }
+    }
+
     /// The lifecycle actions published so far.
     fn actions(&mut self) -> Vec<String> {
         let mut actions = Vec::new();
@@ -805,4 +815,31 @@ async fn a_paused_computer_records_what_it_retained() {
     assert_eq!(snapshot.state, SandboxState::Paused);
     assert_eq!(snapshot.pause_snapshot_id.as_deref(), Some("snap"));
     assert!(snapshot.paused_at.is_some());
+}
+
+/// An idle pause reports itself as one.
+///
+/// The PAUSING event's `reason` is how a client tells the idle detector's
+/// pause from a client's own, and only the expiry knows which this is —
+/// `apply_idle_policy` passed `reason::IDLE_TIMEOUT` explicitly.
+#[tokio::test(start_paused = true)]
+async fn an_idle_pause_says_so_on_its_event() {
+    let mut harness = Harness::start(
+        Boot::Completes,
+        Deadlines {
+            ttl: None,
+            idle_timeout_seconds: 2,
+            on_idle: IdleAction::Pause,
+        },
+    )
+    .await;
+    harness.boot_to_ready().await;
+
+    let pausing = harness
+        .next_event(crate::sandbox::types::action::PAUSING)
+        .await;
+    assert_eq!(
+        pausing.attributes.get("reason").map(String::as_str),
+        Some(crate::sandbox::pause_reason::IDLE_TIMEOUT)
+    );
 }

@@ -551,6 +551,12 @@ impl ComputerActor {
                 () = due(&mut self.idle) => {
                     self.idle = None;
                     let action = self.deadlines.on_idle;
+                    // An idle pause reports itself as one: the PAUSING event's
+                    // reason is how a client tells the detector's pause from a
+                    // client's, and only the expiry knows which this is.
+                    if matches!(action, IdleAction::Pause) {
+                        self.pause_reason = PauseReason::IdleTimeout;
+                    }
                     self.dispatch(&mut machine, Event::IdleExpired { action }).await;
                 }
                 () = due(&mut self.retry) => {
