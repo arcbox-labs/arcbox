@@ -8,10 +8,11 @@ use std::time::Duration;
 use super::ContractHarness;
 use crate::capability::{
     AfterCheckpoint, CheckpointFormat, CheckpointImage, CheckpointKind, CheckpointOptions,
+    DiskSource,
 };
 use crate::driver::{RestoreSpec, ShutdownMode, VmEvent, VmHandle, VmRecord, VmState};
 use crate::error::Error;
-use crate::spec::VmId;
+use crate::spec::{BootSpec, VmId};
 
 /// How long a check waits for something the guest or VMM must do.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -80,6 +81,10 @@ pub async fn capabilities_agree_with_accessors(h: &dyn ContractHarness) {
     assert_eq!(caps.console, vm.console().is_some(), "console");
     assert_eq!(caps.debug, vm.debug().is_some(), "debug");
     assert_eq!(caps.prepare, driver.prepare().is_some(), "prepare");
+    // Staging is reached through a prepared VM, so its accessor is checked
+    // in `a_staged_spec_boots`; claiming it without `Prepare` leaves no way
+    // to reach it at all.
+    assert!(caps.prepare || !caps.staging, "staging without prepare");
     vm.shutdown(ShutdownMode::Kill).await.expect("kill");
 }
 
@@ -449,4 +454,169 @@ pub async fn restore_reattaches_disks(h: &dyn ContractHarness) {
     assert_eq!(restored.state(), VmState::Running);
     h.ready(&*restored).await;
     restored.shutdown(ShutdownMode::Kill).await.expect("kill");
+}
+
+/// A spec that names what [`Staging`](crate::Staging) brought in boots:
+/// the paths it hands back are the ones the VM's own spec must carry.
+///
+/// The capability's accessor and the driver's claim agree here rather than
+/// in `capabilities_agree_with_accessors`, which has a handle and not the
+/// prepared VM this one lives on.
+pub async fn a_staged_spec_boots(h: &dyn ContractHarness) {
+    let driver = h.driver();
+    let Some(prepare) = driver.prepare() else {
+        assert!(!driver.capabilities().prepare);
+        return;
+    };
+    let mut spec = h.spec(&id("staged-boot"));
+    let prepared = prepare
+        .prepare(&spec.id, &spec.isolation, &h.runtime_dir())
+        .await
+        .expect("prepare");
+    let staging = prepared.staging();
+    assert_eq!(driver.capabilities().staging, staging.is_some(), "staging");
+    let Some(staging) = staging else {
+        return;
+    };
+
+    // Exactly what an orchestrator does before it boots: bring the spec's
+    // own files in, and let each answer replace the path it was named by.
+    if let BootSpec::Kernel { image, .. } = &mut spec.boot {
+        *image = staging.stage_kernel(image).await.expect("stage the kernel");
+    }
+    for disk in &mut spec.disks {
+        let staged = staging
+            .stage_disk(&disk.id, DiskSource::Image(&disk.path))
+            .await
+            .expect("stage a disk");
+        disk.path = staged;
+    }
+
+    let vm = prepared.boot(spec).await.expect("boot from staged paths");
+    h.ready(&*vm).await;
+    assert_eq!(vm.state(), VmState::Running);
+    vm.shutdown(ShutdownMode::Kill).await.expect("kill");
+}
+
+/// `unstage_disk` takes a disk back out intact, and `discard` removes
+/// whatever is still staged.
+///
+/// The two halves of the same rule: everything staged for a VM dies with
+/// it, so anything that must outlive it leaves first. A driver that stages
+/// nothing answers the identity — nothing to take out, and the caller's
+/// own file untouched by the discard.
+pub async fn discard_removes_what_was_staged(h: &dyn ContractHarness) {
+    const CONTENT: &[u8] = b"a disk staged by the contract";
+
+    let driver = h.driver();
+    let Some(prepare) = driver.prepare() else {
+        assert!(!driver.capabilities().prepare);
+        return;
+    };
+    let spec = h.spec(&id("staged-discard"));
+    let dir = h.runtime_dir();
+    let prepared = prepare
+        .prepare(&spec.id, &spec.isolation, &dir)
+        .await
+        .expect("prepare");
+    let Some(staging) = prepared.staging() else {
+        assert!(!driver.capabilities().staging);
+        return;
+    };
+
+    // A file of the check's own, outside anything the VM was given.
+    let source = dir.join("staging-source.ext4");
+    tokio::fs::write(&source, CONTENT)
+        .await
+        .expect("a file to stage");
+    let staged = staging
+        .stage_disk("data", DiskSource::Image(&source))
+        .await
+        .expect("stage a disk");
+    assert!(
+        tokio::fs::try_exists(&source).await.unwrap_or(false),
+        "an Image source is the caller's to keep"
+    );
+    assert_eq!(
+        tokio::fs::read(&staged)
+            .await
+            .expect("read the staged disk"),
+        CONTENT
+    );
+
+    if staged == source {
+        // Identity staging: the file was already where the VM reads it, so
+        // there is nothing to take out and nothing for `discard` to remove.
+        assert!(
+            !staging
+                .unstage_disk("data", &dir.join("parked.ext4"))
+                .await
+                .expect("unstage what was never staged")
+        );
+        prepared.discard().await.expect("discard");
+        assert!(
+            tokio::fs::try_exists(&source).await.unwrap_or(false),
+            "a driver that stages nothing must not remove the caller's file"
+        );
+        return;
+    }
+
+    // Staging what is already in the VM's area names it where it is —
+    // never a copy of a file onto itself, which would truncate it.
+    assert_eq!(
+        staging
+            .stage_disk("data", DiskSource::Image(&staged))
+            .await
+            .expect("stage what is already staged"),
+        staged
+    );
+    assert_eq!(
+        tokio::fs::read(&staged)
+            .await
+            .expect("read the staged disk"),
+        CONTENT
+    );
+
+    let parked = dir.join("parked.ext4");
+    assert!(
+        staging
+            .unstage_disk("data", &parked)
+            .await
+            .expect("unstage the disk"),
+        "a staged disk is reported as taken out"
+    );
+    assert_eq!(
+        tokio::fs::read(&parked)
+            .await
+            .expect("read the parked disk"),
+        CONTENT
+    );
+    assert!(
+        !staging
+            .unstage_disk("data", &parked)
+            .await
+            .expect("unstage twice"),
+        "nothing is left to take out"
+    );
+
+    // And back in, consuming the parked copy.
+    let back = staging
+        .stage_disk("data", DiskSource::Handover(&parked))
+        .await
+        .expect("hand the disk back in");
+    assert!(
+        !tokio::fs::try_exists(&parked).await.unwrap_or(true),
+        "a handed-over disk is moved, not copied"
+    );
+
+    let status = prepared.discard().await.expect("discard");
+    assert!(
+        !tokio::fs::try_exists(&back).await.unwrap_or(true),
+        "discard left a staged disk behind"
+    );
+    assert_eq!(
+        prepared.discard().await.expect("second discard"),
+        status,
+        "discard is idempotent once it has removed the staging area"
+    );
 }
