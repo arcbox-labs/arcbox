@@ -117,7 +117,8 @@ jobs:
       # it as `losetup -f` then `losetup LOOPDEV FILE`, and the only honest
       # check is a real busybox. Ubuntu's 1.30 has the same option surface
       # as the System VM's, so it exercises the same path
-      # (busybox_block_tools_attach_report_and_detach).
+      # (block_tools::busybox_attach_report_and_detach). Its util-linux
+      # sibling needs no install: that is what ubuntu's own /usr/sbin is.
       - name: Install busybox
         run: |
           sudo apt-get update
@@ -126,8 +127,12 @@ jobs:
       - name: Build test binary
         run: cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net --no-run
 
+      # ARCBOX_REQUIRE_BLOCK_TOOLS: this runner has busybox (installed
+      # above) and util-linux (stock ubuntu), so the block-tools tests must
+      # run rather than skip — otherwise a regression in the discovery probe
+      # silently takes its own coverage with it.
       - name: Run integration tests (as root for TAP creation and loop devices)
-        run: sudo env PATH="$PATH" HOME="$HOME" cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net
+        run: sudo env PATH="$PATH" HOME="$HOME" ARCBOX_REQUIRE_BLOCK_TOOLS=1 cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net
 
   # ---------------------------------------------------------------------------
   # Job 3: E2E tests — requires KVM + root + Firecracker assets

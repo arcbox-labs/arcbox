@@ -134,6 +134,23 @@ mod block_tools {
 
     const IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
+    /// Set by the `integration` job, which installs both userlands: every
+    /// skip below then becomes a failure. Without it a regression in the
+    /// very code that decides whether to run — `UtilLinuxBlockTools`'s
+    /// discovery probe above all — would take its own coverage down with
+    /// it and leave CI green.
+    const REQUIRE: &str = "ARCBOX_REQUIRE_BLOCK_TOOLS";
+
+    /// Report why `test` cannot run here, or fail when this host promised
+    /// it could. The caller returns straight after.
+    fn skipped(test: &str, reason: &str) {
+        assert!(
+            std::env::var_os(REQUIRE).is_none(),
+            "{test}: {reason}, but {REQUIRE} says this host has both userlands"
+        );
+        eprintln!("SKIP {test} — {reason}");
+    }
+
     /// `BusyboxBlockTools` against a real busybox. BusyBox's `losetup` has
     /// no long options, so the applet-driving code cannot be checked with
     /// util-linux — this is the one place the real thing runs. Skips
@@ -141,13 +158,15 @@ mod block_tools {
     /// `integration` job installs `busybox-static` for it.
     #[test]
     fn busybox_attach_report_and_detach() {
+        const TEST: &str = "busybox_attach_report_and_detach";
+
         if !common::is_root() {
-            eprintln!("SKIP busybox_attach_report_and_detach — requires root");
+            skipped(TEST, "requires root");
             return;
         }
         let busybox = std::env::var("BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
         if !std::path::Path::new(&busybox).exists() {
-            eprintln!("SKIP busybox_attach_report_and_detach — no busybox at {busybox}");
+            skipped(TEST, &format!("no busybox at {busybox}"));
             return;
         }
         attach_report_and_detach(&BusyboxBlockTools::new(&busybox));
@@ -160,14 +179,16 @@ mod block_tools {
     /// util-linux userland.
     #[test]
     fn util_linux_attach_report_and_detach() {
+        const TEST: &str = "util_linux_attach_report_and_detach";
+
         if !common::is_root() {
-            eprintln!("SKIP util_linux_attach_report_and_detach — requires root");
+            skipped(TEST, "requires root");
             return;
         }
         let tools = match UtilLinuxBlockTools::discover() {
             Ok(tools) => tools,
             Err(e) => {
-                eprintln!("SKIP util_linux_attach_report_and_detach — {e}");
+                skipped(TEST, &e.to_string());
                 return;
             }
         };
