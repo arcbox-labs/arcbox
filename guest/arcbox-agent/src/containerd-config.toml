@@ -1,0 +1,25 @@
+# containerd configuration written to /etc/containerd/config.toml at runtime.
+#
+# `@NAME@` placeholders are substituted by `containerd_config::render()` from
+# `arcbox_constants::paths`, so the paths here stay the same ones the agent
+# uses to create those directories. Anything not templated is literal.
+#
+# This file is `include_str!`d into the agent rather than shipped in the guest
+# rootfs on purpose: the rootfs is a separate release train, and a config that
+# can lag the agent depending on it would drop options silently — the exact
+# failure mode the overlayfs section below is most vulnerable to.
+
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri".cni]
+  bin_dir = "@CNI_BIN_DIR@"
+  conf_dir = "@CNI_CONF_DIR@"
+  max_conf_num = 1
+
+# Makes a running container's rootfs exportable over NFS, which is what lets
+# the host browse it live at ~/ArcBox (ABX-424). The two options are coupled by
+# the kernel, not by preference — see OVERLAY_MOUNT_OPTIONS in containerd_config.rs for
+# which of the three branches in `ovl_fs_params_verify` each spelling lands in,
+# and which one fails silently.
+[plugins."io.containerd.snapshotter.v1.overlayfs"]
+  mount_options = @OVERLAY_MOUNT_OPTIONS@

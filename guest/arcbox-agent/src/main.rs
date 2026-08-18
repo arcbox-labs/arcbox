@@ -21,6 +21,10 @@ mod boot_done;
 mod init;
 // Discovery half of the live-container NFS view. Pure parsing and
 // naming, gated like `boot_done` so the tests run on a host build too.
+// The containerd config the agent writes at runtime. Gated like
+// `live_exports` so its tests run on a host build too.
+#[cfg(any(target_os = "linux", test))]
+mod containerd_config;
 #[cfg(any(target_os = "linux", test))]
 mod live_exports;
 #[cfg(any(target_os = "linux", test))]
