@@ -292,10 +292,9 @@ impl Staging for FcPrepared {
     }
 
     async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool> {
-        let Some(jail) = self.layout.jail() else {
+        let Some(staged) = self.layout.jail_path(&render::disk_file(id))? else {
             return Ok(false);
         };
-        let staged = jail.root.join(render::disk_file(id));
         if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
             return Ok(false);
         }

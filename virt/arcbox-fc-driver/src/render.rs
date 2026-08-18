@@ -199,6 +199,25 @@ impl VmLayout {
         });
         Ok(format!("/{in_jail}"))
     }
+
+    /// The host path `in_jail` names inside the jail, or `None` when the VM
+    /// has none.
+    ///
+    /// The read-only counterpart of [`place`](Self::place), for asking
+    /// about a file already staged rather than bringing one in — and it
+    /// holds `in_jail` to the same rule, because a caller that can name a
+    /// staged file can otherwise name one outside the jail and move it.
+    pub fn jail_path(&self, in_jail: &str) -> Result<Option<PathBuf>> {
+        let Some(jail) = &self.jail else {
+            return Ok(None);
+        };
+        if !is_inside_jail(in_jail) {
+            return Err(unsupported(&format!(
+                "`{in_jail}` does not name a path inside the jail"
+            )));
+        }
+        Ok(Some(jail.root.join(in_jail)))
+    }
 }
 
 /// Renders a boot: the API payloads for `spec` and the files a jail needs

@@ -417,7 +417,10 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
         assert!(invalid(fc_config(&s, &config(), Path::new("/run/vms/box"))).contains("disk id"));
     }
 
-    // The same guard covers every staged name, whoever supplies it.
+    // The same guard covers every staged name, whoever supplies it —
+    // including a caller asking where a staged file went, which is how a
+    // disk leaves the jail again.
+    let direct = layout(&IsolationSpec::None);
     let layout = layout(&jailed(&base));
     let mut stage = Vec::new();
     assert!(
@@ -430,6 +433,16 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
         .contains("inside the jail")
     );
     assert!(stage.is_empty());
+    assert!(invalid(layout.jail_path("../rootfs.ext4")).contains("inside the jail"));
+    assert_eq!(
+        layout.jail_path(&disk_file("rootfs")).unwrap(),
+        Some(base.join("firecracker/box/root/rootfs.ext4"))
+    );
+    assert_eq!(
+        direct.jail_path("rootfs.ext4").unwrap(),
+        None,
+        "a VM with no jail has nothing staged anywhere"
+    );
 }
 
 #[test]
