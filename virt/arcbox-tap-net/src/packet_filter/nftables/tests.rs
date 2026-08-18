@@ -53,6 +53,7 @@ fn renderings_agree_on_the_contract() {
     let xt = xt_rules(tap, pool);
     let nft = translation_rules(tap, pool);
 
+    assert_eq!(xt.len(), 7, "the contract is seven rules");
     assert_eq!(xt.len(), nft.len(), "the contract is seven rules on both");
 
     for (xt, nft) in xt.iter().zip(&nft) {
