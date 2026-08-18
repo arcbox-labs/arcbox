@@ -601,9 +601,9 @@ impl ComputerActor {
                 "computer lifecycle transition"
             );
         }
-        // Unconditionally, not only on a public change: the flows write the
-        // lease, the timestamps and the pause checkpoint onto the runtime as
-        // they go, and a dispatch is when the actor next looks.
+        // Before the drain, because a sub-task an effect spawns reads the
+        // public state off the runtime — the checkpoint's precondition, and
+        // the boot's cooperative teardown check.
         self.publish_state(after);
         let mut effects = effects.into_iter();
         while let Some(effect) = effects.next() {
@@ -615,6 +615,10 @@ impl ComputerActor {
                 break;
             }
         }
+        // And after it, because the effects themselves write to the runtime
+        // — what a pause retained, the failure text — and a caller answered
+        // by one of them reads the snapshot the moment it returns.
+        self.publish_state(after);
         while let Some(queued) = self.queued.pop_front() {
             Box::pin(self.dispatch(machine, queued)).await;
         }

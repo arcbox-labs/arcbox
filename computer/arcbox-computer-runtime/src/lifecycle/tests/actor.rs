@@ -790,10 +790,19 @@ async fn a_paused_computer_records_what_it_retained() {
     });
     paused.ok().await;
 
-    let runtime = harness.runtime.lock().unwrap();
-    assert_eq!(runtime.pause_snapshot_id.as_deref(), Some("snap"));
-    assert!(
-        runtime.paused_at.is_some(),
-        "a paused computer reports when it went to sleep"
-    );
+    {
+        let runtime = harness.runtime.lock().unwrap();
+        assert_eq!(runtime.pause_snapshot_id.as_deref(), Some("snap"));
+        assert!(
+            runtime.paused_at.is_some(),
+            "a paused computer reports when it went to sleep"
+        );
+    }
+    // And on the read view *by the time the caller is answered*: `Inspect`
+    // is the very next thing a client does, and the effects that write those
+    // fields run after the transition published the snapshot.
+    let snapshot = harness.snapshot.borrow();
+    assert_eq!(snapshot.state, SandboxState::Paused);
+    assert_eq!(snapshot.pause_snapshot_id.as_deref(), Some("snap"));
+    assert!(snapshot.paused_at.is_some());
 }
