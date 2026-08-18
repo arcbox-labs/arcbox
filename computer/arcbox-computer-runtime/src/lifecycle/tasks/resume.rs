@@ -308,7 +308,11 @@ async fn unwind_resume(
     }
 
     // Copy-mode fallback: park the staged rootfs back in vm_dir so the
-    // retained disk state survives the chroot removal below.
+    // retained disk state survives the chroot removal below. The order is
+    // load-bearing in the same way the pause release's is — the staged
+    // rootfs *is* the paused computer's disk and it lives inside the jail,
+    // so a chroot removed before this point turns the `exists()` guard
+    // false, the move is skipped, and the computer is left unresumable.
     let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
     let cr = chroot_root(&config.firecracker.binary, base, id);
     let staged = cr.join("rootfs.ext4");

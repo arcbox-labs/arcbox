@@ -11,6 +11,15 @@
 //! file kept, or, in copy mode, the staged rootfs is parked in `vm_dir`
 //! before the chroot is removed — and the renaming that leaves every
 //! retained resource keyed by the computer's own id.
+//!
+//! **The copy-mode move must precede the chroot removal, and the kill must
+//! not take the jail with it.** In copy mode the staged rootfs *is* the
+//! paused computer's disk, and it lives inside the jail: the move is guarded
+//! on `staged.exists()`, so a chroot removed any earlier turns that guard
+//! false, the move is silently skipped, pause reports success, and the
+//! resume that follows has no disk to resume from. This is why
+//! `PreparedVm::discard` kills the process without removing the jail the
+//! adapter created — the two only come apart in one order.
 
 use std::sync::{Arc, Mutex};
 

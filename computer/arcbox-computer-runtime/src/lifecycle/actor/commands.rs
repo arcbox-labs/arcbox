@@ -84,17 +84,34 @@ impl ComputerActor {
                 }
             }
             Command::Remove { force, reply } => {
+                // Parked *before* the dispatch: a teardown can fail during
+                // it — a panicked sub-task is found while its effects are
+                // still being applied — and that error has to reach the
+                // caller that asked for the removal.
+                self.waiters.push((Answer::Removed, reply));
                 if self.dispatch(machine, Event::Remove { force }).await {
-                    self.waiters.push((Answer::Removed, reply));
-                } else if matches!(machine.state(), State::Removing {}) {
-                    // Concurrent removals coalesce onto the one under way.
-                    self.waiters.push((Answer::Removed, reply));
-                } else if matches!(machine.state(), State::Gone {}) {
-                    let _ = reply.send(Ok(()));
-                } else {
-                    let _ = reply.send(Err(
-                        self.wrong_state("non-running (pass force=true to override)")
-                    ));
+                    return;
+                }
+                match machine.state() {
+                    // A removal under way coalesces. One that *stopped* — a
+                    // release that failed, a panicked sub-task — is re-driven
+                    // instead: `removing` swallows the retry, so nothing else
+                    // would ever answer it, and a retried
+                    // `remove_sandbox_impl` re-runs the teardown today.
+                    State::Removing {} => {
+                        if self.inflight.is_none() && self.retry.is_none() {
+                            self.restart_teardown(*machine.state()).await;
+                        }
+                    }
+                    State::Gone {} => self.answer(Answer::Removed),
+                    // Refused, and nothing acted — so the reply is still the
+                    // one just parked.
+                    _ => {
+                        let refused = self.wrong_state("non-running (pass force=true to override)");
+                        if let Some((_, reply)) = self.waiters.pop() {
+                            let _ = reply.send(Err(refused));
+                        }
+                    }
                 }
             }
             Command::ClaimWorkload { claim, reply } => {
@@ -113,6 +130,18 @@ impl ComputerActor {
                 self.dispatch(machine, Event::WorkloadExited).await;
             }
             Command::SetLifecycle { deadlines, reply } => {
+                // `set_sandbox_lifecycle` refuses a computer on its way out:
+                // nothing is left for a deadline to fire on, and the record
+                // it would persist to is about to be a tombstone.
+                if matches!(
+                    self.public(),
+                    Some(SandboxState::Stopping | SandboxState::Stopped | SandboxState::Failed)
+                ) {
+                    let _ = reply.send(Err(
+                        self.wrong_state("a live computer (not stopping, stopped, or failed)")
+                    ));
+                    return;
+                }
                 self.deadlines = deadlines;
                 // The timers live in this task; the record is what a restart
                 // re-arms them from, so an acknowledged change has to be on

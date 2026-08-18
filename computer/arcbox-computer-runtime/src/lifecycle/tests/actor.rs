@@ -526,6 +526,16 @@ async fn a_removal_whose_release_fails_answers_its_caller() {
         error.to_string().contains("the vmm would not die"),
         "{error}"
     );
+
+    // And the retry re-drives a teardown that stopped rather than coalescing
+    // onto it: `removing` swallows the event, so nothing else would answer.
+    harness.script.release_fails.store(false, Ordering::SeqCst);
+    harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .ok()
+        .await;
+    harness.joined().await;
+    assert!(harness.actions().contains(&"removed".to_owned()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -544,7 +554,15 @@ async fn a_panicked_sub_task_is_reported_rather_than_swallowed() {
         .error()
         .await;
     assert!(error.to_string().contains("panicked"), "{error}");
-    // ...and the teardown still ran: a release takes more, not less.
+    // The teardown stopped where `remove_sandbox_impl` stops — no release —
+    // so the record and its crash journal survive for the startup sweep.
+    assert!(!harness.script.calls().contains(&"release"));
+
+    // ...and the retry, whose join is clean, finishes it.
+    harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .ok()
+        .await;
     assert!(harness.script.calls().contains(&"release"));
 }
 

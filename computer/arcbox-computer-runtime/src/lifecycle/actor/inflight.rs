@@ -71,13 +71,20 @@ impl ComputerActor {
         match tokio::time::timeout(HANDOFF_TIMEOUT, &mut task.handle).await {
             Err(_) => return self.stall(task),
             // A cancelled task is what we asked for. A panicked one is not:
-            // today's join maps it to an error that fails the removal, and
-            // swallowing it would hide both the panic and whatever the task
-            // never got to transfer. The teardown still runs — a release
-            // takes more, not less — but its caller hears about it.
+            // `cancel_and_join_boot` maps it onto an error that leaves
+            // `remove_sandbox_impl` through `?`, so the release and the
+            // record unlink never run — the record and its journal survive
+            // for the startup sweep, and a retry (whose join is clean)
+            // finishes the job. Carrying on would delete both while whatever
+            // the panicking task never transferred was still out there.
             Ok(Err(error)) if !error.is_cancelled() => {
                 error!(sandbox_id = %self.id, %error, "a computer sub-task panicked");
-                self.answer_error = Some(format!("sub-task panicked: {error}"));
+                self.fail_every_waiter(VmmError::Process(format!(
+                    "computer {} sub-task panicked: {error}",
+                    self.id
+                )));
+                self.epoch += 1;
+                return Flow::Stalled;
             }
             Ok(_) => {}
         }
@@ -99,6 +106,23 @@ impl ComputerActor {
         self.retry = Some(Box::pin(tokio::time::sleep(self.retry_backoff)));
         self.retry_backoff = self.retry_backoff.saturating_mul(2).min(RETRY_MAX);
         Flow::Stalled
+    }
+
+    /// Re-drives a teardown that stopped rather than finished — its release
+    /// failed, or a panicked sub-task abandoned it. Today's equivalent is a
+    /// retried `remove_sandbox_impl`, which re-runs the whole teardown.
+    pub(super) async fn restart_teardown(&mut self, state: State) {
+        if self.stalled.is_some() {
+            self.resume_stalled().await;
+        } else {
+            self.apply(
+                Effect::SpawnRelease {
+                    scope: ReleaseScope::Full,
+                },
+                state,
+            )
+            .await;
+        }
     }
 
     /// Retries the abort a stalled teardown is waiting on, then replays it.
