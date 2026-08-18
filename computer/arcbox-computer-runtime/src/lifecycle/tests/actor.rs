@@ -6,6 +6,7 @@
 //! mailbox. All of it runs with no VMM, no driver and no record store — which
 //! is the point of the [`ComputerTasks`] seam.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines};
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::event::{Provision, RestoreOrigin};
-use crate::lifecycle::tasks::{ComputerTasks, TaskResult};
+use crate::lifecycle::tasks::{ComputerTasks, TaskFailure, TaskResult};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
 use crate::sandbox::{IdleAction, SandboxEvent, SandboxState};
 use crate::testkit::agent::FakeAgentFactory;
@@ -45,6 +46,15 @@ struct Script {
     boot: Boot,
     agent: Arc<dyn GuestAgent>,
     calls: Mutex<Vec<&'static str>>,
+    /// Every release fails, as a teardown that cannot finish does.
+    release_fails: AtomicBool,
+    /// The restore waits this long before returning, and records whether it
+    /// was allowed to finish.
+    restore_takes: Mutex<Option<Duration>>,
+    restore_finished: AtomicBool,
+    /// How long the gate holds READY back, which is how a test observes a
+    /// computer while its launch is still in flight.
+    gate_takes: Mutex<Option<Duration>>,
 }
 
 impl Script {
@@ -53,6 +63,10 @@ impl Script {
             boot,
             agent,
             calls: Mutex::new(Vec::new()),
+            release_fails: AtomicBool::new(false),
+            restore_takes: Mutex::new(None),
+            restore_finished: AtomicBool::new(false),
+            gate_takes: Mutex::new(None),
         })
     }
 
@@ -94,6 +108,10 @@ impl ComputerTasks for Script {
 
     async fn gate(&self) -> TaskResult {
         self.record("gate");
+        let takes = *self.gate_takes.lock().unwrap();
+        if let Some(takes) = takes {
+            tokio::time::sleep(takes).await;
+        }
         Ok(())
     }
 
@@ -102,6 +120,11 @@ impl ComputerTasks for Script {
         _origin: RestoreOrigin,
     ) -> TaskResult<(Arc<dyn GuestAgent>, SandboxProvisionOutcome)> {
         self.record("restore");
+        let takes = *self.restore_takes.lock().unwrap();
+        if let Some(takes) = takes {
+            tokio::time::sleep(takes).await;
+        }
+        self.restore_finished.store(true, Ordering::SeqCst);
         Ok((Arc::clone(&self.agent), SandboxProvisionOutcome::default()))
     }
 
@@ -122,6 +145,11 @@ impl ComputerTasks for Script {
 
     async fn release(&self, _scope: ReleaseScope) -> TaskResult {
         self.record("release");
+        if self.release_fails.load(Ordering::SeqCst) {
+            return Err(TaskFailure::recoverable(VmmError::Process(
+                "the vmm would not die".into(),
+            )));
+        }
         Ok(())
     }
 }
@@ -200,6 +228,13 @@ impl Harness {
     /// gone.
     async fn joined(&mut self) {
         (&mut self.actor).await.unwrap();
+    }
+
+    /// Waits until the scripted tasks have recorded `call`.
+    async fn awaited(&self, call: &str) {
+        while !self.script.calls().contains(&call) {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// The lifecycle actions published so far.
@@ -406,6 +441,86 @@ async fn the_idle_window_is_the_actors_own_timer() {
     harness.joined().await;
     assert_eq!(harness.script.calls(), vec!["boot", "gate", "release"]);
     assert!(harness.actions().contains(&"removed".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_removal_whose_release_fails_answers_its_caller() {
+    // `removing` coalesces the failure, so nothing else ever will — and
+    // `remove_sandbox_impl` hands the release error straight back today.
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    harness.script.release_fails.store(true, Ordering::SeqCst);
+
+    let error = harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .error()
+        .await;
+    assert!(
+        error.to_string().contains("the vmm would not die"),
+        "{error}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restore_is_joined_rather_than_aborted() {
+    // A restore keeps its lease and CoW handle in locals until it commits,
+    // and unwinds them itself; aborting mid-flight would drop that unwind
+    // with the resources still allocated, and the release that follows only
+    // takes what the computer already owns.
+    let harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    *harness.script.restore_takes.lock().unwrap() = Some(Duration::from_secs(3));
+    harness.send(|reply| Command::Provision {
+        provision: Provision::Restore {
+            origin: RestoreOrigin::Restore,
+        },
+        outcome: SandboxProvisionOutcome::default(),
+        reply,
+    });
+    tokio::task::yield_now().await;
+
+    harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .ok()
+        .await;
+    assert!(
+        harness.script.restore_finished.load(Ordering::SeqCst),
+        "the restore was aborted instead of joined"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_during_the_gates_own_cmd_is_still_deferred() {
+    // The gate reads `Running` once the boot's own cmd has the slot, but its
+    // launch is still in flight: keyed on the projection, the stop would be
+    // refused instead of served when the gate lands.
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    *harness.script.gate_takes.lock().unwrap() = Some(Duration::from_secs(5));
+    harness
+        .send(|reply| Command::Provision {
+            provision: Provision::Boot { warm: false },
+            outcome: SandboxProvisionOutcome::default(),
+            reply,
+        })
+        .ok()
+        .await;
+    harness.awaited("gate").await;
+
+    // The boot's own cmd takes the slot the gate reserved: the computer now
+    // reads `Running` with its launch still in flight.
+    harness
+        .send(|reply| Command::ClaimWorkload {
+            claim: crate::sandbox::workload::WorkloadClaim::Initial,
+            reply,
+        })
+        .ok()
+        .await;
+    harness.settled(SandboxState::Running).await;
+    let stopped = harness.send(|reply| Command::Stop {
+        budget: Duration::from_secs(30),
+        reply,
+    });
+    stopped.ok().await;
+    assert!(harness.script.calls().contains(&"stop"));
 }
 
 #[tokio::test(start_paused = true)]

@@ -40,7 +40,7 @@ impl ComputerActor {
             Effect::SpawnBoot { warm } => {
                 let (handed_off, handoff) = oneshot::channel();
                 let tasks = Arc::clone(&self.tasks);
-                self.spawn(Some(handoff), async move {
+                self.spawn(Handoff::Awaited(handoff), async move {
                     match tasks.boot(warm, handed_off).await {
                         Ok(agent) => Report::Booted(agent),
                         Err(failure) => Report::Failed(failure),
@@ -49,7 +49,7 @@ impl ComputerActor {
             }
             Effect::SpawnGate => {
                 let tasks = Arc::clone(&self.tasks);
-                self.spawn(None, async move {
+                self.spawn(Handoff::Abortable, async move {
                     match tasks.gate().await {
                         Ok(()) => Report::Gated,
                         Err(failure) => Report::Failed(failure),
@@ -58,7 +58,10 @@ impl ComputerActor {
             }
             Effect::SpawnRestore { origin } => {
                 let tasks = Arc::clone(&self.tasks);
-                self.spawn(None, async move {
+                // A restore keeps its lease and CoW handle in locals until
+                // it commits, and unwinds them itself: it is joined, never
+                // aborted.
+                self.spawn(Handoff::JoinOnly, async move {
                     match tasks.restore(origin).await {
                         Ok((agent, outcome)) => Report::Restored(agent, outcome),
                         Err(failure) => Report::Failed(failure),
@@ -67,7 +70,7 @@ impl ComputerActor {
             }
             Effect::SpawnCheckpoint { hold } => {
                 let tasks = Arc::clone(&self.tasks);
-                self.spawn(None, async move {
+                self.spawn(Handoff::Abortable, async move {
                     match tasks.checkpoint(hold).await {
                         Ok(snapshot_id) => Report::Captured(snapshot_id),
                         Err(failure) => Report::Failed(failure),
@@ -76,7 +79,9 @@ impl ComputerActor {
             }
             Effect::SpawnResume => {
                 let tasks = Arc::clone(&self.tasks);
-                self.spawn(None, async move {
+                // Same as a restore: everything it re-creates is unwound by
+                // its own failure path, out of locals nothing else can see.
+                self.spawn(Handoff::JoinOnly, async move {
                     match tasks.resume().await {
                         Ok(agent) => Report::Resumed(agent),
                         Err(failure) => Report::Failed(failure),
@@ -87,7 +92,7 @@ impl ComputerActor {
                 self.forget_agent();
                 let tasks = Arc::clone(&self.tasks);
                 let budget = Duration::from_millis(budget_ms);
-                self.spawn(None, async move {
+                self.spawn(Handoff::Abortable, async move {
                     match tasks.stop(budget).await {
                         Ok(()) => Report::Stopped,
                         Err(failure) => Report::Failed(failure),
@@ -99,7 +104,7 @@ impl ComputerActor {
                 // nothing dials this computer from here on.
                 self.forget_agent();
                 let tasks = Arc::clone(&self.tasks);
-                self.spawn(None, async move {
+                self.spawn(Handoff::Abortable, async move {
                     match tasks.release(scope).await {
                         Ok(()) => Report::Released(scope),
                         Err(failure) => Report::Failed(failure),
@@ -218,6 +223,24 @@ impl ComputerActor {
 
     /// Drops the crash journal — never before the durable write that made it
     /// redundant is confirmed *and* the release it describes has completed.
+    /// Persists the resolved deadline knobs. The timers themselves live in
+    /// this task, so the record is the only thing a restart can re-arm them
+    /// from — an acknowledged change that is not on disk silently reverts.
+    pub(super) fn persist_lifecycle(&self) -> Result<()> {
+        let Some(generation) = self.generation else {
+            return Ok(());
+        };
+        self.records
+            .update_lifecycle(
+                &self.id,
+                generation,
+                self.deadlines.ttl,
+                self.deadlines.idle_timeout_seconds,
+                self.deadlines.on_idle,
+            )?
+            .confirmed("computer lifecycle update")
+    }
+
     pub(super) fn clear_journal(&mut self) {
         if std::mem::take(&mut self.journal_blocked) {
             return;

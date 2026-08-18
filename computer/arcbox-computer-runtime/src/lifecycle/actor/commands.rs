@@ -64,15 +64,16 @@ impl ComputerActor {
                     self.waiters.push((Answer::Stopped, reply));
                     return;
                 }
+                // A stop asked for during a launch is deferred until the
+                // launch resolves, rather than refused as today's
+                // `stop_sandbox` does: the alternative is a stop racing a
+                // boot that is still acquiring resources.
+                if launching(*machine.state()) {
+                    self.pending_stop.get_or_insert(budget);
+                    self.waiters.push((Answer::Stopped, reply));
+                    return;
+                }
                 match self.public() {
-                    // A stop asked for during a launch is deferred until the
-                    // launch resolves, rather than refused as today's
-                    // `stop_sandbox` does: the alternative is a stop racing a
-                    // boot that is still acquiring resources.
-                    Some(SandboxState::Starting) => {
-                        self.pending_stop.get_or_insert(budget);
-                        self.waiters.push((Answer::Stopped, reply));
-                    }
                     Some(SandboxState::Stopping) => self.waiters.push((Answer::Stopped, reply)),
                     Some(SandboxState::Stopped) => {
                         let _ = reply.send(Ok(()));
@@ -113,8 +114,12 @@ impl ComputerActor {
             }
             Command::SetLifecycle { deadlines, reply } => {
                 self.deadlines = deadlines;
+                // The timers live in this task; the record is what a restart
+                // re-arms them from, so an acknowledged change has to be on
+                // disk as well (`set_sandbox_lifecycle` today).
+                let persisted = self.persist_lifecycle();
                 self.rearm(*machine.state());
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(persisted);
             }
             Command::VmExited => {
                 self.error
@@ -158,15 +163,26 @@ impl ComputerActor {
     /// Fails every parked caller this failure cancels.
     ///
     /// A parked `Remove` is the exception: a failure elsewhere is what starts
-    /// its teardown, so the removal answers it — a removal that fails on its
-    /// own release keeps waiting for the retry. The typed error goes to the
-    /// first caller; further ones (coalesced verbs) get its text.
+    /// its teardown, so the removal is what answers it. The removal's own
+    /// release failure is [`Self::fail_every_waiter`].
     pub(super) fn fail_waiters(&mut self, error: VmmError) {
+        self.fail_parked(error, false);
+    }
+
+    /// [`Self::fail_waiters`], including the parked removals — for the one
+    /// failure no later answer can reach, a removal's own release.
+    pub(super) fn fail_every_waiter(&mut self, error: VmmError) {
+        self.fail_parked(error, true);
+    }
+
+    /// The typed error goes to the first caller; further ones (coalesced
+    /// verbs) get its text, since an error is not `Clone`.
+    fn fail_parked(&mut self, error: VmmError, removals_too: bool) {
         let text = error.to_string();
         let mut typed = Some(error);
         let mut remaining = Vec::new();
         for (parked, reply) in std::mem::take(&mut self.waiters) {
-            if parked == Answer::Removed {
+            if parked == Answer::Removed && !removals_too {
                 remaining.push((parked, reply));
             } else {
                 let _ = reply.send(Err(typed

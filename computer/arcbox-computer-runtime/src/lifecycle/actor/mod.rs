@@ -176,10 +176,28 @@ enum Report {
 /// The in-flight sub-task.
 struct Preemptible {
     handle: JoinHandle<()>,
-    /// The boot's resource handoff, `Some` until every cleanup resource the
-    /// task allocated belongs to the computer. Aborting before it lands
-    /// strands whatever the task still owns, so the abort waits for it.
-    handoff: Option<oneshot::Receiver<()>>,
+    handoff: Handoff,
+}
+
+/// What a teardown may do to the sub-task it preempts.
+///
+/// The distinction is which side owns the resources the task allocated. Only
+/// the boot hands them over mid-flight, which is what makes it abortable at
+/// all; the flows that keep theirs in locals until they commit unwind them
+/// themselves, and aborting one drops that unwind on the floor — a
+/// `CowHandle` has no `Drop`, and a `NetworkLease` is owed back to the pool
+/// from `reserve` on.
+enum Handoff {
+    /// The task signals once every cleanup resource is the computer's; until
+    /// then an abort would strand one, so the teardown waits for the signal
+    /// (and stalls if it does not come). The boot's `resource_handoff`.
+    Awaited(oneshot::Receiver<()>),
+    /// Nothing the computer would have to reclaim: abortable at will.
+    Abortable,
+    /// The task unwinds what it allocated itself, out of locals nothing else
+    /// can see, so it is joined rather than aborted — restore and resume,
+    /// which nothing can preempt today either.
+    JoinOnly,
 }
 
 /// A teardown parked behind a handoff that has not landed yet.
@@ -337,7 +355,7 @@ impl ComputerActor {
                     // ended without it cannot send it later, and an abort
                     // from here on no longer has to wait.
                     if let Some(task) = self.inflight.as_mut() {
-                        task.handoff = None;
+                        task.handoff = Handoff::Abortable;
                     }
                     if landed {
                         self.dispatch(&mut machine, Event::ResourcesHandedOff).await;
@@ -420,10 +438,26 @@ type Machine = statig::blocking::InitializedStateMachine<ComputerLifecycle>;
 /// Awaits the in-flight task's resource handoff, staying pending when there is
 /// none to wait for. `false` means the producer ended without signalling.
 async fn handoff(inflight: &mut Option<Preemptible>) -> bool {
-    match inflight.as_mut().and_then(|task| task.handoff.as_mut()) {
-        Some(signal) => signal.await.is_ok(),
-        None => std::future::pending().await,
+    match inflight.as_mut().map(|task| &mut task.handoff) {
+        Some(Handoff::Awaited(signal)) => signal.await.is_ok(),
+        _ => std::future::pending().await,
     }
+}
+
+/// Whether this state's launch is still in flight. A stop asked for here is
+/// deferred until it resolves rather than refused — and it is the machine's
+/// state that says so, not the public projection: a gate whose initial `cmd`
+/// has claimed the workload slot already reads `Running`.
+const fn launching(state: State) -> bool {
+    matches!(
+        state,
+        State::Provisioning {}
+            | State::Staging {}
+            | State::Booting {}
+            | State::Restoring { .. }
+            | State::Gating { .. }
+            | State::Resuming {}
+    )
 }
 
 /// Awaits an optional deadline, staying pending while unarmed.

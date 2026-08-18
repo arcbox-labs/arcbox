@@ -38,7 +38,7 @@ pub struct DurableCommit<T> {
 }
 
 impl<T> DurableCommit<T> {
-    pub(in crate::sandbox) fn confirmed(self, operation: &str) -> Result<T> {
+    pub fn confirmed(self, operation: &str) -> Result<T> {
         match self.durability_error {
             Some(error) => Err(VmmError::Unavailable(format!(
                 "{operation} is visible but its durability is unconfirmed: {error}"
@@ -198,7 +198,7 @@ impl SandboxRecordStore {
     /// Called by `SetLifecycle` (CORE-60) with the post-update values so a
     /// paused sandbox reloaded after an agent restart keeps its (re-armed)
     /// TTL deadline and idle policy.
-    pub(in crate::sandbox) fn update_lifecycle(
+    pub fn update_lifecycle(
         &self,
         id: &str,
         generation: Uuid,
