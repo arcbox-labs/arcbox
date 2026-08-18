@@ -3,7 +3,7 @@
 //! One [`TapNetwork`] owns an IPv4 pool and, per VM, a persistent TAP
 //! device on an isolated point-to-point link, the identity-invariant NAT
 //! that gives every guest the same address ([`invariant`]) — applied per
-//! TAP either as two eBPF TCX programs or as the iptables rule set behind
+//! TAP either as two eBPF TCX programs or as the netfilter rule set behind
 //! the [`PacketFilter`] seam — and the durable quarantine ledger that keeps
 //! a released address out of the pool until host-side forwarding state is
 //! confirmed gone. It moved here from `arcbox-vm/src/network` as the Linux
@@ -82,14 +82,20 @@ mod tap;
 pub enum Datapath {
     /// Per-TAP TCX eBPF programs: two attach syscalls and one map update per
     /// activation, stateless, O(1) per packet (CORE-83). Falls back to
-    /// [`Self::Iptables`] automatically when the BPF object cannot be loaded
+    /// [`Self::Filter`] automatically when the BPF object cannot be loaded
     /// or attached.
     #[default]
     Ebpf,
-    /// The CORE-81 iptables rule set (mark + DNAT/SNAT + fwmark fib rules);
-    /// conntrack-stateful and O(active sandboxes) per packet. Also the only
-    /// mechanism ever applied to legacy (non-invariant) TAPs.
-    Iptables,
+    /// The CORE-81 netfilter rule set (mark + DNAT/SNAT + fwmark fib rules)
+    /// as rendered by the composed [`PacketFilter`] — iptables in the System
+    /// VM, nftables on a stock distro. Conntrack-stateful and O(active
+    /// sandboxes) per packet. Also the only mechanism ever applied to legacy
+    /// (non-invariant) TAPs.
+    ///
+    /// The alias is the name this value had while iptables was the only
+    /// rendering; configs written then keep loading.
+    #[serde(alias = "iptables")]
+    Filter,
 }
 
 /// The name this type had inside `arcbox-vm`, kept so the System VM's
@@ -99,7 +105,7 @@ pub type NetworkManager = TapNetwork;
 /// The translation mechanism actually applied to an active TAP.
 ///
 /// Distinct from the configured [`Datapath`]: a TAP configured for
-/// eBPF lands on `Iptables` when the object cannot be loaded or this TAP's
+/// eBPF lands on `Filter` when the object cannot be loaded or this TAP's
 /// attach fails. Teardown and expose targeting must follow what was applied,
 /// not what was asked for — which is why a [`AttachMode::LegacySnapshot`]
 /// TAP records [`Self::Untranslated`] rather than nothing at all: absent and
@@ -116,8 +122,8 @@ pub type NetworkManager = TapNetwork;
 enum AppliedDatapath {
     /// TCX programs + map entry + onlink gateway route.
     Ebpf,
-    /// The CORE-81 iptables/fwmark rule set.
-    Iptables,
+    /// The CORE-81 netfilter/fwmark rule set, through the [`PacketFilter`].
+    Filter,
     /// None: the guest owns the pool address itself, so nothing is
     /// rewritten per TAP ([`AttachMode::LegacySnapshot`]).
     Untranslated,
@@ -139,7 +145,7 @@ pub enum ExposeTarget {
     PoolIp,
     /// DNAT to the fixed invariant guest IP with a companion fwmark `MARK`
     /// rule on the same match, so the rewritten destination routes out the
-    /// right TAP through the CORE-81 fwmark table (iptables datapath only).
+    /// right TAP through the CORE-81 fwmark table (filter datapath only).
     GuestIpWithFwmark,
 }
 
@@ -192,9 +198,9 @@ pub struct TapNetwork {
     /// TAP (activation inserts, teardown removes). A TAP absent here was
     /// either activated by a previous agent process (its eBPF links died
     /// with that process) or is legacy — both tear down via the tolerant
-    /// iptables removal and expose via the fwmark form.
+    /// packet-filter removal and expose via the fwmark form.
     applied: Mutex<HashMap<String, AppliedDatapath>>,
-    /// How the iptables-datapath translation (and the eBPF fallback) is
+    /// How the filter-datapath translation (and the eBPF fallback) is
     /// expressed on this host; see [`packet_filter`].
     #[cfg_attr(
         not(target_os = "linux"),
@@ -484,7 +490,7 @@ impl TapNetwork {
                 // process that opened them (see the `ebpf` module docs), so
                 // an adopted invariant TAP has its onlink route and no
                 // programs: the guest is alive and unreachable until they
-                // are re-attached. Iptables rules survive instead and their
+                // are re-attached. Filter rules survive instead and their
                 // install appends rather than replaces, so remove first —
                 // through the tolerant removal (no `applied` record yet is
                 // exactly its "activated by a previous agent process"
@@ -516,18 +522,18 @@ impl TapNetwork {
     }
 
     /// Apply the invariant pool-IP translation to an existing TAP, honoring
-    /// the configured [`Datapath`] and falling back to iptables when
-    /// the eBPF path is unavailable, then record what was applied.
+    /// the configured [`Datapath`] and falling back to the packet filter
+    /// when the eBPF path is unavailable, then record what was applied.
     #[cfg(target_os = "linux")]
     fn install_translation(&self, allocation: &NetworkAllocation) -> Result<()> {
         let applied = match self.datapath {
-            Datapath::Iptables => {
+            Datapath::Filter => {
                 invariant::install(
                     &*self.packet_filter,
                     &allocation.tap_name,
                     allocation.ip_address,
                 )?;
-                AppliedDatapath::Iptables
+                AppliedDatapath::Filter
             }
             Datapath::Ebpf => match self.attach_ebpf(allocation) {
                 Ok(ebpf::Attach::Done) => AppliedDatapath::Ebpf,
@@ -538,20 +544,20 @@ impl TapNetwork {
                         &allocation.tap_name,
                         allocation.ip_address,
                     )?;
-                    AppliedDatapath::Iptables
+                    AppliedDatapath::Filter
                 }
                 Err(error) => {
                     tracing::warn!(
                         tap = %allocation.tap_name,
                         %error,
-                        "eBPF TAP attach failed; using iptables NAT for this TAP"
+                        "eBPF TAP attach failed; using packet-filter NAT for this TAP"
                     );
                     invariant::install(
                         &*self.packet_filter,
                         &allocation.tap_name,
                         allocation.ip_address,
                     )?;
-                    AppliedDatapath::Iptables
+                    AppliedDatapath::Filter
                 }
             },
         };
@@ -592,9 +598,9 @@ impl TapNetwork {
     /// Remove whatever translation this process applied to the TAP.
     ///
     /// eBPF TAPs detach their links and drop their map entry (the gateway
-    /// route dies with the TAP). Everything else — iptables TAPs, legacy
+    /// route dies with the TAP). Everything else — filter TAPs, legacy
     /// TAPs, and TAPs activated by a previous agent process (whose eBPF
-    /// links died with it) — takes the tolerant iptables removal, exactly
+    /// links died with it) — takes the tolerant packet-filter removal, exactly
     /// as before CORE-83.
     #[cfg(target_os = "linux")]
     fn deactivate_translation(&self, alloc: &NetworkAllocation) -> Result<()> {
@@ -613,13 +619,13 @@ impl TapNetwork {
     /// Follows the *applied* datapath, not the configured one: an eBPF TAP's
     /// egress program translates pool-IP packets on the TAP itself and a
     /// legacy TAP never translated anything, so the plain pool-IP form
-    /// suffices for both; everything else — iptables TAPs, and TAPs whose
+    /// suffices for both; everything else — filter TAPs, and TAPs whose
     /// activation record died with a previous agent process — needs the
     /// CORE-81 guest-IP + fwmark form.
     pub(crate) fn expose_target(&self, tap_name: &str) -> ExposeTarget {
         match self.applied.lock().unwrap().get(tap_name) {
             Some(AppliedDatapath::Ebpf | AppliedDatapath::Untranslated) => ExposeTarget::PoolIp,
-            Some(AppliedDatapath::Iptables) | None => ExposeTarget::GuestIpWithFwmark,
+            Some(AppliedDatapath::Filter) | None => ExposeTarget::GuestIpWithFwmark,
         }
     }
 

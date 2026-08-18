@@ -128,7 +128,7 @@ fn expose_target_follows_the_applied_datapath() {
     };
     record(AppliedDatapath::Ebpf);
     assert_eq!(manager.expose_target("vmtap0-2"), ExposeTarget::PoolIp);
-    record(AppliedDatapath::Iptables);
+    record(AppliedDatapath::Filter);
     assert_eq!(
         manager.expose_target("vmtap0-2"),
         ExposeTarget::GuestIpWithFwmark

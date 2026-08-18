@@ -27,8 +27,8 @@
 //!   destination through a per-sandbox table holding `GUEST_IP dev <tap>`.
 //!
 //! The rule set above is the contract; how it is expressed in the host's
-//! netfilter framework is the [`PacketFilter`](super::packet_filter::PacketFilter)
-//! seam. The reference implementation is iptables-legacy, because that is
+//! netfilter framework is the [`PacketFilter`] seam. The reference
+//! implementation is iptables-legacy, because that is
 //! what the System VM ships (2026-08, boot-assets rootfs + arcbox kernel
 //! config): no nftables userland, no `tc`, and a kernel without
 //! `NET_ACT_NAT` / `NETMAP` / `CONNMARK` — what it does enable (`IP_NF_NAT`,
@@ -52,7 +52,7 @@
 //! activations, and crash-recovery replays; rule specs derive entirely from
 //! the allocation, so cleanup needs no extra state.
 //!
-//! Since CORE-83 this rule set is the `SandboxDatapath::Iptables` mechanism
+//! Since CORE-83 this rule set is the `SandboxDatapath::Filter` mechanism
 //! and the automatic fallback; the default datapath applies the same
 //! translation with two TCX programs per TAP instead (`super::ebpf`),
 //! needing none of the mark/fwmark machinery.

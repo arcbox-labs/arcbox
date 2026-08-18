@@ -281,10 +281,17 @@ mod tests {
         assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Ebpf);
         // The fallback is reachable by config alone.
         let cfg: FirecrackerConfig = toml::from_str(
+            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\nsandbox_datapath = \"filter\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Filter);
+        // And under the name it had while iptables was the only rendering —
+        // a node's config file predates the nftables backend.
+        let cfg: FirecrackerConfig = toml::from_str(
             "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\nsandbox_datapath = \"iptables\"\n",
         )
         .unwrap();
-        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Iptables);
+        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Filter);
     }
 
     #[test]
