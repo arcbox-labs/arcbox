@@ -119,20 +119,26 @@ jobs:
       # as the System VM's, so it exercises the same path
       # (block_tools::busybox_attach_report_and_detach). Its util-linux
       # sibling needs no install: that is what ubuntu's own /usr/sbin is.
-      - name: Install busybox
+      #
+      # nftables is the compute node's netfilter userland (PLAT-191) and is
+      # not in the runner image. ubuntu-22.04 ships nft 1.0.2, an older
+      # floor than Debian 12's 1.0.6, so the JSON listing the teardown reads
+      # is proven below the version the target platform has.
+      - name: Install busybox and nftables
         run: |
           sudo apt-get update
-          sudo apt-get install -y busybox-static
+          sudo apt-get install -y busybox-static nftables
 
       - name: Build test binary
         run: cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net --no-run
 
-      # ARCBOX_REQUIRE_BLOCK_TOOLS: this runner has busybox (installed
-      # above) and util-linux (stock ubuntu), so the block-tools tests must
-      # run rather than skip — otherwise a regression in the discovery probe
-      # silently takes its own coverage with it.
+      # ARCBOX_REQUIRE_BLOCK_TOOLS / ARCBOX_REQUIRE_NFT: this runner has
+      # busybox and nftables (installed above) and util-linux (stock
+      # ubuntu), so those tests must run rather than skip — otherwise a
+      # regression in a discovery probe silently takes its own coverage
+      # with it.
       - name: Run integration tests (as root for TAP creation and loop devices)
-        run: sudo env PATH="$PATH" HOME="$HOME" ARCBOX_REQUIRE_BLOCK_TOOLS=1 cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net
+        run: sudo env PATH="$PATH" HOME="$HOME" ARCBOX_REQUIRE_BLOCK_TOOLS=1 ARCBOX_REQUIRE_NFT=1 cargo test --test integration -p arcbox-computer-runtime -p arcbox-tap-net
 
   # ---------------------------------------------------------------------------
   # Job 3: E2E tests — requires KVM + root + Firecracker assets

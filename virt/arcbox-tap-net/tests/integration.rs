@@ -1,11 +1,16 @@
-//! Root-only TAP integration tests: the network manager against a real
-//! kernel — device creation, point-to-point addressing, host routes, and
-//! pool recycling. Every test skips unless it runs as root on Linux.
+//! Root-only integration tests against a real kernel: the network manager's
+//! device creation, point-to-point addressing, host routes and pool
+//! recycling, and the nftables [`PacketFilter`] rendering the kernel has to
+//! accept. Every test skips unless it runs as root on Linux; the nftables
+//! ones also move their thread into a private network namespace, so they
+//! never touch the host's own ruleset.
+//!
+//! [`PacketFilter`]: arcbox_tap_net::PacketFilter
 
 mod common;
 
 #[cfg(target_os = "linux")]
-use arcbox_tap_net::{NetworkAllocation, NetworkManager};
+use arcbox_tap_net::{NetworkAllocation, NetworkManager, Nftables, PacketFilter};
 
 // ---------------------------------------------------------------------------
 // TAP lifecycle (Linux, root only)
@@ -186,4 +191,80 @@ fn multiple_taps_are_isolated() {
         "TAP {} should not be attached to any bridge",
         a1.tap_name
     );
+}
+
+/// The nftables backend against a real kernel: two sandboxes' rule sets
+/// coexist in one table, teardown removes exactly the one it was asked for,
+/// and a repeat teardown of the same TAP is a no-op rather than an error.
+///
+/// This is the half the unit tests cannot reach — that the rendered batch is
+/// syntax the kernel accepts, and that removal really finds its handles.
+#[test]
+#[cfg(target_os = "linux")]
+fn nftables_translation_installs_and_removes_per_tap() {
+    let Some(nft) =
+        common::nft_in_private_netns("nftables_translation_installs_and_removes_per_tap")
+    else {
+        return;
+    };
+    // Discovery must agree with the binary this host actually has; the rest
+    // of the test drives the found path so a non-standard prefix still works.
+    Nftables::discover().expect("a host with nft must discover it");
+    let filter = Nftables::new(&nft);
+
+    let (tap_a, pool_a) = ("vmtap9-2", "172.31.9.2".parse().unwrap());
+    let (tap_b, pool_b) = ("vmtap9-3", "172.31.9.3".parse().unwrap());
+
+    filter.install_translation(tap_a, pool_a).unwrap();
+    filter.install_translation(tap_b, pool_b).unwrap();
+
+    assert_eq!(
+        common::nft_rules_tagged(&nft, "arcbox-nat:vmtap9-2"),
+        7,
+        "the contract is seven rules"
+    );
+    assert_eq!(common::nft_rules_tagged(&nft, "arcbox-nat:vmtap9-3"), 7);
+
+    filter.remove_translation(tap_a, pool_a).unwrap();
+
+    assert_eq!(
+        common::nft_rules_tagged(&nft, "arcbox-nat:vmtap9-2"),
+        0,
+        "teardown must leave no residue for its own TAP"
+    );
+    assert_eq!(
+        common::nft_rules_tagged(&nft, "arcbox-nat:vmtap9-3"),
+        7,
+        "and must not touch another sandbox's rules"
+    );
+
+    // Tolerating absence is the seam's contract: teardown runs again for
+    // crash replays and partially activated TAPs.
+    filter.remove_translation(tap_a, pool_a).unwrap();
+    filter.remove_translation(tap_b, pool_b).unwrap();
+    assert_eq!(common::nft_rules_tagged(&nft, "arcbox-nat:vmtap9-3"), 0);
+}
+
+/// A crash replay re-installs over rules that survived the process (unlike
+/// eBPF links, netfilter rules do not die with it), so a TAP can end up with
+/// two copies of its set. One teardown must collect both — `iptables -D`
+/// deletes only the first match, which is the residue this backend avoids by
+/// deleting on the tag.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_double_installed_tap_is_fully_torn_down() {
+    let Some(nft) = common::nft_in_private_netns("a_double_installed_tap_is_fully_torn_down")
+    else {
+        return;
+    };
+    let filter = Nftables::new(&nft);
+    let (tap, pool) = ("vmtap9-4", "172.31.9.4".parse().unwrap());
+
+    filter.install_translation(tap, pool).unwrap();
+    filter.install_translation(tap, pool).unwrap();
+    assert_eq!(common::nft_rules_tagged(&nft, "arcbox-nat:vmtap9-4"), 14);
+
+    filter.remove_translation(tap, pool).unwrap();
+
+    assert_eq!(common::nft_rules_tagged(&nft, "arcbox-nat:vmtap9-4"), 0);
 }

@@ -12,9 +12,10 @@ owns:
 - the identity-invariant translation (CORE-81): every guest boots on the
   fixed `169.254.100.2/30` behind `169.254.100.1` (`invariant`), and the
   pool address is applied host-side per TAP — as two eBPF TCX programs
-  (`bpf/sandbox_nat.bpf.o`, the default) or as the iptables rule set
-  behind the `PacketFilter` seam (`IptablesLegacy` is the reference; a
-  stock distro on the nft backend supplies its own);
+  (`bpf/sandbox_nat.bpf.o`, the default) or as the netfilter rule set
+  behind the `PacketFilter` seam (`IptablesLegacy` for the System VM's
+  userland, `Nftables` for a stock distro; legacy and nft rulesets are
+  mutually invisible, so that is a seam rather than a binary path);
 - the hand-encoded rtnetlink requests the invariant scheme needs (fwmark
   fib rule, per-sandbox table route, onlink gateway route) — pure
   encoders, unit-tested;
@@ -63,8 +64,8 @@ use arcbox_tap_net::{AttachMode, Datapath, IptablesLegacy, TapNetwork};
 let network = TapNetwork::with_quarantine_dir(
     "172.20.0.0/16", "172.20.0.1", vec![],
     data_dir.join("sandbox-network-quarantine"),
-    Datapath::default(),                 // eBPF, iptables fallback
-    Arc::new(IptablesLegacy::default()),
+    Datapath::default(),                 // eBPF, packet-filter fallback
+    Arc::new(IptablesLegacy::default()), // or `Nftables::discover()?`
 )?;
 let allocation = network.reserve("box-1")?;          // journal it, then:
 network.activate(&allocation, AttachMode::Invariant)?;
@@ -79,16 +80,30 @@ is `network.reconcile()`.
 ## Requirements and tests
 
 Everything that touches the kernel is Linux-only and needs `CAP_NET_ADMIN`
-(root in practice): TAP creation, netlink, `/sbin/iptables`, and the TCX
-attach (`BPF_SYSCALL`, `BPF_JIT_ALWAYS_ON`, `NET_XGRESS`; the loader
-attaches only through TCX links and never falls back to netlink tc). The
-pool, the encoders, the ledger, and the port mapping compile and are
-unit-tested on every host.
+(root in practice): TAP creation, netlink, `/sbin/iptables` or
+`/usr/sbin/nft`, and the TCX attach (`BPF_SYSCALL`, `BPF_JIT_ALWAYS_ON`,
+`NET_XGRESS`; the loader attaches only through TCX links and never falls
+back to netlink tc). The pool, the encoders, the ledger, the rule
+renderings, and the port mapping compile and are unit-tested on every
+host.
 
 ```bash
 cargo test -p arcbox-tap-net                     # unit + bpf-object guards, no root
 sudo -E cargo test -p arcbox-tap-net --test integration   # real TAPs (skips unless root)
 ```
+
+The nftables tests move their own thread into a private network namespace
+before touching a ruleset, so they never mutate the host's. That also
+makes them runnable without a root shell:
+
+```bash
+cargo test -p arcbox-tap-net --test integration --no-run   # then, on the built binary:
+ARCBOX_REQUIRE_NFT=1 unshare -rn ./target/debug/deps/integration-* nftables
+```
+
+`ARCBOX_REQUIRE_NFT=1` turns "nft is missing, skipping" into a failure —
+set it wherever nft is known to be installed, so the coverage cannot
+evaporate silently.
 
 `.github/workflows/test-vm-linux.yml` runs both.
 
