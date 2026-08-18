@@ -23,7 +23,7 @@ use crate::lifecycle::actor::{
 };
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::event::{Provision, RestoreOrigin};
-use crate::lifecycle::tasks::{ComputerTasks, TaskFailure, TaskResult};
+use crate::lifecycle::tasks::{CaptureSpec, ComputerTasks, TaskFailure, TaskResult};
 use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
 use crate::sandbox::{
@@ -157,7 +157,11 @@ impl ComputerTasks for Script {
         Ok((Arc::clone(&self.agent), SandboxProvisionOutcome::default()))
     }
 
-    async fn checkpoint(&self, _hold: bool) -> TaskResult<CheckpointInfo> {
+    async fn checkpoint(
+        &self,
+        _hold: bool,
+        _spec: Option<CaptureSpec>,
+    ) -> TaskResult<CheckpointInfo> {
         self.record("checkpoint");
         Ok(CheckpointInfo {
             snapshot_id: "snap".to_owned(),

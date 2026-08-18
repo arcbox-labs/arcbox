@@ -29,10 +29,12 @@ impl ComputerActor {
                     let _ = reply.send(self.acknowledged());
                 }
             }
-            Command::Checkpoint { reply } => {
+            Command::Checkpoint { spec, reply } => {
+                self.capture = Some(spec);
                 if self.dispatch(machine, Event::Checkpoint).await {
                     self.capture_reply = Some(reply);
                 } else {
+                    self.capture = None;
                     let _ = reply.send(Err(self.wrong_state("Ready")));
                 }
             }
@@ -162,6 +164,9 @@ impl ComputerActor {
                 // disk as well (`set_sandbox_lifecycle` today).
                 let persisted = self.persist_lifecycle();
                 self.rearm(*machine.state());
+                // `Inspect` reports the deadlines, so the read view has to
+                // move with them.
+                self.publish_state(*machine.state());
                 let _ = reply.send(persisted);
             }
             Command::VmExited => {
@@ -197,9 +202,13 @@ impl ComputerActor {
         self.waiters = remaining;
     }
 
-    /// What a caller is told once its flow is under way: `Ok`, or the visible
-    /// but unconfirmed durable write the flow left behind.
+    /// What a caller is told once its flow is under way: `Ok`, the durable
+    /// write that failed before it could start, or the visible but
+    /// unconfirmed one it left behind.
     fn acknowledged(&mut self) -> Result<()> {
+        if let Some(detail) = self.answer_error.take() {
+            return Err(VmmError::Unavailable(detail));
+        }
         match self.unconfirmed.take() {
             Some(detail) => Err(VmmError::AckUnconfirmed {
                 id: self.id.clone(),

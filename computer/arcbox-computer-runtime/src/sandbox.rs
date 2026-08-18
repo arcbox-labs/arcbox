@@ -36,6 +36,11 @@ use crate::agent::{GuestAgent, GuestAgentFactory, Readiness, VmProtoAgentFactory
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
+use crate::lifecycle::actor::{
+    Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Mailbox, Seeded,
+};
+use crate::lifecycle::event::{Provision, RestoreOrigin};
+use crate::lifecycle::flows::{BootLaunch, ComputerFlows, ComputerServices, Launch, RestoreLaunch};
 use crate::network::NetworkManager;
 use crate::snapshot::SnapshotCatalog;
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
@@ -75,25 +80,43 @@ pub use types::{
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 type ReconcileResult = std::result::Result<(), Arc<str>>;
 
-/// Shared registry of live sandbox instances.
-pub(crate) type InstanceMap = Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>;
+/// One computer as the registry holds it: its mailbox, its read snapshot, and
+/// the identity that tells this incarnation from a same-id replacement.
+///
+/// What replaced `Arc<Mutex<SandboxInstance>>`. Every verb is a send on the
+/// mailbox and every read is a borrow of the snapshot, so neither the map
+/// lock nor a per-computer mutex is ever held across an await — the
+/// discipline `list_sandboxes` used to have to state.
+#[derive(Clone)]
+pub(crate) struct ComputerRef {
+    mailbox: Mailbox,
+    snapshot: tokio::sync::watch::Receiver<ComputerSnapshot>,
+    incarnation: Uuid,
+}
+
+impl ComputerRef {
+    /// A receiver for this computer's read snapshot, for a caller that must
+    /// wait for a state rather than sample one.
+    #[cfg(test)]
+    pub(crate) fn watch(&self) -> tokio::sync::watch::Receiver<ComputerSnapshot> {
+        self.snapshot.clone()
+    }
+}
+
+/// The live computers, by id.
+pub(crate) type Computers = Arc<RwLock<HashMap<SandboxId, ComputerRef>>>;
+
+/// A computer's runtime state as its actor and its sub-tasks share it.
+pub(crate) type Runtime = Arc<Mutex<SandboxInstance>>;
 
 /// Manages the full lifecycle of multiple sandbox microVMs.
 pub struct SandboxManager {
-    instances: Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
+    computers: Computers,
     records: Arc<record::SandboxRecordStore>,
-    /// The VMM every sandbox runs under, behind the driver port. Its
-    /// `Prepare` capability is required at construction: the boot and pool
-    /// flows spawn the VMM ahead of the guest.
-    driver: Arc<dyn VmDriver>,
-    /// What every sandbox NIC attaches to, behind the guest-network port.
-    /// Its `NetworkReconcile` capability is required at construction: the
-    /// cleanup-token protocol and the startup sweep are not optional here.
-    network: Arc<dyn GuestNetwork>,
-    /// How every sandbox's guest agent is reached, behind the guest-agent
-    /// port. It also owns the readiness gate the boot flow arms before the
-    /// guest starts.
-    agent: Arc<dyn GuestAgentFactory>,
+    /// What every computer's flows are built from — the driver, the guest
+    /// network, the agent factory, the record store, the catalogs and the
+    /// pool. One `Arc`, cloned into each actor.
+    services: Arc<ComputerServices>,
     snapshots: Arc<SnapshotCatalog>,
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
@@ -109,11 +132,12 @@ pub struct SandboxManager {
     /// Publishes the startup reconciliation result. Lifecycle and read APIs
     /// gate on it so callers never observe partial recovered state.
     reconcile_done: tokio::sync::watch::Receiver<Option<ReconcileResult>>,
-    /// Per-sandbox TTL / idle expiry timers (CORE-21/60); see `timers.rs`.
-    timers: timers::LifecycleTimers,
-    /// Weak self-handle set by [`Self::into_shared`]; idle timers need it to
-    /// reach the pause/remove flows from a detached task.
-    self_handle: std::sync::OnceLock<std::sync::Weak<Self>>,
+    /// Whether the deadline timers may fire. `false` until
+    /// [`Self::into_shared`], which is the inertness contract a plain
+    /// [`Self::new`] manager has: unit tests of unrelated surfaces rely on it.
+    /// The actors hold receivers, so the flip reaches every one of them —
+    /// including the ones the startup sweep seeded before it was flipped.
+    timers_enabled: tokio::sync::watch::Sender<bool>,
 }
 
 impl SandboxManager {
@@ -224,15 +248,29 @@ impl SandboxManager {
         // constructions (unit tests) have no previous instance to reconcile.
         let (reconcile_tx, reconcile_done) = tokio::sync::watch::channel(None);
         let executions = Arc::new(execution::ExecutionRegistry::default());
-        let instances = Arc::new(RwLock::new(HashMap::new()));
+        let computers: Computers = Arc::new(RwLock::new(HashMap::new()));
+        let pool = Arc::new(pool::SlotPool::default());
+        let (timers_enabled, timers_gate) = tokio::sync::watch::channel(false);
+        let services = Arc::new(ComputerServices {
+            driver,
+            network,
+            agents: agent,
+            config: Arc::clone(&config),
+            cow_manager: Arc::clone(&cow_manager),
+            records: Arc::clone(&records),
+            snapshots: Arc::clone(&snapshots),
+            events_tx: events_tx.clone(),
+            pool: Arc::clone(&pool),
+        });
         if tokio::runtime::Handle::try_current().is_ok() {
             let config = Arc::clone(&config);
-            let driver = Arc::clone(&driver);
-            let network = Arc::clone(&network);
             let cow_manager = Arc::clone(&cow_manager);
             let snapshots = Arc::clone(&snapshots);
             let records = Arc::clone(&records);
-            let instances = Arc::clone(&instances);
+            let computers = Arc::clone(&computers);
+            let services = Arc::clone(&services);
+            let network = Arc::clone(&services.network);
+            let driver = Arc::clone(&services.driver);
             tokio::spawn(async move {
                 let result = async {
                     let mut swept = reconcile::sweep_orphans(
@@ -263,15 +301,11 @@ impl SandboxManager {
                         return Err(error);
                     }
                     // Publish before anything else can fail. The reclaimed
-                    // sandboxes' only handles live in these instances, so a
+                    // sandboxes' only handles live in these computers, so a
                     // later error — a runtime directory that will not delete,
                     // say — would otherwise un-reclaim every guest by
                     // dropping them, over something none of them caused.
-                    instances.write().unwrap().extend(
-                        inactive
-                            .into_iter()
-                            .map(|instance| (instance.id.clone(), Arc::new(Mutex::new(instance)))),
-                    );
+                    reconcile::seed_computers(inactive, &computers, &services, &timers_gate);
                     reconcile::finalize_sweep(swept).await?;
                     reconcile_capability(&*network).replay_complete();
                     Ok::<_, VmmError>(())
@@ -292,49 +326,82 @@ impl SandboxManager {
                 None,
                 &mut inactive,
             )?;
-            reconcile_capability(&*network).replay_complete();
-            instances.write().unwrap().extend(
-                inactive
-                    .into_iter()
-                    .map(|instance| (instance.id.clone(), Arc::new(Mutex::new(instance)))),
-            );
+            reconcile_capability(&*services.network).replay_complete();
+            reconcile::seed_computers(inactive, &computers, &services, &timers_enabled.subscribe());
             let _ = reconcile_tx.send(Some(Ok(())));
         }
 
         Ok(Self {
-            instances,
+            computers,
             records,
-            driver,
-            network,
-            agent,
+            services,
             snapshots,
             templates,
             config,
             events_tx,
             cow_manager,
-            pool: Arc::new(pool::SlotPool::default()),
+            pool,
             warm: Arc::new(warm::WarmCache::default()),
             executions,
             reconcile_done,
-            timers: timers::LifecycleTimers::default(),
-            self_handle: std::sync::OnceLock::new(),
+            timers_enabled,
         })
     }
 
-    /// Wrap the manager in an `Arc` and start the lifecycle monitor that
-    /// arms/cancels the idle and TTL timers off the event stream.
+    /// Wrap the manager in an `Arc` and let its computers' deadline timers
+    /// fire.
     ///
     /// Production embedders (the guest agent's `SandboxService`) must use
     /// this; a plain [`Self::new`] manager never fires idle timers (unit
     /// tests exercising unrelated surfaces rely on that inertness).
+    ///
+    /// One `watch` flip, which every actor is holding a receiver for — the
+    /// weak self-handle a detached expiry task needed is gone with the
+    /// detached task.
     #[must_use]
     pub fn into_shared(self) -> Arc<Self> {
-        let manager = Arc::new(self);
-        let _ = manager.self_handle.set(Arc::downgrade(&manager));
-        if tokio::runtime::Handle::try_current().is_ok() {
-            timers::spawn_lifecycle_monitor(&manager);
-        }
-        manager
+        // `send_replace`, not `send`: a manager with no computers yet has no
+        // receivers, and `send` would refuse — leaving every actor spawned
+        // afterwards reading a gate that was never opened.
+        self.timers_enabled.send_replace(true);
+        Arc::new(self)
+    }
+
+    /// What every actor this manager spawns is built from.
+    pub(super) fn spawn_context(
+        &self,
+    ) -> (Arc<ComputerServices>, tokio::sync::watch::Receiver<bool>) {
+        (Arc::clone(&self.services), self.timers_enabled.subscribe())
+    }
+
+    /// This computer's registry entry.
+    pub(super) fn computer(&self, id: &SandboxId) -> Result<ComputerRef> {
+        self.check_reconcile()?;
+        self.computers
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| VmmError::NotFound(id.clone()))
+    }
+
+    /// This computer's mailbox.
+    pub(super) fn mailbox(&self, id: &SandboxId) -> Result<Mailbox> {
+        Ok(self.computer(id)?.mailbox)
+    }
+
+    /// Replace the CoW manager, for a fixture that needs a probed one.
+    #[cfg(test)]
+    pub(super) fn set_cow_manager(&mut self, cow_manager: Arc<CowManager>) {
+        self.cow_manager = Arc::clone(&cow_manager);
+        Arc::get_mut(&mut self.services)
+            .expect("no actor has been spawned yet")
+            .cow_manager = cow_manager;
+    }
+
+    /// What a read of this computer sees, without touching its mailbox.
+    pub(super) fn snapshot(&self, id: &SandboxId) -> Result<ComputerSnapshot> {
+        Ok(self.computer(id)?.snapshot.borrow().clone())
     }
 
     /// Wait until the startup orphan sweep has completed.
@@ -443,7 +510,7 @@ impl SandboxManager {
 
     /// The guest network's cleanup protocol.
     pub(super) fn reconcile_network(&self) -> &dyn NetworkReconcile {
-        reconcile_capability(&*self.network)
+        reconcile_capability(&*self.services.network)
     }
 
     /// Return the active generation's network identity: the external pool IP
@@ -458,20 +525,21 @@ impl SandboxManager {
     /// have fired for a sandbox that has no lease to report anyway, and it
     /// has no non-blocking form on the port.
     pub fn sandbox_network_identity(&self, id: &str) -> Result<SandboxNetworkIdentity> {
-        let instance = self.get_instance(&id.to_owned())?;
-        let instance = instance.lock().unwrap();
-        let lease = instance
-            .network
+        let snapshot = self.snapshot(&id.to_owned())?;
+        let lease = snapshot
+            .lease
             .as_ref()
             .ok_or_else(|| VmmError::WrongState {
                 id: id.to_owned(),
                 expected: "sandbox with an active network allocation".into(),
-                actual: instance.state.to_string(),
+                actual: snapshot.state.to_string(),
             })?;
         Ok(SandboxNetworkIdentity {
             ip: lease.ipv4()?,
             cleanup_token: lease.cleanup_token.clone(),
-            expose: crate::network::ExposeTarget::try_from(self.network.host_ingress(lease)?)?,
+            expose: crate::network::ExposeTarget::try_from(
+                self.services.network.host_ingress(lease)?,
+            )?,
         })
     }
 }
@@ -684,89 +752,168 @@ pub(super) fn validate_new_sandbox_id(id: &str, config: &VmmConfig) -> Result<()
     validate_id("sandbox id", id)
 }
 
-/// Atomically reserve `id` in the instance map with a placeholder instance.
+/// Atomically claim `id` in the registry and stand up its actor.
 ///
-/// Create and restore both derive per-sandbox resources deterministically from
-/// the id (CoW file `arcbox-cow-{id}`, dm device `arcbox-snap-{id}`, TAP name).
-/// A check-then-insert with those resources set up in between is a TOCTOU: two
-/// concurrent restores to the same id both pass the check, then the second
-/// `create_sparse_file` truncates the file the first's loop device is backing,
-/// corrupting the winner's rootfs. Reserving the id up front (check + insert
-/// under one write lock) makes the loser fail fast with `AlreadyExists` before
-/// it touches any shared resource. The reservation is removed on drop unless
-/// [`IdReservation::commit`] is called, so every restore error path unwinds it.
-pub(super) fn reserve_id(
-    instances: &InstanceMap,
+/// Create and restore both derive per-computer resources deterministically
+/// from the id (CoW file `arcbox-cow-{id}`, dm device `arcbox-snap-{id}`, TAP
+/// name). A check-then-insert with those resources set up in between is a
+/// TOCTOU: two concurrent restores to the same id both pass the check, then
+/// the second `create_sparse_file` truncates the file the first's loop device
+/// is backing, corrupting the winner's rootfs. Claiming the id up front
+/// (check + insert under one write lock) makes the loser fail fast with
+/// `AlreadyExists` before it touches any shared resource.
+///
+/// The actor is **not** spawned here. Its seed needs the durable generation
+/// and the deadlines the record computes, and both are resolved after the
+/// claim; the mailbox and the read snapshot exist from the claim on, so a
+/// caller that finds the entry finds a usable computer either way. The claim
+/// is released on drop unless [`ActorReservation::spawn`] is called, so every
+/// error path unwinds it.
+pub(crate) fn reserve_actor(
+    computers: &Computers,
     id: &SandboxId,
-    placeholder: SandboxInstance,
-) -> Result<IdReservation> {
-    let mut map = instances.write().unwrap();
+    runtime: SandboxInstance,
+) -> Result<ActorReservation> {
+    let mut map = computers.write().unwrap();
     if map.contains_key(id) {
         return Err(VmmError::AlreadyExists(id.clone()));
     }
-    let instance = Arc::new(Mutex::new(placeholder));
-    map.insert(id.clone(), Arc::clone(&instance));
-    Ok(IdReservation {
-        instances: Arc::clone(instances),
+    let incarnation = Uuid::new_v4();
+    let (mailbox_tx, commands) = tokio::sync::mpsc::unbounded_channel();
+    let runtime = Arc::new(Mutex::new(runtime));
+    let (snapshot_tx, snapshot) = tokio::sync::watch::channel(ComputerSnapshot::project(
+        &runtime.lock().unwrap(),
+        SandboxState::Starting,
+        Deadlines::default(),
+    ));
+    map.insert(
+        id.clone(),
+        ComputerRef {
+            mailbox: Mailbox::new(mailbox_tx.clone()),
+            snapshot,
+            incarnation,
+        },
+    );
+    drop(map);
+    Ok(ActorReservation {
+        computers: Arc::clone(computers),
         id: id.clone(),
-        instance,
-        committed: false,
+        incarnation,
+        runtime,
+        mailbox: Mailbox::new(mailbox_tx),
+        commands: Some(commands),
+        snapshot_tx: Some(snapshot_tx),
     })
 }
 
-pub(super) fn ensure_current_instance(
-    instances: &InstanceMap,
-    id: &str,
-    expected: &Arc<Mutex<SandboxInstance>>,
-) -> Result<()> {
-    if instances
-        .read()
-        .unwrap()
-        .get(id)
-        .is_some_and(|current| Arc::ptr_eq(current, expected))
-    {
-        Ok(())
-    } else {
-        Err(VmmError::WrongState {
-            id: id.to_owned(),
-            expected: "the sandbox generation selected by this operation".into(),
-            actual: "a newer generation now owns this sandbox ID".into(),
-        })
-    }
-}
-
-/// RAII reservation returned by [`reserve_id`]. Drops the placeholder from the
-/// instance map unless committed.
-pub(super) struct IdReservation {
-    instances: InstanceMap,
+/// A claimed id, its runtime state, and the channels its actor will run on.
+///
+/// Dropping it without [`Self::spawn`] releases the claim; the mailbox's last
+/// sender goes with it, so an actor already running would stop too.
+pub(crate) struct ActorReservation {
+    computers: Computers,
     id: SandboxId,
-    instance: Arc<Mutex<SandboxInstance>>,
-    committed: bool,
+    incarnation: Uuid,
+    runtime: Runtime,
+    mailbox: Mailbox,
+    commands: Option<tokio::sync::mpsc::UnboundedReceiver<Command>>,
+    snapshot_tx: Option<tokio::sync::watch::Sender<ComputerSnapshot>>,
 }
 
-impl IdReservation {
-    /// The reserved instance `Arc`, for populating it in place on success.
-    pub(super) fn instance(&self) -> Arc<Mutex<SandboxInstance>> {
-        Arc::clone(&self.instance)
+impl ActorReservation {
+    /// The claimed computer's runtime state, for the caller to populate
+    /// before its actor starts.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        &self.runtime
     }
 
-    /// Keep the reservation: the instance is now fully initialized.
-    pub(super) fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for IdReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            let mut map = self.instances.write().unwrap();
-            if map
-                .get(&self.id)
-                .is_some_and(|current| Arc::ptr_eq(current, &self.instance))
-            {
-                map.remove(&self.id);
-            }
+    /// Start the actor and keep the claim.
+    pub(crate) fn spawn(mut self, seed: ActorSpawn) -> Mailbox {
+        let ActorSpawn {
+            services,
+            timers_enabled,
+            generation,
+            deadlines,
+            launch,
+            seeded,
+        } = seed;
+        let mailbox = self.mailbox.clone();
+        let flows = Arc::new(ComputerFlows::new(
+            self.id.clone(),
+            Arc::clone(&self.runtime),
+            Arc::clone(&services),
+            &mailbox,
+            launch,
+        ));
+        let unregister = {
+            let computers = Arc::clone(&self.computers);
+            let id = self.id.clone();
+            let incarnation = self.incarnation;
+            Arc::new(move || forget_computer(&computers, &id, incarnation))
+        };
+        let vm_dir = self.runtime.lock().unwrap().vm_dir.clone();
+        let actor = ComputerActor::new(
+            ComputerSeed {
+                id: self.id.clone(),
+                runtime: Arc::clone(&self.runtime),
+                unregister,
+                generation,
+                vm_dir,
+                records: Arc::clone(&services.records),
+                events_tx: services.events_tx.clone(),
+                tasks: flows,
+                deadlines,
+                timers_enabled,
+                seeded,
+            },
+            self.commands.take().expect("spawned once"),
+            self.snapshot_tx.take().expect("spawned once"),
+        );
+        // Constructors are synchronous and may run outside a runtime (unit
+        // tests of unrelated surfaces); such a manager has no actors to run
+        // and never provisions one.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(actor.run());
         }
+        mailbox
+    }
+}
+
+impl Drop for ActorReservation {
+    fn drop(&mut self) {
+        if self.commands.is_some() {
+            forget_computer(&self.computers, &self.id, self.incarnation);
+        }
+    }
+}
+
+/// Everything an actor needs that the reservation does not already hold.
+///
+/// Assembled from the manager's own pieces rather than from `&SandboxManager`
+/// so the startup sweep can seed actors too: it runs in a task spawned from
+/// the constructor, before the manager it belongs to exists.
+pub(crate) struct ActorSpawn {
+    pub(crate) services: Arc<ComputerServices>,
+    pub(crate) timers_enabled: tokio::sync::watch::Receiver<bool>,
+    pub(crate) generation: Option<Uuid>,
+    pub(crate) deadlines: Deadlines,
+    pub(crate) launch: Launch,
+    pub(crate) seeded: Seeded,
+}
+
+/// Drop `id`'s entry when it is still `incarnation`'s.
+///
+/// The identity check replaces the `Arc::ptr_eq` guard the instance map
+/// needed: a computer removed and re-created under the same id (deterministic
+/// caller-supplied ids make this common) installs a fresh entry, and the
+/// departing actor must not evict it.
+fn forget_computer(computers: &Computers, id: &SandboxId, incarnation: Uuid) {
+    let mut map = computers.write().unwrap();
+    if map
+        .get(id)
+        .is_some_and(|current| current.incarnation == incarnation)
+    {
+        map.remove(id);
     }
 }
 
@@ -834,20 +981,21 @@ mod tests {
 
         let manager = SandboxManager::with_environment(config, environment(FakeDriver::new()))
             .expect("a driver with every needed capability is accepted");
-        assert_eq!(manager.driver.name(), "fake");
+        assert_eq!(manager.services.driver.name(), "fake");
     }
 
     #[test]
-    fn reserve_id_rejects_a_concurrent_duplicate() {
-        let instances: InstanceMap = Arc::new(RwLock::new(HashMap::new()));
-        let first = reserve_id(&instances, &"dup".to_owned(), placeholder("dup")).unwrap();
-        // A second reservation of the same id must fail while the first is live.
+    fn a_claimed_id_rejects_a_concurrent_duplicate() {
+        let computers: Computers = Arc::new(RwLock::new(HashMap::new()));
+        let first = reserve_actor(&computers, &"dup".to_owned(), placeholder("dup")).unwrap();
+        // A second claim of the same id must fail while the first is live —
+        // before either touches the per-id resources they both derive.
         assert!(matches!(
-            reserve_id(&instances, &"dup".to_owned(), placeholder("dup")),
+            reserve_actor(&computers, &"dup".to_owned(), placeholder("dup")),
             Err(VmmError::AlreadyExists(_))
         ));
-        first.commit();
-        assert!(instances.read().unwrap().contains_key("dup"));
+        drop(first);
+        assert!(!computers.read().unwrap().contains_key("dup"));
     }
 
     #[test]
@@ -897,33 +1045,45 @@ mod tests {
     }
 
     #[test]
-    fn dropped_reservation_unwinds_the_placeholder() {
-        let instances: InstanceMap = Arc::new(RwLock::new(HashMap::new()));
+    fn a_dropped_claim_frees_the_id() {
+        let computers: Computers = Arc::new(RwLock::new(HashMap::new()));
         {
-            let _r = reserve_id(&instances, &"tmp".to_owned(), placeholder("tmp")).unwrap();
-            assert!(instances.read().unwrap().contains_key("tmp"));
-            // no commit → dropped here
+            let _claim = reserve_actor(&computers, &"tmp".to_owned(), placeholder("tmp")).unwrap();
+            assert!(computers.read().unwrap().contains_key("tmp"));
+            // never spawned → dropped here
         }
-        assert!(!instances.read().unwrap().contains_key("tmp"));
-        // The id is free to reserve again after an unwound restore.
-        let again = reserve_id(&instances, &"tmp".to_owned(), placeholder("tmp"));
-        assert!(again.is_ok());
+        assert!(!computers.read().unwrap().contains_key("tmp"));
+        // The id is free to claim again after an unwound restore.
+        assert!(reserve_actor(&computers, &"tmp".to_owned(), placeholder("tmp")).is_ok());
     }
 
+    /// A departing actor unregisters *its own* entry and no other.
+    ///
+    /// The `Arc::ptr_eq` guard the instance map needed, as an incarnation:
+    /// a computer removed and re-created under the same id (deterministic
+    /// caller-supplied ids make this common) installs a fresh entry, and the
+    /// one on its way out must not evict it.
     #[test]
-    fn stale_reservation_does_not_remove_a_replacement() {
-        let instances: InstanceMap = Arc::new(RwLock::new(HashMap::new()));
-        let reservation = reserve_id(&instances, &"same".to_owned(), placeholder("same")).unwrap();
-        let replacement = Arc::new(Mutex::new(placeholder("same")));
-        instances
-            .write()
-            .unwrap()
-            .insert("same".to_owned(), Arc::clone(&replacement));
+    fn a_departing_actor_does_not_evict_its_replacement() {
+        let computers: Computers = Arc::new(RwLock::new(HashMap::new()));
+        let departing = reserve_actor(&computers, &"same".to_owned(), placeholder("same")).unwrap();
+        let incarnation = departing.incarnation;
+        std::mem::forget(departing);
 
-        assert!(ensure_current_instance(&instances, "same", &reservation.instance).is_err());
-        drop(reservation);
+        assert!(matches!(
+            reserve_actor(&computers, &"same".to_owned(), placeholder("same")),
+            Err(VmmError::AlreadyExists(_))
+        ));
+        forget_computer(&computers, &"same".to_owned(), incarnation);
+        let replacement = reserve_actor(&computers, &"same".to_owned(), placeholder("same"))
+            .expect("the id is free once the departing actor let it go");
 
-        let current = instances.read().unwrap()["same"].clone();
-        assert!(Arc::ptr_eq(&current, &replacement));
+        forget_computer(&computers, &"same".to_owned(), incarnation);
+        assert!(
+            computers.read().unwrap().contains_key("same"),
+            "the stale incarnation must not evict the replacement"
+        );
+        drop(replacement);
+        assert!(!computers.read().unwrap().contains_key("same"));
     }
 }

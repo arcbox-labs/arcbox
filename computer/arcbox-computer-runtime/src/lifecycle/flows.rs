@@ -12,7 +12,6 @@
 //! last sender drops — which is how a reservation that was never committed
 //! shuts one down.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,7 +25,7 @@ use async_trait::async_trait;
 use super::actor::{Mailbox, WeakMailbox};
 use super::effect::ReleaseScope;
 use super::event::RestoreOrigin;
-use super::tasks::{ComputerTasks, TaskFailure, TaskResult};
+use super::tasks::{CaptureSpec, ComputerTasks, TaskFailure, TaskResult};
 use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
@@ -41,6 +40,8 @@ use crate::snapshot_cow::CowManager;
 mod boot;
 mod restore;
 mod teardown;
+
+pub use boot::ActorSlot;
 
 /// What every computer's flows share with the manager. One `Arc`, cloned per
 /// computer, so a new service reaches the flows without threading another
@@ -89,13 +90,6 @@ pub struct RestoreLaunch {
     pub started: std::time::Instant,
 }
 
-/// What a user checkpoint captures. The pause capture brings none: it writes
-/// the reserved internal name, which no user checkpoint may squat on.
-pub struct Capture {
-    pub name: String,
-    pub labels: HashMap<String, String>,
-}
-
 /// One computer's flows.
 pub struct ComputerFlows {
     id: SandboxId,
@@ -103,10 +97,6 @@ pub struct ComputerFlows {
     services: Arc<ComputerServices>,
     mailbox: WeakMailbox,
     launch: Mutex<Launch>,
-    /// The user checkpoint the actor is about to spawn. Set by the same
-    /// command that drives the machine into `checkpointing`, which is the
-    /// one state that can reach a capture with a caller's name on it.
-    capture: Mutex<Option<Capture>>,
 }
 
 impl ComputerFlows {
@@ -123,17 +113,7 @@ impl ComputerFlows {
             services,
             mailbox: mailbox.downgrade(),
             launch: Mutex::new(launch),
-            capture: Mutex::new(None),
         }
-    }
-
-    /// Names the next capture — a user checkpoint rather than the pause's own.
-    pub fn set_capture(&self, capture: Capture) {
-        *self.capture.lock().unwrap() = Some(capture);
-    }
-
-    fn take_capture(&self) -> Option<Capture> {
-        self.capture.lock().unwrap().take()
     }
 
     /// The agent reaching this computer's guest, built from the running VM's
@@ -200,8 +180,12 @@ impl ComputerTasks for ComputerFlows {
         self.restore_vm(origin).await
     }
 
-    async fn checkpoint(&self, hold: bool) -> TaskResult<CheckpointInfo> {
-        self.capture(hold).await
+    async fn checkpoint(
+        &self,
+        hold: bool,
+        spec: Option<CaptureSpec>,
+    ) -> TaskResult<CheckpointInfo> {
+        self.capture(hold, spec).await
     }
 
     async fn resume(&self) -> TaskResult<Arc<dyn GuestAgent>> {

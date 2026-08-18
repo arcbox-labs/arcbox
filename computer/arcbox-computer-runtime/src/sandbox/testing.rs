@@ -17,8 +17,12 @@ use tokio::sync::broadcast;
 
 use super::reconcile::{JournaledLease, SandboxStateRecord, write_state_record};
 use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
-use super::{SandboxInstance, SandboxManager, SandboxSpec, SandboxState};
+use super::{Runtime, SandboxInstance, SandboxManager, SandboxSpec, SandboxState};
 use crate::config::{JailerConfig, VmmConfig};
+use crate::lifecycle::actor::{Command, Deadlines, Seeded};
+use crate::lifecycle::flows::Launch;
+use crate::sandbox::record::PersistPhase;
+use crate::sandbox::workload::WorkloadClaim;
 use crate::snapshot_cow::{CowManager, CowOptions, CowTestProbe};
 use crate::testkit::agent::FakeAgentFactory;
 use crate::{SandboxEnvironment, VmmError};
@@ -94,9 +98,10 @@ pub(super) async fn fake_manager_with_agent(
     .unwrap();
     manager.await_reconcile().await.unwrap();
     let probe = Arc::new(CowTestProbe::default());
-    manager.cow_manager = Arc::new(
+    let cow_manager = Arc::new(
         CowManager::new_with_test_probe(CowOptions::new(data_dir), Arc::clone(&probe)).unwrap(),
     );
+    manager.set_cow_manager(cow_manager);
     let token = manager.startup_cleanup_token().await.unwrap().unwrap();
     manager.finalize_startup_cleanup(&token).await.unwrap();
     (manager, driver, probe, agent)
@@ -242,12 +247,98 @@ impl VmHandle for RecordsShutdown {
     }
 }
 
+/// A computer in `state`, with a durable record to match and no runtime
+/// resources — what the startup sweep reinstates, and what a test that only
+/// needs a computer in a given state should plant.
+///
+/// Goes through the same claim-and-seed path the sweep does, so the actor
+/// behind it is a real one: its mailbox answers, its snapshot reads, and its
+/// deadlines fire.
+pub(super) async fn plant_computer(
+    manager: &SandboxManager,
+    id: &str,
+    state: SandboxState,
+) -> Runtime {
+    plant_computer_with(manager, id, state, |_| {}).await
+}
+
+/// [`plant_computer`], with the runtime dressed before its actor starts —
+/// the only moment anything but the actor may write to it.
+pub(super) async fn plant_computer_with(
+    manager: &SandboxManager,
+    id: &str,
+    state: SandboxState,
+    dress: impl FnOnce(&mut SandboxInstance),
+) -> Runtime {
+    let vm_dir = PathBuf::from(&manager.config.firecracker.data_dir)
+        .join("sandboxes")
+        .join(id);
+    let mut runtime = SandboxInstance::new(
+        id.to_owned(),
+        SandboxSpec {
+            id: Some(id.to_owned()),
+            ..SandboxSpec::default()
+        },
+        None,
+        vm_dir,
+    );
+    runtime.state = state;
+    dress(&mut runtime);
+    let reservation = super::reserve_actor(&manager.computers, &id.to_owned(), runtime).unwrap();
+    let shared = Arc::clone(reservation.runtime());
+    let (services, timers_enabled) = manager.spawn_context();
+    let mailbox = reservation.spawn(super::ActorSpawn {
+        services,
+        timers_enabled,
+        generation: None,
+        deadlines: Deadlines::default(),
+        launch: Launch::Reinstated,
+        seeded: match state {
+            // A computer this process took back: usable, never booted here.
+            SandboxState::Ready | SandboxState::Running | SandboxState::Starting => Seeded::Adopted,
+            SandboxState::Paused | SandboxState::Pausing => Seeded::Recovered(PersistPhase::Paused),
+            SandboxState::Stopped | SandboxState::Stopping => {
+                Seeded::Recovered(PersistPhase::Stopped)
+            }
+            SandboxState::Failed => Seeded::Recovered(PersistPhase::Failed),
+        },
+    });
+    if state == SandboxState::Running {
+        mailbox
+            .ask(&id.to_owned(), |reply| Command::ClaimWorkload {
+                claim: WorkloadClaim::Api,
+                reply,
+            })
+            .await
+            .expect("an adopted computer accepts a workload");
+    }
+    // The actor dispatches its seeding on its own task, so a read taken
+    // before that lands would still see the claim's `Starting`.
+    await_state(manager, id, state).await;
+    shared
+}
+
+/// Wait until `id`'s read snapshot reports `state`.
+pub(super) async fn await_state(manager: &SandboxManager, id: &str, state: SandboxState) {
+    let mut snapshot = manager
+        .computer(&id.to_owned())
+        .expect("the computer is registered")
+        .watch();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        snapshot.wait_for(|snapshot| snapshot.state == state),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{id} never reached {state}"))
+    .expect("the actor keeps its snapshot open");
+}
+
 /// [`live_sandbox_with`] over the fake VM's own handle.
 pub(super) async fn live_sandbox(
     manager: &SandboxManager,
     driver: &FakeDriver,
     id: &str,
-) -> (Arc<Mutex<SandboxInstance>>, Arc<dyn VmHandle>) {
+) -> (Runtime, Arc<dyn VmHandle>) {
     live_sandbox_with(manager, driver, id, |handle| handle).await
 }
 
@@ -261,7 +352,7 @@ pub(super) async fn live_sandbox_with(
     driver: &FakeDriver,
     id: &str,
     wrap: impl FnOnce(Arc<dyn VmHandle>) -> Arc<dyn VmHandle>,
-) -> (Arc<Mutex<SandboxInstance>>, Arc<dyn VmHandle>) {
+) -> (Runtime, Arc<dyn VmHandle>) {
     let vm_dir = PathBuf::from(&manager.config.firecracker.data_dir)
         .join("sandboxes")
         .join(id);
@@ -278,6 +369,7 @@ pub(super) async fn live_sandbox_with(
     let handle = wrap(Arc::from(prepared.boot(vm_spec(&vm_id)).await.unwrap()));
     let cow_handle = manager.cow_manager.setup(id, "/rootfs.ext4").await.unwrap();
     let lease = manager
+        .services
         .network
         .reserve(&vm_id, super::sandbox_network_policy())
         .await
@@ -327,24 +419,36 @@ pub(super) async fn live_sandbox_with(
     )
     .unwrap();
 
-    // A cold boot activates the interface invariant and hands the instance
+    // A cold boot activates the interface invariant and hands the computer
     // that identity beside the handle, so a planted one must too: it is what
-    // `guest_agent` gives every agent it builds afterwards.
-    let identity = manager.network.identity(&lease, super::attach_mode(true));
-    let mut instance =
+    // every agent built afterwards describes the guest with.
+    let identity = manager
+        .services
+        .network
+        .identity(&lease, super::attach_mode(true));
+    let mut runtime =
         SandboxInstance::new_with_generation(id.to_owned(), spec, Some(lease), vm_dir, generation);
-    instance.state = SandboxState::Ready;
-    instance.prepared = Some(prepared);
-    instance.handle = Some(Arc::clone(&handle));
-    instance.net_identity = Some(identity);
-    instance.cow_handle = Some(cow_handle);
-    let instance = Arc::new(Mutex::new(instance));
-    manager
-        .instances
-        .write()
-        .unwrap()
-        .insert(id.to_owned(), Arc::clone(&instance));
-    (instance, handle)
+    runtime.state = SandboxState::Ready;
+    runtime.prepared = Some(prepared);
+    runtime.handle = Some(Arc::clone(&handle));
+    runtime.net_identity = Some(identity);
+    runtime.cow_handle = Some(cow_handle);
+
+    // Seeded the way the startup sweep seeds a computer whose VM it took
+    // back: durably `Ready`, holding everything a boot hands over, and never
+    // launched in this process.
+    let reservation = super::reserve_actor(&manager.computers, &id.to_owned(), runtime).unwrap();
+    let shared = Arc::clone(reservation.runtime());
+    let (services, timers_enabled) = manager.spawn_context();
+    reservation.spawn(super::ActorSpawn {
+        services,
+        timers_enabled,
+        generation: Some(generation),
+        deadlines: Deadlines::default(),
+        launch: Launch::Reinstated,
+        seeded: Seeded::Adopted,
+    });
+    (shared, handle)
 }
 
 /// Every mark of a sandbox that failed the way a failed boot does: `Failed`
@@ -353,12 +457,25 @@ pub(super) async fn live_sandbox_with(
 /// crash journal cleared. Panics on the first mark that is missing.
 pub(super) async fn assert_failed_and_released(
     manager: &SandboxManager,
-    instance: &Arc<Mutex<SandboxInstance>>,
+    runtime: &Runtime,
     probe: &CowTestProbe,
     id: &str,
 ) {
+    // The failure runs in the computer's actor and its release in a
+    // sub-task, so wait for the last thing either does — the journal clear,
+    // which is gated on both — rather than assuming the caller's error means
+    // it has all landed.
+    let vm_dir = runtime.lock().unwrap().vm_dir.clone();
+    for _ in 0..500 {
+        if runtime.lock().unwrap().state == SandboxState::Failed
+            && !vm_dir.join("state.json").exists()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     {
-        let inst = instance.lock().unwrap();
+        let inst = runtime.lock().unwrap();
         assert_eq!(inst.state, SandboxState::Failed);
         assert!(
             inst.error.is_some(),

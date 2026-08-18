@@ -28,15 +28,8 @@
 //! onwards every resource is keyed by the sandbox id again and resume,
 //! reconciliation, and `Remove` all see one naming scheme.
 
-use crate::lifecycle::tasks::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
-// The pause release and the resume proper live with the machine that names
-// them (`Effect::SpawnRelease { KeepDisk }` / `SpawnResume`); this module
-// still drives them until R3 PR-F2 flips the manager onto the actor.
-use super::record::SandboxTransition;
-use super::types::action;
 use super::*;
-use crate::lifecycle::tasks::pause::release_for_pause;
-use crate::lifecycle::tasks::resume::restore_paused;
+use crate::lifecycle::actor::{ComputerSnapshot, PauseReason};
 
 /// Reserved catalog name for internal pause checkpoints.
 ///
@@ -87,7 +80,6 @@ pub struct ResumedRuntime {
     /// [`SandboxInstance::net_identity`].
     pub net_identity: Option<NetworkIdentity>,
     pub cow_handle: Option<CowHandle>,
-    pub ip_address: String,
 }
 
 /// How a failed resume left the sandbox.
@@ -108,7 +100,8 @@ impl SandboxManager {
     /// answers `WrongState` — an active execution must finish (or be
     /// stopped) first, matching the contract's "requires READY".
     pub async fn pause_sandbox(&self, id: &SandboxId) -> Result<()> {
-        self.pause_sandbox_with_reason(id, reason::PAUSE).await
+        self.pause_sandbox_with_reason(id, PauseReason::Requested)
+            .await
     }
 
     /// [`Self::pause_sandbox`] with an explicit PAUSING-event reason —
@@ -116,189 +109,26 @@ impl SandboxManager {
     pub(super) async fn pause_sandbox_with_reason(
         &self,
         id: &SandboxId,
-        pause_reason: &str,
+        reason: PauseReason,
     ) -> Result<()> {
         self.await_reconcile().await?;
-        let instance = self.get_instance(id)?;
-        let cleanup_lock = instance.lock().unwrap().cleanup_lock.clone();
-        let _cleanup_guard = cleanup_lock.lock().await;
-        super::ensure_current_instance(&self.instances, id, &instance)?;
-
-        // Claim `Ready → Pausing` atomically: setting the state in the same
-        // critical section as the check means a concurrent Run cannot slip
-        // its `Ready → Running` claim in between and end up checkpointed
-        // mid-execution.
-        let generation = {
-            let mut inst = instance.lock().unwrap();
-            match inst.state {
-                SandboxState::Paused => return Ok(()),
-                SandboxState::Ready => {}
-                s => {
-                    return Err(VmmError::WrongState {
-                        id: id.clone(),
-                        expected: "Ready".into(),
-                        actual: s.to_string(),
-                    });
-                }
-            }
-            // Resume restores into a fresh jailer chroot; direct-mode
-            // vmstate pins origin paths, so a direct-mode pause could never
-            // resume. Fail fast before claiming anything.
-            if self.config.firecracker.jailer.is_none() {
-                return Err(VmmError::Config(
-                    "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
-                ));
-            }
-            if inst.handle.is_none() {
-                return Err(VmmError::WrongState {
-                    id: id.clone(),
-                    expected: "a sandbox with a live VM handle".into(),
-                    actual: "no VM handle".into(),
-                });
-            }
-            inst.state = SandboxState::Pausing;
-            inst.record_generation
-        };
-        let jailer = self
-            .config
-            .firecracker
-            .jailer
-            .as_ref()
-            .expect("checked in the claim above");
-
-        if let Some(generation) = generation
-            && let Err(error) = (|| -> Result<()> {
-                let commit = self
-                    .records
-                    .transition(id, generation, SandboxTransition::Pausing)?;
-                if let Some(error) = commit.durability_error {
-                    warn!(
-                        sandbox_id = %id,
-                        error,
-                        "pausing transition is visible but durability is unconfirmed"
-                    );
-                }
-                Ok(())
-            })()
+        let computer = self.computer(id)?;
+        // Resume restores into a fresh jailer chroot; direct-mode vmstate
+        // pins origin paths, so a direct-mode pause could never resume. Read
+        // off the snapshot rather than left to the flow, because it is a
+        // refusal the caller gets *instead* of the claim: only a computer
+        // that would otherwise be paused hears it, exactly as today.
+        if computer.snapshot.borrow().state == SandboxState::Ready
+            && self.config.firecracker.jailer.is_none()
         {
-            // The durable claim failed: release the in-memory claim so the
-            // sandbox stays usable.
-            instance.lock().unwrap().state = SandboxState::Ready;
-            return Err(error);
+            return Err(VmmError::Config(
+                "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
+            ));
         }
-        let _ = self
-            .events_tx
-            .send(SandboxEvent::new(id, action::PAUSING).with_attr("reason", pause_reason));
-
-        // Checkpoint through the shared implementation — it owns the
-        // addressing-mode bookkeeping — but with the guest held quiesced
-        // afterwards: guest progress past the memory image would diverge
-        // from the retained disk overlay. A capture that fails leaves the
-        // guest running (the driver resumes it itself) and the sandbox
-        // reverts to Ready, because a failed pause must leave a usable
-        // sandbox behind. A capture that succeeded and held the guest, with
-        // the failure coming after it — the catalog commit — is different:
-        // the port has no verb to thaw a held VM (pause is hold-then-kill
-        // by design), so that sandbox cannot go back to Ready; it fails the
-        // way a failed boot does — VMM killed and reaped, CoW, TAP + IP and
-        // chroot released, durable `Failed`, journal cleared, FAILED event —
-        // rather than reporting Ready for a frozen guest or holding its
-        // resources until Remove.
-        let snapshot_id = match checkpoint_impl(
-            &instance,
-            &self.snapshots,
-            id,
-            CheckpointRequest {
-                name: PAUSE_SNAPSHOT_NAME.to_owned(),
-                labels: HashMap::new(),
-                expected_state: SandboxState::Pausing,
-                resume_after: false,
-            },
-        )
-        .await
-        {
-            Ok(info) => info.snapshot_id,
-            Err(CheckpointFailure::Frozen(error)) => {
-                let vm_dir = instance.lock().unwrap().vm_dir.clone();
-                super::boot::fail_live_sandbox_locked(
-                    id,
-                    generation,
-                    &error.to_string(),
-                    &vm_dir,
-                    &instance,
-                    &self.network,
-                    &self.config,
-                    &self.cow_manager,
-                    &self.records,
-                    &self.events_tx,
-                )
-                .await;
-                error!(sandbox_id = %id, error = %error, "pause left the guest frozen; sandbox failed");
-                return Err(error);
-            }
-            Err(CheckpointFailure::Recoverable(error)) => {
-                if let Some(generation) = generation
-                    && let Err(revert) =
-                        self.records
-                            .transition(id, generation, SandboxTransition::Ready)
-                {
-                    warn!(sandbox_id = %id, error = %revert, "pause revert transition failed");
-                }
-                instance.lock().unwrap().state = SandboxState::Ready;
-                let _ = self.events_tx.send(SandboxEvent::new(id, action::READY));
-                return Err(error);
-            }
-        };
-        // The guest stays quiesced on success: progress after the snapshot
-        // would diverge from the retained disk overlay.
-
-        // Release the VM, TAP + IP (quarantined for host cleanup), and
-        // chroot; keep the disk. A failure here is a half-released sandbox
-        // whose VM state is already gone — degrade honestly to Failed.
-        if let Err(error) = release_for_pause(
-            id,
-            &instance,
-            jailer,
-            &self.config,
-            &self.cow_manager,
-            &*self.network,
-        )
-        .await
-        {
-            return Err(self.fail_pause(id, &instance, generation, error));
-        }
-
-        let paused_commit = generation
-            .map(|generation| {
-                self.records.transition(
-                    id,
-                    generation,
-                    SandboxTransition::Paused {
-                        snapshot_id: snapshot_id.clone(),
-                    },
-                )
-            })
-            .transpose()?;
-        {
-            let mut inst = instance.lock().unwrap();
-            inst.state = SandboxState::Paused;
-            inst.paused_at = Some(Utc::now());
-            inst.pause_snapshot_id = Some(snapshot_id.clone());
-            if paused_commit
-                .as_ref()
-                .is_none_or(|commit| commit.durability_error.is_none())
-            {
-                // Every runtime resource is released and Paused is durable;
-                // what remains on disk is retained state, not orphans.
-                super::reconcile::clear_state_record(&inst.vm_dir)?;
-            }
-        }
-        let _ = self.events_tx.send(SandboxEvent::new(id, action::PAUSED));
-        info!(sandbox_id = %id, snapshot_id = %snapshot_id, "sandbox paused");
-        paused_commit
-            .map(|commit| commit.confirmed("sandbox pause"))
-            .transpose()?;
-        Ok(())
+        computer
+            .mailbox
+            .ask(id, |reply| Command::Pause { reason, reply })
+            .await
     }
 
     /// Resume a `Paused` sandbox in place: restore from its internal pause
@@ -312,233 +142,45 @@ impl SandboxManager {
     /// Returns the sandbox's (fresh) IP address, empty without networking.
     pub async fn resume_sandbox(&self, id: &SandboxId, resume_reason: &str) -> Result<String> {
         self.await_reconcile().await?;
-        let instance = self.get_instance(id)?;
-        let cleanup_lock = instance.lock().unwrap().cleanup_lock.clone();
-        let _cleanup_guard = cleanup_lock.lock().await;
-        super::ensure_current_instance(&self.instances, id, &instance)?;
-
-        let (generation, snapshot_id, vm_dir, networked) = {
-            let inst = instance.lock().unwrap();
-            match inst.state {
-                SandboxState::Ready | SandboxState::Running => {
-                    return Ok(inst
-                        .network
-                        .as_ref()
-                        .map(|lease| lease.ip.to_string())
-                        .unwrap_or_default());
-                }
-                SandboxState::Paused => {}
-                s => {
-                    return Err(VmmError::WrongState {
-                        id: id.clone(),
-                        expected: "Paused".into(),
-                        actual: s.to_string(),
-                    });
-                }
-            }
-            let snapshot_id = inst.pause_snapshot_id.clone().ok_or_else(|| {
-                VmmError::Snapshot(format!(
-                    "paused sandbox {id} has no pause checkpoint recorded"
-                ))
-            })?;
-            (
-                inst.record_generation,
-                snapshot_id,
-                inst.vm_dir.clone(),
-                inst.spec.network.mode != "none",
-            )
-        };
-        let jailer =
-            self.config.firecracker.jailer.as_ref().ok_or_else(|| {
-                VmmError::Config("sandbox resume requires jailer isolation".into())
-            })?;
-        let snap_meta = self.snapshots.find_by_id(&snapshot_id)?;
-
-        if let Some(generation) = generation {
-            let commit = self
-                .records
-                .transition(id, generation, SandboxTransition::Resuming)?;
-            if let Some(error) = commit.durability_error {
-                // The restart sweep trusts the durable phase: were Resuming to
-                // stay unconfirmed on disk, a crash mid-restore would read as
-                // cleanly Paused and the restore's journaled TAP/IP/chroot
-                // would be dropped as a stale pause journal, never released.
-                // Park back at Paused and fail before allocating anything —
-                // the mirror of the pause path's durability-gated journal
-                // clear.
-                if let Err(revert) = self.records.transition(
-                    id,
-                    generation,
-                    SandboxTransition::Paused {
-                        snapshot_id: snapshot_id.clone(),
-                    },
-                ) {
-                    warn!(sandbox_id = %id, error = %revert, "resume durability revert failed");
-                }
-                return Err(VmmError::Unavailable(format!(
-                    "sandbox resume is visible but its durability is unconfirmed: {error}"
-                )));
-            }
-        }
-        instance.lock().unwrap().state = SandboxState::Starting;
-
-        let restore_started = std::time::Instant::now();
-        match restore_paused(
-            id,
-            jailer,
-            &snap_meta,
-            &vm_dir,
-            networked,
-            &self.config,
-            &self.cow_manager,
-            &*self.driver,
-            &*self.network,
-            &*self.agent,
-        )
-        .await
-        {
-            Ok(resumed) => {
-                let ready_commit = generation
-                    .map(|generation| {
-                        self.records
-                            .transition(id, generation, SandboxTransition::Ready)
-                    })
-                    .transpose()?;
-                let ip_address = resumed.ip_address.clone();
-                {
-                    let mut inst = instance.lock().unwrap();
-                    inst.prepared = Some(resumed.prepared);
-                    inst.handle = Some(resumed.handle);
-                    inst.net_identity = resumed.net_identity;
-                    inst.network = resumed.network;
-                    inst.cow_handle = resumed.cow_handle;
-                    // Re-establish the guest's addressing mode from the
-                    // checkpoint, exactly as Restore does: a paused sandbox
-                    // rebuilt by the restart sweep has no live instance to
-                    // inherit it from, and a later Checkpoint must record the
-                    // guest's actual addressing (CORE-81).
-                    inst.net_invariant = snap_meta.net_invariant;
-                    inst.state = SandboxState::Ready;
-                    inst.paused_at = None;
-                    inst.pause_snapshot_id = None;
-                }
-                // The checkpoint matched the disk *at pause time*; the
-                // sandbox will now diverge, so it must not be restorable
-                // again. Deletion also frees the memory-sized image.
-                if let Err(error) = self.snapshots.delete_by_id(&snapshot_id) {
-                    warn!(
-                        sandbox_id = %id,
-                        snapshot_id = %snapshot_id,
-                        error = %error,
-                        "resumed, but deleting the pause checkpoint failed"
-                    );
-                }
-                let _ = self.events_tx.send(
-                    SandboxEvent::new(id, action::RESUMED).with_attr("reason", resume_reason),
-                );
-                info!(
-                    sandbox_id = %id,
-                    reason = resume_reason,
-                    total_ms = u64::try_from(restore_started.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
-                    "sandbox resumed from pause checkpoint"
-                );
-                ready_commit
-                    .map(|commit| commit.confirmed("sandbox resume"))
-                    .transpose()?;
-                Ok(ip_address)
-            }
-            Err(failure) => {
-                if failure.unwound {
-                    // Retained state is intact: park back at Paused so a
-                    // retry (or Remove) still works.
-                    if let Some(generation) = generation
-                        && let Err(revert) = self.records.transition(
-                            id,
-                            generation,
-                            SandboxTransition::Paused {
-                                snapshot_id: snapshot_id.clone(),
-                            },
-                        )
-                    {
-                        warn!(sandbox_id = %id, error = %revert, "resume revert transition failed");
-                    }
-                    instance.lock().unwrap().state = SandboxState::Paused;
-                    let _ = self.events_tx.send(SandboxEvent::new(id, action::PAUSED));
-                } else {
-                    if let Some(generation) = generation
-                        && let Err(mark) = self.records.transition(
-                            id,
-                            generation,
-                            SandboxTransition::Failed(failure.error.to_string()),
-                        )
-                    {
-                        warn!(sandbox_id = %id, error = %mark, "resume failure transition failed");
-                    }
-                    {
-                        let mut inst = instance.lock().unwrap();
-                        inst.state = SandboxState::Failed;
-                        inst.error = Some(failure.error.to_string());
-                    }
-                    let _ = self.events_tx.send(
-                        SandboxEvent::new(id, action::FAILED)
-                            .with_attr("error", &failure.error.to_string()),
-                    );
-                }
-                Err(failure.error)
-            }
-        }
-    }
-
-    /// Degrade a pause that cannot leave a usable sandbox behind to `Failed`:
-    /// record and publish the failure, and hand `error` back to the caller.
-    fn fail_pause(
-        &self,
-        id: &SandboxId,
-        instance: &Arc<Mutex<SandboxInstance>>,
-        generation: Option<Uuid>,
-        error: VmmError,
-    ) -> VmmError {
-        if let Some(generation) = generation
-            && let Err(mark) = self.records.transition(
-                id,
-                generation,
-                SandboxTransition::Failed(error.to_string()),
-            )
-        {
-            warn!(sandbox_id = %id, error = %mark, "pause failure transition failed");
-        }
-        {
-            let mut inst = instance.lock().unwrap();
-            inst.state = SandboxState::Failed;
-            inst.error = Some(error.to_string());
-        }
-        let _ = self
-            .events_tx
-            .send(SandboxEvent::new(id, action::FAILED).with_attr("error", &error.to_string()));
-        error
-    }
-
-    /// Locate a paused sandbox's retained artifacts.
-    ///
-    /// Pure field reads — no filesystem access — so it is the only half of
-    /// the storage accounting that may run under the instance lock. The
-    /// sizing itself ([`PausedArtifacts::storage_bytes`]) stats files and,
-    /// for the checkpoint, needs a catalog lookup; doing that under the
-    /// lock would block every lifecycle transition on the sandbox behind
-    /// blocking I/O on the async executor.
-    pub(super) fn paused_artifacts(&self, inst: &SandboxInstance) -> PausedArtifacts {
-        PausedArtifacts {
-            pause_snapshot_id: inst.pause_snapshot_id.clone(),
-            preserved_cow: super::preserved_cow_file(&self.config, &inst.id),
-            parked_rootfs: inst.vm_dir.join(PAUSED_ROOTFS_FILE),
-        }
+        let computer = self.computer(id)?;
+        computer
+            .mailbox
+            .ask(id, |reply| Command::Resume {
+                reason: resume_reason.to_owned(),
+                reply,
+            })
+            .await?;
+        // The lease the resume reserved, read back off the snapshot the
+        // actor republished when the flow reported.
+        Ok(computer
+            .snapshot
+            .borrow()
+            .lease
+            .as_ref()
+            .map(|lease| lease.ip.to_string())
+            .unwrap_or_default())
     }
 }
 
-/// Where a paused sandbox's retained state lives on disk.
+/// Locate a paused computer's retained artifacts.
 ///
-/// Collected under the instance lock, sized outside it.
+/// Pure field reads — no filesystem access. The sizing itself
+/// ([`PausedArtifacts::storage_bytes`]) stats files and, for the checkpoint,
+/// needs a catalog lookup, which is why the two halves are separate: the read
+/// borrows the actor's `watch` and the sizing must not.
+pub(super) fn paused_artifacts(
+    config: &VmmConfig,
+    id: &SandboxId,
+    snapshot: &ComputerSnapshot,
+) -> PausedArtifacts {
+    PausedArtifacts {
+        pause_snapshot_id: snapshot.pause_snapshot_id.clone(),
+        preserved_cow: super::preserved_cow_file(config, id),
+        parked_rootfs: snapshot.vm_dir.join(PAUSED_ROOTFS_FILE),
+    }
+}
+
+/// Where a paused computer's retained state lives on disk.
 pub(super) struct PausedArtifacts {
     /// Catalog id of the internal pause checkpoint.
     pause_snapshot_id: Option<String>,
@@ -577,57 +219,26 @@ impl PausedArtifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::sandbox::types::action;
     use crate::snapshot::SnapshotDraft;
-
-    async fn manager(data_dir: &Path) -> SandboxManager {
-        let mut config = VmmConfig::default();
-        config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
-        let manager = SandboxManager::new(config).unwrap();
-        manager.await_reconcile().await.unwrap();
-        manager
-    }
-
-    fn insert_instance(
-        manager: &SandboxManager,
-        id: &str,
-        state: SandboxState,
-    ) -> Arc<Mutex<SandboxInstance>> {
-        let vm_dir = PathBuf::from(&manager.config.firecracker.data_dir)
-            .join("sandboxes")
-            .join(id);
-        let mut inst = SandboxInstance::new(
-            id.to_owned(),
-            SandboxSpec {
-                id: Some(id.to_owned()),
-                ..Default::default()
-            },
-            None,
-            vm_dir,
-        );
-        inst.state = state;
-        let arc = Arc::new(Mutex::new(inst));
-        manager
-            .instances
-            .write()
-            .unwrap()
-            .insert(id.to_owned(), Arc::clone(&arc));
-        arc
-    }
 
     #[tokio::test]
     async fn pause_is_idempotent_and_gates_on_state() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
+        let (manager, _driver, _probe) =
+            super::super::testing::fake_manager_direct(dir.path()).await;
+        let plant = super::super::testing::plant_computer;
 
         assert!(matches!(
             manager.pause_sandbox(&"missing".to_owned()).await,
             Err(VmmError::NotFound(_))
         ));
 
-        insert_instance(&manager, "paused", SandboxState::Paused);
+        plant(&manager, "paused", SandboxState::Paused).await;
         manager.pause_sandbox(&"paused".to_owned()).await.unwrap();
 
-        insert_instance(&manager, "busy", SandboxState::Running);
+        plant(&manager, "busy", SandboxState::Running).await;
         assert!(matches!(
             manager.pause_sandbox(&"busy".to_owned()).await,
             Err(VmmError::WrongState { .. })
@@ -635,7 +246,7 @@ mod tests {
 
         // Ready but no jailer configured: pause must fail fast before
         // touching anything — a direct-mode pause could never resume.
-        insert_instance(&manager, "ready", SandboxState::Ready);
+        plant(&manager, "ready", SandboxState::Ready).await;
         let error = manager
             .pause_sandbox(&"ready".to_owned())
             .await
@@ -694,9 +305,10 @@ mod tests {
     #[tokio::test]
     async fn resume_noops_on_live_states_and_rejects_others() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
+        let (manager, _driver, _probe) =
+            super::super::testing::fake_manager_direct(dir.path()).await;
 
-        insert_instance(&manager, "ready", SandboxState::Ready);
+        super::super::testing::plant_computer(&manager, "ready", SandboxState::Ready).await;
         assert_eq!(
             manager
                 .resume_sandbox(&"ready".to_owned(), reason::RESUME)
@@ -704,13 +316,13 @@ mod tests {
                 .unwrap(),
             ""
         );
-        insert_instance(&manager, "running", SandboxState::Running);
+        super::super::testing::plant_computer(&manager, "running", SandboxState::Running).await;
         manager
             .resume_sandbox(&"running".to_owned(), reason::RESUME)
             .await
             .unwrap();
 
-        insert_instance(&manager, "stopped", SandboxState::Stopped);
+        super::super::testing::plant_computer(&manager, "stopped", SandboxState::Stopped).await;
         assert!(matches!(
             manager
                 .resume_sandbox(&"stopped".to_owned(), reason::RESUME)
@@ -719,7 +331,7 @@ mod tests {
         ));
 
         // Paused with no recorded checkpoint is corrupt retained state.
-        insert_instance(&manager, "hollow", SandboxState::Paused);
+        super::super::testing::plant_computer(&manager, "hollow", SandboxState::Paused).await;
         assert!(matches!(
             manager
                 .resume_sandbox(&"hollow".to_owned(), reason::RESUME)
@@ -731,8 +343,9 @@ mod tests {
     #[tokio::test]
     async fn data_plane_gates_report_paused_machine_readably() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
-        insert_instance(&manager, "asleep", SandboxState::Paused);
+        let (manager, _driver, _probe) =
+            super::super::testing::fake_manager_direct(dir.path()).await;
+        super::super::testing::plant_computer(&manager, "asleep", SandboxState::Paused).await;
 
         assert!(matches!(
             manager.require_ready_agent(&"asleep".to_owned()),
@@ -747,7 +360,8 @@ mod tests {
     #[tokio::test]
     async fn pause_snapshots_are_hidden_and_protected() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
+        let (manager, _driver, _probe) =
+            super::super::testing::fake_manager_direct(dir.path()).await;
 
         // Seed a committed pause snapshot plus a user checkpoint.
         let pending = manager.snapshots.begin("box").unwrap();
@@ -803,7 +417,8 @@ mod tests {
     #[tokio::test]
     async fn list_and_inspect_report_the_same_paused_storage() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
+        let (manager, _driver, _probe) =
+            super::super::testing::fake_manager_direct(dir.path()).await;
 
         let pending = manager.snapshots.begin("napper").unwrap();
         std::fs::write(pending.dir().join("vmstate"), vec![0u8; 128 * 1024]).unwrap();
@@ -827,10 +442,15 @@ mod tests {
         std::fs::create_dir_all(&cow_dir).unwrap();
         std::fs::write(cow_dir.join("arcbox-cow-napper.img"), vec![0u8; 64 * 1024]).unwrap();
 
-        let arc = insert_instance(&manager, "napper", SandboxState::Paused);
-        arc.lock().unwrap().pause_snapshot_id = Some(meta.id);
+        super::super::testing::plant_computer_with(
+            &manager,
+            "napper",
+            SandboxState::Paused,
+            |runtime| runtime.pause_snapshot_id = Some(meta.id),
+        )
+        .await;
         // A live sandbox reports nothing: the field is retained-state only.
-        insert_instance(&manager, "awake", SandboxState::Ready);
+        super::super::testing::plant_computer(&manager, "awake", SandboxState::Ready).await;
 
         let inspected = manager.inspect_sandbox(&"napper".to_owned()).unwrap();
         let listed = manager.list_sandboxes(None, &HashMap::new()).unwrap();

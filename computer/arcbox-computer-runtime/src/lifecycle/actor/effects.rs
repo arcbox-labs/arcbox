@@ -76,8 +76,9 @@ impl ComputerActor {
             }
             Effect::SpawnCheckpoint { hold } => {
                 let tasks = Arc::clone(&self.tasks);
+                let spec = self.capture.take();
                 self.spawn(Handoff::Abortable, async move {
-                    match tasks.checkpoint(hold).await {
+                    match tasks.checkpoint(hold, spec).await {
                         Ok(info) => Report::Captured(info),
                         Err(failure) => Report::Failed(failure),
                     }
@@ -158,11 +159,18 @@ impl ComputerActor {
         let Some(generation) = self.generation else {
             return;
         };
-        let durability_error = match self.records.transition(&self.id, generation, transition) {
-            Ok(commit) => commit.durability_error,
-            Err(error) => Some(error.to_string()),
+        let commit = match self.records.transition(&self.id, generation, transition) {
+            Ok(commit) => commit,
+            // A refused write is not an unconfirmed one: nothing was
+            // recorded at all. Every treatment below assumes the phase is at
+            // least visible — warning and carrying on would leave the
+            // computer running past a phase its record never entered — so
+            // the flow fails the way its own sub-task's failure would.
+            Err(error) => {
+                return self.fail_write(&format!("recording {} failed: {error}", phase.as_str()));
+            }
         };
-        let Some(error) = durability_error else {
+        let Some(error) = commit.durability_error else {
             return;
         };
         let phase = phase.as_str();
@@ -178,7 +186,9 @@ impl ComputerActor {
                 self.journal_blocked = true;
             }
             Durability::Report(Unconfirmed::Ack) => self.unconfirmed = Some(error),
-            Durability::Report(Unconfirmed::Unavailable) => self.refuse(&error),
+            Durability::Report(Unconfirmed::Unavailable) => self.fail_write(&format!(
+                "state is visible, but durability is unconfirmed: {error}"
+            )),
             Durability::Report(Unconfirmed::RevertToPaused) => {
                 // The restart sweep trusts the phase: an unconfirmed
                 // `Resuming` reads back as cleanly paused, and the restore's
@@ -190,19 +200,24 @@ impl ComputerActor {
                     },
                     Durability::Warn,
                 );
-                self.refuse(&error);
+                self.fail_write(&format!(
+                    "state is visible, but durability is unconfirmed: {error}"
+                ));
             }
         }
     }
 
     /// A durable write the flow cannot continue without: fail it the way its
-    /// own sub-task's failure would have.
-    fn refuse(&mut self, error: &str) {
-        let error = VmmError::Unavailable(format!(
-            "computer {} state is visible, but durability is unconfirmed: {error}",
-            self.id
-        ));
+    /// own sub-task's failure would.
+    ///
+    /// `answer_error` as well as the parked callers, because the flows that
+    /// answer *immediately* have nothing parked — a cold create is told its
+    /// boot is under way as soon as the machine acts, and that answer has to
+    /// carry this instead.
+    fn fail_write(&mut self, detail: &str) {
+        let error = VmmError::Unavailable(format!("computer {} {detail}", self.id));
         self.error = Some(error.to_string());
+        self.answer_error = Some(error.to_string());
         self.fail_waiters(error);
         self.queued.push_back(Event::Failure);
     }
@@ -298,6 +313,7 @@ impl ComputerActor {
         let event = match notify {
             Notify::Failed => {
                 let error = self.error.clone().unwrap_or_default();
+                self.runtime.lock().unwrap().error = Some(error.clone());
                 self.snapshot_tx
                     .send_modify(|snapshot| snapshot.error = Some(error.clone()));
                 event.with_attr("error", &error)

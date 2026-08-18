@@ -60,7 +60,9 @@
 /// reaches the crate and no further.
 pub mod actor;
 mod effect;
-mod event;
+/// `pub` in the lint's spelling only, as `tasks` below: the manager builds
+/// the `Provision` and `PauseReason` its commands carry.
+pub mod event;
 /// `pub` in the lint's spelling only, as `tasks` below.
 pub mod flows;
 mod machine;

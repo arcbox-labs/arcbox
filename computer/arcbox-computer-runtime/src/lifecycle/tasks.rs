@@ -93,6 +93,15 @@ impl TaskFailure {
     }
 }
 
+/// What a user checkpoint records in the catalog. The pause capture brings
+/// none: it writes the reserved internal name, which no user checkpoint may
+/// squat on.
+#[derive(Debug, Clone)]
+pub struct CaptureSpec {
+    pub name: String,
+    pub labels: std::collections::HashMap<String, String>,
+}
+
 /// The flows the actor spawns. One method per `Spawn*` effect.
 #[async_trait]
 pub trait ComputerTasks: Send + Sync + 'static {
@@ -123,7 +132,8 @@ pub trait ComputerTasks: Send + Sync + 'static {
     /// Capture a checkpoint. `hold` keeps the guest quiesced afterwards (the
     /// pause path): progress past the memory image would diverge from the
     /// retained disk overlay.
-    async fn checkpoint(&self, hold: bool) -> TaskResult<CheckpointInfo>;
+    async fn checkpoint(&self, hold: bool, spec: Option<CaptureSpec>)
+    -> TaskResult<CheckpointInfo>;
 
     /// Restore a paused computer in place, back onto a fresh network.
     async fn resume(&self) -> TaskResult<Arc<dyn GuestAgent>>;

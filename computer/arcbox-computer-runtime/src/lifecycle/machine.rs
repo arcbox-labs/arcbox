@@ -210,6 +210,14 @@ impl ComputerLifecycle {
                 context.emit(Effect::Publish(Notify::Running));
                 Transition(State::gating(*committed, true))
             }
+            // The boot's own `cmd` can outlive neither the gate nor its own
+            // exit: a ready probe still running when it finishes leaves the
+            // computer idle, and READY then opens the idle window as it does
+            // for a `cmd`-less boot.
+            Event::WorkloadExited if *claimed => {
+                context.emit(Effect::Publish(Notify::Idle));
+                Transition(State::gating(*committed, false))
+            }
             // The dispatch the claim was taken for failed: the slot goes
             // back, and nothing was announced to take back.
             Event::WorkloadReleased if *claimed => Transition(State::gating(*committed, false)),

@@ -10,7 +10,7 @@ use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::tasks::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
 use crate::lifecycle::tasks::pause::release_for_pause;
 use crate::lifecycle::tasks::release::{release_everything, release_runtime_resources};
-use crate::lifecycle::tasks::{TaskFailure, TaskResult};
+use crate::lifecycle::tasks::{CaptureSpec, TaskFailure, TaskResult};
 use crate::sandbox::pause::PAUSE_SNAPSHOT_NAME;
 use crate::sandbox::{CheckpointInfo, SandboxState};
 
@@ -24,11 +24,15 @@ impl ComputerFlows {
     /// past the memory image would diverge from the retained disk overlay.
     /// It is also what names the capture — a pause writes the reserved
     /// internal name, and a user checkpoint brings its own.
-    pub(super) async fn capture(&self, hold: bool) -> TaskResult<CheckpointInfo> {
-        let request = match self.take_capture() {
-            Some(capture) => CheckpointRequest {
-                name: capture.name,
-                labels: capture.labels,
+    pub(super) async fn capture(
+        &self,
+        hold: bool,
+        spec: Option<CaptureSpec>,
+    ) -> TaskResult<CheckpointInfo> {
+        let request = match spec {
+            Some(spec) => CheckpointRequest {
+                name: spec.name,
+                labels: spec.labels,
                 expected_state: SandboxState::Ready,
                 resume_after: !hold,
             },

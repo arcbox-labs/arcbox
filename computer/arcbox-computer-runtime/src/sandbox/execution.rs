@@ -701,7 +701,7 @@ impl SandboxManager {
         // Claim the computer (Ready → Running) before dispatching, so a
         // losing racer never launches a process (same discipline as
         // workload.rs).
-        let slot = self.workload_slot(sandbox_id);
+        let slot = self.workload_slot(sandbox_id)?;
         slot.claim(WorkloadClaim::Api).await?;
 
         let (input_tx, output_rx) = match agent.exec(start).await {
@@ -828,7 +828,7 @@ impl SandboxManager {
     /// The sandbox must exist; an unknown id is `NotFound` rather than an
     /// empty list, so a caller can tell "no executions" from a typo.
     pub fn list_executions(&self, sandbox_id: &SandboxId) -> Result<Vec<ExecutionSnapshot>> {
-        self.get_instance(sandbox_id)?;
+        self.computer(sandbox_id)?;
         let mut snapshots = self.executions.list(sandbox_id);
         snapshots.sort_by(|a, b| {
             a.started_at

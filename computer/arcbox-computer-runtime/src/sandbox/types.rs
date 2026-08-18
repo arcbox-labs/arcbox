@@ -40,11 +40,6 @@ impl NetworkAttachment {
     }
 }
 
-pub(super) struct SandboxBootTask {
-    pub(super) resource_handoff: Option<tokio::sync::oneshot::Receiver<()>>,
-    pub(super) handle: tokio::task::JoinHandle<()>,
-}
-
 // State
 
 /// Lifecycle state of a sandbox.
@@ -218,7 +213,19 @@ pub struct RestoreSandboxSpec {
 
 // Runtime instance
 
-/// Per-sandbox runtime state.
+/// One computer's runtime state: the resources it holds and the timestamps
+/// its readers report, shared between its actor and the sub-tasks the actor
+/// spawns.
+///
+/// Reachable only from the actor that owns the computer and from the flows it
+/// spawns, never from a caller: a verb reaches the computer through its
+/// mailbox and a read through the `watch` snapshot the actor projects from
+/// here. The map lock, the per-computer mutex a caller had to take, and the
+/// generation re-checks every site needed after taking it are all gone.
+///
+/// The `Mutex` around it is not a serialization mechanism — the mailbox is
+/// that. It is what lets a boot hand a `CowHandle` over mid-flight, which is
+/// the one thing an abort must not be able to strand.
 pub struct SandboxInstance {
     /// Unique identifier.
     pub id: SandboxId,
@@ -228,12 +235,11 @@ pub struct SandboxInstance {
     pub labels: HashMap<String, String>,
     /// Original creation spec.
     pub spec: SandboxSpec,
-    /// Current lifecycle state.
+    /// The public lifecycle state, mirrored here from the actor's machine on
+    /// every transition. A sub-task reads it to see a teardown that started
+    /// while it was running — the cooperative half of preemption, which an
+    /// abort alone cannot cover before the resource handoff has landed.
     pub state: SandboxState,
-    /// Serializes Stop/Remove and failure cleanup for this generation.
-    pub(super) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
-    /// In-flight boot, retained until Remove can cancel and join it.
-    pub(super) boot_task: Option<SandboxBootTask>,
     /// The VMM process this sandbox's VM runs on, as the driver prepared
     /// it (`arcbox_vm_driver::PreparedVm`): pid and API socket known,
     /// shared with the boot task, taken by cleanup to kill and reap it.
@@ -327,8 +333,6 @@ impl SandboxInstance {
             labels: spec.labels.clone(),
             spec,
             state: SandboxState::Starting,
-            cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
-            boot_task: None,
             prepared: None,
             handle: None,
             net_identity: None,

@@ -47,9 +47,10 @@ use uuid::Uuid;
 use super::effect::{
     Answer, Durability, Effect, Effects, Notify, RecordEnd, ReleaseScope, Timer, Unconfirmed,
 };
-use super::event::{Event, PauseReason, Provision};
+pub use super::event::PauseReason;
+use super::event::{Event, Provision};
 use super::machine::{ComputerLifecycle, State};
-use super::tasks::{ComputerTasks, TaskFailure};
+use super::tasks::{CaptureSpec, ComputerTasks, TaskFailure};
 use arcbox_vm_driver::VmHandle;
 use arcbox_vm_driver::net::NetworkLease;
 
@@ -91,6 +92,10 @@ type Reply = oneshot::Sender<Result<()>>;
 pub struct Mailbox(mpsc::UnboundedSender<Command>);
 
 impl Mailbox {
+    pub(crate) fn new(sender: mpsc::UnboundedSender<Command>) -> Self {
+        Self(sender)
+    }
+
     /// Asks the actor for something and waits for its answer.
     pub(crate) async fn ask<T>(
         &self,
@@ -140,6 +145,7 @@ pub enum Command {
     },
     /// Capture a user checkpoint; answered with the catalog entry.
     Checkpoint {
+        spec: CaptureSpec,
         reply: oneshot::Sender<Result<CheckpointInfo>>,
     },
     Pause {
@@ -370,6 +376,9 @@ pub struct ComputerActor {
     error: Option<String>,
     /// The pause checkpoint the durable `Paused` write names.
     pause_snapshot_id: Option<String>,
+    /// What the capture the actor is about to spawn records. `None` is the
+    /// pause's own, which names itself.
+    capture: Option<CaptureSpec>,
     /// The provision outcome the `Starting` and atomic-`Ready` writes carry.
     outcome: SandboxProvisionOutcome,
     /// Attributes of the events a transition asks for.
@@ -459,6 +468,7 @@ impl ComputerActor {
             retry_backoff: RETRY_INITIAL,
             error: None,
             pause_snapshot_id: None,
+            capture: None,
             outcome: SandboxProvisionOutcome::default(),
             pause_reason: PauseReason::Requested,
             resume_reason: crate::sandbox::pause_reason::RESUME.to_owned(),

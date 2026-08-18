@@ -1,4 +1,3 @@
-use super::types::action;
 use super::*;
 use crate::lifecycle::actor::WorkloadOutcome;
 
@@ -93,109 +92,13 @@ pub async fn start_run_workload(
     Ok(spawn_exit_watcher(inner_rx, slot))
 }
 
-/// The workload slot as the instance map holds it.
-///
-/// The manager's own implementation until R3 PR-F2 puts the computer's actor
-/// behind the seam; the guarded transitions here are the ones the lifecycle
-/// machine now owns.
-pub(super) struct InstanceSlot {
-    pub(super) id: SandboxId,
-    pub(super) instances: InstanceMap,
-    pub(super) events_tx: broadcast::Sender<SandboxEvent>,
-}
-
-#[async_trait::async_trait]
-impl WorkloadSlot for InstanceSlot {
-    /// Guarded transition into `Running` — the computer's single-workload
-    /// claim.
-    ///
-    /// Taken **before** any command is dispatched into the guest, so a caller
-    /// that loses a concurrent race (or arrives after a `stop` set
-    /// `Stopping`) is rejected with `WrongState` *without* having launched a
-    /// process. A blind assignment here was the original defect: two
-    /// concurrent `Run`s would both dispatch, then one would be told it lost
-    /// — after its command was already executing.
-    async fn claim(&self, claim: WorkloadClaim) -> Result<()> {
-        let arc = self
-            .instances
-            .read()
-            .unwrap()
-            .get(&self.id)
-            .cloned()
-            .ok_or_else(|| VmmError::NotFound(self.id.clone()))?;
-        let mut inst = arc.lock().unwrap();
-        let allowed = inst.state == SandboxState::Ready
-            || (claim == WorkloadClaim::Initial && inst.state == SandboxState::Starting);
-        if !allowed {
-            return Err(VmmError::WrongState {
-                id: self.id.clone(),
-                expected: match claim {
-                    WorkloadClaim::Api => "Ready".into(),
-                    WorkloadClaim::Initial => "Starting or Ready".into(),
-                },
-                actual: inst.state.to_string(),
-            });
-        }
-        inst.state = SandboxState::Running;
-        drop(inst);
-        let _ = self
-            .events_tx
-            .send(SandboxEvent::new(&self.id, action::RUNNING));
-        Ok(())
-    }
-
-    /// Only downgrades while the computer is still `Running` (i.e. this claim
-    /// still owns it). A concurrent `stop` that moved it to `Stopping` owns
-    /// the teardown from there.
-    fn release(&self) {
-        let arc = self.instances.read().unwrap().get(&self.id).cloned();
-        if let Some(arc) = arc {
-            let mut inst = arc.lock().unwrap();
-            if inst.state == SandboxState::Running {
-                inst.state = SandboxState::Ready;
-            }
-        }
-    }
-
-    /// Records the exit and returns the computer to `Ready`. The `Ready` flip
-    /// happens only from `Running`: a concurrent `Stop` owns the `Stopping`
-    /// state, and the exit timestamp signals its drain without reopening the
-    /// computer to new work.
-    fn exited(&self, outcome: WorkloadOutcome) {
-        let arc = self.instances.read().unwrap().get(&self.id).cloned();
-        if let Some(arc) = arc {
-            let mut inst = arc.lock().unwrap();
-            if let WorkloadOutcome::Exited(status) = &outcome {
-                inst.last_exit_status = Some(*status);
-            }
-            inst.last_exited_at = Some(Utc::now());
-            if inst.state == SandboxState::Running {
-                inst.state = SandboxState::Ready;
-            }
-        }
-        let event = SandboxEvent::new(&self.id, action::IDLE);
-        let event = match outcome {
-            WorkloadOutcome::Exited(status) => {
-                let event = event.with_attr("exit_code", &status.conventional_code().to_string());
-                match status {
-                    ExitStatus::Signaled(signal) => event.with_attr("signal", &signal.to_string()),
-                    ExitStatus::Code(_) => event,
-                }
-            }
-            WorkloadOutcome::Broke(error) => event.with_attr("error", &error),
-        };
-        let _ = self.events_tx.send(event);
-    }
-}
-
 impl SandboxManager {
-    /// This computer's workload slot.
-    pub(super) fn workload_slot(&self, id: &SandboxId) -> Arc<dyn WorkloadSlot> {
-        Arc::new(InstanceSlot {
+    /// This computer's workload slot: its actor, behind the seam.
+    pub(super) fn workload_slot(&self, id: &SandboxId) -> Result<Arc<dyn WorkloadSlot>> {
+        Ok(Arc::new(crate::lifecycle::flows::ActorSlot {
             id: id.clone(),
-            instances: Arc::clone(&self.instances),
-            events_tx: self.events_tx.clone(),
-        })
+            mailbox: self.mailbox(id)?,
+        }))
     }
 
     #[allow(
@@ -229,7 +132,7 @@ impl SandboxManager {
         start_run_workload(
             agent.as_ref(),
             start,
-            self.workload_slot(id),
+            self.workload_slot(id)?,
             WorkloadClaim::Api,
         )
         .await

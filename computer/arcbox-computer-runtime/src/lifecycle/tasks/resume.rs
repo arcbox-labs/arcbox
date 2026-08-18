@@ -80,10 +80,6 @@ pub async fn restore_paused(
                     .await?,
             );
         }
-        let ip_address = lease
-            .as_ref()
-            .map(|lease| lease.ip.to_string())
-            .unwrap_or_default();
         let journal = |pid: Option<i32>, cow: Option<&CowHandle>, net: Option<&NetworkLease>| {
             // The lease attaches the way the snapshot says, exactly as
             // the `activate` below does — the same expression, so the
@@ -246,7 +242,6 @@ pub async fn restore_paused(
             net_identity: identity,
             network: lease.take(),
             cow_handle: cow_handle.take(),
-            ip_address,
         })
     }
     .await;

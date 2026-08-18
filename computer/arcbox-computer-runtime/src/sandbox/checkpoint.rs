@@ -1,15 +1,7 @@
 use super::reconcile::JournaledLease;
-use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
-use super::types::action;
+use super::record::{ProvisionIntent, SandboxProvisionOutcome};
 use super::*;
-
-// The restore proper lives with the machine that names it
-// (`Effect::SpawnRestore`); this module still drives it until R3 PR-F2 flips
-// the manager onto the actor.
-use crate::lifecycle::tasks::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
-use crate::lifecycle::tasks::restore::{
-    RestoreFailure, RestoreTimings, RestoreVm, RestoredVm, restore_vm,
-};
+use crate::lifecycle::tasks::CaptureSpec;
 
 /// The image format the reference driver writes, for tests that seed the
 /// catalog by hand. Production never names it: [`checkpoint_impl`] records
@@ -34,16 +26,6 @@ pub(super) struct RestoreRequest {
     pub(super) spec: SandboxSpec,
     /// Which API surface this restore serves; decides the event contract.
     pub(super) origin: RestoreOrigin,
-}
-
-/// Which caller a restore serves.
-pub(super) enum RestoreOrigin {
-    /// The Restore RPC: the sandbox announces itself with READY alone.
-    Restore,
-    /// The warm-create reroute (CORE-77): watchers must see the Create
-    /// contract — CREATED then READY — and the spec's initial `cmd` runs
-    /// after Ready exactly as a cold boot would run it.
-    WarmCreate,
 }
 
 impl SandboxManager {
@@ -81,128 +63,18 @@ impl SandboxManager {
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
-        let computer = self.get_instance(sandbox_id)?;
-        match checkpoint_impl(
-            &computer,
-            &self.snapshots,
-            sandbox_id,
-            CheckpointRequest {
-                name,
-                labels,
-                expected_state: SandboxState::Ready,
-                resume_after: true,
-            },
-        )
-        .await
-        {
-            Ok(info) => Ok(info),
-            Err(CheckpointFailure::Recoverable(error)) => Err(error),
-            // A guest the driver could not resume is unusable: fail the
-            // sandbox the way a failed boot does rather than leave it Ready
-            // with every dial waiting out the budget.
-            Err(CheckpointFailure::Frozen(error)) => {
-                self.fail_frozen_sandbox(sandbox_id, &error).await;
-                Err(error)
-            }
-        }
-    }
-
-    /// Fail a sandbox whose guest is frozen with no way back (see
-    /// [`CheckpointFailure::Frozen`]): kill and reap the VMM, release its
-    /// runtime resources, record and publish `Failed`.
-    async fn fail_frozen_sandbox(&self, id: &SandboxId, error: &VmmError) {
-        let Some((generation, vm_dir)) = self.instances.read().unwrap().get(id).map(|arc| {
-            let inst = arc.lock().unwrap();
-            (inst.record_generation, inst.vm_dir.clone())
-        }) else {
-            return;
-        };
-        super::boot::fail_live_sandbox(
-            id,
-            generation,
-            &error.to_string(),
-            &vm_dir,
-            &self.instances,
-            &self.network,
-            &self.config,
-            &self.cow_manager,
-            &self.records,
-            &self.events_tx,
-        )
-        .await;
-        error!(sandbox_id = %id, error = %error, "checkpoint left the guest frozen; sandbox failed");
+        self.mailbox(sandbox_id)?
+            .ask(sandbox_id, |reply| Command::Checkpoint {
+                spec: CaptureSpec { name, labels },
+                reply,
+            })
+            .await
     }
 
     #[allow(
         clippy::too_many_arguments,
         reason = "restore rollback owns every partially acquired resource"
     )]
-    async fn rollback_restore(
-        &self,
-        id: &str,
-        reservation: IdReservation,
-        error: VmmError,
-        prepared: Option<Arc<dyn PreparedVm>>,
-        network: Option<NetworkLease>,
-        net_invariant: bool,
-        cow_handle: Option<CowHandle>,
-    ) -> VmmError {
-        let arc = reservation.instance();
-        let (vm_dir, pool_slot_id) = {
-            let inst = arc.lock().unwrap();
-            (inst.vm_dir.clone(), inst.pool_slot_id.clone())
-        };
-        let journal_error = super::reconcile::SandboxStateRecord::new(
-            id,
-            prepared.as_deref().and_then(super::journaled_pid),
-            network
-                .as_ref()
-                .map(|lease| JournaledLease::from_snapshot(lease, net_invariant)),
-            cow_handle.as_ref(),
-            &self.config,
-            None,
-        )
-        .map(|record| record.with_pool_slot(pool_slot_id.as_deref()))
-        .and_then(|record| super::reconcile::write_state_record(&vm_dir, &record))
-        .err();
-        {
-            let mut inst = arc.lock().unwrap();
-            inst.state = SandboxState::Failed;
-            inst.error = Some(error.to_string());
-            inst.prepared = prepared;
-            inst.network = network;
-            inst.cow_handle = cow_handle;
-        }
-        reservation.commit();
-
-        let cleanup_error = super::cleanup::remove_sandbox_impl(
-            id,
-            true,
-            &arc,
-            &self.instances,
-            &self.network,
-            &self.events_tx,
-            &self.config,
-            &self.cow_manager,
-            &self.records,
-            &self.snapshots,
-        )
-        .await
-        .err();
-        match (journal_error, cleanup_error) {
-            (None, None) => error,
-            (journal, cleanup) => VmmError::Unavailable(format!(
-                "{error}; restore rollback incomplete{}{}",
-                journal
-                    .map(|journal| format!("; journal: {journal}"))
-                    .unwrap_or_default(),
-                cleanup
-                    .map(|cleanup| format!("; cleanup: {cleanup}"))
-                    .unwrap_or_default()
-            )),
-        }
-    }
-
     /// Restore a new sandbox from a previously created checkpoint.
     ///
     /// The restored sandbox starts in `Ready` state immediately.
@@ -291,24 +163,25 @@ impl SandboxManager {
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
             });
         }
-        let jailer = self.config.firecracker.jailer.as_ref().ok_or_else(|| {
-            VmmError::Config(
-                "checkpoint restore requires jailer isolation; direct mode embeds shared origin paths"
+        if self.config.firecracker.jailer.is_none() {
+            return Err(VmmError::Config(
+                "checkpoint restore requires jailer isolation; direct mode embeds shared origin \
+                 paths"
                     .into(),
-            )
-        })?;
+            ));
+        }
 
-        // Reserve the id atomically so a concurrent restore/create of the same
+        // Claim the id atomically so a concurrent restore/create of the same
         // id fails fast with AlreadyExists instead of both proceeding to set up
         // the deterministic per-id CoW/dm/TAP resources and corrupting each
-        // other (see reserve_id). Unwound on every error path via Drop.
+        // other (see reserve_actor). Unwound on every error path via Drop.
         let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
             .join("sandboxes")
             .join(&new_id);
         let mut restore_spec = request.spec.clone();
         restore_spec.id = Some(new_id.clone());
-        let reservation = super::reserve_id(
-            &self.instances,
+        let reservation = super::reserve_actor(
+            &self.computers,
             &new_id,
             SandboxInstance::new(new_id.clone(), restore_spec.clone(), None, vm_dir.clone()),
         )?;
@@ -330,24 +203,28 @@ impl SandboxManager {
             ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(new_id)),
         };
         let generation = record.generation;
-        // Kept out of the instance for the warm-create origin's initial
-        // workload; the durable copy is redacted once the record leaves the
-        // provisioning phases.
-        let effective_spec = record.effective_spec.clone();
+        let deadlines = Deadlines {
+            ttl: record.ttl_deadline,
+            idle_timeout_seconds: record.effective_spec.idle_timeout_seconds,
+            on_idle: record.effective_spec.on_idle,
+        };
         {
-            let arc = reservation.instance();
-            let mut instance = arc.lock().unwrap();
-            instance.record_generation = Some(generation);
-            instance.labels.clone_from(&record.effective_spec.labels);
-            instance.spec = record.effective_spec;
-            instance.created_at = record.created_at;
-            instance.ttl_deadline = record.ttl_deadline;
+            let mut computer = reservation.runtime().lock().unwrap();
+            computer.record_generation = Some(generation);
+            computer.labels.clone_from(&record.effective_spec.labels);
+            // The effective spec carries the warm-create origin's initial
+            // workload; the durable copy is redacted once the record leaves
+            // the provisioning phases, so the gate reads it from here.
+            computer.spec = record.effective_spec;
+            computer.created_at = record.created_at;
+            computer.ttl_deadline = record.ttl_deadline;
         }
 
         // Reserve network metadata, journal it, then materialize the TAP. This
         // mirrors Create so an agent crash never leaves an unowned interface.
         let lease = if request.network_override {
             match self
+                .services
                 .network
                 .reserve(
                     &VmId::new(new_id.as_str())?,
@@ -400,7 +277,8 @@ impl SandboxManager {
                 // NAT, no guest work); legacy snapshots keep the legacy TAP
                 // shape and are re-addressed over the reconfig RPC below.
                 nic = Some(
-                    self.network
+                    self.services
+                        .network
                         .activate(lease, super::attach_mode(snap_meta.net_invariant))
                         .await?,
                 );
@@ -409,242 +287,67 @@ impl SandboxManager {
         }
         .await;
         if let Err(error) = setup {
-            return Err(self
-                .rollback_restore(
-                    &new_id,
-                    reservation,
-                    error,
-                    None,
-                    lease,
-                    snap_meta.net_invariant,
-                    None,
-                )
-                .await);
-        }
-        // The restore proper (`Effect::SpawnRestore`), which unwinds through
-        // the rollback below rather than in place: the id and its request key
-        // must be free again for a retry, and a warm create must be able to
-        // fall back to a cold boot.
-        let claimed = super::pool::claim_restore_slot(
-            &self.pool,
-            &self.config,
-            &self.cow_manager,
-            &request.snapshot_id,
-        );
-        let restored = restore_vm(RestoreVm {
-            new_id: &new_id,
-            snap_meta: &snap_meta,
-            lease: lease.as_ref(),
-            nic,
-            net_invariant,
-            vm_dir: &vm_dir,
-            jailer,
-            instance: &reservation.instance(),
-            claimed,
-            config: &self.config,
-            cow_manager: &self.cow_manager,
-            driver: &*self.driver,
-            network: &*self.network,
-            agents: &*self.agent,
-        })
-        .await;
-        let RestoredVm {
-            prepared,
-            handle,
-            agent,
-            identity,
-            cow_handle: mut pending_cow,
-            pool_hit,
-            timings,
-        } = match restored {
-            Ok(restored) => restored,
-            Err(RestoreFailure {
-                error,
-                prepared,
-                cow_handle,
-            }) => {
-                return Err(self
-                    .rollback_restore(
-                        &new_id,
-                        reservation,
-                        error,
-                        prepared,
-                        lease.clone(),
-                        snap_meta.net_invariant,
-                        cow_handle,
-                    )
-                    .await);
+            // Nothing has been handed to a computer yet: the claim's drop
+            // frees the id, and the rollback here is the caller's own — the
+            // same shape a create's pre-actor setup failure takes.
+            let abort = self.records.abort_provision(&new_id, generation);
+            let mut unwound = Vec::new();
+            if let Some(reserved) = lease
+                && let Err(release_error) = self.services.network.release(reserved).await
+            {
+                unwound.push(format!("network: {release_error}"));
             }
-        };
-        let RestoreTimings {
-            prepared: t_prepared,
-            staged: t_staged,
-            loaded: t_loaded,
-            guest_cfg: t_guest_cfg,
-        } = timings;
+            if let Err(abort_error) = abort {
+                unwound.push(format!("record: {abort_error}"));
+            }
+            if unwound.is_empty() {
+                return Err(error);
+            }
+            return Err(VmmError::Unavailable(format!(
+                "{error}; restore rollback incomplete: {}",
+                unwound.join("; ")
+            )));
+        }
 
+        // The actor takes it from here: the restore proper, the atomic
+        // `ReadyWithOutcome` commit, the CREATED event a warm create owes,
+        // the gate and READY. A failure before the commit is unwound by the
+        // machine's own force-remove — the id and its request key must be
+        // free again for a retry, and a warm create must be able to fall
+        // back to a cold boot.
+        let (services, timers_enabled) = self.spawn_context();
+        let mailbox = reservation.spawn(super::ActorSpawn {
+            services,
+            timers_enabled,
+            generation: Some(generation),
+            deadlines,
+            launch: Launch::Restore(Box::new(RestoreLaunch {
+                snapshot_id: request.snapshot_id.clone(),
+                snap_meta,
+                lease,
+                nic,
+                started: restore_started,
+            })),
+            seeded: Seeded::Fresh,
+        });
         let outcome = SandboxProvisionOutcome {
             ip_address: ip_address.clone(),
         };
-        let ready_commit = match self.records.transition(
-            &new_id,
-            generation,
-            SandboxTransition::ReadyWithOutcome(outcome),
-        ) {
-            Ok(commit) => commit,
-            Err(error) => {
-                return Err(self
-                    .rollback_restore(
-                        &new_id,
-                        reservation,
-                        error,
-                        Some(Arc::clone(&prepared)),
-                        lease.clone(),
-                        snap_meta.net_invariant,
-                        pending_cow,
-                    )
-                    .await);
-            }
-        };
-
-        let warm_create = matches!(request.origin, RestoreOrigin::WarmCreate);
-
-        // Populate the reserved instance in place, then commit the reservation
-        // so it survives (the placeholder inserted by reserve_id is otherwise
-        // removed on drop). All resources are now tracked on the instance and
-        // torn down via remove_sandbox_impl.
-        let arc = reservation.instance();
-        {
-            let mut inst = arc.lock().unwrap();
-            inst.network.clone_from(&lease);
-            inst.prepared = Some(prepared);
-            inst.handle = Some(handle);
-            inst.net_identity.clone_from(&identity);
-            inst.cow_handle = pending_cow.take();
-            inst.net_invariant = snap_meta.net_invariant;
-            // A warm create that owes the spec's initial cmd stays
-            // `Starting` so the workload slot is reserved for that cmd —
-            // an Inspect-polling client must not see Ready here and steal
-            // it with an exec (the cold-boot tail has the same guard).
-            inst.state = if warm_create && !effective_spec.cmd.is_empty() {
-                SandboxState::Starting
-            } else {
-                SandboxState::Ready
-            };
-            inst.ready_at = Some(Utc::now());
-        }
-        reservation.commit();
-
-        if warm_create {
-            // The Create event contract: watchers see CREATED then READY for
-            // this id in that order, exactly as a cold boot emits them.
-            let _ = self
-                .events_tx
-                .send(SandboxEvent::new(&new_id, action::CREATED));
-        }
-
-        // Initial cmd + ready probe on a warm create (CORE-107): READY
-        // carries the same promise as a probed cold boot. The cmd starts
-        // first through the reserved Initial claim (it is the only listener
-        // source); a prewarmed snapshot's listener lives in the memory
-        // image, so the port form passes near-instantly there. Unlike the
-        // cold-boot path, this runs POST-commit — the cmd needs the
-        // populated instance, and the restore transaction's rollback
-        // machinery ends at reservation.commit — so a probe failure is
-        // unwound with the post-commit verb (force remove), and the
-        // caller's create falls back to a cold boot that probes from
-        // scratch — when the teardown succeeded; a failed teardown leaves
-        // the record Removing, which blocks the same-id retry until startup
-        // reconcile clears it (the warn below carries the id). A crash
-        // mid-probe leaves a durable Ready record whose FC process is dead;
-        // startup reconcile normalizes it, and the create RPC never
-        // returned, so no client ever saw an unprobed READY.
-        let cmd_started = if warm_create && !effective_spec.cmd.is_empty() {
-            super::boot::run_initial_cmd(
-                &new_id,
-                effective_spec.clone(),
-                agent.as_ref(),
-                self.workload_slot(&new_id),
-            )
-            .await
-        } else {
-            false
-        };
-        if warm_create
-            && let Some(probe) = effective_spec.ready_probe.clone()
-            && let Err(probe_error) = super::boot::run_ready_probe(&probe, agent.as_ref()).await
-        {
-            let message = format!("ready probe failed after restore: {probe_error}");
-            if let Err(remove_error) = self.remove_sandbox(&new_id, true).await {
-                warn!(
-                    sandbox_id = %new_id,
-                    error = %remove_error,
-                    "failed to tear down the probe-failed restore"
-                );
-            }
-            return Err(VmmError::FailedPrecondition(message));
-        }
-        let _ = self
-            .events_tx
-            .send(SandboxEvent::new(&new_id, action::READY));
-
-        // Arm the TTL expiry timer if a deadline was set — identity-guarded
-        // so a stale timer can't remove a same-id sandbox re-created after
-        // this one (see expire_sandbox), re-armable via SetLifecycle.
-        self.arm_ttl_timer(&new_id);
-
-        // On a pool hit, spawn_ms covers records + network + the claim
-        // itself (the phases that still ran) and stage_ms is genuinely 0 —
-        // the log never fakes the pre-executed phases. guest_cfg_ms bills
-        // only what stayed awaited (the legacy net-reconfig RPC): invariant
-        // snapshots await nothing and honestly read ~0, since the detached
-        // clock sync is not restore latency.
-        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        info!(
-            sandbox_id = %new_id,
-            snapshot_id = %request.snapshot_id,
-            pool_hit,
-            warm_create,
-            spawn_ms = ms(t_prepared.duration_since(restore_started)),
-            stage_ms = ms(t_staged.duration_since(t_prepared)),
-            load_ms = ms(t_loaded.duration_since(t_staged)),
-            guest_cfg_ms = ms(t_guest_cfg.duration_since(t_loaded)),
-            total_ms = ms(restore_started.elapsed()),
-            "sandbox restored from checkpoint"
-        );
-
-        // Populate/refill the pool for this snapshot in the background:
-        // the successful restore is what makes it eligible for pooling.
-        super::pool::spawn_pool_refill(
-            &self.pool,
-            &self.driver,
-            &self.config,
-            &self.cow_manager,
-            &self.snapshots,
-            &request.snapshot_id,
-        );
-
-        // A failed initial start released the claim (the sandbox is Ready);
-        // give the cmd its one ordinary post-READY attempt, exactly as the
-        // cold-boot tail does. Kept off the timing log above — the workload
-        // is the user's, not restore's.
-        if warm_create && !cmd_started && !effective_spec.cmd.is_empty() {
-            let _ = super::boot::run_initial_cmd(
-                &new_id,
-                effective_spec,
-                agent.as_ref(),
-                self.workload_slot(&new_id),
-            )
+        // A restore's caller waits for READY: that is what makes the sandbox
+        // usable, and what a warm create's own caller was promised.
+        let restored = mailbox
+            .ask(&new_id, |reply| Command::Provision {
+                provision: Provision::Restore {
+                    origin: request.origin,
+                },
+                outcome,
+                reply,
+            })
             .await;
+        match restored {
+            Ok(()) => Ok((new_id, ip_address)),
+            Err(error) => Err(error),
         }
-
-        if let Some(error) = ready_commit.durability_error {
-            return Err(VmmError::AckUnconfirmed {
-                id: new_id,
-                detail: error,
-            });
-        }
-        Ok((new_id, ip_address))
     }
 
     /// List checkpoints, optionally filtered by origin sandbox ID.
