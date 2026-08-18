@@ -83,9 +83,13 @@ fn a_stop_only_acts_while_the_guest_serves() {
                 budget_ms: BUDGET_MS,
             },
         );
+        // `active` is the superstate that serves: `gating` projects `Running`
+        // once the boot's own cmd has claimed the slot, but its launch is
+        // still in flight, so the actor defers the stop (`pending_stop`)
+        // rather than the machine acting on it.
         let acts = matches!(
-            node.state.to_public(),
-            SandboxState::Ready | SandboxState::Running
+            node.state,
+            State::Ready {} | State::Running {} | State::Checkpointing {}
         );
         assert_eq!(
             !effects.is_empty(),

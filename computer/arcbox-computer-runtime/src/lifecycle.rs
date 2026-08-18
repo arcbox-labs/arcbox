@@ -60,7 +60,10 @@ mod effect;
 mod event;
 mod machine;
 mod projection;
-mod tasks;
+/// `pub` in the lint's spelling only: `lifecycle` is a private module, so
+/// this reaches the crate and no further. The flows it holds are still
+/// driven from `sandbox` until PR-F2 flips the manager onto the actor.
+pub mod tasks;
 
 #[cfg(test)]
 mod tests;

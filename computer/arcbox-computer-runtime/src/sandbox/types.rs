@@ -35,7 +35,7 @@ pub struct NetworkAttachment {
 
 impl NetworkAttachment {
     /// This attachment as the crash journal records it.
-    pub(super) fn journaled(&self) -> super::reconcile::JournaledLease<'_> {
+    pub(crate) fn journaled(&self) -> super::reconcile::JournaledLease<'_> {
         super::reconcile::JournaledLease::cold_boot(&self.lease, self.invariant_identity)
     }
 }
@@ -223,7 +223,7 @@ pub struct SandboxInstance {
     /// Unique identifier.
     pub id: SandboxId,
     /// Durable lifecycle record generation.
-    pub(super) record_generation: Option<Uuid>,
+    pub(crate) record_generation: Option<Uuid>,
     /// User-supplied labels.
     pub labels: HashMap<String, String>,
     /// Original creation spec.

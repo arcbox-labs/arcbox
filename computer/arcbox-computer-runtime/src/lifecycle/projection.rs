@@ -18,8 +18,11 @@ impl State {
             | Self::Staging {}
             | Self::Booting {}
             | Self::Restoring {}
-            | Self::Gating { .. }
             | Self::Resuming {} => SandboxState::Starting,
+            // A gate whose reservation the boot's own `cmd` has taken is
+            // already running that workload, which is what a caller sees.
+            Self::Gating { claimed: false, .. } => SandboxState::Starting,
+            Self::Gating { claimed: true, .. } => SandboxState::Running,
             Self::Ready {} | Self::Checkpointing {} => SandboxState::Ready,
             Self::Running {} => SandboxState::Running,
             Self::Capturing {} | Self::Releasing {} => SandboxState::Pausing,
@@ -51,7 +54,7 @@ impl State {
             Self::Staging {} | Self::Booting {} => Some(PersistPhase::Starting),
             // A cold boot arrives here still `Starting` and commits `Ready`
             // after the probe; a restore arrives already committed.
-            Self::Gating { committed } => Some(if committed {
+            Self::Gating { committed, .. } => Some(if committed {
                 PersistPhase::Ready
             } else {
                 PersistPhase::Starting

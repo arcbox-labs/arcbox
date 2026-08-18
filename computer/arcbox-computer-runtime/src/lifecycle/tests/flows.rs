@@ -78,7 +78,13 @@ fn a_restore_commits_ready_in_one_hop_before_its_gate() {
 
     let (state, effects) = step(&mut sm, &mut context, &Event::Restored);
     assert_eq!(state.to_public(), SandboxState::Starting);
-    assert!(matches!(state, State::Gating { committed: true }));
+    assert!(matches!(
+        state,
+        State::Gating {
+            committed: true,
+            claimed: false
+        }
+    ));
     assert_eq!(
         effects,
         vec![
@@ -109,11 +115,11 @@ fn a_restore_commits_ready_in_one_hop_before_its_gate() {
 
 #[test]
 fn the_boots_own_cmd_claims_the_slot_the_gate_reserved_for_it() {
-    // The reservation `gating` names is this claim, and today
-    // `workload::claim_workload` takes it by flipping the instance to
-    // `Running` (publishing RUNNING; the exit publishes IDLE). The machine
-    // swallows it instead, so nothing carries the claim past `Gated` — the
-    // actor has to, when the boot tail moves onto the machine.
+    // The reservation `gating` names is this claim: `start_run_workload`
+    // takes it before READY, publishing RUNNING, and the workload's exit
+    // publishes IDLE. So the claim has to survive the gate — landing in
+    // `ready` instead would leave `WorkloadExited` with nothing to do and
+    // drop the IDLE publish.
     let (mut sm, mut context) = reach(&[
         Event::Provision(Provision::Boot { warm: false }),
         Event::ResourcesHandedOff,
@@ -126,8 +132,52 @@ fn the_boots_own_cmd_claims_the_slot_the_gate_reserved_for_it() {
             claim: WorkloadClaim::Initial,
         },
     );
-    assert!(matches!(state, State::Gating { committed: false }));
+    assert!(matches!(
+        state,
+        State::Gating {
+            committed: false,
+            claimed: true
+        }
+    ));
+    // A cmd-carrying boot reads `Running` from here on, exactly as the
+    // instance does today — an Inspect during the gate cannot see `Ready`
+    // and steal the slot.
+    assert_eq!(state.to_public(), SandboxState::Running);
+    assert_eq!(effects, vec![Effect::Publish(Notify::Running)]);
+
+    // A second initial claim is the same workload twice: refused, for the
+    // actor to answer.
+    let (_, effects) = step(
+        &mut sm,
+        &mut context,
+        &Event::ClaimWorkload {
+            claim: WorkloadClaim::Initial,
+        },
+    );
     assert!(effects.is_empty());
+
+    // READY then announces a computer that is already running its own cmd,
+    // and the idle window opens only when that workload exits.
+    let (state, effects) = step(&mut sm, &mut context, &Event::Gated);
+    assert!(matches!(state, State::Running {}));
+    assert_eq!(
+        effects,
+        vec![
+            persist(
+                PersistPhase::Ready,
+                Durability::Report(Unconfirmed::Unavailable)
+            ),
+            Effect::Publish(Notify::Ready),
+            Effect::Answer(Answer::Ready),
+        ]
+    );
+
+    let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadExited);
+    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(
+        effects,
+        vec![Effect::Publish(Notify::Idle), Effect::ArmTimer(Timer::Idle)]
+    );
 }
 
 #[test]

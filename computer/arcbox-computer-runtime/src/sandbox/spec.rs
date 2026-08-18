@@ -33,7 +33,7 @@ use crate::sandbox::{NetworkAttachment, SandboxSpec, ipv4, netmask};
 /// adapter's addressing. A caller who pinned its own `ip=` keeps it. The
 /// guest-side vm-agent parses the parameter back via
 /// `KernelIpParam::from_str` to derive the DNS nameserver.
-pub(super) fn build_vm_spec(
+pub fn build_vm_spec(
     id: &str,
     spec: &SandboxSpec,
     net: Option<&NetworkAttachment>,

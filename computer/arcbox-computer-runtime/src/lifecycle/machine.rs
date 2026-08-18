@@ -113,7 +113,7 @@ impl ComputerLifecycle {
         match event {
             Event::AgentReady => {
                 context.emit(Effect::SpawnGate);
-                Transition(State::gating(false))
+                Transition(State::gating(false, false))
             }
             _ => Super,
         }
@@ -128,7 +128,7 @@ impl ComputerLifecycle {
                 });
                 context.emit(Effect::ArmTimer(Timer::Ttl));
                 context.emit(Effect::SpawnGate);
-                Transition(State::gating(true))
+                Transition(State::gating(true, false))
             }
             // A restore that fails before its commit is rolled back, not
             // failed in place: `rollback_restore` force-removes the record and
@@ -147,12 +147,16 @@ impl ComputerLifecycle {
     /// The VM is up and READY is withheld: the warm publish freezes the guest
     /// and the initial `cmd` owns the workload slot, so a client acting on an
     /// early READY would hit a stopped guest or steal that slot.
+    ///
+    /// `claimed` is that slot: the boot's own `cmd` takes it here, *before*
+    /// READY, and it must survive the gate — the workload it started is still
+    /// running when READY lands, and its exit is what publishes IDLE.
     #[state(superstate = "computer")]
     #[allow(
         clippy::trivially_copy_pass_by_ref,
         reason = "statig passes state-local storage by reference"
     )]
-    fn gating(committed: &bool, event: &Event, context: &mut Effects) -> Outcome {
+    fn gating(committed: &bool, claimed: &bool, event: &Event, context: &mut Effects) -> Outcome {
         match event {
             Event::Gated => {
                 // A cold boot commits `Ready` here, after the probe, so a
@@ -168,15 +172,26 @@ impl ComputerLifecycle {
                 }
                 context.emit(Effect::Publish(Notify::Ready));
                 context.emit(Effect::Answer(Answer::Ready));
-                context.emit(Effect::ArmTimer(Timer::Idle));
-                Transition(State::ready())
+                if *claimed {
+                    // READY announces a computer that is already running its
+                    // own `cmd`: the idle window opens when that workload
+                    // exits, not here.
+                    Transition(State::running())
+                } else {
+                    context.emit(Effect::ArmTimer(Timer::Idle));
+                    Transition(State::ready())
+                }
             }
-            // The slot is reserved for this boot's own `cmd`; an API claim
-            // cannot reach a computer that has not announced READY.
+            // The slot is reserved for this boot's own `cmd` — an API claim
+            // cannot reach a computer that has not announced READY, and a
+            // second initial claim is the same one workload twice.
             Event::ClaimWorkload {
                 claim: WorkloadClaim::Initial,
+            } if !*claimed => {
+                context.emit(Effect::Publish(Notify::Running));
+                Transition(State::gating(*committed, true))
             }
-            | Event::Remove { force: false } => Handled,
+            Event::ClaimWorkload { .. } | Event::Remove { force: false } => Handled,
             _ => Super,
         }
     }

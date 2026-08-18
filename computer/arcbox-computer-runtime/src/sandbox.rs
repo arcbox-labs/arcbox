@@ -42,7 +42,7 @@ use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::template_catalog::TemplateCatalog;
 
-mod boot;
+pub(crate) mod boot;
 mod checkpoint;
 mod cleanup;
 mod execution;
@@ -53,7 +53,7 @@ pub(crate) mod policy;
 mod pool;
 pub(crate) mod reconcile;
 pub(crate) mod record;
-mod spec;
+pub(crate) mod spec;
 mod templates;
 #[cfg(test)]
 mod testing;
@@ -568,7 +568,7 @@ pub(super) fn reconcile_capability(network: &dyn GuestNetwork) -> &dyn NetworkRe
 /// The driver's `Prepare` capability, which [`SandboxManager::with_environment`]
 /// requires — the boot, pool, and restore flows all spawn the VMM before
 /// there is a guest to run on it.
-pub(super) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
+pub(crate) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
     driver
         .prepare()
         .expect("SandboxManager::with_environment requires the driver's Prepare capability")
@@ -576,7 +576,7 @@ pub(super) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
 
 /// The VMM's pid as the crash journal records it: what a restart sweep
 /// kills before tearing the sandbox's other resources down.
-pub(super) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
+pub(crate) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
     prepared
         .record()
         .process
@@ -585,7 +585,7 @@ pub(super) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
 
 /// The isolation every sandbox VMM runs under: the jailer's, when one is
 /// configured; none otherwise (direct mode).
-pub(super) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
+pub(crate) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
     config
         .firecracker
         .jailer
