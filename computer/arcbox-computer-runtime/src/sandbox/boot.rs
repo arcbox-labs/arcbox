@@ -127,45 +127,74 @@ pub struct StageError {
     pub cow_handle: Option<CowHandle>,
 }
 
-/// Stage a snapshot's rootfs into a jailer chroot: dm-snapshot + mknod
-/// when device-mapper is available, full copy otherwise.
+/// The root disk as the VM will see it, and the overlay behind it.
+pub struct StagedRootfs {
+    /// Where the disk is now — the path the spec must name for it.
+    pub path: PathBuf,
+    /// The copy-on-write overlay the disk is a view of, when that path was
+    /// taken; `None` after the full-copy fallback.
+    pub cow_handle: Option<CowHandle>,
+}
+
+/// Stage `rootfs` as the computer's root disk: a copy-on-write device when
+/// device-mapper gives one, a private copy of the template otherwise.
 ///
-/// `owner_id` keys the dm/CoW resource names (the sandbox id, or a pool
+/// The decision is the runtime's and cannot be left to the driver: it is
+/// made from whether `setup` produced a device *and* whether the driver
+/// could bring that device into the VM's area, and the fallback has to
+/// tear the overlay down and re-journal before it copies. Everything else
+/// about where the disk goes — the name it lands under, whether a
+/// confinement exists at all — belongs to [`Staging`] and is not decided
+/// here.
+///
+/// `owner_id` keys the dm/CoW resource names (the computer id, or a pool
 /// slot id for pre-warmed slots). `journal` persists the caller's crash
 /// record whenever CoW resources appear or disappear, so reconciliation
-/// can always identify them. Returns the CoW handle when the dm path was
-/// taken; the staged rootfs is `/rootfs.ext4` inside the chroot either way.
+/// can always identify them.
 pub async fn stage_rootfs_cow_or_copy(
     cow_manager: &CowManager,
-    chroot: &Path,
+    staging: &dyn Staging,
     owner_id: &str,
     rootfs: &str,
-    uid: u32,
-    gid: u32,
     journal: &(dyn Fn(Option<&CowHandle>) -> Result<()> + Sync),
-) -> std::result::Result<Option<CowHandle>, StageError> {
+) -> std::result::Result<StagedRootfs, StageError> {
     let fail = |error: VmmError, cow_handle: Option<CowHandle>| StageError { error, cow_handle };
+    let copy = async || {
+        staging
+            .stage_disk(ROOTFS_DISK_ID, DiskSource::Image(Path::new(rootfs)))
+            .await
+            .map_err(VmmError::from)
+    };
     match cow_manager.setup(owner_id, rootfs).await {
         Ok(handle) => {
             if let Err(error) = journal(Some(&handle)) {
                 return Err(fail(error, Some(handle)));
             }
-            match stage_rootfs_device_for_jailer(chroot, &handle.dm_device, uid, gid).await {
-                Ok(_) => Ok(Some(handle)),
+            match staging
+                .stage_disk(
+                    ROOTFS_DISK_ID,
+                    DiskSource::Device(Path::new(&handle.dm_device)),
+                )
+                .await
+            {
+                Ok(path) => Ok(StagedRootfs {
+                    path,
+                    cow_handle: Some(handle),
+                }),
                 Err(e) => {
                     debug!(
                         owner_id,
                         error = %e,
-                        "mknod failed, falling back to rootfs copy"
+                        "the overlay could not be brought into the vm's area, falling back to a rootfs copy"
                     );
                     if let Err(error) = cow_manager.teardown_checked(&handle).await {
                         return Err(fail(error.into(), Some(handle)));
                     }
                     journal(None).map_err(|error| fail(error, None))?;
-                    stage_rootfs_copy_for_jailer(chroot, rootfs, uid, gid)
-                        .await
-                        .map_err(|error| fail(error.into(), None))?;
-                    Ok(None)
+                    Ok(StagedRootfs {
+                        path: copy().await.map_err(|error| fail(error, None))?,
+                        cow_handle: None,
+                    })
                 }
             }
         }
@@ -174,12 +203,12 @@ pub async fn stage_rootfs_cow_or_copy(
             debug!(
                 owner_id,
                 error = %e,
-                "dm-snapshot unavailable, copying rootfs into chroot"
+                "dm-snapshot unavailable, staging a copy of the rootfs"
             );
-            stage_rootfs_copy_for_jailer(chroot, rootfs, uid, gid)
-                .await
-                .map_err(|error| fail(error.into(), None))?;
-            Ok(None)
+            Ok(StagedRootfs {
+                path: copy().await.map_err(|error| fail(error, None))?,
+                cow_handle: None,
+            })
         }
     }
 }
