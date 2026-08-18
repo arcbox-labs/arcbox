@@ -77,13 +77,12 @@ the driver), the loop-device tooling behind
 stock-distro one; an ioctl implementation is a consumer's few dozen
 lines) and the netfilter
 rendering of the identity-invariant translation behind
-`arcbox_tap_net::PacketFilter` (`IptablesLegacy` is the reference;
-a stock distro on the nft backend supplies an nftables one — legacy and
-nft rulesets are mutually invisible, so this is a seam, not a path); the
-path seams follow.
+`arcbox_tap_net::PacketFilter` (`IptablesLegacy` is the reference,
+`Nftables` the stock-distro one — legacy and nft rulesets are mutually
+invisible, so this is a seam, not a path); the path seams follow.
 
 The sandbox network itself — the IPv4 pool, the per-sandbox TAP, the
-invariant NAT (eBPF TCX or iptables), and the quarantine ledger — is
+invariant NAT (eBPF TCX or netfilter), and the quarantine ledger — is
 [`arcbox-tap-net`](../../virt/arcbox-tap-net), the Linux adapter of the
 `arcbox-vm-driver` `GuestNetwork` port; `arcbox_computer_runtime::network`
 re-exports it and `NetworkManager` is an alias of its `TapNetwork` until

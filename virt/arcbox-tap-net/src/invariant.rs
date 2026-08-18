@@ -27,14 +27,16 @@
 //!   destination through a per-sandbox table holding `GUEST_IP dev <tap>`.
 //!
 //! The rule set above is the contract; how it is expressed in the host's
-//! netfilter framework is the [`PacketFilter`] seam. The reference
-//! implementation is iptables-legacy, because that is
+//! netfilter framework is the [`PacketFilter`] seam. The reference implementation is iptables-legacy, because that is
 //! what the System VM ships (2026-08, boot-assets rootfs + arcbox kernel
 //! config): no nftables userland, no `tc`, and a kernel without
 //! `NET_ACT_NAT` / `NETMAP` / `CONNMARK` — what it does enable (`IP_NF_NAT`,
 //! `IP_NF_MANGLE`, `NETFILTER_XT_MARK`, `IP_MULTIPLE_TABLES`) is exactly
-//! that rule set. The sysctls, the fwmark fib rule, and the per-sandbox
-//! table route are framework-independent and installed here.
+//! that rule set. A stock distro is the other way round — nft is the live
+//! ruleset and a legacy rule would be installed into one nothing consults —
+//! so it composes [`Nftables`](super::packet_filter::Nftables) instead. The
+//! sysctls, the fwmark fib rule, and the per-sandbox table route are
+//! framework-independent and installed here.
 //!
 //! The TAP itself keeps today's point-to-point shape with one change: its
 //! local address is the fixed [`GUEST_GATEWAY`] instead of the pool gateway.

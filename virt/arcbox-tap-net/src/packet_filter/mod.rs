@@ -22,18 +22,23 @@
 //! iptables-legacy and nothing else, so [`IptablesLegacy`] is the reference
 //! implementation. A stock distro is usually on the nft backend, and legacy
 //! and nft rulesets are mutually invisible — rules that exist but do not
-//! take effect — so a composer there supplies an nftables implementation
-//! rather than a path to a different `iptables` binary. Removal must
-//! tolerate absence: teardown runs for partially activated and crash-
-//! recovered TAPs alike.
+//! take effect — so a composer there supplies [`Nftables`] rather than a path
+//! to a different `iptables` binary. Removal must tolerate absence: teardown
+//! runs for partially activated and crash-recovered TAPs alike.
+//!
+//! The two backends render the same five points as the same seven rules, in
+//! the same order; the `renderings_agree_on_the_contract` test is what keeps
+//! them a pair rather than two drifting dialects.
 //!
 //! [`GUEST_IP`]: super::invariant::GUEST_IP
 
 mod iptables_legacy;
+mod nftables;
 
 use std::net::Ipv4Addr;
 
 pub use iptables_legacy::IptablesLegacy;
+pub use nftables::Nftables;
 
 use crate::error::Result;
 
@@ -56,9 +61,9 @@ use crate::error::Result;
 ///   attempt every rule, tolerate ones that are already absent (partial
 ///   installs, crash replays, legacy TAPs), and report the failures it could
 ///   not clear together rather than stopping at the first. An implementation
-///   whose install is atomic satisfies this trivially; one that applies
-///   rules one at a time ([`IptablesLegacy`]) leaves the earlier ones in
-///   place and relies on that tolerance.
+///   whose install is atomic ([`Nftables`]) satisfies this trivially; one
+///   that applies rules one at a time ([`IptablesLegacy`]) leaves the earlier
+///   ones in place and relies on that tolerance.
 pub trait PacketFilter: Send + Sync {
     /// Install the translation for `tap` ↔ `pool_ip`.
     fn install_translation(&self, tap: &str, pool_ip: Ipv4Addr) -> Result<()>;
@@ -70,5 +75,7 @@ pub trait PacketFilter: Send + Sync {
 /// Tag stamped on every translation rule, marking them as arcbox-owned for
 /// forensics (`iptables -S`, `nft list ruleset`).
 ///
-/// [`IptablesLegacy`] uses it bare and deletes by exact rule spec.
+/// [`IptablesLegacy`] uses it bare and deletes by exact rule spec;
+/// [`Nftables`] qualifies it per TAP (`arcbox-nat:<tap>`) and deletes by it,
+/// because nft can only delete a rule by handle.
 const RULE_COMMENT: &str = "arcbox-nat";

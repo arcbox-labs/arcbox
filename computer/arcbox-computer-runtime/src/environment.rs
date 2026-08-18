@@ -65,7 +65,11 @@ pub struct SandboxEnvironment {
     pub cow_manager: Option<Arc<CowManager>>,
     /// How the identity-invariant translation is expressed in the host's
     /// netfilter framework ([`crate::network::packet_filter`]) — used by
-    /// the iptables datapath and as the eBPF datapath's fallback.
+    /// the filter datapath and as the eBPF datapath's fallback. The
+    /// reference is iptables-legacy; a composer on a stock distro supplies
+    /// `Nftables::discover()?`, because legacy and nft rulesets are mutually
+    /// invisible and pointing this at another `iptables` binary would install
+    /// rules that never take effect.
     pub packet_filter: Arc<dyn PacketFilter>,
 }
 
