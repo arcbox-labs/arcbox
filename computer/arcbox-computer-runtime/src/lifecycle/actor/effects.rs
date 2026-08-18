@@ -262,6 +262,12 @@ impl ComputerActor {
             .confirmed("computer lifecycle update")
     }
 
+    /// Lets the next journal clear through: the write that blocked it has
+    /// since been confirmed.
+    pub(super) fn unblock_journal(&mut self) {
+        self.journal_blocked = false;
+    }
+
     pub(super) fn clear_journal(&mut self) {
         if std::mem::take(&mut self.journal_blocked) {
             return;

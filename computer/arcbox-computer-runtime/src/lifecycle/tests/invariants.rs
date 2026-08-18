@@ -287,3 +287,49 @@ fn the_idle_policy_only_fires_on_a_ready_computer() {
     );
     assert!(matches!(state, State::Removing {}));
 }
+
+/// An idle expiry can only reach a computer that is still idle.
+///
+/// `expire_sandbox` took a `force` flag for exactly this: the TTL cap
+/// destroys regardless of activity, while the idle detector passed
+/// `force = false` so a non-forced removal would refuse a computer that had
+/// turned busy between the timer firing and the teardown claiming it. The
+/// actor closes that window rather than guarding it — the expiry and the
+/// claim are both messages to the same task, so whichever arrives second
+/// finds the state the first left. From `ready` the two flags emit the
+/// identical teardown, so the surviving encoding is the forced one.
+#[test]
+fn an_idle_expiry_cannot_reach_a_busy_computer() {
+    for action in [IdleAction::Kill, IdleAction::Pause] {
+        for node in explore() {
+            let (mut sm, mut context) = reach(&node.path);
+            let before = *sm.state();
+            let (after, effects) = step(&mut sm, &mut context, &Event::IdleExpired { action });
+            if matches!(before, State::Ready {}) {
+                assert_ne!(before, after, "{before:?} must act on an idle expiry");
+                continue;
+            }
+            assert_eq!(before, after, "{before:?} acted on an idle expiry");
+            assert!(effects.is_empty(), "{before:?} acted on an idle expiry");
+        }
+    }
+}
+
+/// And a `Kill` expiry from `ready` is the same teardown a forced remove is.
+#[test]
+fn an_idle_kill_is_the_teardown_a_forced_remove_runs() {
+    let (mut sm, mut context) = ready_machine();
+    let (state, killed) = step(
+        &mut sm,
+        &mut context,
+        &Event::IdleExpired {
+            action: IdleAction::Kill,
+        },
+    );
+    assert!(matches!(state, State::Removing {}));
+
+    let (mut sm, mut context) = ready_machine();
+    let (state, removed) = step(&mut sm, &mut context, &Event::Remove { force: true });
+    assert!(matches!(state, State::Removing {}));
+    assert_eq!(killed, removed);
+}

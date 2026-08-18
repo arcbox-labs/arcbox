@@ -79,8 +79,13 @@ impl ComputerActor {
                 }
                 match self.public() {
                     SandboxState::Stopping => self.waiters.push((Answer::Stopped, reply)),
+                    // `stop_sandbox`'s retry. A `Stopped` write that was
+                    // visible but not confirmed kept the crash journal, and
+                    // a second stop is the only thing that finishes it —
+                    // answering `Ok` would leave a journal naming resources
+                    // that are already gone for the next startup sweep.
                     SandboxState::Stopped => {
-                        let _ = reply.send(Ok(()));
+                        let _ = reply.send(self.finish_stop());
                     }
                     _ => {
                         let _ = reply.send(Err(self.wrong_state("Ready, Running, or Stopping")));
@@ -175,6 +180,22 @@ impl ComputerActor {
                 self.dispatch(machine, Event::VmExited).await;
             }
         }
+    }
+
+    /// Re-confirms a computer that is already stopped, and drops the crash
+    /// journal its first stop could not.
+    fn finish_stop(&mut self) -> Result<()> {
+        let Some(generation) = self.generation else {
+            return Ok(());
+        };
+        self.records
+            .transition(&self.id, generation, SandboxTransition::Stopped)?
+            .confirmed("computer stop retry")?;
+        // The write just confirmed, so whatever blocked the first clear is
+        // answered.
+        self.unblock_journal();
+        self.clear_journal();
+        Ok(())
     }
 
     pub(super) fn answer(&mut self, answer: Answer) {
