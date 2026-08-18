@@ -255,7 +255,7 @@ pub struct SandboxInstance {
     /// agent the exec and file paths build would otherwise describe the
     /// guest differently from the one its boot built. Cleared with the
     /// handle.
-    pub(super) net_identity: Option<NetworkIdentity>,
+    pub(crate) net_identity: Option<NetworkIdentity>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
     pub vm_dir: PathBuf,
     /// When the sandbox record was created.

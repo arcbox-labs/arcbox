@@ -65,7 +65,7 @@ pub mod reason {
 /// Scans by the reserved name rather than the recorded snapshot id so a
 /// checkpoint leaked by an interrupted pause (committed to the catalog but
 /// never recorded durably) is cleaned up too.
-pub(super) fn delete_pause_snapshots(
+pub fn delete_pause_snapshots(
     snapshots: &crate::snapshot::SnapshotCatalog,
     sandbox_id: &str,
 ) -> Result<()> {

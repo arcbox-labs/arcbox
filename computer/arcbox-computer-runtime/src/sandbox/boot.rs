@@ -287,7 +287,7 @@ pub(super) async fn boot_sandbox(
                 }
             }
             let cleanup_complete = if updated_current {
-                match super::cleanup::release_runtime_resources(
+                match crate::lifecycle::tasks::release::release_runtime_resources(
                     &id,
                     value.as_ref().unwrap(),
                     &network,
@@ -448,16 +448,21 @@ pub(super) async fn fail_live_sandbox_locked(
         inst.error = Some(message.to_owned());
         persisted
     };
-    let cleanup_complete =
-        match super::cleanup::release_runtime_resources(id, instance, network, config, cow_manager)
-            .await
-        {
-            Ok(()) => true,
-            Err(error) => {
-                error!(sandbox_id = %id, error = %error, "sandbox failure cleanup incomplete");
-                false
-            }
-        };
+    let cleanup_complete = match crate::lifecycle::tasks::release::release_runtime_resources(
+        id,
+        instance,
+        network,
+        config,
+        cow_manager,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            error!(sandbox_id = %id, error = %error, "sandbox failure cleanup incomplete");
+            false
+        }
+    };
     if failure_record_visible && cleanup_complete {
         if let Err(error) = super::reconcile::clear_state_record(vm_dir) {
             error!(sandbox_id = %id, error = %error, "sandbox failure journal cleanup is not durable");

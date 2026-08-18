@@ -613,7 +613,7 @@ impl SandboxManager {
         // Release the VMM (already exited, or never booted), TAP/IP, CoW
         // device, and chroot; the record itself stays inspectable until Remove.
         let stop_commit = {
-            super::cleanup::release_runtime_resources(
+            crate::lifecycle::tasks::release::release_runtime_resources(
                 id,
                 &instance,
                 &self.network,

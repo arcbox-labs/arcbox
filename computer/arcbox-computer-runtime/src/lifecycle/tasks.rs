@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 pub mod boot;
 pub mod checkpoint;
 pub mod pause;
+pub mod release;
 pub mod restore;
 pub mod resume;
 

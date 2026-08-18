@@ -47,8 +47,8 @@ pub async fn release_for_pause(
     cow_manager: &CowManager,
     network: &dyn GuestNetwork,
 ) -> Result<()> {
-    sandbox::cleanup::kill_sandbox_process(id, arc).await?;
-    let owner = sandbox::cleanup::chroot_owner(id, arc);
+    super::release::kill_sandbox_process(id, arc).await?;
+    let owner = super::release::chroot_owner(id, arc);
 
     // Disk: detach the overlay but keep its COW file; the copy-mode
     // fallback parks the staged rootfs (the sandbox's actual disk) in
@@ -90,7 +90,7 @@ pub async fn release_for_pause(
         }
     }
 
-    sandbox::cleanup::remove_jailer_chroot(id, arc, config).await?;
+    super::release::remove_jailer_chroot(id, arc, config).await?;
     // Nothing slot-keyed survives this point.
     arc.lock().unwrap().pool_slot_id = None;
     Ok(())
