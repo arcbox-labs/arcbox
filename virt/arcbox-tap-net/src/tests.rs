@@ -293,13 +293,16 @@ fn durable_quarantine_blocks_reuse_until_startup_and_generation_finalize() {
     assert_eq!(reused.ip_address, allocation.ip_address);
 }
 
-/// A `VmId` may start with a dot, so its marker is a dotfile; the loader
-/// must still read it — it skips staging leftovers by their `.tmp` shape,
-/// not by the leading dot — or the address silently returns to the pool
-/// on restart while the marker lingers unlisted.
+/// A crash mid-write leaves a staging file (`.{id}-{uuid}.tmp`) beside the
+/// markers, and the loader must skip it by that shape while still reading
+/// the real marker — or the quarantined address silently returns to the
+/// pool on restart while the marker lingers unlisted.
+///
+/// The id itself carries no dot to confuse this: `VmId` refuses one, so the
+/// leading dot in the directory belongs to the staging writer alone.
 #[test]
 #[cfg(not(target_os = "linux"))]
-fn quarantine_of_a_dotted_id_survives_reload() {
+fn quarantine_survives_reload_past_a_staging_leftover() {
     let root = tempfile::tempdir().unwrap();
     let quarantine = root.path().join("network-quarantine");
     let network = || {
@@ -317,8 +320,8 @@ fn quarantine_of_a_dotted_id_survives_reload() {
     first.mark_reconciled();
     let startup = first.startup_cleanup_token().unwrap();
     first.finalize_startup_cleanup(&startup).unwrap();
-    let allocation = first.reserve(".hidden").unwrap();
-    first.quarantine_checked(".hidden", &allocation).unwrap();
+    let allocation = first.reserve("hidden").unwrap();
+    first.quarantine_checked("hidden", &allocation).unwrap();
     // A staging leftover of the shape a crash mid-write leaves behind.
     std::fs::write(quarantine.join(".hidden-stale.tmp"), b"{").unwrap();
     drop(first);
@@ -326,7 +329,7 @@ fn quarantine_of_a_dotted_id_survives_reload() {
     let restarted = network();
     assert_eq!(
         restarted.pending_quarantines(),
-        vec![(".hidden".to_owned(), allocation.cleanup_token)]
+        vec![("hidden".to_owned(), allocation.cleanup_token)]
     );
     assert!(
         restarted
