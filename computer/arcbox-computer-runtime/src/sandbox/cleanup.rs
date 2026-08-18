@@ -13,21 +13,9 @@ use super::*;
 mod tests {
     use arcbox_vm_driver::ShutdownMode;
 
-    use crate::lifecycle::tasks::release::release_runtime_resources;
-
     use super::*;
     use crate::snapshot_cow::{CowOptions, CowTestProbe};
-    use arcbox_vm_driver::testkit::FakeNetwork;
     use std::os::unix::fs::PermissionsExt;
-
-    fn instance(id: &str) -> Arc<Mutex<ComputerRuntime>> {
-        Arc::new(Mutex::new(ComputerRuntime::new(
-            id.to_owned(),
-            SandboxSpec::default(),
-            None,
-            PathBuf::from("/tmp/x"),
-        )))
-    }
 
     /// A sandbox this process adopted rather than booted holds a handle and
     /// no `PreparedVm`, and Remove must still reach its VMM: the old code
@@ -220,45 +208,5 @@ mod tests {
         assert!(!vm_dir.exists());
 
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn release_removes_the_chroot_of_an_adopted_pool_slot() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let chroot_base = data_dir.path().join("jailer");
-        let mut config = VmmConfig::default();
-        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
-        config.firecracker.jailer = Some(crate::config::JailerConfig {
-            binary: "/usr/bin/jailer".into(),
-            uid: 0,
-            gid: 0,
-            chroot_base_dir: Some(chroot_base.to_string_lossy().into_owned()),
-            netns: None,
-            new_pid_ns: false,
-            cgroup_version: None,
-            parent_cgroup: None,
-            resource_limits: vec![],
-        });
-        let slot_chroot = chroot_root(&config.firecracker.binary, &chroot_base, "pool-slot");
-        let sandbox_chroot = chroot_root(&config.firecracker.binary, &chroot_base, "job");
-        std::fs::create_dir_all(&slot_chroot).unwrap();
-        std::fs::create_dir_all(&sandbox_chroot).unwrap();
-
-        let arc = instance("job");
-        arc.lock().unwrap().pool_slot_id = Some("pool-slot".into());
-        let config = Arc::new(config);
-        let network: Arc<dyn GuestNetwork> = Arc::new(FakeNetwork::new());
-        let cow_manager =
-            Arc::new(CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap());
-
-        release_runtime_resources("job", &arc, &network, &config, &cow_manager)
-            .await
-            .unwrap();
-
-        assert!(!slot_chroot.parent().unwrap().exists());
-        assert!(
-            sandbox_chroot.exists(),
-            "the sandbox-id chroot belongs to nobody here and must not be touched"
-        );
     }
 }

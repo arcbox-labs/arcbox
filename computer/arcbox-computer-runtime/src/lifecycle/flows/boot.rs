@@ -110,7 +110,6 @@ impl ComputerFlows {
                 &self.id,
                 &ticket,
                 &self.computer,
-                &services.config,
                 &services.cow_manager,
                 // The gate holds `Starting` for its whole duration — the
                 // reservation the boot's own `cmd` is owed — so the

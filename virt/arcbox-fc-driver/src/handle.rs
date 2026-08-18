@@ -148,6 +148,17 @@ impl VmHandle for FcHandle {
         self.process.events()
     }
 
+    /// Stops the VM — and, for one this driver adopted rather than
+    /// spawned, takes its jail with it.
+    ///
+    /// A VM's area belongs to the grip that owns its process. A spawned
+    /// VM has a [`FcPrepared`](crate::FcPrepared) for that, and
+    /// [`PreparedVm::discard`](arcbox_vm_driver::PreparedVm::discard)
+    /// removes the jail there; an adopted VM's jail outlived the process
+    /// that made it, and this handle is the only grip on it, so the jail
+    /// would otherwise be left behind by every teardown. A handle that
+    /// was handed on ([`Detach`]) keeps its hands off: the next owner
+    /// gets the VM and the area it runs in.
     async fn shutdown(&self, mode: ShutdownMode) -> Result<ExitStatus> {
         let status = match mode {
             ShutdownMode::Kill => self.process.kill().await?,
@@ -174,6 +185,12 @@ impl VmHandle for FcHandle {
             },
         };
         self.unlink_vsock();
+        if let Some(jail) = self.layout.jail()
+            && self.process.is_adopted()
+            && !self.process.is_detached()
+        {
+            jail.remove().await?;
+        }
         Ok(status)
     }
 

@@ -14,12 +14,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arcbox_fc_driver::jail::{
-    chroot_root, link_or_copy_for_jailer, move_file, stage_kernel_for_jailer,
-    stage_rootfs_device_for_jailer,
-};
 use arcbox_vm_driver::net::{GuestNetwork, NetworkLease};
-use arcbox_vm_driver::{IsolationSpec, NicSpec, PreparedVm, VmDriver, VmHandle, VmId};
+use arcbox_vm_driver::{DiskSource, IsolationSpec, NicSpec, PreparedVm, VmDriver, VmHandle, VmId};
 use tracing::warn;
 
 use crate::agent::{ClockSync, GuestAgentFactory};
@@ -28,16 +24,16 @@ use crate::error::{Result, VmmError};
 use crate::sandbox::pause::{PAUSED_ROOTFS_FILE, ResumeFailure, ResumedRuntime};
 use crate::sandbox::reconcile::JournaledLease;
 use crate::sandbox::spec::restore_spec;
-use crate::sandbox::{self, SandboxId};
+use crate::sandbox::{self, ROOTFS_DISK_ID, SandboxId};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
 /// Re-create the runtime of a paused sandbox from its checkpoint.
 ///
-/// On failure every re-created resource is unwound (the VMM killed,
-/// overlay detached with its COW kept, copy-mode rootfs parked again,
-/// fresh network quarantined, chroot and journal removed) so the caller
-/// can park the sandbox back at `Paused`.
+/// On failure every re-created resource is unwound (a copy-mode rootfs
+/// parked again, the VMM killed — which takes the area it ran in — the
+/// overlay detached with its COW kept, the fresh network quarantined, the
+/// journal removed) so the caller can park the sandbox back at `Paused`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the resume spans the resource set its computer owns"
@@ -54,12 +50,6 @@ pub async fn restore_paused(
     network: &dyn GuestNetwork,
     agents: &dyn GuestAgentFactory,
 ) -> std::result::Result<ResumedRuntime, ResumeFailure> {
-    let fc_cfg = &config.firecracker;
-    let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-    let cr = chroot_root(&fc_cfg.binary, base, id);
-    let uid = jailer.uid;
-    let gid = jailer.gid;
-
     // Incrementally-owned resources for the unwind. The lease is held
     // apart from the NIC because it is owed to the pool from `reserve`
     // on, and the journal write between the two can fail — an unwind
@@ -103,73 +93,60 @@ pub async fn restore_paused(
             );
         }
 
-        // Fresh chroot + VMM process, prepared through the driver.
+        // A fresh VMM, prepared through the driver.
         let spawned: Arc<dyn PreparedVm> = Arc::from(
             sandbox::prepare_capability(driver)
                 .prepare(&VmId::new(id)?, &IsolationSpec::try_from(jailer)?, vm_dir)
                 .await?,
         );
         let pid = sandbox::journaled_pid(&*spawned);
-        prepared = Some(spawned);
+        let staging = sandbox::staging_capability(&*spawned);
+        prepared = Some(Arc::clone(&spawned));
         journal(pid, None, lease.as_ref())?;
 
-        // Stage kernel + the retained disk + snapshot files.
+        // Bring the kernel, the retained disk and the checkpoint into the
+        // area the fresh VMM reads from.
         if let Some(kernel) = snap_meta.kernel_path.as_deref() {
-            stage_kernel_for_jailer(&cr, kernel, uid, gid).await?;
+            staging.stage_kernel(Path::new(kernel)).await?;
         }
         let preserved_cow = sandbox::preserved_cow_file(config, id);
-        if preserved_cow.exists() {
-            let rootfs = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
+        let rootfs = if preserved_cow.exists() {
+            let template = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
                 VmmError::Snapshot(format!(
                     "pause checkpoint for {id} records no rootfs template"
                 ))
             })?;
-            let handle = cow_manager.reattach(id, rootfs).await?;
+            let handle = cow_manager.reattach(id, template).await?;
             journal(pid, Some(&handle), lease.as_ref())?;
-            stage_rootfs_device_for_jailer(&cr, &handle.dm_device, uid, gid).await?;
+            let staged = staging
+                .stage_disk(
+                    ROOTFS_DISK_ID,
+                    DiskSource::Device(Path::new(&handle.dm_device)),
+                )
+                .await?;
             cow_handle = Some(handle);
+            staged
         } else {
+            // The copy-mode disk the pause parked outside: handed over, so
+            // it is moved back in rather than duplicated — it is the size
+            // of a guest rootfs, and nothing else holds a copy of it.
             let parked = vm_dir.join(PAUSED_ROOTFS_FILE);
             if !parked.exists() {
                 return Err(VmmError::Snapshot(format!(
                     "paused sandbox {id} has neither a preserved overlay nor a parked rootfs"
                 )));
             }
-            let staged = cr.join("rootfs.ext4");
-            move_file(&parked, &staged).await.map_err(VmmError::Io)?;
-            nix::unistd::chown(
-                &staged,
-                Some(nix::unistd::Uid::from_raw(uid)),
-                Some(nix::unistd::Gid::from_raw(gid)),
-            )
-            .map_err(|e| VmmError::Process(format!("chown parked rootfs: {e}")))?;
-        }
+            staging
+                .stage_disk(ROOTFS_DISK_ID, DiskSource::Handover(&parked))
+                .await?
+        };
+        let image = staging
+            .stage_checkpoint(&sandbox::catalogued_checkpoint(snap_meta)?)
+            .await?;
 
-        let snap_in_chroot = cr.join("snapshots").join(&snap_meta.id);
-        std::fs::create_dir_all(&snap_in_chroot).map_err(VmmError::Io)?;
-        nix::unistd::chown(
-            &snap_in_chroot,
-            Some(nix::unistd::Uid::from_raw(uid)),
-            Some(nix::unistd::Gid::from_raw(gid)),
-        )
-        .map_err(|e| VmmError::Process(format!("chown snap dir: {e}")))?;
-        link_or_copy_for_jailer(
-            &snap_meta.vmstate_path,
-            &snap_in_chroot.join("vmstate"),
-            uid,
-            gid,
-        )
-        .await?;
-        if let Some(ref mem) = snap_meta.mem_path
-            && mem.exists()
-        {
-            link_or_copy_for_jailer(mem, &snap_in_chroot.join("mem"), uid, gid).await?;
-        }
-
-        // Load the snapshot on the prepared VMM: the retained disk in
-        // this jail, eth0 retargeted onto the fresh TAP.
-        let image = sandbox::checkpoint_image(snap_in_chroot, &snap_meta.format);
-        let restore = restore_spec(id, &cr, nic.clone(), IsolationSpec::try_from(jailer)?)?;
+        // Load the snapshot on the prepared VMM: the retained disk where
+        // staging put it, eth0 retargeted onto the fresh TAP.
+        let restore = restore_spec(id, rootfs, nic.clone(), IsolationSpec::try_from(jailer)?)?;
         let handle: Arc<dyn VmHandle> = Arc::from(
             prepared
                 .as_ref()
@@ -252,7 +229,6 @@ pub async fn restore_paused(
             let unwound = unwind_resume(
                 id,
                 vm_dir,
-                jailer,
                 config,
                 cow_manager,
                 network,
@@ -262,6 +238,45 @@ pub async fn restore_paused(
             )
             .await;
             Err(ResumeFailure { error, unwound })
+        }
+    }
+}
+
+/// Take a copy-mode rootfs back out of the VM's area and park it in
+/// `vm_dir`, restoring what a clean pause leaves behind.
+///
+/// This runs before the discard, for the same reason the pause release's
+/// does: the staged rootfs *is* the paused computer's disk, it sits in an
+/// area the discard is entitled to take with it, and only the grip being
+/// discarded can reach in there. Nothing is writing it — a resume that got
+/// as far as a running guest dropped that handle on its way out, and a
+/// dropped handle SIGKILLs.
+///
+/// `false` when the disk could not be parked, which is what stops the
+/// computer being recorded as cleanly `Paused`. Unlike the pause release,
+/// *nothing staged* is a normal outcome here and not a refusal: a resume
+/// that failed before it handed the parked disk over never moved it, so
+/// the file is still sitting in `vm_dir` where a clean pause left it.
+async fn park_copy_mode_rootfs(
+    id: &SandboxId,
+    vm_dir: &Path,
+    config: &VmmConfig,
+    prepared: Option<&Arc<dyn PreparedVm>>,
+) -> bool {
+    let Some(prepared) = prepared else {
+        return true;
+    };
+    if sandbox::preserved_cow_file(config, id).exists() {
+        return true;
+    }
+    match sandbox::staging_capability(&**prepared)
+        .unstage_disk(ROOTFS_DISK_ID, &vm_dir.join(PAUSED_ROOTFS_FILE))
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(sandbox_id = %id, error = %error, "resume unwind: parking rootfs failed");
+            false
         }
     }
 }
@@ -277,7 +292,6 @@ pub async fn restore_paused(
 async fn unwind_resume(
     id: &SandboxId,
     vm_dir: &Path,
-    jailer: &JailerConfig,
     config: &VmmConfig,
     cow_manager: &CowManager,
     network: &dyn GuestNetwork,
@@ -285,7 +299,7 @@ async fn unwind_resume(
     cow_handle: Option<CowHandle>,
     net_lease: Option<NetworkLease>,
 ) -> bool {
-    let mut clean = true;
+    let mut clean = park_copy_mode_rootfs(id, vm_dir, config, prepared.as_ref()).await;
 
     if let Some(prepared) = prepared {
         // SIGKILL plus the driver's bounded wait for the reaper.
@@ -302,34 +316,10 @@ async fn unwind_resume(
         clean = false;
     }
 
-    // Copy-mode fallback: park the staged rootfs back in vm_dir so the
-    // retained disk state survives the chroot removal below. The order is
-    // load-bearing in the same way the pause release's is — the staged
-    // rootfs *is* the paused computer's disk and it lives inside the jail,
-    // so a chroot removed before this point turns the `exists()` guard
-    // false, the move is skipped, and the computer is left unresumable.
-    let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-    let cr = chroot_root(&config.firecracker.binary, base, id);
-    let staged = cr.join("rootfs.ext4");
-    if !sandbox::preserved_cow_file(config, id).exists() && staged.exists() {
-        if let Err(error) = move_file(&staged, &vm_dir.join(PAUSED_ROOTFS_FILE)).await {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: parking rootfs failed");
-            clean = false;
-        }
-    }
-
     if let Some(lease) = net_lease
         && let Err(error) = network.quarantine(lease).await
     {
         warn!(sandbox_id = %id, error = %error, "resume unwind: network quarantine failed");
-        clean = false;
-    }
-
-    if let Some(parent) = cr.parent()
-        && let Err(error) = tokio::fs::remove_dir_all(parent).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: chroot removal failed");
         clean = false;
     }
 

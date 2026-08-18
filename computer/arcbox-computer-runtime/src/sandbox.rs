@@ -13,18 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use arcbox_fc_driver::jail::{
-    SnapshotFiles, api_socket_path, chroot_root, stage_kernel_for_jailer,
-    stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
-};
+use arcbox_fc_driver::jail::{api_socket_path, chroot_root};
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::net::{
     AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy,
     NetworkReconcile,
 };
 use arcbox_vm_driver::{
-    CheckpointFormat, CheckpointImage, CheckpointKind, IsolationSpec, NicSpec, Prepare, PreparedVm,
-    VmDriver, VmHandle, VmId,
+    CheckpointFormat, CheckpointImage, CheckpointKind, DiskSource, IsolationSpec, NicSpec, Prepare,
+    PreparedVm, Staging, VmDriver, VmHandle, VmId,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
@@ -43,7 +40,7 @@ use crate::lifecycle::event::{Provision, RestoreOrigin};
 use crate::lifecycle::flows::{BootLaunch, ComputerFlows, ComputerServices, Launch, RestoreLaunch};
 use crate::lifecycle::runtime::{ComputerRuntime, Runtime};
 use crate::network::NetworkManager;
-use crate::snapshot::SnapshotCatalog;
+use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::template_catalog::TemplateCatalog;
 
@@ -71,6 +68,7 @@ pub use execution::{
     ExecutionChannel, ExecutionOutput, ExecutionSnapshot, ExecutionSpec, StdinState,
 };
 pub use pause::reason as pause_reason;
+pub(crate) use spec::ROOTFS_DISK_ID;
 pub(crate) use types::NetworkAttachment;
 pub use types::{
     CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
@@ -161,6 +159,12 @@ impl SandboxManager {
                 driver.prepare().is_none(),
                 "prepare",
                 "the boot and pool flows spawn the VMM ahead of the guest",
+            ),
+            (
+                !capabilities.staging,
+                "staging",
+                "every flow brings the files its computer boots from into the area the VMM \
+                 can reach, and pause takes the disk back out of it",
             ),
             // The last hard-wired transport assumption in this layer: every
             // agent implementation the crate ships reaches its guest through
@@ -624,6 +628,16 @@ pub(crate) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
         .expect("SandboxManager::with_environment requires the driver's Prepare capability")
 }
 
+/// The prepared VM's `Staging` capability, which
+/// [`SandboxManager::with_environment`] requires — every flow that puts a
+/// guest on a VMM first brings that guest's files into the area the VMM can
+/// reach, and pause takes its disk back out of it.
+pub(crate) fn staging_capability(prepared: &dyn PreparedVm) -> &dyn Staging {
+    prepared
+        .staging()
+        .expect("SandboxManager::with_environment requires the driver's Staging capability")
+}
+
 /// The VMM's pid as the crash journal records it: what a restart sweep
 /// kills before tearing the sandbox's other resources down.
 pub(crate) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
@@ -652,15 +666,29 @@ pub(crate) fn preserved_cow_file(config: &VmmConfig, id: &str) -> PathBuf {
         .join(format!("arcbox-cow-{id}.img"))
 }
 
-/// A catalogued checkpoint as the driver reads it back: the directory the
-/// files were staged into (`vmstate` + `mem`) and the format the catalog
-/// recorded at capture — legacy entries default to the Firecracker format.
-pub(super) fn checkpoint_image(dir: PathBuf, format: &str) -> CheckpointImage {
-    CheckpointImage {
-        dir,
-        format: CheckpointFormat::new(format),
+/// A checkpoint as the catalog holds it, which is what
+/// [`Staging::stage_checkpoint`] takes and what the driver reads back.
+///
+/// The catalog writes one directory per checkpoint and puts `vmstate` and
+/// `mem` in it, so the image is that directory — read off the meta's own
+/// `vmstate_path` rather than recomputed from the catalog's layout, which
+/// this layer does not own. Its name is what the driver stages the
+/// checkpoint under, and a restore reproduces that name from the same
+/// image, so the two cannot drift. The format is the one the catalog
+/// recorded at capture; legacy entries default to the Firecracker format.
+pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointImage> {
+    let dir = meta.vmstate_path.parent().ok_or_else(|| {
+        VmmError::Snapshot(format!(
+            "checkpoint {} records a vmstate at {}, which is in no directory",
+            meta.id,
+            meta.vmstate_path.display()
+        ))
+    })?;
+    Ok(CheckpointImage {
+        dir: dir.to_path_buf(),
+        format: CheckpointFormat::new(&meta.format),
         kind: CheckpointKind::Full,
-    }
+    })
 }
 
 /// Stock sandbox id budget: what [`max_sandbox_id_len`] computes for the

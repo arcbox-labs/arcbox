@@ -111,7 +111,6 @@ pub async fn publish_after_boot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
     computer: &Arc<Mutex<ComputerRuntime>>,
-    config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,
 ) -> Result<()> {
@@ -123,15 +122,8 @@ pub async fn publish_after_boot(
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let published = publish_warm_snapshot(
-        sandbox_id,
-        ticket,
-        computer,
-        config,
-        cow_manager,
-        expected_state,
-    )
-    .await;
+    let published =
+        publish_warm_snapshot(sandbox_id, ticket, computer, cow_manager, expected_state).await;
     ticket.cache.end_publish(&ticket.key);
     match published {
         Ok(Some(snapshot_id)) => {
@@ -187,7 +179,6 @@ async fn publish_warm_snapshot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
     computer: &Arc<Mutex<ComputerRuntime>>,
-    config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,
 ) -> std::result::Result<Option<String>, PublishFailure> {
@@ -231,13 +222,8 @@ async fn publish_warm_snapshot(
     for entry in entries {
         let replaced = entry.key == ticket.key.hex() && entry.snapshot_id != info.snapshot_id;
         if replaced || evicted.contains(&entry.key) {
-            super::pool::drain_pool_slots(
-                &ticket.pool,
-                config,
-                cow_manager,
-                Some(&entry.snapshot_id),
-            )
-            .await;
+            super::pool::drain_pool_slots(&ticket.pool, cow_manager, Some(&entry.snapshot_id))
+                .await;
             if let Err(error) = ticket.snapshots.delete_by_id(&entry.snapshot_id) {
                 warn!(
                     snapshot_id = %entry.snapshot_id,
@@ -297,7 +283,6 @@ mod tests {
             &"warm-ok".to_owned(),
             &ticket("a"),
             &instance,
-            &manager.config,
             &manager.cow_manager,
             SandboxState::Ready,
         )
@@ -312,7 +297,6 @@ mod tests {
             &"warm-frozen".to_owned(),
             &ticket("b"),
             &instance,
-            &manager.config,
             &manager.cow_manager,
             SandboxState::Ready,
         )

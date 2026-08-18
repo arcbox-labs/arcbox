@@ -15,13 +15,10 @@
 //! crash window with no journal at all, and the slot-keyed VMM, chroot and
 //! CoW invisible to reconciliation.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use arcbox_fc_driver::jail::{
-    SnapshotFiles, chroot_root, stage_kernel_for_jailer, stage_snapshot_files,
-};
 use arcbox_vm_driver::net::{GuestNetwork, NetworkIdentity, NetworkLease};
 use arcbox_vm_driver::{
     CheckpointImage, IsolationSpec, NicSpec, PreparedVm, VmDriver, VmHandle, VmId,
@@ -36,6 +33,7 @@ use crate::sandbox;
 use crate::sandbox::boot::{StageError, stage_rootfs_cow_or_copy};
 use crate::sandbox::pool::PreparedSlot;
 use crate::sandbox::reconcile::JournaledLease;
+use crate::sandbox::spec::restore_spec;
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
@@ -124,8 +122,6 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
         agents,
     } = inputs;
 
-    let fc_cfg = &config.firecracker;
-
     // Track resources that need cleanup if anything between this point
     // and the final instance registration fails:
     //
@@ -139,11 +135,10 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
     // reconfiguration as the only restore work. From the claim on, the
     // slot's resources are owned by this restore and unwind through
     // rollback_restore like freshly created ones.
-    let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
     let pool_hit = claimed.is_some();
-    // The id the jail is keyed by (the slot's for a pool hit), which is
-    // also the id the driver prepared the VMM under.
-    let (prepared, resource_owner, chroot, staged_checkpoint, t_prepared, t_staged) =
+    // The id this restore's resources are keyed by (the slot's for a pool
+    // hit), which is also the id the driver prepared the VMM under.
+    let (prepared, resource_owner, rootfs, staged_checkpoint, t_prepared, t_staged) =
         if let Some(slot) = claimed {
             // Record the adopting sandbox's slot id first: failure cleanup
             // and crash reconciliation key the chroot and dm/CoW teardown
@@ -165,6 +160,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                 slot_id,
                 prepared: slot_prepared,
                 cow_handle,
+                rootfs,
                 image,
                 vm_dir: slot_vm_dir,
             } = slot;
@@ -211,12 +207,11 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             // Both phases were pre-executed by the slot; the timestamps
             // collapse so the completion log reports them honestly as ~0.
             let t_claimed = std::time::Instant::now();
-            let chroot = chroot_root(&fc_cfg.binary, base, &slot_id);
-            (slot_prepared, slot_id, chroot, image, t_claimed, t_claimed)
+            (slot_prepared, slot_id, rootfs, image, t_claimed, t_claimed)
         } else {
-            // Each jailer restore owns a distinct chroot; the driver's
-            // prepared VMM spawns into it.
-            let cr = chroot_root(&fc_cfg.binary, base, new_id);
+            // Each jailer restore owns a VMM of its own; the driver spawns
+            // it and stages this restore's files into the area it reads
+            // from.
             let spawned: Result<Arc<dyn PreparedVm>> = async {
                 let prepared = sandbox::prepare_capability(driver)
                     .prepare(
@@ -263,60 +258,58 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
 
             let t_prepared = std::time::Instant::now();
 
-            // In jailer mode the restored FC process also runs inside a
-            // chroot and cannot access the catalog's host-absolute paths.
-            // Stage the snapshot files into the new sandbox's chroot and use
-            // chroot-relative paths.
-            let setup_result: Result<CheckpointImage> = async {
-                let jc = jailer;
+            // The restored VMM reads none of the catalog's host-absolute
+            // paths: everything it loads is brought into the area it can
+            // reach first, and named by where staging put it.
+            let setup_result: Result<(PathBuf, CheckpointImage)> = async {
+                let staging = sandbox::staging_capability(&*spawned_prepared);
 
-                // Stage kernel (always hard-linked or copied, ~16MB).
+                // The kernel. A snapshot load names only the vmstate and
+                // the mem file, so this stage may well be vestigial — but
+                // nothing on the restore path proves that, so it is
+                // brought in exactly as before rather than dropped on a
+                // guess. (The *boot* path's kernel stage did go: rendering
+                // a boot stages the kernel its spec names.)
                 if let Some(k) = snap_meta.kernel_path.as_deref() {
-                    stage_kernel_for_jailer(&cr, k, jc.uid, jc.gid).await?;
+                    staging.stage_kernel(Path::new(k)).await?;
                 }
 
-                // Stage rootfs: dm-snapshot + mknod with full-copy fallback,
-                // mirroring the boot path so restored sandboxes get the same
-                // CoW semantics (block-level template sharing, sparse COW).
-                if let Some(r) = snap_meta.rootfs_path.as_deref() {
-                    match stage_rootfs_cow_or_copy(
-                        cow_manager,
-                        &cr,
-                        new_id,
-                        r,
-                        jc.uid,
-                        jc.gid,
-                        &journal,
-                    )
-                    .await
+                // The disk: a copy-on-write device with a full-copy
+                // fallback, mirroring the boot path so a restored computer
+                // gets the same CoW semantics (block-level template
+                // sharing, sparse COW).
+                let rootfs = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
+                    VmmError::Snapshot(format!(
+                        "checkpoint {} records no rootfs template; there is no disk to restore \
+                         it onto",
+                        snap_meta.id
+                    ))
+                })?;
+                let staged =
+                    match stage_rootfs_cow_or_copy(cow_manager, staging, new_id, rootfs, &journal)
+                        .await
                     {
-                        Ok(cow) => pending_cow = cow,
+                        Ok(staged) => staged,
                         Err(StageError { error, cow_handle }) => {
                             pending_cow = cow_handle;
                             return Err(error);
                         }
-                    }
-                }
+                    };
+                pending_cow = staged.cow_handle;
 
-                // Stage vmstate + mem into the chroot. Both are read-only to
-                // FC (mem is mapped MAP_PRIVATE on load), so the root jailer
-                // hard-links them instead of copying — the mem file is the
-                // sandbox's full memory size (CORE-75).
-                let files = SnapshotFiles {
-                    id: &snap_meta.id,
-                    vmstate: &snap_meta.vmstate_path,
-                    mem: snap_meta.mem_path.as_deref(),
-                };
-                stage_snapshot_files(&cr, &files, jc.uid, jc.gid).await?;
-                Ok(sandbox::checkpoint_image(
-                    cr.join("snapshots").join(&snap_meta.id),
-                    &snap_meta.format,
-                ))
+                // The checkpoint itself. Its mem file is the guest's whole
+                // memory (CORE-75), which is why bringing it in is the
+                // expensive half of a restore and why a pre-warmed slot
+                // that already paid for it restores in milliseconds.
+                let image = staging
+                    .stage_checkpoint(&sandbox::catalogued_checkpoint(snap_meta)?)
+                    .await?;
+                Ok((staged.path, image))
             }
             .await;
 
-            let image = match setup_result {
-                Ok(image) => image,
+            let (rootfs, image) = match setup_result {
+                Ok(staged) => staged,
                 Err(error) => {
                     return Err(RestoreFailure {
                         error,
@@ -328,7 +321,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             (
                 spawned_prepared,
                 new_id.to_owned(),
-                cr,
+                rootfs,
                 image,
                 t_prepared,
                 std::time::Instant::now(),
@@ -347,12 +340,12 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
     // nothing is told how to reach it by address in the meantime.
     let settled_on_load = snap_meta.net_invariant.then(|| identity.clone()).flatten();
 
-    // Load the image on the prepared VMM: the disk is the rootfs staged
-    // into the owner's jail, eth0 lands on the fresh TAP.
+    // Load the image on the prepared VMM: the disk is the rootfs staging
+    // put in the VMM's reach, eth0 lands on the fresh TAP.
     let loaded: Result<(Arc<dyn VmHandle>, Arc<dyn GuestAgent>)> = async {
-        let restore = sandbox::spec::restore_spec(
+        let restore = restore_spec(
             &resource_owner,
-            &chroot,
+            rootfs,
             nic.clone(),
             IsolationSpec::try_from(jailer)?,
         )?;

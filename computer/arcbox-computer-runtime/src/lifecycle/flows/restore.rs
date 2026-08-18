@@ -57,12 +57,7 @@ impl ComputerFlows {
             )));
         };
 
-        let claimed = pool::claim_restore_slot(
-            &services.pool,
-            &services.config,
-            &services.cow_manager,
-            &snapshot_id,
-        );
+        let claimed = pool::claim_restore_slot(&services.pool, &services.cow_manager, &snapshot_id);
         let restored = restore_vm(RestoreVm {
             new_id: &self.id,
             snap_meta: &snap_meta,

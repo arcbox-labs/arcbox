@@ -24,20 +24,22 @@ use crate::snapshot::SnapshotMeta;
 /// `pool::SlotPool`.
 pub use super::policy::pool::SlotPool;
 
-/// A fully staged restore slot: jailer chroot prepared, the VMM spawned
-/// (API socket up, nothing loaded yet), kernel + vmstate + mem staged,
+/// A fully staged restore slot: the VMM spawned (API socket up, nothing
+/// loaded yet), kernel + vmstate + mem staged into the area it reads from,
 /// dm-snapshot of the rootfs created.
 pub struct PreparedSlot {
-    /// Slot id (`pool-<uuid>`): the chroot, dm/CoW names, and crash
+    /// Slot id (`pool-<uuid>`): the VM, its dm/CoW names, and its crash
     /// journal are keyed by it.
     pub slot_id: String,
-    /// The VMM the driver prepared, chrooted into the slot's jail and
-    /// waiting for the snapshot load.
+    /// The VMM the driver prepared, waiting for the snapshot load.
     pub prepared: Arc<dyn PreparedVm>,
     /// dm-snapshot of the snapshot's rootfs (`None` = copy fallback).
     pub cow_handle: Option<CowHandle>,
-    /// The checkpoint as staged into the slot's chroot, ready for the
-    /// driver to load.
+    /// The root disk as staging left it — the path the restore's spec must
+    /// name, which is not the caller's to recompute.
+    pub rootfs: PathBuf,
+    /// The checkpoint as staged for this slot, ready for the driver to
+    /// load.
     pub image: CheckpointImage,
     /// Slot runtime dir (`sandboxes/pool-<uuid>`) holding its crash journal.
     pub vm_dir: PathBuf,
@@ -81,11 +83,12 @@ pub(super) async fn prepare_slot(
     )?;
 
     match stage_slot(driver, config, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
-        Ok((prepared, cow_handle, image)) => Ok(PreparedSlot {
+        Ok(staged) => Ok(PreparedSlot {
             slot_id,
-            prepared,
-            cow_handle,
-            image,
+            prepared: staged.prepared,
+            cow_handle: staged.cow_handle,
+            rootfs: staged.rootfs,
+            image: staged.image,
             vm_dir,
         }),
         Err(mut failure) => {
@@ -111,12 +114,9 @@ pub(super) async fn prepare_slot(
                 },
                 None => true,
             };
+            // The discard above took the area the slot's files were staged
+            // into with it, so what is left to unwind is the journal.
             if fc_unwound && cow_unwound {
-                let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                let chroot = chroot_root(&fc_cfg.binary, base, &slot_id);
-                if let Some(parent) = chroot.parent() {
-                    let _ = tokio::fs::remove_dir_all(parent).await;
-                }
                 if let Err(error) = reconcile::clear_state_record(&vm_dir) {
                     warn!(slot_id, error = %error, "failed slot prepare kept its journal");
                 } else {
@@ -144,7 +144,13 @@ impl From<VmmError> for SlotFailure {
     }
 }
 
-type StagedSlot = (Arc<dyn PreparedVm>, Option<CowHandle>, CheckpointImage);
+/// What [`stage_slot`] pre-executes, and [`PreparedSlot`] then carries.
+struct StagedSlot {
+    prepared: Arc<dyn PreparedVm>,
+    cow_handle: Option<CowHandle>,
+    rootfs: PathBuf,
+    image: CheckpointImage,
+}
 
 async fn stage_slot(
     driver: &dyn VmDriver,
@@ -155,10 +161,6 @@ async fn stage_slot(
     slot_id: &str,
     vm_dir: &Path,
 ) -> std::result::Result<StagedSlot, SlotFailure> {
-    let fc_cfg = &config.firecracker;
-    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-    let cr = chroot_root(&fc_cfg.binary, base, slot_id);
-
     let prepared: Arc<dyn PreparedVm> = Arc::from(
         super::prepare_capability(driver)
             .prepare(
@@ -185,37 +187,51 @@ async fn stage_slot(
         return Err(carry(error, Some(prepared), None));
     }
 
+    // Everything the restore would otherwise pay for on its critical path,
+    // brought into the area this slot's VMM reads from — under the same
+    // names a restore renders, so claiming the slot stages nothing twice.
+    let staging = super::staging_capability(&*prepared);
     if let Some(kernel) = snapshot.kernel_path.as_deref() {
-        if let Err(error) = stage_kernel_for_jailer(&cr, kernel, jc.uid, jc.gid).await {
+        if let Err(error) = staging.stage_kernel(Path::new(kernel)).await {
             return Err(carry(error.into(), Some(prepared), None));
         }
     }
 
-    let mut cow_handle = None;
-    if let Some(rootfs) = snapshot.rootfs_path.as_deref() {
-        match stage_rootfs_cow_or_copy(cow_manager, &cr, slot_id, rootfs, jc.uid, jc.gid, &journal)
-            .await
-        {
-            Ok(handle) => cow_handle = handle,
+    let Some(rootfs) = snapshot.rootfs_path.as_deref() else {
+        return Err(carry(
+            VmmError::Snapshot(format!(
+                "checkpoint {} records no rootfs template; there is no disk to pre-warm a slot \
+                 with",
+                snapshot.id
+            )),
+            Some(prepared),
+            None,
+        ));
+    };
+    let staged =
+        match stage_rootfs_cow_or_copy(cow_manager, staging, slot_id, rootfs, &journal).await {
+            Ok(staged) => staged,
             Err(StageError {
                 error,
                 cow_handle: leaked,
             }) => return Err(carry(error, Some(prepared), leaked)),
-        }
-    }
+        };
 
-    let files = SnapshotFiles {
-        id: &snapshot.id,
-        vmstate: &snapshot.vmstate_path,
-        mem: snapshot.mem_path.as_deref(),
+    let image = match super::catalogued_checkpoint(snapshot) {
+        Ok(catalogued) => staging
+            .stage_checkpoint(&catalogued)
+            .await
+            .map_err(Into::into),
+        Err(error) => Err(error),
     };
-    match stage_snapshot_files(&cr, &files, jc.uid, jc.gid).await {
-        Ok(_) => {
-            let image =
-                super::checkpoint_image(cr.join("snapshots").join(&snapshot.id), &snapshot.format);
-            Ok((prepared, cow_handle, image))
-        }
-        Err(error) => Err(carry(error.into(), Some(prepared), cow_handle)),
+    match image {
+        Ok(image) => Ok(StagedSlot {
+            prepared,
+            cow_handle: staged.cow_handle,
+            rootfs: staged.path,
+            image,
+        }),
+        Err(error) => Err(carry(error, Some(prepared), staged.cow_handle)),
     }
 }
 
@@ -224,13 +240,12 @@ async fn stage_slot(
 /// sweep — the slots' crash journals keep them reclaimable.
 pub(super) async fn drain_pool_slots(
     pool: &SlotPool,
-    config: &VmmConfig,
     cow_manager: &CowManager,
     snapshot_id: Option<&str>,
 ) {
     for slot in pool.drain(snapshot_id) {
         let slot_id = slot.slot_id.clone();
-        if let Err(error) = destroy_slot(config, cow_manager, slot).await {
+        if let Err(error) = destroy_slot(cow_manager, slot).await {
             warn!(
                 slot_id,
                 error = %error,
@@ -240,30 +255,17 @@ pub(super) async fn drain_pool_slots(
     }
 }
 
-/// Tear down a slot completely: process, CoW resources, chroot, journal.
+/// Tear down a slot completely: process (and the area its files were
+/// staged into, which the discard takes), CoW resources, journal.
 ///
 /// On error the slot's crash journal is left in place so the startup
 /// sweep retries; callers log and move on.
-pub(super) async fn destroy_slot(
-    config: &VmmConfig,
-    cow_manager: &CowManager,
-    mut slot: PreparedSlot,
-) -> Result<()> {
+pub(super) async fn destroy_slot(cow_manager: &CowManager, mut slot: PreparedSlot) -> Result<()> {
     // The VMM must be dead before the dm teardown (`dmsetup remove` returns
     // EBUSY while the block device is open).
     slot.prepared.discard().await?;
     if let Some(handle) = slot.cow_handle.take() {
         cow_manager.teardown_checked(&handle).await?;
-    }
-    if let Some(ref jc) = config.firecracker.jailer {
-        let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        let chroot = chroot_root(&config.firecracker.binary, base, &slot.slot_id);
-        if let Some(parent) = chroot.parent()
-            && let Err(error) = tokio::fs::remove_dir_all(parent).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(VmmError::Io(error));
-        }
     }
     reconcile::clear_state_record(&slot.vm_dir)?;
     match tokio::fs::remove_dir_all(&slot.vm_dir).await {
@@ -282,7 +284,6 @@ pub(super) async fn destroy_slot(
 /// be per-computer.
 pub fn claim_restore_slot(
     pool: &SlotPool,
-    config: &Arc<VmmConfig>,
     cow_manager: &Arc<CowManager>,
     snapshot_id: &str,
 ) -> Option<PreparedSlot> {
@@ -296,17 +297,16 @@ pub fn claim_restore_slot(
             slot_id = %slot.slot_id,
             "discarding pre-warmed slot whose vmm died"
         );
-        spawn_slot_teardown(config, cow_manager, slot);
+        spawn_slot_teardown(cow_manager, slot);
     }
 }
 
-fn spawn_slot_teardown(config: &Arc<VmmConfig>, cow_manager: &Arc<CowManager>, slot: PreparedSlot) {
+fn spawn_slot_teardown(cow_manager: &Arc<CowManager>, slot: PreparedSlot) {
     {
-        let config = Arc::clone(config);
         let cow_manager = Arc::clone(cow_manager);
         tokio::spawn(async move {
             let slot_id = slot.slot_id.clone();
-            if let Err(error) = destroy_slot(&config, &cow_manager, slot).await {
+            if let Err(error) = destroy_slot(&cow_manager, slot).await {
                 warn!(
                     slot_id,
                     error = %error,
@@ -332,7 +332,7 @@ pub fn spawn_pool_refill(
     {
         let plan = pool.begin_fill(snapshot_id, config.firecracker.pool_size);
         for slot in plan.evicted {
-            spawn_slot_teardown(config, cow_manager, slot);
+            spawn_slot_teardown(cow_manager, slot);
         }
         for _ in 0..plan.spawn {
             let pool = Arc::clone(pool);
@@ -353,8 +353,7 @@ pub fn spawn_pool_refill(
                         Some(rejected) => {
                             // Evicted or drained while the fill was in flight.
                             let slot_id = rejected.slot_id.clone();
-                            if let Err(error) = destroy_slot(&config, &cow_manager, rejected).await
-                            {
+                            if let Err(error) = destroy_slot(&cow_manager, rejected).await {
                                 warn!(
                                     slot_id,
                                     error = %error,
@@ -377,7 +376,7 @@ impl SandboxManager {
     /// Tear down pooled slots: all of them, or those staged from one
     /// snapshot.
     pub(super) async fn drain_pool(&self, snapshot_id: Option<&str>) {
-        drain_pool_slots(&self.pool, &self.config, &self.cow_manager, snapshot_id).await;
+        drain_pool_slots(&self.pool, &self.cow_manager, snapshot_id).await;
     }
 
     /// Release manager-held background resources: tears down every

@@ -5,7 +5,7 @@
 //! single NIC, vsock, the kernel cmdline — so a boot and a restore of the
 //! same sandbox cannot drift apart in what they hand the driver.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use arcbox_vm_driver::{
     BootSpec, CacheMode, ConsoleSpec, DiskSpec, IsolationSpec, NicSpec, RestoreSpec, VmId, VmSpec,
@@ -81,11 +81,24 @@ pub fn build_vm_spec(
     })
 }
 
-/// The root disk: writable, `Unsafe` host caching, id `rootfs` — the name a
-/// checkpoint of this driver records for it, which a restore must reuse.
+/// The id the root disk carries, everywhere it is named.
+///
+/// One constant because two things must agree on it: the spec a boot or a
+/// restore hands the driver, and the [`Staging::stage_disk`] call that put
+/// the disk where that spec points. A driver stages a disk under a name it
+/// makes from this id and records that name in its checkpoints, so a disk
+/// staged under one id and specced under another is a checkpoint that will
+/// not restore.
+///
+/// [`Staging::stage_disk`]: arcbox_vm_driver::Staging::stage_disk
+pub const ROOTFS_DISK_ID: &str = "rootfs";
+
+/// The root disk: writable, `Unsafe` host caching, id [`ROOTFS_DISK_ID`] —
+/// the name a checkpoint of this driver records for it, which a restore
+/// must reuse.
 pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
     DiskSpec {
-        id: "rootfs".into(),
+        id: ROOTFS_DISK_ID.into(),
         path,
         read_only: false,
         root: true,
@@ -94,25 +107,27 @@ pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
 }
 
 /// What a restore may change about the checkpointed VM: its identity
-/// (`owner`, the id the jail is keyed by), the fresh NIC the guest network
-/// activated, and the disk it runs on — the rootfs staged into the owner's
-/// jail.
+/// (`owner`, the id its resources are keyed by), the fresh NIC the guest
+/// network activated, and the disk it runs on — wherever staging said that
+/// disk now is.
 pub fn restore_spec(
     owner: &str,
-    chroot: &Path,
+    rootfs: PathBuf,
     nic: Option<NicSpec>,
     isolation: IsolationSpec,
 ) -> Result<RestoreSpec> {
     Ok(RestoreSpec {
         id: VmId::new(owner)?,
         nics: nic.into_iter().collect(),
-        disks: vec![rootfs_disk(chroot.join("rootfs.ext4"))],
+        disks: vec![rootfs_disk(rootfs)],
         isolation,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use arcbox_vm_driver::NicAttachment;
     use arcbox_vm_driver::net::{NetworkIdentity, NetworkLease};
 

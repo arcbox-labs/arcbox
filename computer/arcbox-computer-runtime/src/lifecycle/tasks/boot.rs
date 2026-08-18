@@ -11,10 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arcbox_fc_driver::jail::{
-    chroot_root, stage_kernel_for_jailer, stage_rootfs_copy_for_jailer,
-    stage_rootfs_device_for_jailer,
-};
 use arcbox_snapshot::SnapshotError;
 use arcbox_vm_driver::{IsolationSpec, PreparedVm, VmDriver, VmHandle, VmId};
 use tracing::{debug, warn};
@@ -23,7 +19,7 @@ use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory, ReadyGate};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::runtime::ComputerRuntime;
-use crate::sandbox::boot::create_rootfs_symlink;
+use crate::sandbox::boot::{StageError, create_rootfs_symlink, stage_rootfs_cow_or_copy};
 use crate::sandbox::spec::build_vm_spec;
 use crate::sandbox::{self, NetworkAttachment, SandboxSpec, SandboxState};
 use crate::snapshot_cow::{CowHandle, CowManager};
@@ -228,79 +224,56 @@ pub async fn do_boot(
 
     // Determine the kernel and rootfs paths.
     //
-    // In jailer mode the files must exist inside the chroot: they are staged
-    // there and named to the driver by their in-jail host path, which it
-    // passes to the VMM chroot-relative. In direct mode the host-absolute
-    // paths from the spec are used as-is.
+    // The kernel is not brought anywhere here: rendering the boot stages
+    // whatever the spec names, wherever the VMM has to be able to open it
+    // from, so a pre-staged copy beside the one the render makes is pure
+    // cost. The disk is the one file this layer does stage itself, because
+    // only it can decide between a copy-on-write device and the copy that
+    // falls back from one — see `stage_rootfs_cow_or_copy`.
+    //
+    // Direct mode keeps its own arrangement: without a confinement staging
+    // is the identity, so the VM would be told the ephemeral dm device
+    // name and record *that* in its vmstate. `rootfs.link` is the stable
+    // name a later restore can retarget, and it is worth the branch.
     let mut cow_handle = None;
     let paths: Result<(PathBuf, PathBuf)> = async {
-        if let Some(ref jc) = fc_cfg.jailer {
-            // Jailer mode: stage kernel + rootfs into chroot.
-            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            let cr = chroot_root(&fc_cfg.binary, base, id);
-
-            // Kernel is always copied (small, ~16MB).
-            let k = stage_kernel_for_jailer(&cr, &spec.kernel, jc.uid, jc.gid).await?;
-
-            // Rootfs: try dm-snapshot + mknod, fall back to full copy.
-            let r = match cow_manager.setup(id, &spec.rootfs).await {
-                Ok(handle) => {
-                    cow_handle = Some(handle);
-                    let record = sandbox::reconcile::SandboxStateRecord::new(
-                        id,
-                        process_pid,
-                        net.map(NetworkAttachment::journaled),
-                        cow_handle.as_ref(),
-                        config,
-                        None,
-                    )?;
-                    sandbox::reconcile::write_state_record(vm_dir, &record)?;
-                    match stage_rootfs_device_for_jailer(
-                        &cr,
-                        &cow_handle.as_ref().unwrap().dm_device,
-                        jc.uid,
-                        jc.gid,
-                    )
-                    .await
-                    {
-                        Ok(path) => path,
-                        Err(e) => {
-                            debug!(
-                                sandbox_id = %id,
-                                error = %e,
-                                "mknod failed, falling back to rootfs copy"
-                            );
-                            cow_manager
-                                .teardown_checked(cow_handle.as_ref().unwrap())
-                                .await?;
-                            cow_handle = None;
-                            let record = sandbox::reconcile::SandboxStateRecord::new(
-                                id,
-                                process_pid,
-                                net.map(NetworkAttachment::journaled),
-                                None,
-                                config,
-                                None,
-                            )?;
-                            sandbox::reconcile::write_state_record(vm_dir, &record)?;
-                            stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid).await?
-                        }
-                    }
+        if fc_cfg.jailer.is_some() {
+            let journal = |cow: Option<&CowHandle>| {
+                sandbox::reconcile::SandboxStateRecord::new(
+                    id,
+                    process_pid,
+                    net.map(NetworkAttachment::journaled),
+                    cow,
+                    config,
+                    None,
+                )
+                .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
+            };
+            let staged = stage_rootfs_cow_or_copy(
+                cow_manager,
+                sandbox::staging_capability(&*prepared),
+                id,
+                &spec.rootfs,
+                &journal,
+            )
+            .await;
+            let rootfs = match staged {
+                Ok(staged) => {
+                    cow_handle = staged.cow_handle;
+                    staged.path
                 }
-                Err(e) => {
-                    if matches!(e, SnapshotError::Unavailable(_)) {
-                        return Err(e.into());
-                    }
-                    debug!(
-                        sandbox_id = %id,
-                        error = %e,
-                        "dm-snapshot unavailable, copying rootfs into chroot"
-                    );
-                    stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid).await?
+                Err(StageError {
+                    error,
+                    cow_handle: acquired,
+                }) => {
+                    // Whatever the failed staging left is handed to the
+                    // computer with everything else below, so cleanup finds
+                    // it: the error is reported, not the resources dropped.
+                    cow_handle = acquired;
+                    return Err(error);
                 }
             };
-
-            Ok((in_jail(&cr, &k), in_jail(&cr, &r)))
+            Ok((PathBuf::from(&spec.kernel), rootfs))
         } else {
             // Direct mode: try dm-snapshot CoW, fall back to using rootfs directly.
             // When CoW is active, create a stable `{vm_dir}/rootfs.link` symlink
@@ -391,12 +364,6 @@ pub async fn do_boot(
         .await
         .map_err(|error| failed(error.into()))?;
     Ok((Arc::from(handle), ready_gate))
-}
-
-/// A staged file's host path inside the jail, from the chroot-relative name
-/// the staging helpers return (`/vmlinux` → `{chroot}/vmlinux`).
-fn in_jail(chroot: &Path, name: &str) -> PathBuf {
-    chroot.join(name.trim_start_matches('/'))
 }
 
 fn complete_resource_handoff(signal: &mut Option<tokio::sync::oneshot::Sender<()>>) {

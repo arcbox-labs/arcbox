@@ -95,9 +95,9 @@ impl ComputerFlows {
                 })?;
         }
 
-        // Release the VMM (already exited, or never booted), TAP/IP, CoW
-        // device, and chroot; the record itself stays inspectable until
-        // Remove.
+        // Release the VMM (already exited, or never booted) and with it the
+        // area its files were staged into, then TAP/IP and the CoW device;
+        // the record itself stays inspectable until Remove.
         self.release_scope(ReleaseScope::Runtime).await?;
         info!(sandbox_id = %self.id, "computer stopped");
         Ok(())
@@ -111,30 +111,28 @@ impl ComputerFlows {
                     &self.id,
                     &self.computer,
                     &services.network,
-                    &services.config,
                     &services.cow_manager,
                 )
                 .await
             }
-            ReleaseScope::KeepDisk => match services.config.firecracker.jailer.as_ref() {
-                Some(jailer) => {
-                    release_for_pause(
-                        &self.id,
-                        &self.computer,
-                        jailer,
-                        &services.config,
-                        &services.cow_manager,
-                        &*services.network,
-                    )
-                    .await
-                }
-                // Unreachable: `pause_sandbox` refuses direct mode before it
-                // claims anything, because a direct-mode vmstate pins origin
-                // paths and could never resume.
-                None => Err(VmmError::Config(
+            // Unreachable: `pause_sandbox` refuses direct mode before it
+            // claims anything, because a direct-mode vmstate pins origin
+            // paths and could never resume.
+            ReleaseScope::KeepDisk if services.config.firecracker.jailer.is_none() => {
+                Err(VmmError::Config(
                     "computer pause requires jailer isolation; direct mode cannot resume".into(),
-                )),
-            },
+                ))
+            }
+            ReleaseScope::KeepDisk => {
+                release_for_pause(
+                    &self.id,
+                    &self.computer,
+                    &services.config,
+                    &services.cow_manager,
+                    &*services.network,
+                )
+                .await
+            }
             ReleaseScope::Full => {
                 release_everything(
                     &self.id,
