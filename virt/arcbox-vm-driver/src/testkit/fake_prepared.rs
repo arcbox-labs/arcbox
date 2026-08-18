@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::fake_driver::{DriverInner, NAME};
-use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, VmInner};
+use super::fake_vm::{CHECKPOINT_FORMAT, CheckpointFile, FakeVm, MEM_FILE, VMSTATE_FILE, VmInner};
 use super::fake_vsock::{FakeListener, Inbound};
 use super::lock;
 use crate::capability::{
-    CheckpointImage, DiskSource, Prepare, PreparedVm, Staging, VsockListen, VsockListener,
+    CheckpointImage, CheckpointKind, DiskSource, Prepare, PreparedVm, Staging, VsockListen,
+    VsockListener,
 };
 use crate::driver::{ExitStatus, ProcessRecord, RestoreSpec, VmHandle, VmRecord, VmState};
 use crate::error::{Error, Result};
@@ -154,17 +155,17 @@ impl PreparedFake {
         Ok(())
     }
 
-    fn launch(&self, spec: VmSpec, balloon_target_bytes: u64) -> Result<Box<dyn VmHandle>> {
+    fn launch(
+        &self,
+        spec: VmSpec,
+        balloon_target_bytes: u64,
+        restored: bool,
+    ) -> Result<Box<dyn VmHandle>> {
         self.require_same_identity(&spec.id, &spec.isolation)?;
         spec.validate()?;
         let mut phase = lock(&self.phase);
         self.require_unused(&phase)?;
-        if self
-            .driver
-            .knobs
-            .fail_boot_once
-            .swap(false, Ordering::AcqRel)
-        {
+        if self.driver.knobs.fail_boot.swap(false, Ordering::AcqRel) {
             return Err(Error::Driver {
                 driver: NAME,
                 message: "scripted boot failure".into(),
@@ -176,6 +177,7 @@ impl PreparedFake {
             self.record.clone(),
             balloon_target_bytes,
             Arc::clone(&self.inbound),
+            restored,
         )?;
         *phase = Phase::Booted(Arc::clone(&vm));
         Ok(Box::new(FakeVm::new(vm)))
@@ -298,7 +300,7 @@ impl PreparedVm for PreparedFake {
 
     async fn boot(&self, spec: VmSpec) -> Result<Box<dyn VmHandle>> {
         let balloon_target_bytes = u64::from(spec.memory_mib) << 20;
-        self.launch(spec, balloon_target_bytes)
+        self.launch(spec, balloon_target_bytes, false)
     }
 
     async fn restore(
@@ -309,10 +311,24 @@ impl PreparedVm for PreparedFake {
         if !self.driver.caps.checkpoint || image.format.as_str() != CHECKPOINT_FORMAT {
             return Err(Error::ForeignCheckpoint(image.format.clone()));
         }
-        let bytes = tokio::fs::read(image.dir.join("checkpoint.json")).await?;
+        let bytes = tokio::fs::read(image.dir.join(VMSTATE_FILE)).await?;
         let file: CheckpointFile = serde_json::from_slice(&bytes).map_err(std::io::Error::from)?;
         if file.format.as_str() != CHECKPOINT_FORMAT {
             return Err(Error::ForeignCheckpoint(file.format));
+        }
+        // A full checkpoint is the vmstate *and* the memory image, and a
+        // restore needs both. Checked because the failure it catches is a
+        // catalog or a staging step that carried one file and not the
+        // other — which a restore reading only the vmstate would let pass.
+        if file.kind == CheckpointKind::Full
+            && !tokio::fs::try_exists(image.dir.join(MEM_FILE))
+                .await
+                .unwrap_or(false)
+        {
+            return Err(Error::InvalidSpec(format!(
+                "full checkpoint {} has no {MEM_FILE}",
+                image.dir.display()
+            )));
         }
         let image_disks: BTreeSet<&str> = file.spec.disks.iter().map(|d| d.id.as_str()).collect();
         let given_disks: BTreeSet<&str> = spec.disks.iter().map(|d| d.id.as_str()).collect();
@@ -326,7 +342,7 @@ impl PreparedVm for PreparedFake {
         vm_spec.nics = spec.nics;
         vm_spec.disks = spec.disks;
         vm_spec.isolation = spec.isolation;
-        self.launch(vm_spec, file.balloon_target_bytes)
+        self.launch(vm_spec, file.balloon_target_bytes, true)
     }
 
     async fn discard(&self) -> Result<ExitStatus> {

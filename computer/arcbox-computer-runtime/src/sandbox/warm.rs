@@ -238,9 +238,6 @@ async fn publish_warm_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::{
-        FrozenOnCheckpoint, fake_manager, live_sandbox, live_sandbox_with,
-    };
     use super::*;
     use crate::snapshot::SnapshotDraft;
 
@@ -257,57 +254,6 @@ mod tests {
 
     fn some_key() -> WarmKey {
         warm_key(&base_spec(), fingerprint_of(7), fingerprint_of(42))
-    }
-
-    /// The warm publish is best-effort — a failed capture that left the
-    /// guest running is a warning and the boot goes on — except when the
-    /// capture left the guest frozen: that comes back as the error the boot
-    /// task fails the sandbox on, instead of announcing READY for it.
-    #[tokio::test]
-    async fn publish_after_boot_surfaces_only_a_frozen_guest() {
-        let dir = tempfile::tempdir().unwrap();
-        let (manager, driver, _probe) = fake_manager(dir.path()).await;
-        let ticket = |suffix: &str| WarmPublishTicket {
-            key: some_key(),
-            cache: Arc::new(WarmCache::default()),
-            snapshots: Arc::new(SnapshotCatalog::new(
-                dir.path().join(suffix).to_string_lossy().as_ref(),
-            )),
-            pool: Arc::new(super::super::pool::SlotPool::default()),
-        };
-
-        // The fake's capture succeeds and the guest runs on; only the commit
-        // fails (no vmstate/mem pair): recoverable, so the boot proceeds.
-        let (instance, _handle) = live_sandbox(&manager, &driver, "warm-ok").await;
-        publish_after_boot(
-            &"warm-ok".to_owned(),
-            &ticket("a"),
-            &instance,
-            &manager.cow_manager,
-            SandboxState::Ready,
-        )
-        .await
-        .expect("a recoverable publish failure is not the boot's problem");
-        assert_eq!(instance.lock().unwrap().state, SandboxState::Ready);
-
-        // The guest stayed frozen: the boot task must fail the sandbox.
-        let (instance, _handle) =
-            live_sandbox_with(&manager, &driver, "warm-frozen", FrozenOnCheckpoint::over).await;
-        let error = publish_after_boot(
-            &"warm-frozen".to_owned(),
-            &ticket("b"),
-            &instance,
-            &manager.cow_manager,
-            SandboxState::Ready,
-        )
-        .await
-        .expect_err("a frozen guest fails the boot");
-        assert!(
-            error.to_string().contains("could not be resumed"),
-            "{error}"
-        );
-        // The publish itself only reports; the boot task does the failing.
-        assert_eq!(instance.lock().unwrap().state, SandboxState::Ready);
     }
 
     fn base_spec() -> SandboxSpec {

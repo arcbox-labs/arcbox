@@ -14,7 +14,8 @@ use super::fake_vsock::Inbound;
 use super::lock;
 use crate::capability::{Adopt, CheckpointImage, Prepare, PreparedVm as _};
 use crate::driver::{
-    DriverCapabilities, NestedVirt, RestoreSpec, VmDriver, VmHandle, VmRecord, VmState,
+    DriverCapabilities, ExitStatus, NestedVirt, RestoreSpec, ShutdownMode, VmDriver, VmHandle,
+    VmRecord, VmState,
 };
 use crate::error::{Error, Result};
 use crate::spec::{VmId, VmSpec};
@@ -22,8 +23,9 @@ use crate::spec::{VmId, VmSpec};
 /// Scripted failures, armed once and consumed by the next matching call.
 #[derive(Debug, Default)]
 pub(super) struct Knobs {
-    pub(super) fail_boot_once: AtomicBool,
-    pub(super) fail_checkpoint_once: AtomicBool,
+    pub(super) fail_boot: AtomicBool,
+    pub(super) fail_checkpoint: AtomicBool,
+    pub(super) freeze_checkpoint: AtomicBool,
 }
 
 /// An in-memory VM driver.
@@ -32,16 +34,18 @@ pub(super) struct Knobs {
 /// `HoldQuiesced` → `Exited` on shutdown, kill, or drop) with an events
 /// broadcast, and every capability is implemented: `Vsock::dial` returns
 /// one end of a socketpair whose other end echoes; `VsockListen` accepts
-/// what [`FakeDriver::guest_dial`] pushes; `Checkpoint` writes a
-/// `checkpoint.json` that `restore` reads back; `Adopt`/`Detach` go through
+/// what [`FakeDriver::guest_dial`] pushes; `Checkpoint` writes the
+/// `vmstate` + `mem` pair a catalog commits and a jail stages, and
+/// `restore` reads the vmstate back; `Adopt`/`Detach` go through
 /// the driver's registry; `Prepare` hands out a process with a synthetic
 /// pid that `boot`/`restore` then run on — the driver's own `boot` is
 /// exactly that pair; `Staging` brings files into a `staged/` directory
 /// under the runtime dir, which outlives the discard as a real driver's
 /// staging area does today; `Console` returns what
-/// [`FakeDriver::push_console`] pushed. [`FakeDriver::builder`] scripts
-/// failures and narrows the claimed capabilities — the accessors follow
-/// the claims, so the contract can be run against a reduced set.
+/// [`FakeDriver::push_console`] pushed. [`FakeDriver::builder`] narrows
+/// the claimed capabilities — the accessors follow the claims, so the
+/// contract can be run against a reduced set — and `fail_next_*` scripts
+/// one-shot failures at the moment a scenario needs them.
 ///
 /// The driver's name is `"fake"`; its checkpoint format is `"fake/v1"`.
 #[derive(Clone)]
@@ -56,6 +60,9 @@ pub(super) const NAME: &str = "fake";
 
 /// The first synthetic pid a prepared fake process gets.
 const FIRST_PID: u32 = 100_000;
+
+/// What [`FakeDriver::kill`] reports, matching a real SIGKILL.
+const SIGKILL: i32 = 9;
 
 pub(super) struct DriverInner {
     pub(super) caps: DriverCapabilities,
@@ -76,21 +83,6 @@ impl FakeDriverBuilder {
     /// Claims exactly `caps`; the handles' accessors follow the claims.
     pub fn capabilities(mut self, caps: DriverCapabilities) -> Self {
         self.caps = caps;
-        self
-    }
-
-    /// The next `boot` fails with [`Error::Driver`].
-    pub fn fail_boot_once(self) -> Self {
-        self.knobs.fail_boot_once.store(true, Ordering::Release);
-        self
-    }
-
-    /// The next `Checkpoint::checkpoint` on any VM fails with
-    /// [`Error::Driver`].
-    pub fn fail_checkpoint_once(self) -> Self {
-        self.knobs
-            .fail_checkpoint_once
-            .store(true, Ordering::Release);
         self
     }
 
@@ -148,6 +140,87 @@ impl FakeDriver {
         Ok(guest)
     }
 
+    /// The next `boot` or `restore` fails with [`Error::Driver`].
+    ///
+    /// Armed on the driver rather than on its builder because a scenario
+    /// arms it *between* operations — a fixture that boots before the
+    /// interesting call would otherwise feed the knob to the wrong one.
+    pub fn fail_next_boot(&self) -> &Self {
+        self.inner.knobs.fail_boot.store(true, Ordering::Release);
+        self
+    }
+
+    /// The next `Checkpoint::checkpoint` on any VM fails with
+    /// [`Error::Driver`], leaving the guest as it found it: recoverable,
+    /// and the caller keeps the VM.
+    pub fn fail_next_checkpoint(&self) -> &Self {
+        self.inner
+            .knobs
+            .fail_checkpoint
+            .store(true, Ordering::Release);
+        self
+    }
+
+    /// The next `Checkpoint::checkpoint` on any VM fails with
+    /// [`Error::Driver`] **and leaves the guest quiesced** — the driver's
+    /// own resume after the capture failed.
+    ///
+    /// The unrecoverable half, and the reason it is a second knob: the
+    /// port has no verb that thaws a guest, so a caller reading
+    /// `VmState::Quiesced` back from a capture it asked to resume has to
+    /// dispose of the VM rather than reuse it.
+    pub fn freeze_next_checkpoint(&self) -> &Self {
+        self.inner
+            .knobs
+            .freeze_checkpoint
+            .store(true, Ordering::Release);
+        self
+    }
+
+    /// Every `shutdown` mode `vm` was asked for, in order — empty for a VM
+    /// this driver never had, or one that only ever died with its handle.
+    ///
+    /// The way to prove a teardown *asked* a VM to die: the fake reports
+    /// the same exit status whether it was killed or dropped, so a path
+    /// that forgot its shutdown and merely let the handle fall out of
+    /// scope looks identical from the outside.
+    pub fn shutdowns(&self, vm: &VmId) -> Vec<ShutdownMode> {
+        self.inner
+            .registered(vm)
+            .map(|vm| vm.shutdowns())
+            .unwrap_or_default()
+    }
+
+    /// End `vm` as if its VMM process had been killed out from under
+    /// whoever holds it — the shape of a node that lost its VMMs while its
+    /// manager was away. Answers with the status it ended on, or `None`
+    /// for a VM this driver never had.
+    pub fn kill(&self, vm: &VmId) -> Option<ExitStatus> {
+        self.inner
+            .registered(vm)
+            .map(|vm| vm.exit(ExitStatus::signaled(SIGKILL)))
+    }
+
+    /// The VMs that came up from a checkpoint rather than from a boot.
+    ///
+    /// The one observable that tells a restore from a cold boot: both end
+    /// with a running guest under the caller's id, so a warm or pooled
+    /// path that quietly regressed into booting looks identical from
+    /// above.
+    pub fn restored_vms(&self) -> Vec<VmId> {
+        self.inner.filtered(VmInner::is_restored)
+    }
+
+    /// The live VMs a handle still holds — exactly the ones
+    /// [`Adopt::adopt`] would refuse.
+    ///
+    /// What a test waits on when it stands a second owner up over the same
+    /// driver: an owner lets go on its own schedule, and the successor's
+    /// adoption is only meaningful once it has.
+    pub fn owned_vms(&self) -> Vec<VmId> {
+        self.inner.owned_vms()
+    }
+
     /// Appends `bytes` to what `Console::read_output` returns for `vm`.
     pub fn push_console(&self, vm: &VmId, bytes: &[u8]) -> Result<()> {
         self.inner.live(vm)?.push_console(bytes);
@@ -173,6 +246,7 @@ impl DriverInner {
         record: VmRecord,
         balloon_target_bytes: u64,
         inbound: Arc<Inbound>,
+        restored: bool,
     ) -> Result<Arc<VmInner>> {
         let mut vms = lock(&self.vms);
         if let Some(existing) = vms.get(&spec.id) {
@@ -194,9 +268,30 @@ impl DriverInner {
             Arc::clone(&self.knobs),
             balloon_target_bytes,
             inbound,
+            restored,
         );
         vms.insert(vm.id().clone(), Arc::clone(&vm));
         Ok(vm)
+    }
+
+    fn owned_vms(&self) -> Vec<VmId> {
+        self.filtered(|vm| !matches!(vm.state(), VmState::Exited(_)) && vm.is_owned())
+    }
+
+    fn filtered(&self, keep: impl Fn(&VmInner) -> bool) -> Vec<VmId> {
+        let mut ids: Vec<VmId> = lock(&self.vms)
+            .values()
+            .filter(|vm| keep(vm))
+            .map(|vm| vm.id().clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The VM under `id`, alive or exited — unlike [`Self::live`], this
+    /// forgets nothing, because a post-mortem read is the point.
+    fn registered(&self, id: &VmId) -> Option<Arc<VmInner>> {
+        lock(&self.vms).get(id).map(Arc::clone)
     }
 
     /// The VM if it has not exited; an exited entry is forgotten here.

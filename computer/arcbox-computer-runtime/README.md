@@ -100,6 +100,12 @@ cargo test -p arcbox-tap-net             # the TAP network (root-only TAP tests 
 cargo build -p arcbox-vm-agent --bin vm-agent --target aarch64-unknown-linux-musl --release
 ```
 
+`tests/manager_over_fakes.rs` drives the manager's own flows — create,
+boot, exec, files, pause, resume, checkpoint, restore, expiry, remove,
+adoption — over the driver port's `FakeDriver`/`FakeNetwork` and this
+crate's `FakeAgent`, so the whole lifecycle is testable with no KVM, no
+root and no Firecracker.
+
 Everything real — TAP creation (`arcbox-tap-net`), boot, checkpoint —
 needs Linux with `CAP_NET_ADMIN`, a `firecracker` binary, and (for jailer
 mode) root.

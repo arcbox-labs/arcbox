@@ -89,6 +89,15 @@ jobs:
         # target_os = "linux" and never run under the macOS workspace job.
         run: cargo test --lib --bins -p arcbox-computer-runtime -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot
 
+      - name: Manager lifecycle over the fakes
+        # The manager's own flows (create, boot, exec, files, pause, resume,
+        # checkpoint, restore, expiry, remove, adoption) over the driver,
+        # network and agent fakes: no KVM, no root, no Firecracker, so it
+        # belongs in this unprivileged job. Named because the target is new
+        # — `--lib --bins` above does not pick it up, and these tests used
+        # to run here as library tests.
+        run: cargo test -p arcbox-computer-runtime --test manager_over_fakes
+
   # ---------------------------------------------------------------------------
   # Job 2: integration tests — requires root (TAP interface creation)
   # ---------------------------------------------------------------------------

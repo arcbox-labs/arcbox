@@ -11,89 +11,9 @@ use super::*;
 
 #[cfg(test)]
 mod tests {
-    use arcbox_vm_driver::ShutdownMode;
-
     use super::*;
     use crate::snapshot_cow::{CowOptions, CowTestProbe};
     use std::os::unix::fs::PermissionsExt;
-
-    /// A sandbox this process adopted rather than booted holds a handle and
-    /// no `PreparedVm`, and Remove must still reach its VMM: the old code
-    /// took the `None` arm, cleared the handle, and reported success while
-    /// Firecracker kept running — after which the dm device and TAP were
-    /// torn out from under a live guest.
-    #[tokio::test]
-    async fn removing_an_adopted_sandbox_kills_its_vm_through_the_handle() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let (manager, driver, probe) =
-            super::super::testing::fake_manager_direct(data_dir.path()).await;
-        let recorder = std::sync::OnceLock::new();
-        let (runtime, _handle) =
-            super::super::testing::live_sandbox_with(&manager, &driver, "adopted", |inner| {
-                let (recording, handle) = super::super::testing::RecordsShutdown::wrap(inner);
-                let _ = recorder.set(recording);
-                handle
-            })
-            .await;
-        // What the startup sweep hands back: the VM's handle, and no grip on
-        // the process — nothing returns a `PreparedVm` across a restart.
-        runtime.lock().unwrap().prepared = None;
-
-        manager
-            .remove_sandbox(&"adopted".to_owned(), false)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            recorder.get().unwrap().modes(),
-            vec![ShutdownMode::Kill],
-            "the adopted vm is killed through its own handle"
-        );
-        let runtime = runtime.lock().unwrap();
-        assert!(runtime.handle.is_none(), "the dead VM's handle is dropped");
-        assert!(runtime.cow_handle.is_none(), "the CoW overlay is released");
-        assert!(runtime.network.is_none(), "the network lease is released");
-        assert_eq!(probe.teardown_count(), 1);
-    }
-
-    /// A computer the startup sweep took back must be usable, not merely
-    /// listed: it runs no flow in this process, so nothing publishes the
-    /// agent the exec path reads unless the seeding does.
-    ///
-    /// The unit-scale half of the CORE-135 acceptance test, which proves the
-    /// same thing across a real process boundary.
-    #[tokio::test]
-    async fn an_adopted_computer_serves_an_exec() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let (manager, driver, _probe, agents) =
-            super::super::testing::fake_manager_with_agent(data_dir.path(), None).await;
-        agents.on(
-            &["echo", "still here"],
-            crate::testkit::agent::Reply::stdout(b"still here".to_vec()),
-        );
-        super::super::testing::live_sandbox(&manager, &driver, "adopted").await;
-
-        let mut output = manager
-            .run_in_sandbox(
-                &"adopted".to_owned(),
-                vec!["echo".into(), "still here".into()],
-                HashMap::new(),
-                String::new(),
-                String::new(),
-                false,
-                None,
-                0,
-            )
-            .await
-            .expect("an adopted computer is dialable");
-        let mut stdout = Vec::new();
-        while let Some(chunk) = output.recv().await {
-            if let crate::agent::OutputChunk::Stdout(data) = chunk.unwrap() {
-                stdout.extend_from_slice(&data);
-            }
-        }
-        assert_eq!(stdout, b"still here");
-    }
 
     #[tokio::test]
     async fn force_remove_tears_down_cow_after_blocked_boot() {
