@@ -81,9 +81,21 @@ pub async fn release_for_pause(
                  it can be stopped or removed, but not paused"
             ))
         })?;
-        sandbox::staging_capability(&*prepared)
+        // Nothing taken out is a refusal, not a skip: in copy mode the
+        // VM's area is where this computer's only writable disk lives, so
+        // `false` means there is no disk to pause. Discarding anyway would
+        // commit `Paused` with neither a preserved overlay nor a parked
+        // rootfs — the exact state resume refuses to start from, reached
+        // after the disk is already unrecoverable.
+        if !sandbox::staging_capability(&*prepared)
             .unstage_disk(ROOTFS_DISK_ID, &vm_dir.join(PAUSED_ROOTFS_FILE))
-            .await?;
+            .await?
+        {
+            return Err(VmmError::Snapshot(format!(
+                "computer {id} runs on a copied rootfs but its vm has no disk staged to take \
+                 out; pausing it would leave nothing to resume from"
+            )));
+        }
     }
 
     super::release::kill_sandbox_process(id, arc).await?;

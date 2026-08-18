@@ -253,7 +253,10 @@ pub async fn restore_paused(
 /// dropped handle SIGKILLs.
 ///
 /// `false` when the disk could not be parked, which is what stops the
-/// computer being recorded as cleanly `Paused`.
+/// computer being recorded as cleanly `Paused`. Unlike the pause release,
+/// *nothing staged* is a normal outcome here and not a refusal: a resume
+/// that failed before it handed the parked disk over never moved it, so
+/// the file is still sitting in `vm_dir` where a clean pause left it.
 async fn park_copy_mode_rootfs(
     id: &SandboxId,
     vm_dir: &Path,
