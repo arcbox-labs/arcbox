@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 pub use crate::allocation::NetworkAllocation;
 pub use crate::error::{Result, TapNetError};
-pub use packet_filter::{IptablesLegacy, PacketFilter};
+pub use packet_filter::{IptablesLegacy, Nftables, PacketFilter};
 
 pub mod allocation;
 pub mod error;
