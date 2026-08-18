@@ -93,6 +93,8 @@ fn a_restore_commits_ready_in_one_hop_before_its_gate() {
             Effect::CommitRestored {
                 durability: Durability::Report(Unconfirmed::Ack),
             },
+            // A warm-create reroute owes the Create event contract.
+            Effect::Publish(Notify::Created),
             Effect::ArmTimer(Timer::Ttl),
             Effect::SpawnGate,
         ]
@@ -177,6 +179,21 @@ fn the_boots_own_cmd_claims_the_slot_the_gate_reserved_for_it() {
     assert_eq!(
         effects,
         vec![Effect::Publish(Notify::Idle), Effect::ArmTimer(Timer::Idle)]
+    );
+}
+
+#[test]
+fn only_the_warm_create_reroute_announces_a_restore_as_a_create() {
+    // A Restore RPC's computer is new to its caller but not to the Create
+    // event contract: it announces itself with READY alone, and a watcher
+    // that saw CREATED for it would be watching a create nobody asked for.
+    let (mut sm, mut context) = reach(&[Event::Provision(Provision::Restore {
+        origin: RestoreOrigin::Restore,
+    })]);
+    let (_, effects) = step(&mut sm, &mut context, &Event::Restored);
+    assert!(
+        !effects.contains(&Effect::Publish(Notify::Created)),
+        "{effects:?}"
     );
 }
 

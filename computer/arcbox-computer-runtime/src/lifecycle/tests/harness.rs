@@ -53,7 +53,7 @@ pub(super) fn ordinal(state: State) -> usize {
         State::Provisioning {} => 0,
         State::Staging {} => 1,
         State::Booting {} => 2,
-        State::Restoring {} => 3,
+        State::Restoring { .. } => 3,
         State::Gating { .. } => 4,
         State::Ready {} => 5,
         State::Running {} => 6,

@@ -97,7 +97,7 @@ pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
 /// (`owner`, the id the jail is keyed by), the fresh NIC the guest network
 /// activated, and the disk it runs on — the rootfs staged into the owner's
 /// jail.
-pub(super) fn restore_spec(
+pub fn restore_spec(
     owner: &str,
     chroot: &Path,
     nic: Option<NicSpec>,

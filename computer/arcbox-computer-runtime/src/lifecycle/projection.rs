@@ -17,7 +17,7 @@ impl State {
             Self::Provisioning {}
             | Self::Staging {}
             | Self::Booting {}
-            | Self::Restoring {}
+            | Self::Restoring { .. }
             | Self::Resuming {} => SandboxState::Starting,
             // A gate whose reservation the boot's own `cmd` has taken is
             // already running that workload, which is what a caller sees.
@@ -50,7 +50,7 @@ impl State {
     /// projection guessing.
     pub(super) fn durable(self) -> Option<PersistPhase> {
         match self {
-            Self::Provisioning {} | Self::Restoring {} => Some(PersistPhase::Creating),
+            Self::Provisioning {} | Self::Restoring { .. } => Some(PersistPhase::Creating),
             Self::Staging {} | Self::Booting {} => Some(PersistPhase::Starting),
             // A cold boot arrives here still `Starting` and commits `Ready`
             // after the probe; a restore arrives already committed.

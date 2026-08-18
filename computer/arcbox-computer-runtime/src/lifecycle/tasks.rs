@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 pub mod boot;
+pub mod restore;
 
 use super::effect::ReleaseScope;
 use super::event::{Event, RestoreOrigin};

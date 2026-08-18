@@ -50,7 +50,7 @@ mod files;
 mod lifecycle;
 mod pause;
 pub(crate) mod policy;
-mod pool;
+pub(crate) mod pool;
 pub(crate) mod reconcile;
 pub(crate) mod record;
 pub(crate) mod spec;

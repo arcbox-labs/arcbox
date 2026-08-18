@@ -640,7 +640,7 @@ pub(super) async fn run_initial_cmd(
 
 /// A failed restore-staging step, carrying whichever CoW resources were
 /// acquired before the failure so the caller can roll them back.
-pub(super) struct StageError {
+pub struct StageError {
     pub error: VmmError,
     pub cow_handle: Option<CowHandle>,
 }
@@ -653,7 +653,7 @@ pub(super) struct StageError {
 /// record whenever CoW resources appear or disappear, so reconciliation
 /// can always identify them. Returns the CoW handle when the dm path was
 /// taken; the staged rootfs is `/rootfs.ext4` inside the chroot either way.
-pub(super) async fn stage_rootfs_cow_or_copy(
+pub async fn stage_rootfs_cow_or_copy(
     cow_manager: &CowManager,
     chroot: &Path,
     owner_id: &str,

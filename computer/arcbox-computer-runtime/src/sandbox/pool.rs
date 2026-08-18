@@ -27,7 +27,7 @@ pub(super) use super::policy::pool::SlotPool;
 /// A fully staged restore slot: jailer chroot prepared, the VMM spawned
 /// (API socket up, nothing loaded yet), kernel + vmstate + mem staged,
 /// dm-snapshot of the rootfs created.
-pub(super) struct PreparedSlot {
+pub struct PreparedSlot {
     /// Slot id (`pool-<uuid>`): the chroot, dm/CoW names, and crash
     /// journal are keyed by it.
     pub slot_id: String,

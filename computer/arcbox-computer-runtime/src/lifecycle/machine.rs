@@ -7,7 +7,7 @@ use statig::prelude::*;
 use super::effect::{
     Answer, Durability, Effect, Effects, Notify, RecordEnd, ReleaseScope, Timer, Unconfirmed,
 };
-use super::event::{Event, PauseReason, Provision};
+use super::event::{Event, PauseReason, Provision, RestoreOrigin};
 use crate::sandbox::IdleAction;
 use crate::sandbox::record::PersistPhase;
 use crate::sandbox::workload::WorkloadClaim;
@@ -60,10 +60,13 @@ impl ComputerLifecycle {
                 Transition(State::staging())
             }
             // The restore path commits `ReadyWithOutcome` in one hop from
-            // `Creating`, so it writes nothing on the way in.
+            // `Creating`, so it writes nothing on the way in. The origin
+            // rides the state: it decides whether this restore owes the
+            // Create event contract, and only the state is still around when
+            // the restore reports back.
             Event::Provision(Provision::Restore { origin }) => {
                 context.emit(Effect::SpawnRestore { origin: *origin });
-                Transition(State::restoring())
+                Transition(State::restoring(*origin))
             }
             Event::Failure => {
                 context.emit(Effect::ForgetRecord(RecordEnd::Aborted));
@@ -120,12 +123,23 @@ impl ComputerLifecycle {
     }
 
     #[state(superstate = "launching")]
-    fn restoring(event: &Event, context: &mut Effects) -> Outcome {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "statig passes state-local storage by reference"
+    )]
+    fn restoring(origin: &RestoreOrigin, event: &Event, context: &mut Effects) -> Outcome {
         match event {
             Event::Restored => {
                 context.emit(Effect::CommitRestored {
                     durability: Durability::Report(Unconfirmed::Ack),
                 });
+                // The warm-create reroute owes the Create event contract:
+                // a watcher sees CREATED then READY for this id, in that
+                // order, exactly as a cold boot emits them. A Restore RPC
+                // announces itself with READY alone.
+                if matches!(origin, RestoreOrigin::WarmCreate) {
+                    context.emit(Effect::Publish(Notify::Created));
+                }
                 context.emit(Effect::ArmTimer(Timer::Ttl));
                 context.emit(Effect::SpawnGate);
                 Transition(State::gating(true, false))

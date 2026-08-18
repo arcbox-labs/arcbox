@@ -278,7 +278,7 @@ pub struct SandboxInstance {
     /// Cleared by pause: releasing a paused sandbox renames its retained
     /// overlay to the sandbox-id path and destroys the slot chroot, so a
     /// resumed sandbox owns everything under its own id again.
-    pub(super) pool_slot_id: Option<String>,
+    pub(crate) pool_slot_id: Option<String>,
     /// Whether this guest runs the fixed invariant network identity
     /// (CORE-81). Set by the create path when the boot bakes the invariant
     /// `ip=` parameter, and inherited from [`crate::snapshot::SnapshotMeta`]
