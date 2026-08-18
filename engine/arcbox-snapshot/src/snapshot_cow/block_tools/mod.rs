@@ -75,9 +75,21 @@ fn parse_loop_device(what: &str, stdout: &[u8]) -> Result<String> {
 /// failure. A device that answers with a different file is detached again
 /// so a failed attach leaks nothing.
 fn verify_attached(tools: &dyn BlockTools, device: &str, backing: &Path) -> Result<()> {
-    let Some(actual) = loop_backing_file(device)? else {
-        return Ok(());
-    };
+    match loop_backing_file(device)? {
+        Some(actual) => verify_reported_backing(tools, device, backing, &actual),
+        None => Ok(()),
+    }
+}
+
+/// The decision half of [`verify_attached`], split out so the mismatch
+/// branch is reachable without a real loop device: sysfs is the one input
+/// a test cannot supply.
+fn verify_reported_backing(
+    tools: &dyn BlockTools,
+    device: &str,
+    backing: &Path,
+    actual: &str,
+) -> Result<()> {
     let matches = actual == backing.to_string_lossy()
         || std::fs::canonicalize(backing).is_ok_and(|path| path.to_string_lossy() == actual);
     if matches {
@@ -196,6 +208,97 @@ mod tests {
     fn device_major_minor_reports_missing_paths() {
         let err = device_major_minor("/nonexistent/arcbox-blkdev").unwrap_err();
         assert!(err.to_string().contains("stat"), "{err}");
+    }
+
+    /// Records the detaches `verify_reported_backing` orders, and can be
+    /// told to fail them.
+    struct DetachSpy {
+        detached: std::sync::Mutex<Vec<String>>,
+        fails: bool,
+    }
+
+    impl DetachSpy {
+        fn new(fails: bool) -> Self {
+            Self {
+                detached: std::sync::Mutex::new(Vec::new()),
+                fails,
+            }
+        }
+
+        fn detached(&self) -> Vec<String> {
+            self.detached.lock().unwrap().clone()
+        }
+    }
+
+    impl BlockTools for DetachSpy {
+        fn attach_loop(&self, _backing: &Path, _read_only: bool) -> Result<String> {
+            unreachable!("verification never attaches")
+        }
+
+        fn detach_loop(&self, device: &str) -> Result<()> {
+            self.detached.lock().unwrap().push(device.to_owned());
+            if self.fails {
+                return Err(SnapshotError::DeviceMapper("device busy".into()));
+            }
+            Ok(())
+        }
+
+        fn device_sectors(&self, _device: &str) -> Result<u64> {
+            unreachable!("verification never sizes")
+        }
+    }
+
+    #[test]
+    fn a_device_backing_the_expected_file_verifies_without_a_detach() {
+        let spy = DetachSpy::new(false);
+
+        verify_reported_backing(
+            &spy,
+            "/dev/loop0",
+            Path::new("/tmp/cow.img"),
+            "/tmp/cow.img",
+        )
+        .unwrap();
+
+        assert!(spy.detached().is_empty());
+    }
+
+    #[test]
+    fn a_device_backing_something_else_is_given_back_and_reported() {
+        let spy = DetachSpy::new(false);
+
+        let err = verify_reported_backing(
+            &spy,
+            "/dev/loop0",
+            Path::new("/tmp/cow.img"),
+            "/tmp/other.img",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("/dev/loop0 backs /tmp/other.img"),
+            "{err}"
+        );
+        assert_eq!(spy.detached(), ["/dev/loop0"]);
+    }
+
+    #[test]
+    fn a_mismatch_whose_detach_also_fails_reports_both() {
+        let spy = DetachSpy::new(true);
+
+        let err = verify_reported_backing(
+            &spy,
+            "/dev/loop0",
+            Path::new("/tmp/cow.img"),
+            "/tmp/other.img",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not /tmp/cow.img"), "{err}");
+        assert!(
+            err.to_string().contains("detaching it again failed"),
+            "{err}"
+        );
     }
 
     #[test]
