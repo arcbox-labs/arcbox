@@ -10,7 +10,7 @@ use crate::sandbox::{IdleAction, pause_reason};
 /// decide before the machine is driven: whether a warm-publish ticket was
 /// taken, and which restore this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Provision {
+pub enum Provision {
     /// `warm` = a warm-snapshot publish ticket was taken, so the boot tail
     /// must checkpoint the idle guest before announcing readiness.
     Boot {
@@ -33,14 +33,14 @@ pub enum RestoreOrigin {
 
 /// Why a pause is running; projects onto the PAUSING event's `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PauseReason {
+pub enum PauseReason {
     Requested,
     IdleTimeout,
 }
 
 impl PauseReason {
     /// The wire reason the PAUSING event reports.
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Requested => pause_reason::PAUSE,
             Self::IdleTimeout => pause_reason::IDLE_TIMEOUT,

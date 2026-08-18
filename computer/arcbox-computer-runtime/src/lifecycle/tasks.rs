@@ -35,7 +35,7 @@ use crate::sandbox::record::SandboxProvisionOutcome;
 
 /// What a sub-task hands back: its own success value, or the failure class
 /// the machine branches on.
-pub(super) type TaskResult<T = ()> = std::result::Result<T, TaskFailure>;
+pub type TaskResult<T = ()> = std::result::Result<T, TaskFailure>;
 
 /// A sub-task failure: the error the caller gets, plus the class the machine
 /// branches on.
@@ -44,7 +44,7 @@ pub(super) type TaskResult<T = ()> = std::result::Result<T, TaskFailure>;
 /// constructors below — an arbitrary `Event` here would let a task's error
 /// path drive the machine anywhere.
 #[derive(Debug)]
-pub(super) struct TaskFailure {
+pub struct TaskFailure {
     event: Event,
     error: VmmError,
 }
@@ -52,7 +52,7 @@ pub(super) struct TaskFailure {
 impl TaskFailure {
     /// Whatever usable state the computer had survives: the flow unwound what
     /// it had allocated.
-    pub(super) fn recoverable(error: VmmError) -> Self {
+    pub fn recoverable(error: VmmError) -> Self {
         Self {
             event: Event::Failure,
             error,
@@ -61,7 +61,7 @@ impl TaskFailure {
 
     /// The guest is quiesced with no verb able to thaw it: the port is
     /// hold-then-kill by design, so the computer cannot go back to `Ready`.
-    pub(super) fn frozen(error: VmmError) -> Self {
+    pub fn frozen(error: VmmError) -> Self {
         Self {
             event: Event::Frozen,
             error,
@@ -70,7 +70,7 @@ impl TaskFailure {
 
     /// The flow could not unwind what it had allocated, so the computer
     /// cannot go back to the phase it came from — see [`Event::Stranded`].
-    pub(super) fn stranded(error: VmmError) -> Self {
+    pub fn stranded(error: VmmError) -> Self {
         Self {
             event: Event::Stranded,
             error,
@@ -95,7 +95,7 @@ impl TaskFailure {
 
 /// The flows the actor spawns. One method per `Spawn*` effect.
 #[async_trait]
-pub(super) trait ComputerTasks: Send + Sync + 'static {
+pub trait ComputerTasks: Send + Sync + 'static {
     /// Boot the VM and wait for the guest agent to announce itself.
     ///
     /// `handed_off` is signalled once every cleanup resource the boot

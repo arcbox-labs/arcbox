@@ -196,7 +196,17 @@ pub(super) async fn boot_sandbox(
             let cmd_started = if spec.cmd.is_empty() {
                 false
             } else {
-                run_initial_cmd(&id, spec.clone(), agent.as_ref(), &instances, &events_tx).await
+                run_initial_cmd(
+                    &id,
+                    spec.clone(),
+                    agent.as_ref(),
+                    Arc::new(super::workload::InstanceSlot {
+                        id: id.clone(),
+                        instances: Arc::clone(&instances),
+                        events_tx: events_tx.clone(),
+                    }),
+                )
+                .await
             };
             if let Some(probe) = spec.ready_probe.clone()
                 && let Err(probe_error) = run_ready_probe(&probe, agent.as_ref()).await
@@ -257,7 +267,17 @@ pub(super) async fn boot_sandbox(
             // second failure is final — warned, the sandbox stays Ready,
             // the caller can still Run/Exec.
             if !cmd_started && !spec.cmd.is_empty() {
-                let _ = run_initial_cmd(&id, spec, agent.as_ref(), &instances, &events_tx).await;
+                let _ = run_initial_cmd(
+                    &id,
+                    spec,
+                    agent.as_ref(),
+                    Arc::new(super::workload::InstanceSlot {
+                        id: id.clone(),
+                        instances: Arc::clone(&instances),
+                        events_tx: events_tx.clone(),
+                    }),
+                )
+                .await;
             }
         }
         Err(mut failure) => {
@@ -611,8 +631,7 @@ pub(super) async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
     agent: &dyn GuestAgent,
-    instances: &super::InstanceMap,
-    events_tx: &broadcast::Sender<SandboxEvent>,
+    slot: Arc<dyn super::workload::WorkloadSlot>,
 ) -> bool {
     let start = StartCommand {
         cmd: spec.cmd,
@@ -625,11 +644,9 @@ pub(super) async fn run_initial_cmd(
         timeout_seconds: 0,
     };
     match super::workload::start_run_workload(
-        id,
         agent,
         start,
-        instances,
-        events_tx,
+        slot,
         super::workload::WorkloadClaim::Initial,
     )
     .await

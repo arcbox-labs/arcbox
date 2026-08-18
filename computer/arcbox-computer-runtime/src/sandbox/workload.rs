@@ -1,5 +1,6 @@
 use super::types::action;
 use super::*;
+use crate::lifecycle::actor::WorkloadOutcome;
 
 /// Which caller is taking the single-workload slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,98 +8,32 @@ pub enum WorkloadClaim {
     /// The public Run/Exec surface: claims from `Ready` only.
     Api,
     /// The boot/restore pipeline's own initial cmd: additionally claims
-    /// from `Starting`. A boot with an initial cmd keeps the instance
-    /// `Starting` until this claim, so an Inspect-polling client cannot
-    /// slip an exec into the boot tail (the warm-snapshot publish pause is
-    /// a wide window) and silently steal the slot the template's default
-    /// cmd was owed — the CORE-107 e2e caught exactly that.
+    /// from the readiness gate. A boot with an initial cmd holds the gate
+    /// until this claim, so an Inspect-polling client cannot slip an exec
+    /// into the boot tail (the warm-snapshot publish pause is a wide
+    /// window) and silently steal the slot the template's default cmd was
+    /// owed — the CORE-107 e2e caught exactly that.
     Initial,
 }
 
-/// Guarded transition into `Running` — the sandbox's single-workload claim.
+/// A computer's single-workload slot.
 ///
-/// It is taken **before** any command is dispatched into the guest, so a
-/// caller that loses a concurrent race (or arrives after a `stop` set
-/// `Stopping`) is rejected with `WrongState` *without* having launched a
-/// process. A blind assignment here was the original defect: two concurrent
-/// `Run`s would both dispatch, then one would be told it lost — after its
-/// command was already executing.
-pub(super) fn claim_workload(
-    id: &SandboxId,
-    instances: &InstanceMap,
-    claim: WorkloadClaim,
-) -> Result<()> {
-    let arc = instances
-        .read()
-        .unwrap()
-        .get(id)
-        .cloned()
-        .ok_or_else(|| VmmError::NotFound(id.clone()))?;
-    let mut inst = arc.lock().unwrap();
-    let allowed = inst.state == SandboxState::Ready
-        || (claim == WorkloadClaim::Initial && inst.state == SandboxState::Starting);
-    if !allowed {
-        return Err(VmmError::WrongState {
-            id: id.clone(),
-            expected: match claim {
-                WorkloadClaim::Api => "Ready".into(),
-                WorkloadClaim::Initial => "Starting or Ready".into(),
-            },
-            actual: inst.state.to_string(),
-        });
-    }
-    inst.state = SandboxState::Running;
-    Ok(())
-}
-
-/// The public Run/Exec claim: `Ready → Running` only.
-pub(super) fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
-    claim_workload(id, instances, WorkloadClaim::Api)
-}
-
-/// Roll a claim back to `Ready` after a failed dispatch.
-///
-/// Only downgrades when the sandbox is still `Running` (i.e. this claim still
-/// owns it). If a concurrent `stop` moved it to `Stopping`, that transition is
-/// left intact — stop owns the teardown from there.
-pub(super) fn release_running(id: &SandboxId, instances: &InstanceMap) {
-    // Drop the map read guard before taking the instance lock.
-    let arc = instances.read().unwrap().get(id).cloned();
-    if let Some(arc) = arc {
-        let mut inst = arc.lock().unwrap();
-        if inst.state == SandboxState::Running {
-            inst.state = SandboxState::Ready;
-        }
-    }
-}
-
-/// Record a workload's exit and return the sandbox to `Ready`.
-///
-/// Runs when the `exit` chunk is observed. The `Ready` flip happens only from
-/// `Running`. A concurrent `Stop` owns the `Stopping` state; workload exit
-/// timestamps signal its drain without reopening the sandbox to new work.
-pub(super) fn finish_workload(
-    id: &SandboxId,
-    status: ExitStatus,
-    instances: &InstanceMap,
-    events_tx: &broadcast::Sender<SandboxEvent>,
-) {
-    // Drop the map read guard before taking the instance lock.
-    let arc = instances.read().unwrap().get(id).cloned();
-    if let Some(arc) = arc {
-        let mut inst = arc.lock().unwrap();
-        inst.last_exit_status = Some(status);
-        inst.last_exited_at = Some(Utc::now());
-        if inst.state == SandboxState::Running {
-            inst.state = SandboxState::Ready;
-        }
-    }
-    let mut event = SandboxEvent::new(id, action::IDLE)
-        .with_attr("exit_code", &status.conventional_code().to_string());
-    if let ExitStatus::Signaled(signal) = status {
-        event = event.with_attr("signal", &signal.to_string());
-    }
-    let _ = events_tx.send(event);
+/// Taking it, giving it back and reporting the exit are all lifecycle
+/// transitions, so all three belong to the computer's actor rather than to
+/// the code that dispatches the command. The seam keeps the dispatch itself
+/// off the mailbox: [`start_run_workload`] talks to the guest directly, and
+/// only the three edges are verbs.
+#[async_trait::async_trait]
+pub trait WorkloadSlot: Send + Sync {
+    /// Take the slot. `WrongState` when a workload is already running, the
+    /// computer is on its way out, or an `Api` claim reached one that has
+    /// not announced READY.
+    async fn claim(&self, claim: WorkloadClaim) -> Result<()>;
+    /// Give the slot back after a dispatch the guest refused. Nothing ran,
+    /// so nothing is announced.
+    fn release(&self);
+    /// The workload ended.
+    fn exited(&self, outcome: WorkloadOutcome);
 }
 
 /// Spawn the watcher that mirrors a workload's output to the caller and drives
@@ -108,25 +43,20 @@ pub(super) fn finish_workload(
 /// is processed even after the caller drops its receiver. Coupling the state
 /// update to a successful forward was the original defect: a consumer that
 /// disconnected mid-workload broke the loop before the exit frame, stranding
-/// the sandbox in `Running` forever. Now a gone consumer only stops the
-/// forwarding; the drain (and the `Running → Ready` flip) continues.
+/// the computer in `Running` forever. Now a gone consumer only stops the
+/// forwarding; the drain (and the exit report) continues.
 fn spawn_exit_watcher(
-    id: &SandboxId,
     inner_rx: tokio::sync::mpsc::Receiver<Result<OutputChunk>>,
-    instances: &InstanceMap,
-    events_tx: &broadcast::Sender<SandboxEvent>,
+    slot: Arc<dyn WorkloadSlot>,
 ) -> tokio::sync::mpsc::Receiver<Result<OutputChunk>> {
     let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
-    let instances = Arc::clone(instances);
-    let events_tx = events_tx.clone();
-    let sandbox_id = id.clone();
     tokio::spawn(async move {
         let mut inner_rx = inner_rx;
         let mut consumer_gone = false;
         while let Some(result) = inner_rx.recv().await {
             // Handle the exit chunk regardless of the consumer's presence.
             if let Ok(OutputChunk::Exit(status)) = &result {
-                finish_workload(&sandbox_id, *status, &instances, &events_tx);
+                slot.exited(WorkloadOutcome::Exited(*status));
             }
             // Forward until the consumer goes away, then keep draining so the
             // exit chunk above is still reached.
@@ -138,37 +68,136 @@ fn spawn_exit_watcher(
     wrapped_rx
 }
 
-/// Start a non-interactive workload through the sandbox's agent and wire up
-/// the `Running → Ready` state machine.
+/// Start a non-interactive workload through the computer's agent and wire up
+/// the workload slot.
 ///
 /// Shared by `Run` (`WorkloadClaim::Api`) and the initial `cmd` launched by
-/// the boot/restore tails (`WorkloadClaim::Initial`): claims the sandbox
+/// the boot/restore gates (`WorkloadClaim::Initial`): claims the slot
 /// **before** connecting so a losing racer never dispatches a command,
-/// launches the session, then spawns the exit watcher. A launch failure
-/// rolls the claim back to `Ready`.
-pub(super) async fn start_run_workload(
-    id: &SandboxId,
+/// launches the session, then spawns the exit watcher. A launch failure gives
+/// the claim back.
+pub async fn start_run_workload(
     agent: &dyn GuestAgent,
     start: StartCommand,
-    instances: &super::InstanceMap,
-    events_tx: &broadcast::Sender<SandboxEvent>,
+    slot: Arc<dyn WorkloadSlot>,
     claim: WorkloadClaim,
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
-    claim_workload(id, instances, claim)?;
-
+    slot.claim(claim).await?;
     let inner_rx = match agent.run(start).await {
         Ok(rx) => rx,
-        Err(e) => {
-            release_running(id, instances);
-            return Err(e);
+        Err(error) => {
+            slot.release();
+            return Err(error);
         }
     };
-    let _ = events_tx.send(SandboxEvent::new(id, action::RUNNING));
+    Ok(spawn_exit_watcher(inner_rx, slot))
+}
 
-    Ok(spawn_exit_watcher(id, inner_rx, instances, events_tx))
+/// The workload slot as the instance map holds it.
+///
+/// The manager's own implementation until R3 PR-F2 puts the computer's actor
+/// behind the seam; the guarded transitions here are the ones the lifecycle
+/// machine now owns.
+pub(super) struct InstanceSlot {
+    pub(super) id: SandboxId,
+    pub(super) instances: InstanceMap,
+    pub(super) events_tx: broadcast::Sender<SandboxEvent>,
+}
+
+#[async_trait::async_trait]
+impl WorkloadSlot for InstanceSlot {
+    /// Guarded transition into `Running` — the computer's single-workload
+    /// claim.
+    ///
+    /// Taken **before** any command is dispatched into the guest, so a caller
+    /// that loses a concurrent race (or arrives after a `stop` set
+    /// `Stopping`) is rejected with `WrongState` *without* having launched a
+    /// process. A blind assignment here was the original defect: two
+    /// concurrent `Run`s would both dispatch, then one would be told it lost
+    /// — after its command was already executing.
+    async fn claim(&self, claim: WorkloadClaim) -> Result<()> {
+        let arc = self
+            .instances
+            .read()
+            .unwrap()
+            .get(&self.id)
+            .cloned()
+            .ok_or_else(|| VmmError::NotFound(self.id.clone()))?;
+        let mut inst = arc.lock().unwrap();
+        let allowed = inst.state == SandboxState::Ready
+            || (claim == WorkloadClaim::Initial && inst.state == SandboxState::Starting);
+        if !allowed {
+            return Err(VmmError::WrongState {
+                id: self.id.clone(),
+                expected: match claim {
+                    WorkloadClaim::Api => "Ready".into(),
+                    WorkloadClaim::Initial => "Starting or Ready".into(),
+                },
+                actual: inst.state.to_string(),
+            });
+        }
+        inst.state = SandboxState::Running;
+        drop(inst);
+        let _ = self
+            .events_tx
+            .send(SandboxEvent::new(&self.id, action::RUNNING));
+        Ok(())
+    }
+
+    /// Only downgrades while the computer is still `Running` (i.e. this claim
+    /// still owns it). A concurrent `stop` that moved it to `Stopping` owns
+    /// the teardown from there.
+    fn release(&self) {
+        let arc = self.instances.read().unwrap().get(&self.id).cloned();
+        if let Some(arc) = arc {
+            let mut inst = arc.lock().unwrap();
+            if inst.state == SandboxState::Running {
+                inst.state = SandboxState::Ready;
+            }
+        }
+    }
+
+    /// Records the exit and returns the computer to `Ready`. The `Ready` flip
+    /// happens only from `Running`: a concurrent `Stop` owns the `Stopping`
+    /// state, and the exit timestamp signals its drain without reopening the
+    /// computer to new work.
+    fn exited(&self, outcome: WorkloadOutcome) {
+        let arc = self.instances.read().unwrap().get(&self.id).cloned();
+        if let Some(arc) = arc {
+            let mut inst = arc.lock().unwrap();
+            if let WorkloadOutcome::Exited(status) = &outcome {
+                inst.last_exit_status = Some(*status);
+            }
+            inst.last_exited_at = Some(Utc::now());
+            if inst.state == SandboxState::Running {
+                inst.state = SandboxState::Ready;
+            }
+        }
+        let event = SandboxEvent::new(&self.id, action::IDLE);
+        let event = match outcome {
+            WorkloadOutcome::Exited(status) => {
+                let event = event.with_attr("exit_code", &status.conventional_code().to_string());
+                match status {
+                    ExitStatus::Signaled(signal) => event.with_attr("signal", &signal.to_string()),
+                    ExitStatus::Code(_) => event,
+                }
+            }
+            WorkloadOutcome::Broke(error) => event.with_attr("error", &error),
+        };
+        let _ = self.events_tx.send(event);
+    }
 }
 
 impl SandboxManager {
+    /// This computer's workload slot.
+    pub(super) fn workload_slot(&self, id: &SandboxId) -> Arc<dyn WorkloadSlot> {
+        Arc::new(InstanceSlot {
+            id: id.clone(),
+            instances: Arc::clone(&self.instances),
+            events_tx: self.events_tx.clone(),
+        })
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "public API mirrors workload request"
@@ -198,11 +227,9 @@ impl SandboxManager {
         };
 
         start_run_workload(
-            id,
             agent.as_ref(),
             start,
-            &self.instances,
-            &self.events_tx,
+            self.workload_slot(id),
             WorkloadClaim::Api,
         )
         .await
@@ -213,106 +240,39 @@ impl SandboxManager {
 mod tests {
     use super::*;
 
-    /// Build a one-instance map in the given state for state-machine tests.
-    fn instance_map(id: &str, state: SandboxState) -> InstanceMap {
-        let mut inst = SandboxInstance::new(
-            id.to_owned(),
-            SandboxSpec::default(),
-            None,
-            PathBuf::from("/tmp/does-not-matter"),
-        );
-        inst.state = state;
-        let map = HashMap::from([(id.to_owned(), Arc::new(Mutex::new(inst)))]);
-        Arc::new(RwLock::new(map))
+    /// Records what the watcher reported, standing in for the computer's
+    /// actor: the state machine those reports drive is table-tested in
+    /// `crate::lifecycle::tests`.
+    #[derive(Default)]
+    struct RecordingSlot {
+        reports: Mutex<Vec<String>>,
     }
 
-    fn state_of(id: &str, instances: &InstanceMap) -> SandboxState {
-        instances.read().unwrap()[id].lock().unwrap().state
-    }
+    #[async_trait::async_trait]
+    impl WorkloadSlot for RecordingSlot {
+        async fn claim(&self, _claim: WorkloadClaim) -> Result<()> {
+            self.reports.lock().unwrap().push("claim".to_owned());
+            Ok(())
+        }
 
-    #[test]
-    fn claim_running_transitions_from_ready_only() {
-        let instances = instance_map("s", SandboxState::Ready);
-        claim_running(&"s".to_owned(), &instances).unwrap();
-        assert_eq!(state_of("s", &instances), SandboxState::Running);
+        fn release(&self) {
+            self.reports.lock().unwrap().push("release".to_owned());
+        }
 
-        // A second claim on the now-Running sandbox must be rejected — this is
-        // the guard that stops a concurrent workload from being dispatched.
-        let err = claim_running(&"s".to_owned(), &instances).unwrap_err();
-        assert!(matches!(err, VmmError::WrongState { .. }));
-        assert_eq!(state_of("s", &instances), SandboxState::Running);
-    }
-
-    #[test]
-    fn initial_claim_reserves_the_slot_from_starting() {
-        // The boot tail keeps a cmd-carrying instance `Starting`; only the
-        // Initial claim may take the slot from there.
-        let instances = instance_map("s", SandboxState::Starting);
-        assert!(matches!(
-            claim_running(&"s".to_owned(), &instances).unwrap_err(),
-            VmmError::WrongState { .. }
-        ));
-        claim_workload(&"s".to_owned(), &instances, WorkloadClaim::Initial).unwrap();
-        assert_eq!(state_of("s", &instances), SandboxState::Running);
-
-        // The post-READY retry path claims from Ready with the same verb.
-        let instances = instance_map("s", SandboxState::Ready);
-        claim_workload(&"s".to_owned(), &instances, WorkloadClaim::Initial).unwrap();
-        assert_eq!(state_of("s", &instances), SandboxState::Running);
-    }
-
-    #[test]
-    fn claim_running_rejects_missing_and_stopping() {
-        let instances = instance_map("s", SandboxState::Stopping);
-        assert!(matches!(
-            claim_running(&"s".to_owned(), &instances).unwrap_err(),
-            VmmError::WrongState { .. }
-        ));
-        assert!(matches!(
-            claim_running(&"missing".to_owned(), &instances).unwrap_err(),
-            VmmError::NotFound(_)
-        ));
-    }
-
-    #[test]
-    fn release_running_only_downgrades_running() {
-        let instances = instance_map("s", SandboxState::Running);
-        release_running(&"s".to_owned(), &instances);
-        assert_eq!(state_of("s", &instances), SandboxState::Ready);
-
-        // A stop that won the race left Stopping; rollback must not clobber it.
-        instances.read().unwrap()["s"].lock().unwrap().state = SandboxState::Stopping;
-        release_running(&"s".to_owned(), &instances);
-        assert_eq!(state_of("s", &instances), SandboxState::Stopping);
-    }
-
-    #[test]
-    fn workload_exit_does_not_reopen_a_stopping_sandbox() {
-        let instances = instance_map("s", SandboxState::Stopping);
-        let (events_tx, _) = broadcast::channel(4);
-
-        finish_workload(&"s".to_owned(), ExitStatus::Code(0), &instances, &events_tx);
-
-        assert_eq!(state_of("s", &instances), SandboxState::Stopping);
-        assert!(
-            instances.read().unwrap()["s"]
-                .lock()
-                .unwrap()
-                .last_exited_at
-                .is_some()
-        );
+        fn exited(&self, outcome: WorkloadOutcome) {
+            self.reports.lock().unwrap().push(format!("{outcome:?}"));
+        }
     }
 
     #[tokio::test]
-    async fn watcher_restores_ready_even_when_consumer_disconnects() {
+    async fn the_watcher_reports_the_exit_even_when_the_consumer_disconnects() {
         // Regression for the strand-in-Running bug: drop the consumer before
-        // the exit chunk; the watcher must still process the exit and flip
-        // Running → Ready.
-        let instances = instance_map("s", SandboxState::Running);
-        let (events_tx, _events_rx) = broadcast::channel(16);
+        // the exit chunk; the watcher must still process the exit, or the
+        // computer never leaves `Running`.
+        let slot = Arc::new(RecordingSlot::default());
         let (inner_tx, inner_rx) = tokio::sync::mpsc::channel(8);
 
-        let wrapped_rx = spawn_exit_watcher(&"s".to_owned(), inner_rx, &instances, &events_tx);
+        let wrapped_rx = spawn_exit_watcher(inner_rx, Arc::clone(&slot) as Arc<dyn WorkloadSlot>);
         drop(wrapped_rx); // consumer gone immediately
 
         inner_tx
@@ -325,28 +285,22 @@ mod tests {
             .unwrap();
         drop(inner_tx); // guest side closes after exit
 
-        // Give the detached watcher a moment to drain and update state.
         for _ in 0..50 {
-            if state_of("s", &instances) == SandboxState::Ready {
+            if !slot.reports.lock().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(state_of("s", &instances), SandboxState::Ready);
-        let last_exit_status = {
-            let guard = instances.read().unwrap();
-            guard["s"].lock().unwrap().last_exit_status
-        };
-        assert_eq!(last_exit_status, Some(ExitStatus::Code(7)));
+        assert_eq!(slot.reports.lock().unwrap().as_slice(), ["Exited(Code(7))"]);
     }
 
     #[tokio::test]
-    async fn watcher_forwards_then_finishes_for_a_live_consumer() {
-        let instances = instance_map("s", SandboxState::Running);
-        let (events_tx, mut events_rx) = broadcast::channel(16);
+    async fn the_watcher_forwards_then_reports_for_a_live_consumer() {
+        let slot = Arc::new(RecordingSlot::default());
         let (inner_tx, inner_rx) = tokio::sync::mpsc::channel(8);
 
-        let mut wrapped_rx = spawn_exit_watcher(&"s".to_owned(), inner_rx, &instances, &events_tx);
+        let mut wrapped_rx =
+            spawn_exit_watcher(inner_rx, Arc::clone(&slot) as Arc<dyn WorkloadSlot>);
 
         inner_tx
             .send(Ok(OutputChunk::Stdout(b"hello".to_vec())))
@@ -365,10 +319,40 @@ mod tests {
         let exit = wrapped_rx.recv().await.unwrap().unwrap();
         assert!(matches!(exit, OutputChunk::Exit(ExitStatus::Code(0))));
         assert!(wrapped_rx.recv().await.is_none());
-        assert_eq!(state_of("s", &instances), SandboxState::Ready);
+        assert_eq!(slot.reports.lock().unwrap().as_slice(), ["Exited(Code(0))"]);
+    }
 
-        // An "idle" event was broadcast on exit.
-        let ev = events_rx.recv().await.unwrap();
-        assert_eq!(ev.action, "idle");
+    /// A guest that refuses the dispatch must give the slot back — and only
+    /// the slot: nothing ran, so there is no exit to report.
+    #[tokio::test]
+    async fn a_refused_dispatch_gives_the_claim_back() {
+        let slot = Arc::new(RecordingSlot::default());
+        let agents = crate::testkit::agent::FakeAgentFactory::new();
+        agents.on(
+            &["/bin/nope"],
+            crate::testkit::agent::Reply::Fails("no such file".into()),
+        );
+
+        start_run_workload(
+            agents.agent().as_ref(),
+            StartCommand {
+                cmd: vec!["/bin/nope".into()],
+                env: HashMap::new(),
+                working_dir: String::new(),
+                user: String::new(),
+                tty: false,
+                tty_width: 80,
+                tty_height: 24,
+                timeout_seconds: 0,
+            },
+            Arc::clone(&slot) as Arc<dyn WorkloadSlot>,
+            WorkloadClaim::Api,
+        )
+        .await
+        .expect_err("the guest refused the command");
+        assert_eq!(
+            slot.reports.lock().unwrap().as_slice(),
+            ["claim", "release"]
+        );
     }
 }

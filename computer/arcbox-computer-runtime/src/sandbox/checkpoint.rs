@@ -559,8 +559,7 @@ impl SandboxManager {
                 &new_id,
                 effective_spec.clone(),
                 agent.as_ref(),
-                &self.instances,
-                &self.events_tx,
+                self.workload_slot(&new_id),
             )
             .await
         } else {
@@ -622,8 +621,7 @@ impl SandboxManager {
                 &new_id,
                 effective_spec,
                 agent.as_ref(),
-                &self.instances,
-                &self.events_tx,
+                self.workload_slot(&new_id),
             )
             .await;
         }

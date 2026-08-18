@@ -76,8 +76,55 @@ const RETRY_MAX: Duration = Duration::from_secs(5);
 /// A parked caller.
 type Reply = oneshot::Sender<Result<()>>;
 
+/// One computer's mailbox: the only way to ask its actor for anything.
+///
+/// A closed mailbox means the computer is gone — the actor's loop ends only
+/// once its record has been forgotten, or once the last sender was dropped
+/// without the reservation being committed — so both failures answer
+/// `NotFound`, which is what a caller racing a removal is told today.
+#[derive(Clone)]
+pub struct Mailbox(mpsc::UnboundedSender<Command>);
+
+impl Mailbox {
+    /// Asks the actor for something and waits for its answer.
+    pub(crate) async fn ask<T>(
+        &self,
+        id: &SandboxId,
+        command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
+    ) -> Result<T> {
+        let (reply, answer) = oneshot::channel();
+        self.0
+            .send(command(reply))
+            .map_err(|_| VmmError::NotFound(id.clone()))?;
+        answer.await.map_err(|_| VmmError::NotFound(id.clone()))?
+    }
+
+    /// Tells the actor something it does not answer.
+    pub(crate) fn tell(&self, command: Command) {
+        let _ = self.0.send(command);
+    }
+
+    /// A handle that does **not** keep the actor alive, for the flows the
+    /// actor itself spawns: a sub-task holding a live sender would make its
+    /// own computer unstoppable.
+    pub(crate) fn downgrade(&self) -> WeakMailbox {
+        WeakMailbox(self.0.downgrade())
+    }
+}
+
+/// A [`Mailbox`] that does not keep its actor running. See
+/// [`Mailbox::downgrade`].
+#[derive(Clone)]
+pub struct WeakMailbox(mpsc::WeakUnboundedSender<Command>);
+
+impl WeakMailbox {
+    pub(crate) fn upgrade(&self) -> Option<Mailbox> {
+        self.0.upgrade().map(Mailbox)
+    }
+}
+
 /// A verb addressed to one computer.
-pub(super) enum Command {
+pub enum Command {
     /// Drive the provisioned computer's first flow. A cold boot is answered
     /// as soon as it is under way (`create` returns `starting`); a restore is
     /// answered by READY, which is what its caller waits for.
@@ -133,7 +180,7 @@ pub(super) enum Command {
 /// one arrived. `execution::run_session`'s two branches; both leave the
 /// computer idle, and only the attributes of the IDLE event differ.
 #[derive(Debug, Clone)]
-pub(super) enum WorkloadOutcome {
+pub enum WorkloadOutcome {
     Exited(ExitStatus),
     Broke(String),
 }
@@ -141,10 +188,10 @@ pub(super) enum WorkloadOutcome {
 /// The deadline policy of one computer: the hard lifetime cap, and the idle
 /// window with the action it fires.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Deadlines {
-    pub(super) ttl: Option<DateTime<Utc>>,
-    pub(super) idle_timeout_seconds: u32,
-    pub(super) on_idle: IdleAction,
+pub struct Deadlines {
+    pub ttl: Option<DateTime<Utc>>,
+    pub idle_timeout_seconds: u32,
+    pub on_idle: IdleAction,
 }
 
 /// What a read of a computer sees without touching the mailbox.
@@ -155,11 +202,11 @@ pub(super) struct Deadlines {
 /// for it. PR-F2 grows this into the full read path (the lease, the
 /// timestamps, the pause state) as the manager's instance dies.
 #[derive(Clone, Default)]
-pub(super) struct ComputerSnapshot {
+pub struct ComputerSnapshot {
     /// `None` until the actor has published its first state.
-    pub(super) state: Option<SandboxState>,
-    pub(super) agent: Option<Arc<dyn GuestAgent>>,
-    pub(super) error: Option<String>,
+    pub state: Option<SandboxState>,
+    pub agent: Option<Arc<dyn GuestAgent>>,
+    pub error: Option<String>,
 }
 
 /// A sub-task's outcome, tagged with the epoch of the task that produced it.
@@ -226,7 +273,7 @@ enum Flow {
 }
 
 /// The lifecycle actor.
-pub(super) struct ComputerActor {
+pub struct ComputerActor {
     id: SandboxId,
     /// The durable record's generation, `None` for a computer with no record
     /// — the durable effects are then no-ops, as they are today.
@@ -307,20 +354,20 @@ pub enum Seeded {
 }
 
 /// What one actor is built from.
-pub(super) struct ComputerSeed {
-    pub(super) id: SandboxId,
-    pub(super) generation: Option<Uuid>,
-    pub(super) vm_dir: PathBuf,
-    pub(super) records: Arc<SandboxRecordStore>,
-    pub(super) events_tx: broadcast::Sender<SandboxEvent>,
-    pub(super) tasks: Arc<dyn ComputerTasks>,
-    pub(super) deadlines: Deadlines,
-    pub(super) timers_enabled: watch::Receiver<bool>,
-    pub(super) seeded: Seeded,
+pub struct ComputerSeed {
+    pub id: SandboxId,
+    pub generation: Option<Uuid>,
+    pub vm_dir: PathBuf,
+    pub records: Arc<SandboxRecordStore>,
+    pub events_tx: broadcast::Sender<SandboxEvent>,
+    pub tasks: Arc<dyn ComputerTasks>,
+    pub deadlines: Deadlines,
+    pub timers_enabled: watch::Receiver<bool>,
+    pub seeded: Seeded,
 }
 
 impl ComputerActor {
-    pub(super) fn new(
+    pub fn new(
         seed: ComputerSeed,
         commands: mpsc::UnboundedReceiver<Command>,
         snapshot_tx: watch::Sender<ComputerSnapshot>,
@@ -366,7 +413,7 @@ impl ComputerActor {
     }
 
     /// Runs until the computer is gone or every command sender is dropped.
-    pub(super) async fn run(mut self) {
+    pub async fn run(mut self) {
         let mut machine = ComputerLifecycle
             .uninitialized_state_machine()
             .init_with_context(&mut self.effects);

@@ -96,6 +96,37 @@ fn an_adopted_computer_is_seeded_ready_without_a_launch() {
     assert_eq!(state.to_public(), SandboxState::Running);
 }
 
+/// Who may take the single-workload slot, over every state — the rule
+/// `workload::claim_workload` enforced against `SandboxState`.
+///
+/// The two claims differ in exactly one place: the readiness gate holds the
+/// slot for the boot's own `cmd`, and an `Api` claim cannot reach a computer
+/// that has not announced READY. Everywhere else a claim is refused, and a
+/// refusal must leave the computer where it was — a `Run` that lost the race
+/// must not have moved anything.
+#[test]
+fn only_ready_and_the_gates_own_cmd_take_the_workload_slot() {
+    for node in explore() {
+        for claim in [WorkloadClaim::Api, WorkloadClaim::Initial] {
+            let (mut sm, mut context) = reach(&node.path);
+            let before = *sm.state();
+            let (after, effects) = step(&mut sm, &mut context, &Event::ClaimWorkload { claim });
+            let allowed = matches!(before, State::Ready {})
+                || (claim == WorkloadClaim::Initial
+                    && matches!(before, State::Gating { claimed: false, .. }));
+            assert_eq!(
+                after.to_public() == SandboxState::Running && !effects.is_empty(),
+                allowed,
+                "{before:?} with {claim:?}"
+            );
+            if !allowed {
+                assert_eq!(before, after, "a refused claim moved {before:?}");
+                assert!(effects.is_empty(), "a refused claim acted in {before:?}");
+            }
+        }
+    }
+}
+
 // ----- narrative flows -----
 
 /// Drives a cold create through to `ready`, discarding effects.

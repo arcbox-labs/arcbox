@@ -52,7 +52,7 @@ pub(super) enum Unconfirmed {
 
 /// Which resources a release drops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ReleaseScope {
+pub enum ReleaseScope {
     /// VMM, CoW, TAP + IP and chroot; the record stays inspectable.
     Runtime,
     /// The pause release: the same, but the disk overlay is retained.

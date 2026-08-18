@@ -12,8 +12,9 @@ use std::collections::VecDeque;
 
 use tokio::sync::{mpsc, watch};
 
-use super::types::action;
+use super::workload::{WorkloadClaim, WorkloadSlot};
 use super::*;
+use crate::lifecycle::actor::WorkloadOutcome;
 
 /// Retained bytes per stdio channel. Older bytes are dropped and the buffer's
 /// base offset advances; an attach below the base resumes from the earliest
@@ -593,33 +594,12 @@ pub(super) fn spawn_teardown_purge(
     });
 }
 
-/// Flip a sandbox whose execution session broke (no exit observed) back to
-/// `Ready` and announce the interruption. The guest vm-agent kills the
-/// workload when its host connection drops, so `Ready` is accurate.
-fn abort_workload(
-    id: &SandboxId,
-    error: &str,
-    instances: &InstanceMap,
-    events_tx: &broadcast::Sender<SandboxEvent>,
-) {
-    let arc = instances.read().unwrap().get(id).cloned();
-    if let Some(arc) = arc {
-        let mut inst = arc.lock().unwrap();
-        inst.last_exited_at = Some(Utc::now());
-        if inst.state == SandboxState::Running {
-            inst.state = SandboxState::Ready;
-        }
-    }
-    let _ = events_tx.send(SandboxEvent::new(id, action::IDLE).with_attr("error", error));
-}
-
 /// Drain a session's output into the execution's buffers until it exits,
 /// then keep the exited record around for late attach/wait before GC.
 async fn run_session(
     exec: Arc<Execution>,
     mut output_rx: mpsc::Receiver<Result<OutputChunk>>,
-    instances: InstanceMap,
-    events_tx: broadcast::Sender<SandboxEvent>,
+    slot: Arc<dyn WorkloadSlot>,
     registry: Arc<ExecutionRegistry>,
 ) {
     let outcome: std::result::Result<ExitStatus, String> = loop {
@@ -639,13 +619,14 @@ async fn run_session(
     };
 
     match &outcome {
-        Ok(status) => {
-            super::workload::finish_workload(&exec.sandbox_id, *status, &instances, &events_tx);
-        }
+        Ok(status) => slot.exited(WorkloadOutcome::Exited(*status)),
+        // The guest vm-agent kills the workload when its host connection
+        // drops, so the computer is idle either way — there is just no status
+        // to report, only why.
         Err(e) => {
             warn!(sandbox_id = %exec.sandbox_id, execution_id = %exec.id, error = %e,
                   "execution session broke before exit");
-            abort_workload(&exec.sandbox_id, e, &instances, &events_tx);
+            slot.exited(WorkloadOutcome::Broke(e.clone()));
         }
     }
     exec.mark_exited(&outcome);
@@ -683,7 +664,7 @@ impl SandboxManager {
         // rather than failing it. One await is the normal case (the original
         // commits or unwinds); the bound only stops a pathological interleave
         // of repeated failing starts from spinning here forever.
-        let mut slot = None;
+        let mut reservation = None;
         for _ in 0..MAX_START_RESERVE_ROUNDS {
             match self
                 .executions
@@ -691,7 +672,7 @@ impl SandboxManager {
             {
                 Reserve::Existing(snapshot) => return Ok(snapshot),
                 Reserve::Slot(guard) => {
-                    slot = Some(guard);
+                    reservation = Some(guard);
                     break;
                 }
                 Reserve::AwaitPending(mut done) => {
@@ -699,7 +680,7 @@ impl SandboxManager {
                 }
             }
         }
-        let Some(slot) = slot else {
+        let Some(reservation) = reservation else {
             return Err(VmmError::AlreadyExists(format!(
                 "execution '{id}' (concurrent starts did not settle)"
             )));
@@ -717,14 +698,16 @@ impl SandboxManager {
             timeout_seconds: spec.timeout_seconds,
         };
 
-        // Claim the sandbox (Ready → Running) before dispatching, so a losing
-        // racer never launches a process (same discipline as workload.rs).
-        super::workload::claim_running(sandbox_id, &self.instances)?;
+        // Claim the computer (Ready → Running) before dispatching, so a
+        // losing racer never launches a process (same discipline as
+        // workload.rs).
+        let slot = self.workload_slot(sandbox_id);
+        slot.claim(WorkloadClaim::Api).await?;
 
         let (input_tx, output_rx) = match agent.exec(start).await {
             Ok(pair) => pair,
             Err(e) => {
-                super::workload::release_running(sandbox_id, &self.instances);
+                slot.release();
                 return Err(e);
             }
         };
@@ -737,16 +720,12 @@ impl SandboxManager {
         }
 
         let exec = Arc::new(Execution::new(id, sandbox_id.clone(), &spec, input_tx));
-        slot.commit(&exec);
-        let _ = self
-            .events_tx
-            .send(SandboxEvent::new(sandbox_id, action::RUNNING));
+        reservation.commit(&exec);
 
         tokio::spawn(run_session(
             Arc::clone(&exec),
             output_rx,
-            Arc::clone(&self.instances),
-            self.events_tx.clone(),
+            slot,
             Arc::clone(&self.executions),
         ));
 
