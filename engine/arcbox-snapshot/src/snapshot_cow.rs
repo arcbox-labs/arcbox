@@ -869,16 +869,18 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\\n");
         let binary = dir.join("dmsetup");
-        std::fs::write(
+        crate::test_support::write_script(
             &binary,
-            format!(
+            &format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = ls ]; then printf '{listing}\\n'; else echo \"$@\" >> '{}'; fi\n",
                 dir.join("dmsetup.log").display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
+        // `write_script` execs the stand-in once to prove the kernel will
+        // let it run, and that argument-less run appends to the log the
+        // tests read back. Start them from an empty record.
+        std::fs::remove_file(dir.join("dmsetup.log")).ok();
         binary
     }
 

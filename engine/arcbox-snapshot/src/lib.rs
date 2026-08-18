@@ -19,5 +19,8 @@ pub mod snapshot;
 pub mod snapshot_cow;
 pub mod template_catalog;
 
+#[cfg(test)]
+mod test_support;
+
 pub use error::{Result, SnapshotError};
 pub use snapshot::{SnapshotCatalog, SnapshotInfo, SnapshotType};

@@ -168,8 +168,8 @@ fn is_busy_message(stderr: &str, backing: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{calls, fake_tool};
     use super::*;
+    use crate::test_support::{calls, fake_tool};
 
     #[test]
     fn busybox_tools_default_to_the_system_vm_path() {
