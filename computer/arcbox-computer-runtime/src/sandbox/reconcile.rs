@@ -414,6 +414,9 @@ pub(super) struct OrphanSweep {
     /// Sandboxes reclaimed alive, by id. Their journals stay on disk — they
     /// are live state again, not debris — and so do their runtime dirs.
     adopted: HashMap<String, AdoptedSandbox>,
+    /// Ids whose journal this process could not make sense of, so it acted
+    /// on neither the record nor the resources it names.
+    skipped: HashSet<String>,
     runtime_dirs: Vec<PathBuf>,
 }
 
@@ -424,6 +427,7 @@ impl SweptRuntime {
         Self {
             swept: HashSet::new(),
             adopted: HashMap::new(),
+            skipped: HashSet::new(),
         }
     }
 }
@@ -433,6 +437,7 @@ impl OrphanSweep {
         Self {
             ids: HashSet::new(),
             adopted: HashMap::new(),
+            skipped: HashSet::new(),
             runtime_dirs: Vec::new(),
         }
     }
@@ -444,6 +449,7 @@ impl OrphanSweep {
         SweptRuntime {
             swept: std::mem::take(&mut self.ids),
             adopted: std::mem::take(&mut self.adopted),
+            skipped: std::mem::take(&mut self.skipped),
         }
     }
 }
@@ -476,6 +482,7 @@ pub(super) async fn sweep_orphans(
         Err(error) => return Err(error.into()),
     };
     let mut records = Vec::new();
+    let mut skipped = HashSet::new();
     for entry in entries {
         let entry = entry?;
         let dir = entry.path();
@@ -489,7 +496,41 @@ pub(super) async fn sweep_orphans(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        validate_state_record(config, &sandboxes_dir, &dir, &record)?;
+        // A journal this process cannot make sense of is skipped, not
+        // propagated. Aborting here costs far more than the record itself:
+        // the sweep gates every create, so one unreadable journal would
+        // strand every *other* sandbox's resources and leave the manager
+        // unusable, where skipping leaks only what this one record names.
+        // It stays on disk, so a later version can still reclaim it, and
+        // the warning says which one to look at.
+        //
+        // This is also the single place the question is asked. `VmId` is
+        // narrower than [`super::validate_id`] — the latter runs over
+        // snapshot and execution ids that never become a VM identity, and
+        // is deliberately permissive for exactly this reason — so the id a
+        // driver will be handed is parsed here, letting `adopt_or_kill` and
+        // [`SandboxStateRecord::lease`] rely on it downstream.
+        let usable = validate_state_record(config, &sandboxes_dir, &dir, &record)
+            .and_then(|()| VmId::new(record.id.as_str()).map_err(VmmError::from))
+            .and_then(|_| VmId::new(record.resource_owner()).map_err(VmmError::from));
+        if let Err(error) = usable {
+            warn!(
+                sandbox_id = %record.id,
+                path = %dir.display(),
+                %error,
+                "skipping an unusable crash journal; the resources it names are left in place"
+            );
+            // Both spellings, because one reason a journal is unusable is
+            // that they disagree: the durable record is keyed by the
+            // directory the journal was found in, and by the id the journal
+            // claims, and an unreadable one is exactly the case where those
+            // are not the same sandbox.
+            if let Some(dir_name) = dir.file_name().and_then(|name| name.to_str()) {
+                skipped.insert(dir_name.to_owned());
+            }
+            skipped.insert(record.id);
+            continue;
+        }
         records.push((dir, record));
     }
     // `read_dir` order is arbitrary; a stable one makes a sweep that fails
@@ -536,6 +577,7 @@ pub(super) async fn sweep_orphans(
     Ok(OrphanSweep {
         ids: swept,
         adopted,
+        skipped,
         runtime_dirs,
     })
 }
@@ -651,6 +693,7 @@ pub(super) async fn finalize_sweep(sweep: OrphanSweep) -> Result<()> {
 pub(super) struct SweptRuntime {
     swept: HashSet<String>,
     adopted: HashMap<String, AdoptedSandbox>,
+    skipped: HashSet<String>,
 }
 
 /// Normalizes durable records after the orphan sweep decided each sandbox's
@@ -675,9 +718,10 @@ pub(super) fn normalize_durable_records(
 ) -> Result<()> {
     let inactive = built;
     let mut nothing_adopted = HashMap::new();
-    let (swept, adopted) = match sweep {
-        Some(sweep) => (Some(&sweep.swept), &mut sweep.adopted),
-        None => (None, &mut nothing_adopted),
+    let nothing_skipped = HashSet::new();
+    let (swept, adopted, skipped) = match sweep {
+        Some(sweep) => (Some(&sweep.swept), &mut sweep.adopted, &sweep.skipped),
+        None => (None, &mut nothing_adopted, &nothing_skipped),
     };
 
     for record in store.load_all()? {
@@ -685,6 +729,12 @@ pub(super) fn normalize_durable_records(
             None => JournalEvidence::Unchecked,
             Some(_) if adopted.contains_key(&record.id) => JournalEvidence::Adopted,
             Some(ids) if ids.contains(&record.id) => JournalEvidence::Swept,
+            // The sweep found this one's journal and could not read it, so
+            // it knows no more about the resources than if it had never
+            // run — which is what `Unchecked` means. Reading it as
+            // `Unjournaled` instead would refuse a live phase and abort
+            // startup, undoing the skip that kept the sweep going.
+            Some(_) if skipped.contains(&record.id) => JournalEvidence::Unchecked,
             Some(_) => JournalEvidence::Unjournaled,
         };
         match recovery::plan(record.phase, evidence) {
@@ -1994,6 +2044,55 @@ mod tests {
                 .join(STATE_FILE)
                 .exists(),
             "an adopted journal is live state, not debris"
+        );
+    }
+
+    /// A journal this process cannot make sense of costs only itself. The
+    /// sweep gates every create, so propagating would strand every *other*
+    /// sandbox's resources and leave the manager unusable — a far larger
+    /// leak than the one record names.
+    #[tokio::test]
+    async fn an_unusable_journal_is_skipped_and_the_sweep_goes_on() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        // A journal whose id disagrees with the directory holding it, which
+        // is the shape `validate_state_record` refuses — and the one where
+        // the two spellings name different sandboxes. Written by hand:
+        // nothing this crate does produces one.
+        let broken_dir = data_dir.path().join("sandboxes").join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        let stray = SandboxStateRecord::new("not-broken", None, None, None, &config, None).unwrap();
+        write_state_record(&broken_dir, &stray).unwrap();
+
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, "broken", PersistPhase::Ready);
+        drop(store);
+
+        let (vm, manager, _network, reconciled) =
+            sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
+
+        reconciled.expect("one unreadable journal does not fail the reconciliation");
+        assert_eq!(
+            vm.state(),
+            VmState::Running,
+            "the sandbox the sweep could read was still reclaimed"
+        );
+        assert_eq!(
+            manager.snapshot(&"keeper".to_owned()).unwrap().state,
+            SandboxState::Ready
+        );
+        // Inspectable rather than fatal. `Unjournaled` would have refused a
+        // live phase here, which is the abort the skip exists to avoid.
+        assert_eq!(
+            manager.snapshot(&"broken".to_owned()).unwrap().state,
+            SandboxState::Failed,
+            "the unreadable one is reported, not reconciled"
+        );
+        assert!(
+            broken_dir.join(STATE_FILE).exists(),
+            "its journal stays on disk for a version that can read it"
         );
     }
 
