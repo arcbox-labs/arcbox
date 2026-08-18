@@ -58,7 +58,7 @@ mod templates;
 mod testing;
 mod timers;
 pub(crate) mod types;
-mod warm;
+pub(crate) mod warm;
 pub(crate) mod workload;
 
 pub use execution::{

@@ -89,7 +89,7 @@ pub(super) fn find_warm_snapshot(
 
 /// Everything the boot task needs to publish a warm snapshot once its
 /// sandbox reaches Ready (CORE-77).
-pub(super) struct WarmPublishTicket {
+pub struct WarmPublishTicket {
     pub(super) key: WarmKey,
     pub(super) cache: Arc<WarmCache>,
     pub(super) snapshots: Arc<SnapshotCatalog>,
@@ -107,7 +107,7 @@ pub(super) struct WarmPublishTicket {
 /// `expected_state` is what the boot tail left the instance in: `Ready` for
 /// a cmd-less boot, `Starting` when the tail is still holding the workload
 /// slot for the initial cmd.
-pub(super) async fn publish_after_boot(
+pub async fn publish_after_boot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
     computer: &Arc<Mutex<SandboxInstance>>,

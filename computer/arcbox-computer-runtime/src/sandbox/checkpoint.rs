@@ -425,7 +425,12 @@ impl SandboxManager {
         // the rollback below rather than in place: the id and its request key
         // must be free again for a retry, and a warm create must be able to
         // fall back to a cold boot.
-        let claimed = self.claim_restore_slot(&request.snapshot_id);
+        let claimed = super::pool::claim_restore_slot(
+            &self.pool,
+            &self.config,
+            &self.cow_manager,
+            &request.snapshot_id,
+        );
         let restored = restore_vm(RestoreVm {
             new_id: &new_id,
             snap_meta: &snap_meta,
@@ -610,7 +615,14 @@ impl SandboxManager {
 
         // Populate/refill the pool for this snapshot in the background:
         // the successful restore is what makes it eligible for pooling.
-        self.spawn_pool_refill(&request.snapshot_id);
+        super::pool::spawn_pool_refill(
+            &self.pool,
+            &self.driver,
+            &self.config,
+            &self.cow_manager,
+            &self.snapshots,
+            &request.snapshot_id,
+        );
 
         // A failed initial start released the claim (the sandbox is Ready);
         // give the cmd its one ordinary post-READY attempt, exactly as the

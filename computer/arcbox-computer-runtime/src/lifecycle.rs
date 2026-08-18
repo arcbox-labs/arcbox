@@ -61,6 +61,8 @@
 pub mod actor;
 mod effect;
 mod event;
+/// `pub` in the lint's spelling only, as `tasks` below.
+pub mod flows;
 mod machine;
 mod projection;
 /// `pub` in the lint's spelling only: `lifecycle` is a private module, so

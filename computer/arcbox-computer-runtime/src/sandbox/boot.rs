@@ -508,7 +508,7 @@ const READY_PROBE_RETRY_MS: u64 = 500;
 /// Port form: the vm-agent's listen-table watcher — never a connect probe,
 /// which would perturb the workload. Command form: a one-shot exec retried
 /// until it exits 0 or the deadline elapses.
-pub(super) async fn run_ready_probe(
+pub async fn run_ready_probe(
     probe: &crate::template_catalog::ReadyProbeSpec,
     agent: &dyn GuestAgent,
 ) -> Result<()> {

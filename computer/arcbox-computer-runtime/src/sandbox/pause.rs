@@ -43,7 +43,7 @@ use crate::lifecycle::tasks::resume::restore_paused;
 /// Everything with this name is lifecycle state owned by the pause
 /// machinery: hidden from ListSnapshots, refused by DeleteSnapshot and
 /// Restore, rejected as a user checkpoint name, and deleted by Remove.
-pub(super) const PAUSE_SNAPSHOT_NAME: &str = "arcbox-pause";
+pub const PAUSE_SNAPSHOT_NAME: &str = "arcbox-pause";
 
 /// Where a copy-mode rootfs is parked inside `vm_dir` while paused.
 pub const PAUSED_ROOTFS_FILE: &str = "paused-rootfs.ext4";
