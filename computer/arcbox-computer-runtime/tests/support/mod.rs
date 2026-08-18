@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arcbox_computer_runtime::config::{JailerConfig, VmmConfig};
-use arcbox_computer_runtime::snapshot_cow::{CowManager, CowOptions, CowTestProbe};
 use arcbox_computer_runtime::testkit::agent::FakeAgentFactory;
 use arcbox_computer_runtime::{
     OutputChunk, SandboxEnvironment, SandboxEvent, SandboxId, SandboxManager, SandboxSpec,
@@ -101,6 +100,14 @@ impl Setup {
         let mut config = VmmConfig::default();
         config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
         config.firecracker.warm_create = self.warm;
+        // A node without device-mapper, said explicitly rather than left to
+        // the host: an empty candidate list is how a config disables CoW,
+        // and without it the answer would be "no dmsetup" on macOS and
+        // "dmsetup, unprivileged" on a Linux runner — two different boot
+        // paths for the same test. Every computer here therefore runs on a
+        // copied rootfs, which is also the branch a pause has to take its
+        // disk back out of the VM's area for.
+        config.firecracker.dmsetup_candidates = Some(Vec::new());
         config.defaults.kernel = dir.path().join("k").to_string_lossy().into_owned();
         config.defaults.rootfs = dir.path().join("r.ext4").to_string_lossy().into_owned();
         config.firecracker.jailer = self.jailer.then(|| JailerConfig {
@@ -118,7 +125,6 @@ impl Setup {
         let ports = Ports {
             driver: FakeDriver::new(),
             agent: FakeAgentFactory::new(),
-            cow: Arc::new(CowTestProbe::default()),
         };
         let manager = ports.manager(&config).await;
         Fixture {
@@ -136,7 +142,6 @@ impl Setup {
 struct Ports {
     driver: FakeDriver,
     agent: FakeAgentFactory,
-    cow: Arc<CowTestProbe>,
 }
 
 impl Ports {
@@ -147,13 +152,6 @@ impl Ports {
                 driver: Some(Arc::new(self.driver.clone())),
                 network: Some(Arc::new(FakeNetwork::with_startup_cleanup("test-boot"))),
                 agent: Some(Arc::new(self.agent.clone())),
-                cow_manager: Some(Arc::new(
-                    CowManager::new_with_test_probe(
-                        CowOptions::new(&config.firecracker.data_dir),
-                        Arc::clone(&self.cow),
-                    )
-                    .unwrap(),
-                )),
                 ..SandboxEnvironment::default()
             },
         )
@@ -205,12 +203,6 @@ impl Fixture {
     /// The guest agent every computer here answers through.
     pub const fn agent(&self) -> &FakeAgentFactory {
         &self.ports.agent
-    }
-
-    /// The copy-on-write rootfs probe: how many overlays were set up and
-    /// torn down.
-    pub fn cow(&self) -> &CowTestProbe {
-        &self.ports.cow
     }
 
     /// A computer's runtime directory.

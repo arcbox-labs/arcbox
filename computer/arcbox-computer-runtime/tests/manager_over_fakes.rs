@@ -5,6 +5,16 @@
 //! gets, and no test can reach a state a real flow does not produce.
 //!
 //! Runs anywhere: no KVM, no root, no Firecracker.
+//!
+//! What that buys, and what it does not. These computers are jailed and
+//! run on a copied rootfs — the shape of a node without device-mapper —
+//! so the staging, the pause that takes the disk back out of the VM's
+//! area, and the resume that puts it back are the real ones. But the
+//! *area* is the fake driver's `staged/` directory, and no fake removes a
+//! jail: "a jail goes with the grip that owns its VMM" is the adapter's
+//! rule, and only the fc-driver's own contract tests and the macOS
+//! `sandbox` e2e can see it kept. Read a green run here as "the flows are
+//! right", never as "nothing leaked".
 
 mod support;
 
@@ -783,7 +793,6 @@ async fn a_checkpoint_restores_onto_a_fresh_address() {
 async fn a_recoverable_checkpoint_failure_leaves_the_computer_ready() {
     let fixture = Fixture::jailed().await;
     let id = fixture.ready("keeps").await;
-    let teardowns_before = fixture.cow().teardown_count();
     fixture.driver().fail_next_checkpoint();
 
     fixture
@@ -795,11 +804,6 @@ async fn a_recoverable_checkpoint_failure_leaves_the_computer_ready() {
     assert_eq!(
         fixture.manager.inspect_sandbox(&id).unwrap().state,
         SandboxState::Ready
-    );
-    assert_eq!(
-        fixture.cow().teardown_count(),
-        teardowns_before,
-        "a recoverable failure releases nothing"
     );
     assert!(
         fixture
@@ -1097,6 +1101,49 @@ async fn a_detached_computer_is_adopted_by_the_next_process_and_serves_an_exec()
         vec![arcbox_vm_driver::ShutdownMode::Kill],
         "the adopted vm is killed through its own handle"
     );
+}
+
+/// An adopted computer running on a copied rootfs cannot be paused: its
+/// disk lives in the VM's area, and this process holds no grip on that VM
+/// to reach in with. The refusal is raised before the pause takes anything
+/// out — the boundary R3 PR-G3 moves.
+///
+/// What the refusal costs is the part worth pinning. `release_for_pause`
+/// declines before its own kill, but a release that fails has no
+/// recoverable arm in `releasing` the way a failed *capture* does in
+/// `capturing`, so the computer takes the shared failure path: killed
+/// through its handle, released, durably `Failed`. A caller therefore
+/// loses the computer to a pause that was refused for its safety — and
+/// the kill it loses it to is the grip's completed kill, which on a real
+/// adapter takes the jail, and in copy mode the rootfs inside it. Asserted
+/// as it behaves, not as it should: the fix belongs with the routes G3
+/// adds, and this is the test that will say when they arrive.
+#[tokio::test]
+async fn an_adopted_computer_on_a_copied_rootfs_refuses_to_pause() {
+    let mut fixture = Fixture::jailed().await;
+    let id = fixture.ready("handed-over").await;
+
+    fixture.manager.detach_all().await.unwrap();
+    fixture = fixture.restart().await;
+    fixture.await_state(&id, SandboxState::Ready).await;
+
+    let error = fixture.manager.pause_sandbox(&id).await.unwrap_err();
+    assert!(matches!(error, VmmError::Unavailable(_)), "{error}");
+    assert!(
+        error.to_string().contains("cannot be taken out"),
+        "the refusal names the route it does not have: {error}"
+    );
+
+    // Refused, and then torn down anyway.
+    fixture.await_released(&id).await;
+    assert_eq!(
+        fixture
+            .driver()
+            .shutdowns(&arcbox_vm_driver::VmId::new(&id).unwrap()),
+        vec![arcbox_vm_driver::ShutdownMode::Kill],
+        "the guest the refusal was protecting is killed by the failure path"
+    );
+    assert_eq!(fixture.settle_network_cleanups().await, vec![id]);
 }
 
 /// A computer whose VMM did not survive the gap comes back `Failed`, not
