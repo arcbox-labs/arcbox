@@ -513,7 +513,7 @@ mod tests {
             v4("169.254.100.2")
         );
 
-        record(crate::AppliedDatapath::Iptables);
+        record(crate::AppliedDatapath::Filter);
         assert_eq!(
             network.host_ingress(&lease).unwrap(),
             HostIngress::GuestAddress {
@@ -540,7 +540,7 @@ mod tests {
             (crate::AppliedDatapath::Ebpf, ExposeTarget::PoolIp),
             (crate::AppliedDatapath::Untranslated, ExposeTarget::PoolIp),
             (
-                crate::AppliedDatapath::Iptables,
+                crate::AppliedDatapath::Filter,
                 ExposeTarget::GuestIpWithFwmark,
             ),
         ] {
