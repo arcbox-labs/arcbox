@@ -226,16 +226,39 @@ impl ComputerActor {
                     // The removal's own release: `removing` coalesces the
                     // failure, so nothing else will ever answer its caller —
                     // and `remove_sandbox_impl` hands this error straight back
-                    // today.
+                    // today. A flow whose *own* failure started this removal
+                    // has its error parked, and the two are composed.
+                    let error = match self.unwinding.take() {
+                        Some(cause) => {
+                            VmmError::Unavailable(format!("{cause}; teardown incomplete: {error}"))
+                        }
+                        None => error,
+                    };
                     self.fail_every_waiter(error);
+                    Some(event)
                 } else {
-                    self.fail_waiters(error);
+                    // Parked, not delivered: a failure the machine unwinds
+                    // with a removal answers when the removal is done. A
+                    // restore's caller falls back to a cold boot under the
+                    // same id, and until `ForgetRecord` has run that id is
+                    // still claimed — `rollback_restore` awaited the whole
+                    // teardown before handing its error back for exactly
+                    // that reason.
+                    self.unwinding = Some(error);
+                    Some(event)
                 }
-                Some(event)
             }
         };
         if let Some(event) = event {
             self.dispatch(machine, event).await;
+            // Not a removal after all: the flow parked at `failed` (or went
+            // back where it came from), so its caller hears now.
+            if let Some(error) = self
+                .unwinding
+                .take_if(|_| !matches!(machine.state(), State::Removing {}))
+            {
+                self.fail_waiters(error);
+            }
         } else {
             // A completion the machine does not act on still changed what a
             // reader sees: the release that reported here dropped the lease.

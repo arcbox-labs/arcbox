@@ -123,7 +123,17 @@ impl ComputerActor {
             Effect::ArmTimer(timer) => self.arm(timer, state),
             Effect::CancelTimer(Timer::Ttl) => self.ttl = None,
             Effect::CancelTimer(Timer::Idle) => self.idle = None,
-            Effect::Answer(answer) => self.answer(answer),
+            Effect::Answer(answer) => {
+                // The removal that unwound a failed flow has finished and
+                // the record is forgotten, so the flow's caller can hear —
+                // and re-claim the id it is about to fall back onto.
+                if answer == Answer::Removed
+                    && let Some(error) = self.unwinding.take()
+                {
+                    self.fail_waiters(error);
+                }
+                self.answer(answer);
+            }
         }
         Flow::Continue
     }

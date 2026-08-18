@@ -63,6 +63,7 @@ struct Script {
     /// was allowed to finish.
     restore_takes: Mutex<Option<Duration>>,
     restore_finished: AtomicBool,
+    restore_fails: AtomicBool,
     /// How long the gate holds READY back, which is how a test observes a
     /// computer while its launch is still in flight.
     gate_takes: Mutex<Option<Duration>>,
@@ -79,6 +80,7 @@ impl Script {
             release_fails: AtomicBool::new(false),
             restore_takes: Mutex::new(None),
             restore_finished: AtomicBool::new(false),
+            restore_fails: AtomicBool::new(false),
             gate_takes: Mutex::new(None),
             cleanup_finished: AtomicBool::new(false),
         })
@@ -153,6 +155,11 @@ impl ComputerTasks for Script {
             tokio::time::sleep(takes).await;
         }
         self.restore_finished.store(true, Ordering::SeqCst);
+        if self.restore_fails.load(Ordering::SeqCst) {
+            return Err(TaskFailure::recoverable(VmmError::Process(
+                "the checkpoint would not load".into(),
+            )));
+        }
         Ok((Arc::clone(&self.agent), SandboxProvisionOutcome::default()))
     }
 
@@ -728,4 +735,39 @@ async fn a_claim_the_machine_refuses_is_answered_wrong_state() {
         .error()
         .await;
     assert!(matches!(error, VmmError::WrongState { .. }), "{error}");
+}
+
+/// A restore that fails is unwound by a force remove, and its caller must not
+/// hear until that removal has finished.
+///
+/// The caller's next move is a cold boot **under the same id** — that is the
+/// warm-create fallback — and until the record is forgotten and the registry
+/// entry dropped, the id is still claimed. `rollback_restore` awaited the
+/// whole teardown before handing its error back for exactly this reason; the
+/// `sandbox` e2e's doomed-probe template create is what finds it when it
+/// does not.
+#[tokio::test(start_paused = true)]
+async fn a_failed_restore_answers_only_once_its_teardown_has_freed_the_id() {
+    let harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.script.restore_fails.store(true, Ordering::SeqCst);
+
+    let restoring = harness.send(|reply| Command::Provision {
+        provision: Provision::Restore {
+            origin: RestoreOrigin::WarmCreate,
+        },
+        outcome: SandboxProvisionOutcome::default(),
+        reply,
+    });
+
+    let error = restoring.error().await;
+    assert!(
+        error.to_string().contains("checkpoint would not load"),
+        "the caller hears the restore's own failure: {error}"
+    );
+    // Answered *after* the release, which is what frees the id.
+    assert_eq!(
+        harness.script.calls(),
+        vec!["restore", "release"],
+        "the teardown ran before the caller was told"
+    );
 }

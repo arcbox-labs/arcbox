@@ -390,6 +390,9 @@ pub struct ComputerActor {
     /// A step of the flow that failed loudly without stopping it — a
     /// panicked sub-task — reported to the caller its answer reaches.
     answer_error: Option<String>,
+    /// The failure a removal is unwinding, held until that removal ends.
+    /// Its caller must not hear before the id is free again.
+    unwinding: Option<VmmError>,
     /// A journal clear owed to a release that is still running: the journal
     /// records exactly the resources a restart would have to reclaim, so it
     /// may only be dropped once they are gone.
@@ -474,6 +477,7 @@ impl ComputerActor {
             exit: None,
             unconfirmed: None,
             answer_error: None,
+            unwinding: None,
             clear_journal_after_release: false,
             journal_blocked: false,
             deadlines: seed.deadlines,
