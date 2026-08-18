@@ -16,11 +16,13 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::{GuestAgent, GuestAgentFactory};
+use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines};
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::event::{Provision, RestoreOrigin};
 use crate::lifecycle::tasks::{ComputerTasks, TaskFailure, TaskResult};
+use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
 use crate::sandbox::{IdleAction, SandboxEvent, SandboxState};
 use crate::testkit::agent::FakeAgentFactory;
@@ -171,21 +173,38 @@ struct Harness {
     script: Arc<Script>,
     actor: tokio::task::JoinHandle<()>,
     _timers: watch::Sender<bool>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Harness {
     async fn start(boot: Boot, deadlines: Deadlines) -> Self {
+        Self::started(boot, deadlines, false).await
+    }
+
+    /// A harness whose computer has a crash journal on disk, so what the
+    /// actor refuses to drop is observable.
+    async fn journalled(boot: Boot, deadlines: Deadlines) -> Self {
+        Self::started(boot, deadlines, true).await
+    }
+
+    async fn started(boot: Boot, deadlines: Deadlines, journal: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let script = Script::new(boot, agent().await);
         let (events_tx, events) = broadcast::channel(64);
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (snapshot_tx, snapshot) = watch::channel(ComputerSnapshot::default());
         let (timers, timers_enabled) = watch::channel(true);
+        if journal {
+            let config = VmmConfig::default();
+            let record = SandboxStateRecord::new("box", None, None, None, &config, None).unwrap();
+            write_state_record(dir.path(), &record).unwrap();
+        }
         let seed = ComputerSeed {
             id: "box".to_owned(),
-            // No durable record: this exercises the actor, not the store,
-            // and the durable effects are no-ops without a generation.
+            // No durable record: these tests exercise the actor, not the
+            // store, so the record writes are no-ops. The crash journal is
+            // not — it is a file beside them, and its ordering is the thing
+            // under test above.
             generation: None,
             vm_dir: dir.path().to_path_buf(),
             records: Arc::new(SandboxRecordStore::new(dir.path()).unwrap()),
@@ -202,7 +221,7 @@ impl Harness {
             script,
             actor,
             _timers: timers,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -244,6 +263,11 @@ impl Harness {
         while !self.script.calls().contains(&call) {
             tokio::task::yield_now().await;
         }
+    }
+
+    /// Whether the crash journal is still on disk.
+    fn has_journal(&self) -> bool {
+        self.dir.path().join("state.json").exists()
     }
 
     /// The lifecycle actions published so far.
@@ -450,6 +474,40 @@ async fn the_idle_window_is_the_actors_own_timer() {
     harness.joined().await;
     assert_eq!(harness.script.calls(), vec!["boot", "gate", "release"]);
     assert!(harness.actions().contains(&"removed".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failure_keeps_its_crash_journal_when_the_release_fails() {
+    // The journal names exactly the resources a restart would have to
+    // reclaim, so it may only go once the release that frees them has
+    // *finished* — `fail_live_sandbox` gates on the write being confirmed
+    // AND the cleanup completing, and so must this.
+    let mut harness = Harness::journalled(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    assert!(harness.has_journal());
+    harness.script.release_fails.store(true, Ordering::SeqCst);
+
+    harness.commands.send(Command::VmExited).unwrap();
+    harness.settled(SandboxState::Failed).await;
+    harness.awaited("release").await;
+    tokio::task::yield_now().await;
+    assert!(
+        harness.has_journal(),
+        "a failed release must leave the journal naming what it could not free"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failure_drops_its_crash_journal_once_the_release_is_done() {
+    let mut harness = Harness::journalled(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    assert!(harness.has_journal());
+
+    harness.commands.send(Command::VmExited).unwrap();
+    harness.settled(SandboxState::Failed).await;
+    while harness.has_journal() {
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
