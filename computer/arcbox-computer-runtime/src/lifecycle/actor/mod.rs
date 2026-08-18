@@ -31,6 +31,7 @@
 //! bodies onto [`ComputerTasks`] one file at a time; PR-F2 flips the manager
 //! onto it and implements the port.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -210,9 +211,9 @@ pub(super) struct ComputerActor {
     snapshot_tx: watch::Sender<ComputerSnapshot>,
     /// Effect sink handed to every dispatch as the statig context.
     effects: Effects,
-    /// Events an effect asked for, dispatched once the current drain ends: a
-    /// refused durable write fails the flow that asked for it.
-    queued: Vec<Event>,
+    /// Events an effect asked for, dispatched in order once the current
+    /// drain ends: a refused durable write fails the flow that asked for it.
+    queued: VecDeque<Event>,
     waiters: Vec<(Answer, Reply)>,
     capture_reply: Option<oneshot::Sender<Result<String>>>,
     /// A graceful stop asked for while a launch was in flight, dispatched as
@@ -289,7 +290,7 @@ impl ComputerActor {
             completions,
             snapshot_tx,
             effects: Effects::default(),
-            queued: Vec::new(),
+            queued: VecDeque::new(),
             waiters: Vec::new(),
             capture_reply: None,
             pending_stop: None,
@@ -365,6 +366,15 @@ impl ComputerActor {
         if let Some(task) = self.inflight.take() {
             task.handle.abort();
         }
+        // A caller parked on an answer this computer will never give — a
+        // stop deferred behind a launch a removal then preempted, say —
+        // would otherwise learn only that its channel closed.
+        for (_, reply) in self.waiters.drain(..) {
+            let _ = reply.send(Err(VmmError::NotFound(self.id.clone())));
+        }
+        if let Some(reply) = self.capture_reply.take() {
+            let _ = reply.send(Err(VmmError::NotFound(self.id.clone())));
+        }
     }
 
     /// Dispatches one event, publishes the new public state, and executes the
@@ -397,7 +407,7 @@ impl ComputerActor {
                 break;
             }
         }
-        while let Some(queued) = self.queued.pop() {
+        while let Some(queued) = self.queued.pop_front() {
             Box::pin(self.dispatch(machine, queued)).await;
         }
         acted

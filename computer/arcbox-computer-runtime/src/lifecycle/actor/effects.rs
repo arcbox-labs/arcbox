@@ -193,7 +193,7 @@ impl ComputerActor {
         ));
         self.error = Some(error.to_string());
         self.fail_waiters(error);
-        self.queued.push(Event::Failure);
+        self.queued.push_back(Event::Failure);
     }
 
     fn forget(&mut self, end: RecordEnd) {
