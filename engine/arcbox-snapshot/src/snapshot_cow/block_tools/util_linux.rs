@@ -159,8 +159,8 @@ fn is_util_linux(bin: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{calls, fake_tool};
     use super::*;
+    use crate::test_support::{calls, fake_tool};
 
     /// util-linux stand-ins for both binaries, each driving its own
     /// `case "$*"` body; see `fake_tool`.
