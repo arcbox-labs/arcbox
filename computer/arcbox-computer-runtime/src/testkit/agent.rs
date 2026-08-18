@@ -114,6 +114,15 @@ impl FakeAgentFactory {
         Self::default()
     }
 
+    /// One of this factory's guests, without a VM to reach it through —
+    /// for the host-side wiring that only needs an agent to talk to.
+    #[must_use]
+    pub fn agent(&self) -> Arc<dyn GuestAgent> {
+        Arc::new(FakeAgent {
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
     /// Answer `cmd` with `reply`.
     pub fn on(&self, cmd: &[&str], reply: Reply) -> &Self {
         lock(&self.shared.scripted).insert(cmd.join(" "), reply);

@@ -55,11 +55,21 @@
     reason = "R3 PR-E lands the HSM with its tests; PR-F wires the actor"
 )]
 
-mod actor;
+/// `pub` in the lint's spelling only, as `tasks` below: the manager
+/// constructs and addresses actors, and `lifecycle` is private, so this
+/// reaches the crate and no further.
+pub mod actor;
 mod effect;
-mod event;
+/// `pub` in the lint's spelling only, as `tasks` below: the manager builds
+/// the `Provision` and `PauseReason` its commands carry.
+pub mod event;
+/// `pub` in the lint's spelling only, as `tasks` below.
+pub mod flows;
 mod machine;
 mod projection;
+/// `pub` in the lint's spelling only: the flows and the manager's claim
+/// both name a computer's runtime state.
+pub mod runtime;
 /// `pub` in the lint's spelling only: `lifecycle` is a private module, so
 /// this reaches the crate and no further. The flows it holds are still
 /// driven from `sandbox` until PR-F2 flips the manager onto the actor.

@@ -52,10 +52,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
-use super::record::{SandboxRecord, SandboxRecordStore, SandboxTransition};
-use super::{LeaseExt, SandboxInstance, SandboxState};
+use super::record::{PersistPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
+use super::{LeaseExt, SandboxState};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
+use crate::lifecycle::actor::{Deadlines, Seeded};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::network::NetworkAllocation;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
@@ -185,7 +187,7 @@ pub struct SandboxStateRecord {
     pub attach_mode: Option<JournaledAttachMode>,
     /// Whether the guest holds the fixed invariant identity (CORE-81).
     ///
-    /// [`SandboxInstance::net_invariant`] as an adopted sandbox is rebuilt
+    /// [`ComputerRuntime::net_invariant`] as an adopted sandbox is rebuilt
     /// with it, and so what that sandbox's next checkpoint records as its
     /// restore contract. A different fact from [`Self::attach_mode`] — see
     /// there.
@@ -669,7 +671,7 @@ pub(super) fn normalize_durable_records(
     store: &SandboxRecordStore,
     data_dir: &Path,
     sweep: Option<&mut SweptRuntime>,
-    built: &mut Vec<SandboxInstance>,
+    built: &mut Vec<RecoveredComputer>,
 ) -> Result<()> {
     let inactive = built;
     let mut nothing_adopted = HashMap::new();
@@ -709,14 +711,26 @@ pub(super) fn normalize_durable_records(
                         SandboxTransition::Failed(AGENT_RESTART_ERROR.into()),
                     )?
                     .confirmed("sandbox restart normalization")?;
-                inactive.push(inactive_instance(record, SandboxState::Failed, data_dir));
+                inactive.push(RecoveredComputer::reinstated(inactive_instance(
+                    record,
+                    SandboxState::Failed,
+                    data_dir,
+                )));
             }
             RecoveryAction::Reinstate(state) => {
-                let instance = match adopted.remove(&record.id) {
-                    Some(reclaimed) => adopted_instance(record, state, data_dir, reclaimed),
-                    None => inactive_instance(record, state, data_dir),
+                // The sweep took this VM back: the computer never stopped
+                // being usable and never booted in this process, which is
+                // the one seeding that reaches `ready` without a launch.
+                let computer = match adopted.remove(&record.id) {
+                    Some(reclaimed) => RecoveredComputer {
+                        runtime: adopted_instance(record, state, data_dir, reclaimed),
+                        seeded: Seeded::Adopted,
+                    },
+                    None => {
+                        RecoveredComputer::reinstated(inactive_instance(record, state, data_dir))
+                    }
                 };
-                inactive.push(instance);
+                inactive.push(computer);
             }
             RecoveryAction::FinishRemove => {
                 store
@@ -783,12 +797,12 @@ async fn release_reclaimed(
 /// for when it refused. They hold exactly what the map entries held —
 /// dropping the vector would lose them the same way.
 pub(super) async fn release_instances(
-    instances: &mut Vec<SandboxInstance>,
+    instances: &mut Vec<RecoveredComputer>,
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
 ) {
-    for instance in instances.drain(..) {
-        let mut instance = instance;
+    for computer in instances.drain(..) {
+        let mut instance = computer.runtime;
         let Some(handle) = instance.handle.take() else {
             continue;
         };
@@ -870,13 +884,81 @@ async fn release_one(
     }
 }
 
+/// A computer the startup sweep reconstructed, and how its machine starts.
+pub(super) struct RecoveredComputer {
+    runtime: ComputerRuntime,
+    seeded: Seeded,
+}
+
+impl RecoveredComputer {
+    /// A computer with no runtime resources, in the phase recovery left its
+    /// record in.
+    fn reinstated(runtime: ComputerRuntime) -> Self {
+        let seeded = Seeded::Recovered(phase_of(runtime.state));
+        Self { runtime, seeded }
+    }
+}
+
+/// The durable phase a reinstated computer's record was left in.
+///
+/// Recovery has already written its own verdict, so this is a projection of
+/// what it left rather than a decision: `plan` only ever reinstates the three
+/// inactive phases, and the `Fail` verdict writes `Failed` before it gets
+/// here.
+const fn phase_of(state: SandboxState) -> PersistPhase {
+    match state {
+        SandboxState::Paused | SandboxState::Pausing => PersistPhase::Paused,
+        SandboxState::Stopped | SandboxState::Stopping => PersistPhase::Stopped,
+        _ => PersistPhase::Failed,
+    }
+}
+
+/// Stand up an actor for every computer the sweep reconstructed.
+///
+/// Published as one batch, before anything else in the sweep can fail: an
+/// adopted computer's only handle lives on its runtime, so a later error
+/// would otherwise un-reclaim every guest by dropping them.
+pub(super) fn seed_computers(
+    recovered: Vec<RecoveredComputer>,
+    computers: &crate::sandbox::Computers,
+    services: &Arc<crate::lifecycle::flows::ComputerServices>,
+    timers_enabled: &tokio::sync::watch::Receiver<bool>,
+) {
+    for RecoveredComputer { runtime, seeded } in recovered {
+        let id = runtime.id.clone();
+        let deadlines = Deadlines {
+            ttl: runtime.ttl_deadline,
+            idle_timeout_seconds: runtime.spec.idle_timeout_seconds,
+            on_idle: runtime.spec.on_idle,
+        };
+        let generation = runtime.record_generation;
+        match crate::sandbox::reserve_actor(computers, &id, runtime) {
+            Ok(reservation) => {
+                reservation.spawn(crate::sandbox::ActorSpawn {
+                    services: Arc::clone(services),
+                    timers_enabled: timers_enabled.clone(),
+                    generation,
+                    deadlines,
+                    launch: crate::lifecycle::flows::Launch::Reinstated,
+                    seeded,
+                });
+            }
+            // Unreachable: the sweep runs before any create can claim an id,
+            // and every record it reads is distinct.
+            Err(error) => {
+                warn!(sandbox_id = %id, %error, "a recovered computer's id was already claimed");
+            }
+        }
+    }
+}
+
 fn inactive_instance(
     record: SandboxRecord,
     state: SandboxState,
     data_dir: &Path,
-) -> SandboxInstance {
+) -> ComputerRuntime {
     let vm_dir = data_dir.join("sandboxes").join(&record.id);
-    let mut instance = SandboxInstance::new_with_generation(
+    let mut instance = ComputerRuntime::new_with_generation(
         record.id,
         record.effective_spec,
         None,
@@ -911,7 +993,7 @@ fn adopted_instance(
     state: SandboxState,
     data_dir: &Path,
     adopted: AdoptedSandbox,
-) -> SandboxInstance {
+) -> ComputerRuntime {
     let AdoptedSandbox {
         handle,
         lease,
@@ -1514,7 +1596,7 @@ mod tests {
         normalize_durable_records(&store, data_dir.path(), None, &mut inactive).unwrap();
         let inactive: HashMap<_, _> = inactive
             .into_iter()
-            .map(|instance| (instance.id.clone(), instance))
+            .map(|instance| (instance.runtime.id.clone(), instance))
             .collect();
 
         assert_eq!(inactive.len(), 5);
@@ -1524,18 +1606,18 @@ mod tests {
             assert_eq!(record.error.as_deref(), Some(AGENT_RESTART_ERROR));
 
             let instance = &inactive[id];
-            assert_eq!(instance.state, SandboxState::Failed);
-            assert_eq!(instance.error.as_deref(), Some(AGENT_RESTART_ERROR));
-            assert_eq!(instance.record_generation, Some(record.generation));
-            assert!(instance.prepared.is_none());
-            assert!(instance.handle.is_none());
-            assert!(instance.network.is_none());
+            assert_eq!(instance.runtime.state, SandboxState::Failed);
+            assert_eq!(instance.runtime.error.as_deref(), Some(AGENT_RESTART_ERROR));
+            assert_eq!(instance.runtime.record_generation, Some(record.generation));
+            assert!(instance.runtime.prepared.is_none());
+            assert!(instance.runtime.handle.is_none());
+            assert!(instance.runtime.network.is_none());
         }
 
-        assert_eq!(inactive["stopped"].state, SandboxState::Stopped);
-        assert_eq!(inactive["failed"].state, SandboxState::Failed);
+        assert_eq!(inactive["stopped"].runtime.state, SandboxState::Stopped);
+        assert_eq!(inactive["failed"].runtime.state, SandboxState::Failed);
         assert_eq!(
-            inactive["failed"].error.as_deref(),
+            inactive["failed"].runtime.error.as_deref(),
             Some("original failure")
         );
         assert_eq!(
@@ -1564,10 +1646,10 @@ mod tests {
         .unwrap();
         let inactive: HashMap<_, _> = inactive
             .into_iter()
-            .map(|instance| (instance.id.clone(), instance))
+            .map(|instance| (instance.runtime.id.clone(), instance))
             .collect();
 
-        let clean = &inactive["clean"];
+        let clean = &inactive["clean"].runtime;
         assert_eq!(clean.state, SandboxState::Paused);
         assert_eq!(clean.pause_snapshot_id.as_deref(), Some("snap"));
         assert!(clean.paused_at.is_some());
@@ -1579,7 +1661,7 @@ mod tests {
         // An interrupted pause/resume never reached a durable Paused commit;
         // its resources were swept, so it degrades honestly.
         for id in ["mid-pause", "mid-resume"] {
-            assert_eq!(inactive[id].state, SandboxState::Failed, "{id}");
+            assert_eq!(inactive[id].runtime.state, SandboxState::Failed, "{id}");
             assert_eq!(
                 store.load(id).unwrap().unwrap().phase,
                 PersistPhase::Failed,
@@ -1616,10 +1698,9 @@ mod tests {
         assert!(!vm_dir.join(STATE_FILE).exists());
         assert!(parked_rootfs.exists());
         assert!(cow_file.exists());
-        let instances = manager.instances.read().unwrap();
-        let inst = instances["napper"].lock().unwrap();
-        assert_eq!(inst.state, SandboxState::Paused);
-        assert_eq!(inst.pause_snapshot_id.as_deref(), Some("snap"));
+        let napper = manager.snapshot(&"napper".to_owned()).unwrap();
+        assert_eq!(napper.state, SandboxState::Paused);
+        assert_eq!(napper.pause_snapshot_id.as_deref(), Some("snap"));
     }
 
     /// A journal whose VMM outlived the agent: the sweep finds it through
@@ -1886,23 +1967,21 @@ mod tests {
         reconciled.unwrap();
 
         assert_eq!(vm.state(), VmState::Running, "the guest was never killed");
-        let instances = manager.instances.read().unwrap();
-        let inst = instances["keeper"].lock().unwrap();
+        let keeper = manager.snapshot(&"keeper".to_owned()).unwrap();
         // `Ready`, not `Running`: the workload the previous process was
         // streaming did not survive it, and `Running` refuses the next `Run`.
-        assert_eq!(inst.state, SandboxState::Ready);
-        assert!(inst.handle.is_some(), "the VM's handle came back");
-        assert!(inst.prepared.is_none(), "no PreparedVm crosses a restart");
+        assert_eq!(keeper.state, SandboxState::Ready);
+        assert!(keeper.handle.is_some(), "the VM's handle came back");
         assert_eq!(
-            inst.network.as_ref().map(|lease| lease.ip.to_string()),
+            keeper.lease.as_ref().map(|lease| lease.ip.to_string()),
             Some("10.200.0.9".to_owned()),
             "the lease came back"
         );
-        assert!(
-            inst.net_identity.is_some(),
-            "the guest is described the way its boot described it"
-        );
-        assert!(inst.net_invariant, "and under the identity it holds");
+        // Dialable, not merely `Ready`: an adopted computer runs no flow, so
+        // nothing else would ever publish the agent the data plane reads off
+        // this snapshot — and a `Ready` computer nobody can exec into is
+        // most of what adoption exists to prevent.
+        assert!(keeper.agent.is_some(), "the adopted guest is dialable");
         assert_eq!(
             network.adopted_mode(&VmId::new("keeper").unwrap()),
             Some(AttachMode::Invariant),
@@ -2207,10 +2286,9 @@ mod tests {
                     .exists(),
                 "{what}: the journal is cleared"
             );
-            let instances = manager.instances.read().unwrap();
-            let inst = instances["keeper"].lock().unwrap();
-            assert_eq!(inst.state, SandboxState::Failed, "{what}");
-            assert!(inst.handle.is_none(), "{what}");
+            let keeper = manager.snapshot(&"keeper".to_owned()).unwrap();
+            assert_eq!(keeper.state, SandboxState::Failed, "{what}");
+            assert!(keeper.handle.is_none(), "{what}");
         }
     }
 

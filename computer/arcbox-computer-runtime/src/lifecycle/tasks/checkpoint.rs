@@ -13,14 +13,15 @@
 //! nothing.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arcbox_vm_driver::{AfterCheckpoint, CheckpointKind, CheckpointOptions, VmHandle};
 use tracing::info;
 
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::settle::{self, Capture, GuestHold, Settlement};
-use crate::sandbox::{self, CheckpointInfo, SandboxId, SandboxState};
+use crate::sandbox::{CheckpointInfo, SandboxId, SandboxState};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 
 /// What a single [`checkpoint_impl`] call should capture, and how it should
@@ -79,17 +80,11 @@ struct CheckpointSource {
 }
 
 fn checkpoint_source(
-    instances: &sandbox::InstanceMap,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     sandbox_id: &SandboxId,
     expected_state: SandboxState,
 ) -> Result<CheckpointSource> {
-    let instance = instances
-        .read()
-        .unwrap()
-        .get(sandbox_id)
-        .cloned()
-        .ok_or_else(|| VmmError::NotFound(sandbox_id.clone()))?;
-    let inst = instance.lock().unwrap();
+    let inst = computer.lock().unwrap();
     if inst.state != expected_state {
         return Err(VmmError::WrongState {
             id: sandbox_id.clone(),
@@ -124,13 +119,13 @@ fn checkpoint_source(
 /// of re-deriving it. A failure says whether the guest is still usable
 /// ([`CheckpointFailure`]): every caller must fail the sandbox on `Frozen`.
 pub async fn checkpoint_impl(
-    instances: &sandbox::InstanceMap,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     snapshots: &SnapshotCatalog,
     sandbox_id: &SandboxId,
     request: CheckpointRequest,
 ) -> std::result::Result<CheckpointInfo, CheckpointFailure> {
     let resume_after = request.resume_after;
-    let source = checkpoint_source(instances, sandbox_id, request.expected_state)
+    let source = checkpoint_source(computer, sandbox_id, request.expected_state)
         .map_err(CheckpointFailure::Recoverable)?;
     let handle = Arc::clone(&source.handle);
     let outcome = capture(snapshots, sandbox_id, source, request).await;

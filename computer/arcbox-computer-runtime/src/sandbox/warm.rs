@@ -89,7 +89,7 @@ pub(super) fn find_warm_snapshot(
 
 /// Everything the boot task needs to publish a warm snapshot once its
 /// sandbox reaches Ready (CORE-77).
-pub(super) struct WarmPublishTicket {
+pub struct WarmPublishTicket {
     pub(super) key: WarmKey,
     pub(super) cache: Arc<WarmCache>,
     pub(super) snapshots: Arc<SnapshotCatalog>,
@@ -107,10 +107,10 @@ pub(super) struct WarmPublishTicket {
 /// `expected_state` is what the boot tail left the instance in: `Ready` for
 /// a cmd-less boot, `Starting` when the tail is still holding the workload
 /// slot for the initial cmd.
-pub(super) async fn publish_after_boot(
+pub async fn publish_after_boot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
-    instances: &super::InstanceMap,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,
@@ -126,7 +126,7 @@ pub(super) async fn publish_after_boot(
     let published = publish_warm_snapshot(
         sandbox_id,
         ticket,
-        instances,
+        computer,
         config,
         cow_manager,
         expected_state,
@@ -186,7 +186,7 @@ impl From<crate::lifecycle::tasks::checkpoint::CheckpointFailure> for PublishFai
 async fn publish_warm_snapshot(
     sandbox_id: &SandboxId,
     ticket: &WarmPublishTicket,
-    instances: &super::InstanceMap,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     config: &VmmConfig,
     cow_manager: &CowManager,
     expected_state: SandboxState,
@@ -202,7 +202,7 @@ async fn publish_warm_snapshot(
     let name = format!("warm-{}", &ticket.key.hex()[..12]);
     let labels = HashMap::from([(WARM_KEY_LABEL.to_owned(), ticket.key.hex().to_owned())]);
     let info = crate::lifecycle::tasks::checkpoint::checkpoint_impl(
-        instances,
+        computer,
         &ticket.snapshots,
         sandbox_id,
         crate::lifecycle::tasks::checkpoint::CheckpointRequest {
@@ -296,7 +296,7 @@ mod tests {
         publish_after_boot(
             &"warm-ok".to_owned(),
             &ticket("a"),
-            &manager.instances,
+            &instance,
             &manager.config,
             &manager.cow_manager,
             SandboxState::Ready,
@@ -311,7 +311,7 @@ mod tests {
         let error = publish_after_boot(
             &"warm-frozen".to_owned(),
             &ticket("b"),
-            &manager.instances,
+            &instance,
             &manager.config,
             &manager.cow_manager,
             SandboxState::Ready,

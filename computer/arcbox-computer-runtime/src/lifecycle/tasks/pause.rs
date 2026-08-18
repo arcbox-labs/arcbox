@@ -28,8 +28,9 @@ use arcbox_vm_driver::net::GuestNetwork;
 
 use crate::config::{JailerConfig, VmmConfig};
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pause::PAUSED_ROOTFS_FILE;
-use crate::sandbox::{self, SandboxId, SandboxInstance};
+use crate::sandbox::{self, SandboxId};
 use crate::snapshot_cow::CowManager;
 
 /// Free the VM, network, and chroot of a checkpointed sandbox while
@@ -50,7 +51,7 @@ use crate::snapshot_cow::CowManager;
 )]
 pub async fn release_for_pause(
     id: &SandboxId,
-    arc: &Arc<Mutex<SandboxInstance>>,
+    arc: &Arc<Mutex<ComputerRuntime>>,
     jailer: &JailerConfig,
     config: &VmmConfig,
     cow_manager: &CowManager,

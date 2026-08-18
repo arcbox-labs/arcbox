@@ -15,7 +15,7 @@ mod phase;
 mod store;
 
 pub use phase::PersistPhase;
-pub(super) use phase::ProvisionIntent;
+pub use phase::ProvisionIntent;
 pub use phase::SandboxRecord;
 /// Crate-visible, like [`PersistPhase`]: `crate::lifecycle`'s actor is what
 /// executes the durable writes the machine asks for.

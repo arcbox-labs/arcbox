@@ -18,6 +18,7 @@ impl ComputerActor {
     {
         if let Some(previous) = self.inflight.take() {
             previous.handle.abort();
+            self.abandon_capture();
         }
         self.epoch += 1;
         let epoch = self.epoch;
@@ -27,6 +28,21 @@ impl ComputerActor {
             let _ = completions.send(Completion { epoch, report });
         });
         self.inflight = Some(Preemptible { handle, handoff });
+    }
+
+    /// Answers a capture whose sub-task was preempted.
+    ///
+    /// A `Stop` or a `Remove` during a user checkpoint supersedes the capture
+    /// task, and the epoch then drops whatever it would have reported — so
+    /// without this its caller waits on a reply nobody will ever send. A stop
+    /// that succeeds leaves the actor alive, so not even its exit answers.
+    fn abandon_capture(&mut self) {
+        if let Some(reply) = self.capture_reply.take() {
+            let _ = reply.send(Err(VmmError::Unavailable(format!(
+                "computer {}: the checkpoint was preempted by another operation",
+                self.id
+            ))));
+        }
     }
 
     /// Cancels the in-flight sub-task, waiting out its resource handoff first.
@@ -92,6 +108,7 @@ impl ComputerActor {
         }
         self.epoch += 1;
         self.retry_backoff = RETRY_INITIAL;
+        self.abandon_capture();
         Flow::Continue
     }
 
@@ -104,45 +121,74 @@ impl ComputerActor {
             "the computer's in-flight work still owns resources; retrying the teardown"
         );
         self.inflight = Some(task);
-        self.retry = Some(Box::pin(tokio::time::sleep(self.retry_backoff)));
-        self.retry_backoff = self.retry_backoff.saturating_mul(2).min(RETRY_MAX);
+        self.stalled_on = StalledStep::Handoff;
+        self.schedule_retry();
         Flow::Stalled
     }
 
+    /// Schedules the backoff a stalled teardown resumes on.
+    pub(super) fn schedule_retry(&mut self) {
+        self.retry = Some(Box::pin(tokio::time::sleep(self.retry_backoff)));
+        self.retry_backoff = self.retry_backoff.saturating_mul(2).min(RETRY_MAX);
+    }
+
+    /// Records what the current drain stalled on, with the effects it did not
+    /// reach.
+    pub(super) fn park_stalled(&mut self, state: State, effects: Vec<Effect>) {
+        let retry = std::mem::replace(&mut self.stalled_on, StalledStep::Handoff);
+        self.stalled = Some(Stalled {
+            retry,
+            state,
+            effects,
+        });
+    }
+
     /// Re-drives a teardown that stopped rather than finished — its release
-    /// failed, or a panicked sub-task abandoned it. Today's equivalent is a
-    /// retried `remove_sandbox_impl`, which re-runs the whole teardown.
+    /// failed, a durable write was refused, or a panicked sub-task abandoned
+    /// it. Today's equivalent is a retried `remove_sandbox_impl`, which
+    /// re-runs the whole teardown including the `Removing` write.
     pub(super) async fn restart_teardown(&mut self, state: State) {
         if self.stalled.is_some() {
             self.resume_stalled().await;
-        } else {
-            self.apply(
-                Effect::SpawnRelease {
-                    scope: ReleaseScope::Full,
-                },
-                state,
-            )
-            .await;
+            return;
+        }
+        let mut effects = Effects::default();
+        effects.removal();
+        let mut effects = effects.take().into_iter();
+        while let Some(effect) = effects.next() {
+            match Box::pin(self.apply(effect, state)).await {
+                Flow::Continue => {}
+                Flow::Stalled => {
+                    self.park_stalled(state, effects.collect());
+                    return;
+                }
+                Flow::Refused => return,
+            }
         }
     }
 
-    /// Retries the abort a stalled teardown is waiting on, then replays it.
+    /// Retries the step a stalled teardown is waiting on, then replays it.
     pub(super) async fn resume_stalled(&mut self) {
         let Some(stalled) = self.stalled.take() else {
             return;
         };
-        if self.abort_inflight().await == Flow::Stalled {
+        let retried = match stalled.retry {
+            StalledStep::Handoff => self.abort_inflight().await,
+            StalledStep::Record(end) => self.forget(end),
+        };
+        if retried == Flow::Stalled {
             self.stalled = Some(stalled);
             return;
         }
         let mut effects = stalled.effects.into_iter();
         while let Some(effect) = effects.next() {
-            if Box::pin(self.apply(effect, stalled.state)).await == Flow::Stalled {
-                self.stalled = Some(Stalled {
-                    state: stalled.state,
-                    effects: effects.collect(),
-                });
-                return;
+            match Box::pin(self.apply(effect, stalled.state)).await {
+                Flow::Continue => {}
+                Flow::Stalled => {
+                    self.park_stalled(stalled.state, effects.collect());
+                    return;
+                }
+                Flow::Refused => return,
             }
         }
     }
@@ -192,9 +238,10 @@ impl ComputerActor {
                 Some(Event::Restored)
             }
             Report::Gated => Some(Event::Gated),
-            Report::Captured(snapshot_id) => {
+            Report::Captured(info) => {
+                let snapshot_id = info.snapshot_id.clone();
                 if let Some(reply) = self.capture_reply.take() {
-                    let _ = reply.send(Ok(snapshot_id.clone()));
+                    let _ = reply.send(Ok(info));
                 }
                 self.pause_snapshot_id = Some(snapshot_id.clone());
                 Some(Event::CaptureDone { snapshot_id })
@@ -225,16 +272,43 @@ impl ComputerActor {
                     // The removal's own release: `removing` coalesces the
                     // failure, so nothing else will ever answer its caller —
                     // and `remove_sandbox_impl` hands this error straight back
-                    // today.
+                    // today. A flow whose *own* failure started this removal
+                    // has its error parked, and the two are composed.
+                    let error = match self.unwinding.take() {
+                        Some(cause) => {
+                            VmmError::Unavailable(format!("{cause}; teardown incomplete: {error}"))
+                        }
+                        None => error,
+                    };
                     self.fail_every_waiter(error);
+                    Some(event)
                 } else {
-                    self.fail_waiters(error);
+                    // Parked, not delivered: a failure the machine unwinds
+                    // with a removal answers when the removal is done. A
+                    // restore's caller falls back to a cold boot under the
+                    // same id, and until `ForgetRecord` has run that id is
+                    // still claimed — `rollback_restore` awaited the whole
+                    // teardown before handing its error back for exactly
+                    // that reason.
+                    self.unwinding = Some(error);
+                    Some(event)
                 }
-                Some(event)
             }
         };
         if let Some(event) = event {
             self.dispatch(machine, event).await;
+            // Not a removal after all: the flow parked at `failed` (or went
+            // back where it came from), so its caller hears now.
+            if let Some(error) = self
+                .unwinding
+                .take_if(|_| !matches!(machine.state(), State::Removing {}))
+            {
+                self.fail_waiters(error);
+            }
+        } else {
+            // A completion the machine does not act on still changed what a
+            // reader sees: the release that reported here dropped the lease.
+            self.publish_state(*machine.state());
         }
         self.serve_pending_stop(machine).await;
     }
@@ -255,7 +329,7 @@ impl ComputerActor {
         }
         self.pending_stop = None;
         match self.public() {
-            Some(SandboxState::Ready | SandboxState::Running) => {
+            SandboxState::Ready | SandboxState::Running => {
                 let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
                 self.dispatch(machine, Event::Stop { budget_ms }).await;
             }

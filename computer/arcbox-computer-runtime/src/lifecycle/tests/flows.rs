@@ -447,7 +447,8 @@ fn a_stop_drains_through_stopping_and_clears_the_journal() {
             Effect::CancelTimer(Timer::Idle),
             Effect::Publish(Notify::Stopping),
             Effect::SpawnStop {
-                budget_ms: BUDGET_MS
+                budget_ms: BUDGET_MS,
+                drain: false,
             },
         ]
     );
@@ -513,4 +514,122 @@ fn a_restore_that_fails_before_its_commit_is_rolled_back_not_parked() {
         assert!(matches!(state, State::Gone {}), "{failure:?}");
         assert_eq!(effects[0], Effect::ForgetRecord(RecordEnd::Removed));
     }
+}
+
+/// The claim rollback: a `Run` that claimed the slot and then could not
+/// dispatch.
+///
+/// The claim *is* the transition into `Running`, so it announces RUNNING
+/// before the dispatch it was taken for — and giving the slot back therefore
+/// owes the balancing IDLE, or a subscriber is left believing a workload is
+/// running. It carries no exit status, because nothing ran. Today's
+/// `release_running` announces neither, which is only coherent while the
+/// claim announces nothing either.
+#[test]
+fn a_released_claim_reopens_the_computer_and_balances_its_running() {
+    let (mut sm, mut context) = ready_machine();
+    let (state, _) = step(
+        &mut sm,
+        &mut context,
+        &Event::ClaimWorkload {
+            claim: WorkloadClaim::Api,
+        },
+    );
+    assert_eq!(state.to_public(), SandboxState::Running);
+
+    let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadReleased);
+    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(
+        effects,
+        vec![Effect::Publish(Notify::Idle), Effect::ArmTimer(Timer::Idle)]
+    );
+
+    // The same rollback during the gate gives the reservation back, and READY
+    // is still owed the boot's own `cmd`-less announcement.
+    let (mut sm, mut context) = reach(&[
+        Event::Provision(Provision::Boot { warm: false }),
+        Event::ResourcesHandedOff,
+        Event::AgentReady,
+        Event::ClaimWorkload {
+            claim: WorkloadClaim::Initial,
+        },
+    ]);
+    assert_eq!(sm.state().to_public(), SandboxState::Running);
+    let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadReleased);
+    assert_eq!(state.to_public(), SandboxState::Starting);
+    assert_eq!(effects, vec![Effect::Publish(Notify::Idle)]);
+    let (state, effects) = step(&mut sm, &mut context, &Event::Gated);
+    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert!(effects.contains(&Effect::ArmTimer(Timer::Idle)));
+}
+
+/// Only a stop that has a workload to drain asks for one. `stop_sandbox`
+/// polls for the workload's exit within the budget and skips that poll
+/// entirely when nothing is running — a computer that is merely `Ready`
+/// would otherwise spend the whole budget waiting for an exit that cannot
+/// come.
+#[test]
+fn only_a_running_computer_drains_before_its_guest_is_shut_down() {
+    let (mut sm, mut context) = ready_machine();
+    let (_, effects) = step(
+        &mut sm,
+        &mut context,
+        &Event::Stop {
+            budget_ms: BUDGET_MS,
+        },
+    );
+    assert!(effects.contains(&Effect::SpawnStop {
+        budget_ms: BUDGET_MS,
+        drain: false,
+    }));
+
+    let (mut sm, mut context) = ready_machine();
+    step(
+        &mut sm,
+        &mut context,
+        &Event::ClaimWorkload {
+            claim: WorkloadClaim::Api,
+        },
+    );
+    let (state, effects) = step(
+        &mut sm,
+        &mut context,
+        &Event::Stop {
+            budget_ms: BUDGET_MS,
+        },
+    );
+    assert_eq!(state.to_public(), SandboxState::Stopping);
+    assert!(effects.contains(&Effect::SpawnStop {
+        budget_ms: BUDGET_MS,
+        drain: true,
+    }));
+}
+
+/// The gate's failure is unwound by whichever half of the transaction it sits
+/// in. A cold boot's gate runs before the `Ready` commit, so its computer
+/// parks at `failed` and stays inspectable; a restore's runs *after* its
+/// atomic commit, so the only unwind left is the post-commit one — the force
+/// remove that frees the id and its request key for the cold-boot fallback.
+#[test]
+fn a_gate_failure_unwinds_the_way_its_own_half_of_the_transaction_can() {
+    let (mut sm, mut context) = reach(&[
+        Event::Provision(Provision::Boot { warm: false }),
+        Event::ResourcesHandedOff,
+        Event::AgentReady,
+    ]);
+    let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
+    assert_eq!(state.to_public(), SandboxState::Failed);
+    assert!(effects.contains(&persist(PersistPhase::Failed, Durability::GateJournal)));
+
+    let (mut sm, mut context) = reach(&[
+        Event::Provision(Provision::Restore {
+            origin: RestoreOrigin::WarmCreate,
+        }),
+        Event::Restored,
+    ]);
+    let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
+    assert_eq!(state.to_public(), SandboxState::Stopping);
+    assert!(matches!(state, State::Removing {}));
+    assert!(effects.contains(&persist(PersistPhase::Removing, Durability::Warn)));
+    assert!(effects.contains(&release(ReleaseScope::Full)));
 }

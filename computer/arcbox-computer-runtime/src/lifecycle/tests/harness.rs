@@ -72,8 +72,9 @@ pub(super) fn ordinal(state: State) -> usize {
 
 pub(super) const LEAVES: usize = 17;
 
-/// One event of every shape the actor can deliver. `Recovered` is excluded:
-/// it seeds a machine rather than moving one, and has its own table.
+/// One event of every shape the actor can deliver. `Recovered` and `Adopted`
+/// are excluded: they seed a machine rather than move one, and are roots of
+/// the walk below.
 pub(super) fn alphabet() -> Vec<Event> {
     vec![
         Event::Provision(Provision::Boot { warm: false }),
@@ -95,6 +96,7 @@ pub(super) fn alphabet() -> Vec<Event> {
             claim: WorkloadClaim::Initial,
         },
         Event::WorkloadExited,
+        Event::WorkloadReleased,
         Event::Checkpoint,
         Event::CaptureDone {
             snapshot_id: "snap".to_owned(),
@@ -163,9 +165,14 @@ pub(super) fn explore() -> Vec<Node> {
         path: Vec::new(),
     }];
     // Recovery reconstructs a computer straight into a phase, so those states
-    // are roots of their own rather than reachable from `provisioning`.
-    for phase in ALL_PHASES {
-        let path = vec![Event::Recovered { phase }];
+    // are roots of their own rather than reachable from `provisioning`. So is
+    // the adopted computer, whose VM the sweep took back.
+    let seedings = ALL_PHASES
+        .into_iter()
+        .map(|phase| Event::Recovered { phase })
+        .chain(std::iter::once(Event::Adopted));
+    for seeding in seedings {
+        let path = vec![seeding];
         let (sm, _) = reach(&path);
         queue.push(Node {
             state: *sm.state(),

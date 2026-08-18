@@ -8,7 +8,7 @@
 //! caller.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arcbox_fc_driver::jail::{
@@ -18,11 +18,11 @@ use arcbox_fc_driver::jail::{
 use arcbox_snapshot::SnapshotError;
 use arcbox_vm_driver::{IsolationSpec, PreparedVm, VmDriver, VmHandle, VmId};
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory, ReadyGate};
 use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
+use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::boot::create_rootfs_symlink;
 use crate::sandbox::spec::build_vm_spec;
 use crate::sandbox::{self, NetworkAttachment, SandboxSpec, SandboxState};
@@ -127,7 +127,7 @@ pub async fn wait_for_agent(
 /// Perform the actual boot: prepare the VMM through the driver, stage,
 /// configure, start the VM.
 ///
-/// The prepared VMM is transferred to its [`SandboxInstance`] immediately.
+/// The prepared VMM is transferred to its [`ComputerRuntime`] immediately.
 /// Cleanup is allowed to abort this task only after the paths/CoW phase has
 /// finished and every live `CowHandle` has also been transferred.
 ///
@@ -141,7 +141,7 @@ pub async fn wait_for_agent(
 /// a Remove during a boot is safe at all. Re-stated here because moving code
 /// is exactly when an invariant carried by a single comment gets lost.
 ///
-/// [`SandboxInstance`]: crate::sandbox::SandboxInstance
+/// [`ComputerRuntime`]: crate::sandbox::ComputerRuntime
 #[allow(
     clippy::too_many_arguments,
     reason = "boot owns one exact sandbox generation and its handoff signal"
@@ -155,8 +155,7 @@ pub async fn do_boot(
     agents: &dyn GuestAgentFactory,
     config: &VmmConfig,
     cow_manager: &CowManager,
-    instances: &sandbox::InstanceMap,
-    generation: Uuid,
+    computer: &Arc<Mutex<ComputerRuntime>>,
     resource_handoff: tokio::sync::oneshot::Sender<()>,
 ) -> std::result::Result<BootOutput, BootFailure> {
     let mut resource_handoff = Some(resource_handoff);
@@ -198,33 +197,14 @@ pub async fn do_boot(
     .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
     .err();
 
-    // Once the VMM is up, make it immediately owned by the instance. Cleanup
+    // Once the VMM is up, make it immediately owned by the computer. Cleanup
     // still waits for the paths/CoW phase before it may abort boot.
     let state = {
-        let map = instances.read().unwrap();
-        map.get(id).and_then(|instance| {
-            let mut instance = instance.lock().unwrap();
-            (instance.record_generation == Some(generation)).then(|| {
-                instance.prepared = Some(Arc::clone(&prepared));
-                instance.state
-            })
-        })
+        let mut computer = computer.lock().unwrap();
+        computer.prepared = Some(Arc::clone(&prepared));
+        computer.state
     };
 
-    let Some(state) = state else {
-        // Closing the channel without the explicit signal makes cleanup join
-        // this task instead of aborting it, so the outer failure path can tear
-        // down these unhanded resources.
-        return Err(BootFailure {
-            error: VmmError::WrongState {
-                id: id.to_owned(),
-                expected: "the current sandbox generation".into(),
-                actual: "replaced or removed".into(),
-            },
-            prepared: Some(prepared),
-            cow_handle: None,
-        });
-    };
     if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
         complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
@@ -362,28 +342,12 @@ pub async fn do_boot(
     // No await may occur between transferring a successful CoW handle and
     // completing this signal. Once signalled, Remove is allowed to abort us.
     let state = {
-        let map = instances.read().unwrap();
-        map.get(id).and_then(|instance| {
-            let mut instance = instance.lock().unwrap();
-            (instance.record_generation == Some(generation)).then(|| {
-                if cow_handle.is_some() {
-                    debug_assert!(instance.cow_handle.is_none());
-                    instance.cow_handle = cow_handle.take();
-                }
-                instance.state
-            })
-        })
-    };
-    let Some(state) = state else {
-        return Err(BootFailure {
-            error: VmmError::WrongState {
-                id: id.to_owned(),
-                expected: "the current sandbox generation".into(),
-                actual: "replaced or removed during boot setup".into(),
-            },
-            prepared: None,
-            cow_handle,
-        });
+        let mut computer = computer.lock().unwrap();
+        if cow_handle.is_some() {
+            debug_assert!(computer.cow_handle.is_none());
+            computer.cow_handle = cow_handle.take();
+        }
+        computer.state
     };
     complete_resource_handoff(&mut resource_handoff);
 

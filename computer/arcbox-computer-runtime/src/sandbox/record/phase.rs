@@ -63,7 +63,7 @@ pub struct SandboxProvisionOutcome {
 pub struct SandboxRecord {
     pub(super) version: u32,
     pub(in crate::sandbox) id: SandboxId,
-    pub(in crate::sandbox) generation: Uuid,
+    pub(crate) generation: Uuid,
     pub(in crate::sandbox) request_key: String,
     pub(in crate::sandbox) effective_spec: SandboxSpec,
     pub(in crate::sandbox) phase: SandboxPhase,
@@ -88,7 +88,7 @@ pub struct SandboxRecord {
 
 /// Result of reserving a durable provisioning intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::sandbox) enum ProvisionIntent {
+pub enum ProvisionIntent {
     Created(SandboxRecord),
     Resume(SandboxRecord),
     Replay(SandboxRecord),

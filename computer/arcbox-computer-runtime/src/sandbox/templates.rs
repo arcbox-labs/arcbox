@@ -254,22 +254,19 @@ impl SandboxManager {
                 _ => tokio::time::sleep(std::time::Duration::from_millis(READY_POLL_MS)).await,
             }
         }
-        let info = crate::lifecycle::tasks::checkpoint::checkpoint_impl(
-            &self.instances,
-            &self.snapshots,
-            id,
-            crate::lifecycle::tasks::checkpoint::CheckpointRequest {
-                name: format!("template-{template}"),
-                labels: HashMap::from([(TEMPLATE_LABEL.to_owned(), template.to_owned())]),
-                expected_state: SandboxState::Ready,
-                resume_after: true,
-            },
-        )
-        .await
+        // The prewarm builder is this manager's own computer, captured
+        // through the same path a user checkpoint takes.
+        let info = self
+            .capture_checkpoint(
+                &id.to_owned(),
+                format!("template-{template}"),
+                HashMap::from([(TEMPLATE_LABEL.to_owned(), template.to_owned())]),
+            )
+            .await
         // The builder is force-removed by the caller whichever way this
         // ends, so a guest left frozen needs no failing here: the removal
         // kills and releases it.
-        .map_err(crate::lifecycle::tasks::checkpoint::CheckpointFailure::into_error)?;
+        ?;
         let meta = self.snapshots.find_by_id(&info.snapshot_id)?;
         let mut artifact_bytes = std::fs::metadata(&meta.vmstate_path).map_or(0, |m| m.len());
         if let Some(mem) = &meta.mem_path {

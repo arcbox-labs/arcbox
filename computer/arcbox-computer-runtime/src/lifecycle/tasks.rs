@@ -30,11 +30,12 @@ use super::effect::ReleaseScope;
 use super::event::{Event, RestoreOrigin};
 use crate::agent::GuestAgent;
 use crate::error::VmmError;
+use crate::sandbox::CheckpointInfo;
 use crate::sandbox::record::SandboxProvisionOutcome;
 
 /// What a sub-task hands back: its own success value, or the failure class
 /// the machine branches on.
-pub(super) type TaskResult<T = ()> = std::result::Result<T, TaskFailure>;
+pub type TaskResult<T = ()> = std::result::Result<T, TaskFailure>;
 
 /// A sub-task failure: the error the caller gets, plus the class the machine
 /// branches on.
@@ -43,7 +44,7 @@ pub(super) type TaskResult<T = ()> = std::result::Result<T, TaskFailure>;
 /// constructors below — an arbitrary `Event` here would let a task's error
 /// path drive the machine anywhere.
 #[derive(Debug)]
-pub(super) struct TaskFailure {
+pub struct TaskFailure {
     event: Event,
     error: VmmError,
 }
@@ -51,7 +52,7 @@ pub(super) struct TaskFailure {
 impl TaskFailure {
     /// Whatever usable state the computer had survives: the flow unwound what
     /// it had allocated.
-    pub(super) fn recoverable(error: VmmError) -> Self {
+    pub fn recoverable(error: VmmError) -> Self {
         Self {
             event: Event::Failure,
             error,
@@ -60,7 +61,7 @@ impl TaskFailure {
 
     /// The guest is quiesced with no verb able to thaw it: the port is
     /// hold-then-kill by design, so the computer cannot go back to `Ready`.
-    pub(super) fn frozen(error: VmmError) -> Self {
+    pub fn frozen(error: VmmError) -> Self {
         Self {
             event: Event::Frozen,
             error,
@@ -69,7 +70,7 @@ impl TaskFailure {
 
     /// The flow could not unwind what it had allocated, so the computer
     /// cannot go back to the phase it came from — see [`Event::Stranded`].
-    pub(super) fn stranded(error: VmmError) -> Self {
+    pub fn stranded(error: VmmError) -> Self {
         Self {
             event: Event::Stranded,
             error,
@@ -92,9 +93,35 @@ impl TaskFailure {
     }
 }
 
+/// Whether a stop must wait a workload out, and the exit marker it waits to
+/// move past.
+///
+/// The marker is read **with** the `Running -> Stopping` transition rather
+/// than when the task first runs: the exit and the stop are both messages to
+/// the same actor, so an exit recorded between them is already the change
+/// this is waiting for — and a task that sampled the marker afterwards would
+/// wait for a second exit that can never come, burning the whole budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drain {
+    /// Nothing is running.
+    No,
+    Until {
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    },
+}
+
+/// What a user checkpoint records in the catalog. The pause capture brings
+/// none: it writes the reserved internal name, which no user checkpoint may
+/// squat on.
+#[derive(Debug, Clone)]
+pub struct CaptureSpec {
+    pub name: String,
+    pub labels: std::collections::HashMap<String, String>,
+}
+
 /// The flows the actor spawns. One method per `Spawn*` effect.
 #[async_trait]
-pub(super) trait ComputerTasks: Send + Sync + 'static {
+pub trait ComputerTasks: Send + Sync + 'static {
     /// Boot the VM and wait for the guest agent to announce itself.
     ///
     /// `handed_off` is signalled once every cleanup resource the boot
@@ -122,15 +149,25 @@ pub(super) trait ComputerTasks: Send + Sync + 'static {
     /// Capture a checkpoint. `hold` keeps the guest quiesced afterwards (the
     /// pause path): progress past the memory image would diverge from the
     /// retained disk overlay.
-    async fn checkpoint(&self, hold: bool) -> TaskResult<String>;
+    async fn checkpoint(&self, hold: bool, spec: Option<CaptureSpec>)
+    -> TaskResult<CheckpointInfo>;
 
     /// Restore a paused computer in place, back onto a fresh network.
     async fn resume(&self) -> TaskResult<Arc<dyn GuestAgent>>;
 
-    /// Drain the workload, shut the guest down, and release its runtime
-    /// resources within `budget`.
-    async fn stop(&self, budget: Duration) -> TaskResult;
+    /// Shut the guest down and release its runtime resources within
+    /// `budget`, giving a running workload the budget to finish first.
+    async fn stop(&self, budget: Duration, drain: Drain) -> TaskResult;
 
     /// Release the resources `scope` names.
     async fn release(&self, scope: ReleaseScope) -> TaskResult;
+
+    /// The agent reaching a computer this process never launched: the one
+    /// the startup sweep took back, whose handle it already holds.
+    ///
+    /// Every other computer's agent arrives with the flow that produced it.
+    /// An adopted one runs no flow at all, and the data plane reads the
+    /// agent off the snapshot — so without this an adopted computer would be
+    /// `Ready` and undialable, which is most of what adoption is for.
+    fn adopted_agent(&self) -> Option<Arc<dyn GuestAgent>>;
 }

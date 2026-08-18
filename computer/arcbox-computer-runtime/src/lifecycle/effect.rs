@@ -52,7 +52,7 @@ pub(super) enum Unconfirmed {
 
 /// Which resources a release drops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ReleaseScope {
+pub enum ReleaseScope {
     /// VMM, CoW, TAP + IP and chroot; the record stays inspectable.
     Runtime,
     /// The pause release: the same, but the disk overlay is retained.
@@ -120,6 +120,9 @@ pub(super) enum Effect {
     SpawnResume,
     SpawnStop {
         budget_ms: u64,
+        /// Whether a workload is running and owed the budget to finish
+        /// before the guest is asked to shut down.
+        drain: bool,
     },
     SpawnRelease {
         scope: ReleaseScope,
@@ -152,6 +155,16 @@ impl Effects {
 
     pub(super) fn release(&mut self, scope: ReleaseScope) {
         self.emit(Effect::SpawnRelease { scope });
+    }
+
+    /// The graceful stop: `stop_sandbox`. `drain` says whether a workload is
+    /// running and owed the budget to finish first — the machine knows,
+    /// because it is the state the stop came from.
+    pub(super) fn stop(&mut self, budget_ms: u64, drain: bool) {
+        self.persist(PersistPhase::Stopping, Durability::Warn);
+        self.emit(Effect::CancelTimer(Timer::Idle));
+        self.emit(Effect::Publish(Notify::Stopping));
+        self.emit(Effect::SpawnStop { budget_ms, drain });
     }
 
     /// Shared teardown: what `remove_sandbox_impl` does once its busy gate has

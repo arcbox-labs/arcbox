@@ -22,7 +22,7 @@ use crate::snapshot::SnapshotMeta;
 /// The slot policy — LRU, refill accounting, eviction — lives in
 /// [`super::policy::pool`]; re-exported so callers keep naming one
 /// `pool::SlotPool`.
-pub(super) use super::policy::pool::SlotPool;
+pub use super::policy::pool::SlotPool;
 
 /// A fully staged restore slot: jailer chroot prepared, the VMM spawned
 /// (API socket up, nothing loaded yet), kernel + vmstate + mem staged,
@@ -273,27 +273,37 @@ pub(super) async fn destroy_slot(
     }
 }
 
-impl SandboxManager {
-    /// Claim a live pre-warmed slot for `snapshot_id`. Slots whose VMM
-    /// died in the meantime are discarded and torn down in the background.
-    pub(super) fn claim_restore_slot(&self, snapshot_id: &str) -> Option<PreparedSlot> {
-        loop {
-            let slot = self.pool.claim(snapshot_id)?;
-            if slot.prepared.alive() {
-                return Some(slot);
-            }
-            warn!(
-                snapshot_id,
-                slot_id = %slot.slot_id,
-                "discarding pre-warmed slot whose vmm died"
-            );
-            self.spawn_slot_teardown(slot);
+/// Claim a live pre-warmed slot for `snapshot_id`. Slots whose VMM died in
+/// the meantime are discarded and torn down in the background.
+///
+/// A free function, like [`spawn_pool_refill`] below: the restore flow that
+/// calls both runs in the computer's actor, while the pool stays
+/// manager-wide — it is keyed by *snapshot* and LRU across ids, so it cannot
+/// be per-computer.
+pub fn claim_restore_slot(
+    pool: &SlotPool,
+    config: &Arc<VmmConfig>,
+    cow_manager: &Arc<CowManager>,
+    snapshot_id: &str,
+) -> Option<PreparedSlot> {
+    loop {
+        let slot = pool.claim(snapshot_id)?;
+        if slot.prepared.alive() {
+            return Some(slot);
         }
+        warn!(
+            snapshot_id,
+            slot_id = %slot.slot_id,
+            "discarding pre-warmed slot whose vmm died"
+        );
+        spawn_slot_teardown(config, cow_manager, slot);
     }
+}
 
-    fn spawn_slot_teardown(&self, slot: PreparedSlot) {
-        let config = Arc::clone(&self.config);
-        let cow_manager = Arc::clone(&self.cow_manager);
+fn spawn_slot_teardown(config: &Arc<VmmConfig>, cow_manager: &Arc<CowManager>, slot: PreparedSlot) {
+    {
+        let config = Arc::clone(config);
+        let cow_manager = Arc::clone(cow_manager);
         tokio::spawn(async move {
             let slot_id = slot.slot_id.clone();
             if let Err(error) = destroy_slot(&config, &cow_manager, slot).await {
@@ -305,25 +315,31 @@ impl SandboxManager {
             }
         });
     }
+}
 
-    /// Refill the pool for `snapshot_id` up to `firecracker.pool_size`
-    /// spare slots, in the background. Fired after each successful
-    /// restore — which is exactly what makes a snapshot "restored at
-    /// least once" and eligible for pooling — so a failing restore never
-    /// spawns warm processes in a loop.
-    pub(super) fn spawn_pool_refill(&self, snapshot_id: &str) {
-        let plan = self
-            .pool
-            .begin_fill(snapshot_id, self.config.firecracker.pool_size);
+/// Refill the pool for `snapshot_id` up to `firecracker.pool_size` spare
+/// slots, in the background. Fired after each successful restore — which is
+/// exactly what makes a snapshot "restored at least once" and eligible for
+/// pooling — so a failing restore never spawns warm processes in a loop.
+pub fn spawn_pool_refill(
+    pool: &Arc<SlotPool>,
+    driver: &Arc<dyn VmDriver>,
+    config: &Arc<VmmConfig>,
+    cow_manager: &Arc<CowManager>,
+    snapshots: &Arc<SnapshotCatalog>,
+    snapshot_id: &str,
+) {
+    {
+        let plan = pool.begin_fill(snapshot_id, config.firecracker.pool_size);
         for slot in plan.evicted {
-            self.spawn_slot_teardown(slot);
+            spawn_slot_teardown(config, cow_manager, slot);
         }
         for _ in 0..plan.spawn {
-            let pool = Arc::clone(&self.pool);
-            let driver = Arc::clone(&self.driver);
-            let config = Arc::clone(&self.config);
-            let cow_manager = Arc::clone(&self.cow_manager);
-            let snapshots = Arc::clone(&self.snapshots);
+            let pool = Arc::clone(pool);
+            let driver = Arc::clone(driver);
+            let config = Arc::clone(config);
+            let cow_manager = Arc::clone(cow_manager);
+            let snapshots = Arc::clone(snapshots);
             let snapshot_id = snapshot_id.to_owned();
             tokio::spawn(async move {
                 // Re-resolve the snapshot: it may have been deleted since.
@@ -355,7 +371,9 @@ impl SandboxManager {
             });
         }
     }
+}
 
+impl SandboxManager {
     /// Tear down pooled slots: all of them, or those staged from one
     /// snapshot.
     pub(super) async fn drain_pool(&self, snapshot_id: Option<&str>) {

@@ -19,7 +19,7 @@ const MAX_POOLED_SNAPSHOTS: usize = 2;
 
 /// Refill work computed under the pool lock: how many slot prepares to
 /// spawn and which evicted slots to tear down.
-pub(in crate::sandbox) struct FillPlan<S> {
+pub struct FillPlan<S> {
     pub spawn: usize,
     pub evicted: Vec<S>,
 }
@@ -28,7 +28,7 @@ pub(in crate::sandbox) struct FillPlan<S> {
 /// [`MAX_POOLED_SNAPSHOTS`] distinct ids (LRU), with in-flight refill
 /// accounting. Generic over the slot type so the policy is unit-testable
 /// without spawning a VMM; the lock is never held across an await.
-pub(in crate::sandbox) struct SlotPool<S = PreparedSlot> {
+pub struct SlotPool<S = PreparedSlot> {
     inner: Mutex<PoolInner<S>>,
 }
 
