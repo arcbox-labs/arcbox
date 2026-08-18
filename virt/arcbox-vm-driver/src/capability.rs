@@ -122,11 +122,13 @@ pub trait PreparedVm: Send + Sync {
 /// names it where it is — so a caller may stage what an earlier stage, or
 /// a warm slot it claimed, already put there.
 ///
-/// The area belongs to the VM and does not outlive it, so a disk that must
-/// is taken back out with [`unstage_disk`](Self::unstage_disk). Which verb
-/// removes the area is the driver's business, and today it is not
-/// [`PreparedVm::discard`] on every adapter — do not read the absence of a
-/// disk after a discard as "the driver kept it".
+/// Everything staged belongs to the VM's area, so a disk that has to
+/// outlive the VM is taken back out with
+/// [`unstage_disk`](Self::unstage_disk) first. When that area is removed,
+/// and by which verb, is the driver's own business — it is not
+/// [`PreparedVm::discard`] on every adapter today, so a caller may assume
+/// neither that a discard took the area with it nor that it left the area
+/// standing.
 #[async_trait]
 pub trait Staging: Send + Sync {
     /// Stages `src` as this VM's kernel image, and returns the path the
