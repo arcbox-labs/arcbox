@@ -91,17 +91,22 @@ mod tests {
             .join("rootfs")
             .to_string_lossy()
             .into_owned();
-        let mut manager = SandboxManager::new(config).unwrap();
-        manager.await_reconcile().await.unwrap();
         let cow_probe = Arc::new(CowTestProbe::default());
-        let cow_manager = Arc::new(
-            CowManager::new_with_test_probe(
-                CowOptions::new(&manager.config.firecracker.data_dir),
-                Arc::clone(&cow_probe),
-            )
-            .unwrap(),
-        );
-        manager.set_cow_manager(cow_manager);
+        let manager = SandboxManager::with_environment(
+            config.clone(),
+            crate::SandboxEnvironment {
+                cow_manager: Some(Arc::new(
+                    CowManager::new_with_test_probe(
+                        CowOptions::new(&config.firecracker.data_dir),
+                        Arc::clone(&cow_probe),
+                    )
+                    .unwrap(),
+                )),
+                ..crate::SandboxEnvironment::default()
+            },
+        )
+        .unwrap();
+        manager.await_reconcile().await.unwrap();
 
         // Reconciliation must finish before the test creates runtime state;
         // otherwise the startup sweep correctly classifies it as an orphan.

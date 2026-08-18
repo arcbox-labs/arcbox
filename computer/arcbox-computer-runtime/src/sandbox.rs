@@ -94,15 +94,6 @@ pub(crate) struct ComputerRef {
     incarnation: Uuid,
 }
 
-impl ComputerRef {
-    /// A receiver for this computer's read snapshot, for a caller that must
-    /// wait for a state rather than sample one.
-    #[cfg(test)]
-    pub(crate) fn watch(&self) -> tokio::sync::watch::Receiver<ComputerSnapshot> {
-        self.snapshot.clone()
-    }
-}
-
 /// The live computers, by id.
 pub(crate) type Computers = Arc<RwLock<HashMap<SandboxId, ComputerRef>>>;
 
@@ -230,7 +221,10 @@ impl SandboxManager {
         if let Some(candidates) = &config.firecracker.dmsetup_candidates {
             cow_options.dmsetup_candidates = candidates.iter().map(PathBuf::from).collect();
         }
-        let cow_manager = Arc::new(CowManager::new(cow_options)?);
+        let cow_manager = match environment.cow_manager {
+            Some(cow_manager) => cow_manager,
+            None => Arc::new(CowManager::new(cow_options)?),
+        };
 
         // Ensure the jailer chroot base directory exists.
         if let Some(ref jc) = config.firecracker.jailer {
@@ -388,15 +382,6 @@ impl SandboxManager {
     /// This computer's mailbox.
     pub(super) fn mailbox(&self, id: &SandboxId) -> Result<Mailbox> {
         Ok(self.computer(id)?.mailbox)
-    }
-
-    /// Replace the CoW manager, for a fixture that needs a probed one.
-    #[cfg(test)]
-    pub(super) fn set_cow_manager(&mut self, cow_manager: Arc<CowManager>) {
-        self.cow_manager = Arc::clone(&cow_manager);
-        Arc::get_mut(&mut self.services)
-            .expect("no actor has been spawned yet")
-            .cow_manager = cow_manager;
     }
 
     /// What a read of this computer sees, without touching its mailbox.

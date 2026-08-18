@@ -86,22 +86,22 @@ pub(super) async fn fake_manager_with_agent(
     config.firecracker.jailer = jailer;
     let driver = FakeDriver::new();
     let agent = FakeAgentFactory::new();
-    let mut manager = SandboxManager::with_environment(
+    let probe = Arc::new(CowTestProbe::default());
+    let manager = SandboxManager::with_environment(
         config,
         SandboxEnvironment {
             driver: Some(Arc::new(driver.clone())),
             network: Some(Arc::new(FakeNetwork::with_startup_cleanup("test-boot"))),
             agent: Some(Arc::new(agent.clone())),
+            cow_manager: Some(Arc::new(
+                CowManager::new_with_test_probe(CowOptions::new(data_dir), Arc::clone(&probe))
+                    .unwrap(),
+            )),
             ..SandboxEnvironment::default()
         },
     )
     .unwrap();
     manager.await_reconcile().await.unwrap();
-    let probe = Arc::new(CowTestProbe::default());
-    let cow_manager = Arc::new(
-        CowManager::new_with_test_probe(CowOptions::new(data_dir), Arc::clone(&probe)).unwrap(),
-    );
-    manager.set_cow_manager(cow_manager);
     let token = manager.startup_cleanup_token().await.unwrap().unwrap();
     manager.finalize_startup_cleanup(&token).await.unwrap();
     (manager, driver, probe, agent)
@@ -323,7 +323,7 @@ pub(super) async fn await_state(manager: &SandboxManager, id: &str, state: Sandb
     let mut snapshot = manager
         .computer(&id.to_owned())
         .expect("the computer is registered")
-        .watch();
+        .snapshot;
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         snapshot.wait_for(|snapshot| snapshot.state == state),

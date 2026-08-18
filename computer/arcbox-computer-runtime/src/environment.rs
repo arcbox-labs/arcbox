@@ -16,6 +16,7 @@ use arcbox_vm_driver::net::GuestNetwork;
 
 use crate::agent::GuestAgentFactory;
 use crate::network::{IptablesLegacy, PacketFilter};
+use crate::snapshot_cow::CowManager;
 
 /// What differs between hosts of the sandbox stack.
 #[derive(Clone)]
@@ -53,6 +54,12 @@ pub struct SandboxEnvironment {
     /// Loop-device and block-size operations for the copy-on-write rootfs
     /// (`arcbox_snapshot::snapshot_cow::BlockTools`).
     pub block_tools: Arc<dyn BlockTools>,
+    /// The copy-on-write rootfs manager. `None` — the reference — is built
+    /// from the config's data dir and [`Self::block_tools`] inside
+    /// `SandboxManager::with_environment`; a composer that needs a
+    /// differently-built one (a probed manager, a foreign thin pool)
+    /// supplies it here rather than reaching into a constructed manager.
+    pub cow_manager: Option<Arc<CowManager>>,
     /// How the identity-invariant translation is expressed in the host's
     /// netfilter framework ([`crate::network::packet_filter`]) — used by
     /// the iptables datapath and as the eBPF datapath's fallback.
@@ -71,6 +78,7 @@ impl Default for SandboxEnvironment {
             network: None,
             agent: None,
             block_tools: Arc::new(BusyboxBlockTools::default()),
+            cow_manager: None,
             packet_filter: Arc::new(IptablesLegacy::default()),
         }
     }
