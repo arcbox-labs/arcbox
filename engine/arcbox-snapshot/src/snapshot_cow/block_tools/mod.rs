@@ -6,17 +6,21 @@
 //! busybox applets in the System VM's EROFS userland, `util-linux` on a
 //! stock distro, or no program at all through the loop-control ioctls —
 //! so [`BlockTools`] names the operations and the composer supplies the
-//! implementation. [`BusyboxBlockTools`] is the reference: the System VM's
-//! behaviour, unchanged. Each implementation gets its own file — what
-//! differs between userlands is the whole tool surface, not a path.
+//! implementation. Two ship here: [`BusyboxBlockTools`], the reference
+//! (the System VM's behaviour, unchanged), and [`UtilLinuxBlockTools`]
+//! for a stock distro's `/sbin` userland. Each gets its own file — what
+//! differs between userlands is the whole tool surface, not a path; see
+//! [`UtilLinuxBlockTools`] for what busybox cannot express.
 //!
 //! Device-node helpers that only need syscalls (`stat`, `mknod`) or a
 //! sysfs read are plain functions here rather than trait methods: there is
 //! nothing environment specific about them once they stop shelling out.
 
 mod busybox;
+mod util_linux;
 
 pub use busybox::BusyboxBlockTools;
+pub use util_linux::UtilLinuxBlockTools;
 
 use std::path::Path;
 

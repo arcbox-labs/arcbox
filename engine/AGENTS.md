@@ -57,19 +57,27 @@ The restructure plan and its locked decisions live in the company repo:
     keep its own platform-neutrality promise.
   - Loop-device tooling is a seam, not an assumption: `CowManager` takes
     `CowOptions { block_tools: Arc<dyn BlockTools>, dmsetup_candidates, .. }`
-    (`snapshot_cow/block_tools.rs`). `BusyboxBlockTools` is the reference
-    (the System VM's `/bin/busybox` applets); a consumer on a stock distro
-    supplies its own — `util-linux` binaries or the loop ioctls — without
-    forking the module. `stat`/`mknod` are syscalls, not applets, so they
-    have no seam. The crate's own `dmsetup` search list is the stock-distro
-    one; the System VM's `/arcbox/bin/dmsetup` comes from the guest
+    (`snapshot_cow/block_tools/`, one file per implementation).
+    `BusyboxBlockTools` is the reference (the System VM's `/bin/busybox`
+    applets); `UtilLinuxBlockTools` covers a stock distro's
+    `losetup`/`blockdev`, and a consumer wanting neither (the loop ioctls
+    direct) supplies its own without forking the module. `stat`/`mknod`
+    are syscalls, not applets, so they have no seam. The crate's own
+    `dmsetup` search list is the stock-distro one; the System VM's
+    `/arcbox/bin/dmsetup` comes from the guest
     agent's `VmmConfig` (`firecracker.dmsetup_candidates`), not from here.
     Adding a new host operation means adding a trait method, never a
     hard-coded binary path. BusyBox's `losetup` has no `--show` (no long
     options at all), so `BusyboxBlockTools` attaches as `losetup -f` then
     `losetup LOOPDEV FILE` with a bounded retry when the queried device is
-    claimed in between — tested against a real busybox in
-    `test-vm-linux`'s `integration` job.
+    claimed in between; util-linux attaches in one atomic `losetup -f
+    --show` and retries `EBUSY` internally, which is why the two are
+    separate types and not one configurable path. Both are tested against
+    the real binaries in `test-vm-linux`'s `integration` job.
+    `UtilLinuxBlockTools::discover` probes `--version` rather than trusting
+    existence: on busybox-based images `/sbin/losetup` is a symlink to the
+    applet, which would fail on the first attach instead of at
+    composition.
   - `CowManager`'s test seam (`CowTestProbe`, `new_with_test_probe`) is
     behind the **`test-probe` feature**, not `#[cfg(test)]`: a
     `cfg(test)` item does not exist for another crate's tests, and its

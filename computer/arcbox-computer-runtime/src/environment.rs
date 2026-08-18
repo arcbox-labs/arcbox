@@ -52,7 +52,10 @@ pub struct SandboxEnvironment {
     /// at the first boot.
     pub agent: Option<Arc<dyn GuestAgentFactory>>,
     /// Loop-device and block-size operations for the copy-on-write rootfs
-    /// (`arcbox_snapshot::snapshot_cow::BlockTools`).
+    /// and the `vm-agent` injection mount
+    /// (`arcbox_snapshot::snapshot_cow::BlockTools`). The reference is
+    /// busybox; a composer on a stock distro supplies
+    /// `UtilLinuxBlockTools::discover()?`.
     pub block_tools: Arc<dyn BlockTools>,
     /// The copy-on-write rootfs manager. `None` — the reference — is built
     /// from the config's data dir and [`Self::block_tools`] inside
