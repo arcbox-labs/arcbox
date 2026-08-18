@@ -21,6 +21,28 @@ use crate::spec::{IsolationSpec, VmId, VmSpec};
 /// What `discard` reports for a process killed before or after its boot.
 const SIGKILL: i32 = 9;
 
+/// `path` with its `.` and `..` components resolved as far as they can be
+/// without touching the filesystem.
+///
+/// Enough for deciding whether a path lands inside a directory: a `..`
+/// that walks out of one is what the check exists to catch, and symlinks
+/// are beyond what a fake needs to model.
+fn lexically_resolved(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// How a staged file gets into the staging area.
 #[derive(Debug, Clone, Copy)]
 enum Bring {
@@ -188,7 +210,11 @@ impl PreparedFake {
     /// it landed. A source already inside the area is left where it is —
     /// the same short-circuit a real confinement makes.
     async fn bring_in(&self, src: &Path, dst: &Path, how: Bring) -> Result<PathBuf> {
-        if src.starts_with(self.staging_root()) {
+        // Against the resolved path, not the written one: `starts_with`
+        // compares components, so `{staged}/../elsewhere` would look like
+        // it is already inside the area and be left where it is — and a
+        // `Handover` would then report a move that never happened.
+        if lexically_resolved(src).starts_with(self.staging_root()) {
             return Ok(src.to_path_buf());
         }
         if let Some(parent) = dst.parent() {

@@ -439,6 +439,25 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
     // from, so the rule would otherwise hold in one isolation mode only.
     assert!(invalid(staged_disk_file("../escape")).contains("plain name"));
     assert_eq!(staged_disk_file("rootfs").unwrap(), "rootfs.ext4");
+
+    // A source spelled through the jail root but resolving outside it is
+    // not already in the jail; `place` compares components, so staging
+    // resolves first — otherwise a handover would be reported as a move
+    // that never happened.
+    let outside = base.join("firecracker/box/root/../../../outside.ext4");
+    assert!(
+        layout.jail().unwrap().view(&outside).is_some(),
+        "as written"
+    );
+    assert_eq!(lexically_resolved(&outside), base.join("outside.ext4"));
+    assert!(
+        layout
+            .jail()
+            .unwrap()
+            .view(&lexically_resolved(&outside))
+            .is_none(),
+        "resolved, it is outside the jail and has to be staged"
+    );
     assert_eq!(
         layout.jail_path(&disk_file("rootfs")).unwrap(),
         Some(base.join("firecracker/box/root/rootfs.ext4"))

@@ -634,9 +634,21 @@ pub async fn a_staged_disk_can_be_taken_back_out(h: &dyn ContractHarness) {
 /// The warm-pool path, and the reason [`Staging::stage_checkpoint`] is a
 /// verb of its own: a slot brings the image in — the memory file is the
 /// guest's entire RAM — long before any restore is asked for, and the
-/// restore then loads what is already there. Nothing else in this
-/// contract touches that verb, so an image that comes back naming a
-/// directory the files never reached would pass everything else.
+/// restore then loads what is already there.
+///
+/// So the check deletes the source image once staging says it has been
+/// brought in, and only then restores. That is the property, and nothing
+/// weaker states it: a `stage_checkpoint` that copied nothing and handed
+/// its argument straight back would otherwise pass, because both a jailed
+/// restore and a plain one will bring the files in themselves — leaving
+/// the copy on the restore's critical path, exactly where a warm slot
+/// exists to take it off.
+///
+/// A driver with no confinement legitimately stages nothing and answers
+/// with the image it was given. The check asks it which it is by staging
+/// a file of its own first and seeing whether that moved — taking the
+/// answer from a verb it cannot fake, rather than from this one, which is
+/// the verb under test.
 ///
 /// [`Staging::stage_checkpoint`]: crate::Staging::stage_checkpoint
 pub async fn a_staged_checkpoint_restores(h: &dyn ContractHarness) {
@@ -676,12 +688,37 @@ pub async fn a_staged_checkpoint_restores(h: &dyn ContractHarness) {
         .await
         .expect("prepare");
     let staging = prepared.staging().expect("the driver claims staging");
+
+    // Does this driver's staging area move anything at all? Asked of a
+    // disk, because a checkpoint is what is under test here — and the
+    // answer must not differ between the two.
+    let probe = h.runtime_dir().join("probe.ext4");
+    tokio::fs::write(&probe, b"probe")
+        .await
+        .expect("a file to probe staging with");
+    let confined = staging
+        .stage_disk("probe", DiskSource::Image(&probe))
+        .await
+        .expect("stage a probe disk")
+        != probe;
+
     let staged = staging
         .stage_checkpoint(&image)
         .await
         .expect("stage the checkpoint");
     assert_eq!(staged.format, image.format);
     assert_eq!(staged.kind, image.kind);
+    if confined {
+        assert_ne!(
+            staged.dir, image.dir,
+            "a driver that brings a disk in must bring a checkpoint in too"
+        );
+        // Brought in, so the source is expendable from here — which is
+        // what "the slot already paid for it" means.
+        tokio::fs::remove_dir_all(&image.dir)
+            .await
+            .expect("the source image is no longer needed once staged");
+    }
     let mut disks = Vec::new();
     for mut disk in template.disks {
         disk.path = staging

@@ -533,6 +533,32 @@ fn tap_name(nic: &NicSpec) -> Result<String> {
     }
 }
 
+/// `path` with its `.` and `..` components resolved as far as they can be
+/// without touching the filesystem.
+///
+/// [`VmLayout::place`] decides whether a file is already inside the jail
+/// by stripping the root off the path *as written*, and `..` walks out of
+/// a directory the components still name. Staging resolves its source
+/// first so that short-circuit answers about where the file is, not about
+/// how it was spelled. Symlinks are deliberately not followed: a symlink
+/// inside the jail is a file the jailed VMM can open, which is the
+/// question being asked.
+pub fn lexically_resolved(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// True when `name` is one plain path component: no separator, no `.` or
 /// `..`, no root, nothing a jail-relative path may not be made of.
 fn is_plain_component(name: &str) -> bool {
