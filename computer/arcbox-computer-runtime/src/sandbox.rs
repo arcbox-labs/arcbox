@@ -721,10 +721,11 @@ pub(super) fn max_sandbox_id_len(config: &VmmConfig) -> usize {
 
 /// Validate a caller-supplied sandbox or snapshot id.
 ///
-/// Ids become filesystem path components, jailer `--id` values, and dm/TAP name
-/// fragments, so they are restricted to `[A-Za-z0-9_-]`. This rejects path
-/// traversal (`/`, `\`, `..`), NUL, whitespace, and anything the jailer would
-/// otherwise reject much later with an opaque boot failure.
+/// Ids become filesystem path components and dm/TAP name fragments, so they are
+/// restricted to `[A-Za-z0-9_-]`. This rejects path traversal (`/`, `\`, `..`),
+/// NUL and whitespace. The jailer's own, narrower charset is *not* checked here
+/// — see [`validate_new_sandbox_id`], which is where an id becomes a jailer
+/// identity.
 ///
 /// Deliberately NO length cap here: this also runs against persisted
 /// records (reconcile, record loads) — where rejecting one legacy
@@ -748,8 +749,9 @@ pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
 }
 
 /// Validate a sandbox id at request ingress (create / restore), where the
-/// id becomes a jailer identity — [`validate_id`] plus the
-/// [`max_sandbox_id_len`] socket-path budget.
+/// id becomes a jailer identity — [`validate_id`] plus the two limits the
+/// jailer imposes: the [`max_sandbox_id_len`] socket-path budget and its
+/// charset.
 pub(super) fn validate_new_sandbox_id(id: &str, config: &VmmConfig) -> Result<()> {
     let max = max_sandbox_id_len(config);
     if id.len() > max {
@@ -758,7 +760,33 @@ pub(super) fn validate_new_sandbox_id(id: &str, config: &VmmConfig) -> Result<()
              (the jailer socket path must fit the AF_UNIX limit)"
         )));
     }
-    validate_id("sandbox id", id)
+    validate_id("sandbox id", id)?;
+    // The jailer's `--id` takes only alphanumerics and hyphens, a strictly
+    // narrower set than the path-safe one above, and it is checked only when a
+    // jailer is configured — nothing else in the layer minds an underscore.
+    //
+    // Enforced here rather than in `validate_id` because that one also runs
+    // over persisted records during reconcile, where one legacy underscored id
+    // would abort the whole sweep, and over snapshot and execution ids that
+    // never reach the jailer.
+    //
+    // Without this the id reaches the jailer, which refuses to exec with
+    // `InvalidInstanceId` from inside the async boot task: an error with
+    // nothing tying it back to the request that caused it.
+    if config.firecracker.jailer.is_some() {
+        if let Some(offending) = id.bytes().position(|b| !jailer_id_byte(b)) {
+            return Err(VmmError::Config(format!(
+                "invalid sandbox id {id:?}: byte {offending} is not accepted by the jailer, \
+                 whose --id takes only ASCII letters, digits and '-'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the jailer's `--id` accepts this byte.
+fn jailer_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
 }
 
 /// Atomically claim `id` in the registry and stand up its actor.
@@ -1051,6 +1079,42 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn an_underscored_id_is_refused_at_ingress_only_under_a_jailer() {
+        // The jailer's `--id` takes no underscore, so an id carrying one has to
+        // fail at create — not later, from inside the boot task, as the
+        // jailer's own `InvalidInstanceId`.
+        let mut config = VmmConfig::default();
+        config.firecracker.binary = "/usr/local/bin/firecracker".into();
+        config.firecracker.jailer = Some(crate::config::JailerConfig {
+            binary: "/usr/local/bin/jailer".into(),
+            uid: 0,
+            gid: 0,
+            chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
+            netns: None,
+            new_pid_ns: false,
+            cgroup_version: None,
+            parent_cgroup: None,
+            resource_limits: Vec::new(),
+        });
+        let error = validate_new_sandbox_id("inst_019e409e-7546", &config)
+            .expect_err("the jailer would refuse to exec on this id");
+        assert!(
+            matches!(&error, VmmError::Config(message) if message.contains("byte 4")),
+            "the error should name the offending byte, got {error}"
+        );
+        assert!(validate_new_sandbox_id("inst-019e409e-7546", &config).is_ok());
+
+        // Without a jailer nothing in the layer minds an underscore: it is only
+        // a path component and a dm/TAP name fragment there.
+        config.firecracker.jailer = None;
+        assert!(validate_new_sandbox_id("inst_019e409e-7546", &config).is_ok());
+        // And the generic validator keeps accepting it either way, because it
+        // also runs over persisted records and over ids that never reach a
+        // jailer at all.
+        assert!(validate_id("id", "inst_019e409e-7546").is_ok());
     }
 
     #[test]
