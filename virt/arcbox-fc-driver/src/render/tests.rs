@@ -441,22 +441,31 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
     assert_eq!(staged_disk_file("rootfs").unwrap(), "rootfs.ext4");
 
     // A source spelled through the jail root but resolving outside it is
-    // not already in the jail; `place` compares components, so staging
-    // resolves first — otherwise a handover would be reported as a move
-    // that never happened.
+    // not already in the jail, so `place` stages it rather than naming it
+    // where the components pretend it is — otherwise Firecracker is told
+    // a path its chroot cannot reach, and a move never happens at all.
     let outside = base.join("firecracker/box/root/../../../outside.ext4");
     assert!(
         layout.jail().unwrap().view(&outside).is_some(),
-        "as written"
+        "as written it passes for a file in the jail"
     );
     assert_eq!(lexically_resolved(&outside), base.join("outside.ext4"));
-    assert!(
+    let mut planned = Vec::new();
+    assert_eq!(
         layout
-            .jail()
-            .unwrap()
-            .view(&lexically_resolved(&outside))
-            .is_none(),
-        "resolved, it is outside the jail and has to be staged"
+            .place(&outside, "rootfs.ext4", StageKind::Copy, &mut planned)
+            .unwrap(),
+        "/rootfs.ext4"
+    );
+    assert_eq!(
+        planned,
+        vec![StagePlan {
+            // Staged from the path as given: which file to read is not
+            // the question the resolution answers.
+            src: outside,
+            dst: base.join("firecracker/box/root/rootfs.ext4"),
+            kind: StageKind::Copy,
+        }]
     );
     assert_eq!(
         layout.jail_path(&disk_file("rootfs")).unwrap(),

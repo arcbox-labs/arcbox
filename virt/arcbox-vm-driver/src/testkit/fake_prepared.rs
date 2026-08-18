@@ -213,9 +213,11 @@ impl PreparedFake {
         // Against the resolved path, not the written one: `starts_with`
         // compares components, so `{staged}/../elsewhere` would look like
         // it is already inside the area and be left where it is — and a
-        // `Handover` would then report a move that never happened.
-        if lexically_resolved(src).starts_with(self.staging_root()) {
-            return Ok(src.to_path_buf());
+        // `Handover` would then report a move that never happened. The
+        // answer names where the file is, not how it was spelled.
+        let resolved = lexically_resolved(src);
+        if resolved.starts_with(self.staging_root()) {
+            return Ok(resolved);
         }
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -368,8 +370,12 @@ impl Staging for PreparedFake {
 
     async fn stage_checkpoint(&self, image: &CheckpointImage) -> Result<CheckpointImage> {
         let root = self.staging_root();
-        if image.dir.starts_with(&root) {
-            return Ok(image.clone());
+        let resolved = lexically_resolved(&image.dir);
+        if resolved.starts_with(&root) {
+            return Ok(CheckpointImage {
+                dir: resolved,
+                ..image.clone()
+            });
         }
         let name = image.dir.file_name().ok_or_else(|| {
             Error::InvalidSpec(format!(

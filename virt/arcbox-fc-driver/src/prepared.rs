@@ -124,13 +124,7 @@ impl FcPrepared {
     /// instead of being copied onto itself.
     async fn bring_in(&self, src: &Path, in_jail: &str, kind: StageKind) -> Result<PathBuf> {
         let mut stage = Vec::new();
-        // Resolved first: `place` decides "already in the jail" by
-        // stripping the root as written, so `{jail}/../elsewhere` would
-        // pass for a file inside it — named to Firecracker as a path its
-        // chroot cannot reach, and, for a handover, never moved at all.
-        let named =
-            self.layout
-                .place(&render::lexically_resolved(src), in_jail, kind, &mut stage)?;
+        let named = self.layout.place(src, in_jail, kind, &mut stage)?;
         if let Some(jail) = self.layout.jail() {
             jail::apply(jail, &stage).await?;
         }
@@ -307,8 +301,15 @@ impl Staging for FcPrepared {
         let Some(jail) = self.layout.jail() else {
             return Ok(image.clone());
         };
-        if jail.view(&image.dir).is_some() {
-            return Ok(image.clone());
+        // Resolved, for the same reason `place` resolves: a dir spelled
+        // through the jail root but landing outside it has to be brought
+        // in, not loaded from where the VMM cannot reach.
+        let resolved = render::lexically_resolved(&image.dir);
+        if jail.view(&resolved).is_some() {
+            return Ok(CheckpointImage {
+                dir: resolved,
+                ..image.clone()
+            });
         }
         let name = image
             .dir

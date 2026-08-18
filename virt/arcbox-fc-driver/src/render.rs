@@ -174,6 +174,13 @@ impl VmLayout {
     /// come from the spec (a disk `id`), and staging writes, replaces, and
     /// mknods at the destination, so a `..` in it would reach a host file
     /// outside the jail.
+    ///
+    /// Whether `host` is already inside is decided on its resolved form:
+    /// `strip_prefix` compares components, so `{jail}/../elsewhere` names
+    /// the jail on the way past and would otherwise be passed to
+    /// Firecracker as a path its chroot cannot reach — never staged, and
+    /// for a move, never moved. The file is staged *from* `host` as given,
+    /// which is the path the caller named.
     pub fn place(
         &self,
         host: &Path,
@@ -189,7 +196,7 @@ impl VmLayout {
                 "`{in_jail}` does not name a path inside the jail"
             )));
         }
-        if let Some(view) = jail.view(host) {
+        if let Some(view) = jail.view(&lexically_resolved(host)) {
             return Ok(view);
         }
         stage.push(StagePlan {
@@ -536,13 +543,14 @@ fn tap_name(nic: &NicSpec) -> Result<String> {
 /// `path` with its `.` and `..` components resolved as far as they can be
 /// without touching the filesystem.
 ///
-/// [`VmLayout::place`] decides whether a file is already inside the jail
-/// by stripping the root off the path *as written*, and `..` walks out of
-/// a directory the components still name. Staging resolves its source
-/// first so that short-circuit answers about where the file is, not about
-/// how it was spelled. Symlinks are deliberately not followed: a symlink
-/// inside the jail is a file the jailed VMM can open, which is the
-/// question being asked.
+/// Used for one question only — is this path inside the jail — because
+/// `strip_prefix` compares components and `..` walks out of a directory
+/// the components still name. Symlinks are deliberately not followed: a
+/// symlink inside the jail is a file the jailed VMM can open, which is
+/// exactly the question being asked, and resolving one would answer a
+/// different one. That is also why nothing stages *from* the resolved
+/// path: reading the file is a different question, and the caller named
+/// the path it meant.
 pub(crate) fn lexically_resolved(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
