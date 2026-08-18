@@ -30,6 +30,10 @@ pub(super) async fn boot_sandbox(
     resource_handoff: tokio::sync::oneshot::Sender<()>,
     agents: Arc<dyn GuestAgentFactory>,
 ) {
+    let Some(computer) = instances.read().unwrap().get(&id).cloned() else {
+        info!(sandbox_id = %id, "stale sandbox boot completed");
+        return;
+    };
     match do_boot(
         &id,
         &spec,
@@ -39,8 +43,7 @@ pub(super) async fn boot_sandbox(
         agents.as_ref(),
         &config,
         &cow_manager,
-        &instances,
-        generation,
+        &computer,
         resource_handoff,
     )
     .await
@@ -151,7 +154,7 @@ pub(super) async fn boot_sandbox(
                 if let Err(frozen) = super::warm::publish_after_boot(
                     &id,
                     ticket,
-                    &instances,
+                    &computer,
                     &config,
                     &cow_manager,
                     expected,

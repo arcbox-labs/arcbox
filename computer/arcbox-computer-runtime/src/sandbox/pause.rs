@@ -205,7 +205,7 @@ impl SandboxManager {
         // rather than reporting Ready for a frozen guest or holding its
         // resources until Remove.
         let snapshot_id = match checkpoint_impl(
-            &self.instances,
+            &instance,
             &self.snapshots,
             id,
             CheckpointRequest {

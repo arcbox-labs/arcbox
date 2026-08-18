@@ -254,8 +254,9 @@ impl SandboxManager {
                 _ => tokio::time::sleep(std::time::Duration::from_millis(READY_POLL_MS)).await,
             }
         }
+        let computer = self.get_instance(&id.to_owned())?;
         let info = crate::lifecycle::tasks::checkpoint::checkpoint_impl(
-            &self.instances,
+            &computer,
             &self.snapshots,
             id,
             crate::lifecycle::tasks::checkpoint::CheckpointRequest {

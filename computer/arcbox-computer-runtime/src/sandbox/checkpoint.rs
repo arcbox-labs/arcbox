@@ -81,8 +81,9 @@ impl SandboxManager {
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
+        let computer = self.get_instance(sandbox_id)?;
         match checkpoint_impl(
-            &self.instances,
+            &computer,
             &self.snapshots,
             sandbox_id,
             CheckpointRequest {
