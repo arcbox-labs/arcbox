@@ -1125,3 +1125,36 @@ async fn a_refused_resume_write_abandons_the_resume_it_was_recording() {
         "the resume the write was recording must not have run"
     );
 }
+
+/// A refused `Failed` write does not stop the release it records.
+///
+/// The other refusals abandon the rest of their transition, because the
+/// effects after them are the work the write was recording. `Failed` is the
+/// opposite: it records where the computer *ended up*, and
+/// `persist_boot_failure` reports the refusal and lets the release run —
+/// keeping the crash journal, which is what a restart would reclaim from.
+#[tokio::test(start_paused = true)]
+async fn a_refused_failure_write_still_releases_and_keeps_the_journal() {
+    let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    let journal =
+        SandboxStateRecord::new("box", None, None, None, &VmmConfig::default(), None).unwrap();
+    write_state_record(harness.dir.path(), &journal).unwrap();
+
+    let record_path = harness.dir.path().join("sandbox-records").join("box.json");
+    std::fs::remove_file(&record_path).unwrap();
+    std::fs::create_dir(&record_path).unwrap();
+
+    harness.commands.send(Command::VmExited).unwrap();
+    harness.settled(SandboxState::Failed).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        harness.script.calls().contains(&"release"),
+        "the release runs even though the failure was not recorded"
+    );
+    assert!(
+        harness.has_journal(),
+        "and the journal stays: nothing proved the failure durable"
+    );
+}

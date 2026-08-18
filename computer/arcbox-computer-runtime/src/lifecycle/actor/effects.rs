@@ -190,10 +190,26 @@ impl ComputerActor {
         let commit = match self.records.transition(&self.id, generation, transition) {
             Ok(commit) => commit,
             // A refused write is not an unconfirmed one: nothing was
-            // recorded at all. Every treatment below assumes the phase is at
-            // least visible — warning and carrying on would leave the
-            // computer running past a phase its record never entered — so
-            // the flow fails the way its own sub-task's failure would.
+            // recorded at all.
+            //
+            // What that costs depends on what the phase was for. A phase the
+            // flow is *about to act on* — `Stopping` before a shutdown,
+            // `Removing` before a release, `Resuming` before a resume — must
+            // stop it, which is what `stop_sandbox`, `begin_removal` and
+            // `resume_sandbox` do with their `?`. A phase that only records
+            // where the computer *ended up* must not: `persist_boot_failure`
+            // reports the failure and lets the release run, keeping the
+            // crash journal — which is exactly what `GateJournal` means.
+            Err(error) if matches!(durability, Durability::GateJournal) => {
+                error!(
+                    sandbox_id = %self.id,
+                    %error,
+                    phase = phase.as_str(),
+                    "durable write was refused; keeping the crash journal"
+                );
+                self.journal_blocked = true;
+                return Flow::Continue;
+            }
             Err(error) => {
                 return self.fail_write(&format!("recording {} failed: {error}", phase.as_str()));
             }
