@@ -164,6 +164,15 @@ impl ComputerActor {
                     return;
                 }
                 self.deadlines = deadlines;
+                {
+                    // Mirrored onto the runtime too: it is what the startup
+                    // sweep reads a computer's deadlines back from, so a
+                    // reader that reaches for either finds the same policy.
+                    let mut runtime = self.runtime.lock().unwrap();
+                    runtime.ttl_deadline = deadlines.ttl;
+                    runtime.spec.idle_timeout_seconds = deadlines.idle_timeout_seconds;
+                    runtime.spec.on_idle = deadlines.on_idle;
+                }
                 // The timers live in this task; the record is what a restart
                 // re-arms them from, so an acknowledged change has to be on
                 // disk as well (`set_sandbox_lifecycle` today).
