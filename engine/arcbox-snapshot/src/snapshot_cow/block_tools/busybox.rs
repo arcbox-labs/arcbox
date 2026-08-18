@@ -256,6 +256,86 @@ mod tests {
     }
 
     #[test]
+    fn a_free_device_query_that_fails_is_reported_as_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, log) = fake_busybox(
+            dir.path(),
+            "\"losetup -f\") echo \"losetup: /dev/loop-control: No such device\" >&2; exit 1 ;;\n\
+             *) exit 2 ;;",
+        );
+
+        let err = tools
+            .attach_loop(Path::new("/tmp/cow.img"), false)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("losetup -f"), "{err}");
+        assert!(err.to_string().contains("No such device"), "{err}");
+        // The attach never ran: there was no device to attach to.
+        assert_eq!(calls(&log), ["losetup -f"]);
+    }
+
+    #[test]
+    fn detach_and_size_drive_the_applets_and_parse_the_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, log) = fake_busybox(
+            dir.path(),
+            "\"losetup -d /dev/loop9999\") exit 0 ;;\n\
+             \"blockdev --getsz /dev/loop9999\") echo 8192 ;;\n\
+             *) exit 2 ;;",
+        );
+
+        tools.detach_loop("/dev/loop9999").unwrap();
+        assert_eq!(tools.device_sectors("/dev/loop9999").unwrap(), 8192);
+        assert_eq!(
+            calls(&log),
+            ["losetup -d /dev/loop9999", "blockdev --getsz /dev/loop9999"]
+        );
+    }
+
+    #[test]
+    fn a_failed_detach_carries_the_applets_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, _) = fake_busybox(
+            dir.path(),
+            "*) echo \"losetup: /dev/loop9999: Device or resource busy\" >&2; exit 1 ;;",
+        );
+
+        let err = tools.detach_loop("/dev/loop9999").unwrap_err();
+
+        assert!(
+            err.to_string().contains("losetup -d /dev/loop9999"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Device or resource busy"), "{err}");
+    }
+
+    #[test]
+    fn a_size_that_is_not_a_number_is_a_parse_error_not_a_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, _) = fake_busybox(dir.path(), "*) echo \"lots of them\" ;;");
+
+        let err = tools.device_sectors("/dev/loop9999").unwrap_err();
+
+        assert!(err.to_string().contains("blockdev parse"), "{err}");
+    }
+
+    #[test]
+    fn a_size_query_that_fails_names_the_applet_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, _) = fake_busybox(
+            dir.path(),
+            "*) echo \"blockdev: /dev/loop9999: No such device\" >&2; exit 1 ;;",
+        );
+
+        let err = tools.device_sectors("/dev/loop9999").unwrap_err();
+
+        assert!(
+            err.to_string().contains("blockdev --getsz /dev/loop9999"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn attach_retries_a_claimed_device_a_bounded_number_of_times() {
         let dir = tempfile::tempdir().unwrap();
         let (tools, log) = fake_busybox(

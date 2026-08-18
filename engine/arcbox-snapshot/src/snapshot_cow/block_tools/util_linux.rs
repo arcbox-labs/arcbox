@@ -265,6 +265,52 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_detach_carries_losetups_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, _) = fake_tools(
+            dir.path(),
+            "*) echo \"losetup: /dev/loop9999: detach failed: Device or resource busy\" >&2; \
+             exit 1 ;;",
+            NO_BLOCKDEV,
+        );
+
+        let err = tools.detach_loop("/dev/loop9999").unwrap_err();
+
+        assert!(
+            err.to_string().contains("losetup -d /dev/loop9999"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Device or resource busy"), "{err}");
+    }
+
+    #[test]
+    fn a_size_that_is_not_a_number_is_a_parse_error_not_a_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, _) = fake_tools(dir.path(), NO_BLOCKDEV, "*) echo \"lots of them\" ;;");
+
+        let err = tools.device_sectors("/dev/loop9999").unwrap_err();
+
+        assert!(err.to_string().contains("blockdev parse"), "{err}");
+    }
+
+    #[test]
+    fn a_size_query_that_fails_names_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, _) = fake_tools(
+            dir.path(),
+            NO_BLOCKDEV,
+            "*) echo \"blockdev: cannot open /dev/loop9999: No such device\" >&2; exit 1 ;;",
+        );
+
+        let err = tools.device_sectors("/dev/loop9999").unwrap_err();
+
+        assert!(
+            err.to_string().contains("blockdev --getsz /dev/loop9999"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_missing_binary_is_reported_as_a_failed_spawn() {
         let tools = UtilLinuxBlockTools::new(
             "/nonexistent/arcbox-losetup",
