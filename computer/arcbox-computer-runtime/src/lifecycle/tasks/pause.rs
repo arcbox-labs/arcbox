@@ -135,3 +135,125 @@ pub async fn release_for_pause(
     arc.lock().unwrap().pool_slot_id = None;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
+    use arcbox_vm_driver::{DiskSource, IsolationSpec, PreparedVm, VmDriver as _, VmId};
+
+    use super::*;
+    use crate::sandbox::SandboxSpec;
+    use crate::snapshot_cow::CowOptions;
+
+    /// A copy-mode computer — no overlay, its disk staged into its VM's
+    /// area — with `staged` written there under the root disk's id when
+    /// asked for.
+    async fn copy_mode_computer(
+        data_dir: &std::path::Path,
+        driver: &FakeDriver,
+        staged: Option<&[u8]>,
+    ) -> (Arc<Mutex<ComputerRuntime>>, Arc<dyn PreparedVm>, PathBuf) {
+        let vm_dir = data_dir.join("sandboxes/job");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let prepared: Arc<dyn PreparedVm> = Arc::from(
+            driver
+                .prepare()
+                .unwrap()
+                .prepare(&VmId::new("job").unwrap(), &IsolationSpec::None, &vm_dir)
+                .await
+                .unwrap(),
+        );
+        if let Some(bytes) = staged {
+            let source = data_dir.join("template.ext4");
+            std::fs::write(&source, bytes).unwrap();
+            prepared
+                .staging()
+                .unwrap()
+                .stage_disk(ROOTFS_DISK_ID, DiskSource::Image(&source))
+                .await
+                .unwrap();
+        }
+        let mut computer = ComputerRuntime::new(
+            "job".to_owned(),
+            SandboxSpec::default(),
+            None,
+            vm_dir.clone(),
+        );
+        computer.prepared = Some(Arc::clone(&prepared));
+        (Arc::new(Mutex::new(computer)), prepared, vm_dir)
+    }
+
+    fn config(data_dir: &std::path::Path) -> VmmConfig {
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
+        config
+    }
+
+    /// A copy-mode computer's disk comes out of the VM's area and lands
+    /// where resume looks for it, and the VM is released.
+    ///
+    /// That the take-out *precedes* the discard is not observable through
+    /// the fake, whose staging area survives one; the ordering is held by
+    /// the comment at the site and proven by the `sandbox` e2e, where the
+    /// area really does go with the kill.
+    #[tokio::test]
+    async fn the_copy_mode_disk_is_parked_before_the_vm_is_discarded() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let (computer, prepared, vm_dir) =
+            copy_mode_computer(data_dir.path(), &driver, Some(b"the guest's disk")).await;
+        let config = config(data_dir.path());
+        let cow = CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap();
+
+        release_for_pause(
+            &"job".to_owned(),
+            &computer,
+            &config,
+            &cow,
+            &FakeNetwork::new(),
+        )
+        .await
+        .expect("a copy-mode pause parks the disk and releases the vm");
+
+        assert_eq!(
+            std::fs::read(vm_dir.join(PAUSED_ROOTFS_FILE)).unwrap(),
+            b"the guest's disk"
+        );
+        assert!(
+            !prepared.alive(),
+            "the vm is discarded after the disk is out"
+        );
+    }
+
+    /// Nothing to take out is a refusal, not a skip: continuing would
+    /// discard the VM, take its area with it, and record `Paused` for a
+    /// computer with no disk to resume from.
+    #[tokio::test]
+    async fn a_copy_mode_pause_with_no_staged_disk_is_refused_before_the_kill() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let (computer, prepared, vm_dir) = copy_mode_computer(data_dir.path(), &driver, None).await;
+        let config = config(data_dir.path());
+        let cow = CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap();
+
+        let refused = release_for_pause(
+            &"job".to_owned(),
+            &computer,
+            &config,
+            &cow,
+            &FakeNetwork::new(),
+        )
+        .await;
+
+        match refused {
+            Err(VmmError::Snapshot(message)) => {
+                assert!(message.contains("nothing to resume from"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(prepared.alive(), "the vm is left running for a retry");
+        assert!(!vm_dir.join(PAUSED_ROOTFS_FILE).exists());
+    }
+}
