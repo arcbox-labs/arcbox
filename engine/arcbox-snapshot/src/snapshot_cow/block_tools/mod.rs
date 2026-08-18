@@ -215,8 +215,10 @@ mod tests {
             b"/dev/loopX",
             b"loop3\n",
             b"/dev/sda1\n",
-            // util-linux's `losetup -f` marks a device whose backing file
-            // was deleted; only the bare name is a usable target.
+            // util-linux's `losetup -f` appends " (lost)" when the /dev
+            // node is gone while the kernel still knows the device
+            // (`losetup.c` A_FIND_FREE, `loopcxt_is_lost`). Only the bare
+            // name is a usable target.
             b"/dev/loop3 (lost)\n",
         ] {
             let err = parse_loop_device("losetup -f", garbage).unwrap_err();
