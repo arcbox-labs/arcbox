@@ -204,6 +204,7 @@ macro_rules! driver_contract {
                 restore_reattaches_disks,
                 a_staged_spec_boots,
                 a_staged_disk_can_be_taken_back_out,
+                a_staged_checkpoint_restores,
             }
         }
     };

@@ -628,3 +628,83 @@ pub async fn a_staged_disk_can_be_taken_back_out(h: &dyn ContractHarness) {
     );
     prepared.discard().await.expect("discard");
 }
+
+/// A checkpoint staged into a prepared VM restores from where it landed.
+///
+/// The warm-pool path, and the reason [`Staging::stage_checkpoint`] is a
+/// verb of its own: a slot brings the image in — the memory file is the
+/// guest's entire RAM — long before any restore is asked for, and the
+/// restore then loads what is already there. Nothing else in this
+/// contract touches that verb, so an image that comes back naming a
+/// directory the files never reached would pass everything else.
+///
+/// [`Staging::stage_checkpoint`]: crate::Staging::stage_checkpoint
+pub async fn a_staged_checkpoint_restores(h: &dyn ContractHarness) {
+    let driver = h.driver();
+    if !driver.capabilities().checkpoint || !driver.capabilities().staging {
+        return;
+    }
+    let Some(prepare) = driver.prepare() else {
+        assert!(!driver.capabilities().prepare);
+        return;
+    };
+
+    let source = boot(h, "staged-restore-src").await;
+    let Some(cp) = source.checkpoint() else {
+        assert!(!driver.capabilities().checkpoint);
+        source.shutdown(ShutdownMode::Kill).await.expect("kill");
+        return;
+    };
+    let opts = CheckpointOptions {
+        after: AfterCheckpoint::HoldQuiesced,
+        kind: CheckpointKind::Full,
+    };
+    let image = cp
+        .checkpoint(&h.runtime_dir().join("checkpoint"), opts)
+        .await
+        .expect("checkpoint");
+    source
+        .shutdown(ShutdownMode::Kill)
+        .await
+        .expect("kill source");
+
+    // The slot: prepared, then handed the image and the disks it will run
+    // on, with nothing left for the restore to bring in.
+    let template = h.spec(&id("staged-restore-dst"));
+    let prepared = prepare
+        .prepare(&template.id, &template.isolation, &h.runtime_dir())
+        .await
+        .expect("prepare");
+    let staging = prepared.staging().expect("the driver claims staging");
+    let staged = staging
+        .stage_checkpoint(&image)
+        .await
+        .expect("stage the checkpoint");
+    assert_eq!(staged.format, image.format);
+    assert_eq!(staged.kind, image.kind);
+    let mut disks = Vec::new();
+    for mut disk in template.disks {
+        disk.path = staging
+            .stage_disk(&disk.id, DiskSource::Image(&disk.path))
+            .await
+            .expect("stage a disk for the restore");
+        disks.push(disk);
+    }
+
+    let restored = prepared
+        .restore(
+            &staged,
+            RestoreSpec {
+                id: id("staged-restore-dst"),
+                nics: template.nics,
+                disks,
+                isolation: template.isolation,
+            },
+        )
+        .await
+        .expect("restore from the staged image");
+    assert_eq!(*restored.id(), id("staged-restore-dst"));
+    assert_eq!(restored.state(), VmState::Running);
+    h.ready(&*restored).await;
+    restored.shutdown(ShutdownMode::Kill).await.expect("kill");
+}
