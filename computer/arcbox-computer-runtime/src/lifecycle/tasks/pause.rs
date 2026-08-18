@@ -12,57 +12,82 @@
 //! before the chroot is removed — and the renaming that leaves every
 //! retained resource keyed by the computer's own id.
 //!
-//! **The copy-mode move must precede the chroot removal, and the kill must
-//! not take the jail with it.** In copy mode the staged rootfs *is* the
-//! paused computer's disk, and it lives inside the jail: the move is guarded
-//! on `staged.exists()`, so a chroot removed any earlier turns that guard
-//! false, the move is silently skipped, pause reports success, and the
-//! resume that follows has no disk to resume from. This is why
-//! `PreparedVm::discard` kills the process without removing the jail the
-//! adapter created — the two only come apart in one order.
+//! **The copy-mode disk comes out of the VM's area before the VMM is
+//! killed.** In copy mode the staged rootfs *is* the paused computer's
+//! disk, and it lives wherever the driver put it — an area a kill is
+//! entitled to take with it, and one nothing here can name. So the disk is
+//! taken back out through the port first, while the grip that staged it is
+//! still held; only then is the VMM discarded. The other order reports a
+//! successful pause and leaves the resume that follows with no disk, which
+//! is why it is stated here rather than left to the reader of two
+//! statements twenty lines apart.
+//!
+//! The guest is quiesced by the checkpoint that precedes this, which is
+//! what makes taking its disk out safe while its VMM is still up.
 
 use std::sync::{Arc, Mutex};
 
-use arcbox_fc_driver::jail::{chroot_root, move_file};
 use arcbox_vm_driver::net::GuestNetwork;
 
-use crate::config::{JailerConfig, VmmConfig};
+use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pause::PAUSED_ROOTFS_FILE;
-use crate::sandbox::{self, SandboxId};
+use crate::sandbox::{self, ROOTFS_DISK_ID, SandboxId};
 use crate::snapshot_cow::CowManager;
 
-/// Free the VM, network, and chroot of a checkpointed sandbox while
-/// keeping its disk.
+/// Free the VM and the network of a checkpointed sandbox while keeping its
+/// disk.
 ///
 /// Ordering is load-bearing, mirroring full release: the VMM must be
-/// dead before the dm detach (EBUSY) and TAP destruction. The network
-/// allocation is quarantined — the daemon completes host-side forwarding
-/// cleanup through the same durable ticket flow Stop uses.
+/// dead before the dm detach (EBUSY) and TAP destruction — and, ahead of
+/// both, a copy-mode disk must leave the VM's area before the kill that
+/// may take that area with it. The network allocation is quarantined —
+/// the daemon completes host-side forwarding cleanup through the same
+/// durable ticket flow Stop uses.
 ///
-/// A sandbox that adopted a pre-warmed slot (CORE-78) is released out of
-/// the *slot's* chroot and its slot-keyed overlay is renamed onto the
-/// sandbox-id path, so `Paused` is always reached with every retained
-/// resource keyed by the sandbox id.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the pause release spans the resource set its computer owns"
-)]
+/// A sandbox that adopted a pre-warmed slot (CORE-78) has its slot-keyed
+/// overlay renamed onto the sandbox-id path, so `Paused` is always reached
+/// with every retained resource keyed by the sandbox id.
 pub async fn release_for_pause(
     id: &SandboxId,
     arc: &Arc<Mutex<ComputerRuntime>>,
-    jailer: &JailerConfig,
     config: &VmmConfig,
     cow_manager: &CowManager,
     network: &dyn GuestNetwork,
 ) -> Result<()> {
+    // Copy mode: the staged rootfs IS this computer's disk. Take it out of
+    // the VM's area first — the guest is quiesced, the grip that staged it
+    // is still held, and after the kill neither is true.
+    let (prepared, in_copy_mode, vm_dir) = {
+        let computer = arc.lock().unwrap();
+        (
+            computer.prepared.clone(),
+            computer.cow_handle.is_none(),
+            computer.vm_dir.clone(),
+        )
+    };
+    if in_copy_mode {
+        let prepared = prepared.ok_or_else(|| {
+            // A computer this process adopted rather than booted (CORE-135)
+            // holds no prepared VM, so nothing here can reach into the area
+            // its disk sits in. Refusing before the checkpoint's guest is
+            // killed leaves the disk where it is and the pause retryable;
+            // the routes an adopted computer is missing arrive with R3
+            // PR-G3.
+            VmmError::Unavailable(format!(
+                "computer {id} runs on a copied rootfs and was adopted after an agent restart,                  so its disk cannot be taken out of the vm it was staged into; it can be                  stopped or removed, but not paused"
+            ))
+        })?;
+        sandbox::staging_capability(&*prepared)
+            .unstage_disk(ROOTFS_DISK_ID, &vm_dir.join(PAUSED_ROOTFS_FILE))
+            .await?;
+    }
+
     super::release::kill_sandbox_process(id, arc).await?;
     let owner = super::release::chroot_owner(id, arc);
 
-    // Disk: detach the overlay but keep its COW file; the copy-mode
-    // fallback parks the staged rootfs (the sandbox's actual disk) in
-    // vm_dir before the chroot is removed.
+    // Disk: detach the overlay but keep its COW file.
     let cow_handle = arc.lock().unwrap().cow_handle.take();
     if let Some(handle) = cow_handle {
         if let Err(error) = cow_manager.detach_keep_cow(&handle).await {
@@ -76,15 +101,6 @@ pub async fn release_for_pause(
         let detached = sandbox::preserved_cow_file(config, &owner);
         if detached != retained && detached.exists() {
             tokio::fs::rename(&detached, &retained)
-                .await
-                .map_err(VmmError::Io)?;
-        }
-    } else {
-        let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-        let staged = chroot_root(&config.firecracker.binary, base, &owner).join("rootfs.ext4");
-        if staged.exists() {
-            let vm_dir = arc.lock().unwrap().vm_dir.clone();
-            move_file(&staged, &vm_dir.join(PAUSED_ROOTFS_FILE))
                 .await
                 .map_err(VmmError::Io)?;
         }

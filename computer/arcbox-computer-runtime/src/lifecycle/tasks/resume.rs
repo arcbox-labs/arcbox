@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arcbox_fc_driver::jail::{chroot_root, move_file};
+use arcbox_fc_driver::jail::chroot_root;
 use arcbox_vm_driver::net::{GuestNetwork, NetworkLease};
 use arcbox_vm_driver::{DiskSource, IsolationSpec, NicSpec, PreparedVm, VmDriver, VmHandle, VmId};
 use tracing::warn;
@@ -31,10 +31,10 @@ use crate::snapshot_cow::{CowHandle, CowManager};
 
 /// Re-create the runtime of a paused sandbox from its checkpoint.
 ///
-/// On failure every re-created resource is unwound (the VMM killed,
-/// overlay detached with its COW kept, copy-mode rootfs parked again,
-/// fresh network quarantined, chroot and journal removed) so the caller
-/// can park the sandbox back at `Paused`.
+/// On failure every re-created resource is unwound (a copy-mode rootfs
+/// parked again, the VMM killed, the overlay detached with its COW kept,
+/// the fresh network quarantined, chroot and journal removed) so the
+/// caller can park the sandbox back at `Paused`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the resume spans the resource set its computer owns"
@@ -244,6 +244,42 @@ pub async fn restore_paused(
     }
 }
 
+/// Take a copy-mode rootfs back out of the VM's area and park it in
+/// `vm_dir`, restoring what a clean pause leaves behind.
+///
+/// This runs before the discard, for the same reason the pause release's
+/// does: the staged rootfs *is* the paused computer's disk, it sits in an
+/// area the discard is entitled to take with it, and only the grip being
+/// discarded can reach in there. Nothing is writing it — a resume that got
+/// as far as a running guest dropped that handle on its way out, and a
+/// dropped handle SIGKILLs.
+///
+/// `false` when the disk could not be parked, which is what stops the
+/// computer being recorded as cleanly `Paused`.
+async fn park_copy_mode_rootfs(
+    id: &SandboxId,
+    vm_dir: &Path,
+    config: &VmmConfig,
+    prepared: Option<&Arc<dyn PreparedVm>>,
+) -> bool {
+    let Some(prepared) = prepared else {
+        return true;
+    };
+    if sandbox::preserved_cow_file(config, id).exists() {
+        return true;
+    }
+    match sandbox::staging_capability(&**prepared)
+        .unstage_disk(ROOTFS_DISK_ID, &vm_dir.join(PAUSED_ROOTFS_FILE))
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(sandbox_id = %id, error = %error, "resume unwind: parking rootfs failed");
+            false
+        }
+    }
+}
+
 /// Best-effort release of everything a failed resume re-created,
 /// restoring the on-disk shape of a cleanly paused sandbox.
 ///
@@ -263,7 +299,7 @@ async fn unwind_resume(
     cow_handle: Option<CowHandle>,
     net_lease: Option<NetworkLease>,
 ) -> bool {
-    let mut clean = true;
+    let mut clean = park_copy_mode_rootfs(id, vm_dir, config, prepared.as_ref()).await;
 
     if let Some(prepared) = prepared {
         // SIGKILL plus the driver's bounded wait for the reaper.
@@ -280,21 +316,8 @@ async fn unwind_resume(
         clean = false;
     }
 
-    // Copy-mode fallback: park the staged rootfs back in vm_dir so the
-    // retained disk state survives the chroot removal below. The order is
-    // load-bearing in the same way the pause release's is — the staged
-    // rootfs *is* the paused computer's disk and it lives inside the jail,
-    // so a chroot removed before this point turns the `exists()` guard
-    // false, the move is skipped, and the computer is left unresumable.
     let base = jailer.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
     let cr = chroot_root(&config.firecracker.binary, base, id);
-    let staged = cr.join("rootfs.ext4");
-    if !sandbox::preserved_cow_file(config, id).exists() && staged.exists() {
-        if let Err(error) = move_file(&staged, &vm_dir.join(PAUSED_ROOTFS_FILE)).await {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: parking rootfs failed");
-            clean = false;
-        }
-    }
 
     if let Some(lease) = net_lease
         && let Err(error) = network.quarantine(lease).await

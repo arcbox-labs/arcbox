@@ -116,25 +116,24 @@ impl ComputerFlows {
                 )
                 .await
             }
-            ReleaseScope::KeepDisk => match services.config.firecracker.jailer.as_ref() {
-                Some(jailer) => {
-                    release_for_pause(
-                        &self.id,
-                        &self.computer,
-                        jailer,
-                        &services.config,
-                        &services.cow_manager,
-                        &*services.network,
-                    )
-                    .await
-                }
-                // Unreachable: `pause_sandbox` refuses direct mode before it
-                // claims anything, because a direct-mode vmstate pins origin
-                // paths and could never resume.
-                None => Err(VmmError::Config(
+            // Unreachable: `pause_sandbox` refuses direct mode before it
+            // claims anything, because a direct-mode vmstate pins origin
+            // paths and could never resume.
+            ReleaseScope::KeepDisk if services.config.firecracker.jailer.is_none() => {
+                Err(VmmError::Config(
                     "computer pause requires jailer isolation; direct mode cannot resume".into(),
-                )),
-            },
+                ))
+            }
+            ReleaseScope::KeepDisk => {
+                release_for_pause(
+                    &self.id,
+                    &self.computer,
+                    &services.config,
+                    &services.cow_manager,
+                    &*services.network,
+                )
+                .await
+            }
             ReleaseScope::Full => {
                 release_everything(
                     &self.id,
