@@ -543,7 +543,7 @@ fn tap_name(nic: &NicSpec) -> Result<String> {
 /// how it was spelled. Symlinks are deliberately not followed: a symlink
 /// inside the jail is a file the jailed VMM can open, which is the
 /// question being asked.
-pub fn lexically_resolved(path: &Path) -> PathBuf {
+pub(crate) fn lexically_resolved(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
