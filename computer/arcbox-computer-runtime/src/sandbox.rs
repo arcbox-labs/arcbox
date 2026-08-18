@@ -57,8 +57,6 @@ pub(crate) mod reconcile;
 pub(crate) mod record;
 pub(crate) mod spec;
 mod templates;
-#[cfg(test)]
-mod testing;
 mod timers;
 pub(crate) mod types;
 pub(crate) mod warm;

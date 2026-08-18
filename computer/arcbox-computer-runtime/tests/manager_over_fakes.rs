@@ -179,6 +179,53 @@ async fn a_boot_the_driver_refuses_fails_and_releases_the_computer() {
     );
 }
 
+/// A create that fails between reserving an address and building its TAP
+/// must hand the address back.
+///
+/// That window is real — the durable journal is written inside it, on
+/// purpose, so no host resource exists before its cleanup metadata — and a
+/// rollback that only knew about *activated* leases would strand the
+/// address in the pool for the life of the process. Driven by planting a
+/// directory where the journal's file goes.
+#[tokio::test]
+async fn a_create_that_fails_before_activation_hands_the_address_back() {
+    let fixture = Fixture::jailed().await;
+    std::fs::create_dir_all(fixture.vm_dir("doomed").join("state.json")).unwrap();
+
+    fixture
+        .manager
+        .create_sandbox(SandboxSpec {
+            id: Some("doomed".into()),
+            ..SandboxSpec::default()
+        })
+        .await
+        .expect_err("the journal write cannot succeed against a directory");
+
+    // Nothing is quarantined — the lease never reached a TAP — and the
+    // address is back in the pool for the next computer, which is only
+    // visible in the address that one is given.
+    assert!(
+        fixture
+            .manager
+            .pending_network_cleanups()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (_id, reused) = fixture
+        .manager
+        .create_sandbox(SandboxSpec {
+            id: Some("next".into()),
+            ..SandboxSpec::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        reused, "10.200.0.2",
+        "the pool hands out its lowest free address, so a stranded lease shows up here"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Deadlines
 // ---------------------------------------------------------------------
@@ -731,6 +778,61 @@ async fn a_failed_restore_frees_its_id_before_it_answers() {
         .await
         .expect("the failed restore left nothing owning the id");
     fixture.await_state(&again, SandboxState::Ready).await;
+}
+
+/// The names and labels the lifecycle machinery owns are not a caller's to
+/// take: Remove deletes every snapshot carrying the pause name, and the
+/// warm cache trusts its label as a lookup key.
+#[tokio::test]
+async fn a_caller_cannot_squat_on_the_reserved_checkpoint_name_or_labels() {
+    let fixture = Fixture::jailed().await;
+    let id = fixture.ready("origin").await;
+
+    for (name, labels) in [
+        ("arcbox-pause", HashMap::new()),
+        (
+            "ok",
+            HashMap::from([("arcbox.warm_key".to_owned(), "mine".to_owned())]),
+        ),
+        (
+            "ok",
+            HashMap::from([("arcbox.template".to_owned(), "mine".to_owned())]),
+        ),
+    ] {
+        let error = fixture
+            .manager
+            .checkpoint_sandbox(&id, name.to_owned(), labels)
+            .await
+            .expect_err("a reserved name or label is refused");
+        assert!(matches!(error, VmmError::Config(_)), "{error}");
+    }
+}
+
+/// A paused computer's checkpoint is lifecycle state, so Remove takes it
+/// with the computer rather than leaving it in the catalog pinning the
+/// rootfs it was captured from.
+#[tokio::test]
+async fn removing_a_paused_computer_takes_its_retained_checkpoint() {
+    let fixture = Fixture::jailed().await;
+    let id = fixture.ready("napper").await;
+    assert!(
+        fixture.manager.pinned_rootfs_paths().unwrap().is_empty(),
+        "nothing is pinned before there is a checkpoint"
+    );
+
+    fixture.manager.pause_sandbox(&id).await.unwrap();
+    fixture.await_state(&id, SandboxState::Paused).await;
+    assert!(
+        !fixture.manager.pinned_rootfs_paths().unwrap().is_empty(),
+        "the pause checkpoint pins the rootfs it was captured from"
+    );
+
+    fixture.manager.remove_sandbox(&id, false).await.unwrap();
+    fixture.await_gone(&id).await;
+    assert!(
+        fixture.manager.pinned_rootfs_paths().unwrap().is_empty(),
+        "the retained checkpoint went with the computer"
+    );
 }
 
 // ---------------------------------------------------------------------
