@@ -60,8 +60,8 @@ pub(super) async fn prepare_slot(
         .jailer
         .as_ref()
         .ok_or_else(|| VmmError::Config("restore slot pooling requires jailer isolation".into()))?;
-    // Short suffix on purpose: the slot id becomes a jailer identity and
-    // must fit the API-socket budget (`max_sandbox_id_len`) under any
+    // Short suffix on purpose: the slot id becomes a VM identity and must
+    // fit the driver's own id budget (`VmDriver::id_budget`) under any
     // configured chroot layout — internal mints bypass the ingress
     // validator, so they keep themselves comfortably inside it. 16 hex
     // chars keep collisions out of reach for a handful of pool slots;

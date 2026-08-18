@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use arcbox_fc_driver::jail::{api_socket_path, chroot_root};
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::net::{
     AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy,
@@ -689,49 +688,19 @@ pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointIma
     })
 }
 
-/// Stock sandbox id budget: what [`max_sandbox_id_len`] computes for the
-/// guest config (`/var/lib/arcbox/jailer` + `firecracker`), kept as the
-/// fallback when no jailer is configured — direct mode has no jailer
-/// socket, but ids still become path components everywhere else.
-const STOCK_MAX_ID_LEN: usize = 44;
-
-/// Longest sandbox id the configured jailer layout leaves room for: the
-/// jailer API socket (`arcbox_fc_driver::jail::api_socket_path`, under
-/// `{chroot_base}/{vmm basename}/{id}/root`) must fit AF_UNIX's 107-byte
-/// `sun_path`. An oversized id otherwise fails as an opaque "timed out
-/// waiting for socket": the driver's readiness probe is a `connect()`,
-/// which ENAMETOOLONGs on every attempt even though the VMM is up and
-/// bound inside the chroot (caught by the CORE-107 prewarm e2e, whose
-/// 51-char builder id overflowed the stock budget by 7 bytes). Measured on
-/// the driver's own layout so a longer chroot base or binary name tightens
-/// the budget instead of silently reintroducing the timeout.
-pub(super) fn max_sandbox_id_len(config: &VmmConfig) -> usize {
-    const SUN_PATH: usize = 107;
-    let Some(jc) = &config.firecracker.jailer else {
-        return STOCK_MAX_ID_LEN;
-    };
-    // Everything around the id, measured on a one-byte id.
-    let with_one_byte_id = api_socket_path(&chroot_root(
-        &config.firecracker.binary,
-        jc.chroot_base(),
-        "x",
-    ));
-    SUN_PATH.saturating_sub(with_one_byte_id.as_os_str().len() - 1)
-}
-
 /// Validate a caller-supplied sandbox or snapshot id.
 ///
 /// Ids become filesystem path components and dm/TAP name fragments, so they are
 /// restricted to `[A-Za-z0-9_-]`. This rejects path traversal (`/`, `\`, `..`),
-/// NUL and whitespace. The jailer's own, narrower charset is *not* checked here
-/// — see [`validate_new_sandbox_id`], which is where an id becomes a jailer
-/// identity.
+/// NUL and whitespace. The narrower rule a VMM imposes on the id it runs under
+/// is *not* checked here — that is [`VmId`]'s, applied by
+/// [`validate_new_sandbox_id`] where an id becomes a VM identity.
 ///
 /// Deliberately NO length cap here: this also runs against persisted
 /// records (reconcile, record loads) — where rejecting one legacy
 /// over-long id would abort a whole sweep — and against snapshot /
-/// execution ids that never enter the jailer path. The jailer budget is
-/// enforced only where a sandbox id enters the system:
+/// execution ids that never become a VM identity at all. Both limits the
+/// driver imposes are enforced only where a sandbox id enters the system:
 /// [`validate_new_sandbox_id`].
 pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty() {
@@ -748,45 +717,42 @@ pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a sandbox id at request ingress (create / restore), where the
-/// id becomes a jailer identity — [`validate_id`] plus the two limits the
-/// jailer imposes: the [`max_sandbox_id_len`] socket-path budget and its
-/// charset.
-pub(super) fn validate_new_sandbox_id(id: &str, config: &VmmConfig) -> Result<()> {
-    let max = max_sandbox_id_len(config);
-    if id.len() > max {
+/// Validate a sandbox id at request ingress (create / restore), where it
+/// becomes the identity the VM runs under.
+///
+/// Both halves belong to the driver, and neither is restated here. The
+/// alphabet and the 64-byte ceiling are [`VmId`]'s: an id a VMM will not
+/// take is refused by construction, and Firecracker — which `panic!`s on
+/// its own `--id` in *both* jailed and direct mode — is what that rule is
+/// cut to. The length budget is [`VmDriver::id_budget`], measured on the
+/// layout the configured driver will actually lay down, so a longer chroot
+/// base or binary name tightens it rather than silently reintroducing the
+/// failure it exists to prevent.
+///
+/// Refusing here is the whole point: past this call the id is validated
+/// again inside the async boot task, where the refusal arrives with
+/// nothing tying it back to the request that caused it — an
+/// `InvalidInstanceId` under the jailer, an abort under bare Firecracker,
+/// and an opaque "timed out waiting for socket" when it is the length
+/// (the driver's readiness probe is a `connect()`, which ENAMETOOLONGs on
+/// every attempt while the VMM is up and bound inside its chroot; caught
+/// by the CORE-107 prewarm e2e, whose 51-char builder id overflowed the
+/// stock budget).
+pub(super) fn validate_new_sandbox_id(
+    id: &str,
+    driver: &dyn VmDriver,
+    config: &VmmConfig,
+) -> Result<()> {
+    VmId::new(id)?;
+    if let Some(budget) = driver.id_budget(&isolation_spec(config)?)
+        && id.len() > budget
+    {
         return Err(VmmError::Config(format!(
-            "invalid sandbox id {id:?}: at most {max} characters \
-             (the jailer socket path must fit the AF_UNIX limit)"
+            "invalid sandbox id {id:?}: at most {budget} characters under this \
+             driver's layout (its sockets must fit the AF_UNIX path limit)"
         )));
     }
-    validate_id("sandbox id", id)?;
-    // The jailer's `--id` takes only alphanumerics and hyphens, a strictly
-    // narrower set than the path-safe one above, and it is checked only when a
-    // jailer is configured — nothing else in the layer minds an underscore.
-    //
-    // Enforced here rather than in `validate_id` because that one also runs
-    // over persisted records during reconcile, where one legacy underscored id
-    // would abort the whole sweep, and over snapshot and execution ids that
-    // never reach the jailer.
-    //
-    // Without this the id reaches the jailer, which refuses to exec with
-    // `InvalidInstanceId` from inside the async boot task: an error with
-    // nothing tying it back to the request that caused it.
-    if config.firecracker.jailer.is_some() {
-        if let Some(offending) = id.bytes().position(|b| !jailer_id_byte(b)) {
-            return Err(VmmError::Config(format!(
-                "invalid sandbox id {id:?}: byte {offending} is not accepted by the jailer, \
-                 whose --id takes only ASCII letters, digits and '-'"
-            )));
-        }
-    }
     Ok(())
-}
-
-/// Whether the jailer's `--id` accepts this byte.
-fn jailer_id_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'-'
 }
 
 /// Atomically claim `id` in the registry and stand up its actor.
@@ -1035,16 +1001,9 @@ mod tests {
         assert!(!computers.read().unwrap().contains_key("dup"));
     }
 
-    #[test]
-    fn validate_id_accepts_safe_ids_and_rejects_traversal() {
-        for ok in ["sandbox1", "a-b_c", "0f3e9d16-1234", "A_B-9"] {
-            assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
-        }
-        // A 36-char UUID fits; anything past the jailer socket budget must
-        // fail fast at ingress instead of surfacing as a socket connect
-        // timeout. The generic validator stays uncapped — it also runs
-        // against persisted records and non-jailer (snapshot/execution)
-        // ids, where a legacy over-long id must not become fatal.
+    /// A jailed `FcDriver` on the stock guest layout, which is what pins the
+    /// id budget the sandbox flows are held to.
+    fn stock_jailed_config() -> VmmConfig {
         let mut config = VmmConfig::default();
         config.firecracker.binary = "/usr/local/bin/firecracker".into();
         config.firecracker.jailer = Some(crate::config::JailerConfig {
@@ -1058,21 +1017,24 @@ mod tests {
             parent_cgroup: None,
             resource_limits: Vec::new(),
         });
-        // The stock guest layout leaves exactly 44 bytes for the id.
-        assert_eq!(max_sandbox_id_len(&config), 44);
-        assert!(validate_new_sandbox_id(&"a".repeat(44), &config).is_ok());
-        assert!(validate_new_sandbox_id(&"a".repeat(45), &config).is_err());
-        // A longer chroot base tightens the budget instead of silently
-        // reintroducing the connect timeout.
         config
-            .firecracker
-            .jailer
-            .as_mut()
-            .expect("jailer set above")
-            .chroot_base_dir = Some(format!("/var/lib/arcbox/jailer/{}", "x".repeat(10)));
-        assert_eq!(max_sandbox_id_len(&config), 33);
-        assert!(validate_new_sandbox_id(&"a".repeat(34), &config).is_err());
+    }
+
+    fn fc_driver(config: &VmmConfig) -> FcDriver {
+        FcDriver::new(FcDriverConfig::from(&config.firecracker))
+    }
+
+    #[test]
+    fn validate_id_accepts_safe_ids_and_rejects_traversal() {
+        for ok in ["sandbox1", "a-b_c", "0f3e9d16-1234", "A_B-9"] {
+            assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
+        }
+        // The generic validator stays uncapped and keeps the underscore: it
+        // also runs against persisted records and against snapshot /
+        // execution ids that never become a VM identity, where a legacy id
+        // must not become fatal.
         assert!(validate_id("id", &"a".repeat(60)).is_ok());
+        assert!(validate_id("id", "inst_019e409e-7546").is_ok());
         for bad in ["", "..", ".", "a/b", "a\\b", "a b", "a.b", "a\0b", "../etc"] {
             assert!(
                 validate_id("id", bad).is_err(),
@@ -1081,40 +1043,55 @@ mod tests {
         }
     }
 
+    /// The budget is the driver's, measured on the layout it will lay down —
+    /// not a constant this layer keeps its own copy of. A 36-char UUID fits;
+    /// anything past it must fail fast at ingress instead of surfacing as a
+    /// socket connect timeout.
     #[test]
-    fn an_underscored_id_is_refused_at_ingress_only_under_a_jailer() {
-        // The jailer's `--id` takes no underscore, so an id carrying one has to
-        // fail at create — not later, from inside the boot task, as the
-        // jailer's own `InvalidInstanceId`.
-        let mut config = VmmConfig::default();
-        config.firecracker.binary = "/usr/local/bin/firecracker".into();
-        config.firecracker.jailer = Some(crate::config::JailerConfig {
-            binary: "/usr/local/bin/jailer".into(),
-            uid: 0,
-            gid: 0,
-            chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
-            netns: None,
-            new_pid_ns: false,
-            cgroup_version: None,
-            parent_cgroup: None,
-            resource_limits: Vec::new(),
-        });
-        let error = validate_new_sandbox_id("inst_019e409e-7546", &config)
-            .expect_err("the jailer would refuse to exec on this id");
+    fn a_new_sandbox_id_is_held_to_the_drivers_own_budget() {
+        let mut config = stock_jailed_config();
+        let driver = fc_driver(&config);
+        let budget = driver
+            .id_budget(&isolation_spec(&config).expect("a jailed isolation spec"))
+            .expect("a jailed layout bounds the id");
         assert!(
-            matches!(&error, VmmError::Config(message) if message.contains("byte 4")),
-            "the error should name the offending byte, got {error}"
+            budget >= Uuid::new_v4().to_string().len(),
+            "the stock layout must still fit a UUID, got {budget}"
         );
-        assert!(validate_new_sandbox_id("inst-019e409e-7546", &config).is_ok());
+        assert!(validate_new_sandbox_id(&"a".repeat(budget), &driver, &config).is_ok());
+        assert!(validate_new_sandbox_id(&"a".repeat(budget + 1), &driver, &config).is_err());
 
-        // Without a jailer nothing in the layer minds an underscore: it is only
-        // a path component and a dm/TAP name fragment there.
-        config.firecracker.jailer = None;
-        assert!(validate_new_sandbox_id("inst_019e409e-7546", &config).is_ok());
-        // And the generic validator keeps accepting it either way, because it
-        // also runs over persisted records and over ids that never reach a
-        // jailer at all.
-        assert!(validate_id("id", "inst_019e409e-7546").is_ok());
+        // A longer chroot base tightens the budget instead of silently
+        // reintroducing the connect timeout.
+        config
+            .firecracker
+            .jailer
+            .as_mut()
+            .expect("jailer set above")
+            .chroot_base_dir = Some(format!("/var/lib/arcbox/jailer/{}", "x".repeat(10)));
+        let deeper = fc_driver(&config);
+        assert!(validate_new_sandbox_id(&"a".repeat(budget), &deeper, &config).is_err());
+    }
+
+    /// CORE-140. Firecracker validates the `--id` it is handed and refuses it
+    /// by panicking — under the jailer *and* in direct mode, where the same
+    /// flag is passed straight to the VMM. So the refusal cannot be gated on
+    /// a jailer being configured: it belongs to the id itself.
+    #[test]
+    fn an_underscored_id_is_refused_at_ingress_in_every_spawn_mode() {
+        let mut config = stock_jailed_config();
+        for _ in 0..2 {
+            let driver = fc_driver(&config);
+            let error = validate_new_sandbox_id("inst_019e409e-7546", &driver, &config)
+                .expect_err("firecracker would refuse to run under this id");
+            assert!(
+                matches!(&error, VmmError::Config(message) if message.contains('_')),
+                "the error should name the offending character, got {error}"
+            );
+            assert!(validate_new_sandbox_id("inst-019e409e-7546", &driver, &config).is_ok());
+            // Direct mode passes the same `--id`, so it is refused there too.
+            config.firecracker.jailer = None;
+        }
     }
 
     #[test]

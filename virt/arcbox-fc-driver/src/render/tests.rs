@@ -380,19 +380,22 @@ fn jailer_mode_mirrors_a_block_device_as_a_node() {
 #[test]
 fn a_vm_id_cannot_name_another_jail() {
     // The jail is `{base}/{exec}/{id}/root`, so `.` and `..` would name the
-    // binary's or the base's own `root`. The port refuses them at the id;
-    // the layout's guard is the second lock on the same door.
-    for id in [".", ".."] {
+    // binary's or the base's own `root`. The port refuses every `.` at the
+    // id — Firecracker's own `--id` takes none either — and the layout's
+    // guard is the second lock on the same door.
+    for id in [".", "..", "box.1"] {
         assert!(
             matches!(VmId::new(id), Err(Error::InvalidSpec(_))),
             "`{id}` is refused by the port"
         );
+    }
+    for id in [".", ".."] {
         assert!(!is_plain_component(id), "`{id}` is refused by the layout");
     }
-    // A dot inside a name is not a component of its own.
+    // A hyphen inside a name is not a component of its own.
     assert!(
         VmLayout::new(
-            &VmId::new("box.1").unwrap(),
+            &VmId::new("box-1").unwrap(),
             &jailed(Path::new("/srv/jailer")),
             &config(),
             Path::new("/run/vms/box"),
