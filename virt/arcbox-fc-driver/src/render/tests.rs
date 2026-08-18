@@ -446,10 +446,14 @@ fn a_disk_id_cannot_reach_out_of_the_jail() {
     // a path its chroot cannot reach, and a move never happens at all.
     let outside = base.join("firecracker/box/root/../../../outside.ext4");
     assert!(
-        layout.jail().unwrap().view(&outside).is_some(),
+        outside.starts_with(layout.jail().unwrap().root.as_path()),
         "as written it passes for a file in the jail"
     );
-    assert_eq!(lexically_resolved(&outside), base.join("outside.ext4"));
+    assert_eq!(
+        layout.jail().unwrap().view(&outside),
+        None,
+        "resolved, it is not in the jail"
+    );
     let mut planned = Vec::new();
     assert_eq!(
         layout

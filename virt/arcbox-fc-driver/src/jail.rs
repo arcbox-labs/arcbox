@@ -34,11 +34,41 @@ pub struct Jail {
 impl Jail {
     /// `host` as Firecracker sees it, when `host` is already inside the
     /// jail: `/` + its path relative to the root.
+    ///
+    /// Decided on the resolved path. `strip_prefix` compares components,
+    /// so `{root}/../elsewhere` names the root on the way past and would
+    /// otherwise answer `Some("/../elsewhere")` — a path Firecracker's
+    /// chroot resolves to something else entirely, for a file that was
+    /// never brought in. Every decision this jail makes about a host path
+    /// asks through here, so the question cannot be asked the wrong way.
+    ///
+    /// Symlinks are deliberately not followed: a symlink inside the jail
+    /// is a file the jailed Firecracker can open, which is exactly what is
+    /// being asked.
     pub fn view(&self, host: &Path) -> Option<String> {
-        host.strip_prefix(&self.root)
+        lexically_resolved(host)
+            .strip_prefix(&self.root)
             .ok()
             .map(|rel| format!("/{}", rel.display()))
     }
+}
+
+/// `path` with its `.` and `..` components resolved as far as they can be
+/// without touching the filesystem.
+pub(crate) fn lexically_resolved(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The jailer's own default chroot base, used when a config names none.
@@ -443,6 +473,14 @@ mod tests {
             Some("/snapshots/abc/vmstate")
         );
         assert_eq!(jail.view(Path::new("/images/vmlinux")), None);
+        // A path that names the root on its way past it is not in the
+        // jail, however its components read — every decision the jail
+        // makes about a host path is this one, so it resolves here.
+        assert_eq!(jail.view(&root.join("../../../outside.ext4")), None);
+        assert_eq!(
+            jail.view(&root.join("snapshots/../rootfs.ext4")).as_deref(),
+            Some("/rootfs.ext4")
+        );
     }
 
     #[test]

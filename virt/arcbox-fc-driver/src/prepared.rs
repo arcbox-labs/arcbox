@@ -301,13 +301,13 @@ impl Staging for FcPrepared {
         let Some(jail) = self.layout.jail() else {
             return Ok(image.clone());
         };
-        // Resolved, for the same reason `place` resolves: a dir spelled
-        // through the jail root but landing outside it has to be brought
-        // in, not loaded from where the VMM cannot reach.
-        let resolved = render::lexically_resolved(&image.dir);
-        if jail.view(&resolved).is_some() {
+        // Through the jail's own question, which resolves: a dir spelled
+        // through the root but landing outside it has to be brought in,
+        // not loaded from where the VMM cannot reach. The answer is where
+        // the files are, which is what the image must name.
+        if let Some(view) = jail.view(&image.dir) {
             return Ok(CheckpointImage {
-                dir: resolved,
+                dir: self.layout.host_view(&view),
                 ..image.clone()
             });
         }

@@ -175,12 +175,9 @@ impl VmLayout {
     /// mknods at the destination, so a `..` in it would reach a host file
     /// outside the jail.
     ///
-    /// Whether `host` is already inside is decided on its resolved form:
-    /// `strip_prefix` compares components, so `{jail}/../elsewhere` names
-    /// the jail on the way past and would otherwise be passed to
-    /// Firecracker as a path its chroot cannot reach — never staged, and
-    /// for a move, never moved. The file is staged *from* `host` as given,
-    /// which is the path the caller named.
+    /// Whether `host` is already inside is [`Jail::view`]'s question, and
+    /// it resolves the path to answer it. The file is staged *from*
+    /// `host` as given, which is the path the caller named.
     pub fn place(
         &self,
         host: &Path,
@@ -196,7 +193,7 @@ impl VmLayout {
                 "`{in_jail}` does not name a path inside the jail"
             )));
         }
-        if let Some(view) = jail.view(&lexically_resolved(host)) {
+        if let Some(view) = jail.view(host) {
             return Ok(view);
         }
         stage.push(StagePlan {
@@ -538,33 +535,6 @@ fn tap_name(nic: &NicSpec) -> Result<String> {
             nic.id
         ))),
     }
-}
-
-/// `path` with its `.` and `..` components resolved as far as they can be
-/// without touching the filesystem.
-///
-/// Used for one question only — is this path inside the jail — because
-/// `strip_prefix` compares components and `..` walks out of a directory
-/// the components still name. Symlinks are deliberately not followed: a
-/// symlink inside the jail is a file the jailed VMM can open, which is
-/// exactly the question being asked, and resolving one would answer a
-/// different one. That is also why nothing stages *from* the resolved
-/// path: reading the file is a different question, and the caller named
-/// the path it meant.
-pub(crate) fn lexically_resolved(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !out.pop() {
-                    out.push(component);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// True when `name` is one plain path component: no separator, no `.` or
