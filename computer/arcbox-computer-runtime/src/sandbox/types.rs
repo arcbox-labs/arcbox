@@ -322,6 +322,7 @@ impl SandboxEvent {
 // Checkpoint / Restore output types
 
 /// Info returned after a successful checkpoint.
+#[derive(Debug, Clone)]
 pub struct CheckpointInfo {
     pub snapshot_id: String,
     pub snapshot_dir: String,
