@@ -242,13 +242,19 @@ impl ComputerActor {
                 // The restart sweep trusts the phase: an unconfirmed
                 // `Resuming` reads back as cleanly paused, and the restore's
                 // journaled resources would never be released.
-                self.commit(
+                // A revert that is itself refused already failed the flow;
+                // running the outer report as well would queue a second
+                // `Failure` and fail the same callers twice.
+                let reverted = self.commit(
                     PersistPhase::Paused,
                     SandboxTransition::Paused {
                         snapshot_id: self.pause_snapshot_id.clone().unwrap_or_default(),
                     },
                     Durability::Warn,
                 );
+                if reverted == Flow::Refused {
+                    return reverted;
+                }
                 self.fail_write(&format!(
                     "state is visible, but durability is unconfirmed: {error}"
                 ))
@@ -269,10 +275,16 @@ impl ComputerActor {
     /// happen. `begin_removal` propagates a refused `Removing` write the same
     /// way, before anything is torn down.
     fn fail_write(&mut self, detail: &str) -> Flow {
-        let error = VmmError::Unavailable(format!("computer {} {detail}", self.id));
+        let message = format!("computer {} {detail}", self.id);
+        let error = VmmError::Unavailable(message.clone());
         self.error = Some(error.to_string());
-        self.answer_error = Some(error.to_string());
-        self.fail_every_waiter(error);
+        // Parked to be reported only when nobody was there to hear it: the
+        // flows that answer immediately (a cold create) have nothing parked,
+        // and leaving it set after it *was* delivered would poison the next
+        // caller with a failure that is already answered.
+        if self.fail_every_waiter(error) == 0 {
+            self.answer_error = Some(message);
+        }
         self.queued.push_back(Event::Failure);
         // The rest of this transition described work the write was recording:
         // a resume, a shutdown, a release. None of it may happen now.
@@ -319,7 +331,10 @@ impl ComputerActor {
                     retry_millis = self.retry_backoff.as_millis(),
                     "the computer's record would not delete; retrying the teardown"
                 );
-                self.answer_error = Some(error.to_string());
+                self.answer_error = Some(format!(
+                    "computer {}: the record would not delete: {error}",
+                    self.id
+                ));
                 self.stalled_on = StalledStep::Record(end);
                 self.schedule_retry();
                 Flow::Stalled
