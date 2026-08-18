@@ -24,30 +24,36 @@ fn every_leaf_is_reachable_by_driving_events() {
 #[test]
 fn every_leaf_projects_onto_a_public_state() {
     // An arm nobody projects is how a state becomes invisible to callers, so
-    // this asserts the whole table rather than sampling it.
-    let expected = [
-        (0, SandboxState::Starting),  // provisioning
-        (1, SandboxState::Starting),  // staging
-        (2, SandboxState::Starting),  // booting
-        (3, SandboxState::Starting),  // restoring
-        (4, SandboxState::Starting),  // gating
-        (5, SandboxState::Ready),     // ready
-        (6, SandboxState::Running),   // running
-        (7, SandboxState::Ready),     // checkpointing
-        (8, SandboxState::Pausing),   // capturing
-        (9, SandboxState::Pausing),   // releasing
-        (10, SandboxState::Paused),   // paused
-        (11, SandboxState::Starting), // resuming
-        (12, SandboxState::Stopping), // stopping
-        (13, SandboxState::Stopped),  // stopped
-        (14, SandboxState::Failed),   // failed
-        (15, SandboxState::Stopping), // removing
-        (16, SandboxState::Stopped),  // gone
+    // this asserts the whole table rather than sampling it. `gating` is the
+    // one leaf with two answers: the boot's own `cmd` claims the workload
+    // slot before READY, and from there a caller reads `Running` — which is
+    // what stops an Inspect-polling client from stealing that slot.
+    let expected: [&[SandboxState]; LEAVES] = [
+        &[SandboxState::Starting],                        // provisioning
+        &[SandboxState::Starting],                        // staging
+        &[SandboxState::Starting],                        // booting
+        &[SandboxState::Starting],                        // restoring
+        &[SandboxState::Starting, SandboxState::Running], // gating
+        &[SandboxState::Ready],                           // ready
+        &[SandboxState::Running],                         // running
+        &[SandboxState::Ready],                           // checkpointing
+        &[SandboxState::Pausing],                         // capturing
+        &[SandboxState::Pausing],                         // releasing
+        &[SandboxState::Paused],                          // paused
+        &[SandboxState::Starting],                        // resuming
+        &[SandboxState::Stopping],                        // stopping
+        &[SandboxState::Stopped],                         // stopped
+        &[SandboxState::Failed],                          // failed
+        &[SandboxState::Stopping],                        // removing
+        &[SandboxState::Stopped],                         // gone
     ];
-    assert_eq!(expected.len(), LEAVES);
     for node in explore() {
-        let (_, public) = expected[ordinal(node.state)];
-        assert_eq!(node.state.to_public(), public, "{:?}", node.state);
+        let public = node.state.to_public();
+        assert!(
+            expected[ordinal(node.state)].contains(&public),
+            "{:?} projects {public}",
+            node.state
+        );
     }
 }
 

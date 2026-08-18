@@ -36,9 +36,11 @@
 //! `projection` answers the two questions the rest of the system asks about
 //! a state — what a caller sees, and what a crash-restart reads back.
 //!
-//! Nothing consumes any of it yet: the machine lands with its transition table
-//! pinned by tests so the flows can move onto an already-specified machine one
-//! file at a time, rather than being rewritten and re-specified at once.
+//! `actor` is the single consumer: one task per computer, owning the machine,
+//! executing its effects, and running the slow flows as sub-tasks behind the
+//! `tasks` port. Nothing constructs one yet — the flows move onto it one file
+//! at a time (R3 PR-F1) and the manager is flipped onto it in PR-F2, so each
+//! move is reviewed against a machine and an actor that are already specified.
 //!
 //! [`Event`]: event::Event
 //! [`Effect`]: effect::Effect
@@ -53,10 +55,15 @@
     reason = "R3 PR-E lands the HSM with its tests; PR-F wires the actor"
 )]
 
+mod actor;
 mod effect;
 mod event;
 mod machine;
 mod projection;
+/// `pub` in the lint's spelling only: `lifecycle` is a private module, so
+/// this reaches the crate and no further. The flows it holds are still
+/// driven from `sandbox` until PR-F2 flips the manager onto the actor.
+pub mod tasks;
 
 #[cfg(test)]
 mod tests;

@@ -96,6 +96,18 @@ pub(super) enum Event {
     /// The guest is quiesced with no verb able to thaw it — the port is
     /// hold-then-kill by design, so it cannot go back to `Ready`.
     Frozen,
+    /// A failure whose unwind did not complete: resources the flow allocated
+    /// are still held, so the computer cannot go back to the phase it came
+    /// from.
+    ///
+    /// The distinction is crash safety, not cosmetics. A resume that unwound
+    /// leaves the retained pause state intact and parks back at `Paused`; one
+    /// that did not leaves a half-allocated computer, and recording that as
+    /// cleanly `Paused` would have the restart sweep `Reinstate` it as
+    /// resumable and drop its journal as a stale pause. `resume_sandbox`
+    /// has always been two-valued here (`ResumeFailure::unwound`); the
+    /// vocabulary now is too.
+    Stranded,
     // Observations.
     /// The VM exited without being asked to.
     VmExited,

@@ -14,9 +14,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arcbox_fc_driver::jail::{
-    SnapshotFiles, api_socket_path, chroot_root, link_or_copy_for_jailer, move_file,
-    stage_kernel_for_jailer, stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer,
-    stage_snapshot_files,
+    SnapshotFiles, api_socket_path, chroot_root, stage_kernel_for_jailer,
+    stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer, stage_snapshot_files,
 };
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::net::{
@@ -32,33 +31,33 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::agent::{ClockSync, ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
+use crate::agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 use crate::agent::{GuestAgent, GuestAgentFactory, Readiness, VmProtoAgentFactory};
 use crate::config::VmmConfig;
 use crate::environment::SandboxEnvironment;
 use crate::error::{Result, VmmError};
 use crate::network::NetworkManager;
-use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
+use crate::snapshot::SnapshotCatalog;
 use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
 use crate::template_catalog::TemplateCatalog;
 
-mod boot;
+pub(crate) mod boot;
 mod checkpoint;
-mod cleanup;
+pub(crate) mod cleanup;
 mod execution;
 mod files;
 mod lifecycle;
-mod pause;
+pub(crate) mod pause;
 pub(crate) mod policy;
-mod pool;
-mod reconcile;
+pub(crate) mod pool;
+pub(crate) mod reconcile;
 pub(crate) mod record;
-mod spec;
+pub(crate) mod spec;
 mod templates;
 #[cfg(test)]
 mod testing;
 mod timers;
-mod types;
+pub(crate) mod types;
 mod warm;
 pub(crate) mod workload;
 
@@ -568,7 +567,7 @@ pub(super) fn reconcile_capability(network: &dyn GuestNetwork) -> &dyn NetworkRe
 /// The driver's `Prepare` capability, which [`SandboxManager::with_environment`]
 /// requires — the boot, pool, and restore flows all spawn the VMM before
 /// there is a guest to run on it.
-pub(super) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
+pub(crate) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
     driver
         .prepare()
         .expect("SandboxManager::with_environment requires the driver's Prepare capability")
@@ -576,7 +575,7 @@ pub(super) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
 
 /// The VMM's pid as the crash journal records it: what a restart sweep
 /// kills before tearing the sandbox's other resources down.
-pub(super) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
+pub(crate) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
     prepared
         .record()
         .process
@@ -585,12 +584,21 @@ pub(super) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
 
 /// The isolation every sandbox VMM runs under: the jailer's, when one is
 /// configured; none otherwise (direct mode).
-pub(super) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
+pub(crate) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
     config
         .firecracker
         .jailer
         .as_ref()
         .map_or(Ok(IsolationSpec::None), IsolationSpec::try_from)
+}
+
+/// Where a paused computer's retained disk overlay lives: a function of the
+/// data dir and the id, which is why the flows that keep, rename, look for
+/// and delete it can all say it the same way.
+pub(crate) fn preserved_cow_file(config: &VmmConfig, id: &str) -> PathBuf {
+    PathBuf::from(&config.firecracker.data_dir)
+        .join("cow")
+        .join(format!("arcbox-cow-{id}.img"))
 }
 
 /// A catalogued checkpoint as the driver reads it back: the directory the

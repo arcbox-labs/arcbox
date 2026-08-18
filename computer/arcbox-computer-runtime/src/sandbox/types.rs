@@ -35,7 +35,7 @@ pub struct NetworkAttachment {
 
 impl NetworkAttachment {
     /// This attachment as the crash journal records it.
-    pub(super) fn journaled(&self) -> super::reconcile::JournaledLease<'_> {
+    pub(crate) fn journaled(&self) -> super::reconcile::JournaledLease<'_> {
         super::reconcile::JournaledLease::cold_boot(&self.lease, self.invariant_identity)
     }
 }
@@ -223,7 +223,7 @@ pub struct SandboxInstance {
     /// Unique identifier.
     pub id: SandboxId,
     /// Durable lifecycle record generation.
-    pub(super) record_generation: Option<Uuid>,
+    pub(crate) record_generation: Option<Uuid>,
     /// User-supplied labels.
     pub labels: HashMap<String, String>,
     /// Original creation spec.
@@ -255,7 +255,7 @@ pub struct SandboxInstance {
     /// agent the exec and file paths build would otherwise describe the
     /// guest differently from the one its boot built. Cleared with the
     /// handle.
-    pub(super) net_identity: Option<NetworkIdentity>,
+    pub(crate) net_identity: Option<NetworkIdentity>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
     pub vm_dir: PathBuf,
     /// When the sandbox record was created.
@@ -278,12 +278,12 @@ pub struct SandboxInstance {
     /// Cleared by pause: releasing a paused sandbox renames its retained
     /// overlay to the sandbox-id path and destroys the slot chroot, so a
     /// resumed sandbox owns everything under its own id again.
-    pub(super) pool_slot_id: Option<String>,
+    pub(crate) pool_slot_id: Option<String>,
     /// Whether this guest runs the fixed invariant network identity
     /// (CORE-81). Set by the create path when the boot bakes the invariant
     /// `ip=` parameter, and inherited from [`crate::snapshot::SnapshotMeta`]
     /// on restore so chained checkpoints record the guest's actual addressing.
-    pub(super) net_invariant: bool,
+    pub(crate) net_invariant: bool,
     /// When the sandbox reached `Paused` (None otherwise).
     pub paused_at: Option<DateTime<Utc>>,
     /// Catalog id of the internal pause checkpoint (state == `Paused` only).
@@ -431,7 +431,7 @@ pub struct SandboxEvent {
 }
 
 impl SandboxEvent {
-    pub(super) fn new(sandbox_id: &str, action: &str) -> Self {
+    pub fn new(sandbox_id: &str, action: &str) -> Self {
         Self {
             sandbox_id: sandbox_id.to_owned(),
             action: action.to_owned(),
@@ -440,7 +440,7 @@ impl SandboxEvent {
         }
     }
 
-    pub(super) fn with_attr(mut self, key: &str, value: &str) -> Self {
+    pub fn with_attr(mut self, key: &str, value: &str) -> Self {
         self.attributes.insert(key.to_owned(), value.to_owned());
         self
     }

@@ -33,7 +33,7 @@ use crate::sandbox::{NetworkAttachment, SandboxSpec, ipv4, netmask};
 /// adapter's addressing. A caller who pinned its own `ip=` keeps it. The
 /// guest-side vm-agent parses the parameter back via
 /// `KernelIpParam::from_str` to derive the DNS nameserver.
-pub(super) fn build_vm_spec(
+pub fn build_vm_spec(
     id: &str,
     spec: &SandboxSpec,
     net: Option<&NetworkAttachment>,
@@ -97,7 +97,7 @@ pub(super) fn rootfs_disk(path: PathBuf) -> DiskSpec {
 /// (`owner`, the id the jail is keyed by), the fresh NIC the guest network
 /// activated, and the disk it runs on — the rootfs staged into the owner's
 /// jail.
-pub(super) fn restore_spec(
+pub fn restore_spec(
     owner: &str,
     chroot: &Path,
     nic: Option<NicSpec>,

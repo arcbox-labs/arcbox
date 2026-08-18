@@ -130,7 +130,7 @@ impl CowRecord {
 /// the daemon stages the agent it shipped with, so an old agent only ever sees
 /// new records across a daemon downgrade.
 #[derive(Debug, Serialize, Deserialize)]
-pub(super) struct SandboxStateRecord {
+pub struct SandboxStateRecord {
     /// Sandbox ID (also the directory name).
     pub id: String,
     /// The VMM's PID at boot time.
@@ -199,7 +199,7 @@ pub(super) struct SandboxStateRecord {
 /// mapped at the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum JournaledAttachMode {
+pub enum JournaledAttachMode {
     Invariant,
     LegacySnapshot,
 }
@@ -231,7 +231,7 @@ impl From<JournaledAttachMode> for AttachMode {
 /// One parameter rather than a lease plus two loose flags is what stops a
 /// journal site from recording an address without saying how it is attached.
 #[derive(Clone, Copy)]
-pub(super) struct JournaledLease<'a> {
+pub struct JournaledLease<'a> {
     lease: &'a NetworkLease,
     mode: AttachMode,
     invariant_identity: bool,
@@ -349,7 +349,7 @@ fn legacy_allocation(lease: &NetworkLease, dns: &[String]) -> Result<NetworkAllo
 }
 
 /// Atomically persist crash-recovery metadata before resources are exposed.
-pub(super) fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) -> Result<()> {
+pub fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(record)?;
     arcbox_atomic_file::write(&vm_dir.join(STATE_FILE), &bytes)?;
     Ok(())
@@ -379,7 +379,7 @@ pub(super) fn create_runtime_dir(vm_dir: &Path) -> Result<()> {
 }
 
 /// Remove the crash-recovery record (resources have been released).
-pub(super) fn clear_state_record(vm_dir: &Path) -> Result<()> {
+pub fn clear_state_record(vm_dir: &Path) -> Result<()> {
     match std::fs::remove_file(vm_dir.join(STATE_FILE)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

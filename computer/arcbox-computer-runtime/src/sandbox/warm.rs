@@ -101,7 +101,7 @@ pub(super) struct WarmPublishTicket {
 /// Single-flighted per key, and a failed publish is a warn — cache
 /// population must never fail a healthy boot. The one exception is a
 /// checkpoint that left the guest frozen
-/// ([`CheckpointFailure::Frozen`](super::checkpoint::CheckpointFailure)):
+/// ([`CheckpointFailure::Frozen`](crate::lifecycle::tasks::checkpoint::CheckpointFailure)):
 /// that sandbox is not healthy, and the error comes back so the boot fails
 /// instead of announcing READY for a guest that never runs again.
 /// `expected_state` is what the boot tail left the instance in: `Ready` for
@@ -157,7 +157,7 @@ pub(super) async fn publish_after_boot(
 
 /// How a warm publish failed: the sandbox is either as usable as it was, or
 /// its guest is frozen and the boot must fail (see
-/// [`CheckpointFailure`](super::checkpoint::CheckpointFailure)).
+/// [`CheckpointFailure`](crate::lifecycle::tasks::checkpoint::CheckpointFailure)).
 enum PublishFailure {
     Recoverable(VmmError),
     Frozen(VmmError),
@@ -169,9 +169,9 @@ impl From<VmmError> for PublishFailure {
     }
 }
 
-impl From<super::checkpoint::CheckpointFailure> for PublishFailure {
-    fn from(failure: super::checkpoint::CheckpointFailure) -> Self {
-        use super::checkpoint::CheckpointFailure;
+impl From<crate::lifecycle::tasks::checkpoint::CheckpointFailure> for PublishFailure {
+    fn from(failure: crate::lifecycle::tasks::checkpoint::CheckpointFailure) -> Self {
+        use crate::lifecycle::tasks::checkpoint::CheckpointFailure;
         match failure {
             CheckpointFailure::Recoverable(error) => Self::Recoverable(error),
             CheckpointFailure::Frozen(error) => Self::Frozen(error),
@@ -201,11 +201,11 @@ async fn publish_warm_snapshot(
 
     let name = format!("warm-{}", &ticket.key.hex()[..12]);
     let labels = HashMap::from([(WARM_KEY_LABEL.to_owned(), ticket.key.hex().to_owned())]);
-    let info = super::checkpoint::checkpoint_impl(
+    let info = crate::lifecycle::tasks::checkpoint::checkpoint_impl(
         instances,
         &ticket.snapshots,
         sandbox_id,
-        super::checkpoint::CheckpointRequest {
+        crate::lifecycle::tasks::checkpoint::CheckpointRequest {
             name,
             labels,
             expected_state,
@@ -384,7 +384,7 @@ mod tests {
                 rootfs_path: None,
                 net_invariant: true,
                 geometry: None,
-                format: super::checkpoint::CHECKPOINT_FORMAT.to_owned(),
+                format: crate::sandbox::checkpoint::CHECKPOINT_FORMAT.to_owned(),
             })
             .unwrap()
             .id

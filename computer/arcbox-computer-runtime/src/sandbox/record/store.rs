@@ -32,13 +32,13 @@ const RECORDS_DIR: &str = "sandbox-records";
 /// A filesystem mutation whose rename/unlink happened, but whose directory
 /// fsync may have failed. Callers must treat `value` as the visible state and
 /// may surface `durability_error` as an unconfirmed result.
-pub(in crate::sandbox) struct DurableCommit<T> {
+pub struct DurableCommit<T> {
     pub(in crate::sandbox) value: T,
-    pub(in crate::sandbox) durability_error: Option<String>,
+    pub durability_error: Option<String>,
 }
 
 impl<T> DurableCommit<T> {
-    pub(in crate::sandbox) fn confirmed(self, operation: &str) -> Result<T> {
+    pub fn confirmed(self, operation: &str) -> Result<T> {
         match self.durability_error {
             Some(error) => Err(VmmError::Unavailable(format!(
                 "{operation} is visible but its durability is unconfirmed: {error}"
@@ -49,14 +49,14 @@ impl<T> DurableCommit<T> {
 }
 
 /// File-backed sandbox record store serialized by a process-local mutex.
-pub(in crate::sandbox) struct SandboxRecordStore {
+pub struct SandboxRecordStore {
     root: PathBuf,
     lock: Mutex<()>,
 }
 
 impl SandboxRecordStore {
     /// Opens the durable store beside, rather than inside, runtime sandboxes.
-    pub(in crate::sandbox) fn new(data_dir: &Path) -> Result<Self> {
+    pub fn new(data_dir: &Path) -> Result<Self> {
         let root = data_dir.join(RECORDS_DIR);
         fs::create_dir_all(&root)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
@@ -172,7 +172,7 @@ impl SandboxRecordStore {
     }
 
     /// Applies a lifecycle transition only to the expected generation.
-    pub(in crate::sandbox) fn transition(
+    pub fn transition(
         &self,
         id: &str,
         generation: Uuid,
@@ -198,7 +198,7 @@ impl SandboxRecordStore {
     /// Called by `SetLifecycle` (CORE-60) with the post-update values so a
     /// paused sandbox reloaded after an agent restart keeps its (re-armed)
     /// TTL deadline and idle policy.
-    pub(in crate::sandbox) fn update_lifecycle(
+    pub fn update_lifecycle(
         &self,
         id: &str,
         generation: Uuid,
@@ -224,20 +224,12 @@ impl SandboxRecordStore {
     }
 
     /// Removes a known pre-ACK provision intent after side effects rolled back.
-    pub(in crate::sandbox) fn abort_provision(
-        &self,
-        id: &str,
-        generation: Uuid,
-    ) -> Result<DurableCommit<()>> {
+    pub fn abort_provision(&self, id: &str, generation: Uuid) -> Result<DurableCommit<()>> {
         self.delete_record(id, generation, SandboxPhase::Creating)
     }
 
     /// Releases an ID only after removal and resource cleanup completed.
-    pub(in crate::sandbox) fn finish_remove(
-        &self,
-        id: &str,
-        generation: Uuid,
-    ) -> Result<DurableCommit<()>> {
+    pub fn finish_remove(&self, id: &str, generation: Uuid) -> Result<DurableCommit<()>> {
         self.delete_record(id, generation, SandboxPhase::Removing)
     }
 

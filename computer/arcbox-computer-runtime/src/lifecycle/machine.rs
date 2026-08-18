@@ -7,7 +7,7 @@ use statig::prelude::*;
 use super::effect::{
     Answer, Durability, Effect, Effects, Notify, RecordEnd, ReleaseScope, Timer, Unconfirmed,
 };
-use super::event::{Event, PauseReason, Provision};
+use super::event::{Event, PauseReason, Provision, RestoreOrigin};
 use crate::sandbox::IdleAction;
 use crate::sandbox::record::PersistPhase;
 use crate::sandbox::workload::WorkloadClaim;
@@ -40,7 +40,7 @@ impl ComputerLifecycle {
                 context.removal();
                 Transition(State::removing())
             }
-            Event::Frozen | Event::Failure | Event::VmExited => {
+            Event::Frozen | Event::Failure | Event::Stranded | Event::VmExited => {
                 context.failure();
                 Transition(State::failed())
             }
@@ -60,10 +60,13 @@ impl ComputerLifecycle {
                 Transition(State::staging())
             }
             // The restore path commits `ReadyWithOutcome` in one hop from
-            // `Creating`, so it writes nothing on the way in.
+            // `Creating`, so it writes nothing on the way in. The origin
+            // rides the state: it decides whether this restore owes the
+            // Create event contract, and only the state is still around when
+            // the restore reports back.
             Event::Provision(Provision::Restore { origin }) => {
                 context.emit(Effect::SpawnRestore { origin: *origin });
-                Transition(State::restoring())
+                Transition(State::restoring(*origin))
             }
             Event::Failure => {
                 context.emit(Effect::ForgetRecord(RecordEnd::Aborted));
@@ -113,30 +116,42 @@ impl ComputerLifecycle {
         match event {
             Event::AgentReady => {
                 context.emit(Effect::SpawnGate);
-                Transition(State::gating(false))
+                Transition(State::gating(false, false))
             }
             _ => Super,
         }
     }
 
     #[state(superstate = "launching")]
-    fn restoring(event: &Event, context: &mut Effects) -> Outcome {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "statig passes state-local storage by reference"
+    )]
+    fn restoring(origin: &RestoreOrigin, event: &Event, context: &mut Effects) -> Outcome {
         match event {
             Event::Restored => {
                 context.emit(Effect::CommitRestored {
                     durability: Durability::Report(Unconfirmed::Ack),
                 });
+                // The warm-create reroute owes the Create event contract:
+                // a watcher sees CREATED then READY for this id, in that
+                // order, exactly as a cold boot emits them. A Restore RPC
+                // announces itself with READY alone.
+                if matches!(origin, RestoreOrigin::WarmCreate) {
+                    context.emit(Effect::Publish(Notify::Created));
+                }
                 context.emit(Effect::ArmTimer(Timer::Ttl));
                 context.emit(Effect::SpawnGate);
-                Transition(State::gating(true))
+                Transition(State::gating(true, false))
             }
             // A restore that fails before its commit is rolled back, not
             // failed in place: `rollback_restore` force-removes the record and
             // every artefact, so the id and its request key are free again and
             // a warm create can fall back to a cold boot. (Failing before any
             // resource exists is `abort_provision` today — the same end, one
-            // durable write cheaper.)
-            Event::Failure | Event::VmExited | Event::Frozen => {
+            // durable write cheaper.) It force-removes either way, so a
+            // stranded restore takes the same path.
+            Event::Failure | Event::Stranded | Event::VmExited | Event::Frozen => {
                 context.removal();
                 Transition(State::removing())
             }
@@ -147,12 +162,16 @@ impl ComputerLifecycle {
     /// The VM is up and READY is withheld: the warm publish freezes the guest
     /// and the initial `cmd` owns the workload slot, so a client acting on an
     /// early READY would hit a stopped guest or steal that slot.
+    ///
+    /// `claimed` is that slot: the boot's own `cmd` takes it here, *before*
+    /// READY, and it must survive the gate — the workload it started is still
+    /// running when READY lands, and its exit is what publishes IDLE.
     #[state(superstate = "computer")]
     #[allow(
         clippy::trivially_copy_pass_by_ref,
         reason = "statig passes state-local storage by reference"
     )]
-    fn gating(committed: &bool, event: &Event, context: &mut Effects) -> Outcome {
+    fn gating(committed: &bool, claimed: &bool, event: &Event, context: &mut Effects) -> Outcome {
         match event {
             Event::Gated => {
                 // A cold boot commits `Ready` here, after the probe, so a
@@ -168,15 +187,26 @@ impl ComputerLifecycle {
                 }
                 context.emit(Effect::Publish(Notify::Ready));
                 context.emit(Effect::Answer(Answer::Ready));
-                context.emit(Effect::ArmTimer(Timer::Idle));
-                Transition(State::ready())
+                if *claimed {
+                    // READY announces a computer that is already running its
+                    // own `cmd`: the idle window opens when that workload
+                    // exits, not here.
+                    Transition(State::running())
+                } else {
+                    context.emit(Effect::ArmTimer(Timer::Idle));
+                    Transition(State::ready())
+                }
             }
-            // The slot is reserved for this boot's own `cmd`; an API claim
-            // cannot reach a computer that has not announced READY.
+            // The slot is reserved for this boot's own `cmd` — an API claim
+            // cannot reach a computer that has not announced READY, and a
+            // second initial claim is the same one workload twice.
             Event::ClaimWorkload {
                 claim: WorkloadClaim::Initial,
+            } if !*claimed => {
+                context.emit(Effect::Publish(Notify::Running));
+                Transition(State::gating(*committed, true))
             }
-            | Event::Remove { force: false } => Handled,
+            Event::ClaimWorkload { .. } | Event::Remove { force: false } => Handled,
             _ => Super,
         }
     }
@@ -351,7 +381,11 @@ impl ComputerLifecycle {
             }
             // The restore unwound: retained state is intact, so park back at
             // `Paused` — which keeps its original `paused_at` — and let a retry
-            // or a Remove work.
+            // or a Remove work. A resume that could *not* unwind is
+            // `Stranded` and falls through to `computer`, which fails the
+            // computer: recording `Paused` for a half-allocated one would
+            // have the restart sweep reinstate it as resumable and drop the
+            // journal naming what it still holds.
             Event::Failure => {
                 context.persist(PersistPhase::Paused, Durability::Warn);
                 context.emit(Effect::Publish(Notify::Paused));
@@ -387,6 +421,7 @@ impl ComputerLifecycle {
             | Event::IdleExpired { .. }
             | Event::VmExited
             | Event::Failure
+            | Event::Stranded
             | Event::Frozen => Handled,
             _ => Super,
         }
@@ -415,6 +450,7 @@ impl ComputerLifecycle {
             Event::Remove { .. }
             | Event::TtlExpired
             | Event::Failure
+            | Event::Stranded
             | Event::Frozen
             | Event::VmExited => Handled,
             _ => Super,

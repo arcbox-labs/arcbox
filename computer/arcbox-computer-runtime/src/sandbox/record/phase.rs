@@ -53,14 +53,14 @@ pub enum SandboxPhase {
 pub type PersistPhase = SandboxPhase;
 
 /// The stable result returned once a provisioning request has been accepted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::sandbox) struct SandboxProvisionOutcome {
-    pub(in crate::sandbox) ip_address: String,
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxProvisionOutcome {
+    pub ip_address: String,
 }
 
 /// Versioned durable state for one sandbox generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::sandbox) struct SandboxRecord {
+pub struct SandboxRecord {
     pub(super) version: u32,
     pub(in crate::sandbox) id: SandboxId,
     pub(in crate::sandbox) generation: Uuid,
@@ -97,7 +97,7 @@ pub(in crate::sandbox) enum ProvisionIntent {
 
 /// Generation-checked lifecycle update.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::sandbox) enum SandboxTransition {
+pub enum SandboxTransition {
     Starting(SandboxProvisionOutcome),
     ReadyWithOutcome(SandboxProvisionOutcome),
     Ready,
