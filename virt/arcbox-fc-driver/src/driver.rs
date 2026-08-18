@@ -112,10 +112,16 @@ impl VmDriver for FcDriver {
     /// longer binary name tightens the budget rather than silently
     /// reintroducing the connect timeout it exists to prevent.
     ///
-    /// Nothing bounds the id in direct mode: the API socket and the vsock
-    /// live in the runtime dir, where the id is not part of the path. An
-    /// isolation this driver cannot run at all is refused when its layout
-    /// is built, not here.
+    /// Nothing bounds the id in direct mode — not because the id stays out
+    /// of the path (the sockets live in the caller's `runtime_dir`, which
+    /// may well be named after it), but because an over-long path there
+    /// announces itself: Firecracker binds the same absolute path the host
+    /// connects to, so the kernel raises `ENAMETOOLONG` at bind and names
+    /// the path it could not bind. The jail's budget exists for the
+    /// asymmetry direct mode does not have — a name short inside the chroot
+    /// and long outside it, which binds cleanly and fails only on the
+    /// host's `connect`. An isolation this driver cannot run at all is
+    /// refused when its layout is built, not here.
     fn id_budget(&self, isolation: &IsolationSpec) -> Option<usize> {
         match isolation {
             IsolationSpec::Jailer { chroot_base, .. } => Some(jail::id_budget(
