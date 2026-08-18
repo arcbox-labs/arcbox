@@ -57,6 +57,11 @@ pub struct KeepAlive {}
 pub struct CreateSandboxRequest {
     /// Caller-supplied unique ID for durable retry idempotency.
     /// If empty the daemon generates a fresh UUID for every attempt.
+    ///
+    /// A supplied ID must be 1-64 characters of \[A-Za-z0-9-\]. The sandbox runs
+    /// under this ID as its VMM instance identity, and the VMM refuses any
+    /// other character - `_` and `.` included - so the daemon rejects it here
+    /// rather than letting the boot fail with nothing naming the request.
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
     /// Arbitrary key-value metadata (used for filtering in List / Events).
@@ -1425,6 +1430,10 @@ pub struct CheckpointResponse {
 pub struct RestoreRequest {
     /// Caller-supplied ID for durable retry idempotency. Empty asks the daemon
     /// to generate a fresh UUID for every attempt.
+    ///
+    /// Same rule as CreateSandboxRequest.id: 1-64 characters of \[A-Za-z0-9-\],
+    /// because the restored sandbox runs under this ID as its VMM instance
+    /// identity.
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
     /// Source snapshot ID.
