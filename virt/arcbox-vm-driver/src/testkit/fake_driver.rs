@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::fake_prepared::Preparer;
+use super::fake_staging::StagingArea;
 use super::fake_vm::{FakeVm, VmInner};
 use super::fake_vsock::Inbound;
 use super::lock;
@@ -18,7 +19,7 @@ use crate::driver::{
     VmRecord, VmState,
 };
 use crate::error::{Error, Result};
-use crate::spec::{VmId, VmSpec};
+use crate::spec::{IsolationSpec, VmId, VmSpec};
 
 /// Scripted failures, armed once and consumed by the next matching call.
 #[derive(Debug, Default)]
@@ -70,6 +71,9 @@ pub(super) struct DriverInner {
     next_pid: AtomicU32,
     /// Every VM booted or restored and not yet seen exited.
     vms: Mutex<HashMap<VmId, Arc<VmInner>>>,
+    /// Every `Adopt::discard_area`, in order, with what it was told the VM
+    /// ran under.
+    discarded_areas: Mutex<Vec<(VmId, IsolationSpec)>>,
 }
 
 /// Configures a [`FakeDriver`].
@@ -93,6 +97,7 @@ impl FakeDriverBuilder {
             knobs: Arc::new(self.knobs),
             next_pid: AtomicU32::new(FIRST_PID),
             vms: Mutex::new(HashMap::new()),
+            discarded_areas: Mutex::new(Vec::new()),
         });
         FakeDriver {
             adopter: Adopter(Arc::clone(&inner)),
@@ -219,6 +224,18 @@ impl FakeDriver {
     /// adoption is only meaningful once it has.
     pub fn owned_vms(&self) -> Vec<VmId> {
         self.inner.owned_vms()
+    }
+
+    /// Every [`Adopt::discard_area`] this driver was asked for, in order,
+    /// paired with the isolation the caller said the VM had run under.
+    ///
+    /// A sweep is expected to discard each dead VM's area exactly once and
+    /// to leave alone the ones it must not touch, and neither is visible
+    /// from the filesystem afterwards: a second discard of an
+    /// already-cleared area looks like the first, and an area nobody ever
+    /// staged into looks like one correctly skipped.
+    pub fn discarded_areas(&self) -> Vec<(VmId, IsolationSpec)> {
+        lock(&self.inner.discarded_areas).clone()
     }
 
     /// Appends `bytes` to what `Console::read_output` returns for `vm`.
@@ -367,6 +384,27 @@ impl Adopt for Adopter {
             });
         }
         Ok(Some(Box::new(FakeVm::new(vm))))
+    }
+
+    /// Removes `{runtime_dir}/staged`, and records the call.
+    ///
+    /// A VM that has not been seen to exit is refused: the port says this
+    /// is never asked of a running VM, and the fake is where a caller that
+    /// asks anyway is caught — on disk, tearing a live VM's area down looks
+    /// exactly like tearing a dead one's down.
+    async fn discard_area(&self, record: &VmRecord, isolation: &IsolationSpec) -> Result<()> {
+        if let Some(vm) = self.0.registered(&record.id) {
+            let state = vm.state();
+            if !matches!(state, VmState::Exited(_)) {
+                return Err(Error::WrongState {
+                    id: record.id.clone(),
+                    state,
+                    expected: "a vm that is gone",
+                });
+            }
+        }
+        lock(&self.0.discarded_areas).push((record.id.clone(), isolation.clone()));
+        StagingArea::new(&record.runtime_dir).remove().await
     }
 }
 

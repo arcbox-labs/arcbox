@@ -165,6 +165,25 @@ impl Adopt for FcDriver {
             None => Ok(None),
         }
     }
+
+    /// Removes the jail the VM ran in, and with it everything staged into
+    /// it — the jailer's whole per-VM directory,
+    /// `{chroot base}/{firecracker binary name}/{id}`, exactly as
+    /// [`PreparedVm::discard`] and an adopted handle's `shutdown` remove
+    /// it. Where the jail is comes from `isolation` and this driver's own
+    /// binary path, the same two things a boot builds it from; nothing is
+    /// asked of the VMM, which is gone.
+    ///
+    /// Firecracker run without the jailer reads host paths as they are, has
+    /// no area of its own, and leaves nothing to remove.
+    async fn discard_area(&self, record: &VmRecord, isolation: &IsolationSpec) -> Result<()> {
+        let layout =
+            render::VmLayout::new(&record.id, isolation, &self.config, &record.runtime_dir)?;
+        match layout.jail() {
+            Some(jail) => jail.remove().await,
+            None => Ok(()),
+        }
+    }
 }
 
 /// Whether guests may run their own hypervisor: KVM's `nested` module
@@ -257,6 +276,54 @@ mod tests {
             driver.id_budget(&jailed(&format!("/{}", "d".repeat(200)))),
             Some(0)
         );
+    }
+
+    /// The startup-sweep route: a VM whose process died with the agent
+    /// leaves its jail, and the driver is the only thing that knows where
+    /// that is. A second sweep finding it already cleared is not an error,
+    /// and a driver in direct mode has no area at all.
+    #[tokio::test]
+    async fn a_gone_vms_jail_is_removed_and_direct_mode_has_no_area() {
+        let base = tempfile::tempdir().unwrap();
+        let driver = driver();
+        let per_vm = base.path().join("firecracker/box");
+        std::fs::create_dir_all(per_vm.join("root/run")).unwrap();
+        std::fs::write(per_vm.join("root/rootfs.ext4"), b"the guest's disk").unwrap();
+        let record = VmRecord {
+            id: VmId::new("box").unwrap(),
+            driver: NAME.to_owned(),
+            runtime_dir: base.path().join("run/box"),
+            process: None,
+        };
+        let jailed = IsolationSpec::Jailer {
+            uid: 0,
+            gid: 0,
+            chroot_base: base.path().to_path_buf(),
+            netns: None,
+            new_pid_ns: false,
+            cgroup: None,
+        };
+
+        Adopt::discard_area(&driver, &record, &jailed)
+            .await
+            .unwrap();
+        assert!(
+            !per_vm.exists(),
+            "the whole per-vm directory goes, not just the chroot inside it"
+        );
+        Adopt::discard_area(&driver, &record, &jailed)
+            .await
+            .expect("a sweep may find what an earlier one already cleared");
+
+        // Direct mode: nothing was ever brought anywhere, so there is
+        // nothing to take away — and saying so is a success, not an error.
+        let outside = base.path().join("run/box/rootfs.ext4");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"the caller's own file").unwrap();
+        Adopt::discard_area(&driver, &record, &IsolationSpec::None)
+            .await
+            .unwrap();
+        assert!(outside.exists(), "direct mode removed the caller's file");
     }
 
     #[tokio::test]

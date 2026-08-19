@@ -61,6 +61,15 @@ impl StagingArea {
         }
     }
 
+    /// Removes the area and everything in it; already gone is success.
+    pub(super) async fn remove(&self) -> Result<()> {
+        match tokio::fs::remove_dir_all(&self.root).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
     /// Where the disk `id` sits in the area.
     ///
     /// Refuses an id that is not a plain name, exactly as a real adapter

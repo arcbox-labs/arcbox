@@ -316,7 +316,8 @@ impl AsRef<str> for CheckpointFormat {
     }
 }
 
-/// Find a VM that outlived the process which booted it.
+/// Find a VM that outlived the process which booted it — or clear away what
+/// it left when it did not.
 ///
 /// Present on external-process VMMs only: an in-process VM dies with its
 /// process, so "adopt" has no meaning there and the accessor is `None`.
@@ -327,6 +328,28 @@ pub trait Adopt: Send + Sync {
     /// `Ok(None)` means nothing survived — a stale record, a dead pid — which
     /// is an outcome, not an absence of the capability.
     async fn adopt(&self, record: &VmRecord) -> Result<Option<Box<dyn VmHandle>>>;
+
+    /// Removes the host area of the VM `record` names, which is gone.
+    ///
+    /// A VM's area belongs to whichever grip owns its VMM: the
+    /// [`PreparedVm`] that made it, or the handle of a VM this driver
+    /// adopted. A VM that died with the process which booted it leaves
+    /// neither, and leaves its area — which, where a driver confines its
+    /// VMMs, holds everything [`Staging`] brought in. This is the only
+    /// route left to it, and only the driver knows where "it" is.
+    ///
+    /// `isolation` is what the VM was configured to run under, because
+    /// nothing can be read back off a process that is gone. A driver that
+    /// confines nothing has no area to remove and succeeds.
+    ///
+    /// Already removed is success: a startup sweep runs this on every
+    /// journal it does not keep, and may find what an earlier sweep
+    /// cleared.
+    ///
+    /// Never called on a VM that is still running — [`adopt`](Self::adopt)
+    /// answers that case with a handle, and the handle's stop takes the
+    /// area.
+    async fn discard_area(&self, record: &VmRecord, isolation: &IsolationSpec) -> Result<()>;
 }
 
 /// Give up ownership of a running VM without stopping it.

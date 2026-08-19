@@ -746,3 +746,78 @@ pub async fn a_staged_checkpoint_restores(h: &dyn ContractHarness) {
     h.ready(&*restored).await;
     restored.shutdown(ShutdownMode::Kill).await.expect("kill");
 }
+
+/// The area of a VM that died with the process which prepared it is
+/// removed by [`Adopt::discard_area`], and removed again without
+/// complaint.
+///
+/// The startup-sweep shape: a prepared VM is dropped without a discard, so
+/// its VMM dies and no grip is left to take the area with it. The check
+/// then asks the driver — the only thing that knows where the area is — to
+/// clear it, and reads the answer off the disk the staging returned rather
+/// than off any path of its own.
+///
+/// A driver that confines nothing stages in place, has no area, and must
+/// answer success rather than an error; the check tells the two apart the
+/// way `a_staged_disk_can_be_taken_back_out` does, by whether staging
+/// moved the file at all. Either way the VM's runtime directory is the
+/// caller's, and survives.
+///
+/// [`Adopt::discard_area`]: crate::Adopt::discard_area
+pub async fn a_dead_vms_area_is_discarded(h: &dyn ContractHarness) {
+    const CONTENT: &[u8] = b"a disk left behind by a dead vm";
+
+    let driver = h.driver();
+    let (Some(prepare), Some(adopt)) = (driver.prepare(), driver.adopt()) else {
+        assert!(!driver.capabilities().prepare || !driver.capabilities().adopt);
+        return;
+    };
+    let spec = h.spec(&id("dead-area"));
+    let dir = h.runtime_dir();
+    let prepared = prepare
+        .prepare(&spec.id, &spec.isolation, &dir)
+        .await
+        .expect("prepare");
+    let record = prepared.record();
+    let Some(staging) = prepared.staging() else {
+        assert!(!driver.capabilities().staging);
+        return;
+    };
+
+    let source = dir.join("left-behind.ext4");
+    tokio::fs::write(&source, CONTENT)
+        .await
+        .expect("a file to stage");
+    let staged = staging
+        .stage_disk("data", DiskSource::Image(&source))
+        .await
+        .expect("stage a disk");
+
+    // The VMM dies with the grip that made it, and nothing takes the area:
+    // `discard` is what would, and a process that crashed never ran one.
+    drop(prepared);
+
+    adopt
+        .discard_area(&record, &spec.isolation)
+        .await
+        .expect("discard the area of a vm that is gone");
+    if staged == source {
+        // Nothing was brought anywhere, so there is no area to remove and
+        // the caller's own file is untouched.
+        assert!(
+            tokio::fs::try_exists(&source).await.unwrap_or(false),
+            "a driver that stages in place removed the caller's file"
+        );
+    } else {
+        assert!(
+            !tokio::fs::try_exists(&staged).await.unwrap_or(true),
+            "the area of a vm that is gone was left standing"
+        );
+    }
+    assert!(dir.is_dir(), "the vm's runtime directory is the caller's");
+
+    adopt
+        .discard_area(&record, &spec.isolation)
+        .await
+        .expect("an area already gone is discarded again without complaint");
+}
