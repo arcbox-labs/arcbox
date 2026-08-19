@@ -56,7 +56,7 @@ The `NetworkLease` carries VM, address, prefix, gateway, MAC and cleanup
 token; the allocation is rebuilt from it (TAP name from the address,
 resolvers from the network), so there is no side table to keep. Errors:
 `TapNetError` maps variant for variant into
-`arcbox_computer_runtime::VmmError` (`WrongState` / `Unavailable` keep
+`arcbox_computer_runtime::ComputerError` (`WrongState` / `Unavailable` keep
 their 412 / 503 meaning) and into the port's `Error` (`Unavailable` and
 `PreconditionFailed` carry the same two answers; `Io` keeps its shape, the
 faults land on `Network`).
